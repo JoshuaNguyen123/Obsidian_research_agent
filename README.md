@@ -17,6 +17,11 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Web search and fetch tools for sourced research when enabled by the mission.
 - Persisted chat history capped to useful user and assistant messages only.
 - `Run Details` diagnostics for model config, status, planning, tool timeline, receipts, and trace logs.
+- Click `Stop Mission` while a run is active to request a controlled stop before the next model, tool, or writeback step.
+- Model/API calls default to a 3-minute timeout and emit waiting status updates during long responses.
+- Final-answer streaming buffers early output and stops off-topic responses before unrelated text is displayed or persisted.
+- Short follow-ups such as `Continue` can inherit a pending current-note read intent from recent chat instead of producing another "I'll read it" preamble.
+- Current-note prompt extraction lets prompts such as `Read the prompt on the page` read the visible note, execute the prompt written there, and stream generated writing back into that same note when the page prompt asks for prose or markdown output.
 
 ## Requirements
 
@@ -67,6 +72,20 @@ Start the development build watcher:
 npm run dev
 ```
 
+Sync the built plugin artifacts into the live test vault:
+
+```bash
+npm run sync:test-vault
+```
+
+Run the Obsidian desktop e2e test:
+
+```bash
+npm run test:e2e
+```
+
+The e2e harness builds the plugin, syncs only `main.js`, `manifest.json`, and `styles.css` into the live test vault plugin folder, launches a controlled Obsidian process, and verifies a real append mission against a seeded note. By default it resolves the vault as `%USERPROFILE%\OneDrive\Desktop\test_vault_obsidian_ai`; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
+
 ## Project Layout
 
 ```text
@@ -77,8 +96,15 @@ src/model/                 Ollama-compatible model client
 src/tools/                 Vault, web, validation, and registry tools
 src/conversationHistory.ts Persisted bounded chat memory
 tests/                     Node test suite
+e2e/                       Playwright Obsidian desktop tests
+scripts/                   Local helper scripts for vault sync and validation
+docs/                      Project specification and technical details
 ```
+
+## Technical Documentation
+
+Architecture, implementation choices, runtime flow, tool contracts, and validation details live in `docs/technical_details.md`. Update that document when changing core architecture, agent flow, settings, tool behavior, safety rules, test strategy, or build/deployment workflows.
 
 ## GitHub Notes
 
-This repository intentionally ignores local planning and agent context such as `AGENTS.md`, `docs/`, `skills/`, `.agents/`, and `.codex/`. Those files can stay on a developer machine without being published to GitHub.
+This repository keeps project instructions and technical documentation in source control. Local-only agent, skill, and planning context should use ignored paths such as `AGENTS.local.md`, `agents.local.md`, `skills/`, `.agents/`, and `.codex/`.

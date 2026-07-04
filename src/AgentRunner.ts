@@ -4,6 +4,7 @@ import type {
   ModelChatMessage,
   ModelClient,
   ModelChatStreamEvents,
+  ModelToolCall,
   ModelRequestOptions,
   ModelThink,
 } from "./model/types";
@@ -12,6 +13,7 @@ import type {
   AgentMissionMode,
   MissionIntent,
   ToolExecutionContext,
+  ToolExecutionResult,
   ToolRegistry,
 } from "./tools/types";
 import {
@@ -100,9 +102,17 @@ export interface AgentRunConfigEvent {
   numCtx?: number;
   writeAutonomy: boolean;
   missionMode: AgentMissionMode;
+  contextScope: AgentRunContextScope;
+  currentNoteContext: boolean;
   vaultContext: boolean;
   maxSteps: number;
 }
+
+export type AgentRunContextScope =
+  | "none"
+  | "current_note"
+  | "vault"
+  | "vault_and_current_note";
 
 export type AgentTraceKind =
   | "status"
@@ -145,6 +155,7 @@ export type AgentRunStopReason =
   | "final"
   | "write_completed"
   | "clarifying_question"
+  | "user_stopped"
   | "budget"
   | "error";
 
@@ -186,6 +197,7 @@ interface RunAgentMissionOptions {
   enableStreaming: boolean;
   conversationHistory?: AgentConversationMessage[];
   events?: AgentRunEvents;
+  abortSignal?: AbortSignal;
 }
 
 const SYSTEM_PROMPT = `You are an agentic research assistant running inside Obsidian.
@@ -216,14 +228,127 @@ Operating rules:
 18. When the mission is expected to produce note output, choose the safest useful write tool instead of only answering in chat.
 19. If a date calculation is missing a year or reference date, ask one concise clarifying question instead of guessing.
 20. When you have enough context and no note write is required, stop requesting tools and write the final answer.
-21. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.`;
+21. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
+22. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
+23. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
 
 const FINAL_ANSWER_PROMPT = [
   "Provide the final answer for the user now.",
   "Use the current conversation, current-note context, and any tool results.",
+  "Use English unless the current user mission explicitly asks for another language.",
+  "Stay on the exact user-requested topic.",
   "Do not request tools.",
   "Do not mention hidden planning unless it is directly useful to the user.",
 ].join(" ");
+
+function buildFinalAnswerPrompt(prompt: string): string {
+  return [
+    FINAL_ANSWER_PROMPT,
+    `Current user mission: ${JSON.stringify(truncateForPromptAnchor(prompt))}.`,
+    "Answer only that mission. If any prior model content is empty, unrelated, or off topic, ignore it and produce the requested answer from the current mission.",
+  ].join(" ");
+}
+
+function buildCurrentNoteFinalAnswerPrompt(prompt: string): string {
+  return [
+    FINAL_ANSWER_PROMPT,
+    "The active markdown note has already been read and is available as Current note context.",
+    "Do not say you will read the note; use the provided Current note context now.",
+    isPromptOnCurrentPageIntent(prompt)
+      ? "The user wants the prompt written on the active note/page to be extracted and executed."
+      : `Current user mission: ${JSON.stringify(truncateForPromptAnchor(prompt))}.`,
+  ].join(" ");
+}
+
+function getFinalAnswerRelevancePrompt(
+  prompt: string,
+  currentNoteContext: unknown,
+): string {
+  if (!isPromptOnCurrentPageIntent(prompt)) {
+    return prompt;
+  }
+
+  const noteContent = getCurrentNoteContextContent(currentNoteContext);
+  if (!noteContent) {
+    return prompt;
+  }
+
+  return `${prompt}\n\n${truncateForPromptAnchor(noteContent)}`;
+}
+
+function getCurrentNoteContextContent(currentNoteContext: unknown): string | null {
+  if (!isRecord(currentNoteContext)) {
+    return null;
+  }
+
+  return getString(currentNoteContext.content) ?? null;
+}
+
+function isPromptOnCurrentPageIntent(prompt: string): boolean {
+  return /\b(read|check|extract|use|answer|run|execute|follow)\b[\s\S]{0,80}\b(prompt|instruction|question|task|request)\b[\s\S]{0,80}\b(?:on|from|in)\s+(?:the\s+)?(?:page|note|document)\b|\b(prompt|instruction|question|task|request)\b[\s\S]{0,80}\b(?:on|from|in)\s+(?:the\s+)?(?:page|note|document)\b/i.test(
+    prompt,
+  );
+}
+
+const EMPTY_STREAMING_WRITEBACK_MESSAGE =
+  "The model returned no writable content. Nothing was written.";
+const OFF_TOPIC_MODEL_OUTPUT_MESSAGE =
+  "Stopped model output because it drifted off topic from the current mission.";
+
+function resolvePromptForIntent(
+  prompt: string,
+  conversationHistory: AgentConversationMessage[],
+): string {
+  if (!isVagueContinuationFollowup(prompt)) {
+    return prompt;
+  }
+
+  if (hasRecentCurrentNoteReadContext(conversationHistory)) {
+    return "Read the current note.";
+  }
+
+  if (hasRecentVaultToolContinuationContext(conversationHistory)) {
+    return "Continue the prior vault exploration. Use available vault tools to inspect folders and files, then answer with the findings.";
+  }
+
+  return prompt;
+}
+
+function isVagueContinuationFollowup(prompt: string): boolean {
+  return /^\s*(continue|go on|keep going|keep exploring|keep searching|read it|check it|do that|please do|yes|ok|okay)\.?\s*$/i.test(
+    prompt,
+  );
+}
+
+function hasRecentCurrentNoteReadContext(
+  conversationHistory: AgentConversationMessage[],
+): boolean {
+  return conversationHistory.slice(-8).some((message) =>
+    /\b(read|check|inspect|look at|open)\b[\s\S]{0,80}\b(current|active|this)\s+(note|file|markdown|document)\b|\b(current|active|this)\s+(note|file|markdown|document)\b[\s\S]{0,80}\b(read|check|inspect|look at|open)\b|\bactive markdown file\b/i.test(
+      message.content,
+    ),
+  );
+}
+
+function hasRecentVaultToolContinuationContext(
+  conversationHistory: AgentConversationMessage[],
+): boolean {
+  return conversationHistory.slice(-10).some((message) => {
+    const content = message.content;
+    return (
+      /\b(list_folder|list_current_folder|list_markdown_files|read_markdown_files|search_markdown_files|read_file|get_path_info)\b/i.test(
+        content,
+      ) ||
+      /\bvault\b[\s\S]{0,140}\b(folder|folders|file|files|structure|explor|personal details)\b/i.test(
+        content,
+      ) ||
+      /\b(folder|folders|file|files|structure|explor|personal details)\b[\s\S]{0,140}\bvault\b/i.test(
+        content,
+      ) ||
+      /\b(tool usage|tool request|use tools|using tools)\b/i.test(content)
+    );
+  });
+}
 
 export async function runAgentMission({
   prompt,
@@ -233,10 +358,12 @@ export async function runAgentMission({
   enableStreaming,
   conversationHistory = [],
   events = {},
+  abortSignal,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
   let activeThink = resolveThinkingMode(toolContext.settings);
-  const missionIntent = classifyMissionIntent(prompt);
+  const intentPrompt = resolvePromptForIntent(prompt, conversationHistory);
+  const missionIntent = classifyMissionIntent(intentPrompt);
   const writeAutonomy = missionIntent.allowAutonomousWrite;
   const runToolContext: ToolExecutionContext = {
     ...toolContext,
@@ -244,6 +371,8 @@ export async function runAgentMission({
     missionIntent,
   };
   const modelOptions = buildModelRequestOptions(runToolContext.settings);
+  const followupIntentContext =
+    intentPrompt === prompt ? null : formatFollowupIntentContext(intentPrompt);
   const disableThinkingForRun = () => {
     if (activeThink !== undefined) {
       activeThink = undefined;
@@ -251,19 +380,22 @@ export async function runAgentMission({
     }
   };
   const streamingWritebackKind = getStreamingWritebackKind(
-    prompt,
+    intentPrompt,
     runToolContext,
     enableStreaming,
   );
   const tools = getAllowedToolDefinitions(
     toolRegistry,
-    prompt,
+    intentPrompt,
     missionIntent,
     streamingWritebackKind,
   );
+  const knownToolNames = new Set(
+    toolRegistry.getDefinitions().map((tool) => tool.function.name),
+  );
   const allowedToolNames = new Set(tools.map((tool) => tool.function.name));
   const requiredWriteTools = getRequiredWriteToolNames(
-    prompt,
+    intentPrompt,
     allowedToolNames,
     missionIntent,
     streamingWritebackKind,
@@ -271,7 +403,7 @@ export async function runAgentMission({
   const writeRequired =
     missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
   const shouldReadCurrentNote = shouldObserveCurrentNote(
-    prompt,
+    intentPrompt,
     allowedToolNames,
     missionIntent,
   );
@@ -281,6 +413,18 @@ export async function runAgentMission({
   let lastStep = 0;
   const writeReceipts: AgentRunReceipt[] = [];
   let preparedStreamingSectionEdit: PreparedStreamingSectionEdit | null = null;
+  const stopIfRequested = (step = Math.max(lastStep, 0)) => {
+    if (!isRunStopRequested(abortSignal)) {
+      return false;
+    }
+
+    completeRun(events, "user_stopped", step, runStartedAt);
+    return true;
+  };
+
+  if (stopIfRequested(0)) {
+    return;
+  }
 
   events.onRunConfig?.(
     buildRunConfigEvent({
@@ -290,6 +434,7 @@ export async function runAgentMission({
       modelOptions,
       writeAutonomy,
       missionIntent,
+      currentNoteContext: shouldReadCurrentNote,
     }),
   );
   events.onTrace?.({
@@ -310,6 +455,20 @@ export async function runAgentMission({
   const currentNoteContext = shouldReadCurrentNote
     ? await readInitialCurrentNote(toolRegistry, runToolContext, events)
     : null;
+  if (stopIfRequested(0)) {
+    return;
+  }
+  const finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
+    intentPrompt,
+    currentNoteContext,
+  );
+  const promptOnPageWritebackKind = getPromptOnPageWritebackKind({
+    prompt,
+    currentNoteContext,
+    toolContext: runToolContext,
+    enableStreaming,
+  });
+
   const conversationMessages = toConversationModelMessages(conversationHistory);
 
   const messages: ModelChatMessage[] = [
@@ -323,8 +482,28 @@ export async function runAgentMission({
     },
     {
       role: "system" as const,
+      content: formatResponseLanguageContext(prompt),
+    },
+    {
+      role: "system" as const,
       content: formatMissionIntentContext(missionIntent),
     },
+    ...(isPromptOnCurrentPageIntent(prompt)
+      ? [
+          {
+            role: "system" as const,
+            content: formatPromptOnCurrentPageContext(),
+          },
+        ]
+      : []),
+    ...(followupIntentContext === null
+      ? []
+      : [
+          {
+            role: "system" as const,
+            content: followupIntentContext,
+          },
+        ]),
     ...(currentNoteContext === null
       ? []
       : [
@@ -360,7 +539,112 @@ export async function runAgentMission({
     },
   ];
 
+  if (promptOnPageWritebackKind !== null) {
+    if (stopIfRequested(1)) {
+      return;
+    }
+    emitRunDiagnostics({
+      events,
+      toolContext: {
+        ...runToolContext,
+        writeAutonomy: true,
+      },
+      tools,
+      enableStreaming,
+      finalMode: "streaming_writeback",
+    });
+    let receipt: AgentRunReceipt;
+    try {
+      receipt = await streamCurrentNoteWriteback({
+        kind: promptOnPageWritebackKind,
+        preparedSectionEdit: null,
+        modelClient,
+        messages: [
+          ...messages,
+          {
+            role: "system" as const,
+            content: formatPromptOnCurrentPageWritebackContext(),
+          },
+        ],
+        events,
+        toolContext: runToolContext,
+        think: activeThink,
+        options: modelOptions,
+        abortSignal,
+        onThinkingUnsupported: disableThinkingForRun,
+      });
+    } catch (error) {
+      if (stopIfRequested(1)) {
+        return;
+      }
+      throw error;
+    }
+    if (stopIfRequested(1)) {
+      return;
+    }
+    writeReceipts.push(receipt);
+    events.onReceipt?.(receipt);
+    completeRun(events, "write_completed", 1, runStartedAt);
+    return;
+  }
+
+  if (
+    enableStreaming &&
+    currentNoteContext !== null &&
+    !writeRequired &&
+    streamingWritebackKind === null &&
+    canStreamAnswerFromInitialCurrentNoteContext(tools)
+  ) {
+    if (stopIfRequested(1)) {
+      return;
+    }
+    emitRunDiagnostics({
+      events,
+      toolContext: runToolContext,
+      tools,
+      enableStreaming,
+      finalMode: "streaming_direct",
+    });
+    let response: ModelChatResponse | null;
+    try {
+      response = await emitFinalAnswer({
+        modelClient,
+        messages,
+        events,
+        enableStreaming,
+        fallbackContent: "",
+        finalInstruction: buildCurrentNoteFinalAnswerPrompt(prompt),
+        metricName: "current_note_answer",
+        relevancePrompt: finalAnswerRelevancePrompt,
+        think: activeThink,
+        options: modelOptions,
+        abortSignal,
+        onThinkingUnsupported: disableThinkingForRun,
+      });
+    } catch (error) {
+      if (stopIfRequested(1)) {
+        return;
+      }
+      throw error;
+    }
+    if (stopIfRequested(1)) {
+      return;
+    }
+    completeRun(
+      events,
+      isClarifyingQuestionResponse(prompt, response?.message.content ?? "")
+        ? "clarifying_question"
+        : "final",
+      1,
+      runStartedAt,
+    );
+    return;
+  }
+
   if (enableStreaming && tools.length === 0 && !writeRequired) {
+    if (stopIfRequested(1)) {
+      return;
+    }
     emitRunDiagnostics({
         events,
         toolContext: runToolContext,
@@ -368,18 +652,31 @@ export async function runAgentMission({
         enableStreaming,
         finalMode: "streaming_direct",
     });
-    const response = await emitFinalAnswer({
-      modelClient,
-      messages,
-      events,
-      enableStreaming,
+    let response: ModelChatResponse | null;
+    try {
+      response = await emitFinalAnswer({
+        modelClient,
+        messages,
+        events,
+        enableStreaming,
       fallbackContent: "",
       finalInstruction: null,
       metricName: "direct_answer",
+      relevancePrompt: finalAnswerRelevancePrompt,
       think: activeThink,
       options: modelOptions,
-      onThinkingUnsupported: disableThinkingForRun,
-    });
+      abortSignal,
+        onThinkingUnsupported: disableThinkingForRun,
+      });
+    } catch (error) {
+      if (stopIfRequested(1)) {
+        return;
+      }
+      throw error;
+    }
+    if (stopIfRequested(1)) {
+      return;
+    }
     completeRun(
       events,
       isClarifyingQuestionResponse(prompt, response?.message.content ?? "")
@@ -394,6 +691,10 @@ export async function runAgentMission({
   emitStatus(events, "Planning...", "planning");
 
   for (let step = 1; step <= MAX_AGENT_STEPS; step += 1) {
+    if (stopIfRequested(step)) {
+      return;
+    }
+
     lastStep = step;
     events.onStatus?.(`Agent step ${step} of max ${MAX_AGENT_STEPS}...`);
     events.onPhaseChange?.(
@@ -401,21 +702,55 @@ export async function runAgentMission({
       `Planning step ${step} of max ${MAX_AGENT_STEPS}...`,
     );
 
-    const response = await chatForAgentStep(
-      modelClient,
-      buildChatRequest(messages, tools, activeThink, modelOptions),
+    let response: ModelChatResponse;
+    try {
+      response = await chatForAgentStep(
+        modelClient,
+        buildChatRequest(messages, tools, activeThink, modelOptions, abortSignal),
+        events,
+        step,
+        disableThinkingForRun,
+      );
+    } catch (error) {
+      if (stopIfRequested(step)) {
+        return;
+      }
+      throw error;
+    }
+
+    if (stopIfRequested(step)) {
+      return;
+    }
+
+    const responseToolCalls = getResponseToolCallsFromModelOutput(
+      response,
+      knownToolNames,
       events,
       step,
-      disableThinkingForRun,
+    );
+    const recoveredTextToolCalls =
+      response.toolCalls.length === 0 && responseToolCalls.length > 0;
+
+    messages.push(
+      withoutThinking(
+        recoveredTextToolCalls
+          ? {
+              ...response.message,
+              content: "",
+              toolCalls: responseToolCalls,
+            }
+          : response.message,
+      ),
     );
 
-    messages.push(withoutThinking(response.message));
-
-    if (response.toolCalls.length === 0) {
+    if (responseToolCalls.length === 0) {
       if (
         streamingWritebackKind &&
         (streamingWritebackKind !== "edit" || preparedStreamingSectionEdit)
       ) {
+        if (stopIfRequested(step)) {
+          return;
+        }
         emitRunDiagnostics({
           events,
           toolContext: runToolContext,
@@ -423,17 +758,29 @@ export async function runAgentMission({
           enableStreaming,
           finalMode: "streaming_writeback",
         });
-        const receipt = await streamCurrentNoteWriteback({
-          kind: streamingWritebackKind,
-          preparedSectionEdit: preparedStreamingSectionEdit,
-          modelClient,
-          messages,
-          events,
-          toolContext: runToolContext,
-          think: activeThink,
-          options: modelOptions,
-          onThinkingUnsupported: disableThinkingForRun,
-        });
+        let receipt: AgentRunReceipt;
+        try {
+          receipt = await streamCurrentNoteWriteback({
+            kind: streamingWritebackKind,
+            preparedSectionEdit: preparedStreamingSectionEdit,
+            modelClient,
+            messages,
+            events,
+            toolContext: runToolContext,
+            think: activeThink,
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+          });
+        } catch (error) {
+          if (stopIfRequested(step)) {
+            return;
+          }
+          throw error;
+        }
+        if (stopIfRequested(step)) {
+          return;
+        }
         writeReceipts.push(receipt);
         events.onReceipt?.(receipt);
         completeRun(events, "write_completed", lastStep, runStartedAt);
@@ -457,25 +804,44 @@ export async function runAgentMission({
         response.message.content,
       );
 
-      if (executedModelTool && enableStreaming && !hasDirectFinalContent) {
+      if (enableStreaming && !hasDirectFinalContent) {
+        if (stopIfRequested(step)) {
+          return;
+        }
         emitRunDiagnostics({
           events,
           toolContext: runToolContext,
           tools,
           enableStreaming,
-          finalMode: "streaming_final",
+          finalMode: executedModelTool ? "streaming_final" : "streaming_direct",
         });
-        await emitFinalAnswer({
-          modelClient,
-          messages,
-          events,
-          enableStreaming,
-          fallbackContent: response.message.content,
-          think: activeThink,
-          options: modelOptions,
-          onThinkingUnsupported: disableThinkingForRun,
-        });
+        try {
+          await emitFinalAnswer({
+            modelClient,
+            messages,
+            events,
+            enableStreaming,
+            fallbackContent: response.message.content,
+            finalInstruction: buildFinalAnswerPrompt(prompt),
+            relevancePrompt: finalAnswerRelevancePrompt,
+            think: activeThink,
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+          });
+        } catch (error) {
+          if (stopIfRequested(step)) {
+            return;
+          }
+          throw error;
+        }
+        if (stopIfRequested(step)) {
+          return;
+        }
       } else {
+        if (stopIfRequested(step)) {
+          return;
+        }
         emitRunDiagnostics({
           events,
           toolContext: runToolContext,
@@ -498,8 +864,12 @@ export async function runAgentMission({
 
     let shouldReplanAfterUnavailableTool = false;
 
-    for (let toolIndex = 0; toolIndex < response.toolCalls.length; toolIndex += 1) {
-      const toolCall = response.toolCalls[toolIndex];
+    for (let toolIndex = 0; toolIndex < responseToolCalls.length; toolIndex += 1) {
+      if (stopIfRequested(step)) {
+        return;
+      }
+
+      const toolCall = responseToolCalls[toolIndex];
       const toolEventBase: AgentToolRunEvent = {
         id: `${step}:${toolIndex}:${toolCall.name}`,
         name: toolCall.name,
@@ -563,13 +933,21 @@ export async function runAgentMission({
       emitToolPreparationStatus(toolCall.name, events);
 
       events.onStatus?.(`Running tool: ${toolCall.name}`);
-      const result = await executeToolWithMetrics({
-        toolRegistry,
-        toolCall,
-        toolContext: runToolContext,
-        events,
-        step,
-      });
+      let result: ToolExecutionResult;
+      try {
+        result = await executeToolWithMetrics({
+          toolRegistry,
+          toolCall,
+          toolContext: runToolContext,
+          events,
+          step,
+        });
+      } catch (error) {
+        if (stopIfRequested(step)) {
+          return;
+        }
+        throw error;
+      }
       executedModelTool = true;
       messages.push({
         role: "tool" as const,
@@ -643,6 +1021,10 @@ export async function runAgentMission({
           outputPreview: truncateTracePayload(result),
         });
       }
+    }
+
+    if (!wroteToNote && stopIfRequested(step)) {
+      return;
     }
 
     if (
@@ -755,6 +1137,28 @@ function formatRuntimeContext(
   return parts.join(" ");
 }
 
+function formatResponseLanguageContext(prompt: string): string {
+  const languageHint = isLikelyEnglishPrompt(prompt)
+    ? "The current user mission appears to be English."
+    : "Infer the response language from the current user mission.";
+
+  return [
+    "Response language policy:",
+    languageHint,
+    "Default to English for English missions.",
+    "Use another language only when the current user mission is primarily in that language or explicitly requests it.",
+    "Do not switch to Chinese, translated programming problems, or unrelated templates unless the user asks for them.",
+    "Answer the exact requested topic; if grounded support is requested but no source tool is available, avoid fabricated sources and use careful, qualified prose.",
+  ].join(" ");
+}
+
+function isLikelyEnglishPrompt(prompt: string): boolean {
+  const englishLetters = prompt.match(/[A-Za-z]/g)?.length ?? 0;
+  const nonAsciiChars = prompt.match(/[^\x00-\x7F]/g)?.length ?? 0;
+
+  return englishLetters > 0 && englishLetters >= nonAsciiChars;
+}
+
 function formatMissionIntentContext(intent: MissionIntent): string {
   return [
     `Mission mode: ${intent.mode}.`,
@@ -764,6 +1168,33 @@ function formatMissionIntentContext(intent: MissionIntent): string {
     `Delete allowed: ${
       intent.explicitDelete ? "yes, explicit delete intent detected" : "no"
     }.`,
+  ].join(" ");
+}
+
+function formatFollowupIntentContext(intentPrompt: string): string {
+  return [
+    "The current user message is a short follow-up to recent chat.",
+    `Resolve this turn's tool routing as: ${JSON.stringify(intentPrompt)}.`,
+    "Use the actual latest user message for conversational wording, but execute the resolved tool intent.",
+  ].join(" ");
+}
+
+function formatPromptOnCurrentPageContext(): string {
+  return [
+    "The user is referring to the active Obsidian note/page.",
+    "Extract the prompt, instructions, question, or task from the Current note context.",
+    "Then answer or execute that extracted prompt.",
+    "Do not merely describe the note or say you will read it.",
+  ].join(" ");
+}
+
+function formatPromptOnCurrentPageWritebackContext(): string {
+  return [
+    "Prompt-on-page writeback is active.",
+    "Execute the prompt, instructions, question, or task from the Current note context.",
+    "Write only the generated answer or requested markdown that belongs below the existing prompt on the same note.",
+    "Do not repeat the prompt unless the prompt explicitly asks you to.",
+    "Do not describe that you read the note.",
   ].join(" ");
 }
 
@@ -813,12 +1244,14 @@ function buildChatRequest(
   tools: ModelChatRequest["tools"],
   think?: ModelThink,
   options?: ModelRequestOptions,
+  abortSignal?: AbortSignal,
 ): ModelChatRequest {
   return {
     messages,
     tools: tools && tools.length > 0 ? tools : undefined,
     think,
     options,
+    abortSignal,
   };
 }
 
@@ -853,6 +1286,7 @@ function buildRunConfigEvent({
   modelOptions,
   writeAutonomy,
   missionIntent,
+  currentNoteContext,
 }: {
   toolContext: ToolExecutionContext;
   enableStreaming: boolean;
@@ -860,6 +1294,7 @@ function buildRunConfigEvent({
   modelOptions: ModelRequestOptions | undefined;
   writeAutonomy: boolean;
   missionIntent: MissionIntent;
+  currentNoteContext: boolean;
 }): AgentRunConfigEvent {
   const settings = toolContext.settings;
   return {
@@ -874,9 +1309,36 @@ function buildRunConfigEvent({
     numCtx: modelOptions?.num_ctx,
     writeAutonomy,
     missionMode: missionIntent.mode,
+    contextScope: getRunContextScope({
+      vaultContext: missionIntent.vaultContext,
+      currentNoteContext,
+    }),
+    currentNoteContext,
     vaultContext: missionIntent.vaultContext,
     maxSteps: MAX_AGENT_STEPS,
   };
+}
+
+function getRunContextScope({
+  vaultContext,
+  currentNoteContext,
+}: {
+  vaultContext: boolean;
+  currentNoteContext: boolean;
+}): AgentRunContextScope {
+  if (vaultContext && currentNoteContext) {
+    return "vault_and_current_note";
+  }
+
+  if (vaultContext) {
+    return "vault";
+  }
+
+  if (currentNoteContext) {
+    return "current_note";
+  }
+
+  return "none";
 }
 
 function formatResolvedThink(think: ModelThink | undefined): string {
@@ -890,6 +1352,272 @@ function isFiniteNumber(value: unknown): value is number {
 function withoutThinking(message: ModelChatMessage): ModelChatMessage {
   const { thinking: _thinking, ...messageWithoutThinking } = message;
   return messageWithoutThinking;
+}
+
+const MAX_RECOVERED_TEXT_TOOL_CALLS = 4;
+
+function getResponseToolCallsFromModelOutput(
+  response: ModelChatResponse,
+  knownToolNames: Set<string>,
+  events: AgentRunEvents,
+  step: number,
+): ModelToolCall[] {
+  if (response.toolCalls.length > 0) {
+    return response.toolCalls;
+  }
+
+  const recoveredToolCalls = extractToolCallsFromAssistantText(
+    response.message.content,
+    knownToolNames,
+  );
+
+  if (recoveredToolCalls.length > 0) {
+    const names = recoveredToolCalls.map((toolCall) => toolCall.name).join(", ");
+    events.onStatus?.(`Recovered text tool request: ${names}`);
+    events.onTrace?.({
+      id: `recovered-text-tool-call-${step}`,
+      kind: "tool",
+      step,
+      message: `Recovered assistant JSON tool request: ${names}`,
+      outputPreview: recoveredToolCalls.map((toolCall) => ({
+        name: toolCall.name,
+        arguments: redactToolArguments(toolCall.name, toolCall.arguments),
+      })),
+    });
+  }
+
+  return recoveredToolCalls;
+}
+
+function extractToolCallsFromAssistantText(
+  content: string,
+  knownToolNames: Set<string>,
+): ModelToolCall[] {
+  if (!content.trim() || knownToolNames.size === 0) {
+    return [];
+  }
+
+  const parsedCandidates = extractJsonCandidates(content);
+  const toolCalls: ModelToolCall[] = [];
+
+  for (const candidate of parsedCandidates) {
+    collectToolCallsFromJson(candidate, knownToolNames, toolCalls);
+
+    if (toolCalls.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
+      break;
+    }
+  }
+
+  return toolCalls.slice(0, MAX_RECOVERED_TEXT_TOOL_CALLS);
+}
+
+function extractJsonCandidates(content: string): unknown[] {
+  const candidates: unknown[] = [];
+  const fencedJsonPattern =
+    /\\?`\\?`\\?`(?:json|tool_call|tool|function)?\s*([\s\S]*?)\\?`\\?`\\?`/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = fencedJsonPattern.exec(content)) !== null) {
+    const parsed = parseJsonCandidate(match[1]);
+    if (parsed !== undefined) {
+      candidates.push(parsed);
+    }
+  }
+
+  const trimmed = content.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    const parsed = parseJsonCandidate(trimmed);
+    if (parsed !== undefined) {
+      candidates.push(parsed);
+    }
+  }
+
+  if (candidates.length === 0) {
+    for (const snippet of extractInlineJsonObjectSnippets(content)) {
+      const parsed = parseJsonCandidate(snippet);
+      if (parsed !== undefined) {
+        candidates.push(parsed);
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function extractInlineJsonObjectSnippets(content: string): string[] {
+  const snippets: string[] = [];
+  let searchStart = 0;
+
+  while (
+    snippets.length < MAX_RECOVERED_TEXT_TOOL_CALLS &&
+    searchStart < content.length
+  ) {
+    const start = content.indexOf("{", searchStart);
+    if (start < 0) {
+      break;
+    }
+
+    const end = findBalancedJsonObjectEnd(content, start);
+    if (end < 0) {
+      break;
+    }
+
+    const snippet = content.slice(start, end + 1);
+    if (/"name"\s*:/.test(snippet)) {
+      snippets.push(snippet);
+    }
+    searchStart = end + 1;
+  }
+
+  return snippets;
+}
+
+function findBalancedJsonObjectEnd(content: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function parseJsonCandidate(value: string): unknown | undefined {
+  try {
+    return JSON.parse(value.trim());
+  } catch {
+    return undefined;
+  }
+}
+
+function collectToolCallsFromJson(
+  value: unknown,
+  knownToolNames: Set<string>,
+  output: ModelToolCall[],
+) {
+  if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectToolCallsFromJson(item, knownToolNames, output);
+
+      if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
+        return;
+      }
+    }
+    return;
+  }
+
+  if (!isRecord(value)) {
+    return;
+  }
+
+  const directToolCall = parseToolCallRecord(value, knownToolNames, output.length);
+  if (directToolCall) {
+    output.push(directToolCall);
+    return;
+  }
+
+  for (const nestedKey of ["tool_calls", "toolCalls", "tools", "calls"]) {
+    collectToolCallsFromJson(value[nestedKey], knownToolNames, output);
+
+    if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
+      return;
+    }
+  }
+
+  collectToolCallsFromJson(value.function, knownToolNames, output);
+}
+
+function parseToolCallRecord(
+  value: Record<string, unknown>,
+  knownToolNames: Set<string>,
+  index: number,
+): ModelToolCall | null {
+  const name = getString(value.name);
+  if (!name || !knownToolNames.has(name)) {
+    return null;
+  }
+
+  return {
+    name,
+    arguments: normalizeRecoveredToolArguments(
+      name,
+      parseRecoveredToolArguments(value),
+    ),
+    index,
+    raw: value,
+  };
+}
+
+function parseRecoveredToolArguments(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  const args =
+    value.arguments ??
+    value.args ??
+    value.parameters ??
+    value.input ??
+    {};
+
+  if (isRecord(args)) {
+    return args;
+  }
+
+  if (typeof args === "string" && args.trim()) {
+    const parsedArgs = parseJsonCandidate(args);
+    if (isRecord(parsedArgs)) {
+      return parsedArgs;
+    }
+  }
+
+  return {};
+}
+
+function normalizeRecoveredToolArguments(
+  toolName: string,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  if (
+    (toolName === "list_folder" || toolName === "get_path_info") &&
+    args.path === "/"
+  ) {
+    return {
+      ...args,
+      path: "",
+    };
+  }
+
+  return args;
 }
 
 function emitRunDiagnostics({
@@ -1058,6 +1786,26 @@ function emitMetricEvent(
   });
 }
 
+async function withModelWaitStatus<T>(
+  operation: () => Promise<T>,
+  events: AgentRunEvents,
+  label: string,
+): Promise<T> {
+  const startedAt = nowMs();
+  const interval = setInterval(() => {
+    const elapsedSeconds = Math.max(30, Math.round(elapsedMs(startedAt) / 1000));
+    events.onStatus?.(
+      `Still waiting for ${label} (${elapsedSeconds}s elapsed)...`,
+    );
+  }, 30_000);
+
+  try {
+    return await operation();
+  } finally {
+    clearInterval(interval);
+  }
+}
+
 async function chatForAgentStep(
   modelClient: ModelClient,
   request: ModelChatRequest,
@@ -1075,7 +1823,11 @@ async function chatForAgentStep(
   });
 
   try {
-    const response = await modelClient.chat(request);
+    const response = await withModelWaitStatus(
+      () => modelClient.chat(request),
+      events,
+      "model API response",
+    );
     emitMetricEvent(events, {
       kind: "model_chat",
       name: "agent_step",
@@ -1091,7 +1843,11 @@ async function chatForAgentStep(
     if (request.think !== undefined && isThinkingUnsupportedError(error)) {
       onThinkingUnsupported();
       const retryRequest = { ...request, think: undefined };
-      const retryResponse = await modelClient.chat(retryRequest);
+      const retryResponse = await withModelWaitStatus(
+        () => modelClient.chat(retryRequest),
+        events,
+        "model API retry",
+      );
       emitMetricEvent(events, {
         kind: "model_chat",
         name: "agent_step",
@@ -1126,8 +1882,10 @@ async function emitFinalAnswer({
   fallbackContent,
   finalInstruction = FINAL_ANSWER_PROMPT,
   metricName = "final_answer",
+  relevancePrompt,
   think,
   options,
+  abortSignal,
   onThinkingUnsupported,
 }: {
   modelClient: ModelClient;
@@ -1137,8 +1895,10 @@ async function emitFinalAnswer({
   fallbackContent: string;
   finalInstruction?: string | null;
   metricName?: string;
+  relevancePrompt?: string;
   think?: ModelThink;
   options?: ModelRequestOptions;
+  abortSignal?: AbortSignal;
   onThinkingUnsupported: () => void;
 }): Promise<ModelChatResponse | null> {
   if (!enableStreaming) {
@@ -1151,21 +1911,14 @@ async function emitFinalAnswer({
   events.onAssistantMessageStart?.();
 
   let emittedContent = "";
+  let observedContent = false;
   const contentSanitizer = createAssistantContentSanitizer();
+  const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
   const thinkingStream = createThinkingStream(events);
   const streamRequest: ModelChatRequest = {
-    messages:
-      finalInstruction === null
-        ? [...messages]
-        : [
-            ...messages,
-            {
-              role: "system" as const,
-              content: finalInstruction,
-            },
-          ],
-    think,
+    messages: buildFinalAnswerMessages(messages, finalInstruction),
     options,
+    abortSignal,
   };
   const requestChars = measureSerializedChars(streamRequest);
   const startedAt = nowMs();
@@ -1188,9 +1941,15 @@ async function emitFinalAnswer({
           return;
         }
 
-        emittedContent += sanitized;
-        events.onFinalDelta?.(sanitized);
-        events.onAssistantDelta?.(sanitized);
+        observedContent = true;
+        const topicalContent = relevanceGate.push(sanitized);
+        if (!topicalContent) {
+          return;
+        }
+
+        emittedContent += topicalContent;
+        events.onFinalDelta?.(topicalContent);
+        events.onAssistantDelta?.(topicalContent);
       },
       onThinkingDelta: thinkingStream.onDelta,
       },
@@ -1216,17 +1975,32 @@ async function emitFinalAnswer({
 
   const trailingContent = contentSanitizer.flush();
   if (trailingContent) {
-    emittedContent += trailingContent;
-    events.onFinalDelta?.(trailingContent);
-    events.onAssistantDelta?.(trailingContent);
+    observedContent = true;
+    const topicalContent = relevanceGate.push(trailingContent);
+    if (topicalContent) {
+      emittedContent += topicalContent;
+      events.onFinalDelta?.(topicalContent);
+      events.onAssistantDelta?.(topicalContent);
+    }
   }
 
   thinkingStream.done();
 
   const sanitizedResponse = sanitizeAssistantContent(response.message.content);
-  if (!emittedContent.trim() && sanitizedResponse.trim()) {
-    events.onFinalDelta?.(sanitizedResponse);
-    events.onAssistantDelta?.(sanitizedResponse);
+  if (!observedContent && sanitizedResponse.trim()) {
+    const topicalContent = relevanceGate.push(sanitizedResponse);
+    if (topicalContent) {
+      emittedContent += topicalContent;
+      events.onFinalDelta?.(topicalContent);
+      events.onAssistantDelta?.(topicalContent);
+    }
+  }
+
+  const bufferedTopicalContent = relevanceGate.finish();
+  if (bufferedTopicalContent) {
+    emittedContent += bufferedTopicalContent;
+    events.onFinalDelta?.(bufferedTopicalContent);
+    events.onAssistantDelta?.(bufferedTopicalContent);
   }
 
   events.onFinalDone?.();
@@ -1234,6 +2008,229 @@ async function emitFinalAnswer({
   messages.push(withoutThinking(response.message));
   return response;
 }
+
+function buildFinalAnswerMessages(
+  messages: ModelChatMessage[],
+  finalInstruction: string | null,
+): ModelChatMessage[] {
+  if (finalInstruction === null) {
+    return [...messages];
+  }
+
+  return [
+    ...messages.filter((message) => {
+      if (message.role !== "assistant") {
+        return true;
+      }
+
+      return (
+        hasRenderableAssistantContent(message.content) ||
+        (message.toolCalls?.length ?? 0) > 0
+      );
+    }),
+    {
+      role: "user" as const,
+      content: finalInstruction,
+    },
+  ];
+}
+
+interface RelevanceGate {
+  push(delta: string): string;
+  finish(): string;
+}
+
+interface RelevanceProfile {
+  anchors: Set<string>;
+  minOutputChars: number;
+}
+
+function createFinalAnswerRelevanceGate(
+  prompt: string | undefined,
+  events: AgentRunEvents,
+): RelevanceGate {
+  const profile = buildRelevanceProfile(prompt ?? "");
+
+  if (!profile) {
+    return {
+      push: (delta) => delta,
+      finish: () => "",
+    };
+  }
+
+  let buffer = "";
+  let released = false;
+
+  const stopOffTopicOutput = (): never => {
+    events.onStatus?.(OFF_TOPIC_MODEL_OUTPUT_MESSAGE);
+    events.onTrace?.({
+      id: `off-topic-output-${nowMs()}`,
+      kind: "error",
+      message: OFF_TOPIC_MODEL_OUTPUT_MESSAGE,
+      outputPreview: {
+        anchors: [...profile.anchors],
+        preview: truncateForTrace(buffer.trim(), 500),
+      },
+      error: {
+        code: "off_topic_model_output",
+        message: OFF_TOPIC_MODEL_OUTPUT_MESSAGE,
+      },
+    });
+    throw new ModelClientError(
+      "invalid_response",
+      OFF_TOPIC_MODEL_OUTPUT_MESSAGE,
+      {
+        details: {
+          anchors: [...profile.anchors],
+          preview: truncateForTrace(buffer.trim(), 500),
+        },
+      },
+    );
+  };
+
+  return {
+    push(delta: string) {
+      if (released) {
+        return delta;
+      }
+
+      buffer += delta;
+
+      if (isTopicallyRelevant(profile, buffer)) {
+        released = true;
+        const output = buffer;
+        buffer = "";
+        return output;
+      }
+
+      if (shouldStopForOffTopicOutput(profile, buffer)) {
+        return stopOffTopicOutput();
+      }
+
+      return "";
+    },
+    finish() {
+      if (released || !buffer) {
+        return "";
+      }
+
+      if (isTopicallyRelevant(profile, buffer)) {
+        released = true;
+        const output = buffer;
+        buffer = "";
+        return output;
+      }
+
+      return stopOffTopicOutput();
+    },
+  };
+}
+
+function buildRelevanceProfile(prompt: string): RelevanceProfile | null {
+  const anchors = new Set(
+    extractSemanticTokens(prompt).filter(
+      (token) => !PROMPT_ANCHOR_STOPWORDS.has(token),
+    ),
+  );
+
+  if (anchors.size < 2) {
+    return null;
+  }
+
+  return {
+    anchors,
+    minOutputChars: 360,
+  };
+}
+
+function isTopicallyRelevant(
+  profile: RelevanceProfile,
+  content: string,
+): boolean {
+  const outputTokens = new Set(extractSemanticTokens(content));
+  for (const anchor of profile.anchors) {
+    if (outputTokens.has(anchor)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function shouldStopForOffTopicOutput(
+  profile: RelevanceProfile,
+  content: string,
+): boolean {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (trimmed.length >= profile.minOutputChars) {
+    return true;
+  }
+
+  return extractSemanticTokens(trimmed).length >= 70;
+}
+
+function extractSemanticTokens(text: string): string[] {
+  const tokens = text
+    .toLowerCase()
+    .match(/[a-z][a-z0-9']{2,}/g);
+
+  if (!tokens) {
+    return [];
+  }
+
+  return tokens
+    .map(normalizeSemanticToken)
+    .filter((token) => token.length >= 4);
+}
+
+function normalizeSemanticToken(token: string): string {
+  let normalized = token.replace(/'s$/u, "");
+
+  if (normalized.length > 5 && normalized.endsWith("ies")) {
+    normalized = `${normalized.slice(0, -3)}y`;
+  } else if (normalized.length > 5 && normalized.endsWith("ing")) {
+    normalized = normalized.slice(0, -3);
+  } else if (normalized.length > 5 && normalized.endsWith("ed")) {
+    normalized = normalized.slice(0, -2);
+  } else if (normalized.length > 4 && normalized.endsWith("s")) {
+    normalized = normalized.slice(0, -1);
+  }
+
+  return normalized;
+}
+
+const PROMPT_ANCHOR_STOPWORDS = new Set([
+  "about",
+  "answer",
+  "argumentative",
+  "clearly",
+  "compose",
+  "current",
+  "detail",
+  "draft",
+  "essay",
+  "exact",
+  "generate",
+  "grounded",
+  "mission",
+  "note",
+  "please",
+  "prompt",
+  "provide",
+  "regard",
+  "response",
+  "source",
+  "summarize",
+  "summary",
+  "user",
+  "word",
+  "write",
+  "written",
+]);
 
 async function streamChatWithThinkingFallback({
   modelClient,
@@ -1249,14 +2246,22 @@ async function streamChatWithThinkingFallback({
   onThinkingUnsupported: () => void;
 }): Promise<ModelChatResponse> {
   try {
-    return await modelClient.streamChat(request, streamEvents);
+    return await withModelWaitStatus(
+      () => modelClient.streamChat(request, streamEvents),
+      events,
+      "streaming model response",
+    );
   } catch (error) {
     if (request.think === undefined || !isThinkingUnsupportedError(error)) {
       throw error;
     }
 
     onThinkingUnsupported();
-    return modelClient.streamChat({ ...request, think: undefined }, streamEvents);
+    return withModelWaitStatus(
+      () => modelClient.streamChat({ ...request, think: undefined }, streamEvents),
+      events,
+      "streaming model retry",
+    );
   }
 }
 
@@ -1603,6 +2608,64 @@ function shouldObserveCurrentNote(
   );
 }
 
+function canStreamAnswerFromInitialCurrentNoteContext(
+  tools: ModelChatRequest["tools"],
+): boolean {
+  const toolNames = tools?.map((tool) => tool.function.name) ?? [];
+  return toolNames.length === 1 && toolNames[0] === "read_current_file";
+}
+
+function getPromptOnPageWritebackKind({
+  prompt,
+  currentNoteContext,
+  toolContext,
+  enableStreaming,
+}: {
+  prompt: string;
+  currentNoteContext: unknown;
+  toolContext: ToolExecutionContext;
+  enableStreaming: boolean;
+}): StreamingWritebackKind | null {
+  if (
+    !enableStreaming ||
+    !isPromptOnCurrentPageIntent(prompt) ||
+    toolContext.settings?.streamWritebackMode !==
+      "all_current_note_content_writes"
+  ) {
+    return null;
+  }
+
+  const pagePrompt = getCurrentNoteContextContent(currentNoteContext);
+  if (!pagePrompt || hasDeleteIntent(pagePrompt) || hasDeletePathIntent(pagePrompt)) {
+    return null;
+  }
+
+  const preferPathTarget =
+    hasPathTargetIntent(pagePrompt) && !hasCurrentNoteTarget(pagePrompt);
+  if (preferPathTarget) {
+    return null;
+  }
+
+  if (hasReplaceIntent(pagePrompt) && hasCurrentNoteTarget(pagePrompt)) {
+    return "replace";
+  }
+
+  if (hasEditIntent(pagePrompt) && !hasWholeNoteReplaceIntent(pagePrompt)) {
+    return null;
+  }
+
+  if (
+    hasAppendIntent(pagePrompt) ||
+    hasNoteOutputIntent(pagePrompt) ||
+    hasStaticGenerationIntent(pagePrompt) ||
+    hasGeneratedWritingIntent(pagePrompt)
+  ) {
+    return "append";
+  }
+
+  return null;
+}
+
 function getStreamingWritebackKind(
   prompt: string,
   toolContext: ToolExecutionContext,
@@ -1721,7 +2784,16 @@ function hasExplicitWritePersistenceIntent(prompt: string): boolean {
 }
 
 function hasCurrentNoteReadIntent(prompt: string): boolean {
-  return /\b(current|this|active)\s+(note|file|markdown|document)\b|\b(note|file|markdown|document)\b[\s\S]{0,40}\b(current|this|active)\b|\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b[\s\S]{0,80}\b(note|file|markdown|document)\b|\b(note|file|markdown|document)\b[\s\S]{0,80}\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b/i.test(
+  return (
+    isPromptOnCurrentPageIntent(prompt) ||
+    /\b(current|this|active)\s+(note|file|markdown|document)\b|\b(note|file|markdown|document)\b[\s\S]{0,40}\b(current|this|active)\b|\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b[\s\S]{0,80}\b(note|file|markdown|document)\b|\b(note|file|markdown|document)\b[\s\S]{0,80}\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b/i.test(
+      prompt,
+    )
+  );
+}
+
+function hasGeneratedWritingIntent(prompt: string): boolean {
+  return /\b(write|draft|compose|generate|create)\b[\s\S]{0,100}\b(essay|article|paragraph|summary|brief|outline|report|analysis|response|answer|markdown|content|write[-\s]?up)\b|\b(essay|article|paragraph|summary|brief|outline|report|analysis|response|answer|markdown|content|write[-\s]?up)\b[\s\S]{0,100}\b(write|draft|compose|generate|create)\b/i.test(
     prompt,
   );
 }
@@ -1786,7 +2858,7 @@ function hasNoteOutputIntent(prompt: string): boolean {
   }
 
   if (hasStaticGenerationIntent(prompt)) {
-    return true;
+    return false;
   }
 
   return /\b(research|investigate|analy[sz]e|synthesi[sz]e|summari[sz]e|summary|outline|brief|report|literature\s+review|field\s+notes?|meeting\s+notes?|findings|digest|recap|write[-\s]?up|cited\s+sources?|citations?)\b/i.test(
@@ -2261,6 +3333,10 @@ function truncateForTrace(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars)}\n[truncated]`;
 }
 
+function truncateForPromptAnchor(text: string): string {
+  return text.length <= 2000 ? text : `${text.slice(0, 2000)}\n[truncated]`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -2311,6 +3387,7 @@ async function streamCurrentNoteWriteback({
   toolContext,
   think,
   options,
+  abortSignal,
   onThinkingUnsupported,
 }: {
   kind: StreamingWritebackKind;
@@ -2321,6 +3398,7 @@ async function streamCurrentNoteWriteback({
   toolContext: ToolExecutionContext;
   think?: ModelThink;
   options?: ModelRequestOptions;
+  abortSignal?: AbortSignal;
   onThinkingUnsupported: () => void;
 }): Promise<AgentRunReceipt> {
   const writer = await createStreamingNoteWriter({
@@ -2328,100 +3406,160 @@ async function streamCurrentNoteWriteback({
     toolContext,
     preparedSectionEdit,
   });
-  const instruction = buildStreamingWritebackPrompt(kind, preparedSectionEdit);
-  const streamRequest: ModelChatRequest = {
-    messages: [
-      ...messages,
-      {
-        role: "system" as const,
-        content: instruction,
-      },
-    ],
-    think,
-    options,
-  };
-  const requestChars = measureSerializedChars(streamRequest);
-  const startedAt = nowMs();
-  emitModelCallTrace(events, {
-    id: "model-call-stream-writeback",
-    message: "Model stream: stream_writeback",
-    request: streamRequest,
-  });
 
   emitStatus(events, "Streaming writeback to note...", "final_answer");
   events.onFinalStart?.();
   events.onAssistantMessageStart?.();
 
-  const contentSanitizer = createAssistantContentSanitizer();
-  const thinkingStream = createThinkingStream(events);
   let response: ModelChatResponse | null = null;
+  let emittedContent = "";
+
+  const streamAttempt = async (retry: boolean) => {
+    const instruction = buildStreamingWritebackPrompt(
+      kind,
+      preparedSectionEdit,
+      retry,
+    );
+    const streamRequest: ModelChatRequest = {
+      messages: [
+        ...messages,
+        {
+          role: "system" as const,
+          content: instruction,
+        },
+      ],
+      options,
+      abortSignal,
+    };
+    const metricName = retry ? "stream_writeback_retry" : "stream_writeback";
+    const requestChars = measureSerializedChars(streamRequest);
+    const startedAt = nowMs();
+    const contentSanitizer = createAssistantContentSanitizer();
+    const thinkingStream = createThinkingStream(events);
+    let attemptContent = "";
+
+    emitModelCallTrace(events, {
+      id: retry
+        ? "model-call-stream-writeback-retry"
+        : "model-call-stream-writeback",
+      message: `Model stream: ${metricName}`,
+      request: streamRequest,
+    });
+
+    try {
+      const attemptResponse = await streamChatWithThinkingFallback({
+        modelClient,
+        request: streamRequest,
+        events,
+        streamEvents: {
+          onContentDelta: (delta) => {
+            const sanitized = contentSanitizer.push(delta);
+            if (!sanitized) {
+              return;
+            }
+
+            attemptContent += sanitized;
+            emittedContent += sanitized;
+            events.onFinalDelta?.(sanitized);
+            events.onAssistantDelta?.(sanitized);
+            writer.push(sanitized);
+          },
+          onThinkingDelta: thinkingStream.onDelta,
+        },
+        onThinkingUnsupported,
+      });
+      emitMetricEvent(events, {
+        kind: "model_stream",
+        name: metricName,
+        durationMs: elapsedMs(startedAt),
+        requestChars,
+        responseChars: measureSerializedChars(
+          attemptResponse.raw ?? attemptResponse.message,
+        ),
+        ...extractTokenUsageFields(attemptResponse.raw),
+      });
+
+      const trailingContent = contentSanitizer.flush();
+      if (trailingContent) {
+        attemptContent += trailingContent;
+        emittedContent += trailingContent;
+        events.onFinalDelta?.(trailingContent);
+        events.onAssistantDelta?.(trailingContent);
+        writer.push(trailingContent);
+      }
+
+      thinkingStream.done();
+
+      const sanitizedResponse = sanitizeAssistantContent(
+        attemptResponse.message.content,
+      );
+      if (!attemptContent.trim() && sanitizedResponse.trim()) {
+        attemptContent += sanitizedResponse;
+        emittedContent += sanitizedResponse;
+        events.onFinalDelta?.(sanitizedResponse);
+        events.onAssistantDelta?.(sanitizedResponse);
+        writer.push(sanitizedResponse);
+      }
+
+      return attemptResponse;
+    } catch (error) {
+      emitMetricEvent(events, {
+        kind: "model_stream",
+        name: metricName,
+        durationMs: elapsedMs(startedAt),
+        requestChars,
+      });
+      const trailingContent = contentSanitizer.flush();
+      if (trailingContent) {
+        attemptContent += trailingContent;
+        emittedContent += trailingContent;
+        events.onFinalDelta?.(trailingContent);
+        events.onAssistantDelta?.(trailingContent);
+        writer.push(trailingContent);
+      }
+
+      thinkingStream.done();
+      throw error;
+    }
+  };
 
   try {
-    response = await streamChatWithThinkingFallback({
-      modelClient,
-      request: streamRequest,
-      events,
-      streamEvents: {
-        onContentDelta: (delta) => {
-          const sanitized = contentSanitizer.push(delta);
-          if (!sanitized) {
-            return;
-          }
+    response = await streamAttempt(false);
 
-          events.onFinalDelta?.(sanitized);
-          events.onAssistantDelta?.(sanitized);
-          writer.push(sanitized);
-        },
-        onThinkingDelta: thinkingStream.onDelta,
-      },
-      onThinkingUnsupported,
-    });
-    emitMetricEvent(events, {
-      kind: "model_stream",
-      name: "stream_writeback",
-      durationMs: elapsedMs(startedAt),
-      requestChars,
-      responseChars: measureSerializedChars(response.raw ?? response.message),
-      ...extractTokenUsageFields(response.raw),
-    });
-
-    const trailingContent = contentSanitizer.flush();
-    if (trailingContent) {
-      events.onFinalDelta?.(trailingContent);
-      events.onAssistantDelta?.(trailingContent);
-      writer.push(trailingContent);
+    if (!emittedContent.trim()) {
+      events.onStatus?.(
+        "No writable content received; retrying content-only writeback...",
+      );
+      writer.discardNonWritableContent();
+      response = await streamAttempt(true);
     }
 
-    thinkingStream.done();
+    if (!emittedContent.trim()) {
+      events.onStatus?.(EMPTY_STREAMING_WRITEBACK_MESSAGE);
+      throw new Error(EMPTY_STREAMING_WRITEBACK_MESSAGE);
+    }
+
     await writer.finish({ force: true });
 
     events.onFinalDone?.();
     events.onAssistantMessageDone?.();
-    messages.push(withoutThinking(response.message));
+    if (response) {
+      messages.push(withoutThinking(response.message));
+    }
     events.onStatus?.("Streaming writeback complete.");
     return writer.buildReceipt(false);
   } catch (error) {
-    emitMetricEvent(events, {
-      kind: "model_stream",
-      name: "stream_writeback",
-      durationMs: elapsedMs(startedAt),
-      requestChars,
-    });
-    const trailingContent = contentSanitizer.flush();
-    if (trailingContent) {
-      events.onFinalDelta?.(trailingContent);
-      events.onAssistantDelta?.(trailingContent);
-      writer.push(trailingContent);
-    }
-
-    thinkingStream.done();
     await writer.finish();
     events.onFinalDone?.();
     events.onAssistantMessageDone?.();
 
-    const receipt = writer.buildReceipt(true);
-    events.onReceipt?.(receipt);
-    events.onStatus?.("Streaming writeback interrupted; partial content may have been written.");
+    if (writer.hasWritableContent()) {
+      const receipt = writer.buildReceipt(true);
+      events.onReceipt?.(receipt);
+      events.onStatus?.(
+        "Streaming writeback interrupted; partial content may have been written.",
+      );
+    }
     throw error;
   }
 }
@@ -2429,10 +3567,20 @@ async function streamCurrentNoteWriteback({
 function buildStreamingWritebackPrompt(
   kind: StreamingWritebackKind,
   preparedSectionEdit: PreparedStreamingSectionEdit | null,
+  retry = false,
 ): string {
+  const retryPrefix = retry
+    ? [
+        "The previous writeback stream returned no writable markdown.",
+        "Return only the requested markdown content now.",
+      ]
+    : [];
+
   if (kind === "append") {
     return [
+      ...retryPrefix,
       "Write the markdown content to append to the current note now.",
+      "Use English unless the user explicitly requested another language in the current mission.",
       "Return only the markdown that should be appended.",
       "Do not include preambles, explanations, receipts, or thinking traces.",
     ].join(" ");
@@ -2440,15 +3588,19 @@ function buildStreamingWritebackPrompt(
 
   if (kind === "replace") {
     return [
+      ...retryPrefix,
       "Write the full replacement markdown for the current note now.",
+      "Use English unless the user explicitly requested another language in the current mission.",
       "Return only the complete replacement note content.",
       "Do not include preambles, explanations, receipts, or thinking traces.",
     ].join(" ");
   }
 
   return [
+    ...retryPrefix,
     `Write the replacement markdown body for the section "${preparedSectionEdit?.heading ?? "target section"}" now.`,
     "Do not include the heading line itself.",
+    "Use English unless the user explicitly requested another language in the current mission.",
     "Return only the markdown body that belongs under that heading.",
     "Do not include preambles, explanations, receipts, or thinking traces.",
   ].join(" ");
@@ -2464,7 +3616,9 @@ async function createStreamingNoteWriter({
   preparedSectionEdit: PreparedStreamingSectionEdit | null;
 }) {
   const file = getActiveMarkdownFile(toolContext);
-  const current = await toolContext.app.vault.read(file);
+  const current =
+    toolContext.getCurrentMarkdownContent?.(file) ??
+    (await toolContext.app.vault.read(file));
   const baseContent =
     kind === "append"
       ? `${current}${current.length > 0 && !current.endsWith("\n") ? "\n" : ""}`
@@ -2495,6 +3649,7 @@ async function createStreamingNoteWriter({
       section?.suffix ?? "",
     )}${section?.suffix ?? ""}`;
   };
+  const hasWritableContent = () => streamedContent.trim().length > 0;
 
   const queueFlush = () => {
     pendingChars = 0;
@@ -2512,8 +3667,22 @@ async function createStreamingNoteWriter({
         queueFlush();
       }
     },
+    hasWritableContent() {
+      return hasWritableContent();
+    },
+    discardNonWritableContent() {
+      if (hasWritableContent()) {
+        return;
+      }
+
+      streamedContent = "";
+      pendingChars = 0;
+    },
     async finish(options: { force?: boolean } = {}) {
-      if (options.force || streamedContent.length > 0 || pendingChars > 0) {
+      if (
+        hasWritableContent() &&
+        (options.force || pendingChars > 0)
+      ) {
         queueFlush();
       }
       await flushChain;
@@ -2601,9 +3770,13 @@ function requirePreparedSectionEdit(
 }
 
 function getActiveMarkdownFile(toolContext: ToolExecutionContext) {
-  const file = toolContext.app.workspace.getActiveFile();
+  const file =
+    toolContext.getCurrentMarkdownFile?.() ??
+    toolContext.app.workspace.getActiveFile();
   if (!file || file.extension !== "md") {
-    throw new Error("An active markdown file is required.");
+    throw new Error(
+      "An active markdown file is required. Open or focus a markdown note before running the mission.",
+    );
   }
 
   return file;
@@ -2651,7 +3824,7 @@ function getByteLength(text: string): number {
 
 export function sanitizeAssistantContent(content: string): string {
   return content.replace(
-    /<\s*\|\s*(?:begin\s*_+\s*of\s*_+\s*sentence|end\s*_+\s*of\s*_+\s*sentence|start\s*_+\s*header\s*_+\s*id|end\s*_+\s*header\s*_+\s*id|eot\s*_+\s*id|eom\s*_+\s*id)\s*\|\s*>/gi,
+    /[<＜]\s*[|｜]\s*(?:begin\s*[_▁]+\s*of\s*[_▁]+\s*sentence|end\s*[_▁]+\s*of\s*[_▁]+\s*sentence|start\s*[_▁]+\s*header\s*[_▁]+\s*id|end\s*[_▁]+\s*header\s*[_▁]+\s*id|eot\s*[_▁]+\s*id|eom\s*[_▁]+\s*id)\s*[|｜]\s*[>＞]/gi,
     "",
   );
 }
@@ -2695,9 +3868,11 @@ const SPECIAL_TOKEN_LOOKBACK_CHARS = 80;
 
 function findPotentialSpecialTokenStart(content: string): number {
   const searchStart = Math.max(0, content.length - SPECIAL_TOKEN_LOOKBACK_CHARS);
-  let index = content.indexOf("<", searchStart);
+  for (let index = searchStart; index < content.length; index += 1) {
+    if (content[index] !== "<" && content[index] !== "＜") {
+      continue;
+    }
 
-  while (index >= 0) {
     const candidate = normalizeSpecialTokenCandidate(content.slice(index));
 
     if (
@@ -2706,15 +3881,19 @@ function findPotentialSpecialTokenStart(content: string): number {
     ) {
       return index;
     }
-
-    index = content.indexOf("<", index + 1);
   }
 
   return -1;
 }
 
 function normalizeSpecialTokenCandidate(candidate: string): string {
-  return candidate.toLowerCase().replace(/\s+/g, "").replace(/_+/g, "");
+  return candidate
+    .toLowerCase()
+    .replace(/＜/g, "<")
+    .replace(/＞/g, ">")
+    .replace(/｜/g, "|")
+    .replace(/\s+/g, "")
+    .replace(/[_▁]+/g, "");
 }
 
 function isClarifyingQuestionResponse(prompt: string, content: string): boolean {
@@ -2762,7 +3941,9 @@ function completeRun(
   emitStatus(
     events,
     message,
-    stopReason === "budget" ? "stopped" : "done",
+    stopReason === "budget" || stopReason === "user_stopped"
+      ? "stopped"
+      : "done",
   );
   events.onRunComplete?.({
     step,
@@ -2796,6 +3977,8 @@ function getStopReasonMessage(stopReason: AgentRunStopReason): string {
       return "Write complete.";
     case "clarifying_question":
       return "Needs clarification.";
+    case "user_stopped":
+      return "Stopped by user.";
     case "budget":
       return "Stopped at safety limit. Review partial results.";
     case "error":
@@ -2804,6 +3987,10 @@ function getStopReasonMessage(stopReason: AgentRunStopReason): string {
     default:
       return "Done.";
   }
+}
+
+function isRunStopRequested(abortSignal: AbortSignal | undefined): boolean {
+  return abortSignal?.aborted ?? false;
 }
 
 async function executeToolWithMetrics({

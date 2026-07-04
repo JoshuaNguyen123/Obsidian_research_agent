@@ -31,9 +31,15 @@ Thumbs.db
 .agent-backups/
 
 # Local-only planning, agent, and skill context
-AGENTS.md
-agents.md
-docs/
+AGENTS.local.md
+agents.local.md
 skills/
 .agents/
 .codex/
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
