@@ -409,10 +409,12 @@ export class AgentView extends ItemView {
           onToolDone: (event) => this.handleToolDone(event),
           onFinalStart: () => this.startFinalStream(),
           onFinalDelta: (delta) => this.appendFinalDelta(delta),
+          onFinalReplace: (content) => this.replaceFinalContent(content),
           onFinalDone: () => this.finishFinalStream(),
           onReceipt: (receipt) => this.appendReceipt(receipt),
           onAssistantMessageStart: () => this.startLiveAssistantMessage(),
           onAssistantDelta: (delta) => this.appendAssistantDelta(delta),
+          onAssistantReplace: (content) => this.replaceAssistantContent(content),
           onAssistantMessageDone: () => this.finishLiveAssistantMessage(),
           onThinkingMessageStart: () => this.startLiveThinkingMessage(),
           onThinkingDelta: () => undefined,
@@ -687,6 +689,19 @@ export class AgentView extends ItemView {
     this.appendText(this.liveFinalMessageEl, delta);
   }
 
+  private replaceFinalContent(content: string) {
+    if (!this.finalStreamEl) {
+      return;
+    }
+
+    if (!this.liveFinalMessageEl) {
+      this.startFinalStream();
+    }
+
+    this.liveFinalMessageEl?.empty();
+    this.appendText(this.liveFinalMessageEl, content);
+  }
+
   private finishFinalStream() {
     this.liveFinalMessageEl = null;
   }
@@ -946,6 +961,24 @@ export class AgentView extends ItemView {
 
     this.pendingAssistantContent = `${this.pendingAssistantContent}${delta}`;
     this.appendText(this.liveAssistantMessageEl, delta);
+
+    if (this.logEl) {
+      this.logEl.scrollTop = this.logEl.scrollHeight;
+    }
+  }
+
+  private replaceAssistantContent(content: string) {
+    this.pendingAssistantContent = content;
+
+    if (!this.liveAssistantMessageEl) {
+      const itemEl = this.createLogItem("assistant");
+      this.liveAssistantMessageEl = itemEl?.querySelector(
+        ".agentic-researcher-log-message",
+      ) as HTMLElement | null;
+    }
+
+    this.liveAssistantMessageEl?.empty();
+    this.appendText(this.liveAssistantMessageEl, content);
 
     if (this.logEl) {
       this.logEl.scrollTop = this.logEl.scrollHeight;

@@ -178,10 +178,12 @@ export interface AgentRunEvents {
   onToolDone?: (event: AgentToolRunEvent) => void;
   onFinalStart?: () => void;
   onFinalDelta?: (delta: string) => void;
+  onFinalReplace?: (content: string) => void;
   onFinalDone?: () => void;
   onReceipt?: (receipt: AgentRunReceipt) => void;
   onAssistantMessageStart?: () => void;
   onAssistantDelta?: (delta: string) => void;
+  onAssistantReplace?: (content: string) => void;
   onAssistantMessageDone?: () => void;
   onThinkingMessageStart?: () => void;
   onThinkingDelta?: (delta: string) => void;
@@ -3997,7 +3999,7 @@ async function streamCurrentNoteWriteback({
     response: ModelChatResponse;
     toolRequestDetected: boolean;
     content: string;
-    deltas: string[];
+    wroteContent: boolean;
   }> => {
     const instruction = buildStreamingWritebackPrompt(
       kind,
@@ -4020,8 +4022,12 @@ async function streamCurrentNoteWriteback({
     const startedAt = nowMs();
     const contentSanitizer = createAssistantContentSanitizer();
     const thinkingStream = createThinkingStream(events);
+    const liveEmitter = createLiveWritebackEmitter({
+      events,
+      writer,
+      knownToolNames,
+    });
     let attemptContent = "";
-    const attemptDeltas: string[] = [];
 
     emitModelCallTrace(events, {
       id: retry
@@ -4044,7 +4050,7 @@ async function streamCurrentNoteWriteback({
             }
 
             attemptContent += sanitized;
-            attemptDeltas.push(sanitized);
+            liveEmitter.push(sanitized);
           },
           onThinkingDelta: thinkingStream.onDelta,
         },
@@ -4062,7 +4068,7 @@ async function streamCurrentNoteWriteback({
       const trailingContent = contentSanitizer.flush();
       if (trailingContent) {
         attemptContent += trailingContent;
-        attemptDeltas.push(trailingContent);
+        liveEmitter.push(trailingContent);
       }
 
       thinkingStream.done();
@@ -4072,15 +4078,20 @@ async function streamCurrentNoteWriteback({
       );
       if (!attemptContent.trim() && sanitizedResponse.trim()) {
         attemptContent += sanitizedResponse;
-        attemptDeltas.push(sanitizedResponse);
+        liveEmitter.push(sanitizedResponse);
       }
 
-      if (containsRecoverableToolRequest(attemptContent, knownToolNames)) {
+      const liveState = liveEmitter.finish();
+      if (
+        liveState.toolRequestDetected ||
+        (!liveState.wroteContent &&
+          containsRecoverableToolRequest(attemptContent, knownToolNames))
+      ) {
         return {
           response: attemptResponse,
           toolRequestDetected: true,
           content: "",
-          deltas: [],
+          wroteContent: liveState.wroteContent,
         };
       }
 
@@ -4088,7 +4099,7 @@ async function streamCurrentNoteWriteback({
         response: attemptResponse,
         toolRequestDetected: false,
         content: attemptContent,
-        deltas: attemptDeltas,
+        wroteContent: liveState.wroteContent,
       };
     } catch (error) {
       emitMetricEvent(events, {
@@ -4100,15 +4111,12 @@ async function streamCurrentNoteWriteback({
       const trailingContent = contentSanitizer.flush();
       if (trailingContent) {
         attemptContent += trailingContent;
-        attemptDeltas.push(trailingContent);
+        liveEmitter.push(trailingContent);
       }
 
       thinkingStream.done();
-      if (
-        attemptContent.trim() &&
-        !containsRecoverableToolRequest(attemptContent, knownToolNames)
-      ) {
-        emitBufferedWritebackContent(attemptDeltas, events, writer);
+      const liveState = liveEmitter.finish();
+      if (liveState.wroteContent) {
         emittedContent += attemptContent;
       }
       throw error;
@@ -4121,6 +4129,11 @@ async function streamCurrentNoteWriteback({
     response = attempt.response;
 
     if (attempt.toolRequestDetected) {
+      if (attempt.wroteContent) {
+        throw new Error(
+          "The model requested a tool after streamed writeback had started. Partial content may have been written.",
+        );
+      }
       events.onStatus?.(
         "Model requested a tool during writeback; retrying content-only output...",
       );
@@ -4152,7 +4165,6 @@ async function streamCurrentNoteWriteback({
     const wordTarget = parseWritebackWordCountTargetFromMessages(messages);
     let correctionUsed = false;
     let contentToWrite = attempt.content;
-    let deltasToWrite = attempt.deltas;
     if (wordTarget) {
       const initialCount = countMarkdownVisibleText(contentToWrite).wordCount;
       if (!isWordCountWithinTarget(initialCount, wordTarget)) {
@@ -4173,13 +4185,14 @@ async function streamCurrentNoteWriteback({
         });
         if (corrected.trim()) {
           contentToWrite = corrected;
-          deltasToWrite = [corrected];
+          writer.replaceContent(corrected);
+          events.onFinalReplace?.(corrected);
+          events.onAssistantReplace?.(corrected);
           correctionUsed = true;
         }
       }
     }
 
-    emitBufferedWritebackContent(deltasToWrite, events, writer);
     emittedContent += contentToWrite;
 
     await writer.finish({ force: true });
@@ -4262,21 +4275,6 @@ interface WordCountTarget {
   max: number;
 }
 
-function emitBufferedWritebackContent(
-  deltas: string[],
-  events: AgentRunEvents,
-  writer: Awaited<ReturnType<typeof createStreamingNoteWriter>>,
-) {
-  for (const delta of deltas) {
-    if (!delta) {
-      continue;
-    }
-    events.onFinalDelta?.(delta);
-    events.onAssistantDelta?.(delta);
-    writer.push(delta);
-  }
-}
-
 function containsRecoverableToolRequest(
   content: string,
   knownToolNames: Set<string>,
@@ -4289,6 +4287,137 @@ function containsRecoverableToolRequest(
     /<requested_tool_call\b/i.test(content) ||
     extractToolCallsFromAssistantText(content, knownToolNames).length > 0
   );
+}
+
+function createLiveWritebackEmitter({
+  events,
+  writer,
+  knownToolNames,
+}: {
+  events: AgentRunEvents;
+  writer: Awaited<ReturnType<typeof createStreamingNoteWriter>>;
+  knownToolNames: Set<string>;
+}) {
+  let safetyBuffer = "";
+  let live = false;
+  let wroteContent = false;
+  let toolRequestDetected = false;
+
+  const emit = (delta: string) => {
+    if (!delta) {
+      return;
+    }
+
+    wroteContent = true;
+    events.onFinalDelta?.(delta);
+    events.onAssistantDelta?.(delta);
+    writer.push(delta);
+  };
+
+  return {
+    push(delta: string) {
+      if (!delta || toolRequestDetected) {
+        return;
+      }
+
+      if (live) {
+        if (safetyBuffer) {
+          safetyBuffer += delta;
+
+          if (containsRecoverableToolRequest(safetyBuffer, knownToolNames)) {
+            toolRequestDetected = true;
+            safetyBuffer = "";
+            return;
+          }
+
+          if (shouldKeepWritebackSafetyBuffer(safetyBuffer)) {
+            return;
+          }
+
+          emit(safetyBuffer);
+          safetyBuffer = "";
+          return;
+        }
+
+        if (containsRecoverableToolRequest(delta, knownToolNames)) {
+          toolRequestDetected = true;
+          return;
+        }
+
+        if (shouldKeepWritebackSafetyBuffer(delta)) {
+          safetyBuffer = delta;
+          return;
+        }
+
+        emit(delta);
+        return;
+      }
+
+      safetyBuffer += delta;
+
+      if (containsRecoverableToolRequest(safetyBuffer, knownToolNames)) {
+        toolRequestDetected = true;
+        safetyBuffer = "";
+        return;
+      }
+
+      if (shouldKeepWritebackSafetyBuffer(safetyBuffer)) {
+        return;
+      }
+
+      live = true;
+      emit(safetyBuffer);
+      safetyBuffer = "";
+    },
+    finish() {
+      if (!live && safetyBuffer && !toolRequestDetected) {
+        if (containsRecoverableToolRequest(safetyBuffer, knownToolNames)) {
+          toolRequestDetected = true;
+          safetyBuffer = "";
+        } else {
+          live = true;
+          emit(safetyBuffer);
+          safetyBuffer = "";
+        }
+      }
+
+      return { toolRequestDetected, wroteContent };
+    },
+  };
+}
+
+function shouldKeepWritebackSafetyBuffer(content: string): boolean {
+  const trimmed = content.trimStart();
+
+  if (!trimmed) {
+    return true;
+  }
+
+  const lower = trimmed.toLowerCase();
+  if ("<requested_tool_call".startsWith(lower)) {
+    return true;
+  }
+
+  if (lower.startsWith("<requested_tool_call")) {
+    return true;
+  }
+
+  if (
+    (trimmed.startsWith("`") || trimmed.startsWith("\\`")) &&
+    !/\n/.test(trimmed)
+  ) {
+    return true;
+  }
+
+  if (/^\\?`\\?`?\\?`?\s*(json|tool|tool_call|function)?\s*$/i.test(trimmed)) {
+    return true;
+  }
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return true;
+  }
+
+  return false;
 }
 
 function parseWritebackWordCountTargetFromMessages(
@@ -4509,6 +4638,7 @@ async function createStreamingNoteWriter({
   let pendingChars = 0;
   let lastFlushAt = nowMs();
   let flushChain = Promise.resolve();
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   const render = () => {
     if (kind === "append") {
@@ -4527,10 +4657,27 @@ async function createStreamingNoteWriter({
   const hasWritableContent = () => streamedContent.trim().length > 0;
 
   const queueFlush = () => {
+    if (flushTimer !== null) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
     pendingChars = 0;
     lastFlushAt = nowMs();
     const nextContent = render();
     flushChain = flushChain.then(() => toolContext.app.vault.modify(file, nextContent));
+  };
+
+  const scheduleFlush = () => {
+    if (flushTimer !== null || pendingChars <= 0) {
+      return;
+    }
+
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      if (pendingChars > 0) {
+        queueFlush();
+      }
+    }, 250);
   };
 
   return {
@@ -4540,7 +4687,14 @@ async function createStreamingNoteWriter({
 
       if (pendingChars >= 800 || nowMs() - lastFlushAt >= 750) {
         queueFlush();
+      } else {
+        scheduleFlush();
       }
+    },
+    replaceContent(content: string) {
+      streamedContent = content;
+      pendingChars = content.length;
+      queueFlush();
     },
     hasWritableContent() {
       return hasWritableContent();
@@ -4550,10 +4704,18 @@ async function createStreamingNoteWriter({
         return;
       }
 
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
       streamedContent = "";
       pendingChars = 0;
     },
     async finish(options: { force?: boolean } = {}) {
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
       if (
         hasWritableContent() &&
         (options.force || pendingChars > 0)
