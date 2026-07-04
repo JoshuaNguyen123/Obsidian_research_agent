@@ -684,6 +684,7 @@ export async function runAgentMission({
         events,
         toolContext: runToolContext,
         knownToolNames,
+        relevancePrompt: finalAnswerRelevancePrompt,
         think: activeThink,
         options: modelOptions,
         abortSignal,
@@ -732,6 +733,7 @@ export async function runAgentMission({
         events,
         toolContext: runToolContext,
         knownToolNames,
+        relevancePrompt: finalAnswerRelevancePrompt,
         think: activeThink,
         options: modelOptions,
         abortSignal,
@@ -946,6 +948,7 @@ export async function runAgentMission({
             events,
             toolContext: runToolContext,
             knownToolNames,
+            relevancePrompt: finalAnswerRelevancePrompt,
             think: activeThink,
             options: modelOptions,
             abortSignal,
@@ -2385,6 +2388,7 @@ interface RelevanceGate {
 interface RelevanceProfile {
   anchors: Set<string>;
   minOutputChars: number;
+  expectedEnglish: boolean;
 }
 
 function createFinalAnswerRelevanceGate(
@@ -2438,7 +2442,15 @@ function createFinalAnswerRelevanceGate(
 
       buffer += delta;
 
+      if (shouldStopForWrongLanguage(profile, buffer)) {
+        return stopOffTopicOutput();
+      }
+
       if (isTopicallyRelevant(profile, buffer)) {
+        if (!canReleaseForLanguage(profile, buffer, false)) {
+          return "";
+        }
+
         released = true;
         const output = buffer;
         buffer = "";
@@ -2456,7 +2468,15 @@ function createFinalAnswerRelevanceGate(
         return "";
       }
 
+      if (shouldStopForWrongLanguage(profile, buffer)) {
+        return stopOffTopicOutput();
+      }
+
       if (isTopicallyRelevant(profile, buffer)) {
+        if (!canReleaseForLanguage(profile, buffer, true)) {
+          return stopOffTopicOutput();
+        }
+
         released = true;
         const output = buffer;
         buffer = "";
@@ -2482,6 +2502,7 @@ function buildRelevanceProfile(prompt: string): RelevanceProfile | null {
   return {
     anchors,
     minOutputChars: 360,
+    expectedEnglish: isLikelyEnglishPrompt(prompt),
   };
 }
 
@@ -2515,6 +2536,53 @@ function shouldStopForOffTopicOutput(
   return extractSemanticTokens(trimmed).length >= 70;
 }
 
+function shouldStopForWrongLanguage(
+  profile: RelevanceProfile,
+  content: string,
+): boolean {
+  if (!profile.expectedEnglish) {
+    return false;
+  }
+
+  const cjkChars = content.match(/[\u3400-\u9FFF\uF900-\uFAFF]/gu)?.length ?? 0;
+  if (cjkChars < 24) {
+    return false;
+  }
+
+  const englishLetters = content.match(/[A-Za-z]/g)?.length ?? 0;
+  return cjkChars >= 80 || cjkChars > englishLetters * 1.25;
+}
+
+function canReleaseForLanguage(
+  profile: RelevanceProfile,
+  content: string,
+  isFinal: boolean,
+): boolean {
+  if (!profile.expectedEnglish) {
+    return true;
+  }
+
+  if (shouldStopForWrongLanguage(profile, content)) {
+    return false;
+  }
+
+  if (isFinal) {
+    return true;
+  }
+
+  if (isBriefMarkdownHeadingOnly(content)) {
+    return false;
+  }
+
+  const englishLetters = content.match(/[A-Za-z]/g)?.length ?? 0;
+  return englishLetters >= 10 || extractSemanticTokens(content).length >= 2;
+}
+
+function isBriefMarkdownHeadingOnly(content: string): boolean {
+  const trimmed = content.trim();
+  return /^#{1,6}\s+\S.{0,100}$/u.test(trimmed) && !/\n\S/u.test(trimmed);
+}
+
 function extractSemanticTokens(text: string): string[] {
   const tokens = text
     .toLowerCase()
@@ -2526,7 +2594,10 @@ function extractSemanticTokens(text: string): string[] {
 
   return tokens
     .map(normalizeSemanticToken)
-    .filter((token) => token.length >= 4);
+    .filter(
+      (token) =>
+        token.length >= 4 || SHORT_PROMPT_ANCHOR_TOKENS.has(token),
+    );
 }
 
 function normalizeSemanticToken(token: string): string {
@@ -2547,10 +2618,14 @@ function normalizeSemanticToken(token: string): string {
 
 const PROMPT_ANCHOR_STOPWORDS = new Set([
   "about",
+  "action",
+  "add",
   "answer",
+  "append",
   "argumentative",
   "clearly",
   "compose",
+  "content",
   "current",
   "detail",
   "draft",
@@ -2558,20 +2633,40 @@ const PROMPT_ANCHOR_STOPWORDS = new Set([
   "exact",
   "generate",
   "grounded",
+  "insert",
+  "item",
+  "items",
   "mission",
   "note",
   "please",
+  "project",
   "prompt",
   "provide",
   "regard",
   "response",
+  "short",
   "source",
   "summarize",
   "summary",
+  "that",
+  "this",
+  "update",
   "user",
+  "with",
   "word",
   "write",
   "written",
+]);
+
+const SHORT_PROMPT_ANCHOR_TOKENS = new Set([
+  "ai",
+  "api",
+  "css",
+  "dom",
+  "mcp",
+  "ui",
+  "war",
+  "web",
 ]);
 
 async function streamChatWithThinkingFallback({
@@ -3963,6 +4058,7 @@ async function streamCurrentNoteWriteback({
   events,
   toolContext,
   knownToolNames,
+  relevancePrompt,
   think,
   options,
   abortSignal,
@@ -3975,6 +4071,7 @@ async function streamCurrentNoteWriteback({
   events: AgentRunEvents;
   toolContext: ToolExecutionContext;
   knownToolNames: Set<string>;
+  relevancePrompt?: string;
   think?: ModelThink;
   options?: ModelRequestOptions;
   abortSignal?: AbortSignal;
@@ -4026,6 +4123,7 @@ async function streamCurrentNoteWriteback({
       events,
       writer,
       knownToolNames,
+      relevancePrompt,
     });
     let attemptContent = "";
 
@@ -4108,6 +4206,10 @@ async function streamCurrentNoteWriteback({
         durationMs: elapsedMs(startedAt),
         requestChars,
       });
+      if (isInvalidResponseError(error)) {
+        thinkingStream.done();
+        throw error;
+      }
       const trailingContent = contentSanitizer.flush();
       if (trailingContent) {
         attemptContent += trailingContent;
@@ -4293,25 +4395,33 @@ function createLiveWritebackEmitter({
   events,
   writer,
   knownToolNames,
+  relevancePrompt,
 }: {
   events: AgentRunEvents;
   writer: Awaited<ReturnType<typeof createStreamingNoteWriter>>;
   knownToolNames: Set<string>;
+  relevancePrompt?: string;
 }) {
   let safetyBuffer = "";
   let live = false;
   let wroteContent = false;
   let toolRequestDetected = false;
+  const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
 
   const emit = (delta: string) => {
     if (!delta) {
       return;
     }
 
+    const topicalDelta = relevanceGate.push(delta);
+    if (!topicalDelta) {
+      return;
+    }
+
     wroteContent = true;
-    events.onFinalDelta?.(delta);
-    events.onAssistantDelta?.(delta);
-    writer.push(delta);
+    events.onFinalDelta?.(topicalDelta);
+    events.onAssistantDelta?.(topicalDelta);
+    writer.push(topicalDelta);
   };
 
   return {
@@ -4381,6 +4491,16 @@ function createLiveWritebackEmitter({
         }
       }
 
+      if (!toolRequestDetected) {
+        const trailingTopicalContent = relevanceGate.finish();
+        if (trailingTopicalContent) {
+          wroteContent = true;
+          events.onFinalDelta?.(trailingTopicalContent);
+          events.onAssistantDelta?.(trailingTopicalContent);
+          writer.push(trailingTopicalContent);
+        }
+      }
+
       return { toolRequestDetected, wroteContent };
     },
   };
@@ -4418,6 +4538,13 @@ function shouldKeepWritebackSafetyBuffer(content: string): boolean {
   }
 
   return false;
+}
+
+function isInvalidResponseError(error: unknown): boolean {
+  return (
+    error instanceof ModelClientError &&
+    error.category === "invalid_response"
+  );
 }
 
 function parseWritebackWordCountTargetFromMessages(

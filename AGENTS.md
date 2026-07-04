@@ -77,6 +77,7 @@ Keep `MAX_AGENT_STEPS` and other caps meaningful. Avoid broad autonomous mutatio
 - `count_words` must return metadata only, never note content. Generated draft word-count verification should stay bounded to one correction pass unless explicitly changed.
 - Streamed note writeback must not display or write model-emitted tool-call markup. Preserve the retry-and-fail-cleanly behavior when editing streaming code.
 - Streamed note writeback should stream safe content chunks into both chat and the active note after only a short safety buffer. Do not reintroduce full-response buffering except for a clearly documented safety requirement.
+- Streamed note writeback must apply the topic/language relevance gate before writing safe-looking content. English prompts with clear anchors must not write unrelated Chinese/template/code-analysis output.
 - Target-only current-note write prompts should skip redundant `read_current_file` and planner loops when they do not depend on existing note content, vault context, web/source verification, graph context, or word-count checks.
 - Prompt-on-page runs must reclassify the extracted note prompt for tool selection. If the extracted prompt asks for sources, citations, verification, vault context, graph context, specific files, or word counts, require the relevant tool loop before streamed writeback.
 - Every write returns a receipt with path, operation, bytes written/deleted where applicable, and backup path for risky writes.

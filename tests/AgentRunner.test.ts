@@ -2847,6 +2847,59 @@ test("current-note writeback streams chunks live to chat and note", async () => 
   );
 });
 
+test("streamed note writeback stops Chinese off-topic output before note mutation", async () => {
+  const finalDeltas: string[] = [];
+  const assistantDeltas: string[] = [];
+  const statuses: string[] = [];
+  const receipts: Array<Record<string, unknown>> = [];
+  const prompt = "In this note, can you write me a summary of the Vietnam war?";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+  });
+  const client = createClient({
+    chatRequests: [],
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# 1. 前言\n\n",
+          "在上一篇文章中，我们分析了`axios`的请求配置，知道了在`axios`中，默认配置和用户配置可以合并，并且用户配置会优先于默认配置。",
+          "接下来，我们就合并后的配置看看`axios`是如何来发请求的。\n\n",
+          "在`/lib/core/Axios.js`文件中，我们可以看到，在`Axios`的原型上存在一个`request`方法。",
+        ]),
+    ],
+  });
+
+  await assert.rejects(
+    () =>
+      runAgentMission({
+        prompt,
+        modelClient: client,
+        toolRegistry: createDefaultToolRegistry(),
+        toolContext: vault.context,
+        enableStreaming: true,
+        events: {
+          onFinalDelta: (delta) => finalDeltas.push(delta),
+          onAssistantDelta: (delta) => assistantDeltas.push(delta),
+          onStatus: (message) => statuses.push(message),
+          onReceipt: (receipt) =>
+            receipts.push(receipt.output as Record<string, unknown>),
+        },
+      }),
+    /drifted off topic/,
+  );
+
+  assert.deepEqual(finalDeltas, []);
+  assert.deepEqual(assistantDeltas, []);
+  assert.deepEqual(receipts, []);
+  assert.equal(vault.content.get("Current.md"), "Initial note");
+  assert.ok(
+    statuses.includes(
+      "Stopped model output because it drifted off topic from the current mission.",
+    ),
+  );
+});
+
 test("thinking-only writeback retries once and fails without a receipt", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
