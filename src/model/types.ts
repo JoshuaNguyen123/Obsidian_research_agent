@@ -51,6 +51,7 @@ export interface ModelChatRequest {
   tools?: ModelToolDefinition[];
   think?: ModelThink;
   options?: ModelRequestOptions;
+  abortSignal?: AbortSignal;
 }
 
 export interface ModelRequestOptions {
@@ -88,6 +89,7 @@ export interface HttpRequest {
   headers?: Record<string, string>;
   throw?: boolean;
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface HttpResponse {

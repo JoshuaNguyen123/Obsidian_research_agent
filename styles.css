@@ -173,6 +173,9 @@
   flex: 0 0 auto;
   flex-direction: column;
   gap: 8px;
+  isolation: isolate;
+  position: relative;
+  z-index: 2;
 }
 
 .agentic-researcher-prompt {
@@ -203,6 +206,8 @@
   display: grid;
   gap: 8px;
   grid-template-columns: minmax(0, 1fr) auto;
+  position: relative;
+  z-index: 3;
 }
 
 .agentic-researcher-run-status {
@@ -250,6 +255,20 @@
 .agentic-researcher-view button.agentic-researcher-run {
   background: rgba(92, 255, 141, 0.12);
   color: var(--agent-terminal-green);
+  pointer-events: auto;
+  position: relative;
+  z-index: 4;
+}
+
+.agentic-researcher-view button.agentic-researcher-run.is-stop {
+  border-color: var(--agent-terminal-warning);
+  color: var(--agent-terminal-warning);
+}
+
+.agentic-researcher-view button.agentic-researcher-run.is-stop:hover,
+.agentic-researcher-view button.agentic-researcher-run.is-stop:focus-visible {
+  background: rgba(255, 191, 71, 0.12);
+  box-shadow: inset 0 0 0 1px var(--agent-terminal-warning);
 }
 
 .agentic-researcher-view button.agentic-researcher-clear {
@@ -271,18 +290,19 @@
   background: var(--agent-terminal-panel);
   border: 1px solid var(--agent-terminal-border);
   border-radius: 4px;
-  display: flex;
+  display: block;
   flex: 1 1 auto;
-  flex-direction: column;
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .agentic-researcher-metrics {
   background: rgba(92, 255, 141, 0.18);
   display: grid;
   gap: 1px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
 }
 
 .agentic-researcher-metric {
@@ -306,6 +326,14 @@
   display: flex;
   gap: 8px;
   justify-content: space-between;
+  min-width: 0;
+}
+
+.agentic-researcher-dashboard-label,
+.agentic-researcher-log-label,
+.agentic-researcher-receipt-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .agentic-researcher-metric-value {
@@ -320,15 +348,21 @@
 .agentic-researcher-stream-grid {
   border-top: 1px solid var(--agent-terminal-border);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  min-height: 120px;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
 }
 
 .agentic-researcher-dashboard-section {
+  background: var(--agent-terminal-panel);
   border-top: 1px solid var(--agent-terminal-border);
-  min-height: 86px;
+  contain: layout paint;
+  flex: 0 0 auto;
+  isolation: isolate;
+  min-height: 76px;
   min-width: 0;
+  overflow: hidden;
   padding: 8px;
+  position: relative;
 }
 
 .agentic-researcher-stream-grid .agentic-researcher-dashboard-section {
@@ -336,18 +370,46 @@
 }
 
 .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
-  border-left: 1px solid var(--agent-terminal-border);
+  border-left: 0;
+  border-top: 1px solid var(--agent-terminal-border);
 }
 
 .agentic-researcher-dashboard-body {
   color: var(--agent-terminal-green);
+  contain: layout paint;
+  display: flow-root;
   font-size: var(--font-ui-small);
+  isolation: isolate;
   line-height: 1.45;
   margin-top: 6px;
-  max-height: 150px;
-  overflow-y: auto;
+  max-height: clamp(96px, 24vh, 260px);
+  min-width: 0;
+  overflow: auto;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+  padding-right: 6px;
+  position: relative;
+  scrollbar-gutter: stable;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.agentic-researcher-dashboard-body-planning,
+.agentic-researcher-dashboard-body-status,
+.agentic-researcher-dashboard-body-model-config {
+  max-height: clamp(104px, 22vh, 220px);
+}
+
+.agentic-researcher-dashboard-body-final-answer {
+  max-height: clamp(180px, 42vh, 460px);
+}
+
+.agentic-researcher-dashboard-body-run-log {
+  max-height: clamp(180px, 36vh, 420px);
+}
+
+.agentic-researcher-dashboard-body-tool-timeline,
+.agentic-researcher-dashboard-body-receipts {
+  max-height: clamp(120px, 28vh, 280px);
 }
 
 .agentic-researcher-copy,
@@ -362,6 +424,7 @@
   flex: 0 0 auto;
   height: 24px;
   justify-content: center;
+  margin-left: auto;
   padding: 0;
   width: 24px;
 }
@@ -384,6 +447,7 @@
 .agentic-researcher-status-line {
   border-top: 1px dotted rgba(92, 255, 141, 0.25);
   padding: 4px 0;
+  white-space: pre-wrap;
 }
 
 .agentic-researcher-status-line:first-child {
@@ -392,11 +456,17 @@
 }
 
 .agentic-researcher-stream-text {
+  display: block;
   min-height: 44px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .agentic-researcher-placeholder {
   color: var(--agent-terminal-muted);
+  white-space: pre-wrap;
 }
 
 .agentic-researcher-tool-item,
@@ -432,10 +502,10 @@
 }
 
 .agentic-researcher-tool-header {
-  align-items: baseline;
-  display: flex;
+  align-items: start;
+  display: grid;
   gap: 8px;
-  justify-content: space-between;
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .agentic-researcher-tool-name {
@@ -447,8 +517,9 @@
 
 .agentic-researcher-tool-status {
   color: var(--agent-terminal-warning);
-  flex: 0 0 auto;
   font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+  white-space: nowrap;
 }
 
 .agentic-researcher-tool-item.is-complete .agentic-researcher-tool-status {
@@ -466,17 +537,23 @@
   line-height: 1.4;
   margin-top: 3px;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .agentic-researcher-receipt-message {
   color: var(--agent-terminal-green);
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .agentic-researcher-config-line,
 .agentic-researcher-trace-row {
   border-top: 1px dotted rgba(92, 255, 141, 0.25);
   padding: 4px 0;
+}
+
+.agentic-researcher-config-line {
+  white-space: pre-wrap;
 }
 
 .agentic-researcher-config-line:first-child,
@@ -487,7 +564,18 @@
 .agentic-researcher-trace-row {
   display: grid;
   gap: 8px;
-  grid-template-columns: 72px minmax(0, 1fr);
+  grid-template-columns: minmax(88px, 110px) minmax(0, 1fr);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.agentic-researcher-dashboard-body-run-log .agentic-researcher-trace-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.agentic-researcher-dashboard-body-run-log .agentic-researcher-trace-meta,
+.agentic-researcher-dashboard-body-run-log .agentic-researcher-payload {
+  grid-column: 1;
 }
 
 .agentic-researcher-trace-receipt {
@@ -504,6 +592,7 @@
 .agentic-researcher-trace-kind {
   color: var(--agent-terminal-muted);
   font-size: var(--font-ui-smaller);
+  line-height: 1.4;
   text-transform: uppercase;
 }
 
@@ -511,6 +600,7 @@
   color: var(--agent-terminal-green);
   min-width: 0;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .agentic-researcher-trace-meta {
@@ -522,12 +612,15 @@
   gap: 6px;
   grid-column: 2;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .agentic-researcher-payload {
   color: var(--agent-terminal-muted);
   grid-column: 1 / -1;
   margin-top: 6px;
+  max-width: 100%;
+  overflow: auto;
 }
 
 .agentic-researcher-payload summary {
@@ -543,6 +636,7 @@
   font-size: var(--font-ui-smaller);
   margin: 6px 0 0;
   max-height: 180px;
+  max-width: 100%;
   overflow: auto;
   padding: 8px;
   white-space: pre-wrap;
@@ -570,6 +664,37 @@
   }
 
   .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
+    border-left: 0;
+    border-top: 1px solid var(--agent-terminal-border);
+  }
+}
+
+@media (max-width: 720px) {
+  .agentic-researcher-responsive-run-details .agentic-researcher-stream-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .agentic-researcher-responsive-run-details .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
+    border-left: 0;
+    border-top: 1px solid var(--agent-terminal-border);
+  }
+
+  .agentic-researcher-responsive-run-details .agentic-researcher-trace-row {
+    grid-template-columns: 1fr;
+  }
+
+  .agentic-researcher-responsive-run-details .agentic-researcher-trace-meta,
+  .agentic-researcher-responsive-run-details .agentic-researcher-payload {
+    grid-column: 1;
+  }
+}
+
+@media (max-width: 860px) {
+  .agentic-researcher-responsive-run-details .agentic-researcher-stream-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .agentic-researcher-responsive-run-details .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
     border-left: 0;
     border-top: 1px solid var(--agent-terminal-border);
   }

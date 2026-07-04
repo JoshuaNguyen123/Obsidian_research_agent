@@ -1,4 +1,4 @@
-import type { App } from "obsidian";
+import type { App, TFile } from "obsidian";
 import type { AgentSettings } from "../settings";
 import type {
   HttpTransport,
@@ -33,6 +33,8 @@ export interface ToolExecutionContext {
   writeAutonomy?: boolean;
   missionIntent?: MissionIntent;
   now?: () => Date;
+  getCurrentMarkdownFile?: () => TFile | null;
+  getCurrentMarkdownContent?: (file: TFile) => string | null;
 }
 
 export interface ToolExecutionResult {

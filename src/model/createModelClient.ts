@@ -29,6 +29,7 @@ export async function requestUrlTransport(
     requestUrl(request),
     request.timeoutMs,
     `Request timed out after ${request.timeoutMs}ms.`,
+    request.abortSignal,
   );
 
   return {
@@ -66,6 +67,9 @@ async function fetchStreamingTransport(
 
   const controller = new AbortController();
   const timeout = startAbortTimeout(controller, request.timeoutMs);
+  const unlinkAbort = linkAbortSignal(request.abortSignal, () =>
+    controller.abort(),
+  );
 
   let response: Response;
   try {
@@ -77,6 +81,12 @@ async function fetchStreamingTransport(
     });
   } catch (error) {
     clearAbortTimeout(timeout);
+    unlinkAbort();
+    if (request.abortSignal?.aborted) {
+      throw new ModelClientErrorClass("network", "Request cancelled.", {
+        originalError: error,
+      });
+    }
     if (controller.signal.aborted) {
       throw new ModelClientErrorClass(
         "network",
@@ -90,6 +100,7 @@ async function fetchStreamingTransport(
 
   if (!response.body) {
     clearAbortTimeout(timeout);
+    unlinkAbort();
     throw new Error("Streaming response body is unavailable.");
   }
 
@@ -101,7 +112,10 @@ async function fetchStreamingTransport(
   return {
     status: response.status,
     headers: responseHeaders,
-    body: decodeStream(response.body, () => clearAbortTimeout(timeout)),
+    body: decodeStream(response.body, () => {
+      clearAbortTimeout(timeout);
+      unlinkAbort();
+    }),
   };
 }
 
@@ -169,6 +183,12 @@ async function nodeStreamingTransport(
     );
 
     req.on("error", reject);
+    const unlinkAbort = linkAbortSignal(request.abortSignal, () => {
+      req.destroy(
+        new ModelClientErrorClass("network", "Request cancelled."),
+      );
+    });
+    req.on("close", unlinkAbort);
     if (request.timeoutMs && request.timeoutMs > 0) {
       req.setTimeout(request.timeoutMs, () => {
         req.destroy(
@@ -274,23 +294,67 @@ function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number | undefined,
   message: string,
+  abortSignal?: AbortSignal,
 ): Promise<T> {
-  if (!timeoutMs || timeoutMs <= 0) {
+  if (abortSignal?.aborted) {
+    return Promise.reject(
+      new ModelClientErrorClass("network", "Request cancelled."),
+    );
+  }
+
+  if ((!timeoutMs || timeoutMs <= 0) && !abortSignal) {
     return promise;
   }
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<T>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(new ModelClientErrorClass("network", message));
-    }, timeoutMs);
-  });
+  let removeAbortListener: (() => void) | undefined;
+  const races: Array<Promise<T>> = [promise];
 
-  return Promise.race([promise, timeoutPromise]).finally(() => {
+  if (timeoutMs && timeoutMs > 0) {
+    races.push(
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new ModelClientErrorClass("network", message));
+        }, timeoutMs);
+      }),
+    );
+  }
+
+  if (abortSignal) {
+    races.push(
+      new Promise<T>((_, reject) => {
+        const onAbort = () =>
+          reject(new ModelClientErrorClass("network", "Request cancelled."));
+        abortSignal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () =>
+          abortSignal.removeEventListener("abort", onAbort);
+      }),
+    );
+  }
+
+  return Promise.race(races).finally(() => {
     if (timeoutId !== undefined) {
       clearTimeout(timeoutId);
     }
+    removeAbortListener?.();
   });
+}
+
+function linkAbortSignal(
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+): () => void {
+  if (!signal) {
+    return () => undefined;
+  }
+
+  if (signal.aborted) {
+    onAbort();
+    return () => undefined;
+  }
+
+  signal.addEventListener("abort", onAbort, { once: true });
+  return () => signal.removeEventListener("abort", onAbort);
 }
 
 function startAbortTimeout(

@@ -23,7 +23,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   ollamaBaseUrl: "https://ollama.com/api",
   model: "gpt-oss:120b",
   enableStreaming: true,
-  requestTimeoutMs: 60000,
+  requestTimeoutMs: 180000,
   thinkingMode: "auto",
   streamWritebackMode: "all_current_note_content_writes",
   temperature: null,
@@ -198,7 +198,7 @@ export class AgentSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Request timeout")
-      .setDesc("Maximum time to wait for model and web requests, in milliseconds.")
+      .setDesc("Maximum time to wait for model and web requests, in milliseconds. Default is 180000 (3 minutes).")
       .addText((text) =>
         text
           .setPlaceholder(String(DEFAULT_SETTINGS.requestTimeoutMs))

@@ -94,7 +94,9 @@ export const readCurrentFileTool: AgentTool = {
       MAX_FILE_READ_CHARS,
     );
     const file = getActiveMarkdownFile(context);
-    const content = await context.app.vault.cachedRead(file);
+    const content =
+      context.getCurrentMarkdownContent?.(file) ??
+      (await context.app.vault.cachedRead(file));
 
     return {
       path: file.path,
@@ -1432,9 +1434,12 @@ function getParentFolderPath(path: string): string {
 }
 
 function getActiveMarkdownFile(context: ToolExecutionContext): TFile {
-  const file = context.app.workspace.getActiveFile();
+  const file =
+    context.getCurrentMarkdownFile?.() ?? context.app.workspace.getActiveFile();
   if (!file || file.extension !== "md") {
-    throw new Error("An active markdown file is required.");
+    throw new Error(
+      "An active markdown file is required. Open or focus a markdown note before asking the agent to read the current note.",
+    );
   }
 
   return file;
