@@ -293,6 +293,51 @@ test("assistant JSON tool blocks are recovered and executed as tool calls", asyn
   assert.match(chatRequests[1].messages.at(-1)?.content ?? "", /list_current_folder/);
 });
 
+test("assistant XML-ish tool blocks are recovered and executed as tool calls", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithContent(
+          [
+            "<requested_tool_call>",
+            "<name>list_folder</name>",
+            "<arguments>{\"path\":\"/\"}</arguments>",
+            "</requested_tool_call>",
+          ].join(""),
+        ),
+      () => responseWithContent("Root folder inspected."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Look through my vault folders.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(chatRequests.length, 2);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["list_folder"],
+  );
+  assert.deepEqual(executedCalls[0].arguments, { path: "" });
+  assert.ok(
+    statuses.some((message) =>
+      message.includes("Recovered text tool request: list_folder"),
+    ),
+  );
+});
+
 test("recovered list_folder slash path targets the vault root", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const deltas: string[] = [];
@@ -399,7 +444,7 @@ test("static essay prompts stream as chat answers without note writeback", async
   const assistantDeltas: string[] = [];
   const statuses: string[] = [];
   const vault = createRunnerVaultContext({
-    prompt: "Write me a 300 word essay about the Mexican-American war.",
+    prompt: "Write me a short essay about the Mexican-American war.",
     content: "Existing note",
   });
 
@@ -416,7 +461,7 @@ test("static essay prompts stream as chat answers without note writeback", async
   });
 
   await runAgentMission({
-    prompt: "Write me a 300 word essay about the Mexican-American war.",
+    prompt: "Write me a short essay about the Mexican-American war.",
     modelClient: client,
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
@@ -443,6 +488,54 @@ test("static essay prompts stream as chat answers without note writeback", async
   assert.equal(vault.content.get("Current.md"), "Existing note");
   assert.ok(!statuses.includes("Streaming writeback to note..."));
   assert.ok(statuses.includes("Drafting final answer..."));
+});
+
+test("chat-only word-target generation performs one internal correction pass", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const finalDeltas: string[] = [];
+  const statuses: string[] = [];
+  const correctedDraft = "one two three four five six seven eight nine ten";
+  const vault = createRunnerVaultContext({
+    prompt: "Write exactly 10 words about Obsidian.",
+    content: "Existing note",
+  });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["Obsidian draft."]),
+    ],
+    chatResponders: [
+      () => responseWithContent(correctedDraft),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Write exactly 10 words about Obsidian.",
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(streamRequests.length, 1);
+  assert.equal(chatRequests.length, 1);
+  assert.deepEqual(finalDeltas, [correctedDraft]);
+  assert.ok(
+    statuses.includes(
+      "Word count 2/10 outside target; requesting one correction pass...",
+    ),
+  );
+  assert.ok(
+    statuses.includes("Word count: 10/10 (within target; correction=used)."),
+  );
+  assert.equal(vault.content.get("Current.md"), "Existing note");
 });
 
 test("prompt-on-page generation streams the extracted answer into the current note", async () => {
@@ -531,6 +624,52 @@ test("prompt-on-page generation streams the extracted answer into the current no
   assert.ok(statuses.includes("Streaming writeback complete."));
 });
 
+test("prompt-on-page word target counts generated output only before writing", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const notePrompt = "Prompt: Write exactly 5 words about Obsidian.";
+  const correctedDraft = "one two three four five";
+  const vault = createRunnerVaultContext({
+    prompt: "Read the prompt on the page",
+    content: notePrompt,
+  });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["Obsidian note"]),
+    ],
+    chatResponders: [
+      () => responseWithContent(correctedDraft),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Read the prompt on the page",
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(streamRequests.length, 1);
+  assert.equal(chatRequests.length, 1);
+  assert.equal(vault.content.get("Current.md"), `${notePrompt}\n${correctedDraft}`);
+  assert.ok(
+    statuses.includes(
+      "Word count 2/5 outside target; requesting one correction pass...",
+    ),
+  );
+  assert.ok(
+    statuses.includes("Word count: 5/5 (within target; correction=used)."),
+  );
+});
+
 test("buffered final answers strip raw model special tokens", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const deltas: string[] = [];
@@ -593,7 +732,7 @@ test("plain static writing prompts do not expose current-note write tools", asyn
   });
 
   await runAgentMission({
-    prompt: "I want you to generate a research essay regarding the Vietnam War in 300 words.",
+    prompt: "I want you to generate a concise research paragraph regarding the Vietnam War.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -893,6 +1032,80 @@ test("what do you know about me prompts expose read-only vault traversal tools",
   assert.equal(chatRequests.length, 1);
   assert.deepEqual(deltas, ["I found notes about you in the vault."]);
   assert.ok(!statuses.includes("Write required; asking model to use a write tool..."));
+});
+
+test("graph connection questions expose read-only graph tools", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [() => responseWithContent("These notes are related.")],
+  });
+
+  await runAgentMission({
+    prompt: "Are my current note and related notes connected in the Obsidian graph?",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  for (const toolName of [
+    "get_note_graph_context",
+    "find_related_notes",
+    "suggest_note_links",
+  ]) {
+    assert.ok(toolNames.includes(toolName), toolName);
+  }
+  assert.ok(!toolNames.includes("link_related_notes_in_current_file"));
+});
+
+test("connect-note prompts expose inline graph link writing", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("link_related_notes_in_current_file", {}),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Connect this note to related notes with inline wiki links.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("get_note_graph_context"));
+  assert.ok(toolNames.includes("find_related_notes"));
+  assert.ok(toolNames.includes("suggest_note_links"));
+  assert.ok(toolNames.includes("link_related_notes_in_current_file"));
+});
+
+test("word count prompts expose count_words without write tools", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [() => responseWithContent("The note has 12 words.")],
+  });
+
+  await runAgentMission({
+    prompt: "Count the words in the current note.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("count_words"));
+  assert.ok(!toolNames.includes("append_to_current_file"));
+  assert.ok(!toolNames.includes("replace_current_file"));
 });
 
 test("what did you learn about me can traverse untitled notes before answering", async () => {
@@ -2522,6 +2735,99 @@ test("thinking-only writeback retries once and fails without a receipt", async (
   );
 });
 
+test("streamed writeback suppresses requested tool markup and retries without writing it", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const finalDeltas: string[] = [];
+  const statuses: string[] = [];
+  const prompt = "Append 2 action items to this note.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+  });
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [() => responseWithContent("Ready to append.")],
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "<requested_tool_call>",
+          "<name>read_current_file</name>",
+          "</requested_tool_call>",
+        ]),
+      () => responseWithContentDeltas(["- Real action\n"]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(streamRequests.length, 2);
+  assert.deepEqual(finalDeltas, ["- Real action\n"]);
+  assert.equal(vault.content.get("Current.md"), "Initial note\n- Real action\n");
+  assert.ok(!vault.content.get("Current.md")?.includes("requested_tool_call"));
+  assert.ok(
+    statuses.includes(
+      "Model requested a tool during writeback; retrying content-only output...",
+    ),
+  );
+});
+
+test("repeated streamed tool markup fails cleanly without note mutation", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const receipts: Array<Record<string, unknown>> = [];
+  const prompt = "Append 2 action items to this note.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+  });
+  const toolMarkup = [
+    "<requested_tool_call>",
+    "<name>read_current_file</name>",
+    "</requested_tool_call>",
+  ];
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [() => responseWithContent("Ready to append.")],
+    streamResponders: [
+      () => responseWithContentDeltas(toolMarkup),
+      () => responseWithContentDeltas(toolMarkup),
+    ],
+  });
+
+  await assert.rejects(
+    () =>
+      runAgentMission({
+        prompt,
+        modelClient: client,
+        toolRegistry: createDefaultToolRegistry(),
+        toolContext: vault.context,
+        enableStreaming: true,
+        events: {
+          onReceipt: (receipt) =>
+            receipts.push(receipt.output as Record<string, unknown>),
+        },
+      }),
+    /requested a tool during streamed writeback/,
+  );
+
+  assert.equal(streamRequests.length, 2);
+  assert.equal(vault.content.get("Current.md"), "Initial note");
+  assert.deepEqual(receipts, []);
+});
+
 test("writeback retry writes content from the second stream", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
@@ -3116,6 +3422,34 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "count_words",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "get_note_graph_context",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "find_related_notes",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "suggest_note_links",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "list_folder",
           parameters: { type: "object", properties: {} },
         },
@@ -3222,6 +3556,13 @@ function createRegistry(
         type: "function",
         function: {
           name: "delete_current_file",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "link_related_notes_in_current_file",
           parameters: { type: "object", properties: {} },
         },
       },
@@ -3379,6 +3720,15 @@ function createRegistry(
                   path: "Current.md",
                   backupPath: ".agent-backups/1-Current.md",
                   bytesDeleted: 12,
+                }
+            : call.name === "link_related_notes_in_current_file"
+              ? {
+                  path: "Current.md",
+                  operation: "link_related_notes",
+                  backupPath: ".agent-backups/1-Current.md",
+                  insertedLinks: [],
+                  skipped: [],
+                  bytesWritten: 12,
                 }
             : call.name === "web_fetch"
               ? {

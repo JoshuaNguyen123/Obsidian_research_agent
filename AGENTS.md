@@ -33,6 +33,7 @@ Optimize for real execution inside Obsidian, not abstract control panels or simu
 
 - Treat `docs/technical_details.md` as the living technical architecture record.
 - Update `docs/technical_details.md` in the same change when you alter architecture, agent loop flow, settings, tool contracts, vault safety policy, writeback behavior, model/API behavior, validation strategy, e2e harness behavior, build scripts, or deployment/sync workflow.
+- Update `docs/technical_details.md` in the same change when graph tools, related-note scoring, inline wiki-link behavior, streamed writeback guardrails, tool-call recovery, or word-count behavior changes.
 - Give details as interview ready answers to technical questions
 - Keep the document implementation-grounded: describe actual files, runtime flow, safety checks, limits, and tradeoffs that exist in the repo.
 - If a requested change intentionally diverges from the technical details document, update the document and briefly call out the change in the final response.
@@ -62,11 +63,19 @@ Keep `MAX_AGENT_STEPS` and other caps meaningful. Avoid broad autonomous mutatio
   - `read_current_file`
   - `list_markdown_files`
   - `read_file`
+  - `count_words`
+  - `get_note_graph_context`
+  - `find_related_notes`
+  - `suggest_note_links`
   - `web_search`
   - `web_fetch`
   - `append_to_current_file`
   - `replace_current_file`
+  - `link_related_notes_in_current_file` for explicit connect/link requests only
   - section/title/path tools already implemented in the repo
+- Graph tools must stay local and read-first by default. Do not add embeddings, vector databases, persisted semantic indexes, or backend services unless explicitly requested.
+- `count_words` must return metadata only, never note content. Generated draft word-count verification should stay bounded to one correction pass unless explicitly changed.
+- Streamed note writeback must not display or write model-emitted tool-call markup. Preserve the retry-and-fail-cleanly behavior when editing streaming code.
 - Every write returns a receipt with path, operation, bytes written/deleted where applicable, and backup path for risky writes.
 - Replacements and destructive edits require backup in `.agent-backups/`.
 - Hard delete is not a default capability; use Obsidian-safe trash behavior only when explicitly implemented and requested.

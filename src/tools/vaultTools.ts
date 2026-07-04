@@ -31,6 +31,8 @@ import {
   normalizeVaultPath,
   truncateText,
 } from "./validation";
+import { createGraphTools } from "./graphTools";
+import { countMarkdownVisibleText } from "./wordCount";
 
 const CREATE_INTENT_PATTERN = /\b(create|new|make)\b/i;
 const REPLACE_INTENT_PATTERN =
@@ -57,6 +59,8 @@ export function createVaultTools(): AgentTool[] {
     searchMarkdownFilesTool,
     readMarkdownFilesTool,
     readFileTool,
+    countWordsTool,
+    ...createGraphTools(),
     listFolderTool,
     getPathInfoTool,
     createFolderTool,
@@ -397,6 +401,43 @@ export const readFileTool: AgentTool = {
     return {
       path: file.path,
       content: truncateText(content, MAX_FILE_READ_CHARS),
+    };
+  },
+};
+
+export const countWordsTool: AgentTool = {
+  name: "count_words",
+  description:
+    "Count visible markdown words in the active note or a vault-relative markdown file. Returns counts only, not note content.",
+  parameters: {
+    type: "object",
+    properties: {
+      path: {
+        type: "string",
+        description:
+          "Optional vault-relative markdown path. Omit to count the active note.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const requestedPath = getOptionalString(args, "path");
+    const file = requestedPath
+      ? getMarkdownFileByPath(
+          context,
+          normalizeVaultPath(requestedPath, { requireMarkdown: true }),
+        )
+      : getActiveMarkdownFile(context);
+    const content =
+      !requestedPath && context.getCurrentMarkdownContent
+        ? context.getCurrentMarkdownContent(file) ??
+          (await context.app.vault.cachedRead(file))
+        : await context.app.vault.cachedRead(file);
+    const counts = countMarkdownVisibleText(content);
+
+    return {
+      path: file.path,
+      ...counts,
     };
   },
 };
