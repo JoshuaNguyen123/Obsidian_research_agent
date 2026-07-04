@@ -16,6 +16,15 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.ok(definitions.some((tool) => tool.function.name === "list_folder"));
   assert.ok(definitions.some((tool) => tool.function.name === "search_markdown_files"));
   assert.ok(definitions.some((tool) => tool.function.name === "read_markdown_files"));
+  assert.ok(definitions.some((tool) => tool.function.name === "count_words"));
+  assert.ok(definitions.some((tool) => tool.function.name === "get_note_graph_context"));
+  assert.ok(definitions.some((tool) => tool.function.name === "find_related_notes"));
+  assert.ok(definitions.some((tool) => tool.function.name === "suggest_note_links"));
+  assert.ok(
+    definitions.some(
+      (tool) => tool.function.name === "link_related_notes_in_current_file",
+    ),
+  );
   assert.ok(definitions.some((tool) => tool.function.name === "create_file"));
 
   const result = await registry.execute(
@@ -334,6 +343,197 @@ test("get_path_info reports files, folders, and missing paths", async () => {
     path: "Projects/missing.md",
     exists: false,
   });
+});
+
+test("get_note_graph_context returns links, backlinks, unresolved links, tags, aliases, and headings", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  mock.content.set("Backlinks/source.md", "Links to [[Current]].");
+  attachMetadataCache(mock, {
+    resolvedLinks: {
+      "Current.md": { "Projects/example.md": 1 },
+      "Backlinks/source.md": { "Current.md": 1 },
+    },
+    unresolvedLinks: {
+      "Current.md": { "Missing Note": 1 },
+    },
+    fileCaches: {
+      "Current.md": {
+        links: [{ link: "Projects/example" }],
+        tags: [{ tag: "#agent" }],
+        headings: [{ heading: "Current Heading", level: 1 }],
+        frontmatter: { aliases: ["Home Base"] },
+      },
+    },
+  });
+
+  const result = await registry.execute(
+    { name: "get_note_graph_context", arguments: {} },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    source: { path: string };
+    aliases: string[];
+    tags: string[];
+    headings: Array<{ heading: string; level: number }>;
+    outgoingLinks: Array<{ path: string; count: number }>;
+    backlinks: Array<{ path: string; count: number }>;
+    unresolvedLinks: Array<{ target: string; count: number }>;
+  };
+  assert.equal(output.source.path, "Current.md");
+  assert.deepEqual(output.aliases, ["Home Base"]);
+  assert.deepEqual(output.tags, ["agent"]);
+  assert.deepEqual(output.headings, [{ heading: "Current Heading", level: 1 }]);
+  assert.deepEqual(output.outgoingLinks, [
+    { path: "Projects/example.md", basename: "example", count: 1, exists: true },
+  ]);
+  assert.deepEqual(output.backlinks, [
+    { path: "Backlinks/source.md", basename: "source", count: 1, exists: true },
+  ]);
+  assert.deepEqual(output.unresolvedLinks, [{ target: "Missing Note", count: 1 }]);
+});
+
+test("find_related_notes ranks explicit graph links above semantic overlap", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  mock.content.set(
+    "Current.md",
+    "# Local AI Research\n\nAgentic Obsidian research with source receipts.",
+  );
+  mock.content.set(
+    "Projects/example.md",
+    "# Agentic Obsidian\n\nA directly linked note about receipts.",
+  );
+  mock.content.set(
+    "Research/semantic.md",
+    "# Local AI Notes\n\nLocal AI research and Obsidian context.",
+  );
+  attachMetadataCache(mock, {
+    resolvedLinks: {
+      "Current.md": { "Projects/example.md": 1 },
+    },
+    fileCaches: {
+      "Current.md": {
+        links: [{ link: "Projects/example" }],
+        tags: [{ tag: "#research" }],
+      },
+      "Projects/example.md": {
+        tags: [{ tag: "#research" }],
+      },
+      "Research/semantic.md": {
+        tags: [{ tag: "#research" }],
+      },
+    },
+  });
+
+  const result = await registry.execute(
+    { name: "find_related_notes", arguments: { limit: 5 } },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    results: Array<{ path: string; reasons: string[]; score: number }>;
+  };
+  assert.equal(output.results[0].path, "Projects/example.md");
+  assert.ok(output.results[0].reasons.includes("direct_link"));
+  assert.ok(
+    output.results.some(
+      (item) =>
+        item.path === "Research/semantic.md" &&
+        item.reasons.includes("content_overlap"),
+    ),
+  );
+});
+
+test("link_related_notes_in_current_file inserts inline wiki links with a backup", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Connect this note to related notes with inline links.",
+  });
+  mock.content.set(
+    "Current.md",
+    "Related Note belongs here.\n\n`Related Note` should stay code.\n",
+  );
+  mock.content.set("Topics/Related Note.md", "# Related Note\n\nGraph target.");
+  attachMetadataCache(mock, {});
+
+  const result = await registry.execute(
+    {
+      name: "link_related_notes_in_current_file",
+      arguments: { targetPaths: ["Topics/Related Note.md"] },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    changed: boolean;
+    backupPath: string;
+    insertedLinks: Array<{ targetPath: string; wikiLink: string }>;
+  };
+  assert.equal(output.changed, true);
+  assert.match(output.backupPath, /^\.agent-backups\/123-Current\.md$/);
+  assert.deepEqual(output.insertedLinks, [
+    {
+      targetPath: "Topics/Related Note.md",
+      label: "Related Note",
+      wikiLink: "[[Topics/Related Note|Related Note]]",
+      reasons: ["content_overlap"],
+    },
+  ]);
+  assert.equal(
+    mock.content.get("Current.md"),
+    "[[Topics/Related Note|Related Note]] belongs here.\n\n`Related Note` should stay code.\n",
+  );
+  assert.equal(mock.content.get(".agent-backups/123-Current.md")?.includes("Related Note belongs here."), true);
+});
+
+test("count_words counts active live editor content and safe markdown paths", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    currentMarkdownPath: "Current.md",
+    liveContent:
+      "---\ntitle: Hidden\n---\n# Visible Title\n\nThis note has **five** visible words.\n```js\nignored code words\n```",
+  });
+  mock.content.set("Projects/word-count.md", "One two three.");
+
+  const active = await registry.execute(
+    { name: "count_words", arguments: {} },
+    mock.context,
+  );
+  assert.equal(active.ok, true);
+  assert.deepEqual(active.output, {
+    path: "Current.md",
+    wordCount: 8,
+    characterCount: 47,
+    nonWhitespaceCharacterCount: 40,
+    lineCount: 9,
+    mode: "markdown_visible_text",
+  });
+
+  const byPath = await registry.execute(
+    { name: "count_words", arguments: { path: "Projects/word-count.md" } },
+    mock.context,
+  );
+  assert.equal(byPath.ok, true);
+  assert.equal((byPath.output as { wordCount: number }).wordCount, 3);
+
+  const unsafe = await registry.execute(
+    { name: "count_words", arguments: { path: "../secret.md" } },
+    mock.context,
+  );
+  assert.equal(unsafe.ok, false);
+  assert.equal(unsafe.error?.code, "unsafe_path");
+
+  const nonMarkdown = await registry.execute(
+    { name: "count_words", arguments: { path: "Projects/image.png" } },
+    mock.context,
+  );
+  assert.equal(nonMarkdown.ok, false);
+  assert.equal(nonMarkdown.error?.code, "unsafe_path");
 });
 
 test("path CRUD tools create, append, replace with backup, move, and trash markdown files", async () => {
@@ -1125,6 +1325,56 @@ test("delete_current_file rejects arguments and requires delete intent", async (
   assert.match(result.error?.message ?? "", /explicitly ask/);
   assert.equal(withoutIntent.content.has("Current.md"), true);
 });
+
+function attachMetadataCache(
+  mock: ReturnType<typeof createMockContext>,
+  options: {
+    resolvedLinks?: Record<string, Record<string, number>>;
+    unresolvedLinks?: Record<string, Record<string, number>>;
+    fileCaches?: Record<
+      string,
+      {
+        links?: Array<{ link: string; displayText?: string; original?: string }>;
+        tags?: Array<{ tag: string }>;
+        headings?: Array<{ heading: string; level: number }>;
+        frontmatter?: Record<string, unknown>;
+      }
+    >;
+  },
+) {
+  const app = mock.context.app as unknown as {
+    metadataCache?: unknown;
+    vault: {
+      getFileByPath: (path: string) => { path: string; extension: string } | null;
+    };
+  };
+  app.metadataCache = {
+    resolvedLinks: options.resolvedLinks ?? {},
+    unresolvedLinks: options.unresolvedLinks ?? {},
+    getFileCache: (file: { path: string }) =>
+      options.fileCaches?.[file.path] ?? null,
+    getFirstLinkpathDest: (linktext: string) => {
+      const normalized = linktext.replace(/\.md$/i, "");
+      const candidates = [
+        `${normalized}.md`,
+        ...[...mock.content.keys()].filter(
+          (path) =>
+            path.replace(/\.md$/i, "") === normalized ||
+            path.split("/").pop()?.replace(/\.md$/i, "") === normalized,
+        ),
+      ];
+
+      for (const candidate of candidates) {
+        const file = app.vault.getFileByPath(candidate);
+        if (file) {
+          return file;
+        }
+      }
+
+      return null;
+    },
+  };
+}
 
 function createMockContext(options: {
   prompt?: string;
