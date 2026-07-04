@@ -151,7 +151,7 @@ The same data file also stores bounded `conversationHistory`. Only user and assi
 
 ## UI And Receipts
 
-The UI is intentionally prompt-first. `Chat` is the default surface and `Run Mission` is the primary action. During an active run, that same primary button becomes `Stop Mission` so cancellation stays in the main workflow. Details are grouped in `Run Details` so the main workflow stays small.
+The UI is intentionally prompt-first. `Chat` is the default surface and `Run Mission` is the primary action. The mission form uses a native submit button plus an explicit click handler, and the textarea also supports `Ctrl+Enter` or `Cmd+Enter` submission so Obsidian focus handling has more than one reliable path into `capturePrompt`. During an active run, that same primary button becomes `Stop Mission` so cancellation stays in the main workflow. Details are grouped in `Run Details` so the main workflow stays small.
 
 The view emits and renders:
 

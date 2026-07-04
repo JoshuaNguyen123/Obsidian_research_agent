@@ -158,6 +158,7 @@ export class AgentView extends ItemView {
       attr: {
         placeholder: "Ask a research question...",
         rows: "5",
+        "aria-label": "Ask a research question",
       },
     });
 
@@ -167,7 +168,7 @@ export class AgentView extends ItemView {
       text: "Run Mission",
       cls: "agentic-researcher-run",
       attr: {
-        type: "button",
+        type: "submit",
       },
     });
 
@@ -191,6 +192,15 @@ export class AgentView extends ItemView {
 
     formEl.addEventListener("submit", (event) => {
       event.preventDefault();
+      void this.capturePrompt();
+    });
+    this.promptEl.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || (!event.ctrlKey && !event.metaKey)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
       void this.capturePrompt();
     });
     this.runButtonEl.addEventListener("click", (event) => {
@@ -335,17 +345,13 @@ export class AgentView extends ItemView {
     }
 
     const conversationHistory = [...this.plugin.conversationHistory];
-    this.resetDashboardForRun();
-    this.pendingAssistantContent = "";
-    const userLogItem = this.appendLog("user", prompt);
-    this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
-
-    if (this.promptEl) {
-      this.promptEl.value = "";
-    }
-
     this.stopRequested = false;
     this.runAbortController = new AbortController();
+    this.resetDashboardForRun();
+    this.pendingAssistantContent = "";
+    this.appendStatus("Starting mission...");
+    const userLogItem = this.appendLog("user", prompt);
+    this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
     this.setRunning(true);
 
     try {
@@ -353,6 +359,10 @@ export class AgentView extends ItemView {
         role: "user",
         content: prompt,
       });
+
+      if (this.promptEl?.value.trim() === prompt) {
+        this.promptEl.value = "";
+      }
 
       await runAgentMission({
         prompt,
