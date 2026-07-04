@@ -26,6 +26,7 @@ import {
   toConversationModelMessages,
   type AgentConversationMessage,
 } from "./conversationHistory";
+import { countMarkdownVisibleText } from "./tools/wordCount";
 
 export { MAX_AGENT_STEPS } from "./tools/constants";
 export type { AgentConversationMessage } from "./conversationHistory";
@@ -63,6 +64,7 @@ export interface AgentRunReceipt {
     | "replace"
     | "edit"
     | "retitle"
+    | "link_related_notes"
     | "move"
     | "trash"
     | "delete";
@@ -223,14 +225,16 @@ Operating rules:
 13. Use list_folder and get_path_info to inspect vault folder structure before making path-based file changes.
 14. Use path-based CRUD tools only for explicit file or folder create, append, replace, move, rename, delete, remove, or trash requests.
 15. For vault context questions, including "what do you know about me", inspect note contents before answering. Do not rely on filenames or note titles because notes may be untitled. Start with list_current_folder when the active note's location may matter, then use list_markdown_files, search_markdown_files, read_markdown_files, read_file, list_folder, or get_path_info as needed. Cite vault-relative source paths in the final answer.
-16. Do not write to notes for a vault context answer unless the user asks to save, write, update, create, move, rename, or delete something.
-17. When you need tools, request tools without writing user-facing prose or preambles.
-18. When the mission is expected to produce note output, choose the safest useful write tool instead of only answering in chat.
-19. If a date calculation is missing a year or reference date, ask one concise clarifying question instead of guessing.
-20. When you have enough context and no note write is required, stop requesting tools and write the final answer.
-21. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
-22. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
-23. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
+16. For graph, backlink, related-note, or note-connection questions, use graph/search tools before answering. Separate explicit Obsidian links/backlinks from inferred semantic relationships and cite vault-relative note paths.
+17. For note/file word-count or length-check questions, call count_words and answer from the tool result.
+18. Do not write to notes for a vault context answer unless the user asks to save, write, update, create, move, rename, delete, connect, link, or graph something.
+19. When you need tools, request tools without writing user-facing prose or preambles.
+20. When the mission is expected to produce note output, choose the safest useful write tool instead of only answering in chat.
+21. If a date calculation is missing a year or reference date, ask one concise clarifying question instead of guessing.
+22. When you have enough context and no note write is required, stop requesting tools and write the final answer.
+23. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
+24. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
+25. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
 
 const FINAL_ANSWER_PROMPT = [
   "Provide the final answer for the user now.",
@@ -568,6 +572,7 @@ export async function runAgentMission({
         ],
         events,
         toolContext: runToolContext,
+        knownToolNames,
         think: activeThink,
         options: modelOptions,
         abortSignal,
@@ -767,6 +772,7 @@ export async function runAgentMission({
             messages,
             events,
             toolContext: runToolContext,
+            knownToolNames,
             think: activeThink,
             options: modelOptions,
             abortSignal,
@@ -842,6 +848,37 @@ export async function runAgentMission({
         if (stopIfRequested(step)) {
           return;
         }
+        let directContent = response.message.content;
+        const wordTarget = parseGeneratedWordCountTargetFromMessages(messages);
+        if (wordTarget) {
+          const initialCount = countMarkdownVisibleText(directContent).wordCount;
+          let correctionUsed = false;
+          if (!isWordCountWithinTarget(initialCount, wordTarget)) {
+            events.onStatus?.(
+              `Word count ${initialCount}/${wordTarget.target} outside target; requesting one correction pass...`,
+            );
+            const corrected = await requestWordCountCorrection({
+              modelClient,
+              messages,
+              draft: directContent,
+              wordTarget,
+              events,
+              think: activeThink,
+              options: modelOptions,
+              abortSignal,
+              onThinkingUnsupported: disableThinkingForRun,
+              metricName: "direct_answer_word_count_correction",
+            });
+            if (corrected.trim()) {
+              directContent = corrected;
+              correctionUsed = true;
+            }
+          }
+          const finalCount = countMarkdownVisibleText(directContent).wordCount;
+          events.onStatus?.(
+            `Word count: ${finalCount}/${wordTarget.target} (${isWordCountWithinTarget(finalCount, wordTarget) ? "within target" : "outside target"}; correction=${correctionUsed ? "used" : "not used"}).`,
+          );
+        }
         emitRunDiagnostics({
           events,
           toolContext: runToolContext,
@@ -849,7 +886,7 @@ export async function runAgentMission({
           enableStreaming,
           finalMode: executedModelTool ? "buffered_final" : "direct",
         });
-        emitDirectAssistantAnswer(response.message.content, events);
+        emitDirectAssistantAnswer(directContent, events);
       }
       completeRun(
         events,
@@ -1397,8 +1434,17 @@ function extractToolCallsFromAssistantText(
     return [];
   }
 
-  const parsedCandidates = extractJsonCandidates(content);
   const toolCalls: ModelToolCall[] = [];
+
+  for (const toolCall of extractXmlToolCallCandidates(content, knownToolNames)) {
+    toolCalls.push(toolCall);
+
+    if (toolCalls.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
+      return toolCalls.slice(0, MAX_RECOVERED_TEXT_TOOL_CALLS);
+    }
+  }
+
+  const parsedCandidates = extractJsonCandidates(content);
 
   for (const candidate of parsedCandidates) {
     collectToolCallsFromJson(candidate, knownToolNames, toolCalls);
@@ -1409,6 +1455,61 @@ function extractToolCallsFromAssistantText(
   }
 
   return toolCalls.slice(0, MAX_RECOVERED_TEXT_TOOL_CALLS);
+}
+
+function extractXmlToolCallCandidates(
+  content: string,
+  knownToolNames: Set<string>,
+): ModelToolCall[] {
+  const toolCalls: ModelToolCall[] = [];
+  const pattern =
+    /<requested_tool_call\b[^>]*>([\s\S]*?)<\/requested_tool_call>/gi;
+  let match: RegExpExecArray | null;
+
+  while (
+    (match = pattern.exec(content)) !== null &&
+    toolCalls.length < MAX_RECOVERED_TEXT_TOOL_CALLS
+  ) {
+    const body = match[1];
+    const name = readXmlTag(body, "name");
+    if (!name || !knownToolNames.has(name)) {
+      continue;
+    }
+
+    const rawArgs =
+      readXmlTag(body, "arguments") ??
+      readXmlTag(body, "args") ??
+      readXmlTag(body, "parameters");
+    const parsedArgs = rawArgs ? parseJsonCandidate(rawArgs) : undefined;
+    const args = isRecord(parsedArgs) ? parsedArgs : {};
+
+    toolCalls.push({
+      name,
+      arguments: normalizeRecoveredToolArguments(name, args),
+      index: toolCalls.length,
+      raw: match[0],
+    });
+  }
+
+  return toolCalls;
+}
+
+function readXmlTag(content: string, tagName: string): string | null {
+  const pattern = new RegExp(
+    `<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`,
+    "i",
+  );
+  const match = pattern.exec(content);
+  return match ? decodeBasicXmlEntities(match[1].trim()) : null;
+}
+
+function decodeBasicXmlEntities(value: string): string {
+  return value
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
 }
 
 function extractJsonCandidates(content: string): unknown[] {
@@ -1912,6 +2013,8 @@ async function emitFinalAnswer({
 
   let emittedContent = "";
   let observedContent = false;
+  const wordTarget = parseGeneratedWordCountTargetFromMessages(messages);
+  const verifyWordCount = wordTarget !== null;
   const contentSanitizer = createAssistantContentSanitizer();
   const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
   const thinkingStream = createThinkingStream(events);
@@ -1948,8 +2051,10 @@ async function emitFinalAnswer({
         }
 
         emittedContent += topicalContent;
-        events.onFinalDelta?.(topicalContent);
-        events.onAssistantDelta?.(topicalContent);
+        if (!verifyWordCount) {
+          events.onFinalDelta?.(topicalContent);
+          events.onAssistantDelta?.(topicalContent);
+        }
       },
       onThinkingDelta: thinkingStream.onDelta,
       },
@@ -1979,8 +2084,10 @@ async function emitFinalAnswer({
     const topicalContent = relevanceGate.push(trailingContent);
     if (topicalContent) {
       emittedContent += topicalContent;
-      events.onFinalDelta?.(topicalContent);
-      events.onAssistantDelta?.(topicalContent);
+      if (!verifyWordCount) {
+        events.onFinalDelta?.(topicalContent);
+        events.onAssistantDelta?.(topicalContent);
+      }
     }
   }
 
@@ -1991,16 +2098,62 @@ async function emitFinalAnswer({
     const topicalContent = relevanceGate.push(sanitizedResponse);
     if (topicalContent) {
       emittedContent += topicalContent;
-      events.onFinalDelta?.(topicalContent);
-      events.onAssistantDelta?.(topicalContent);
+      if (!verifyWordCount) {
+        events.onFinalDelta?.(topicalContent);
+        events.onAssistantDelta?.(topicalContent);
+      }
     }
   }
 
   const bufferedTopicalContent = relevanceGate.finish();
   if (bufferedTopicalContent) {
     emittedContent += bufferedTopicalContent;
-    events.onFinalDelta?.(bufferedTopicalContent);
-    events.onAssistantDelta?.(bufferedTopicalContent);
+    if (!verifyWordCount) {
+      events.onFinalDelta?.(bufferedTopicalContent);
+      events.onAssistantDelta?.(bufferedTopicalContent);
+    }
+  }
+
+  if (wordTarget) {
+    let finalContent = emittedContent;
+    let correctionUsed = false;
+    const initialCount = countMarkdownVisibleText(finalContent).wordCount;
+    if (!isWordCountWithinTarget(initialCount, wordTarget)) {
+      events.onStatus?.(
+        `Word count ${initialCount}/${wordTarget.target} outside target; requesting one correction pass...`,
+      );
+      const corrected = await requestWordCountCorrection({
+        modelClient,
+        messages: buildFinalAnswerMessages(messages, finalInstruction),
+        draft: finalContent,
+        wordTarget,
+        events,
+        think,
+        options,
+        abortSignal,
+        onThinkingUnsupported,
+        metricName: `${metricName}_word_count_correction`,
+      });
+      if (corrected.trim()) {
+        finalContent = corrected;
+        correctionUsed = true;
+      }
+    }
+
+    emittedContent = finalContent;
+    response = {
+      message: {
+        role: "assistant",
+        content: finalContent,
+      },
+      toolCalls: [],
+    };
+    events.onFinalDelta?.(finalContent);
+    events.onAssistantDelta?.(finalContent);
+    const finalCount = countMarkdownVisibleText(finalContent).wordCount;
+    events.onStatus?.(
+      `Word count: ${finalCount}/${wordTarget.target} (${isWordCountWithinTarget(finalCount, wordTarget) ? "within target" : "outside target"}; correction=${correctionUsed ? "used" : "not used"}).`,
+    );
   }
 
   events.onFinalDone?.();
@@ -2319,6 +2472,10 @@ const READ_NAV_TOOL_NAMES = new Set([
   "read_markdown_files",
   "search_markdown_files",
   "read_file",
+  "count_words",
+  "get_note_graph_context",
+  "find_related_notes",
+  "suggest_note_links",
   "list_folder",
   "get_path_info",
 ]);
@@ -2334,6 +2491,7 @@ const WRITE_TOOL_NAMES = new Set([
   "prepare_edit_current_section",
   "edit_current_section",
   "replace_current_file",
+  "link_related_notes_in_current_file",
 ]);
 
 const DELETE_TOOL_NAMES = new Set(["delete_path", "delete_current_file"]);
@@ -2355,8 +2513,11 @@ function getAllowedToolDefinitions(
   const allowRetitle = hasTitleIntent(prompt);
   const allowWebSearch = hasWebSearchIntent(prompt);
   const allowCurrentNoteRead = hasCurrentNoteReadIntent(prompt);
+  const allowWordCount = hasWordCountIntent(prompt);
+  const allowGraphContext = hasGraphConnectionIntent(prompt);
+  const allowGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
   const allowVaultBrowse =
-    missionIntent.vaultContext || hasVaultBrowseIntent(prompt);
+    missionIntent.vaultContext || hasVaultBrowseIntent(prompt) || allowGraphContext;
   const allowSpecificFileRead = hasSpecificFileReadIntent(prompt);
   const allowCreateFile = hasCreateFileIntent(prompt);
   const allowCreateFolder = hasCreateFolderIntent(prompt);
@@ -2405,6 +2566,18 @@ function getAllowedToolDefinitions(
 
     if (name === "read_file") {
       return allowSpecificFileRead || allowVaultBrowse;
+    }
+
+    if (name === "count_words") {
+      return allowWordCount;
+    }
+
+    if (
+      name === "get_note_graph_context" ||
+      name === "find_related_notes" ||
+      name === "suggest_note_links"
+    ) {
+      return allowGraphContext;
     }
 
     if (name === "list_folder" || name === "get_path_info") {
@@ -2470,6 +2643,10 @@ function getAllowedToolDefinitions(
       return allowDelete;
     }
 
+    if (name === "link_related_notes_in_current_file") {
+      return allowGraphLinkWrite && !preferPathTarget;
+    }
+
     return true;
   });
 }
@@ -2485,6 +2662,8 @@ function isAllowedForMission(
       hasVaultBrowseIntent(prompt) ||
       hasSpecificFileReadIntent(prompt) ||
       hasCurrentNoteReadIntent(prompt) ||
+      hasWordCountIntent(prompt) ||
+      hasGraphConnectionIntent(prompt) ||
       intent.noteOutput ||
       intent.explicitMutation
     );
@@ -2570,6 +2749,10 @@ function getRequiredWriteToolNames(
 
   if (hasMovePathIntent(prompt)) {
     requiredToolNames.push("move_path");
+  }
+
+  if (hasGraphLinkWriteIntent(prompt)) {
+    requiredToolNames.push("link_related_notes_in_current_file");
   }
 
   return requiredToolNames.filter((name) => allowedToolNames.has(name));
@@ -2707,7 +2890,9 @@ function getStreamingWritebackKind(
 
 function classifyMissionIntent(prompt: string): MissionIntent {
   const vaultContext = hasVaultContextQuestionIntent(prompt);
-  const explicitPersistence = hasExplicitWritePersistenceIntent(prompt);
+  const explicitGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
+  const explicitPersistence =
+    hasExplicitWritePersistenceIntent(prompt) || explicitGraphLinkWrite;
   const explicitDelete = hasDeleteIntent(prompt) || hasDeletePathIntent(prompt);
   const explicitMutation =
     explicitPersistence ||
@@ -2717,6 +2902,7 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     hasReplaceIntent(prompt) ||
     hasEditIntent(prompt) ||
     hasTitleIntent(prompt) ||
+    explicitGraphLinkWrite ||
     explicitDelete;
   const noteOutput = !vaultContext && hasNoteOutputIntent(prompt);
 
@@ -2774,11 +2960,29 @@ function classifyMissionIntent(prompt: string): MissionIntent {
 function hasVaultContextQuestionIntent(prompt: string): boolean {
   return /\b(what\s+(did|do)\s+you\s+(learn|know|remember)\s+about\s+me|what\s+have\s+i\s+told\s+you|what\s+do\s+my\s+notes\s+say|based\s+on\s+my\s+notes|in\s+my\s+notes|across\s+my\s+notes|search\s+(my\s+)?notes|find\s+(notes?|details?|mentions?|references?)|where\s+did\s+i\s+mention|summari[sz]e\s+what\s+i\s+(know|have|wrote)|look\s+through\s+(my\s+)?vault|check\s+(my\s+)?folders?)\b/i.test(
     prompt,
-  );
+  ) || hasGraphConnectionIntent(prompt);
 }
 
 function hasExplicitWritePersistenceIntent(prompt: string): boolean {
   return /\b(append|save|write|update|add|insert|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b[\s\S]{0,100}\b(note|file|markdown|vault|folder|directory|path)\b|\b(note|file|markdown|vault|folder|directory|path)\b[\s\S]{0,100}\b(append|save|write|update|add|insert|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b|\.md\b/i.test(
+    prompt,
+  );
+}
+
+function hasWordCountIntent(prompt: string): boolean {
+  return /\b(word\s*count|count\s+(?:the\s+)?words?|how\s+many\s+words?|length\s+check|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(
+    prompt,
+  );
+}
+
+function hasGraphConnectionIntent(prompt: string): boolean {
+  return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
+    prompt,
+  ) && /\b(note|notes|file|files|vault|current|this|active|markdown)\b/i.test(prompt);
+}
+
+function hasGraphLinkWriteIntent(prompt: string): boolean {
+  return /\b(connect|link|add\s+(?:wiki\s+)?links?|insert\s+(?:wiki\s+)?links?|create\s+(?:wiki\s+)?links?)\b[\s\S]{0,100}\b(note|notes|current|this|active|markdown|file)\b|\b(note|notes|current|this|active|markdown|file)\b[\s\S]{0,100}\b(connect|link|add\s+(?:wiki\s+)?links?|insert\s+(?:wiki\s+)?links?|create\s+(?:wiki\s+)?links?)\b/i.test(
     prompt,
   );
 }
@@ -2793,7 +2997,7 @@ function hasCurrentNoteReadIntent(prompt: string): boolean {
 }
 
 function hasGeneratedWritingIntent(prompt: string): boolean {
-  return /\b(write|draft|compose|generate|create)\b[\s\S]{0,100}\b(essay|article|paragraph|summary|brief|outline|report|analysis|response|answer|markdown|content|write[-\s]?up)\b|\b(essay|article|paragraph|summary|brief|outline|report|analysis|response|answer|markdown|content|write[-\s]?up)\b[\s\S]{0,100}\b(write|draft|compose|generate|create)\b/i.test(
+  return /\b(write|draft|compose|generate|create)\b[\s\S]{0,100}\b(essay|article|paragraph|summary|brief|outline|report|analysis|response|answer|markdown|content|write[-\s]?up)\b|\b(essay|article|paragraph|summary|brief|outline|report|analysis|response|answer|markdown|content|write[-\s]?up)\b[\s\S]{0,100}\b(write|draft|compose|generate|create)\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,80}\b\d{1,5}\s*words?\b/i.test(
     prompt,
   );
 }
@@ -2954,7 +3158,7 @@ function hasAmbiguousDatePrompt(prompt: string): boolean {
 }
 
 function hasStaticGenerationIntent(prompt: string): boolean {
-  return /\b(generate|write|draft|compose|create)\b[\s\S]{0,80}\b(essay|article|paragraph|summary|brief|outline|report|note|content|post)\b|\b(essay|article|paragraph|summary|brief|outline|report)\b[\s\S]{0,80}\b\d+\s*words?\b/i.test(
+  return /\b(generate|write|draft|compose|create)\b[\s\S]{0,80}\b(essay|article|paragraph|summary|brief|outline|report|note|content|post)\b|\b(essay|article|paragraph|summary|brief|outline|report)\b[\s\S]{0,80}\b\d+\s*words?\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,80}\b\d{1,5}\s*words?\b/i.test(
     prompt,
   );
 }
@@ -3002,6 +3206,22 @@ function getToolPreparationStatus(toolName: string): string | null {
 
   if (toolName === "read_file") {
     return "Reading vault note...";
+  }
+
+  if (toolName === "count_words") {
+    return "Counting note words...";
+  }
+
+  if (toolName === "get_note_graph_context") {
+    return "Inspecting note graph context...";
+  }
+
+  if (toolName === "find_related_notes") {
+    return "Finding related notes...";
+  }
+
+  if (toolName === "suggest_note_links") {
+    return "Suggesting note links...";
   }
 
   if (toolName === "list_markdown_files") {
@@ -3062,6 +3282,10 @@ function getToolPreparationStatus(toolName: string): string | null {
 
   if (toolName === "delete_current_file") {
     return "Deleting current note with backup...";
+  }
+
+  if (toolName === "link_related_notes_in_current_file") {
+    return "Linking related notes...";
   }
 
   return null;
@@ -3156,6 +3380,17 @@ function emitToolSuccessStatus(
     const message = `Deleted ${String(
       output.path ?? "current note",
     )}; backup saved to ${String(output.backupPath ?? "backup")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "link_related_notes_in_current_file" && isRecord(output)) {
+    const insertedCount = Array.isArray(output.insertedLinks)
+      ? output.insertedLinks.length
+      : 0;
+    const message = `Linked ${insertedCount} related note${
+      insertedCount === 1 ? "" : "s"
+    } in ${String(output.path ?? "current note")}.`;
     events.onStatus?.(message);
     return message;
   }
@@ -3261,6 +3496,10 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
     return "delete";
   }
 
+  if (toolName === "link_related_notes_in_current_file") {
+    return "link_related_notes";
+  }
+
   return "append";
 }
 
@@ -3276,7 +3515,8 @@ function isWriteToolName(toolName: string): boolean {
     toolName === "retitle_current_file" ||
     toolName === "edit_current_section" ||
     toolName === "replace_current_file" ||
-    toolName === "delete_current_file"
+    toolName === "delete_current_file" ||
+    toolName === "link_related_notes_in_current_file"
   );
 }
 
@@ -3385,6 +3625,7 @@ async function streamCurrentNoteWriteback({
   messages,
   events,
   toolContext,
+  knownToolNames,
   think,
   options,
   abortSignal,
@@ -3396,6 +3637,7 @@ async function streamCurrentNoteWriteback({
   messages: ModelChatMessage[];
   events: AgentRunEvents;
   toolContext: ToolExecutionContext;
+  knownToolNames: Set<string>;
   think?: ModelThink;
   options?: ModelRequestOptions;
   abortSignal?: AbortSignal;
@@ -3414,7 +3656,14 @@ async function streamCurrentNoteWriteback({
   let response: ModelChatResponse | null = null;
   let emittedContent = "";
 
-  const streamAttempt = async (retry: boolean) => {
+  const streamAttempt = async (
+    retry: boolean,
+  ): Promise<{
+    response: ModelChatResponse;
+    toolRequestDetected: boolean;
+    content: string;
+    deltas: string[];
+  }> => {
     const instruction = buildStreamingWritebackPrompt(
       kind,
       preparedSectionEdit,
@@ -3437,6 +3686,7 @@ async function streamCurrentNoteWriteback({
     const contentSanitizer = createAssistantContentSanitizer();
     const thinkingStream = createThinkingStream(events);
     let attemptContent = "";
+    const attemptDeltas: string[] = [];
 
     emitModelCallTrace(events, {
       id: retry
@@ -3459,10 +3709,7 @@ async function streamCurrentNoteWriteback({
             }
 
             attemptContent += sanitized;
-            emittedContent += sanitized;
-            events.onFinalDelta?.(sanitized);
-            events.onAssistantDelta?.(sanitized);
-            writer.push(sanitized);
+            attemptDeltas.push(sanitized);
           },
           onThinkingDelta: thinkingStream.onDelta,
         },
@@ -3482,10 +3729,7 @@ async function streamCurrentNoteWriteback({
       const trailingContent = contentSanitizer.flush();
       if (trailingContent) {
         attemptContent += trailingContent;
-        emittedContent += trailingContent;
-        events.onFinalDelta?.(trailingContent);
-        events.onAssistantDelta?.(trailingContent);
-        writer.push(trailingContent);
+        attemptDeltas.push(trailingContent);
       }
 
       thinkingStream.done();
@@ -3495,13 +3739,24 @@ async function streamCurrentNoteWriteback({
       );
       if (!attemptContent.trim() && sanitizedResponse.trim()) {
         attemptContent += sanitizedResponse;
-        emittedContent += sanitizedResponse;
-        events.onFinalDelta?.(sanitizedResponse);
-        events.onAssistantDelta?.(sanitizedResponse);
-        writer.push(sanitizedResponse);
+        attemptDeltas.push(sanitizedResponse);
       }
 
-      return attemptResponse;
+      if (containsRecoverableToolRequest(attemptContent, knownToolNames)) {
+        return {
+          response: attemptResponse,
+          toolRequestDetected: true,
+          content: "",
+          deltas: [],
+        };
+      }
+
+      return {
+        response: attemptResponse,
+        toolRequestDetected: false,
+        content: attemptContent,
+        deltas: attemptDeltas,
+      };
     } catch (error) {
       emitMetricEvent(events, {
         kind: "model_stream",
@@ -3512,32 +3767,87 @@ async function streamCurrentNoteWriteback({
       const trailingContent = contentSanitizer.flush();
       if (trailingContent) {
         attemptContent += trailingContent;
-        emittedContent += trailingContent;
-        events.onFinalDelta?.(trailingContent);
-        events.onAssistantDelta?.(trailingContent);
-        writer.push(trailingContent);
+        attemptDeltas.push(trailingContent);
       }
 
       thinkingStream.done();
+      if (
+        attemptContent.trim() &&
+        !containsRecoverableToolRequest(attemptContent, knownToolNames)
+      ) {
+        emitBufferedWritebackContent(attemptDeltas, events, writer);
+        emittedContent += attemptContent;
+      }
       throw error;
     }
   };
 
   try {
-    response = await streamAttempt(false);
+    let retryUsed = false;
+    let attempt = await streamAttempt(false);
+    response = attempt.response;
 
-    if (!emittedContent.trim()) {
+    if (attempt.toolRequestDetected) {
+      events.onStatus?.(
+        "Model requested a tool during writeback; retrying content-only output...",
+      );
+      writer.discardNonWritableContent();
+      retryUsed = true;
+      attempt = await streamAttempt(true);
+      response = attempt.response;
+    } else if (!attempt.content.trim()) {
       events.onStatus?.(
         "No writable content received; retrying content-only writeback...",
       );
       writer.discardNonWritableContent();
-      response = await streamAttempt(true);
+      retryUsed = true;
+      attempt = await streamAttempt(true);
+      response = attempt.response;
     }
 
-    if (!emittedContent.trim()) {
+    if (attempt.toolRequestDetected) {
+      throw new Error(
+        "The model requested a tool during streamed writeback instead of returning writable content. Nothing was written.",
+      );
+    }
+
+    if (!attempt.content.trim()) {
       events.onStatus?.(EMPTY_STREAMING_WRITEBACK_MESSAGE);
       throw new Error(EMPTY_STREAMING_WRITEBACK_MESSAGE);
     }
+
+    const wordTarget = parseWritebackWordCountTargetFromMessages(messages);
+    let correctionUsed = false;
+    let contentToWrite = attempt.content;
+    let deltasToWrite = attempt.deltas;
+    if (wordTarget) {
+      const initialCount = countMarkdownVisibleText(contentToWrite).wordCount;
+      if (!isWordCountWithinTarget(initialCount, wordTarget)) {
+        events.onStatus?.(
+          `Word count ${initialCount}/${wordTarget.target} outside target; requesting one correction pass...`,
+        );
+        const corrected = await requestWordCountCorrection({
+          modelClient,
+          messages,
+          draft: contentToWrite,
+          wordTarget,
+          events,
+          think,
+          options,
+          abortSignal,
+          onThinkingUnsupported,
+          metricName: "stream_writeback_word_count_correction",
+        });
+        if (corrected.trim()) {
+          contentToWrite = corrected;
+          deltasToWrite = [corrected];
+          correctionUsed = true;
+        }
+      }
+    }
+
+    emitBufferedWritebackContent(deltasToWrite, events, writer);
+    emittedContent += contentToWrite;
 
     await writer.finish({ force: true });
 
@@ -3545,6 +3855,12 @@ async function streamCurrentNoteWriteback({
     events.onAssistantMessageDone?.();
     if (response) {
       messages.push(withoutThinking(response.message));
+    }
+    if (wordTarget) {
+      const count = countMarkdownVisibleText(emittedContent).wordCount;
+      events.onStatus?.(
+        `Word count: ${count}/${wordTarget.target} (${isWordCountWithinTarget(count, wordTarget) ? "within target" : "outside target"}; correction=${correctionUsed ? "used" : "not used"}).`,
+      );
     }
     events.onStatus?.("Streaming writeback complete.");
     return writer.buildReceipt(false);
@@ -3603,6 +3919,232 @@ function buildStreamingWritebackPrompt(
     "Use English unless the user explicitly requested another language in the current mission.",
     "Return only the markdown body that belongs under that heading.",
     "Do not include preambles, explanations, receipts, or thinking traces.",
+  ].join(" ");
+}
+
+interface WordCountTarget {
+  target: number;
+  exact: boolean;
+  min: number;
+  max: number;
+}
+
+function emitBufferedWritebackContent(
+  deltas: string[],
+  events: AgentRunEvents,
+  writer: Awaited<ReturnType<typeof createStreamingNoteWriter>>,
+) {
+  for (const delta of deltas) {
+    if (!delta) {
+      continue;
+    }
+    events.onFinalDelta?.(delta);
+    events.onAssistantDelta?.(delta);
+    writer.push(delta);
+  }
+}
+
+function containsRecoverableToolRequest(
+  content: string,
+  knownToolNames: Set<string>,
+): boolean {
+  if (!content.trim()) {
+    return false;
+  }
+
+  return (
+    /<requested_tool_call\b/i.test(content) ||
+    extractToolCallsFromAssistantText(content, knownToolNames).length > 0
+  );
+}
+
+function parseWritebackWordCountTargetFromMessages(
+  messages: ModelChatMessage[],
+): WordCountTarget | null {
+  for (const message of [...messages].reverse()) {
+    if (
+      message.role !== "user" &&
+      !/Current note context:/i.test(message.content)
+    ) {
+      continue;
+    }
+
+    const target = parseWordCountTarget(message.content);
+    if (target) {
+      return target;
+    }
+  }
+
+  return null;
+}
+
+function parseGeneratedWordCountTargetFromMessages(
+  messages: ModelChatMessage[],
+): WordCountTarget | null {
+  const latestUserMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "user");
+  if (!latestUserMessage || !hasGeneratedWritingIntent(latestUserMessage.content)) {
+    return null;
+  }
+
+  return parseWordCountTarget(latestUserMessage.content);
+}
+
+function parseWordCountTarget(content: string): WordCountTarget | null {
+  const exactMatch =
+    /\bexactly\s+(\d{1,5})\s+words?\b/i.exec(content) ??
+    /\b(\d{1,5})\s+words?\s+exactly\b/i.exec(content);
+  if (exactMatch) {
+    const target = Number(exactMatch[1]);
+    return {
+      target,
+      exact: true,
+      min: target,
+      max: target,
+    };
+  }
+
+  const approximateMatch =
+    /\b(\d{1,5})\s*(?:-| )?words?\b/i.exec(content) ??
+    /\b(\d{1,5})\s*(?:-| )?word\b/i.exec(content);
+  if (!approximateMatch) {
+    return null;
+  }
+
+  const target = Number(approximateMatch[1]);
+  const tolerance = Math.max(1, Math.round(target * 0.1));
+  return {
+    target,
+    exact: false,
+    min: Math.max(1, target - tolerance),
+    max: target + tolerance,
+  };
+}
+
+function isWordCountWithinTarget(
+  count: number,
+  target: WordCountTarget,
+): boolean {
+  return count >= target.min && count <= target.max;
+}
+
+async function requestWordCountCorrection({
+  modelClient,
+  messages,
+  draft,
+  wordTarget,
+  events,
+  think,
+  options,
+  abortSignal,
+  onThinkingUnsupported,
+  metricName,
+}: {
+  modelClient: ModelClient;
+  messages: ModelChatMessage[];
+  draft: string;
+  wordTarget: WordCountTarget;
+  events: AgentRunEvents;
+  think?: ModelThink;
+  options?: ModelRequestOptions;
+  abortSignal?: AbortSignal;
+  onThinkingUnsupported: () => void;
+  metricName: string;
+}): Promise<string> {
+  const request: ModelChatRequest = {
+    messages: [
+      ...messages,
+      {
+        role: "assistant" as const,
+        content: draft,
+      },
+      {
+        role: "user" as const,
+        content: buildWordCountCorrectionPrompt(wordTarget),
+      },
+    ],
+    think,
+    options,
+    abortSignal,
+  };
+  const requestChars = measureSerializedChars(request);
+  const startedAt = nowMs();
+
+  emitModelCallTrace(events, {
+    id: `model-call-${metricName}`,
+    message: `Model chat: ${metricName}`,
+    request,
+  });
+
+  try {
+    const response = await chatWithThinkingFallback({
+      modelClient,
+      request,
+      events,
+      onThinkingUnsupported,
+    });
+    emitMetricEvent(events, {
+      kind: "model_chat",
+      name: metricName,
+      durationMs: elapsedMs(startedAt),
+      requestChars,
+      responseChars: measureSerializedChars(response.raw ?? response.message),
+      ...extractTokenUsageFields(response.raw),
+    });
+    emitThinking(response.message.thinking, events);
+    return sanitizeAssistantContent(response.message.content);
+  } catch (error) {
+    emitMetricEvent(events, {
+      kind: "model_chat",
+      name: metricName,
+      durationMs: elapsedMs(startedAt),
+      requestChars,
+    });
+    throw error;
+  }
+}
+
+async function chatWithThinkingFallback({
+  modelClient,
+  request,
+  events,
+  onThinkingUnsupported,
+}: {
+  modelClient: ModelClient;
+  request: ModelChatRequest;
+  events: AgentRunEvents;
+  onThinkingUnsupported: () => void;
+}): Promise<ModelChatResponse> {
+  try {
+    return await withModelWaitStatus(
+      () => modelClient.chat(request),
+      events,
+      "word-count correction",
+    );
+  } catch (error) {
+    if (request.think === undefined || !isThinkingUnsupportedError(error)) {
+      throw error;
+    }
+
+    onThinkingUnsupported();
+    return withModelWaitStatus(
+      () => modelClient.chat({ ...request, think: undefined }),
+      events,
+      "word-count correction retry",
+    );
+  }
+}
+
+function buildWordCountCorrectionPrompt(target: WordCountTarget): string {
+  const targetText = target.exact
+    ? `exactly ${target.target} words`
+    : `between ${target.min} and ${target.max} words, targeting ${target.target}`;
+
+  return [
+    `Revise the previous draft to be ${targetText}.`,
+    "Keep the same topic, claims, citations, and useful details.",
+    "Return only the revised answer text.",
   ].join(" ");
 }
 

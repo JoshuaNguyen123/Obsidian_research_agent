@@ -14,12 +14,15 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Ollama-compatible model client for local model chat and streaming.
 - Agent loop with bounded steps, tool validation, and run receipts.
 - Vault tools for reading markdown files, inspecting folders, editing sections, appending to notes, replacing notes with backups, moving paths, and Obsidian-safe trash flows.
+- Graph-aware vault tools for explicit links, backlinks, unresolved links, related-note discovery, link suggestions, and controlled inline wiki-link insertion with backups.
+- `count_words` support for active notes and safe markdown paths, plus one-pass generated draft word-count correction for explicit word targets.
 - Web search and fetch tools for sourced research when enabled by the mission.
 - Persisted chat history capped to useful user and assistant messages only.
 - `Run Details` diagnostics for model config, status, planning, tool timeline, receipts, and trace logs.
 - Click `Stop Mission` while a run is active to request a controlled stop before the next model, tool, or writeback step.
 - Model/API calls default to a 3-minute timeout and emit waiting status updates during long responses.
 - Final-answer streaming buffers early output and stops off-topic responses before unrelated text is displayed or persisted.
+- Streamed note writeback suppresses model-emitted tool-call markup, retries once with a content-only instruction, and leaves the note unchanged if the retry still returns a tool request.
 - Short follow-ups such as `Continue` can inherit a pending current-note read intent from recent chat instead of producing another "I'll read it" preamble.
 - Current-note prompt extraction lets prompts such as `Read the prompt on the page` read the visible note, execute the prompt written there, and stream generated writing back into that same note when the page prompt asks for prose or markdown output.
 

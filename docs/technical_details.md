@@ -38,7 +38,11 @@ The implementation favors a small native surface, real Obsidian vault APIs, boun
 
 `src/tools/createToolRegistry.ts` combines vault tools and web tools into a `DefaultToolRegistry`. The registry exposes model tool definitions and executes only known tools.
 
-`src/tools/vaultTools.ts` owns note and vault operations. It includes read, list, search, batch-read, path info, create, append, replace, move, trash, retitle, section-edit, current-note append, current-note replace, and current-note delete behavior.
+`src/tools/vaultTools.ts` owns note and vault operations. It includes read, list, search, batch-read, word count, path info, create, append, replace, move, trash, retitle, section-edit, current-note append, current-note replace, and current-note delete behavior.
+
+`src/tools/graphTools.ts` owns graph-aware note relationship tools. It reads Obsidian `metadataCache` when available, falls back to markdown parsing when needed, builds ephemeral note profiles from vault markdown files, ranks related notes with local heuristics, suggests wiki links, and performs controlled inline wiki-link insertion with backups.
+
+`src/tools/wordCount.ts` owns markdown visible-text counting shared by `count_words` and generated draft verification. It strips frontmatter, fenced code blocks, inline code markers, and common markdown syntax before counting Unicode word tokens.
 
 `src/tools/webTools.ts` owns `web_search` and `web_fetch`. These call the configured Ollama-compatible `/web_search` and `/web_fetch` endpoints and normalize compact source output for model consumption.
 
@@ -55,9 +59,11 @@ The implementation favors a small native surface, real Obsidian vault APIs, boun
 7. Tool results are serialized and returned to the model for the next step.
 8. Write tools stop the loop after a successful write and emit receipts. Chat-only runs stop on final answer. The loop also stops on clarification, user stop, error, or step budget.
 
-Some local or Ollama-compatible models respond with a JSON tool request in assistant text instead of native `tool_calls`. `AgentRunner` recovers those known tool requests from normal fenced code blocks, escaped fenced code blocks such as `\`\`\`json`, and inline JSON objects inside prose. It normalizes root folder paths such as `/` to the vault root, stores the recovered call back into internal assistant history as a structured tool call, and then sends it through the same per-mission allow-list and tool execution path. This keeps the loop moving when the model writes `{ "name": "list_folder", "arguments": { "path": "/" } }` as text, while still rejecting tools that are not allowed for the current mission.
+Some local or Ollama-compatible models respond with a tool request in assistant text instead of native `tool_calls`. `AgentRunner` recovers those known tool requests from normal fenced code blocks, escaped fenced code blocks such as `\`\`\`json`, inline JSON objects inside prose, and XML-ish `<requested_tool_call><name>...</name></requested_tool_call>` blocks. It normalizes root folder paths such as `/` to the vault root, stores the recovered call back into internal assistant history as a structured tool call, and then sends it through the same per-mission allow-list and tool execution path. This keeps the loop moving when the model writes `{ "name": "list_folder", "arguments": { "path": "/" } }` as text, while still rejecting tools that are not allowed for the current mission.
 
 Current-note prompt extraction synchronizes with the visible markdown editor. When the user asks something like `Read the prompt on the page`, `AgentRunner` exposes `read_current_file`, reads the active note once, adds a system instruction to extract the prompt or task from that note context, and executes it. If the page prompt asks for generated prose or markdown output, the runner uses streaming append writeback so the response appears below the prompt in the same note while also streaming in chat. Destructive operations still require explicit replace/delete wording.
+
+Streamed note writeback buffers a model stream attempt until it can tell the output is normal content rather than a tool request. If the model emits known JSON/fenced/XML-ish tool-call markup during writeback, the runner emits a status line, displays nothing, writes nothing, and retries once with a stronger content-only instruction. If the retry is also a tool request or returns no writable content, the run fails cleanly and leaves the note unchanged. Genuine stream interruptions after content still preserve the existing partial-write receipt behavior.
 
 The plugin tracks the last active markdown file from Obsidian `file-open` and `active-leaf-change` events. `ToolExecutionContext` exposes `getCurrentMarkdownFile` and `getCurrentMarkdownContent` so tools can resolve the visible editor even after focus moves into the right-side assistant pane. `read_current_file` prefers live editor text when available, then falls back to the vault cache.
 
@@ -70,6 +76,10 @@ The abort signal is passed from `AgentView` to `AgentRunner`, then into model ch
 Model/API waits are intentionally long enough for slow local or cloud models. The default `requestTimeoutMs` is `180000` milliseconds (3 minutes), and the plugin migrates the old 60-second default to the new value in memory. While a model chat or streaming request is pending, the runner emits `Still waiting...` status lines every 30 seconds so `Run Details` shows progress during long responses.
 
 Plain static generation prompts such as "write a 500 word essay" are chat-first. They do not write to the active note unless the user explicitly asks to append, save, write, update, or insert into a note, file, markdown, or vault target.
+
+Generated drafts with explicit word targets get one internal verification pass. Exact prompts such as `exactly 300 words` require the exact count. Non-exact prompts such as `300 word essay` accept a 10 percent tolerance. Chat-only drafts are counted before display when possible; prompt-on-page writeback counts only generated output, not the prompt already in the note, before writing. If the count is outside the target, the runner asks the model for one correction and reports the final count in Run Details.
+
+Graph and related-note questions are search-first. Read-only graph prompts expose `get_note_graph_context`, `find_related_notes`, and `suggest_note_links`; explicit connect/link prompts may also expose `link_related_notes_in_current_file`. The graph layer distinguishes explicit Obsidian graph connections from inferred semantic relationships. Explicit relationships come from resolved links, backlinks, and unresolved links in Obsidian metadata. Semantic relationships are inferred locally from titles, aliases, tags, headings, shared graph neighbors, and content-term overlap. The implementation does not use embeddings, a vector database, a backend service, or a persisted semantic index.
 
 English user missions are English-first. The runner adds a per-run response language policy that defaults English prompts to English output and tells the model not to switch into Chinese, translated programming problems, or unrelated templates unless the user explicitly asks for that. Final-answer and streaming writeback prompts repeat this constraint so both chat answers and raw markdown writes follow the same rule.
 
@@ -96,8 +106,11 @@ Allowed tools are filtered per mission. For example:
 
 - Current-note append prompts can expose `read_current_file` and `append_to_current_file`.
 - Vault-context questions expose read-only traversal/search tools and do not expose write tools unless the user also asks to save or write.
+- Graph connection questions expose graph/read tools first and do not expose the inline link writer unless the user explicitly asks to connect or link notes.
+- Word-count and length-check questions expose `count_words`, which returns count metadata only and never returns note content.
 - Web tools are exposed only for web, current, latest, source, citation, research, or verification intent.
 - Replace, edit, retitle, move, create, and delete tools require explicit intent.
+- Inline related-note linking requires explicit connect/link wording and creates a backup before inserting wiki links.
 - Plain essay/article/summary drafting remains chat-only unless the prompt contains explicit persistence intent.
 
 Vault path safety is centralized in `src/tools/validation.ts`. Unsafe paths are rejected before vault access:
@@ -113,6 +126,8 @@ Vault path safety is centralized in `src/tools/validation.ts`. Unsafe paths are 
 Write behavior is append-first. Replace and destructive operations require explicit user intent and backup or Obsidian-safe trash behavior. Replacements and section edits create backups in `.agent-backups/`. Hard delete is not a default capability.
 
 Every write receipt includes the operation, path, relevant byte counts, affected count when applicable, and backup path when a backup is involved.
+
+Inline graph-link receipts include the current note path, operation `link_related_notes`, backup path, inserted links, skipped suggestions, and byte counts. The writer skips frontmatter, fenced code blocks, inline code, existing markdown links, and existing wiki links.
 
 ## Settings And Persistence
 
