@@ -21,7 +21,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - `Run Details` diagnostics for model config, status, planning, tool timeline, receipts, and trace logs.
 - Click `Stop Mission` while a run is active to request a controlled stop before the next model, tool, or writeback step.
 - Model/API calls default to a 3-minute timeout and emit waiting status updates during long responses.
-- Final-answer streaming buffers early output and stops off-topic responses before unrelated text is displayed or persisted.
+- Final-answer and note-writeback streaming buffer early output and stop off-topic or wrong-language responses before unrelated text is displayed or persisted.
 - Streamed note writeback uses a small safety buffer, then streams safe chunks into both chat and the active note while suppressing model-emitted tool-call markup.
 - Short follow-ups such as `Continue` can inherit a pending current-note read intent from recent chat instead of producing another "I'll read it" preamble.
 - Simple target-only current-note writes skip redundant read/planner loops and stream directly into the active note.
