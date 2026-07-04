@@ -1,0 +1,10 @@
+{
+  "id": "agentic-researcher",
+  "name": "Agentic Researcher",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Minimal right-side shell for an agentic Obsidian research assistant.",
+  "author": "Josh",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}

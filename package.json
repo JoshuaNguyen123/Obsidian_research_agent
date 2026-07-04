@@ -1,0 +1,26 @@
+{
+  "name": "agentic-researcher",
+  "version": "0.1.0",
+  "description": "Minimal Obsidian plugin shell for an agentic research assistant.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "node --import tsx --test tests/**/*.test.ts"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "research"
+  ],
+  "author": "Josh",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.28.1",
+    "obsidian": "^1.6.7",
+    "tsx": "^4.23.0",
+    "typescript": "^5.5.3"
+  }
+}

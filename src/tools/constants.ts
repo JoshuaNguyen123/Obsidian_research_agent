@@ -1,0 +1,14 @@
+export const MAX_AGENT_STEPS = 6;
+export const MAX_FILE_READ_CHARS = 12000;
+export const MAX_INITIAL_CURRENT_NOTE_CHARS = 6000;
+export const MAX_TOOL_RESULT_CHARS = 8000;
+export const MAX_LISTED_FILES = 300;
+export const MAX_BATCH_READ_FILES = 20;
+export const MAX_BATCH_READ_CHARS_PER_FILE = 6000;
+export const MAX_SEARCH_RESULTS = 30;
+export const MAX_SEARCH_SNIPPET_CHARS = 420;
+export const MAX_WEB_RESULTS = 10;
+export const MAX_WEB_SEARCH_SNIPPET_CHARS = 800;
+export const MAX_WEB_FETCH_CHARS = 6000;
+export const DEFAULT_WEB_RESULTS = 3;
+export const BACKUP_FOLDER = ".agent-backups";

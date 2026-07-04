@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build and cache output
+dist/
+.cache/
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local Obsidian vault/runtime state
+.obsidian/
+.agent-backups/
+
+# Local-only planning, agent, and skill context
+AGENTS.md
+agents.md
+docs/
+skills/
+.agents/
+.codex/
