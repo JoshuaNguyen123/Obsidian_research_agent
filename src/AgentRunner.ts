@@ -367,15 +367,16 @@ export async function runAgentMission({
   const runStartedAt = nowMs();
   let activeThink = resolveThinkingMode(toolContext.settings);
   const intentPrompt = resolvePromptForIntent(prompt, conversationHistory);
-  const missionIntent = classifyMissionIntent(intentPrompt);
-  const writeAutonomy = missionIntent.allowAutonomousWrite;
-  const runToolContext: ToolExecutionContext = {
+  let activeIntentPrompt = intentPrompt;
+  let missionIntent = classifyMissionIntent(activeIntentPrompt);
+  let writeAutonomy = missionIntent.allowAutonomousWrite;
+  let runToolContext: ToolExecutionContext = {
     ...toolContext,
     writeAutonomy,
     missionIntent,
   };
   const modelOptions = buildModelRequestOptions(runToolContext.settings);
-  const followupIntentContext =
+  let followupIntentContext =
     intentPrompt === prompt ? null : formatFollowupIntentContext(intentPrompt);
   const disableThinkingForRun = () => {
     if (activeThink !== undefined) {
@@ -383,31 +384,32 @@ export async function runAgentMission({
       events.onStatus?.("Thinking unsupported; using standard loop.");
     }
   };
-  const streamingWritebackKind = getStreamingWritebackKind(
-    intentPrompt,
+  let streamingWritebackKind = getStreamingWritebackKind(
+    activeIntentPrompt,
     runToolContext,
     enableStreaming,
   );
-  const tools = getAllowedToolDefinitions(
+  let tools = getAllowedToolDefinitions(
     toolRegistry,
-    intentPrompt,
+    activeIntentPrompt,
     missionIntent,
     streamingWritebackKind,
   );
   const knownToolNames = new Set(
     toolRegistry.getDefinitions().map((tool) => tool.function.name),
   );
-  const allowedToolNames = new Set(tools.map((tool) => tool.function.name));
-  const requiredWriteTools = getRequiredWriteToolNames(
-    intentPrompt,
+  let allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+  let requiredWriteTools = getRequiredWriteToolNames(
+    activeIntentPrompt,
     allowedToolNames,
     missionIntent,
     streamingWritebackKind,
   );
-  const writeRequired =
+  let writeRequired =
     missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
+  let requireToolBeforeStreamingWriteback = false;
   const shouldReadCurrentNote = shouldObserveCurrentNote(
-    intentPrompt,
+    activeIntentPrompt,
     allowedToolNames,
     missionIntent,
   );
@@ -462,8 +464,79 @@ export async function runAgentMission({
   if (stopIfRequested(0)) {
     return;
   }
+
+  const promptOnPageRoutingPrompt = getPromptOnCurrentPageRoutingPrompt(
+    prompt,
+    currentNoteContext,
+  );
+  if (promptOnPageRoutingPrompt !== null) {
+    activeIntentPrompt = promptOnPageRoutingPrompt;
+    missionIntent = classifyPromptOnCurrentPageMissionIntent(activeIntentPrompt);
+    writeAutonomy = missionIntent.allowAutonomousWrite;
+    runToolContext = {
+      ...toolContext,
+      writeAutonomy,
+      missionIntent,
+    };
+    streamingWritebackKind = getStreamingWritebackKind(
+      activeIntentPrompt,
+      runToolContext,
+      enableStreaming,
+    );
+    tools = getAllowedToolDefinitions(
+      toolRegistry,
+      activeIntentPrompt,
+      missionIntent,
+      streamingWritebackKind,
+    );
+    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    requiredWriteTools = getRequiredWriteToolNames(
+      activeIntentPrompt,
+      allowedToolNames,
+      missionIntent,
+      streamingWritebackKind,
+    );
+    writeRequired =
+      missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
+    requireToolBeforeStreamingWriteback = promptRequiresToolLoop(
+      activeIntentPrompt,
+    );
+    followupIntentContext = null;
+
+    events.onStatus?.("Using prompt from current note for tool routing...");
+    events.onRunConfig?.(
+      buildRunConfigEvent({
+        toolContext: runToolContext,
+        enableStreaming,
+        activeThink,
+        modelOptions,
+        writeAutonomy,
+        missionIntent,
+        currentNoteContext: true,
+      }),
+    );
+    events.onTrace?.({
+      id: "prompt-on-page-routing",
+      kind: "mission_intent",
+      message: `Using current-note prompt as mission: ${missionIntent.mode}`,
+      outputPreview: {
+        missionIntent,
+        requiresToolLoop: requireToolBeforeStreamingWriteback,
+        prompt: truncateForPromptAnchor(activeIntentPrompt),
+      },
+    });
+    events.onTrace?.({
+      id: "prompt-on-page-allowed-tools",
+      kind: "allowed_tools",
+      message: `Allowed tools: ${
+        tools.map((tool) => tool.function.name).join(", ") || "none"
+      }`,
+      outputPreview: tools.map((tool) => tool.function.name),
+    });
+  }
+
   const finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
-    intentPrompt,
+    activeIntentPrompt,
     currentNoteContext,
   );
   const promptOnPageWritebackKind = getPromptOnPageWritebackKind({
@@ -482,11 +555,11 @@ export async function runAgentMission({
     },
     {
       role: "system" as const,
-      content: formatRuntimeContext(runToolContext, prompt),
+      content: formatRuntimeContext(runToolContext, activeIntentPrompt),
     },
     {
       role: "system" as const,
-      content: formatResponseLanguageContext(prompt),
+      content: formatResponseLanguageContext(activeIntentPrompt),
     },
     {
       role: "system" as const,
@@ -539,7 +612,7 @@ export async function runAgentMission({
         ]),
     {
       role: "user" as const,
-      content: prompt,
+      content: activeIntentPrompt,
     },
   ];
 
@@ -618,7 +691,7 @@ export async function runAgentMission({
         events,
         enableStreaming,
         fallbackContent: "",
-        finalInstruction: buildCurrentNoteFinalAnswerPrompt(prompt),
+        finalInstruction: buildCurrentNoteFinalAnswerPrompt(activeIntentPrompt),
         metricName: "current_note_answer",
         relevancePrompt: finalAnswerRelevancePrompt,
         think: activeThink,
@@ -637,7 +710,7 @@ export async function runAgentMission({
     }
     completeRun(
       events,
-      isClarifyingQuestionResponse(prompt, response?.message.content ?? "")
+      isClarifyingQuestionResponse(activeIntentPrompt, response?.message.content ?? "")
         ? "clarifying_question"
         : "final",
       1,
@@ -684,7 +757,7 @@ export async function runAgentMission({
     }
     completeRun(
       events,
-      isClarifyingQuestionResponse(prompt, response?.message.content ?? "")
+      isClarifyingQuestionResponse(activeIntentPrompt, response?.message.content ?? "")
         ? "clarifying_question"
         : "final",
       1,
@@ -753,6 +826,20 @@ export async function runAgentMission({
         streamingWritebackKind &&
         (streamingWritebackKind !== "edit" || preparedStreamingSectionEdit)
       ) {
+        if (requireToolBeforeStreamingWriteback && !executedModelTool) {
+          if (step < MAX_AGENT_STEPS) {
+            events.onStatus?.(
+              "Sources or vault tools are required; asking model to use tools before writing...",
+            );
+            messages.push({
+              role: "system" as const,
+              content: buildToolBeforeStreamingWritebackPrompt(tools),
+            });
+            continue;
+          }
+
+          break;
+        }
         if (stopIfRequested(step)) {
           return;
         }
@@ -828,7 +915,7 @@ export async function runAgentMission({
             events,
             enableStreaming,
             fallbackContent: response.message.content,
-            finalInstruction: buildFinalAnswerPrompt(prompt),
+            finalInstruction: buildFinalAnswerPrompt(activeIntentPrompt),
             relevancePrompt: finalAnswerRelevancePrompt,
             think: activeThink,
             options: modelOptions,
@@ -890,7 +977,7 @@ export async function runAgentMission({
       }
       completeRun(
         events,
-        isClarifyingQuestionResponse(prompt, response.message.content)
+        isClarifyingQuestionResponse(activeIntentPrompt, response.message.content)
           ? "clarifying_question"
           : "final",
         lastStep,
@@ -2766,6 +2853,18 @@ function buildWriteCorrectionPrompt(requiredWriteTools: string[]): string {
   ].join(" ");
 }
 
+function buildToolBeforeStreamingWritebackPrompt(
+  tools: ModelChatRequest["tools"],
+): string {
+  const toolNames = tools?.map((tool) => tool.function.name) ?? [];
+
+  return [
+    "The mission asks for sources, vault context, graph context, or verification before writing.",
+    `Use the relevant available tools before final writeback. Available tools: ${toolNames.join(", ") || "none"}.`,
+    "Request tools only. Do not draft the final answer yet.",
+  ].join(" ");
+}
+
 function buildUnavailableToolCorrectionPrompt(
   tools: ModelChatRequest["tools"],
 ): string {
@@ -2798,6 +2897,52 @@ function canStreamAnswerFromInitialCurrentNoteContext(
   return toolNames.length === 1 && toolNames[0] === "read_current_file";
 }
 
+function getPromptOnCurrentPageRoutingPrompt(
+  prompt: string,
+  currentNoteContext: unknown,
+): string | null {
+  if (!isPromptOnCurrentPageIntent(prompt)) {
+    return null;
+  }
+
+  const pagePrompt = getCurrentNoteContextContent(currentNoteContext)?.trim();
+  return pagePrompt ? pagePrompt : null;
+}
+
+function classifyPromptOnCurrentPageMissionIntent(prompt: string): MissionIntent {
+  const intent = classifyMissionIntent(prompt);
+  if (intent.explicitMutation || intent.explicitDelete) {
+    return intent;
+  }
+
+  if (
+    intent.noteOutput ||
+    hasGeneratedWritingIntent(prompt) ||
+    hasStaticGenerationIntent(prompt)
+  ) {
+    return {
+      ...intent,
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    };
+  }
+
+  return intent;
+}
+
+function promptRequiresToolLoop(prompt: string): boolean {
+  return (
+    hasWebSearchIntent(prompt) ||
+    hasVaultContextQuestionIntent(prompt) ||
+    hasVaultBrowseIntent(prompt) ||
+    hasSpecificFileReadIntent(prompt) ||
+    hasGraphConnectionIntent(prompt) ||
+    hasWordCountIntent(prompt)
+  );
+}
+
 function getPromptOnPageWritebackKind({
   prompt,
   currentNoteContext,
@@ -2820,6 +2965,10 @@ function getPromptOnPageWritebackKind({
 
   const pagePrompt = getCurrentNoteContextContent(currentNoteContext);
   if (!pagePrompt || hasDeleteIntent(pagePrompt) || hasDeletePathIntent(pagePrompt)) {
+    return null;
+  }
+
+  if (promptRequiresToolLoop(pagePrompt)) {
     return null;
   }
 
@@ -2881,7 +3030,11 @@ function getStreamingWritebackKind(
     return "append";
   }
 
-  if (hasNoteOutputIntent(prompt)) {
+  if (
+    hasNoteOutputIntent(prompt) ||
+    (toolContext.missionIntent?.noteOutput &&
+      (hasStaticGenerationIntent(prompt) || hasGeneratedWritingIntent(prompt)))
+  ) {
     return "append";
   }
 

@@ -624,6 +624,78 @@ test("prompt-on-page generation streams the extracted answer into the current no
   assert.ok(statuses.includes("Streaming writeback complete."));
 });
 
+test("prompt-on-page citation prompts use tools before streamed writeback", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const notePrompt =
+    "Write a concise essay about The Grapes of Wrath with cited source URLs.";
+  const vault = createRunnerVaultContext({
+    prompt: "Read the prompt on the page",
+    content: notePrompt,
+  });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () => responseWithContent("I can draft that now."),
+      () =>
+        responseWithToolCall("web_search", {
+          query: "The Grapes of Wrath Steinbeck sources",
+        }),
+      () => responseWithContent("Ready to write the cited essay."),
+    ],
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "Steinbeck's novel follows the Joad family under Depression-era pressure. ",
+          "Source: https://example.com/grapes-of-wrath",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Read the prompt on the page",
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(chatRequests.length, 3);
+  assert.equal(streamRequests.length, 1);
+  const firstStepToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstStepToolNames.includes("read_current_file"));
+  assert.ok(firstStepToolNames.includes("web_search"));
+  assert.ok(firstStepToolNames.includes("web_fetch"));
+  assert.ok(!firstStepToolNames.includes("append_to_current_file"));
+  assert.match(chatRequests[0].messages.at(-1)?.content ?? "", /cited source URLs/);
+  assert.match(
+    chatRequests[1].messages.at(-1)?.content ?? "",
+    /Use the relevant available tools before final writeback/,
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file", "web_search"],
+  );
+  assert.ok(statuses.includes("Using prompt from current note for tool routing..."));
+  assert.ok(
+    statuses.includes(
+      "Sources or vault tools are required; asking model to use tools before writing...",
+    ),
+  );
+  assert.equal(
+    vault.content.get("Current.md"),
+    `${notePrompt}\nSteinbeck's novel follows the Joad family under Depression-era pressure. Source: https://example.com/grapes-of-wrath`,
+  );
+});
+
 test("prompt-on-page word target counts generated output only before writing", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
