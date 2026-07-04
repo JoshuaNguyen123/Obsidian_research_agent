@@ -159,6 +159,7 @@ export class AgentView extends ItemView {
         placeholder: "Ask a research question...",
         rows: "5",
         "aria-label": "Ask a research question",
+        tabindex: "0",
       },
     });
 
@@ -192,16 +193,31 @@ export class AgentView extends ItemView {
 
     formEl.addEventListener("submit", (event) => {
       event.preventDefault();
+      event.stopPropagation();
       void this.capturePrompt();
     });
+    this.promptEl.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+    });
+    this.promptEl.addEventListener("mousedown", (event) => {
+      event.stopPropagation();
+    });
+    this.promptEl.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.promptEl?.focus();
+    });
     this.promptEl.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" || (!event.ctrlKey && !event.metaKey)) {
+      event.stopPropagation();
+
+      if (event.key !== "Enter" || event.shiftKey) {
         return;
       }
 
       event.preventDefault();
-      event.stopPropagation();
       void this.capturePrompt();
+    });
+    this.promptEl.addEventListener("keyup", (event) => {
+      event.stopPropagation();
     });
     this.runButtonEl.addEventListener("click", (event) => {
       event.preventDefault();
