@@ -49,6 +49,8 @@ export class AgentView extends ItemView {
   private readonly traceRowEls = new Map<string, HTMLElement>();
   private activeTab: AgentViewTab = "chat";
   private isRunning = false;
+  private stopRequested = false;
+  private runAbortController: AbortController | null = null;
   private pendingAssistantContent = "";
   private chatMessageSequence = 0;
   private currentRunChatId: string | null = null;
@@ -165,7 +167,7 @@ export class AgentView extends ItemView {
       text: "Run Mission",
       cls: "agentic-researcher-run",
       attr: {
-        type: "submit",
+        type: "button",
       },
     });
 
@@ -189,6 +191,11 @@ export class AgentView extends ItemView {
 
     formEl.addEventListener("submit", (event) => {
       event.preventDefault();
+      void this.capturePrompt();
+    });
+    this.runButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       void this.capturePrompt();
     });
     this.clearButtonEl.addEventListener("click", () => {
@@ -216,7 +223,7 @@ export class AgentView extends ItemView {
     container.addClass("agentic-researcher-details-panel");
 
     const dashboardEl = container.createDiv({
-      cls: "agentic-researcher-dashboard",
+      cls: "agentic-researcher-dashboard agentic-researcher-responsive-run-details",
       attr: { "aria-live": "polite" },
     });
 
@@ -229,18 +236,42 @@ export class AgentView extends ItemView {
     this.activeToolValueEl = this.createMetric(metricsEl, "Active tool", "None");
     this.activityValueEl = this.createMetric(metricsEl, "Activity", "Idle");
 
-    this.modelConfigEl = this.createDashboardSection(dashboardEl, "Model config");
-    this.statusStreamEl = this.createDashboardSection(dashboardEl, "Status");
+    this.modelConfigEl = this.createDashboardSection(
+      dashboardEl,
+      "Model config",
+      "model-config",
+    );
+    this.statusStreamEl = this.createDashboardSection(
+      dashboardEl,
+      "Status",
+      "status",
+    );
 
     const streamsEl = dashboardEl.createDiv({
       cls: "agentic-researcher-stream-grid",
     });
 
-    this.planningStreamEl = this.createDashboardSection(streamsEl, "Planning");
-    this.finalStreamEl = this.createDashboardSection(streamsEl, "Final answer");
-    this.toolTimelineEl = this.createDashboardSection(dashboardEl, "Tool timeline");
-    this.receiptsEl = this.createDashboardSection(dashboardEl, "Receipts");
-    this.runLogEl = this.createDashboardSection(dashboardEl, "Run log");
+    this.planningStreamEl = this.createDashboardSection(
+      streamsEl,
+      "Planning",
+      "planning",
+    );
+    this.finalStreamEl = this.createDashboardSection(
+      streamsEl,
+      "Final answer",
+      "final-answer",
+    );
+    this.toolTimelineEl = this.createDashboardSection(
+      dashboardEl,
+      "Tool timeline",
+      "tool-timeline",
+    );
+    this.receiptsEl = this.createDashboardSection(
+      dashboardEl,
+      "Receipts",
+      "receipts",
+    );
+    this.runLogEl = this.createDashboardSection(dashboardEl, "Run log", "run-log");
 
     this.setSectionPlaceholder(this.modelConfigEl, "No run yet.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
@@ -270,9 +301,10 @@ export class AgentView extends ItemView {
   private createDashboardSection(
     container: HTMLElement,
     label: string,
+    key: string,
   ): HTMLElement {
     const sectionEl = container.createDiv({
-      cls: "agentic-researcher-dashboard-section",
+      cls: `agentic-researcher-dashboard-section agentic-researcher-dashboard-section-${key}`,
     });
     const labelEl = sectionEl.createDiv({
       cls: "agentic-researcher-dashboard-label-row",
@@ -282,7 +314,7 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-dashboard-label",
     });
     const bodyEl = sectionEl.createDiv({
-      cls: "agentic-researcher-dashboard-body",
+      cls: `agentic-researcher-dashboard-body agentic-researcher-dashboard-body-${key}`,
     });
     this.createCopyButton(labelEl, () => bodyEl.textContent ?? "", `Copy ${label}`);
     return bodyEl;
@@ -290,6 +322,7 @@ export class AgentView extends ItemView {
 
   private async capturePrompt() {
     if (this.isRunning) {
+      this.requestStop();
       return;
     }
 
@@ -311,6 +344,8 @@ export class AgentView extends ItemView {
       this.promptEl.value = "";
     }
 
+    this.stopRequested = false;
+    this.runAbortController = new AbortController();
     this.setRunning(true);
 
     try {
@@ -326,6 +361,7 @@ export class AgentView extends ItemView {
         toolRegistry: this.plugin.createToolRegistry(),
         toolContext: this.plugin.createToolExecutionContext(prompt),
         enableStreaming: this.plugin.settings.enableStreaming,
+        abortSignal: this.runAbortController.signal,
         events: {
           onStatus: (message) => this.appendStatus(message),
           onPhaseChange: (phase, message) => this.updatePhase(phase, message),
@@ -353,11 +389,30 @@ export class AgentView extends ItemView {
     } catch (error) {
       const message = formatModelClientError(error);
       this.updatePhase("error", "Error");
+      this.setSectionPlaceholder(this.finalStreamEl, message);
       this.appendLog("error", message);
     } finally {
       await this.persistPendingAssistantMessage();
       this.setRunning(false);
+      this.runAbortController = null;
+      this.stopRequested = false;
       this.promptEl?.focus();
+    }
+  }
+
+  private requestStop() {
+    if (!this.isRunning || this.stopRequested) {
+      return;
+    }
+
+    this.stopRequested = true;
+    this.runAbortController?.abort();
+    this.appendStatus("Stop requested. Finishing current operation...");
+    this.updatePhase("stopped", "Stop requested");
+    this.updateRunButtonState();
+
+    if (this.runStatusTextEl) {
+      this.runStatusTextEl.setText("Stopping mission...");
     }
   }
 
@@ -712,7 +767,9 @@ export class AgentView extends ItemView {
       `model=${this.runConfig.model}`,
       `base=${this.runConfig.base}`,
       `mission=${this.runConfig.missionMode}`,
-      `vault_context=${this.runConfig.vaultContext ? "on" : "off"}`,
+      `context_scope=${this.runConfig.contextScope}`,
+      `vault_question=${this.runConfig.vaultContext ? "on" : "off"}`,
+      `current_note_context=${this.runConfig.currentNoteContext ? "on" : "off"}`,
       `streaming=${this.runConfig.streaming ? "on" : "off"}`,
       `thinking=${this.runConfig.thinkingMode} (resolved ${this.runConfig.resolvedThink})`,
       `temperature=${this.formatOptionalNumber(this.runConfig.temperature)}`,
@@ -887,10 +944,7 @@ export class AgentView extends ItemView {
     this.contentEl.classList.toggle("is-running", isRunning);
     this.contentEl.setAttribute("aria-busy", String(isRunning));
 
-    if (this.runButtonEl) {
-      this.runButtonEl.disabled = isRunning;
-      this.runButtonEl.setText(isRunning ? "Running..." : "Run Mission");
-    }
+    this.updateRunButtonState();
 
     if (this.clearButtonEl) {
       this.clearButtonEl.disabled = isRunning;
@@ -907,6 +961,37 @@ export class AgentView extends ItemView {
     this.setMetric(
       this.activityValueEl,
       isRunning ? "Running" : (this.phaseValueEl?.textContent ?? "Idle"),
+    );
+  }
+
+  private updateRunButtonState() {
+    if (!this.runButtonEl) {
+      return;
+    }
+
+    this.runButtonEl.disabled = this.isRunning && this.stopRequested;
+    this.runButtonEl.classList.toggle(
+      "is-stop",
+      this.isRunning && !this.stopRequested,
+    );
+    this.runButtonEl.classList.toggle(
+      "is-stopping",
+      this.isRunning && this.stopRequested,
+    );
+    this.runButtonEl.setAttribute(
+      "aria-label",
+      this.isRunning
+        ? this.stopRequested
+          ? "Stopping mission"
+          : "Stop mission"
+        : "Run Mission",
+    );
+    this.runButtonEl.setText(
+      this.isRunning
+        ? this.stopRequested
+          ? "Stopping..."
+          : "Stop Mission"
+        : "Run Mission",
     );
   }
 
@@ -1196,6 +1281,8 @@ export class AgentView extends ItemView {
         return "Write complete";
       case "clarifying_question":
         return "Needs clarification";
+      case "user_stopped":
+        return "Stopped by user";
       case "budget":
         return "Stopped at safety limit";
       case "error":

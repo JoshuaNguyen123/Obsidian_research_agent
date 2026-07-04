@@ -55,6 +55,26 @@ test("read_current_file honors optional maxChars cap", async () => {
   });
 });
 
+test("read_current_file uses plugin current page resolver and live editor text", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    activePath: null,
+    currentMarkdownPath: "Current.md",
+    liveContent: "Unsaved prompt from the open editor",
+  });
+
+  const result = await registry.execute(
+    { name: "read_current_file", arguments: {} },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.output, {
+    path: "Current.md",
+    content: "Unsaved prompt from the open editor",
+  });
+});
+
 test("list_folder traverses vault folders with depth, caps, and markdown filtering", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext();
@@ -160,7 +180,7 @@ test("list_current_folder reports active note siblings and parent folder", async
 test("read_markdown_files reads safe markdown files and reports skipped paths", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext();
-  mock.content.set("People/Untitled.md", "Josh likes local AI tools.");
+  mock.content.set("People/Untitled.md", "Alex likes local AI tools.");
   mock.content.set("Archive/Untitled.md", "x".repeat(30));
   mock.content.set("Projects/image.png", "binary");
 
@@ -206,15 +226,15 @@ test("read_markdown_files reads safe markdown files and reports skipped paths", 
 test("search_markdown_files finds content in untitled notes and skips system folders", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext();
-  mock.content.set("People/Untitled.md", "Josh likes local AI tools. Josh uses Obsidian.");
+  mock.content.set("People/Untitled.md", "Alex likes local AI tools. Alex uses Obsidian.");
   mock.content.set("Projects/Untitled.md", "The agent should trace every action.");
-  mock.content.set(".agent-backups/Untitled.md", "Josh hidden backup match.");
-  mock.content.set(".trash/Untitled.md", "Josh trashed match.");
+  mock.content.set(".agent-backups/Untitled.md", "Alex hidden backup match.");
+  mock.content.set(".trash/Untitled.md", "Alex trashed match.");
 
   const result = await registry.execute(
     {
       name: "search_markdown_files",
-      arguments: { query: "Josh", limit: 10, maxSnippetChars: 120 },
+      arguments: { query: "Alex", limit: 10, maxSnippetChars: 120 },
     },
     mock.context,
   );
@@ -1109,17 +1129,22 @@ test("delete_current_file rejects arguments and requires delete intent", async (
 function createMockContext(options: {
   prompt?: string;
   now?: Date;
-  activePath?: string;
+  activePath?: string | null;
+  currentMarkdownPath?: string;
+  liveContent?: string;
 } = {}) {
-  const activePath = options.activePath ?? "Current.md";
-  const activeName = activePath.split("/").pop() ?? activePath;
-  const activeFile = {
-    path: activePath,
-    basename: activeName.replace(/\.[^.]+$/i, ""),
-    extension: activeName.includes(".")
-      ? activeName.split(".").pop()?.toLowerCase() ?? ""
-      : "",
-  };
+  const activePath =
+    options.activePath === null ? null : (options.activePath ?? "Current.md");
+  const activeName = activePath?.split("/").pop() ?? activePath;
+  const activeFile = activePath
+    ? {
+        path: activePath,
+        basename: activeName?.replace(/\.[^.]+$/i, "") ?? activePath,
+        extension: activeName?.includes(".")
+          ? activeName.split(".").pop()?.toLowerCase() ?? ""
+          : "",
+      }
+    : null;
   const projectFile = {
     path: "Projects/example.md",
     basename: "example",
@@ -1129,8 +1154,11 @@ function createMockContext(options: {
     ["Current.md", "Initial note"],
     ["Projects/example.md", "Project note"],
   ]);
-  if (!content.has(activePath)) {
+  if (activePath && !content.has(activePath)) {
     content.set(activePath, "Initial note");
+  }
+  if (options.currentMarkdownPath && !content.has(options.currentMarkdownPath)) {
+    content.set(options.currentMarkdownPath, "Initial note");
   }
   const folders = new Set<string>(["Projects"]);
   const operations: string[] = [];
@@ -1276,6 +1304,7 @@ function createMockContext(options: {
       },
     },
   };
+  const currentMarkdownPath = options.currentMarkdownPath;
 
   const context: ToolExecutionContext = {
     app: app as never,
@@ -1299,6 +1328,16 @@ function createMockContext(options: {
       json: { error: "not mocked" },
     }),
     now: () => options.now ?? new Date(123),
+    getCurrentMarkdownFile: currentMarkdownPath
+      ? () => getFile(currentMarkdownPath) as never
+      : undefined,
+    getCurrentMarkdownContent:
+      currentMarkdownPath && options.liveContent !== undefined
+        ? (file) =>
+            file.path === currentMarkdownPath
+              ? options.liveContent ?? null
+              : null
+        : undefined,
   };
 
   return { context, content, folders, operations };
