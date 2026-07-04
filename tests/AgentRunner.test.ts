@@ -640,7 +640,6 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
     chatRequests,
     streamRequests,
     chatResponders: [
-      () => responseWithContent("I can draft that now."),
       () =>
         responseWithToolCall("web_search", {
           query: "The Grapes of Wrath Steinbeck sources",
@@ -667,26 +666,35 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
     },
   });
 
-  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests.length, 2);
   assert.equal(streamRequests.length, 1);
   const firstStepToolNames =
     chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
-  assert.ok(firstStepToolNames.includes("read_current_file"));
-  assert.ok(firstStepToolNames.includes("web_search"));
-  assert.ok(firstStepToolNames.includes("web_fetch"));
-  assert.ok(!firstStepToolNames.includes("append_to_current_file"));
+  assert.deepEqual(firstStepToolNames, ["web_search", "web_fetch"]);
   assert.match(chatRequests[0].messages.at(-1)?.content ?? "", /cited source URLs/);
-  assert.match(
-    chatRequests[1].messages.at(-1)?.content ?? "",
-    /Use the relevant available tools before final writeback/,
+  assert.ok(
+    chatRequests[0].messages.some((message) =>
+      /current note has already been read/i.test(message.content),
+    ),
+  );
+  assert.ok(
+    chatRequests[0].messages.some((message) =>
+      /Use the relevant available tools before final writeback/i.test(
+        message.content,
+      ),
+    ),
   );
   assert.deepEqual(
     executedCalls.map((call) => call.name),
     ["read_current_file", "web_search"],
   );
+  assert.equal(
+    executedCalls.filter((call) => call.name === "read_current_file").length,
+    1,
+  );
   assert.ok(statuses.includes("Using prompt from current note for tool routing..."));
   assert.ok(
-    statuses.includes(
+    !statuses.includes(
       "Sources or vault tools are required; asking model to use tools before writing...",
     ),
   );
@@ -731,6 +739,7 @@ test("prompt-on-page word target counts generated output only before writing", a
 
   assert.equal(streamRequests.length, 1);
   assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests[0].think, undefined);
   assert.equal(vault.content.get("Current.md"), `${notePrompt}\n${correctedDraft}`);
   assert.ok(
     statuses.includes(
