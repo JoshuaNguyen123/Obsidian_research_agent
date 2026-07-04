@@ -2804,6 +2804,49 @@ test("simple generated current-note writeback skips read and planner loops", asy
   );
 });
 
+test("current-note writeback streams chunks live to chat and note", async () => {
+  const finalDeltas: string[] = [];
+  const prompt = "In this note, write a short project update.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+  });
+  const firstChunk = `${"A".repeat(801)}\n`;
+  const secondChunk = "Second live chunk.\n";
+  const client: ModelClient = {
+    chat: async () => {
+      throw new Error("chat should not be called for direct writeback");
+    },
+    streamChat: async (_request, events = {}) => {
+      events.onContentDelta?.(firstChunk);
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(finalDeltas.join(""), firstChunk);
+      assert.equal(vault.content.get("Current.md"), `Initial note\n${firstChunk}`);
+
+      events.onContentDelta?.(secondChunk);
+      return responseWithContent(firstChunk + secondChunk);
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+    },
+  });
+
+  assert.equal(finalDeltas.join(""), firstChunk + secondChunk);
+  assert.equal(
+    vault.content.get("Current.md"),
+    `Initial note\n${firstChunk}${secondChunk}`,
+  );
+});
+
 test("thinking-only writeback retries once and fails without a receipt", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
