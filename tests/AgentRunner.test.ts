@@ -1016,7 +1016,7 @@ test("current-note summary prompts expose read and append tools", async () => {
   );
 });
 
-test("append-only prompts expose read_current_file and append_to_current_file", async () => {
+test("append-only prompts expose append_to_current_file without reading target-only note content", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
 
@@ -1037,7 +1037,7 @@ test("append-only prompts expose read_current_file and append_to_current_file", 
 
   assert.deepEqual(
     chatRequests[0].tools?.map((tool) => tool.function.name),
-    ["read_current_file", "append_to_current_file"],
+    ["append_to_current_file"],
   );
 });
 
@@ -1418,8 +1418,8 @@ test("run config reports current-note context separately from vault questions", 
   });
 
   assert.equal(configs[0].missionMode, "explicit_file_mutation");
-  assert.equal(configs[0].contextScope, "current_note");
-  assert.equal(configs[0].currentNoteContext, true);
+  assert.equal(configs[0].contextScope, "none");
+  assert.equal(configs[0].currentNoteContext, false);
   assert.equal(configs[0].vaultContext, false);
 });
 
@@ -1486,7 +1486,7 @@ test("web append prompts expose web and current-note write tools without path CR
   });
 
   const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
-  assert.ok(toolNames.includes("read_current_file"));
+  assert.ok(!toolNames.includes("read_current_file"));
   assert.ok(toolNames.includes("web_search"));
   assert.ok(toolNames.includes("web_fetch"));
   assert.ok(toolNames.includes("append_to_current_file"));
@@ -1978,7 +1978,7 @@ test("append prompts require a write tool and do not implicitly append", async (
   assert.deepEqual(deltas, ["Done. append Current.md."]);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "append_to_current_file"],
+    ["append_to_current_file"],
   );
   assert.ok(statuses.includes("Write required; asking model to use a write tool..."));
   assert.ok(statuses.includes("Appended result to Current.md."));
@@ -2015,7 +2015,7 @@ test("successful write tools stop the loop without an extra final answer", async
   assert.deepEqual(deltas, ["Done. append Current.md."]);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "append_to_current_file"],
+    ["append_to_current_file"],
   );
   assert.ok(statuses.includes("Appending to note..."));
   assert.ok(statuses.includes("Appended result to Current.md."));
@@ -2058,7 +2058,7 @@ test("write missions emit receipts and a local final answer", async () => {
   assert.equal(streamRequests.length, 0);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "append_to_current_file"],
+    ["append_to_current_file"],
   );
   assert.deepEqual(finalDeltas, ["Done. append Current.md."]);
   assert.deepEqual(receipts, ["append Current.md"]);
@@ -2408,7 +2408,7 @@ test("web research can search then fetch a source before answering", async () =>
   assert.ok(firstStepToolNames.includes("web_fetch"));
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "web_search", "web_fetch", "append_to_current_file"],
+    ["web_search", "web_fetch", "append_to_current_file"],
   );
   assert.deepEqual(deltas, ["Done. append Current.md."]);
 });
@@ -2492,9 +2492,8 @@ test("web append payload stays compact with capped note and source context", asy
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "web_search", "web_fetch", "append_to_current_file"],
+    ["web_search", "web_fetch", "append_to_current_file"],
   );
-  assert.equal(executedCalls[0].arguments.maxChars, MAX_INITIAL_CURRENT_NOTE_CHARS);
   const maxRequestChars = Math.max(
     ...chatRequests.map((request) => JSON.stringify(request).length),
   );
@@ -2724,30 +2723,20 @@ test("append writeback streams final markdown into the current note only", async
     },
   });
 
-  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 1);
-  assert.equal(chatRequests[0].think, "medium");
   assert.equal(streamRequests[0].think, undefined);
   assert.deepEqual(
-    chatRequests[0].tools?.map((tool) => tool.function.name),
-    ["read_current_file"],
-  );
-  assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file"],
+    [],
   );
   assert.equal(
     vault.content.get("Current.md"),
     "Initial note\n- First action\n- Second action\n",
   );
   assert.equal(finalDeltas.join(""), "- First action\n- Second action\n");
-  assert.deepEqual(thinkingDeltas, [
-    "private planning",
-    "private thinking should stay out",
-  ]);
-  assert.ok(!JSON.stringify(streamRequests[0]).includes("private planning"));
+  assert.deepEqual(thinkingDeltas, ["private thinking should stay out"]);
   assert.ok(!vault.content.get("Current.md")?.includes("private thinking"));
-  assert.ok(!vault.content.get("Current.md")?.includes("private planning"));
   assert.equal(receipts[0].streamed, true);
   assert.equal(receipts[0].partial, false);
   assert.equal(receipts[0].operation, "append");
@@ -2758,6 +2747,60 @@ test("append writeback streams final markdown into the current note only", async
         event.name === "stream_writeback" &&
         (event.requestChars ?? 0) > 0,
     ),
+  );
+});
+
+test("simple generated current-note writeback skips read and planner loops", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const finalDeltas: string[] = [];
+  const statuses: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const prompt = "In this note, can you write me a summary of the Vietnam war?";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "",
+  });
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "The Vietnam War was a Cold War-era conflict involving Vietnam, the United States, and regional allies.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    [],
+  );
+  assert.ok(statuses.includes("Using direct note writeback; no tool loop needed..."));
+  assert.ok(!statuses.includes("Reading current note..."));
+  assert.ok(!statuses.includes("Planning..."));
+  assert.ok(!statuses.some((message) => /Agent step/.test(message)));
+  assert.equal(
+    finalDeltas.join(""),
+    "The Vietnam War was a Cold War-era conflict involving Vietnam, the United States, and regional allies.",
+  );
+  assert.equal(
+    vault.content.get("Current.md"),
+    "The Vietnam War was a Cold War-era conflict involving Vietnam, the United States, and regional allies.",
   );
 });
 
@@ -2798,7 +2841,7 @@ test("thinking-only writeback retries once and fails without a receipt", async (
     /The model returned no writable content\. Nothing was written\./,
   );
 
-  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 2);
   assert.equal(streamRequests[0].think, undefined);
   assert.equal(streamRequests[1].think, undefined);
@@ -2944,7 +2987,7 @@ test("writeback retry writes content from the second stream", async () => {
     },
   });
 
-  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 2);
   assert.equal(streamRequests[0].think, undefined);
   assert.equal(streamRequests[1].think, undefined);

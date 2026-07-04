@@ -5,6 +5,7 @@ import type {
   ModelClient,
   ModelChatStreamEvents,
   ModelToolCall,
+  ModelToolDefinition,
   ModelRequestOptions,
   ModelThink,
 } from "./model/types";
@@ -395,6 +396,15 @@ export async function runAgentMission({
     missionIntent,
     streamingWritebackKind,
   );
+  let directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
+    prompt: activeIntentPrompt,
+    missionIntent,
+    streamingWritebackKind,
+    toolContext: runToolContext,
+  });
+  if (shouldOmitCurrentNoteReadForTargetOnlyWrite(activeIntentPrompt, missionIntent)) {
+    tools = removeToolDefinition(tools, "read_current_file");
+  }
   const knownToolNames = new Set(
     toolRegistry.getDefinitions().map((tool) => tool.function.name),
   );
@@ -484,6 +494,7 @@ export async function runAgentMission({
       runToolContext,
       enableStreaming,
     );
+    directCurrentNoteWritebackKind = null;
     tools = getAllowedToolDefinitions(
       toolRegistry,
       activeIntentPrompt,
@@ -666,6 +677,54 @@ export async function runAgentMission({
           {
             role: "system" as const,
             content: formatPromptOnCurrentPageWritebackContext(),
+          },
+        ],
+        events,
+        toolContext: runToolContext,
+        knownToolNames,
+        think: activeThink,
+        options: modelOptions,
+        abortSignal,
+        onThinkingUnsupported: disableThinkingForRun,
+      });
+    } catch (error) {
+      if (stopIfRequested(1)) {
+        return;
+      }
+      throw error;
+    }
+    if (stopIfRequested(1)) {
+      return;
+    }
+    writeReceipts.push(receipt);
+    events.onReceipt?.(receipt);
+    completeRun(events, "write_completed", 1, runStartedAt);
+    return;
+  }
+
+  if (directCurrentNoteWritebackKind !== null) {
+    if (stopIfRequested(1)) {
+      return;
+    }
+    events.onStatus?.("Using direct note writeback; no tool loop needed...");
+    emitRunDiagnostics({
+      events,
+      toolContext: runToolContext,
+      tools,
+      enableStreaming,
+      finalMode: "streaming_writeback",
+    });
+    let receipt: AgentRunReceipt;
+    try {
+      receipt = await streamCurrentNoteWriteback({
+        kind: directCurrentNoteWritebackKind,
+        preparedSectionEdit: null,
+        modelClient,
+        messages: [
+          ...messages,
+          {
+            role: "system" as const,
+            content: formatDirectCurrentNoteWritebackContext(),
           },
         ],
         events,
@@ -1352,6 +1411,14 @@ function formatPromptOnCurrentPageWritebackContext(): string {
     "Write only the generated answer or requested markdown that belongs below the existing prompt on the same note.",
     "Do not repeat the prompt unless the prompt explicitly asks you to.",
     "Do not describe that you read the note.",
+  ].join(" ");
+}
+
+function formatDirectCurrentNoteWritebackContext(): string {
+  return [
+    "Direct current-note writeback is active.",
+    "The mission asks for generated content to be written into the current note and does not require reading current note content or using tools first.",
+    "Draft the requested markdown directly for the current note.",
   ].join(" ");
 }
 
@@ -2915,11 +2982,10 @@ function shouldObserveCurrentNote(
   allowedToolNames: Set<string>,
   missionIntent: MissionIntent,
 ): boolean {
-  const preferPathTarget = hasPathTargetIntent(prompt) && !hasCurrentNoteTarget(prompt);
+  void missionIntent;
   return (
     allowedToolNames.has("read_current_file") &&
-    (hasCurrentNoteReadIntent(prompt) ||
-      (missionIntent.noteOutput && !preferPathTarget))
+    requiresCurrentNoteContent(prompt)
   );
 }
 
@@ -2928,6 +2994,89 @@ function canStreamAnswerFromInitialCurrentNoteContext(
 ): boolean {
   const toolNames = tools?.map((tool) => tool.function.name) ?? [];
   return toolNames.length === 1 && toolNames[0] === "read_current_file";
+}
+
+function removeToolDefinition(
+  tools: ModelToolDefinition[],
+  name: string,
+): ModelToolDefinition[] {
+  return tools.filter((tool) => tool.function.name !== name);
+}
+
+function shouldOmitCurrentNoteReadForTargetOnlyWrite(
+  prompt: string,
+  missionIntent: MissionIntent,
+): boolean {
+  return (
+    missionIntent.noteOutput &&
+    !missionIntent.vaultContext &&
+    !missionIntent.explicitDelete &&
+    !requiresCurrentNoteContent(prompt)
+  );
+}
+
+function getDirectCurrentNoteWritebackKind({
+  prompt,
+  missionIntent,
+  streamingWritebackKind,
+  toolContext,
+}: {
+  prompt: string;
+  missionIntent: MissionIntent;
+  streamingWritebackKind: StreamingWritebackKind | null;
+  toolContext: ToolExecutionContext;
+}): StreamingWritebackKind | null {
+  if (
+    streamingWritebackKind !== "append" ||
+    !canUseCurrentNoteStreamingWriteback(toolContext) ||
+    !missionIntent.noteOutput ||
+    missionIntent.explicitDelete ||
+    promptRequiresToolLoop(prompt) ||
+    requiresCurrentNoteContent(prompt) ||
+    (hasPathTargetIntent(prompt) && !hasCurrentNoteTarget(prompt))
+  ) {
+    return null;
+  }
+
+  return "append";
+}
+
+function canUseCurrentNoteStreamingWriteback(
+  toolContext: ToolExecutionContext,
+): boolean {
+  return (
+    typeof toolContext.app?.workspace?.getActiveFile === "function" &&
+    typeof toolContext.app?.vault?.read === "function" &&
+    typeof toolContext.app?.vault?.modify === "function"
+  );
+}
+
+function requiresCurrentNoteContent(prompt: string): boolean {
+  return (
+    isPromptOnCurrentPageIntent(prompt) ||
+    hasEditIntent(prompt) ||
+    hasReplaceIntent(prompt) ||
+    hasTitleIntent(prompt) ||
+    hasDeleteIntent(prompt) ||
+    /\b(read|check|inspect|look\s+at|open)\b[\s\S]{0,80}\b(current|this|active)\s+(note|file|markdown|document)\b/i.test(
+      prompt,
+    ) ||
+    /\b(current|this|active)\s+(note|file|markdown|document)\b[\s\S]{0,80}\b(read|check|inspect|look\s+at|open)\b/i.test(
+      prompt,
+    ) ||
+    /\b(summari[sz]e|analy[sz]e|explain|extract|review|describe)\b[\s\S]{0,40}\b(current|this|active)\s+(note|file|markdown|document)\b/i.test(
+      prompt,
+    ) ||
+    /\b(summary|analysis|explanation|review|description)\s+of\s+(?:the\s+)?(current|this|active)\s+(note|file|markdown|document)\b/i.test(
+      prompt,
+    ) ||
+    /\b(what|which|where|why|how)\b[\s\S]{0,80}\b(current|this|active)\s+(note|file|markdown|document)\b/i.test(
+      prompt,
+    ) ||
+    /\b(based\s+on|from|using|according\s+to)\s+(?:the\s+)?(current|this|active)\s+(note|file|markdown|document|content)\b/i.test(
+      prompt,
+    )
+  );
 }
 
 function getPromptOnCurrentPageRoutingPrompt(

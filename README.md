@@ -24,6 +24,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Final-answer streaming buffers early output and stops off-topic responses before unrelated text is displayed or persisted.
 - Streamed note writeback suppresses model-emitted tool-call markup, retries once with a content-only instruction, and leaves the note unchanged if the retry still returns a tool request.
 - Short follow-ups such as `Continue` can inherit a pending current-note read intent from recent chat instead of producing another "I'll read it" preamble.
+- Simple target-only current-note writes skip redundant read/planner loops and stream directly into the active note.
 - Current-note prompt extraction lets prompts such as `Read the prompt on the page` read the visible note, execute the prompt written there, and stream generated writing back into that same note when the page prompt asks for prose or markdown output.
 - Prompt-on-page source, citation, verification, vault, and graph requests route through the normal tool loop before writeback, so the run shows tool progress instead of waiting inside one long direct stream.
 
