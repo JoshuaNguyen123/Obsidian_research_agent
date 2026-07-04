@@ -224,7 +224,18 @@ export class AgentView extends ItemView {
       event.stopPropagation();
       void this.capturePrompt();
     });
-    this.clearButtonEl.addEventListener("click", () => {
+    this.clearButtonEl.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+    });
+    this.clearButtonEl.addEventListener("mousedown", (event) => {
+      event.stopPropagation();
+    });
+    this.clearButtonEl.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+    });
+    this.clearButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       void this.clearChat();
     });
   }
@@ -452,6 +463,7 @@ export class AgentView extends ItemView {
     );
 
     if (!confirmed) {
+      this.focusPromptSoon();
       return;
     }
 
@@ -459,7 +471,26 @@ export class AgentView extends ItemView {
     this.pendingAssistantContent = "";
     this.liveAssistantMessageEl = null;
     this.renderConversationLog();
-    this.promptEl?.focus();
+    this.focusPromptSoon();
+  }
+
+  private focusPromptSoon() {
+    const promptEl = this.promptEl;
+    if (!promptEl) {
+      return;
+    }
+
+    const focus = () => {
+      if (this.promptEl === promptEl && promptEl.isConnected) {
+        promptEl.focus();
+      }
+    };
+
+    focus();
+    window.setTimeout(focus, 0);
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(focus);
+    }
   }
 
   private resetDashboardForRun() {
