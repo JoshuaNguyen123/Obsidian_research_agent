@@ -408,6 +408,7 @@ export async function runAgentMission({
   let writeRequired =
     missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
   let requireToolBeforeStreamingWriteback = false;
+  let promptOnPageCurrentNoteReadSatisfied = false;
   const shouldReadCurrentNote = shouldObserveCurrentNote(
     activeIntentPrompt,
     allowedToolNames,
@@ -489,6 +490,14 @@ export async function runAgentMission({
       missionIntent,
       streamingWritebackKind,
     );
+    if (currentNoteContext !== null) {
+      const filteredTools = tools.filter(
+        (tool) => tool.function.name !== "read_current_file",
+      );
+      promptOnPageCurrentNoteReadSatisfied =
+        filteredTools.length !== tools.length;
+      tools = filteredTools;
+    }
     allowedToolNames = new Set(tools.map((tool) => tool.function.name));
     requiredWriteTools = getRequiredWriteToolNames(
       activeIntentPrompt,
@@ -589,6 +598,14 @@ export async function runAgentMission({
             content: formatCurrentNoteContext(currentNoteContext),
           },
         ]),
+    ...(promptOnPageCurrentNoteReadSatisfied
+      ? [
+          {
+            role: "system" as const,
+            content: formatCurrentNoteReadSatisfiedContext(),
+          },
+        ]
+      : []),
     {
       role: "system" as const,
       content: formatAllowedToolsContext(tools),
@@ -601,6 +618,14 @@ export async function runAgentMission({
             content: formatStreamingWritebackContext(streamingWritebackKind),
           },
         ]),
+    ...(requireToolBeforeStreamingWriteback
+      ? [
+          {
+            role: "system" as const,
+            content: buildToolBeforeStreamingWritebackPrompt(tools),
+          },
+        ]
+      : []),
     ...(conversationMessages.length === 0
       ? []
       : [
@@ -1235,6 +1260,14 @@ async function observeCurrentNote(
 
 function formatCurrentNoteContext(currentNoteContext: unknown): string {
   return `Current note context: ${JSON.stringify(currentNoteContext)}`;
+}
+
+function formatCurrentNoteReadSatisfiedContext(): string {
+  return [
+    "The active current note has already been read for this run.",
+    "Use the included Current note context instead of requesting read_current_file again.",
+    "If sources, verification, graph, vault search, or word-count tools are available and relevant, request those tools directly.",
+  ].join(" ");
 }
 
 function formatRuntimeContext(
@@ -2152,7 +2185,7 @@ async function emitFinalAnswer({
       name: metricName,
       durationMs: elapsedMs(startedAt),
       requestChars,
-      responseChars: measureSerializedChars(response.raw ?? response.message),
+      responseChars: measureSerializedChars(response.message),
       ...extractTokenUsageFields(response.raw),
     });
   } catch (error) {
@@ -3873,9 +3906,7 @@ async function streamCurrentNoteWriteback({
         name: metricName,
         durationMs: elapsedMs(startedAt),
         requestChars,
-        responseChars: measureSerializedChars(
-          attemptResponse.raw ?? attemptResponse.message,
-        ),
+        responseChars: measureSerializedChars(attemptResponse.message),
         ...extractTokenUsageFields(attemptResponse.raw),
       });
 
@@ -4217,7 +4248,7 @@ async function requestWordCountCorrection({
         content: buildWordCountCorrectionPrompt(wordTarget),
       },
     ],
-    think,
+    think: undefined,
     options,
     abortSignal,
   };
