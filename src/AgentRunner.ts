@@ -371,7 +371,7 @@ Operating rules:
 28. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
 29. Use template tools only when the user asks to create, list, read, use, apply, or fill templates. Saved templates live in the configured template folder and use {{field}} placeholders.
 30. When filling a template, prefer fill_template over generic file creation. Use templateText for ad hoc templates supplied in the mission, or templatePath for saved templates.
-31. For conceptual vault questions, call semantic_search_notes before broad file reads. For exact path, title, heading, or filename requests, prefer read_file, search_markdown_files, inspect_vault_index, or list tools. Do not use semantic search for delete, move, replace, or direct current-note write-only requests.
+31. For conceptual vault questions, first inspect the semantic index when available, then call semantic_search_notes for ranked evidence before broad file reads. Use exact path/title/heading tools for exact requests. Never use semantic index tools for delete, move, replace, or direct write-only requests. Treat index summaries as navigation aids; cite and rely on source note paths.
 32. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
 
 const ENGLISH_ONLY_POLICY = [
@@ -4417,6 +4417,7 @@ const READ_NAV_TOOL_NAMES = new Set([
   "list_markdown_files",
   "read_markdown_files",
   "search_markdown_files",
+  "inspect_semantic_index",
   "semantic_search_notes",
   "read_file",
   "count_words",
@@ -4451,6 +4452,7 @@ const WRITE_TOOL_NAMES = new Set([
   "edit_current_section",
   "replace_current_file",
   "link_related_notes_in_current_file",
+  "rebuild_semantic_index",
 ]);
 
 const DELETE_TOOL_NAMES = new Set(["delete_path", "delete_current_file"]);
@@ -4501,6 +4503,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   list_current_folder: "read",
   list_markdown_files: "read",
   search_markdown_files: "read",
+  inspect_semantic_index: "read",
   semantic_search_notes: "read",
   read_markdown_files: "read",
   read_file: "read",
@@ -4539,6 +4542,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   render_html_preview: "code",
   create_design_canvas: "write",
   create_svg_design: "write",
+  rebuild_semantic_index: "write",
 };
 
 function getAllowedToolDefinitions(
@@ -4573,6 +4577,10 @@ function getAllowedToolDefinitions(
   const allowVaultIndex = hasVaultIndexIntent(prompt);
   const allowSemanticSearch =
     isSemanticSearchEnabled(settings) && hasConceptualVaultSearchIntent(prompt);
+  const allowSemanticIndexInspect =
+    isSemanticIndexEnabled(settings) && hasConceptualVaultSearchIntent(prompt);
+  const allowSemanticIndexMaintenance =
+    isSemanticIndexEnabled(settings) && hasSemanticIndexMaintenanceIntent(prompt);
   const allowOpenWebSource = hasOpenWebSourceIntent(prompt);
   const allowCodeExecution = hasCodeExecutionIntent(prompt);
   const allowHtmlPreview = hasHtmlPreviewIntent(prompt) || allowCodeExecution;
@@ -4654,8 +4662,16 @@ function getAllowedToolDefinitions(
       return allowVaultBrowse || allowSpecificFileRead;
     }
 
+    if (name === "inspect_semantic_index") {
+      return allowSemanticIndexInspect;
+    }
+
     if (name === "semantic_search_notes") {
       return allowSemanticSearch;
+    }
+
+    if (name === "rebuild_semantic_index") {
+      return allowSemanticIndexMaintenance;
     }
 
     if (name === "list_current_folder") {
@@ -4810,6 +4826,10 @@ function isAllowedForMission(
   }
 
   if (WRITE_TOOL_NAMES.has(name)) {
+    if (name === "rebuild_semantic_index") {
+      return hasSemanticIndexMaintenanceIntent(prompt);
+    }
+
     if (name === "open_web_source") {
       return hasOpenWebSourceIntent(prompt);
     }
@@ -4836,6 +4856,15 @@ function isSemanticSearchEnabled(
   settings: ToolExecutionContext["settings"] | undefined,
 ): boolean {
   return settings?.semanticSearchEnabled !== false;
+}
+
+function isSemanticIndexEnabled(
+  settings: ToolExecutionContext["settings"] | undefined,
+): boolean {
+  return (
+    settings?.semanticSearchEnabled !== false &&
+    settings?.semanticIndexEnabled !== false
+  );
 }
 
 function isToolWithinAutonomyScope(
@@ -5835,6 +5864,12 @@ function hasConceptualVaultSearchIntent(prompt: string): boolean {
   );
 }
 
+function hasSemanticIndexMaintenanceIntent(prompt: string): boolean {
+  return /\b(rebuild|refresh|update|regenerate|repair|create)\b[\s\S]{0,120}\bsemantic\s+(vault\s+)?index\b|\bsemantic\s+(vault\s+)?index\b[\s\S]{0,120}\b(rebuild|refresh|update|regenerate|repair|create)\b/i.test(
+    prompt,
+  );
+}
+
 function requiresVaultTraversalBeforeFinalAnswer(
   prompt: string,
   runPlan: RunPlan,
@@ -6752,6 +6787,14 @@ function getToolPreparationStatus(toolName: string): string | null {
 
   if (toolName === "semantic_search_notes") {
     return "Searching notes semantically...";
+  }
+
+  if (toolName === "inspect_semantic_index") {
+    return "Inspecting semantic vault index...";
+  }
+
+  if (toolName === "rebuild_semantic_index") {
+    return "Rebuilding semantic vault index...";
   }
 
   if (toolName === "suggest_note_links") {
@@ -8940,6 +8983,7 @@ const CACHEABLE_TOOL_NAMES = new Set([
   "inspect_vault_context",
   "list_markdown_files",
   "search_markdown_files",
+  "inspect_semantic_index",
   "semantic_search_notes",
   "read_markdown_files",
   "read_file",

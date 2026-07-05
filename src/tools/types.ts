@@ -8,6 +8,7 @@ import type {
 } from "../model/types";
 import type { AutonomyScope } from "../agent/missionScope";
 import type { SemanticEmbeddingProvider } from "../embeddings/types";
+import type { SemanticIndexService } from "../embeddings/semanticIndexTypes";
 
 export type AgentMissionMode =
   | "chat_only"
@@ -52,6 +53,7 @@ export interface ToolExecutionContext {
     entries: ResearchMemoryIndexEntry[],
   ) => Promise<void> | void;
   semanticEmbeddingProvider?: SemanticEmbeddingProvider;
+  semanticIndexService?: SemanticIndexService;
 }
 
 export interface ToolExecutionResult {
