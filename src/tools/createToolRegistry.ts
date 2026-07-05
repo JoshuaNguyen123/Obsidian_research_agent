@@ -6,11 +6,13 @@ import { createVaultIndexTools } from "./vaultIndexTools";
 import { createVaultTools } from "./vaultTools";
 import { createWebViewerTools } from "./webViewerTools";
 import { createWebTools } from "./webTools";
+import { createSemanticSearchTools } from "./semanticSearchTools";
 
 export function createDefaultToolRegistry(): ToolRegistry {
   return new DefaultToolRegistry([
     ...createVaultTools(),
     ...createVaultIndexTools(),
+    ...createSemanticSearchTools(),
     ...createWebTools(),
     ...createWebViewerTools(),
     ...createCodeTools(),

@@ -107,7 +107,7 @@ function getGeneratedOutputTarget(
     return "chat_only";
   }
 
-  if (/\b(replace|overwrite|rewrite|clear|start\s+fresh|reset|delete|remove)\b[\s\S]{0,160}\b(write|generate|draft|compose|create)\b|\b(write|generate|draft|compose|create)\b[\s\S]{0,160}\b(replace|overwrite|rewrite|clear|start\s+fresh|reset|delete|remove)\b/i.test(prompt)) {
+  if (/\b(replace|overwrite|rewrite|clear|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b[\s\S]{0,180}\b(write|generate|draft|compose|create)\b|\b(write|generate|draft|compose|create)\b[\s\S]{0,180}\b(replace|overwrite|rewrite|clear|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i.test(prompt)) {
     return "current_note_replace";
   }
 

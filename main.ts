@@ -9,6 +9,7 @@ import {
   createConfiguredModelClient,
   requestUrlTransport,
 } from "./src/model/createModelClient";
+import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
 import type { ModelClient } from "./src/model/types";
 import { AgentSettings, AgentSettingTab, DEFAULT_SETTINGS } from "./src/settings";
 import { getProjectMemoryLocation } from "./src/agent/projectMemory";
@@ -118,6 +119,46 @@ export default class AgenticResearcherPlugin extends Plugin {
         Math.max(1, Math.trunc(settings.maxAgentSteps)),
       );
     }
+    settings.semanticSearchEnabled = settings.semanticSearchEnabled !== false;
+    settings.semanticEmbeddingModel =
+      typeof settings.semanticEmbeddingModel === "string" &&
+      settings.semanticEmbeddingModel.trim()
+        ? settings.semanticEmbeddingModel.trim()
+        : DEFAULT_SETTINGS.semanticEmbeddingModel;
+    settings.semanticEmbeddingDim =
+      settings.semanticEmbeddingDim === 256 ? 256 : 512;
+    settings.semanticChunkMinTokens = clampIntegerSetting(
+      settings.semanticChunkMinTokens,
+      50,
+      700,
+      DEFAULT_SETTINGS.semanticChunkMinTokens,
+    );
+    settings.semanticChunkTargetTokens = clampIntegerSetting(
+      settings.semanticChunkTargetTokens,
+      settings.semanticChunkMinTokens,
+      700,
+      DEFAULT_SETTINGS.semanticChunkTargetTokens,
+    );
+    settings.semanticChunkMaxTokens = clampIntegerSetting(
+      settings.semanticChunkMaxTokens,
+      settings.semanticChunkTargetTokens,
+      1000,
+      DEFAULT_SETTINGS.semanticChunkMaxTokens,
+    );
+    settings.semanticChunkOverlapTokens = clampIntegerSetting(
+      settings.semanticChunkOverlapTokens,
+      0,
+      Math.max(0, settings.semanticChunkMinTokens - 1),
+      DEFAULT_SETTINGS.semanticChunkOverlapTokens,
+    );
+    settings.semanticPythonCommand =
+      typeof settings.semanticPythonCommand === "string"
+        ? settings.semanticPythonCommand.trim()
+        : "";
+    settings.semanticModelCacheDir =
+      typeof settings.semanticModelCacheDir === "string"
+        ? settings.semanticModelCacheDir.trim()
+        : "";
 
     this.settings = settings;
     this.conversationHistory = normalizeConversationHistory(rawHistory);
@@ -238,6 +279,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         this.setCurrentMarkdownContent(file, content),
       getResearchMemoryIndex: () => [...this.researchMemoryIndex],
       setResearchMemoryIndex: (entries) => this.setResearchMemoryIndex(entries),
+      semanticEmbeddingProvider: createPythonFastEmbedProvider(this.settings),
     };
   }
 
@@ -336,6 +378,20 @@ export default class AgenticResearcherPlugin extends Plugin {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function clampIntegerSetting(
+  value: unknown,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(Math.trunc(parsed), min), max);
 }
 
 function normalizeResearchMemoryIndex(
