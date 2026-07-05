@@ -4,6 +4,10 @@ import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import { DEFAULT_TEMPLATE_SEEDS } from "../src/tools/vaultTools";
 import { chunkMarkdownForSemanticSearch } from "../src/tools/semanticSearchTools";
 import {
+  createSemanticIndexService,
+  shouldSemanticIndexTrackPath,
+} from "../src/embeddings/semanticIndex";
+import {
   BACKUP_FOLDER,
   DEFAULT_WEB_RESULTS,
   MAX_WEB_FETCH_CHARS,
@@ -19,6 +23,8 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.ok(definitions.some((tool) => tool.function.name === "list_folder"));
   assert.ok(definitions.some((tool) => tool.function.name === "search_markdown_files"));
   assert.ok(definitions.some((tool) => tool.function.name === "semantic_search_notes"));
+  assert.ok(definitions.some((tool) => tool.function.name === "inspect_semantic_index"));
+  assert.ok(definitions.some((tool) => tool.function.name === "rebuild_semantic_index"));
   assert.ok(definitions.some((tool) => tool.function.name === "read_markdown_files"));
   assert.ok(definitions.some((tool) => tool.function.name === "inspect_vault_context"));
   assert.ok(definitions.some((tool) => tool.function.name === "count_words"));
@@ -629,6 +635,213 @@ test("semantic_search_notes falls back to lexical search when embedding fails", 
   assert.equal(output.fallbackReason, "missing_fastembed");
   assert.equal(output.results[0].path, "People/Untitled.md");
   assert.ok(output.results[0].lexicalScore > 0);
+});
+
+test("semantic_search_notes uses a fresh semantic index before live embedding", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  let liveEmbeddingCalled = false;
+  mock.context.semanticEmbeddingProvider = {
+    async embed() {
+      liveEmbeddingCalled = true;
+      return {
+        ok: false,
+        model: "test",
+        dim: 512,
+        code: "should_not_call_live_embedding",
+        message: "unexpected",
+      };
+    },
+  };
+  mock.context.semanticIndexService = {
+    async load() {
+      return null;
+    },
+    async rebuild() {
+      throw new Error("not used");
+    },
+    async updatePaths() {
+      throw new Error("not used");
+    },
+    async removePaths() {
+      return undefined;
+    },
+    async search() {
+      return {
+        ok: true,
+        operation: "semantic_index_search",
+        mode: "indexed_semantic",
+        indexUsed: true,
+        indexFresh: true,
+        model: "nomic-ai/nomic-embed-text-v1.5-Q",
+        dim: 512,
+        indexedAt: "2026-07-05T00:00:00.000Z",
+        resultCount: 1,
+        results: [
+          {
+            path: "Research/Semantic.md",
+            title: "Semantic",
+            score: 0.91,
+            semanticScore: 0.9,
+            lexicalScore: 0.1,
+            reasons: ["indexed_semantic_similarity"],
+            heading: "Local Embeddings",
+            snippet: "Local semantic index evidence.",
+          },
+        ],
+      };
+    },
+  };
+
+  const result = await registry.execute(
+    {
+      name: "semantic_search_notes",
+      arguments: { query: "local embeddings" },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    mode: string;
+    indexUsed: boolean;
+    results: Array<{ path: string; reasons: string[]; vector?: unknown }>;
+  };
+  assert.equal(output.mode, "indexed_semantic");
+  assert.equal(output.indexUsed, true);
+  assert.equal(output.results[0].path, "Research/Semantic.md");
+  assert.equal(output.results[0].vector, undefined);
+  assert.equal(liveEmbeddingCalled, false);
+});
+
+test("semantic index service rebuild writes JSON vectors and vector-free markdown", async () => {
+  const mock = createMockContext({
+    fileStats: {
+      "Research/Semantic.md": { mtime: 10, size: 120 },
+      "Agent Runs/old.md": { mtime: 20, size: 50 },
+      "Agent Memory/Semantic Vault Index.md": { mtime: 30, size: 50 },
+    },
+  });
+  mock.content.delete("Current.md");
+  mock.content.delete("Projects/example.md");
+  mock.content.set(
+    "Research/Semantic.md",
+    "# Local Embeddings\n\nFastEmbed semantic retrieval with #ai and [[Search]].",
+  );
+  mock.content.set("Agent Runs/old.md", "# Old Run\n\nShould be skipped.");
+  mock.content.set(
+    "Agent Memory/Semantic Vault Index.md",
+    "# Existing self index\n\nShould be skipped.",
+  );
+  mock.folders.add("Research");
+  mock.folders.add("Agent Memory");
+  mock.context.semanticEmbeddingProvider = {
+    async embed(request) {
+      return {
+        ok: true,
+        model: request.model,
+        dim: request.dim,
+        documents: request.documents.map(() =>
+          Array.from({ length: request.dim }, (_, index) =>
+            index === 0 ? 1 : 0,
+          ),
+        ),
+        queries: request.queries.map(() =>
+          Array.from({ length: request.dim }, (_, index) =>
+            index === 0 ? 1 : 0,
+          ),
+        ),
+      };
+    },
+  };
+  const service = createSemanticIndexService({
+    app: mock.context.app,
+    getSettings: () => mock.context.settings,
+    getEmbeddingProvider: () => mock.context.semanticEmbeddingProvider!,
+    now: () => new Date("2026-07-05T00:00:00.000Z"),
+  });
+
+  const result = await service.rebuild();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.noteCount, 1);
+  const json = JSON.parse(
+    mock.content.get("Agent Memory/semantic-vault-index.json") ?? "{}",
+  ) as {
+    notes: Array<{ path: string; chunks: Array<{ vector: number[] }> }>;
+  };
+  assert.equal(json.notes[0].path, "Research/Semantic.md");
+  assert.equal(json.notes[0].chunks[0].vector.length, 512);
+  const markdown = mock.content.get("Agent Memory/Semantic Vault Index.md") ?? "";
+  assert.match(markdown, /# Semantic Vault Index/);
+  assert.match(markdown, /Research\/Semantic\.md/);
+  assert.doesNotMatch(markdown, /"vector"/);
+  assert.doesNotMatch(markdown, /Agent Runs\/old\.md/);
+});
+
+test("semantic index excludes unsafe, system, and self paths", () => {
+  const settings = createMockContext().context.settings;
+
+  assert.equal(shouldSemanticIndexTrackPath("Research/Semantic.md", settings), true);
+  assert.equal(shouldSemanticIndexTrackPath("../Secret.md", settings), false);
+  assert.equal(
+    shouldSemanticIndexTrackPath("C:/Users/joshb/Secret.md", settings),
+    false,
+  );
+  assert.equal(shouldSemanticIndexTrackPath("Research\\Semantic.md", settings), false);
+  assert.equal(shouldSemanticIndexTrackPath(".agent-backups/Old.md", settings), false);
+  assert.equal(shouldSemanticIndexTrackPath("Agent Runs/Run.md", settings), false);
+  assert.equal(
+    shouldSemanticIndexTrackPath("Agent Memory/Semantic Vault Index.md", settings),
+    false,
+  );
+  assert.equal(
+    shouldSemanticIndexTrackPath("Agent Memory/semantic-vault-index.json", settings),
+    false,
+  );
+});
+
+test("rebuild_semantic_index delegates to the semantic index service", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  let called = false;
+  mock.context.semanticIndexService = {
+    async load() {
+      return null;
+    },
+    async rebuild() {
+      called = true;
+      return {
+        ok: true,
+        operation: "semantic_index_rebuild",
+        markdownPath: "Agent Memory/Semantic Vault Index.md",
+        jsonPath: "Agent Memory/semantic-vault-index.json",
+        indexedAt: "2026-07-05T00:00:00.000Z",
+        noteCount: 0,
+        chunkCount: 0,
+        updatedPaths: [],
+        removedPaths: [],
+        skippedPaths: [],
+      };
+    },
+    async updatePaths() {
+      throw new Error("not used");
+    },
+    async removePaths() {
+      return undefined;
+    },
+    async search() {
+      throw new Error("not used");
+    },
+  };
+
+  const result = await registry.execute(
+    { name: "rebuild_semantic_index", arguments: {} },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(called, true);
 });
 
 test("get_path_info reports files, folders, and missing paths", async () => {
@@ -2360,6 +2573,11 @@ function createMockContext(options: {
       semanticChunkOverlapTokens: 80,
       semanticPythonCommand: "",
       semanticModelCacheDir: "",
+      semanticIndexEnabled: true,
+      semanticIndexFolder: "Agent Memory",
+      semanticIndexDebounceMs: 3000,
+      semanticIndexMaxFiles: 1000,
+      semanticIndexPersistVectors: true,
       requestTimeoutMs: 60000,
       temperature: null,
       topK: null,

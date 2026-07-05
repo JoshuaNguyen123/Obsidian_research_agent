@@ -27,6 +27,11 @@ export interface AgentSettings {
   semanticChunkOverlapTokens: number;
   semanticPythonCommand: string;
   semanticModelCacheDir: string;
+  semanticIndexEnabled: boolean;
+  semanticIndexFolder: string;
+  semanticIndexDebounceMs: number;
+  semanticIndexMaxFiles: number;
+  semanticIndexPersistVectors: boolean;
   temperature: number | null;
   topK: number | null;
   topP: number | null;
@@ -55,6 +60,11 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   semanticChunkOverlapTokens: 80,
   semanticPythonCommand: "",
   semanticModelCacheDir: "",
+  semanticIndexEnabled: true,
+  semanticIndexFolder: "Agent Memory",
+  semanticIndexDebounceMs: 3000,
+  semanticIndexMaxFiles: 1000,
+  semanticIndexPersistVectors: true,
   temperature: null,
   topK: null,
   topP: null,
@@ -355,6 +365,76 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Semantic index")
+      .setDesc("Maintains a derived Markdown map and local JSON vector index for faster conceptual vault search.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.semanticIndexEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.semanticIndexEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic index folder")
+      .setDesc("Vault folder for Semantic Vault Index.md and semantic-vault-index.json.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.semanticIndexFolder)
+          .setValue(this.plugin.settings.semanticIndexFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.semanticIndexFolder = normalizeVaultFolderSetting(
+              value,
+              DEFAULT_SETTINGS.semanticIndexFolder,
+            );
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic index debounce")
+      .setDesc("Milliseconds to wait before indexing changed markdown files after vault events.")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.semanticIndexDebounceMs))
+          .setValue(String(this.plugin.settings.semanticIndexDebounceMs))
+          .onChange(async (value) => {
+            this.plugin.settings.semanticIndexDebounceMs =
+              parseOptionalInteger(value, { min: 250, max: 60000 }) ??
+              DEFAULT_SETTINGS.semanticIndexDebounceMs;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic index max files")
+      .setDesc("Maximum markdown files to include in the derived semantic index.")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.semanticIndexMaxFiles))
+          .setValue(String(this.plugin.settings.semanticIndexMaxFiles))
+          .onChange(async (value) => {
+            this.plugin.settings.semanticIndexMaxFiles =
+              parseOptionalInteger(value, { min: 1, max: 10000 }) ??
+              DEFAULT_SETTINGS.semanticIndexMaxFiles;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Persist semantic vectors")
+      .setDesc("Stores local embedding vectors in semantic-vault-index.json. Vectors are never shown to the model.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.semanticIndexPersistVectors)
+          .onChange(async (value) => {
+            this.plugin.settings.semanticIndexPersistVectors = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
       .setName("Temperature")
       .setDesc("Optional Ollama sampling temperature. Leave blank for provider default.")
       .addText((text) =>
@@ -480,4 +560,26 @@ function parseOptionalInteger(
 ): number | null {
   const parsed = parseOptionalNumber(value, bounds);
   return parsed === null ? null : Math.trunc(parsed);
+}
+
+function normalizeVaultFolderSetting(value: string, fallback: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    return fallback;
+  }
+  if (
+    trimmed.includes("..") ||
+    trimmed.includes("\\") ||
+    trimmed.startsWith("/") ||
+    /^[a-zA-Z]:/.test(trimmed)
+  ) {
+    return fallback;
+  }
+
+  const parts = trimmed.split("/");
+  if (parts.some((part) => !part || part === ".")) {
+    return fallback;
+  }
+
+  return trimmed;
 }

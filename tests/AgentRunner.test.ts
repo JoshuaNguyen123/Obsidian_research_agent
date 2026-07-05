@@ -2130,6 +2130,7 @@ test("vault context search prompts expose search and batch read tools", async ()
 
   const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
   assert.ok(toolNames.includes("search_markdown_files"));
+  assert.ok(toolNames.includes("inspect_semantic_index"));
   assert.ok(toolNames.includes("semantic_search_notes"));
   assert.ok(toolNames.includes("read_markdown_files"));
   assert.ok(!toolNames.includes("append_to_current_file"));
@@ -2162,6 +2163,7 @@ test("conceptual vault prompts expose semantic search as a read tool", async () 
   });
 
   const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("inspect_semantic_index"));
   assert.ok(toolNames.includes("semantic_search_notes"));
   assert.ok(toolNames.includes("search_markdown_files"));
   assert.ok(!toolNames.includes("append_to_current_file"));
@@ -2193,7 +2195,38 @@ test("direct mutation prompts withhold semantic search", async () => {
   });
 
   const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(!toolNames.includes("inspect_semantic_index"));
   assert.ok(!toolNames.includes("semantic_search_notes"));
+});
+
+test("semantic index maintenance prompts expose rebuild tool only on request", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("rebuild_semantic_index", {}),
+      () => responseWithContent("Semantic index rebuilt."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Rebuild the semantic vault index.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("rebuild_semantic_index"));
+  assert.ok(!toolNames.includes("inspect_semantic_index"));
+  assert.ok(!toolNames.includes("semantic_search_notes"));
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["rebuild_semantic_index"],
+  );
 });
 
 test("saving a vault-context answer enables agent-selected current-note writeback", async () => {
@@ -5500,6 +5533,11 @@ function createRunnerSettings(
     semanticChunkOverlapTokens: 80,
     semanticPythonCommand: "",
     semanticModelCacheDir: "",
+    semanticIndexEnabled: true,
+    semanticIndexFolder: "Agent Memory",
+    semanticIndexDebounceMs: 3000,
+    semanticIndexMaxFiles: 1000,
+    semanticIndexPersistVectors: true,
     requestTimeoutMs: 60000,
     temperature: null,
     topK: null,
@@ -5676,7 +5714,21 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "inspect_semantic_index",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "semantic_search_notes",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "rebuild_semantic_index",
           parameters: { type: "object", properties: {} },
         },
       },
@@ -5988,6 +6040,8 @@ function createRegistry(
               ? {
                   operation: "semantic_search_notes",
                   mode: "hybrid_semantic",
+                  indexUsed: false,
+                  indexFresh: false,
                   model: "nomic-ai/nomic-embed-text-v1.5-Q",
                   dim: 512,
                   fallbackUsed: false,
@@ -6003,6 +6057,36 @@ function createRegistry(
                       snippet: "Alex likes local AI tools.",
                     },
                   ],
+                }
+            : call.name === "inspect_semantic_index"
+              ? {
+                  operation: "inspect_semantic_index",
+                  indexAvailable: true,
+                  indexFresh: true,
+                  indexedAt: "2026-07-05T00:00:00.000Z",
+                  model: "nomic-ai/nomic-embed-text-v1.5-Q",
+                  dim: 512,
+                  concepts: [{ term: "local", count: 1, paths: ["People/Untitled.md"] }],
+                  results: [
+                    {
+                      path: "People/Untitled.md",
+                      title: "Untitled",
+                      snippet: "Alex likes local AI tools.",
+                    },
+                  ],
+                }
+            : call.name === "rebuild_semantic_index"
+              ? {
+                  ok: true,
+                  operation: "semantic_index_rebuild",
+                  markdownPath: "Agent Memory/Semantic Vault Index.md",
+                  jsonPath: "Agent Memory/semantic-vault-index.json",
+                  indexedAt: "2026-07-05T00:00:00.000Z",
+                  noteCount: 1,
+                  chunkCount: 1,
+                  updatedPaths: ["People/Untitled.md"],
+                  removedPaths: [],
+                  skippedPaths: [],
                 }
             : call.name === "read_markdown_files"
               ? {
