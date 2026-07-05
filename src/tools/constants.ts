@@ -1,4 +1,6 @@
-export const MAX_AGENT_STEPS = 6;
+export const MAX_AGENT_STEPS = 30;
+export const CHECKPOINT_EVERY_STEPS = 5;
+export const LONG_RUN_STEP_WARN_AT = 15;
 export const MAX_FILE_READ_CHARS = 12000;
 export const MAX_INITIAL_CURRENT_NOTE_CHARS = 6000;
 export const MAX_TOOL_RESULT_CHARS = 8000;

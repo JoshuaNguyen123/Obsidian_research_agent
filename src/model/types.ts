@@ -69,6 +69,7 @@ export interface ModelChatResponse {
 }
 
 export interface ModelChatStreamEvents {
+  onRawChunk?: (chunk: string) => void;
   onContentDelta?: (delta: string) => void;
   onThinkingDelta?: (delta: string) => void;
 }

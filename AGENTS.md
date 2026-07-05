@@ -38,6 +38,13 @@ Optimize for real execution inside Obsidian, not abstract control panels or simu
 - Keep the document implementation-grounded: describe actual files, runtime flow, safety checks, limits, and tradeoffs that exist in the repo.
 - If a requested change intentionally diverges from the technical details document, update the document and briefly call out the change in the final response.
 
+## Mistakes/Lessons learned Maintenance
+
+- Treat `docs/MISTAKES.md` as a living document for tracking errors, mistakes and issues.
+- Update when you make a mistake, keep looping on the same behavior, or do something that the user said was a mistake
+- Give details for what went wrong
+- Treat the document as a context document so you don't repeat the same mistakes or incorrect behaviors.
+
 ## Agent Loop
 
 The model plans; the plugin executes. The model must never directly mutate the vault. It may request tool calls, and the plugin validates and runs them.
@@ -115,6 +122,10 @@ npm run build
 ```
 
 Do not claim tests passed unless they actually ran. For UI work, also verify that the built artifacts contain the expected UI strings/classes when a visual Obsidian check is not available.
+
+After every functional implementation in the application, add or update an e2e test utilizing Playwright that exercises the implemented behavior before declaring the change complete.
+
+For e2e tests that cover longer requests, multi-step agent runs, web/source work, model responses, or vault writeback, configure appropriately longer Playwright timeouts and waits so the test reflects the expected runtime instead of failing on the default short wait.
 
 ## Test Vault Freshness
 

@@ -25,16 +25,29 @@ export interface MissionIntent {
   requireWriteCompletion: boolean;
 }
 
+export interface ResearchMemoryIndexEntry {
+  topic: string;
+  path: string;
+  keywords: string[];
+  lastUpdated: string;
+}
+
 export interface ToolExecutionContext {
   app: App;
   settings: AgentSettings;
   originalPrompt: string;
   httpTransport: HttpTransport;
+  runtimeCache?: AgentRuntimeCache;
   writeAutonomy?: boolean;
   missionIntent?: MissionIntent;
   now?: () => Date;
   getCurrentMarkdownFile?: () => TFile | null;
   getCurrentMarkdownContent?: (file: TFile) => string | null;
+  setCurrentMarkdownContent?: (file: TFile, content: string) => boolean;
+  getResearchMemoryIndex?: () => ResearchMemoryIndexEntry[];
+  setResearchMemoryIndex?: (
+    entries: ResearchMemoryIndexEntry[],
+  ) => Promise<void> | void;
 }
 
 export interface ToolExecutionResult {
@@ -45,6 +58,12 @@ export interface ToolExecutionResult {
     code: string;
     message: string;
   };
+}
+
+export interface AgentRuntimeCache {
+  toolResults: Map<string, ToolExecutionResult>;
+  semanticProfiles?: Map<string, unknown>;
+  graphProfiles?: Map<string, unknown>;
 }
 
 export interface AgentTool {

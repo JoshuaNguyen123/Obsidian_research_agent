@@ -7,6 +7,7 @@ import {
   sanitizeAssistantContent,
   type AgentRunConfigEvent,
   type AgentRunMetricEvent,
+  type AgentRunReceipt,
 } from "../src/AgentRunner";
 import { ModelClientError } from "../src/model/types";
 import type {
@@ -26,7 +27,10 @@ import type {
   StreamWritebackMode,
   ThinkingMode,
 } from "../src/settings";
-import { MAX_INITIAL_CURRENT_NOTE_CHARS } from "../src/tools/constants";
+import {
+  BACKUP_FOLDER,
+  MAX_INITIAL_CURRENT_NOTE_CHARS,
+} from "../src/tools/constants";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 
 test("observes the current note before the first model planning step", async () => {
@@ -60,13 +64,16 @@ test("observes the current note before the first model planning step", async () 
     maxChars: MAX_INITIAL_CURRENT_NOTE_CHARS,
   });
   assert.equal(chatRequests.length, 1);
-  assert.match(chatRequests[0].messages[4].content, /Current note context/);
-  assert.match(chatRequests[0].messages[4].content, /"path":"Current.md"/);
-  assert.match(chatRequests[0].messages[4].content, /"content":"Initial note"/);
+  const currentNoteContextMessage = chatRequests[0].messages.find((message) =>
+    /Current note context/.test(message.content),
+  );
+  assert.ok(currentNoteContextMessage);
+  assert.match(currentNoteContextMessage.content, /"path":"Current.md"/);
+  assert.match(currentNoteContextMessage.content, /"content":"Initial note"/);
   assert.deepEqual(statuses.slice(0, 3), [
     "Reading current note...",
     "Planning...",
-    `Agent step 1 of max ${MAX_AGENT_STEPS}...`,
+    "Agent step 1 of max 2...",
   ]);
   assert.deepEqual(deltas, ["Final answer"]);
   assert.ok(statuses.includes("Done."));
@@ -256,7 +263,7 @@ test("assistant JSON tool blocks are recovered and executed as tool calls", asyn
   });
 
   await runAgentMission({
-    prompt: "Browse the vault folders and locate the three folders with personal details.",
+    prompt: "Inspect the vault structure with tools.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -278,19 +285,6 @@ test("assistant JSON tool blocks are recovered and executed as tool calls", asyn
       message.includes("Recovered text tool request: list_current_folder"),
     ),
   );
-  assert.deepEqual(chatRequests[1].messages.at(-2), {
-    role: "assistant",
-    content: "",
-    toolCalls: [
-      {
-        name: "list_current_folder",
-        arguments: {},
-        index: 0,
-        raw: { name: "list_current_folder" },
-      },
-    ],
-  });
-  assert.match(chatRequests[1].messages.at(-1)?.content ?? "", /list_current_folder/);
 });
 
 test("assistant XML-ish tool blocks are recovered and executed as tool calls", async () => {
@@ -361,7 +355,7 @@ test("recovered list_folder slash path targets the vault root", async () => {
   });
 
   await runAgentMission({
-    prompt: "Browse the vault folders and locate the three folders with personal details.",
+    prompt: "Inspect the vault structure with tools.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -435,7 +429,7 @@ test("vague keep-going prompts inherit prior vault tool exploration intent", asy
   assert.deepEqual(finalDeltas, ["Vault folder exploration can continue."]);
 });
 
-test("static essay prompts stream as chat answers without note writeback", async () => {
+test("static essay prompts stream to chat and append to the current note", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
@@ -485,15 +479,19 @@ test("static essay prompts stream as chat answers without note writeback", async
   assert.deepEqual(planningDeltas, []);
   assert.deepEqual(finalDeltas, ["A 300 word Mexican-American War essay."]);
   assert.deepEqual(assistantDeltas, ["A 300 word Mexican-American War essay."]);
-  assert.equal(vault.content.get("Current.md"), "Existing note");
-  assert.ok(!statuses.includes("Streaming writeback to note..."));
-  assert.ok(statuses.includes("Drafting final answer..."));
+  assert.equal(
+    vault.content.get("Current.md"),
+    "Existing note\nA 300 word Mexican-American War essay.",
+  );
+  assert.ok(statuses.includes("Using direct note writeback; no tool loop needed..."));
+  assert.ok(statuses.includes("Streaming writeback to note..."));
 });
 
-test("chat-only word-target generation performs one internal correction pass", async () => {
+test("word-target generation writeback performs one internal correction pass", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const finalDeltas: string[] = [];
+  const finalReplacements: string[] = [];
   const statuses: string[] = [];
   const correctedDraft = "one two three four five six seven eight nine ten";
   const vault = createRunnerVaultContext({
@@ -520,13 +518,15 @@ test("chat-only word-target generation performs one internal correction pass", a
     enableStreaming: true,
     events: {
       onFinalDelta: (delta) => finalDeltas.push(delta),
+      onFinalReplace: (content) => finalReplacements.push(content),
       onStatus: (message) => statuses.push(message),
     },
   });
 
   assert.equal(streamRequests.length, 1);
   assert.equal(chatRequests.length, 1);
-  assert.deepEqual(finalDeltas, [correctedDraft]);
+  assert.deepEqual(finalDeltas, ["Obsidian draft."]);
+  assert.deepEqual(finalReplacements, [correctedDraft]);
   assert.ok(
     statuses.includes(
       "Word count 2/10 outside target; requesting one correction pass...",
@@ -535,7 +535,7 @@ test("chat-only word-target generation performs one internal correction pass", a
   assert.ok(
     statuses.includes("Word count: 10/10 (within target; correction=used)."),
   );
-  assert.equal(vault.content.get("Current.md"), "Existing note");
+  assert.equal(vault.content.get("Current.md"), `Existing note\n${correctedDraft}`);
 });
 
 test("prompt-on-page generation streams the extracted answer into the current note", async () => {
@@ -630,7 +630,7 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
   const executedCalls: ModelToolCall[] = [];
   const statuses: string[] = [];
   const notePrompt =
-    "Write a concise essay about The Grapes of Wrath with cited source URLs.";
+    "Use web search to write a concise essay about The Grapes of Wrath with cited source URLs.";
   const vault = createRunnerVaultContext({
     prompt: "Read the prompt on the page",
     content: notePrompt,
@@ -702,6 +702,407 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
     vault.content.get("Current.md"),
     `${notePrompt}\nSteinbeck's novel follows the Joad family under Depression-era pressure. Source: https://example.com/grapes-of-wrath`,
   );
+});
+
+test("notepage prompt wrapper routes to prefetched vault writeback", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const notePrompt = [
+    "You job is to traverse the 3 untitled folders. They are named Untitled, Untitled 1 and Untitled 2.",
+    "",
+    "I need you to tell me about the things discovered in those folders. Specifically, I want you to stream them onto this page.",
+  ].join("\n");
+  const streamedFinding = "quasarflux";
+  const vault = createRunnerVaultContext({
+    prompt: "Refer  to the notes in the notepage as the prompt",
+    content: notePrompt,
+  });
+  vault.content.set("Untitled/alpha.md", "quasarflux discovery");
+  vault.content.set("Untitled 1/beta.md", "beta discovery");
+  vault.content.set("Untitled 2/gamma.md", "gamma discovery");
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas([streamedFinding]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Refer  to the notes in the notepage as the prompt",
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onRunConfig: (event) => configs.push(event),
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file", "inspect_vault_context"],
+  );
+  assert.deepEqual(executedCalls[1].arguments, {
+    scope: "all_vault",
+    targetFolders: ["Untitled", "Untitled 1", "Untitled 2"],
+  });
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.equal(streamRequests[0].tools, undefined);
+  assert.equal(streamRequests[0].think, undefined);
+  assert.equal(configs.at(-1)?.route, "prefetched_vault_writeback");
+  assert.equal(configs.at(-1)?.writebackMode, "streaming_current_note");
+  assert.ok(
+    streamRequests[0].messages.some((message) =>
+      /Prefetched vault context/.test(message.content),
+    ),
+  );
+  assert.equal(vault.content.get("Current.md"), `${notePrompt}\n${streamedFinding}`);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].operation, "append");
+  assert.ok(statuses.includes("Inspecting named vault folders locally..."));
+  assert.ok(!statuses.some((status) => /Vault traversal required/i.test(status)));
+  assert.ok(
+    !statuses.some((status) =>
+      /could not get the model to request vault tools/i.test(status),
+    ),
+  );
+});
+
+test("prompt-on-page routing ignores prior generated findings as instructions", async () => {
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const notePrompt = [
+    "You job is to traverse the 3 untitled folders. They are named Untitled, Untitled 1 and Untitled 2.",
+    "",
+    "I need you to tell me about the things discovered in those folders. Specifically, I want you to stream them onto this page.",
+    "## Findings",
+    "",
+    "- Old generated finding that should remain context only.",
+    "",
+    "## A Tale of Toyota, Lion, and Blue",
+    "",
+    "Old generated story that should not become the new mission.",
+  ].join("\n");
+  const vault = createRunnerVaultContext({
+    prompt: "Refer to the notes in the notepage as the prompt",
+    content: notePrompt,
+  });
+  vault.content.set("Untitled/alpha.md", "alpha discovery");
+  vault.content.set("Untitled 1/beta.md", "beta discovery");
+  vault.content.set("Untitled 2/gamma.md", "gamma discovery");
+  const client = createClient({
+    chatRequests: [],
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["Fresh folder findings."]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Refer to the notes in the notepage as the prompt",
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file", "inspect_vault_context"],
+  );
+  assert.deepEqual(executedCalls[1].arguments, {
+    scope: "all_vault",
+    targetFolders: ["Untitled", "Untitled 1", "Untitled 2"],
+  });
+  const userMission =
+    [...streamRequests[0].messages]
+      .reverse()
+      .find((message) => message.role === "user")?.content ?? "";
+  assert.match(userMission, /traverse the 3 untitled folders/i);
+  assert.doesNotMatch(userMission, /Old generated finding/);
+  assert.doesNotMatch(userMission, /A Tale of Toyota/);
+  assert.equal(vault.content.get("Current.md"), `${notePrompt}\nFresh folder findings.`);
+});
+
+test("below Findings section routes to section append with backup", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const vault = createRunnerVaultContext({
+    prompt:
+      "Great, below the Findings section, can you write me a short story incorporating my favorite things?",
+    content: [
+      "# Research Note",
+      "",
+      "## Findings",
+      "",
+      "- Favorite car brand: Toyota.",
+      "- Favorite animal: Lion.",
+      "- Favorite color: Blue.",
+      "",
+      "## Next",
+      "",
+      "Keep this section.",
+    ].join("\n"),
+    now: new Date(321),
+  });
+  const story = "A blue Toyota carried a lion toward a quiet sunrise.";
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("append_to_current_section", {
+          heading: "Findings",
+          level: 2,
+          content: story,
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Great, below the Findings section, can you write me a short story incorporating my favorite things?",
+    conversationHistory: [
+      {
+        role: "assistant",
+        content:
+          "Favorite car brand: Toyota. Favorite animal: Lion. Favorite color: Blue.",
+      },
+    ],
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file", "append_to_current_section"],
+  );
+  const firstToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("append_to_current_section"));
+  assert.ok(!firstToolNames.includes("append_to_current_file"));
+  assert.equal(
+    vault.content.get("Current.md"),
+    [
+      "# Research Note",
+      "",
+      "## Findings",
+      "",
+      "- Favorite car brand: Toyota.",
+      "- Favorite animal: Lion.",
+      "- Favorite color: Blue.",
+      "",
+      story,
+      "",
+      "## Next",
+      "",
+      "Keep this section.",
+    ].join("\n"),
+  );
+  assert.equal(
+    vault.content.get(".agent-backups/321-Current.md"),
+    [
+      "# Research Note",
+      "",
+      "## Findings",
+      "",
+      "- Favorite car brand: Toyota.",
+      "- Favorite animal: Lion.",
+      "- Favorite color: Blue.",
+      "",
+      "## Next",
+      "",
+      "Keep this section.",
+    ].join("\n"),
+  );
+  assert.equal(receipts[0].toolName, "append_to_current_section");
+  assert.equal(receipts[0].backupPath, ".agent-backups/321-Current.md");
+});
+
+test("context follow-up favorite things passes relevance gate", async () => {
+  const streamRequests: ModelChatRequest[] = [];
+  const finalDeltas: string[] = [];
+  const statuses: string[] = [];
+  const client = createClient({
+    chatRequests: [],
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "A blue Toyota waited as a lion crossed the quiet road.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Write a short story incorporating my favorite things.",
+    conversationHistory: [
+      {
+        role: "assistant",
+        content:
+          "Favorite car brand: Toyota. Favorite animal: Lion. Favorite color: Blue.",
+      },
+    ],
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(streamRequests.length, 1);
+  assert.equal(
+    finalDeltas.join(""),
+    "A blue Toyota waited as a lion crossed the quiet road.",
+  );
+  assert.ok(
+    !statuses.includes(
+      "Stopped model output because it drifted off topic from the current mission.",
+    ),
+  );
+});
+
+test("delete all notes on the page routes to replace-current-page with backup", async () => {
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const prompt =
+    "I want you to delete all the notes on the page and then write a 300 word essay on the renaissance.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Old Notes\n\nOld Renaissance notes to remove.",
+    now: new Date(987),
+  });
+  const backupVault = vault.context.app.vault as never as {
+    getFolderByPath: (path: string) => unknown;
+    createFolder: (path: string) => Promise<void>;
+  };
+  const originalGetFolderByPath = backupVault.getFolderByPath;
+  backupVault.getFolderByPath = (path: string) =>
+    path === BACKUP_FOLDER ? null : originalGetFolderByPath(path);
+  backupVault.createFolder = async (path: string) => {
+    vault.operations.push(`createFolder:${path}`);
+    if (path === BACKUP_FOLDER) {
+      throw new Error("Folder already exists.");
+    }
+  };
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () => responseWithContent("Ready to replace the page."),
+      () =>
+        responseWithContent(
+          "# The Renaissance\n\nThe Renaissance reshaped European art, science, and humanist thought.",
+        ),
+    ],
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# The Renaissance\n\n",
+          "The Renaissance reshaped European art, science, and humanist thought.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file"],
+  );
+  assert.equal(streamRequests.length, 1);
+  assert.equal(
+    vault.content.get("Current.md"),
+    "# The Renaissance\n\nThe Renaissance reshaped European art, science, and humanist thought.",
+  );
+  assert.equal(
+    vault.content.get(".agent-backups/987-Current.md"),
+    "# Old Notes\n\nOld Renaissance notes to remove.",
+  );
+  assert.ok(vault.operations.includes(`createFolder:${BACKUP_FOLDER}`));
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].operation, "replace");
+  assert.equal(receipts[0].toolName, "replace_current_file");
+});
+
+test("research memory save uses durable memory tool with streaming enabled", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const prompt =
+    "Save this to research memory for E2E memory topic: E2E_MEMORY_MARKER.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-04T12:00:00.000Z"),
+  });
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      (request) => {
+        const toolNames =
+          request.tools?.map((tool) => tool.function.name).filter(Boolean) ?? [];
+        assert.ok(toolNames.includes("append_research_memory"));
+        assert.ok(!toolNames.includes("append_to_current_file"));
+        return responseWithToolCall("append_research_memory", {
+          topic: "E2E memory topic",
+          text: "E2E_MEMORY_MARKER",
+          keywords: ["e2e", "memory"],
+        });
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.equal(streamRequests.length, 0);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["append_research_memory"],
+  );
+  assert.match(
+    vault.content.get("Agent Memory/Research/e2e-memory-topic.md") ?? "",
+    /E2E_MEMORY_MARKER/,
+  );
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].toolName, "append_research_memory");
 });
 
 test("prompt-on-page word target counts generated output only before writing", async () => {
@@ -840,7 +1241,10 @@ test("vault traversal prompts expose folder and path inspection tools", async ()
 
   const client = createClient({
     chatRequests,
-    chatResponders: [() => responseWithContent("Vault placement answer")],
+    chatResponders: [
+      () => responseWithToolCall("list_current_folder", {}),
+      () => responseWithContent("Vault placement answer"),
+    ],
   });
 
   await runAgentMission({
@@ -856,6 +1260,10 @@ test("vault traversal prompts expose folder and path inspection tools", async ()
   assert.ok(toolNames.includes("list_folder"));
   assert.ok(toolNames.includes("get_path_info"));
   assert.ok(toolNames.includes("list_markdown_files"));
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file", "list_current_folder"],
+  );
 });
 
 test("path CRUD prompts expose only the relevant mutation tools", async () => {
@@ -893,6 +1301,76 @@ test("path CRUD prompts expose only the relevant mutation tools", async () => {
       prompt: "Delete the folder Projects/Archive.",
       expected: ["delete_path"],
       absent: ["delete_current_file", "replace_file"],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const chatRequests: ModelChatRequest[] = [];
+    const client = createClient({
+      chatRequests,
+      chatResponders: Array.from(
+        { length: MAX_AGENT_STEPS },
+        () => () => responseWithContent("Done"),
+      ),
+    });
+
+    await runAgentMission({
+      prompt: scenario.prompt,
+      modelClient: client,
+      toolRegistry: createRegistry([]),
+      toolContext: {} as ToolExecutionContext,
+      enableStreaming: false,
+    });
+
+    const toolNames =
+      chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+    for (const toolName of scenario.expected) {
+      assert.ok(toolNames.includes(toolName), scenario.prompt);
+    }
+
+    for (const toolName of scenario.absent) {
+      assert.ok(!toolNames.includes(toolName), scenario.prompt);
+    }
+  }
+});
+
+test("template prompts expose template tools without generic file creation", async () => {
+  const scenarios: Array<{
+    prompt: string;
+    expected: string[];
+    absent: string[];
+  }> = [
+    {
+      prompt: "List my saved templates.",
+      expected: ["list_templates", "read_template"],
+      absent: ["create_template", "fill_template", "create_file"],
+    },
+    {
+      prompt: "Create a reusable meeting notes template.",
+      expected: ["create_template"],
+      absent: ["seed_default_templates", "fill_template", "create_file"],
+    },
+    {
+      prompt: "Seed the default starter templates.",
+      expected: ["seed_default_templates"],
+      absent: ["create_template", "fill_template", "create_file"],
+    },
+    {
+      prompt:
+        "Use the meeting template to create a note at Meetings/Product Sync.md.",
+      expected: ["list_templates", "read_template", "fill_template"],
+      absent: ["seed_default_templates", "create_file", "append_to_current_file"],
+    },
+    {
+      prompt: "Write a 500 word essay about coral reefs.",
+      expected: [],
+      absent: [
+        "list_templates",
+        "read_template",
+        "seed_default_templates",
+        "create_template",
+        "fill_template",
+      ],
     },
   ];
 
@@ -966,18 +1444,177 @@ test("path write prompts require the matching path-based write tool", async () =
   assert.ok(statuses.includes("Created file Projects/Brief.md."));
 });
 
-test("explicit web and citation prompts expose web_search and web_fetch", async () => {
+test("template fill prompts require fill_template and emit a create receipt", async () => {
   const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const receipts: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
 
   const client = createClient({
     chatRequests,
-    chatResponders: [() => responseWithContent("Research answer")],
+    chatResponders: [
+      () => responseWithContent("I filled it in chat only."),
+      () =>
+        responseWithToolCall("fill_template", {
+          templatePath: "Meeting.md",
+          values: { title: "Product Sync" },
+          targetPath: "Meetings/Product Sync.md",
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Use the meeting template to create a note at Meetings/Product Sync.md.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onReceipt: (receipt) => receipts.push(receipt.message),
+    },
+  });
+
+  assert.equal(chatRequests.length, 2);
+  assert.match(
+    chatRequests[1].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: fill_template/,
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["fill_template"],
+  );
+  assert.ok(statuses.includes("Created filled template note Meetings/Product Sync.md."));
+  assert.deepEqual(receipts, ["create Meetings/Product Sync.md"]);
+});
+
+test("default template seed prompts require seed_default_templates and emit receipts", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const receipts: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("I created the templates in chat only."),
+      () =>
+        responseWithToolCall("seed_default_templates", {
+          createFolders: true,
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Seed the default starter templates in my vault.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onReceipt: (receipt) => receipts.push(receipt.message),
+    },
+  });
+
+  assert.equal(chatRequests.length, 2);
+  assert.match(
+    chatRequests[1].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: seed_default_templates/,
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["seed_default_templates"],
+  );
+  assert.ok(statuses.includes("Created 6 default templates."));
+  assert.deepEqual(receipts, ["create Templates; affected: 6"]);
+});
+
+test("design prompts expose and require native artifact write tools", async () => {
+  const scenarios: Array<{
+    prompt: string;
+    requiredTool: string;
+    absentTool: string;
+    expectedStatus: string;
+    expectedReceipt: string;
+  }> = [
+    {
+      prompt: "Draw an Obsidian canvas product flow diagram.",
+      requiredTool: "create_design_canvas",
+      absentTool: "create_svg_design",
+      expectedStatus: "Created canvas Designs/Product Flow.canvas with 2 nodes and 1 edges.",
+      expectedReceipt: "create Designs/Product Flow.canvas",
+    },
+    {
+      prompt: "Create an SVG wireframe mockup for the settings screen.",
+      requiredTool: "create_svg_design",
+      absentTool: "create_design_canvas",
+      expectedStatus: "Created SVG Designs/settings-wireframe.svg with 3 shapes.",
+      expectedReceipt: "create Designs/settings-wireframe.svg",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const chatRequests: ModelChatRequest[] = [];
+    const statuses: string[] = [];
+    const receipts: string[] = [];
+    const executedCalls: ModelToolCall[] = [];
+
+    const client = createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithContent("I described the design in chat only."),
+        () => responseWithToolCall(scenario.requiredTool, {}),
+      ],
+    });
+
+    await runAgentMission({
+      prompt: scenario.prompt,
+      modelClient: client,
+      toolRegistry: createRegistry(executedCalls),
+      toolContext: {} as ToolExecutionContext,
+      enableStreaming: false,
+      events: {
+        onStatus: (message) => statuses.push(message),
+        onReceipt: (receipt) => receipts.push(receipt.message),
+      },
+    });
+
+    const firstToolNames =
+      chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+    assert.ok(firstToolNames.includes(scenario.requiredTool), scenario.prompt);
+    assert.ok(!firstToolNames.includes(scenario.absentTool), scenario.prompt);
+    assert.match(
+      chatRequests[1].messages.at(-1)?.content ?? "",
+      new RegExp(`Request one of these allowed write tools now: ${scenario.requiredTool}`),
+    );
+    assert.deepEqual(
+      executedCalls.map((call) => call.name),
+      [scenario.requiredTool],
+    );
+    assert.ok(statuses.includes(scenario.expectedStatus), scenario.prompt);
+    assert.deepEqual(receipts, [scenario.expectedReceipt]);
+  }
+});
+
+test("explicit web and citation prompts expose web_search and web_fetch", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "Vietnam War scholarship" }),
+      () => responseWithToolCall("web_fetch", { url: "https://example.com/vietnam" }),
+      () => responseWithContent("Research answer with https://example.com/vietnam"),
+    ],
   });
 
   await runAgentMission({
     prompt: "Search the web and give me source URLs on recent Vietnam War scholarship.",
     modelClient: client,
-    toolRegistry: createRegistry([]),
+    toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
     enableStreaming: false,
   });
@@ -985,6 +1622,10 @@ test("explicit web and citation prompts expose web_search and web_fetch", async 
   const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
   assert.ok(toolNames.includes("web_search"));
   assert.ok(toolNames.includes("web_fetch"));
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
 });
 
 test("current-note summary prompts expose read and append tools", async () => {
@@ -1039,6 +1680,105 @@ test("append-only prompts expose append_to_current_file without reading target-o
     chatRequests[0].tools?.map((tool) => tool.function.name),
     ["append_to_current_file"],
   );
+});
+
+test("page and document write targets expose append_to_current_file", async () => {
+  const scenarios = [
+    "Can you write this short update onto the page?",
+    "Copy this summary into the document.",
+  ];
+
+  for (const prompt of scenarios) {
+    const chatRequests: ModelChatRequest[] = [];
+    const executedCalls: ModelToolCall[] = [];
+    const client = createClient({
+      chatRequests,
+      chatResponders: [
+        () =>
+          responseWithToolCall("append_to_current_file", {
+            text: `Content for ${prompt}`,
+          }),
+      ],
+    });
+
+    await runAgentMission({
+      prompt,
+      modelClient: client,
+      toolRegistry: createRegistry(executedCalls),
+      toolContext: {} as ToolExecutionContext,
+      enableStreaming: false,
+    });
+
+    const toolNames =
+      chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+    assert.ok(toolNames.includes("append_to_current_file"), prompt);
+    assert.deepEqual(
+      executedCalls.map((call) => call.name),
+      ["append_to_current_file"],
+    );
+  }
+});
+
+test("prior assistant essay follow-up requires current-note append", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const deltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const priorEssay =
+    "The Mexican-American War reshaped borders and politics in North America.";
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithContent(
+          "You can copy the text from my previous response and paste it directly.",
+        ),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: priorEssay,
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Can you write this essay onto the page?",
+    conversationHistory: [
+      {
+        role: "assistant",
+        content: priorEssay,
+      },
+    ],
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => deltas.push(delta),
+    },
+  });
+
+  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests[0].tools?.some((tool) => tool.function.name === "append_to_current_file"), true);
+  assert.ok(
+    chatRequests[0].messages.some((message) =>
+      /Append the most recent assistant response/.test(message.content),
+    ),
+  );
+  assert.ok(
+    chatRequests[0].messages.some((message) => message.content.includes(priorEssay)),
+  );
+  assert.match(
+    chatRequests[1].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: append_to_current_file/,
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["append_to_current_file"],
+  );
+  assert.deepEqual(deltas, ["Done. append Current.md."]);
+  assert.ok(statuses.includes("Write required; asking model to use a write tool..."));
 });
 
 test("vault placement prompts expose markdown file listing", async () => {
@@ -1113,6 +1853,142 @@ test("what do you know about me prompts expose read-only vault traversal tools",
   assert.equal(chatRequests.length, 1);
   assert.deepEqual(deltas, ["I found notes about you in the vault."]);
   assert.ok(!statuses.includes("Write required; asking model to use a write tool..."));
+});
+
+test("other-folder content prompts prefetch vault context before final answer", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const deltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithContent(
+          "People/Untitled.md says Alex likes local AI tools. Projects/Untitled.md says Alex is building an Obsidian research agent. Archive/Untitled.md says Alex prefers traceable agent actions.",
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "What do the other notes in the other folders say?",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => deltas.push(delta),
+    },
+  });
+
+  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests[0].tools, undefined);
+  assert.equal(chatRequests[0].think, undefined);
+  assert.match(
+    chatRequests[0].messages.map((message) => message.content).join("\n"),
+    /Prefetched vault context/i,
+  );
+  assert.ok(
+    statuses.includes(
+      "Inspecting vault context locally...",
+    ),
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["inspect_vault_context"],
+  );
+  assert.match(deltas.join(""), /People\/Untitled\.md/);
+  assert.ok(!deltas.join("").includes("cannot access"));
+});
+
+test("gather-details folder prompts are classified as vault context answers", async () => {
+  const configs: AgentRunConfigEvent[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithContent(
+          "People/Untitled.md says Alex likes local AI tools.",
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "On this note, I want you to gather details from the other folders and report back to me what they say.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(configs[0].missionMode, "vault_context_answer");
+  assert.equal(configs[0].contextScope, "vault");
+  assert.equal(configs[0].vaultContext, true);
+  assert.equal(configs[0].currentNoteContext, false);
+  assert.equal(configs[0].route, "prefetched_vault_answer");
+  assert.equal(configs[0].slowPathReason, "needs_vault_context");
+  assert.equal(
+    chatRequests[0].tools,
+    undefined,
+  );
+  assert.equal(chatRequests[0].think, undefined);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["inspect_vault_context"],
+  );
+});
+
+test("vault traversal fallback stops after one non-tool correction", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const deltas: string[] = [];
+  const completions: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("I cannot access the vault."),
+      () => responseWithContent("I still cannot access the vault."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "What do the other notes in the other folders say?",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls, {
+      inspectVaultError: "mock prefetch failure",
+    }),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => deltas.push(delta),
+      onRunComplete: (event) => completions.push(event.stopReason),
+    },
+  });
+
+  assert.equal(chatRequests.length, 2);
+  assert.ok(
+    statuses.includes(
+      "Vault traversal required; asking model to inspect folders and notes before answering...",
+    ),
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["inspect_vault_context"],
+  );
+  assert.match(deltas.join(""), /could not get the model to request vault tools/i);
+  assert.deepEqual(completions, ["error"]);
 });
 
 test("graph connection questions expose read-only graph tools", async () => {
@@ -1238,7 +2114,10 @@ test("vault context search prompts expose search and batch read tools", async ()
 
   const client = createClient({
     chatRequests,
-    chatResponders: [() => responseWithContent("MCP appears in your notes.")],
+    chatResponders: [
+      () => responseWithToolCall("search_markdown_files", { query: "MCP" }),
+      () => responseWithContent("MCP appears in your notes."),
+    ],
   });
 
   await runAgentMission({
@@ -1429,7 +2308,9 @@ test("run config reports vault and mixed context scopes", async () => {
   const client = createClient({
     chatRequests,
     chatResponders: [
+      () => responseWithToolCall("list_markdown_files", {}),
       () => responseWithContent("Vault answer"),
+      () => responseWithToolCall("list_markdown_files", {}),
       () => responseWithContent("Mixed answer"),
     ],
   });
@@ -1464,6 +2345,37 @@ test("run config reports vault and mixed context scopes", async () => {
   assert.equal(configs[1].contextScope, "vault_and_current_note");
   assert.equal(configs[1].currentNoteContext, true);
   assert.equal(configs[1].vaultContext, true);
+});
+
+test("run config reports browse-only vault routes as vault context", async () => {
+  const configs: AgentRunConfigEvent[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("list_current_folder", {}),
+      () => responseWithContent("Vault placement answer"),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Browse the vault folders and suggest where this note belongs.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(configs[0].missionMode, "vault_context_answer");
+  assert.equal(configs[0].contextScope, "vault_and_current_note");
+  assert.equal(configs[0].vaultContext, true);
+  assert.equal(configs[0].currentNoteContext, true);
+  assert.equal(configs[0].route, "grounded_workflow");
+  assert.equal(configs[0].slowPathReason, "needs_vault_context");
 });
 
 test("web append prompts expose web and current-note write tools without path CRUD", async () => {
@@ -1525,7 +2437,7 @@ test("tool-planning preambles stay out of streamed final output", async () => {
   });
 
   await runAgentMission({
-    prompt: "Search the web for MCP servers and give me source URLs.",
+    prompt: "Search the web for MCP servers and summarize what you find.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -1545,7 +2457,9 @@ test("tool-planning preambles stay out of streamed final output", async () => {
     executedCalls.map((call) => call.name),
     ["web_search"],
   );
-  assert.deepEqual(planningDeltas, []);
+  assert.equal(planningDeltas.length, 2);
+  assert.ok(planningDeltas.every((delta) => delta.includes("route=grounded_workflow")));
+  assert.ok(planningDeltas.every((delta) => delta.includes("tools=web_search, web_fetch")));
   assert.deepEqual(finalDeltas, ["Ready to answer"]);
   assert.deepEqual(assistantDeltas, ["Ready to answer"]);
   assert.ok(!assistantDeltas.join("").includes("Hidden tool preamble"));
@@ -1580,7 +2494,7 @@ test("streamed final answers strip special tokens split across chunks", async ()
   });
 
   await runAgentMission({
-    prompt: "Search the web for MCP servers and give me source URLs.",
+    prompt: "Search the web for MCP servers and summarize what you find.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -1622,7 +2536,7 @@ test("tool-result final prose skips redundant streaming synthesis", async () => 
   });
 
   await runAgentMission({
-    prompt: "Search the web for MCP servers and give me source URLs.",
+    prompt: "Search the web for MCP servers and summarize what you find.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -1647,6 +2561,7 @@ test("empty direct model content falls back to streamed final answer", async () 
     chatRequests,
     streamRequests,
     chatResponders: [
+      () => responseWithToolCall("web_search", { query: "The Grapes of Wrath" }),
       () => responseWithContent("", "thinking without final prose"),
     ],
     streamResponders: [
@@ -1659,7 +2574,7 @@ test("empty direct model content falls back to streamed final answer", async () 
   });
 
   await runAgentMission({
-    prompt: "Write a cited essay about The Grapes of Wrath.",
+    prompt: "Search the web for The Grapes of Wrath and summarize what you find.",
     modelClient: client,
     toolRegistry: createRegistry([]),
     toolContext: {} as ToolExecutionContext,
@@ -1670,12 +2585,12 @@ test("empty direct model content falls back to streamed final answer", async () 
     },
   });
 
-  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests.length, 2);
   assert.equal(streamRequests.length, 1);
   assert.equal(streamRequests[0].messages.at(-1)?.role, "user");
   assert.match(
     streamRequests[0].messages.at(-1)?.content ?? "",
-    /Current user mission: "Write a cited essay about The Grapes of Wrath\."/,
+    /Current user mission: "Search the web for The Grapes of Wrath and summarize what you find\."/,
   );
   assert.match(
     streamRequests[0].messages.at(-1)?.content ?? "",
@@ -1708,15 +2623,17 @@ test("off-topic streamed final answer is stopped before display", async () => {
     chatRequests,
     streamRequests,
     chatResponders: [
+      () => responseWithToolCall("web_search", { query: "The Grapes of Wrath" }),
       () => responseWithContent("", "thinking without final prose"),
     ],
     streamResponders: [
       () =>
         responseWithContentDeltas([
-          "# What is the percentage increase/decrease from 100 to 99.999999999999?\n\n",
-          "The answer: the change from 100 to 99.999999999999 is a tiny decrease. ",
-          "Formula: ((99.999999999999 - 100) / 100) x 100. ",
-          "This calculator result has nothing to do with the requested literary essay.",
+          "# Compound Interest Worksheet\n\n",
+          "A quarterly compounding schedule starts with a principal balance, applies a fixed annual rate, ",
+          "adds each period's accrued amount to the balance, and repeats the arithmetic for the next quarter. ",
+          "The method is useful for amortization tables, savings projections, and classroom finance examples. ",
+          "It does not require narrative interpretation, historical context, literary analysis, or outside evidence.",
         ]),
     ],
   });
@@ -1724,7 +2641,7 @@ test("off-topic streamed final answer is stopped before display", async () => {
   await assert.rejects(
     () =>
       runAgentMission({
-        prompt: "Write a cited essay about The Grapes of Wrath.",
+        prompt: "Search the web for The Grapes of Wrath and summarize what you find.",
         modelClient: client,
         toolRegistry: createRegistry([]),
         toolContext: {} as ToolExecutionContext,
@@ -1738,7 +2655,7 @@ test("off-topic streamed final answer is stopped before display", async () => {
     /drifted off topic/,
   );
 
-  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests.length, 2);
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(finalDeltas, []);
   assert.deepEqual(assistantDeltas, []);
@@ -1768,7 +2685,7 @@ test("empty tool-result final content falls back to streamed synthesis", async (
   });
 
   await runAgentMission({
-    prompt: "Search the web for MCP servers and give me source URLs.",
+    prompt: "Search the web for MCP servers and summarize what you find.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -1803,7 +2720,7 @@ test("metrics are emitted for model, tool, stream fallback, and run timing", asy
   });
 
   await runAgentMission({
-    prompt: "Search the web for MCP servers and give me source URLs.",
+    prompt: "Search the web for MCP servers and summarize what you find.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -1942,6 +2859,46 @@ test("unavailable tool calls are rejected before execution", async () => {
   );
   assert.ok(statuses.includes("Rejected unavailable tool: web_search"));
   assert.deepEqual(deltas, ["Final direct answer"]);
+});
+
+test("duplicate read-only tool calls hit the run-local cache", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const metrics: AgentRunMetricEvent[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("search_markdown_files", { query: "local AI" }),
+      () => responseWithToolCall("search_markdown_files", { query: "local AI" }),
+      () => responseWithContent("Found local AI notes."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Search my notes for local AI tools.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onMetric: (event) => metrics.push(event),
+    },
+  });
+
+  assert.equal(chatRequests.length, 3);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["search_markdown_files"],
+  );
+  assert.ok(
+    metrics.some(
+      (event) =>
+        event.kind === "tool" &&
+        event.name === "search_markdown_files" &&
+        event.cached === true,
+    ),
+  );
 });
 
 test("append prompts require a write tool and do not implicitly append", async () => {
@@ -2260,7 +3217,7 @@ test("delete prompts expose delete and suppress other mutation tools", async () 
   );
 });
 
-test("budget stop makes at most six model calls and does not synthesize", async () => {
+test("budget stop uses adaptive web budget and does not synthesize", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
@@ -2292,15 +3249,63 @@ test("budget stop makes at most six model calls and does not synthesize", async 
     },
   });
 
-  assert.equal(chatRequests.length, MAX_AGENT_STEPS);
+  assert.ok(chatRequests.length < MAX_AGENT_STEPS);
+  assert.equal(chatRequests.length, 6);
   assert.equal(streamRequests.length, 0);
   assert.equal(
     executedCalls.filter((call) => call.name === "web_search").length,
-    MAX_AGENT_STEPS,
+    5,
   );
-  assert.equal(toolStarts.length, MAX_AGENT_STEPS);
+  assert.equal(toolStarts.length, 5);
   assert.ok(statuses.includes("Stopped at safety limit. Review partial results."));
   assert.deepEqual(deltas, []);
+});
+
+test("configured max agent steps caps grounded research loops", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const configuredMax = 3;
+  const chatResponders: ChatResponder[] = Array.from(
+    { length: MAX_AGENT_STEPS },
+    (_, index) => () =>
+      responseWithToolCall("web_search", { query: `deep-${index + 1}` }),
+  );
+
+  const client = createClient({
+    chatRequests,
+    chatResponders,
+  });
+
+  await runAgentMission({
+    prompt: "Do deep research on Obsidian plugins.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {
+      settings: createRunnerSettings({
+        model: "gpt-oss:120b",
+        maxAgentSteps: configuredMax,
+      }),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(configs[0].route, "grounded_workflow");
+  assert.equal(configs[0].maxSteps, configuredMax);
+  assert.equal(configs[0].maxStepsForRun, configuredMax);
+  assert.equal(configs[0].resolvedThink, "medium");
+  assert.equal(chatRequests.length, configuredMax);
+  assert.equal(chatRequests[0].think, "medium");
+  assert.equal(
+    executedCalls.filter((call) => call.name === "web_search").length,
+    configuredMax - 1,
+  );
+  assert.ok(statuses.includes("Stopped at safety limit. Review partial results."));
 });
 
 test("aborted runs stop before the next model loop step", async () => {
@@ -2343,12 +3348,12 @@ test("aborted runs stop before the next model loop step", async () => {
   assert.ok(statuses.includes("Stopped by user."));
 });
 
-test("write-required chat-only answers stop at budget without emitting content", async () => {
+test("write-required chat-only answers stop at route budget without emitting content", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const deltas: string[] = [];
   const chatResponders: ChatResponder[] = Array.from(
-    { length: MAX_AGENT_STEPS },
+    { length: 3 },
     () => () => responseWithContent("chat-only answer"),
   );
 
@@ -2369,7 +3374,7 @@ test("write-required chat-only answers stop at budget without emitting content",
     },
   });
 
-  assert.equal(chatRequests.length, MAX_AGENT_STEPS);
+  assert.equal(chatRequests.length, 3);
   assert.ok(statuses.includes("Stopped at safety limit. Review partial results."));
   assert.deepEqual(deltas, []);
 });
@@ -2384,10 +3389,7 @@ test("web research can search then fetch a source before answering", async () =>
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
       () => responseWithToolCall("web_fetch", { url: "https://example.com/mcp" }),
-      () =>
-        responseWithToolCall("append_to_current_file", {
-          text: "Cited answer with https://example.com/mcp",
-        }),
+      () => responseWithContent("Cited answer with https://example.com/mcp"),
     ],
   });
 
@@ -2408,15 +3410,140 @@ test("web research can search then fetch a source before answering", async () =>
   assert.ok(firstStepToolNames.includes("web_fetch"));
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search", "web_fetch", "append_to_current_file"],
+    ["web_search", "web_fetch"],
   );
-  assert.deepEqual(deltas, ["Done. append Current.md."]);
+  assert.deepEqual(deltas, ["Cited answer with https://example.com/mcp"]);
+});
+
+test("low-cap sourced generated essay finalizes with note writeback", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const finalDeltas: string[] = [];
+  const vault = createRunnerVaultContext({
+    prompt:
+      "Write me a 1000 word essay on Grapes of Wrath. Use text level quotation and citations.",
+    content: "Essay prompt",
+  });
+  vault.context.settings = createRunnerSettings({
+    maxAgentSteps: 5,
+    streamWritebackMode: "all_current_note_content_writes",
+  });
+  const essayDraft = [
+    "The Grapes of Wrath argues for solidarity with cited textual evidence.",
+    ...Array.from({ length: 920 }, (_, index) => `solidarity${index}`),
+  ].join(" ");
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("web_search", {
+          query: "Grapes of Wrath quotations citations",
+        }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/grapes",
+        }),
+      () => responseWithContent("Ready to write the sourced essay."),
+    ],
+    streamResponders: [
+      () => responseWithContentDeltas([essayDraft]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Write me a 1000 word essay on Grapes of Wrath. Use text level quotation and citations.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
+  assert.equal(chatRequests.length, 3);
+  assert.equal(streamRequests.length, 1);
+  assert.ok(
+    statuses.some((message) =>
+      /Tool context is sufficient; drafting final output/.test(message),
+    ),
+  );
+  assert.ok(!statuses.includes("Stopped at safety limit. Review partial results."));
+  assert.deepEqual(finalDeltas, [essayDraft]);
+  assert.equal(
+    vault.content.get("Current.md"),
+    `Essay prompt\n${essayDraft}`,
+  );
+});
+
+test("delete then write replaces current note instead of trashing it", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const vault = createRunnerVaultContext({
+    prompt:
+      "Delete the current note. Ensure the space is empty. I want you to write now, a 1000 word essay on Grapes of Wrath.",
+    content: "Old essay",
+  });
+  const essayDraft = [
+    "New Grapes of Wrath essay.",
+    ...Array.from({ length: 920 }, (_, index) => `migration${index}`),
+  ].join(" ");
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [() => responseWithContent("Ready to replace the note.")],
+    streamResponders: [
+      () => responseWithContentDeltas([essayDraft]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Delete the current note. Ensure the space is empty. I want you to write now, a 1000 word essay on Grapes of Wrath.",
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.equal(chatRequests.length, 1);
+  assert.equal(streamRequests.length, 1);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file"],
+  );
+  assert.equal(vault.content.get("Current.md"), essayDraft);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].operation, "replace");
+  assert.ok(receipts[0].backupPath?.startsWith(".agent-backups/"));
+  assert.equal(vault.content.has("Current.md"), true);
 });
 
 test("web append payload stays compact with capped note and source context", async () => {
   const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const baseRegistry = createDefaultToolRegistry();
+  const vault = createRunnerVaultContext({
+    prompt: "Research MCP servers and append a concise cited summary to this note.",
+    content: "n".repeat(12000),
+  });
 
   const registry: ToolRegistry = {
     getDefinitions: () => baseRegistry.getDefinitions(),
@@ -2475,10 +3602,14 @@ test("web append payload stays compact with capped note and source context", asy
 
   const client = createClient({
     chatRequests,
+    streamRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
       () => responseWithToolCall("web_fetch", { url: "https://example.com/1" }),
-      () => responseWithToolCall("append_to_current_file", { text: "Summary" }),
+      () => responseWithContent("Ready to append the sourced summary."),
+    ],
+    streamResponders: [
+      () => responseWithContentDeltas(["MCP server research cited summary."]),
     ],
   });
 
@@ -2486,16 +3617,23 @@ test("web append payload stays compact with capped note and source context", asy
     prompt: "Research MCP servers and append a concise cited summary to this note.",
     modelClient: client,
     toolRegistry: registry,
-    toolContext: {} as ToolExecutionContext,
+    toolContext: vault.context,
     enableStreaming: true,
   });
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search", "web_fetch", "append_to_current_file"],
+    ["web_search", "web_fetch"],
+  );
+  assert.equal(streamRequests.length, 1);
+  assert.equal(
+    vault.content.get("Current.md"),
+    `${"n".repeat(12000)}\nMCP server research cited summary.`,
   );
   const maxRequestChars = Math.max(
-    ...chatRequests.map((request) => JSON.stringify(request).length),
+    ...[...chatRequests, ...streamRequests].map((request) =>
+      JSON.stringify(request).length,
+    ),
   );
   assert.ok(maxRequestChars < 30000, `request was ${maxRequestChars} chars`);
 });
@@ -2503,6 +3641,7 @@ test("web append payload stays compact with capped note and source context", asy
 test("simple date prompts avoid vault and web tools", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
+  const deltas: string[] = [];
 
   const client = createClient({
     chatRequests,
@@ -2513,13 +3652,18 @@ test("simple date prompts avoid vault and web tools", async () => {
     prompt: "What is today's date?",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
-    toolContext: {} as ToolExecutionContext,
+    toolContext: {
+      now: () => new Date("2026-07-04T12:34:56"),
+    } as ToolExecutionContext,
     enableStreaming: false,
+    events: {
+      onAssistantDelta: (delta) => deltas.push(delta),
+    },
   });
 
-  assert.equal(chatRequests[0].tools, undefined);
+  assert.equal(chatRequests.length, 0);
   assert.deepEqual(executedCalls, []);
-  assert.match(chatRequests[0].messages[1].content, /Current date\/time:/);
+  assert.match(deltas.join(""), /Today is Saturday, July 4, 2026\./);
 });
 
 test("ambiguous date math is marked as a clarification stop", async () => {
@@ -2545,6 +3689,33 @@ test("ambiguous date math is marked as a clarification stop", async () => {
   });
 
   assert.equal(chatRequests[0].tools, undefined);
+  assert.deepEqual(completions, ["clarifying_question"]);
+});
+
+test("concise assistant questions are marked as clarification stops", async () => {
+  const completions: string[] = [];
+  const deltas: string[] = [];
+
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () => responseWithContent("Which note should I use as the source?"),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Help me with this.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onAssistantDelta: (delta) => deltas.push(delta),
+      onRunComplete: (event) => completions.push(event.stopReason),
+    },
+  });
+
+  assert.deepEqual(deltas, ["Which note should I use as the source?"]);
   assert.deepEqual(completions, ["clarifying_question"]);
 });
 
@@ -2634,12 +3805,13 @@ test("unsupported thinking retries once without think and completes", async () =
       () => {
         throw new ModelClientError("api", "thinking is unsupported by this model");
       },
+      () => responseWithToolCall("web_search", { query: "MCP servers status" }),
       () => responseWithContent("Fallback answer"),
     ],
   });
 
   await runAgentMission({
-    prompt: "Write a short static answer.",
+    prompt: "Look up the current status of MCP servers.",
     modelClient: client,
     toolRegistry: createRegistry([]),
     toolContext: {
@@ -2652,11 +3824,50 @@ test("unsupported thinking retries once without think and completes", async () =
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(chatRequests[0].think, "medium");
   assert.equal(chatRequests[1].think, undefined);
+  assert.equal(chatRequests[2].think, undefined);
   assert.ok(statuses.includes("Thinking unsupported; using standard loop."));
   assert.deepEqual(deltas, ["Fallback answer"]);
+});
+
+test("english-only direct answers repair CJK before display", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const deltas: string[] = [];
+  const statuses: string[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("Coral reefs 珊瑚 support biodiversity."),
+      () => responseWithContent("Coral reefs support biodiversity."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "What is one fact about coral reefs?",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onAssistantDelta: (delta) => deltas.push(delta),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(chatRequests.length, 2);
+  assert.match(
+    chatRequests[1].messages.at(-1)?.content ?? "",
+    /Rewrite the previous answer in English only/,
+  );
+  assert.deepEqual(deltas, ["Coral reefs support biodiversity."]);
+  assert.ok(
+    statuses.includes(
+      "Model produced non-English output; requesting English-only repair...",
+    ),
+  );
 });
 
 test("unknown auto thinking model omits think in runner requests", async () => {
@@ -2755,6 +3966,7 @@ test("simple generated current-note writeback skips read and planner loops", asy
   const streamRequests: ModelChatRequest[] = [];
   const finalDeltas: string[] = [];
   const statuses: string[] = [];
+  const configs: AgentRunConfigEvent[] = [];
   const executedCalls: ModelToolCall[] = [];
   const prompt = "In this note, can you write me a summary of the Vietnam war?";
   const vault = createRunnerVaultContext({
@@ -2781,9 +3993,13 @@ test("simple generated current-note writeback skips read and planner loops", asy
     events: {
       onFinalDelta: (delta) => finalDeltas.push(delta),
       onStatus: (message) => statuses.push(message),
+      onRunConfig: (event) => configs.push(event),
     },
   });
 
+  assert.equal(configs[0].writeAutonomy, true);
+  assert.equal(configs[0].writebackMode, "streaming_current_note");
+  assert.equal(configs[0].route, "direct_writeback");
   assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(
@@ -2801,6 +4017,37 @@ test("simple generated current-note writeback skips read and planner loops", asy
   assert.equal(
     vault.content.get("Current.md"),
     "The Vietnam War was a Cold War-era conflict involving Vietnam, the United States, and regional allies.",
+  );
+});
+
+test("current-note writeback prefers live editor updates when available", async () => {
+  const prompt = "In this note, write a short project update.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+    liveEditorWrite: true,
+  });
+  const client = createClient({
+    chatRequests: [],
+    streamResponders: [
+      () => responseWithContentDeltas(["Live editor chunk.\n"]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+  });
+
+  assert.equal(vault.content.get("Current.md"), "Initial note\nLive editor chunk.\n");
+  assert.ok(vault.operations.includes("setEditor:Current.md"));
+  assert.ok(vault.operations.includes("modify:Current.md"));
+  assert.ok(
+    vault.operations.indexOf("setEditor:Current.md") <
+      vault.operations.indexOf("modify:Current.md"),
   );
 });
 
@@ -2896,6 +4143,52 @@ test("streamed note writeback stops Chinese off-topic output before note mutatio
   assert.ok(
     statuses.includes(
       "Stopped model output because it drifted off topic from the current mission.",
+    ),
+  );
+});
+
+test("streamed note writeback retries CJK output before note mutation", async () => {
+  const streamRequests: ModelChatRequest[] = [];
+  const finalDeltas: string[] = [];
+  const lifecycleMessages: string[] = [];
+  const statuses: string[] = [];
+  const prompt = "In this note, can you write me a summary of the Vietnam war?";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+  });
+  const client = createClient({
+    chatRequests: [],
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["Vietnam 战争 summary.\n"]),
+      () => responseWithContentDeltas(["The Vietnam War summary.\n"]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onStatus: (message) => statuses.push(message),
+      onStreamLifecycle: (event) => lifecycleMessages.push(event.message),
+    },
+  });
+
+  assert.equal(streamRequests.length, 2);
+  assert.deepEqual(finalDeltas, ["The Vietnam War summary.\n"]);
+  assert.equal(vault.content.get("Current.md"), "Initial note\nThe Vietnam War summary.\n");
+  assert.ok(!vault.content.get("Current.md")?.includes("战争"));
+  assert.ok(
+    lifecycleMessages.includes("Language gate retrying English-only output..."),
+  );
+  assert.ok(
+    statuses.includes(
+      "Model produced non-English output; retrying English-only writeback...",
     ),
   );
 });
@@ -3001,6 +4294,54 @@ test("streamed writeback suppresses requested tool markup and retries without wr
       "Model requested a tool during writeback; retrying content-only output...",
     ),
   );
+});
+
+test("streamed writeback writes post-release python fence chunks", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const finalDeltas: string[] = [];
+  const prompt = "Can you write the solution to two sum leetcode problem on the current page?";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+  });
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "```",
+          "python\n",
+          "def two_sum(nums, target):\n",
+          "    seen = {}\n",
+          "    for index, num in enumerate(nums):\n",
+          "        need = target - num\n",
+          "        if need in seen:\n",
+          "            return [seen[need], index]\n",
+          "        seen[num] = index\n",
+          "    return []\n",
+          "```\n",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.match(finalDeltas.join(""), /def two_sum/);
+  assert.match(vault.content.get("Current.md") ?? "", /return \[seen\[need\], index\]/);
+  assert.match(vault.content.get("Current.md") ?? "", /```\n$/);
 });
 
 test("repeated streamed tool markup fails cleanly without note mutation", async () => {
@@ -3463,6 +4804,11 @@ function createRunnerSettings(
     enableStreaming: true,
     thinkingMode: "auto",
     streamWritebackMode: "all_current_note_content_writes",
+    maxAgentSteps: MAX_AGENT_STEPS,
+    templateFolder: "Templates",
+    templateOutputFolder: "",
+    researchMemoryEnabled: true,
+    researchMemoryFolder: "Agent Research Memory",
     requestTimeoutMs: 60000,
     temperature: null,
     topK: null,
@@ -3479,6 +4825,7 @@ function createRunnerVaultContext(options: {
   model?: string;
   thinkingMode?: ThinkingMode;
   streamWritebackMode?: StreamWritebackMode;
+  liveEditorWrite?: boolean;
 } = {}) {
   const content = new Map<string, string>([
     ["Current.md", options.content ?? "Initial note"],
@@ -3573,6 +4920,15 @@ function createRunnerVaultContext(options: {
       json: { error: "not mocked" },
     }),
     now: () => options.now ?? new Date(123),
+    getCurrentMarkdownFile: () => activeFile as never,
+    getCurrentMarkdownContent: (file) => content.get(file.path) ?? null,
+    setCurrentMarkdownContent: options.liveEditorWrite
+      ? (file, data) => {
+          operations.push(`setEditor:${file.path}`);
+          content.set(file.path, data);
+          return true;
+        }
+      : undefined,
   };
 
   return { context, content, folders, operations };
@@ -3593,6 +4949,7 @@ function createRegistry(
   executedCalls: ModelToolCall[],
   options: {
     readCurrentError?: string;
+    inspectVaultError?: string;
   } = {},
 ): ToolRegistry {
   return {
@@ -3642,6 +4999,13 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "inspect_vault_context",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "count_words",
           parameters: { type: "object", properties: {} },
         },
@@ -3678,6 +5042,62 @@ function createRegistry(
         type: "function",
         function: {
           name: "get_path_info",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "search_research_memory",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "read_research_memory",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "append_research_memory",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "list_templates",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "read_template",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "seed_default_templates",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "create_template",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "fill_template",
           parameters: { type: "object", properties: {} },
         },
       },
@@ -3747,6 +5167,13 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "append_to_current_section",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "retitle_current_file",
           parameters: { type: "object", properties: {} },
         },
@@ -3786,6 +5213,20 @@ function createRegistry(
           parameters: { type: "object", properties: {} },
         },
       },
+      {
+        type: "function",
+        function: {
+          name: "create_design_canvas",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "create_svg_design",
+          parameters: { type: "object", properties: {} },
+        },
+      },
     ],
     execute: async (call): Promise<ToolExecutionResult> => {
       executedCalls.push(call);
@@ -3797,6 +5238,17 @@ function createRegistry(
           error: {
             code: "execution_failed",
             message: options.readCurrentError,
+          },
+        };
+      }
+
+      if (call.name === "inspect_vault_context" && options.inspectVaultError) {
+        return {
+          ok: false,
+          toolName: call.name,
+          error: {
+            code: "execution_failed",
+            message: options.inspectVaultError,
           },
         };
       }
@@ -3861,10 +5313,119 @@ function createRegistry(
                   ],
                   skipped: [],
                 }
+            : call.name === "inspect_vault_context"
+              ? {
+                  activeFile: {
+                    path: "Current.md",
+                    folder: "",
+                    basename: "Current",
+                  },
+                  scope: call.arguments.scope ?? "other_folders",
+                  folders: [
+                    { path: "People", name: "People", markdownCount: 1 },
+                    { path: "Projects", name: "Projects", markdownCount: 1 },
+                    { path: "Archive", name: "Archive", markdownCount: 1 },
+                  ],
+                  selectedFiles: [
+                    {
+                      path: "People/Untitled.md",
+                      folder: "People",
+                      basename: "Untitled",
+                    },
+                    {
+                      path: "Projects/Untitled.md",
+                      folder: "Projects",
+                      basename: "Untitled",
+                    },
+                    {
+                      path: "Archive/Untitled.md",
+                      folder: "Archive",
+                      basename: "Untitled",
+                    },
+                  ],
+                  files: [
+                    {
+                      path: "People/Untitled.md",
+                      folder: "People",
+                      basename: "Untitled",
+                      content: "Alex likes local AI tools.",
+                      truncated: false,
+                    },
+                    {
+                      path: "Projects/Untitled.md",
+                      folder: "Projects",
+                      basename: "Untitled",
+                      content: "Alex is building an Obsidian research agent.",
+                      truncated: false,
+                    },
+                    {
+                      path: "Archive/Untitled.md",
+                      folder: "Archive",
+                      basename: "Untitled",
+                      content: "Alex prefers traceable agent actions.",
+                      truncated: false,
+                    },
+                  ],
+                  skipped: [],
+                  truncated: false,
+                }
             : call.name === "list_folder"
               ? { path: call.arguments.path ?? "", entries: [] }
             : call.name === "get_path_info"
               ? { path: call.arguments.path ?? "", exists: true, type: "folder" }
+            : call.name === "list_templates"
+              ? {
+                  templateFolder: "Templates",
+                  templates: [
+                    {
+                      path: "Templates/Meeting.md",
+                      basename: "Meeting",
+                    },
+                  ],
+                  truncated: false,
+                }
+            : call.name === "read_template"
+              ? {
+                  path: call.arguments.path ?? "Templates/Meeting.md",
+                  content: "# {{title}}\n\nDate: {{date}}",
+                  placeholders: ["title", "date"],
+                  truncated: false,
+                }
+            : call.name === "seed_default_templates"
+              ? {
+                  path: "Templates",
+                  operation: "create",
+                  createdTemplates: [
+                    { path: "Templates/Research brief.md" },
+                    { path: "Templates/Research note.md" },
+                    { path: "Templates/Linear ticket.md" },
+                    { path: "Templates/Experiment log.md" },
+                    { path: "Templates/Essay section.md" },
+                    { path: "Templates/Design brief.md" },
+                  ],
+                  skippedExisting: [],
+                  affectedCount: 6,
+                }
+            : call.name === "create_template"
+              ? {
+                  path: call.arguments.path,
+                  operation: "create",
+                  templateFolder: "Templates",
+                  placeholders: ["title"],
+                  bytesWritten: 12,
+                }
+            : call.name === "fill_template"
+              ? {
+                  path: call.arguments.targetPath ?? "Meeting.md",
+                  operation: "create",
+                  templateSource: call.arguments.templatePath
+                    ? "saved_template"
+                    : "ad_hoc_template",
+                  templatePath: call.arguments.templatePath,
+                  placeholders: ["title"],
+                  valuesApplied: ["title"],
+                  bytesWritten: 12,
+                }
             : call.name === "create_folder"
               ? { path: call.arguments.path, operation: "create_folder" }
             : call.name === "create_file"
@@ -3956,6 +5517,24 @@ function createRegistry(
                   url: call.arguments.url,
                   content: "Fetched content",
                   links: [],
+                }
+            : call.name === "create_design_canvas"
+              ? {
+                  path: "Designs/Product Flow.canvas",
+                  operation: "create",
+                  nodeCount: 2,
+                  edgeCount: 1,
+                  canvas: {
+                    nodes: [{ id: "start" }, { id: "end" }],
+                    edges: [{ id: "edge" }],
+                  },
+                }
+            : call.name === "create_svg_design"
+              ? {
+                  path: "Designs/settings-wireframe.svg",
+                  operation: "create",
+                  shapeCount: 3,
+                  svg: "<svg><rect/><text>Settings</text></svg>",
                 }
               : { value: call.name, args: call.arguments },
       };

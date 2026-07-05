@@ -12,6 +12,7 @@ import type {
 import { ModelClientError } from "./model/types";
 import type {
   AgentMissionMode,
+  AgentRuntimeCache,
   MissionIntent,
   ToolExecutionContext,
   ToolExecutionResult,
@@ -19,15 +20,47 @@ import type {
 } from "./tools/types";
 import {
   BACKUP_FOLDER,
+  CHECKPOINT_EVERY_STEPS,
+  LONG_RUN_STEP_WARN_AT,
   MAX_AGENT_STEPS,
   MAX_INITIAL_CURRENT_NOTE_CHARS,
 } from "./tools/constants";
-import { serializeToolResult } from "./tools/validation";
+import { getErrorMessage, serializeToolResult } from "./tools/validation";
 import {
-  toConversationModelMessages,
   type AgentConversationMessage,
 } from "./conversationHistory";
 import { countMarkdownVisibleText } from "./tools/wordCount";
+import {
+  assertEnglishOnlyOutput,
+  buildEnglishOnlyRepairPrompt,
+  inspectEnglishOnlyOutput,
+} from "./languageGuard";
+import {
+  estimateLoopBudget,
+  resolveConfiguredMaxAgentSteps,
+} from "./agent/runBudget";
+import {
+  analyzeGeneratedOutputPrompt,
+} from "./agent/generatedOutputPolicy";
+import {
+  analyzeCurrentNoteResetPrompt,
+  isCurrentNoteReplaceResetPrompt,
+} from "./agent/currentNoteResetPolicy";
+import { planLoopBudget } from "./agent/loopPlanner";
+import {
+  decideNextLoopAction,
+  type LoopLedger,
+} from "./agent/loopDecision";
+import {
+  appendAgentRunCheckpoint,
+  createAgentRunId,
+  type LatestAgentRunCheckpoint,
+  readLatestAgentRunCheckpoint,
+} from "./agent/checkpoints";
+import {
+  compactConversationForPrompt,
+  toCompactedConversationModelMessages,
+} from "./memory/contextCompaction";
 
 export { MAX_AGENT_STEPS } from "./tools/constants";
 export type { AgentConversationMessage } from "./conversationHistory";
@@ -84,6 +117,9 @@ export interface AgentRunMetricEvent {
   name: string;
   step?: number;
   durationMs: number;
+  cached?: boolean;
+  cacheKey?: string;
+  savedDurationMs?: number;
   requestChars?: number;
   responseChars?: number;
   inputChars?: number;
@@ -99,6 +135,12 @@ export interface AgentRunConfigEvent {
   streaming: boolean;
   thinkingMode: string;
   resolvedThink: string;
+  writebackMode: RunWritebackMode;
+  route: RunRoute;
+  expectedTimeClass: RunPlan["expectedTimeClass"];
+  maxStepsForRun: number;
+  slowPathReason: SlowPathReason;
+  englishGuard: boolean;
   temperature?: number;
   topK?: number;
   topP?: number;
@@ -109,6 +151,61 @@ export interface AgentRunConfigEvent {
   currentNoteContext: boolean;
   vaultContext: boolean;
   maxSteps: number;
+}
+
+export type StreamLifecycleKind =
+  | "stream_started"
+  | "stream_connected"
+  | "first_raw_chunk"
+  | "first_thinking_delta"
+  | "first_content_delta"
+  | "buffering_safety"
+  | "buffering_language"
+  | "first_visible_content"
+  | "first_note_write";
+
+export interface AgentStreamLifecycleEvent {
+  kind: StreamLifecycleKind;
+  elapsedMs: number;
+  bufferedChars?: number;
+  releasedChars?: number;
+  message: string;
+}
+
+export type RunRoute =
+  | "instant_local"
+  | "direct_writeback"
+  | "prefetched_vault_answer"
+  | "prefetched_vault_writeback"
+  | "single_model_answer"
+  | "single_model_writeback"
+  | "tool_required"
+  | "grounded_workflow";
+
+export type SlowPathReason =
+  | "none"
+  | "needs_current_note"
+  | "needs_web_sources"
+  | "needs_vault_context"
+  | "needs_graph_context"
+  | "needs_word_count"
+  | "needs_edit_or_replace"
+  | "needs_model_planning";
+
+export type RunWritebackMode =
+  | "off"
+  | "tool_write"
+  | "streaming_current_note"
+  | "streaming_after_tools";
+
+export interface RunPlan {
+  route: RunRoute;
+  maxStepsForRun: number;
+  thinking: ModelThink | undefined;
+  allowedTools: ModelToolDefinition[];
+  slowPathReason: SlowPathReason;
+  expectedTimeClass: "quick" | "normal" | "long";
+  requiresEnglishGuard: boolean;
 }
 
 export type AgentRunContextScope =
@@ -188,6 +285,7 @@ export interface AgentRunEvents {
   onThinkingMessageStart?: () => void;
   onThinkingDelta?: (delta: string) => void;
   onThinkingMessageDone?: () => void;
+  onStreamLifecycle?: (event: AgentStreamLifecycleEvent) => void;
   onMetric?: (event: AgentRunMetricEvent) => void;
   onRunConfig?: (event: AgentRunConfigEvent) => void;
   onRunComplete?: (event: AgentRunCompleteEvent) => void;
@@ -222,22 +320,39 @@ Operating rules:
 7. Do not append duplicate H1 titles. Updating the markdown H1 is separate from renaming the file; suggest file renames in the final answer only when the tool returns a suggestion.
 8. Prefer append_to_current_file only for explicit append/add/insert requests that do not replace an existing title or section.
 9. Use edit_current_section when the user asks to edit, revise, update, rewrite, or replace a heading section.
-10. Only request replace_current_file when the user explicitly asks to rewrite, replace, clean up, reset, start fresh, or overwrite the whole current note.
-11. Only request delete_current_file when the user explicitly asks to delete, remove, or trash the current note.
-12. Use list_current_folder before broad vault traversal when the mission depends on where the active note lives.
-13. Use list_folder and get_path_info to inspect vault folder structure before making path-based file changes.
-14. Use path-based CRUD tools only for explicit file or folder create, append, replace, move, rename, delete, remove, or trash requests.
-15. For vault context questions, including "what do you know about me", inspect note contents before answering. Do not rely on filenames or note titles because notes may be untitled. Start with list_current_folder when the active note's location may matter, then use list_markdown_files, search_markdown_files, read_markdown_files, read_file, list_folder, or get_path_info as needed. Cite vault-relative source paths in the final answer.
-16. For graph, backlink, related-note, or note-connection questions, use graph/search tools before answering. Separate explicit Obsidian links/backlinks from inferred semantic relationships and cite vault-relative note paths.
-17. For note/file word-count or length-check questions, call count_words and answer from the tool result.
-18. Do not write to notes for a vault context answer unless the user asks to save, write, update, create, move, rename, delete, connect, link, or graph something.
-19. When you need tools, request tools without writing user-facing prose or preambles.
-20. When the mission is expected to produce note output, choose the safest useful write tool instead of only answering in chat.
-21. If a date calculation is missing a year or reference date, ask one concise clarifying question instead of guessing.
-22. When you have enough context and no note write is required, stop requesting tools and write the final answer.
-23. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
-24. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
-25. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
+10. Use append_to_current_section when the user asks to write, add, append, or insert content below, under, after, or inside a named heading section.
+11. Only request replace_current_file when the user explicitly asks to rewrite, replace, clean up, reset, start fresh, overwrite the whole current note, or clear/delete page content and then write new content.
+12. Only request delete_current_file when the user explicitly asks to delete, remove, or trash the current note. Treat "delete all notes on the page and write..." as replacing current page content, not trashing the note.
+13. Use list_current_folder before broad vault traversal when the mission depends on where the active note lives.
+14. Use list_folder and get_path_info to inspect vault folder structure before making path-based file changes.
+15. Use path-based CRUD tools only for explicit file or folder create, append, replace, move, rename, delete, remove, or trash requests.
+16. For vault context questions, including "what do you know about me", inspect note contents before answering. Do not rely on filenames or note titles because notes may be untitled. Start with list_current_folder when the active note's location may matter, then use list_markdown_files, search_markdown_files, read_markdown_files, read_file, list_folder, or get_path_info as needed. Cite vault-relative source paths in the final answer.
+17. For durable research memory, use search_research_memory/read_research_memory before continuing a remembered topic, and append_research_memory when the user asks to save, remember, persist, or build durable topic memory.
+18. For graph, backlink, related-note, or note-connection questions, use graph/search tools before answering. Separate explicit Obsidian links/backlinks from inferred semantic relationships and cite vault-relative note paths.
+19. For note/file word-count or length-check questions, call count_words and answer from the tool result.
+20. Do not write to notes for a vault context answer unless the user asks to save, write, update, create, move, rename, delete, connect, link, graph, or remember something.
+21. When you need tools, request tools without writing user-facing prose or preambles.
+22. When the mission is expected to produce note output, choose the safest useful write tool instead of only answering in chat.
+23. If a date calculation is missing a year or reference date, ask one concise clarifying question instead of guessing.
+24. Ask one concise clarifying question when the mission is impossible, dangerous, destructive, missing required credentials, or lacks a required target/value that tools cannot discover. Do not ask when you can proceed safely from vault context, defaults, or available tools.
+25. When you have enough context and no note write is required, stop requesting tools and write the final answer.
+26. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
+27. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
+28. Use template tools only when the user asks to create, list, read, use, apply, or fill templates. Saved templates live in the configured template folder and use {{field}} placeholders.
+29. When filling a template, prefer fill_template over generic file creation. Use templateText for ad hoc templates supplied in the mission, or templatePath for saved templates.
+30. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
+
+const ENGLISH_ONLY_POLICY = [
+  "You are an English-only research assistant for an Obsidian vault.",
+  "All visible output must be in English.",
+  "Do not write Chinese characters in the final answer.",
+  "Translate and summarize non-English sources into English before using them.",
+  "Use English headings, bullets, source notes, and citation labels.",
+  "Final output must be English-only Markdown suitable for Obsidian.",
+].join("\n");
+
+const FINAL_ENGLISH_ONLY_RULE =
+  "Final output must be English-only Markdown. Do not include Chinese characters. Translate any non-English source material into English before writing the answer.";
 
 const FINAL_ANSWER_PROMPT = [
   "Provide the final answer for the user now.",
@@ -253,6 +368,7 @@ function buildFinalAnswerPrompt(prompt: string): string {
     FINAL_ANSWER_PROMPT,
     `Current user mission: ${JSON.stringify(truncateForPromptAnchor(prompt))}.`,
     "Answer only that mission. If any prior model content is empty, unrelated, or off topic, ignore it and produce the requested answer from the current mission.",
+    ...(isLikelyEnglishPrompt(prompt) ? [FINAL_ENGLISH_ONLY_RULE] : []),
   ].join(" ");
 }
 
@@ -264,23 +380,41 @@ function buildCurrentNoteFinalAnswerPrompt(prompt: string): string {
     isPromptOnCurrentPageIntent(prompt)
       ? "The user wants the prompt written on the active note/page to be extracted and executed."
       : `Current user mission: ${JSON.stringify(truncateForPromptAnchor(prompt))}.`,
+    ...(isLikelyEnglishPrompt(prompt) ? [FINAL_ENGLISH_ONLY_RULE] : []),
   ].join(" ");
 }
 
 function getFinalAnswerRelevancePrompt(
   prompt: string,
   currentNoteContext: unknown,
+  conversationHistory: AgentConversationMessage[] = [],
 ): string {
-  if (!isPromptOnCurrentPageIntent(prompt)) {
-    return prompt;
+  const contextParts = [prompt];
+
+  if (
+    isContextDependentFollowupPrompt(prompt) ||
+    isPromptOnCurrentPageIntent(prompt)
+  ) {
+    const assistantMessage = getRecentSubstantiveAssistantMessage(
+      conversationHistory,
+    );
+    if (assistantMessage) {
+      contextParts.push(truncateForPromptAnchor(assistantMessage.content));
+    }
   }
 
-  const noteContent = getCurrentNoteContextContent(currentNoteContext);
-  if (!noteContent) {
-    return prompt;
+  if (
+    isPromptOnCurrentPageIntent(prompt) ||
+    hasCurrentNoteSectionTarget(prompt) ||
+    isContextDependentFollowupPrompt(prompt)
+  ) {
+    const noteContent = getCurrentNoteContextContent(currentNoteContext);
+    if (noteContent) {
+      contextParts.push(truncateForPromptAnchor(noteContent));
+    }
   }
 
-  return `${prompt}\n\n${truncateForPromptAnchor(noteContent)}`;
+  return contextParts.join("\n\n");
 }
 
 function getCurrentNoteContextContent(currentNoteContext: unknown): string | null {
@@ -292,8 +426,16 @@ function getCurrentNoteContextContent(currentNoteContext: unknown): string | nul
 }
 
 function isPromptOnCurrentPageIntent(prompt: string): boolean {
-  return /\b(read|check|extract|use|answer|run|execute|follow)\b[\s\S]{0,80}\b(prompt|instruction|question|task|request)\b[\s\S]{0,80}\b(?:on|from|in)\s+(?:the\s+)?(?:page|note|document)\b|\b(prompt|instruction|question|task|request)\b[\s\S]{0,80}\b(?:on|from|in)\s+(?:the\s+)?(?:page|note|document)\b/i.test(
-    prompt,
+  return (
+    /\b(read|check|extract|use|answer|run|execute|follow|refer)\b[\s\S]{0,100}\b(prompt|instruction|question|task|request)\b[\s\S]{0,100}\b(?:on|from|in|as)\s+(?:the\s+)?(?:page|note|document|notepage)\b/i.test(
+      prompt,
+    ) ||
+    /\b(prompt|instruction|question|task|request)\b[\s\S]{0,100}\b(?:on|from|in)\s+(?:the\s+)?(?:page|note|document|notepage)\b/i.test(
+      prompt,
+    ) ||
+    /\b(read|check|extract|use|answer|run|execute|follow|refer)\b[\s\S]{0,120}\bnotes?\b[\s\S]{0,120}\b(?:notepage|page|note|document)\b[\s\S]{0,80}\bas\s+(?:the\s+)?prompt\b/i.test(
+      prompt,
+    )
   );
 }
 
@@ -306,6 +448,13 @@ function resolvePromptForIntent(
   prompt: string,
   conversationHistory: AgentConversationMessage[],
 ): string {
+  if (
+    isRecentAssistantWritebackFollowup(prompt) &&
+    getRecentSubstantiveAssistantMessage(conversationHistory) !== null
+  ) {
+    return "Append the most recent assistant response from this chat to the current Obsidian note.";
+  }
+
   if (!isVagueContinuationFollowup(prompt)) {
     return prompt;
   }
@@ -321,9 +470,50 @@ function resolvePromptForIntent(
   return prompt;
 }
 
+function isRecentAssistantWritebackFollowup(prompt: string): boolean {
+  return /\b(write|copy|save|append|add|insert|paste|put)\b[\s\S]{0,100}\b(this|that|the|your|previous|prior|last|above)\s+(essay|answer|response|reply|summary|analysis|content|text|draft|paragraph|article|report)\b[\s\S]{0,100}\b(?:on|onto|to|into|in)\s+(?:the\s+)?(?:page|note|document|file|markdown)\b|\b(?:on|onto|to|into|in)\s+(?:the\s+)?(?:page|note|document|file|markdown)\b[\s\S]{0,100}\b(write|copy|save|append|add|insert|paste|put)\b[\s\S]{0,100}\b(this|that|the|your|previous|prior|last|above)\s+(essay|answer|response|reply|summary|analysis|content|text|draft|paragraph|article|report)\b/i.test(
+    prompt,
+  );
+}
+
+function hasPriorAssistantResponseWritebackIntent(prompt: string): boolean {
+  return /\bmost recent assistant response\b[\s\S]{0,120}\bcurrent Obsidian note\b/i.test(
+    prompt,
+  ) || isRecentAssistantWritebackFollowup(prompt);
+}
+
+function getRecentSubstantiveAssistantMessage(
+  conversationHistory: AgentConversationMessage[],
+): AgentConversationMessage | null {
+  for (let index = conversationHistory.length - 1; index >= 0; index -= 1) {
+    const message = conversationHistory[index];
+    if (message.role !== "assistant") {
+      continue;
+    }
+
+    if (message.content.trim()) {
+      return message;
+    }
+  }
+
+  return null;
+}
+
 function isVagueContinuationFollowup(prompt: string): boolean {
   return /^\s*(continue|go on|keep going|keep exploring|keep searching|read it|check it|do that|please do|yes|ok|okay)\.?\s*$/i.test(
     prompt,
+  );
+}
+
+function isContextDependentFollowupPrompt(prompt: string): boolean {
+  return (
+    isVagueContinuationFollowup(prompt) ||
+    /\b(my|your|the|those|these|that|it|them|above|previous|prior|last|same|favorite\s+things?)\b/i.test(
+      prompt,
+    ) ||
+    /\b(continue|expand|extend|build\s+on|follow\s+up|below|under|after)\b/i.test(
+      prompt,
+    )
   );
 }
 
@@ -368,6 +558,8 @@ export async function runAgentMission({
   abortSignal,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
+  const runId = createAgentRunId(toolContext.now?.() ?? new Date());
+  const runtimeCache = createRuntimeCache();
   let activeThink = resolveThinkingMode(toolContext.settings);
   const intentPrompt = resolvePromptForIntent(prompt, conversationHistory);
   let activeIntentPrompt = intentPrompt;
@@ -375,9 +567,27 @@ export async function runAgentMission({
   let writeAutonomy = missionIntent.allowAutonomousWrite;
   let runToolContext: ToolExecutionContext = {
     ...toolContext,
+    runtimeCache,
     writeAutonomy,
     missionIntent,
   };
+  if (
+    shouldFallbackGeneratedNoteOutputToChat(activeIntentPrompt, missionIntent, runToolContext)
+  ) {
+    missionIntent = {
+      ...missionIntent,
+      mode: "chat_only",
+      noteOutput: false,
+      allowAutonomousWrite: false,
+      requireWriteCompletion: false,
+    };
+    writeAutonomy = false;
+    runToolContext = {
+      ...runToolContext,
+      writeAutonomy,
+      missionIntent,
+    };
+  }
   const modelOptions = buildModelRequestOptions(runToolContext.settings);
   let followupIntentContext =
     intentPrompt === prompt ? null : formatFollowupIntentContext(intentPrompt);
@@ -429,15 +639,41 @@ export async function runAgentMission({
   let executedModelTool = false;
   let wroteToNote = false;
   let unavailableToolCorrectionUsed = false;
+  let vaultTraversalCorrectionUsed = false;
+  let webResearchCorrectionUsed = false;
+  let toolBeforeWriteCorrectionUsed = false;
+  let consecutiveNoProgressSteps = 0;
+  let lastProgressSignature = "";
   let lastStep = 0;
+  let executedWebSearchTool = false;
+  let executedWebFetchTool = false;
+  const successfulToolNames: string[] = [];
+  const failedToolNames: string[] = [];
   const writeReceipts: AgentRunReceipt[] = [];
   let preparedStreamingSectionEdit: PreparedStreamingSectionEdit | null = null;
+  let runPlan = createRunPlan({
+    prompt: activeIntentPrompt,
+    missionIntent,
+    tools,
+    settings: runToolContext.settings,
+    streamingWritebackKind,
+    directCurrentNoteWritebackKind,
+  });
+  activeThink = runPlan.thinking;
+  tools = runPlan.allowedTools;
+  allowedToolNames = new Set(tools.map((tool) => tool.function.name));
   const stopIfRequested = (step = Math.max(lastStep, 0)) => {
     if (!isRunStopRequested(abortSignal)) {
       return false;
     }
 
-    completeRun(events, "user_stopped", step, runStartedAt);
+    completeRun(
+      events,
+      "user_stopped",
+      step,
+      runStartedAt,
+      runPlan.maxStepsForRun,
+    );
     return true;
   };
 
@@ -454,6 +690,9 @@ export async function runAgentMission({
       writeAutonomy,
       missionIntent,
       currentNoteContext: shouldReadCurrentNote,
+      runPlan,
+      streamingWritebackKind,
+      directCurrentNoteWritebackKind,
     }),
   );
   events.onTrace?.({
@@ -488,6 +727,7 @@ export async function runAgentMission({
     writeAutonomy = missionIntent.allowAutonomousWrite;
     runToolContext = {
       ...toolContext,
+      runtimeCache,
       writeAutonomy,
       missionIntent,
     };
@@ -523,6 +763,31 @@ export async function runAgentMission({
     requireToolBeforeStreamingWriteback = promptRequiresToolLoop(
       activeIntentPrompt,
     );
+    runPlan = createRunPlan({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      tools,
+      settings: runToolContext.settings,
+      streamingWritebackKind,
+      directCurrentNoteWritebackKind,
+    });
+    activeThink = runPlan.thinking;
+    tools = runPlan.allowedTools;
+    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    requiredWriteTools = getRequiredWriteToolNames(
+      activeIntentPrompt,
+      allowedToolNames,
+      missionIntent,
+      streamingWritebackKind,
+    );
+    writeRequired =
+      missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
+    if (
+      runPlan.route === "prefetched_vault_answer" ||
+      runPlan.route === "prefetched_vault_writeback"
+    ) {
+      requireToolBeforeStreamingWriteback = false;
+    }
     followupIntentContext = null;
 
     events.onStatus?.("Using prompt from current note for tool routing...");
@@ -535,6 +800,9 @@ export async function runAgentMission({
         writeAutonomy,
         missionIntent,
         currentNoteContext: true,
+        runPlan,
+        streamingWritebackKind,
+        directCurrentNoteWritebackKind,
       }),
     );
     events.onTrace?.({
@@ -557,9 +825,18 @@ export async function runAgentMission({
     });
   }
 
+  if (
+    streamingWritebackKind !== null &&
+    promptRequiresToolLoop(activeIntentPrompt) &&
+    runPlan.route !== "prefetched_vault_writeback"
+  ) {
+    requireToolBeforeStreamingWriteback = true;
+  }
+
   const finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
     activeIntentPrompt,
     currentNoteContext,
+    conversationHistory,
   );
   const promptOnPageWritebackKind = getPromptOnPageWritebackKind({
     prompt,
@@ -567,8 +844,24 @@ export async function runAgentMission({
     toolContext: runToolContext,
     enableStreaming,
   });
+  const checkpointResumeContext = await buildCheckpointResumeContext({
+    prompt,
+    activeIntentPrompt,
+    toolContext: runToolContext,
+    events,
+  });
+  const generatedOutputPolicy = analyzeGeneratedOutputPrompt(activeIntentPrompt);
+  const loopBudgetPlan = planLoopBudget({
+    prompt: activeIntentPrompt,
+    route: runPlan.route,
+    generated: generatedOutputPolicy,
+    configuredMaxSteps: getConfiguredMaxAgentSteps(runToolContext.settings),
+  });
 
-  const conversationMessages = toConversationModelMessages(conversationHistory);
+  const compactedConversation =
+    compactConversationForPrompt(conversationHistory);
+  const conversationMessages =
+    toCompactedConversationModelMessages(compactedConversation);
 
   const messages: ModelChatMessage[] = [
     {
@@ -583,10 +876,26 @@ export async function runAgentMission({
       role: "system" as const,
       content: formatResponseLanguageContext(activeIntentPrompt),
     },
+    ...(runPlan.requiresEnglishGuard
+      ? [
+          {
+            role: "system" as const,
+            content: ENGLISH_ONLY_POLICY,
+          },
+        ]
+      : []),
     {
       role: "system" as const,
       content: formatMissionIntentContext(missionIntent),
     },
+    ...(generatedOutputPolicy.wordTarget
+      ? [
+          {
+            role: "system" as const,
+            content: formatGeneratedWordTargetContext(generatedOutputPolicy.wordTarget),
+          },
+        ]
+      : []),
     ...(isPromptOnCurrentPageIntent(prompt)
       ? [
           {
@@ -601,6 +910,14 @@ export async function runAgentMission({
           {
             role: "system" as const,
             content: followupIntentContext,
+          },
+        ]),
+    ...(checkpointResumeContext === null
+      ? []
+      : [
+          {
+            role: "system" as const,
+            content: checkpointResumeContext,
           },
         ]),
     ...(currentNoteContext === null
@@ -623,6 +940,10 @@ export async function runAgentMission({
       role: "system" as const,
       content: formatAllowedToolsContext(tools),
     },
+    {
+      role: "system" as const,
+      content: formatToolAuthorityContext(tools),
+    },
     ...(streamingWritebackKind === null
       ? []
       : [
@@ -639,13 +960,22 @@ export async function runAgentMission({
           },
         ]
       : []),
-    ...(conversationMessages.length === 0
+    ...(conversationMessages.length === 0 &&
+      compactedConversation.summary === null
       ? []
       : [
           {
             role: "system" as const,
             content: formatConversationHistoryContext(),
           },
+          ...(compactedConversation.summary === null
+            ? []
+            : [
+                {
+                  role: "system" as const,
+                  content: compactedConversation.summary,
+                },
+              ]),
           ...conversationMessages,
         ]),
     {
@@ -653,6 +983,235 @@ export async function runAgentMission({
       content: activeIntentPrompt,
     },
   ];
+
+  if (runPlan.route === "instant_local") {
+    if (stopIfRequested(0)) {
+      return;
+    }
+    emitRunDiagnostics({
+      events,
+      toolContext: runToolContext,
+      tools,
+      enableStreaming,
+      finalMode: "direct",
+      runPlan,
+    });
+    emitDirectAssistantAnswer(
+      buildInstantLocalAnswer(activeIntentPrompt, runToolContext),
+      events,
+      runPlan.requiresEnglishGuard,
+    );
+    completeRun(
+      events,
+      "final",
+      0,
+      runStartedAt,
+      runPlan.maxStepsForRun,
+    );
+    return;
+  }
+
+  if (runPlan.route === "prefetched_vault_answer") {
+    if (stopIfRequested(0)) {
+      return;
+    }
+
+    try {
+      events.onStatus?.("Inspecting vault context locally...");
+      const vaultContext = await runObservedTool({
+        name: "inspect_vault_context",
+        arguments: buildVaultPrefetchArgs(activeIntentPrompt),
+        toolRegistry,
+        toolContext: runToolContext,
+        events,
+        step: 0,
+      });
+      if (stopIfRequested(0)) {
+        return;
+      }
+
+      emitRunDiagnostics({
+        events,
+        toolContext: runToolContext,
+        tools,
+        enableStreaming,
+        finalMode: enableStreaming ? "streaming_direct" : "direct",
+        runPlan,
+      });
+      const messagesWithContext = [
+        ...messages,
+        {
+          role: "system" as const,
+          content: `Prefetched vault context: ${JSON.stringify(vaultContext)}`,
+        },
+        {
+          role: "system" as const,
+          content:
+            "Answer from the prefetched vault context. Cite vault-relative paths. If the context is sampled or truncated, say so briefly. Do not request tools.",
+        },
+      ];
+      const relevancePromptWithVaultContext = appendRelevancePromptContext(
+        finalAnswerRelevancePrompt,
+        "Prefetched vault context",
+        vaultContext,
+      );
+      const response = enableStreaming
+        ? await emitFinalAnswer({
+            modelClient,
+            messages: messagesWithContext,
+            events,
+            enableStreaming,
+            fallbackContent: "",
+            finalInstruction: null,
+            metricName: "prefetched_vault_answer",
+            relevancePrompt: relevancePromptWithVaultContext,
+            think: undefined,
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+          })
+        : await emitNonStreamingFinalModelAnswer({
+            modelClient,
+            messages: messagesWithContext,
+            events,
+            metricName: "prefetched_vault_answer",
+            options: modelOptions,
+            abortSignal,
+          });
+      if (stopIfRequested(1)) {
+        return;
+      }
+      completeRun(
+        events,
+        isClarifyingQuestionResponse(activeIntentPrompt, response?.message.content ?? "")
+          ? "clarifying_question"
+          : "final",
+        1,
+        runStartedAt,
+        runPlan.maxStepsForRun,
+      );
+      return;
+    } catch (error) {
+      if (stopIfRequested(0)) {
+        return;
+      }
+
+      events.onStatus?.(
+        `Local vault prefetch failed; falling back to tool planning: ${getUnknownErrorMessage(error)}`,
+      );
+      tools = getAllowedToolDefinitions(
+        toolRegistry,
+        activeIntentPrompt,
+        missionIntent,
+        streamingWritebackKind,
+      );
+      runPlan = {
+        ...runPlan,
+        route: "grounded_workflow",
+        maxStepsForRun: estimateLoopBudget({
+          route: "grounded_workflow",
+          configuredMaxSteps: getConfiguredMaxAgentSteps(runToolContext.settings),
+          requestedSteps: 2,
+        }),
+        thinking: resolveThinkingMode(runToolContext.settings),
+        allowedTools: tools,
+        expectedTimeClass: "normal",
+      };
+      activeThink = runPlan.thinking;
+      allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+      messages.push({
+        role: "system" as const,
+        content: [
+          "Local vault prefetch failed, so normal vault tools are available.",
+          formatAllowedToolsContext(tools),
+          formatToolAuthorityContext(tools),
+        ].join(" "),
+      });
+    }
+  }
+
+  if (runPlan.route === "prefetched_vault_writeback") {
+    if (stopIfRequested(0)) {
+      return;
+    }
+
+    events.onStatus?.("Inspecting named vault folders locally...");
+    const vaultContext = await runObservedTool({
+      name: "inspect_vault_context",
+      arguments: buildVaultPrefetchArgs(activeIntentPrompt),
+      toolRegistry,
+      toolContext: runToolContext,
+      events,
+      step: 0,
+    });
+    if (stopIfRequested(0)) {
+      return;
+    }
+
+    emitRunDiagnostics({
+      events,
+      toolContext: {
+        ...runToolContext,
+        writeAutonomy: true,
+      },
+      tools,
+      enableStreaming,
+      finalMode: "streaming_writeback",
+      runPlan,
+    });
+    const messagesWithContext = [
+      ...messages,
+      {
+        role: "system" as const,
+        content: `Prefetched vault context: ${JSON.stringify(vaultContext)}`,
+      },
+      {
+        role: "system" as const,
+        content:
+          "Write findings from the prefetched vault context. Cite vault-relative paths when useful. Do not request tools.",
+      },
+    ];
+    const relevancePromptWithVaultContext = appendRelevancePromptContext(
+      finalAnswerRelevancePrompt,
+      "Prefetched vault context",
+      vaultContext,
+    );
+    let receipt: AgentRunReceipt;
+    try {
+      receipt = await streamCurrentNoteWriteback({
+        kind: "append",
+        preparedSectionEdit: null,
+        modelClient,
+        messages: messagesWithContext,
+        events,
+        toolContext: runToolContext,
+        knownToolNames,
+        relevancePrompt: relevancePromptWithVaultContext,
+        think: undefined,
+        options: modelOptions,
+        abortSignal,
+        onThinkingUnsupported: disableThinkingForRun,
+      });
+    } catch (error) {
+      if (stopIfRequested(1)) {
+        return;
+      }
+      throw error;
+    }
+    if (stopIfRequested(1)) {
+      return;
+    }
+    writeReceipts.push(receipt);
+    events.onReceipt?.(receipt);
+    completeRun(
+      events,
+      "write_completed",
+      1,
+      runStartedAt,
+      runPlan.maxStepsForRun,
+    );
+    return;
+  }
 
   if (promptOnPageWritebackKind !== null) {
     if (stopIfRequested(1)) {
@@ -667,6 +1226,7 @@ export async function runAgentMission({
       tools,
       enableStreaming,
       finalMode: "streaming_writeback",
+      runPlan,
     });
     let receipt: AgentRunReceipt;
     try {
@@ -701,7 +1261,13 @@ export async function runAgentMission({
     }
     writeReceipts.push(receipt);
     events.onReceipt?.(receipt);
-    completeRun(events, "write_completed", 1, runStartedAt);
+    completeRun(
+      events,
+      "write_completed",
+      1,
+      runStartedAt,
+      runPlan.maxStepsForRun,
+    );
     return;
   }
 
@@ -716,6 +1282,7 @@ export async function runAgentMission({
       tools,
       enableStreaming,
       finalMode: "streaming_writeback",
+      runPlan,
     });
     let receipt: AgentRunReceipt;
     try {
@@ -750,7 +1317,13 @@ export async function runAgentMission({
     }
     writeReceipts.push(receipt);
     events.onReceipt?.(receipt);
-    completeRun(events, "write_completed", 1, runStartedAt);
+    completeRun(
+      events,
+      "write_completed",
+      1,
+      runStartedAt,
+      runPlan.maxStepsForRun,
+    );
     return;
   }
 
@@ -770,6 +1343,7 @@ export async function runAgentMission({
       tools,
       enableStreaming,
       finalMode: "streaming_direct",
+      runPlan,
     });
     let response: ModelChatResponse | null;
     try {
@@ -803,6 +1377,7 @@ export async function runAgentMission({
         : "final",
       1,
       runStartedAt,
+      runPlan.maxStepsForRun,
     );
     return;
   }
@@ -817,6 +1392,7 @@ export async function runAgentMission({
         tools,
         enableStreaming,
         finalMode: "streaming_direct",
+        runPlan,
     });
     let response: ModelChatResponse | null;
     try {
@@ -850,22 +1426,40 @@ export async function runAgentMission({
         : "final",
       1,
       runStartedAt,
+      runPlan.maxStepsForRun,
     );
     return;
   }
 
   emitStatus(events, "Planning...", "planning");
+  const stepLimit = Math.min(runPlan.maxStepsForRun, MAX_AGENT_STEPS);
 
-  for (let step = 1; step <= MAX_AGENT_STEPS; step += 1) {
+  for (let step = 1; step <= stepLimit; step += 1) {
     if (stopIfRequested(step)) {
       return;
     }
 
     lastStep = step;
-    events.onStatus?.(`Agent step ${step} of max ${MAX_AGENT_STEPS}...`);
+    events.onStatus?.(`Agent step ${step} of max ${stepLimit}...`);
     events.onPhaseChange?.(
       "planning",
-      `Planning step ${step} of max ${MAX_AGENT_STEPS}...`,
+      `Planning step ${step} of max ${stepLimit}...`,
+    );
+    if (step === LONG_RUN_STEP_WARN_AT && stepLimit >= LONG_RUN_STEP_WARN_AT) {
+      events.onStatus?.(
+        `Long run continuing past step ${LONG_RUN_STEP_WARN_AT}; checkpoints save every ${CHECKPOINT_EVERY_STEPS} steps when vault access is available.`,
+      );
+    }
+    events.onPlanningStart?.(step);
+    events.onPlanningDelta?.(
+      [
+        `Step ${step}/${stepLimit}`,
+        `route=${runPlan.route}`,
+        `reason=${runPlan.slowPathReason}`,
+        `tool_budget=${loopBudgetPlan.toolStepBudget}`,
+        `finalization_reserved=${loopBudgetPlan.finalizationReserve}`,
+        `tools=${Array.from(allowedToolNames).join(", ") || "none"}`,
+      ].join("; "),
     );
 
     let response: ModelChatResponse;
@@ -883,6 +1477,7 @@ export async function runAgentMission({
       }
       throw error;
     }
+    events.onPlanningDone?.(step);
 
     if (stopIfRequested(step)) {
       return;
@@ -894,6 +1489,17 @@ export async function runAgentMission({
       events,
       step,
     );
+    const progressSignature =
+      responseToolCalls.length > 0
+        ? responseToolCalls
+            .map((call) => `${call.name}:${stableStringify(call.arguments)}`)
+            .join("|")
+        : "no-tool-call";
+    consecutiveNoProgressSteps =
+      progressSignature === lastProgressSignature
+        ? consecutiveNoProgressSteps + 1
+        : 0;
+    lastProgressSignature = progressSignature;
     const recoveredTextToolCalls =
       response.toolCalls.length === 0 && responseToolCalls.length > 0;
 
@@ -915,7 +1521,8 @@ export async function runAgentMission({
         (streamingWritebackKind !== "edit" || preparedStreamingSectionEdit)
       ) {
         if (requireToolBeforeStreamingWriteback && !executedModelTool) {
-          if (step < MAX_AGENT_STEPS) {
+          if (!toolBeforeWriteCorrectionUsed && step < stepLimit) {
+            toolBeforeWriteCorrectionUsed = true;
             events.onStatus?.(
               "Sources or vault tools are required; asking model to use tools before writing...",
             );
@@ -926,7 +1533,11 @@ export async function runAgentMission({
             continue;
           }
 
-          break;
+          const message =
+            "I could not get the model to request the required read tools before writing. No vault files were changed.";
+          emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+          completeRun(events, "error", lastStep, runStartedAt, stepLimit);
+          return;
         }
         if (stopIfRequested(step)) {
           return;
@@ -937,6 +1548,7 @@ export async function runAgentMission({
           tools,
           enableStreaming,
           finalMode: "streaming_writeback",
+          runPlan,
         });
         let receipt: AgentRunReceipt;
         try {
@@ -965,12 +1577,18 @@ export async function runAgentMission({
         }
         writeReceipts.push(receipt);
         events.onReceipt?.(receipt);
-        completeRun(events, "write_completed", lastStep, runStartedAt);
+        completeRun(
+          events,
+          "write_completed",
+          lastStep,
+          runStartedAt,
+          stepLimit,
+        );
         return;
       }
 
       if (writeRequired && !wroteToNote) {
-        if (step < MAX_AGENT_STEPS) {
+        if (step < stepLimit) {
           events.onStatus?.("Write required; asking model to use a write tool...");
           messages.push({
             role: "system" as const,
@@ -980,6 +1598,64 @@ export async function runAgentMission({
         }
 
         break;
+      }
+
+      const missingWebTools = getMissingRequiredWebToolNames({
+        prompt: activeIntentPrompt,
+        allowedToolNames,
+        executedWebSearchTool,
+        executedWebFetchTool,
+      });
+      if (missingWebTools.length > 0) {
+        if (!webResearchCorrectionUsed && step < stepLimit) {
+          webResearchCorrectionUsed = true;
+          events.onStatus?.(
+            "Web research required; asking model to use web tools before answering...",
+          );
+          messages.push({
+            role: "system" as const,
+            content: buildWebResearchBeforeFinalAnswerPrompt(
+              missingWebTools,
+              tools,
+            ),
+          });
+          continue;
+        }
+
+        const message =
+          "I could not get the model to request the required web research tools before answering. No vault files were changed.";
+        emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+        completeRun(events, "error", lastStep, runStartedAt, stepLimit);
+        return;
+      }
+
+      if (
+        requiresVaultTraversalBeforeFinalAnswer(
+          activeIntentPrompt,
+          runPlan,
+          allowedToolNames,
+        ) &&
+        !executedModelTool
+      ) {
+        if (!vaultTraversalCorrectionUsed && step < stepLimit) {
+          vaultTraversalCorrectionUsed = true;
+          events.onStatus?.(
+            "Vault traversal required; asking model to inspect folders and notes before answering...",
+          );
+          messages.push({
+            role: "system" as const,
+            content: buildVaultTraversalBeforeFinalAnswerPrompt(tools),
+          });
+          continue;
+        }
+
+        const message =
+          consecutiveNoProgressSteps > 0
+            ? "I could not get the model to request vault tools after a corrective retry. No vault files were changed."
+            : "I could not get the model to request vault tools. No vault files were changed.";
+        emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+        completeRun(events, "error", lastStep, runStartedAt, stepLimit);
+        return;
       }
 
       const hasDirectFinalContent = hasRenderableAssistantContent(
@@ -996,6 +1672,7 @@ export async function runAgentMission({
           tools,
           enableStreaming,
           finalMode: executedModelTool ? "streaming_final" : "streaming_direct",
+          runPlan,
         });
         try {
           await emitFinalAnswer({
@@ -1061,9 +1738,36 @@ export async function runAgentMission({
           tools,
           enableStreaming,
           finalMode: executedModelTool ? "buffered_final" : "direct",
+          runPlan,
         });
-        emitDirectAssistantAnswer(directContent, events);
+        if (runPlan.requiresEnglishGuard) {
+          directContent = await repairEnglishOnlyOutput({
+            modelClient,
+            messages,
+            draft: directContent,
+            events,
+            think: activeThink,
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+            metricName: "direct_answer_english_repair",
+          });
+        }
+        emitDirectAssistantAnswer(
+          directContent,
+          events,
+          runPlan.requiresEnglishGuard,
+        );
       }
+      await checkpointRunIfDue({
+        toolContext: runToolContext,
+        events,
+        runId,
+        step,
+        stepLimit,
+        runPlan,
+        toolNames: responseToolCalls.map((toolCall) => toolCall.name),
+      });
       completeRun(
         events,
         isClarifyingQuestionResponse(activeIntentPrompt, response.message.content)
@@ -1071,6 +1775,7 @@ export async function runAgentMission({
           : "final",
         lastStep,
         runStartedAt,
+        stepLimit,
       );
       return;
     }
@@ -1169,6 +1874,7 @@ export async function runAgentMission({
       });
 
       if (result.ok) {
+        successfulToolNames.push(toolCall.name);
         const successMessage = emitToolSuccessStatus(
           toolCall.name,
           result.output,
@@ -1213,10 +1919,19 @@ export async function runAgentMission({
           );
         }
 
+        if (toolCall.name === "web_search") {
+          executedWebSearchTool = true;
+        }
+
+        if (toolCall.name === "web_fetch") {
+          executedWebFetchTool = true;
+        }
+
         if (isWriteToolName(toolCall.name)) {
           wroteToNote = true;
         }
       } else {
+        failedToolNames.push(toolCall.name);
         events.onStatus?.(`Tool returned error: ${toolCall.name}`);
         events.onToolDone?.({
           ...toolEventBase,
@@ -1243,7 +1958,7 @@ export async function runAgentMission({
     if (
       shouldReplanAfterUnavailableTool &&
       !unavailableToolCorrectionUsed &&
-      step < MAX_AGENT_STEPS
+      step < stepLimit
     ) {
       unavailableToolCorrectionUsed = true;
       events.onStatus?.("Unavailable write tool requested; asking model to choose an allowed path...");
@@ -1254,6 +1969,73 @@ export async function runAgentMission({
       continue;
     }
 
+    await checkpointRunIfDue({
+      toolContext: runToolContext,
+      events,
+      runId,
+      step,
+      stepLimit,
+      runPlan,
+      toolNames: responseToolCalls.map((toolCall) => toolCall.name),
+    });
+
+    if (
+      consecutiveNoProgressSteps === 1 &&
+      !wroteToNote &&
+      step < stepLimit
+    ) {
+      events.onStatus?.(
+        "Repeated tool call detected; asking model to synthesize or choose a different tool...",
+      );
+      messages.push({
+        role: "system" as const,
+        content:
+          "You repeated the same tool call without making progress. Do not repeat that same call again. Either use a different useful tool or draft the final answer/writeback from the context already gathered.",
+      });
+      continue;
+    }
+
+    const loopLedger: LoopLedger = {
+      successfulTools: [...successfulToolNames],
+      failedTools: [...failedToolNames],
+      repeatedToolCalls: consecutiveNoProgressSteps,
+      requiredToolsSatisfied: areLoopRequiredToolsSatisfied(
+        loopBudgetPlan.expectedTools,
+        successfulToolNames,
+      ),
+      finalizationReserved: loopBudgetPlan.finalizationReserve > 0,
+      writeCompleted: wroteToNote,
+    };
+    const loopDecision = decideNextLoopAction(loopLedger, loopBudgetPlan);
+    if (
+      loopDecision.action === "force_final_no_tools" &&
+      !wroteToNote &&
+      step < stepLimit
+    ) {
+      events.onStatus?.(
+        `Tool context is sufficient; drafting final output (${loopDecision.reason})...`,
+      );
+      tools = [];
+      allowedToolNames = new Set();
+      messages.push({
+        role: "system" as const,
+        content:
+          "Required context has been gathered. Do not request more tools. Draft the final answer or note writeback now from the gathered tool results.",
+      });
+      continue;
+    }
+    if (
+      loopDecision.action === "stop_budget" &&
+      loopDecision.reason === "repeated_tool_call_without_progress" &&
+      !wroteToNote
+    ) {
+      events.onStatus?.(
+        "Stopped repeated tool loop before burning the full safety limit.",
+      );
+      completeRun(events, "budget", lastStep, runStartedAt, stepLimit);
+      return;
+    }
+
     if (wroteToNote) {
       emitRunDiagnostics({
         events,
@@ -1261,14 +2043,27 @@ export async function runAgentMission({
         tools,
         enableStreaming,
         finalMode: "none",
+        runPlan,
       });
       emitLocalWriteSummary(events, writeReceipts);
-      completeRun(events, "write_completed", lastStep, runStartedAt);
+      completeRun(events, "write_completed", lastStep, runStartedAt, stepLimit);
       return;
     }
   }
 
-  completeRun(events, "budget", Math.max(lastStep, MAX_AGENT_STEPS), runStartedAt);
+  await checkpointRunIfDue({
+    toolContext: runToolContext,
+    events,
+    runId,
+    step: Math.max(lastStep, stepLimit),
+    stepLimit,
+    runPlan,
+    toolNames: [],
+    status: "budget",
+    message: "Stopped at safety limit. Review partial results.",
+    force: true,
+  });
+  completeRun(events, "budget", Math.max(lastStep, stepLimit), runStartedAt, stepLimit);
 }
 
 export type FinalEmissionMode =
@@ -1318,6 +2113,91 @@ async function observeCurrentNote(
   if (!result.ok) {
     throw new Error(result.error?.message ?? "Unable to read current note.");
   }
+
+  return result.output;
+}
+
+async function runObservedTool({
+  name,
+  arguments: toolArguments,
+  toolRegistry,
+  toolContext,
+  events,
+  step,
+}: {
+  name: string;
+  arguments: Record<string, unknown>;
+  toolRegistry: ToolRegistry;
+  toolContext: ToolExecutionContext;
+  events: AgentRunEvents;
+  step: number;
+}): Promise<unknown> {
+  const toolCall = { name, arguments: toolArguments };
+  const toolEventBase: AgentToolRunEvent = {
+    id: `${step}:local:${name}`,
+    name,
+    step,
+  };
+
+  events.onToolStart?.({
+    ...toolEventBase,
+    message: `Running tool: ${name}`,
+  });
+  events.onTrace?.({
+    id: `${toolEventBase.id}:start`,
+    kind: "tool_start",
+    step,
+    toolName: name,
+    message: `Running ${name}`,
+    inputPreview: redactToolArguments(name, toolArguments),
+  });
+  events.onPhaseChange?.("running_tool", `Running tool: ${name}`);
+  emitToolPreparationStatus(name, events);
+  events.onStatus?.(`Running tool: ${name}`);
+
+  const result = await executeToolWithMetrics({
+    toolRegistry,
+    toolCall,
+    toolContext,
+    events,
+    step,
+  });
+
+  if (!result.ok) {
+    events.onStatus?.(`Tool returned error: ${name}`);
+    events.onToolDone?.({
+      ...toolEventBase,
+      ok: false,
+      message: `Tool returned error: ${name}`,
+      error: result.error,
+    });
+    events.onTrace?.({
+      id: `${toolEventBase.id}:result`,
+      kind: "tool_result",
+      step,
+      toolName: name,
+      message: `Tool returned error: ${name}`,
+      error: result.error,
+      outputPreview: truncateTracePayload(result),
+    });
+    throw new Error(result.error?.message ?? `Tool returned error: ${name}`);
+  }
+
+  const successMessage = emitToolSuccessStatus(name, result.output, events);
+  events.onToolDone?.({
+    ...toolEventBase,
+    ok: true,
+    message: successMessage,
+    output: result.output,
+  });
+  events.onTrace?.({
+    id: `${toolEventBase.id}:result`,
+    kind: "tool_result",
+    step,
+    toolName: name,
+    message: successMessage,
+    outputPreview: truncateTracePayload(result.output),
+  });
 
   return result.output;
 }
@@ -1392,9 +2272,21 @@ function formatMissionIntentContext(intent: MissionIntent): string {
   ].join(" ");
 }
 
+function formatGeneratedWordTargetContext(wordTarget: {
+  target: number;
+  exact: boolean;
+  tolerancePct: number;
+}): string {
+  return [
+    `Generated output word target: ${wordTarget.target} words.`,
+    `Exact word target: ${wordTarget.exact ? "yes" : "no"}.`,
+    `Word target tolerance percent: ${wordTarget.tolerancePct}.`,
+  ].join(" ");
+}
+
 function formatFollowupIntentContext(intentPrompt: string): string {
   return [
-    "The current user message is a short follow-up to recent chat.",
+    "The current user message is a follow-up to recent chat.",
     `Resolve this turn's tool routing as: ${JSON.stringify(intentPrompt)}.`,
     "Use the actual latest user message for conversational wording, but execute the resolved tool intent.",
   ].join(" ");
@@ -1439,6 +2331,22 @@ function formatAllowedToolsContext(
   ].join(" ");
 }
 
+function formatToolAuthorityContext(
+  tools: ModelChatRequest["tools"],
+): string {
+  const toolNames = tools?.map((tool) => tool.function.name) ?? [];
+  const authority = toolNames
+    .map((name) => `${name}:${TOOL_AUTHORITY[name] ?? "read"}`)
+    .join(", ");
+
+  return [
+    `Available tool authority: ${authority || "none"}.`,
+    "Read tools can be used autonomously for vault and note questions.",
+    "Write, edit, delete, and web tools require matching user intent.",
+    "Use the smallest valid tool sequence.",
+  ].join(" ");
+}
+
 function formatStreamingWritebackContext(kind: StreamingWritebackKind): string {
   if (kind === "edit") {
     return [
@@ -1466,6 +2374,65 @@ function formatConversationHistoryContext(): string {
     "Use it to resolve references such as the essay, answer, or plan you previously gave.",
     "Status logs, hidden thinking, tool traces, and receipts are intentionally excluded.",
   ].join(" ");
+}
+
+async function buildCheckpointResumeContext({
+  prompt,
+  activeIntentPrompt,
+  toolContext,
+  events,
+}: {
+  prompt: string;
+  activeIntentPrompt: string;
+  toolContext: ToolExecutionContext;
+  events: AgentRunEvents;
+}): Promise<string | null> {
+  if (
+    !hasCheckpointResumeIntent(prompt) &&
+    !hasCheckpointResumeIntent(activeIntentPrompt)
+  ) {
+    return null;
+  }
+
+  try {
+    const checkpoint = await readLatestAgentRunCheckpoint(toolContext);
+    if (checkpoint === null) {
+      events.onTrace?.({
+        id: "checkpoint-resume:none",
+        kind: "status",
+        message: "No Agent Runs checkpoint was available for resume context.",
+      });
+      return null;
+    }
+
+    events.onStatus?.(`Loaded checkpoint ${checkpoint.path} for resume context...`);
+    return formatCheckpointResumeContext(checkpoint);
+  } catch (error) {
+    events.onTrace?.({
+      id: "checkpoint-resume:error",
+      kind: "error",
+      message: `Could not load checkpoint resume context: ${getUnknownErrorMessage(error)}`,
+      error: {
+        code: "checkpoint_resume_failed",
+        message: getUnknownErrorMessage(error),
+      },
+    });
+    return null;
+  }
+}
+
+function formatCheckpointResumeContext(
+  checkpoint: LatestAgentRunCheckpoint,
+): string {
+  return [
+    "Latest Agent Runs checkpoint for resume context.",
+    "Use this checkpoint only if it clearly matches the user's requested continuation.",
+    "Do not claim completed work from the checkpoint unless it appears in the content below.",
+    `Checkpoint path: ${checkpoint.path}`,
+    `Checkpoint modified: ${new Date(checkpoint.mtime).toISOString()}`,
+    "",
+    checkpoint.content,
+  ].join("\n");
 }
 
 function buildChatRequest(
@@ -1516,6 +2483,9 @@ function buildRunConfigEvent({
   writeAutonomy,
   missionIntent,
   currentNoteContext,
+  runPlan,
+  streamingWritebackKind,
+  directCurrentNoteWritebackKind,
 }: {
   toolContext: ToolExecutionContext;
   enableStreaming: boolean;
@@ -1524,28 +2494,93 @@ function buildRunConfigEvent({
   writeAutonomy: boolean;
   missionIntent: MissionIntent;
   currentNoteContext: boolean;
+  runPlan: RunPlan;
+  streamingWritebackKind: StreamingWritebackKind | null;
+  directCurrentNoteWritebackKind: StreamingWritebackKind | null;
 }): AgentRunConfigEvent {
   const settings = toolContext.settings;
+  const vaultContext =
+    missionIntent.vaultContext || runPlan.slowPathReason === "needs_vault_context";
+  const missionMode =
+    missionIntent.mode === "chat_only" && vaultContext
+      ? "vault_context_answer"
+      : missionIntent.mode;
+
   return {
     model: settings?.model?.trim() || "unknown",
     base: formatBaseUrlCategory(settings?.ollamaBaseUrl?.trim() || ""),
     streaming: enableStreaming,
     thinkingMode: settings?.thinkingMode ?? "auto",
     resolvedThink: formatResolvedThink(activeThink),
+    writebackMode: getRunWritebackMode({
+      enableStreaming,
+      settings,
+      writeAutonomy,
+      missionIntent,
+      runPlan,
+      streamingWritebackKind,
+      directCurrentNoteWritebackKind,
+    }),
+    route: runPlan.route,
+    expectedTimeClass: runPlan.expectedTimeClass,
+    maxStepsForRun: runPlan.maxStepsForRun,
+    slowPathReason: runPlan.slowPathReason,
+    englishGuard: runPlan.requiresEnglishGuard,
     temperature: modelOptions?.temperature,
     topK: modelOptions?.top_k,
     topP: modelOptions?.top_p,
     numCtx: modelOptions?.num_ctx,
     writeAutonomy,
-    missionMode: missionIntent.mode,
+    missionMode,
     contextScope: getRunContextScope({
-      vaultContext: missionIntent.vaultContext,
+      vaultContext,
       currentNoteContext,
     }),
     currentNoteContext,
-    vaultContext: missionIntent.vaultContext,
-    maxSteps: MAX_AGENT_STEPS,
+    vaultContext,
+    maxSteps: getConfiguredMaxAgentSteps(settings),
   };
+}
+
+function getRunWritebackMode({
+  enableStreaming,
+  settings,
+  writeAutonomy,
+  missionIntent,
+  runPlan,
+  streamingWritebackKind,
+  directCurrentNoteWritebackKind,
+}: {
+  enableStreaming: boolean;
+  settings: ToolExecutionContext["settings"];
+  writeAutonomy: boolean;
+  missionIntent: MissionIntent;
+  runPlan: RunPlan;
+  streamingWritebackKind: StreamingWritebackKind | null;
+  directCurrentNoteWritebackKind: StreamingWritebackKind | null;
+}): RunWritebackMode {
+  const streamWritebackEnabled =
+    enableStreaming &&
+    settings?.streamWritebackMode === "all_current_note_content_writes";
+
+  if (
+    streamWritebackEnabled &&
+    writeAutonomy &&
+    (streamingWritebackKind !== null ||
+      directCurrentNoteWritebackKind !== null ||
+      runPlan.route === "direct_writeback" ||
+      runPlan.route === "single_model_writeback")
+  ) {
+    return runPlan.route === "grounded_workflow"
+      ? "streaming_after_tools"
+      : "streaming_current_note";
+  }
+
+  if (missionIntent.requireWriteCompletion) {
+    return "tool_write";
+  }
+
+  return "off";
 }
 
 function getRunContextScope({
@@ -1919,12 +2954,14 @@ function emitRunDiagnostics({
   tools,
   enableStreaming,
   finalMode,
+  runPlan,
 }: {
   events: AgentRunEvents;
   toolContext: ToolExecutionContext;
   tools: ModelChatRequest["tools"];
   enableStreaming: boolean;
   finalMode: FinalEmissionMode;
+  runPlan: RunPlan;
 }) {
   events.onStatus?.(
     formatRunDiagnostics({
@@ -1932,6 +2969,7 @@ function emitRunDiagnostics({
       toolCount: tools?.length ?? 0,
       enableStreaming,
       finalMode,
+      runPlan,
     }),
   );
 }
@@ -1941,11 +2979,13 @@ export function formatRunDiagnostics({
   toolCount,
   enableStreaming,
   finalMode,
+  runPlan,
 }: {
   toolContext: ToolExecutionContext;
   toolCount: number;
   enableStreaming: boolean;
   finalMode: FinalEmissionMode;
+  runPlan: RunPlan;
 }): string {
   const settings = toolContext.settings;
   const model = settings?.model?.trim() || "unknown";
@@ -1959,6 +2999,11 @@ export function formatRunDiagnostics({
     `streaming=${enableStreaming ? "on" : "off"};`,
     `missionMode=${toolContext.missionIntent?.mode ?? "unknown"};`,
     `writeAutonomy=${toolContext.writeAutonomy ? "on" : "off"};`,
+    `route=${runPlan.route};`,
+    `expected=${runPlan.expectedTimeClass};`,
+    `step_cap=${runPlan.maxStepsForRun};`,
+    `slow_path=${runPlan.slowPathReason};`,
+    `english_guard=${runPlan.requiresEnglishGuard ? "on" : "off"};`,
     `temperature=${formatOptionalDiagnostic(modelOptions?.temperature)};`,
     `top_k=${formatOptionalDiagnostic(modelOptions?.top_k)};`,
     `top_p=${formatOptionalDiagnostic(modelOptions?.top_p)};`,
@@ -2079,6 +3124,39 @@ function emitMetricEvent(
   });
 }
 
+function createStreamLifecycleTracker(
+  events: AgentRunEvents,
+  startedAt = nowMs(),
+) {
+  const emittedOnce = new Set<StreamLifecycleKind>();
+
+  return {
+    mark(
+      kind: StreamLifecycleKind,
+      message: string,
+      extra: Omit<
+        Partial<AgentStreamLifecycleEvent>,
+        "kind" | "elapsedMs" | "message"
+      > = {},
+    ) {
+      if (
+        (kind.startsWith("first_") || kind === "stream_connected") &&
+        emittedOnce.has(kind)
+      ) {
+        return;
+      }
+
+      emittedOnce.add(kind);
+      events.onStreamLifecycle?.({
+        kind,
+        elapsedMs: elapsedMs(startedAt),
+        message,
+        ...extra,
+      });
+    },
+  };
+}
+
 async function withModelWaitStatus<T>(
   operation: () => Promise<T>,
   events: AgentRunEvents,
@@ -2167,6 +3245,53 @@ async function chatForAgentStep(
   }
 }
 
+async function emitNonStreamingFinalModelAnswer({
+  modelClient,
+  messages,
+  events,
+  metricName,
+  options,
+  abortSignal,
+}: {
+  modelClient: ModelClient;
+  messages: ModelChatMessage[];
+  events: AgentRunEvents;
+  metricName: string;
+  options?: ModelRequestOptions;
+  abortSignal?: AbortSignal;
+}): Promise<ModelChatResponse> {
+  emitStatus(events, "Drafting final answer...", "final_answer");
+  const request: ModelChatRequest = {
+    messages,
+    options,
+    abortSignal,
+  };
+  const startedAt = nowMs();
+  const requestChars = measureSerializedChars(request);
+  emitModelCallTrace(events, {
+    id: `model-call-${metricName}`,
+    message: `Model call: ${metricName}`,
+    request,
+  });
+
+  const response = await withModelWaitStatus(
+    () => modelClient.chat(request),
+    events,
+    "model API response",
+  );
+  emitMetricEvent(events, {
+    kind: "model_chat",
+    name: metricName,
+    durationMs: elapsedMs(startedAt),
+    requestChars,
+    responseChars: measureSerializedChars(response.raw ?? response.message),
+    ...extractTokenUsageFields(response.raw),
+  });
+  emitThinking(response.message.thinking, events);
+  emitDirectAssistantAnswer(response.message.content ?? "", events);
+  return response;
+}
+
 async function emitFinalAnswer({
   modelClient,
   messages,
@@ -2207,6 +3332,7 @@ async function emitFinalAnswer({
   let observedContent = false;
   const wordTarget = parseGeneratedWordCountTargetFromMessages(messages);
   const verifyWordCount = wordTarget !== null;
+  const englishGuard = isLikelyEnglishPrompt(relevancePrompt ?? "");
   const contentSanitizer = createAssistantContentSanitizer();
   const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
   const thinkingStream = createThinkingStream(events);
@@ -2217,7 +3343,21 @@ async function emitFinalAnswer({
   };
   const requestChars = measureSerializedChars(streamRequest);
   const startedAt = nowMs();
+  const lifecycle = createStreamLifecycleTracker(events, startedAt);
   let response: ModelChatResponse;
+  const emitVisibleFinalDelta = (content: string) => {
+    if (englishGuard) {
+      assertEnglishOnlyVisibleOutput(content, events);
+    }
+
+    lifecycle.mark("first_visible_content", "Showing safe answer text...", {
+      releasedChars: content.length,
+    });
+    events.onFinalDelta?.(content);
+    events.onAssistantDelta?.(content);
+  };
+
+  lifecycle.mark("stream_started", "Waiting for provider to send content...");
   emitModelCallTrace(events, {
     id: `model-call-stream-${metricName}`,
     message: `Model stream: ${metricName}`,
@@ -2230,25 +3370,41 @@ async function emitFinalAnswer({
       request: streamRequest,
       events,
       streamEvents: {
-      onContentDelta: (delta) => {
-        const sanitized = contentSanitizer.push(delta);
-        if (!sanitized) {
-          return;
-        }
+        onRawChunk: () => {
+          lifecycle.mark("stream_connected", "Connected to model stream.");
+          lifecycle.mark("first_raw_chunk", "Provider sent the first stream chunk.");
+        },
+        onContentDelta: (delta) => {
+          lifecycle.mark(
+            "first_content_delta",
+            "Received answer text; checking early output...",
+          );
+          const sanitized = contentSanitizer.push(delta);
+          if (!sanitized) {
+            return;
+          }
 
-        observedContent = true;
-        const topicalContent = relevanceGate.push(sanitized);
-        if (!topicalContent) {
-          return;
-        }
+          observedContent = true;
+          const topicalContent = relevanceGate.push(sanitized);
+          if (!topicalContent) {
+            lifecycle.mark("buffering_safety", "Checking early output before writing...", {
+              bufferedChars: sanitized.length,
+            });
+            return;
+          }
 
-        emittedContent += topicalContent;
-        if (!verifyWordCount) {
-          events.onFinalDelta?.(topicalContent);
-          events.onAssistantDelta?.(topicalContent);
-        }
-      },
-      onThinkingDelta: thinkingStream.onDelta,
+          emittedContent += topicalContent;
+          if (!verifyWordCount) {
+            emitVisibleFinalDelta(topicalContent);
+          }
+        },
+        onThinkingDelta: (delta) => {
+          lifecycle.mark(
+            "first_thinking_delta",
+            "Received thinking, waiting for answer text...",
+          );
+          thinkingStream.onDelta(delta);
+        },
       },
       onThinkingUnsupported,
     });
@@ -2277,8 +3433,7 @@ async function emitFinalAnswer({
     if (topicalContent) {
       emittedContent += topicalContent;
       if (!verifyWordCount) {
-        events.onFinalDelta?.(topicalContent);
-        events.onAssistantDelta?.(topicalContent);
+        emitVisibleFinalDelta(topicalContent);
       }
     }
   }
@@ -2291,8 +3446,7 @@ async function emitFinalAnswer({
     if (topicalContent) {
       emittedContent += topicalContent;
       if (!verifyWordCount) {
-        events.onFinalDelta?.(topicalContent);
-        events.onAssistantDelta?.(topicalContent);
+        emitVisibleFinalDelta(topicalContent);
       }
     }
   }
@@ -2301,8 +3455,7 @@ async function emitFinalAnswer({
   if (bufferedTopicalContent) {
     emittedContent += bufferedTopicalContent;
     if (!verifyWordCount) {
-      events.onFinalDelta?.(bufferedTopicalContent);
-      events.onAssistantDelta?.(bufferedTopicalContent);
+      emitVisibleFinalDelta(bufferedTopicalContent);
     }
   }
 
@@ -2340,8 +3493,7 @@ async function emitFinalAnswer({
       },
       toolCalls: [],
     };
-    events.onFinalDelta?.(finalContent);
-    events.onAssistantDelta?.(finalContent);
+    emitVisibleFinalDelta(finalContent);
     const finalCount = countMarkdownVisibleText(finalContent).wordCount;
     events.onStatus?.(
       `Word count: ${finalCount}/${wordTarget.target} (${isWordCountWithinTarget(finalCount, wordTarget) ? "within target" : "outside target"}; correction=${correctionUsed ? "used" : "not used"}).`,
@@ -2389,6 +3541,7 @@ interface RelevanceProfile {
   anchors: Set<string>;
   minOutputChars: number;
   expectedEnglish: boolean;
+  acceptsCodeOutput: boolean;
 }
 
 function createFinalAnswerRelevanceGate(
@@ -2503,6 +3656,7 @@ function buildRelevanceProfile(prompt: string): RelevanceProfile | null {
     anchors,
     minOutputChars: 360,
     expectedEnglish: isLikelyEnglishPrompt(prompt),
+    acceptsCodeOutput: hasCodeAnswerIntent(prompt),
   };
 }
 
@@ -2510,6 +3664,10 @@ function isTopicallyRelevant(
   profile: RelevanceProfile,
   content: string,
 ): boolean {
+  if (profile.acceptsCodeOutput && looksLikeCodeAnswer(content)) {
+    return true;
+  }
+
   const outputTokens = new Set(extractSemanticTokens(content));
   for (const anchor of profile.anchors) {
     if (outputTokens.has(anchor)) {
@@ -2518,6 +3676,21 @@ function isTopicallyRelevant(
   }
 
   return false;
+}
+
+function hasCodeAnswerIntent(prompt: string): boolean {
+  return /\b(code|leetcode|program|function|method|algorithm|solution|solve|implementation)\b/i.test(
+    prompt,
+  );
+}
+
+function looksLikeCodeAnswer(content: string): boolean {
+  const trimmed = content.trimStart();
+  return (
+    /^```[a-z0-9_-]*\s*$/i.test(trimmed) ||
+    /^```[a-z0-9_-]*\s*[\r\n]/i.test(trimmed) ||
+    /\b(def|function|class|const|let|var|return|for|while|if)\b/.test(content)
+  );
 }
 
 function shouldStopForOffTopicOutput(
@@ -2751,6 +3924,8 @@ function emitThinking(thinking: string | undefined, events: AgentRunEvents) {
 
 const READ_NAV_TOOL_NAMES = new Set([
   "read_current_file",
+  "inspect_vault_context",
+  "inspect_vault_index",
   "list_current_folder",
   "list_markdown_files",
   "read_markdown_files",
@@ -2762,15 +3937,27 @@ const READ_NAV_TOOL_NAMES = new Set([
   "suggest_note_links",
   "list_folder",
   "get_path_info",
+  "search_research_memory",
+  "read_research_memory",
+  "list_templates",
+  "read_template",
 ]);
 
 const WRITE_TOOL_NAMES = new Set([
+  "open_web_source",
+  "create_design_canvas",
+  "create_svg_design",
+  "seed_default_templates",
+  "create_template",
+  "fill_template",
   "create_folder",
   "create_file",
   "append_file",
   "replace_file",
   "move_path",
   "append_to_current_file",
+  "append_to_current_section",
+  "append_research_memory",
   "retitle_current_file",
   "prepare_edit_current_section",
   "edit_current_section",
@@ -2780,6 +3967,56 @@ const WRITE_TOOL_NAMES = new Set([
 
 const DELETE_TOOL_NAMES = new Set(["delete_path", "delete_current_file"]);
 
+const CODE_TOOL_NAMES = new Set(["run_code_block", "render_html_preview"]);
+
+type ToolAuthority = "read" | "write" | "edit" | "delete" | "web" | "code";
+
+const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
+  read_current_file: "read",
+  inspect_vault_context: "read",
+  inspect_vault_index: "read",
+  list_current_folder: "read",
+  list_markdown_files: "read",
+  search_markdown_files: "read",
+  read_markdown_files: "read",
+  read_file: "read",
+  count_words: "read",
+  get_note_graph_context: "read",
+  find_related_notes: "read",
+  suggest_note_links: "read",
+  list_folder: "read",
+  get_path_info: "read",
+  search_research_memory: "read",
+  read_research_memory: "read",
+  list_templates: "read",
+  read_template: "read",
+  seed_default_templates: "write",
+  create_template: "write",
+  fill_template: "write",
+  create_folder: "write",
+  create_file: "write",
+  append_file: "write",
+  replace_file: "edit",
+  move_path: "edit",
+  append_to_current_file: "write",
+  append_to_current_section: "write",
+  append_research_memory: "write",
+  retitle_current_file: "edit",
+  prepare_edit_current_section: "edit",
+  edit_current_section: "edit",
+  replace_current_file: "edit",
+  link_related_notes_in_current_file: "edit",
+  delete_path: "delete",
+  delete_current_file: "delete",
+  web_search: "web",
+  web_fetch: "web",
+  open_web_source: "web",
+  run_code_block: "code",
+  render_html_preview: "code",
+  create_design_canvas: "write",
+  create_svg_design: "write",
+};
+
 function getAllowedToolDefinitions(
   toolRegistry: ToolRegistry,
   prompt: string,
@@ -2788,6 +4025,7 @@ function getAllowedToolDefinitions(
 ) {
   const noteOutputIntent = missionIntent.noteOutput;
   const allowAppend = hasAppendIntent(prompt);
+  const allowSectionAppend = hasSectionAppendIntent(prompt);
   const allowDelete = hasDeleteIntent(prompt);
   const allowDeletePath = hasDeletePathIntent(prompt);
   const allowWholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
@@ -2795,13 +4033,30 @@ function getAllowedToolDefinitions(
   const allowReplace =
     hasReplaceIntent(prompt) && (!allowEdit || allowWholeNoteReplace) && !allowDelete;
   const allowRetitle = hasTitleIntent(prompt);
-  const allowWebSearch = hasWebSearchIntent(prompt);
-  const allowCurrentNoteRead = hasCurrentNoteReadIntent(prompt);
+  const allowWebSearch = shouldAllowWebSearch(prompt, missionIntent);
+  const allowCurrentNoteRead =
+    hasCurrentNoteReadIntent(prompt) || hasCurrentNoteSectionTarget(prompt);
   const allowWordCount = hasWordCountIntent(prompt);
   const allowGraphContext = hasGraphConnectionIntent(prompt);
   const allowGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
+  const allowTemplateTools = hasTemplateIntent(prompt);
+  const allowTemplateSeed = hasTemplateSeedIntent(prompt);
+  const allowTemplateCreate = hasTemplateCreateIntent(prompt);
+  const allowTemplateFill = hasTemplateFillIntent(prompt);
+  const allowResearchMemory = hasResearchMemoryIntent(prompt);
+  const allowResearchMemoryWrite = hasResearchMemoryWriteIntent(prompt);
+  const allowVaultIndex = hasVaultIndexIntent(prompt);
+  const allowOpenWebSource = hasOpenWebSourceIntent(prompt);
+  const allowCodeExecution = hasCodeExecutionIntent(prompt);
+  const allowHtmlPreview = hasHtmlPreviewIntent(prompt) || allowCodeExecution;
+  const allowDesignTools = hasDesignIntent(prompt);
+  const allowCanvasDesign = hasCanvasDesignIntent(prompt);
+  const allowSvgDesign = hasSvgDesignIntent(prompt);
   const allowVaultBrowse =
-    missionIntent.vaultContext || hasVaultBrowseIntent(prompt) || allowGraphContext;
+    missionIntent.vaultContext ||
+    hasVaultBrowseIntent(prompt) ||
+    allowGraphContext ||
+    allowVaultIndex;
   const allowSpecificFileRead = hasSpecificFileReadIntent(prompt);
   const allowCreateFile = hasCreateFileIntent(prompt);
   const allowCreateFolder = hasCreateFolderIntent(prompt);
@@ -2828,12 +4083,40 @@ function getAllowedToolDefinitions(
       return allowWebSearch;
     }
 
+    if (name === "open_web_source") {
+      return allowOpenWebSource;
+    }
+
+    if (name === "run_code_block") {
+      return allowCodeExecution;
+    }
+
+    if (name === "render_html_preview") {
+      return allowHtmlPreview;
+    }
+
+    if (name === "create_design_canvas") {
+      return allowDesignTools && allowCanvasDesign;
+    }
+
+    if (name === "create_svg_design") {
+      return allowDesignTools && allowSvgDesign;
+    }
+
     if (name === "read_current_file") {
       return (
         missionIntent.vaultContext ||
         allowCurrentNoteRead ||
         allowCurrentNoteOutput
       );
+    }
+
+    if (name === "inspect_vault_context") {
+      return allowVaultBrowse;
+    }
+
+    if (name === "inspect_vault_index") {
+      return allowVaultBrowse || allowVaultIndex;
     }
 
     if (name === "list_markdown_files") {
@@ -2868,12 +4151,36 @@ function getAllowedToolDefinitions(
       return allowVaultBrowse || allowSpecificFileRead;
     }
 
+    if (name === "list_templates" || name === "read_template") {
+      return allowTemplateTools;
+    }
+
+    if (name === "seed_default_templates") {
+      return allowTemplateSeed;
+    }
+
+    if (name === "search_research_memory" || name === "read_research_memory") {
+      return allowResearchMemory;
+    }
+
+    if (name === "append_research_memory") {
+      return allowResearchMemoryWrite;
+    }
+
+    if (name === "create_template") {
+      return allowTemplateCreate && !allowTemplateSeed;
+    }
+
+    if (name === "fill_template") {
+      return allowTemplateFill;
+    }
+
     if (name === "create_folder") {
       return allowCreateFolder;
     }
 
     if (name === "create_file") {
-      return allowCreateFile;
+      return allowCreateFile && !allowTemplateTools;
     }
 
     if (name === "append_file") {
@@ -2896,12 +4203,17 @@ function getAllowedToolDefinitions(
       return allowEdit && streamingWritebackKind === "edit";
     }
 
+    if (name === "append_to_current_section") {
+      return allowSectionAppend && !preferPathTarget && !allowDelete;
+    }
+
     if (name === "append_to_current_file") {
       return (
         (allowAppend || allowAutonomousAppend) &&
         streamingWritebackKind !== "append" &&
         !preferPathTarget &&
         !hasTitleOnlyIntent(prompt) &&
+        !allowSectionAppend &&
         !allowEdit &&
         !allowDelete
       );
@@ -2948,6 +4260,10 @@ function isAllowedForMission(
       hasCurrentNoteReadIntent(prompt) ||
       hasWordCountIntent(prompt) ||
       hasGraphConnectionIntent(prompt) ||
+      hasTemplateIntent(prompt) ||
+      hasResearchMemoryIntent(prompt) ||
+      hasVaultIndexIntent(prompt) ||
+      hasDesignIntent(prompt) ||
       intent.noteOutput ||
       intent.explicitMutation
     );
@@ -2958,11 +4274,23 @@ function isAllowedForMission(
   }
 
   if (WRITE_TOOL_NAMES.has(name)) {
-    return intent.noteOutput || intent.explicitMutation;
+    if (name === "open_web_source") {
+      return hasOpenWebSourceIntent(prompt);
+    }
+
+    if (name === "create_design_canvas" || name === "create_svg_design") {
+      return hasDesignIntent(prompt);
+    }
+
+    return intent.noteOutput || intent.explicitMutation || hasResearchMemoryWriteIntent(prompt);
   }
 
   if (name === "web_search" || name === "web_fetch") {
     return hasWebSearchIntent(prompt);
+  }
+
+  if (CODE_TOOL_NAMES.has(name)) {
+    return hasCodeExecutionIntent(prompt) || hasHtmlPreviewIntent(prompt);
   }
 
   return true;
@@ -2984,10 +4312,19 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("prepare_edit_current_section");
   }
 
+  if (hasSectionAppendIntent(prompt)) {
+    requiredToolNames.push("append_to_current_section");
+  }
+
+  if (hasResearchMemoryWriteIntent(prompt)) {
+    requiredToolNames.push("append_research_memory");
+  }
+
   if (
     (hasAppendIntent(prompt) || noteOutputIntent) &&
     !preferPathTarget &&
     !wholeNoteReplace &&
+    !hasSectionAppendIntent(prompt) &&
     !hasEditIntent(prompt) &&
     !hasDeleteIntent(prompt) &&
     streamingWritebackKind !== "append"
@@ -3007,6 +4344,26 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("replace_file");
   }
 
+  if (hasTemplateSeedIntent(prompt)) {
+    requiredToolNames.push("seed_default_templates");
+  } else if (hasTemplateCreateIntent(prompt)) {
+    requiredToolNames.push("create_template");
+  }
+
+  if (hasTemplateFillIntent(prompt)) {
+    requiredToolNames.push("fill_template");
+  }
+
+  if (hasDesignIntent(prompt)) {
+    if (hasCanvasDesignIntent(prompt)) {
+      requiredToolNames.push("create_design_canvas");
+    }
+
+    if (hasSvgDesignIntent(prompt)) {
+      requiredToolNames.push("create_svg_design");
+    }
+  }
+
   if (hasTitleIntent(prompt) && !preferPathTarget) {
     requiredToolNames.push("retitle_current_file");
   }
@@ -3015,7 +4372,7 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("create_folder");
   }
 
-  if (hasCreateFileIntent(prompt)) {
+  if (hasCreateFileIntent(prompt) && !hasTemplateIntent(prompt)) {
     requiredToolNames.push("create_file");
   }
 
@@ -3044,9 +4401,9 @@ function getRequiredWriteToolNames(
 
 function buildWriteCorrectionPrompt(requiredWriteTools: string[]): string {
   return [
-    "The user explicitly requested a note write, but you answered without using a write tool.",
+    "The user explicitly requested a vault write or artifact creation, but you answered without using a write tool.",
     `Request one of these allowed write tools now: ${requiredWriteTools.join(", ")}.`,
-    "Do not provide chat-only prose until the note write has completed.",
+    "Do not provide chat-only prose until the requested write or artifact has completed.",
   ].join(" ");
 }
 
@@ -3059,6 +4416,34 @@ function buildToolBeforeStreamingWritebackPrompt(
     "The mission asks for sources, vault context, graph context, or verification before writing.",
     `Use the relevant available tools before final writeback. Available tools: ${toolNames.join(", ") || "none"}.`,
     "Request tools only. Do not draft the final answer yet.",
+  ].join(" ");
+}
+
+function buildVaultTraversalBeforeFinalAnswerPrompt(
+  tools: ModelChatRequest["tools"],
+): string {
+  const toolNames = tools?.map((tool) => tool.function.name) ?? [];
+
+  return [
+    "The user asked what other folders, notes, or files say. You have vault traversal and read tools available, so do not claim you cannot access the vault.",
+    "Request vault tools before giving the final answer. Start with list_current_folder when the active note location may matter, then use list_markdown_files, list_folder, search_markdown_files, read_markdown_files, read_file, or get_path_info as needed.",
+    `Available tools: ${toolNames.join(", ") || "none"}.`,
+    "Request tools only. Do not answer from filenames alone.",
+  ].join(" ");
+}
+
+function buildWebResearchBeforeFinalAnswerPrompt(
+  missingToolNames: string[],
+  tools: ModelChatRequest["tools"],
+): string {
+  const toolNames = tools?.map((tool) => tool.function.name) ?? [];
+
+  return [
+    "The user asked for current web research, sources, citations, or verification.",
+    `Request these missing web tools before giving the final answer: ${missingToolNames.join(", ")}.`,
+    `Available tools: ${toolNames.join(", ") || "none"}.`,
+    "Use web_search before web_fetch unless the user supplied a specific URL.",
+    "Request tools only. Do not answer from memory.",
   ].join(" ");
 }
 
@@ -3084,6 +4469,21 @@ function shouldObserveCurrentNote(
     allowedToolNames.has("read_current_file") &&
     requiresCurrentNoteContent(prompt)
   );
+}
+
+function shouldAllowWebSearch(
+  prompt: string,
+  missionIntent: MissionIntent,
+): boolean {
+  if (!hasWebSearchIntent(prompt)) {
+    return false;
+  }
+
+  if (!missionIntent.vaultContext) {
+    return true;
+  }
+
+  return hasExplicitWebSearchIntent(prompt);
 }
 
 function canStreamAnswerFromInitialCurrentNoteContext(
@@ -3138,6 +4538,260 @@ function getDirectCurrentNoteWritebackKind({
   return "append";
 }
 
+function createRuntimeCache(): AgentRuntimeCache {
+  return {
+    toolResults: new Map(),
+  };
+}
+
+function createRunPlan({
+  prompt,
+  missionIntent,
+  tools,
+  settings,
+  streamingWritebackKind,
+  directCurrentNoteWritebackKind,
+}: {
+  prompt: string;
+  missionIntent: MissionIntent;
+  tools: ModelToolDefinition[];
+  settings: ToolExecutionContext["settings"];
+  streamingWritebackKind: StreamingWritebackKind | null;
+  directCurrentNoteWritebackKind: StreamingWritebackKind | null;
+}): RunPlan {
+  const requiresEnglishGuard = isLikelyEnglishPrompt(prompt);
+  const configuredMaxSteps = getConfiguredMaxAgentSteps(settings);
+  const capSteps = (steps: number) =>
+    estimateLoopBudget({
+      route: "tool_required",
+      configuredMaxSteps,
+      requestedSteps: steps,
+    });
+
+  const plan = ({
+    route,
+    maxStepsForRun,
+    thinking,
+    allowedTools,
+    slowPathReason,
+    expectedTimeClass,
+  }: Omit<RunPlan, "requiresEnglishGuard">): RunPlan => ({
+    route,
+    maxStepsForRun,
+    thinking,
+    allowedTools,
+    slowPathReason,
+    expectedTimeClass,
+    requiresEnglishGuard,
+  });
+
+  const grounded = (
+    slowPathReason: SlowPathReason,
+    expectedTimeClass: RunPlan["expectedTimeClass"] = "long",
+  ) => {
+    const generated = analyzeGeneratedOutputPrompt(prompt);
+    const loopBudget = planLoopBudget({
+      prompt,
+      route: "grounded_workflow",
+      generated,
+      configuredMaxSteps,
+    });
+    return plan({
+      route: "grounded_workflow",
+      maxStepsForRun: Math.max(
+        1,
+        Math.min(
+          loopBudget.hardCap,
+          loopBudget.toolStepBudget + loopBudget.finalizationReserve,
+        ),
+      ),
+      thinking: resolveThinkingMode(settings),
+      allowedTools: tools,
+      slowPathReason,
+      expectedTimeClass,
+    });
+  };
+
+  if (hasSimpleDateTimePrompt(prompt)) {
+    return plan({
+      route: "instant_local",
+      maxStepsForRun: 0,
+      thinking: undefined,
+      allowedTools: [],
+      slowPathReason: "none",
+      expectedTimeClass: "quick",
+    });
+  }
+
+  if (directCurrentNoteWritebackKind !== null) {
+    return plan({
+      route: "direct_writeback",
+      maxStepsForRun: capSteps(1),
+      thinking: undefined,
+      allowedTools: [],
+      slowPathReason: "none",
+      expectedTimeClass: "quick",
+    });
+  }
+
+  if (hasGraphConnectionIntent(prompt)) {
+    return grounded("needs_graph_context", "normal");
+  }
+
+  if (shouldPrefetchVaultFolderAnswer(prompt, missionIntent)) {
+    return plan({
+      route:
+        missionIntent.noteOutput && streamingWritebackKind === "append"
+          ? "prefetched_vault_writeback"
+          : "prefetched_vault_answer",
+      maxStepsForRun: capSteps(1),
+      thinking: undefined,
+      allowedTools: [],
+      slowPathReason: "needs_vault_context",
+      expectedTimeClass: "quick",
+    });
+  }
+
+  if (hasVaultContextQuestionIntent(prompt) || hasVaultBrowseIntent(prompt)) {
+    return grounded("needs_vault_context", "normal");
+  }
+
+  if (hasWebSearchIntent(prompt)) {
+    return grounded("needs_web_sources", "long");
+  }
+
+  if (
+    hasDesignIntent(prompt) ||
+    hasCodeExecutionIntent(prompt) ||
+    hasHtmlPreviewIntent(prompt) ||
+    hasOpenWebSourceIntent(prompt)
+  ) {
+    const generated = analyzeGeneratedOutputPrompt(prompt);
+    const loopBudget = planLoopBudget({
+      prompt,
+      route: "grounded_workflow",
+      generated,
+      configuredMaxSteps,
+    });
+    return plan({
+      route: "grounded_workflow",
+      maxStepsForRun: Math.max(
+        1,
+        Math.min(
+          loopBudget.hardCap,
+          loopBudget.toolStepBudget + loopBudget.finalizationReserve,
+        ),
+      ),
+      thinking: resolveThinkingMode(settings),
+      allowedTools: tools,
+      slowPathReason: "needs_model_planning",
+      expectedTimeClass: "normal",
+    });
+  }
+
+  if (hasWordCountIntent(prompt)) {
+    return plan({
+      route: "tool_required",
+      maxStepsForRun: capSteps(2),
+      thinking: undefined,
+      allowedTools: tools,
+      slowPathReason: "needs_word_count",
+      expectedTimeClass: "quick",
+    });
+  }
+
+  if (hasResearchMemoryReadIntent(prompt)) {
+    return plan({
+      route: "tool_required",
+      maxStepsForRun: capSteps(2),
+      thinking: undefined,
+      allowedTools: tools,
+      slowPathReason: "needs_vault_context",
+      expectedTimeClass: "quick",
+    });
+  }
+
+  if (requiresCurrentNoteContent(prompt)) {
+    return plan({
+      route: "tool_required",
+      maxStepsForRun: capSteps(2),
+      thinking: undefined,
+      allowedTools: tools,
+      slowPathReason: "needs_current_note",
+      expectedTimeClass: "quick",
+    });
+  }
+
+  if (streamingWritebackKind !== null) {
+    return plan({
+      route: "single_model_writeback",
+      maxStepsForRun: capSteps(streamingWritebackKind === "edit" ? 3 : 1),
+      thinking: undefined,
+      allowedTools: tools,
+      slowPathReason:
+        streamingWritebackKind === "edit" ? "needs_edit_or_replace" : "none",
+      expectedTimeClass: streamingWritebackKind === "edit" ? "normal" : "quick",
+    });
+  }
+
+  if (missionIntent.explicitMutation || missionIntent.requireWriteCompletion) {
+    return plan({
+      route: "tool_required",
+      maxStepsForRun: capSteps(3),
+      thinking: undefined,
+      allowedTools: tools,
+      slowPathReason: missionIntent.explicitMutation
+        ? "needs_edit_or_replace"
+        : "needs_model_planning",
+      expectedTimeClass: "normal",
+    });
+  }
+
+  return plan({
+    route: "single_model_answer",
+    maxStepsForRun: capSteps(2),
+    thinking: undefined,
+    allowedTools: tools,
+    slowPathReason: "none",
+    expectedTimeClass: "quick",
+  });
+}
+
+function getConfiguredMaxAgentSteps(
+  settings: ToolExecutionContext["settings"] | undefined,
+): number {
+  return resolveConfiguredMaxAgentSteps(settings?.maxAgentSteps);
+}
+
+function buildInstantLocalAnswer(
+  prompt: string,
+  toolContext: ToolExecutionContext,
+): string {
+  const now = toolContext.now?.() ?? new Date();
+  const lowerPrompt = prompt.toLowerCase();
+  const date = now.toLocaleDateString(undefined, {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  const time = now.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+  if (/\btime\b/.test(lowerPrompt) && !/\bdate|day\b/.test(lowerPrompt)) {
+    return `Current local time: ${time}.`;
+  }
+
+  if (/\bdate|day\b/.test(lowerPrompt) && !/\btime\b/.test(lowerPrompt)) {
+    return `Today is ${date}.`;
+  }
+
+  return `Today is ${date}. Current local time: ${time}.`;
+}
+
 function canUseCurrentNoteStreamingWriteback(
   toolContext: ToolExecutionContext,
 ): boolean {
@@ -3152,6 +4806,7 @@ function requiresCurrentNoteContent(prompt: string): boolean {
   return (
     isPromptOnCurrentPageIntent(prompt) ||
     hasEditIntent(prompt) ||
+    hasSectionAppendIntent(prompt) ||
     hasReplaceIntent(prompt) ||
     hasTitleIntent(prompt) ||
     hasDeleteIntent(prompt) ||
@@ -3185,11 +4840,61 @@ function getPromptOnCurrentPageRoutingPrompt(
   }
 
   const pagePrompt = getCurrentNoteContextContent(currentNoteContext)?.trim();
-  return pagePrompt ? pagePrompt : null;
+  if (!pagePrompt) {
+    return null;
+  }
+
+  const instructionPrompt = extractActiveInstructionBlockFromCurrentNote(pagePrompt);
+  return instructionPrompt ? instructionPrompt : null;
+}
+
+function extractActiveInstructionBlockFromCurrentNote(markdown: string): string {
+  const withoutFrontmatter = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/u, "");
+  const lines = withoutFrontmatter.split(/\r?\n/u);
+  const collected: string[] = [];
+
+  for (const line of lines) {
+    if (isGeneratedOutputBoundaryHeading(line) && collected.some((item) => item.trim())) {
+      break;
+    }
+
+    collected.push(line);
+  }
+
+  const prompt = collected.join("\n").trim();
+  if (prompt) {
+    return prompt;
+  }
+
+  return withoutFrontmatter.trim();
+}
+
+function isGeneratedOutputBoundaryHeading(line: string): boolean {
+  const match = /^#{1,6}\s+(.+?)\s*#*\s*$/u.exec(line.trim());
+  if (!match) {
+    return false;
+  }
+
+  const heading = match[1].trim().toLowerCase();
+  return (
+    /^(findings?|results?|sources?|references?|receipts?|run details?|assistant|answer|output|summary|draft)\b/u.test(
+      heading,
+    ) ||
+    /^a tale\b/u.test(heading)
+  );
 }
 
 function classifyPromptOnCurrentPageMissionIntent(prompt: string): MissionIntent {
   const intent = classifyMissionIntent(prompt);
+  if (intent.vaultContext && hasCurrentPageWritebackIntent(prompt)) {
+    return {
+      ...intent,
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    };
+  }
+
   if (intent.explicitMutation || intent.explicitDelete) {
     return intent;
   }
@@ -3216,10 +4921,123 @@ function promptRequiresToolLoop(prompt: string): boolean {
     hasWebSearchIntent(prompt) ||
     hasVaultContextQuestionIntent(prompt) ||
     hasVaultBrowseIntent(prompt) ||
+    hasVaultIndexIntent(prompt) ||
     hasSpecificFileReadIntent(prompt) ||
     hasGraphConnectionIntent(prompt) ||
+    hasTemplateIntent(prompt) ||
+    hasResearchMemoryReadIntent(prompt) ||
+    hasDesignIntent(prompt) ||
+    hasCodeExecutionIntent(prompt) ||
+    hasHtmlPreviewIntent(prompt) ||
+    hasOpenWebSourceIntent(prompt) ||
     hasWordCountIntent(prompt)
   );
+}
+
+function shouldPrefetchVaultFolderAnswer(
+  prompt: string,
+  intent: MissionIntent,
+): boolean {
+  const safeCurrentPageWriteback =
+    intent.explicitMutation &&
+    intent.noteOutput &&
+    hasCurrentPageWritebackIntent(prompt) &&
+    !hasReplaceIntent(prompt) &&
+    !hasEditIntent(prompt) &&
+    !hasDeleteIntent(prompt) &&
+    !hasDeletePathIntent(prompt);
+
+  return (
+    intent.vaultContext &&
+    hasPrefetchableFolderSummaryIntent(prompt) &&
+    !hasWebSearchIntent(prompt) &&
+    !hasGraphConnectionIntent(prompt) &&
+    !hasTemplateIntent(prompt) &&
+    !hasSpecificFileReadIntent(prompt) &&
+    !hasTopicSearchVaultQuestionIntent(prompt) &&
+    !/^\s*Continue the prior vault exploration\b/i.test(prompt) &&
+    (!intent.explicitMutation || safeCurrentPageWriteback) &&
+    !intent.explicitDelete
+  );
+}
+
+function hasPrefetchableFolderSummaryIntent(prompt: string): boolean {
+  return (
+    hasFolderContentQuestionIntent(prompt) &&
+    /\b(say|says|contain|contains|contents?|details?|discover(?:ed|ies)?|findings?|report\s+back|gather|collect|read|summari[sz]e|what\s+they\s+say|tell\s+me(?:\s+what|\s+about)?)\b/i.test(
+      prompt,
+    )
+  ) || /\b(gather|collect|read|summari[sz]e|report\s+back|tell\s+me)\b[\s\S]{0,160}\bother\s+folders?\b[\s\S]{0,80}\b(say|says|what\s+they\s+say|details?|contents?)\b/i.test(
+    prompt,
+  ) || hasNamedFolderTraversalIntent(prompt);
+}
+
+function hasTopicSearchVaultQuestionIntent(prompt: string): boolean {
+  return /\b(what|where|find|search|show|list)\b[\s\S]{0,80}\b(my\s+)?notes?\b[\s\S]{0,80}\b(about|mention|mentions|reference|references|related\s+to)\b/i.test(
+    prompt,
+  );
+}
+
+function requiresVaultTraversalBeforeFinalAnswer(
+  prompt: string,
+  runPlan: RunPlan,
+  allowedToolNames: Set<string>,
+): boolean {
+  return (
+    runPlan.slowPathReason === "needs_vault_context" &&
+    hasFolderContentQuestionIntent(prompt) &&
+    hasAnyAllowedTool(allowedToolNames, [
+      "list_current_folder",
+      "list_markdown_files",
+      "search_markdown_files",
+      "read_markdown_files",
+      "read_file",
+      "list_folder",
+      "get_path_info",
+    ])
+  );
+}
+
+function getMissingRequiredWebToolNames({
+  prompt,
+  allowedToolNames,
+  executedWebSearchTool,
+  executedWebFetchTool,
+}: {
+  prompt: string;
+  allowedToolNames: Set<string>;
+  executedWebSearchTool: boolean;
+  executedWebFetchTool: boolean;
+}): string[] {
+  if (!hasWebSearchIntent(prompt)) {
+    return [];
+  }
+
+  const missing: string[] = [];
+  if (allowedToolNames.has("web_search") && !executedWebSearchTool) {
+    missing.push("web_search");
+  }
+
+  return missing;
+}
+
+function areLoopRequiredToolsSatisfied(
+  expectedTools: string[],
+  successfulTools: string[],
+): boolean {
+  if (expectedTools.length === 0) {
+    return false;
+  }
+
+  const successful = new Set(successfulTools);
+  return expectedTools.every((toolName) => successful.has(toolName));
+}
+
+function hasAnyAllowedTool(
+  allowedToolNames: Set<string>,
+  toolNames: string[],
+): boolean {
+  return toolNames.some((toolName) => allowedToolNames.has(toolName));
 }
 
 function getPromptOnPageWritebackKind({
@@ -3242,7 +5060,10 @@ function getPromptOnPageWritebackKind({
     return null;
   }
 
-  const pagePrompt = getCurrentNoteContextContent(currentNoteContext);
+  const pageContent = getCurrentNoteContextContent(currentNoteContext);
+  const pagePrompt = pageContent
+    ? extractActiveInstructionBlockFromCurrentNote(pageContent)
+    : "";
   if (!pagePrompt || hasDeleteIntent(pagePrompt) || hasDeletePathIntent(pagePrompt)) {
     return null;
   }
@@ -3285,6 +5106,8 @@ function getStreamingWritebackKind(
   if (
     !enableStreaming ||
     !toolContext.writeAutonomy ||
+    hasPriorAssistantResponseWritebackIntent(prompt) ||
+    hasResearchMemoryWriteIntent(prompt) ||
     toolContext.settings?.streamWritebackMode !==
       "all_current_note_content_writes"
   ) {
@@ -3309,6 +5132,10 @@ function getStreamingWritebackKind(
     return "append";
   }
 
+  if (hasCurrentPageWritebackIntent(prompt)) {
+    return "append";
+  }
+
   if (
     hasNoteOutputIntent(prompt) ||
     (toolContext.missionIntent?.noteOutput &&
@@ -3321,11 +5148,24 @@ function getStreamingWritebackKind(
 }
 
 function classifyMissionIntent(prompt: string): MissionIntent {
-  const vaultContext = hasVaultContextQuestionIntent(prompt);
+  const generated = analyzeGeneratedOutputPrompt(prompt);
+  const resetAction = analyzeCurrentNoteResetPrompt(prompt);
   const explicitGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
+  const explicitTemplateWrite =
+    hasTemplateSeedIntent(prompt) ||
+    hasTemplateCreateIntent(prompt) ||
+    hasTemplateFillIntent(prompt);
+  const explicitResearchMemoryWrite = hasResearchMemoryWriteIntent(prompt);
+  const explicitDesignWrite = hasDesignIntent(prompt);
   const explicitPersistence =
-    hasExplicitWritePersistenceIntent(prompt) || explicitGraphLinkWrite;
-  const explicitDelete = hasDeleteIntent(prompt) || hasDeletePathIntent(prompt);
+    hasExplicitWritePersistenceIntent(prompt) ||
+    explicitGraphLinkWrite ||
+    explicitTemplateWrite ||
+    explicitResearchMemoryWrite ||
+    explicitDesignWrite;
+  const explicitDelete =
+    resetAction.kind !== "replace_current_note" &&
+    (hasDeleteIntent(prompt) || hasDeletePathIntent(prompt));
   const explicitMutation =
     explicitPersistence ||
     hasCreateFileIntent(prompt) ||
@@ -3333,10 +5173,30 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     hasMovePathIntent(prompt) ||
     hasReplaceIntent(prompt) ||
     hasEditIntent(prompt) ||
+    hasSectionAppendIntent(prompt) ||
     hasTitleIntent(prompt) ||
     explicitGraphLinkWrite ||
+    explicitTemplateWrite ||
+    explicitResearchMemoryWrite ||
+    explicitDesignWrite ||
     explicitDelete;
-  const noteOutput = !vaultContext && hasNoteOutputIntent(prompt);
+  const vaultContext =
+    hasVaultContextQuestionIntent(prompt) ||
+    hasResearchMemoryReadIntent(prompt) ||
+    (!explicitMutation && hasVaultBrowseIntent(prompt));
+  const webAnswerOnly =
+    hasWebSearchIntent(prompt) &&
+    generated.target === "chat_only" &&
+    !explicitPersistence &&
+    !hasCurrentPageWritebackIntent(prompt) &&
+    !hasPathTargetIntent(prompt);
+  const noteOutput =
+    !vaultContext &&
+    !explicitResearchMemoryWrite &&
+    !webAnswerOnly &&
+    (hasNoteOutputIntent(prompt) ||
+      generated.target === "current_note_append" ||
+      generated.target === "current_note_replace");
 
   if (explicitDelete) {
     return {
@@ -3389,14 +5249,46 @@ function classifyMissionIntent(prompt: string): MissionIntent {
   };
 }
 
+function shouldFallbackGeneratedNoteOutputToChat(
+  prompt: string,
+  missionIntent: MissionIntent,
+  toolContext: ToolExecutionContext,
+): boolean {
+  if (!missionIntent.noteOutput || hasActiveCurrentMarkdownFile(toolContext)) {
+    return false;
+  }
+
+  const generated = analyzeGeneratedOutputPrompt(prompt);
+  return (
+    generated.target === "current_note_append" &&
+    !hasExplicitWritePersistenceIntent(prompt) &&
+    !hasCurrentPageWritebackIntent(prompt) &&
+    !hasPathTargetIntent(prompt)
+  );
+}
+
+function hasActiveCurrentMarkdownFile(
+  toolContext: ToolExecutionContext,
+): boolean {
+  const resolved = toolContext.getCurrentMarkdownFile?.();
+  if (resolved) {
+    return true;
+  }
+
+  const workspace = (toolContext.app as { workspace?: {
+    getActiveFile?: () => { extension?: string } | null;
+  } } | undefined)?.workspace;
+  return workspace?.getActiveFile?.()?.extension === "md";
+}
+
 function hasVaultContextQuestionIntent(prompt: string): boolean {
   return /\b(what\s+(did|do)\s+you\s+(learn|know|remember)\s+about\s+me|what\s+have\s+i\s+told\s+you|what\s+do\s+my\s+notes\s+say|based\s+on\s+my\s+notes|in\s+my\s+notes|across\s+my\s+notes|search\s+(my\s+)?notes|find\s+(notes?|details?|mentions?|references?)|where\s+did\s+i\s+mention|summari[sz]e\s+what\s+i\s+(know|have|wrote)|look\s+through\s+(my\s+)?vault|check\s+(my\s+)?folders?)\b/i.test(
     prompt,
-  ) || hasGraphConnectionIntent(prompt);
+  ) || hasFolderContentQuestionIntent(prompt) || hasGraphConnectionIntent(prompt);
 }
 
 function hasExplicitWritePersistenceIntent(prompt: string): boolean {
-  return /\b(append|save|write|update|add|insert|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b[\s\S]{0,100}\b(note|file|markdown|vault|folder|directory|path)\b|\b(note|file|markdown|vault|folder|directory|path)\b[\s\S]{0,100}\b(append|save|write|update|add|insert|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b|\.md\b/i.test(
+  return /\b(append|save|write|update|add|insert|copy|paste|put|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b[\s\S]{0,100}\b(note|file|markdown|vault|folder|directory|path|page|document)\b|\b(note|file|markdown|vault|folder|directory|path|page|document)\b[\s\S]{0,100}\b(append|save|write|update|add|insert|copy|paste|put|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b|\.md\b/i.test(
     prompt,
   );
 }
@@ -3419,10 +5311,101 @@ function hasGraphLinkWriteIntent(prompt: string): boolean {
   );
 }
 
+function hasVaultIndexIntent(prompt: string): boolean {
+  return /\b(index|map|overview|inventory|catalog|where\s+are|what\s+(notes|files|documents)|locate|find)\b[\s\S]{0,120}\b(vault|notes?|files?|documents?|folders?|markdown|notebook)\b|\b(vault|notes?|files?|documents?|folders?|markdown|notebook)\b[\s\S]{0,120}\b(index|map|overview|inventory|catalog|where|locate|find)\b/i.test(
+    prompt,
+  );
+}
+
+function hasOpenWebSourceIntent(prompt: string): boolean {
+  return /\b(open|view|show|launch)\b[\s\S]{0,120}\b(source|sources|link|url|web|browser|reference|citation|page)\b|\b(source|sources|link|url|web\s+page|reference|citation|page)\b[\s\S]{0,120}\b(open|view|show|launch)\b/i.test(
+    prompt,
+  );
+}
+
+function hasCodeExecutionIntent(prompt: string): boolean {
+  return /\b(run|execute|eval|evaluate|test|compile)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile)\b/i.test(
+    prompt,
+  );
+}
+
+function hasHtmlPreviewIntent(prompt: string): boolean {
+  return /\b(preview|render|show)\b[\s\S]{0,100}\b(html|css|web\s+page|mockup|prototype)\b|\b(html|css|web\s+page|mockup|prototype)\b[\s\S]{0,100}\b(preview|render|show)\b/i.test(
+    prompt,
+  );
+}
+
+function hasDesignIntent(prompt: string): boolean {
+  return /\b(create|make|draw|generate|build|draft|render|save|write)\b[\s\S]{0,140}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|architecture)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|architecture)\b[\s\S]{0,140}\b(create|make|draw|generate|build|draft|render|save|write)\b/i.test(
+    prompt,
+  );
+}
+
+function hasCanvasDesignIntent(prompt: string): boolean {
+  return (
+    /\b(canvas|mind\s*map|concept\s*map|flowchart|workflow|process\s*map|research\s*map|architecture\s*diagram|dependency\s*map|visual\s*map|diagram)\b/i.test(
+      prompt,
+    ) ||
+    (hasDesignIntent(prompt) && !hasSvgDesignIntent(prompt))
+  );
+}
+
+function hasSvgDesignIntent(prompt: string): boolean {
+  return /\b(svg|wireframe|mockup|screen|layout|ui\s+design|static\s+diagram|sketch)\b/i.test(
+    prompt,
+  );
+}
+
+function hasTemplateIntent(prompt: string): boolean {
+  return /\b(template|templates|templated|form|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i.test(
+    prompt,
+  );
+}
+
+function hasTemplateCreateIntent(prompt: string): boolean {
+  return (
+    /\b(create|new|make|save)\b[\s\S]{0,100}\b(template|boilerplate|reusable\s+(?:note|markdown|outline|format|structure))\b|\b(template|boilerplate|reusable\s+(?:note|markdown|outline|format|structure))\b[\s\S]{0,100}\b(create|new|make|save)\b/i.test(
+      prompt,
+    ) && !hasCreateNoteFromTemplateIntent(prompt)
+  );
+}
+
+function hasTemplateSeedIntent(prompt: string): boolean {
+  return /\b(seed|install|create|make|add)\b[\s\S]{0,120}\b(default|starter|example|sample|built[-\s]?in)\b[\s\S]{0,80}\btemplates?\b|\b(default|starter|example|sample|built[-\s]?in)\b[\s\S]{0,80}\btemplates?\b[\s\S]{0,120}\b(seed|install|create|make|add)\b/i.test(
+    prompt,
+  );
+}
+
+function hasTemplateFillIntent(prompt: string): boolean {
+  return /\b(fill|use|apply|complete|populate|render)\b[\s\S]{0,100}\b(template|form|boilerplate)\b|\b(template|form|boilerplate)\b[\s\S]{0,100}\b(fill|use|apply|complete|populate|render)\b|\bcreate\b[\s\S]{0,80}\b(note|file|markdown)\b[\s\S]{0,80}\bfrom\b[\s\S]{0,80}\btemplate\b|\bfrom\b[\s\S]{0,80}\btemplate\b[\s\S]{0,80}\bcreate\b[\s\S]{0,80}\b(note|file|markdown)\b/i.test(
+    prompt,
+  );
+}
+
+function hasCreateNoteFromTemplateIntent(prompt: string): boolean {
+  return /\bcreate\b[\s\S]{0,80}\b(note|file|markdown)\b[\s\S]{0,100}\bfrom\b[\s\S]{0,80}\btemplate\b|\btemplate\b[\s\S]{0,100}\bcreate\b[\s\S]{0,80}\b(note|file|markdown)\b/i.test(
+    prompt,
+  );
+}
+
+function hasCheckpointResumeIntent(prompt: string): boolean {
+  return (
+    /^\s*(continue|keep\s+going|resume|carry\s+on|pick\s+up)\b/i.test(
+      prompt,
+    ) ||
+    /\b(resume|continue|keep\s+going|carry\s+on|pick\s+up)\b[\s\S]{0,120}\b(agent\s+run|mission|checkpoint|previous\s+run|prior\s+run|last\s+run)\b/i.test(
+      prompt,
+    ) ||
+    /\b(agent\s+run|mission|checkpoint|previous\s+run|prior\s+run|last\s+run)\b[\s\S]{0,120}\b(resume|continue|keep\s+going|carry\s+on|pick\s+up)\b/i.test(
+      prompt,
+    )
+  );
+}
+
 function hasCurrentNoteReadIntent(prompt: string): boolean {
   return (
     isPromptOnCurrentPageIntent(prompt) ||
-    /\b(current|this|active)\s+(note|file|markdown|document)\b|\b(note|file|markdown|document)\b[\s\S]{0,40}\b(current|this|active)\b|\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b[\s\S]{0,80}\b(note|file|markdown|document)\b|\b(note|file|markdown|document)\b[\s\S]{0,80}\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b/i.test(
+    /\b(current|this|active)\s+(note|file|markdown|document|page)\b|\b(note|file|markdown|document|page)\b[\s\S]{0,40}\b(current|this|active)\b|\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b[\s\S]{0,80}\b(note|file|markdown|document|page)\b|\b(note|file|markdown|document|page)\b[\s\S]{0,80}\b(summarize|summary|append|replace|rewrite|reset|overwrite|edit|revise|delete|remove|trash|retitle|title|heading|h1|organize|restructure|clean\s+up)\b/i.test(
       prompt,
     )
   );
@@ -3434,9 +5417,107 @@ function hasGeneratedWritingIntent(prompt: string): boolean {
   );
 }
 
+function hasCurrentPageWritebackIntent(prompt: string): boolean {
+  return (
+    /\b(stream|write|append|save|add|insert|put|record)\b[\s\S]{0,120}\b(?:onto|to|into|in|on)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
+      prompt,
+    ) ||
+    /\b(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,120}\b(stream|write|append|save|add|insert|put|record)\b/i.test(
+      prompt,
+    )
+  );
+}
+
+function hasCurrentNoteSectionTarget(prompt: string): boolean {
+  return /\b(?:below|under|after|beneath|inside)\b[\s\S]{0,100}\b(?:section|heading)\b|\b(?:section|heading)\b[\s\S]{0,100}\b(?:below|under|after|beneath|inside)\b/i.test(
+    prompt,
+  );
+}
+
+function hasSectionAppendIntent(prompt: string): boolean {
+  return (
+    hasCurrentNoteSectionTarget(prompt) &&
+    /\b(write|draft|compose|generate|append|add|insert|put)\b/i.test(prompt)
+  );
+}
+
+function hasResearchMemoryIntent(prompt: string): boolean {
+  return hasResearchMemoryReadIntent(prompt) || hasResearchMemoryWriteIntent(prompt);
+}
+
+function hasResearchMemoryReadIntent(prompt: string): boolean {
+  return /\b(research\s+memory|topic\s+memory|memory|remember|recall|long[-\s]?term|continue\s+(?:this|the)\s+research|build\s+on\s+(?:this|the)\s+research)\b/i.test(
+    prompt,
+  );
+}
+
+function hasResearchMemoryWriteIntent(prompt: string): boolean {
+  return /\b(save|store|remember|record|persist|append|add|update)\b[\s\S]{0,120}\b(research\s+memory|topic\s+memory|memory|long[-\s]?term|research\s+topic)\b|\b(research\s+memory|topic\s+memory|memory|long[-\s]?term|research\s+topic)\b[\s\S]{0,120}\b(save|store|remember|record|persist|append|add|update)\b/i.test(
+    prompt,
+  );
+}
+
+function hasNamedFolderTraversalIntent(prompt: string): boolean {
+  return (
+    /\b(traverse|inspect|browse|read|look\s+through|check|summari[sz]e)\b[\s\S]{0,120}\bfolders?\b/i.test(
+      prompt,
+    ) &&
+    /\bfolders?\b[\s\S]{0,100}\b(?:named|called)\b/i.test(prompt)
+  );
+}
+
+function extractNamedVaultFolders(prompt: string): string[] {
+  const names = new Set<string>();
+  const patterns = [
+    /\bfolders?\s+(?:are\s+)?(?:named|called)\s+([^.\n]+)/gi,
+    /\bthey\s+(?:are\s+)?(?:named|called)\s+([^.\n]+)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of prompt.matchAll(pattern)) {
+      const rawList = match[1] ?? "";
+      for (const raw of rawList.split(/\s*,\s*|\s+\band\s+/i)) {
+        const name = raw.trim().replace(/^["'`]+|["'`]+$/g, "");
+        if (name) {
+          names.add(name);
+        }
+      }
+    }
+  }
+
+  return [...names];
+}
+
+function buildVaultPrefetchArgs(prompt: string): Record<string, unknown> {
+  const targetFolders = extractNamedVaultFolders(prompt);
+  if (targetFolders.length > 0) {
+    return {
+      scope: "all_vault",
+      targetFolders,
+    };
+  }
+
+  return { scope: "other_folders" };
+}
+
 function hasVaultBrowseIntent(prompt: string): boolean {
   return /\b(vault|files|file names|filenames|markdown files|md files|folders|folder|directory|directories|path|paths|list|browse|inspect|where\s+this\s+note\s+belongs|placement|organize\s+(?:the\s+)?vault|across\s+files)\b/i.test(
     prompt,
+  );
+}
+
+function hasFolderContentQuestionIntent(prompt: string): boolean {
+  return (
+    hasNamedFolderTraversalIntent(prompt) ||
+    /\b(other|all|nearby|related|vault|my)\s+(folders?|notes?|files?)\b/i.test(
+      prompt,
+    ) ||
+    /\b(folders?|vault)\b[\s\S]{0,100}\b(say|says|contain|contains|details?|contents?|report\s+back|gather|browse|locate|summari[sz]e|tell\s+me)\b/i.test(
+      prompt,
+    ) ||
+    /\b(gather|collect|read|inspect|look\s+through|browse|check|summari[sz]e|report)\b[\s\S]{0,140}\b(other\s+)?(folders?|vault|my\s+notes|notes?\s+in\s+(?:the\s+)?other\s+folders?|files?\s+in\s+(?:the\s+)?other\s+folders?)\b/i.test(
+      prompt,
+    )
   );
 }
 
@@ -3473,17 +5554,27 @@ function hasPathTargetIntent(prompt: string): boolean {
 }
 
 function hasCurrentNoteTarget(prompt: string): boolean {
-  return /\b(current|this|active)\s+(note|file|markdown|document)\b|\b(note|file|markdown|document)\b[\s\S]{0,40}\b(current|this|active)\b/i.test(
+  return /\b(current|this|active)\s+(note|file|markdown|document|page)\b|\b(note|file|markdown|document|page)\b[\s\S]{0,40}\b(current|this|active)\b/i.test(
     prompt,
   );
 }
 
 function hasNoteOutputIntent(prompt: string): boolean {
+  const generated = analyzeGeneratedOutputPrompt(prompt);
+  if (
+    generated.target === "current_note_append" ||
+    generated.target === "current_note_replace"
+  ) {
+    return true;
+  }
+
   if (
     hasAppendIntent(prompt) ||
     hasReplaceIntent(prompt) ||
     hasTitleIntent(prompt) ||
     hasEditIntent(prompt) ||
+    hasSectionAppendIntent(prompt) ||
+    hasResearchMemoryWriteIntent(prompt) ||
     hasCreateFileIntent(prompt) ||
     hasCreateFolderIntent(prompt) ||
     hasMovePathIntent(prompt) ||
@@ -3493,7 +5584,7 @@ function hasNoteOutputIntent(prompt: string): boolean {
     return true;
   }
 
-  if (hasStaticGenerationIntent(prompt)) {
+  if (hasStaticGenerationIntent(prompt) && !hasFetchedWebSourceIntent(prompt)) {
     return false;
   }
 
@@ -3503,14 +5594,17 @@ function hasNoteOutputIntent(prompt: string): boolean {
 }
 
 function hasAppendIntent(prompt: string): boolean {
-  return /\b(append|save|write|update|add|insert)\b[\s\S]{0,80}\b(note|file|markdown|vault)\b|\b(note|file|markdown|vault)\b[\s\S]{0,80}\b(append|save|write|update|add|insert)\b/i.test(
+  return /\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,80}\b(note|file|markdown|vault|page|document)\b|\b(note|file|markdown|vault|page|document)\b[\s\S]{0,80}\b(append|save|write|update|add|insert|copy|paste|put)\b/i.test(
     prompt,
   );
 }
 
 function hasReplaceIntent(prompt: string): boolean {
-  return /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+fresh\b/i.test(
-    prompt,
+  return (
+    isCurrentNoteReplaceResetPrompt(prompt) ||
+    /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+fresh\b/i.test(
+      prompt,
+    ) || hasClearPageAndWriteIntent(prompt)
   );
 }
 
@@ -3519,7 +5613,16 @@ function hasWholeNoteReplaceIntent(prompt: string): boolean {
     return false;
   }
 
-  return /\b(rewrite|replace|reset|overwrite|clean\s+up|start\s+fresh)\b[\s\S]{0,100}\b(current|this|active|whole|entire)\s+(note|file|markdown|document|content)\b|\b(current|this|active|whole|entire)\s+(note|file|markdown|document|content)\b[\s\S]{0,100}\b(rewrite|replace|reset|overwrite|clean\s+up|start\s+fresh)\b/i.test(
+  return (
+    hasClearPageAndWriteIntent(prompt) ||
+    /\b(rewrite|replace|reset|overwrite|clean\s+up|start\s+fresh)\b[\s\S]{0,100}\b(current|this|active|whole|entire)\s+(note|file|markdown|document|page|content)\b|\b(current|this|active|whole|entire)\s+(note|file|markdown|document|page|content)\b[\s\S]{0,100}\b(rewrite|replace|reset|overwrite|clean\s+up|start\s+fresh)\b/i.test(
+      prompt,
+    )
+  );
+}
+
+function hasClearPageAndWriteIntent(prompt: string): boolean {
+  return /\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\b(write|draft|compose|generate|create)\b[\s\S]{0,180}\b(?:after|then)\b[\s\S]{0,120}\b(clear|delete|remove)\s+all\s+(?:the\s+)?(?:notes?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
     prompt,
   );
 }
@@ -3531,12 +5634,20 @@ function hasEditIntent(prompt: string): boolean {
 }
 
 function hasDeleteIntent(prompt: string): boolean {
+  if (isCurrentNoteReplaceResetPrompt(prompt)) {
+    return false;
+  }
+
   return /\b(delete|remove|trash)\b[\s\S]{0,80}\b(?:current|this|active|whole|entire)\s+(?:note|file)\b|\b(?:current|this|active|whole|entire)\s+(?:note|file)\b[\s\S]{0,80}\b(delete|remove|trash)\b/i.test(
     prompt,
   );
 }
 
 function hasDeletePathIntent(prompt: string): boolean {
+  if (isCurrentNoteReplaceResetPrompt(prompt)) {
+    return false;
+  }
+
   return /\b(delete|remove|trash)\b/i.test(prompt) && hasPathTargetIntent(prompt);
 }
 
@@ -3551,15 +5662,35 @@ function hasWebSearchIntent(prompt: string): boolean {
     return false;
   }
 
-  if (hasExplicitWebSearchIntent(prompt)) {
+  if (/\b(search|use|check|consult)\s+(?:the\s+)?web\b/i.test(prompt)) {
     return true;
   }
 
-  if (hasStaticGenerationIntent(prompt)) {
+  if (hasStaticGenerationIntent(prompt) && !hasFetchedWebSourceIntent(prompt)) {
     return false;
   }
 
+  if (hasFolderContentQuestionIntent(prompt)) {
+    return false;
+  }
+
+  if (hasExplicitWebSearchIntent(prompt) || hasDeepResearchIntent(prompt)) {
+    return true;
+  }
+
   return /\b(research|investigate|find|gather)\b/i.test(prompt);
+}
+
+function hasFetchedWebSourceIntent(prompt: string): boolean {
+  return /\b(cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?))\b/i.test(
+    prompt,
+  );
+}
+
+function hasDeepResearchIntent(prompt: string): boolean {
+  return /\b(deep\s+research|in[-\s]?depth(?:\s+(?:research|analysis|investigation|report))?|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
+    prompt,
+  );
 }
 
 function hasExplicitWebSearchIntent(prompt: string): boolean {
@@ -3636,8 +5767,20 @@ function getToolPreparationStatus(toolName: string): string | null {
     return "Fetching source page...";
   }
 
+  if (toolName === "open_web_source") {
+    return "Opening source and writing source note...";
+  }
+
   if (toolName === "read_file") {
     return "Reading vault note...";
+  }
+
+  if (toolName === "inspect_vault_index") {
+    return "Inspecting vault metadata index...";
+  }
+
+  if (toolName === "inspect_vault_context") {
+    return "Inspecting vault folders and note contents...";
   }
 
   if (toolName === "count_words") {
@@ -3668,6 +5811,38 @@ function getToolPreparationStatus(toolName: string): string | null {
     return "Inspecting vault path...";
   }
 
+  if (toolName === "list_templates") {
+    return "Listing templates...";
+  }
+
+  if (toolName === "read_template") {
+    return "Reading template...";
+  }
+
+  if (toolName === "seed_default_templates") {
+    return "Creating default templates...";
+  }
+
+  if (toolName === "search_research_memory") {
+    return "Searching research memory...";
+  }
+
+  if (toolName === "read_research_memory") {
+    return "Reading research memory...";
+  }
+
+  if (toolName === "append_research_memory") {
+    return "Saving research memory...";
+  }
+
+  if (toolName === "create_template") {
+    return "Creating template...";
+  }
+
+  if (toolName === "fill_template") {
+    return "Filling template...";
+  }
+
   if (toolName === "create_folder") {
     return "Creating folder...";
   }
@@ -3696,6 +5871,10 @@ function getToolPreparationStatus(toolName: string): string | null {
     return "Appending to note...";
   }
 
+  if (toolName === "append_to_current_section") {
+    return "Appending below note heading with backup...";
+  }
+
   if (toolName === "retitle_current_file") {
     return "Retitling current note...";
   }
@@ -3718,6 +5897,22 @@ function getToolPreparationStatus(toolName: string): string | null {
 
   if (toolName === "link_related_notes_in_current_file") {
     return "Linking related notes...";
+  }
+
+  if (toolName === "run_code_block") {
+    return "Running explicit code block...";
+  }
+
+  if (toolName === "render_html_preview") {
+    return "Rendering HTML preview...";
+  }
+
+  if (toolName === "create_design_canvas") {
+    return "Creating Obsidian canvas design...";
+  }
+
+  if (toolName === "create_svg_design") {
+    return "Creating SVG design...";
   }
 
   return null;
@@ -3768,8 +5963,126 @@ function emitToolSuccessStatus(
     return message;
   }
 
+  if (toolName === "inspect_vault_index" && isRecord(output)) {
+    const count = getNumber(output.entryCount) ?? 0;
+    const message = `Indexed ${count} vault entr${count === 1 ? "y" : "ies"} without reading note bodies.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "open_web_source" && isRecord(output)) {
+    const message = `Saved source note ${String(output.path ?? "Agent Sources")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "run_code_block" && isRecord(output)) {
+    const result = isRecord(output.result) ? output.result : isRecord(output.run) ? output.run : null;
+    const exitCode = result ? getNumber(result.exitCode) : undefined;
+    const timedOut = result ? Boolean(result.timedOut) : false;
+    const message = timedOut
+      ? `Code timed out for ${String(output.language ?? "snippet")}.`
+      : exitCode === undefined
+        ? `Code artifact prepared for ${String(output.language ?? "snippet")}.`
+        : `Code finished with exit code ${exitCode}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "render_html_preview" && isRecord(output)) {
+    const message = `Rendered HTML preview (${String(output.bytesRendered ?? "unknown")} bytes).`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "create_design_canvas" && isRecord(output)) {
+    const message = `Created canvas ${String(output.path ?? "design")} with ${String(output.nodeCount ?? 0)} nodes and ${String(output.edgeCount ?? 0)} edges.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "create_svg_design" && isRecord(output)) {
+    const message = `Created SVG ${String(output.path ?? "design")} with ${String(output.shapeCount ?? 0)} shapes.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "list_templates" && isRecord(output)) {
+    const count = Array.isArray(output.templates) ? output.templates.length : 0;
+    const message = `Found ${count} template${count === 1 ? "" : "s"}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "read_template" && isRecord(output)) {
+    const message = `Read template ${String(output.path ?? "template")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "seed_default_templates" && isRecord(output)) {
+    const created = Array.isArray(output.createdTemplates)
+      ? output.createdTemplates.length
+      : 0;
+    const skipped = Array.isArray(output.skippedExisting)
+      ? output.skippedExisting.length
+      : 0;
+    const message = `Created ${created} default template${created === 1 ? "" : "s"}${
+      skipped > 0 ? `; skipped ${skipped} existing` : ""
+    }.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "search_research_memory" && isRecord(output)) {
+    const count = Array.isArray(output.matches) ? output.matches.length : 0;
+    const message = `Found ${count} research memor${count === 1 ? "y" : "ies"}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "read_research_memory" && isRecord(output)) {
+    const message = Boolean(output.found)
+      ? `Read research memory ${String(output.path ?? "memory note")}.`
+      : `No research memory found for ${String(output.topic ?? "that topic")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "append_research_memory" && isRecord(output)) {
+    const message = `Saved research memory to ${String(
+      output.path ?? "memory note",
+    )}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "create_template" && isRecord(output)) {
+    const message = `Created template ${String(output.path ?? "template")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "fill_template" && isRecord(output)) {
+    const message = `Created filled template note ${String(
+      output.path ?? "vault note",
+    )}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
   if (toolName === "append_to_current_file" && isRecord(output)) {
     const message = `Appended result to ${String(output.path ?? "current note")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "append_to_current_section" && isRecord(output)) {
+    const message = `Appended below section ${String(
+      output.heading ?? "target",
+    )} in ${String(output.path ?? "current note")}; backup saved to ${String(
+      output.backupPath ?? "backup",
+    )}.`;
     events.onStatus?.(message);
     return message;
   }
@@ -3884,6 +6197,22 @@ function buildReceipt(
 }
 
 function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
+  if (
+    toolName === "open_web_source" ||
+    toolName === "create_design_canvas" ||
+    toolName === "create_svg_design" ||
+    toolName === "seed_default_templates"
+  ) {
+    return "create";
+  }
+
+  if (
+    toolName === "create_template" ||
+    toolName === "fill_template"
+  ) {
+    return "create";
+  }
+
   if (toolName === "create_folder") {
     return "create_folder";
   }
@@ -3909,6 +6238,14 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
   }
 
   if (toolName === "append_to_current_file") {
+    return "append";
+  }
+
+  if (toolName === "append_to_current_section") {
+    return "append";
+  }
+
+  if (toolName === "append_research_memory") {
     return "append";
   }
 
@@ -3938,12 +6275,20 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
 function isWriteToolName(toolName: string): boolean {
   return (
     toolName === "create_folder" ||
+    toolName === "open_web_source" ||
+    toolName === "create_design_canvas" ||
+    toolName === "create_svg_design" ||
+    toolName === "seed_default_templates" ||
+    toolName === "create_template" ||
+    toolName === "fill_template" ||
     toolName === "create_file" ||
     toolName === "append_file" ||
     toolName === "replace_file" ||
     toolName === "move_path" ||
     toolName === "delete_path" ||
     toolName === "append_to_current_file" ||
+    toolName === "append_to_current_section" ||
+    toolName === "append_research_memory" ||
     toolName === "retitle_current_file" ||
     toolName === "edit_current_section" ||
     toolName === "replace_current_file" ||
@@ -3956,7 +6301,7 @@ function redactToolArguments(
   _toolName: string,
   args: Record<string, unknown>,
 ): unknown {
-  const textFields = new Set(["text", "content"]);
+  const textFields = new Set(["text", "content", "templateText", "code", "html", "svg"]);
   const output: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(args)) {
@@ -4009,6 +6354,23 @@ function truncateForPromptAnchor(text: string): string {
   return text.length <= 2000 ? text : `${text.slice(0, 2000)}\n[truncated]`;
 }
 
+function appendRelevancePromptContext(
+  basePrompt: string,
+  label: string,
+  context: unknown,
+): string {
+  const serialized =
+    typeof context === "string" ? context : (JSON.stringify(context) ?? "");
+  const trimmed = serialized.trim();
+  if (!trimmed) {
+    return basePrompt;
+  }
+
+  return [basePrompt, `${label}: ${truncateForPromptAnchor(trimmed)}`]
+    .filter((part) => part.trim().length > 0)
+    .join("\n\n");
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -4021,10 +6383,17 @@ function getNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
-function emitDirectAssistantAnswer(content: string, events: AgentRunEvents) {
+function emitDirectAssistantAnswer(
+  content: string,
+  events: AgentRunEvents,
+  requiresEnglishGuard = false,
+) {
   const sanitized = sanitizeAssistantContent(content);
   if (!sanitized.trim()) {
     return;
+  }
+  if (requiresEnglishGuard) {
+    assertEnglishOnlyVisibleOutput(sanitized, events);
   }
 
   emitStatus(events, "Drafting final answer...", "final_answer");
@@ -4034,6 +6403,39 @@ function emitDirectAssistantAnswer(content: string, events: AgentRunEvents) {
   events.onAssistantDelta?.(sanitized);
   events.onFinalDone?.();
   events.onAssistantMessageDone?.();
+}
+
+function assertEnglishOnlyVisibleOutput(
+  content: string,
+  events: AgentRunEvents,
+): void {
+  const language = inspectEnglishOnlyOutput(content);
+  if (language.ok) {
+    return;
+  }
+
+  events.onStreamLifecycle?.({
+    kind: "buffering_language",
+    elapsedMs: 0,
+    bufferedChars: content.length,
+    message: "Language gate retrying English-only output...",
+  });
+  events.onStatus?.("Blocked non-English output before showing it.");
+  throw new ModelClientError(
+    "invalid_response",
+    "Model produced non-English output.",
+    {
+      details: language,
+    },
+  );
+}
+
+function isEnglishOnlyGuardError(error: unknown): boolean {
+  return (
+    error instanceof ModelClientError &&
+    error.category === "invalid_response" &&
+    /non-English output|English-only guard/i.test(error.message)
+  );
 }
 
 function emitLocalWriteSummary(
@@ -4117,6 +6519,7 @@ async function streamCurrentNoteWriteback({
     const metricName = retry ? "stream_writeback_retry" : "stream_writeback";
     const requestChars = measureSerializedChars(streamRequest);
     const startedAt = nowMs();
+    const lifecycle = createStreamLifecycleTracker(events, startedAt);
     const contentSanitizer = createAssistantContentSanitizer();
     const thinkingStream = createThinkingStream(events);
     const liveEmitter = createLiveWritebackEmitter({
@@ -4124,9 +6527,11 @@ async function streamCurrentNoteWriteback({
       writer,
       knownToolNames,
       relevancePrompt,
+      lifecycle,
     });
     let attemptContent = "";
 
+    lifecycle.mark("stream_started", "Waiting for provider to send content...");
     emitModelCallTrace(events, {
       id: retry
         ? "model-call-stream-writeback-retry"
@@ -4141,7 +6546,18 @@ async function streamCurrentNoteWriteback({
         request: streamRequest,
         events,
         streamEvents: {
+          onRawChunk: () => {
+            lifecycle.mark("stream_connected", "Connected to model stream.");
+            lifecycle.mark(
+              "first_raw_chunk",
+              "Provider sent the first stream chunk.",
+            );
+          },
           onContentDelta: (delta) => {
+            lifecycle.mark(
+              "first_content_delta",
+              "Received answer text; checking early output...",
+            );
             const sanitized = contentSanitizer.push(delta);
             if (!sanitized) {
               return;
@@ -4150,7 +6566,13 @@ async function streamCurrentNoteWriteback({
             attemptContent += sanitized;
             liveEmitter.push(sanitized);
           },
-          onThinkingDelta: thinkingStream.onDelta,
+          onThinkingDelta: (delta) => {
+            lifecycle.mark(
+              "first_thinking_delta",
+              "Received thinking, waiting for answer text...",
+            );
+            thinkingStream.onDelta(delta);
+          },
         },
         onThinkingUnsupported,
       });
@@ -4227,7 +6649,21 @@ async function streamCurrentNoteWriteback({
 
   try {
     let retryUsed = false;
-    let attempt = await streamAttempt(false);
+    let attempt: Awaited<ReturnType<typeof streamAttempt>>;
+    try {
+      attempt = await streamAttempt(false);
+    } catch (error) {
+      if (!isEnglishOnlyGuardError(error) || writer.hasWritableContent()) {
+        throw error;
+      }
+
+      events.onStatus?.(
+        "Model produced non-English output; retrying English-only writeback...",
+      );
+      writer.discardNonWritableContent();
+      retryUsed = true;
+      attempt = await streamAttempt(true);
+    }
     response = attempt.response;
 
     if (attempt.toolRequestDetected) {
@@ -4262,6 +6698,27 @@ async function streamCurrentNoteWriteback({
     if (!attempt.content.trim()) {
       events.onStatus?.(EMPTY_STREAMING_WRITEBACK_MESSAGE);
       throw new Error(EMPTY_STREAMING_WRITEBACK_MESSAGE);
+    }
+
+    if (!retryUsed && hasUnclosedFence(attempt.content)) {
+      events.onStatus?.(
+        "Streamed writeback ended inside a fenced code block; retrying complete content...",
+      );
+      writer.replaceContent("");
+      retryUsed = true;
+      attempt = await streamAttempt(true);
+      response = attempt.response;
+
+      if (attempt.toolRequestDetected) {
+        throw new Error(
+          "The model requested a tool during streamed writeback instead of returning writable content. Nothing was written.",
+        );
+      }
+
+      if (!attempt.content.trim()) {
+        events.onStatus?.(EMPTY_STREAMING_WRITEBACK_MESSAGE);
+        throw new Error(EMPTY_STREAMING_WRITEBACK_MESSAGE);
+      }
     }
 
     const wordTarget = parseWritebackWordCountTargetFromMessages(messages);
@@ -4335,8 +6792,8 @@ function buildStreamingWritebackPrompt(
 ): string {
   const retryPrefix = retry
     ? [
-        "The previous writeback stream returned no writable markdown.",
-        "Return only the requested markdown content now.",
+        "The previous writeback stream returned no writable markdown or incomplete markdown.",
+        "Return the complete requested markdown content now.",
       ]
     : [];
 
@@ -4345,6 +6802,7 @@ function buildStreamingWritebackPrompt(
       ...retryPrefix,
       "Write the markdown content to append to the current note now.",
       "Use English unless the user explicitly requested another language in the current mission.",
+      FINAL_ENGLISH_ONLY_RULE,
       "Return only the markdown that should be appended.",
       "Do not include preambles, explanations, receipts, or thinking traces.",
     ].join(" ");
@@ -4355,6 +6813,7 @@ function buildStreamingWritebackPrompt(
       ...retryPrefix,
       "Write the full replacement markdown for the current note now.",
       "Use English unless the user explicitly requested another language in the current mission.",
+      FINAL_ENGLISH_ONLY_RULE,
       "Return only the complete replacement note content.",
       "Do not include preambles, explanations, receipts, or thinking traces.",
     ].join(" ");
@@ -4365,6 +6824,7 @@ function buildStreamingWritebackPrompt(
     `Write the replacement markdown body for the section "${preparedSectionEdit?.heading ?? "target section"}" now.`,
     "Do not include the heading line itself.",
     "Use English unless the user explicitly requested another language in the current mission.",
+    FINAL_ENGLISH_ONLY_RULE,
     "Return only the markdown body that belongs under that heading.",
     "Do not include preambles, explanations, receipts, or thinking traces.",
   ].join(" ");
@@ -4396,17 +6856,20 @@ function createLiveWritebackEmitter({
   writer,
   knownToolNames,
   relevancePrompt,
+  lifecycle,
 }: {
   events: AgentRunEvents;
   writer: Awaited<ReturnType<typeof createStreamingNoteWriter>>;
   knownToolNames: Set<string>;
   relevancePrompt?: string;
+  lifecycle: ReturnType<typeof createStreamLifecycleTracker>;
 }) {
   let safetyBuffer = "";
   let live = false;
   let wroteContent = false;
   let toolRequestDetected = false;
   const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
+  const englishGuard = isLikelyEnglishPrompt(relevancePrompt ?? "");
 
   const emit = (delta: string) => {
     if (!delta) {
@@ -4415,10 +6878,23 @@ function createLiveWritebackEmitter({
 
     const topicalDelta = relevanceGate.push(delta);
     if (!topicalDelta) {
+      lifecycle.mark("buffering_safety", "Checking early output before writing...", {
+        bufferedChars: delta.length,
+      });
       return;
     }
 
+    if (englishGuard) {
+      assertEnglishOnlyVisibleOutput(topicalDelta, events);
+    }
+
     wroteContent = true;
+    lifecycle.mark("first_visible_content", "Showing safe answer text...", {
+      releasedChars: topicalDelta.length,
+    });
+    lifecycle.mark("first_note_write", "Writing safe content to note...", {
+      releasedChars: topicalDelta.length,
+    });
     events.onFinalDelta?.(topicalDelta);
     events.onAssistantDelta?.(topicalDelta);
     writer.push(topicalDelta);
@@ -4440,7 +6916,10 @@ function createLiveWritebackEmitter({
             return;
           }
 
-          if (shouldKeepWritebackSafetyBuffer(safetyBuffer)) {
+          if (shouldKeepPostReleaseBuffer(safetyBuffer)) {
+            lifecycle.mark("buffering_safety", "Checking possible tool output before writing...", {
+              bufferedChars: safetyBuffer.length,
+            });
             return;
           }
 
@@ -4454,8 +6933,11 @@ function createLiveWritebackEmitter({
           return;
         }
 
-        if (shouldKeepWritebackSafetyBuffer(delta)) {
+        if (shouldKeepPostReleaseBuffer(delta)) {
           safetyBuffer = delta;
+          lifecycle.mark("buffering_safety", "Checking possible tool output before writing...", {
+            bufferedChars: safetyBuffer.length,
+          });
           return;
         }
 
@@ -4472,6 +6954,9 @@ function createLiveWritebackEmitter({
       }
 
       if (shouldKeepWritebackSafetyBuffer(safetyBuffer)) {
+        lifecycle.mark("buffering_safety", "Checking early output before writing...", {
+          bufferedChars: safetyBuffer.length,
+        });
         return;
       }
 
@@ -4480,7 +6965,7 @@ function createLiveWritebackEmitter({
       safetyBuffer = "";
     },
     finish() {
-      if (!live && safetyBuffer && !toolRequestDetected) {
+      if (safetyBuffer && !toolRequestDetected) {
         if (containsRecoverableToolRequest(safetyBuffer, knownToolNames)) {
           toolRequestDetected = true;
           safetyBuffer = "";
@@ -4540,6 +7025,18 @@ function shouldKeepWritebackSafetyBuffer(content: string): boolean {
   return false;
 }
 
+function shouldKeepPostReleaseBuffer(content: string): boolean {
+  const trimmed = content.trimStart();
+  const lower = trimmed.toLowerCase();
+
+  return (
+    lower.startsWith("<requested_tool_call") ||
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[") ||
+    /^\\?`\\?`?\\?`?\s*(json|tool|tool_call|function)\b/i.test(trimmed)
+  );
+}
+
 function isInvalidResponseError(error: unknown): boolean {
   return (
     error instanceof ModelClientError &&
@@ -4553,7 +7050,7 @@ function parseWritebackWordCountTargetFromMessages(
   for (const message of [...messages].reverse()) {
     if (
       message.role !== "user" &&
-      !/Current note context:/i.test(message.content)
+      !/Current note context:|Generated output word target:/i.test(message.content)
     ) {
       continue;
     }
@@ -4565,6 +7062,10 @@ function parseWritebackWordCountTargetFromMessages(
   }
 
   return null;
+}
+
+function hasUnclosedFence(content: string): boolean {
+  return (content.match(/```/g)?.length ?? 0) % 2 === 1;
 }
 
 function parseGeneratedWordCountTargetFromMessages(
@@ -4694,6 +7195,100 @@ async function requestWordCountCorrection({
   }
 }
 
+async function repairEnglishOnlyOutput({
+  modelClient,
+  messages,
+  draft,
+  events,
+  think,
+  options,
+  abortSignal,
+  onThinkingUnsupported,
+  metricName,
+}: {
+  modelClient: ModelClient;
+  messages: ModelChatMessage[];
+  draft: string;
+  events: AgentRunEvents;
+  think?: ModelThink;
+  options?: ModelRequestOptions;
+  abortSignal?: AbortSignal;
+  onThinkingUnsupported: () => void;
+  metricName: string;
+}): Promise<string> {
+  const language = inspectEnglishOnlyOutput(draft);
+  if (language.ok) {
+    return draft;
+  }
+
+  events.onStreamLifecycle?.({
+    kind: "buffering_language",
+    elapsedMs: 0,
+    bufferedChars: draft.length,
+    message: "Language gate retrying English-only output...",
+  });
+  events.onStatus?.("Model produced non-English output; requesting English-only repair...");
+
+  const repairOptions: ModelRequestOptions = {
+    ...(options ?? {}),
+    temperature: 0.1,
+    top_p: 0.8,
+  };
+  const request: ModelChatRequest = {
+    messages: [
+      ...messages,
+      {
+        role: "assistant" as const,
+        content: draft,
+      },
+      {
+        role: "user" as const,
+        content: buildEnglishOnlyRepairPrompt(),
+      },
+    ],
+    think,
+    options: repairOptions,
+    abortSignal,
+  };
+  const requestChars = measureSerializedChars(request);
+  const startedAt = nowMs();
+
+  emitModelCallTrace(events, {
+    id: `model-call-${metricName}`,
+    message: `Model chat: ${metricName}`,
+    request,
+  });
+
+  try {
+    const response = await chatWithThinkingFallback({
+      modelClient,
+      request,
+      events,
+      onThinkingUnsupported,
+    });
+    emitMetricEvent(events, {
+      kind: "model_chat",
+      name: metricName,
+      durationMs: elapsedMs(startedAt),
+      requestChars,
+      responseChars: measureSerializedChars(response.raw ?? response.message),
+      ...extractTokenUsageFields(response.raw),
+    });
+    emitThinking(response.message.thinking, events);
+    const repaired = sanitizeAssistantContent(response.message.content);
+    assertEnglishOnlyOutput(repaired);
+    return repaired;
+  } catch (error) {
+    emitMetricEvent(events, {
+      kind: "model_chat",
+      name: metricName,
+      durationMs: elapsedMs(startedAt),
+      requestChars,
+    });
+    throw error;
+  }
+}
+
 async function chatWithThinkingFallback({
   modelClient,
   request,
@@ -4782,6 +7377,10 @@ async function createStreamingNoteWriter({
     )}${section?.suffix ?? ""}`;
   };
   const hasWritableContent = () => streamedContent.trim().length > 0;
+  const writeContent = async (content: string) => {
+    toolContext.setCurrentMarkdownContent?.(file, content);
+    await toolContext.app.vault.modify(file, content);
+  };
 
   const queueFlush = () => {
     if (flushTimer !== null) {
@@ -4791,7 +7390,7 @@ async function createStreamingNoteWriter({
     pendingChars = 0;
     lastFlushAt = nowMs();
     const nextContent = render();
-    flushChain = flushChain.then(() => toolContext.app.vault.modify(file, nextContent));
+    flushChain = flushChain.then(() => writeContent(nextContent));
   };
 
   const scheduleFlush = () => {
@@ -4952,7 +7551,13 @@ async function backupActiveFile(
   content: string,
 ): Promise<string> {
   if (!toolContext.app.vault.getFolderByPath(BACKUP_FOLDER)) {
-    await toolContext.app.vault.createFolder(BACKUP_FOLDER);
+    try {
+      await toolContext.app.vault.createFolder(BACKUP_FOLDER);
+    } catch (error) {
+      if (!isFolderAlreadyExistsError(error)) {
+        throw error;
+      }
+    }
   }
 
   const timestamp = (toolContext.now?.() ?? new Date()).getTime();
@@ -4967,6 +7572,10 @@ async function backupActiveFile(
 
   await toolContext.app.vault.create(backupPath, content);
   return backupPath;
+}
+
+function isFolderAlreadyExistsError(error: unknown): boolean {
+  return /folder already exists|already exists/i.test(getErrorMessage(error));
 }
 
 function sanitizeBackupBasename(basename: string): string {
@@ -5061,7 +7670,27 @@ function normalizeSpecialTokenCandidate(candidate: string): string {
 }
 
 function isClarifyingQuestionResponse(prompt: string, content: string): boolean {
-  return hasAmbiguousDatePrompt(prompt) && /\?\s*$/.test(sanitizeAssistantContent(content).trim());
+  const sanitized = sanitizeAssistantContent(content).trim();
+  if (!/\?\s*$/.test(sanitized)) {
+    return false;
+  }
+
+  if (hasAmbiguousDatePrompt(prompt)) {
+    return true;
+  }
+
+  if (sanitized.length > 700) {
+    return false;
+  }
+
+  return (
+    /^(before i|could you|can you|would you|which|what|where|when|who|how should|do you want|should i|may i|please (?:provide|confirm|choose|tell me)|i need|i(?:'|’)ll need|to proceed|to continue)\b/i.test(
+      sanitized,
+    ) ||
+    /\b(clarify|clarification|confirm|choose|which|what|where|when|missing|required|need(?:ed)?|target|credential|permission)\b/i.test(
+      sanitized,
+    )
+  );
 }
 
 function hasRenderableAssistantContent(content: string): boolean {
@@ -5076,6 +7705,18 @@ function isThinkingUnsupportedError(error: unknown): boolean {
       text,
     )
   );
+}
+
+function getUnknownErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  return "Unknown error";
 }
 
 function getErrorSearchText(error: unknown): string {
@@ -5100,6 +7741,7 @@ function completeRun(
   stopReason: AgentRunStopReason,
   step: number,
   runStartedAt?: number,
+  maxSteps = MAX_AGENT_STEPS,
 ) {
   const message = getStopReasonMessage(stopReason);
   emitStatus(
@@ -5111,7 +7753,7 @@ function completeRun(
   );
   events.onRunComplete?.({
     step,
-    maxSteps: MAX_AGENT_STEPS,
+    maxSteps,
     stopReason,
   });
   events.onTrace?.({
@@ -5121,7 +7763,7 @@ function completeRun(
     message,
     outputPreview: {
       step,
-      maxSteps: MAX_AGENT_STEPS,
+      maxSteps,
       stopReason,
     },
   });
@@ -5157,6 +7799,100 @@ function isRunStopRequested(abortSignal: AbortSignal | undefined): boolean {
   return abortSignal?.aborted ?? false;
 }
 
+async function checkpointRunIfDue({
+  toolContext,
+  events,
+  runId,
+  step,
+  stepLimit,
+  runPlan,
+  toolNames,
+  status = "running",
+  message,
+  force = false,
+}: {
+  toolContext: ToolExecutionContext;
+  events: AgentRunEvents;
+  runId: string;
+  step: number;
+  stepLimit: number;
+  runPlan: RunPlan;
+  toolNames: string[];
+  status?: string;
+  message?: string;
+  force?: boolean;
+}) {
+  if (
+    step <= 0 ||
+    (!force && step % CHECKPOINT_EVERY_STEPS !== 0) ||
+    stepLimit < CHECKPOINT_EVERY_STEPS ||
+    !hasCheckpointVaultApi(toolContext)
+  ) {
+    return;
+  }
+
+  try {
+    const result = await appendAgentRunCheckpoint(toolContext, {
+      runId,
+      step,
+      maxSteps: stepLimit,
+      status,
+      route: runPlan.route,
+      toolNames,
+      message: message ?? `Completed planning step ${step}; continuing agent loop.`,
+      timestamp: toolContext.now?.() ?? new Date(),
+    });
+    events.onTrace?.({
+      id: `checkpoint-${step}`,
+      kind: "status",
+      step,
+      path: result.path,
+      message: `Saved run checkpoint to ${result.path}`,
+      outputPreview: result,
+    });
+  } catch (error) {
+    events.onTrace?.({
+      id: `checkpoint-${step}:error`,
+      kind: "error",
+      step,
+      message: `Run checkpoint failed: ${getUnknownErrorMessage(error)}`,
+      error: {
+        code: "checkpoint_failed",
+        message: getUnknownErrorMessage(error),
+      },
+    });
+  }
+}
+
+function hasCheckpointVaultApi(toolContext: ToolExecutionContext): boolean {
+  const vault = (toolContext as Partial<ToolExecutionContext>).app?.vault as
+    | Record<string, unknown>
+    | undefined;
+
+  return (
+    typeof vault?.getFolderByPath === "function" &&
+    typeof vault.getFileByPath === "function" &&
+    typeof vault.createFolder === "function" &&
+    typeof vault.create === "function" &&
+    typeof vault.read === "function" &&
+    typeof vault.modify === "function"
+  );
+}
+
+const CACHEABLE_TOOL_NAMES = new Set([
+  "read_current_file",
+  "inspect_vault_context",
+  "list_markdown_files",
+  "search_markdown_files",
+  "read_markdown_files",
+  "read_file",
+  "count_words",
+  "web_fetch",
+  "get_note_graph_context",
+  "find_related_notes",
+  "suggest_note_links",
+]);
+
 async function executeToolWithMetrics({
   toolRegistry,
   toolCall,
@@ -5172,9 +7908,35 @@ async function executeToolWithMetrics({
 }) {
   const startedAt = nowMs();
   const inputChars = measureSerializedChars(toolCall.arguments);
+  const toolCache = toolContext.runtimeCache?.toolResults;
+  const cacheKey =
+    toolCache && CACHEABLE_TOOL_NAMES.has(toolCall.name)
+      ? getToolCacheKey(toolCall.name, toolCall.arguments)
+      : null;
+
+  if (cacheKey) {
+    const cachedResult = toolCache?.get(cacheKey);
+    if (cachedResult) {
+      emitMetricEvent(events, {
+        kind: "tool",
+        name: toolCall.name,
+        step,
+        durationMs: 0,
+        cached: true,
+        cacheKey,
+        savedDurationMs: elapsedMs(startedAt),
+        inputChars,
+        outputChars: measureSerializedChars(cachedResult),
+      });
+      return cachedResult;
+    }
+  }
 
   try {
     const result = await toolRegistry.execute(toolCall, toolContext);
+    if (cacheKey && result.ok) {
+      toolCache?.set(cacheKey, result);
+    }
     emitMetricEvent(events, {
       kind: "tool",
       name: toolCall.name,
@@ -5194,6 +7956,31 @@ async function executeToolWithMetrics({
     });
     throw error;
   }
+}
+
+function getToolCacheKey(name: string, args: Record<string, unknown>): string {
+  return `${name}:${stableStringify(args)}`;
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(stableNormalize(value));
+}
+
+function stableNormalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stableNormalize(item));
+  }
+
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  return Object.keys(value)
+    .sort()
+    .reduce<Record<string, unknown>>((output, key) => {
+      output[key] = stableNormalize(value[key]);
+      return output;
+    }, {});
 }
 
 function nowMs(): number {

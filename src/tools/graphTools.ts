@@ -445,6 +445,17 @@ function scoreRelatedProfile({
 async function buildVaultProfiles(
   context: ToolExecutionContext,
 ): Promise<Map<string, NoteProfile>> {
+  const cacheKey = "graph:vault_profiles:v1";
+  const graphProfiles =
+    context.runtimeCache?.graphProfiles ??
+    (context.runtimeCache
+      ? (context.runtimeCache.graphProfiles = new Map<string, unknown>())
+      : undefined);
+  const cachedProfiles = graphProfiles?.get(cacheKey);
+  if (cachedProfiles instanceof Map) {
+    return cachedProfiles as Map<string, NoteProfile>;
+  }
+
   const profiles = new Map<string, NoteProfile>();
   const files = context.app.vault
     .getFiles()
@@ -455,6 +466,7 @@ async function buildVaultProfiles(
     profiles.set(file.path, await buildNoteProfile(context, file));
   }
 
+  graphProfiles?.set(cacheKey, profiles);
   return profiles;
 }
 

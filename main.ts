@@ -11,19 +11,27 @@ import {
 } from "./src/model/createModelClient";
 import type { ModelClient } from "./src/model/types";
 import { AgentSettings, AgentSettingTab, DEFAULT_SETTINGS } from "./src/settings";
+import { getProjectMemoryLocation } from "./src/agent/projectMemory";
 import { createDefaultToolRegistry } from "./src/tools/createToolRegistry";
-import type { ToolExecutionContext, ToolRegistry } from "./src/tools/types";
+import { MAX_AGENT_STEPS } from "./src/tools/constants";
+import type {
+  ResearchMemoryIndexEntry,
+  ToolExecutionContext,
+  ToolRegistry,
+} from "./src/tools/types";
 
 const LEGACY_DEFAULT_REQUEST_TIMEOUT_MS = 60000;
 
 export default class AgenticResearcherPlugin extends Plugin {
   settings: AgentSettings = { ...DEFAULT_SETTINGS };
   conversationHistory: AgentConversationMessage[] = [];
+  researchMemoryIndex: ResearchMemoryIndexEntry[] = [];
   private lastActiveMarkdownFile: TFile | null = null;
 
   async onload() {
     await this.loadSettings();
     this.updateLastActiveMarkdownFile(this.resolveCurrentMarkdownFile());
+    await this.loadProjectMemoryData();
 
     this.registerView(
       AGENT_VIEW_TYPE,
@@ -33,12 +41,14 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         this.updateLastActiveMarkdownFile(file);
+        void this.loadProjectMemoryData();
       }),
     );
 
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", (leaf) => {
         this.updateLastActiveMarkdownFile(getMarkdownFileFromLeaf(leaf));
+        void this.loadProjectMemoryData();
       }),
     );
 
@@ -83,7 +93,11 @@ export default class AgenticResearcherPlugin extends Plugin {
   async loadSettings() {
     const data = await this.loadData();
     const record = isRecord(data) ? data : {};
-    const { conversationHistory: rawHistory, ...settingsData } = record;
+    const {
+      conversationHistory: rawHistory,
+      researchMemoryIndex: rawResearchMemoryIndex,
+      ...settingsData
+    } = record;
 
     const settings = Object.assign({}, DEFAULT_SETTINGS, settingsData);
     if (
@@ -93,9 +107,22 @@ export default class AgenticResearcherPlugin extends Plugin {
     ) {
       settings.requestTimeoutMs = DEFAULT_SETTINGS.requestTimeoutMs;
     }
+    if (
+      !Number.isFinite(settings.maxAgentSteps) ||
+      settings.maxAgentSteps <= 0
+    ) {
+      settings.maxAgentSteps = DEFAULT_SETTINGS.maxAgentSteps;
+    } else {
+      settings.maxAgentSteps = Math.min(
+        MAX_AGENT_STEPS,
+        Math.max(1, Math.trunc(settings.maxAgentSteps)),
+      );
+    }
 
     this.settings = settings;
     this.conversationHistory = normalizeConversationHistory(rawHistory);
+    this.researchMemoryIndex =
+      normalizeResearchMemoryIndex(rawResearchMemoryIndex);
   }
 
   async saveSettings() {
@@ -108,18 +135,87 @@ export default class AgenticResearcherPlugin extends Plugin {
       message,
     );
     await this.savePluginData();
+    await this.saveProjectMemoryData();
   }
 
   async clearConversationHistory() {
     this.conversationHistory = [];
     await this.savePluginData();
+    await this.saveProjectMemoryData();
+  }
+
+  async setResearchMemoryIndex(entries: ResearchMemoryIndexEntry[]) {
+    this.researchMemoryIndex = normalizeResearchMemoryIndex(entries);
+    await this.savePluginData();
+    await this.saveProjectMemoryData();
   }
 
   private async savePluginData() {
     await this.saveData({
       ...this.settings,
       conversationHistory: this.conversationHistory,
+      researchMemoryIndex: this.researchMemoryIndex,
     });
+  }
+
+  private async loadProjectMemoryData() {
+    const location = getProjectMemoryLocation(this.getCurrentMarkdownFile()?.path ?? null);
+    const conversationHistory = await this.readProjectMemoryJson(
+      location.conversationPath,
+    );
+    const researchMemoryIndex = await this.readProjectMemoryJson(
+      location.researchIndexPath,
+    );
+
+    if (conversationHistory !== null) {
+      this.conversationHistory = normalizeConversationHistory(conversationHistory);
+    }
+
+    if (researchMemoryIndex !== null) {
+      this.researchMemoryIndex =
+        normalizeResearchMemoryIndex(researchMemoryIndex);
+    }
+  }
+
+  private async saveProjectMemoryData() {
+    const location = getProjectMemoryLocation(this.getCurrentMarkdownFile()?.path ?? null);
+    await this.writeProjectMemoryJson(
+      location.conversationPath,
+      this.conversationHistory,
+    );
+    await this.writeProjectMemoryJson(
+      location.researchIndexPath,
+      this.researchMemoryIndex,
+    );
+  }
+
+  private async readProjectMemoryJson(path: string): Promise<unknown | null> {
+    const file = this.app.vault.getFileByPath(path);
+    if (!file) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(await this.app.vault.read(file));
+    } catch (error) {
+      console.warn(`Unable to read Agent Memory file ${path}`, error);
+      return null;
+    }
+  }
+
+  private async writeProjectMemoryJson(path: string, value: unknown) {
+    try {
+      await ensureVaultFolderPath(this.app, getVaultParentPath(path));
+      const text = `${JSON.stringify(value, null, 2)}\n`;
+      const file = this.app.vault.getFileByPath(path);
+      if (file) {
+        await this.app.vault.modify(file, text);
+      } else {
+        await this.app.vault.create(path, text);
+      }
+    } catch (error) {
+      console.warn(`Unable to write Agent Memory file ${path}`, error);
+    }
   }
 
   createModelClient(): ModelClient {
@@ -138,6 +234,10 @@ export default class AgenticResearcherPlugin extends Plugin {
       httpTransport: requestUrlTransport,
       getCurrentMarkdownFile: () => this.getCurrentMarkdownFile(),
       getCurrentMarkdownContent: (file) => this.getCurrentMarkdownContent(file),
+      setCurrentMarkdownContent: (file, content) =>
+        this.setCurrentMarkdownContent(file, content),
+      getResearchMemoryIndex: () => [...this.researchMemoryIndex],
+      setResearchMemoryIndex: (entries) => this.setResearchMemoryIndex(entries),
     };
   }
 
@@ -183,6 +283,27 @@ export default class AgenticResearcherPlugin extends Plugin {
     return null;
   }
 
+  setCurrentMarkdownContent(file: TFile, content: string): boolean {
+    const recentEditor = getMarkdownEditorFromLeaf(
+      this.app.workspace.getMostRecentLeaf(),
+      file,
+    );
+    if (recentEditor?.setValue) {
+      recentEditor.setValue(content);
+      return true;
+    }
+
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const editor = getMarkdownEditorFromLeaf(leaf, file);
+      if (editor?.setValue) {
+        editor.setValue(content);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   private resolveCurrentMarkdownFile(): TFile | null {
     const activeFile = this.app.workspace.getActiveFile();
     if (isMarkdownFile(activeFile)) {
@@ -217,8 +338,70 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function normalizeResearchMemoryIndex(
+  value: unknown,
+): ResearchMemoryIndexEntry[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const entries: ResearchMemoryIndexEntry[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+
+    const topic = typeof item.topic === "string" ? item.topic.trim() : "";
+    const path = typeof item.path === "string" ? item.path.trim() : "";
+    const lastUpdated =
+      typeof item.lastUpdated === "string" ? item.lastUpdated.trim() : "";
+    if (!topic || !path || !lastUpdated) {
+      continue;
+    }
+
+    const keywords = Array.isArray(item.keywords)
+      ? item.keywords
+          .filter((keyword): keyword is string => typeof keyword === "string")
+          .map((keyword) => keyword.trim())
+          .filter(Boolean)
+          .slice(0, 24)
+      : [];
+
+    entries.push({ topic, path, keywords, lastUpdated });
+  }
+
+  return entries.slice(0, 200);
+}
+
 function isMarkdownFile(file: TFile | null | undefined): file is TFile {
   return Boolean(file && file.extension === "md");
+}
+
+function getVaultParentPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const slash = normalized.lastIndexOf("/");
+  return slash <= 0 ? "" : normalized.slice(0, slash);
+}
+
+async function ensureVaultFolderPath(
+  app: AgenticResearcherPlugin["app"],
+  path: string,
+) {
+  const parts = path
+    .split("/")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  let currentPath = "";
+
+  for (const part of parts) {
+    currentPath = currentPath ? `${currentPath}/${part}` : part;
+    const existing = app.vault.getAbstractFileByPath(currentPath);
+    if (existing) {
+      continue;
+    }
+
+    await app.vault.createFolder(currentPath);
+  }
 }
 
 function getMarkdownFileFromLeaf(leaf: WorkspaceLeaf | null): TFile | null {
@@ -230,14 +413,32 @@ function getMarkdownTextFromLeaf(
   leaf: WorkspaceLeaf | null,
   file: TFile,
 ): string | null {
-  const view = leaf?.view as
-    | { file?: TFile | null; editor?: { getValue?: () => string } }
-    | undefined;
+  const editor = getMarkdownEditorFromLeaf(leaf, file);
+  const value = editor?.getValue?.();
+  return typeof value === "string" ? value : null;
+}
 
+function getMarkdownEditorFromLeaf(
+  leaf: WorkspaceLeaf | null,
+  file: TFile,
+):
+  | {
+      getValue?: () => string;
+      setValue?: (value: string) => void;
+    }
+  | null {
+  const view = leaf?.view as
+    | {
+        file?: TFile | null;
+        editor?: {
+          getValue?: () => string;
+          setValue?: (value: string) => void;
+        };
+      }
+    | undefined;
   if (!view || view.file?.path !== file.path) {
     return null;
   }
 
-  const value = view.editor?.getValue?.();
-  return typeof value === "string" ? value : null;
+  return view.editor ?? null;
 }
