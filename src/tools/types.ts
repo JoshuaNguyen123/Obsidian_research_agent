@@ -6,6 +6,8 @@ import type {
   ModelToolCall,
   ModelToolDefinition,
 } from "../model/types";
+import type { AutonomyScope } from "../agent/missionScope";
+import type { SemanticEmbeddingProvider } from "../embeddings/types";
 
 export type AgentMissionMode =
   | "chat_only"
@@ -23,6 +25,7 @@ export interface MissionIntent {
   explicitDelete: boolean;
   allowAutonomousWrite: boolean;
   requireWriteCompletion: boolean;
+  autonomyScope: AutonomyScope;
 }
 
 export interface ResearchMemoryIndexEntry {
@@ -48,6 +51,7 @@ export interface ToolExecutionContext {
   setResearchMemoryIndex?: (
     entries: ResearchMemoryIndexEntry[],
   ) => Promise<void> | void;
+  semanticEmbeddingProvider?: SemanticEmbeddingProvider;
 }
 
 export interface ToolExecutionResult {
