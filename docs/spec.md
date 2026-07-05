@@ -1,5 +1,7 @@
 # One-Day MVP Spec: Agentic Obsidian Researcher Plugin
 
+> Current status: this document is retained as the original one-day MVP scope, not as the current product contract. The implementation has moved beyond the MVP and now includes continuous autonomous loop budgets up to 30 steps, checkpoint notes under `Agent Runs/`, larger bounded chat history with prompt-time compaction, metadata-only vault indexing, optional seeded templates, web search/fetch/source-note tools, explicit desktop-only code execution, sandboxed HTML previews, native JSON Canvas and SVG design artifact tools, artifact verification, and Playwright e2e coverage for long-loop and design workflows. For the current implementation-grounded architecture, use `docs/technical_details.md`.
+
 ## 1. Objective
 
 Build a native Obsidian plugin that provides a minimal right-side chat panel for an agentic research assistant.
@@ -430,13 +432,13 @@ The plugin runs a bounded loop:
 ### Step Budget
 
 ```ts
-const MAX_AGENT_STEPS = 6;
+const MAX_AGENT_STEPS = 30;
 ```
 
-If the model does not finish within six steps:
+If the model does not finish within the run's route-specific step budget:
 
 ```text
-Stopped after step budget. Review partial results.
+Stopped at safety limit. Review partial results.
 ```
 
 ### Agent Operating Rules
@@ -451,6 +453,11 @@ You can:
 - list vault markdown files
 - read specific markdown files
 - search the web
+- open explicitly requested source URLs with a source-note receipt
+- inspect a metadata-only vault index
+- run explicitly requested desktop code
+- render explicitly requested HTML/CSS previews
+- create verified JSON Canvas and SVG design artifacts
 - append to the current note
 - patch the current note title/frontmatter
 - replace the current note after backup
@@ -519,7 +526,7 @@ Required progress events:
 ```text
 Planning...
 Reading current note...
-Agent step 1/6...
+Agent step 1/10...
 Running tool: web_search
 Running tool: append_to_current_file
 Done.
@@ -542,9 +549,10 @@ Day-one implementation should still feel active even if actual model response st
 ### General Guards
 
 ```ts
-const MAX_AGENT_STEPS = 6;
+const MAX_AGENT_STEPS = 30;
+const CHECKPOINT_EVERY_STEPS = 5;
 const MAX_FILE_READ_CHARS = 12000;
-const MAX_TOOL_RESULT_CHARS = 12000;
+const MAX_TOOL_RESULT_CHARS = 8000;
 const MAX_LISTED_FILES = 300;
 const MAX_WEB_RESULTS = 10;
 ```
@@ -859,7 +867,7 @@ Force the model into excessive tool use.
 
 Expected:
 
-* Agent stops after six steps.
+* Agent stops after ten steps.
 * UI says:
 
 ```text
