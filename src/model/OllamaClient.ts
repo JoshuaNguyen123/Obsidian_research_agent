@@ -310,6 +310,7 @@ export async function parseOllamaChatStream(
   };
 
   for await (const chunk of stream) {
+    events.onRawChunk?.(chunk);
     buffer += chunk;
 
     let newlineIndex = buffer.indexOf("\n");

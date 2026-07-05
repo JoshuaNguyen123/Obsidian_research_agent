@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
+import { DEFAULT_TEMPLATE_SEEDS } from "../src/tools/vaultTools";
 import {
+  BACKUP_FOLDER,
   DEFAULT_WEB_RESULTS,
   MAX_WEB_FETCH_CHARS,
   MAX_WEB_SEARCH_SNIPPET_CHARS,
@@ -16,6 +18,7 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.ok(definitions.some((tool) => tool.function.name === "list_folder"));
   assert.ok(definitions.some((tool) => tool.function.name === "search_markdown_files"));
   assert.ok(definitions.some((tool) => tool.function.name === "read_markdown_files"));
+  assert.ok(definitions.some((tool) => tool.function.name === "inspect_vault_context"));
   assert.ok(definitions.some((tool) => tool.function.name === "count_words"));
   assert.ok(definitions.some((tool) => tool.function.name === "get_note_graph_context"));
   assert.ok(definitions.some((tool) => tool.function.name === "find_related_notes"));
@@ -25,6 +28,15 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
       (tool) => tool.function.name === "link_related_notes_in_current_file",
     ),
   );
+  assert.ok(definitions.some((tool) => tool.function.name === "list_templates"));
+  assert.ok(definitions.some((tool) => tool.function.name === "read_template"));
+  assert.ok(definitions.some((tool) => tool.function.name === "seed_default_templates"));
+  assert.ok(definitions.some((tool) => tool.function.name === "create_template"));
+  assert.ok(definitions.some((tool) => tool.function.name === "fill_template"));
+  assert.ok(definitions.some((tool) => tool.function.name === "search_research_memory"));
+  assert.ok(definitions.some((tool) => tool.function.name === "read_research_memory"));
+  assert.ok(definitions.some((tool) => tool.function.name === "append_research_memory"));
+  assert.ok(definitions.some((tool) => tool.function.name === "append_to_current_section"));
   assert.ok(definitions.some((tool) => tool.function.name === "create_file"));
 
   const result = await registry.execute(
@@ -82,6 +94,200 @@ test("read_current_file uses plugin current page resolver and live editor text",
     path: "Current.md",
     content: "Unsaved prompt from the open editor",
   });
+});
+
+test("inspect_vault_context reads bounded notes outside the active folder", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({ activePath: "Projects/current.md" });
+  mock.content.set("Projects/current.md", "Active note should be excluded.");
+  mock.content.set("Projects/neighbor.md", "Neighbor should be excluded.");
+  mock.content.set("People/Untitled.md", "People note details for the agent.");
+  mock.content.set("Archive/Untitled.md", "Archive note details for the agent.");
+  mock.content.set("Research/Long.md", "x".repeat(40));
+
+  const result = await registry.execute(
+    {
+      name: "inspect_vault_context",
+      arguments: {
+        scope: "other_folders",
+        maxFiles: 2,
+        maxCharsPerFile: 8,
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    activeFile: { path: string; folder: string };
+    selectedFiles: Array<{ path: string; folder: string }>;
+    files: Array<{ path: string; content: string; truncated: boolean }>;
+    skipped: Array<{ path: string; reason: string }>;
+    truncated: boolean;
+    limits: { maxFiles: number; maxCharsPerFile: number };
+  };
+
+  assert.equal(output.activeFile.path, "Projects/current.md");
+  assert.equal(output.activeFile.folder, "Projects");
+  assert.equal(output.limits.maxFiles, 2);
+  assert.equal(output.limits.maxCharsPerFile, 8);
+  assert.equal(output.files.length, 2);
+  assert.ok(!output.selectedFiles.some((file) => file.path === "Projects/current.md"));
+  assert.ok(!output.selectedFiles.some((file) => file.folder === "Projects"));
+  assert.ok(output.files.every((file) => file.content.length <= 22));
+  assert.equal(output.truncated, true);
+  assert.ok(output.skipped.some((item) => item.reason === "file_limit_exceeded"));
+});
+
+test("inspect_vault_context targets folder basenames and descendants", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({ activePath: "Untitled/current.md" });
+  mock.content.set("Untitled/current.md", "Active prompt should be excluded.");
+  mock.content.set("Untitled/discovery.md", "Root untitled discovery.");
+  mock.content.set("Untitled/Sub/deeper.md", "Nested untitled discovery.");
+  mock.content.set("Research/Untitled/research.md", "Research untitled discovery.");
+  mock.content.set("Untitled 1/one.md", "Second folder discovery.");
+  mock.content.set("Unrelated/skip.md", "Should not be included.");
+
+  const result = await registry.execute(
+    {
+      name: "inspect_vault_context",
+      arguments: {
+        scope: "all_vault",
+        targetFolders: ["Untitled", "Untitled 1", "Missing Folder"],
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    targetFolders: {
+      requested: string[];
+      matched: Array<{ target: string; paths: string[] }>;
+      unmatched: string[];
+    };
+    selectedFiles: Array<{ path: string; folder: string }>;
+  };
+  const selectedPaths = output.selectedFiles.map((file) => file.path);
+
+  assert.deepEqual(output.targetFolders.requested, [
+    "Untitled",
+    "Untitled 1",
+    "Missing Folder",
+  ]);
+  assert.ok(selectedPaths.includes("Untitled/discovery.md"));
+  assert.ok(selectedPaths.includes("Untitled/Sub/deeper.md"));
+  assert.ok(selectedPaths.includes("Research/Untitled/research.md"));
+  assert.ok(selectedPaths.includes("Untitled 1/one.md"));
+  assert.ok(!selectedPaths.includes("Untitled/current.md"));
+  assert.ok(!selectedPaths.includes("Unrelated/skip.md"));
+  assert.ok(
+    output.targetFolders.matched.some(
+      (item) => item.target === "Untitled" && item.paths.includes("Untitled/Sub"),
+    ),
+  );
+  assert.deepEqual(output.targetFolders.unmatched, ["Missing Folder"]);
+});
+
+test("inspect_vault_context prioritizes recent files for targeted folders", async () => {
+  const registry = createDefaultToolRegistry();
+  const oldStats: Record<string, { mtime: number }> = {};
+
+  for (let index = 0; index < 12; index += 1) {
+    oldStats[`Untitled/old-${index}.md`] = { mtime: index + 1 };
+  }
+
+  const mock = createMockContext({
+    activePath: "Current.md",
+    fileStats: {
+      ...oldStats,
+      "Untitled/recent.md": { mtime: 100 },
+      "Untitled 1/recent.md": { mtime: 101 },
+      "Untitled 2/recent.md": { mtime: 102 },
+    },
+  });
+
+  for (const path of Object.keys(oldStats)) {
+    mock.content.set(path, `Old content for ${path}`);
+  }
+  mock.content.set("Untitled/recent.md", "Fresh folder one.");
+  mock.content.set("Untitled 1/recent.md", "Fresh folder two.");
+  mock.content.set("Untitled 2/recent.md", "Fresh folder three.");
+
+  const result = await registry.execute(
+    {
+      name: "inspect_vault_context",
+      arguments: {
+        scope: "all_vault",
+        targetFolders: ["Untitled", "Untitled 1", "Untitled 2"],
+        maxFiles: 3,
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    selectedFiles: Array<{ path: string }>;
+    skipped: Array<{ path: string; reason: string }>;
+  };
+
+  assert.deepEqual(
+    output.selectedFiles.map((file) => file.path),
+    ["Untitled 2/recent.md", "Untitled 1/recent.md", "Untitled/recent.md"],
+  );
+  assert.ok(
+    output.skipped.some(
+      (item) =>
+        item.path === "Untitled/old-11.md" &&
+        item.reason === "file_limit_exceeded",
+    ),
+  );
+});
+
+test("inspect_vault_context targets exact folder paths and rejects unsafe targets", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  mock.content.set("Untitled/root.md", "Root folder.");
+  mock.content.set("Research/Untitled/research.md", "Nested folder.");
+
+  const exact = await registry.execute(
+    {
+      name: "inspect_vault_context",
+      arguments: {
+        scope: "all_vault",
+        targetFolders: ["Research/Untitled"],
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(exact.ok, true);
+  const output = exact.output as {
+    selectedFiles: Array<{ path: string }>;
+    targetFolders: { matched: Array<{ target: string; paths: string[] }> };
+  };
+  assert.deepEqual(
+    output.selectedFiles.map((file) => file.path),
+    ["Research/Untitled/research.md"],
+  );
+  assert.deepEqual(output.targetFolders.matched, [
+    { target: "Research/Untitled", paths: ["Research/Untitled"] },
+  ]);
+
+  const unsafe = await registry.execute(
+    {
+      name: "inspect_vault_context",
+      arguments: {
+        targetFolders: ["../Secrets"],
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(unsafe.ok, false);
+  assert.equal(unsafe.error?.code, "unsafe_path");
 });
 
 test("list_folder traverses vault folders with depth, caps, and markdown filtering", async () => {
@@ -617,10 +823,209 @@ test("path CRUD tools create, append, replace with backup, move, and trash markd
   assert.ok(mock.operations.includes("trash:Projects/New/Renamed.md:false"));
 });
 
+test("template tools list, read, create, and fill saved templates", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt:
+      "Create a reusable template and fill the meeting template into a new note.",
+  });
+  mock.content.set(
+    "Templates/Meeting.md",
+    "# {{title}}\n\nDate: {{date}}\nAttendees: {{attendees}}",
+  );
+
+  const listed = await registry.execute(
+    {
+      name: "list_templates",
+      arguments: { includePlaceholders: true },
+    },
+    mock.context,
+  );
+  assert.equal(listed.ok, true);
+  assert.deepEqual(listed.output, {
+    templateFolder: "Templates",
+    templates: [
+      {
+        path: "Templates/Meeting.md",
+        basename: "Meeting",
+        placeholders: ["title", "date", "attendees"],
+      },
+    ],
+    truncated: false,
+  });
+
+  const read = await registry.execute(
+    { name: "read_template", arguments: { path: "Meeting.md" } },
+    mock.context,
+  );
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.output, {
+    path: "Templates/Meeting.md",
+    content: "# {{title}}\n\nDate: {{date}}\nAttendees: {{attendees}}",
+    placeholders: ["title", "date", "attendees"],
+    truncated: false,
+  });
+
+  const created = await registry.execute(
+    {
+      name: "create_template",
+      arguments: {
+        path: "Daily.md",
+        content: "# {{title}}\n\n- {{priority}}",
+      },
+    },
+    mock.context,
+  );
+  assert.equal(created.ok, true);
+  assert.equal(mock.content.get("Templates/Daily.md"), "# {{title}}\n\n- {{priority}}");
+  assert.deepEqual(created.output, {
+    path: "Templates/Daily.md",
+    operation: "create",
+    templateFolder: "Templates",
+    placeholders: ["title", "priority"],
+    bytesWritten: new TextEncoder().encode("# {{title}}\n\n- {{priority}}").length,
+  });
+
+  const filled = await registry.execute(
+    {
+      name: "fill_template",
+      arguments: {
+        templatePath: "Meeting.md",
+        values: {
+          title: "Product Sync",
+          date: "2026-07-04",
+          attendees: "Alex, Jordan",
+        },
+        targetPath: "Meetings/Product Sync.md",
+      },
+    },
+    mock.context,
+  );
+  assert.equal(filled.ok, true);
+  assert.equal(
+    mock.content.get("Meetings/Product Sync.md"),
+    "# Product Sync\n\nDate: 2026-07-04\nAttendees: Alex, Jordan",
+  );
+  assert.deepEqual(filled.output, {
+    path: "Meetings/Product Sync.md",
+    operation: "create",
+    templateSource: "saved_template",
+    templatePath: "Templates/Meeting.md",
+    placeholders: ["title", "date", "attendees"],
+    valuesApplied: ["attendees", "date", "title"],
+    bytesWritten: new TextEncoder().encode(
+      "# Product Sync\n\nDate: 2026-07-04\nAttendees: Alex, Jordan",
+    ).length,
+  });
+});
+
+test("seed_default_templates creates starter templates without overwriting existing files", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Seed the default starter templates in my vault.",
+  });
+  mock.content.set("Templates/Research brief.md", "# Existing research brief");
+
+  const seeded = await registry.execute(
+    { name: "seed_default_templates", arguments: {} },
+    mock.context,
+  );
+
+  assert.equal(seeded.ok, true);
+  const output = seeded.output as {
+    path: string;
+    operation: string;
+    createdTemplates: Array<{ path: string; placeholders: string[] }>;
+    skippedExisting: string[];
+    affectedCount: number;
+  };
+  assert.equal(output.path, "Templates");
+  assert.equal(output.operation, "create");
+  assert.equal(output.createdTemplates.length, Object.keys(DEFAULT_TEMPLATE_SEEDS).length - 1);
+  assert.equal(output.affectedCount, Object.keys(DEFAULT_TEMPLATE_SEEDS).length - 1);
+  assert.deepEqual(output.skippedExisting, ["Templates/Research brief.md"]);
+  assert.equal(mock.content.get("Templates/Research brief.md"), "# Existing research brief");
+  assert.equal(
+    mock.content.get("Templates/Experiment log.md"),
+    DEFAULT_TEMPLATE_SEEDS["Experiment log.md"],
+  );
+  assert.ok(mock.operations.includes("createFolder:Templates"));
+
+  const repeated = await registry.execute(
+    { name: "seed_default_templates", arguments: {} },
+    mock.context,
+  );
+  assert.equal(repeated.ok, true);
+  assert.equal(
+    (repeated.output as { createdTemplates: unknown[] }).createdTemplates.length,
+    0,
+  );
+  assert.equal(
+    (repeated.output as { skippedExisting: unknown[] }).skippedExisting.length,
+    Object.keys(DEFAULT_TEMPLATE_SEEDS).length,
+  );
+});
+
+test("fill_template supports ad hoc template text and default output folders", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Use this template to create a note.",
+  });
+  mock.context.settings.templateOutputFolder = "Generated";
+
+  const filled = await registry.execute(
+    {
+      name: "fill_template",
+      arguments: {
+        templateText: "# {{title}}\n\n{{body}}",
+        values: {
+          title: "Weekly Plan",
+          body: "Focus on template support.",
+        },
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(filled.ok, true);
+  assert.equal(
+    mock.content.get("Generated/Weekly Plan.md"),
+    "# Weekly Plan\n\nFocus on template support.",
+  );
+  assert.ok(mock.operations.includes("createFolder:Generated"));
+});
+
+test("fill_template rejects unresolved placeholders before creating notes", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Fill this template into a note.",
+  });
+
+  const result = await registry.execute(
+    {
+      name: "fill_template",
+      arguments: {
+        templateText: "# {{title}}\n\nDate: {{date}}",
+        values: {
+          title: "Missing Date",
+        },
+        targetPath: "Missing Date.md",
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "invalid_arguments");
+  assert.match(result.error?.message ?? "", /date/);
+  assert.equal(mock.content.has("Missing Date.md"), false);
+});
+
 test("path CRUD rejects unsafe paths and accidental overwrites", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({
-    prompt: "Create, append, replace, rename, and delete vault paths.",
+    prompt:
+      "Create, append, replace, rename, and delete vault paths, and use a template.",
   });
 
   for (const [name, args] of [
@@ -631,6 +1036,15 @@ test("path CRUD rejects unsafe paths and accidental overwrites", async () => {
     ["replace_file", { path: "Projects/example.txt", text: "" }],
     ["move_path", { fromPath: "Projects/example.md", toPath: "/abs.md" }],
     ["delete_path", { path: ".agent-backups/123-Current.md" }],
+    ["read_template", { path: ".obsidian/template.md" }],
+    [
+      "fill_template",
+      {
+        templateText: "# {{title}}",
+        values: { title: "Unsafe" },
+        targetPath: ".agent-backups/Unsafe.md",
+      },
+    ],
   ] as const) {
     const result = await registry.execute({ name, arguments: args }, mock.context);
     assert.equal(result.ok, false, name);
@@ -725,6 +1139,38 @@ test("replace_current_file uses a collision-safe backup path", async () => {
   assert.equal(mock.content.get("Current.md"), "Replacement");
 });
 
+test("replace_current_file tolerates an already existing backup folder", async () => {
+  const mock = createMockContext({
+    prompt: "Replace this current note with a short update.",
+    now: new Date(123),
+  });
+  const vault = mock.context.app.vault as never as {
+    getFolderByPath: (path: string) => unknown;
+    createFolder: (path: string) => Promise<void>;
+  };
+  const originalGetFolderByPath = vault.getFolderByPath;
+
+  vault.getFolderByPath = (path: string) =>
+    path === BACKUP_FOLDER ? null : originalGetFolderByPath(path);
+  vault.createFolder = async (path: string) => {
+    mock.operations.push(`createFolder:${path}`);
+    if (path === BACKUP_FOLDER) {
+      throw new Error("Folder already exists.");
+    }
+  };
+
+  const registry = createDefaultToolRegistry();
+  const result = await registry.execute(
+    { name: "replace_current_file", arguments: { text: "Replacement after race" } },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.get("Current.md"), "Replacement after race");
+  assert.equal(mock.content.get(".agent-backups/123-Current.md"), "Initial note");
+  assert.ok(mock.operations.includes(`createFolder:${BACKUP_FOLDER}`));
+});
+
 test("replace_current_file is blocked without explicit replace intent", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({ prompt: "Summarize this note." });
@@ -749,6 +1195,204 @@ test("append_to_current_file is blocked without explicit append intent", async (
 
   assert.equal(result.ok, false);
   assert.match(result.error?.message ?? "", /explicitly ask/);
+});
+
+test("append_to_current_section inserts below a heading with backup", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Below the Findings section, write a short story.",
+    now: new Date(234),
+  });
+  const original = [
+    "# Research",
+    "",
+    "## Findings",
+    "",
+    "- Toyota",
+    "- Lion",
+    "- Blue",
+    "",
+    "## Next",
+    "Keep this.",
+  ].join("\n");
+  mock.content.set("Current.md", original);
+
+  const result = await registry.execute(
+    {
+      name: "append_to_current_section",
+      arguments: {
+        heading: "Findings",
+        level: 2,
+        content: "A blue Toyota rolled past a lion.",
+      },
+    },
+    mock.context,
+  );
+
+  const expected = [
+    "# Research",
+    "",
+    "## Findings",
+    "",
+    "- Toyota",
+    "- Lion",
+    "- Blue",
+    "",
+    "A blue Toyota rolled past a lion.",
+    "",
+    "## Next",
+    "Keep this.",
+  ].join("\n");
+
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.get("Current.md"), expected);
+  assert.equal(mock.content.get(".agent-backups/234-Current.md"), original);
+  assert.deepEqual(result.output, {
+    path: "Current.md",
+    backupPath: ".agent-backups/234-Current.md",
+    heading: "Findings",
+    level: 2,
+    bytesWritten: new TextEncoder().encode("A blue Toyota rolled past a lion.\n\n").length,
+    insertedChars: "A blue Toyota rolled past a lion.\n\n".length,
+  });
+  assert.ok(
+    mock.operations.indexOf("create:.agent-backups/234-Current.md") <
+      mock.operations.indexOf("modify:Current.md"),
+  );
+});
+
+test("replace_current_file allows clear-page-and-write wording", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt:
+      "Delete all the notes on the page and then write a 300 word essay on the renaissance.",
+    now: new Date(345),
+  });
+
+  const result = await registry.execute(
+    {
+      name: "replace_current_file",
+      arguments: { text: "# The Renaissance\n\nNew essay." },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.get("Current.md"), "# The Renaissance\n\nNew essay.");
+  assert.equal(mock.content.get(".agent-backups/345-Current.md"), "Initial note");
+});
+
+test("research memory tools write markdown source and update index", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Save this to research memory for my Renaissance topic.",
+    now: new Date("2026-07-04T12:00:00.000Z"),
+  });
+  let memoryIndex: Array<{
+    topic: string;
+    path: string;
+    keywords: string[];
+    lastUpdated: string;
+  }> = [];
+  mock.context.getResearchMemoryIndex = () => memoryIndex;
+  mock.context.setResearchMemoryIndex = async (entries) => {
+    memoryIndex = entries;
+  };
+
+  const append = await registry.execute(
+    {
+      name: "append_research_memory",
+      arguments: {
+        topic: "Renaissance Research",
+        text: "Humanism and patronage are important threads.",
+        keywords: ["humanism", "patronage"],
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(append.ok, true);
+  assert.equal(mock.folders.has("Agent Memory"), true);
+  assert.equal(mock.folders.has("Agent Memory/Research"), true);
+  assert.match(
+    mock.content.get("Agent Memory/Research/renaissance-research.md") ?? "",
+    /Humanism and patronage/,
+  );
+  assert.deepEqual(memoryIndex, [
+    {
+      topic: "Renaissance Research",
+      path: "Agent Memory/Research/renaissance-research.md",
+      keywords: ["humanism", "patronage", "renaissance"],
+      lastUpdated: "2026-07-04T12:00:00.000Z",
+    },
+  ]);
+
+  const read = await registry.execute(
+    {
+      name: "read_research_memory",
+      arguments: { topic: "Renaissance Research" },
+    },
+    mock.context,
+  );
+
+  assert.equal(read.ok, true);
+  assert.match((read.output as { content: string }).content, /Humanism/);
+
+  const search = await registry.execute(
+    {
+      name: "search_research_memory",
+      arguments: { query: "patronage" },
+    },
+    mock.context,
+  );
+
+  assert.equal(search.ok, true);
+  const matches = (search.output as {
+    matches: Array<{ path: string; found: boolean; content: string }>;
+  }).matches;
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].path, "Agent Memory/Research/renaissance-research.md");
+  assert.equal(matches[0].found, true);
+});
+
+test("research memory write tolerates an already existing memory folder", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Save this to research memory for my Renaissance topic.",
+    now: new Date("2026-07-04T12:00:00.000Z"),
+  });
+  const vault = mock.context.app.vault as never as {
+    getFolderByPath: (path: string) => unknown;
+    createFolder: (path: string) => Promise<void>;
+  };
+  const originalGetFolderByPath = vault.getFolderByPath;
+
+  vault.getFolderByPath = (path: string) =>
+    path === "Agent Memory/Research" ? null : originalGetFolderByPath(path);
+  vault.createFolder = async (path: string) => {
+    mock.operations.push(`createFolder:${path}`);
+    if (path === "Agent Memory/Research") {
+      throw new Error("Folder already exists.");
+    }
+  };
+
+  const result = await registry.execute(
+    {
+      name: "append_research_memory",
+      arguments: {
+        topic: "Renaissance Research",
+        text: "Memory survives the folder race.",
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.match(
+    mock.content.get("Agent Memory/Research/renaissance-research.md") ?? "",
+    /Memory survives the folder race/,
+  );
+  assert.ok(mock.operations.includes("createFolder:Agent Memory/Research"));
 });
 
 test("retitle_current_file updates metadata and H1 without renaming the file", async () => {
@@ -1059,6 +1703,8 @@ test("mutation tool schemas do not accept arbitrary paths", () => {
   const registry = createDefaultToolRegistry();
   const mutationToolNames = [
     "append_to_current_file",
+    "append_to_current_section",
+    "append_research_memory",
     "retitle_current_file",
     "prepare_edit_current_section",
     "edit_current_section",
@@ -1382,6 +2028,7 @@ function createMockContext(options: {
   activePath?: string | null;
   currentMarkdownPath?: string;
   liveContent?: string;
+  fileStats?: Record<string, { ctime?: number; mtime?: number; size?: number }>;
 } = {}) {
   const activePath =
     options.activePath === null ? null : (options.activePath ?? "Current.md");
@@ -1418,6 +2065,7 @@ function createMockContext(options: {
       return null;
     }
 
+    const stats = options.fileStats?.[path];
     const extension = path.includes(".")
       ? path.split(".").pop()?.toLowerCase() ?? ""
       : "";
@@ -1427,6 +2075,11 @@ function createMockContext(options: {
       name: path.split("/").pop() ?? path,
       basename: path.split("/").pop()?.replace(/\.[^.]+$/i, "") ?? path,
       extension,
+      stat: {
+        ctime: stats?.ctime ?? stats?.mtime ?? 0,
+        mtime: stats?.mtime ?? stats?.ctime ?? 0,
+        size: stats?.size ?? content.get(path)?.length ?? 0,
+      },
     };
   };
 
@@ -1565,6 +2218,11 @@ function createMockContext(options: {
       enableStreaming: true,
       thinkingMode: "auto",
       streamWritebackMode: "all_current_note_content_writes",
+      maxAgentSteps: 10,
+      templateFolder: "Templates",
+      templateOutputFolder: "",
+      researchMemoryEnabled: true,
+      researchMemoryFolder: "Agent Research Memory",
       requestTimeoutMs: 60000,
       temperature: null,
       topK: null,

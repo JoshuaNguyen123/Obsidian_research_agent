@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
+import { MAX_AGENT_STEPS } from "./tools/constants";
 
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
@@ -10,8 +11,13 @@ export interface AgentSettings {
   model: string;
   enableStreaming: boolean;
   requestTimeoutMs: number;
+  maxAgentSteps: number;
   thinkingMode: ThinkingMode;
   streamWritebackMode: StreamWritebackMode;
+  templateFolder: string;
+  templateOutputFolder: string;
+  researchMemoryEnabled: boolean;
+  researchMemoryFolder: string;
   temperature: number | null;
   topK: number | null;
   topP: number | null;
@@ -24,8 +30,13 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   model: "gpt-oss:120b",
   enableStreaming: true,
   requestTimeoutMs: 180000,
+  maxAgentSteps: MAX_AGENT_STEPS,
   thinkingMode: "auto",
   streamWritebackMode: "all_current_note_content_writes",
+  templateFolder: "Templates",
+  templateOutputFolder: "",
+  researchMemoryEnabled: true,
+  researchMemoryFolder: "Agent Research Memory",
   temperature: null,
   topK: null,
   topP: null,
@@ -124,6 +135,24 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Maximum agent steps")
+      .setDesc(`Upper bound for autonomous planning/tool loops. The hard safety ceiling is ${MAX_AGENT_STEPS}.`)
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.maxAgentSteps))
+          .setValue(String(this.plugin.settings.maxAgentSteps))
+          .onChange(async (value) => {
+            const parsed = parseOptionalInteger(value, {
+              min: 1,
+              max: MAX_AGENT_STEPS,
+            });
+            this.plugin.settings.maxAgentSteps =
+              parsed ?? DEFAULT_SETTINGS.maxAgentSteps;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
       .setName("Stream note writeback")
       .setDesc("Streams content-producing current-note writes directly into the note.")
       .addDropdown((dropdown) =>
@@ -135,6 +164,59 @@ export class AgentSettingTab extends PluginSettingTab {
             this.plugin.settings.streamWritebackMode = isStreamWritebackMode(value)
               ? value
               : DEFAULT_SETTINGS.streamWritebackMode;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Template folder")
+      .setDesc("Vault folder for reusable markdown templates with {{field}} placeholders.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.templateFolder)
+          .setValue(this.plugin.settings.templateFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.templateFolder =
+              value.trim() || DEFAULT_SETTINGS.templateFolder;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Template output folder")
+      .setDesc("Optional default vault folder for notes created from filled templates.")
+      .addText((text) =>
+        text
+          .setPlaceholder("vault root")
+          .setValue(this.plugin.settings.templateOutputFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.templateOutputFolder = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Research memory")
+      .setDesc("Stores durable topic memory as markdown notes in the vault. Clear chat does not remove this memory.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.researchMemoryEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.researchMemoryEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Research memory folder")
+      .setDesc("Vault folder for durable topic memory notes.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.researchMemoryFolder)
+          .setValue(this.plugin.settings.researchMemoryFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.researchMemoryFolder =
+              value.trim() || DEFAULT_SETTINGS.researchMemoryFolder;
             await this.plugin.saveSettings();
           }),
       );
