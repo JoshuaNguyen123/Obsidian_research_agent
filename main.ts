@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { Notice, Plugin, TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
 import { AgentView, AGENT_VIEW_TYPE } from "./src/AgentView";
 import {
   appendConversationMessage,
@@ -10,6 +10,12 @@ import {
   requestUrlTransport,
 } from "./src/model/createModelClient";
 import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
+import {
+  createSemanticIndexService,
+  getSemanticIndexPaths,
+  shouldSemanticIndexTrackPath,
+} from "./src/embeddings/semanticIndex";
+import type { SemanticIndexService } from "./src/embeddings/semanticIndexTypes";
 import type { ModelClient } from "./src/model/types";
 import { AgentSettings, AgentSettingTab, DEFAULT_SETTINGS } from "./src/settings";
 import { getProjectMemoryLocation } from "./src/agent/projectMemory";
@@ -28,9 +34,13 @@ export default class AgenticResearcherPlugin extends Plugin {
   conversationHistory: AgentConversationMessage[] = [];
   researchMemoryIndex: ResearchMemoryIndexEntry[] = [];
   private lastActiveMarkdownFile: TFile | null = null;
+  private semanticIndexService: SemanticIndexService | null = null;
+  private semanticIndexQueuedPaths = new Set<string>();
+  private semanticIndexTimer: ReturnType<typeof setTimeout> | null = null;
 
   async onload() {
     await this.loadSettings();
+    this.semanticIndexService = this.createSemanticIndexService();
     this.updateLastActiveMarkdownFile(this.resolveCurrentMarkdownFile());
     await this.loadProjectMemoryData();
 
@@ -53,6 +63,31 @@ export default class AgenticResearcherPlugin extends Plugin {
       }),
     );
 
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        this.queueSemanticIndexPath(file);
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        this.queueSemanticIndexPath(file);
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        this.queueSemanticIndexRemoval(file.path);
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        this.queueSemanticIndexRemoval(oldPath);
+        this.queueSemanticIndexPath(file);
+      }),
+    );
+
     this.addRibbonIcon("bot", "Open Agentic Researcher", () => {
       void this.activateView();
     });
@@ -65,7 +100,42 @@ export default class AgenticResearcherPlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "rebuild-semantic-vault-index",
+      name: "Rebuild Semantic Vault Index",
+      callback: async () => {
+        const result = await this.getSemanticIndexService().rebuild();
+        new Notice(
+          result.ok
+            ? `Semantic index rebuilt: ${result.noteCount} notes, ${result.chunkCount} chunks.`
+            : `Semantic index rebuild failed: ${result.message ?? result.code ?? "unknown error"}`,
+        );
+      },
+    });
+
+    this.addCommand({
+      id: "open-semantic-vault-index",
+      name: "Open Semantic Vault Index",
+      callback: async () => {
+        const { markdownPath } = getSemanticIndexPaths(this.settings);
+        const file = this.app.vault.getFileByPath(markdownPath);
+        if (!file) {
+          new Notice("Semantic Vault Index.md does not exist yet.");
+          return;
+        }
+        const leaf = this.app.workspace.getLeaf("tab");
+        await leaf.openFile(file);
+      },
+    });
+
     this.addSettingTab(new AgentSettingTab(this.app, this));
+  }
+
+  onunload() {
+    if (this.semanticIndexTimer) {
+      clearTimeout(this.semanticIndexTimer);
+      this.semanticIndexTimer = null;
+    }
   }
 
   async activateView() {
@@ -159,8 +229,28 @@ export default class AgenticResearcherPlugin extends Plugin {
       typeof settings.semanticModelCacheDir === "string"
         ? settings.semanticModelCacheDir.trim()
         : "";
+    settings.semanticIndexEnabled = settings.semanticIndexEnabled !== false;
+    settings.semanticIndexFolder = normalizeVaultFolderSetting(
+      settings.semanticIndexFolder,
+      DEFAULT_SETTINGS.semanticIndexFolder,
+    );
+    settings.semanticIndexDebounceMs = clampIntegerSetting(
+      settings.semanticIndexDebounceMs,
+      250,
+      60000,
+      DEFAULT_SETTINGS.semanticIndexDebounceMs,
+    );
+    settings.semanticIndexMaxFiles = clampIntegerSetting(
+      settings.semanticIndexMaxFiles,
+      1,
+      10000,
+      DEFAULT_SETTINGS.semanticIndexMaxFiles,
+    );
+    settings.semanticIndexPersistVectors =
+      settings.semanticIndexPersistVectors !== false;
 
     this.settings = settings;
+    this.semanticIndexService = this.createSemanticIndexService();
     this.conversationHistory = normalizeConversationHistory(rawHistory);
     this.researchMemoryIndex =
       normalizeResearchMemoryIndex(rawResearchMemoryIndex);
@@ -280,6 +370,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       getResearchMemoryIndex: () => [...this.researchMemoryIndex],
       setResearchMemoryIndex: (entries) => this.setResearchMemoryIndex(entries),
       semanticEmbeddingProvider: createPythonFastEmbedProvider(this.settings),
+      semanticIndexService: this.getSemanticIndexService(),
     };
   }
 
@@ -346,6 +437,64 @@ export default class AgenticResearcherPlugin extends Plugin {
     return false;
   }
 
+  private createSemanticIndexService(): SemanticIndexService {
+    return createSemanticIndexService({
+      app: this.app,
+      getSettings: () => this.settings,
+      getEmbeddingProvider: () => createPythonFastEmbedProvider(this.settings),
+    });
+  }
+
+  private getSemanticIndexService(): SemanticIndexService {
+    if (!this.semanticIndexService) {
+      this.semanticIndexService = this.createSemanticIndexService();
+    }
+    return this.semanticIndexService;
+  }
+
+  private queueSemanticIndexPath(file: TAbstractFile | null) {
+    if (!this.settings.semanticIndexEnabled || !(file instanceof TFile)) {
+      return;
+    }
+    if (!shouldSemanticIndexTrackPath(file.path, this.settings)) {
+      return;
+    }
+    this.semanticIndexQueuedPaths.add(file.path);
+    this.scheduleSemanticIndexFlush();
+  }
+
+  private queueSemanticIndexRemoval(path: string) {
+    if (!this.settings.semanticIndexEnabled) {
+      return;
+    }
+    this.semanticIndexQueuedPaths.add(path);
+    this.scheduleSemanticIndexFlush();
+  }
+
+  private scheduleSemanticIndexFlush() {
+    if (this.semanticIndexTimer) {
+      clearTimeout(this.semanticIndexTimer);
+    }
+    this.semanticIndexTimer = setTimeout(() => {
+      this.semanticIndexTimer = null;
+      void this.flushSemanticIndexQueue();
+    }, this.settings.semanticIndexDebounceMs);
+  }
+
+  private async flushSemanticIndexQueue() {
+    if (!this.settings.semanticIndexEnabled || this.semanticIndexQueuedPaths.size === 0) {
+      return;
+    }
+    const paths = [...this.semanticIndexQueuedPaths];
+    this.semanticIndexQueuedPaths.clear();
+
+    try {
+      await this.getSemanticIndexService().updatePaths(paths);
+    } catch (error) {
+      console.warn("Unable to update semantic index.", error);
+    }
+  }
+
   private resolveCurrentMarkdownFile(): TFile | null {
     const activeFile = this.app.workspace.getActiveFile();
     if (isMarkdownFile(activeFile)) {
@@ -392,6 +541,31 @@ function clampIntegerSetting(
   }
 
   return Math.min(Math.max(Math.trunc(parsed), min), max);
+}
+
+function normalizeVaultFolderSetting(value: unknown, fallback: string): string {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    return fallback;
+  }
+  if (
+    trimmed.includes("..") ||
+    trimmed.includes("\\") ||
+    trimmed.startsWith("/") ||
+    /^[a-zA-Z]:/.test(trimmed)
+  ) {
+    return fallback;
+  }
+
+  const parts = trimmed.split("/");
+  if (parts.some((part) => !part || part === ".")) {
+    return fallback;
+  }
+
+  return trimmed;
 }
 
 function normalizeResearchMemoryIndex(

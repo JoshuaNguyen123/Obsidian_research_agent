@@ -8,6 +8,11 @@ import {
   getRequiredString,
   normalizeVaultPath,
 } from "./validation";
+import type {
+  SemanticIndexNote,
+  SemanticVaultIndex,
+} from "../embeddings/semanticIndexTypes";
+import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
 
 const DEFAULT_SEMANTIC_LIMIT = 8;
 const MAX_SEMANTIC_LIMIT = 20;
@@ -89,7 +94,11 @@ interface ScoredChunk {
 }
 
 export function createSemanticSearchTools(): AgentTool[] {
-  return [semanticSearchNotesTool];
+  return [
+    semanticSearchNotesTool,
+    inspectSemanticIndexTool,
+    rebuildSemanticIndexTool,
+  ];
 }
 
 export const semanticSearchNotesTool: AgentTool = {
@@ -140,6 +149,17 @@ export const semanticSearchNotesTool: AgentTool = {
     );
     const folder = normalizeOptionalFolder(getOptionalString(args, "folder"));
     const chunking = getSemanticChunkingOptions(context);
+    const indexed = await searchSemanticIndexFirst({
+      context,
+      query,
+      limit,
+      folder,
+      maxSnippetChars,
+    });
+    if (indexed) {
+      return indexed;
+    }
+
     const chunks = await buildSemanticChunkProfiles(context, folder, chunking);
     const queryTerms = tokenizeConceptText(query);
     let fallbackUsed = !context.semanticEmbeddingProvider;
@@ -186,6 +206,8 @@ export const semanticSearchNotesTool: AgentTool = {
     return {
       operation: "semantic_search_notes",
       mode: fallbackUsed ? "lexical_fallback" : "hybrid_semantic",
+      indexUsed: false,
+      indexFresh: false,
       model: getSemanticModel(context),
       dim: getSemanticDim(context),
       chunking,
@@ -196,6 +218,167 @@ export const semanticSearchNotesTool: AgentTool = {
     };
   },
 };
+
+export const inspectSemanticIndexTool: AgentTool = {
+  name: "inspect_semantic_index",
+  description:
+    "Inspect the semantic vault index for concepts, paths, freshness, and short evidence summaries. Read-only.",
+  parameters: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "Optional concept query to inspect in the index.",
+      },
+      limit: {
+        type: "integer",
+        description: "Maximum concepts or notes to return. Defaults to 8, maximum 20.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    if (!context.semanticIndexService || !context.settings.semanticIndexEnabled) {
+      return {
+        operation: "inspect_semantic_index",
+        indexAvailable: false,
+        indexFresh: false,
+        concepts: [],
+        results: [],
+        message: "Semantic index service is unavailable or disabled.",
+      };
+    }
+
+    const limit = clampInteger(
+      getOptionalInteger(args, "limit") ?? DEFAULT_SEMANTIC_LIMIT,
+      1,
+      MAX_SEMANTIC_LIMIT,
+    );
+    const query = getOptionalString(args, "query")?.trim() ?? "";
+    if (query) {
+      const search = await context.semanticIndexService.search({
+        query,
+        limit,
+        maxSnippetChars: DEFAULT_MAX_SNIPPET_CHARS,
+      });
+      return {
+        operation: "inspect_semantic_index",
+        indexAvailable: search.ok || search.code !== "missing_index",
+        indexFresh: search.indexFresh,
+        indexedAt: search.indexedAt,
+        model: search.model,
+        dim: search.dim,
+        concepts: [],
+        results: search.results,
+        fallbackReason: search.ok ? null : search.code,
+        message: search.ok ? undefined : search.message,
+      };
+    }
+
+    const index = await context.semanticIndexService.load();
+    if (!index) {
+      return {
+        operation: "inspect_semantic_index",
+        indexAvailable: false,
+        indexFresh: false,
+        concepts: [],
+        results: [],
+        message: "Semantic index has not been built.",
+      };
+    }
+
+    const freshness = getSemanticIndexFreshness(context.app, context.settings, index);
+    return {
+      operation: "inspect_semantic_index",
+      indexAvailable: true,
+      indexFresh: freshness.fresh,
+      staleReason: freshness.fresh ? null : freshness.reason,
+      indexedAt: index.indexedAt,
+      model: index.model,
+      dim: index.dim,
+      noteCount: index.notes.length,
+      chunkCount: index.notes.reduce((sum, note) => sum + note.chunks.length, 0),
+      concepts: summarizeIndexConcepts(index, limit),
+      results: summarizeIndexNotes(index.notes, limit),
+    };
+  },
+};
+
+export const rebuildSemanticIndexTool: AgentTool = {
+  name: "rebuild_semantic_index",
+  description:
+    "Rebuild the derived semantic vault index files when the user explicitly asks for index maintenance.",
+  parameters: {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const keys = Object.keys(args);
+    if (keys.length > 0) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        "rebuild_semantic_index does not accept arguments.",
+      );
+    }
+    if (!context.semanticIndexService) {
+      throw new ToolExecutionError(
+        "semantic_index_unavailable",
+        "Semantic index service is unavailable.",
+      );
+    }
+
+    return context.semanticIndexService.rebuild();
+  },
+};
+
+async function searchSemanticIndexFirst({
+  context,
+  query,
+  limit,
+  folder,
+  maxSnippetChars,
+}: {
+  context: ToolExecutionContext;
+  query: string;
+  limit: number;
+  folder: string | null;
+  maxSnippetChars: number;
+}) {
+  if (!context.settings.semanticIndexEnabled || !context.semanticIndexService) {
+    return null;
+  }
+
+  const search = await context.semanticIndexService.search({
+    query,
+    limit,
+    folder,
+    maxSnippetChars,
+  });
+
+  if (!search.ok) {
+    return null;
+  }
+
+  return {
+    operation: "semantic_search_notes",
+    mode: "indexed_semantic",
+    indexUsed: true,
+    indexFresh: true,
+    indexedAt: search.indexedAt,
+    model: search.model,
+    dim: search.dim,
+    fallbackUsed: false,
+    fallbackReason: null,
+    resultCount: search.results.length,
+    results: search.results.map((result) => ({
+      ...result,
+      reasons: result.reasons.length
+        ? result.reasons
+        : ["indexed_semantic_similarity"],
+    })),
+  };
+}
 
 export function chunkMarkdownForSemanticSearch(
   markdown: string,
@@ -747,4 +930,49 @@ function clampInteger(value: number, min: number, max: number): number {
 
 function dedupeStrings(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function summarizeIndexConcepts(index: SemanticVaultIndex, limit: number) {
+  const byTerm = new Map<string, { count: number; paths: Set<string> }>();
+  for (const note of index.notes) {
+    const terms = tokenizeConceptText(
+      [
+        note.title,
+        note.tags.join(" "),
+        note.headings.join(" "),
+        note.chunks[0]?.snippet ?? "",
+      ].join(" "),
+    );
+    for (const term of terms) {
+      const existing = byTerm.get(term) ?? {
+        count: 0,
+        paths: new Set<string>(),
+      };
+      existing.count += 1;
+      existing.paths.add(note.path);
+      byTerm.set(term, existing);
+    }
+  }
+
+  return [...byTerm.entries()]
+    .map(([term, value]) => ({
+      term,
+      count: value.count,
+      paths: [...value.paths].slice(0, 6),
+    }))
+    .sort(
+      (left, right) =>
+        right.count - left.count || left.term.localeCompare(right.term),
+    )
+    .slice(0, limit);
+}
+
+function summarizeIndexNotes(notes: SemanticIndexNote[], limit: number) {
+  return notes.slice(0, limit).map((note) => ({
+    path: note.path,
+    title: note.title,
+    tags: note.tags,
+    headings: note.headings.slice(0, 6),
+    snippet: note.chunks[0]?.snippet ?? "",
+  }));
 }

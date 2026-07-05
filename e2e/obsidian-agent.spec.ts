@@ -184,6 +184,7 @@ test("semantic vault search uses semantic_search_notes", async () => {
         hasText: input.folderAnswerMarker,
       }),
     ).toBeVisible();
+    await expectToolRun(page, "inspect_semantic_index");
     await expectToolRun(page, "semantic_search_notes");
     await expectNoReceipts(page);
   });
@@ -1372,6 +1373,78 @@ async function setupVaultNoteAndMockModel(
         folderTraversalContent,
       );
     }
+    const semanticIndexedFile =
+      app.vault.getAbstractFileByPath(folderTraversalNotePath);
+    const semanticIndexVector = Array.from({ length: 512 }, (_, index) =>
+      index === 0 ? 1 : 0,
+    );
+    const semanticIndexModel =
+      semanticEmbeddingConfig.mode === "ollama"
+        ? semanticEmbeddingConfig.model
+        : "nomic-ai/nomic-embed-text-v1.5-Q";
+    const semanticIndex = {
+      version: 1,
+      model: semanticIndexModel,
+      dim: 512,
+      chunking: {
+        minTokens: 300,
+        targetTokens: 500,
+        maxTokens: 700,
+        overlapTokens: 80,
+      },
+      indexedAt: new Date().toISOString(),
+      notes: [
+        {
+          path: folderTraversalNotePath,
+          title: "Other Folder Note",
+          mtime: semanticIndexedFile?.stat?.mtime ?? 0,
+          size: semanticIndexedFile?.stat?.size ?? folderTraversalContent.length,
+          contentHash: "e2e-semantic-content",
+          tags: ["e2e"],
+          links: [],
+          headings: ["Other Folder Note"],
+          chunks: [
+            {
+              id: `${folderTraversalNotePath}#0`,
+              path: folderTraversalNotePath,
+              title: "Other Folder Note",
+              heading: "Other Folder Note",
+              textHash: "e2e-semantic-chunk",
+              tokenCount: 12,
+              snippet: folderTraversalContent.replace(/\s+/g, " ").trim(),
+              vector: semanticIndexVector,
+            },
+          ],
+        },
+      ],
+    };
+    await ensureFolderPath(app, "Agent Memory");
+    await writeVaultTextFile(
+      app,
+      "Agent Memory/semantic-vault-index.json",
+      `${JSON.stringify(semanticIndex, null, 2)}\n`,
+    );
+    await writeVaultTextFile(
+      app,
+      "Agent Memory/Semantic Vault Index.md",
+      [
+        "# Semantic Vault Index",
+        "",
+        `Indexed at: ${semanticIndex.indexedAt}`,
+        `Model: ${semanticIndex.model}`,
+        "Dimension: 512",
+        "Notes: 1",
+        "Chunks: 1",
+        "",
+        "## Indexed Notes",
+        "",
+        "### Other Folder Note",
+        "",
+        `- Path: ${folderTraversalNotePath}`,
+        `- Snippet: ${folderAnswerMarker}`,
+        "",
+      ].join("\n"),
+    );
 
     const targetFolderSeeds = [
       {
@@ -1448,6 +1521,14 @@ async function setupVaultNoteAndMockModel(
         semanticEmbeddingConfig.mode === "ollama"
           ? semanticEmbeddingConfig.model
           : plugin.settings.semanticEmbeddingModel,
+      semanticEmbeddingDim: 512,
+      semanticChunkMinTokens: 300,
+      semanticChunkTargetTokens: 500,
+      semanticChunkMaxTokens: 700,
+      semanticChunkOverlapTokens: 80,
+      semanticIndexEnabled: true,
+      semanticIndexFolder: "Agent Memory",
+      semanticIndexPersistVectors: true,
       maxAgentSteps: 30,
       streamWritebackMode: "off",
     };
@@ -1705,9 +1786,12 @@ async function setupVaultNoteAndMockModel(
           if (requestText.includes("E2E_SEMANTIC_SEARCH")) {
             const key = `E2E_SEMANTIC_SEARCH:${folderAnswerMarker}`;
             const semanticStep = semanticSearchStepCounts.get(key) ?? 0;
-            if (semanticStep > 0) {
+            if (semanticStep > 1) {
               if (
-                !requestText.includes('"mode":"hybrid_semantic"') ||
+                !(
+                  requestText.includes('"mode":"indexed_semantic"') ||
+                  requestText.includes('"mode":"hybrid_semantic"')
+                ) ||
                 !requestText.includes('"fallbackUsed":false')
               ) {
                 throw new Error(
@@ -1729,13 +1813,42 @@ async function setupVaultNoteAndMockModel(
               };
             }
 
+            if (semanticStep === 0) {
+              if (!toolNames.includes("inspect_semantic_index")) {
+                throw new Error(
+                  `inspect_semantic_index was not available. Tools: ${toolNames.join(", ")}`,
+                );
+              }
+
+              semanticSearchStepCounts.set(key, 1);
+              const toolCall = {
+                id: "playwright-e2e-inspect-semantic-index",
+                index: 0,
+                name: "inspect_semantic_index",
+                arguments: {
+                  query: `E2E_SEMANTIC_SEARCH ${folderAnswerMarker} themes`,
+                  limit: 5,
+                },
+              };
+
+              return {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [toolCall],
+                },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+
             if (!toolNames.includes("semantic_search_notes")) {
               throw new Error(
                 `semantic_search_notes was not available. Tools: ${toolNames.join(", ")}`,
               );
             }
 
-            semanticSearchStepCounts.set(key, 1);
+            semanticSearchStepCounts.set(key, 2);
             const toolCall = {
               id: "playwright-e2e-semantic-search",
               index: 0,
@@ -2660,6 +2773,14 @@ async function setupVaultNoteAndMockModel(
           semanticEmbeddingConfig.mode === "ollama"
             ? semanticEmbeddingConfig.model
             : target.settings.semanticEmbeddingModel,
+        semanticEmbeddingDim: 512,
+        semanticChunkMinTokens: 300,
+        semanticChunkTargetTokens: 500,
+        semanticChunkMaxTokens: 700,
+        semanticChunkOverlapTokens: 80,
+        semanticIndexEnabled: true,
+        semanticIndexFolder: "Agent Memory",
+        semanticIndexPersistVectors: true,
         maxAgentSteps: 30,
         streamWritebackMode: "off",
       };
