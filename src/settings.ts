@@ -18,6 +18,15 @@ export interface AgentSettings {
   templateOutputFolder: string;
   researchMemoryEnabled: boolean;
   researchMemoryFolder: string;
+  semanticSearchEnabled: boolean;
+  semanticEmbeddingModel: string;
+  semanticEmbeddingDim: 256 | 512;
+  semanticChunkMinTokens: number;
+  semanticChunkTargetTokens: number;
+  semanticChunkMaxTokens: number;
+  semanticChunkOverlapTokens: number;
+  semanticPythonCommand: string;
+  semanticModelCacheDir: string;
   temperature: number | null;
   topK: number | null;
   topP: number | null;
@@ -37,6 +46,15 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   templateOutputFolder: "",
   researchMemoryEnabled: true,
   researchMemoryFolder: "Agent Research Memory",
+  semanticSearchEnabled: true,
+  semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
+  semanticEmbeddingDim: 512,
+  semanticChunkMinTokens: 300,
+  semanticChunkTargetTokens: 500,
+  semanticChunkMaxTokens: 700,
+  semanticChunkOverlapTokens: 80,
+  semanticPythonCommand: "",
+  semanticModelCacheDir: "",
   temperature: null,
   topK: null,
   topP: null,
@@ -217,6 +235,121 @@ export class AgentSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.researchMemoryFolder =
               value.trim() || DEFAULT_SETTINGS.researchMemoryFolder;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic search")
+      .setDesc("Adds local FastEmbed-powered conceptual vault search as a read-only tool.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.semanticSearchEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.semanticSearchEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic embedding model")
+      .setDesc("FastEmbed model used for semantic_search_notes.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.semanticEmbeddingModel)
+          .setValue(this.plugin.settings.semanticEmbeddingModel)
+          .onChange(async (value) => {
+            this.plugin.settings.semanticEmbeddingModel =
+              value.trim() || DEFAULT_SETTINGS.semanticEmbeddingModel;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic embedding dimension")
+      .setDesc("Matryoshka truncation dimension. Use 512 for quality or 256 for a smaller/faster search footprint.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("512", "512")
+          .addOption("256", "256")
+          .setValue(String(this.plugin.settings.semanticEmbeddingDim))
+          .onChange(async (value) => {
+            this.plugin.settings.semanticEmbeddingDim =
+              value === "256" ? 256 : 512;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic chunk tokens")
+      .setDesc("Min, target, max, and overlap token estimates for markdown chunks.")
+      .addText((text) =>
+        text
+          .setPlaceholder("300")
+          .setValue(String(this.plugin.settings.semanticChunkMinTokens))
+          .onChange(async (value) => {
+            this.plugin.settings.semanticChunkMinTokens =
+              parseOptionalInteger(value, { min: 50, max: 700 }) ??
+              DEFAULT_SETTINGS.semanticChunkMinTokens;
+            await this.plugin.saveSettings();
+          }),
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("500")
+          .setValue(String(this.plugin.settings.semanticChunkTargetTokens))
+          .onChange(async (value) => {
+            this.plugin.settings.semanticChunkTargetTokens =
+              parseOptionalInteger(value, { min: 50, max: 700 }) ??
+              DEFAULT_SETTINGS.semanticChunkTargetTokens;
+            await this.plugin.saveSettings();
+          }),
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("700")
+          .setValue(String(this.plugin.settings.semanticChunkMaxTokens))
+          .onChange(async (value) => {
+            this.plugin.settings.semanticChunkMaxTokens =
+              parseOptionalInteger(value, { min: 50, max: 1000 }) ??
+              DEFAULT_SETTINGS.semanticChunkMaxTokens;
+            await this.plugin.saveSettings();
+          }),
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("80")
+          .setValue(String(this.plugin.settings.semanticChunkOverlapTokens))
+          .onChange(async (value) => {
+            this.plugin.settings.semanticChunkOverlapTokens =
+              parseOptionalInteger(value, { min: 0, max: 300 }) ??
+              DEFAULT_SETTINGS.semanticChunkOverlapTokens;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic Python command")
+      .setDesc("Optional Python command for FastEmbed. Leave blank to try python, then py.")
+      .addText((text) =>
+        text
+          .setPlaceholder("python")
+          .setValue(this.plugin.settings.semanticPythonCommand)
+          .onChange(async (value) => {
+            this.plugin.settings.semanticPythonCommand = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Semantic model cache folder")
+      .setDesc("Optional local folder for downloaded FastEmbed model files.")
+      .addText((text) =>
+        text
+          .setPlaceholder("FastEmbed default")
+          .setValue(this.plugin.settings.semanticModelCacheDir)
+          .onChange(async (value) => {
+            this.plugin.settings.semanticModelCacheDir = value.trim();
             await this.plugin.saveSettings();
           }),
       );

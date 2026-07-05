@@ -79,6 +79,20 @@ test("current note reset policy separates delete-only from delete-then-write", (
   );
 });
 
+test("current note reset policy treats keep-note clear wording as replace", () => {
+  for (const prompt of [
+    "Keep the note, but delete all the contents on the note. Start cleanly. Then write the essay again.",
+    "Clear all contents on this page and write a new Grapes of Wrath essay.",
+    "Start cleanly by emptying the current note, then draft the report.",
+  ]) {
+    assert.deepEqual(
+      analyzeCurrentNoteResetPrompt(prompt),
+      { kind: "replace_current_note", reason: "clear_then_write" },
+      prompt,
+    );
+  }
+});
+
 test("loop planner reserves finalization for grounded generated writing", () => {
   const generated = analyzeGeneratedOutputPrompt(
     "Generate me a 1000 word essay on Grapes of Wrath with citations.",

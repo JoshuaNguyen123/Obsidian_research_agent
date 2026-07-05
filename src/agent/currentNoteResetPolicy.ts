@@ -34,13 +34,13 @@ export function isCurrentNoteReplaceResetPrompt(prompt: string): boolean {
 }
 
 function hasCurrentNoteDeleteIntent(prompt: string): boolean {
-  return /\b(delete|remove|trash|clear|empty)\b[\s\S]{0,120}\b(?:current|this|active|the)\s+(?:note|page|document|file|space)\b|\b(?:current|this|active|the)\s+(?:note|page|document|file|space)\b[\s\S]{0,120}\b(delete|remove|trash|clear|empty)\b/i.test(
+  return /\b(delete|remove|trash|clear|empty|emptying)\b[\s\S]{0,160}\b(?:current|this|active|the)\s+(?:note|page|document|file|space|contents?|text|writing)\b|\b(?:current|this|active|the)\s+(?:note|page|document|file|space|contents?|text|writing)\b[\s\S]{0,160}\b(delete|remove|trash|clear|empty|emptying)\b|\b(delete|remove|clear|empty|emptying)\s+all\s+(?:of\s+)?(?:the\s+)?(?:contents?|text|writing)\b[\s\S]{0,120}\b(?:note|page|document|file)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty|emptying)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i.test(
     prompt,
   );
 }
 
 function hasWriteAfterResetIntent(prompt: string): boolean {
-  return /\b(delete|remove|trash|clear|empty)\b[\s\S]{0,240}\b(write|generate|draft|compose|create|replace)\b|\b(write|generate|draft|compose|create|replace)\b[\s\S]{0,240}\b(delete|remove|trash|clear|empty)\b/i.test(
+  return /\b(delete|remove|trash|clear|empty|emptying|start\s+(?:fresh|cleanly))\b[\s\S]{0,260}\b(write|generate|draft|compose|create|replace)\b|\b(write|generate|draft|compose|create|replace)\b[\s\S]{0,260}\b(delete|remove|trash|clear|empty|emptying|start\s+(?:fresh|cleanly))\b/i.test(
     prompt,
   );
 }

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import { DEFAULT_TEMPLATE_SEEDS } from "../src/tools/vaultTools";
+import { chunkMarkdownForSemanticSearch } from "../src/tools/semanticSearchTools";
 import {
   BACKUP_FOLDER,
   DEFAULT_WEB_RESULTS,
@@ -17,6 +18,7 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.ok(definitions.some((tool) => tool.function.name === "read_current_file"));
   assert.ok(definitions.some((tool) => tool.function.name === "list_folder"));
   assert.ok(definitions.some((tool) => tool.function.name === "search_markdown_files"));
+  assert.ok(definitions.some((tool) => tool.function.name === "semantic_search_notes"));
   assert.ok(definitions.some((tool) => tool.function.name === "read_markdown_files"));
   assert.ok(definitions.some((tool) => tool.function.name === "inspect_vault_context"));
   assert.ok(definitions.some((tool) => tool.function.name === "count_words"));
@@ -501,6 +503,132 @@ test("search_markdown_files validates query and result limits", async () => {
   };
   assert.equal(output.results.length, 1);
   assert.equal(output.truncated, true);
+});
+
+test("semantic_search_notes rejects empty query and unsafe folders", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+
+  const empty = await registry.execute(
+    { name: "semantic_search_notes", arguments: { query: "   " } },
+    mock.context,
+  );
+  assert.equal(empty.ok, false);
+  assert.equal(empty.error?.code, "invalid_arguments");
+
+  const unsafe = await registry.execute(
+    {
+      name: "semantic_search_notes",
+      arguments: { query: "local AI", folder: "../secret" },
+    },
+    mock.context,
+  );
+  assert.equal(unsafe.ok, false);
+  assert.equal(unsafe.error?.code, "unsafe_path");
+});
+
+test("semantic search chunking keeps bounded heading-aware chunks", () => {
+  const paragraphs = Array.from({ length: 8 }, (_, index) => {
+    const words = Array.from({ length: 90 }, (__, wordIndex) =>
+      `token${index}_${wordIndex}`,
+    );
+    return words.join(" ");
+  });
+  const chunks = chunkMarkdownForSemanticSearch(`# Ritual Kingship\n\n${paragraphs.join("\n\n")}`, {
+    minTokens: 300,
+    targetTokens: 500,
+    maxTokens: 700,
+    overlapTokens: 80,
+  });
+
+  assert.ok(chunks.length >= 2);
+  assert.ok(chunks.every((chunk) => chunk.tokenCount <= 700));
+  assert.ok(chunks.some((chunk) => chunk.tokenCount >= 300));
+  assert.equal(chunks[0].heading, "Ritual Kingship");
+});
+
+test("semantic_search_notes ranks semantic matches above lexical distractors", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  mock.content.set(
+    "Research/Gilgamesh.md",
+    "# Gilgamesh\n\nA flood myth about kingship, ritual duty, grief, and divine limits.",
+  );
+  mock.content.set(
+    "Research/Keyword.md",
+    "# Keyword\n\nThis note repeats the exact query words but is a shallow placeholder: sacred monarchy deluge story.",
+  );
+  mock.context.semanticEmbeddingProvider = {
+    async embed(request) {
+      return {
+        ok: true,
+        model: request.model,
+        dim: request.dim,
+        queries: [[1, 0]],
+        documents: request.documents.map((document) =>
+          document.includes("Gilgamesh") ? [1, 0] : [0.2, 0.8],
+        ),
+      };
+    },
+  };
+
+  const result = await registry.execute(
+    {
+      name: "semantic_search_notes",
+      arguments: {
+        query: "sacred monarchy deluge story",
+        limit: 2,
+        maxSnippetChars: 200,
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    fallbackUsed: boolean;
+    results: Array<{ path: string; reasons: string[]; semanticScore: number }>;
+  };
+  assert.equal(output.fallbackUsed, false);
+  assert.equal(output.results[0].path, "Research/Gilgamesh.md");
+  assert.ok(output.results[0].reasons.includes("semantic_similarity"));
+  assert.ok(output.results[0].semanticScore > 0.9);
+});
+
+test("semantic_search_notes falls back to lexical search when embedding fails", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  mock.content.set("People/Untitled.md", "Alex likes local AI tools in Obsidian.");
+  mock.context.semanticEmbeddingProvider = {
+    async embed(request) {
+      return {
+        ok: false,
+        model: request.model,
+        dim: request.dim,
+        code: "missing_fastembed",
+        message: "Install FastEmbed with: python -m pip install fastembed",
+      };
+    },
+  };
+
+  const result = await registry.execute(
+    {
+      name: "semantic_search_notes",
+      arguments: { query: "Alex local AI", limit: 5 },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    fallbackUsed: boolean;
+    fallbackReason: string;
+    results: Array<{ path: string; lexicalScore: number }>;
+  };
+  assert.equal(output.fallbackUsed, true);
+  assert.equal(output.fallbackReason, "missing_fastembed");
+  assert.equal(output.results[0].path, "People/Untitled.md");
+  assert.ok(output.results[0].lexicalScore > 0);
 });
 
 test("get_path_info reports files, folders, and missing paths", async () => {
@@ -2223,6 +2351,15 @@ function createMockContext(options: {
       templateOutputFolder: "",
       researchMemoryEnabled: true,
       researchMemoryFolder: "Agent Research Memory",
+      semanticSearchEnabled: true,
+      semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
+      semanticEmbeddingDim: 512,
+      semanticChunkMinTokens: 300,
+      semanticChunkTargetTokens: 500,
+      semanticChunkMaxTokens: 700,
+      semanticChunkOverlapTokens: 80,
+      semanticPythonCommand: "",
+      semanticModelCacheDir: "",
       requestTimeoutMs: 60000,
       temperature: null,
       topK: null,

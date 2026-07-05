@@ -206,17 +206,16 @@ export class AgentView extends ItemView {
       event.stopPropagation();
       void this.capturePrompt();
     });
-    const focusPromptFromEvent = (event: Event) => {
+    const stopPromptEvent = (event: Event) => {
       event.stopPropagation();
-      this.focusPrompt();
     };
-    this.promptEl.addEventListener("pointerdown", focusPromptFromEvent, {
+    this.promptEl.addEventListener("pointerdown", stopPromptEvent, {
       capture: true,
     });
-    this.promptEl.addEventListener("mousedown", focusPromptFromEvent, {
+    this.promptEl.addEventListener("mousedown", stopPromptEvent, {
       capture: true,
     });
-    this.promptEl.addEventListener("click", focusPromptFromEvent, {
+    this.promptEl.addEventListener("click", stopPromptEvent, {
       capture: true,
     });
     this.promptEl.addEventListener("keydown", (event) => {
@@ -519,7 +518,7 @@ export class AgentView extends ItemView {
     this.setRunning(false);
     this.setChatLoaderActive(false);
     this.updateRunButtonState();
-    this.focusPrompt();
+    this.focusPrompt({ moveCaretToEnd: true });
 
     const promptEl = this.promptEl;
     if (!promptEl) {
@@ -527,7 +526,7 @@ export class AgentView extends ItemView {
     }
 
     const focus = () => {
-      this.focusPrompt();
+      this.focusPrompt({ moveCaretToEnd: true });
     };
 
     window.setTimeout(focus, 0);
@@ -537,7 +536,7 @@ export class AgentView extends ItemView {
     }
   }
 
-  private focusPrompt() {
+  private focusPrompt(options: { moveCaretToEnd?: boolean } = {}) {
     const promptEl = this.promptEl;
     if (!promptEl || !promptEl.isConnected) {
       return;
@@ -546,7 +545,9 @@ export class AgentView extends ItemView {
     promptEl.disabled = false;
     promptEl.removeAttribute("aria-disabled");
     promptEl.focus({ preventScroll: true });
-    promptEl.setSelectionRange(promptEl.value.length, promptEl.value.length);
+    if (options.moveCaretToEnd) {
+      promptEl.setSelectionRange(promptEl.value.length, promptEl.value.length);
+    }
   }
 
   private resetDashboardForRun() {
@@ -1027,7 +1028,10 @@ export class AgentView extends ItemView {
     }
 
     this.modelConfigEl.empty();
+    const scope = this.runConfig.autonomyScope;
+    const ledger = this.runConfig.missionLedger;
     const lines = [
+      `run_id=${this.runConfig.runId}`,
       `model=${this.runConfig.model}`,
       `base=${this.runConfig.base}`,
       `mission=${this.runConfig.missionMode}`,
@@ -1047,6 +1051,18 @@ export class AgentView extends ItemView {
       `top_p=${this.formatOptionalNumber(this.runConfig.topP)}`,
       `num_ctx=${this.formatOptionalNumber(this.runConfig.numCtx)}`,
       `write_autonomy=${this.runConfig.writeAutonomy ? "on" : "off"}`,
+      `autonomy_read=current_note ${scope.read.currentNote ? "on" : "off"}, vault ${scope.read.vault ? "on" : "off"}, web ${scope.read.web ? "on" : "off"}, files ${this.formatScopeList(scope.read.files)}, folders ${this.formatScopeList(scope.read.folders)}`,
+      `autonomy_write=current_note ${scope.write.currentNote ? "on" : "off"}, files ${this.formatScopeList(scope.write.files)}, folders ${this.formatScopeList(scope.write.folders)}, artifacts ${scope.write.artifacts ? "on" : "off"}, research_memory ${scope.write.researchMemory ? "on" : "off"}`,
+      `autonomy_destructive=replace_current_note ${scope.destructive.replaceCurrentNote ? "on" : "off"}, delete_current_note ${scope.destructive.deleteCurrentNote ? "on" : "off"}, delete_paths ${scope.destructive.deletePaths ? "on" : "off"}`,
+      ...(ledger
+        ? [
+            `ledger_status=${ledger.status}`,
+            `ledger_evidence=${ledger.evidenceCount}`,
+            `ledger_receipts=${ledger.receiptCount}`,
+            `ledger_expected_tools=${this.formatScopeList(ledger.expectedTools)}`,
+            `ledger_next_action=${ledger.nextAction}`,
+          ]
+        : []),
       `usage_chars=request ${this.formatChars(this.usageTotals.requestChars)}, response ${this.formatChars(this.usageTotals.responseChars)}`,
       `usage_tokens=prompt ${this.formatOptionalNumber(this.usageTotals.promptTokens)}, completion ${this.formatOptionalNumber(this.usageTotals.completionTokens)}, total ${this.formatOptionalNumber(this.usageTotals.totalTokens)}`,
     ];
@@ -1057,6 +1073,10 @@ export class AgentView extends ItemView {
         cls: "agentic-researcher-config-line",
       });
     }
+  }
+
+  private formatScopeList(values: string[]) {
+    return values.length > 0 ? values.join(",") : "none";
   }
 
   private updateUsageTotals(event: AgentRunMetricEvent) {
