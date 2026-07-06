@@ -42,6 +42,12 @@ export class AgentView extends ItemView {
   private toolTimelineEl: HTMLElement | null = null;
   private finalStreamEl: HTMLElement | null = null;
   private receiptsEl: HTMLElement | null = null;
+  private browserDetailsEl: HTMLElement | null = null;
+  private actionsDetailsEl: HTMLElement | null = null;
+  private milestonesDetailsEl: HTMLElement | null = null;
+  private memoryDetailsEl: HTMLElement | null = null;
+  private evidenceDetailsEl: HTMLElement | null = null;
+  private artifactsDetailsEl: HTMLElement | null = null;
   private verificationEl: HTMLElement | null = null;
   private previewEl: HTMLElement | null = null;
   private runLogEl: HTMLElement | null = null;
@@ -322,6 +328,36 @@ export class AgentView extends ItemView {
       "Receipts",
       "receipts",
     );
+    this.browserDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Browser",
+      "browser",
+    );
+    this.actionsDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Actions",
+      "actions",
+    );
+    this.milestonesDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Milestones",
+      "milestones",
+    );
+    this.memoryDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Memory",
+      "memory",
+    );
+    this.evidenceDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Evidence",
+      "evidence",
+    );
+    this.artifactsDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Artifacts",
+      "artifacts",
+    );
     this.verificationEl = this.createDashboardSection(
       dashboardEl,
       "Verification",
@@ -340,6 +376,15 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
     this.setSectionPlaceholder(this.receiptsEl, "No writes yet.");
+    this.setSectionPlaceholder(
+      this.browserDetailsEl,
+      "Live browser embedding is unavailable. Showing screenshot and extracted page state instead.",
+    );
+    this.setSectionPlaceholder(this.actionsDetailsEl, "No actions yet.");
+    this.setSectionPlaceholder(this.milestonesDetailsEl, "No milestones yet.");
+    this.setSectionPlaceholder(this.memoryDetailsEl, "No memory activity yet.");
+    this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
+    this.setSectionPlaceholder(this.artifactsDetailsEl, "No artifacts yet.");
     this.setSectionPlaceholder(this.verificationEl, "No artifacts verified yet.");
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
@@ -406,7 +451,7 @@ export class AgentView extends ItemView {
     this.appendStatus("Starting mission...");
     const userLogItem = this.appendLog("user", prompt);
     this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
-    this.setRunning(true);
+    this.setRunning(true, "SYS> mission accepted");
     this.updateChatLoader("SYS> mission accepted");
 
     try {
@@ -567,6 +612,15 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
     this.setSectionPlaceholder(this.receiptsEl, "No writes yet.");
+    this.setSectionPlaceholder(
+      this.browserDetailsEl,
+      "Live browser embedding is unavailable. Showing screenshot and extracted page state instead.",
+    );
+    this.setSectionPlaceholder(this.actionsDetailsEl, "No actions yet.");
+    this.setSectionPlaceholder(this.milestonesDetailsEl, "No milestones yet.");
+    this.setSectionPlaceholder(this.memoryDetailsEl, "No memory activity yet.");
+    this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
+    this.setSectionPlaceholder(this.artifactsDetailsEl, "No artifacts yet.");
     this.setSectionPlaceholder(this.verificationEl, "No artifacts verified yet.");
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
@@ -1033,6 +1087,7 @@ export class AgentView extends ItemView {
     const lines = [
       `run_id=${this.runConfig.runId}`,
       `model=${this.runConfig.model}`,
+      `provider=${this.runConfig.modelProvider ?? "ollama"}`,
       `base=${this.runConfig.base}`,
       `mission=${this.runConfig.missionMode}`,
       `context_scope=${this.runConfig.contextScope}`,
@@ -1054,6 +1109,17 @@ export class AgentView extends ItemView {
       `autonomy_read=current_note ${scope.read.currentNote ? "on" : "off"}, vault ${scope.read.vault ? "on" : "off"}, web ${scope.read.web ? "on" : "off"}, files ${this.formatScopeList(scope.read.files)}, folders ${this.formatScopeList(scope.read.folders)}`,
       `autonomy_write=current_note ${scope.write.currentNote ? "on" : "off"}, files ${this.formatScopeList(scope.write.files)}, folders ${this.formatScopeList(scope.write.folders)}, artifacts ${scope.write.artifacts ? "on" : "off"}, research_memory ${scope.write.researchMemory ? "on" : "off"}`,
       `autonomy_destructive=replace_current_note ${scope.destructive.replaceCurrentNote ? "on" : "off"}, delete_current_note ${scope.destructive.deleteCurrentNote ? "on" : "off"}, delete_paths ${scope.destructive.deletePaths ? "on" : "off"}`,
+      ...(this.runConfig.reflexLabel
+        ? [
+            `reflex_intent=${this.runConfig.reflexLabel}`,
+            `reflex_confidence=${this.formatOptionalNumber(this.runConfig.reflexConfidence)}`,
+            `reflex_top_action=${this.runConfig.reflexTopAction ?? "none"}`,
+            `reflex_progress=${this.formatOptionalNumber(this.runConfig.reflexProgressScore)}`,
+            `reflex_loop_risk=${this.formatOptionalNumber(this.runConfig.reflexLoopRisk)}`,
+            `reflex_missing=${this.formatScopeList(this.runConfig.reflexCompletionMissing ?? [])}`,
+            `reflex_reason=${this.runConfig.reflexAppliedReason ?? "none"}`,
+          ]
+        : []),
       ...(ledger
         ? [
             `ledger_status=${ledger.status}`,
@@ -1260,7 +1326,7 @@ export class AgentView extends ItemView {
     }
   }
 
-  private setRunning(isRunning: boolean) {
+  private setRunning(isRunning: boolean, loaderMessage?: string) {
     this.isRunning = isRunning;
     if (isRunning) {
       this.setClearConfirmPending(false);
@@ -1282,7 +1348,7 @@ export class AgentView extends ItemView {
       this.runStatusTextEl.setText(isRunning ? "Running mission..." : "Idle");
     }
 
-    this.setChatLoaderActive(isRunning);
+    this.setChatLoaderActive(isRunning, loaderMessage);
 
     this.setMetric(
       this.activityValueEl,
@@ -1328,7 +1394,7 @@ export class AgentView extends ItemView {
 
     this.chatLoaderEl = this.logEl.createDiv({
       cls: "agentic-researcher-chat-loader",
-      attr: { "aria-live": "polite" },
+      attr: { "aria-live": "polite", "aria-hidden": "true" },
     });
     const headerEl = this.chatLoaderEl.createDiv({
       cls: "agentic-researcher-chat-loader-header",
@@ -1338,7 +1404,7 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-chat-loader-label",
     });
     this.chatLoaderTextEl = headerEl.createSpan({
-      text: "idle",
+      text: "",
       cls: "agentic-researcher-chat-loader-text",
     });
     this.chatLoaderEl.createDiv({
@@ -1350,15 +1416,24 @@ export class AgentView extends ItemView {
     return this.chatLoaderEl;
   }
 
-  private setChatLoaderActive(isActive: boolean) {
+  private setChatLoaderActive(isActive: boolean, loaderMessage?: string) {
     const loaderEl = this.ensureChatLoader();
     if (!loaderEl) {
       return;
     }
 
     loaderEl.classList.toggle("is-active", isActive);
-    if (!isActive && this.chatLoaderTextEl) {
-      this.chatLoaderTextEl.setText("idle");
+    loaderEl.setAttribute("aria-hidden", String(!isActive));
+    if (this.chatLoaderTextEl) {
+      if (isActive) {
+        const message =
+          loaderMessage?.trim() ||
+          this.chatLoaderTextEl.textContent?.trim() ||
+          "loading...";
+        this.chatLoaderTextEl.setText(this.compactLoaderMessage(message));
+      } else {
+        this.chatLoaderTextEl.setText("");
+      }
     }
     this.moveChatLoaderToEnd();
   }
@@ -1375,6 +1450,7 @@ export class AgentView extends ItemView {
 
     this.chatLoaderTextEl.setText(this.compactLoaderMessage(message));
     loaderEl.classList.add("is-active");
+    loaderEl.setAttribute("aria-hidden", "false");
     this.moveChatLoaderToEnd();
   }
 
@@ -1511,6 +1587,7 @@ export class AgentView extends ItemView {
     }
 
     this.setExpandablePayload(rowEl, this.buildTracePayload(event));
+    this.appendRunDetailProjection(event);
 
     if (chatId) {
       this.bindTraceNavigation(rowEl, chatId);
@@ -1519,6 +1596,87 @@ export class AgentView extends ItemView {
     this.traceRowEls.set(event.id, rowEl);
     this.runLogEl.scrollTop = this.runLogEl.scrollHeight;
     return rowEl;
+  }
+
+  private appendRunDetailProjection(event: AgentTraceEvent) {
+    const toolName = event.toolName ?? "";
+    if (toolName.startsWith("browser_")) {
+      this.appendDetailLine(this.browserDetailsEl, event);
+    }
+
+    if (
+      event.kind === "tool_start" ||
+      event.kind === "tool_result" ||
+      event.kind === "tool_rejected" ||
+      event.kind === "receipt"
+    ) {
+      this.appendDetailLine(this.actionsDetailsEl, event);
+    }
+
+    if (
+      event.kind === "planning" ||
+      event.kind === "tool_result" ||
+      event.kind === "receipt" ||
+      event.kind === "final" ||
+      event.kind === "complete"
+    ) {
+      this.appendDetailLine(this.milestonesDetailsEl, event);
+    }
+
+    if (toolName.startsWith("memory_")) {
+      this.appendDetailLine(this.memoryDetailsEl, event);
+    }
+
+    if (
+      toolName === "web_fetch" ||
+      toolName === "open_web_source" ||
+      toolName === "read_file" ||
+      toolName === "read_markdown_files" ||
+      toolName === "browser_extract_markdown"
+    ) {
+      this.appendDetailLine(this.evidenceDetailsEl, event);
+    }
+
+    if (
+      toolName === "create_design_canvas" ||
+      toolName === "create_svg_design" ||
+      toolName === "create_design_package" ||
+      toolName === "open_web_source" ||
+      event.kind === "receipt"
+    ) {
+      this.appendDetailLine(this.artifactsDetailsEl, event);
+    }
+  }
+
+  private appendDetailLine(element: HTMLElement | null, event: AgentTraceEvent) {
+    if (!element || !event.message) {
+      return;
+    }
+
+    this.clearPlaceholder(element);
+    const rowEl = element.createDiv({
+      cls: `agentic-researcher-detail-line agentic-researcher-detail-${event.kind}`,
+    });
+    rowEl.createSpan({
+      text: event.toolName ? `${event.toolName}: ` : `${event.kind}: `,
+      cls: "agentic-researcher-detail-kind",
+    });
+    rowEl.createSpan({
+      text: event.message,
+      cls: "agentic-researcher-detail-message",
+    });
+    const meta = [
+      event.path ? `path=${event.path}` : null,
+      event.toPath ? `to=${event.toPath}` : null,
+      event.operation ? `op=${event.operation}` : null,
+    ].filter((part): part is string => Boolean(part));
+    if (meta.length > 0) {
+      rowEl.createSpan({
+        text: ` ${meta.join(" ")}`,
+        cls: "agentic-researcher-detail-meta",
+      });
+    }
+    this.setExpandablePayload(rowEl, this.buildTracePayload(event));
   }
 
   private normalizeTraceKind(kind: string): AgentTraceEvent["kind"] {

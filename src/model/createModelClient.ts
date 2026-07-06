@@ -1,6 +1,6 @@
-import { requestUrl } from "obsidian";
 import type { AgentSettings } from "../settings";
 import { OllamaClient } from "./OllamaClient";
+import { OpenAICompatibleClient } from "./OpenAICompatibleClient";
 import type {
   HttpRequest,
   HttpResponse,
@@ -11,20 +11,41 @@ import { ModelClientError as ModelClientErrorClass } from "./types";
 
 type NodeHttpModule = typeof import("http");
 
+type ObsidianRequestUrl = (request: HttpRequest) => Promise<{
+  status: number;
+  headers: Record<string, string>;
+  json?: unknown;
+  text?: string;
+  arrayBuffer?: ArrayBuffer;
+}>;
+
 export function createConfiguredModelClient(settings: AgentSettings): ModelClient {
-  return new OllamaClient({
-    baseUrl: settings.ollamaBaseUrl,
-    apiKey: settings.ollamaApiKey,
+  const common = {
     model: settings.model,
     transport: requestUrlTransport,
     streamingTransport: hybridStreamingTransport,
     requestTimeoutMs: settings.requestTimeoutMs,
+  };
+
+  if (settings.modelProvider === "openai_compatible") {
+    return new OpenAICompatibleClient({
+      ...common,
+      baseUrl: settings.openAiCompatibleBaseUrl,
+      apiKey: settings.openAiCompatibleApiKey,
+    });
+  }
+
+  return new OllamaClient({
+    ...common,
+    baseUrl: settings.ollamaBaseUrl,
+    apiKey: settings.ollamaApiKey,
   });
 }
 
 export async function requestUrlTransport(
   request: HttpRequest,
 ): Promise<HttpResponse> {
+  const requestUrl = getObsidianRequestUrl();
   const response = await withTimeout(
     requestUrl(request),
     request.timeoutMs,
@@ -39,6 +60,36 @@ export async function requestUrlTransport(
     text: response.text,
     arrayBuffer: response.arrayBuffer,
   };
+}
+
+function getObsidianRequestUrl(): ObsidianRequestUrl {
+  const nodeRequire =
+    typeof require === "function"
+      ? require
+      : typeof window !== "undefined" &&
+          typeof (window as Window & { require?: NodeRequire }).require ===
+            "function"
+        ? (window as Window & { require: NodeRequire }).require
+        : null;
+
+  if (!nodeRequire) {
+    throw new ModelClientErrorClass(
+      "network",
+      "Obsidian requestUrl is unavailable in this runtime.",
+    );
+  }
+
+  const obsidianModule = nodeRequire("obsidian") as {
+    requestUrl?: ObsidianRequestUrl;
+  };
+  if (typeof obsidianModule.requestUrl !== "function") {
+    throw new ModelClientErrorClass(
+      "network",
+      "Obsidian requestUrl is unavailable in this runtime.",
+    );
+  }
+
+  return obsidianModule.requestUrl;
 }
 
 async function hybridStreamingTransport(

@@ -71,18 +71,89 @@ test("create_design_canvas creates and verifies a canvas artifact", async () => 
   assert.deepEqual(output, {
     path: "Designs/workflow.canvas",
     operation: "create",
+    diagramType: "sequence",
     bytesWritten: mock.bytes("Designs/workflow.canvas"),
     nodeCount: 3,
     edgeCount: 2,
+    summary: "Canvas sequence planned: 3 nodes, 2 edges.",
     opened: false,
   });
   assert.equal(mock.folders.has("Designs"), true);
   assert.match(mock.content.get("Designs/workflow.canvas") ?? "", /Read context/);
+  assert.ok(mock.progress.includes("Planning canvas design for Designs/workflow.canvas..."));
+  assert.ok(mock.progress.includes("Canvas structure validated; writing artifact..."));
+});
+
+test("create_design_canvas creates lane-based architecture diagrams", async () => {
+  const mock = createMockContext({
+    prompt: "Create a software architecture diagram as an Obsidian canvas.",
+  });
+
+  const output = await createDesignCanvasTool.execute(
+    {
+      path: "Designs/architecture.canvas",
+      title: "Agent Architecture",
+      diagramType: "architecture",
+      items: [
+        {
+          id: "user",
+          title: "User",
+          kind: "actor",
+          lane: "Client",
+          text: "Submits a mission.",
+        },
+        {
+          id: "plugin",
+          title: "Obsidian Plugin",
+          kind: "service",
+          lane: "Application",
+          text: "Runs the agent loop.",
+        },
+        {
+          id: "tools",
+          title: "Tool Registry",
+          kind: "service",
+          lane: "Application",
+          text: "Executes validated tools.",
+        },
+        {
+          id: "vault",
+          title: "Vault",
+          kind: "database",
+          lane: "Data",
+          text: "Stores notes and artifacts.",
+        },
+      ],
+      connections: [
+        { from: "user", to: "plugin", label: "mission" },
+        { from: "plugin", to: "tools", label: "tool call" },
+        { from: "tools", to: "vault", label: "safe write" },
+      ],
+    },
+    mock.context,
+  );
+
+  assert.equal((output as { diagramType: string }).diagramType, "architecture");
+  assert.equal((output as { nodeCount: number }).nodeCount, 8);
+  assert.equal((output as { edgeCount: number }).edgeCount, 3);
+  assert.match(
+    (output as { summary: string }).summary,
+    /Canvas architecture planned: 8 nodes, 3 edges across 3 lanes\./,
+  );
+  const canvas = mock.content.get("Designs/architecture.canvas") ?? "";
+  assert.match(canvas, /"label": "Application"/);
+  assert.match(canvas, /"label": "safe write"/);
+  assert.match(canvas, /_database_/);
+  assert.ok(
+    mock.progress.includes(
+      "Canvas architecture planned: 8 nodes, 3 edges across 3 lanes.",
+    ),
+  );
 });
 
 test("create_svg_design creates an escaped SVG artifact", async () => {
   const mock = createMockContext({
-    prompt: "Create an SVG wireframe design for the run details.",
+    prompt: "Create an SVG software architecture diagram for the run details.",
   });
 
   const output = await createSvgDesignTool.execute(
@@ -99,11 +170,28 @@ test("create_svg_design creates an escaped SVG artifact", async () => {
           label: "Safe <label>",
         },
         {
-          type: "arrow",
-          x1: 240,
-          y1: 60,
-          x2: 340,
-          y2: 60,
+          type: "diamond",
+          x: 300,
+          y: 80,
+          width: 120,
+          height: 90,
+          label: "Decision",
+        },
+        {
+          type: "cylinder",
+          x: 470,
+          y: 90,
+          width: 140,
+          height: 110,
+          label: "Vault",
+        },
+        {
+          type: "ellipse",
+          cx: 540,
+          cy: 280,
+          rx: 80,
+          ry: 38,
+          label: "Model API",
         },
       ],
     },
@@ -111,10 +199,24 @@ test("create_svg_design creates an escaped SVG artifact", async () => {
   );
 
   assert.equal((output as { path: string }).path, "Designs/run-details.svg");
-  assert.equal((output as { shapeCount: number }).shapeCount, 2);
+  assert.equal((output as { shapeCount: number }).shapeCount, 4);
+  assert.deepEqual((output as { shapeTypes: string[] }).shapeTypes, [
+    "rect",
+    "diamond",
+    "cylinder",
+    "ellipse",
+  ]);
   const svg = mock.content.get("Designs/run-details.svg") ?? "";
   assert.match(svg, /Safe &lt;label&gt;/);
+  assert.match(svg, /<polygon/);
+  assert.match(svg, /<ellipse/);
+  assert.match(svg, /<path/);
   assert.doesNotMatch(svg, /<script/);
+  assert.ok(
+    mock.progress.includes(
+      "SVG design planned: 4 shapes (rect, diamond, cylinder, ellipse).",
+    ),
+  );
 });
 
 test("open_web_source creates a source note and returns fallback when window is unavailable", async () => {
@@ -216,6 +318,7 @@ function createMockContext(options: {
   const content = new Map<string, string>();
   const folders = new Set<string>();
   const operations: string[] = [];
+  const progress: string[] = [];
 
   const getFile = (path: string) => {
     if (!content.has(path)) {
@@ -289,13 +392,22 @@ function createMockContext(options: {
   const context: ToolExecutionContext = {
     app: app as never,
     settings: {
+      modelProvider: "ollama",
       ollamaApiKey: "test-key",
       ollamaBaseUrl: "https://ollama.com/api",
+      openAiCompatibleApiKey: "",
+      openAiCompatibleBaseUrl: "https://api.openai.com/v1",
       model: "gpt-oss:120b",
       enableStreaming: true,
       thinkingMode: "auto",
       streamWritebackMode: "all_current_note_content_writes",
       maxAgentSteps: 10,
+      companionBaseUrl: "http://127.0.0.1:8765",
+      browserToolsEnabled: false,
+      experienceMemoryEnabled: false,
+      defaultBrowserMissionMode: "supervised",
+      agenticReflexEnabled: false,
+      agenticReflexDiagnosticsEnabled: true,
       templateFolder: "Templates",
       templateOutputFolder: "",
       researchMemoryEnabled: true,
@@ -321,6 +433,7 @@ function createMockContext(options: {
       numCtx: null,
     },
     originalPrompt: options.prompt ?? "Create a design artifact.",
+    reportProgress: (message) => progress.push(message),
     httpTransport: async () => ({
       status: 500,
       headers: {},
@@ -334,6 +447,7 @@ function createMockContext(options: {
     content,
     folders,
     operations,
+    progress,
     bytes: (path: string) => new TextEncoder().encode(content.get(path) ?? "").length,
   };
 }

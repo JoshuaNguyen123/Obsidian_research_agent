@@ -72,7 +72,7 @@ export function deriveAutonomyScope(
     /\bnotepage\b/i.test(prompt) ||
     input.noteOutput === true;
   scope.read.web =
-    /\b(web|online|source|sources|citation|citations|latest|current|verify|verified|fact[-\s]?check|research)\b/i.test(
+    /\b(web|online|source|sources|citation|citations|latest|current|verify|verified|fact[-\s]?check|research|browser|page|url|click|scroll|navigate|open\s+page)\b/i.test(
       prompt,
     );
   scope.read.vault =
@@ -96,9 +96,13 @@ export function deriveAutonomyScope(
   scope.write.researchMemory =
     /\b(remember|save|persist|store)\b[\s\S]{0,120}\b(research memory|memory)\b/i.test(
       prompt,
-    ) || /\bresearch memory\b/i.test(prompt);
+    ) ||
+    /\b(experience memory|procedural memory|episodic memory|semantic memory|source memory|memory write|learned strategy)\b/i.test(
+      prompt,
+    ) ||
+    /\bresearch memory\b/i.test(prompt);
   scope.write.artifacts =
-    /\b(canvas|svg|diagram|wireframe|preview|artifact|source note|templates?)\b/i.test(
+    /\b(canvas|svg|diagram|wireframe|preview|artifact|source note|templates?|design package|service blueprint|logistics system|project ideation|mind map|ui flow)\b/i.test(
       prompt,
     );
   scope.write.files =

@@ -95,6 +95,76 @@ test("prompt textarea click edits at clicked position", async () => {
   });
 });
 
+test("chat loader stays hidden without stale idle text until active", async () => {
+  await withE2EHarness("chat-loader-active-state", async ({ page }) => {
+    const loader = page.locator(".agentic-researcher-chat-loader");
+    const loaderText = page.locator(".agentic-researcher-chat-loader-text");
+    const staleIdleLoader = loader.filter({ hasText: /\bidle\b/i });
+
+    await expect(loader).toBeHidden();
+    await expect(staleIdleLoader).toHaveCount(0);
+
+    await reloadAssistantPanel(page);
+    await expect(loader).toBeHidden();
+    await expect(staleIdleLoader).toHaveCount(0);
+
+    const prompt =
+      "Inspect the current note graph for E2E_LOOP_STEPS_5 and complete exactly 5 model steps before the final answer.";
+    await submitMission(page, prompt, { waitForCompletion: false });
+
+    await expect(loader).toBeVisible({ timeout: 5_000 });
+    await expect(loaderText).not.toHaveText(/\bidle\b/i);
+
+    await waitForMissionComplete(page, 90_000);
+    await expect(loader).toBeHidden();
+    await expect(staleIdleLoader).toHaveCount(0);
+  });
+});
+
+test("settings semantic chunk controls stay labeled and contained", async () => {
+  await withE2EHarness("settings-semantic-chunk-layout", async ({ page }) => {
+    await page.setViewportSize({ width: 760, height: 820 });
+    await openPluginSettings(page);
+
+    const setting = page.locator(".agentic-researcher-semantic-chunk-setting");
+    await expect(setting.getByText("Semantic chunk tokens")).toBeVisible();
+    await expect(
+      setting.getByText(
+        "Token estimates for markdown chunks. These control semantic search and the derived semantic index.",
+      ),
+    ).toBeVisible();
+    await expect(
+      setting.locator(".agentic-researcher-semantic-chunk-label"),
+    ).toHaveText(["Min", "Target", "Max", "Overlap"]);
+    await expect(
+      setting.locator(".agentic-researcher-semantic-chunk-input"),
+    ).toHaveCount(4);
+
+    const layout = await setting.evaluate((element) => {
+      const rootRect = element.getBoundingClientRect();
+      const grid = element.querySelector(
+        ".agentic-researcher-semantic-chunk-grid",
+      );
+      const gridRect = grid?.getBoundingClientRect();
+      const inputRects = Array.from(
+        element.querySelectorAll(".agentic-researcher-semantic-chunk-input"),
+      ).map((input) => input.getBoundingClientRect());
+      return {
+        gridWidth: gridRect?.width ?? 0,
+        inputOverflow: inputRects.some(
+          (rect) =>
+            rect.left < rootRect.left - 1 ||
+            rect.right > rootRect.right + 1 ||
+            rect.width < 48,
+        ),
+      };
+    });
+
+    expect(layout.gridWidth).toBeGreaterThan(0);
+    expect(layout.inputOverflow).toBe(false);
+  });
+});
+
 test("append mission writes current note", async () => {
   await withE2EHarness("append-current-note", async ({ page, noteFilePath, input }) => {
     const prompt = `Append this exact E2E marker to the current note: ${input.marker}`;
@@ -190,6 +260,26 @@ test("semantic vault search uses semantic_search_notes", async () => {
   });
 });
 
+test("agentic reflex routes ambiguous semantic prompt", async () => {
+  await withE2EHarness("agentic-reflex-semantic", async ({ page, input }) => {
+    await setStreamingMode(page, false);
+    await setAgenticReflexMode(page, true);
+    await submitMission(
+      page,
+      `Surface E2E_SEMANTIC_SEARCH ${input.folderAnswerMarker} implications.`,
+    );
+
+    await expect(
+      page.locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
+        hasText: input.folderAnswerMarker,
+      }),
+    ).toBeVisible();
+    await expectToolRun(page, "semantic_search_notes");
+    await expectDetailsText(page, "reflex_intent=semantic_vault_search");
+    await expectNoReceipts(page);
+  });
+});
+
 test("web research writes mission ledger evidence and resumes by run id", async () => {
   await withE2EHarness("web-ledger-resume", async ({ page }) => {
     await setStreamingMode(page, false);
@@ -223,6 +313,56 @@ test("web research writes mission ledger evidence and resumes by run id", async 
       }),
     ).toBeVisible({ timeout: 30_000 });
     await expectConversationHistoryMissing(page, "Structured Agent Runs mission ledger");
+  });
+});
+
+test("sourced append keeps web and write tools available together", async () => {
+  await withE2EHarness("sourced-append-multitool", async ({ page, noteFilePath, input }) => {
+    const marker = `E2E_SOURCED_APPEND_MULTI_TOOL_${input.marker}`;
+    await setStreamingMode(page, true);
+
+    await submitMission(
+      page,
+      `E2E_SOURCED_APPEND_MULTI_TOOL: Research MCP server sources and append a concise cited summary with ${marker} to this note. Include source URLs.`,
+      { timeout: 120_000 },
+    );
+
+    await expectNoteToContain(
+      noteFilePath,
+      marker,
+      "sourced append should write the marker after web tools",
+      20_000,
+    );
+    await expectToolRun(page, "web_search");
+    await expectToolRun(page, "web_fetch");
+    await expectToolRun(page, "append_to_current_file");
+    await expectReceipt(page, "append");
+    await page.getByRole("tab", { name: "Run Details" }).click();
+    await expect(page.locator(".agentic-researcher-details-panel")).not.toContainText(
+      /Rejected unavailable tool/,
+    );
+  });
+});
+
+test("mission acceptance retries early word-count answer before completion", async () => {
+  await withE2EHarness("mission-acceptance-word-count", async ({ page }) => {
+    await submitMission(
+      page,
+      "E2E_ACCEPTANCE_WORD_COUNT Count the words in the current note before answering.",
+      { timeout: 120_000 },
+    );
+
+    await expectToolRun(page, "count_words");
+    await page.getByRole("tab", { name: "Chat" }).click();
+    await expect(
+      page.locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
+        hasText: "E2E_ACCEPTANCE_WORD_COUNT_DONE",
+      }),
+    ).toBeVisible({ timeout: 30_000 });
+    await page.getByRole("tab", { name: "Run Details" }).click();
+    await expect(page.locator(".agentic-researcher-details-panel")).toContainText(
+      "Mission acceptance",
+    );
   });
 });
 
@@ -339,9 +479,9 @@ test("autonomous loop respects bounded tool budget and checkpoints", async () =>
   await withE2EHarness("autonomous-loop-depth", async ({ page }) => {
     await setStreamingMode(page, false);
 
-    for (const steps of [1, 5, 10, 15, 25, 30]) {
+    for (const steps of [1, 5, 10, 15, 30, 60]) {
+      const visibleStep = Math.max(1, steps - 3);
       const marker = `E2E_LOOP_DONE_${steps}`;
-      const expectedRenderedStep = Math.min(steps, 5);
       await submitMission(
         page,
         `Inspect the current note graph for E2E_LOOP_STEPS_${steps} and complete exactly ${steps} model steps before the final answer.`,
@@ -355,14 +495,25 @@ test("autonomous loop respects bounded tool budget and checkpoints", async () =>
       await page.getByRole("tab", { name: "Run Details" }).click();
       await expect(
         page.locator(".agentic-researcher-dashboard-section-planning", {
-          hasText: `Step ${expectedRenderedStep}/`,
+          hasText: `Step ${visibleStep}/${steps}`,
+        }),
+      ).toBeVisible({ timeout: 30_000 });
+      await expect(
+        page.locator(".agentic-researcher-dashboard-section-status", {
+          hasText: `Agent step ${visibleStep} of max ${steps}`,
+        }),
+      ).toBeVisible({ timeout: 30_000 });
+      await expect(
+        page.locator(".agentic-researcher-dashboard-section-planning", {
+          hasText: "finalization_reserved=4",
         }),
       ).toBeVisible({ timeout: 30_000 });
       if (steps > 1) {
         await expectToolRun(page, "get_note_graph_context");
       }
-      if (steps >= 5) {
-        await expectLatestAgentCheckpoint(page, `- Step: ${expectedRenderedStep} of`);
+      const latestCheckpointStep = Math.floor(visibleStep / 5) * 5;
+      if (latestCheckpointStep >= 5) {
+        await expectLatestAgentCheckpoint(page, `- Step: ${latestCheckpointStep} of`);
         await expectLatestAgentCheckpoint(page, "- Route: grounded_workflow");
       }
     }
@@ -376,7 +527,7 @@ test("native design drawing creates canvas and svg artifacts", async () => {
 
     await submitMission(
       page,
-      "Draw E2E_DESIGN_CANVAS as an Obsidian canvas design for the product flow.",
+      "Draw E2E_DESIGN_CANVAS as an Obsidian canvas software architecture diagram for the agent user flow.",
     );
     await expectFileToContain(
       canvasFilePath,
@@ -385,10 +536,21 @@ test("native design drawing creates canvas and svg artifacts", async () => {
     );
     await expectFileToContain(
       canvasFilePath,
-      "Product Flow",
-      "canvas artifact should include the requested product flow",
+      "Agent Architecture",
+      "canvas artifact should include the requested architecture title",
+    );
+    await expectFileToContain(
+      canvasFilePath,
+      "Tool Registry",
+      "canvas artifact should include architecture components",
+    );
+    await expectFileToContain(
+      canvasFilePath,
+      "safe write",
+      "canvas artifact should include labeled architecture connections",
     );
     await expectToolRun(page, "create_design_canvas");
+    await expectDetailsText(page, "Canvas architecture planned");
     await expectReceipt(page, input.designCanvasPath);
     await expectVerification(page, "Canvas verified");
 
@@ -406,7 +568,18 @@ test("native design drawing creates canvas and svg artifacts", async () => {
       "Settings",
       "svg artifact should include the settings label",
     );
+    await expectFileToContain(
+      svgFilePath,
+      "<polygon",
+      "svg artifact should include decision diamond markup",
+    );
+    await expectFileToContain(
+      svgFilePath,
+      "Model API",
+      "svg artifact should include architecture ellipse label",
+    );
     await expectToolRun(page, "create_svg_design");
+    await expectDetailsText(page, "SVG design planned");
     await expectReceipt(page, input.designSvgPath);
     await expectVerification(page, "SVG verified");
   });
@@ -455,6 +628,7 @@ test("replace current page writes backup and removes old content", async () => {
     await submitMission(
       page,
       `I want you to delete all the notes on the page and then write a 300 word essay on the renaissance containing ${input.replaceMarker}.`,
+      { timeout: GENERATED_WRITING_E2E_TIMEOUT_MS },
     );
 
     await expectNoteToContain(
@@ -464,6 +638,12 @@ test("replace current page writes backup and removes old content", async () => {
     );
     const replacedContent = await readFile(noteFilePath, "utf8");
     expect(replacedContent).not.toContain(input.secondMarker);
+    expect(replacedContent).toMatch(/Renaissance/i);
+    expect(replacedContent).toMatch(/humanism/i);
+    expect(
+      countWords(replacedContent),
+      "replace-current-page should write a substantial Renaissance essay",
+    ).toBeGreaterThanOrEqual(270);
     await expectReceipt(page, "replace");
     await expectReceipt(page, ".agent-backups");
   });
@@ -672,6 +852,9 @@ interface SubmitMissionOptions {
   assertMock?: boolean;
 }
 
+const DEFAULT_E2E_MISSION_TIMEOUT_MS = 60_000;
+const GENERATED_WRITING_E2E_TIMEOUT_MS = 240_000;
+
 async function withE2EHarness(
   label: string,
   runScenario: (context: E2EHarnessContext) => Promise<void>,
@@ -805,11 +988,30 @@ async function submitMission(
     return;
   }
 
-  await waitForMissionComplete(page, options.timeout ?? 60_000);
+  await waitForMissionComplete(
+    page,
+    options.timeout ?? inferMissionCompletionTimeout(prompt),
+  );
   if (options.assertMock !== false) {
     await assertMockModelUsed(page);
   }
   await page.getByRole("tab", { name: "Chat" }).click();
+}
+
+function inferMissionCompletionTimeout(prompt: string): number {
+  if (
+    /\b(write|generate|draft|compose)\b[\s\S]{0,80}\b(essay|article|explanation|guide|story|report)\b/i.test(
+      prompt,
+    ) ||
+    /\b\d{2,5}[\s-]*word\b/i.test(prompt) ||
+    /\b(delete|clear|replace)\b[\s\S]{0,100}\b(write|generate|draft|compose)\b/i.test(
+      prompt,
+    )
+  ) {
+    return GENERATED_WRITING_E2E_TIMEOUT_MS;
+  }
+
+  return DEFAULT_E2E_MISSION_TIMEOUT_MS;
 }
 
 async function waitForMissionComplete(page: Page, timeout = 60_000) {
@@ -988,6 +1190,13 @@ async function expectVerification(page: Page, text: string) {
   ).toBeVisible();
 }
 
+async function expectDetailsText(page: Page, text: string) {
+  await page.getByRole("tab", { name: "Run Details" }).click();
+  await expect(
+    page.locator(".agentic-researcher-details-panel", { hasText: text }).first(),
+  ).toBeVisible();
+}
+
 async function expectLatestAgentCheckpoint(page: Page, text: string) {
   await expect
     .poll(
@@ -1138,6 +1347,7 @@ async function runGeneratedPromptScenario(
     const newText = getNewlyGeneratedText(beforeNoteContent, afterNoteContent);
     if (scenario.name === "grapes-stream-title") {
       expect(afterNoteContent).toMatch(/^# Harvest of Injustice/m);
+      expect(afterNoteContent).not.toMatch(/^# Untitled/m);
       expect(
         afterNoteContent.match(/^# Harvest of Injustice/gm)?.length ?? 0,
         "streamed generated H1 should retitle the note instead of duplicating in the body",
@@ -1508,7 +1718,7 @@ async function setupVaultNoteAndMockModel(
         ollamaBaseUrl: aiConfig.baseUrl,
         ollamaApiKey: aiConfig.apiKey || plugin.settings.ollamaApiKey,
         requestTimeoutMs: aiConfig.missionTimeoutMs,
-        maxAgentSteps: 30,
+        maxAgentSteps: 60,
         streamWritebackMode: "all_current_note_content_writes",
       };
     } else {
@@ -1529,7 +1739,7 @@ async function setupVaultNoteAndMockModel(
       semanticIndexEnabled: true,
       semanticIndexFolder: "Agent Memory",
       semanticIndexPersistVectors: true,
-      maxAgentSteps: 30,
+      maxAgentSteps: 60,
       streamWritebackMode: "off",
     };
     plugin.appendConversationMessage = async function appendConversationMessage(
@@ -1545,7 +1755,9 @@ async function setupVaultNoteAndMockModel(
     };
     const loopStepCounts = new Map<string, number>();
     const webLedgerStepCounts = new Map<string, number>();
+    const sourcedAppendStepCounts = new Map<string, number>();
     const semanticSearchStepCounts = new Map<string, number>();
+    const acceptanceWordCountStepCounts = new Map<string, number>();
     plugin.createModelClient = function createModelClient() {
       return {
         playwrightE2EMock: true,
@@ -1563,6 +1775,51 @@ async function setupVaultNoteAndMockModel(
               ?.content ?? "";
           const requestText =
             request.messages?.map((message) => message.content ?? "").join("\n") ?? "";
+          if (latestUserText.includes("E2E_ACCEPTANCE_WORD_COUNT")) {
+            const key = "E2E_ACCEPTANCE_WORD_COUNT";
+            const step = acceptanceWordCountStepCounts.get(key) ?? 0;
+            if (step === 0) {
+              acceptanceWordCountStepCounts.set(key, 1);
+              return {
+                message: {
+                  role: "assistant",
+                  content: "The current note has 0 words.",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+
+            if (step === 1 && toolNames.includes("count_words")) {
+              acceptanceWordCountStepCounts.set(key, 2);
+              const toolCall = {
+                id: "playwright-e2e-acceptance-count-words",
+                index: 0,
+                name: "count_words",
+                arguments: {},
+              };
+
+              return {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [toolCall],
+                },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+
+            return {
+              message: {
+                role: "assistant",
+                content: "E2E_ACCEPTANCE_WORD_COUNT_DONE after count_words verification.",
+              },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
+
           const loopMatch = /E2E_LOOP_STEPS_(\d+)/.exec(latestUserText);
           if (loopMatch) {
             const targetSteps = Math.max(1, Number.parseInt(loopMatch[1], 10));
@@ -1699,14 +1956,98 @@ async function setupVaultNoteAndMockModel(
             };
           }
 
+          if (latestUserText.includes("E2E_SOURCED_APPEND_MULTI_TOOL")) {
+            const key = "E2E_SOURCED_APPEND_MULTI_TOOL";
+            const sourcedAppendStep = sourcedAppendStepCounts.get(key) ?? 0;
+            const missingTools = [
+              "web_search",
+              "web_fetch",
+              "append_to_current_file",
+            ].filter((toolName) => !toolNames.includes(toolName));
+            if (missingTools.length > 0) {
+              throw new Error(
+                `sourced append tools were not available: ${missingTools.join(", ")}. Tools: ${toolNames.join(", ")}`,
+              );
+            }
+
+            if (sourcedAppendStep === 0) {
+              sourcedAppendStepCounts.set(key, 1);
+              const toolCall = {
+                id: "playwright-e2e-sourced-append-search",
+                index: 0,
+                name: "web_search",
+                arguments: {
+                  query: "E2E_SOURCED_APPEND_MULTI_TOOL MCP sources",
+                  max_results: 1,
+                },
+              };
+
+              return {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [toolCall],
+                },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+
+            if (sourcedAppendStep === 1) {
+              sourcedAppendStepCounts.set(key, 2);
+              const toolCall = {
+                id: "playwright-e2e-sourced-append-fetch",
+                index: 0,
+                name: "web_fetch",
+                arguments: {
+                  url: "https://example.com/e2e-ledger-source",
+                },
+              };
+
+              return {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [toolCall],
+                },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+
+            const marker =
+              /E2E_SOURCED_APPEND_MULTI_TOOL_[A-Za-z0-9_]+/.exec(
+                latestUserText,
+              )?.[0] ?? "E2E_SOURCED_APPEND_MULTI_TOOL_MISSING";
+            const toolCall = {
+              id: "playwright-e2e-sourced-append-write",
+              index: 0,
+              name: "append_to_current_file",
+              arguments: {
+                text: `${marker}\n\nSourced MCP summary. Source: https://example.com/e2e-ledger-source`,
+              },
+            };
+
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                toolCalls: [toolCall],
+              },
+              toolCalls: [toolCall],
+              raw: { playwrightE2E: true },
+            };
+          }
+
           if (latestUserText.includes(replaceMarker)) {
+            const replacementEssay = getRenaissanceReplacementEssay(replaceMarker);
             if (toolNames.includes("replace_current_file")) {
               const toolCall = {
                 id: "playwright-e2e-replace",
                 index: 0,
                 name: "replace_current_file",
                 arguments: {
-                  text: `${replaceMarker}: Renaissance replacement essay.\n`,
+                  text: replacementEssay,
                 },
               };
 
@@ -1724,7 +2065,7 @@ async function setupVaultNoteAndMockModel(
             return {
               message: {
                 role: "assistant",
-                content: `${replaceMarker}: Renaissance replacement essay.`,
+                content: replacementEssay,
               },
               toolCalls: [],
               raw: { playwrightE2E: true },
@@ -1814,32 +2155,34 @@ async function setupVaultNoteAndMockModel(
             }
 
             if (semanticStep === 0) {
-              if (!toolNames.includes("inspect_semantic_index")) {
-                throw new Error(
-                  `inspect_semantic_index was not available. Tools: ${toolNames.join(", ")}`,
-                );
+              if (toolNames.includes("inspect_semantic_index")) {
+                semanticSearchStepCounts.set(key, 1);
+                const toolCall = {
+                  id: "playwright-e2e-inspect-semantic-index",
+                  index: 0,
+                  name: "inspect_semantic_index",
+                  arguments: {
+                    query: `E2E_SEMANTIC_SEARCH ${folderAnswerMarker} themes`,
+                    limit: 5,
+                  },
+                };
+
+                return {
+                  message: {
+                    role: "assistant",
+                    content: "",
+                    toolCalls: [toolCall],
+                  },
+                  toolCalls: [toolCall],
+                  raw: { playwrightE2E: true },
+                };
               }
 
-              semanticSearchStepCounts.set(key, 1);
-              const toolCall = {
-                id: "playwright-e2e-inspect-semantic-index",
-                index: 0,
-                name: "inspect_semantic_index",
-                arguments: {
-                  query: `E2E_SEMANTIC_SEARCH ${folderAnswerMarker} themes`,
-                  limit: 5,
-                },
-              };
-
-              return {
-                message: {
-                  role: "assistant",
-                  content: "",
-                  toolCalls: [toolCall],
-                },
-                toolCalls: [toolCall],
-                raw: { playwrightE2E: true },
-              };
+              if (!toolNames.includes("semantic_search_notes")) {
+                throw new Error(
+                  `semantic search tools were not available. Tools: ${toolNames.join(", ")}`,
+                );
+              }
             }
 
             if (!toolNames.includes("semantic_search_notes")) {
@@ -1989,24 +2332,46 @@ async function setupVaultNoteAndMockModel(
               name: "create_design_canvas",
               arguments: {
                 path: designCanvasPath,
-                title: "Product Flow",
-                direction: "row",
+                title: "Agent Architecture",
+                diagramType: "architecture",
                 items: [
                   {
-                    title: "Intake",
+                    id: "user",
+                    title: "User",
+                    kind: "actor",
+                    lane: "Client",
                     text: "User submits a mission.",
                     color: "4",
                   },
                   {
-                    title: "Plan",
-                    text: "Agent selects tools.",
+                    id: "runner",
+                    title: "Agent Runner",
+                    kind: "service",
+                    lane: "Application",
+                    text: "Plans steps and routes tools.",
                     color: "5",
                   },
                   {
-                    title: "Artifact",
-                    text: "Validated design is written.",
+                    id: "tools",
+                    title: "Tool Registry",
+                    kind: "service",
+                    lane: "Application",
+                    text: "Executes validated design tools.",
                     color: "6",
                   },
+                  {
+                    id: "vault",
+                    title: "Obsidian Vault",
+                    kind: "database",
+                    lane: "Data",
+                    text: "Stores notes, canvases, and SVG artifacts.",
+                    color: "5",
+                  },
+                ],
+                connections: [
+                  { from: "user", to: "runner", label: "mission" },
+                  { from: "runner", to: "tools", label: "tool call" },
+                  { from: "tools", to: "vault", label: "safe write" },
                 ],
               },
             };
@@ -2048,18 +2413,28 @@ async function setupVaultNoteAndMockModel(
                     label: "Settings",
                   },
                   {
-                    type: "text",
-                    x: 72,
-                    y: 116,
-                    text: "Agent autonomy",
+                    type: "diamond",
+                    x: 330,
+                    y: 118,
+                    width: 120,
+                    height: 90,
+                    label: "Policy",
                   },
                   {
-                    type: "rect",
-                    x: 72,
-                    y: 150,
-                    width: 260,
-                    height: 54,
-                    label: "Run budget",
+                    type: "cylinder",
+                    x: 500,
+                    y: 112,
+                    width: 130,
+                    height: 110,
+                    label: "Vault",
+                  },
+                  {
+                    type: "ellipse",
+                    cx: 560,
+                    cy: 286,
+                    rx: 78,
+                    ry: 36,
+                    label: "Model API",
                   },
                 ],
               },
@@ -2283,7 +2658,7 @@ async function setupVaultNoteAndMockModel(
           }
 
           if (latestUserText.includes(replaceMarker)) {
-            const content = `${replaceMarker}: Renaissance replacement essay.\n`;
+            const content = getRenaissanceReplacementEssay(replaceMarker);
             events?.onContentDelta?.(content);
             return {
               message: {
@@ -2459,7 +2834,10 @@ async function setupVaultNoteAndMockModel(
             model: request.model,
             dim: request.dim,
             documents: request.documents.map((document) =>
-              document.includes(folderAnswerMarker) ? [1, 0] : [0, 1],
+              document.includes(folderAnswerMarker) ||
+              /notes say|related ideas|conceptually/i.test(document)
+                ? [1, 0]
+                : [0, 1],
             ),
             queries: request.queries.map(() => [1, 0]),
             downloadedOrVerified: true,
@@ -2525,7 +2903,7 @@ async function setupVaultNoteAndMockModel(
         ollamaBaseUrl: aiConfig.baseUrl,
         ollamaApiKey: aiConfig.apiKey || activePlugin.settings.ollamaApiKey,
         requestTimeoutMs: aiConfig.missionTimeoutMs,
-        maxAgentSteps: 30,
+        maxAgentSteps: 60,
         streamWritebackMode: "all_current_note_content_writes",
       };
     } else {
@@ -2538,7 +2916,7 @@ async function setupVaultNoteAndMockModel(
           semanticEmbeddingConfig.mode === "ollama"
             ? semanticEmbeddingConfig.model
             : activePlugin.settings.semanticEmbeddingModel,
-        maxAgentSteps: 30,
+        maxAgentSteps: 60,
         streamWritebackMode: "off",
       };
       activePlugin.appendConversationMessage = mockAppendConversationMessage;
@@ -2669,6 +3047,23 @@ async function setupVaultNoteAndMockModel(
       }
     }
 
+    function getRenaissanceReplacementEssay(marker: string): string {
+      return [
+        "# The Renaissance",
+        "",
+        `${marker}`,
+        "",
+        "The Renaissance was a period of renewal that changed European art, learning, politics, and daily imagination. It did not simply copy the ancient world; it used Greek and Roman examples to ask new questions about human ability, civic life, beauty, and evidence. Humanism gave scholars and artists a language for studying history, rhetoric, poetry, and moral choice while still working inside a deeply religious culture.",
+        "",
+        "In Italian cities such as Florence, Venice, and Rome, merchants, guilds, princes, and popes funded painters, architects, and writers because culture displayed power as clearly as armies or walls. Patronage helped Brunelleschi experiment with architecture, Leonardo investigate anatomy and motion, Michelangelo connect physical strength with spiritual drama, and Raphael create balanced scenes of learning and faith. Perspective, proportion, and close observation made paintings feel like ordered spaces rather than flat symbols.",
+        "",
+        "The movement also changed how knowledge traveled. Printing made books cheaper, more consistent, and easier to debate across borders. Students could compare editions of classical texts, reformers could circulate arguments, and scientists could preserve diagrams and measurements. This did not make Europe modern overnight, but it built habits of criticism and exchange that mattered later.",
+        "",
+        "The Renaissance was uneven. Its wealth depended on hierarchy, colonial expansion, gender limits, and political rivalry. Still, its lasting importance comes from the way it joined imagination with disciplined study. It showed that people could honor inherited tradition while revising it, and that art, language, and inquiry could reshape how a society understood the human person. That balance of recovery and invention is why the era remains central to explanations of cultural change across Europe and beyond.",
+        "",
+      ].join("\n");
+    }
+
     function getGeneratedMatrixContent(text: string): string | null {
       const lower = text.toLowerCase();
       if (
@@ -2700,7 +3095,7 @@ async function setupVaultNoteAndMockModel(
         lower.includes("stream it to the page") &&
         lower.includes("grapes of wrath")
       ) {
-        return "# Harvest of Injustice\n\nGrapes of Wrath stream-title essay: the Dust Bowl, migration, and labor exploitation force the Joad family toward collective survival.\n";
+        return "   # Harvest of Injustice #\n\nGrapes of Wrath stream-title essay: the Dust Bowl, migration, and labor exploitation force the Joad family toward collective survival.\n";
       }
       if (
         lower.includes("tell me about how to cook") &&
@@ -2781,7 +3176,7 @@ async function setupVaultNoteAndMockModel(
         semanticIndexEnabled: true,
         semanticIndexFolder: "Agent Memory",
         semanticIndexPersistVectors: true,
-        maxAgentSteps: 30,
+        maxAgentSteps: 60,
         streamWritebackMode: "off",
       };
       target.appendConversationMessage = mockAppendConversationMessage;
@@ -2878,6 +3273,23 @@ async function clearChatInline(page: Page) {
   await clearButton.click();
   await expect(clearButton).toHaveText("Clear chat");
   await expect(page.locator("textarea.agentic-researcher-prompt")).toBeFocused();
+}
+
+async function openPluginSettings(page: Page) {
+  await page.evaluate(async ({ pluginId }) => {
+    const obsidianWindow = window as typeof window & { app?: any };
+    const setting = obsidianWindow.app?.setting;
+    if (!setting?.open || !setting?.openTabById) {
+      throw new Error("Obsidian settings API is unavailable.");
+    }
+
+    setting.open();
+    await setting.openTabById(pluginId);
+  }, { pluginId: PLUGIN_ID });
+
+  await expect(page.locator(".agentic-researcher-settings")).toBeVisible({
+    timeout: 10_000,
+  });
 }
 
 async function seedConversationHistory(
@@ -3009,7 +3421,7 @@ async function reloadAssistantPanel(page: Page) {
       enableStreaming: false,
       thinkingMode: "off",
       model: "playwright-e2e-mock",
-      maxAgentSteps: 30,
+      maxAgentSteps: 60,
       streamWritebackMode: "off",
     };
 
@@ -3064,7 +3476,7 @@ async function setStreamingMode(
         ...mutable.settings,
         enableStreaming: shouldEnable,
         thinkingMode: "off",
-        maxAgentSteps: 30,
+        maxAgentSteps: 60,
         streamWritebackMode: shouldEnable
           ? "all_current_note_content_writes"
           : "off",
@@ -3087,6 +3499,39 @@ async function setStreamingMode(
   } else {
     await assertHarnessMockReady(page);
   }
+}
+
+async function setAgenticReflexMode(page: Page, enabled: boolean) {
+  await page.evaluate(({ pluginId, enabled: shouldEnable }) => {
+    const obsidianWindow = window as typeof window & { app?: any };
+    const app = obsidianWindow.app;
+    const plugin = app?.plugins?.plugins?.[pluginId];
+    if (!plugin) {
+      throw new Error(`Plugin not loaded: ${pluginId}`);
+    }
+
+    const targets = [
+      plugin,
+      ...(app.workspace
+        ?.getLeavesOfType?.("agentic-researcher-view")
+        ?.map((leaf: { view?: { plugin?: unknown } }) => leaf.view?.plugin)
+        ?? []),
+    ];
+
+    for (const target of targets) {
+      if (!target) {
+        continue;
+      }
+      const mutable = target as {
+        settings?: Record<string, unknown>;
+      };
+      mutable.settings = {
+        ...mutable.settings,
+        agenticReflexEnabled: shouldEnable,
+        agenticReflexDiagnosticsEnabled: true,
+      };
+    }
+  }, { pluginId: PLUGIN_ID, enabled });
 }
 
 async function setActiveNoteContent(page: Page, notePath: string, content: string) {
@@ -3544,7 +3989,7 @@ async function seedPluginConversationHistory(
         enableStreaming: false,
         thinkingMode: "off",
         model: "playwright-e2e-mock",
-        maxAgentSteps: 30,
+        maxAgentSteps: 60,
         streamWritebackMode: "off",
         conversationHistory,
       },

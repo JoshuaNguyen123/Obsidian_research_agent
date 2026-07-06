@@ -43,3 +43,14 @@ skills/
 /blob-report/
 /playwright/.cache/
 /playwright/.auth/
+
+# Local companion service runtime
+companion/.venv/
+companion/__pycache__/
+companion/**/__pycache__/
+*.pyc
+companion/.pytest_cache/
+companion/data/*
+!companion/data/.gitkeep
+!companion/data/README.md
+companion/test-results/

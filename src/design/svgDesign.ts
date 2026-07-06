@@ -2,7 +2,10 @@ export type SvgWireframeShape =
   | SvgRectShape
   | SvgTextShape
   | SvgLineShape
-  | SvgCircleShape;
+  | SvgCircleShape
+  | SvgEllipseShape
+  | SvgDiamondShape
+  | SvgCylinderShape;
 
 export interface SvgWireframeInput {
   title?: string;
@@ -54,6 +57,33 @@ export interface SvgCircleShape extends SvgBaseShape {
   label?: string;
 }
 
+export interface SvgEllipseShape extends SvgBaseShape {
+  type: "ellipse";
+  cx: number;
+  cy: number;
+  rx: number;
+  ry: number;
+  label?: string;
+}
+
+export interface SvgDiamondShape extends SvgBaseShape {
+  type: "diamond";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  label?: string;
+}
+
+export interface SvgCylinderShape extends SvgBaseShape {
+  type: "cylinder";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  label?: string;
+}
+
 const DEFAULT_WIDTH = 960;
 const DEFAULT_HEIGHT = 540;
 const DEFAULT_STROKE = "#5cff8d";
@@ -97,6 +127,12 @@ function renderShape(shape: SvgWireframeShape): string {
       return renderLine(shape);
     case "circle":
       return renderCircle(shape);
+    case "ellipse":
+      return renderEllipse(shape);
+    case "diamond":
+      return renderDiamond(shape);
+    case "cylinder":
+      return renderCylinder(shape);
   }
 }
 
@@ -159,6 +195,79 @@ function renderCircle(shape: SvgCircleShape): string {
     : "";
 
   return `  <circle${renderId(shape.id)} cx="${shape.cx}" cy="${shape.cy}" r="${getPositiveNumber(shape.r, 1, "shape.r")}" fill="${escapeAttribute(fill)}" stroke="${escapeAttribute(stroke)}" stroke-width="${Math.max(1, shape.strokeWidth ?? 1)}"/>${label}`;
+}
+
+function renderEllipse(shape: SvgEllipseShape): string {
+  const stroke = sanitizeColor(shape.stroke, DEFAULT_STROKE);
+  const fill = sanitizeColor(shape.fill, DEFAULT_FILL);
+  const label = shape.label
+    ? `\n  ${renderText({
+        type: "text",
+        x: shape.cx,
+        y: shape.cy + 5,
+        text: shape.label,
+        fontSize: 14,
+        anchor: "middle",
+      })}`
+    : "";
+
+  return `  <ellipse${renderId(shape.id)} cx="${shape.cx}" cy="${shape.cy}" rx="${getPositiveNumber(shape.rx, 1, "shape.rx")}" ry="${getPositiveNumber(shape.ry, 1, "shape.ry")}" fill="${escapeAttribute(fill)}" stroke="${escapeAttribute(stroke)}" stroke-width="${Math.max(1, shape.strokeWidth ?? 1)}"/>${label}`;
+}
+
+function renderDiamond(shape: SvgDiamondShape): string {
+  const stroke = sanitizeColor(shape.stroke, DEFAULT_STROKE);
+  const fill = sanitizeColor(shape.fill, DEFAULT_FILL);
+  const width = getPositiveNumber(shape.width, 1, "shape.width");
+  const height = getPositiveNumber(shape.height, 1, "shape.height");
+  const points = [
+    `${shape.x + width / 2},${shape.y}`,
+    `${shape.x + width},${shape.y + height / 2}`,
+    `${shape.x + width / 2},${shape.y + height}`,
+    `${shape.x},${shape.y + height / 2}`,
+  ].join(" ");
+  const label = shape.label
+    ? `\n  ${renderText({
+        type: "text",
+        x: shape.x + width / 2,
+        y: shape.y + height / 2 + 5,
+        text: shape.label,
+        fontSize: 13,
+        anchor: "middle",
+      })}`
+    : "";
+
+  return `  <polygon${renderId(shape.id)} points="${points}" fill="${escapeAttribute(fill)}" stroke="${escapeAttribute(stroke)}" stroke-width="${Math.max(1, shape.strokeWidth ?? 1)}"/>${label}`;
+}
+
+function renderCylinder(shape: SvgCylinderShape): string {
+  const stroke = sanitizeColor(shape.stroke, DEFAULT_STROKE);
+  const fill = sanitizeColor(shape.fill, DEFAULT_FILL);
+  const width = getPositiveNumber(shape.width, 1, "shape.width");
+  const height = getPositiveNumber(shape.height, 1, "shape.height");
+  const cap = Math.min(28, Math.max(12, Math.round(height * 0.16)));
+  const x = shape.x;
+  const y = shape.y;
+  const bottom = y + height - cap;
+  const bodyPath = [
+    `M ${x} ${y + cap}`,
+    `C ${x} ${y - cap / 3}, ${x + width} ${y - cap / 3}, ${x + width} ${y + cap}`,
+    `L ${x + width} ${bottom}`,
+    `C ${x + width} ${bottom + cap}, ${x} ${bottom + cap}, ${x} ${bottom}`,
+    "Z",
+  ].join(" ");
+  const topPath = `M ${x} ${y + cap} C ${x} ${y + cap * 2}, ${x + width} ${y + cap * 2}, ${x + width} ${y + cap}`;
+  const label = shape.label
+    ? `\n  ${renderText({
+        type: "text",
+        x: x + width / 2,
+        y: y + height / 2 + 8,
+        text: shape.label,
+        fontSize: 14,
+        anchor: "middle",
+      })}`
+    : "";
+
+  return `  <path${renderId(shape.id)} d="${bodyPath}" fill="${escapeAttribute(fill)}" stroke="${escapeAttribute(stroke)}" stroke-width="${Math.max(1, shape.strokeWidth ?? 1)}"/>\n  <path d="${topPath}" fill="none" stroke="${escapeAttribute(stroke)}" stroke-width="${Math.max(1, shape.strokeWidth ?? 1)}"/>${label}`;
 }
 
 function renderArrowMarker(): string {

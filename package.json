@@ -1,6 +1,6 @@
 {
   "name": "agentic-researcher",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Minimal Obsidian plugin shell for an agentic research assistant.",
   "main": "main.js",
   "scripts": {
