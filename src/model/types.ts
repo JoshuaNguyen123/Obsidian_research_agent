@@ -1,5 +1,6 @@
 export type ModelRole = "system" | "user" | "assistant" | "tool";
 export type ModelThink = boolean | "low" | "medium" | "high" | "max";
+export type ModelProvider = "ollama" | "openai_compatible";
 
 export type ModelClientErrorCategory =
   | "missing_api_key"
@@ -42,6 +43,7 @@ export interface ModelChatMessage {
   content: string;
   thinking?: string;
   toolName?: string;
+  toolCallId?: string;
   toolCalls?: ModelToolCall[];
 }
 
@@ -51,6 +53,7 @@ export interface ModelChatRequest {
   tools?: ModelToolDefinition[];
   think?: ModelThink;
   options?: ModelRequestOptions;
+  abortSignal?: AbortSignal;
 }
 
 export interface ModelRequestOptions {
@@ -68,6 +71,7 @@ export interface ModelChatResponse {
 }
 
 export interface ModelChatStreamEvents {
+  onRawChunk?: (chunk: string) => void;
   onContentDelta?: (delta: string) => void;
   onThinkingDelta?: (delta: string) => void;
 }
@@ -88,6 +92,7 @@ export interface HttpRequest {
   headers?: Record<string, string>;
   throw?: boolean;
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface HttpResponse {

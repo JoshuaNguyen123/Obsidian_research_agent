@@ -1,0 +1,129 @@
+import { MAX_AGENT_STEPS } from "../tools/constants";
+import { FINALIZATION_RESERVE_STEPS } from "./AgentBudget";
+import type { RunBudgetRoute } from "./runBudget";
+import { resolveConfiguredMaxAgentSteps } from "./runBudget";
+import type { GeneratedOutputPolicy } from "./generatedOutputPolicy";
+
+export interface LoopBudgetPlan {
+  hardCap: number;
+  toolStepBudget: number;
+  finalizationReserve: number;
+  expectedTools: string[];
+  stopWhenSatisfied: boolean;
+}
+
+export function planLoopBudget(input: {
+  prompt: string;
+  route: RunBudgetRoute;
+  generated: GeneratedOutputPolicy;
+  configuredMaxSteps?: number | null;
+  requestedSteps?: number | null;
+}): LoopBudgetPlan {
+  const hardCap = resolveConfiguredMaxAgentSteps(input.configuredMaxSteps);
+  const expectedTools = getExpectedTools(input.prompt, input.generated);
+  const finalizationReserve = FINALIZATION_RESERVE_STEPS;
+  const requestedToolBudget =
+    typeof input.requestedSteps === "number" && Number.isFinite(input.requestedSteps)
+      ? Math.max(0, Math.trunc(input.requestedSteps) - finalizationReserve)
+      : getRequestedToolBudget({
+          route: input.route,
+          prompt: input.prompt,
+          generated: input.generated,
+          expectedTools,
+          hardCap,
+          finalizationReserve,
+        });
+  const toolStepBudget = Math.max(
+    0,
+    Math.min(requestedToolBudget, Math.max(0, hardCap - finalizationReserve)),
+  );
+
+  return {
+    hardCap: Math.min(MAX_AGENT_STEPS, hardCap),
+    toolStepBudget,
+    finalizationReserve,
+    expectedTools,
+    stopWhenSatisfied:
+      input.generated.kind !== "general" || input.generated.requiresGrounding,
+  };
+}
+
+function getExpectedTools(
+  prompt: string,
+  generated: GeneratedOutputPolicy,
+): string[] {
+  if (generated.kind === "diagram") {
+    if (
+      /\b(design\s*package|service\s*blueprint|logistics\s*system|project\s*ideation|ui\s*flow|canvas\s+plus\s+(brief|markdown)|brief\s+plus\s+canvas)\b/i.test(
+        prompt,
+      )
+    ) {
+      return ["create_design_package"];
+    }
+
+    return /\b(svg|wireframe|mockup|screen|layout|ui\s+design|static\s+diagram|sketch)\b/i.test(
+      prompt,
+    )
+      ? ["create_svg_design"]
+      : ["create_design_canvas"];
+  }
+
+  if (generated.requiresGrounding || /\b(web|online|sources?|citations?)\b/i.test(prompt)) {
+    return ["web_search", "web_fetch"];
+  }
+
+  return [];
+}
+
+function getRequestedToolBudget({
+  route,
+  prompt,
+  generated,
+  expectedTools,
+  hardCap,
+  finalizationReserve,
+}: {
+  route: RunBudgetRoute;
+  prompt: string;
+  generated: GeneratedOutputPolicy;
+  expectedTools: string[];
+  hardCap: number;
+  finalizationReserve: number;
+}): number {
+  if (
+    route === "instant_local" ||
+    route === "direct_writeback" ||
+    route === "prefetched_vault_answer" ||
+    route === "prefetched_vault_writeback"
+  ) {
+    return 0;
+  }
+
+  if (generated.kind === "diagram") {
+    return 3;
+  }
+
+  if (generated.requiresTextQuotes) {
+    return 7;
+  }
+
+  if (hasLongResearchIntent(prompt)) {
+    return Math.max(1, hardCap - finalizationReserve);
+  }
+
+  if (generated.requiresGrounding || expectedTools.length > 0) {
+    return 5;
+  }
+
+  if (generated.wordTarget && generated.wordTarget.target >= 1000) {
+    return 2;
+  }
+
+  return route === "grounded_workflow" ? 4 : 2;
+}
+
+function hasLongResearchIntent(prompt: string): boolean {
+  return /\b(deep\s+research|long\s+research|in-depth\s+research|deep\s+dive|investigate|compare\s+sources|multi[-\s]?source|strategy|broad\s+constraints|evidence\s+ledger|checkpoint|long[-\s]?running)\b/i.test(
+    prompt,
+  );
+}

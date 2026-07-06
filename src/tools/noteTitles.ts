@@ -73,12 +73,14 @@ export function getFirstH1(markdown: string): Heading | null {
       continue;
     }
 
-    const match = /^#\s+(.+)$/.exec(line.text);
+    const match = /^(?: {0,3})#(?:[ \t]+)(.+?)(?:[ \t]+#+)?[ \t]*$/.exec(
+      line.text,
+    );
     if (match) {
       return {
         start: line.start,
         end: line.textEnd,
-        text: match[1],
+        text: match[1].trim(),
       };
     }
   }
@@ -169,7 +171,7 @@ function findFrontmatterTitleLine(
   );
 
   for (const line of lines) {
-    const match = /^title\s*:(.*)$/.exec(line.text);
+    const match = /^title\s*:(.*)$/i.exec(line.text);
     if (!match) {
       continue;
     }

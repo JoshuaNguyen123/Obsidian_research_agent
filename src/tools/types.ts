@@ -1,4 +1,4 @@
-import type { App } from "obsidian";
+import type { App, TFile } from "obsidian";
 import type { AgentSettings } from "../settings";
 import type {
   HttpTransport,
@@ -6,6 +6,9 @@ import type {
   ModelToolCall,
   ModelToolDefinition,
 } from "../model/types";
+import type { AutonomyScope } from "../agent/missionScope";
+import type { SemanticEmbeddingProvider } from "../embeddings/types";
+import type { SemanticIndexService } from "../embeddings/semanticIndexTypes";
 
 export type AgentMissionMode =
   | "chat_only"
@@ -23,6 +26,19 @@ export interface MissionIntent {
   explicitDelete: boolean;
   allowAutonomousWrite: boolean;
   requireWriteCompletion: boolean;
+  autonomyScope: AutonomyScope;
+}
+
+export interface ResearchMemoryIndexEntry {
+  topic: string;
+  path: string;
+  keywords: string[];
+  lastUpdated: string;
+  confidence?: "low" | "medium" | "high";
+  sourcePaths?: string[];
+  sourceUrls?: string[];
+  contentHash?: string;
+  updateCount?: number;
 }
 
 export interface ToolExecutionContext {
@@ -30,9 +46,20 @@ export interface ToolExecutionContext {
   settings: AgentSettings;
   originalPrompt: string;
   httpTransport: HttpTransport;
+  runtimeCache?: AgentRuntimeCache;
+  reportProgress?: (message: string) => void;
   writeAutonomy?: boolean;
   missionIntent?: MissionIntent;
   now?: () => Date;
+  getCurrentMarkdownFile?: () => TFile | null;
+  getCurrentMarkdownContent?: (file: TFile) => string | null;
+  setCurrentMarkdownContent?: (file: TFile, content: string) => boolean;
+  getResearchMemoryIndex?: () => ResearchMemoryIndexEntry[];
+  setResearchMemoryIndex?: (
+    entries: ResearchMemoryIndexEntry[],
+  ) => Promise<void> | void;
+  semanticEmbeddingProvider?: SemanticEmbeddingProvider;
+  semanticIndexService?: SemanticIndexService;
 }
 
 export interface ToolExecutionResult {
@@ -43,6 +70,12 @@ export interface ToolExecutionResult {
     code: string;
     message: string;
   };
+}
+
+export interface AgentRuntimeCache {
+  toolResults: Map<string, ToolExecutionResult>;
+  semanticProfiles?: Map<string, unknown>;
+  graphProfiles?: Map<string, unknown>;
 }
 
 export interface AgentTool {
