@@ -1,5 +1,11 @@
 # Mistakes And Lessons Learned
 
+## Acceptance Gates Must Not Treat Every Exposed Tool As Required
+
+The first mission-acceptance implementation treated route-expected or exposed tools as mandatory completion requirements, and it also matched the bare word `current` as web-current evidence. That made ordinary current-note and web-search flows ask for extra model turns after a valid final answer.
+
+Lesson: completion acceptance should distinguish available tools from required proof. Force another step only for actionable missing requirements such as write receipts, explicit web/source evidence, word-count checks, or explicit vault-before-answering requests. Do not make broad tool exposure itself a hard acceptance item, and do not treat `current note` as current-events web intent.
+
 ## Follow-Up Revision Approvals Must Complete The Edit
 
 The user reproduced a flow where the assistant said it would revise an essay, then `Go ahead and revise` and `Edit the essay` did not produce the expected note edit. The runner recognized only a narrow set of continuation phrases, and broad essay/paragraph edit wording could fall into section-edit routing that expects a named heading.
@@ -29,6 +35,18 @@ Lesson: explicit stream-to-page/note/document/current-file wording must route to
 The generated essay title was written below the existing `# Untitled` heading, leaving two H1s and keeping the visible top note title unchanged.
 
 Lesson: streamed generated markdown needs a leading-H1 consumer. If the first generated block is `# Title`, update the existing frontmatter/H1 through the note-title helper and stream only the remaining body. Do not rename the file unless the user explicitly asks for a file rename or move.
+
+## Generated H1 Retitle Must Use Latest Note Content
+
+The first generated-title fix retitled the initial note snapshot captured when streaming writeback started. If the editor/body content changed between writer setup and the first generated H1, the title patch could miss or discard the latest active body state.
+
+Lesson: leading-H1 consumption should apply the targeted title replacement to the latest active markdown content available from the editor hook, then stream only the generated body. This keeps the header/body split from turning into a stale-snapshot write.
+
+## Title Replacement Must Accept Markdown Variants
+
+Generated and existing note titles are not always emitted as a plain `# Title` line. A streamed provider can split the heading across chunks, include up to three leading spaces, or include a closing hash marker such as `# Title #`. Frontmatter can also use `Title:` casing.
+
+Lesson: note-title replacement must use a tolerant targeted Markdown heading match and case-insensitive frontmatter title matching. Tests should cover split streamed headings and decorated H1 lines so the title/body split does not leave `# Untitled` in place.
 
 ## Compound Missions Must Not Stop After The First Mutation
 
@@ -65,6 +83,18 @@ Lesson: e2e scenarios that assert prompt-specific generated output must clear bo
 The mock streaming implementation matched generated-output prompts against the full model request, including prior user messages. That let a Gilgamesh prompt receive Revolutionary War content because the earlier prompt was still present in history.
 
 Lesson: model mocks should inspect the latest user message first and use full request text only as a fallback. This keeps table-driven prompt tests from passing or failing because of stale history text.
+
+## Word-Count Targets Must Be Scoped To The Current Prompt
+
+The user reproduced a prompt-matrix flow where a later short Grapes of Wrath stream-to-page prompt inherited the earlier `1000 word` target and started a correction pass against the wrong request.
+
+Lesson: streamed writeback word-count correction should read the active mission's generated-word-target system context first and only fall back to the latest user prompt. It must not scan older chat history or current-note context for numeric word targets when deciding whether to correct the current streamed draft.
+
+## Loop-Depth E2E Must Assert The Requested Max
+
+The loop-depth UI could show `Agent step 5 of max 5` for prompts that explicitly requested 10, 15, 25, or 30 model steps because the grounded-workflow route budget stayed at its default five-step cap. The Playwright test also masked the bug by expecting `Math.min(steps, 5)`.
+
+Lesson: diagnostic prompts that explicitly request a number of model/agent/planning/loop steps should set the run cap to that requested count, still bounded by settings and the hard max. E2E assertions must check the actual requested `Step N/N` and `Agent step N of max N` display, not the old route default.
 
 ## Obsidian Vault Cache Races Can Surface As File-Exists Errors
 
@@ -113,3 +143,27 @@ Lesson: opt-in real-AI e2e should default to `gpt-oss:120b-cloud` and preserve t
 The real-AI smoke subset included a free-form three-block diagram prompt. The live provider completed the essay and source prompts but did not create the expected `.canvas` file, so the test failed on provider-dependent tool choice instead of the requested long-form generation behavior.
 
 Lesson: keep native artifact/tool-shape assertions in the deterministic mock matrix unless the live prompt explicitly exercises a stable tool contract. The opt-in real-AI path should focus on live generation, source/tool use, word-count verification, write receipts, and safety-limit regressions.
+
+## Loader Placeholders Can Flash During Reload Or Run Start
+
+The chat CRT loader created its DOM with default `idle` text and then activated during run startup. Even though inactive CSS hid the loader, Obsidian reloads and the run-start sequence could briefly paint that stale background text before the real loading status arrived.
+
+Lesson: transient UI elements should be blank and `aria-hidden` while inactive, and activation should seed the first meaningful status before display. E2E should assert the absence of stale placeholder text, not only the final hidden/visible state.
+
+## Multi-Control Settings Rows Need A Real Layout
+
+The semantic chunk token setting put four `Setting.addText` controls into one Obsidian setting row. In the settings modal this collapsed the label/description area, left a large blank card, and let the final input overflow the panel.
+
+Lesson: grouped settings need explicit labels, a bounded grid or stacked layout, and a settings-panel e2e check for narrow widths. Do not rely on Obsidian's default single-row `Setting` layout for four related inputs.
+
+## Grounded Writeback Must Not Clear Write Tools Too Early
+
+The runner could gather required web evidence, then force a no-tool finalization step while a current-note writeback was still pending. If the model requested `append_to_current_file`, `replace_current_file`, or another valid follow-up tool in that step, Run Details showed red `Rejected unavailable tool` rows even though the mission still needed a write.
+
+Lesson: read/source gathering and current-note writing can belong to the same grounded run. Preserve matching write tools while a write goal or streaming writeback is pending, and only clear the tool list for pure answer synthesis.
+
+## Filled Template Defaults Should Follow The Active Project
+
+Blank `templateOutputFolder` previously meant vault root, which made generated notes from filled templates land outside the active project folder unless the model supplied an explicit target path.
+
+Lesson: saved reusable templates can stay in the configured template folder, but filled-template output should default to the active note's project folder when no explicit target or output setting is provided.

@@ -40,6 +40,18 @@ test("generated output policy classifies prompt matrix targets", () => {
   );
   assert.equal(diagram.kind, "diagram");
   assert.equal(diagram.target, "design_canvas");
+
+  const userFlow = analyzeGeneratedOutputPrompt(
+    "Create a user flow for onboarding and checkout.",
+  );
+  assert.equal(userFlow.kind, "diagram");
+  assert.equal(userFlow.target, "design_canvas");
+
+  const architecture = analyzeGeneratedOutputPrompt(
+    "Draw a software architecture diagram for the Obsidian agent.",
+  );
+  assert.equal(architecture.kind, "diagram");
+  assert.equal(architecture.target, "design_canvas");
 });
 
 test("generated output policy detects grounded quote prompts", () => {
@@ -105,8 +117,8 @@ test("loop planner reserves finalization for grounded generated writing", () => 
   });
 
   assert.equal(budget.hardCap, 5);
-  assert.equal(budget.finalizationReserve, 1);
-  assert.equal(budget.toolStepBudget, 4);
+  assert.equal(budget.finalizationReserve, 4);
+  assert.equal(budget.toolStepBudget, 1);
   assert.deepEqual(budget.expectedTools, ["web_search", "web_fetch"]);
 });
 

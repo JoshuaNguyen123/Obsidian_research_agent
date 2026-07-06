@@ -5,8 +5,12 @@ import {
 } from "../agent/verification";
 import {
   buildLayoutCanvas,
+  type CanvasConnectionMode,
+  type CanvasLayoutConnection,
+  type CanvasLayoutDiagramType,
   type CanvasLayoutDirection,
   type CanvasLayoutItem,
+  type CanvasLayoutItemKind,
 } from "../design/layout";
 import {
   assertValidJsonCanvas,
@@ -17,6 +21,7 @@ import {
   renderSvgWireframe,
   type SvgWireframeShape,
 } from "../design/svgDesign";
+import { createDesignPackageTool } from "../agent/design/CreateDesignPackageTool";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 import {
@@ -29,16 +34,16 @@ import {
 } from "./validation";
 
 const DESIGN_INTENT_PATTERN =
-  /\b(create|make|draw|generate|build|draft|render|save|write)\b[\s\S]{0,120}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch)\b[\s\S]{0,120}\b(create|make|draw|generate|build|draft|render|save|write)\b/i;
+  /\b(create|make|draw|generate|build|draft|render|save|write)\b[\s\S]{0,120}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b[\s\S]{0,120}\b(create|make|draw|generate|build|draft|render|save|write)\b/i;
 
 export function createDesignTools(): AgentTool[] {
-  return [createDesignCanvasTool, createSvgDesignTool];
+  return [createDesignCanvasTool, createSvgDesignTool, createDesignPackageTool];
 }
 
 export const createDesignCanvasTool: AgentTool = {
   name: "create_design_canvas",
   description:
-    "Create a new Obsidian JSON Canvas artifact from validated nodes/edges or layout items.",
+    "Create a new Obsidian JSON Canvas artifact for diagrams, user flows, or architecture maps.",
   parameters: {
     type: "object",
     required: ["path"],
@@ -68,12 +73,36 @@ export const createDesignCanvasTool: AgentTool = {
       items: {
         type: "array",
         items: { type: "object" },
-        description: "Optional simple layout items with title/text/url/file/color.",
+        description: "Optional layout items with title/text/kind/lane/url/file/color.",
+      },
+      diagramType: {
+        type: "string",
+        enum: [
+          "sequence",
+          "user_flow",
+          "ui_flow",
+          "logistics_system",
+          "service_blueprint",
+          "project_ideation",
+          "architecture",
+          "mind_map",
+        ],
+        description: "Generated diagram style for layout items.",
       },
       direction: {
         type: "string",
         enum: ["row", "column", "grid"],
         description: "Generated layout direction.",
+      },
+      connect: {
+        type: "string",
+        enum: ["none", "sequence"],
+        description: "Auto-connect layout items. Defaults to sequence.",
+      },
+      connections: {
+        type: "array",
+        items: { type: "object" },
+        description: "Optional explicit edges with from/to ids, labels, colors, and sides.",
       },
       createFolders: {
         type: "boolean",
@@ -95,12 +124,17 @@ export const createDesignCanvasTool: AgentTool = {
     assertPathDoesNotExist(context, path);
     await ensureParentFolder(context, path, createFolders);
 
+    reportProgress(context, `Planning canvas design for ${path}...`);
     const canvas = getCanvasFromArgs(args);
+    const diagramType = getDiagramType(args.diagramType);
+    const canvasSummary = summarizeCanvas(canvas, diagramType);
+    reportProgress(context, canvasSummary);
     const content = stringifyJsonCanvas(canvas);
     const preflight = verifyCanvasArtifact(content);
     if (!preflight.ok) {
       throw new Error(`Canvas preflight verification failed: ${preflight.errors.join(" ")}`);
     }
+    reportProgress(context, "Canvas structure validated; writing artifact...");
 
     const file = await context.app.vault.create(path, content);
     const readBack = await context.app.vault.read(file);
@@ -114,9 +148,11 @@ export const createDesignCanvasTool: AgentTool = {
     return {
       path,
       operation: "create",
+      diagramType,
       bytesWritten: getByteLength(content),
       nodeCount: verification.nodeCount,
       edgeCount: verification.edgeCount,
+      summary: canvasSummary,
       opened,
     };
   },
@@ -125,7 +161,7 @@ export const createDesignCanvasTool: AgentTool = {
 export const createSvgDesignTool: AgentTool = {
   name: "create_svg_design",
   description:
-    "Create a new escaped SVG wireframe artifact from structured shape instructions.",
+    "Create a new escaped SVG diagram or wireframe from structured shape instructions.",
   parameters: {
     type: "object",
     required: ["path", "shapes"],
@@ -149,7 +185,7 @@ export const createSvgDesignTool: AgentTool = {
       shapes: {
         type: "array",
         items: { type: "object" },
-        description: "Structured wireframe shapes.",
+        description: "Structured shapes: rect, text, line, arrow, circle, ellipse, diamond, or cylinder.",
       },
       createFolders: {
         type: "boolean",
@@ -171,7 +207,13 @@ export const createSvgDesignTool: AgentTool = {
     assertPathDoesNotExist(context, path);
     await ensureParentFolder(context, path, createFolders);
 
+    reportProgress(context, `Planning SVG design for ${path}...`);
     const shapes = getShapes(args);
+    const shapeTypes = [...new Set(shapes.map((shape) => shape.type))];
+    reportProgress(
+      context,
+      `SVG design planned: ${shapes.length} shapes (${shapeTypes.join(", ")}).`,
+    );
     const content = renderSvgWireframe({
       title: getOptionalString(args, "title"),
       width: getOptionalInteger(args, "width"),
@@ -182,6 +224,7 @@ export const createSvgDesignTool: AgentTool = {
     if (!preflight.ok) {
       throw new Error(`SVG preflight verification failed: ${preflight.errors.join(" ")}`);
     }
+    reportProgress(context, "SVG structure validated; writing artifact...");
 
     const file = await context.app.vault.create(path, content);
     const readBack = await context.app.vault.read(file);
@@ -197,6 +240,7 @@ export const createSvgDesignTool: AgentTool = {
       operation: "create",
       bytesWritten: getByteLength(content),
       shapeCount: shapes.length,
+      shapeTypes,
       opened,
     };
   },
@@ -209,6 +253,25 @@ function assertDesignIntent(context: ToolExecutionContext, toolName: string) {
       `${toolName} requires explicit design, canvas, diagram, wireframe, layout, or SVG creation intent.`,
     );
   }
+}
+
+function reportProgress(context: ToolExecutionContext, message: string) {
+  context.reportProgress?.(message);
+}
+
+function summarizeCanvas(
+  canvas: JsonCanvas,
+  diagramType: CanvasLayoutDiagramType,
+): string {
+  const lanes = canvas.nodes
+    .filter((node) => node.type === "group" && typeof node.label === "string")
+    .map((node) => String(node.label));
+  const laneSummary = lanes.length > 0 ? ` across ${lanes.length} lanes` : "";
+  return `Canvas ${formatDiagramType(diagramType)} planned: ${canvas.nodes.length} nodes, ${canvas.edges.length} edges${laneSummary}.`;
+}
+
+function formatDiagramType(diagramType: CanvasLayoutDiagramType): string {
+  return diagramType.replace(/_/g, " ");
 }
 
 function normalizeArtifactPath(path: string, extension: ".canvas" | ".svg"): string {
@@ -242,6 +305,9 @@ function getCanvasFromArgs(args: Record<string, unknown>): JsonCanvas {
     title: getOptionalString(args, "title"),
     items: getLayoutItems(args),
     direction: getDirection(args.direction),
+    connect: getConnect(args.connect),
+    diagramType: getDiagramType(args.diagramType),
+    connections: getConnections(args.connections),
   });
 }
 
@@ -269,10 +335,12 @@ function getLayoutItems(args: Record<string, unknown>): CanvasLayoutItem[] {
         item.type === "group"
           ? item.type
           : undefined,
+      kind: getItemKind(item.kind, index),
       title,
       text: typeof item.text === "string" ? item.text : undefined,
       file: typeof item.file === "string" ? item.file : undefined,
       url: typeof item.url === "string" ? item.url : undefined,
+      lane: typeof item.lane === "string" ? item.lane : undefined,
       color: typeof item.color === "string" ? item.color : undefined,
     };
   });
@@ -290,6 +358,126 @@ function getDirection(value: unknown): CanvasLayoutDirection | undefined {
   throw new ToolExecutionError(
     "invalid_arguments",
     "direction must be row, column, or grid.",
+  );
+}
+
+function getDiagramType(value: unknown): CanvasLayoutDiagramType {
+  if (value === undefined) {
+    return "sequence";
+  }
+
+  if (
+    value === "sequence" ||
+    value === "user_flow" ||
+    value === "ui_flow" ||
+    value === "logistics_system" ||
+    value === "service_blueprint" ||
+    value === "project_ideation" ||
+    value === "architecture" ||
+    value === "mind_map"
+  ) {
+    return value;
+  }
+
+  throw new ToolExecutionError(
+    "invalid_arguments",
+    "diagramType must be sequence, user_flow, ui_flow, logistics_system, service_blueprint, project_ideation, architecture, or mind_map.",
+  );
+}
+
+function getConnect(value: unknown): CanvasConnectionMode | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === "none" || value === "sequence") {
+    return value;
+  }
+
+  throw new ToolExecutionError(
+    "invalid_arguments",
+    "connect must be none or sequence.",
+  );
+}
+
+function getConnections(value: unknown): CanvasLayoutConnection[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      "connections must be an array.",
+    );
+  }
+
+  return value.map((connection, index) => {
+    if (!isRecord(connection)) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        `connections[${index}] must be an object.`,
+      );
+    }
+
+    return {
+      from: getShapeString(connection, "from", index),
+      to: getShapeString(connection, "to", index),
+      label: getOptionalShapeString(connection, "label", index),
+      color: getOptionalShapeString(connection, "color", index),
+      fromSide: getCanvasSide(connection.fromSide, index, "fromSide"),
+      toSide: getCanvasSide(connection.toSide, index, "toSide"),
+    };
+  });
+}
+
+function getCanvasSide(
+  value: unknown,
+  index: number,
+  field: string,
+): CanvasLayoutConnection["fromSide"] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === "top" || value === "right" || value === "bottom" || value === "left") {
+    return value;
+  }
+
+  throw new ToolExecutionError(
+    "invalid_arguments",
+    `connections[${index}].${field} must be top, right, bottom, or left.`,
+  );
+}
+
+function getItemKind(value: unknown, index: number): CanvasLayoutItemKind | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (
+    value === "step" ||
+    value === "persona" ||
+    value === "actor" ||
+    value === "screen" ||
+    value === "decision" ||
+    value === "service" ||
+    value === "resource" ||
+    value === "database" ||
+    value === "queue" ||
+    value === "milestone" ||
+    value === "risk" ||
+    value === "metric" ||
+    value === "dependency" ||
+    value === "note" ||
+    value === "external"
+  ) {
+    return value;
+  }
+
+  throw new ToolExecutionError(
+    "invalid_arguments",
+    `items[${index}].kind must be step, persona, actor, screen, decision, service, resource, database, queue, milestone, risk, metric, dependency, note, or external.`,
   );
 }
 
@@ -373,9 +561,45 @@ function normalizeShape(
     };
   }
 
+  if (type === "ellipse") {
+    return {
+      ...base,
+      type,
+      cx: getShapeNumber(shape, "cx", index),
+      cy: getShapeNumber(shape, "cy", index),
+      rx: getPositiveShapeNumber(shape, "rx", index),
+      ry: getPositiveShapeNumber(shape, "ry", index),
+      label: getOptionalShapeString(shape, "label", index),
+    };
+  }
+
+  if (type === "diamond") {
+    return {
+      ...base,
+      type,
+      x: getShapeNumber(shape, "x", index),
+      y: getShapeNumber(shape, "y", index),
+      width: getPositiveShapeNumber(shape, "width", index),
+      height: getPositiveShapeNumber(shape, "height", index),
+      label: getOptionalShapeString(shape, "label", index),
+    };
+  }
+
+  if (type === "cylinder") {
+    return {
+      ...base,
+      type,
+      x: getShapeNumber(shape, "x", index),
+      y: getShapeNumber(shape, "y", index),
+      width: getPositiveShapeNumber(shape, "width", index),
+      height: getPositiveShapeNumber(shape, "height", index),
+      label: getOptionalShapeString(shape, "label", index),
+    };
+  }
+
   throw new ToolExecutionError(
     "invalid_arguments",
-    `shapes[${index}].type must be rect, text, line, arrow, or circle.`,
+    `shapes[${index}].type must be rect, text, line, arrow, circle, ellipse, diamond, or cylinder.`,
   );
 }
 

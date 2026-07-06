@@ -432,7 +432,8 @@ The plugin runs a bounded loop:
 ### Step Budget
 
 ```ts
-const MAX_AGENT_STEPS = 30;
+const MAX_AGENT_STEPS = 60;
+const FINALIZATION_RESERVE_STEPS = 4;
 ```
 
 If the model does not finish within the run's route-specific step budget:
@@ -549,7 +550,8 @@ Day-one implementation should still feel active even if actual model response st
 ### General Guards
 
 ```ts
-const MAX_AGENT_STEPS = 30;
+const MAX_AGENT_STEPS = 60;
+const FINALIZATION_RESERVE_STEPS = 4;
 const CHECKPOINT_EVERY_STEPS = 5;
 const MAX_FILE_READ_CHARS = 12000;
 const MAX_TOOL_RESULT_CHARS = 8000;

@@ -36,6 +36,7 @@ import {
 import { createGraphTools } from "./graphTools";
 import { countMarkdownVisibleText } from "./wordCount";
 import { getProjectMemoryLocation } from "../agent/projectMemory";
+import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 
 const CREATE_INTENT_PATTERN = /\b(create|creating|new|make)\b/i;
 const REPLACE_INTENT_PATTERN =
@@ -105,6 +106,9 @@ export function createVaultTools(): AgentTool[] {
     searchResearchMemoryTool,
     readResearchMemoryTool,
     appendResearchMemoryTool,
+    reviewResearchMemoryTool,
+    compactResearchMemoryTool,
+    deleteResearchMemoryEntryTool,
     listTemplatesTool,
     readTemplateTool,
     seedDefaultTemplatesTool,
@@ -623,6 +627,28 @@ export const inspectVaultContextTool: AgentTool = {
         maxFiles,
         maxCharsPerFile,
       },
+      coverage: buildRetrievalCoverage({
+        mode:
+          orderedScopedFiles.length > selectedFiles.length ||
+          files.some((file) => file.truncated)
+            ? "sampled"
+            : "exact",
+        considered: orderedScopedFiles.length,
+        read: files.length,
+        skipped: skipped.length,
+        truncated:
+          orderedScopedFiles.length > selectedFiles.length ||
+          files.some((file) => file.truncated),
+        reasons: [
+          targetFolders.length > 0 ? "target_folder_scope" : `scope_${scope}`,
+          orderedScopedFiles.length > selectedFiles.length
+            ? "file_limit_applied"
+            : "file_limit_not_reached",
+          files.some((file) => file.truncated)
+            ? "content_truncated"
+            : "content_within_limit",
+        ],
+      }),
     };
   },
 };
@@ -973,6 +999,22 @@ export const appendResearchMemoryTool: AgentTool = {
     const sourcePaths = getOptionalStringArray(args, "sourcePaths");
     const sourceUrls = getOptionalStringArray(args, "sourceUrls");
     const path = buildResearchMemoryPath(context, topic);
+    const contentHash = hashResearchMemoryText(text);
+    const existingIndexEntry = (context.getResearchMemoryIndex?.() ?? []).find(
+      (entry) => entry.path === path,
+    );
+    if (existingIndexEntry?.contentHash === contentHash) {
+      return {
+        path,
+        operation: "duplicate",
+        topic,
+        keywords: existingIndexEntry.keywords,
+        lastUpdated: existingIndexEntry.lastUpdated,
+        contentHash,
+        duplicate: true,
+        bytesWritten: 0,
+      };
+    }
     await ensureParentFolder(context, path, true);
     const now = context.now?.() ?? new Date();
     const nowIso = now.toISOString();
@@ -1004,6 +1046,11 @@ export const appendResearchMemoryTool: AgentTool = {
         path,
         keywords,
         lastUpdated: nowIso,
+        confidence: "high",
+        sourcePaths,
+        sourceUrls,
+        contentHash,
+        updateCount: (existingIndexEntry?.updateCount ?? 0) + 1,
       },
     );
     await context.setResearchMemoryIndex?.(nextIndex);
@@ -1014,7 +1061,166 @@ export const appendResearchMemoryTool: AgentTool = {
       topic,
       keywords,
       lastUpdated: nowIso,
+      contentHash,
+      duplicate: false,
       bytesWritten: getByteLength(entryText),
+    };
+  },
+};
+
+export const reviewResearchMemoryTool: AgentTool = {
+  name: "review_research_memory",
+  description:
+    "Review durable research memory hygiene: missing files, duplicate topics or content hashes, and cleanup recommendations.",
+  parameters: {
+    type: "object",
+    properties: {
+      includeExisting: {
+        type: "boolean",
+        description: "When true, include indexed memory entries in the result.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    assertResearchMemoryEnabled(context);
+    const entries = context.getResearchMemoryIndex?.() ?? [];
+    const includeExisting = getOptionalBoolean(args, "includeExisting") ?? false;
+    const duplicates = findResearchMemoryDuplicates(entries);
+    const stale: Array<{ topic: string; path: string; reason: string }> = [];
+
+    for (const entry of entries) {
+      if (!context.app.vault.getFileByPath(entry.path)) {
+        stale.push({
+          topic: entry.topic,
+          path: entry.path,
+          reason: "indexed_file_missing",
+        });
+      }
+    }
+
+    const recommendations: string[] = [];
+    if (duplicates.length > 0) {
+      recommendations.push("Compact or merge duplicate research memory topics.");
+    }
+    if (stale.length > 0) {
+      recommendations.push("Remove or repair stale memory index entries.");
+    }
+    if (recommendations.length === 0) {
+      recommendations.push("No memory hygiene issues detected.");
+    }
+
+    return {
+      operation: "review_research_memory",
+      entryCount: entries.length,
+      duplicates,
+      stale,
+      recommendations,
+      entries: includeExisting ? entries : undefined,
+    };
+  },
+};
+
+export const compactResearchMemoryTool: AgentTool = {
+  name: "compact_research_memory",
+  description:
+    "Replace one research memory note with a compacted summary after creating a backup.",
+  parameters: {
+    type: "object",
+    required: ["topic", "summary"],
+    properties: {
+      topic: { type: "string" },
+      summary: { type: "string" },
+      keywords: { type: "array", items: { type: "string" } },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    assertResearchMemoryEnabled(context);
+    const topic = getRequiredString(args, "topic").trim();
+    const summary = getRequiredString(args, "summary").trim();
+    if (!topic || !summary) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        "compact_research_memory requires non-empty topic and summary.",
+      );
+    }
+    const indexed = findResearchMemoryIndexEntry(context, topic);
+    const path = indexed?.path ?? buildResearchMemoryPath(context, topic);
+    const file = getMarkdownFileByPath(context, path);
+    const current = await context.app.vault.read(file);
+    const backupPath = await backupCurrentFile(context, file, current);
+    const nowIso = (context.now?.() ?? new Date()).toISOString();
+    const content = [
+      `# ${indexed?.topic ?? topic}`,
+      "",
+      `## Compacted Memory - ${nowIso}`,
+      "",
+      summary,
+      "",
+    ].join("\n");
+    await context.app.vault.modify(file, content);
+    const keywords = getOptionalStringArray(args, "keywords");
+    const nextIndex = upsertResearchMemoryIndexEntry(
+      context.getResearchMemoryIndex?.() ?? [],
+      {
+        topic: indexed?.topic ?? topic,
+        path,
+        keywords,
+        lastUpdated: nowIso,
+        confidence: indexed?.confidence ?? "medium",
+        sourcePaths: indexed?.sourcePaths ?? [],
+        sourceUrls: indexed?.sourceUrls ?? [],
+        contentHash: hashResearchMemoryText(summary),
+        updateCount: (indexed?.updateCount ?? 0) + 1,
+      },
+    );
+    await context.setResearchMemoryIndex?.(nextIndex);
+    return {
+      path,
+      operation: "replace",
+      topic: indexed?.topic ?? topic,
+      backupPath,
+      bytesWritten: getByteLength(content),
+      bytesDeleted: getByteLength(current),
+    };
+  },
+};
+
+export const deleteResearchMemoryEntryTool: AgentTool = {
+  name: "delete_research_memory_entry",
+  description:
+    "Trash one durable research memory note and remove its index entry. Requires explicit delete/remove/trash memory intent.",
+  parameters: {
+    type: "object",
+    required: ["topic"],
+    properties: {
+      topic: { type: "string" },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    assertResearchMemoryEnabled(context);
+    if (!/\b(delete|remove|trash)\b/i.test(context.originalPrompt)) {
+      throw new Error("delete_research_memory_entry requires explicit delete, remove, or trash intent.");
+    }
+    const topic = getRequiredString(args, "topic").trim();
+    const indexed = findResearchMemoryIndexEntry(context, topic);
+    const path = indexed?.path ?? buildResearchMemoryPath(context, topic);
+    const file = getMarkdownFileByPath(context, path);
+    const current = await context.app.vault.read(file);
+    const backupPath = await backupCurrentFile(context, file, current);
+    await trashVaultPath(context, file);
+    const nextIndex = (context.getResearchMemoryIndex?.() ?? []).filter(
+      (entry) => entry.path !== path,
+    );
+    await context.setResearchMemoryIndex?.(nextIndex);
+    return {
+      path,
+      operation: "trash",
+      topic: indexed?.topic ?? topic,
+      backupPath,
+      bytesDeleted: getByteLength(current),
     };
   },
 };
@@ -2111,11 +2317,65 @@ function upsertResearchMemoryIndexEntry(
       ...extractResearchKeywords(entry.topic),
     ]).slice(0, 24),
     lastUpdated: entry.lastUpdated,
+    confidence: entry.confidence ?? byPath.get(entry.path)?.confidence,
+    sourcePaths: dedupeStrings([
+      ...(byPath.get(entry.path)?.sourcePaths ?? []),
+      ...(entry.sourcePaths ?? []),
+    ]).slice(0, 24),
+    sourceUrls: dedupeStrings([
+      ...(byPath.get(entry.path)?.sourceUrls ?? []),
+      ...(entry.sourceUrls ?? []),
+    ]).slice(0, 24),
+    contentHash: entry.contentHash ?? byPath.get(entry.path)?.contentHash,
+    updateCount: entry.updateCount ?? byPath.get(entry.path)?.updateCount,
   });
 
   return [...byPath.values()]
     .sort((left, right) => right.lastUpdated.localeCompare(left.lastUpdated))
     .slice(0, 200);
+}
+
+function findResearchMemoryIndexEntry(
+  context: ToolExecutionContext,
+  topic: string,
+): ResearchMemoryIndexEntry | undefined {
+  const targetPath = buildResearchMemoryPath(context, topic);
+  return (context.getResearchMemoryIndex?.() ?? []).find(
+    (entry) =>
+      entry.path === targetPath ||
+      entry.topic.toLowerCase() === topic.trim().toLowerCase(),
+  );
+}
+
+function findResearchMemoryDuplicates(
+  entries: ResearchMemoryIndexEntry[],
+): Array<{ topic: string; paths: string[]; reason: string }> {
+  const groups = new Map<string, ResearchMemoryIndexEntry[]>();
+  for (const entry of entries) {
+    const keys = [
+      `topic:${entry.topic.trim().toLowerCase()}`,
+      entry.contentHash ? `hash:${entry.contentHash}` : null,
+    ].filter((key): key is string => key !== null);
+    for (const key of keys) {
+      groups.set(key, [...(groups.get(key) ?? []), entry]);
+    }
+  }
+
+  return [...groups.entries()]
+    .filter(([, group]) => new Set(group.map((entry) => entry.path)).size > 1)
+    .map(([key, group]) => ({
+      topic: group[0]?.topic ?? "unknown",
+      paths: dedupeStrings(group.map((entry) => entry.path)),
+      reason: key.startsWith("hash:") ? "duplicate_content_hash" : "duplicate_topic",
+    }));
+}
+
+function hashResearchMemoryText(value: string): string {
+  let hash = 0;
+  for (const char of value.replace(/\s+/g, " ").trim().toLowerCase()) {
+    hash = (hash * 31 + char.charCodeAt(0)) | 0;
+  }
+  return Math.abs(hash).toString(36) || "0";
 }
 
 function rankResearchMemoryIndex(
@@ -2196,7 +2456,7 @@ function getTemplateFolder(context: ToolExecutionContext): string {
 function getTemplateOutputFolder(context: ToolExecutionContext): string {
   const rawFolder = context.settings.templateOutputFolder?.trim();
   if (!rawFolder) {
-    return "";
+    return getActiveProjectBaseFolder(context);
   }
 
   const folder = normalizeVaultPath(rawFolder, { allowRoot: true });
@@ -2208,6 +2468,28 @@ function getTemplateOutputFolder(context: ToolExecutionContext): string {
   }
 
   return folder;
+}
+
+function getActiveProjectBaseFolder(context: ToolExecutionContext): string {
+  const activePath =
+    context.getCurrentMarkdownFile?.()?.path ??
+    context.app.workspace.getActiveFile()?.path ??
+    "";
+  if (!activePath.trim()) {
+    return "";
+  }
+
+  const normalizedPath = normalizeVaultPath(activePath, {
+    requireMarkdown: true,
+  });
+  const lastSlash = normalizedPath.lastIndexOf("/");
+  if (lastSlash <= 0) {
+    return "";
+  }
+
+  return normalizeVaultPath(normalizedPath.slice(0, lastSlash), {
+    allowRoot: true,
+  });
 }
 
 function normalizeTemplatePath(
