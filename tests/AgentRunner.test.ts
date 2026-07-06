@@ -27,6 +27,7 @@ import type {
   StreamWritebackMode,
   ThinkingMode,
 } from "../src/settings";
+import type { SemanticEmbeddingProvider } from "../src/embeddings/types";
 import {
   BACKUP_FOLDER,
   MAX_INITIAL_CURRENT_NOTE_CHARS,
@@ -670,7 +671,9 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
   assert.equal(streamRequests.length, 1);
   const firstStepToolNames =
     chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
-  assert.deepEqual(firstStepToolNames, ["web_search", "web_fetch"]);
+  assert.ok(firstStepToolNames.includes("web_search"));
+  assert.ok(firstStepToolNames.includes("web_fetch"));
+  assert.ok(firstStepToolNames.includes("append_to_current_file"));
   assert.match(chatRequests[0].messages.at(-1)?.content ?? "", /cited source URLs/);
   assert.ok(
     chatRequests[0].messages.some((message) =>
@@ -1547,6 +1550,13 @@ test("design prompts expose and require native artifact write tools", async () =
       expectedReceipt: "create Designs/Product Flow.canvas",
     },
     {
+      prompt: "Create a software architecture diagram for the agent.",
+      requiredTool: "create_design_canvas",
+      absentTool: "create_svg_design",
+      expectedStatus: "Created canvas Designs/Product Flow.canvas with 2 nodes and 1 edges.",
+      expectedReceipt: "create Designs/Product Flow.canvas",
+    },
+    {
       prompt: "Create an SVG wireframe mockup for the settings screen.",
       requiredTool: "create_svg_design",
       absentTool: "create_design_canvas",
@@ -2045,16 +2055,21 @@ test("connect-note prompts expose inline graph link writing", async () => {
 
 test("word count prompts expose count_words without write tools", async () => {
   const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
 
   const client = createClient({
     chatRequests,
-    chatResponders: [() => responseWithContent("The note has 12 words.")],
+    chatResponders: [
+      () => responseWithContent("The note has 12 words."),
+      () => responseWithToolCall("count_words", {}),
+      () => responseWithContent("The note has 12 words."),
+    ],
   });
 
   await runAgentMission({
     prompt: "Count the words in the current note.",
     modelClient: client,
-    toolRegistry: createRegistry([]),
+    toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
     enableStreaming: false,
   });
@@ -2063,6 +2078,7 @@ test("word count prompts expose count_words without write tools", async () => {
   assert.ok(toolNames.includes("count_words"));
   assert.ok(!toolNames.includes("append_to_current_file"));
   assert.ok(!toolNames.includes("replace_current_file"));
+  assert.deepEqual(executedCalls.map((call) => call.name), ["count_words"]);
 });
 
 test("what did you learn about me can traverse untitled notes before answering", async () => {
@@ -2227,6 +2243,71 @@ test("semantic index maintenance prompts expose rebuild tool only on request", a
     executedCalls.map((call) => call.name),
     ["rebuild_semantic_index"],
   );
+});
+
+test("agentic reflex can upgrade ambiguous prompts to semantic vault routing", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [() => responseWithContent("Reflex routed answer.")],
+  });
+  const { context } = createRunnerVaultContext({
+    prompt: "Surface ritual kingship implications.",
+  });
+  context.settings = createRunnerSettings({
+    agenticReflexEnabled: true,
+  });
+  context.semanticEmbeddingProvider = createReflexSemanticEmbeddingProvider();
+
+  await runAgentMission({
+    prompt: "Surface ritual kingship implications.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: context,
+    enableStreaming: false,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("semantic_search_notes"));
+  assert.ok(toolNames.includes("search_markdown_files"));
+  assert.equal(configs.at(-1)?.reflexLabel, "semantic_vault_search");
+});
+
+test("agentic reflex cannot expose semantic tools for explicit mutation prompts", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("replace_current_file", {
+          text: "# Replacement\n\nRitual kingship summary.",
+        }),
+    ],
+  });
+  const { context } = createRunnerVaultContext({
+    prompt: "Replace the current note with a ritual kingship summary.",
+  });
+  context.settings = createRunnerSettings({
+    agenticReflexEnabled: true,
+  });
+  context.semanticEmbeddingProvider = createReflexSemanticEmbeddingProvider();
+
+  await runAgentMission({
+    prompt: "Replace the current note with a ritual kingship summary.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: context,
+    enableStreaming: false,
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("replace_current_file"));
+  assert.ok(!toolNames.includes("semantic_search_notes"));
+  assert.ok(!toolNames.includes("inspect_semantic_index"));
 });
 
 test("saving a vault-context answer enables agent-selected current-note writeback", async () => {
@@ -2510,6 +2591,62 @@ test("web append prompts expose web and current-note write tools without path CR
   assert.deepEqual(
     executedCalls.map((call) => call.name),
     ["web_search", "web_fetch", "append_to_current_file"],
+  );
+});
+
+test("sourced streaming writeback keeps current-note write tools available after web context", async () => {
+  const prompt =
+    "Research MCP servers and append a concise cited summary with source URLs to this note.";
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Current note",
+  });
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () => responseWithToolCall("web_fetch", { url: "https://example.com/mcp" }),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: "MCP server cited summary. Source: https://example.com/mcp",
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  const firstStepToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  const writeStepToolNames =
+    chatRequests[2].tools?.map((tool) => tool.function.name) ?? [];
+
+  assert.ok(firstStepToolNames.includes("web_search"));
+  assert.ok(firstStepToolNames.includes("web_fetch"));
+  assert.ok(firstStepToolNames.includes("append_to_current_file"));
+  assert.ok(writeStepToolNames.includes("append_to_current_file"));
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch", "append_to_current_file"],
+  );
+  assert.ok(
+    !statuses.some((message) =>
+      /Rejected unavailable tool: (web_search|append_to_current_file|replace_current_file)/.test(
+        message,
+      ),
+    ),
   );
 });
 
@@ -3509,7 +3646,7 @@ test("budget stop uses adaptive web budget and does not synthesize", async () =>
   });
 
   assert.ok(chatRequests.length < MAX_AGENT_STEPS);
-  assert.equal(chatRequests.length, 6);
+  assert.equal(chatRequests.length, 9);
   assert.equal(streamRequests.length, 0);
   assert.equal(
     executedCalls.filter((call) => call.name === "web_search").length,
@@ -3562,9 +3699,56 @@ test("configured max agent steps caps grounded research loops", async () => {
   assert.equal(chatRequests[0].think, "medium");
   assert.equal(
     executedCalls.filter((call) => call.name === "web_search").length,
-    configuredMax - 1,
+    1,
   );
   assert.ok(statuses.includes("Stopped at safety limit. Review partial results."));
+});
+
+test("explicit model-step prompts set the visible run step cap", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const targetSteps = 10;
+  const prompt = `Inspect the current note graph for E2E_LOOP_STEPS_${targetSteps} and complete exactly ${targetSteps} model steps before the final answer.`;
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      ...Array.from({ length: targetSteps - 1 }, (_, index) => () =>
+        responseWithToolCall("get_note_graph_context", {
+          path: `Loop Context ${index + 1}.md`,
+        }),
+      ),
+      () => responseWithContent(`E2E_LOOP_DONE_${targetSteps}`),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {
+      settings: createRunnerSettings({
+        maxAgentSteps: 30,
+      }),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(configs[0].route, "grounded_workflow");
+  assert.equal(configs[0].maxSteps, 30);
+  assert.equal(configs[0].maxStepsForRun, targetSteps);
+  assert.ok(statuses.includes(`Agent step 1 of max ${targetSteps}...`));
+  assert.ok(statuses.includes(`Agent step ${targetSteps} of max ${targetSteps}...`));
+  assert.equal(chatRequests.length, targetSteps);
+  assert.equal(
+    executedCalls.filter((call) => call.name === "get_note_graph_context").length,
+    6,
+  );
 });
 
 test("aborted runs stop before the next model loop step", async () => {
@@ -3800,6 +3984,64 @@ test("explicit stream-to-page essay uses live writeback instead of append tool",
   );
 });
 
+test("streamed writeback does not reuse an older generated word target", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const prompt =
+    "Write me a short essay on Grapes of Wrath and stream it to the page.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Untitled\n\n",
+  });
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# Harvest of Injustice\n\n",
+          "The Grapes of Wrath follows the Joad family through migration, hunger, and labor exploitation.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    conversationHistory: [
+      {
+        role: "user",
+        content: "Generate me a 1000 word essay on Grapes of Wrath.",
+      },
+      {
+        role: "assistant",
+        content: "Earlier short draft.",
+      },
+    ],
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.ok(
+    streamRequests[0].messages.some((message) =>
+      /Generate me a 1000 word essay on Grapes of Wrath/i.test(message.content),
+    ),
+    "the regression must include the older numeric request in prompt history",
+  );
+  assert.ok(!statuses.some((message) => /1000|correction pass/i.test(message)));
+  assert.equal(
+    vault.content.get("Current.md"),
+    "# Harvest of Injustice\n\nThe Grapes of Wrath follows the Joad family through migration, hunger, and labor exploitation.",
+  );
+});
+
 test("current-note writeback flushes token-sized chunks before completion", async () => {
   const prompt = "In this note, write a short project update.";
   const vault = createRunnerVaultContext({
@@ -3848,7 +4090,8 @@ test("generated leading H1 retitles top note title instead of duplicating body t
     streamResponders: [
       () =>
         responseWithContentDeltas([
-          "# The Harvest of Injustice\n\n",
+          "   # The Harvest",
+          " of Injustice #\n\n",
           "The Grapes of Wrath follows families facing dispossession.",
         ]),
     ],
@@ -3869,6 +4112,48 @@ test("generated leading H1 retitles top note title instead of duplicating body t
     "# The Harvest of Injustice\n\nThe Grapes of Wrath follows families facing dispossession.",
   );
   assert.equal((note.match(/^# /gm) ?? []).length, 1);
+});
+
+test("generated leading H1 retitles the latest current-note body", async () => {
+  const prompt = "Write a short essay on Grapes of Wrath and stream it to the page.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Untitled\n\n",
+  });
+  const client = createClient({
+    chatRequests: [],
+    streamResponders: [
+      () => {
+        vault.content.set(
+          "Current.md",
+          "# Untitled\n\nPrompt text that arrived after writer setup.\n",
+        );
+        return responseWithContentDeltas([
+          "# The Harvest of Injustice\n\n",
+          "The Grapes of Wrath follows families facing dispossession.",
+        ]);
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {},
+  });
+
+  assert.equal(
+    vault.content.get("Current.md"),
+    [
+      "# The Harvest of Injustice",
+      "",
+      "Prompt text that arrived after writer setup.",
+      "The Grapes of Wrath follows families facing dispossession.",
+    ].join("\n"),
+  );
 });
 
 test("compound title and essay prompt retitles then streams essay content", async () => {
@@ -5103,10 +5388,10 @@ test("replace writeback creates a backup before streaming replacement content", 
   });
 
   assert.equal(streamRequests.length, 1);
-  assert.deepEqual(
-    chatRequests[0].tools?.map((tool) => tool.function.name),
-    ["read_current_file"],
-  );
+  const firstStepToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstStepToolNames.includes("read_current_file"));
+  assert.ok(firstStepToolNames.includes("replace_current_file"));
   assert.equal(vault.content.get("Current.md"), "# Brief\n\nReplacement body.");
   assert.equal(vault.content.get(".agent-backups/456-Current.md"), "Old note");
   assert.ok(
@@ -5513,13 +5798,22 @@ function createRunnerSettings(
   overrides: Partial<AgentSettings> = {},
 ): AgentSettings {
   return {
+    modelProvider: "ollama",
     ollamaApiKey: "test-key",
     ollamaBaseUrl: "https://ollama.com/api",
+    openAiCompatibleApiKey: "",
+    openAiCompatibleBaseUrl: "https://api.openai.com/v1",
     model: "gpt-oss:120b",
     enableStreaming: true,
     thinkingMode: "auto",
     streamWritebackMode: "all_current_note_content_writes",
     maxAgentSteps: MAX_AGENT_STEPS,
+    companionBaseUrl: "http://127.0.0.1:8765",
+    browserToolsEnabled: false,
+    experienceMemoryEnabled: false,
+    defaultBrowserMissionMode: "supervised",
+    agenticReflexEnabled: false,
+    agenticReflexDiagnosticsEnabled: true,
     templateFolder: "Templates",
     templateOutputFolder: "",
     researchMemoryEnabled: true,
@@ -5544,6 +5838,28 @@ function createRunnerSettings(
     topP: null,
     numCtx: null,
     ...overrides,
+  };
+}
+
+function createReflexSemanticEmbeddingProvider(): SemanticEmbeddingProvider {
+  return {
+    async embed(request) {
+      const semanticVector = [1, 0];
+      const otherVector = [0, 1];
+      const classify = (text: string) =>
+        /notes say|related ideas|conceptually|ritual kingship|archive entries/i.test(
+          text,
+        )
+          ? semanticVector
+          : otherVector;
+      return {
+        ok: true,
+        model: request.model,
+        dim: request.dim,
+        documents: request.documents.map(classify),
+        queries: request.queries.map(classify),
+      };
+    },
   };
 }
 

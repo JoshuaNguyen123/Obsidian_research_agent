@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Ruffle Game Host</title>
+  <script src="/static/ruffle/ruffle.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #111;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #container {
+      width: 960px;
+      height: 720px;
+      border: 1px solid #333;
+    }
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+  <script>
+    window.RufflePlayer = window.RufflePlayer || {};
+    window.addEventListener("DOMContentLoaded", () => {
+      const params = new URLSearchParams(window.location.search);
+      const swf = params.get("swf");
+      const ruffle = window.RufflePlayer.newest();
+      const player = ruffle.createPlayer();
+      const container = document.getElementById("container");
+      container.appendChild(player);
+      if (swf) {
+        player.ruffle().load(swf);
+      }
+    });
+  </script>
+</body>
+</html>

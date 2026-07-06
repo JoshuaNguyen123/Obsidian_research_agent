@@ -2,6 +2,7 @@ import { DefaultToolRegistry } from "./ToolRegistry";
 import type { ToolRegistry } from "./types";
 import { createCodeTools } from "./codeTools";
 import { createDesignTools } from "./designTools";
+import { createCompanionTools } from "./companionTools";
 import { createVaultIndexTools } from "./vaultIndexTools";
 import { createVaultTools } from "./vaultTools";
 import { createWebViewerTools } from "./webViewerTools";
@@ -17,5 +18,6 @@ export function createDefaultToolRegistry(): ToolRegistry {
     ...createWebViewerTools(),
     ...createCodeTools(),
     ...createDesignTools(),
+    ...createCompanionTools(),
   ]);
 }

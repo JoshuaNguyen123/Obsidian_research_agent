@@ -34,6 +34,11 @@ export interface ResearchMemoryIndexEntry {
   path: string;
   keywords: string[];
   lastUpdated: string;
+  confidence?: "low" | "medium" | "high";
+  sourcePaths?: string[];
+  sourceUrls?: string[];
+  contentHash?: string;
+  updateCount?: number;
 }
 
 export interface ToolExecutionContext {
@@ -42,6 +47,7 @@ export interface ToolExecutionContext {
   originalPrompt: string;
   httpTransport: HttpTransport;
   runtimeCache?: AgentRuntimeCache;
+  reportProgress?: (message: string) => void;
   writeAutonomy?: boolean;
   missionIntent?: MissionIntent;
   now?: () => Date;

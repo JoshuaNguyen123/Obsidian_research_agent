@@ -13,7 +13,7 @@ import {
   MAX_WEB_FETCH_CHARS,
   MAX_WEB_SEARCH_SNIPPET_CHARS,
 } from "../src/tools/constants";
-import type { ToolExecutionContext } from "../src/tools/types";
+import type { ResearchMemoryIndexEntry, ToolExecutionContext } from "../src/tools/types";
 
 test("registry exposes tool definitions and rejects unknown tools", async () => {
   const registry = createDefaultToolRegistry();
@@ -44,6 +44,9 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.ok(definitions.some((tool) => tool.function.name === "search_research_memory"));
   assert.ok(definitions.some((tool) => tool.function.name === "read_research_memory"));
   assert.ok(definitions.some((tool) => tool.function.name === "append_research_memory"));
+  assert.ok(definitions.some((tool) => tool.function.name === "review_research_memory"));
+  assert.ok(definitions.some((tool) => tool.function.name === "compact_research_memory"));
+  assert.ok(definitions.some((tool) => tool.function.name === "delete_research_memory_entry"));
   assert.ok(definitions.some((tool) => tool.function.name === "append_to_current_section"));
   assert.ok(definitions.some((tool) => tool.function.name === "create_file"));
 
@@ -1336,6 +1339,46 @@ test("fill_template supports ad hoc template text and default output folders", a
   assert.ok(mock.operations.includes("createFolder:Generated"));
 });
 
+test("fill_template defaults generated notes to the active project folder", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Use this template to create a note.",
+    activePath: "Projects/Novel/Current.md",
+  });
+
+  const filled = await registry.execute(
+    {
+      name: "fill_template",
+      arguments: {
+        templateText: "# {{title}}\n\n{{body}}",
+        values: {
+          title: "Scene Plan",
+          body: "Draft the opening scene.",
+        },
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(filled.ok, true);
+  assert.equal(
+    mock.content.get("Projects/Novel/Scene Plan.md"),
+    "# Scene Plan\n\nDraft the opening scene.",
+  );
+  assert.ok(mock.operations.includes("createFolder:Projects/Novel"));
+  assert.deepEqual(filled.output, {
+    path: "Projects/Novel/Scene Plan.md",
+    operation: "create",
+    templateSource: "ad_hoc_template",
+    templatePath: undefined,
+    placeholders: ["title", "body"],
+    valuesApplied: ["body", "title"],
+    bytesWritten: new TextEncoder().encode(
+      "# Scene Plan\n\nDraft the opening scene.",
+    ).length,
+  });
+});
+
 test("fill_template rejects unresolved placeholders before creating notes", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({
@@ -1629,12 +1672,7 @@ test("research memory tools write markdown source and update index", async () =>
     prompt: "Save this to research memory for my Renaissance topic.",
     now: new Date("2026-07-04T12:00:00.000Z"),
   });
-  let memoryIndex: Array<{
-    topic: string;
-    path: string;
-    keywords: string[];
-    lastUpdated: string;
-  }> = [];
+  let memoryIndex: ResearchMemoryIndexEntry[] = [];
   mock.context.getResearchMemoryIndex = () => memoryIndex;
   mock.context.setResearchMemoryIndex = async (entries) => {
     memoryIndex = entries;
@@ -1659,14 +1697,14 @@ test("research memory tools write markdown source and update index", async () =>
     mock.content.get("Agent Memory/Research/renaissance-research.md") ?? "",
     /Humanism and patronage/,
   );
-  assert.deepEqual(memoryIndex, [
-    {
-      topic: "Renaissance Research",
-      path: "Agent Memory/Research/renaissance-research.md",
-      keywords: ["humanism", "patronage", "renaissance"],
-      lastUpdated: "2026-07-04T12:00:00.000Z",
-    },
-  ]);
+  assert.equal(memoryIndex.length, 1);
+  assert.equal(memoryIndex[0].topic, "Renaissance Research");
+  assert.equal(memoryIndex[0].path, "Agent Memory/Research/renaissance-research.md");
+  assert.deepEqual(memoryIndex[0].keywords, ["humanism", "patronage", "renaissance"]);
+  assert.equal(memoryIndex[0].lastUpdated, "2026-07-04T12:00:00.000Z");
+  assert.equal(memoryIndex[0].confidence, "high");
+  assert.equal(memoryIndex[0].updateCount, 1);
+  assert.equal(typeof memoryIndex[0].contentHash, "string");
 
   const read = await registry.execute(
     {
@@ -1694,6 +1732,124 @@ test("research memory tools write markdown source and update index", async () =>
   assert.equal(matches.length, 1);
   assert.equal(matches[0].path, "Agent Memory/Research/renaissance-research.md");
   assert.equal(matches[0].found, true);
+
+  const duplicate = await registry.execute(
+    {
+      name: "append_research_memory",
+      arguments: {
+        topic: "Renaissance Research",
+        text: "Humanism and patronage are important threads.",
+        keywords: ["humanism", "patronage"],
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(duplicate.ok, true);
+  assert.equal((duplicate.output as { duplicate: boolean }).duplicate, true);
+  assert.equal(memoryIndex[0].updateCount, 1);
+});
+
+test("research memory review, compact, and delete use backups and index hygiene", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Review, compact, and delete research memory for my Renaissance topic.",
+    now: new Date("2026-07-04T12:00:00.000Z"),
+  });
+  let memoryIndex: ResearchMemoryIndexEntry[] = [
+    {
+      topic: "Renaissance Research",
+      path: "Agent Memory/Research/renaissance-research.md",
+      keywords: ["humanism"],
+      lastUpdated: "2026-07-04T11:00:00.000Z",
+      contentHash: "same-hash",
+      updateCount: 1,
+    },
+    {
+      topic: "Renaissance Research Copy",
+      path: "Agent Memory/Research/renaissance-copy.md",
+      keywords: ["humanism"],
+      lastUpdated: "2026-07-04T11:30:00.000Z",
+      contentHash: "same-hash",
+      updateCount: 1,
+    },
+    {
+      topic: "Missing Memory",
+      path: "Agent Memory/Research/missing.md",
+      keywords: [],
+      lastUpdated: "2026-07-04T10:00:00.000Z",
+    },
+  ];
+  mock.context.getResearchMemoryIndex = () => memoryIndex;
+  mock.context.setResearchMemoryIndex = async (entries) => {
+    memoryIndex = entries;
+  };
+  mock.content.set(
+    "Agent Memory/Research/renaissance-research.md",
+    "# Renaissance Research\n\nVerbose memory.",
+  );
+  mock.content.set(
+    "Agent Memory/Research/renaissance-copy.md",
+    "# Renaissance Research Copy\n\nDuplicate memory.",
+  );
+
+  const review = await registry.execute(
+    {
+      name: "review_research_memory",
+      arguments: { includeExisting: true },
+    },
+    mock.context,
+  );
+
+  assert.equal(review.ok, true);
+  const reviewOutput = review.output as {
+    entryCount: number;
+    duplicates: unknown[];
+    stale: Array<{ path: string }>;
+  };
+  assert.equal(reviewOutput.entryCount, 3);
+  assert.equal(reviewOutput.duplicates.length, 1);
+  assert.deepEqual(reviewOutput.stale.map((entry) => entry.path), [
+    "Agent Memory/Research/missing.md",
+  ]);
+
+  const compact = await registry.execute(
+    {
+      name: "compact_research_memory",
+      arguments: {
+        topic: "Renaissance Research",
+        summary: "Compacted memory keeps humanism and patronage only.",
+        keywords: ["humanism", "patronage"],
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(compact.ok, true);
+  const compactOutput = compact.output as { backupPath: string; bytesDeleted: number };
+  assert.match(compactOutput.backupPath, /^\.agent-backups\//);
+  assert.ok(compactOutput.bytesDeleted > 0);
+  assert.match(
+    mock.content.get("Agent Memory/Research/renaissance-research.md") ?? "",
+    /Compacted memory keeps humanism/,
+  );
+  assert.equal(memoryIndex.find((entry) => entry.topic === "Renaissance Research")?.updateCount, 2);
+
+  const deleted = await registry.execute(
+    {
+      name: "delete_research_memory_entry",
+      arguments: { topic: "Renaissance Research Copy" },
+    },
+    mock.context,
+  );
+
+  assert.equal(deleted.ok, true);
+  assert.equal(mock.content.has("Agent Memory/Research/renaissance-copy.md"), false);
+  assert.ok(mock.operations.some((operation) => operation.startsWith("trash:Agent Memory/Research/renaissance-copy.md")));
+  assert.equal(
+    memoryIndex.some((entry) => entry.path === "Agent Memory/Research/renaissance-copy.md"),
+    false,
+  );
 });
 
 test("research memory write tolerates an already existing memory folder", async () => {
@@ -2553,13 +2709,22 @@ function createMockContext(options: {
   const context: ToolExecutionContext = {
     app: app as never,
     settings: {
+      modelProvider: "ollama",
       ollamaApiKey: "test-key",
       ollamaBaseUrl: "https://ollama.com/api",
+      openAiCompatibleApiKey: "",
+      openAiCompatibleBaseUrl: "https://api.openai.com/v1",
       model: "gpt-oss:120b",
       enableStreaming: true,
       thinkingMode: "auto",
       streamWritebackMode: "all_current_note_content_writes",
       maxAgentSteps: 10,
+      companionBaseUrl: "http://127.0.0.1:8765",
+      browserToolsEnabled: false,
+      experienceMemoryEnabled: false,
+      defaultBrowserMissionMode: "supervised",
+      agenticReflexEnabled: false,
+      agenticReflexDiagnosticsEnabled: true,
       templateFolder: "Templates",
       templateOutputFolder: "",
       researchMemoryEnabled: true,

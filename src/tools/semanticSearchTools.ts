@@ -13,6 +13,7 @@ import type {
   SemanticVaultIndex,
 } from "../embeddings/semanticIndexTypes";
 import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
+import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 
 const DEFAULT_SEMANTIC_LIMIT = 8;
 const MAX_SEMANTIC_LIMIT = 20;
@@ -215,6 +216,18 @@ export const semanticSearchNotesTool: AgentTool = {
       fallbackReason,
       resultCount: results.length,
       results,
+      coverage: buildRetrievalCoverage({
+        mode: fallbackUsed ? "fallback" : "sampled",
+        considered: chunks.length,
+        read: results.length,
+        skipped: Math.max(0, chunks.length - results.length),
+        truncated: results.length < chunks.length,
+        fallbackUsed,
+        reasons: [
+          fallbackUsed ? String(fallbackReason ?? "lexical_fallback") : "live_semantic_search",
+          folder ? "folder_scope" : "vault_scope",
+        ],
+      }),
     };
   },
 };
@@ -377,6 +390,15 @@ async function searchSemanticIndexFirst({
         ? result.reasons
         : ["indexed_semantic_similarity"],
     })),
+    coverage: buildRetrievalCoverage({
+      mode: "indexed",
+      considered: search.results.length,
+      read: search.results.length,
+      skipped: 0,
+      truncated: false,
+      fallbackUsed: false,
+      reasons: ["fresh_persisted_semantic_index"],
+    }),
   };
 }
 

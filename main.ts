@@ -171,6 +171,17 @@ export default class AgenticResearcherPlugin extends Plugin {
     } = record;
 
     const settings = Object.assign({}, DEFAULT_SETTINGS, settingsData);
+    settings.modelProvider =
+      settings.modelProvider === "openai_compatible"
+        ? settings.modelProvider
+        : DEFAULT_SETTINGS.modelProvider;
+    settings.openAiCompatibleApiKey =
+      typeof settings.openAiCompatibleApiKey === "string"
+        ? settings.openAiCompatibleApiKey.trim()
+        : "";
+    settings.openAiCompatibleBaseUrl =
+      normalizeBaseUrlSetting(settings.openAiCompatibleBaseUrl) ??
+      DEFAULT_SETTINGS.openAiCompatibleBaseUrl;
     if (
       settings.requestTimeoutMs === LEGACY_DEFAULT_REQUEST_TIMEOUT_MS ||
       !Number.isFinite(settings.requestTimeoutMs) ||
@@ -248,6 +259,19 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     settings.semanticIndexPersistVectors =
       settings.semanticIndexPersistVectors !== false;
+    settings.companionBaseUrl =
+      normalizeCompanionBaseUrl(settings.companionBaseUrl) ??
+      DEFAULT_SETTINGS.companionBaseUrl;
+    settings.browserToolsEnabled = settings.browserToolsEnabled === true;
+    settings.experienceMemoryEnabled =
+      settings.experienceMemoryEnabled === true;
+    settings.defaultBrowserMissionMode =
+      settings.defaultBrowserMissionMode === "extract_only"
+        ? "extract_only"
+        : "supervised";
+    settings.agenticReflexEnabled = settings.agenticReflexEnabled === true;
+    settings.agenticReflexDiagnosticsEnabled =
+      settings.agenticReflexDiagnosticsEnabled !== false;
 
     this.settings = settings;
     this.semanticIndexService = this.createSemanticIndexService();
@@ -566,6 +590,34 @@ function normalizeVaultFolderSetting(value: unknown, fallback: string): string {
   }
 
   return trimmed;
+}
+
+function normalizeCompanionBaseUrl(value: unknown): string | null {
+  return normalizeBaseUrlSetting(value);
+}
+
+function normalizeBaseUrlSetting(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    if (parsed.username || parsed.password) {
+      return null;
+    }
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
 }
 
 function normalizeResearchMemoryIndex(

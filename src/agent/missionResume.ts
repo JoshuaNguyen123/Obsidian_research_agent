@@ -8,7 +8,16 @@ import type { ToolExecutionContext } from "../tools/types";
 export interface MissionResumeContext {
   path: string;
   ledger: MissionLedger;
+  plan: MissionResumePlan;
   promptContext: string;
+}
+
+export interface MissionResumePlan {
+  runId: string;
+  canResume: boolean;
+  reason: string;
+  remainingActions: string[];
+  restoredEvidenceCount: number;
 }
 
 export function hasMissionResumeIntent(prompt: string): boolean {
@@ -50,7 +59,28 @@ export async function buildMissionResumeContext({
   return {
     path: loaded.path,
     ledger: loaded.ledger,
+    plan: buildMissionResumePlan(loaded.ledger),
     promptContext: formatLedgerForModel(loaded.ledger, loaded.path),
+  };
+}
+
+export function buildMissionResumePlan(ledger: MissionLedger): MissionResumePlan {
+  const remainingActions = [
+    ...ledger.remainingActions,
+    ...ledger.nextActions,
+  ].filter((item, index, all) => item.trim() && all.indexOf(item) === index);
+  const terminalComplete = ledger.status === "complete" &&
+    ledger.acceptance?.status === "pass";
+  return {
+    runId: ledger.runId,
+    canResume: !terminalComplete,
+    reason: terminalComplete
+      ? "ledger_already_complete"
+      : ledger.blockers.length > 0
+        ? "ledger_has_blockers"
+        : "ledger_has_remaining_work",
+    remainingActions,
+    restoredEvidenceCount: ledger.evidence.length,
   };
 }
 
@@ -77,6 +107,11 @@ export function formatLedgerForModel(
     `Incomplete tasks: ${incomplete.map((task) => task.title).join("; ") || "none"}`,
     `Blockers: ${ledger.blockers.join("; ") || "none"}`,
     `Next actions: ${ledger.nextActions.join("; ") || "none"}`,
+    `Remaining actions: ${ledger.remainingActions.join("; ") || "none"}`,
+    `Acceptance: ${ledger.acceptance?.status ?? "unchecked"}`,
+    `Acceptance missing: ${ledger.acceptance?.missing.join(", ") || "none"}`,
+    `Resume count: ${ledger.resumeCount}`,
+    `Last safe step: ${ledger.lastSafeStep}`,
     "Evidence:",
     evidence.length > 0 ? evidence.join("\n") : "none",
   ].join("\n");

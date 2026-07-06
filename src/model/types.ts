@@ -1,5 +1,6 @@
 export type ModelRole = "system" | "user" | "assistant" | "tool";
 export type ModelThink = boolean | "low" | "medium" | "high" | "max";
+export type ModelProvider = "ollama" | "openai_compatible";
 
 export type ModelClientErrorCategory =
   | "missing_api_key"
@@ -42,6 +43,7 @@ export interface ModelChatMessage {
   content: string;
   thinking?: string;
   toolName?: string;
+  toolCallId?: string;
   toolCalls?: ModelToolCall[];
 }
 

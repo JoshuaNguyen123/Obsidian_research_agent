@@ -28,6 +28,17 @@ export type MissionEvidenceKind =
   | "artifact"
   | "receipt";
 
+export type MissionStage =
+  | "plan"
+  | "gather"
+  | "browser_observe"
+  | "browser_act"
+  | "synthesize"
+  | "verify"
+  | "write_save"
+  | "memory_reflection"
+  | "next_action";
+
 export interface MissionTask {
   id: string;
   title: string;
@@ -47,6 +58,21 @@ export interface MissionEvidence {
   confidence: "low" | "medium" | "high";
 }
 
+export interface MissionMilestone {
+  id: string;
+  missionId: string;
+  step: number;
+  stage: MissionStage;
+  summary: string;
+  decision?: string;
+  toolCalls?: string[];
+  evidenceIds?: string[];
+  artifacts?: string[];
+  error?: string;
+  nextAction?: string;
+  createdAt: string;
+}
+
 export interface MissionLedger {
   runId: string;
   mission: string;
@@ -54,6 +80,14 @@ export interface MissionLedger {
   createdAt: string;
   updatedAt: string;
   status: MissionLedgerStatus;
+  acceptance?: {
+    status: string;
+    confidence: number;
+    missing: string[];
+    reasons: string[];
+    nextAction?: string;
+    checkedAt: string;
+  };
   loopBudget: {
     hardCap: number;
     toolStepBudget: number;
@@ -61,10 +95,15 @@ export interface MissionLedger {
     expectedTools: string[];
   };
   tasks: MissionTask[];
+  milestones: MissionMilestone[];
   evidence: MissionEvidence[];
   receipts: string[];
   blockers: string[];
   nextActions: string[];
+  remainingActions: string[];
+  resumeCount: number;
+  lastSafeStep: number;
+  continuationPrompt?: string;
 }
 
 export interface MissionLedgerWriteResult {
@@ -118,11 +157,54 @@ export function createMissionLedger({
         notes: "",
       },
     ],
+    milestones: [
+      {
+        id: "milestone-1",
+        missionId: runId,
+        step: 0,
+        stage: "plan",
+        summary: "Mission ledger created and route budget selected.",
+        decision: route,
+        toolCalls: [],
+        evidenceIds: [],
+        artifacts: [],
+        nextAction: "Begin bounded agent loop.",
+        createdAt: timestamp,
+      },
+    ],
     evidence: [],
     receipts: [],
     blockers: [],
     nextActions: [],
+    remainingActions: [],
+    resumeCount: 0,
+    lastSafeStep: 0,
   };
+}
+
+export function addMissionMilestone(
+  ledger: MissionLedger,
+  input: Omit<MissionMilestone, "id" | "missionId" | "createdAt">,
+  now = new Date(),
+): MissionMilestone {
+  const timestamp = now.toISOString();
+  const milestone: MissionMilestone = {
+    id: `milestone-${ledger.milestones.length + 1}`,
+    missionId: ledger.runId,
+    step: input.step,
+    stage: input.stage,
+    summary: input.summary,
+    decision: input.decision,
+    toolCalls: input.toolCalls ? [...input.toolCalls] : [],
+    evidenceIds: input.evidenceIds ? [...input.evidenceIds] : [],
+    artifacts: input.artifacts ? [...input.artifacts] : [],
+    error: input.error,
+    nextAction: input.nextAction,
+    createdAt: timestamp,
+  };
+  ledger.milestones.push(milestone);
+  ledger.updatedAt = timestamp;
+  return milestone;
 }
 
 export function updateMissionLedgerStatus(
@@ -204,6 +286,47 @@ export function setLedgerNextAction(
   now = new Date(),
 ) {
   ledger.nextActions = action.trim() ? [action.trim()] : [];
+  ledger.updatedAt = now.toISOString();
+}
+
+export function setLedgerAcceptance(
+  ledger: MissionLedger,
+  acceptance: {
+    status: string;
+    confidence: number;
+    missing: string[];
+    reasons: string[];
+    nextAction?: string;
+  },
+  now = new Date(),
+) {
+  const timestamp = now.toISOString();
+  ledger.acceptance = {
+    ...acceptance,
+    missing: [...acceptance.missing],
+    reasons: [...acceptance.reasons],
+    checkedAt: timestamp,
+  };
+  ledger.remainingActions = acceptance.nextAction ? [acceptance.nextAction] : [];
+  ledger.updatedAt = timestamp;
+}
+
+export function markLedgerResumeLoaded(
+  ledger: MissionLedger,
+  continuationPrompt: string,
+  now = new Date(),
+) {
+  ledger.resumeCount += 1;
+  ledger.continuationPrompt = continuationPrompt;
+  ledger.updatedAt = now.toISOString();
+}
+
+export function setLedgerLastSafeStep(
+  ledger: MissionLedger,
+  step: number,
+  now = new Date(),
+) {
+  ledger.lastSafeStep = Math.max(ledger.lastSafeStep, step);
   ledger.updatedAt = now.toISOString();
 }
 
@@ -342,7 +465,10 @@ export function formatMissionLedgerBlock(ledger: MissionLedger): string {
     `- Expected tools: ${ledger.loopBudget.expectedTools.join(", ") || "none"}`,
     `- Evidence: ${ledger.evidence.length}`,
     `- Receipts: ${ledger.receipts.length}`,
+    `- Milestones: ${ledger.milestones.length}`,
+    `- Acceptance: ${ledger.acceptance?.status ?? "unchecked"}`,
     `- Next action: ${ledger.nextActions[0] ?? "none"}`,
+    `- Remaining actions: ${ledger.remainingActions.join("; ") || "none"}`,
     "",
   ].join("\n");
 }
@@ -394,6 +520,7 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
     createdAt,
     updatedAt,
     status,
+    acceptance: normalizeLedgerAcceptance(value.acceptance),
     loopBudget: {
       hardCap: getNumber(loopBudget.hardCap) ?? 0,
       toolStepBudget: getNumber(loopBudget.toolStepBudget) ?? 0,
@@ -403,12 +530,76 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
     tasks: Array.isArray(value.tasks)
       ? value.tasks.map(normalizeMissionTask).filter(isMissionTask)
       : [],
+    milestones: Array.isArray(value.milestones)
+      ? value.milestones
+          .map(normalizeMissionMilestone)
+          .filter(isMissionMilestone)
+      : [],
     evidence: Array.isArray(value.evidence)
       ? value.evidence.map(normalizeMissionEvidence).filter(isMissionEvidence)
       : [],
     receipts: getStringArray(value.receipts),
     blockers: getStringArray(value.blockers),
     nextActions: getStringArray(value.nextActions),
+    remainingActions: getStringArray(value.remainingActions),
+    resumeCount: getNumber(value.resumeCount) ?? 0,
+    lastSafeStep: getNumber(value.lastSafeStep) ?? 0,
+    continuationPrompt: getString(value.continuationPrompt),
+  };
+}
+
+function normalizeLedgerAcceptance(value: unknown):
+  | MissionLedger["acceptance"]
+  | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const status = getString(value.status);
+  const confidence = getNumber(value.confidence);
+  const checkedAt = getString(value.checkedAt);
+  if (!status || confidence === undefined || !checkedAt) {
+    return undefined;
+  }
+
+  return {
+    status,
+    confidence,
+    missing: getStringArray(value.missing),
+    reasons: getStringArray(value.reasons),
+    nextAction: getString(value.nextAction),
+    checkedAt,
+  };
+}
+
+function normalizeMissionMilestone(value: unknown): MissionMilestone | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const id = getString(value.id);
+  const missionId = getString(value.missionId);
+  const step = getNumber(value.step);
+  const stage = getMissionStage(value.stage);
+  const summary = getString(value.summary);
+  const createdAt = getString(value.createdAt);
+  if (!id || !missionId || step === undefined || !stage || !summary || !createdAt) {
+    return null;
+  }
+
+  return {
+    id,
+    missionId,
+    step,
+    stage,
+    summary,
+    decision: getString(value.decision),
+    toolCalls: getStringArray(value.toolCalls),
+    evidenceIds: getStringArray(value.evidenceIds),
+    artifacts: getStringArray(value.artifacts),
+    error: getString(value.error),
+    nextAction: getString(value.nextAction),
+    createdAt,
   };
 }
 
@@ -464,6 +655,10 @@ function isMissionEvidence(value: MissionEvidence | null): value is MissionEvide
   return value !== null;
 }
 
+function isMissionMilestone(value: MissionMilestone | null): value is MissionMilestone {
+  return value !== null;
+}
+
 function getLedgerStatus(value: unknown): MissionLedgerStatus | null {
   return value === "running" ||
     value === "complete" ||
@@ -489,6 +684,20 @@ function getEvidenceKind(value: unknown): MissionEvidenceKind | null {
     value === "tool_result" ||
     value === "artifact" ||
     value === "receipt"
+    ? value
+    : null;
+}
+
+function getMissionStage(value: unknown): MissionStage | null {
+  return value === "plan" ||
+    value === "gather" ||
+    value === "browser_observe" ||
+    value === "browser_act" ||
+    value === "synthesize" ||
+    value === "verify" ||
+    value === "write_save" ||
+    value === "memory_reflection" ||
+    value === "next_action"
     ? value
     : null;
 }

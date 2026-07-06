@@ -34,6 +34,24 @@ export function evidenceFromToolResult(
     };
   }
 
+  if (toolName === "web_search" && isRecord(result.output)) {
+    const query = getString(result.output.query) ?? "web search";
+    const results = Array.isArray(result.output.results)
+      ? result.output.results
+      : [];
+    const summary =
+      results.length > 0
+        ? summarizeText(JSON.stringify(results.slice(0, 5)))
+        : summarizeText(JSON.stringify(result.output));
+    return {
+      id: `web_search:${hashEvidenceKey(`${query}:${summary}`)}`,
+      kind: "web_source",
+      title: `Web search: ${query}`,
+      summary,
+      confidence: "medium",
+    };
+  }
+
   if (toolName === "read_file" && isRecord(result.output)) {
     const path = getString(result.output.path) ?? "";
     return {
@@ -74,6 +92,16 @@ export function evidenceFromToolResult(
   }
 
   if (
+    (toolName === "semantic_search_notes" ||
+      toolName === "search_markdown_files" ||
+      toolName === "inspect_vault_context" ||
+      toolName === "list_markdown_files") &&
+    isRecord(result.output)
+  ) {
+    return vaultSearchEvidenceFromToolResult(toolName, result.output);
+  }
+
+  if (
     toolName === "get_note_graph_context" ||
     toolName === "find_related_notes" ||
     toolName === "suggest_note_links"
@@ -84,6 +112,7 @@ export function evidenceFromToolResult(
   if (
     toolName === "create_design_canvas" ||
     toolName === "create_svg_design" ||
+    toolName === "create_design_package" ||
     toolName === "open_web_source"
   ) {
     return artifactEvidenceFromToolResult(toolName, result.output);
@@ -131,6 +160,67 @@ export function hashEvidenceKey(value: string): string {
   return Math.abs(hash).toString(36) || "0";
 }
 
+function vaultSearchEvidenceFromToolResult(
+  toolName: string,
+  output: Record<string, unknown>,
+): MissionEvidence | null {
+  const candidateArrays = [
+    output.results,
+    output.matches,
+    output.files,
+    output.notes,
+  ];
+  const rows = candidateArrays.find(Array.isArray) ?? [];
+  const paths = rows
+    .filter(isRecord)
+    .map((row) => getString(row.path) ?? getString(row.filePath))
+    .filter((path): path is string => Boolean(path));
+  const query =
+    getString(output.query) ??
+    getString(output.prompt) ??
+    getString(output.term) ??
+    toolName;
+
+  if (paths.length === 0 && rows.length === 0) {
+    return null;
+  }
+
+  const summary = rows
+    .filter(isRecord)
+    .slice(0, 8)
+    .map((row, index) => {
+      const path = getString(row.path) ?? getString(row.filePath) ?? `result ${index + 1}`;
+      const heading = getString(row.heading) ?? getString(row.title);
+      const snippet =
+        getString(row.snippet) ??
+        getString(row.summary) ??
+        getString(row.content) ??
+        "";
+      return summarizeText(
+        [path, heading, snippet].filter(Boolean).join(": "),
+        220,
+      );
+    })
+    .join("\n");
+  const coverageSummary = summarizeCoverage(output.coverage);
+
+  return {
+    id: `vault_search:${hashEvidenceKey(`${toolName}:${query}:${paths.join("|")}`)}`,
+    kind: "vault_note",
+    title:
+      paths.length > 0
+        ? `${paths.length} vault search result${paths.length === 1 ? "" : "s"}`
+        : `${rows.length} vault search result${rows.length === 1 ? "" : "s"}`,
+    ...(paths[0] ? { path: paths[0] } : {}),
+    summary: [coverageSummary, summary || summarizeText(JSON.stringify(output))]
+      .filter(Boolean)
+      .join("\n"),
+    confidence:
+      getCoverageConfidence(output.coverage) ??
+      (toolName === "semantic_search_notes" ? "medium" : "high"),
+  };
+}
+
 function graphEvidenceFromToolResult(
   toolName: string,
   output: unknown,
@@ -169,7 +259,7 @@ function artifactEvidenceFromToolResult(
     return null;
   }
 
-  const path = getString(output.path);
+  const path = getString(output.path) ?? getString(output.briefPath) ?? getString(output.canvasPath);
   const url = getString(output.url);
   const title = path ?? url ?? toolName;
   const summary = [
@@ -177,6 +267,7 @@ function artifactEvidenceFromToolResult(
     getNumber(output.nodeCount) !== undefined ? `nodes=${output.nodeCount}` : null,
     getNumber(output.edgeCount) !== undefined ? `edges=${output.edgeCount}` : null,
     getNumber(output.shapeCount) !== undefined ? `shapes=${output.shapeCount}` : null,
+    getNumber(output.itemCount) !== undefined ? `items=${output.itemCount}` : null,
     getNumber(output.bytesWritten) !== undefined
       ? `bytesWritten=${output.bytesWritten}`
       : null,
@@ -213,4 +304,30 @@ function getNumber(value: unknown): number | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function summarizeCoverage(value: unknown): string {
+  if (!isRecord(value)) {
+    return "";
+  }
+
+  return `Coverage: mode=${String(value.mode ?? "unknown")}; confidence=${String(
+    value.confidence ?? "unknown",
+  )}; considered=${String(value.considered ?? "unknown")}; read=${String(
+    value.read ?? "unknown",
+  )}; skipped=${String(value.skipped ?? "unknown")}; truncated=${String(
+    value.truncated ?? "unknown",
+  )}.`;
+}
+
+function getCoverageConfidence(
+  value: unknown,
+): MissionEvidence["confidence"] | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const confidence = value.confidence;
+  return confidence === "low" || confidence === "medium" || confidence === "high"
+    ? confidence
+    : undefined;
 }
