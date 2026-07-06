@@ -1,12 +1,15 @@
 {
   "name": "agentic-researcher",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Minimal Obsidian plugin shell for an agentic research assistant.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "node --import tsx --test tests/**/*.test.ts"
+    "test": "node --import tsx --test tests/**/*.test.ts",
+    "sync:test-vault": "node scripts/sync-test-vault.mjs",
+    "test:e2e": "npm run build && npm run sync:test-vault && playwright test",
+    "test:e2e:headed": "npm run build && npm run sync:test-vault && playwright test --headed"
   },
   "keywords": [
     "obsidian",
@@ -16,6 +19,7 @@
   "author": "Josh",
   "license": "MIT",
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^20.14.10",
     "builtin-modules": "^3.3.0",
     "esbuild": "^0.28.1",

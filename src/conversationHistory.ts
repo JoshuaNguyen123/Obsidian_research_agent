@@ -7,9 +7,9 @@ export interface AgentConversationMessage {
   content: string;
 }
 
-export const MAX_CONVERSATION_MESSAGES = 20;
-export const MAX_CONVERSATION_MESSAGE_CHARS = 12_000;
-export const MAX_CONVERSATION_TOTAL_CHARS = 40_000;
+export const MAX_CONVERSATION_MESSAGES = 60;
+export const MAX_CONVERSATION_MESSAGE_CHARS = 16_000;
+export const MAX_CONVERSATION_TOTAL_CHARS = 120_000;
 
 export interface ConversationHistoryLimits {
   maxMessages: number;
