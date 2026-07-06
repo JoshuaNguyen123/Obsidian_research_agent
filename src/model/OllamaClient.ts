@@ -69,6 +69,7 @@ export class OllamaClient implements ModelClient {
       headers: this.buildHeaders(),
       throw: false,
       timeoutMs: this.requestTimeoutMs,
+      abortSignal: request.abortSignal,
       body: JSON.stringify(buildOllamaChatBody(request, model, false)),
     };
 
@@ -122,6 +123,7 @@ export class OllamaClient implements ModelClient {
       headers: this.buildHeaders(),
       throw: false,
       timeoutMs: this.requestTimeoutMs,
+      abortSignal: request.abortSignal,
       body: JSON.stringify(buildOllamaChatBody(request, model, true)),
     };
 
@@ -308,6 +310,7 @@ export async function parseOllamaChatStream(
   };
 
   for await (const chunk of stream) {
+    events.onRawChunk?.(chunk);
     buffer += chunk;
 
     let newlineIndex = buffer.indexOf("\n");

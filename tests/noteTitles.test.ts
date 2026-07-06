@@ -57,6 +57,35 @@ test("retitleNoteMarkdown updates frontmatter title and existing H1", () => {
   );
 });
 
+test("retitleNoteMarkdown targets casing and decorated heading variants", () => {
+  const input = [
+    "---",
+    'Title: "Old Agent Notes"',
+    "status: draft",
+    "---",
+    "",
+    "   # Old Agent Notes #",
+    "",
+    "Body content.",
+  ].join("\n");
+
+  const expected = [
+    "---",
+    "Title: Native Obsidian Agentic Research",
+    "status: draft",
+    "---",
+    "",
+    "# Native Obsidian Agentic Research",
+    "",
+    "Body content.",
+  ].join("\n");
+
+  assert.equal(
+    retitleNoteMarkdown(input, "Native Obsidian Agentic Research"),
+    expected,
+  );
+});
+
 test("retitleNoteMarkdown inserts frontmatter title and missing H1", () => {
   const input = [
     "---",

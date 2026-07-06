@@ -8,10 +8,12 @@ import {
   type AgentRunMetricEvent,
   type AgentRunPhase,
   type AgentRunReceipt,
+  type AgentStreamLifecycleEvent,
   type AgentTraceEvent,
   type AgentToolRunEvent,
 } from "./AgentRunner";
 import { formatModelClientError } from "./model/types";
+import { renderSandboxedHtmlPreview } from "./ui/htmlPreview";
 
 export const AGENT_VIEW_TYPE = "agentic-researcher-view";
 
@@ -40,7 +42,17 @@ export class AgentView extends ItemView {
   private toolTimelineEl: HTMLElement | null = null;
   private finalStreamEl: HTMLElement | null = null;
   private receiptsEl: HTMLElement | null = null;
+  private browserDetailsEl: HTMLElement | null = null;
+  private actionsDetailsEl: HTMLElement | null = null;
+  private milestonesDetailsEl: HTMLElement | null = null;
+  private memoryDetailsEl: HTMLElement | null = null;
+  private evidenceDetailsEl: HTMLElement | null = null;
+  private artifactsDetailsEl: HTMLElement | null = null;
+  private verificationEl: HTMLElement | null = null;
+  private previewEl: HTMLElement | null = null;
   private runLogEl: HTMLElement | null = null;
+  private chatLoaderEl: HTMLElement | null = null;
+  private chatLoaderTextEl: HTMLElement | null = null;
   private liveAssistantMessageEl: HTMLElement | null = null;
   private livePlanningMessageEl: HTMLElement | null = null;
   private liveFinalMessageEl: HTMLElement | null = null;
@@ -49,6 +61,11 @@ export class AgentView extends ItemView {
   private readonly traceRowEls = new Map<string, HTMLElement>();
   private activeTab: AgentViewTab = "chat";
   private isRunning = false;
+  private isClearingChat = false;
+  private clearConfirmPending = false;
+  private clearConfirmTimeout: number | null = null;
+  private stopRequested = false;
+  private runAbortController: AbortController | null = null;
   private pendingAssistantContent = "";
   private chatMessageSequence = 0;
   private currentRunChatId: string | null = null;
@@ -77,6 +94,7 @@ export class AgentView extends ItemView {
   }
 
   async onClose() {
+    this.setClearConfirmPending(false);
     this.contentEl.empty();
   }
 
@@ -156,6 +174,8 @@ export class AgentView extends ItemView {
       attr: {
         placeholder: "Ask a research question...",
         rows: "5",
+        "aria-label": "Ask a research question",
+        tabindex: "0",
       },
     });
 
@@ -189,9 +209,51 @@ export class AgentView extends ItemView {
 
     formEl.addEventListener("submit", (event) => {
       event.preventDefault();
+      event.stopPropagation();
       void this.capturePrompt();
     });
-    this.clearButtonEl.addEventListener("click", () => {
+    const stopPromptEvent = (event: Event) => {
+      event.stopPropagation();
+    };
+    this.promptEl.addEventListener("pointerdown", stopPromptEvent, {
+      capture: true,
+    });
+    this.promptEl.addEventListener("mousedown", stopPromptEvent, {
+      capture: true,
+    });
+    this.promptEl.addEventListener("click", stopPromptEvent, {
+      capture: true,
+    });
+    this.promptEl.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+
+      if (event.key !== "Enter" || event.shiftKey) {
+        return;
+      }
+
+      event.preventDefault();
+      void this.capturePrompt();
+    });
+    this.promptEl.addEventListener("keyup", (event) => {
+      event.stopPropagation();
+    });
+    this.runButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.capturePrompt();
+    });
+    this.clearButtonEl.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+    });
+    this.clearButtonEl.addEventListener("mousedown", (event) => {
+      event.stopPropagation();
+    });
+    this.clearButtonEl.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+    });
+    this.clearButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       void this.clearChat();
     });
   }
@@ -202,6 +264,8 @@ export class AgentView extends ItemView {
     }
 
     this.logEl.empty();
+    this.chatLoaderEl = null;
+    this.chatLoaderTextEl = null;
     this.createLogItem(
       "system",
       "Agent ready. Persistent chat memory is on.",
@@ -216,7 +280,7 @@ export class AgentView extends ItemView {
     container.addClass("agentic-researcher-details-panel");
 
     const dashboardEl = container.createDiv({
-      cls: "agentic-researcher-dashboard",
+      cls: "agentic-researcher-dashboard agentic-researcher-responsive-run-details",
       attr: { "aria-live": "polite" },
     });
 
@@ -229,18 +293,82 @@ export class AgentView extends ItemView {
     this.activeToolValueEl = this.createMetric(metricsEl, "Active tool", "None");
     this.activityValueEl = this.createMetric(metricsEl, "Activity", "Idle");
 
-    this.modelConfigEl = this.createDashboardSection(dashboardEl, "Model config");
-    this.statusStreamEl = this.createDashboardSection(dashboardEl, "Status");
+    this.modelConfigEl = this.createDashboardSection(
+      dashboardEl,
+      "Model config",
+      "model-config",
+    );
+    this.statusStreamEl = this.createDashboardSection(
+      dashboardEl,
+      "Status",
+      "status",
+    );
 
     const streamsEl = dashboardEl.createDiv({
       cls: "agentic-researcher-stream-grid",
     });
 
-    this.planningStreamEl = this.createDashboardSection(streamsEl, "Planning");
-    this.finalStreamEl = this.createDashboardSection(streamsEl, "Final answer");
-    this.toolTimelineEl = this.createDashboardSection(dashboardEl, "Tool timeline");
-    this.receiptsEl = this.createDashboardSection(dashboardEl, "Receipts");
-    this.runLogEl = this.createDashboardSection(dashboardEl, "Run log");
+    this.planningStreamEl = this.createDashboardSection(
+      streamsEl,
+      "Planning",
+      "planning",
+    );
+    this.finalStreamEl = this.createDashboardSection(
+      streamsEl,
+      "Final answer",
+      "final-answer",
+    );
+    this.toolTimelineEl = this.createDashboardSection(
+      dashboardEl,
+      "Tool timeline",
+      "tool-timeline",
+    );
+    this.receiptsEl = this.createDashboardSection(
+      dashboardEl,
+      "Receipts",
+      "receipts",
+    );
+    this.browserDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Browser",
+      "browser",
+    );
+    this.actionsDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Actions",
+      "actions",
+    );
+    this.milestonesDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Milestones",
+      "milestones",
+    );
+    this.memoryDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Memory",
+      "memory",
+    );
+    this.evidenceDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Evidence",
+      "evidence",
+    );
+    this.artifactsDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Artifacts",
+      "artifacts",
+    );
+    this.verificationEl = this.createDashboardSection(
+      dashboardEl,
+      "Verification",
+      "verification",
+    );
+    this.previewEl = this.createDashboardSection(
+      dashboardEl,
+      "Preview",
+      "preview",
+    );
+    this.runLogEl = this.createDashboardSection(dashboardEl, "Run log", "run-log");
 
     this.setSectionPlaceholder(this.modelConfigEl, "No run yet.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
@@ -248,6 +376,17 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
     this.setSectionPlaceholder(this.receiptsEl, "No writes yet.");
+    this.setSectionPlaceholder(
+      this.browserDetailsEl,
+      "Live browser embedding is unavailable. Showing screenshot and extracted page state instead.",
+    );
+    this.setSectionPlaceholder(this.actionsDetailsEl, "No actions yet.");
+    this.setSectionPlaceholder(this.milestonesDetailsEl, "No milestones yet.");
+    this.setSectionPlaceholder(this.memoryDetailsEl, "No memory activity yet.");
+    this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
+    this.setSectionPlaceholder(this.artifactsDetailsEl, "No artifacts yet.");
+    this.setSectionPlaceholder(this.verificationEl, "No artifacts verified yet.");
+    this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
   }
 
@@ -270,9 +409,10 @@ export class AgentView extends ItemView {
   private createDashboardSection(
     container: HTMLElement,
     label: string,
+    key: string,
   ): HTMLElement {
     const sectionEl = container.createDiv({
-      cls: "agentic-researcher-dashboard-section",
+      cls: `agentic-researcher-dashboard-section agentic-researcher-dashboard-section-${key}`,
     });
     const labelEl = sectionEl.createDiv({
       cls: "agentic-researcher-dashboard-label-row",
@@ -282,7 +422,7 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-dashboard-label",
     });
     const bodyEl = sectionEl.createDiv({
-      cls: "agentic-researcher-dashboard-body",
+      cls: `agentic-researcher-dashboard-body agentic-researcher-dashboard-body-${key}`,
     });
     this.createCopyButton(labelEl, () => bodyEl.textContent ?? "", `Copy ${label}`);
     return bodyEl;
@@ -290,9 +430,11 @@ export class AgentView extends ItemView {
 
   private async capturePrompt() {
     if (this.isRunning) {
+      this.requestStop();
       return;
     }
 
+    this.setClearConfirmPending(false);
     const prompt = this.promptEl?.value.trim() ?? "";
 
     if (!prompt) {
@@ -302,22 +444,25 @@ export class AgentView extends ItemView {
     }
 
     const conversationHistory = [...this.plugin.conversationHistory];
+    this.stopRequested = false;
+    this.runAbortController = new AbortController();
     this.resetDashboardForRun();
     this.pendingAssistantContent = "";
+    this.appendStatus("Starting mission...");
     const userLogItem = this.appendLog("user", prompt);
     this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
-
-    if (this.promptEl) {
-      this.promptEl.value = "";
-    }
-
-    this.setRunning(true);
+    this.setRunning(true, "SYS> mission accepted");
+    this.updateChatLoader("SYS> mission accepted");
 
     try {
       await this.plugin.appendConversationMessage({
         role: "user",
         content: prompt,
       });
+
+      if (this.promptEl?.value.trim() === prompt) {
+        this.promptEl.value = "";
+      }
 
       await runAgentMission({
         prompt,
@@ -326,6 +471,7 @@ export class AgentView extends ItemView {
         toolRegistry: this.plugin.createToolRegistry(),
         toolContext: this.plugin.createToolExecutionContext(prompt),
         enableStreaming: this.plugin.settings.enableStreaming,
+        abortSignal: this.runAbortController.signal,
         events: {
           onStatus: (message) => this.appendStatus(message),
           onPhaseChange: (phase, message) => this.updatePhase(phase, message),
@@ -336,14 +482,17 @@ export class AgentView extends ItemView {
           onToolDone: (event) => this.handleToolDone(event),
           onFinalStart: () => this.startFinalStream(),
           onFinalDelta: (delta) => this.appendFinalDelta(delta),
+          onFinalReplace: (content) => this.replaceFinalContent(content),
           onFinalDone: () => this.finishFinalStream(),
           onReceipt: (receipt) => this.appendReceipt(receipt),
           onAssistantMessageStart: () => this.startLiveAssistantMessage(),
           onAssistantDelta: (delta) => this.appendAssistantDelta(delta),
+          onAssistantReplace: (content) => this.replaceAssistantContent(content),
           onAssistantMessageDone: () => this.finishLiveAssistantMessage(),
           onThinkingMessageStart: () => this.startLiveThinkingMessage(),
           onThinkingDelta: () => undefined,
           onThinkingMessageDone: () => this.finishLiveThinkingMessage(),
+          onStreamLifecycle: (event) => this.handleStreamLifecycle(event),
           onMetric: (event) => this.appendMetric(event),
           onRunConfig: (event) => this.handleRunConfig(event),
           onRunComplete: (event) => this.handleRunComplete(event),
@@ -353,32 +502,97 @@ export class AgentView extends ItemView {
     } catch (error) {
       const message = formatModelClientError(error);
       this.updatePhase("error", "Error");
+      this.setSectionPlaceholder(this.finalStreamEl, message);
       this.appendLog("error", message);
     } finally {
       await this.persistPendingAssistantMessage();
       this.setRunning(false);
+      this.runAbortController = null;
+      this.stopRequested = false;
       this.promptEl?.focus();
     }
   }
 
+  private requestStop() {
+    if (!this.isRunning || this.stopRequested) {
+      return;
+    }
+
+    this.stopRequested = true;
+    this.runAbortController?.abort();
+    this.appendStatus("Stop requested. Finishing current operation...");
+    this.updateChatLoader("SYS> stop requested");
+    this.updatePhase("stopped", "Stop requested");
+    this.updateRunButtonState();
+
+    if (this.runStatusTextEl) {
+      this.runStatusTextEl.setText("Stopping mission...");
+    }
+  }
+
   private async clearChat() {
-    if (this.isRunning) {
+    if (this.isRunning || this.isClearingChat) {
       return;
     }
 
-    const confirmed = confirm(
-      "Clear the Agentic Researcher chat history? This will not modify notes, backups, receipts, or settings.",
-    );
-
-    if (!confirmed) {
+    if (!this.clearConfirmPending) {
+      this.setClearConfirmPending(true);
+      this.appendStatus(
+        "Click Confirm clear to clear chat history only. Notes, memory, backups, receipts, and settings are unchanged.",
+      );
+      this.restorePromptInteractivity();
       return;
     }
 
-    await this.plugin.clearConversationHistory();
-    this.pendingAssistantContent = "";
-    this.liveAssistantMessageEl = null;
-    this.renderConversationLog();
-    this.promptEl?.focus();
+    this.isClearingChat = true;
+    this.setClearConfirmPending(false);
+
+    try {
+      await this.plugin.clearConversationHistory();
+      this.pendingAssistantContent = "";
+      this.liveAssistantMessageEl = null;
+      this.renderConversationLog();
+    } finally {
+      this.isClearingChat = false;
+      this.restorePromptInteractivity();
+    }
+  }
+
+  private restorePromptInteractivity() {
+    this.setActiveTab("chat");
+    this.setRunning(false);
+    this.setChatLoaderActive(false);
+    this.updateRunButtonState();
+    this.focusPrompt({ moveCaretToEnd: true });
+
+    const promptEl = this.promptEl;
+    if (!promptEl) {
+      return;
+    }
+
+    const focus = () => {
+      this.focusPrompt({ moveCaretToEnd: true });
+    };
+
+    window.setTimeout(focus, 0);
+    window.setTimeout(focus, 50);
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(focus);
+    }
+  }
+
+  private focusPrompt(options: { moveCaretToEnd?: boolean } = {}) {
+    const promptEl = this.promptEl;
+    if (!promptEl || !promptEl.isConnected) {
+      return;
+    }
+
+    promptEl.disabled = false;
+    promptEl.removeAttribute("aria-disabled");
+    promptEl.focus({ preventScroll: true });
+    if (options.moveCaretToEnd) {
+      promptEl.setSelectionRange(promptEl.value.length, promptEl.value.length);
+    }
   }
 
   private resetDashboardForRun() {
@@ -398,6 +612,17 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
     this.setSectionPlaceholder(this.receiptsEl, "No writes yet.");
+    this.setSectionPlaceholder(
+      this.browserDetailsEl,
+      "Live browser embedding is unavailable. Showing screenshot and extracted page state instead.",
+    );
+    this.setSectionPlaceholder(this.actionsDetailsEl, "No actions yet.");
+    this.setSectionPlaceholder(this.milestonesDetailsEl, "No milestones yet.");
+    this.setSectionPlaceholder(this.memoryDetailsEl, "No memory activity yet.");
+    this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
+    this.setSectionPlaceholder(this.artifactsDetailsEl, "No artifacts yet.");
+    this.setSectionPlaceholder(this.verificationEl, "No artifacts verified yet.");
+    this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
   }
 
@@ -430,6 +655,9 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-status-line",
     });
     this.statusStreamEl.scrollTop = this.statusStreamEl.scrollHeight;
+    if (kind === "status") {
+      this.updateChatLoader(message);
+    }
     this.appendTrace(kind, message);
   }
 
@@ -466,6 +694,7 @@ export class AgentView extends ItemView {
   private handleToolStart(event: AgentToolRunEvent) {
     this.setMetric(this.stepValueEl, this.formatStepMetric(event.step));
     this.setMetric(this.activeToolValueEl, event.name);
+    this.updateChatLoader(`RUN> ${event.name}`);
 
     const itemEl = this.ensureToolTimelineItem(event);
     itemEl.removeClass("is-complete");
@@ -483,19 +712,150 @@ export class AgentView extends ItemView {
     this.setTimelineStatus(itemEl, ok ? "Complete" : "Error");
     this.setTimelineDetail(itemEl, event.message ?? event.name);
     this.setExpandablePayload(itemEl, event.output ?? event.error);
+    this.renderToolVerification(event);
+    this.renderToolPreview(event);
     this.setMetric(this.activeToolValueEl, "None");
+    this.updateChatLoader(event.message ?? `${event.name} complete`);
     this.appendTrace(
       ok ? "tool" : "error",
       event.message ?? `${event.name} ${ok ? "complete" : "error"}`,
     );
   }
 
+  private renderToolVerification(event: AgentToolRunEvent) {
+    if (!this.verificationEl || event.ok === false || !isPlainRecord(event.output)) {
+      return;
+    }
+
+    const message = this.getVerificationMessage(event.name, event.output);
+    if (!message) {
+      return;
+    }
+
+    this.clearPlaceholder(this.verificationEl);
+    const rowEl = this.verificationEl.createDiv({
+      cls: "agentic-researcher-verification-row",
+    });
+    rowEl.createSpan({
+      text: event.name,
+      cls: "agentic-researcher-verification-kind",
+    });
+    rowEl.createSpan({
+      text: message,
+      cls: "agentic-researcher-verification-message",
+    });
+  }
+
+  private getVerificationMessage(
+    toolName: string,
+    output: Record<string, unknown>,
+  ): string | null {
+    if (toolName === "create_design_canvas") {
+      return `Canvas verified: ${String(output.nodeCount ?? 0)} nodes, ${String(output.edgeCount ?? 0)} edges.`;
+    }
+
+    if (toolName === "create_svg_design") {
+      return `SVG verified: ${String(output.shapeCount ?? 0)} shapes.`;
+    }
+
+    if (toolName === "render_html_preview" || output.previewHtml) {
+      return `HTML preview ready: ${String(output.bytesRendered ?? "srcdoc")} bytes.`;
+    }
+
+    if (toolName === "run_code_block") {
+      const result = isPlainRecord(output.result)
+        ? output.result
+        : isPlainRecord(output.run)
+          ? output.run
+          : null;
+      if (!result) {
+        return output.previewHtml ? "HTML code preview ready." : null;
+      }
+
+      const exitCode = result.exitCode;
+      const timedOut = result.timedOut === true;
+      return timedOut
+        ? "Code run timed out and was stopped."
+        : `Code run completed with exit code ${String(exitCode ?? "unknown")}.`;
+    }
+
+    if (toolName === "open_web_source") {
+      return `Source note saved: ${String(output.path ?? "Agent Sources")}.`;
+    }
+
+    return null;
+  }
+
+  private renderToolPreview(event: AgentToolRunEvent) {
+    if (!this.previewEl || event.ok === false || !isPlainRecord(event.output)) {
+      return;
+    }
+
+    const previewHtml = event.output.previewHtml;
+    if (typeof previewHtml !== "string" || previewHtml.trim().length === 0) {
+      return;
+    }
+
+    this.previewEl.empty();
+    renderSandboxedHtmlPreview(this.previewEl, previewHtml, {
+      title: "Agent HTML preview",
+    });
+  }
+
   private handleRunComplete(event: AgentRunCompleteEvent) {
-    this.setMetric(this.stepValueEl, this.formatStepMetric(event.step));
+    this.setMetric(this.stepValueEl, this.formatStepMetric(event.step, event.maxSteps));
     this.setMetric(this.phaseValueEl, this.formatStopReason(event.stopReason));
     this.setMetric(this.activityValueEl, this.formatStopReason(event.stopReason));
     this.setMetric(this.activeToolValueEl, "None");
     this.appendTrace("complete", this.formatStopReason(event.stopReason));
+  }
+
+  private handleStreamLifecycle(event: AgentStreamLifecycleEvent) {
+    const streamLabel = this.formatStreamLifecycleLabel(event.kind);
+    const parts = [
+      `${streamLabel}: ${event.message}`,
+      event.bufferedChars !== undefined
+        ? `buffered ${this.formatChars(event.bufferedChars)}`
+        : null,
+      event.releasedChars !== undefined
+        ? `released ${this.formatChars(event.releasedChars)}`
+        : null,
+      `${event.elapsedMs}ms`,
+    ].filter((part): part is string => Boolean(part));
+
+    this.appendStatus(parts.join(" "));
+    this.updateChatLoader(event.message);
+  }
+
+  private formatStreamLifecycleLabel(
+    kind: AgentStreamLifecycleEvent["kind"],
+  ): string {
+    if (kind === "first_visible_content") {
+      return "chat_stream";
+    }
+    if (kind === "first_note_write") {
+      return "note_stream";
+    }
+    return kind;
+  }
+
+  private formatReceiptOperationLabel(
+    operation: AgentRunReceipt["operation"],
+  ): string {
+    if (operation === "append") {
+      return "note_append";
+    }
+    if (
+      operation === "replace" ||
+      operation === "edit" ||
+      operation === "retitle"
+    ) {
+      return "note_replace";
+    }
+    if (operation === "trash" || operation === "delete") {
+      return "note_delete";
+    }
+    return `note_${operation}`;
   }
 
   private ensureToolTimelineItem(event: AgentToolRunEvent): HTMLElement {
@@ -575,6 +935,19 @@ export class AgentView extends ItemView {
     this.appendText(this.liveFinalMessageEl, delta);
   }
 
+  private replaceFinalContent(content: string) {
+    if (!this.finalStreamEl) {
+      return;
+    }
+
+    if (!this.liveFinalMessageEl) {
+      this.startFinalStream();
+    }
+
+    this.liveFinalMessageEl?.empty();
+    this.appendText(this.liveFinalMessageEl, content);
+  }
+
   private finishFinalStream() {
     this.liveFinalMessageEl = null;
   }
@@ -604,6 +977,7 @@ export class AgentView extends ItemView {
     this.createCopyButton(headerEl, () => receiptEl.textContent ?? "", "Copy receipt");
 
     const metaParts = [
+      `receipt=${this.formatReceiptOperationLabel(receipt.operation)}`,
       receipt.bytesWritten !== undefined
         ? `${receipt.bytesWritten} bytes written`
         : null,
@@ -634,7 +1008,7 @@ export class AgentView extends ItemView {
     this.renderModelConfig();
     this.appendTrace(
       "config",
-      `Model ${event.model}, mission ${event.missionMode}, streaming ${event.streaming ? "on" : "off"}, write autonomy ${event.writeAutonomy ? "on" : "off"}`,
+      `Model ${event.model}, mission ${event.missionMode}, streaming ${event.streaming ? "on" : "off"}, write autonomy ${event.writeAutonomy ? "on" : "off"}, note writeback ${event.writebackMode}`,
     );
   }
 
@@ -681,7 +1055,7 @@ export class AgentView extends ItemView {
 
     if (event.kind === "tool") {
       return [
-        `Timing: ${event.name}`,
+        event.cached ? `Cache hit: ${event.name}` : `Timing: ${event.name}`,
         this.formatDuration(event.durationMs),
         event.inputChars !== undefined
           ? `input ${this.formatChars(event.inputChars)}`
@@ -708,18 +1082,53 @@ export class AgentView extends ItemView {
     }
 
     this.modelConfigEl.empty();
+    const scope = this.runConfig.autonomyScope;
+    const ledger = this.runConfig.missionLedger;
     const lines = [
+      `run_id=${this.runConfig.runId}`,
       `model=${this.runConfig.model}`,
+      `provider=${this.runConfig.modelProvider ?? "ollama"}`,
       `base=${this.runConfig.base}`,
       `mission=${this.runConfig.missionMode}`,
-      `vault_context=${this.runConfig.vaultContext ? "on" : "off"}`,
+      `context_scope=${this.runConfig.contextScope}`,
+      `vault_question=${this.runConfig.vaultContext ? "on" : "off"}`,
+      `current_note_context=${this.runConfig.currentNoteContext ? "on" : "off"}`,
       `streaming=${this.runConfig.streaming ? "on" : "off"}`,
+      `note_writeback=${this.runConfig.writebackMode}`,
+      `route=${this.runConfig.route}`,
+      `expected=${this.runConfig.expectedTimeClass}`,
+      `step_cap=${this.runConfig.maxStepsForRun}`,
+      `slow_path=${this.runConfig.slowPathReason}`,
+      `english_guard=${this.runConfig.englishGuard ? "on" : "off"}`,
       `thinking=${this.runConfig.thinkingMode} (resolved ${this.runConfig.resolvedThink})`,
       `temperature=${this.formatOptionalNumber(this.runConfig.temperature)}`,
       `top_k=${this.formatOptionalNumber(this.runConfig.topK)}`,
       `top_p=${this.formatOptionalNumber(this.runConfig.topP)}`,
       `num_ctx=${this.formatOptionalNumber(this.runConfig.numCtx)}`,
       `write_autonomy=${this.runConfig.writeAutonomy ? "on" : "off"}`,
+      `autonomy_read=current_note ${scope.read.currentNote ? "on" : "off"}, vault ${scope.read.vault ? "on" : "off"}, web ${scope.read.web ? "on" : "off"}, files ${this.formatScopeList(scope.read.files)}, folders ${this.formatScopeList(scope.read.folders)}`,
+      `autonomy_write=current_note ${scope.write.currentNote ? "on" : "off"}, files ${this.formatScopeList(scope.write.files)}, folders ${this.formatScopeList(scope.write.folders)}, artifacts ${scope.write.artifacts ? "on" : "off"}, research_memory ${scope.write.researchMemory ? "on" : "off"}`,
+      `autonomy_destructive=replace_current_note ${scope.destructive.replaceCurrentNote ? "on" : "off"}, delete_current_note ${scope.destructive.deleteCurrentNote ? "on" : "off"}, delete_paths ${scope.destructive.deletePaths ? "on" : "off"}`,
+      ...(this.runConfig.reflexLabel
+        ? [
+            `reflex_intent=${this.runConfig.reflexLabel}`,
+            `reflex_confidence=${this.formatOptionalNumber(this.runConfig.reflexConfidence)}`,
+            `reflex_top_action=${this.runConfig.reflexTopAction ?? "none"}`,
+            `reflex_progress=${this.formatOptionalNumber(this.runConfig.reflexProgressScore)}`,
+            `reflex_loop_risk=${this.formatOptionalNumber(this.runConfig.reflexLoopRisk)}`,
+            `reflex_missing=${this.formatScopeList(this.runConfig.reflexCompletionMissing ?? [])}`,
+            `reflex_reason=${this.runConfig.reflexAppliedReason ?? "none"}`,
+          ]
+        : []),
+      ...(ledger
+        ? [
+            `ledger_status=${ledger.status}`,
+            `ledger_evidence=${ledger.evidenceCount}`,
+            `ledger_receipts=${ledger.receiptCount}`,
+            `ledger_expected_tools=${this.formatScopeList(ledger.expectedTools)}`,
+            `ledger_next_action=${ledger.nextAction}`,
+          ]
+        : []),
       `usage_chars=request ${this.formatChars(this.usageTotals.requestChars)}, response ${this.formatChars(this.usageTotals.responseChars)}`,
       `usage_tokens=prompt ${this.formatOptionalNumber(this.usageTotals.promptTokens)}, completion ${this.formatOptionalNumber(this.usageTotals.completionTokens)}, total ${this.formatOptionalNumber(this.usageTotals.totalTokens)}`,
     ];
@@ -730,6 +1139,10 @@ export class AgentView extends ItemView {
         cls: "agentic-researcher-config-line",
       });
     }
+  }
+
+  private formatScopeList(values: string[]) {
+    return values.length > 0 ? values.join(",") : "none";
   }
 
   private updateUsageTotals(event: AgentRunMetricEvent) {
@@ -780,6 +1193,18 @@ export class AgentView extends ItemView {
     return `${chars} B`;
   }
 
+  private compactLoaderMessage(message: string): string {
+    const normalized = message.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      return "running";
+    }
+
+    const maxChars = 72;
+    return normalized.length <= maxChars
+      ? normalized
+      : `${normalized.slice(0, maxChars - 3)}...`;
+  }
+
   private createLogItem(kind: LogKind, message = ""): HTMLElement | null {
     if (!this.logEl) {
       return null;
@@ -810,6 +1235,7 @@ export class AgentView extends ItemView {
       `Copy ${this.getLogLabel(kind)} message`,
     );
 
+    this.moveChatLoaderToEnd();
     this.logEl.scrollTop = this.logEl.scrollHeight;
     return itemEl;
   }
@@ -832,6 +1258,24 @@ export class AgentView extends ItemView {
 
     this.pendingAssistantContent = `${this.pendingAssistantContent}${delta}`;
     this.appendText(this.liveAssistantMessageEl, delta);
+
+    if (this.logEl) {
+      this.logEl.scrollTop = this.logEl.scrollHeight;
+    }
+  }
+
+  private replaceAssistantContent(content: string) {
+    this.pendingAssistantContent = content;
+
+    if (!this.liveAssistantMessageEl) {
+      const itemEl = this.createLogItem("assistant");
+      this.liveAssistantMessageEl = itemEl?.querySelector(
+        ".agentic-researcher-log-message",
+      ) as HTMLElement | null;
+    }
+
+    this.liveAssistantMessageEl?.empty();
+    this.appendText(this.liveAssistantMessageEl, content);
 
     if (this.logEl) {
       this.logEl.scrollTop = this.logEl.scrollHeight;
@@ -882,18 +1326,18 @@ export class AgentView extends ItemView {
     }
   }
 
-  private setRunning(isRunning: boolean) {
+  private setRunning(isRunning: boolean, loaderMessage?: string) {
     this.isRunning = isRunning;
+    if (isRunning) {
+      this.setClearConfirmPending(false);
+    }
     this.contentEl.classList.toggle("is-running", isRunning);
     this.contentEl.setAttribute("aria-busy", String(isRunning));
 
-    if (this.runButtonEl) {
-      this.runButtonEl.disabled = isRunning;
-      this.runButtonEl.setText(isRunning ? "Running..." : "Run Mission");
-    }
+    this.updateRunButtonState();
 
     if (this.clearButtonEl) {
-      this.clearButtonEl.disabled = isRunning;
+      this.clearButtonEl.disabled = isRunning || this.isClearingChat;
     }
 
     if (this.runStatusEl) {
@@ -904,9 +1348,148 @@ export class AgentView extends ItemView {
       this.runStatusTextEl.setText(isRunning ? "Running mission..." : "Idle");
     }
 
+    this.setChatLoaderActive(isRunning, loaderMessage);
+
     this.setMetric(
       this.activityValueEl,
       isRunning ? "Running" : (this.phaseValueEl?.textContent ?? "Idle"),
+    );
+  }
+
+  private setClearConfirmPending(pending: boolean) {
+    this.clearConfirmPending = pending;
+
+    if (this.clearConfirmTimeout !== null) {
+      window.clearTimeout(this.clearConfirmTimeout);
+      this.clearConfirmTimeout = null;
+    }
+
+    if (pending) {
+      this.clearConfirmTimeout = window.setTimeout(() => {
+        this.setClearConfirmPending(false);
+        this.restorePromptInteractivity();
+      }, 5000);
+    }
+
+    if (!this.clearButtonEl) {
+      return;
+    }
+
+    this.clearButtonEl.setText(pending ? "Confirm clear" : "Clear chat");
+    this.clearButtonEl.classList.toggle("is-confirming", pending);
+    this.clearButtonEl.setAttribute(
+      "aria-label",
+      pending ? "Confirm clear chat history" : "Clear chat",
+    );
+  }
+
+  private ensureChatLoader(): HTMLElement | null {
+    if (this.chatLoaderEl?.isConnected) {
+      return this.chatLoaderEl;
+    }
+
+    if (!this.logEl) {
+      return null;
+    }
+
+    this.chatLoaderEl = this.logEl.createDiv({
+      cls: "agentic-researcher-chat-loader",
+      attr: { "aria-live": "polite", "aria-hidden": "true" },
+    });
+    const headerEl = this.chatLoaderEl.createDiv({
+      cls: "agentic-researcher-chat-loader-header",
+    });
+    headerEl.createSpan({
+      text: "CRT LOAD",
+      cls: "agentic-researcher-chat-loader-label",
+    });
+    this.chatLoaderTextEl = headerEl.createSpan({
+      text: "",
+      cls: "agentic-researcher-chat-loader-text",
+    });
+    this.chatLoaderEl.createDiv({
+      cls: "agentic-researcher-chat-loader-bar",
+      attr: { "aria-hidden": "true" },
+    });
+    this.moveChatLoaderToEnd();
+
+    return this.chatLoaderEl;
+  }
+
+  private setChatLoaderActive(isActive: boolean, loaderMessage?: string) {
+    const loaderEl = this.ensureChatLoader();
+    if (!loaderEl) {
+      return;
+    }
+
+    loaderEl.classList.toggle("is-active", isActive);
+    loaderEl.setAttribute("aria-hidden", String(!isActive));
+    if (this.chatLoaderTextEl) {
+      if (isActive) {
+        const message =
+          loaderMessage?.trim() ||
+          this.chatLoaderTextEl.textContent?.trim() ||
+          "loading...";
+        this.chatLoaderTextEl.setText(this.compactLoaderMessage(message));
+      } else {
+        this.chatLoaderTextEl.setText("");
+      }
+    }
+    this.moveChatLoaderToEnd();
+  }
+
+  private updateChatLoader(message: string) {
+    if (!this.isRunning && !this.stopRequested) {
+      return;
+    }
+
+    const loaderEl = this.ensureChatLoader();
+    if (!loaderEl || !this.chatLoaderTextEl) {
+      return;
+    }
+
+    this.chatLoaderTextEl.setText(this.compactLoaderMessage(message));
+    loaderEl.classList.add("is-active");
+    loaderEl.setAttribute("aria-hidden", "false");
+    this.moveChatLoaderToEnd();
+  }
+
+  private moveChatLoaderToEnd() {
+    if (!this.logEl || !this.chatLoaderEl?.isConnected) {
+      return;
+    }
+
+    this.logEl.appendChild(this.chatLoaderEl);
+  }
+
+  private updateRunButtonState() {
+    if (!this.runButtonEl) {
+      return;
+    }
+
+    this.runButtonEl.disabled = this.isRunning && this.stopRequested;
+    this.runButtonEl.classList.toggle(
+      "is-stop",
+      this.isRunning && !this.stopRequested,
+    );
+    this.runButtonEl.classList.toggle(
+      "is-stopping",
+      this.isRunning && this.stopRequested,
+    );
+    this.runButtonEl.setAttribute(
+      "aria-label",
+      this.isRunning
+        ? this.stopRequested
+          ? "Stopping mission"
+          : "Stop mission"
+        : "Run Mission",
+    );
+    this.runButtonEl.setText(
+      this.isRunning
+        ? this.stopRequested
+          ? "Stopping..."
+          : "Stop Mission"
+        : "Run Mission",
     );
   }
 
@@ -1004,6 +1587,7 @@ export class AgentView extends ItemView {
     }
 
     this.setExpandablePayload(rowEl, this.buildTracePayload(event));
+    this.appendRunDetailProjection(event);
 
     if (chatId) {
       this.bindTraceNavigation(rowEl, chatId);
@@ -1012,6 +1596,87 @@ export class AgentView extends ItemView {
     this.traceRowEls.set(event.id, rowEl);
     this.runLogEl.scrollTop = this.runLogEl.scrollHeight;
     return rowEl;
+  }
+
+  private appendRunDetailProjection(event: AgentTraceEvent) {
+    const toolName = event.toolName ?? "";
+    if (toolName.startsWith("browser_")) {
+      this.appendDetailLine(this.browserDetailsEl, event);
+    }
+
+    if (
+      event.kind === "tool_start" ||
+      event.kind === "tool_result" ||
+      event.kind === "tool_rejected" ||
+      event.kind === "receipt"
+    ) {
+      this.appendDetailLine(this.actionsDetailsEl, event);
+    }
+
+    if (
+      event.kind === "planning" ||
+      event.kind === "tool_result" ||
+      event.kind === "receipt" ||
+      event.kind === "final" ||
+      event.kind === "complete"
+    ) {
+      this.appendDetailLine(this.milestonesDetailsEl, event);
+    }
+
+    if (toolName.startsWith("memory_")) {
+      this.appendDetailLine(this.memoryDetailsEl, event);
+    }
+
+    if (
+      toolName === "web_fetch" ||
+      toolName === "open_web_source" ||
+      toolName === "read_file" ||
+      toolName === "read_markdown_files" ||
+      toolName === "browser_extract_markdown"
+    ) {
+      this.appendDetailLine(this.evidenceDetailsEl, event);
+    }
+
+    if (
+      toolName === "create_design_canvas" ||
+      toolName === "create_svg_design" ||
+      toolName === "create_design_package" ||
+      toolName === "open_web_source" ||
+      event.kind === "receipt"
+    ) {
+      this.appendDetailLine(this.artifactsDetailsEl, event);
+    }
+  }
+
+  private appendDetailLine(element: HTMLElement | null, event: AgentTraceEvent) {
+    if (!element || !event.message) {
+      return;
+    }
+
+    this.clearPlaceholder(element);
+    const rowEl = element.createDiv({
+      cls: `agentic-researcher-detail-line agentic-researcher-detail-${event.kind}`,
+    });
+    rowEl.createSpan({
+      text: event.toolName ? `${event.toolName}: ` : `${event.kind}: `,
+      cls: "agentic-researcher-detail-kind",
+    });
+    rowEl.createSpan({
+      text: event.message,
+      cls: "agentic-researcher-detail-message",
+    });
+    const meta = [
+      event.path ? `path=${event.path}` : null,
+      event.toPath ? `to=${event.toPath}` : null,
+      event.operation ? `op=${event.operation}` : null,
+    ].filter((part): part is string => Boolean(part));
+    if (meta.length > 0) {
+      rowEl.createSpan({
+        text: ` ${meta.join(" ")}`,
+        cls: "agentic-researcher-detail-meta",
+      });
+    }
+    this.setExpandablePayload(rowEl, this.buildTracePayload(event));
   }
 
   private normalizeTraceKind(kind: string): AgentTraceEvent["kind"] {
@@ -1186,8 +1851,11 @@ export class AgentView extends ItemView {
     return Number.isFinite(step) && step > 0 ? step : 1;
   }
 
-  private formatStepMetric(step: number): string {
-    return `${step} used (max ${MAX_AGENT_STEPS})`;
+  private formatStepMetric(
+    step: number,
+    maxSteps = this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS,
+  ): string {
+    return `${step} used (max ${maxSteps})`;
   }
 
   private formatStopReason(stopReason: AgentRunCompleteEvent["stopReason"]) {
@@ -1196,6 +1864,8 @@ export class AgentView extends ItemView {
         return "Write complete";
       case "clarifying_question":
         return "Needs clarification";
+      case "user_stopped":
+        return "Stopped by user";
       case "budget":
         return "Stopped at safety limit";
       case "error":
@@ -1212,4 +1882,8 @@ export class AgentView extends ItemView {
       .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
       .join(" ");
   }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
