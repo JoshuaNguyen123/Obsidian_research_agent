@@ -3,7 +3,7 @@
   "name": "Agentic Researcher",
   "version": "0.2.0",
   "minAppVersion": "1.5.0",
-  "description": "Minimal right-side shell for an agentic Obsidian research assistant.",
+  "description": "Native right-side Obsidian co-researcher: plan, use approved tools, write notes with receipts. Overnight needs Obsidian open (not a daemon); keep-awake and model router are opt-in.",
   "author": "Josh",
   "authorUrl": "",
   "isDesktopOnly": false

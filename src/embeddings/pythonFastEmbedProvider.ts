@@ -4,49 +4,389 @@ import type {
   SemanticEmbeddingRequest,
   SemanticEmbeddingResponse,
 } from "./types";
+import { getNodeRequireForObsidian } from "../platform/nodeRequire";
 
-const HELPER_TIMEOUT_MS = 180000;
+const REQUEST_TIMEOUT_MS = 180000;
+const IDLE_SHUTDOWN_MS = 120000;
 const MAX_OUTPUT_CHARS = 10_000_000;
+const MAX_STDERR_CHARS = 20_000;
 
-interface NodeEmbeddingRuntime {
-  spawn: typeof import("child_process").spawn;
+export interface HelperChildLike {
+  stdin: {
+    write(chunk: string, encoding?: BufferEncoding): unknown;
+    end(): void;
+    on?(event: "error", listener: (error: Error) => void): unknown;
+  };
+  stdout: {
+    on(event: "data", listener: (chunk: Buffer) => void): unknown;
+  };
+  stderr: {
+    on(event: "data", listener: (chunk: Buffer) => void): unknown;
+  };
+  on(event: "error", listener: (error: NodeJS.ErrnoException) => void): unknown;
+  on(event: "close", listener: () => void): unknown;
+  kill(): void;
 }
 
+export type HelperSpawn = (
+  command: string,
+  args: string[],
+  options: {
+    shell: boolean;
+    windowsHide: boolean;
+    stdio: ["pipe", "pipe", "pipe"];
+  },
+) => HelperChildLike;
+
+export interface NodeEmbeddingRuntime {
+  spawn: HelperSpawn;
+}
+
+export interface PythonFastEmbedProviderOptions {
+  requestTimeoutMs?: number;
+  idleShutdownMs?: number;
+  loadRuntime?: () => NodeEmbeddingRuntime;
+}
+
+interface PendingHelperRequest {
+  id: string;
+  settled: boolean;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve: (response: SemanticEmbeddingResponse) => void;
+}
+
+interface HelperSession {
+  command: string;
+  child: HelperChildLike;
+  alive: boolean;
+  stdoutBuffer: string;
+  stderrTail: string;
+  spawnErrorResponse: SemanticEmbeddingResponse | null;
+  pending: PendingHelperRequest | null;
+}
+
+/**
+ * Creates the FastEmbed semantic embedding provider backed by one long-lived
+ * Python helper process. The helper keeps loaded FastEmbed models in memory and
+ * answers line-delimited JSON requests over stdin/stdout, so repeated embeds
+ * skip interpreter startup and model reload. The child is killed after an idle
+ * window and on dispose; it is respawned transparently on the next request.
+ */
 export function createPythonFastEmbedProvider(
-  settings: AgentSettings,
+  settings: AgentSettings | (() => AgentSettings),
+  options: PythonFastEmbedProviderOptions = {},
 ): SemanticEmbeddingProvider {
+  const getSettings = typeof settings === "function" ? settings : () => settings;
+  const requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+  const idleShutdownMs = options.idleShutdownMs ?? IDLE_SHUTDOWN_MS;
+  const loadRuntime = options.loadRuntime ?? loadNodeEmbeddingRuntime;
+
+  let session: HelperSession | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let disposed = false;
+  let requestSeq = 0;
+  let queueTail: Promise<unknown> = Promise.resolve();
+
+  const clearIdleTimer = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
+  const destroySession = (target: HelperSession) => {
+    target.alive = false;
+    try {
+      target.child.stdin.end();
+    } catch {
+      // Child stdin may already be closed.
+    }
+    try {
+      target.child.kill();
+    } catch {
+      // Child may already be gone.
+    }
+    settlePending(target, helperExitedResponse(target));
+    if (session === target) {
+      session = null;
+    }
+  };
+
+  const armIdleTimer = () => {
+    clearIdleTimer();
+    if (!session?.alive || disposed) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (session) {
+        destroySession(session);
+      }
+    }, idleShutdownMs);
+  };
+
+  const spawnSession = (
+    runtime: NodeEmbeddingRuntime,
+    command: string,
+  ): HelperSession => {
+    const child = runtime.spawn(command, ["-c", PYTHON_FASTEMBED_HELPER], {
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const created: HelperSession = {
+      command,
+      child,
+      alive: true,
+      stdoutBuffer: "",
+      stderrTail: "",
+      spawnErrorResponse: null,
+      pending: null,
+    };
+
+    // Failed spawns can surface async EPIPE errors on stdin; without a
+    // listener those become uncaught stream exceptions in the renderer.
+    child.stdin.on?.("error", () => {});
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (created.stdoutBuffer.length < MAX_OUTPUT_CHARS) {
+        created.stdoutBuffer += chunk.toString("utf8");
+      }
+      drainStdoutLines(created);
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      created.stderrTail = (created.stderrTail + chunk.toString("utf8")).slice(
+        -MAX_STDERR_CHARS,
+      );
+    });
+
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      created.alive = false;
+      created.spawnErrorResponse = {
+        ok: false,
+        model: "",
+        dim: 0,
+        code: error.code === "ENOENT" ? "missing_python" : "spawn_error",
+        message: error.message,
+      };
+      settlePending(created, created.spawnErrorResponse);
+      if (session === created) {
+        session = null;
+      }
+    });
+
+    child.on("close", () => {
+      created.alive = false;
+      settlePending(created, helperExitedResponse(created));
+      if (session === created) {
+        session = null;
+      }
+    });
+
+    return created;
+  };
+
+  const drainStdoutLines = (target: HelperSession) => {
+    while (true) {
+      const newlineIndex = target.stdoutBuffer.indexOf("\n");
+      if (newlineIndex < 0) {
+        return;
+      }
+      const line = target.stdoutBuffer.slice(0, newlineIndex).trim();
+      target.stdoutBuffer = target.stdoutBuffer.slice(newlineIndex + 1);
+      if (!line) {
+        continue;
+      }
+      const parsed = parseHelperLine(line);
+      if (!parsed) {
+        continue;
+      }
+      const pending = target.pending;
+      if (!pending || pending.settled || parsed.id !== pending.id) {
+        continue;
+      }
+      settlePending(target, parsed.response);
+    }
+  };
+
+  const sendRequest = (
+    target: HelperSession,
+    request: SemanticEmbeddingRequest,
+    activeSettings: AgentSettings,
+  ): Promise<SemanticEmbeddingResponse> => {
+    return new Promise((resolve) => {
+      const id = `req-${++requestSeq}`;
+      const pending: PendingHelperRequest = {
+        id,
+        settled: false,
+        resolve,
+        timeout: setTimeout(() => {
+          settlePending(target, {
+            ok: false,
+            model: request.model,
+            dim: request.dim,
+            code: "timeout",
+            message: `FastEmbed helper timed out after ${requestTimeoutMs}ms.`,
+          });
+          destroySession(target);
+        }, requestTimeoutMs),
+      };
+      target.pending = pending;
+
+      if (target.spawnErrorResponse) {
+        settlePending(target, target.spawnErrorResponse);
+        return;
+      }
+      if (!target.alive) {
+        settlePending(target, helperExitedResponse(target));
+        return;
+      }
+
+      const body =
+        JSON.stringify({
+          id,
+          ...request,
+          cacheDir: request.cacheDir ?? activeSettings.semanticModelCacheDir,
+        }) + "\n";
+      try {
+        target.child.stdin.write(body, "utf8");
+      } catch {
+        settlePending(target, helperExitedResponse(target));
+        destroySession(target);
+      }
+    });
+  };
+
+  const embedNow = async (
+    request: SemanticEmbeddingRequest,
+  ): Promise<SemanticEmbeddingResponse> => {
+    if (disposed) {
+      return {
+        ok: false,
+        model: request.model,
+        dim: request.dim,
+        code: "disposed",
+        message: "FastEmbed provider is disposed.",
+      };
+    }
+    clearIdleTimer();
+    try {
+      let runtime: NodeEmbeddingRuntime;
+      try {
+        runtime = loadRuntime();
+      } catch (error) {
+        return {
+          ok: false,
+          model: request.model,
+          dim: request.dim,
+          code: "node_runtime_unavailable",
+          message: getErrorMessage(error),
+        };
+      }
+
+      const activeSettings = getSettings();
+      const commands = getPythonCommands(activeSettings.semanticPythonCommand);
+
+      if (session?.alive && commands.includes(session.command)) {
+        const result = await sendRequest(session, request, activeSettings);
+        // A previously-working helper that died mid-request falls through to
+        // one fresh respawn attempt below instead of failing the embed.
+        if (result.code !== "helper_exited") {
+          return result;
+        }
+      } else if (session) {
+        destroySession(session);
+      }
+
+      const errors: string[] = [];
+      for (const command of commands) {
+        const fresh = spawnSession(runtime, command);
+        session = fresh;
+        const result = await sendRequest(fresh, request, activeSettings);
+        if (result.ok || result.code !== "missing_python") {
+          return result;
+        }
+        errors.push(`${command}: ${result.message ?? result.code}`);
+        destroySession(fresh);
+      }
+
+      return {
+        ok: false,
+        model: request.model,
+        dim: request.dim,
+        code: "missing_python",
+        message: errors.join(" "),
+      };
+    } finally {
+      armIdleTimer();
+    }
+  };
+
+  const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = queueTail.then(task, task);
+    queueTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
   return {
-    embed: (request) => embedWithPythonFastEmbed(request, settings),
+    embed: (request) => enqueue(() => embedNow(request)),
+    dispose: () => {
+      disposed = true;
+      clearIdleTimer();
+      if (session) {
+        destroySession(session);
+      }
+    },
   };
 }
 
-async function embedWithPythonFastEmbed(
-  request: SemanticEmbeddingRequest,
-  settings: AgentSettings,
-): Promise<SemanticEmbeddingResponse> {
-  const runtime = await loadNodeEmbeddingRuntime();
-  const commands = getPythonCommands(settings.semanticPythonCommand);
-  const body = JSON.stringify({
-    ...request,
-    cacheDir: request.cacheDir ?? settings.semanticModelCacheDir,
-  });
-  const errors: string[] = [];
-
-  for (const command of commands) {
-    const result = await runPythonHelper(runtime, command, body);
-    if (result.ok || result.code !== "missing_python") {
-      return result;
-    }
-    errors.push(`${command}: ${result.message ?? result.code}`);
+function settlePending(
+  target: HelperSession,
+  response: SemanticEmbeddingResponse,
+) {
+  const pending = target.pending;
+  if (!pending || pending.settled) {
+    return;
   }
+  pending.settled = true;
+  clearTimeout(pending.timeout);
+  target.pending = null;
+  pending.resolve(response);
+}
 
+function helperExitedResponse(target: HelperSession): SemanticEmbeddingResponse {
   return {
     ok: false,
-    model: request.model,
-    dim: request.dim,
-    code: "missing_python",
-    message: errors.join(" "),
+    model: "",
+    dim: 0,
+    code: "helper_exited",
+    message:
+      target.stderrTail.trim() ||
+      "FastEmbed helper exited before returning a response.",
   };
+}
+
+function parseHelperLine(
+  line: string,
+): { id: string; response: SemanticEmbeddingResponse } | null {
+  try {
+    const parsed = JSON.parse(line) as SemanticEmbeddingResponse & {
+      id?: unknown;
+    };
+    if (typeof parsed?.ok !== "boolean") {
+      return null;
+    }
+    const id = typeof parsed.id === "string" ? parsed.id : "";
+    const response = { ...parsed };
+    delete (response as { id?: unknown }).id;
+    return { id, response };
+  } catch {
+    return null;
+  }
 }
 
 function getPythonCommands(configuredCommand: string): string[] {
@@ -58,104 +398,24 @@ function getPythonCommands(configuredCommand: string): string[] {
   return [...new Set(commands)];
 }
 
-async function runPythonHelper(
-  runtime: NodeEmbeddingRuntime,
-  command: string,
-  body: string,
-): Promise<SemanticEmbeddingResponse> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let stdout = "";
-    let stderr = "";
-    const child = runtime.spawn(command, ["-c", PYTHON_FASTEMBED_HELPER], {
-      shell: false,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const timeout = setTimeout(() => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      child.kill();
-      resolve({
-        ok: false,
-        model: "",
-        dim: 0,
-        code: "timeout",
-        message: `FastEmbed helper timed out after ${HELPER_TIMEOUT_MS}ms.`,
-      });
-    }, HELPER_TIMEOUT_MS);
-
-    child.on("error", (error: NodeJS.ErrnoException) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      resolve({
-        ok: false,
-        model: "",
-        dim: 0,
-        code: error.code === "ENOENT" ? "missing_python" : "spawn_error",
-        message: error.message,
-      });
-    });
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (stdout.length < MAX_OUTPUT_CHARS) {
-        stdout += chunk.toString("utf8");
-      }
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      if (stderr.length < MAX_OUTPUT_CHARS) {
-        stderr += chunk.toString("utf8");
-      }
-    });
-
-    child.on("close", () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      const parsed = parseHelperResponse(stdout);
-      if (parsed) {
-        resolve(parsed);
-        return;
-      }
-      resolve({
-        ok: false,
-        model: "",
-        dim: 0,
-        code: "invalid_response",
-        message: stderr.trim() || "FastEmbed helper returned invalid JSON.",
-      });
-    });
-
-    child.stdin.end(body, "utf8");
-  });
-}
-
-function parseHelperResponse(stdout: string): SemanticEmbeddingResponse | null {
-  try {
-    const parsed = JSON.parse(stdout.trim()) as SemanticEmbeddingResponse;
-    if (typeof parsed?.ok === "boolean") {
-      return parsed;
-    }
-  } catch {
-    return null;
+function loadNodeEmbeddingRuntime(): NodeEmbeddingRuntime {
+  const nodeRequire = getNodeRequireForObsidian();
+  if (!nodeRequire) {
+    throw new Error("Node require is unavailable for FastEmbed semantic search.");
   }
 
-  return null;
+  const childProcess = nodeRequire("child_process") as typeof import("child_process");
+  if (typeof childProcess.spawn !== "function") {
+    throw new Error("Node child_process.spawn is unavailable for FastEmbed semantic search.");
+  }
+
+  return {
+    spawn: childProcess.spawn as unknown as HelperSpawn,
+  };
 }
 
-async function loadNodeEmbeddingRuntime(): Promise<NodeEmbeddingRuntime> {
-  const childProcess = await import("child_process");
-  return {
-    spawn: childProcess.spawn,
-  };
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 const PYTHON_FASTEMBED_HELPER = String.raw`
@@ -164,12 +424,14 @@ import math
 import os
 import sys
 
+MODELS = {}
+
 def emit(payload):
-    sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
-def fail(code, message, model="", dim=0):
-    emit({"ok": False, "model": model, "dim": dim, "code": code, "message": message})
+def fail(rid, code, message, model="", dim=0):
+    emit({"id": rid, "ok": False, "model": model, "dim": dim, "code": code, "message": message})
 
 def as_vector(value):
     if hasattr(value, "tolist"):
@@ -196,13 +458,25 @@ def matryoshka(values, dim):
         raise ValueError("embedding dimension %d is smaller than requested dim %d" % (len(normalized), dim))
     return l2_norm(normalized[:dim])
 
-def main():
+def get_model(model_name, cache_dir):
+    key = (model_name, cache_dir)
+    cached = MODELS.get(key)
+    if cached is not None:
+        return cached
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ["FASTEMBED_CACHE_PATH"] = cache_dir
+    from fastembed import TextEmbedding
     try:
-        request = json.loads(sys.stdin.read())
-    except Exception as error:
-        fail("invalid_json", str(error))
-        return
+        instance = TextEmbedding(model_name=model_name, cache_dir=cache_dir or None)
+    except TypeError:
+        instance = TextEmbedding(model_name=model_name)
+    list(instance.embed(["search_query: warmup"], batch_size=1))
+    MODELS[key] = instance
+    return instance
 
+def handle(request):
+    rid = str(request.get("id") or "")
     model = str(request.get("model") or "nomic-ai/nomic-embed-text-v1.5-Q")
     dim = int(request.get("dim") or 512)
     cache_dir = str(request.get("cacheDir") or "").strip()
@@ -210,26 +484,19 @@ def main():
     queries = request.get("queries") or []
 
     if dim not in (256, 512):
-        fail("invalid_dim", "dim must be 256 or 512", model, dim)
+        fail(rid, "invalid_dim", "dim must be 256 or 512", model, dim)
         return
 
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-        os.environ["FASTEMBED_CACHE_PATH"] = cache_dir
-
     try:
-        from fastembed import TextEmbedding
+        embedding_model = get_model(model, cache_dir)
     except ImportError:
-        fail("missing_fastembed", "Install FastEmbed with: python -m pip install fastembed", model, dim)
+        fail(rid, "missing_fastembed", "Install FastEmbed with: python -m pip install fastembed", model, dim)
+        return
+    except Exception as error:
+        fail(rid, "embed_failed", str(error), model, dim)
         return
 
     try:
-        try:
-            embedding_model = TextEmbedding(model_name=model, cache_dir=cache_dir or None)
-        except TypeError:
-            embedding_model = TextEmbedding(model_name=model)
-
-        list(embedding_model.embed(["search_query: warmup"], batch_size=1))
         document_inputs = ["search_document: " + str(item) for item in documents]
         query_inputs = ["search_query: " + str(item) for item in queries]
         document_vectors = []
@@ -243,10 +510,11 @@ def main():
                 for vector in batch:
                     query_vectors.append(matryoshka(vector, dim))
     except Exception as error:
-        fail("embed_failed", str(error), model, dim)
+        fail(rid, "embed_failed", str(error), model, dim)
         return
 
     emit({
+        "id": rid,
         "ok": True,
         "model": model,
         "dim": dim,
@@ -255,6 +523,18 @@ def main():
         "downloadedOrVerified": True,
         "cacheDir": cache_dir,
     })
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except Exception as error:
+            fail("", "invalid_json", str(error))
+            continue
+        handle(request)
 
 main()
 `;

@@ -9,10 +9,15 @@ import {
   createMissionLedger,
   formatMissionLedgerBlock,
   parseMissionLedgerFromMarkdown,
+  readLatestMissionLedger,
   readMissionLedgerByRunId,
+  setLedgerAcceptance,
+  setLedgerDependencyStatus,
   summarizeMissionLedger,
   upsertLedgerEvidence,
+  upsertMissionEvidenceRecord,
   writeMissionLedger,
+  type MissionEvidence,
   type MissionLedger,
 } from "../src/agent/missionLedger";
 import {
@@ -21,8 +26,10 @@ import {
 } from "../src/agent/missionEvidence";
 import {
   buildMissionResumeContext,
+  buildMissionResumePlan,
   extractRequestedRunId,
   formatLedgerForModel,
+  hasMissionResumeIntent,
 } from "../src/agent/missionResume";
 import type { ToolExecutionContext, ToolExecutionResult } from "../src/tools/types";
 
@@ -92,6 +99,26 @@ test("mission ledger creates, updates, serializes, parses, and summarizes durabl
     confidence: "high",
   });
   addLedgerReceipt(ledger, "receipt:append");
+  setLedgerAcceptance(
+    ledger,
+    {
+      status: "pass",
+      confidence: 0.92,
+      missing: [],
+      reasons: ["required_evidence_and_receipts_present"],
+    },
+    new Date("2026-07-05T12:00:00.000Z"),
+  );
+  setLedgerDependencyStatus(ledger, [
+    {
+      category: "provider_auth",
+      status: "ok",
+      capability: "model requests",
+      summary: "Provider auth configured.",
+      nextAction: "No user action needed.",
+      checkedAt: "2026-07-05T12:00:00.000Z",
+    },
+  ]);
 
   const block = formatMissionLedgerBlock(ledger);
   const parsed = parseMissionLedgerFromMarkdown(`# Agent Run\n\n${block}`);
@@ -102,19 +129,63 @@ test("mission ledger creates, updates, serializes, parses, and summarizes durabl
 
   const firstWrite = await writeMissionLedger(mock.context, ledger);
   assert.equal(firstWrite?.path, "Agent Runs/run-test.md");
+  assert.equal(firstWrite?.revision, 1);
   ledger.status = "complete";
   const secondWrite = await writeMissionLedger(mock.context, ledger);
   assert.equal(secondWrite?.path, "Agent Runs/run-test.md");
+  assert.equal(secondWrite?.revision, 2);
+
+  const concurrentFirst = {
+    ...ledger,
+    blockers: [...ledger.blockers, "first queued update"],
+  };
+  const concurrentSecond = {
+    ...ledger,
+    blockers: [...ledger.blockers, "second queued update"],
+  };
+  const concurrentWrites = await Promise.all([
+    writeMissionLedger(mock.context, concurrentFirst),
+    writeMissionLedger(mock.context, concurrentSecond),
+  ]);
+  assert.deepEqual(
+    concurrentWrites.map((result) => result?.revision),
+    [3, 4],
+  );
   const file = mock.files.get("Agent Runs/run-test.md") ?? "";
   assert.equal((file.match(/## Mission Ledger/g) ?? []).length, 1);
   assert.match(file, /"status": "complete"/);
+  assert.match(file, /"revision": 4/);
   assert.deepEqual(summarizeMissionLedger(ledger), {
     runId: "run:test",
     status: "complete",
+    acceptance: {
+      status: "pass",
+      confidence: 0.92,
+      missing: [],
+      reasons: ["required_evidence_and_receipts_present"],
+      checkedAt: "2026-07-05T12:00:00.000Z",
+    },
     evidenceCount: 1,
     receiptCount: 1,
     expectedTools: ["web_search", "web_fetch"],
     nextAction: "none",
+    remainingActions: [],
+    continuationCommand: "continue run run:test",
+    canResume: false,
+    blockerCategory: undefined,
+    dependencyStatus: [
+      {
+        category: "provider_auth",
+        status: "ok",
+        capability: "model requests",
+        summary: "Provider auth configured.",
+        nextAction: "No user action needed.",
+        checkedAt: "2026-07-05T12:00:00.000Z",
+      },
+    ],
+    iterationCount: 0,
+    progressScore: 0,
+    stalledCount: 0,
   });
 });
 
@@ -162,6 +233,48 @@ test("mission evidence converts web, vault, artifact, and receipt outputs and de
   assert.equal(ledger.evidence.length, 4);
 });
 
+test("same-source section evidence merges passage ids in memory and ledger round trips", () => {
+  const url = "https://example.com/sectioned-source";
+  const first = evidenceFromToolResult("read_source_section", okResult({
+    url,
+    normalizedUrl: url,
+    title: "Sectioned source",
+    sourceStartChar: 0,
+    content: "First-section claim and context.",
+  }));
+  const second = evidenceFromToolResult("read_source_section", okResult({
+    url,
+    normalizedUrl: url,
+    title: "Sectioned source",
+    sourceStartChar: 6000,
+    content: "Second-section limitation and conclusion.",
+  }));
+  assert.ok(first?.passageId);
+  assert.ok(second?.passageId);
+  assert.notEqual(first.passageId, second.passageId);
+
+  const inMemory: MissionEvidence[] = [];
+  upsertMissionEvidenceRecord(inMemory, first);
+  upsertMissionEvidenceRecord(inMemory, second);
+  assert.equal(inMemory.length, 1);
+  assert.equal(inMemory[0].passageId, first.passageId);
+  assert.equal(inMemory[0].sourceId, first.sourceId);
+  assert.equal(inMemory[0].url, url);
+  assert.ok(inMemory[0].passageIds?.includes(first.passageId));
+  assert.ok(inMemory[0].passageIds?.includes(second.passageId));
+
+  const ledger = createTestLedger();
+  upsertLedgerEvidence(ledger, first);
+  upsertLedgerEvidence(ledger, second);
+  const restored = parseMissionLedgerFromMarkdown(
+    formatMissionLedgerBlock(ledger),
+  );
+  assert.equal(restored?.evidence.length, 1);
+  assert.equal(restored?.evidence[0].passageId, first.passageId);
+  assert.ok(restored?.evidence[0].passageIds?.includes(first.passageId));
+  assert.ok(restored?.evidence[0].passageIds?.includes(second.passageId));
+});
+
 test("mission resume parses explicit run ids and formats transient resume context", async () => {
   const mock = createMissionLedgerContext();
   const ledger = createTestLedger();
@@ -190,6 +303,152 @@ test("mission resume parses explicit run ids and formats transient resume contex
   assert.equal(resume?.ledger.runId, "run:test");
   assert.match(resume?.promptContext ?? "", /Do not persist this ledger text/);
   assert.match(formatLedgerForModel(ledger), /Useful source summary/);
+  assert.match(formatLedgerForModel(ledger), /Continuation command: continue run run:test/);
+  assert.match(formatLedgerForModel(ledger), /Proof debt \(recomputed/);
+  assert.equal(resume?.plan.proofDebt.empty, false);
+  assert.ok(resume?.plan.proofDebt);
+});
+
+test("research memory continuation does not trigger mission ledger resume", async () => {
+  const mock = createMissionLedgerContext();
+  await writeMissionLedger(mock.context, createTestLedger());
+
+  assert.equal(
+    hasMissionResumeIntent("Continue this research from memory: routing topic"),
+    false,
+  );
+  assert.equal(
+    hasMissionResumeIntent("continue run run:test"),
+    true,
+  );
+  assert.equal(
+    hasMissionResumeIntent(
+      "Run a new overnight study, inspect the graph, and continue with deep sources until the mission is complete.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasMissionResumeIntent("Please resume the unfinished mission."),
+    true,
+  );
+
+  const resume = await buildMissionResumeContext({
+    prompt: "Continue this research from memory: routing topic",
+    activeIntentPrompt: "Continue this research from memory: routing topic",
+    toolContext: mock.context,
+  });
+  assert.equal(resume, null);
+});
+
+test("generic resume selects latest incomplete ledger before newer complete ledgers", async () => {
+  const mock = createMissionLedgerContext();
+  const incomplete = createMissionLedger({
+    runId: "run:incomplete",
+    mission: "Continue this mission.",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 30,
+      toolStepBudget: 5,
+      finalizationReserve: 1,
+      expectedTools: ["web_search"],
+      stopWhenSatisfied: false,
+    },
+    now: new Date("2026-07-05T12:00:00.000Z"),
+  });
+  incomplete.status = "budget";
+  incomplete.remainingActions = ["Fetch one more source."];
+  await writeMissionLedger(mock.context, incomplete);
+
+  const complete = createMissionLedger({
+    runId: "run:complete",
+    mission: "Already done.",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 30,
+      toolStepBudget: 5,
+      finalizationReserve: 1,
+      expectedTools: [],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-07-05T12:01:00.000Z"),
+  });
+  complete.status = "complete";
+  complete.acceptance = {
+    status: "pass",
+    confidence: 0.95,
+    missing: [],
+    reasons: ["done"],
+    checkedAt: "2026-07-05T12:01:00.000Z",
+  };
+  await writeMissionLedger(mock.context, complete);
+
+  const latest = await readLatestMissionLedger(mock.context);
+  assert.equal(latest?.ledger.runId, "run:incomplete");
+
+  const resume = await buildMissionResumeContext({
+    prompt: "continue",
+    activeIntentPrompt: "continue",
+    toolContext: mock.context,
+  });
+  assert.equal(resume?.plan.continuationCommand, "continue run run:incomplete");
+  assert.ok(
+    resume?.plan.remainingActions.includes("Fetch one more source."),
+  );
+});
+
+test("resume plan next action comes from proof debt and skips completed subquestions", () => {
+  const ledger = createTestLedger();
+  ledger.status = "budget";
+  ledger.researchPlan = {
+    version: 1,
+    mode: "deep_web",
+    sourceRequirements: { minFetchedSources: 2, minDistinctDomains: 1 },
+    coverageRequirements: {
+      minVaultCoverageConfidence: "medium",
+      expandWhenSampledOrTruncated: true,
+    },
+    subquestions: [
+      {
+        id: "rq-1",
+        question: "Already answered question",
+        requiredEvidenceType: "web_source",
+        minEvidence: 1,
+        status: "complete",
+        evidenceIds: ["web:1"],
+      },
+      {
+        id: "rq-2",
+        question: "Still unpaid fetch question",
+        requiredEvidenceType: "web_source",
+        minEvidence: 1,
+        status: "in_progress",
+        evidenceIds: [],
+      },
+    ],
+    evidenceIds: ["web_search:1", "web:1"],
+    status: "in_progress",
+  };
+  ledger.acceptance = {
+    status: "needs_more_work",
+    confidence: 0.4,
+    missing: ["web_evidence", "fetched_sources"],
+    reasons: ["need_fetch"],
+    checkedAt: "2026-07-05T12:00:00.000Z",
+  };
+  ledger.nextActions = [
+    "Continue research item rq-1: Already answered question",
+    "Stale narrative keep going",
+  ];
+  ledger.remainingActions = ["Reopen rq-1 somehow"];
+
+  const plan = buildMissionResumePlan(ledger);
+  assert.equal(plan.proofDebt.empty, false);
+  assert.equal(plan.proofDebt.nextAction.toolName, "web_fetch");
+  assert.match(plan.remainingActions[0] ?? "", /web_fetch/);
+  assert.ok(plan.remainingActions.some((item) => item.includes("rq-2")));
+  assert.ok(!plan.remainingActions.some((item) => /\brq-1\b/.test(item)));
+  assert.match(formatLedgerForModel(ledger), /Resume next action \(from proof debt\): web_fetch/);
+  assert.match(formatLedgerForModel(ledger), /do not reopen completed research subquestions/i);
 });
 
 function createTestLedger(): MissionLedger {

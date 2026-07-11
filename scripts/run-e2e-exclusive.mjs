@@ -1,0 +1,477 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+  mkdir,
+  open,
+  readFile,
+  unlink,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const DEFAULT_WAIT_MS = 30_000;
+const DEFAULT_POLL_MS = 250;
+const SIGNAL_EXIT_CODES = {
+  SIGHUP: 129,
+  SIGINT: 130,
+  SIGTERM: 143,
+};
+
+let activeChild = null;
+let activeLock = null;
+let interruptedSignal = null;
+let forcedExitTimer = null;
+
+export async function acquireE2eLock(options = {}) {
+  const lockPath =
+    options.lockPath ?? resolveE2eLockPath(options.env ?? process.env);
+  const waitMs = parseBoundedInteger(
+    options.waitMs ??
+      (options.env ?? process.env).OBSIDIAN_E2E_LOCK_WAIT_MS ??
+      DEFAULT_WAIT_MS,
+    "OBSIDIAN_E2E_LOCK_WAIT_MS",
+    0,
+    30 * 60 * 1000,
+  );
+  const pollMs = parseBoundedInteger(
+    options.pollMs ?? DEFAULT_POLL_MS,
+    "e2e lock poll interval",
+    10,
+    10_000,
+  );
+  const startedWaitingAt = Date.now();
+  const metadata = {
+    version: 1,
+    token: randomUUID(),
+    pid: process.pid,
+    hostname: os.hostname(),
+    startedAt: new Date().toISOString(),
+    cdpPort: parseCdpPort(options.env ?? process.env),
+    vault:
+      (options.env ?? process.env).OBSIDIAN_VAULT ??
+      "default test vault",
+    cwd: repoRoot,
+    playwrightArgs: options.playwrightArgs ?? [],
+  };
+  let loggedWait = false;
+
+  await mkdir(path.dirname(lockPath), { recursive: true });
+
+  while (true) {
+    if (options.isCancelled?.()) {
+      throw new Error("Interrupted while waiting for the exclusive Obsidian e2e lock.");
+    }
+    const handle = await open(lockPath, "wx", 0o600).catch((error) => {
+      if (error?.code === "EEXIST") {
+        return null;
+      }
+      throw error;
+    });
+
+    if (handle) {
+      try {
+        await handle.writeFile(`${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+        await handle.sync();
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await unlink(lockPath).catch((unlinkError) => {
+          if (unlinkError?.code !== "ENOENT") {
+            throw unlinkError;
+          }
+        });
+        throw error;
+      }
+      await handle.close();
+
+      let releasePromise = null;
+      return {
+        lockPath,
+        metadata,
+        async release() {
+          if (!releasePromise) {
+            releasePromise = removeLockIfOwned(lockPath, metadata.token);
+          }
+          await releasePromise;
+        },
+      };
+    }
+
+    const owner = await readLockOwner(lockPath);
+    if (await recoverStaleLock(lockPath, owner, options.log ?? console)) {
+      continue;
+    }
+
+    const elapsedMs = Date.now() - startedWaitingAt;
+    if (elapsedMs >= waitMs) {
+      throw new Error(
+        [
+          `Timed out after ${waitMs} ms waiting for the exclusive Obsidian e2e lock.`,
+          describeOwner(owner),
+          `Lock file: ${lockPath}`,
+          "Wait for the owning run to finish. Remove the lock manually only after confirming its owner process is dead.",
+        ].join(" "),
+      );
+    }
+
+    if (!loggedWait) {
+      (options.log ?? console).warn(
+        `Obsidian e2e is already running; waiting up to ${waitMs} ms. ${describeOwner(owner)} Lock file: ${lockPath}`,
+      );
+      loggedWait = true;
+    }
+    await delay(Math.min(pollMs, waitMs - elapsedMs));
+  }
+}
+
+export function resolveE2eLockPath(env = process.env) {
+  if (env.OBSIDIAN_E2E_LOCK_PATH) {
+    return path.resolve(env.OBSIDIAN_E2E_LOCK_PATH);
+  }
+  return path.join(
+    os.tmpdir(),
+    `agentic-researcher-obsidian-e2e-cdp-${parseCdpPort(env)}.lock`,
+  );
+}
+
+export async function readLockOwner(lockPath) {
+  let raw;
+  try {
+    raw = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  try {
+    return { raw, metadata: JSON.parse(raw) };
+  } catch {
+    return { raw, metadata: null };
+  }
+}
+
+export function isProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function main() {
+  const { playwrightArgs, aiMode } = normalizeExclusiveArgs(process.argv.slice(2));
+  applyE2eAiMode(aiMode);
+  installSignalHandlers();
+
+  try {
+    activeLock = await acquireE2eLock({
+      playwrightArgs,
+      isCancelled: () => Boolean(interruptedSignal),
+    });
+    console.log(
+      `Acquired exclusive Obsidian e2e lock for PID ${process.pid}: ${activeLock.lockPath}`,
+    );
+    console.log(
+      `E2E AI mode=${process.env.E2E_AI_MODE} model=${process.env.E2E_AI_MODEL || "(unset)"}`,
+    );
+    const exitCode = await runE2ePipeline(playwrightArgs);
+    process.exitCode = interruptedSignal
+      ? SIGNAL_EXIT_CODES[interruptedSignal] ?? 1
+      : exitCode;
+  } catch (error) {
+    if (!interruptedSignal) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    } else {
+      process.exitCode = SIGNAL_EXIT_CODES[interruptedSignal] ?? 1;
+    }
+  } finally {
+    if (forcedExitTimer) {
+      clearTimeout(forcedExitTimer);
+      forcedExitTimer = null;
+    }
+    await activeLock?.release().catch((error) => {
+      console.error(`Failed to release Obsidian e2e lock: ${error.message}`);
+      process.exitCode = 1;
+    });
+    activeLock = null;
+    removeSignalHandlers();
+  }
+}
+
+async function runE2ePipeline(playwrightArgs) {
+  const stages = [
+    ["build", () => runNpmScript("build")],
+    ["test-vault sync", () => runNpmScript("sync:test-vault")],
+    ["e2e preflight", () => runNpmScript("e2e:preflight")],
+    ["Playwright", () => runPlaywright(playwrightArgs)],
+  ];
+
+  for (const [label, run] of stages) {
+    throwIfInterrupted();
+    const exitCode = await run();
+    throwIfInterrupted();
+    if (exitCode !== 0) {
+      console.error(`${label} exited with code ${exitCode}.`);
+      return exitCode;
+    }
+  }
+  return 0;
+}
+
+function runNpmScript(scriptName) {
+  const npmExecPath = process.env.npm_execpath;
+  if (npmExecPath) {
+    return runCommand(process.execPath, [npmExecPath, "run", scriptName]);
+  }
+  // On Windows, spawning npm.cmd without a shell yields EINVAL.
+  if (process.platform === "win32") {
+    return runCommand(process.env.ComSpec || "cmd.exe", [
+      "/d",
+      "/s",
+      "/c",
+      "npm",
+      "run",
+      scriptName,
+    ]);
+  }
+  return runCommand("npm", ["run", scriptName]);
+}
+
+function runPlaywright(playwrightArgs) {
+  const playwrightCli = path.join(
+    repoRoot,
+    "node_modules",
+    "@playwright",
+    "test",
+    "cli.js",
+  );
+  return runCommand(process.execPath, [playwrightCli, "test", ...playwrightArgs]);
+}
+
+function runCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: "inherit",
+      windowsHide: true,
+    });
+    activeChild = child;
+    child.once("error", (error) => {
+      if (activeChild === child) {
+        activeChild = null;
+      }
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      if (activeChild === child) {
+        activeChild = null;
+      }
+      if (signal && !interruptedSignal) {
+        console.error(`Child process stopped by ${signal}.`);
+      }
+      resolve(code ?? 1);
+    });
+  });
+}
+
+async function recoverStaleLock(lockPath, owner, logger) {
+  const metadata = owner?.metadata;
+  if (
+    !owner ||
+    !metadata ||
+    metadata.hostname !== os.hostname() ||
+    !Number.isSafeInteger(metadata.pid) ||
+    metadata.pid <= 0 ||
+    isProcessAlive(metadata.pid)
+  ) {
+    return false;
+  }
+
+  const confirmation = await readLockOwner(lockPath);
+  if (!confirmation || confirmation.raw !== owner.raw) {
+    return false;
+  }
+
+  await unlink(lockPath).catch((error) => {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  });
+  logger.warn(
+    `Recovered stale Obsidian e2e lock from dead PID ${metadata.pid}: ${lockPath}`,
+  );
+  return true;
+}
+
+async function removeLockIfOwned(lockPath, token) {
+  const owner = await readLockOwner(lockPath);
+  if (!owner || owner.metadata?.token !== token) {
+    return false;
+  }
+  await unlink(lockPath).catch((error) => {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  });
+  return true;
+}
+
+function installSignalHandlers() {
+  for (const signal of Object.keys(SIGNAL_EXIT_CODES)) {
+    process.on(signal, signalHandlers[signal]);
+  }
+}
+
+function removeSignalHandlers() {
+  for (const signal of Object.keys(SIGNAL_EXIT_CODES)) {
+    process.off(signal, signalHandlers[signal]);
+  }
+}
+
+const signalHandlers = Object.fromEntries(
+  Object.keys(SIGNAL_EXIT_CODES).map((signal) => [
+    signal,
+    () => {
+      if (interruptedSignal) {
+        return;
+      }
+      interruptedSignal = signal;
+      terminateActiveChild(signal);
+      forcedExitTimer = setTimeout(() => {
+        void Promise.resolve(activeLock?.release()).finally(() => {
+          process.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
+        });
+      }, 5_000);
+    },
+  ]),
+);
+
+function terminateActiveChild(signal) {
+  const child = activeChild;
+  if (!child || child.exitCode !== null || !child.pid) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    const killer = spawn(
+      "taskkill",
+      ["/PID", String(child.pid), "/T", "/F"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    killer.once("error", () => terminateChildDirectly(child));
+    killer.once("close", (code) => {
+      if (code !== 0 && child.exitCode === null) {
+        terminateChildDirectly(child);
+      }
+    });
+    return;
+  }
+  terminateChildDirectly(child, signal);
+}
+
+function terminateChildDirectly(child, signal = "SIGTERM") {
+  try {
+    child.kill(signal);
+  } catch {
+    // The owned child may have exited between the liveness check and kill.
+  }
+}
+
+function throwIfInterrupted() {
+  if (interruptedSignal) {
+    throw new Error(`Interrupted by ${interruptedSignal}.`);
+  }
+}
+
+function describeOwner(owner) {
+  const metadata = owner?.metadata;
+  if (!owner) {
+    return "The lock owner changed while it was inspected.";
+  }
+  if (!metadata) {
+    return "The lock metadata is unreadable, so owner liveness cannot be proven.";
+  }
+  return `Owner PID ${metadata.pid ?? "unknown"} on ${metadata.hostname ?? "unknown host"}, started ${metadata.startedAt ?? "at an unknown time"}.`;
+}
+
+function parseCdpPort(env) {
+  return parseBoundedInteger(
+    env.OBSIDIAN_CDP_PORT ?? 11223,
+    "OBSIDIAN_CDP_PORT",
+    1,
+    65_535,
+  );
+}
+
+function parseBoundedInteger(value, label, min, max) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${label} must be an integer from ${min} to ${max}.`);
+  }
+  return parsed;
+}
+
+function normalizePlaywrightArgs(args) {
+  return args[0] === "--" ? args.slice(1) : args;
+}
+
+function normalizeExclusiveArgs(rawArgs) {
+  const args = normalizePlaywrightArgs(rawArgs);
+  let aiMode = null;
+  const playwrightArgs = [];
+  for (const arg of args) {
+    if (arg === "--real-ai") {
+      aiMode = "real";
+      continue;
+    }
+    if (arg === "--mock-ai") {
+      aiMode = "mock";
+      continue;
+    }
+    playwrightArgs.push(arg);
+  }
+  return { playwrightArgs, aiMode };
+}
+
+/**
+ * Apply AI mode for the Playwright child. Explicit CLI flags win; otherwise
+ * leave any caller-provided E2E_AI_* env vars alone. Default package scripts
+ * pass --real-ai (gpt-oss:120b-cloud) or --mock-ai for deterministic runs.
+ */
+function applyE2eAiMode(aiMode) {
+  if (aiMode === "real") {
+    process.env.E2E_AI_MODE = "real";
+    process.env.E2E_REAL_AI = "1";
+    if (!process.env.E2E_AI_MODEL?.trim()) {
+      process.env.E2E_AI_MODEL = "gpt-oss:120b-cloud";
+    }
+    return;
+  }
+  if (aiMode === "mock") {
+    process.env.E2E_AI_MODE = "mock";
+    process.env.E2E_REAL_AI = "0";
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+) {
+  void main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

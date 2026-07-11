@@ -5,26 +5,33 @@ import {
   type SemanticChunkingOptions,
 } from "../tools/semanticSearchTools";
 import { normalizeVaultPath } from "../tools/validation";
+import { isPathUnderVaultFolder, isVaultPathExcluded } from "../tools/vaultExclusions";
 import type { SemanticEmbeddingProvider } from "./types";
 import type {
   SemanticIndexBuildResult,
   SemanticIndexChunk,
   SemanticIndexNote,
+  SemanticIndexNoteMeta,
+  SemanticIndexRowMeta,
+  SemanticIndexShardV2,
   SemanticIndexSearchHit,
   SemanticIndexSearchRequest,
   SemanticIndexSearchResult,
   SemanticIndexService,
   SemanticVaultIndex,
+  SemanticVaultIndexV1,
+  SemanticVaultIndexV2,
 } from "./semanticIndexTypes";
 
 const DEFAULT_INDEX_FOLDER = "Agent Memory";
 const DEFAULT_INDEX_MAX_FILES = 1000;
 const INDEX_MARKDOWN_NAME = "Semantic Vault Index.md";
 const INDEX_JSON_NAME = "semantic-vault-index.json";
-const INDEX_VERSION = 1;
+const INDEX_VERSION = 2;
+const LEGACY_INDEX_VERSION = 1;
+const INDEX_SHARD_ROW_LIMIT = 2048;
+const INDEX_SHARD_NAME_PREFIX = "semantic-vault-index-shard-";
 const MAX_INDEX_SNIPPET_CHARS = 360;
-const SYSTEM_PATH_PATTERN =
-  /^(?:\.agent-backups|\.obsidian|\.trash|trash|Agent Runs)(?:\/|$)/i;
 const STOP_TERMS = new Set([
   "the",
   "and",
@@ -69,10 +76,23 @@ interface PendingNoteBuild {
   }>;
 }
 
+interface SemanticIndexBuildPayload {
+  index: SemanticVaultIndex;
+  shards: SemanticIndexShardV2[];
+}
+
 interface Freshness {
   fresh: boolean;
   reason?: string;
 }
+
+interface CachedSemanticShard {
+  mtime: number;
+  size: number;
+  shard: SemanticIndexShardV2;
+}
+
+const semanticShardReadCache = new Map<string, CachedSemanticShard>();
 
 export function createSemanticIndexService(
   options: SemanticIndexServiceOptions,
@@ -105,11 +125,12 @@ export function shouldSemanticIndexTrackPath(
   if (!normalized) {
     return false;
   }
-  const { markdownPath, jsonPath } = getSemanticIndexPaths(settings);
+  const { folder, markdownPath, jsonPath } = getSemanticIndexPaths(settings);
   return (
     normalized !== markdownPath &&
     normalized !== jsonPath &&
-    !SYSTEM_PATH_PATTERN.test(normalized)
+    !isVaultPathExcluded(normalized) &&
+    !isPathUnderVaultFolder(normalized, folder)
   );
 }
 
@@ -148,8 +169,8 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       0,
       getIndexMaxFiles(settings),
     );
-    const result = await this.buildIndexFromFiles(files);
-    if (!result.ok || !result.index) {
+    const result = await this.buildIndexFromFiles(files, INDEX_VERSION);
+    if (!result.ok || !result.payload) {
       return makeBuildResult({
         operation: "semantic_index_rebuild",
         paths,
@@ -159,13 +180,13 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       });
     }
 
-    await this.writeIndex(result.index);
+    await this.writeIndex(result.payload.index, result.payload.shards);
     return makeBuildResult({
       operation: "semantic_index_rebuild",
       paths,
       ok: true,
-      index: result.index,
-      updatedPaths: result.index.notes.map((note) => note.path),
+      index: result.payload.index,
+      updatedPaths: result.payload.index.notes.map((note) => note.path),
     });
   }
 
@@ -199,8 +220,19 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       files.push(file);
     }
 
-    const result = await this.buildIndexFromFiles(files);
-    if (!result.ok || !result.index) {
+    if (existing.version === 2) {
+      return this.updateV2Index({
+        existing,
+        normalizedPaths,
+        files,
+        removedPaths,
+        skippedPaths,
+        indexPaths,
+      });
+    }
+
+    const result = await this.buildIndexFromFiles(files, LEGACY_INDEX_VERSION);
+    if (!result.ok || !result.payload) {
       return makeBuildResult({
         operation: "semantic_index_update",
         paths: indexPaths,
@@ -211,14 +243,14 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     }
 
     const replacements = new Map(
-      result.index.notes.map((note) => [note.path, note]),
+      (result.payload.index as SemanticVaultIndexV1).notes.map((note) => [note.path, note]),
     );
     const removeSet = new Set([...normalizedPaths, ...removedPaths]);
     const notes = existing.notes
       .filter((note) => !removeSet.has(note.path))
       .concat([...replacements.values()])
       .sort((left, right) => left.path.localeCompare(right.path));
-    const nextIndex: SemanticVaultIndex = {
+    const nextIndex: SemanticVaultIndexV1 = {
       ...existing,
       indexedAt: this.now().toISOString(),
       notes,
@@ -241,13 +273,25 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     if (!existing) {
       return;
     }
-
-    const removeSet = new Set(
+    const normalizedPaths = dedupeStrings(
       paths
         .map(normalizeQueuedPath)
         .filter((path): path is string => Boolean(path)),
     );
-    const nextIndex: SemanticVaultIndex = {
+    if (existing.version === 2) {
+      await this.updateV2Index({
+        existing,
+        normalizedPaths,
+        files: [],
+        removedPaths: normalizedPaths,
+        skippedPaths: [],
+        indexPaths: getSemanticIndexPaths(this.getSettings()),
+      });
+      return;
+    }
+
+    const removeSet = new Set(normalizedPaths);
+    const nextIndex: SemanticVaultIndexV1 = {
       ...existing,
       indexedAt: this.now().toISOString(),
       notes: existing.notes.filter((note) => !removeSet.has(note.path)),
@@ -298,14 +342,33 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       );
     }
 
-    const hits = searchIndexChunks({
-      index,
-      queryVector: response.queries[0],
-      queryTerms: tokenize(query),
-      folder: request.folder ?? null,
-      limit: request.limit,
-      maxSnippetChars: request.maxSnippetChars ?? MAX_INDEX_SNIPPET_CHARS,
-    });
+    const searchResult = index.version === 2
+      ? await searchIndexShards({
+          app: this.app,
+          index,
+          queryVector: response.queries[0],
+          queryTerms: tokenize(query),
+          folder: request.folder ?? null,
+          limit: request.limit,
+          maxSnippetChars: request.maxSnippetChars ?? MAX_INDEX_SNIPPET_CHARS,
+          candidateLimit: getCandidateLimit(request),
+          minScore: request.minScore,
+          cursor: request.cursor ?? null,
+        })
+      : {
+          hits: searchIndexChunks({
+            index,
+            queryVector: response.queries[0],
+            queryTerms: tokenize(query),
+            folder: request.folder ?? null,
+            limit: request.limit,
+            maxSnippetChars: request.maxSnippetChars ?? MAX_INDEX_SNIPPET_CHARS,
+            minScore: request.minScore,
+            cursor: request.cursor ?? null,
+          }),
+          candidateCount: index.notes.reduce((sum, note) => sum + note.chunks.length, 0),
+          nextCursor: null,
+        };
 
     return {
       ok: true,
@@ -316,8 +379,10 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       model: index.model,
       dim: index.dim,
       indexedAt: index.indexedAt,
-      resultCount: hits.length,
-      results: hits,
+      candidateCount: searchResult.candidateCount,
+      nextCursor: searchResult.nextCursor,
+      resultCount: searchResult.hits.length,
+      results: searchResult.hits,
     };
   }
 
@@ -325,9 +390,114 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     return getSemanticIndexFreshness(this.app, this.getSettings(), index);
   }
 
-  private async buildIndexFromFiles(files: TFile[]): Promise<{
+  private async updateV2Index({
+    existing,
+    normalizedPaths,
+    files,
+    removedPaths,
+    skippedPaths,
+    indexPaths,
+  }: {
+    existing: SemanticVaultIndexV2;
+    normalizedPaths: string[];
+    files: TFile[];
+    removedPaths: string[];
+    skippedPaths: string[];
+    indexPaths: ReturnType<typeof getSemanticIndexPaths>;
+  }): Promise<SemanticIndexBuildResult> {
+    const replacement = files.length > 0
+      ? await this.buildIndexFromFiles(files, INDEX_VERSION)
+      : {
+          ok: true,
+          payload: {
+            index: {
+              ...existing,
+              notes: [],
+              shards: [],
+              totalRows: 0,
+            } satisfies SemanticVaultIndexV2,
+            shards: [],
+          } satisfies SemanticIndexBuildPayload,
+        };
+    if (!replacement.ok || !replacement.payload) {
+      return makeBuildResult({
+        operation: "semantic_index_update",
+        paths: indexPaths,
+        ok: false,
+        code: replacement.code ?? "semantic_index_update_failed",
+        message: replacement.message ?? "Unable to update semantic index.",
+      });
+    }
+
+    const currentRows = await readAllIndexRowsAndVectors(this.app, existing);
+    if (!currentRows) {
+      return this.rebuild();
+    }
+    const replacementIndex = replacement.payload.index as SemanticVaultIndexV2;
+    const replacementRows = rowsAndVectorsFromShards(
+      replacement.payload.shards,
+      existing.dim,
+    );
+    if (!replacementRows) {
+      return this.rebuild();
+    }
+
+    const replaceSet = new Set(normalizedPaths);
+    const combined = currentRows.rows
+      .map((row, index) => ({ row, vector: currentRows.vectors[index] }))
+      .filter(({ row }) => !replaceSet.has(row.notePath))
+      .concat(
+        replacementRows.rows.map((row, index) => ({
+          row,
+          vector: replacementRows.vectors[index],
+        })),
+      )
+      .sort((left, right) =>
+        left.row.notePath.localeCompare(right.row.notePath) ||
+        left.row.id.localeCompare(right.row.id),
+      );
+    const indexedAt = this.now().toISOString();
+    const nextShards = buildIndexShards({
+      rows: combined.map((item) => item.row),
+      rowVectors: combined.map((item) => item.vector),
+      folder: indexPaths.folder,
+      model: existing.model,
+      dim: existing.dim,
+      indexedAt,
+    });
+    const nextNotes = existing.notes
+      .filter((note) => !replaceSet.has(note.path))
+      .concat(replacementIndex.notes)
+      .sort((left, right) => left.path.localeCompare(right.path));
+    const nextIndex: SemanticVaultIndexV2 = {
+      ...existing,
+      indexedAt,
+      notes: nextNotes,
+      shards: nextShards.map((shard) => ({
+        id: shard.id,
+        path: getShardPath(indexPaths.folder, shard.id),
+        rowCount: shard.rows.length,
+        vectorEncoding: "float32-base64",
+      })),
+      totalRows: combined.length,
+    };
+
+    await this.writeIndex(nextIndex, nextShards);
+    await removeObsoleteShardFiles(this.app, existing, nextIndex);
+    return makeBuildResult({
+      operation: "semantic_index_update",
+      paths: indexPaths,
+      ok: true,
+      index: nextIndex,
+      updatedPaths: replacementIndex.notes.map((note) => note.path),
+      removedPaths,
+      skippedPaths,
+    });
+  }
+
+  private async buildIndexFromFiles(files: TFile[], version: 1 | 2): Promise<{
     ok: boolean;
-    index?: SemanticVaultIndex;
+    payload?: SemanticIndexBuildPayload;
     code?: string;
     message?: string;
   }> {
@@ -354,40 +524,117 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       return vectors;
     }
 
+    if (version === LEGACY_INDEX_VERSION) {
+      let vectorIndex = 0;
+      const notes = pending.map((entry) => ({
+        ...entry.note,
+        chunks: entry.chunkInputs.map((chunk): SemanticIndexChunk => ({
+          id: chunk.id,
+          path: chunk.path,
+          title: chunk.title,
+          heading: chunk.heading,
+          textHash: chunk.textHash,
+          tokenCount: chunk.tokenCount,
+          snippet: chunk.snippet,
+          vector: settings.semanticIndexPersistVectors
+            ? vectors.vectors[vectorIndex++] ?? []
+            : [],
+        })),
+      }));
+
+      return {
+        ok: true,
+        payload: {
+          index: {
+            version: LEGACY_INDEX_VERSION,
+            model: getSemanticModel(settings),
+            dim: getSemanticDim(settings),
+            chunking,
+            indexedAt: this.now().toISOString(),
+            notes,
+          },
+          shards: [],
+        },
+      };
+    }
+
+    const indexedAt = this.now().toISOString();
+    const dim = getSemanticDim(settings);
+    const rows: SemanticIndexRowMeta[] = [];
+    const rowVectors: number[][] = [];
     let vectorIndex = 0;
-    const notes = pending.map((entry) => ({
-      ...entry.note,
-      chunks: entry.chunkInputs.map((chunk): SemanticIndexChunk => ({
-        id: chunk.id,
-        path: chunk.path,
-        title: chunk.title,
-        heading: chunk.heading,
-        textHash: chunk.textHash,
-        tokenCount: chunk.tokenCount,
-        snippet: chunk.snippet,
-        vector: settings.semanticIndexPersistVectors
-          ? vectors.vectors[vectorIndex++] ?? []
-          : [],
-      })),
-    }));
+    const notes: SemanticIndexNoteMeta[] = pending.map((entry) => {
+      const firstSnippet = entry.chunkInputs[0]?.snippet ?? "";
+      for (const chunk of entry.chunkInputs) {
+        rows.push({
+          id: chunk.id,
+          notePath: chunk.path,
+          title: chunk.title,
+          heading: chunk.heading,
+          textHash: chunk.textHash,
+          tokenCount: chunk.tokenCount,
+          snippet: chunk.snippet,
+        });
+        rowVectors.push(
+          settings.semanticIndexPersistVectors
+            ? vectors.vectors[vectorIndex++] ?? []
+            : [],
+        );
+      }
+      return {
+        ...entry.note,
+        chunkCount: entry.chunkInputs.length,
+        firstSnippet,
+      };
+    });
+
+    const paths = getSemanticIndexPaths(settings);
+    const shards = buildIndexShards({
+      rows,
+      rowVectors,
+      folder: paths.folder,
+      model: getSemanticModel(settings),
+      dim,
+      indexedAt,
+    });
 
     return {
       ok: true,
-      index: {
+      payload: {
+        index: {
         version: INDEX_VERSION,
         model: getSemanticModel(settings),
-        dim: getSemanticDim(settings),
+        dim,
         chunking,
-        indexedAt: this.now().toISOString(),
+        indexedAt,
         notes,
+        shards: shards.map((shard) => ({
+          id: shard.id,
+          path: getShardPath(paths.folder, shard.id),
+          rowCount: shard.rows.length,
+          vectorEncoding: "float32-base64" as const,
+        })),
+        totalRows: rows.length,
+      },
+        shards,
       },
     };
   }
 
-  private async writeIndex(index: SemanticVaultIndex) {
+  private async writeIndex(
+    index: SemanticVaultIndex,
+    shards: SemanticIndexShardV2[] = [],
+  ) {
     const settings = this.getSettings();
     const paths = getSemanticIndexPaths(settings);
     await ensureFolderPath(this.app, paths.folder);
+    for (const shard of shards) {
+      await writeVaultText(
+        this.app,
+        getShardPath(paths.folder, shard.id),
+        `${JSON.stringify(shard)}\n`,
+      );
+    }
     await writeVaultText(
       this.app,
       paths.jsonPath,
@@ -446,6 +693,87 @@ async function buildPendingNote(
   };
 }
 
+function buildIndexShards({
+  rows,
+  rowVectors,
+  folder,
+  model,
+  dim,
+  indexedAt,
+}: {
+  rows: SemanticIndexRowMeta[];
+  rowVectors: number[][];
+  folder: string;
+  model: string;
+  dim: 256 | 512;
+  indexedAt: string;
+}): SemanticIndexShardV2[] {
+  const shards: SemanticIndexShardV2[] = [];
+  for (let start = 0; start < rows.length; start += INDEX_SHARD_ROW_LIMIT) {
+    const shardRows = rows.slice(start, start + INDEX_SHARD_ROW_LIMIT);
+    const shardVectors = rowVectors.slice(start, start + INDEX_SHARD_ROW_LIMIT);
+    const id = `shard-${String(shards.length + 1).padStart(4, "0")}`;
+    void folder;
+    shards.push({
+      version: INDEX_VERSION,
+      id,
+      model,
+      dim,
+      indexedAt,
+      rows: shardRows,
+      vectorsBase64: encodeFloat32Base64(flattenVectors(shardVectors, dim)),
+    });
+  }
+  return shards;
+}
+
+function flattenVectors(vectors: number[][], dim: number): number[] {
+  const output: number[] = [];
+  for (const vector of vectors) {
+    for (let index = 0; index < dim; index += 1) {
+      output.push(Number.isFinite(vector[index]) ? vector[index] : 0);
+    }
+  }
+  return output;
+}
+
+function encodeFloat32Base64(values: number[]): string {
+  const array = new Float32Array(values);
+  const bytes = new Uint8Array(array.buffer);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  if (typeof btoa === "function") {
+    return btoa(binary);
+  }
+  const buffer = (globalThis as unknown as {
+    Buffer?: { from: (value: Uint8Array) => { toString: (encoding: string) => string } };
+  }).Buffer;
+  return buffer ? buffer.from(bytes).toString("base64") : "";
+}
+
+function decodeFloat32Base64(value: string): number[] {
+  let binary = "";
+  if (typeof atob === "function") {
+    binary = atob(value);
+  } else {
+    const buffer = (globalThis as unknown as {
+      Buffer?: { from: (value: string, encoding: string) => Uint8Array };
+    }).Buffer;
+    if (!buffer) {
+      return [];
+    }
+    const bytes = buffer.from(value, "base64");
+    return [...new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))];
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return [...new Float32Array(bytes.buffer)];
+}
+
 async function embedIndexDocuments({
   provider,
   settings,
@@ -484,13 +812,17 @@ function searchIndexChunks({
   folder,
   limit,
   maxSnippetChars,
+  minScore,
+  cursor,
 }: {
-  index: SemanticVaultIndex;
+  index: SemanticVaultIndexV1;
   queryVector: number[];
   queryTerms: Set<string>;
   folder: string | null;
   limit: number;
   maxSnippetChars: number;
+  minScore?: number;
+  cursor?: string | null;
 }): SemanticIndexSearchHit[] {
   const scored: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
 
@@ -509,7 +841,7 @@ function searchIndexChunks({
       if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
         continue;
       }
-      scored.push({
+      const hit = {
         path: note.path,
         title: note.title,
         score: roundScore(score),
@@ -519,7 +851,10 @@ function searchIndexChunks({
         heading: chunk.heading,
         snippet: boundedSnippet(chunk.snippet, maxSnippetChars),
         sortPath: note.path,
-      });
+      };
+      if (minScore === undefined || hit.score >= minScore) {
+        scored.push(hit);
+      }
     }
   }
 
@@ -530,7 +865,199 @@ function searchIndexChunks({
     }
   }
 
-  return [...byPath.values()].sort(compareHits).slice(0, limit).map(({ sortPath, ...hit }) => hit);
+  const offset = parseCursorOffset(cursor);
+  return [...byPath.values()]
+    .sort(compareHits)
+    .slice(offset, offset + limit)
+    .map(({ sortPath, ...hit }) => hit);
+}
+
+async function searchIndexShards({
+  app,
+  index,
+  queryVector,
+  queryTerms,
+  folder,
+  limit,
+  maxSnippetChars,
+  candidateLimit,
+  minScore,
+  cursor,
+}: {
+  app: App;
+  index: SemanticVaultIndexV2;
+  queryVector: number[];
+  queryTerms: Set<string>;
+  folder: string | null;
+  limit: number;
+  maxSnippetChars: number;
+  candidateLimit: number;
+  minScore?: number;
+  cursor: string | null;
+}): Promise<{
+  hits: SemanticIndexSearchHit[];
+  candidateCount: number;
+  nextCursor: string | null;
+}> {
+  const scored: Array<SemanticIndexSearchHit & { sortPath: string }> = [];
+  let candidateCount = 0;
+  const noteByPath = new Map(index.notes.map((note) => [note.path, note]));
+
+  for (const ref of index.shards) {
+    const shard = await readIndexShard(app, ref.path);
+    if (!shard || shard.dim !== index.dim) {
+      continue;
+    }
+    const vectors = decodeFloat32Base64(shard.vectorsBase64);
+    for (let rowIndex = 0; rowIndex < shard.rows.length; rowIndex += 1) {
+      const row = shard.rows[rowIndex];
+      if (folder && !row.notePath.startsWith(`${folder}/`)) {
+        continue;
+      }
+      const vector = vectors.slice(rowIndex * index.dim, rowIndex * index.dim + index.dim);
+      const note = noteByPath.get(row.notePath);
+      if (!note) {
+        continue;
+      }
+      candidateCount += 1;
+      const semanticScore = normalizeCosine(cosineSimilarity(queryVector, vector));
+      const lexicalScore = lexicalScoreForRow(note, row, queryTerms);
+      const score = semanticScore * 0.85 + lexicalScore.score * 0.15;
+      if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
+        continue;
+      }
+      const hit = {
+        path: row.notePath,
+        title: row.title,
+        score: roundScore(score),
+        semanticScore: roundScore(semanticScore),
+        lexicalScore: roundScore(lexicalScore.score),
+        reasons: dedupeStrings(
+          semanticScore > 0.55
+            ? ["indexed_semantic_similarity", ...lexicalScore.reasons]
+            : lexicalScore.reasons,
+        ),
+        heading: row.heading,
+        snippet: boundedSnippet(row.snippet, maxSnippetChars),
+        sortPath: row.notePath,
+      };
+      if (minScore !== undefined && hit.score < minScore) {
+        continue;
+      }
+      pushBoundedHit(scored, hit, candidateLimit);
+    }
+  }
+
+  const byPath = new Map<string, SemanticIndexSearchHit & { sortPath: string }>();
+  for (const hit of scored.sort(compareHits)) {
+    if (!byPath.has(hit.path)) {
+      byPath.set(hit.path, hit);
+    }
+  }
+  const allHits = [...byPath.values()].sort(compareHits);
+  const offset = parseCursorOffset(cursor);
+  const page = allHits.slice(offset, offset + limit);
+  const nextOffset = offset + page.length;
+  return {
+    hits: page.map(({ sortPath, ...hit }) => hit),
+    candidateCount,
+    nextCursor: nextOffset < allHits.length ? String(nextOffset) : null,
+  };
+}
+
+async function readIndexShard(
+  app: App,
+  path: string,
+): Promise<SemanticIndexShardV2 | null> {
+  const file = app.vault.getFileByPath(path);
+  if (!file) {
+    semanticShardReadCache.delete(path);
+    return null;
+  }
+  const stat = file.stat ?? { mtime: 0, size: 0 };
+  const cached = semanticShardReadCache.get(path);
+  if (cached && cached.mtime === stat.mtime && cached.size === stat.size) {
+    return cached.shard;
+  }
+  try {
+    const parsed = JSON.parse(await app.vault.cachedRead(file));
+    if (!isSemanticIndexShardV2(parsed)) {
+      semanticShardReadCache.delete(path);
+      return null;
+    }
+    semanticShardReadCache.set(path, {
+      mtime: stat.mtime,
+      size: stat.size,
+      shard: parsed,
+    });
+    return parsed;
+  } catch {
+    semanticShardReadCache.delete(path);
+    return null;
+  }
+}
+
+async function readAllIndexRowsAndVectors(
+  app: App,
+  index: SemanticVaultIndexV2,
+): Promise<{ rows: SemanticIndexRowMeta[]; vectors: number[][] } | null> {
+  const rows: SemanticIndexRowMeta[] = [];
+  const vectors: number[][] = [];
+  for (const ref of index.shards) {
+    const shard = await readIndexShard(app, ref.path);
+    if (!shard || shard.dim !== index.dim) {
+      return null;
+    }
+    const decoded = decodeFloat32Base64(shard.vectorsBase64);
+    if (decoded.length < shard.rows.length * index.dim) {
+      return null;
+    }
+    for (let rowIndex = 0; rowIndex < shard.rows.length; rowIndex += 1) {
+      rows.push(shard.rows[rowIndex]);
+      vectors.push(
+        decoded.slice(rowIndex * index.dim, (rowIndex + 1) * index.dim),
+      );
+    }
+  }
+  return { rows, vectors };
+}
+
+function rowsAndVectorsFromShards(
+  shards: SemanticIndexShardV2[],
+  dim: number,
+): { rows: SemanticIndexRowMeta[]; vectors: number[][] } | null {
+  const rows: SemanticIndexRowMeta[] = [];
+  const vectors: number[][] = [];
+  for (const shard of shards) {
+    const decoded = decodeFloat32Base64(shard.vectorsBase64);
+    if (decoded.length < shard.rows.length * dim) {
+      return null;
+    }
+    for (let rowIndex = 0; rowIndex < shard.rows.length; rowIndex += 1) {
+      rows.push(shard.rows[rowIndex]);
+      vectors.push(decoded.slice(rowIndex * dim, (rowIndex + 1) * dim));
+    }
+  }
+  return { rows, vectors };
+}
+
+async function removeObsoleteShardFiles(
+  app: App,
+  previous: SemanticVaultIndexV2,
+  next: SemanticVaultIndexV2,
+): Promise<void> {
+  const retained = new Set(next.shards.map((shard) => shard.path));
+  for (const shard of previous.shards) {
+    if (retained.has(shard.path)) {
+      continue;
+    }
+    const file = app.vault.getFileByPath(shard.path);
+    if (!file) {
+      continue;
+    }
+    await app.vault.delete(file);
+    semanticShardReadCache.delete(shard.path);
+  }
 }
 
 function lexicalScoreForChunk(
@@ -567,6 +1094,65 @@ function lexicalScoreForChunk(
   return { score: Math.min(1, score), reasons };
 }
 
+function lexicalScoreForRow(
+  note: SemanticIndexNoteMeta,
+  row: SemanticIndexRowMeta,
+  queryTerms: Set<string>,
+): { score: number; reasons: string[] } {
+  if (queryTerms.size === 0) {
+    return { score: 0, reasons: [] };
+  }
+
+  const reasons: string[] = [];
+  let score = 0;
+  const title = overlapRatio(queryTerms, tokenize(note.title));
+  if (title > 0) {
+    score += title * 0.25;
+    reasons.push("title_match");
+  }
+  const heading = overlapRatio(queryTerms, tokenize(row.heading ?? ""));
+  if (heading > 0) {
+    score += heading * 0.2;
+    reasons.push("heading_match");
+  }
+  const tags = overlapRatio(queryTerms, tokenize(note.tags.join(" ")));
+  if (tags > 0) {
+    score += tags * 0.15;
+    reasons.push("tag_match");
+  }
+  const snippet = overlapRatio(queryTerms, tokenize(row.snippet));
+  if (snippet > 0) {
+    score += snippet * 0.55;
+    reasons.push("snippet_match");
+  }
+  return { score: Math.min(1, score), reasons };
+}
+
+function pushBoundedHit<T extends SemanticIndexSearchHit & { sortPath: string }>(
+  hits: T[],
+  hit: T,
+  limit: number,
+) {
+  hits.push(hit);
+  hits.sort(compareHits);
+  if (hits.length > limit) {
+    hits.length = limit;
+  }
+}
+
+function parseCursorOffset(cursor?: string | null): number {
+  if (!cursor) {
+    return 0;
+  }
+  const parsed = Number.parseInt(cursor, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function getCandidateLimit(request: SemanticIndexSearchRequest): number {
+  const requested = request.candidateLimit ?? (request.mode === "deep" ? 128 : request.limit * 8);
+  return clampInteger(requested, request.limit, 500);
+}
+
 function renderSemanticIndexMarkdown(index: SemanticVaultIndex): string {
   const concepts = collectConcepts(index).slice(0, 40);
   const lines = [
@@ -576,7 +1162,9 @@ function renderSemanticIndexMarkdown(index: SemanticVaultIndex): string {
     `Model: ${index.model}`,
     `Dimension: ${index.dim}`,
     `Notes: ${index.notes.length}`,
-    `Chunks: ${index.notes.reduce((sum, note) => sum + note.chunks.length, 0)}`,
+    `Chunks: ${getIndexChunkCount(index)}`,
+    `Index version: ${index.version}`,
+    index.version === 2 ? `Shards: ${index.shards.length}` : "Shards: none",
     "",
     "## Concepts",
     "",
@@ -595,8 +1183,8 @@ function renderSemanticIndexMarkdown(index: SemanticVaultIndex): string {
       `- Path: ${note.path}`,
       `- Tags: ${note.tags.length ? note.tags.join(", ") : "none"}`,
       `- Headings: ${note.headings.slice(0, 8).join("; ") || "none"}`,
-      `- Chunks: ${note.chunks.length}`,
-      `- Snippet: ${note.chunks[0]?.snippet ?? ""}`,
+      `- Chunks: ${getNoteChunkCount(note)}`,
+      `- Snippet: ${getNoteFirstSnippet(note)}`,
       "",
     ]),
   ];
@@ -612,7 +1200,7 @@ function collectConcepts(index: SemanticVaultIndex): Array<{
   const byTerm = new Map<string, { count: number; paths: Set<string> }>();
   for (const note of index.notes) {
     const terms = tokenize(
-      [note.title, note.tags.join(" "), note.headings.join(" "), note.chunks[0]?.snippet ?? ""].join(" "),
+      [note.title, note.tags.join(" "), note.headings.join(" "), getNoteFirstSnippet(note)].join(" "),
     );
     for (const term of terms) {
       const existing = byTerm.get(term) ?? { count: 0, paths: new Set<string>() };
@@ -680,11 +1268,33 @@ export function getSemanticIndexFreshness(
     if (file.stat?.mtime !== note.mtime || file.stat?.size !== note.size) {
       return { fresh: false, reason: "indexed_file_changed" };
     }
+  }
+
+  if (index.version === 1) {
+    for (const note of index.notes) {
     if (
-      note.chunks.length === 0 ||
-      note.chunks.some((chunk) => chunk.vector.length !== index.dim)
+      (note.chunks.length === 0 ||
+        note.chunks.some((chunk) => chunk.vector.length !== index.dim))
     ) {
       return { fresh: false, reason: "missing_vectors" };
+    }
+    }
+  }
+
+  if (index.version === 2) {
+    for (const note of index.notes) {
+      if (note.chunkCount === 0) {
+      return { fresh: false, reason: "missing_rows" };
+    }
+  }
+
+    if (index.shards.length === 0 && index.totalRows > 0) {
+      return { fresh: false, reason: "missing_shards" };
+    }
+    for (const shard of index.shards) {
+      if (shard.rowCount <= 0 || !app.vault.getFileByPath(shard.path)) {
+        return { fresh: false, reason: "missing_shards" };
+      }
     }
   }
 
@@ -703,7 +1313,7 @@ export function getSemanticIndexFreshness(
 function isIndexCompatible(index: SemanticVaultIndex, settings: AgentSettings): boolean {
   const chunking = getChunking(settings);
   return (
-    index.version === INDEX_VERSION &&
+    (index.version === INDEX_VERSION || index.version === LEGACY_INDEX_VERSION) &&
     index.model === getSemanticModel(settings) &&
     index.dim === getSemanticDim(settings) &&
     index.chunking.minTokens === chunking.minTokens &&
@@ -718,13 +1328,45 @@ function isSemanticVaultIndex(value: unknown): value is SemanticVaultIndex {
     return false;
   }
   return (
-    value.version === INDEX_VERSION &&
+    (value.version === INDEX_VERSION || value.version === LEGACY_INDEX_VERSION) &&
     typeof value.model === "string" &&
     (value.dim === 256 || value.dim === 512) &&
     isRecord(value.chunking) &&
     typeof value.indexedAt === "string" &&
     Array.isArray(value.notes)
   );
+}
+
+function isSemanticIndexShardV2(value: unknown): value is SemanticIndexShardV2 {
+  return (
+    isRecord(value) &&
+    value.version === INDEX_VERSION &&
+    typeof value.id === "string" &&
+    typeof value.model === "string" &&
+    (value.dim === 256 || value.dim === 512) &&
+    typeof value.indexedAt === "string" &&
+    Array.isArray(value.rows) &&
+    typeof value.vectorsBase64 === "string"
+  );
+}
+
+function getIndexChunkCount(index: SemanticVaultIndex): number {
+  if (index.version === 2) {
+    return index.totalRows;
+  }
+  return index.notes.reduce((sum, note) => sum + note.chunks.length, 0);
+}
+
+function getNoteChunkCount(
+  note: SemanticIndexNote | SemanticIndexNoteMeta,
+): number {
+  return "chunkCount" in note ? note.chunkCount : note.chunks.length;
+}
+
+function getNoteFirstSnippet(
+  note: SemanticIndexNote | SemanticIndexNoteMeta,
+): string {
+  return "firstSnippet" in note ? note.firstSnippet : note.chunks[0]?.snippet ?? "";
 }
 
 function makeBuildResult({
@@ -755,7 +1397,7 @@ function makeBuildResult({
     jsonPath: paths.jsonPath,
     indexedAt: index?.indexedAt,
     noteCount: index?.notes.length ?? 0,
-    chunkCount: index?.notes.reduce((sum, note) => sum + note.chunks.length, 0) ?? 0,
+    chunkCount: index ? getIndexChunkCount(index) : 0,
     updatedPaths,
     removedPaths,
     skippedPaths,
@@ -854,6 +1496,10 @@ function normalizeQueuedPath(path: string): string | null {
 
 function joinVaultPath(...parts: string[]): string {
   return parts.map(normalizePathParts).filter(Boolean).join("/");
+}
+
+function getShardPath(folder: string, shardId: string): string {
+  return joinVaultPath(folder, `${INDEX_SHARD_NAME_PREFIX}${shardId}.json`);
 }
 
 function boundedSnippet(text: string, maxChars: number): string {

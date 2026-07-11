@@ -22,4 +22,5 @@ export interface SemanticEmbeddingResponse {
 
 export interface SemanticEmbeddingProvider {
   embed(request: SemanticEmbeddingRequest): Promise<SemanticEmbeddingResponse>;
+  dispose?(): void;
 }

@@ -12,21 +12,21 @@ import {
 import { CanvasWriter } from "../src/agent/design/CanvasWriter";
 import type { ToolExecutionContext } from "../src/tools/types";
 
-test("agent budget clamps explicit requests to 60 and preserves reserve", () => {
+test("agent budget clamps explicit requests to 100 and preserves reserve", () => {
   const budget = createAgentBudget({
     route: "long_research",
     explicitStepRequest: 999,
   });
 
-  assert.equal(budget.maxSteps, 60);
+  assert.equal(budget.maxSteps, 100);
   assert.equal(budget.finalizationReserve, FINALIZATION_RESERVE_STEPS);
-  assert.equal(budget.workingSteps, 56);
+  assert.equal(budget.workingSteps, 96);
 });
 
-test("agent budget assigns long, browser, and design route defaults", () => {
-  assert.equal(createAgentBudget({ route: "long_research" }).maxSteps, 52);
-  assert.equal(createAgentBudget({ route: "browser_learning" }).maxSteps, 44);
-  assert.equal(createAgentBudget({ route: "design_package" }).maxSteps, 36);
+test("agent budget delegates legacy long routes to runtime grounded cap", () => {
+  assert.equal(createAgentBudget({ route: "long_research" }).maxSteps, 100);
+  assert.equal(createAgentBudget({ route: "browser_learning" }).maxSteps, 100);
+  assert.equal(createAgentBudget({ route: "design_package" }).maxSteps, 100);
 });
 
 test("safety policy allows observation and blocks unsafe browser conditions", () => {

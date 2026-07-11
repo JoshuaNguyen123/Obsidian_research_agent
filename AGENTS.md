@@ -31,7 +31,7 @@ Optimize for real execution inside Obsidian, not abstract control panels or simu
 
 ## Technical Details Maintenance
 
-- Treat `docs/technical_details.md` as the living technical architecture record.
+- Treat local `docs/technical_details.md` as the living technical architecture record (gitignored; do not commit `docs/`).
 - Update `docs/technical_details.md` in the same change when you alter architecture, agent loop flow, settings, tool contracts, vault safety policy, writeback behavior, model/API behavior, validation strategy, e2e harness behavior, build scripts, or deployment/sync workflow.
 - Update `docs/technical_details.md` in the same change when graph tools, related-note scoring, inline wiki-link behavior, streamed writeback guardrails, tool-call recovery, or word-count behavior changes.
 - Give details as interview ready answers to technical questions
@@ -174,8 +174,8 @@ A good change moves the plugin toward a working native loop: read note, inspect 
 - Before coding, inspect existing architecture and reuse existing abstractions.
 - Do not replace working systems unless the task explicitly requires it.
 - Keep Obsidian plugin behavior native, local-first, and prompt-first.
-- Keep long implementation details in `docs/plans/`.
-- Update tests and docs when behavior changes.
+- Keep long implementation details in local gitignored `docs/plans/`.
+- Update tests and local docs when behavior changes.
 
 ## Safety Rules
 

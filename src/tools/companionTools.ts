@@ -37,7 +37,7 @@ export function createCompanionTools(): AgentTool[] {
   ];
 }
 
-const browserOpenPageTool: AgentTool = {
+export const browserOpenPageTool: AgentTool = {
   name: "browser_open_page",
   description:
     "Open a safe HTTP/HTTPS page in the visible local companion browser and return page observation state.",
@@ -119,7 +119,6 @@ const browserClickTool: AgentTool = {
       candidateRole: { type: "string" },
       candidateHref: { type: "string" },
       visibleText: { type: "string" },
-      explicitUserApproval: { type: "boolean" },
     },
     additionalProperties: false,
   },
@@ -166,7 +165,6 @@ const browserTypeTool: AgentTool = {
       candidateLabel: { type: "string" },
       candidateRole: { type: "string" },
       visibleText: { type: "string" },
-      explicitUserApproval: { type: "boolean" },
     },
     additionalProperties: false,
   },
@@ -284,7 +282,7 @@ const browserScreenshotTool: AgentTool = {
   },
 };
 
-const browserExtractMarkdownTool: AgentTool = {
+export const browserExtractMarkdownTool: AgentTool = {
   name: "browser_extract_markdown",
   description: "Extract readable markdown from the current companion browser page.",
   parameters: {
@@ -464,7 +462,7 @@ function buildSafetyContext(
     candidateLabel: getOptionalString(args, "candidateLabel"),
     candidateRole: getOptionalString(args, "candidateRole"),
     candidateHref: getOptionalString(args, "candidateHref"),
-    explicitUserApproval: getOptionalBoolean(args, "explicitUserApproval") ?? false,
+    explicitUserApproval: context.userApprovalGranted === true,
   };
 }
 

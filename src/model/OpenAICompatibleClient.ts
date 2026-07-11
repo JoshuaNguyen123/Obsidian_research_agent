@@ -149,6 +149,16 @@ export function buildOpenAIChatBody(
     messages: toOpenAIMessages(request.messages),
     tools: request.tools?.map(toOpenAITool),
     tool_choice: request.tools?.length ? "auto" : undefined,
+    response_format: request.format
+      ? {
+          type: "json_schema",
+          json_schema: {
+            name: "agentic_researcher_schema",
+            schema: request.format,
+            strict: true,
+          },
+        }
+      : undefined,
     stream,
   };
   addOpenAIOptions(body, request.options);

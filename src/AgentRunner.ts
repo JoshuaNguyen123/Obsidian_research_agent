@@ -11,6 +11,21 @@ import type {
 } from "./model/types";
 import { ModelClientError } from "./model/types";
 import { appendToolTranscript } from "./model/toolTranscript";
+import { serializeToolResultForModel } from "./model/toolResultPayload";
+import { isTransientModelError, withModelRetry } from "./model/retry";
+import {
+  approvalDeniedFailureCopy,
+  formatAcceptanceFailureCopy,
+  formatFailureCopy,
+  formatModelFailureCopy,
+  formatWebFetchToolFailureCopy,
+  modelTimeoutFailureCopy,
+  phaseGateFailureCopy,
+  policyBlockFailureCopy,
+  providerAuthFailureCopy,
+  semanticCoverageSecondPassCopy,
+  walReconcileFailureCopy,
+} from "./agent/failureCopy";
 import type {
   AgentMissionMode,
   AgentRuntimeCache,
@@ -23,10 +38,18 @@ import {
   BACKUP_FOLDER,
   CHECKPOINT_EVERY_STEPS,
   LONG_RUN_STEP_WARN_AT,
+  MISSION_MILESTONE_STEPS,
   MAX_AGENT_STEPS,
   MAX_INITIAL_CURRENT_NOTE_CHARS,
+  PROGRESS_REVIEW_EVERY_STEPS,
+  MAX_PARALLEL_TOOL_CALLS,
+  READ_ONLY_TOOL_NAMES,
 } from "./tools/constants";
-import { getErrorMessage, serializeToolResult } from "./tools/validation";
+import {
+  getErrorMessage,
+  normalizeVaultPath,
+  serializeToolResult,
+} from "./tools/validation";
 import {
   type AgentConversationMessage,
 } from "./conversationHistory";
@@ -40,6 +63,19 @@ import {
   estimateLoopBudget,
   resolveConfiguredMaxAgentSteps,
 } from "./agent/runBudget";
+import { planReadOnlyFollowups } from "./agent/autoFollowups";
+import {
+  detectLinearIntent,
+  hasExplicitPermanentLinearDeleteIntent,
+} from "./agent/linearIntent";
+import {
+  decideAutoContinuation,
+  type AutoContinuationDecision,
+  type AutoContinuationReason,
+} from "./agent/autoContinuation";
+import { reflectMissionCompletion } from "./agent/completionReflection";
+import { runDependencyPreflight } from "./agent/dependencyPreflight";
+import { evaluatePerformanceGates, type PerformanceGateResult } from "./agent/performanceGates";
 import {
   analyzeGeneratedOutputPrompt,
 } from "./agent/generatedOutputPolicy";
@@ -49,9 +85,19 @@ import {
 } from "./agent/currentNoteResetPolicy";
 import { planLoopBudget } from "./agent/loopPlanner";
 import {
+  applyResearchPhaseToLoopDecision,
   decideNextLoopAction,
   type LoopLedger,
 } from "./agent/loopDecision";
+import {
+  createRunPlan,
+  resolveThinkingMode,
+  type RunPlan,
+  type RunPlanDecision,
+  type RunRoute,
+  type SlowPathReason,
+  type StreamingWritebackKind,
+} from "./agent/runPlan";
 import {
   deriveAutonomyScope,
   isBroadUnscopedVaultMutation,
@@ -64,30 +110,191 @@ import {
   createMissionLedger,
   markLedgerResumeLoaded,
   markLedgerToolUsed,
+  addLedgerApproval,
+  setLedgerDependencyStatus,
+  setLedgerMissionPlan,
+  setLedgerResearchPlan,
   setLedgerNextAction,
   setLedgerAcceptance,
+  setLedgerClaimLedger,
+  setLedgerClaimPassages,
+  setLedgerEvidenceConflicts,
   setLedgerLastSafeStep,
+  setLedgerWallClockExpired,
   summarizeMissionLedger,
   updateMissionLedgerStatus,
   upsertLedgerEvidence,
+  upsertMissionEvidenceRecord,
   writeMissionLedger,
   type MissionLedger,
   type MissionLedgerStatus,
   type MissionLedgerSummary,
+  type MissionBlockerCategory,
+  type MissionDependencyStatus,
 } from "./agent/missionLedger";
+import {
+  ApprovalBroker,
+  type ApprovalDecision,
+  type ApprovalRequest,
+} from "./agent/approvalBroker";
+import {
+  createRunContextBudget,
+  estimatePromptChars,
+  shouldCompactLoopMessages,
+  compactLoopMessages,
+} from "./agent/runContext";
 import {
   evidenceFromReceipt,
   evidenceFromToolResult,
+  claimPassagesFromToolResult,
+  upsertClaimPassageRefs,
 } from "./agent/missionEvidence";
 import { retitleNoteMarkdown } from "./tools/noteTitles";
 import {
   buildMissionResumeContext,
+  extractRequestedRunId,
+  hasMissionResumeIntent,
+  type MissionResumeContext,
 } from "./agent/missionResume";
 import {
-  evaluateMissionAcceptance,
   formatMissionAcceptanceCorrection,
+  mergeClaimGroundingIntoAcceptance,
   type MissionAcceptanceResult,
 } from "./agent/missionAcceptance";
+import {
+  isCurrentNoteEditOrganizeIntent,
+  isNamedSectionEditIntent,
+  isVaultWideOrganizeIntent,
+  isWholeNoteEditIntent,
+  missingIncludesWriteReceipt,
+  prefersStreamedReplaceForEditOrganize,
+} from "./agent/editOrganizeIntent";
+import {
+  evaluateMissionPlanAcceptance,
+} from "./agent/missionPlanAcceptance";
+import {
+  mergeVerificationIntoAcceptance,
+  runMissionVerifiers,
+  type VerificationCheck,
+} from "./agent/verifiers";
+import {
+  type ClaimLedger,
+  type ClaimPassageRef,
+  shouldRequireClaimGrounding,
+} from "./agent/claimLedger";
+import {
+  detectEvidenceConflicts,
+  evidenceConflictsToProofDebtRows,
+  listOpenEvidenceConflicts,
+  mergeEvidenceConflicts,
+  type EvidenceConflict,
+} from "./agent/evidenceConflicts";
+import {
+  buildResearchPhaseTransition,
+  deriveResearchPhase,
+  gateAcceptanceByResearchPhase,
+  type ResearchPhaseDescriptor,
+  type ResearchRunPhase,
+} from "./agent/researchPhaseController";
+import {
+  countRemainingMissionPlanTasks,
+  createMissionPlan,
+  getActiveMissionPlanTask,
+  getNextMissionPlanAction,
+  isToolAllowedForActiveMissionTask,
+  isMissionPlanComplete,
+  type MissionPlan,
+  type MissionPlanProofKind,
+} from "./agent/missionPlan";
+import {
+  advanceMissionPlanFromAcceptance,
+  advanceMissionPlanFromBlocker,
+  advanceMissionPlanFromFinalOutput,
+  advanceMissionPlanFromReceipt,
+  advanceMissionPlanFromToolResult,
+} from "./agent/missionPlanAdvance";
+import {
+  applyRecoveryToPlan,
+  createRecoveryState,
+  decideRecoveryAction,
+  planRecovery,
+  type RecoveryAttempt,
+  type RecoveryState,
+} from "./agent/recoveryEngine";
+import {
+  beginVaultTransaction,
+  commitVaultTransaction,
+  recordTransactionStage,
+  type VaultMutationTransaction,
+} from "./agent/vaultTransactions";
+import {
+  buildContinuationMemoryBundle,
+  formatContinuationBundleForPrompt,
+  recordContinuationLoad,
+} from "./agent/continuationMemory";
+import {
+  formatMissionPlanForPrompt,
+  formatMissionPlanNextActionPrompt,
+} from "./agent/missionPlanPrompts";
+import {
+  applyResearchEvidence,
+  createResearchPlan,
+  formatResearchPlanForPrompt,
+  type ResearchPlan,
+} from "./agent/researchPlan";
+import {
+  isExplicitVisibleFileRenameIntent,
+  isMarkdownTitleContentIntent,
+  isPlaceholderNoteBasename,
+  isTitleOnlyIntent,
+  isVisibleTitleRenameIntent,
+} from "./agent/titleIntent";
+import { maybeAutoTitleAfterWrite } from "./agent/autoTitleOnWrite";
+import type { PlaceholderRenameReceipt } from "./agent/placeholderNoteTitle";
+import {
+  createAutonomousNoteTarget,
+  resolveAutonomousNoteTarget,
+} from "./agent/autonomousNoteTarget";
+import {
+  noteOutputPlanAllowsVaultWrite,
+  resolveNoteOutputPlan,
+  type NoteOutputPlan,
+  type OutputProfile,
+} from "./agent/noteOutputPolicy";
+import { hasReviseDesignIntent } from "./agent/codeDesignIntent";
+import {
+  classifyMissionWithModel,
+  resolveModelRouterMode,
+  type RoutedMissionIntent,
+} from "./agent/missionRouter";
+import {
+  deriveRoutedIntentFallback,
+  evaluateToolPolicy,
+  resolvePolicyRoutedIntent,
+  type PolicyDecision,
+} from "./agent/policyEngine";
+import type {
+  ActionReceipt,
+  AuthorizedActionContext,
+  PreparedAction,
+  ResourceAction,
+  ResourceRef,
+  ToolDescriptor,
+} from "./agent/actions";
+import {
+  consumeAuthorityGrant,
+  createOneShotGrant,
+  evaluateAuthorityGrant,
+  type AuthorityGrantV1,
+} from "./agent/authority";
+import { isCodeToolsDesktopRuntime } from "./tools/codeTools";
+import { buildResearchMemoryExtraction } from "./agent/researchMemoryExtract";
+import { buildHypothesisSystemHintFromIndex } from "./agent/researchHypotheses";
+import {
+  computeProofDebt,
+  proofDebtSnapshotFromLedger,
+  proofDebtSnapshotFromRuntime,
+} from "./agent/proofDebt";
 import {
   classifyStructuredIntent,
   formatStructuredIntentForPrompt,
@@ -96,8 +303,22 @@ import {
   appendAgentRunCheckpoint,
   createAgentRunId,
   type LatestAgentRunCheckpoint,
+  readAgentRunCheckpointByRunId,
   readLatestAgentRunCheckpoint,
 } from "./agent/checkpoints";
+import {
+  createMissionRuntimeSnapshot,
+  buildOperationReconciliationInputs,
+  canPersistMissionRuntimeSnapshot,
+  createOperationJournalRecord,
+  readMissionRuntimeSnapshotByRunId,
+  transitionOperationJournalRecord,
+  writeMissionRuntimeSnapshot,
+  type MissionRuntimeReceipt,
+  type MissionRuntimeStatus,
+  type MissionRuntimeSnapshotV2,
+  type OperationJournalRecord,
+} from "./agent/runStore";
 import {
   compactConversationForPrompt,
   toCompactedConversationModelMessages,
@@ -109,8 +330,14 @@ import type {
   ReflexDecision,
 } from "./agent/reflex/types";
 import type { MissionEvidence } from "./agent/missionLedger";
+import type {
+  OrchestratorEvent,
+  OrchestratorSnapshotV1,
+} from "./orchestrator/types";
 
 export { MAX_AGENT_STEPS } from "./tools/constants";
+export { resolveThinkingMode } from "./agent/runPlan";
+export type { RunPlan, RunRoute, SlowPathReason } from "./agent/runPlan";
 export type { AgentConversationMessage } from "./conversationHistory";
 export type { AgentMissionMode, MissionIntent } from "./tools/types";
 
@@ -138,6 +365,8 @@ export interface AgentToolRunEvent {
 }
 
 export interface AgentRunReceipt {
+  version?: 1;
+  id?: string;
   toolName: string;
   operation:
     | "create"
@@ -145,15 +374,32 @@ export interface AgentRunReceipt {
     | "append"
     | "replace"
     | "edit"
+    | "highlight"
+    | "restore"
     | "retitle"
+    | "rename_current_file"
     | "link_related_notes"
     | "move"
     | "trash"
-    | "delete";
+    | "delete"
+    | ResourceAction;
   message: string;
+  actionId?: string;
+  resource?: ResourceRef;
+  relatedResources?: ResourceRef[];
+  payloadFingerprint?: string;
+  grantId?: string;
+  idempotencyKey?: string;
+  providerRequestId?: string;
+  startedAt?: string;
+  committedAt?: string;
+  commitKind?: ActionReceipt["commitKind"];
+  readback?: ActionReceipt["readback"];
+  effects?: ActionReceipt["effects"];
   path?: string;
   toPath?: string;
   backupPath?: string;
+  restoredFromBackupPath?: string;
   bytesWritten?: number;
   bytesDeleted?: number;
   affectedCount?: number;
@@ -185,15 +431,22 @@ export interface AgentRunConfigEvent {
   thinkingMode: string;
   resolvedThink: string;
   writebackMode: RunWritebackMode;
+  chatOnlyOverride: boolean;
+  noteOutputPlan?: NoteOutputPlan;
   route: RunRoute;
   expectedTimeClass: RunPlan["expectedTimeClass"];
   maxStepsForRun: number;
   slowPathReason: SlowPathReason;
+  allowedToolNames: string[];
+  routeTraceReasons: string[];
+  budgetProfile?: RunPlanDecision["budgetProfile"];
   englishGuard: boolean;
   temperature?: number;
   topK?: number;
   topP?: number;
   numCtx?: number;
+  estimatedPromptChars?: number;
+  contextBudgetChars?: number;
   writeAutonomy: boolean;
   missionMode: AgentMissionMode;
   contextScope: AgentRunContextScope;
@@ -202,6 +455,8 @@ export interface AgentRunConfigEvent {
   maxSteps: number;
   autonomyScope: AutonomyScope;
   missionLedger?: MissionLedgerSummary;
+  dependencyStatus: MissionDependencyStatus[];
+  performanceGates?: PerformanceGateResult[];
   modelProvider?: string;
   reflexLabel?: string;
   reflexConfidence?: number;
@@ -210,6 +465,12 @@ export interface AgentRunConfigEvent {
   reflexLoopRisk?: number;
   reflexCompletionMissing?: string[];
   reflexAppliedReason?: string;
+}
+
+export interface CodeOutputEvent {
+  runId: string;
+  stream: "stdout" | "stderr";
+  chunk: string;
 }
 
 export type StreamLifecycleKind =
@@ -231,41 +492,11 @@ export interface AgentStreamLifecycleEvent {
   message: string;
 }
 
-export type RunRoute =
-  | "instant_local"
-  | "direct_writeback"
-  | "prefetched_vault_answer"
-  | "prefetched_vault_writeback"
-  | "single_model_answer"
-  | "single_model_writeback"
-  | "tool_required"
-  | "grounded_workflow";
-
-export type SlowPathReason =
-  | "none"
-  | "needs_current_note"
-  | "needs_web_sources"
-  | "needs_vault_context"
-  | "needs_graph_context"
-  | "needs_word_count"
-  | "needs_edit_or_replace"
-  | "needs_model_planning";
-
 export type RunWritebackMode =
   | "off"
   | "tool_write"
   | "streaming_current_note"
   | "streaming_after_tools";
-
-export interface RunPlan {
-  route: RunRoute;
-  maxStepsForRun: number;
-  thinking: ModelThink | undefined;
-  allowedTools: ModelToolDefinition[];
-  slowPathReason: SlowPathReason;
-  expectedTimeClass: "quick" | "normal" | "long";
-  requiresEnglishGuard: boolean;
-}
 
 export type AgentRunContextScope =
   | "none"
@@ -275,6 +506,7 @@ export type AgentRunContextScope =
 
 export type AgentTraceKind =
   | "status"
+  | "acceptance"
   | "mission_intent"
   | "allowed_tools"
   | "model_call"
@@ -282,6 +514,7 @@ export type AgentTraceKind =
   | "tool_result"
   | "tool_rejected"
   | "receipt"
+  | "verification"
   | "metric"
   | "final"
   | "phase"
@@ -322,6 +555,8 @@ export interface AgentRunCompleteEvent {
   step: number;
   maxSteps: number;
   stopReason: AgentRunStopReason;
+  autoContinueRecommended?: boolean;
+  autoContinueReason?: AutoContinuationReason;
 }
 
 export interface AgentRunEvents {
@@ -348,11 +583,23 @@ export interface AgentRunEvents {
   onMetric?: (event: AgentRunMetricEvent) => void;
   onRunConfig?: (event: AgentRunConfigEvent) => void;
   onRunComplete?: (event: AgentRunCompleteEvent) => void;
+  onApprovalRequest?: (request: ApprovalRequest) => void | Promise<void>;
+  onApprovalResolved?: (event: {
+    request: ApprovalRequest;
+    decision: ApprovalDecision;
+  }) => void | Promise<void>;
+  onCodeOutput?: (event: CodeOutputEvent) => void;
   onTrace?: (event: AgentTraceEvent) => void;
+  /** Structured operational state only; never model reasoning or hidden prompts. */
+  onOrchestratorEvent?: (
+    event: OrchestratorEvent,
+    snapshot: OrchestratorSnapshotV1,
+  ) => void;
 }
 
 interface RunAgentMissionOptions {
   prompt: string;
+  runId?: string;
   modelClient: ModelClient;
   toolRegistry: ToolRegistry;
   toolContext: ToolExecutionContext;
@@ -360,6 +607,26 @@ interface RunAgentMissionOptions {
   conversationHistory?: AgentConversationMessage[];
   events?: AgentRunEvents;
   abortSignal?: AbortSignal;
+  approvalBroker?: ApprovalBroker;
+  /** Per-run UI override that keeps output in chat and suppresses note writes. */
+  forceChatOnly?: boolean;
+  /** Hard per-invocation cap used by the durable root budget. */
+  maxToolCalls?: number;
+  /** Optional participant cap used by the orchestrator shared root budget. */
+  maxSteps?: number;
+  /** Verified worker observations made available to the Lead. */
+  seedMissionEvidence?: MissionEvidence[];
+  seedClaimPassages?: ClaimPassageRef[];
+  orchestratorContext?: string;
+  orchestratorSnapshot?: OrchestratorSnapshotV1;
+  getOrchestratorSnapshot?: () => OrchestratorSnapshotV1 | null;
+}
+
+interface CheckpointResumeState {
+  promptContext: string;
+  missionResume?: MissionResumeContext;
+  runtimeSnapshot?: MissionRuntimeSnapshotV2;
+  missingRequestedRunId?: string;
 }
 
 const SYSTEM_PROMPT = `You are an agentic research assistant running inside Obsidian.
@@ -375,33 +642,36 @@ Operating rules:
 3. When citations, sources, verification, or current facts matter, use web_search first, then web_fetch 1-3 strong source URLs before synthesizing. Include source URLs in the final answer.
 4. For static writing tasks such as "write/generate a 300 word essay", answer directly without tools unless the user explicitly asks for current information or citations.
 5. Treat the active note as structured markdown, not an append-only buffer.
-6. For title, heading, rename, retitle, organize, restructure, or improve requests, use retitle_current_file for title changes instead of appending a new H1.
-7. Do not append duplicate H1 titles. Updating the markdown H1 is separate from renaming the file; suggest file renames in the final answer only when the tool returns a suggestion.
+6. Visible Obsidian tab/explorer title equals the markdown filename.
+   - Explicit user request to rename/retitle/change the page title: call rename_current_file (visible file rename). Use retitle_current_file only for explicit frontmatter/H1/heading content edits. Never append a second H1 for a title-only request.
+   - Ordinary note writeback onto Untitled / Untitled N: do NOT call rename_current_file. Start the written markdown with one leading H1; the plugin renames the file after writeback.
+7. For generated note content (append/replace writeback), first line MUST be a single H1 title ("# Short Title"), then a blank line, then the body. Do not duplicate that H1 later. Do not use "# Untitled".
 8. Prefer append_to_current_file only for explicit append/add/insert requests that do not replace an existing title or section.
-9. Use edit_current_section when the user asks to edit, revise, update, rewrite, or replace a heading section.
-10. Use append_to_current_section when the user asks to write, add, append, or insert content below, under, after, or inside a named heading section.
-11. Only request replace_current_file when the user explicitly asks to rewrite, replace, clean up, reset, start fresh, overwrite the whole current note, or clear/delete page content and then write new content.
-12. Treat whole-note/essay/body/paragraph revision requests as current-note replacement with backup. Use edit_current_section only when the user names a heading or section.
-13. Only request delete_current_file when the user explicitly asks to delete, remove, or trash the current note. Treat "delete all notes on the page and write..." as replacing current page content, not trashing the note.
-14. Use list_current_folder before broad vault traversal when the mission depends on where the active note lives.
-15. Use list_folder and get_path_info to inspect vault folder structure before making path-based file changes.
-16. Use path-based CRUD tools only for explicit file or folder create, append, replace, move, rename, delete, remove, or trash requests.
-17. For vault context questions, including "what do you know about me", inspect note contents before answering. Do not rely on filenames or note titles because notes may be untitled. Start with list_current_folder when the active note's location may matter, then use list_markdown_files, search_markdown_files, read_markdown_files, read_file, list_folder, or get_path_info as needed. Cite vault-relative source paths in the final answer.
-18. For durable research memory, use search_research_memory/read_research_memory before continuing a remembered topic, and append_research_memory when the user asks to save, remember, persist, or build durable topic memory.
-19. For graph, backlink, related-note, or note-connection questions, use graph/search tools before answering. Separate explicit Obsidian links/backlinks from inferred semantic relationships and cite vault-relative note paths.
-20. For note/file word-count or length-check questions, call count_words and answer from the tool result.
-21. Do not write to notes for a vault context answer unless the user asks to save, write, update, create, move, rename, delete, connect, link, graph, or remember something.
-22. When you need tools, request tools without writing user-facing prose or preambles.
-23. When the mission is expected to produce note output, choose the safest useful write tool instead of only answering in chat.
-24. If a date calculation is missing a year or reference date, ask one concise clarifying question instead of guessing.
-25. Ask one concise clarifying question when the mission is impossible, dangerous, destructive, missing required credentials, or lacks a required target/value that tools cannot discover. Do not ask when you can proceed safely from vault context, defaults, or available tools.
-26. When you have enough context and no note write is required, stop requesting tools and write the final answer.
-27. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
-28. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
-29. Use template tools only when the user asks to create, list, read, use, apply, or fill templates. Saved templates live in the configured template folder and use {{field}} placeholders.
-30. When filling a template, prefer fill_template over generic file creation. Use templateText for ad hoc templates supplied in the mission, or templatePath for saved templates.
-31. For conceptual vault questions, first inspect the semantic index when available, then call semantic_search_notes for ranked evidence before broad file reads. Use exact path/title/heading tools for exact requests. Never use semantic index tools for delete, move, replace, or direct write-only requests. Treat index summaries as navigation aids; cite and rely on source note paths.
-32. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
+9. For find-and-highlight or mark-where-this-phrase-is requests, use highlight_current_file_phrase. Persistent highlighting means wrapping the matched text in Obsidian markdown ==like this==.
+10. Use edit_current_section when the user asks to edit, revise, update, rewrite, or replace a heading section.
+11. Use append_to_current_section when the user asks to write, add, append, or insert content below, under, after, or inside a named heading section.
+12. Only request replace_current_file when the user explicitly asks to rewrite, replace, clean up, reset, start fresh, overwrite the whole current note, or clear/delete page content and then write new content.
+13. Treat whole-note/essay/body/paragraph revision and current-note edit/organize requests as current-note replacement with backup. Use edit_current_section only when the user names a heading or section.
+14. Only request delete_current_file when the user explicitly asks to delete, remove, or trash the current note. Treat "delete all notes on the page and write..." as replacing current page content, not trashing the note.
+15. Use list_current_folder before broad vault traversal when the mission depends on where the active note lives.
+16. Use list_folder and get_path_info to inspect vault folder structure before making path-based file changes.
+17. Use path-based CRUD tools only for explicit file or folder create, append, replace, move, rename, delete, remove, or trash requests.
+18. For vault context questions, including "what do you know about me", inspect note contents before answering. Do not rely on filenames or note titles because notes may be untitled. Start with list_current_folder when the active note's location may matter, then use list_markdown_files, search_markdown_files, read_markdown_files, read_file, list_folder, or get_path_info as needed. Cite vault-relative source paths in the final answer.
+19. For durable research memory, use search_research_memory/read_research_memory before continuing a remembered topic, and append_research_memory when the user asks to save, remember, persist, or build durable topic memory.
+20. For graph, backlink, related-note, or note-connection questions, use graph/search tools before answering. Separate explicit Obsidian links/backlinks from inferred semantic relationships and cite vault-relative note paths.
+21. For note/file word-count or length-check questions, call count_words and answer from the tool result.
+22. When an active markdown note is available and chat-only mode is not requested, gather the needed read/web/vault context first, then let the plugin stream the final answer markdown into the active note. Use chat-only output only when the user explicitly asks for chat-only or the plugin reports no note writeback is required.
+23. When you need tools, request tools without writing user-facing prose or preambles.
+24. When the mission is expected to produce note output, choose the safest useful write tool instead of only answering in chat.
+25. If a date calculation is missing a year or reference date, ask one concise clarifying question instead of guessing.
+26. Ask one concise clarifying question when the mission is impossible, dangerous, destructive, missing required credentials, or lacks a required target/value that tools cannot discover. Do not ask when you can proceed safely from vault context, defaults, or available tools.
+27. When you have enough context and no note write is required, stop requesting tools and write the final answer.
+28. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
+29. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
+30. Use template tools only when the user asks to create, list, read, use, apply, or fill templates. Saved templates live in the configured template folder and use {{field}} placeholders.
+31. When filling a template, prefer fill_template over generic file creation. Use templateText for ad hoc templates supplied in the mission, or templatePath for saved templates. For an explicit multi-note research pack, use create_research_pack so Brief, Sources, Synthesis, and Index are created and verified transactionally.
+32. For conceptual vault questions, first inspect the semantic index when available, then call semantic_search_notes for ranked evidence before broad file reads. Use exact path/title/heading tools for exact requests. Never use semantic index tools for delete, move, replace, or direct write-only requests. Treat index summaries as navigation aids; cite and rely on source note paths.
+33. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
 
 const ENGLISH_ONLY_POLICY = [
   "You are an English-only research assistant for an Obsidian vault.",
@@ -568,7 +838,7 @@ function getRecentSubstantiveAssistantMessage(
 }
 
 function isVagueContinuationFollowup(prompt: string): boolean {
-  return /^\s*(continue|go on|go ahead|keep going|keep exploring|keep searching|read it|check it|do that|do it|please do|yes|ok|okay)\.?\s*$/i.test(
+  return /^\s*(continue|go on|go ahead|keep going|keep exploring|keep searching|read it|check it|do that|do it|please do|please|yes|ok|okay)\.?\s*$/i.test(
     prompt,
   );
 }
@@ -576,10 +846,10 @@ function isVagueContinuationFollowup(prompt: string): boolean {
 function isRevisionApprovalFollowup(prompt: string): boolean {
   const normalized = prompt.trim();
   return (
-    /^(go ahead|do it|do that|please do|yes|ok|okay)\b[\s\S]{0,80}\b(revise|edit|update|rewrite|expand|improve|iterate|change|make)\b/i.test(
+    /^(go ahead|do it|do that|please do|please|yes|ok|okay)\b[\s\S]{0,80}\b(revise|edit|update|rewrite|expand|improve|iterate|change|make)\b/i.test(
       normalized,
     ) ||
-    /^(go ahead|do it|do that|please do|yes|ok|okay)\.?\s*$/i.test(
+    /^(go ahead|do it|do that|please do|please|yes|ok|okay)\.?\s*$/i.test(
       normalized,
     ) ||
     /^(revise|edit|update|rewrite|expand|improve|iterate)\s+(it|that|this|the\s+(?:essay|note|page|draft|article|paragraphs?))\.?\s*$/i.test(
@@ -646,6 +916,7 @@ function hasRecentVaultToolContinuationContext(
 
 export async function runAgentMission({
   prompt,
+  runId: providedRunId,
   modelClient,
   toolRegistry,
   toolContext,
@@ -653,25 +924,128 @@ export async function runAgentMission({
   conversationHistory = [],
   events = {},
   abortSignal,
+  approvalBroker: providedApprovalBroker,
+  forceChatOnly = false,
+  maxToolCalls: providedMaxToolCalls,
+  maxSteps: providedMaxSteps,
+  seedMissionEvidence = [],
+  seedClaimPassages = [],
+  orchestratorContext,
+  orchestratorSnapshot,
+  getOrchestratorSnapshot,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
-  const runId = createAgentRunId(toolContext.now?.() ?? new Date());
+  const configuredMaxRunMs =
+    typeof toolContext.settings?.maxRunMinutes === "number" &&
+    toolContext.settings.maxRunMinutes > 0
+      ? toolContext.settings.maxRunMinutes * 60_000
+      : null;
+  const runDeadlineAt =
+    configuredMaxRunMs === null ? undefined : Date.now() + configuredMaxRunMs;
+  const runId =
+    providedRunId?.trim() ||
+    createAgentRunId(toolContext.now?.() ?? new Date());
+  const metricEvents: AgentRunMetricEvent[] = [];
+  const callerEvents = events;
+  events = new Proxy(callerEvents, {
+    get: (target, property, receiver) => {
+      if (property === "onMetric") {
+        return (event: AgentRunMetricEvent) => {
+          metricEvents.push(event);
+          callerEvents.onMetric?.(event);
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const approvalBroker = providedApprovalBroker ?? new ApprovalBroker();
+  const maxToolCalls = normalizeInvocationToolCallLimit(providedMaxToolCalls);
+  let observedToolCallCount = 0;
+  let toolCallBudgetExhausted = false;
+  let toolCallBudgetNoticeEmitted = false;
   const runtimeCache = createRuntimeCache();
   let activeThink = resolveThinkingMode(toolContext.settings);
   const intentPrompt = resolvePromptForIntent(prompt, conversationHistory);
   let activeIntentPrompt = intentPrompt;
   let missionIntent = classifyMissionIntent(activeIntentPrompt);
+  if (forceChatOnly) {
+    missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
+  }
+  const modelRouterMode = resolveModelRouterMode(toolContext.settings);
+  let routedModelIntent: RoutedMissionIntent | null = null;
+  let routedMissionIntent: RoutedMissionIntent | null = null;
+  if (modelRouterMode !== "off") {
+    events.onStatus?.("Classifying mission with structured router...");
+    routedModelIntent = await classifyMissionWithModel({
+      client: modelClient,
+      prompt: activeIntentPrompt,
+      recentAssistant: conversationHistory
+        .filter((message) => message.role === "assistant")
+        .slice(-1)[0]?.content,
+    });
+    const earlyRegexIntent = deriveRoutedIntentFallback({
+      missionIntent,
+      writeAutonomy: missionIntent.allowAutonomousWrite,
+      writeToolExposed: false,
+    });
+    const earlyResolved = resolvePolicyRoutedIntent({
+      mode: modelRouterMode,
+      modelIntent: routedModelIntent,
+      missionIntent,
+      writeAutonomy: missionIntent.allowAutonomousWrite,
+      writeToolExposed: false,
+    });
+    routedMissionIntent =
+      modelRouterMode === "authority" ? earlyResolved.intent : null;
+    events.onTrace?.({
+      id:
+        modelRouterMode === "authority"
+          ? "structured-router-authority"
+          : "structured-router-shadow",
+      kind: "mission_intent",
+      message:
+        modelRouterMode === "authority"
+          ? earlyResolved.source === "model"
+            ? `Structured router authority decision: ${earlyResolved.intent.mode} (${earlyResolved.intent.confidence}).`
+            : `Structured router authority fell back to regex (${earlyResolved.fallbackReason ?? "unknown"}).`
+          : routedModelIntent
+            ? `Structured router shadow decision: ${routedModelIntent.mode} (${routedModelIntent.confidence}).`
+            : "Structured router shadow decision unavailable; regex fallback remains authoritative.",
+      outputPreview: {
+        mode: modelRouterMode,
+        source: earlyResolved.source,
+        fallbackReason: earlyResolved.fallbackReason,
+        modelIntent: routedModelIntent,
+        resolvedIntent: earlyResolved.intent,
+        regexIntent: earlyRegexIntent,
+        regexMode: missionIntent.mode,
+        agreement: routedModelIntent
+          ? compareRouterWithRegex(routedModelIntent, missionIntent)
+          : "fallback",
+      },
+    });
+  }
   let writeAutonomy = missionIntent.allowAutonomousWrite;
   let runToolContext: ToolExecutionContext = {
     ...toolContext,
     originalPrompt: activeIntentPrompt,
     runtimeCache,
     reportProgress: (message) => events.onStatus?.(message),
+    reportCodeOutput: (event) => events.onCodeOutput?.(event),
+    runId,
+    abortSignal,
+    deadlineAt: runDeadlineAt,
+    userApprovalGranted: false,
     writeAutonomy,
     missionIntent,
   };
   if (
-    shouldFallbackGeneratedNoteOutputToChat(activeIntentPrompt, missionIntent, runToolContext)
+    shouldFallbackGeneratedNoteOutputToChat(
+      activeIntentPrompt,
+      missionIntent,
+      runToolContext,
+      enableStreaming,
+    )
   ) {
     missionIntent = buildMissionIntent(activeIntentPrompt, {
       mode: "chat_only",
@@ -692,7 +1066,12 @@ export async function runAgentMission({
   }
   const reflexController = new AgenticReflexController();
   const recentActions: AgentTrajectoryEvent[] = [];
-  const missionEvidenceRecords: MissionEvidence[] = [];
+  const missionEvidenceRecords: MissionEvidence[] = seedMissionEvidence.map(
+    (item) => ({
+      ...item,
+      passageIds: item.passageIds ? [...item.passageIds] : undefined,
+    }),
+  );
   let reflexOutput = await reflexController.evaluate({
     prompt: activeIntentPrompt,
     missionIntent,
@@ -725,8 +1104,87 @@ export async function runAgentMission({
       missionIntent,
     };
   }
+  missionIntent = applyDefaultActiveNoteWriteback({
+    prompt: activeIntentPrompt,
+    missionIntent,
+    toolContext: runToolContext,
+    enableStreaming,
+    forceChatOnly,
+  });
+  writeAutonomy = missionIntent.allowAutonomousWrite;
+  runToolContext = {
+    ...runToolContext,
+    writeAutonomy,
+    missionIntent,
+  };
+  let noteOutputPlan = buildMissionNoteOutputPlan({
+    prompt: activeIntentPrompt,
+    missionIntent,
+    toolContext: runToolContext,
+    enableStreaming,
+    forceChatOnly,
+  });
+  if (
+    noteOutputPlan.destination === "chat" &&
+    missionIntent.noteOutput &&
+    !forceChatOnly &&
+    !hasChatOnlyResponseIntent(activeIntentPrompt) &&
+    (noteOutputPlan.reason === "explicit_chat_only" ||
+      noteOutputPlan.reason === "force_chat_only" ||
+      noteOutputPlan.reason === "no_active_note_chat_first" ||
+      noteOutputPlan.reason === "active_note_only_no_file" ||
+      noteOutputPlan.reason === "trivial_chat")
+  ) {
+    // Plan says chat (e.g. chat_first profile): suppress note write.
+    // Do not use this path for specialized_route — those keep their own tools.
+    missionIntent = suppressNoteWritebackForChatOnly(
+      activeIntentPrompt,
+      missionIntent,
+    );
+    writeAutonomy = false;
+    runToolContext = {
+      ...runToolContext,
+      writeAutonomy,
+      missionIntent,
+    };
+  } else if (
+    noteOutputPlan.destination === "new_note" &&
+    !missionIntent.noteOutput &&
+    enableStreaming &&
+    resolveOutputProfile(runToolContext.settings) === "active_or_new_note" &&
+    runToolContext.settings?.streamWritebackMode ===
+      "all_current_note_content_writes" &&
+    !(
+      hasWebSearchIntent(activeIntentPrompt) ||
+      hasBrowserAutomationIntent(activeIntentPrompt) ||
+      hasCodeExecutionIntent(activeIntentPrompt)
+    )
+  ) {
+    // Promote only for host-owned lazy create when streaming delivery is available.
+    missionIntent = buildMissionIntent(activeIntentPrompt, {
+      ...missionIntent,
+      mode: missionIntent.vaultContext ? "vault_context_answer" : "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    });
+    writeAutonomy = true;
+    runToolContext = {
+      ...runToolContext,
+      writeAutonomy,
+      missionIntent,
+    };
+  }
+  events.onTrace?.({
+    id: "note-output-plan",
+    kind: "mission_intent",
+    message: `Note output plan: ${noteOutputPlan.destination}/${noteOutputPlan.mutation}/${noteOutputPlan.delivery} (${noteOutputPlan.reason})`,
+    outputPreview: noteOutputPlan,
+  });
   let structuredIntent = classifyStructuredIntent(activeIntentPrompt, missionIntent);
   const modelOptions = buildModelRequestOptions(runToolContext.settings);
+  const runContextBudget = createRunContextBudget(modelOptions?.num_ctx ?? null);
+  let estimatedPromptCharsForRun = 0;
   let followupIntentContext =
     intentPrompt === prompt ? null : formatFollowupIntentContext(intentPrompt);
   const disableThinkingForRun = () => {
@@ -754,7 +1212,10 @@ export async function runAgentMission({
     streamingWritebackKind,
     toolContext: runToolContext,
   });
-  if (shouldOmitCurrentNoteReadForTargetOnlyWrite(activeIntentPrompt, missionIntent)) {
+  if (
+    shouldOmitCurrentNoteReadForTargetOnlyWrite(activeIntentPrompt, missionIntent) &&
+    !hasParallelVaultReadIntent(activeIntentPrompt)
+  ) {
     tools = removeToolDefinition(tools, "read_current_file");
   }
   const knownToolNames = new Set(
@@ -771,7 +1232,7 @@ export async function runAgentMission({
     missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
   let requireToolBeforeStreamingWriteback = false;
   let promptOnPageCurrentNoteReadSatisfied = false;
-  const shouldReadCurrentNote = shouldObserveCurrentNote(
+  let shouldReadCurrentNote = shouldObserveCurrentNote(
     activeIntentPrompt,
     allowedToolNames,
     missionIntent,
@@ -779,19 +1240,43 @@ export async function runAgentMission({
   let executedModelTool = false;
   let wroteToNote = false;
   let unavailableToolCorrectionUsed = false;
+  let proofGatedWriteToolCorrectionUsed = false;
   let vaultTraversalCorrectionUsed = false;
+  let vaultCoverageExpansionUsed = false;
   let webResearchCorrectionUsed = false;
   let toolBeforeWriteCorrectionUsed = false;
+  let finalOutputCorrectionUsed = false;
   let consecutiveNoProgressSteps = 0;
   let lastProgressSignature = "";
   let lastStep = 0;
+  let lastFinalOutput = "";
+  let lastVerificationChecks: VerificationCheck[] = [];
+  let lastClaimLedger: ClaimLedger | null = null;
+  let lastEvidenceConflicts: EvidenceConflict[] = [];
+  const claimPassageRefs: ClaimPassageRef[] = seedClaimPassages.map((item) => ({
+    ...item,
+  }));
+  let recoveryAttemptSignatures: string[] = [];
+  let recoveryState: RecoveryState = createRecoveryState({
+    now: runToolContext.now?.() ?? new Date(),
+  });
+  const vaultTransactionRecords: VaultMutationTransaction[] = [];
   let executedWebSearchTool = false;
   let executedWebFetchTool = false;
+  let executedCodeRunCount = 0;
   const successfulToolNames: string[] = [];
+  const currentSegmentSuccessfulToolNames: string[] = [];
   const failedToolNames: string[] = [];
   const writeReceipts: AgentRunReceipt[] = [];
+  // Live receipt array: streamed writer.buildReceipt and tool writes push here
+  // before any reflexController.evaluate / acceptance check on the same turn.
   let preparedStreamingSectionEdit: PreparedStreamingSectionEdit | null = null;
   let missionLedger: MissionLedger | null = null;
+  let missionPlan: MissionPlan | null = null;
+  let researchPlan: ResearchPlan | null = null;
+  let researchPhaseDescriptor: ResearchPhaseDescriptor | null = null;
+  let lastResearchPhase: ResearchRunPhase | null = null;
+  let runtimeSnapshot: MissionRuntimeSnapshotV2 | null = null;
   let runPlan = createRunPlan({
     prompt: activeIntentPrompt,
     missionIntent,
@@ -831,6 +1316,14 @@ export async function runAgentMission({
         runToolContext.now?.() ?? new Date(),
       );
       void writeMissionLedger(runToolContext, missionLedger);
+      if (runtimeSnapshot) {
+        runtimeSnapshot.status = "stopped";
+        runtimeSnapshot.lastSafeStep = missionLedger.lastSafeStep;
+        runtimeSnapshot.updatedAt = (
+          runToolContext.now?.() ?? new Date()
+        ).toISOString();
+        void writeMissionRuntimeSnapshot(runToolContext, runtimeSnapshot);
+      }
     }
     completeRun(
       events,
@@ -854,6 +1347,7 @@ export async function runAgentMission({
       activeThink,
       modelOptions,
       writeAutonomy,
+      chatOnlyOverride: forceChatOnly,
       missionIntent,
       currentNoteContext: shouldReadCurrentNote,
       runPlan,
@@ -861,6 +1355,10 @@ export async function runAgentMission({
       directCurrentNoteWritebackKind,
       missionLedger: undefined,
       reflexOutput,
+      estimatedPromptChars: estimatedPromptCharsForRun,
+      contextBudgetChars: runContextBudget.maxPromptChars,
+      performanceGates: evaluatePerformanceGates(metricEvents),
+      noteOutputPlan,
     }),
   );
   events.onTrace?.({
@@ -892,6 +1390,9 @@ export async function runAgentMission({
   if (promptOnPageRoutingPrompt !== null) {
     activeIntentPrompt = promptOnPageRoutingPrompt;
     missionIntent = classifyPromptOnCurrentPageMissionIntent(activeIntentPrompt);
+    if (forceChatOnly) {
+      missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
+    }
     reflexOutput = await reflexController.evaluate({
       prompt: activeIntentPrompt,
       missionIntent,
@@ -918,12 +1419,17 @@ export async function runAgentMission({
         },
       };
     }
+    missionIntent = applyDefaultActiveNoteWriteback({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      toolContext: runToolContext,
+      enableStreaming,
+      forceChatOnly,
+    });
     writeAutonomy = missionIntent.allowAutonomousWrite;
     runToolContext = {
-      ...toolContext,
+      ...runToolContext,
       originalPrompt: activeIntentPrompt,
-      runtimeCache,
-      reportProgress: (message) => events.onStatus?.(message),
       writeAutonomy,
       missionIntent,
     };
@@ -1009,6 +1515,7 @@ export async function runAgentMission({
         activeThink,
         modelOptions,
         writeAutonomy,
+        chatOnlyOverride: forceChatOnly,
         missionIntent,
         currentNoteContext: true,
         runPlan,
@@ -1016,6 +1523,7 @@ export async function runAgentMission({
         directCurrentNoteWritebackKind,
         missionLedger: undefined,
         reflexOutput,
+        performanceGates: evaluatePerformanceGates(metricEvents),
       }),
     );
     events.onTrace?.({
@@ -1046,7 +1554,7 @@ export async function runAgentMission({
     requireToolBeforeStreamingWriteback = true;
   }
 
-  const finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
+  let finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
     activeIntentPrompt,
     currentNoteContext,
     conversationHistory,
@@ -1063,30 +1571,566 @@ export async function runAgentMission({
     toolContext: runToolContext,
     events,
   });
+  if (checkpointResumeContext?.missingRequestedRunId) {
+    const missingRunId = checkpointResumeContext.missingRequestedRunId;
+    const message =
+      `Run ${missingRunId} was requested explicitly, but its exact durable ` +
+      "checkpoint is unavailable. Refusing to continue from a different run.";
+    events.onStatus?.(message);
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
+  const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
+  const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
+  if (resumeLedger && checkpointResumeContext?.missionResume?.plan.canResume === false) {
+    const resumeReason = checkpointResumeContext.missionResume.plan.reason;
+    const message =
+      resumeReason === "proof_debt_blocked"
+        ? `Run ${resumeLedger.runId} has blocking proof debt (approvals, policy, or unresolved mutations). ` +
+          "Resolve the blocker before continuing this run."
+        : `Run ${resumeLedger.runId} is already complete and accepted. ` +
+          "Start a new mission explicitly if you want to repeat or revise that work.";
+    events.onTrace?.({
+      id: resumeReason === "proof_debt_blocked"
+        ? "resume-proof-debt-blocked"
+        : "resume-already-complete",
+      kind: "status",
+      message,
+      outputPreview: {
+        runId: resumeLedger.runId,
+        status: resumeLedger.status,
+        acceptance: resumeLedger.acceptance?.status ?? "unchecked",
+      },
+    });
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(events, "final", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
+  const ambiguousResumeOperations = resumeSnapshot
+    ? buildOperationReconciliationInputs(resumeSnapshot.operationJournal).filter(
+        (item) => item.recommendedAction !== "safe_to_retry",
+      )
+    : [];
+  if (resumeLedger && ambiguousResumeOperations.length > 0) {
+    const targets = ambiguousResumeOperations
+      .map((item) => item.targetPath ?? item.toolName)
+      .filter((item, index, all) => all.indexOf(item) === index)
+      .slice(0, 4);
+    const message =
+      `Run ${resumeLedger.runId} has ${ambiguousResumeOperations.length} unresolved mutation ` +
+      `operation(s) that may already have applied${targets.length > 0 ? ` (${targets.join(", ")})` : ""}. ` +
+      "Automatic replay is blocked. Inspect the target and start a new explicit repair mission.";
+    events.onTrace?.({
+      id: "resume-mutation-reconciliation-required",
+      kind: "error",
+      message,
+      outputPreview: ambiguousResumeOperations,
+      error: {
+        code: "mutation_reconciliation_required",
+        message,
+      },
+    });
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
+  const pendingCurrentNoteResumeGoals = resumeSnapshot
+    ? CURRENT_NOTE_RESUME_GOALS.filter((goal) => {
+        const state = resumeSnapshot.operationGoals[goal];
+        return state === "pending" || state === "failed";
+      })
+    : [];
+  const activeResumeNotePath = runToolContext.getCurrentMarkdownFile?.()?.path;
+  if (
+    resumeLedger &&
+    resumeSnapshot?.currentNotePath &&
+    pendingCurrentNoteResumeGoals.length > 0 &&
+    activeResumeNotePath !== resumeSnapshot.currentNotePath
+  ) {
+    const message =
+      `Run ${resumeLedger.runId} was started on ${resumeSnapshot.currentNotePath}, ` +
+      `but the active note is ${activeResumeNotePath ?? "unavailable"}. ` +
+      "Open the original note and continue the run again so current-note work cannot target the wrong file.";
+    events.onTrace?.({
+      id: "resume-current-note-target-mismatch",
+      kind: "status",
+      message,
+      outputPreview: {
+        expectedPath: resumeSnapshot.currentNotePath,
+        activePath: activeResumeNotePath ?? null,
+        pendingGoals: pendingCurrentNoteResumeGoals,
+      },
+    });
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(
+      events,
+      "clarifying_question",
+      0,
+      runStartedAt,
+      runPlan.maxStepsForRun,
+    );
+    return;
+  }
+  const resumedOriginalMission =
+    resumeSnapshot?.originalMission ?? resumeLedger?.mission;
+  if (resumedOriginalMission) {
+    activeIntentPrompt = resumedOriginalMission;
+    missionIntent = classifyMissionIntent(activeIntentPrompt);
+    if (forceChatOnly) {
+      missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
+    }
+    writeAutonomy = missionIntent.allowAutonomousWrite;
+    runToolContext = {
+      ...runToolContext,
+      originalPrompt: activeIntentPrompt,
+      writeAutonomy,
+      missionIntent,
+    };
+    routedMissionIntent = null;
+    reflexOutput = await reflexController.evaluate({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      allowedToolNames: new Set(),
+      recentActions,
+      evidence: missionEvidenceRecords,
+      receipts: writeReceipts,
+      settings: runToolContext.settings,
+      embeddingProvider: runToolContext.semanticEmbeddingProvider,
+    });
+    missionIntent = applyDefaultActiveNoteWriteback({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      toolContext: runToolContext,
+      enableStreaming,
+      forceChatOnly,
+    });
+    writeAutonomy = missionIntent.allowAutonomousWrite;
+    runToolContext = {
+      ...runToolContext,
+      writeAutonomy,
+      missionIntent,
+    };
+    structuredIntent = classifyStructuredIntent(activeIntentPrompt, missionIntent);
+    streamingWritebackKind = getStreamingWritebackKind(
+      activeIntentPrompt,
+      runToolContext,
+      enableStreaming,
+    );
+    tools = getAllowedToolDefinitions(
+      toolRegistry,
+      activeIntentPrompt,
+      missionIntent,
+      runToolContext.settings,
+      streamingWritebackKind,
+      reflexOutput.intent,
+    );
+    directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      streamingWritebackKind,
+      toolContext: runToolContext,
+    });
+    if (shouldOmitCurrentNoteReadForTargetOnlyWrite(activeIntentPrompt, missionIntent)) {
+      tools = removeToolDefinition(tools, "read_current_file");
+    }
+    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    requiredWriteTools = getRequiredWriteToolNames(
+      activeIntentPrompt,
+      allowedToolNames,
+      missionIntent,
+      streamingWritebackKind,
+    );
+    writeRequired =
+      missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
+    requireToolBeforeStreamingWriteback = promptRequiresToolLoop(activeIntentPrompt);
+    shouldReadCurrentNote = shouldObserveCurrentNote(
+      activeIntentPrompt,
+      allowedToolNames,
+      missionIntent,
+    );
+    runPlan = createRunPlan({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      tools,
+      settings: runToolContext.settings,
+      streamingWritebackKind,
+      directCurrentNoteWritebackKind,
+      reflex: reflexOutput.intent,
+    });
+    runPlan.traceReasons = [
+      ...new Set([
+        ...runPlan.traceReasons,
+        `resume_original_route:${resumeLedger?.route ?? runPlan.route}`,
+      ]),
+    ];
+    activeThink = runPlan.thinking;
+    finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
+      activeIntentPrompt,
+      currentNoteContext,
+      conversationHistory,
+    );
+    followupIntentContext = null;
+    events.onTrace?.({
+      id: "resume-original-mission-routing",
+      kind: "mission_intent",
+      message: `Restored original mission routing for continuation: ${runPlan.route}.`,
+      outputPreview: {
+        priorRunId: resumeLedger?.runId ?? null,
+        route: runPlan.route,
+        maxStepsForRun: runPlan.maxStepsForRun,
+        toolBudgetPrompt: activeIntentPrompt,
+      },
+    });
+  }
   const generatedOutputPolicy = analyzeGeneratedOutputPrompt(activeIntentPrompt);
-  const loopBudgetPlan = planLoopBudget({
+  let loopBudgetPlan = planLoopBudget({
     prompt: activeIntentPrompt,
     route: runPlan.route,
     generated: generatedOutputPolicy,
     configuredMaxSteps: getConfiguredMaxAgentSteps(runToolContext.settings),
     requestedSteps: parseExplicitModelStepTarget(activeIntentPrompt),
   });
+  if (resumeLedger) {
+    const configuredCap = getConfiguredMaxAgentSteps(runToolContext.settings);
+    const inheritedHardCap = Math.max(
+      1,
+      Math.min(configuredCap, resumeLedger.loopBudget.hardCap),
+    );
+    const inheritedFinalizationReserve = Math.min(
+      inheritedHardCap,
+      Math.max(0, resumeLedger.loopBudget.finalizationReserve),
+    );
+    const inheritedToolStepBudget = Math.min(
+      Math.max(0, inheritedHardCap - inheritedFinalizationReserve),
+      Math.max(0, resumeLedger.loopBudget.toolStepBudget),
+    );
+    const inheritedExpectedTools = [
+      ...new Set([
+        ...resumeLedger.loopBudget.expectedTools,
+        ...loopBudgetPlan.expectedTools,
+      ]),
+    ];
+    loopBudgetPlan = {
+      ...loopBudgetPlan,
+      hardCap: inheritedHardCap,
+      toolStepBudget: inheritedToolStepBudget,
+      finalizationReserve: inheritedFinalizationReserve,
+      expectedTools: inheritedExpectedTools,
+    };
+    runPlan = {
+      ...runPlan,
+      maxStepsForRun: inheritedHardCap,
+      expectedTimeClass:
+        inheritedHardCap > 12 ? "long" : runPlan.expectedTimeClass,
+      traceReasons: [
+        ...new Set([...runPlan.traceReasons, "resume_inherited_segment_budget"]),
+      ],
+      budgetProfile: {
+        ...runPlan.budgetProfile,
+        maxSteps: inheritedHardCap,
+        toolSteps: inheritedToolStepBudget,
+        finalizationReserve: inheritedFinalizationReserve,
+        reason: "resume_inherited_segment_budget",
+        expectedTools: inheritedExpectedTools,
+      },
+    };
+  }
+  researchPlan = createResearchPlan({
+    prompt: activeIntentPrompt,
+    missionIntent,
+    runPlan,
+  });
+  const restoredResearchPlan =
+    resumeSnapshot?.researchPlan ?? resumeLedger?.researchPlan;
+  if (restoredResearchPlan) {
+    researchPlan = JSON.parse(JSON.stringify(restoredResearchPlan)) as ResearchPlan;
+  }
+  if (
+    researchPlan &&
+    researchPlan.sourceRequirements.minFetchedSources > 0
+  ) {
+    tools = addToolDefinitions(tools, toolRegistry, [
+      "web_search",
+      "web_fetch",
+      "read_source_section",
+    ]);
+    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    runPlan = {
+      ...runPlan,
+      allowedTools: tools,
+      allowedToolNames: [...allowedToolNames],
+      slowPathReason:
+        runPlan.slowPathReason === "none"
+          ? "needs_web_sources"
+          : runPlan.slowPathReason,
+      traceReasons: [
+        ...new Set([
+          ...runPlan.traceReasons,
+          "resume_research_source_tools",
+        ]),
+      ],
+      budgetProfile: {
+        ...runPlan.budgetProfile,
+        expectedTools: [
+          ...new Set([
+            ...runPlan.budgetProfile.expectedTools,
+            "web_search",
+            "web_fetch",
+          ]),
+        ],
+      },
+    };
+  }
   const operationGoals = createMissionOperationGoals({
     prompt: activeIntentPrompt,
     allowedToolNames,
     requiredWriteTools,
+    researchPlan,
     streamingWritebackKind,
   });
   if (currentNoteContext !== null) {
     markOperationGoalDone(operationGoals, "read_current_note");
   }
+  const resolveOrchestratorSnapshot = () =>
+    getOrchestratorSnapshot?.() ?? orchestratorSnapshot ?? null;
   missionLedger = createMissionLedger({
     runId,
     mission: activeIntentPrompt,
     route: runPlan.route,
     loopBudget: loopBudgetPlan,
+    researchPlan,
     now: runToolContext.now?.() ?? new Date(),
   });
+  const initialOrchestratorSnapshot = resolveOrchestratorSnapshot();
+  if (initialOrchestratorSnapshot) {
+    missionLedger.orchestrator = initialOrchestratorSnapshot;
+  }
+  missionPlan = createMissionPlan({
+    runId,
+    prompt: activeIntentPrompt,
+    missionIntent,
+    runPlan,
+    requiredTools: [
+      ...new Set([
+        ...loopBudgetPlan.expectedTools,
+        ...requiredWriteTools,
+        ...[
+          streamingWritebackKind,
+          promptOnPageWritebackKind,
+          directCurrentNoteWritebackKind,
+        ]
+          .filter((kind): kind is StreamingWritebackKind => kind !== null)
+          .map(getStreamingWritebackToolName),
+      ]),
+    ],
+    now: runToolContext.now?.() ?? new Date(),
+  });
+  const restoredMissionPlan =
+    resumeSnapshot?.missionPlan?.version === 1
+      ? resumeSnapshot.missionPlan
+      : resumeLedger?.missionPlan;
+  if (restoredMissionPlan) {
+    missionPlan = {
+      ...JSON.parse(JSON.stringify(restoredMissionPlan)),
+      runId,
+      updatedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+    } as MissionPlan;
+  }
+  const restoredEvidence =
+    resumeSnapshot?.evidence ?? resumeLedger?.evidence ?? [];
+  for (const evidence of restoredEvidence) {
+    upsertMissionEvidenceRecord(missionEvidenceRecords, { ...evidence });
+  }
+  const restoredClaimPassages =
+    resumeSnapshot?.claimPassages ?? resumeLedger?.claimPassages ?? [];
+  if (restoredClaimPassages.length > 0) {
+    upsertClaimPassageRefs(claimPassageRefs, restoredClaimPassages);
+  }
+  if (resumeSnapshot?.claimLedger || resumeLedger?.claimLedger) {
+    lastClaimLedger =
+      resumeSnapshot?.claimLedger ?? resumeLedger?.claimLedger ?? null;
+  }
+  const restoredConflicts =
+    resumeSnapshot?.evidenceConflicts ?? resumeLedger?.evidenceConflicts ?? [];
+  if (restoredConflicts.length > 0) {
+    lastEvidenceConflicts = restoredConflicts.map((item) => ({ ...item }));
+  }
+  if (resumeSnapshot?.receipts.length) {
+    for (const receipt of resumeSnapshot.receipts) {
+      const restoredReceipt = runtimeReceiptToAgentRunReceipt(receipt);
+      if (!restoredReceipt) {
+        continue;
+      }
+      const alreadyRestored = writeReceipts.some(
+        (existing) => sameAgentRunReceiptIdentity(existing, restoredReceipt),
+      );
+      if (!alreadyRestored) {
+        writeReceipts.push(restoredReceipt);
+      }
+    }
+  }
+  const refreshEvidenceConflicts = () => {
+    if (claimPassageRefs.length < 2) {
+      return;
+    }
+    const detected = detectEvidenceConflicts(
+      claimPassageRefs.map((passage) => ({
+        id: passage.id,
+        text: passage.text,
+      })),
+    );
+    lastEvidenceConflicts = mergeEvidenceConflicts(
+      lastEvidenceConflicts,
+      detected,
+    );
+  };
+  const buildClaimConflictState = () => {
+    const openConflictCount = listOpenEvidenceConflicts(lastEvidenceConflicts)
+      .length;
+    if (!lastClaimLedger && openConflictCount === 0) {
+      // Omit claimConflict so analyze stays vacuously complete until ledger/conflicts exist.
+      return null;
+    }
+    const unboundClaimCount = lastClaimLedger
+      ? lastClaimLedger.claims.filter(
+          (claim) =>
+            claim.status === "ungrounded" || claim.status === "invalid_citation",
+        ).length
+      : 0;
+    return {
+      openConflictCount,
+      unboundClaimCount,
+      claimsGrounded:
+        lastClaimLedger == null
+          ? null
+          : lastClaimLedger.status === "pass" ||
+            lastClaimLedger.status === "skipped",
+      analyzeComplete:
+        openConflictCount === 0 &&
+        unboundClaimCount === 0 &&
+        (lastClaimLedger == null ||
+          lastClaimLedger.status === "pass" ||
+          lastClaimLedger.status === "skipped"),
+    };
+  };
+  const refreshResearchPhase = (verifyComplete = false) => {
+    researchPhaseDescriptor = deriveResearchPhase({
+      researchPlan,
+      missionPlan,
+      claimConflict: buildClaimConflictState(),
+      writeReceiptPresent: hasVaultWriteReceipt(writeReceipts),
+      externalActionReceiptPresent:
+        hasExternalActionReceipt(writeReceipts),
+      verifyComplete,
+    });
+    return researchPhaseDescriptor;
+  };
+  refreshEvidenceConflicts();
+  researchPhaseDescriptor = refreshResearchPhase(false);
+  {
+    const phaseTransition = buildResearchPhaseTransition(
+      lastResearchPhase,
+      researchPhaseDescriptor,
+    );
+    if (phaseTransition) {
+      lastResearchPhase = phaseTransition.to;
+      events.onTrace?.({
+        id: `research-phase:${phaseTransition.to}:init`,
+        kind: "status",
+        message: `Research phase → ${phaseTransition.to}: ${phaseTransition.reason}`,
+        outputPreview: {
+          from: phaseTransition.from,
+          to: phaseTransition.to,
+          reason: phaseTransition.reason,
+          writeToolsAllowed: researchPhaseDescriptor.writeToolsAllowed,
+        },
+      });
+    }
+  }
+  if (resumeSnapshot) {
+    recoveryState = resumeSnapshot.recovery;
+    for (const goal of Object.keys(operationGoals.goals) as OperationGoal[]) {
+      const restoredState = resumeSnapshot.operationGoals[goal];
+      if (
+        restoredState === "not_requested" ||
+        restoredState === "pending" ||
+        restoredState === "done" ||
+        restoredState === "failed"
+      ) {
+        const currentState = operationGoals.goals[goal];
+        if (
+          (currentState === "pending" && restoredState === "not_requested") ||
+          (currentState === "done" && restoredState !== "done")
+        ) {
+          continue;
+        }
+        operationGoals.goals[goal] = restoredState;
+      }
+    }
+    operationGoals.completedTools.push(
+      ...successfulToolNames.filter(
+        (toolName) => !operationGoals.completedTools.includes(toolName),
+      ),
+    );
+  }
+  if (resumeLedger) {
+    missionLedger.mission =
+      resumeSnapshot?.originalMission ?? resumeLedger.mission;
+    missionLedger.evidence = missionEvidenceRecords.map((item) => ({ ...item }));
+    missionLedger.receipts = [...resumeLedger.receipts];
+    missionLedger.resumeCount = resumeLedger.resumeCount;
+    missionLedger.lastSafeStep = Math.max(
+      resumeLedger.lastSafeStep,
+      resumeSnapshot?.lastSafeStep ?? 0,
+    );
+  }
+  const previousLineage = resumeSnapshot?.lineage;
+  runtimeSnapshot = createMissionRuntimeSnapshot({
+    runId,
+    originalMission:
+      resumeSnapshot?.originalMission ?? resumeLedger?.mission ?? activeIntentPrompt,
+    currentNotePath:
+      resumeSnapshot?.currentNotePath ??
+      runToolContext.getCurrentMarkdownFile?.()?.path,
+    rootRunId: previousLineage?.rootRunId ?? resumeLedger?.runId ?? runId,
+    segmentId: runId,
+    segmentIndex: previousLineage ? previousLineage.segmentIndex + 1 : resumeLedger ? 1 : 0,
+    parentSegmentId: previousLineage?.segmentId ?? resumeLedger?.runId,
+    priorSegmentIds: previousLineage
+      ? [...previousLineage.priorSegmentIds, previousLineage.segmentId]
+      : resumeLedger
+        ? [resumeLedger.runId]
+        : [],
+    missionPlan,
+    researchPlan,
+    orchestrator: resolveOrchestratorSnapshot(),
+    evidence: missionEvidenceRecords,
+    receipts: writeReceipts,
+    operationGoals: operationGoals.goals,
+    recovery: recoveryState,
+    operationJournal: resumeSnapshot?.operationJournal ?? [],
+    claimLedger: lastClaimLedger,
+    claimPassages: claimPassageRefs,
+    evidenceConflicts: lastEvidenceConflicts,
+    lastSafeStep: missionLedger.lastSafeStep,
+    createdAt: runToolContext.now?.() ?? new Date(),
+  });
+  setLedgerMissionPlan(
+    missionLedger,
+    missionPlan,
+    runToolContext.now?.() ?? new Date(),
+  );
+  const dependencyStatus = buildDependencyStatus({
+    toolContext: runToolContext,
+    runPlan,
+    missionIntent,
+  });
+  setLedgerDependencyStatus(
+    missionLedger,
+    dependencyStatus,
+    runToolContext.now?.() ?? new Date(),
+  );
   if (checkpointResumeContext !== null) {
     markLedgerResumeLoaded(
       missionLedger,
@@ -1124,6 +2168,7 @@ export async function runAgentMission({
         activeThink,
         modelOptions,
         writeAutonomy,
+        chatOnlyOverride: forceChatOnly,
         missionIntent,
         currentNoteContext: shouldReadCurrentNote || currentNoteContext !== null,
         runPlan,
@@ -1131,12 +2176,437 @@ export async function runAgentMission({
         directCurrentNoteWritebackKind,
         missionLedger: summarizeMissionLedger(missionLedger),
         reflexOutput,
+        performanceGates: evaluatePerformanceGates(metricEvents),
       }),
     );
+  };
+  const runtimeSnapshotPersistenceAvailable =
+    canPersistMissionRuntimeSnapshot(runToolContext);
+  const syncRuntimeSnapshotFromRunState = () => {
+    if (!runtimeSnapshot || !missionLedger) {
+      return;
+    }
+    const now = runToolContext.now?.() ?? new Date();
+    runtimeSnapshot = createMissionRuntimeSnapshot({
+      runId,
+      originalMission: runtimeSnapshot.originalMission,
+      currentNotePath: runtimeSnapshot.currentNotePath,
+      rootRunId: runtimeSnapshot.lineage.rootRunId,
+      segmentId: runtimeSnapshot.lineage.segmentId,
+      segmentIndex: runtimeSnapshot.lineage.segmentIndex,
+      parentSegmentId: runtimeSnapshot.lineage.parentSegmentId,
+      priorSegmentIds: runtimeSnapshot.lineage.priorSegmentIds,
+      status: missionLedgerStatusToRuntimeStatus(missionLedger.status),
+      revision: runtimeSnapshot.revision,
+      lastSafeStep: missionLedger.lastSafeStep,
+      missionPlan,
+      researchPlan,
+      orchestrator: resolveOrchestratorSnapshot(),
+      evidence: missionEvidenceRecords,
+      receipts: writeReceipts,
+      operationGoals: operationGoals.goals,
+      recovery: recoveryState,
+      operationJournal: runtimeSnapshot.operationJournal,
+      acceptance: normalizeRuntimeAcceptance(missionLedger.acceptance),
+      claimLedger: lastClaimLedger,
+      claimPassages: claimPassageRefs,
+      evidenceConflicts: lastEvidenceConflicts,
+      notes: runtimeSnapshot.notes,
+      createdAt: new Date(runtimeSnapshot.createdAt),
+      updatedAt: now,
+    });
+  };
+  const persistRuntimeSnapshot = async (
+    traceId: string,
+    { required = false }: { required?: boolean } = {},
+  ): Promise<boolean> => {
+    if (!runtimeSnapshot) {
+      return false;
+    }
+    syncRuntimeSnapshotFromRunState();
+    try {
+      const result = await writeMissionRuntimeSnapshot(
+        runToolContext,
+        runtimeSnapshot,
+      );
+      if (result) {
+        events.onTrace?.({
+          id: `${traceId}:runtime`,
+          kind: "status",
+          path: result.path,
+          message: `Saved resumable runtime snapshot revision ${result.revision}.`,
+          outputPreview: {
+            version: runtimeSnapshot.version,
+            revision: result.revision,
+            rootRunId: runtimeSnapshot.lineage.rootRunId,
+            segmentIndex: runtimeSnapshot.lineage.segmentIndex,
+            lastSafeStep: runtimeSnapshot.lastSafeStep,
+          },
+        });
+        return true;
+      }
+      if (required) {
+        throw new Error(
+          "Required runtime snapshot could not be persisted before a vault mutation.",
+        );
+      }
+      return false;
+    } catch (error) {
+      events.onTrace?.({
+        id: `${traceId}:runtime:error`,
+        kind: "error",
+        message: `Could not save runtime snapshot: ${getUnknownErrorMessage(error)}`,
+        error: {
+          code: "runtime_snapshot_save_failed",
+          message: getUnknownErrorMessage(error),
+        },
+      });
+      if (required) {
+        throw error;
+      }
+      return false;
+    }
+  };
+  const runStreamedWritebackWithJournal = async (
+    input: Parameters<typeof streamCurrentNoteWriteback>[0],
+    step: number,
+  ): Promise<AgentRunReceipt> => {
+    const toolName =
+      input.kind === "append"
+        ? "append_to_current_file"
+        : input.kind === "replace"
+          ? "replace_current_file"
+          : "edit_current_section";
+    const operationId = `${runId}:${step}:stream:${input.kind}`;
+    let activeRecord: OperationJournalRecord | null = null;
+    let durableRecord: OperationJournalRecord | null = null;
+    let partialReceipt: AgentRunReceipt | null = null;
+    let reconciliationAttempted = false;
+    const saveRecord = (record: OperationJournalRecord) => {
+      if (!runtimeSnapshot) {
+        return;
+      }
+      activeRecord = record;
+      runtimeSnapshot.operationJournal = [
+        ...runtimeSnapshot.operationJournal.filter(
+          (item) => item.operationId !== record.operationId,
+        ),
+        record,
+      ];
+    };
+    // Async callbacks update these records. Accessors keep the later
+    // reconciliation narrowing honest instead of letting TypeScript assume
+    // the closure-owned values are still null.
+    const getActiveRecord = (): OperationJournalRecord | null => activeRecord;
+    const getDurableRecord = (): OperationJournalRecord | null => durableRecord;
+    const persistRecord = async (traceId: string, required: boolean) => {
+      const persisted = await persistRuntimeSnapshot(traceId, { required });
+      if (persisted && activeRecord) {
+        durableRecord = activeRecord;
+      }
+      return persisted;
+    };
+
+    if (runtimeSnapshot) {
+      const targetPath =
+        runtimeSnapshot.currentNotePath ??
+        runToolContext.getCurrentMarkdownFile?.()?.path;
+      const intentRecord = createOperationJournalRecord({
+        operationId,
+        rootRunId: runtimeSnapshot.lineage.rootRunId,
+        segmentId: runtimeSnapshot.lineage.segmentId,
+        nodeId: missionPlan?.activeTaskId ?? undefined,
+        toolName,
+        operation: input.kind,
+        targetPath,
+        inputHash: hashOperationInput({
+          kind: input.kind,
+          targetPath,
+          heading: input.preparedSectionEdit?.heading,
+        }),
+        now: runToolContext.now?.() ?? new Date(),
+      });
+      saveRecord(intentRecord);
+      await persistRecord(`${operationId}:wal-intent`, true);
+      const applyingRecord = transitionOperationJournalRecord(
+        intentRecord,
+        "applying",
+        {
+          message: "Streamed note mutation started after durable intent.",
+          now: runToolContext.now?.() ?? new Date(),
+        },
+      );
+      saveRecord(applyingRecord);
+      await persistRecord(`${operationId}:wal-applying`, true);
+    }
+
+    try {
+      let lazyCreatePath: string | null = null;
+      let pinnedCreatedFile: ReturnType<
+        NonNullable<ToolExecutionContext["getCurrentMarkdownFile"]>
+      > = null;
+      if (
+        noteOutputPlan.destination === "new_note" &&
+        !hasActiveCurrentMarkdownFile(runToolContext)
+      ) {
+        const existingPinned = runtimeSnapshot?.currentNotePath
+          ? runToolContext.app.vault.getFileByPath(runtimeSnapshot.currentNotePath)
+          : null;
+        if (existingPinned) {
+          pinnedCreatedFile = existingPinned;
+        } else if (runtimeSnapshot?.currentNotePath) {
+          lazyCreatePath = runtimeSnapshot.currentNotePath;
+        } else {
+          const target = resolveAutonomousNoteTarget({
+            app: runToolContext.app,
+            preferredBasename: "Untitled",
+          });
+          lazyCreatePath = target.path;
+          if (runtimeSnapshot) {
+            runtimeSnapshot.currentNotePath = target.path;
+          }
+        }
+      }
+      const writebackToolContext: ToolExecutionContext = {
+        ...runToolContext,
+        getCurrentMarkdownFile: () =>
+          pinnedCreatedFile ?? runToolContext.getCurrentMarkdownFile?.() ?? null,
+      };
+      const receipt = await streamCurrentNoteWriteback({
+        ...input,
+        toolContext: writebackToolContext,
+        lazyCreatePath,
+        onNoteCreated: (created) => {
+          pinnedCreatedFile =
+            writebackToolContext.app.vault.getFileByPath(created.path) ??
+            pinnedCreatedFile;
+          if (runtimeSnapshot) {
+            runtimeSnapshot.currentNotePath = created.path;
+          }
+          events.onTrace?.({
+            id: `${operationId}:autonomous-note-created`,
+            kind: "status",
+            path: created.path,
+            message: `Created note target ${created.path} after first safe content.`,
+          });
+        },
+        missionPrompt: activeIntentPrompt,
+        onPartialReceipt: (value) => {
+          partialReceipt = value;
+        },
+      });
+      if (activeRecord) {
+        const appliedRecord = transitionOperationJournalRecord(
+          activeRecord,
+          "applied",
+          {
+            message: "Streamed note mutation finished; receipt verification pending.",
+            mutationMayHaveApplied: true,
+            now: runToolContext.now?.() ?? new Date(),
+          },
+        );
+        const verifiedRecord = transitionOperationJournalRecord(
+          appliedRecord,
+          "verified",
+          {
+            message: "Streamed note mutation produced an observable receipt.",
+            receipt,
+            now: runToolContext.now?.() ?? new Date(),
+          },
+        );
+        const committedRecord = transitionOperationJournalRecord(
+          verifiedRecord,
+          "committed",
+          {
+            message: "Streamed mutation and receipt committed to durable run state.",
+            receipt,
+            now: runToolContext.now?.() ?? new Date(),
+          },
+        );
+        saveRecord(committedRecord);
+        try {
+          await persistRecord(`${operationId}:wal-committed`, true);
+        } catch (error) {
+          const durableAtCommitFailure = getDurableRecord();
+          if (durableAtCommitFailure?.state === "applying") {
+            reconciliationAttempted = true;
+            saveRecord(
+              transitionOperationJournalRecord(
+                durableAtCommitFailure,
+                "reconcile_required",
+                {
+                  message:
+                    "Streamed mutation completed but its committed receipt could not be persisted; inspect before retry.",
+                  receipt,
+                  error: getUnknownErrorMessage(error),
+                  mutationMayHaveApplied: true,
+                  now: runToolContext.now?.() ?? new Date(),
+                },
+              ),
+            );
+            events.onStatus?.(
+              formatFailureCopy(
+                walReconcileFailureCopy(
+                  "Streamed mutation completed but its committed receipt could not be persisted.",
+                ),
+              ),
+            );
+            await persistRecord(`${operationId}:wal-reconcile`, false);
+          }
+          throw error;
+        }
+      }
+      await publishPlaceholderAutoRename(input.kind, step);
+      return receipt;
+    } catch (error) {
+      const activeAtFailure = getActiveRecord();
+      const durableAtFailure = getDurableRecord();
+      if (
+        !reconciliationAttempted &&
+        activeAtFailure &&
+        activeAtFailure.state !== "committed"
+      ) {
+        const baseRecord =
+          durableAtFailure?.state === "applying"
+            ? durableAtFailure
+            : activeAtFailure;
+        const mutationMayHaveApplied = partialReceipt !== null;
+        const failedRecord = transitionOperationJournalRecord(
+          baseRecord,
+          mutationMayHaveApplied ? "reconcile_required" : "failed",
+          {
+            message: mutationMayHaveApplied
+              ? "Streamed writeback was interrupted after note content may have changed."
+              : "Streamed writeback failed before any note content was written.",
+            receipt: partialReceipt ?? undefined,
+            error: getUnknownErrorMessage(error),
+            mutationMayHaveApplied,
+            now: runToolContext.now?.() ?? new Date(),
+          },
+        );
+        saveRecord(failedRecord);
+        await persistRecord(`${operationId}:wal-failed`, false);
+      }
+      throw error;
+    }
+  };
+  const updatePinnedCurrentNotePathFromReceipt = (
+    receipt: AgentRunReceipt,
+    traceId: string,
+  ) => {
+    if (!runtimeSnapshot || !receipt.toPath) {
+      return;
+    }
+    const renamedCurrentNote = receipt.toolName === "rename_current_file";
+    const movedPinnedCurrentNote =
+      receipt.toolName === "move_path" &&
+      runtimeSnapshot.currentNotePath !== undefined &&
+      receipt.path === runtimeSnapshot.currentNotePath;
+    if (!renamedCurrentNote && !movedPinnedCurrentNote) {
+      return;
+    }
+    let nextPath: string;
+    try {
+      nextPath = normalizeVaultPath(receipt.toPath, { requireMarkdown: true });
+    } catch {
+      events.onTrace?.({
+        id: `${traceId}:current-note-path-invalid`,
+        kind: "error",
+        toolName: receipt.toolName,
+        operation: receipt.operation,
+        path: receipt.path,
+        toPath: receipt.toPath,
+        message:
+          "The successful mutation returned an unsafe current-note destination, so the durable note pin was not changed.",
+      });
+      return;
+    }
+    const previousPath = runtimeSnapshot.currentNotePath;
+    runtimeSnapshot.currentNotePath = nextPath;
+    if (previousPath !== nextPath) {
+      events.onTrace?.({
+        id: `${traceId}:current-note-path`,
+        kind: "status",
+        toolName: receipt.toolName,
+        operation: receipt.operation,
+        path: previousPath,
+        toPath: nextPath,
+        message: `Updated the durable current-note target to ${nextPath}.`,
+      });
+    }
+  };
+  const placeholderRenameToAgentReceipt = (
+    rename: PlaceholderRenameReceipt,
+  ): AgentRunReceipt => ({
+    toolName: rename.toolName,
+    operation: rename.operation,
+    message: rename.message,
+    path: rename.path,
+    toPath: rename.toPath,
+    bytesWritten: 0,
+    output: rename.output,
+  });
+  const publishPlaceholderAutoRename = async (
+    kind: StreamingWritebackKind | "append" | "replace" | "edit",
+    step: number,
+    writtenMarkdown?: string | null,
+  ): Promise<AgentRunReceipt | null> => {
+    if (kind === "edit") {
+      return null;
+    }
+    try {
+      const file = runToolContext.getCurrentMarkdownFile?.() ??
+        runToolContext.app.workspace.getActiveFile();
+      const noteMarkdown =
+        writtenMarkdown ??
+        (file
+          ? runToolContext.getCurrentMarkdownContent?.(file) ??
+            (await runToolContext.app.vault.read(file))
+          : null);
+      const rename = await maybeAutoTitleAfterWrite({
+        toolContext: {
+          ...runToolContext,
+          autoTitleAuthorized: true,
+        },
+        prompt: activeIntentPrompt,
+        writtenMarkdown: noteMarkdown,
+        kind,
+      });
+      if (!rename) {
+        return null;
+      }
+      const receipt = placeholderRenameToAgentReceipt(rename);
+      const statusLabel = /renamed placeholder/i.test(rename.message)
+        ? `Renamed placeholder note to ${rename.title}`
+        : `Auto-titled note to ${rename.title}`;
+      events.onStatus?.(`${statusLabel}...`);
+      updatePinnedCurrentNotePathFromReceipt(
+        receipt,
+        `auto-title-${step}`,
+      );
+      writeReceipts.push(receipt);
+      events.onReceipt?.(receipt);
+      await recordLedgerReceipt(receipt, step);
+      return receipt;
+    } catch (error) {
+      events.onStatus?.(
+        `Placeholder note rename skipped: ${getUnknownErrorMessage(error)}`,
+      );
+      events.onTrace?.({
+        id: `placeholder-auto-rename-${step}:error`,
+        kind: "error",
+        message: getUnknownErrorMessage(error),
+      });
+      return null;
+    }
   };
   const persistMissionLedger = async (traceId: string) => {
     if (!missionLedger) {
       return;
+    }
+    const latestOrchestrator = resolveOrchestratorSnapshot();
+    if (latestOrchestrator) {
+      missionLedger.orchestrator = latestOrchestrator;
     }
     try {
       const result = await writeMissionLedger(runToolContext, missionLedger);
@@ -1161,21 +2631,195 @@ export async function runAgentMission({
         },
       });
     }
+    await persistRuntimeSnapshot(traceId);
+  };
+  const preflight = runDependencyPreflight(
+    getFatalDependencyRowsForPreflight({
+      rows: dependencyStatus,
+      missionIntent,
+      runPlan,
+      shouldReadCurrentNote,
+      streamingWritebackKind,
+      directCurrentNoteWritebackKind,
+    }),
+  );
+  events.onTrace?.({
+    id: "dependency-preflight",
+    kind: "status",
+    message: `Dependency preflight: ${preflight.status}`,
+    outputPreview: {
+      status: preflight.status,
+      rows: dependencyStatus,
+    },
+  });
+  if (!preflight.canStartModelLoop) {
+    const blocked = preflight.rows.find((row) => row.status === "blocked");
+    const message = blocked
+      ? `Blocked before model loop: ${blocked.summary} ${blocked.nextAction}`
+      : "Blocked before model loop by dependency preflight.";
+    if (missionLedger) {
+      addLedgerBlocker(
+        missionLedger,
+        message,
+        blocked?.category ?? "unknown",
+        runToolContext.now?.() ?? new Date(),
+      );
+      setLedgerNextAction(
+        missionLedger,
+        blocked?.nextAction ?? "Resolve the dependency blocker and retry.",
+        runToolContext.now?.() ?? new Date(),
+      );
+      updateMissionLedgerStatus(
+        missionLedger,
+        "blocked",
+        runToolContext.now?.() ?? new Date(),
+      );
+      await persistMissionLedger("mission-ledger-preflight-blocked");
+    }
+    events.onStatus?.(message);
+    emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
+  const applyMissionPlanAdvance = (
+    advance: {
+      plan: MissionPlan;
+      changed: boolean;
+      meaningfulAction?: string;
+    },
+    step: number,
+    summary: string,
+  ) => {
+    missionPlan = advance.plan;
+    if (!missionLedger || !advance.changed) {
+      return;
+    }
+    setLedgerMissionPlan(
+      missionLedger,
+      missionPlan,
+      runToolContext.now?.() ?? new Date(),
+    );
+    const activeTask = getActiveMissionPlanTask(missionPlan);
+    const nextAction = getNextMissionPlanAction(missionPlan);
+    addMissionMilestone(
+      missionLedger,
+      {
+        step,
+        stage: missionPlan.status === "complete" ? "verify" : "plan",
+        summary,
+        decision: advance.meaningfulAction ?? "mission_plan_update",
+        evidenceIds: activeTask?.evidenceIds ?? [],
+        artifacts: activeTask?.receiptIds ?? [],
+        nextAction: nextAction?.summary,
+      },
+      runToolContext.now?.() ?? new Date(),
+    );
+  };
+  const recordMissionPlanReview = async (step: number, reason: string) => {
+    if (!missionLedger || !missionPlan) {
+      return;
+    }
+    setLedgerMissionPlan(
+      missionLedger,
+      missionPlan,
+      runToolContext.now?.() ?? new Date(),
+    );
+    const activeTask = getActiveMissionPlanTask(missionPlan);
+    const nextAction = getNextMissionPlanAction(missionPlan);
+    const remainingTasks = countRemainingMissionPlanTasks(missionPlan);
+    addMissionMilestone(
+      missionLedger,
+      {
+        step,
+        stage: "plan",
+        summary: `Mission plan review (${reason}): ${missionPlan.status}; ${remainingTasks} task(s) remaining.`,
+        decision: activeTask
+          ? `Active task ${activeTask.id}: ${activeTask.status}`
+          : "No active task.",
+        evidenceIds: activeTask?.evidenceIds ?? [],
+        artifacts: activeTask?.receiptIds ?? [],
+        nextAction: nextAction?.summary ?? "Prepare final answer.",
+      },
+      runToolContext.now?.() ?? new Date(),
+    );
+    events.onTrace?.({
+      id: `mission-plan-review-${step}-${reason}`,
+      kind: "status",
+      step,
+      message: "Mission plan reviewed.",
+      outputPreview: missionPlan,
+    });
+    await persistMissionLedger(`mission-ledger-plan-review-${step}`);
   };
   const evaluateCurrentAcceptance = (
     finalOutput?: string,
   ): MissionAcceptanceResult => {
-    return evaluateMissionAcceptance({
+    refreshEvidenceConflicts();
+    const baseAcceptance = evaluateMissionPlanAcceptance({
       prompt: activeIntentPrompt,
       missionIntent,
       requiredTools: [...new Set(requiredWriteTools)],
       successfulTools: successfulToolNames,
-      failedTools: failedToolNames,
+      failedTools: failedToolNames.filter(
+        (toolName) => !successfulToolNames.includes(toolName),
+      ),
       evidence: missionEvidenceRecords,
       receipts: writeReceipts,
       finalOutput,
       operationGoals: operationGoals.goals,
+      researchPlan,
+      plan: missionPlan,
+      conflicts: lastEvidenceConflicts,
     });
+    // Claim → passage grounding is prompt-driven (cite / passage / deep research /
+    // verify). Auto deep_web from "current/latest" market language alone must not
+    // block ordinary sourced writeback when the model uses URL citations instead
+    // of passage ids; research acceptance still enforces fetched-source coverage.
+    const requireClaimGrounding = shouldRequireClaimGrounding(activeIntentPrompt);
+    const verification = runMissionVerifiers({
+      plan: missionPlan,
+      evidence: missionEvidenceRecords,
+      receipts: writeReceipts,
+      finalOutput,
+      baseAcceptance,
+      prompt: activeIntentPrompt,
+      researchMode: researchPlan?.mode,
+      passages: claimPassageRefs,
+      conflicts: lastEvidenceConflicts,
+      requireClaimGrounding,
+      now: runToolContext.now?.() ?? new Date(),
+    });
+    lastVerificationChecks = verification.checks;
+    if (verification.claimLedger) {
+      lastClaimLedger = verification.claimLedger;
+    }
+    let acceptance = mergeVerificationIntoAcceptance(
+      baseAcceptance,
+      verification,
+    );
+    if (verification.claimLedger) {
+      acceptance = mergeClaimGroundingIntoAcceptance(
+        acceptance,
+        verification.claimLedger,
+      );
+    }
+    // Final acceptance only after verify-complete for research-bearing missions.
+    const phase = refreshResearchPhase(
+      hasRequiredActionReceipt(missionPlan, writeReceipts) &&
+        (buildClaimConflictState()?.analyzeComplete !== false),
+    );
+    return gateAcceptanceByResearchPhase(acceptance, phase);
+  };
+  const hasSatisfiedDurablePreWriteProof = (): boolean => {
+    const requiresPreWriteProof = Boolean(
+      missionPlan?.tasks.some((task) =>
+        task.completionContract.requiredProof.some(isBlockingPreWriteProof),
+      ),
+    );
+    return (
+      requiresPreWriteProof &&
+      !evaluateCurrentAcceptance().missing.some(isBlockingPreWriteProof)
+    );
   };
   const shouldContinueForMissionAcceptance = (
     acceptance: MissionAcceptanceResult,
@@ -1189,6 +2833,8 @@ export async function runAgentMission({
     const missing = new Set(acceptance.missing);
     if (
       missing.has("write_receipt") ||
+      missing.has("visible_title_rename") ||
+      missing.has("highlight_receipt") ||
       acceptance.missing.some(
         (item) => item.startsWith("pending_goal:") || item.startsWith("failed_goal:"),
       )
@@ -1198,6 +2844,24 @@ export async function runAgentMission({
 
     if (missing.has("web_evidence")) {
       return allowedToolNames.has("web_search") || allowedToolNames.has("web_fetch");
+    }
+
+    if (
+      acceptance.missing.some(
+        (item) =>
+          item.startsWith("fetched_sources") ||
+          item.startsWith("distinct_domains") ||
+          item === "research_plan_items",
+      )
+    ) {
+      return (
+        allowedToolNames.has("web_search") ||
+        allowedToolNames.has("web_fetch") ||
+        allowedToolNames.has("semantic_search_notes") ||
+        allowedToolNames.has("inspect_vault_context") ||
+        allowedToolNames.has("read_markdown_files") ||
+        allowedToolNames.has("read_file")
+      );
     }
 
     if (missing.has("word_count")) {
@@ -1219,23 +2883,127 @@ export async function runAgentMission({
 
     return false;
   };
+  const isPendingRequiredWriteReady = (
+    toolName: string,
+    pendingRequiredWrites: string[],
+  ): boolean => {
+    const outstandingDistinctWrite =
+      requiredWriteTools.includes(toolName) &&
+      !successfulToolNames.includes(toolName);
+    if (!pendingRequiredWrites.includes(toolName) && !outstandingDistinctWrite) {
+      return false;
+    }
+    if (!isContentWriteToolThatNeedsEvidence(toolName)) {
+      return true;
+    }
+    return !evaluateCurrentAcceptance().missing.some(isBlockingPreWriteProof);
+  };
   const recordMissionAcceptance = async (
     acceptance: MissionAcceptanceResult,
     step: number,
+    { advancePlan = true }: { advancePlan?: boolean } = {},
   ) => {
     events.onTrace?.({
       id: `mission-acceptance-${step}`,
-      kind: "status",
+      kind: "acceptance",
       step,
       message: `Mission acceptance: ${acceptance.status}`,
       outputPreview: acceptance,
     });
+    for (const check of lastVerificationChecks) {
+      events.onTrace?.({
+        id: `${check.id}-${step}`,
+        kind: "verification",
+        step,
+        message: `${check.kind}: ${check.status}`,
+        outputPreview:
+          check.kind === "claim_grounding" && lastClaimLedger
+            ? {
+                ...check,
+                claimLedger: {
+                  status: lastClaimLedger.status,
+                  claimCount: lastClaimLedger.claims.length,
+                  grounded: lastClaimLedger.claims.filter(
+                    (claim) => claim.status === "grounded",
+                  ).length,
+                  ungrounded: lastClaimLedger.claims.filter(
+                    (claim) =>
+                      claim.status === "ungrounded" ||
+                      claim.status === "invalid_citation",
+                  ).length,
+                  missing: lastClaimLedger.missing,
+                  nextAction: lastClaimLedger.nextAction,
+                },
+              }
+            : check.kind === "evidence_conflicts"
+              ? {
+                  ...check,
+                  openConflicts: evidenceConflictsToProofDebtRows(
+                    lastEvidenceConflicts,
+                  ),
+                  conflictCount: lastEvidenceConflicts.length,
+                  openConflictCount: listOpenEvidenceConflicts(
+                    lastEvidenceConflicts,
+                  ).length,
+                }
+              : check,
+      });
+    }
+    if (
+      listOpenEvidenceConflicts(lastEvidenceConflicts).length > 0 &&
+      !lastVerificationChecks.some((check) => check.kind === "evidence_conflicts")
+    ) {
+      const openConflicts = evidenceConflictsToProofDebtRows(lastEvidenceConflicts);
+      events.onTrace?.({
+        id: `evidence-conflicts-${step}`,
+        kind: "verification",
+        step,
+        message: `evidence_conflicts: open=${openConflicts.length}`,
+        outputPreview: {
+          kind: "evidence_conflicts",
+          status: "needs_more_work",
+          openConflicts,
+          conflictCount: lastEvidenceConflicts.length,
+          openConflictCount: openConflicts.length,
+        },
+      });
+    }
     if (!missionLedger) {
       return;
+    }
+    if (missionPlan && advancePlan) {
+      applyMissionPlanAdvance(
+        advanceMissionPlanFromAcceptance({
+          plan: missionPlan,
+          acceptance,
+          now: runToolContext.now?.() ?? new Date(),
+        }),
+        step,
+        `Mission plan checked against acceptance: ${acceptance.status}.`,
+      );
     }
     setLedgerAcceptance(
       missionLedger,
       acceptance,
+      runToolContext.now?.() ?? new Date(),
+    );
+    if (lastClaimLedger) {
+      setLedgerClaimLedger(
+        missionLedger,
+        lastClaimLedger,
+        runToolContext.now?.() ?? new Date(),
+      );
+    }
+    if (claimPassageRefs.length > 0) {
+      setLedgerClaimPassages(
+        missionLedger,
+        claimPassageRefs,
+        runToolContext.now?.() ?? new Date(),
+      );
+    }
+    setLedgerEvidenceConflicts(
+      missionLedger,
+      lastEvidenceConflicts,
       runToolContext.now?.() ?? new Date(),
     );
     addMissionMilestone(
@@ -1250,43 +3018,247 @@ export async function runAgentMission({
       runToolContext.now?.() ?? new Date(),
     );
   };
+  const maybeExtractResearchMemory = async (
+    acceptance: MissionAcceptanceResult,
+    stopReason: AgentRunStopReason,
+    step: number,
+  ) => {
+    if (
+      acceptance.status !== "pass" ||
+      stopReason !== "final" ||
+      runToolContext.settings?.researchMemoryEnabled !== true ||
+      !runtimeSnapshotPersistenceAvailable ||
+      !missionLedger ||
+      successfulToolNames.includes("append_research_memory")
+    ) {
+      return;
+    }
+    const extraction = buildResearchMemoryExtraction({
+      mission: activeIntentPrompt,
+      finalOutput: lastFinalOutput,
+      evidence: missionLedger.evidence,
+    });
+    if (!extraction) {
+      return;
+    }
+    try {
+      const result = await runObservedModelToolCall({
+        origin: "runner",
+        toolCall: {
+          name: "append_research_memory",
+          arguments: {
+            topic: extraction.topic,
+            text: extraction.text,
+            keywords: extraction.keywords,
+            ...(extraction.sourcePaths.length
+              ? { sourcePaths: extraction.sourcePaths }
+              : {}),
+            ...(extraction.sourceUrls.length
+              ? { sourceUrls: extraction.sourceUrls }
+              : {}),
+          },
+        },
+        step,
+        toolIndex: "auto-research-memory",
+        recordTranscript: false,
+      });
+      if (!result.ok || !isRecord(result.output)) {
+        return;
+      }
+      const path = getString(result.output.path);
+      const operation = result.output.operation;
+      if (!path || result.output.duplicate === true) {
+        return;
+      }
+      events.onStatus?.(`Saved research memory: ${extraction.topic}`);
+      events.onTrace?.({
+        id: `research-memory-auto-${step}`,
+        kind: "status",
+        step,
+        toolName: "append_research_memory",
+        message: `Auto-saved research memory for topic: ${extraction.topic}`,
+        outputPreview: {
+          path,
+          operation,
+          sourceUrls: extraction.sourceUrls,
+        },
+      });
+    } catch (error) {
+      events.onTrace?.({
+        id: `research-memory-auto-${step}-failed`,
+        kind: "status",
+        step,
+        toolName: "append_research_memory",
+        message: `Research memory auto-save skipped: ${getErrorMessage(error)}`,
+      });
+    }
+  };
   const finishRun = async (
     stopReason: AgentRunStopReason,
     step: number,
     maxSteps = runPlan.maxStepsForRun,
     nextAction?: string,
   ) => {
-    const acceptance = evaluateCurrentAcceptance();
-    await recordMissionAcceptance(acceptance, step);
+    if (missionPlan && lastFinalOutput.trim()) {
+      applyMissionPlanAdvance(
+        advanceMissionPlanFromFinalOutput({
+          plan: missionPlan,
+          finalOutput: lastFinalOutput,
+          now: runToolContext.now?.() ?? new Date(),
+        }),
+        step,
+        "Mission plan observed final output.",
+      );
+    }
+    const acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
+    const effectiveStopReason =
+      (stopReason === "final" || stopReason === "write_completed") &&
+        acceptance.status !== "pass"
+        ? "budget"
+        : stopReason;
+    await recordMissionAcceptance(acceptance, step, {
+      // A budget/user stop is resumable. Persist the acceptance diagnosis but
+      // do not turn a repairable, unfinished active task into a blocked task.
+      advancePlan:
+        effectiveStopReason !== "budget" &&
+        effectiveStopReason !== "user_stopped",
+    });
+    if (effectiveStopReason !== stopReason) {
+      events.onStatus?.(
+        `Completion held for verification: ${acceptance.missing.join(", ")}.`,
+      );
+      events.onTrace?.({
+        id: `terminal-acceptance-gate-${step}`,
+        kind: "acceptance",
+        step,
+        message: "Terminal completion was downgraded to a resumable stop.",
+        outputPreview: {
+          requestedStopReason: stopReason,
+          effectiveStopReason,
+          acceptance,
+        },
+      });
+    }
+    await maybeExtractResearchMemory(acceptance, effectiveStopReason, step);
     if (missionLedger) {
       updateMissionLedgerStatus(
         missionLedger,
-        acceptance.status === "fail" &&
-          (stopReason === "final" || stopReason === "write_completed")
-          ? "blocked"
-          : getMissionLedgerStatusForStopReason(stopReason),
+        getMissionLedgerStatusForStopReason(effectiveStopReason),
         runToolContext.now?.() ?? new Date(),
       );
       setLedgerNextAction(
         missionLedger,
         nextAction ??
           acceptance.nextAction ??
-          getStopReasonMessage(stopReason),
+          getStopReasonMessage(effectiveStopReason),
         runToolContext.now?.() ?? new Date(),
       );
-      await persistMissionLedger(`mission-ledger-complete-${stopReason}`);
+      await persistMissionLedger(`mission-ledger-complete-${effectiveStopReason}`);
     }
-    completeRun(events, stopReason, step, runStartedAt, maxSteps);
+    // Agent B: thin completion-reflection hook before auto-continue decision.
+    const proofDebtSnapshot = runtimeSnapshot
+      ? proofDebtSnapshotFromRuntime(runtimeSnapshot, {
+          blockers: missionLedger?.blockers,
+          blockerCategory: missionLedger?.blockerCategory,
+          acceptance,
+        })
+      : missionLedger
+        ? proofDebtSnapshotFromLedger(missionLedger, { acceptance })
+        : {
+            acceptance,
+            missionPlan,
+            researchPlan,
+          };
+    const proofDebtForFinish = computeProofDebt(proofDebtSnapshot);
+    const pendingGoalIds = Object.entries(operationGoals.goals)
+      .filter(([, state]) => state === "pending" || state === "failed")
+      .map(([goalId]) => goalId);
+    const completionReflection = reflectMissionCompletion({
+      prompt: activeIntentPrompt,
+      acceptance,
+      proofDebt: proofDebtForFinish,
+      writeReceiptCount: writeReceipts.length,
+      pendingGoalIds,
+      missionPlanStatus: missionPlan?.status,
+    });
+    if (!completionReflection.done && effectiveStopReason === "budget") {
+      events.onTrace?.({
+        id: `completion-reflection-${step}`,
+        kind: "status",
+        step,
+        message: `Completion reflection: ${completionReflection.reason}`,
+        outputPreview: completionReflection,
+      });
+    }
+    const autoContinuation = decideAutoContinuation({
+      stopReason: effectiveStopReason,
+      acceptance,
+      blockerCategory: missionLedger?.blockerCategory,
+      blockerCount: missionLedger?.blockers.length ?? 0,
+      missionPlanStatus: missionPlan?.status,
+      proofDebt: proofDebtForFinish,
+      completionDriven: runToolContext.settings?.completionDrivenLoops !== false,
+      reflection: completionReflection,
+    });
+    for (const gate of evaluatePerformanceGates(metricEvents).filter(
+      (item) => item.status !== "pass",
+    )) {
+      events.onTrace?.({
+        id: `performance-gate-${gate.name}-${step}`,
+        kind: "metric",
+        step,
+        message: `Performance gate ${gate.status}: ${gate.name}`,
+        outputPreview: gate,
+      });
+    }
+    completeRun(
+      events,
+      effectiveStopReason,
+      step,
+      runStartedAt,
+      maxSteps,
+      autoContinuation,
+    );
   };
   const recordLedgerToolResult = async (
     toolName: string,
     result: ToolExecutionResult,
     step: number,
   ) => {
-    if (!missionLedger || !result.ok) {
+    if (!missionLedger) {
       return;
     }
-    const evidence = evidenceFromToolResult(toolName, result);
+    const evidence = result.ok ? evidenceFromToolResult(toolName, result) : null;
+    if (missionPlan) {
+      applyMissionPlanAdvance(
+        advanceMissionPlanFromToolResult({
+          plan: missionPlan,
+          toolName,
+          result,
+          evidence,
+          now: runToolContext.now?.() ?? new Date(),
+        }),
+        step,
+        `Mission plan advanced after tool ${toolName}.`,
+      );
+    }
+    if (!result.ok) {
+      addMissionMilestone(
+        missionLedger,
+        {
+          step,
+          stage: "next_action",
+          summary: `Tool failed: ${toolName}.`,
+          decision: result.error?.code,
+          toolCalls: [toolName],
+          error: result.error?.message,
+          nextAction: getNextMissionPlanAction(missionPlan)?.summary,
+        },
+        runToolContext.now?.() ?? new Date(),
+      );
+      await persistMissionLedger(`mission-ledger-tool-${toolName}-failed`);
+      return;
+    }
     markLedgerToolUsed(
       missionLedger,
       toolName,
@@ -1294,12 +3266,38 @@ export async function runAgentMission({
       runToolContext.now?.() ?? new Date(),
     );
     if (evidence) {
-      missionEvidenceRecords.push(evidence);
+      upsertMissionEvidenceRecord(missionEvidenceRecords, evidence);
       upsertLedgerEvidence(
         missionLedger,
         evidence,
         runToolContext.now?.() ?? new Date(),
       );
+      if (researchPlan) {
+        researchPlan = applyResearchEvidence(researchPlan, missionEvidenceRecords);
+        setLedgerResearchPlan(
+          missionLedger,
+          researchPlan,
+          runToolContext.now?.() ?? new Date(),
+        );
+      }
+    }
+    if (result.ok) {
+      const passages = claimPassagesFromToolResult(toolName, result);
+      if (passages.length > 0) {
+        upsertClaimPassageRefs(claimPassageRefs, passages);
+        setLedgerClaimPassages(
+          missionLedger,
+          claimPassageRefs,
+          runToolContext.now?.() ?? new Date(),
+        );
+        refreshEvidenceConflicts();
+        setLedgerEvidenceConflicts(
+          missionLedger,
+          lastEvidenceConflicts,
+          runToolContext.now?.() ?? new Date(),
+        );
+        refreshResearchPhase(false);
+      }
     }
     addMissionMilestone(
       missionLedger,
@@ -1326,11 +3324,32 @@ export async function runAgentMission({
       evidence,
       runToolContext.now?.() ?? new Date(),
     );
+    if (researchPlan) {
+      upsertMissionEvidenceRecord(missionEvidenceRecords, evidence);
+      researchPlan = applyResearchEvidence(researchPlan, missionEvidenceRecords);
+      setLedgerResearchPlan(
+        missionLedger,
+        researchPlan,
+        runToolContext.now?.() ?? new Date(),
+      );
+    }
     addLedgerReceipt(
       missionLedger,
       evidence.id,
       runToolContext.now?.() ?? new Date(),
     );
+    if (missionPlan) {
+      applyMissionPlanAdvance(
+        advanceMissionPlanFromReceipt({
+          plan: missionPlan,
+          receipt,
+          evidenceId: evidence.id,
+          now: runToolContext.now?.() ?? new Date(),
+        }),
+        step,
+        `Mission plan advanced after receipt ${receipt.operation}.`,
+      );
+    }
     markLedgerToolUsed(
       missionLedger,
       receipt.toolName,
@@ -1356,23 +3375,855 @@ export async function runAgentMission({
     if (!missionLedger) {
       return;
     }
+    if (missionPlan) {
+      applyMissionPlanAdvance(
+        advanceMissionPlanFromBlocker({
+          plan: missionPlan,
+          blocker,
+          now: runToolContext.now?.() ?? new Date(),
+        }),
+        lastStep,
+        "Mission plan recorded blocker.",
+      );
+    }
     addLedgerBlocker(
       missionLedger,
       blocker,
+      classifyBlockerCategory(blocker),
       runToolContext.now?.() ?? new Date(),
     );
+  };
+  const finishErroredRunFromException = async (
+    error: unknown,
+    step: number,
+    maxSteps: number,
+    source: "model" | "tool",
+  ) => {
+    const errorMessage =
+      source === "model"
+        ? formatModelFailureCopy(
+            error instanceof ModelClientError
+              ? { category: error.category, message: error.message }
+              : { message: getUnknownErrorMessage(error) },
+          )
+        : getUnknownErrorMessage(error);
+    const message =
+      source === "model"
+        ? `Model step failed: ${errorMessage}`
+        : `Tool execution failed: ${errorMessage}`;
+    const continuationCommand = missionLedger?.continuationCommand ?? "continue";
+    const nextAction = `${message} Resolve the blocker, then run "${continuationCommand}".`;
+    events.onStatus?.(message);
+    events.onPhaseChange?.("error", message);
+    events.onTrace?.({
+      id: `${source}-error-${step}`,
+      kind: "error",
+      step,
+      message,
+      error: {
+        code: `${source}_step_failed`,
+        message: errorMessage,
+      },
+    });
+    lastFinalOutput = nextAction;
+    emitDirectAssistantAnswer(nextAction, events, runPlan.requiresEnglishGuard);
+    recordLedgerBlocker(message);
+    await finishRun("error", step, maxSteps, nextAction);
+  };
+  const runProofGatedCurrentNoteWriteback = async (
+    input: Parameters<typeof streamCurrentNoteWriteback>[0],
+    step: number,
+    maxSteps = runPlan.maxStepsForRun,
+  ): Promise<AgentRunReceipt | null> => {
+    const plannedToolName =
+      input.kind === "append"
+        ? "append_to_current_file"
+        : input.kind === "replace"
+          ? "replace_current_file"
+          : "edit_current_section";
+    const activeTaskForWrite = getActiveMissionPlanTask(missionPlan);
+    const pendingRequiredWrites = getPendingRequiredWriteToolNames(
+      operationGoals,
+      requiredWriteTools,
+    );
+    if (
+      missionPlan &&
+      !isToolAllowedForActiveMissionTask(missionPlan, plannedToolName) &&
+      !isPendingRequiredWriteReady(plannedToolName, pendingRequiredWrites)
+    ) {
+      const activeTask = activeTaskForWrite;
+      const nextAction = getNextMissionPlanAction(missionPlan)?.summary;
+      const message = activeTask
+        ? `Note writeback was deferred until active task ${activeTask.id} is complete. The existing note is unchanged.`
+        : "Note writeback was deferred because the mission plan has no ready mutation task. The existing note is unchanged.";
+      events.onStatus?.(message);
+      events.onTrace?.({
+        id: `proof-gated-writeback-${step}:plan-dependency-rejected`,
+        kind: "tool_rejected",
+        step,
+        toolName: plannedToolName,
+        message,
+        outputPreview: {
+          activeTaskId: activeTask?.id,
+          allowedTools: activeTask?.allowedTools ?? [],
+          nextAction,
+        },
+        error: {
+          code: "plan_dependency_violation",
+          message,
+        },
+      });
+      await finishRun("budget", step, maxSteps, nextAction ?? message);
+      return null;
+    }
+
+    if (!requiresVerifiedFinalOutput(missionPlan, researchPlan)) {
+      return runStreamedWritebackWithJournal(input, step);
+    }
+
+    // Tool result payloads are deliberately compact and provider adapters may
+    // normalize them further. Re-bind the canonical, persisted evidence to the
+    // staged writeback request so both the first draft and its single repair
+    // pass can cite the exact source and passage ids that acceptance verifies.
+    const verifiedEvidenceContext = formatDurableEvidenceForWriteback(
+      missionEvidenceRecords,
+    );
+    if (
+      missionEvidenceRecords.length > 0 &&
+      !input.messages.some(
+        (message) =>
+          message.role === "system" &&
+          message.content === verifiedEvidenceContext,
+      )
+    ) {
+      input.messages.push({
+        role: "system" as const,
+        content: verifiedEvidenceContext,
+      });
+    }
+
+    const stageCandidate = async (retry: boolean): Promise<string> => {
+      const response = await emitFinalAnswer({
+        modelClient: input.modelClient,
+        messages: input.messages,
+        events: input.events,
+        enableStreaming: true,
+        fallbackContent: "",
+        finalInstruction: buildStreamingWritebackPrompt(
+          input.kind,
+          input.preparedSectionEdit,
+          retry,
+          {
+            missionPrompt: input.missionPrompt ?? activeIntentPrompt,
+            activeBasename:
+              runToolContext.getCurrentMarkdownFile?.()?.basename ??
+              runToolContext.app.workspace.getActiveFile()?.basename ??
+              undefined,
+          },
+        ),
+        metricName: retry
+          ? "verified_writeback_candidate_correction"
+          : "verified_writeback_candidate",
+        relevancePrompt: input.relevancePrompt,
+        think: input.think,
+        options: input.options,
+        abortSignal: input.abortSignal,
+        onThinkingUnsupported: input.onThinkingUnsupported,
+        deferVisibleOutput: true,
+      });
+      return response?.message.content ?? "";
+    };
+
+    let candidate = await stageCandidate(false);
+    let candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
+      evaluateCurrentAcceptance(candidate),
+      requiredWriteTools,
+    );
+    events.onTrace?.({
+      id: `proof-gated-writeback-${step}:candidate-1`,
+      kind: "verification",
+      step,
+      message: `Held writeback candidate verification: ${candidateAcceptance.status}.`,
+      outputPreview: candidateAcceptance,
+    });
+
+    if (
+      candidateAcceptance.status !== "pass" &&
+      !finalOutputCorrectionUsed &&
+      candidateAcceptance.missing.length > 0 &&
+      candidateAcceptance.missing.every(isRepairableFinalOutputProof)
+    ) {
+      finalOutputCorrectionUsed = true;
+      events.onStatus?.(
+        `Writeback draft held for verification: ${candidateAcceptance.missing.join(", ")}. Requesting one correction...`,
+      );
+      input.messages.push({
+        role: "system" as const,
+        content: buildFinalOutputVerificationCorrectionPrompt(
+          candidateAcceptance,
+          candidate,
+          activeIntentPrompt,
+        ),
+      });
+      candidate = await stageCandidate(true);
+      candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
+        evaluateCurrentAcceptance(candidate),
+        requiredWriteTools,
+      );
+      events.onTrace?.({
+        id: `proof-gated-writeback-${step}:candidate-2`,
+        kind: "verification",
+        step,
+        message: `Corrected writeback candidate verification: ${candidateAcceptance.status}.`,
+        outputPreview: candidateAcceptance,
+      });
+    }
+
+    if (candidateAcceptance.status !== "pass") {
+      lastFinalOutput = "";
+      const message =
+        `Note writeback was not applied because proof verification is incomplete: ${
+          candidateAcceptance.missing.join(", ") || "unknown proof"
+        }. The existing note is unchanged and the run remains resumable.`;
+      events.onStatus?.(message);
+      emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+      await finishRun(
+        "budget",
+        step,
+        maxSteps,
+        candidateAcceptance.nextAction ?? message,
+      );
+      return null;
+    }
+
+    lastFinalOutput = candidate;
+    return runStreamedWritebackWithJournal(
+      {
+        ...input,
+        stagedContent: candidate,
+      },
+      step,
+    );
+  };
+  const hasExposedWriteTool = (): boolean => {
+    for (const name of allowedToolNames) {
+      if (WRITE_TOOL_NAMES.has(name) || DELETE_TOOL_NAMES.has(name)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const requestRunnerToolApproval = async ({
+    toolCall,
+    step,
+    action,
+    reason,
+    policyTags,
+    timeoutMs,
+    preparedAction,
+    confirmationIndex,
+    requiredConfirmations,
+  }: {
+    toolCall: ModelToolCall;
+    step: number;
+    action: string;
+    reason: string;
+    policyTags: string[];
+    timeoutMs?: number;
+    preparedAction?: PreparedAction;
+    confirmationIndex?: number;
+    requiredConfirmations?: 1 | 2;
+  }): Promise<{ decision: ApprovalDecision; request: ApprovalRequest }> => {
+    let emittedRequest: ApprovalRequest | null = null;
+    const decision = await approvalBroker.request(
+      {
+        runId,
+        toolName: toolCall.name,
+        action,
+        reason,
+        policyTags,
+        ...(preparedAction
+          ? {
+              preparedAction,
+              payloadFingerprint: preparedAction.payloadFingerprint,
+              confirmationIndex: confirmationIndex ?? 1,
+              requiredConfirmations: requiredConfirmations ?? 1,
+            }
+          : {}),
+      },
+      {
+        timeoutMs,
+        abortSignal,
+        onRequest: async (request) => {
+          emittedRequest = request;
+          await events.onApprovalRequest?.(request);
+          events.onTrace?.({
+            id: `${request.id}:requested`,
+            kind: "status",
+            step,
+            toolName: toolCall.name,
+            message: `Approval required for ${toolCall.name}: ${request.reason}`,
+            outputPreview: {
+              action: request.action,
+              policyTags: request.policyTags,
+              expiresAtMs: request.expiresAtMs,
+              payloadFingerprint: request.payloadFingerprint,
+              confirmationIndex: request.confirmationIndex,
+              requiredConfirmations: request.requiredConfirmations,
+            },
+          });
+        },
+      },
+    );
+    const request =
+      emittedRequest ??
+      approvalBroker.getPending().find((item) => item.toolName === toolCall.name) ??
+      {
+        id: `approval-${runId}-unknown`,
+        runId,
+        toolName: toolCall.name,
+        action,
+        reason,
+        policyTags,
+        expiresAtMs: Date.now(),
+        ...(preparedAction
+          ? {
+              preparedAction,
+              payloadFingerprint: preparedAction.payloadFingerprint,
+              confirmationIndex: confirmationIndex ?? 1,
+              requiredConfirmations: requiredConfirmations ?? 1,
+            }
+          : {}),
+      };
+    await events.onApprovalResolved?.({ request, decision });
+    if (missionLedger) {
+      addLedgerApproval(
+        missionLedger,
+        {
+          id: request.id,
+          toolName: toolCall.name,
+          action: request.action,
+          decision,
+        },
+        runToolContext.now?.() ?? new Date(),
+      );
+    }
+    events.onTrace?.({
+      id: `${request.id}:resolved`,
+      kind: "status",
+      step,
+      toolName: toolCall.name,
+      message: `Approval ${decision} for ${toolCall.name}.`,
+      outputPreview: {
+        action: request.action,
+        decision,
+      },
+    });
+    return { decision, request };
+  };
+  const buildApprovalDeniedResult = (
+    toolCall: ModelToolCall,
+    request: ApprovalRequest,
+    decision: ApprovalDecision,
+  ): ToolExecutionResult => ({
+    ok: false,
+    toolName: toolCall.name,
+    mutationState: "not_applied",
+    output: {
+      status: "blocked",
+      toolName: toolCall.name,
+      approval: {
+        id: request.id,
+        decision,
+      },
+      reason: `Approval ${decision}.`,
+    },
+    error: {
+      code: `approval_${decision}`,
+      message: `Tool ${toolCall.name} was not run because approval was ${decision}.`,
+    },
+  });
+  const executeToolWithRunnerApproval = async ({
+    toolCall,
+    step,
+    operationId,
+    beforeExecute,
+  }: {
+    toolCall: ModelToolCall;
+    step: number;
+    operationId?: string;
+    beforeExecute?: (
+      preparedAction?: PreparedAction,
+      descriptor?: ToolDescriptor,
+      authorization?: AuthorizedActionContext,
+    ) => Promise<void>;
+  }): Promise<ToolExecutionResult> => {
+    const runToolNow = async (toolContext: ToolExecutionContext) => {
+      await beforeExecute?.(
+        undefined,
+        toolRegistry.getDescriptor?.(toolCall.name) ?? undefined,
+      );
+      if (toolCall.name === "run_code_block") {
+        executedCodeRunCount += 1;
+      }
+      return executeToolWithMetrics({
+        toolRegistry,
+        toolCall,
+        toolContext: operationId
+          ? { ...toolContext, operationId }
+          : toolContext,
+        events,
+        step,
+      });
+    };
+    const policyRouted = resolvePolicyRoutedIntent({
+      mode: modelRouterMode,
+      modelIntent: routedModelIntent,
+      missionIntent,
+      writeAutonomy,
+      writeToolExposed: hasExposedWriteTool(),
+    });
+    if (modelRouterMode === "authority") {
+      routedMissionIntent = policyRouted.intent;
+      if (policyRouted.source === "regex" && policyRouted.fallbackReason) {
+        events.onTrace?.({
+          id: `${step}:${toolCall.name}:router-authority-fallback`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message: `Router authority fallback to regex: ${policyRouted.fallbackReason}`,
+          outputPreview: {
+            fallbackReason: policyRouted.fallbackReason,
+            modelIntent: routedModelIntent,
+            resolvedIntent: policyRouted.intent,
+          },
+        });
+      }
+    }
+    researchPhaseDescriptor = refreshResearchPhase(
+      hasRequiredActionReceipt(missionPlan, writeReceipts) &&
+        (buildClaimConflictState()?.analyzeComplete !== false),
+    );
+    const phaseTransition = buildResearchPhaseTransition(
+      lastResearchPhase,
+      researchPhaseDescriptor,
+    );
+    if (phaseTransition) {
+      lastResearchPhase = phaseTransition.to;
+      events.onTrace?.({
+        id: `research-phase:${phaseTransition.to}:${step}`,
+        kind: "status",
+        step,
+        message: `Research phase → ${phaseTransition.to}: ${phaseTransition.reason}`,
+        outputPreview: {
+          from: phaseTransition.from,
+          to: phaseTransition.to,
+          reason: phaseTransition.reason,
+          writeToolsAllowed: researchPhaseDescriptor.writeToolsAllowed,
+          acceptanceAllowed: researchPhaseDescriptor.acceptanceAllowed,
+        },
+      });
+    }
+    const buildPolicyBlockedResult = (
+      policyDecision: PolicyDecision,
+    ): ToolExecutionResult => {
+      const phaseTag = policyDecision.tags.find((tag) =>
+        tag.startsWith("research_phase_gate"),
+      );
+      const blockedCopy = phaseTag
+        ? formatFailureCopy(
+            phaseGateFailureCopy(
+              policyDecision.tags.find(
+                (tag) =>
+                  tag === "gather" ||
+                  tag === "analyze" ||
+                  tag === "write" ||
+                  tag === "verify",
+              ) ?? researchPhaseDescriptor?.phase,
+              policyDecision.reason,
+            ),
+          )
+        : formatFailureCopy(
+            policyBlockFailureCopy(toolCall.name, policyDecision.reason),
+          );
+      events.onTrace?.({
+        id: `${step}:${toolCall.name}:policy-blocked`,
+        kind: "status",
+        step,
+        toolName: toolCall.name,
+        message: blockedCopy,
+        outputPreview: {
+          policyTags: policyDecision.tags,
+          payloadFingerprint: policyDecision.payloadFingerprint,
+        },
+      });
+      return {
+        ok: false,
+        toolName: toolCall.name,
+        mutationState: "not_applied",
+        output: {
+          status: "blocked",
+          toolName: toolCall.name,
+          reason: policyDecision.reason,
+          policyTags: policyDecision.tags,
+          failureCopy: blockedCopy,
+        },
+        error: {
+          code: "policy_blocked",
+          message: blockedCopy,
+        },
+      };
+    };
+
+    const descriptor = toolRegistry.getDescriptor?.(toolCall.name) ?? null;
+    if (descriptor?.execution.preparation === "required") {
+      if (!toolRegistry.prepare || !toolRegistry.executePrepared) {
+        return {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: {
+            code: "prepared_execution_unavailable",
+            message:
+              `Tool ${toolCall.name} requires preparation, but the registry ` +
+              "does not expose the prepared-action execution contract.",
+          },
+        };
+      }
+      const preparedResult = await toolRegistry.prepare(
+        toolCall,
+        operationId
+          ? { ...runToolContext, operationId }
+          : runToolContext,
+      );
+      if (!preparedResult.ok) {
+        return {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: { ...preparedResult.error },
+        };
+      }
+      const preparedAction = preparedResult.action;
+      const actionPolicyContext = {
+        toolName: toolCall.name,
+        args: toolCall.arguments,
+        intent: policyRouted.intent,
+        approvalGranted: false,
+        isDesktop: isCodeToolsDesktopRuntime(),
+        writeAutonomy,
+        codeRunCount: executedCodeRunCount,
+        maxCodeRunsPerMission: runToolContext.settings?.maxCodeRunsPerMission,
+        researchPhase: researchPhaseDescriptor,
+        descriptor,
+        preparedAction,
+        principal: "single_agent" as const,
+        scopeAllowed: isPreparedActionWithinRunnerScope({
+          toolName: toolCall.name,
+          descriptor,
+          action: preparedAction,
+          allowedToolNames,
+          policyRouted: policyRouted.intent,
+          missionIntent,
+          writeAutonomy,
+        }),
+        now: runToolContext.now?.() ?? new Date(),
+      };
+      let preparedPolicyDecision = evaluateToolPolicy(actionPolicyContext);
+      if (preparedPolicyDecision.action === "block") {
+        return buildPolicyBlockedResult(preparedPolicyDecision);
+      }
+
+      let matchingGrant: AuthorityGrantV1 | null = null;
+      if (preparedPolicyDecision.action === "require_approval") {
+        const requiredConfirmations =
+          preparedPolicyDecision.requiredConfirmations ?? 1;
+        let finalApprovalRequest: ApprovalRequest | null = null;
+        for (
+          let confirmationIndex = 1;
+          confirmationIndex <= requiredConfirmations;
+          confirmationIndex += 1
+        ) {
+          const approval = await requestRunnerToolApproval({
+            toolCall,
+            step,
+            action: preparedAction.preview.summary,
+            reason: preparedPolicyDecision.reason,
+            policyTags: preparedPolicyDecision.tags,
+            timeoutMs: 120000,
+            preparedAction,
+            confirmationIndex,
+            requiredConfirmations,
+          });
+          finalApprovalRequest = approval.request;
+          if (approval.decision !== "approved") {
+            return buildApprovalDeniedResult(
+              toolCall,
+              approval.request,
+              approval.decision,
+            );
+          }
+        }
+
+        try {
+          const grant = await createOneShotGrant({
+            id: `grant:${finalApprovalRequest?.id ?? preparedAction.id}`,
+            action: preparedAction,
+            descriptor,
+            issuedAt: runToolContext.now?.() ?? new Date(),
+          });
+          const evaluated = await evaluateAuthorityGrant({
+            grant,
+            action: preparedAction,
+            descriptor,
+            now: runToolContext.now?.() ?? new Date(),
+          });
+          if (!evaluated.allowed) {
+            return {
+              ok: false,
+              toolName: toolCall.name,
+              mutationState: "not_applied",
+              error: {
+                code: "authority_grant_invalid",
+                message: evaluated.reason,
+              },
+            };
+          }
+          matchingGrant = evaluated.grant;
+          preparedPolicyDecision = evaluateToolPolicy({
+            ...actionPolicyContext,
+            matchingGrant,
+          });
+          if (preparedPolicyDecision.action !== "allow") {
+            return buildPolicyBlockedResult(preparedPolicyDecision);
+          }
+        } catch (error) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "authority_grant_invalid",
+              message: getUnknownErrorMessage(error),
+            },
+          };
+        }
+      }
+
+      const authorization: AuthorizedActionContext = matchingGrant
+        ? {
+            preparedActionId: preparedAction.id,
+            payloadFingerprint: preparedAction.payloadFingerprint,
+            grantId: matchingGrant.id,
+          }
+        : {
+            preparedActionId: preparedAction.id,
+            payloadFingerprint: preparedAction.payloadFingerprint,
+            grantId: "policy:scoped-read",
+          };
+      if (matchingGrant) {
+        const consumed = await consumeAuthorityGrant({
+          grant: matchingGrant,
+          action: preparedAction,
+          descriptor,
+          now: runToolContext.now?.() ?? new Date(),
+        });
+        if (!consumed.allowed) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "authority_grant_consumption_failed",
+              message: consumed.reason,
+            },
+          };
+        }
+      }
+
+      await beforeExecute?.(preparedAction, descriptor, authorization);
+      if (toolCall.name === "run_code_block") {
+        executedCodeRunCount += 1;
+      }
+      events.onStatus?.(
+        matchingGrant
+          ? `Exact payload approved; running tool: ${toolCall.name}`
+          : `Running scoped prepared tool: ${toolCall.name}`,
+      );
+      return executePreparedToolWithMetrics({
+        toolRegistry,
+        preparedAction,
+        authorization,
+        toolContext: {
+          ...runToolContext,
+          ...(operationId ? { operationId } : {}),
+          authorizedAction: authorization,
+        },
+        events,
+        step,
+      });
+    }
+
+    const policyDecision = evaluateToolPolicy({
+      toolName: toolCall.name,
+      args: toolCall.arguments,
+      intent: policyRouted.intent,
+      approvalGranted: runToolContext.userApprovalGranted === true,
+      isDesktop: isCodeToolsDesktopRuntime(),
+      writeAutonomy,
+      codeRunCount: executedCodeRunCount,
+      maxCodeRunsPerMission: runToolContext.settings?.maxCodeRunsPerMission,
+      researchPhase: researchPhaseDescriptor,
+    });
+    if (policyDecision.action === "block") {
+      return buildPolicyBlockedResult(policyDecision);
+    }
+    if (
+      policyDecision.action === "require_approval" &&
+      runToolContext.userApprovalGranted !== true
+    ) {
+      const { decision, request } = await requestRunnerToolApproval({
+        toolCall,
+        step,
+        action: `${toolCall.name} (${policyDecision.tags.join(", ") || "policy"})`,
+        reason: policyDecision.reason,
+        policyTags: policyDecision.tags,
+        timeoutMs: 120000,
+      });
+      if (decision !== "approved") {
+        return buildApprovalDeniedResult(toolCall, request, decision);
+      }
+      events.onStatus?.(`Approval granted; running tool: ${toolCall.name}`);
+      return runToolNow({
+        ...runToolContext,
+        userApprovalGranted: true,
+      });
+    }
+
+    const initialResult = await runToolNow(runToolContext);
+    const approvalInfo = getToolApprovalRequestInfo(toolCall, initialResult);
+    if (!approvalInfo || runToolContext.userApprovalGranted === true) {
+      return initialResult;
+    }
+
+    const { decision, request } = await requestRunnerToolApproval({
+      toolCall,
+      step,
+      action: approvalInfo.action,
+      reason: approvalInfo.reason,
+      policyTags: approvalInfo.policyTags,
+      timeoutMs: approvalInfo.timeoutMs,
+    });
+    if (decision !== "approved") {
+      return buildApprovalDeniedResult(toolCall, request, decision);
+    }
+
+    events.onStatus?.(`Approval granted; running tool: ${toolCall.name}`);
+    return runToolNow({
+      ...runToolContext,
+      userApprovalGranted: true,
+    });
+  };
+  const runAutoFollowupsAfterTool = async ({
+    toolName,
+    result,
+    step,
+    toolIndex,
+  }: {
+    toolName: string;
+    result: ToolExecutionResult;
+    step: number;
+    toolIndex: number | string;
+  }) => {
+    if (!result.ok) {
+      return;
+    }
+    const acceptanceNeeds = evaluateCurrentAcceptance().missing;
+    const maxReadOnlyFollowups = Math.min(
+      3,
+      Math.max(2, researchPlan?.sourceRequirements.minFetchedSources ?? 2),
+    );
+    const followups = planReadOnlyFollowups({
+      mission: activeIntentPrompt,
+      lastToolName: toolName,
+      lastToolResult: result,
+      acceptanceNeeds,
+      alreadyFetchedUrls: missionEvidenceRecords
+        .map((item) => item.url)
+        .filter((url): url is string => Boolean(url)),
+      alreadyReadPaths: missionEvidenceRecords
+        .map((item) => item.path)
+        .filter((path): path is string => Boolean(path)),
+      maxFollowups: maxReadOnlyFollowups,
+    }).filter((request) => allowedToolNames.has(request.toolName));
+
+    for (let index = 0; index < followups.length; index += 1) {
+      const request = followups[index];
+      events.onTrace?.({
+        id: `${step}:${toolIndex}:auto-followup-${index}:${request.toolName}`,
+        kind: "status",
+        step,
+        toolName: request.toolName,
+        message: `Auto follow-up scheduled: ${request.toolName}`,
+        inputPreview: {
+          reason: request.reason,
+          arguments: redactToolArguments(request.toolName, request.args),
+        },
+      });
+      await runObservedModelToolCall({
+        origin: "runner",
+        toolCall: {
+          name: request.toolName,
+          arguments: request.args,
+        },
+        step,
+        toolIndex: `auto-${toolIndex}-${index}`,
+      });
+    }
   };
   const runObservedModelToolCall = async ({
     origin,
     toolCall,
     step,
     toolIndex,
+    recordTranscript = true,
   }: {
     origin: "model" | "runner";
     toolCall: ModelToolCall;
     step: number;
-    toolIndex: number | "runner";
+    toolIndex: number | string;
+    recordTranscript?: boolean;
   }): Promise<ToolExecutionResult> => {
+    if (observedToolCallCount >= maxToolCalls) {
+      toolCallBudgetExhausted = true;
+      if (!toolCallBudgetNoticeEmitted) {
+        toolCallBudgetNoticeEmitted = true;
+        events.onStatus?.(
+          `Tool-call budget reached (${maxToolCalls}); saving the segment for continuation.`,
+        );
+        events.onTrace?.({
+          id: `tool-call-budget-${step}`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message: "Tool-call budget reached before another tool could start.",
+          outputPreview: { maxToolCalls, observedToolCallCount },
+        });
+      }
+      return {
+        ok: false,
+        toolName: toolCall.name,
+        output: {
+          status: "blocked",
+          reason: "Per-segment tool-call budget exhausted.",
+        },
+        error: {
+          code: "tool_call_budget_exhausted",
+          message: "Per-segment tool-call budget exhausted.",
+        },
+      };
+    }
+    observedToolCallCount += 1;
     const toolEventBase: AgentToolRunEvent = {
       id: `${step}:${toolIndex}:${toolCall.name}`,
       name: toolCall.name,
@@ -1395,25 +4246,178 @@ export async function runAgentMission({
     emitToolPreparationStatus(toolCall.name, events);
     events.onStatus?.(`Running tool: ${toolCall.name}`);
 
-    const result = await executeToolWithMetrics({
-      toolRegistry,
+    const toolDescriptor = toolRegistry.getDescriptor?.(toolCall.name) ?? null;
+    const descriptorMutation =
+      toolDescriptor !== null && toolDescriptor.effect !== "read";
+    const journalMutation = toolDescriptor
+      ? descriptorMutation && toolDescriptor.durability.journal
+      : isWriteToolName(toolCall.name);
+    const vaultMutation = toolDescriptor
+      ? descriptorMutation && toolDescriptor.capability.system === "vault"
+      : isWriteToolName(toolCall.name);
+    let vaultTransaction: VaultMutationTransaction | null = null;
+    const operationId = journalMutation
+      ? `${runId}:${step}:${String(toolIndex)}:${toolCall.name}`
+      : undefined;
+    let operationJournalRecord: OperationJournalRecord | null = null;
+    let operationJournalStarted = false;
+    const saveOperationJournalRecord = (record: OperationJournalRecord) => {
+      if (!runtimeSnapshot) {
+        return;
+      }
+      operationJournalRecord = record;
+      runtimeSnapshot.operationJournal = [
+        ...runtimeSnapshot.operationJournal.filter(
+          (item) => item.operationId !== record.operationId,
+        ),
+        record,
+      ];
+    };
+    const getOperationJournalRecord = (): OperationJournalRecord | null =>
+      operationJournalRecord;
+    const beginOperationJournal = async (
+      preparedAction?: PreparedAction,
+      descriptor?: ToolDescriptor,
+      authorization?: AuthorizedActionContext,
+    ) => {
+      if (
+        !operationId ||
+        operationJournalStarted ||
+        !runtimeSnapshot ||
+        !canPersistMissionRuntimeSnapshot(runToolContext)
+      ) {
+        return;
+      }
+      operationJournalStarted = true;
+      const now = runToolContext.now?.() ?? new Date();
+      const intentRecord = createOperationJournalRecord({
+        operationId,
+        rootRunId: runtimeSnapshot.lineage.rootRunId,
+        segmentId: runtimeSnapshot.lineage.segmentId,
+        nodeId: missionPlan?.activeTaskId ?? undefined,
+        toolName: toolCall.name,
+        operation: descriptor?.capability.action ?? toolCall.name,
+        targetPath:
+          preparedAction?.target.path ??
+          getString(toolCall.arguments.path) ??
+          getString(toolCall.arguments.toPath),
+        inputHash:
+          preparedAction?.payloadFingerprint ??
+          hashOperationInput(toolCall.arguments),
+        preparedAction,
+        descriptor,
+        authorization,
+        now,
+      });
+      saveOperationJournalRecord(intentRecord);
+      await persistRuntimeSnapshot(`${toolEventBase.id}:wal-intent`, {
+        required: runtimeSnapshotPersistenceAvailable,
+      });
+      const applyingRecord = transitionOperationJournalRecord(
+        intentRecord,
+        "applying",
+        {
+          message: "Tool execution started after durable mutation intent.",
+          now: runToolContext.now?.() ?? new Date(),
+        },
+      );
+      saveOperationJournalRecord(applyingRecord);
+      await persistRuntimeSnapshot(`${toolEventBase.id}:wal-applying`, {
+        required: runtimeSnapshotPersistenceAvailable,
+      });
+    };
+    if (vaultMutation) {
+      vaultTransaction = recordTransactionStage(
+        beginVaultTransaction({
+          runId,
+          nodeId: missionPlan?.activeTaskId ?? undefined,
+          toolName: toolCall.name,
+          targetPath: getString(toolCall.arguments.path) ?? getString(toolCall.arguments.toPath),
+          now: runToolContext.now?.() ?? new Date(),
+        }),
+        "validated",
+        "Tool arguments accepted by runner policy; tool-level validation will run next.",
+        runToolContext.now?.() ?? new Date(),
+      );
+      events.onTrace?.({
+        id: `${toolEventBase.id}:transaction:validated`,
+        kind: "status",
+        step,
+        toolName: toolCall.name,
+        message: "Vault transaction validated.",
+        outputPreview: vaultTransaction,
+      });
+    }
+
+    const result = await executeToolWithRunnerApproval({
       toolCall,
-      toolContext: runToolContext,
-      events,
       step,
+      operationId,
+      beforeExecute: beginOperationJournal,
     });
+    if (operationJournalRecord) {
+      if (result.ok) {
+        saveOperationJournalRecord(
+          transitionOperationJournalRecord(operationJournalRecord, "applied", {
+            message: "Mutation tool returned successfully; receipt verification pending.",
+            mutationMayHaveApplied: true,
+            now: runToolContext.now?.() ?? new Date(),
+          }),
+        );
+      } else {
+        const approvalBlocked = result.error?.code.startsWith("approval_") === true;
+        const definitelyNotApplied =
+          approvalBlocked || result.mutationState === "not_applied";
+        const reconcileMessage = definitelyNotApplied
+          ? "Mutation was not applied."
+          : "Mutation tool failed after execution started; reconcile before retry.";
+        saveOperationJournalRecord(
+          transitionOperationJournalRecord(
+            operationJournalRecord,
+            definitelyNotApplied ? "failed" : "reconcile_required",
+            {
+              message: reconcileMessage,
+              error: result.error?.message,
+              mutationMayHaveApplied: !definitelyNotApplied,
+              now: runToolContext.now?.() ?? new Date(),
+            },
+          ),
+        );
+        if (!definitelyNotApplied) {
+          events.onStatus?.(
+            formatFailureCopy(walReconcileFailureCopy(reconcileMessage)),
+          );
+        }
+        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-failed`);
+      }
+    }
+    if (vaultTransaction && result.ok) {
+      vaultTransaction = recordTransactionStage(
+        vaultTransaction,
+        "applied",
+        "Vault mutation tool returned successfully.",
+        runToolContext.now?.() ?? new Date(),
+      );
+      events.onTrace?.({
+        id: `${toolEventBase.id}:transaction:applied`,
+        kind: "status",
+        step,
+        toolName: toolCall.name,
+        message: "Vault transaction applied.",
+        outputPreview: vaultTransaction,
+      });
+    }
 
     executedModelTool = true;
-    const recordedToolCall = appendToolTranscript({
-      messages,
-      toolCall,
-      resultContent: serializeToolResult(result),
-      origin,
-      fallbackId: `call_${runId}_${step}_${toolIndex}_${toolCall.name}`.replace(
-        /[^A-Za-z0-9_-]/g,
-        "_",
-      ),
-    });
+    const recordedToolCall = recordTranscript
+      ? appendToolTranscript({
+          messages,
+          toolCall,
+          resultContent: serializeToolResultForModel(result),
+          origin,
+          fallbackId: buildToolCallFallbackId(runId, step, toolIndex, toolCall.name),
+        })
+      : toolCall;
     markOperationGoalsForTool({
       operationGoals,
       toolName: recordedToolCall.name,
@@ -1429,6 +4433,7 @@ export async function runAgentMission({
 
     if (result.ok) {
       successfulToolNames.push(toolCall.name);
+      currentSegmentSuccessfulToolNames.push(toolCall.name);
       if (missionLedger) {
         setLedgerLastSafeStep(
           missionLedger,
@@ -1457,11 +4462,59 @@ export async function runAgentMission({
         outputPreview: truncateTracePayload(result.output),
       });
 
-      const receipt = buildReceipt(toolCall.name, result.output);
+      const receipt = buildReceiptFromToolExecution(
+        toolCall.name,
+        result,
+        toolDescriptor,
+      );
       if (receipt) {
+        updatePinnedCurrentNotePathFromReceipt(receipt, toolEventBase.id);
         writeReceipts.push(receipt);
         events.onReceipt?.(receipt);
         await recordLedgerReceipt(receipt, step);
+        if (
+          toolCall.name === "append_to_current_file" ||
+          toolCall.name === "replace_current_file"
+        ) {
+          const writtenText =
+            typeof toolCall.arguments.text === "string"
+              ? toolCall.arguments.text
+              : typeof toolCall.arguments.content === "string"
+                ? toolCall.arguments.content
+                : null;
+          await publishPlaceholderAutoRename(
+            toolCall.name === "replace_current_file" ? "replace" : "append",
+            step,
+            writtenText,
+          );
+        }
+        if (vaultTransaction) {
+          if (receipt.backupPath) {
+            vaultTransaction = recordTransactionStage(
+              vaultTransaction,
+              "backed_up",
+              `Backup recorded at ${receipt.backupPath}.`,
+              runToolContext.now?.() ?? new Date(),
+            );
+          }
+          vaultTransaction = commitVaultTransaction(
+            vaultTransaction,
+            receipt,
+            runToolContext.now?.() ?? new Date(),
+          );
+          vaultTransactionRecords.push(vaultTransaction);
+          events.onTrace?.({
+            id: `${toolEventBase.id}:transaction:committed`,
+            kind: "receipt",
+            step,
+            toolName: toolCall.name,
+            operation: receipt.operation,
+            path: receipt.path,
+            backupPath: receipt.backupPath,
+            message: "Vault transaction committed.",
+            outputPreview: vaultTransaction,
+          });
+        }
         events.onTrace?.({
           id: `${toolEventBase.id}:receipt`,
           kind: "receipt",
@@ -1474,6 +4527,49 @@ export async function runAgentMission({
           message: receipt.message,
           outputPreview: truncateTracePayload(receipt.output ?? receipt),
         });
+        const receiptJournalRecord = getOperationJournalRecord();
+        if (receiptJournalRecord?.state === "applied") {
+          const verifiedRecord = transitionOperationJournalRecord(
+            receiptJournalRecord,
+            "verified",
+            {
+              message: "Mutation receipt matched the completed tool operation.",
+              receipt,
+              now: runToolContext.now?.() ?? new Date(),
+            },
+          );
+          const committedRecord = transitionOperationJournalRecord(
+            verifiedRecord,
+            "committed",
+            {
+              message: "Mutation and receipt committed to durable run state.",
+              receipt,
+              now: runToolContext.now?.() ?? new Date(),
+            },
+          );
+          saveOperationJournalRecord(committedRecord);
+          await persistRuntimeSnapshot(`${toolEventBase.id}:wal-committed`);
+        }
+      }
+      const unresolvedJournalRecord = getOperationJournalRecord();
+      if (unresolvedJournalRecord?.state === "applied") {
+        const reconcileMessage =
+          "Mutation reported success without a durable receipt; inspect before retry.";
+        saveOperationJournalRecord(
+          transitionOperationJournalRecord(
+            unresolvedJournalRecord,
+            "reconcile_required",
+            {
+              message: reconcileMessage,
+              mutationMayHaveApplied: true,
+              now: runToolContext.now?.() ?? new Date(),
+            },
+          ),
+        );
+        events.onStatus?.(
+          formatFailureCopy(walReconcileFailureCopy(reconcileMessage)),
+        );
+        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-reconcile`);
       }
 
       if (toolCall.name === "prepare_edit_current_section") {
@@ -1490,16 +4586,48 @@ export async function runAgentMission({
         executedWebFetchTool = true;
       }
 
-      if (isWriteToolName(toolCall.name)) {
+      if (
+        toolCall.name === "semantic_search_notes" &&
+        !vaultCoverageExpansionUsed &&
+        shouldExpandVaultRetrievalCoverage(result.output, researchPlan)
+      ) {
+        vaultCoverageExpansionUsed = true;
+        events.onStatus?.(
+          formatFailureCopy(
+            semanticCoverageSecondPassCopy(
+              "Vault retrieval coverage was sampled, truncated, fallback, or low confidence.",
+            ),
+          ),
+        );
+        messages.push({
+          role: "system" as const,
+          content:
+            "The semantic vault retrieval coverage is not strong enough for deep vault research. Expand retrieval before synthesis: call semantic_search_notes again with mode='deep' and a higher candidateLimit when available, then read selected high-signal notes with read_markdown_files or read_file. Do not give the final answer yet.",
+        });
+      }
+
+      if (vaultMutation) {
         wroteToNote = true;
+      }
+      if (origin === "model") {
+        await runAutoFollowupsAfterTool({
+          toolName: toolCall.name,
+          result,
+          step,
+          toolIndex,
+        });
       }
     } else {
       failedToolNames.push(toolCall.name);
-      events.onStatus?.(`Tool returned error: ${toolCall.name}`);
+      const failureStatus = formatObservedToolFailureStatus(
+        toolCall.name,
+        result,
+      );
+      events.onStatus?.(failureStatus);
       events.onToolDone?.({
         ...toolEventBase,
         ok: false,
-        message: `Tool returned error: ${toolCall.name}`,
+        message: failureStatus,
         error: result.error,
       });
       events.onTrace?.({
@@ -1507,10 +4635,11 @@ export async function runAgentMission({
         kind: "tool_result",
         step,
         toolName: toolCall.name,
-        message: `Tool returned error: ${toolCall.name}`,
+        message: failureStatus,
         error: result.error,
         outputPreview: truncateTracePayload(result),
       });
+      await recordLedgerToolResult(toolCall.name, result, step);
     }
 
     if (origin === "runner") {
@@ -1556,7 +4685,10 @@ export async function runAgentMission({
           name: "web_search",
           arguments: {
             query: buildFallbackWebSearchQuery(activeIntentPrompt),
-            max_results: 3,
+            max_results: Math.min(
+              10,
+              Math.max(3, (researchPlan?.sourceRequirements.minFetchedSources ?? 1) * 3),
+            ),
           },
         },
         step,
@@ -1567,28 +4699,37 @@ export async function runAgentMission({
 
     if (
       missingToolNames.includes("web_fetch") &&
-      allowedToolNames.has("web_fetch") &&
-      !executedWebFetchTool
+      allowedToolNames.has("web_fetch")
     ) {
-      const url = getFirstWebSearchResultUrl(
-        searchOutput ?? getLatestToolOutput(messages, "web_search"),
+      const fetchedUrls = getFetchedWebSourceUrls(missionEvidenceRecords);
+      const requiredFetches = researchPlan?.sourceRequirements.minFetchedSources ?? 1;
+      const neededFetches = Math.max(
+        executedWebFetchTool ? 0 : 1,
+        requiredFetches - fetchedUrls.length,
       );
-      if (!url) {
+      const candidateUrls = rankWebSearchResultUrls(
+        searchOutput ?? getLatestToolOutput(messages, "web_search"),
+        activeIntentPrompt,
+      );
+      const urls = selectDomainDiverseUrls(candidateUrls, fetchedUrls, neededFetches);
+      if (urls.length === 0) {
         events.onStatus?.(
           "Web fallback could not find a safe result URL to fetch.",
         );
         return false;
       }
 
-      await runObservedModelToolCall({
-        origin: "runner",
-        toolCall: {
-          name: "web_fetch",
-          arguments: { url },
-        },
-        step,
-        toolIndex: "runner",
-      });
+      for (let index = 0; index < urls.length; index += 1) {
+        await runObservedModelToolCall({
+          origin: "runner",
+          toolCall: {
+            name: "web_fetch",
+            arguments: { url: urls[index] },
+          },
+          step,
+          toolIndex: `runner-fetch-${index}`,
+        });
+      }
     }
 
     return getMissingRequiredWebToolNames({
@@ -1596,6 +4737,8 @@ export async function runAgentMission({
       allowedToolNames,
       executedWebSearchTool,
       executedWebFetchTool,
+      researchPlan,
+      missionEvidence: missionEvidenceRecords,
     }).length === 0;
   };
   await persistMissionLedger("mission-ledger-start");
@@ -1604,6 +4747,14 @@ export async function runAgentMission({
     compactConversationForPrompt(conversationHistory);
   const conversationMessages =
     toCompactedConversationModelMessages(compactedConversation);
+  const researchHypothesisHint =
+    researchPlan !== null &&
+    runToolContext.settings?.researchMemoryEnabled === true
+      ? buildHypothesisSystemHintFromIndex(
+          runToolContext.getResearchMemoryIndex?.() ?? [],
+          activeIntentPrompt,
+        )
+      : null;
 
   const messages: ModelChatMessage[] = [
     {
@@ -1634,6 +4785,52 @@ export async function runAgentMission({
       role: "system" as const,
       content: formatStructuredIntentForPrompt(structuredIntent),
     },
+    ...(shouldEmitPlaceholderTitleWriteHint({
+      missionIntent,
+      streamingWritebackKind,
+      allowedToolNames,
+      activeBasename:
+        runToolContext.getCurrentMarkdownFile?.()?.basename ??
+        runToolContext.app?.workspace?.getActiveFile?.()?.basename,
+    })
+      ? [
+          {
+            role: "system" as const,
+            content: [
+              "When writing titled content to the current note, put `# Title` as the first line of the text argument.",
+              "If the note is Untitled / Untitled N, the plugin will rename the file after a successful write.",
+              "Do not also call rename_current_file unless the user explicitly asked to rename/retitle the page.",
+            ].join(" "),
+          },
+        ]
+      : []),
+    ...(missionPlan === null
+      ? []
+      : [
+          {
+            role: "system" as const,
+            content: [
+              formatMissionPlanForPrompt(missionPlan),
+              formatMissionPlanNextActionPrompt(missionPlan),
+            ].join("\n\n"),
+          },
+        ]),
+    ...(researchPlan === null
+      ? []
+      : [
+          {
+            role: "system" as const,
+            content: formatResearchPlanForPrompt(researchPlan),
+          },
+        ]),
+    ...(researchHypothesisHint
+      ? [
+          {
+            role: "system" as const,
+            content: researchHypothesisHint,
+          },
+        ]
+      : []),
     ...(generatedOutputPolicy.wordTarget
       ? [
           {
@@ -1658,14 +4855,32 @@ export async function runAgentMission({
             content: followupIntentContext,
           },
         ]),
+    ...(orchestratorContext?.trim()
+      ? [
+          {
+            role: "system" as const,
+            content: orchestratorContext.trim(),
+          },
+        ]
+      : []),
     ...(checkpointResumeContext === null
       ? []
       : [
           {
             role: "system" as const,
-            content: checkpointResumeContext,
+            content: checkpointResumeContext.promptContext,
           },
         ]),
+    ...(resumeLedger &&
+      streamingWritebackKind !== null &&
+      missionEvidenceRecords.length > 0
+      ? [
+          {
+            role: "system" as const,
+            content: formatDurableEvidenceForWriteback(missionEvidenceRecords),
+          },
+        ]
+      : []),
     ...(currentNoteContext === null
       ? []
       : [
@@ -1729,6 +4944,28 @@ export async function runAgentMission({
       content: activeIntentPrompt,
     },
   ];
+  estimatedPromptCharsForRun = estimatePromptChars(messages);
+  events.onRunConfig?.(
+    buildRunConfigEvent({
+      runId,
+      toolContext: runToolContext,
+      enableStreaming,
+      activeThink,
+      modelOptions,
+      writeAutonomy,
+      chatOnlyOverride: forceChatOnly,
+      missionIntent,
+      currentNoteContext: shouldReadCurrentNote,
+      runPlan,
+      streamingWritebackKind,
+      directCurrentNoteWritebackKind,
+      missionLedger: missionLedger ? summarizeMissionLedger(missionLedger) : undefined,
+      reflexOutput,
+      estimatedPromptChars: estimatedPromptCharsForRun,
+      contextBudgetChars: runContextBudget.maxPromptChars,
+      performanceGates: evaluatePerformanceGates(metricEvents),
+    }),
+  );
 
   if (runPlan.route === "instant_local") {
     if (stopIfRequested(0)) {
@@ -1742,8 +4979,9 @@ export async function runAgentMission({
       finalMode: "direct",
       runPlan,
     });
+    lastFinalOutput = buildInstantLocalAnswer(activeIntentPrompt, runToolContext);
     emitDirectAssistantAnswer(
-      buildInstantLocalAnswer(activeIntentPrompt, runToolContext),
+      lastFinalOutput,
       events,
       runPlan.requiresEnglishGuard,
     );
@@ -1767,6 +5005,7 @@ export async function runAgentMission({
         step: 0,
       });
       successfulToolNames.push("inspect_vault_context");
+      currentSegmentSuccessfulToolNames.push("inspect_vault_context");
       await recordLedgerToolResult(
         "inspect_vault_context",
         {
@@ -1831,6 +5070,7 @@ export async function runAgentMission({
       if (stopIfRequested(1)) {
         return;
       }
+      lastFinalOutput = response?.message.content ?? "";
       await finishRun(
         isClarifyingQuestionResponse(activeIntentPrompt, response?.message.content ?? "")
           ? "clarifying_question"
@@ -1865,7 +5105,9 @@ export async function runAgentMission({
         }),
         thinking: resolveThinkingMode(runToolContext.settings),
         allowedTools: tools,
+        allowedToolNames: tools.map((tool) => tool.function.name),
         expectedTimeClass: "normal",
+        traceReasons: ["prefetch_failed_fallback"],
       };
       activeThink = runPlan.thinking;
       allowedToolNames = new Set(tools.map((tool) => tool.function.name));
@@ -1895,6 +5137,7 @@ export async function runAgentMission({
       step: 0,
     });
     successfulToolNames.push("inspect_vault_context");
+    currentSegmentSuccessfulToolNames.push("inspect_vault_context");
     await recordLedgerToolResult(
       "inspect_vault_context",
       {
@@ -1938,7 +5181,7 @@ export async function runAgentMission({
     );
     let receipt: AgentRunReceipt;
     try {
-      receipt = await streamCurrentNoteWriteback({
+      const committedReceipt = await runProofGatedCurrentNoteWriteback({
         kind: "append",
         preparedSectionEdit: null,
         modelClient,
@@ -1951,7 +5194,11 @@ export async function runAgentMission({
         options: modelOptions,
         abortSignal,
         onThinkingUnsupported: disableThinkingForRun,
-      });
+      }, 1);
+      if (!committedReceipt) {
+        return;
+      }
+      receipt = committedReceipt;
     } catch (error) {
       if (stopIfRequested(1)) {
         return;
@@ -1961,6 +5208,7 @@ export async function runAgentMission({
     if (stopIfRequested(1)) {
       return;
     }
+    markStreamingWritebackGoalDone(operationGoals, "append");
     writeReceipts.push(receipt);
     events.onReceipt?.(receipt);
     await recordLedgerReceipt(receipt);
@@ -1985,7 +5233,7 @@ export async function runAgentMission({
     });
     let receipt: AgentRunReceipt;
     try {
-      receipt = await streamCurrentNoteWriteback({
+      const committedReceipt = await runProofGatedCurrentNoteWriteback({
         kind: promptOnPageWritebackKind,
         preparedSectionEdit: null,
         modelClient,
@@ -2004,7 +5252,11 @@ export async function runAgentMission({
         options: modelOptions,
         abortSignal,
         onThinkingUnsupported: disableThinkingForRun,
-      });
+      }, 1);
+      if (!committedReceipt) {
+        return;
+      }
+      receipt = committedReceipt;
     } catch (error) {
       if (stopIfRequested(1)) {
         return;
@@ -2014,6 +5266,7 @@ export async function runAgentMission({
     if (stopIfRequested(1)) {
       return;
     }
+    markStreamingWritebackGoalDone(operationGoals, promptOnPageWritebackKind);
     writeReceipts.push(receipt);
     events.onReceipt?.(receipt);
     await recordLedgerReceipt(receipt);
@@ -2036,7 +5289,7 @@ export async function runAgentMission({
     });
     let receipt: AgentRunReceipt;
     try {
-      receipt = await streamCurrentNoteWriteback({
+      const committedReceipt = await runProofGatedCurrentNoteWriteback({
         kind: directCurrentNoteWritebackKind,
         preparedSectionEdit: null,
         modelClient,
@@ -2055,7 +5308,11 @@ export async function runAgentMission({
         options: modelOptions,
         abortSignal,
         onThinkingUnsupported: disableThinkingForRun,
-      });
+      }, 1);
+      if (!committedReceipt) {
+        return;
+      }
+      receipt = committedReceipt;
     } catch (error) {
       if (stopIfRequested(1)) {
         return;
@@ -2065,6 +5322,7 @@ export async function runAgentMission({
     if (stopIfRequested(1)) {
       return;
     }
+    markStreamingWritebackGoalDone(operationGoals, directCurrentNoteWritebackKind);
     writeReceipts.push(receipt);
     events.onReceipt?.(receipt);
     await recordLedgerReceipt(receipt);
@@ -2115,6 +5373,7 @@ export async function runAgentMission({
     if (stopIfRequested(1)) {
       return;
     }
+    lastFinalOutput = response?.message.content ?? "";
     await finishRun(
       isClarifyingQuestionResponse(activeIntentPrompt, response?.message.content ?? "")
         ? "clarifying_question"
@@ -2162,6 +5421,7 @@ export async function runAgentMission({
     if (stopIfRequested(1)) {
       return;
     }
+    lastFinalOutput = response?.message.content ?? "";
     await finishRun(
       isClarifyingQuestionResponse(activeIntentPrompt, response?.message.content ?? "")
         ? "clarifying_question"
@@ -2173,10 +5433,69 @@ export async function runAgentMission({
   }
 
   emitStatus(events, "Planning...", "planning");
-  const stepLimit = Math.min(runPlan.maxStepsForRun, MAX_AGENT_STEPS);
+  const stepLimit = Math.min(
+    runPlan.maxStepsForRun,
+    MAX_AGENT_STEPS,
+    normalizeInvocationStepLimit(providedMaxSteps),
+  );
+  const maxRunMs = configuredMaxRunMs;
+  const isRepeatedToolBudgetSpent = () => {
+    const lastActionName = recentActions.at(-1)?.name;
+    const previousActionName = recentActions.at(-2)?.name;
+    return (
+      loopBudgetPlan.toolStepBudget > 0 &&
+      currentSegmentSuccessfulToolNames.length >= loopBudgetPlan.toolStepBudget &&
+      recoveryAttemptSignatures.length >= 2 &&
+      lastActionName !== undefined &&
+      lastActionName === previousActionName
+    );
+  };
+  const stopRepeatedToolBudget = async () => {
+    const message = "Repeated tool loop stopped before full safety limit.";
+    events.onStatus?.(
+      "Stopped repeated tool loop before burning the full safety limit.",
+    );
+    // Do not record a ledger blocker here: this is a productive budget stop so
+    // overnight/auto-continue can still schedule the next segment.
+    await finishRun("budget", lastStep, stepLimit, message);
+  };
 
   for (let step = 1; step <= stepLimit; step += 1) {
     if (stopIfRequested(step)) {
+      return;
+    }
+
+    if (maxRunMs !== null && nowMs() - runStartedAt >= maxRunMs) {
+      const message =
+        "Wall-clock run budget expired. The ledger was saved and this run can be continued.";
+      if (missionLedger) {
+        setLedgerWallClockExpired(
+          missionLedger,
+          runToolContext.now?.() ?? new Date(),
+        );
+        setLedgerNextAction(
+          missionLedger,
+          `${message} Run "${missionLedger.continuationCommand}" to continue.`,
+          runToolContext.now?.() ?? new Date(),
+        );
+      }
+      events.onStatus?.(message);
+      events.onTrace?.({
+        id: `wall-clock-budget:${step}`,
+        kind: "status",
+        step,
+        message,
+        outputPreview: {
+          elapsedMs: Math.round(nowMs() - runStartedAt),
+          maxRunMs,
+        },
+      });
+      emitDirectAssistantAnswer(
+        `${message} Run "continue" when ready.`,
+        events,
+        runPlan.requiresEnglishGuard,
+      );
+      await finishRun("budget", Math.max(lastStep, step), stepLimit, message);
       return;
     }
 
@@ -2192,16 +5511,81 @@ export async function runAgentMission({
       );
     }
     events.onPlanningStart?.(step);
+    estimatedPromptCharsForRun = estimatePromptChars(messages);
+    if (
+      missionLedger &&
+      shouldCompactLoopMessages(messages, runContextBudget)
+    ) {
+      const compacted = compactLoopMessages({
+        messages,
+        ledger: missionLedger,
+      });
+      messages.splice(0, messages.length, ...compacted.messages);
+      estimatedPromptCharsForRun = compacted.estimatedCharsAfter;
+      events.onStatus?.(
+        `Compacted loop context from ${compacted.estimatedCharsBefore} to ${compacted.estimatedCharsAfter} estimated chars before model call.`,
+      );
+      events.onTrace?.({
+        id: `context-compaction:${step}`,
+        kind: "status",
+        step,
+        message: "Compacted loop context before model call.",
+        outputPreview: {
+          estimated_prompt_chars_before: compacted.estimatedCharsBefore,
+          estimated_prompt_chars_after: compacted.estimatedCharsAfter,
+          compacted_tool_messages: compacted.compactedToolMessages,
+          num_ctx: modelOptions?.num_ctx ?? null,
+        },
+      });
+      events.onRunConfig?.(
+        buildRunConfigEvent({
+          runId,
+          toolContext: runToolContext,
+          enableStreaming,
+          activeThink,
+          modelOptions,
+          writeAutonomy,
+          chatOnlyOverride: forceChatOnly,
+          missionIntent,
+          currentNoteContext: shouldReadCurrentNote,
+          runPlan,
+          streamingWritebackKind,
+          directCurrentNoteWritebackKind,
+          missionLedger: summarizeMissionLedger(missionLedger),
+          reflexOutput,
+          estimatedPromptChars: estimatedPromptCharsForRun,
+          contextBudgetChars: runContextBudget.maxPromptChars,
+          performanceGates: evaluatePerformanceGates(metricEvents),
+        }),
+      );
+    }
     events.onPlanningDelta?.(
       [
         `Step ${step}/${stepLimit}`,
         `route=${runPlan.route}`,
         `reason=${runPlan.slowPathReason}`,
+        `estimated_prompt_chars=${estimatedPromptCharsForRun}`,
+        `num_ctx=${modelOptions?.num_ctx ?? "default"}`,
         `tool_budget=${loopBudgetPlan.toolStepBudget}`,
         `finalization_reserved=${loopBudgetPlan.finalizationReserve}`,
         `tools=${Array.from(allowedToolNames).join(", ") || "none"}`,
       ].join("; "),
     );
+    if (
+      missionPlan &&
+      (step % PROGRESS_REVIEW_EVERY_STEPS === 0 ||
+        (MISSION_MILESTONE_STEPS as readonly number[]).includes(step))
+    ) {
+      events.onStatus?.(
+        `Mission plan review at step ${step}: ${missionPlan.progress.completedTasks}/${missionPlan.progress.totalTasks} task(s) complete.`,
+      );
+      await recordMissionPlanReview(
+        step,
+        (MISSION_MILESTONE_STEPS as readonly number[]).includes(step)
+          ? "milestone"
+          : "periodic",
+      );
+    }
 
     let response: ModelChatResponse;
     try {
@@ -2216,7 +5600,8 @@ export async function runAgentMission({
       if (stopIfRequested(step)) {
         return;
       }
-      throw error;
+      await finishErroredRunFromException(error, step, stepLimit, "model");
+      return;
     }
     events.onPlanningDone?.(step);
 
@@ -2244,6 +5629,55 @@ export async function runAgentMission({
     const recoveredTextToolCalls =
       response.toolCalls.length === 0 && responseToolCalls.length > 0;
 
+    const missingRequiredWebToolsBeforeToolUse = getMissingRequiredWebToolNames({
+      prompt: activeIntentPrompt,
+      allowedToolNames,
+      executedWebSearchTool,
+      executedWebFetchTool,
+      researchPlan,
+      missionEvidence: missionEvidenceRecords,
+    });
+    const responseOnlyRequestsMissingRequiredWebTools =
+      responseToolCalls.length > 0 &&
+      responseToolCalls.every((toolCall) =>
+        missingRequiredWebToolsBeforeToolUse.includes(toolCall.name),
+      );
+    const pendingRequiredWritesBeforeToolUse = getPendingRequiredWriteToolNames(
+      operationGoals,
+      requiredWriteTools,
+    );
+    const responseRequestsPendingRequiredWrite = responseToolCalls.some(
+      (toolCall) =>
+        pendingRequiredWritesBeforeToolUse.includes(toolCall.name) ||
+        (requiredWriteTools.includes(toolCall.name) &&
+          !successfulToolNames.includes(toolCall.name)),
+    );
+    const shouldReserveFinalizationBeforeTool =
+      responseToolCalls.length > 0 &&
+      !responseRequestsPendingRequiredWrite &&
+      loopBudgetPlan.finalizationReserve > 0 &&
+      step < stepLimit &&
+      ((loopBudgetPlan.toolStepBudget > 0 &&
+        currentSegmentSuccessfulToolNames.length >= loopBudgetPlan.toolStepBudget &&
+        !responseOnlyRequestsMissingRequiredWebTools) ||
+        (loopBudgetPlan.toolStepBudget === 0 &&
+          currentSegmentSuccessfulToolNames.length > 0 &&
+          !responseOnlyRequestsMissingRequiredWebTools));
+
+    if (shouldReserveFinalizationBeforeTool) {
+      events.onStatus?.(
+        "Tool budget is spent; reserving remaining steps for verification and final output...",
+      );
+      tools = [];
+      allowedToolNames = new Set();
+      messages.push({
+        role: "system" as const,
+        content:
+          "The tool budget is spent. Do not request more tools. Verify the gathered context and draft the final answer or concise blocker.",
+      });
+      continue;
+    }
+
     messages.push(
       withoutThinking(
         recoveredTextToolCalls
@@ -2261,7 +5695,21 @@ export async function runAgentMission({
         streamingWritebackKind &&
         (streamingWritebackKind !== "edit" || preparedStreamingSectionEdit)
       ) {
-        if (requireToolBeforeStreamingWriteback && !executedModelTool) {
+        const webFallbackSatisfiedForWriteback =
+          executedWebSearchTool ||
+          executedWebFetchTool ||
+          countFetchedWebSources(missionEvidenceRecords) > 0;
+        const durablePreWriteProofSatisfied =
+          requireToolBeforeStreamingWriteback &&
+          !executedModelTool &&
+          !webFallbackSatisfiedForWriteback &&
+          hasSatisfiedDurablePreWriteProof();
+        if (
+          requireToolBeforeStreamingWriteback &&
+          !executedModelTool &&
+          !webFallbackSatisfiedForWriteback &&
+          !durablePreWriteProofSatisfied
+        ) {
           if (!toolBeforeWriteCorrectionUsed && step < stepLimit) {
             toolBeforeWriteCorrectionUsed = true;
             events.onStatus?.(
@@ -2279,6 +5727,8 @@ export async function runAgentMission({
             allowedToolNames,
             executedWebSearchTool,
             executedWebFetchTool,
+            researchPlan,
+            missionEvidence: missionEvidenceRecords,
           });
           if (missingWebToolsBeforeWriteback.length > 0) {
             try {
@@ -2305,6 +5755,23 @@ export async function runAgentMission({
             }
           }
 
+          if (
+            step < stepLimit &&
+            hasCurrentWebFactIntent(activeIntentPrompt) &&
+            executedWebSearchTool &&
+            countFetchedWebSources(missionEvidenceRecords) > 0
+          ) {
+            events.onStatus?.(
+              "Current web context gathered; drafting final note output with available sources...",
+            );
+            messages.push({
+              role: "system" as const,
+              content:
+                "Current web research has fetched available source context, though the full source target may not be complete. Do not request more tools. Draft the requested note writeback from the gathered source results, include source URLs when available, and state limitations where source coverage is thin.",
+            });
+            continue;
+          }
+
           const message =
             "I could not get the model to request the required read tools before writing. No vault files were changed.";
           emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
@@ -2327,7 +5794,7 @@ export async function runAgentMission({
         });
         let receipt: AgentRunReceipt;
         try {
-          receipt = await streamCurrentNoteWriteback({
+          const committedReceipt = await runProofGatedCurrentNoteWriteback({
             kind: streamingWritebackKind,
             preparedSectionEdit: preparedStreamingSectionEdit,
             modelClient,
@@ -2340,11 +5807,16 @@ export async function runAgentMission({
             options: modelOptions,
             abortSignal,
             onThinkingUnsupported: disableThinkingForRun,
-          });
+          }, step, stepLimit);
+          if (!committedReceipt) {
+            return;
+          }
+          receipt = committedReceipt;
         } catch (error) {
           if (stopIfRequested(step)) {
             return;
           }
+          await finishErroredRunFromException(error, step, stepLimit, "model");
           throw error;
         }
         if (stopIfRequested(step)) {
@@ -2354,8 +5826,23 @@ export async function runAgentMission({
         writeReceipts.push(receipt);
         events.onReceipt?.(receipt);
         await recordLedgerReceipt(receipt);
-        await finishRun("write_completed", lastStep, stepLimit);
-        return;
+        // Item 16: do not finish while other operation goals remain pending.
+        if (hasPendingOperationGoals(operationGoals)) {
+          events.onStatus?.(
+            "Streamed write complete; remaining operation goals still pending...",
+          );
+          if (step < stepLimit) {
+            messages.push({
+              role: "system" as const,
+              content:
+                "The note write completed with a receipt. Continue with any remaining pending goals (such as title rename) before finishing.",
+            });
+            continue;
+          }
+        } else {
+          await finishRun("write_completed", lastStep, stepLimit);
+          return;
+        }
       }
 
       const pendingRequiredWriteTools = getPendingRequiredWriteToolNames(
@@ -2380,6 +5867,8 @@ export async function runAgentMission({
         allowedToolNames,
         executedWebSearchTool,
         executedWebFetchTool,
+        researchPlan,
+        missionEvidence: missionEvidenceRecords,
       });
       if (missingWebTools.length > 0) {
         if (!webResearchCorrectionUsed && step < stepLimit) {
@@ -2486,6 +5975,8 @@ export async function runAgentMission({
         allowedToolNames,
         recentActions,
         evidence: missionEvidenceRecords,
+        // Live array: streamed writer.buildReceipt / tool writes push here
+        // before this evaluate so write_receipt proof stays current.
         receipts: writeReceipts,
         settings: runToolContext.settings,
         embeddingProvider: runToolContext.semanticEmbeddingProvider,
@@ -2494,6 +5985,19 @@ export async function runAgentMission({
         runToolContext.settings?.agenticReflexEnabled === true &&
         !reflexOutput.completion.complete
       ) {
+        const missingWriteReceipt = missingIncludesWriteReceipt(
+          reflexOutput.completion.missing,
+        );
+        const writeRecoveryAvailable =
+          missingWriteReceipt &&
+          (streamingWritebackKind !== null ||
+            reflexOutput.completion.recommendedNextTool !== undefined ||
+            [...allowedToolNames].some((name) =>
+              /^(append_to_current_file|replace_current_file|edit_current_section|create_file|append_file|replace_file)$/.test(
+                name,
+              ),
+            ));
+
         if (step < stepLimit) {
           events.onStatus?.(
             `Reflex completion gate missing: ${reflexOutput.completion.missing.join(", ")}.`,
@@ -2508,15 +6012,111 @@ export async function runAgentMission({
           continue;
         }
 
-        const message = `I could not complete the mission because required evidence is missing: ${reflexOutput.completion.missing.join(", ")}. No additional vault files were changed.`;
-        emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
-        recordLedgerBlocker(message);
-        await finishRun("error", lastStep, stepLimit);
-        return;
+        // Item 1/15: at last step, attempt runner-owned streamed replace when
+        // write_receipt is missing and current-note write/stream is allowed.
+        if (
+          missingWriteReceipt &&
+          writeAutonomy &&
+          hasActiveCurrentMarkdownFile(runToolContext) &&
+          (streamingWritebackKind !== null ||
+            prefersStreamedReplaceForEditOrganize(activeIntentPrompt) ||
+            missionIntent.noteOutput ||
+            missionIntent.requireWriteCompletion)
+        ) {
+          events.onStatus?.(
+            "Write receipt missing; applying runner-owned current-note rewrite...",
+          );
+          try {
+            const fallbackKind: StreamingWritebackKind =
+              streamingWritebackKind === "edit" && preparedStreamingSectionEdit
+                ? "edit"
+                : "replace";
+            const fallbackMessages: ModelChatMessage[] = [
+              ...messages,
+              {
+                role: "system" as const,
+                content:
+                  "Reorganize and improve the current note. Replace the full note body with a clearer, better-structured markdown draft that preserves the user's topic and intent. Output only the note markdown.",
+              },
+            ];
+            emitRunDiagnostics({
+              events,
+              toolContext: runToolContext,
+              tools,
+              enableStreaming,
+              finalMode: "streaming_writeback",
+              runPlan,
+            });
+            const committedReceipt = await runProofGatedCurrentNoteWriteback(
+              {
+                kind: fallbackKind,
+                preparedSectionEdit:
+                  fallbackKind === "edit" ? preparedStreamingSectionEdit : null,
+                modelClient,
+                messages: fallbackMessages,
+                events,
+                toolContext: runToolContext,
+                knownToolNames,
+                relevancePrompt: finalAnswerRelevancePrompt,
+                think: activeThink,
+                options: modelOptions,
+                abortSignal,
+                onThinkingUnsupported: disableThinkingForRun,
+              },
+              lastStep,
+              stepLimit,
+            );
+            if (committedReceipt) {
+              markStreamingWritebackGoalDone(operationGoals, fallbackKind);
+              writeReceipts.push(committedReceipt);
+              events.onReceipt?.(committedReceipt);
+              await recordLedgerReceipt(committedReceipt);
+              if (hasPendingOperationGoals(operationGoals)) {
+                events.onStatus?.(
+                  "Write completed; continuing for remaining operation goals...",
+                );
+                if (step < stepLimit) {
+                  messages.push({
+                    role: "system" as const,
+                    content:
+                      "A write receipt is now present. Complete any remaining pending operation goals (for example title rename) before finishing.",
+                  });
+                  continue;
+                }
+                // Last step: do not finish as write_completed while goals remain.
+              } else {
+                await finishRun("write_completed", lastStep, stepLimit);
+                return;
+              }
+            }
+          } catch (error) {
+            events.onStatus?.(
+              `Runner-owned write fallback failed: ${getUnknownErrorMessage(error)}`,
+            );
+          }
+        }
+
+        // Item 15: do not terminal-fail reflex when write recovery is still
+        // available; let mission acceptance decide the hard stop.
+        if (writeRecoveryAvailable) {
+          events.onStatus?.(
+            `Reflex still missing ${reflexOutput.completion.missing.join(", ")}; deferring to acceptance.`,
+          );
+        } else {
+          const message = `I could not complete the mission because required evidence is missing: ${reflexOutput.completion.missing.join(", ")}. No additional vault files were changed.`;
+          emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+          recordLedgerBlocker(message);
+          await finishRun("error", lastStep, stepLimit);
+          return;
+        }
       }
 
       const acceptanceBeforeFinal = evaluateCurrentAcceptance();
       await recordMissionAcceptance(acceptanceBeforeFinal, step);
+      if (acceptanceBeforeFinal.status !== "pass" && isRepeatedToolBudgetSpent()) {
+        await stopRepeatedToolBudget();
+        return;
+      }
       if (
         shouldContinueForMissionAcceptance(
           acceptanceBeforeFinal,
@@ -2526,7 +6126,7 @@ export async function runAgentMission({
       ) {
         if (step < stepLimit) {
           events.onStatus?.(
-            `Mission acceptance missing: ${acceptanceBeforeFinal.missing.join(", ")}.`,
+            formatAcceptanceFailureCopy(acceptanceBeforeFinal.missing),
           );
           messages.push({
             role: "system" as const,
@@ -2550,6 +6150,10 @@ export async function runAgentMission({
       const hasDirectFinalContent = hasRenderableAssistantContent(
         response.message.content,
       );
+      const requiresPreEmissionVerification = requiresVerifiedFinalOutput(
+        missionPlan,
+        researchPlan,
+      );
 
       if (enableStreaming && !hasDirectFinalContent) {
         if (stopIfRequested(step)) {
@@ -2564,7 +6168,7 @@ export async function runAgentMission({
           runPlan,
         });
         try {
-          await emitFinalAnswer({
+          const streamedResponse = await emitFinalAnswer({
             modelClient,
             messages,
             events,
@@ -2576,7 +6180,10 @@ export async function runAgentMission({
             options: modelOptions,
             abortSignal,
             onThinkingUnsupported: disableThinkingForRun,
+            deferVisibleOutput: requiresPreEmissionVerification,
           });
+          lastFinalOutput =
+            streamedResponse?.message.content ?? response.message.content ?? "";
         } catch (error) {
           if (stopIfRequested(step)) {
             return;
@@ -2642,11 +6249,70 @@ export async function runAgentMission({
             metricName: "direct_answer_english_repair",
           });
         }
+        if (!requiresPreEmissionVerification) {
+          emitDirectAssistantAnswer(
+            directContent,
+            events,
+            runPlan.requiresEnglishGuard,
+          );
+        }
+        lastFinalOutput = directContent;
+      }
+      if (requiresPreEmissionVerification) {
+        const candidateAcceptance = evaluateCurrentAcceptance(lastFinalOutput);
+        await recordMissionAcceptance(candidateAcceptance, step);
+        if (candidateAcceptance.status !== "pass") {
+          const rejectedCandidate = lastFinalOutput;
+          lastFinalOutput = "";
+          if (
+            step < stepLimit &&
+            !finalOutputCorrectionUsed &&
+            candidateAcceptance.missing.length > 0 &&
+            candidateAcceptance.missing.every(isRepairableFinalOutputProof)
+          ) {
+            finalOutputCorrectionUsed = true;
+            events.onStatus?.(
+              `Draft held for verification: ${candidateAcceptance.missing.join(", ")}.`,
+            );
+            messages.push({
+              role: "system" as const,
+              content: buildFinalOutputVerificationCorrectionPrompt(
+                candidateAcceptance,
+                rejectedCandidate,
+                activeIntentPrompt,
+              ),
+            });
+            continue;
+          }
+
+          const message =
+            `Final output was not shown because verification is incomplete: ${
+              candidateAcceptance.missing.join(", ") || "unknown proof"
+            }. The run remains resumable.`;
+          events.onStatus?.(message);
+          emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+          recordLedgerBlocker(message);
+          await finishRun(
+            "budget",
+            lastStep,
+            stepLimit,
+            candidateAcceptance.nextAction ?? message,
+          );
+          return;
+        }
+
         emitDirectAssistantAnswer(
-          directContent,
+          lastFinalOutput,
           events,
           runPlan.requiresEnglishGuard,
         );
+      }
+      if (
+        missionIntent.explicitMutation &&
+        isBroadUnscopedVaultMutation(missionIntent.autonomyScope) &&
+        lastFinalOutput.trim()
+      ) {
+        recordLedgerBlocker(lastFinalOutput.trim());
       }
       await checkpointRunIfDue({
         toolContext: runToolContext,
@@ -2668,9 +6334,20 @@ export async function runAgentMission({
     }
 
     let shouldReplanAfterUnavailableTool = false;
+    let shouldReplanAfterProofGatedWriteTool = false;
 
-    for (let toolIndex = 0; toolIndex < responseToolCalls.length; toolIndex += 1) {
+    for (let toolIndex = 0; toolIndex < responseToolCalls.length;) {
       if (stopIfRequested(step)) {
+        return;
+      }
+      if (toolCallBudgetExhausted || observedToolCallCount >= maxToolCalls) {
+        toolCallBudgetExhausted = true;
+        await finishRun(
+          "budget",
+          lastStep,
+          stepLimit,
+          "Per-segment tool-call budget exhausted; continue from the saved ledger.",
+        );
         return;
       }
 
@@ -2707,7 +6384,7 @@ export async function runAgentMission({
         messages.push({
           role: "tool" as const,
           toolName: toolCall.name,
-          content: serializeToolResult({
+          content: serializeToolResultForModel({
             ok: false,
             toolName: toolCall.name,
             error: {
@@ -2719,7 +6396,200 @@ export async function runAgentMission({
         if (isWriteToolName(toolCall.name)) {
           shouldReplanAfterUnavailableTool = true;
         }
+        toolIndex += 1;
         continue;
+      }
+
+      if (
+        isWriteToolName(toolCall.name) &&
+        !(
+          hasParallelVaultReadIntent(activeIntentPrompt) &&
+          toolCall.name === "append_to_current_file" &&
+          requiredWriteTools.includes("append_to_current_file") &&
+          currentSegmentSuccessfulToolNames.filter((name) =>
+            READ_ONLY_TOOL_NAMES.has(name),
+          ).length >= 2
+        ) &&
+        !isToolAllowedForActiveMissionTask(missionPlan, toolCall.name) &&
+        !isPendingRequiredWriteReady(
+          toolCall.name,
+          getPendingRequiredWriteToolNames(
+            operationGoals,
+            requiredWriteTools,
+          ),
+        )
+      ) {
+        const activeTask = getActiveMissionPlanTask(missionPlan);
+        const nextAction = getNextMissionPlanAction(missionPlan)?.summary;
+        const message = activeTask
+          ? `Deferred ${toolCall.name}: active task ${activeTask.id} must complete first.`
+          : `Deferred ${toolCall.name}: the mission plan has no ready task for this mutation.`;
+        events.onStatus?.(message);
+        events.onTrace?.({
+          id: `${toolEventBase.id}:plan-dependency-rejected`,
+          kind: "tool_rejected",
+          step,
+          toolName: toolCall.name,
+          message,
+          inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
+          outputPreview: {
+            activeTaskId: activeTask?.id,
+            allowedTools: activeTask?.allowedTools ?? [],
+            nextAction,
+          },
+          error: {
+            code: "plan_dependency_violation",
+            message,
+          },
+        });
+        events.onToolDone?.({
+          ...toolEventBase,
+          ok: false,
+          message,
+          error: {
+            code: "plan_dependency_violation",
+            message,
+          },
+        });
+        messages.push({
+          role: "tool" as const,
+          toolName: toolCall.name,
+          content: serializeToolResultForModel({
+            ok: false,
+            toolName: toolCall.name,
+            error: {
+              code: "plan_dependency_violation",
+              message: [
+                message,
+                nextAction ? `Next: ${nextAction}` : "",
+              ].filter(Boolean).join(" "),
+            },
+          }),
+        });
+        messages.push({
+          role: "system" as const,
+          content: [
+            "Follow the persisted mission-plan dependency order.",
+            nextAction ? `Next: ${nextAction}` : "Complete the current ready task first.",
+            `Do not request ${toolCall.name} again until it is allowed by the active task.`,
+          ].join(" "),
+        });
+        shouldReplanAfterUnavailableTool = true;
+        toolIndex += 1;
+        continue;
+      }
+
+      if (
+        streamingWritebackKind !== null &&
+        toolCall.name === getStreamingWritebackToolName(streamingWritebackKind) &&
+        requiresVerifiedFinalOutput(missionPlan, researchPlan)
+      ) {
+        const message =
+          `Held ${toolCall.name} before mutation because this sourced writeback requires final passage verification. Return the complete proposed note content as the final answer without a tool call; the runner will verify and commit it exactly once.`;
+        events.onStatus?.(message);
+        events.onTrace?.({
+          id: `${toolEventBase.id}:proof-gated-writeback-rejected`,
+          kind: "tool_rejected",
+          step,
+          toolName: toolCall.name,
+          message,
+          inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
+          error: {
+            code: "proof_gated_writeback_required",
+            message,
+          },
+        });
+        events.onToolDone?.({
+          ...toolEventBase,
+          ok: false,
+          message,
+          error: {
+            code: "proof_gated_writeback_required",
+            message,
+          },
+        });
+        messages.push({
+          role: "tool" as const,
+          toolName: toolCall.name,
+          content: serializeToolResultForModel({
+            ok: false,
+            toolName: toolCall.name,
+            error: {
+              code: "proof_gated_writeback_required",
+              message,
+            },
+          }),
+        });
+        messages.push({
+          role: "system" as const,
+          content:
+            "Do not request a current-note write tool again. Return the complete sourced markdown as your final answer. The runner will hold it, verify passage ids and quotation spans, and perform the single authorized note mutation only after verification passes.",
+        });
+        shouldReplanAfterProofGatedWriteTool = true;
+        toolIndex += 1;
+        continue;
+      }
+
+      if (READ_ONLY_TOOL_NAMES.has(toolCall.name)) {
+        const batch: Array<{ call: ModelToolCall; index: number }> = [];
+        for (
+          let batchIndex = toolIndex;
+          batchIndex < responseToolCalls.length &&
+          batch.length < MAX_PARALLEL_TOOL_CALLS &&
+          batch.length < maxToolCalls - observedToolCallCount;
+          batchIndex += 1
+        ) {
+          const candidate = responseToolCalls[batchIndex];
+          if (
+            !allowedToolNames.has(candidate.name) ||
+            !READ_ONLY_TOOL_NAMES.has(candidate.name)
+          ) {
+            break;
+          }
+          batch.push({ call: candidate, index: batchIndex });
+        }
+
+        if (batch.length > 1) {
+          events.onStatus?.(
+            `Running ${batch.length} read-only tools in parallel...`,
+          );
+          try {
+            const results = await Promise.all(
+              batch.map(({ call, index }) =>
+                runObservedModelToolCall({
+                  origin: "model",
+                  toolCall: call,
+                  step,
+                  toolIndex: index,
+                  recordTranscript: false,
+                }),
+              ),
+            );
+            for (let resultIndex = 0; resultIndex < batch.length; resultIndex += 1) {
+              const item = batch[resultIndex];
+              appendToolTranscript({
+                messages,
+                toolCall: item.call,
+                resultContent: serializeToolResultForModel(results[resultIndex]),
+                origin: "model",
+                fallbackId: buildToolCallFallbackId(
+                  runId,
+                  step,
+                  item.index,
+                  item.call.name,
+                ),
+              });
+            }
+          } catch (error) {
+            if (stopIfRequested(step)) {
+              return;
+            }
+            await finishErroredRunFromException(error, step, stepLimit, "tool");
+            return;
+          }
+          toolIndex += batch.length;
+          continue;
+        }
       }
 
       try {
@@ -2733,12 +6603,23 @@ export async function runAgentMission({
         if (stopIfRequested(step)) {
           return;
         }
-        throw error;
+        await finishErroredRunFromException(error, step, stepLimit, "tool");
+        return;
       }
+      toolIndex += 1;
     }
 
     if (stopIfRequested(step)) {
       return;
+    }
+
+    if (
+      shouldReplanAfterProofGatedWriteTool &&
+      !proofGatedWriteToolCorrectionUsed &&
+      step < stepLimit
+    ) {
+      proofGatedWriteToolCorrectionUsed = true;
+      continue;
     }
 
     if (
@@ -2778,14 +6659,24 @@ export async function runAgentMission({
       allowedToolNames,
       executedWebSearchTool,
       executedWebFetchTool,
+      researchPlan,
+      missionEvidence: missionEvidenceRecords,
     });
     const pendingStreamingWriteback =
       hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
-    const writeMissionComplete =
+    const operationWriteComplete =
       completedAnyWrite &&
       pendingRequiredWriteToolsAfterToolUse.length === 0 &&
       missingRequiredWebToolsAfterToolUse.length === 0 &&
       !pendingStreamingWriteback;
+    const requiresPostWriteAcceptance = researchPlan !== null;
+    const postToolAcceptance =
+      operationWriteComplete && requiresPostWriteAcceptance
+      ? evaluateCurrentAcceptance()
+      : null;
+    const writeMissionComplete =
+      operationWriteComplete &&
+      (!requiresPostWriteAcceptance || postToolAcceptance?.status === "pass");
     events.onTrace?.({
       id: `operation-goals:${step}`,
       kind: "status",
@@ -2799,6 +6690,10 @@ export async function runAgentMission({
         missingRequiredWebTools: missingRequiredWebToolsAfterToolUse,
         pendingStreamingWriteback,
         missionComplete,
+        operationWriteComplete,
+        requiresPostWriteAcceptance,
+        postToolAcceptanceStatus: postToolAcceptance?.status,
+        postToolAcceptanceMissing: postToolAcceptance?.missing,
         writeMissionComplete,
       },
     });
@@ -2820,7 +6715,7 @@ export async function runAgentMission({
       continue;
     }
 
-    if (writeMissionComplete) {
+    if (writeMissionComplete && !hasPendingOperationGoals(operationGoals)) {
       emitRunDiagnostics({
         events,
         toolContext: runToolContext,
@@ -2834,24 +6729,247 @@ export async function runAgentMission({
       return;
     }
 
+    if (writeMissionComplete && hasPendingOperationGoals(operationGoals)) {
+      events.onStatus?.(
+        "Write tools finished; remaining operation goals still pending...",
+      );
+      if (step < stepLimit) {
+        messages.push({
+          role: "system" as const,
+          content:
+            "A write completed, but other requested operation goals are still pending. Continue with the remaining goals before finishing.",
+        });
+        continue;
+      }
+    }
+
+    const requiredLoopToolsSatisfied = areLoopRequiredToolsSatisfied(
+      loopBudgetPlan.expectedTools,
+      successfulToolNames,
+    );
     const loopLedger: LoopLedger = {
       successfulTools: [...successfulToolNames],
       failedTools: [...failedToolNames],
       repeatedToolCalls: consecutiveNoProgressSteps,
-      requiredToolsSatisfied: areLoopRequiredToolsSatisfied(
-        loopBudgetPlan.expectedTools,
-        successfulToolNames,
-      ),
+      requiredToolsSatisfied: requiredLoopToolsSatisfied,
       finalizationReserved: loopBudgetPlan.finalizationReserve > 0,
       writeCompleted: writeMissionComplete,
+      wallClockExpired: missionLedger?.wallClockExpired === true,
+      planComplete: missionPlan
+        ? isMissionPlanComplete(missionPlan) &&
+          missionComplete &&
+          loopBudgetPlan.expectedTools.length > 0 &&
+          requiredLoopToolsSatisfied
+        : undefined,
+      planNeedsVerification:
+        getActiveMissionPlanTask(missionPlan)?.status === "needs_verification",
+      planHasBlocker:
+        missionPlan?.status === "blocked" ||
+        getActiveMissionPlanTask(missionPlan)?.status === "blocked",
+      shouldReplan: missionPlan ? missionPlan.progress.stalledCount >= 2 : false,
+      researchPhase: researchPhaseDescriptor?.phase,
+      researchWriteToolsBlocked:
+        researchPhaseDescriptor?.researchBearing === true &&
+        researchPhaseDescriptor.writeToolsAllowed !== true,
     };
-    const loopDecision = decideNextLoopAction(loopLedger, loopBudgetPlan);
+    const loopDecision = applyResearchPhaseToLoopDecision(
+      decideNextLoopAction(loopLedger, loopBudgetPlan),
+      researchPhaseDescriptor,
+    );
+    if (
+      loopDecision.action === "stop_budget" &&
+      loopDecision.reason === "required_tools_failed"
+    ) {
+      const unresolvedFailures = [
+        ...new Set(
+          failedToolNames.filter(
+            (toolName) => !successfulToolNames.includes(toolName),
+          ),
+        ),
+      ];
+      const message =
+        `Required tool execution failed without producing usable proof: ${
+          unresolvedFailures.join(", ") || "unknown tool"
+        }.`;
+      events.onStatus?.(message);
+      recordLedgerBlocker(message);
+      await finishRun("budget", lastStep, stepLimit, message);
+      return;
+    }
+    if (loopDecision.action === "verify_active_task" && step < stepLimit) {
+      const acceptanceAfterToolUse = evaluateCurrentAcceptance();
+      await recordMissionAcceptance(acceptanceAfterToolUse, step);
+      if (
+        shouldContinueForMissionAcceptance(
+          acceptanceAfterToolUse,
+          step,
+          stepLimit,
+        )
+      ) {
+        events.onStatus?.(
+          formatAcceptanceFailureCopy(acceptanceAfterToolUse.missing),
+        );
+        messages.push({
+          role: "system" as const,
+          content: formatMissionAcceptanceCorrection(
+            acceptanceAfterToolUse,
+            tools.map((tool) => tool.function.name),
+          ),
+        });
+        continue;
+      }
+
+      events.onStatus?.("Mission plan proof is ready; drafting final output...");
+      messages.push({
+        role: "system" as const,
+        content:
+          "The active mission-plan proof is ready for final synthesis. Do not request more tools unless one is strictly required by the latest acceptance check. Draft the final answer or complete the requested writeback from the gathered evidence.",
+      });
+      continue;
+    }
+    if (loopDecision.action === "reflect_and_replan" && missionPlan && step < stepLimit) {
+      const failedAction = recentActions.at(-1)?.name;
+      const boundedRecovery = decideRecoveryAction({
+        plan: missionPlan,
+        failure: {
+          source: missionPlan.activeTaskId ?? "mission",
+          message: `stalled:${failedAction ?? "model_step"}`,
+          retryable: true,
+          requiresReplan: true,
+        },
+        state: recoveryState,
+        now: runToolContext.now?.() ?? new Date(),
+      });
+      recoveryState = boundedRecovery.state;
+      events.onTrace?.({
+        id: `bounded-recovery-${step}`,
+        kind: "status",
+        step,
+        toolName: failedAction,
+        message: boundedRecovery.reason,
+        outputPreview: {
+          action: boundedRecovery.action,
+          signature: boundedRecovery.signature,
+          attemptsUsed: boundedRecovery.attemptsUsed,
+          attemptsRemaining: boundedRecovery.attemptsRemaining,
+        },
+      });
+      if (boundedRecovery.action === "block") {
+        if (boundedRecovery.planAdvance) {
+          applyMissionPlanAdvance(
+            boundedRecovery.planAdvance,
+            step,
+            boundedRecovery.reason,
+          );
+        }
+        recordLedgerBlocker(boundedRecovery.reason);
+        await persistMissionLedger(`mission-ledger-bounded-recovery-${step}`);
+        await finishRun(
+          "budget",
+          lastStep,
+          stepLimit,
+          boundedRecovery.reason,
+        );
+        return;
+      }
+      const recoveryDecision = planRecovery({
+        plan: missionPlan,
+        reason: "stalled",
+        failedAction,
+        allowedToolNames: [...allowedToolNames],
+        attemptedActions: recoveryAttemptSignatures,
+      });
+      for (const attempt of recoveryDecision.attempts) {
+        recoveryAttemptSignatures.push(`${attempt.nodeId ?? "run"}:${attempt.selectedAction.toolName ?? attempt.selectedAction.kind}`);
+        events.onTrace?.({
+          id: `${attempt.id}-${step}`,
+          kind: "status",
+          step,
+          toolName: attempt.selectedAction.toolName,
+          message: `Recovery planned: ${attempt.message}`,
+          outputPreview: attempt,
+        });
+      }
+      if (recoveryDecision.status === "block") {
+        missionPlan = applyRecoveryToPlan(missionPlan, recoveryDecision);
+        recordLedgerBlocker(recoveryDecision.blocker ?? "Recovery blocked.");
+        await persistMissionLedger(`mission-ledger-recovery-blocked-${step}`);
+        if (isRepeatedToolBudgetSpent()) {
+          await stopRepeatedToolBudget();
+          return;
+        }
+        const message = recoveryDecision.blocker ?? "Recovery blocked.";
+        emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+        await finishRun("error", lastStep, stepLimit, message);
+        return;
+      }
+      if (recoveryDecision.updatedAction) {
+        missionPlan = applyRecoveryToPlan(missionPlan, recoveryDecision);
+        if (missionLedger) {
+          setLedgerMissionPlan(
+            missionLedger,
+            missionPlan,
+            runToolContext.now?.() ?? new Date(),
+          );
+        }
+      }
+      events.onStatus?.(
+        "Mission plan appears stalled; asking model to choose a different next action...",
+      );
+      messages.push({
+        role: "system" as const,
+        content: [
+          "The current plan action appears stalled. Do not repeat the same tool call or model-only step.",
+          recoveryDecision.updatedAction
+            ? `Runner recovery selected: ${recoveryDecision.updatedAction.summary}`
+            : "",
+          formatMissionPlanNextActionPrompt(missionPlan),
+          "Choose a different available tool, summarize the blocker, or synthesize from gathered evidence if the proof contract is satisfied.",
+        ].filter(Boolean).join("\n\n"),
+      });
+      consecutiveNoProgressSteps = 0;
+      continue;
+    }
+    if (loopDecision.action === "stop_resumable_blocker") {
+      const message =
+        missionPlan?.nextAction?.summary ??
+        "Mission plan is blocked and can be resumed from the saved ledger.";
+      emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+      recordLedgerBlocker(message);
+      await finishRun("budget", lastStep, stepLimit, message);
+      return;
+    }
+    if (
+      loopDecision.action === "stop_budget" &&
+      loopDecision.reason === "wall_clock_budget"
+    ) {
+      const message =
+        "Wall-clock run budget expired. The ledger was saved and this run can be continued.";
+      emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+      await finishRun("budget", lastStep, stepLimit, message);
+      return;
+    }
+    if (loopDecision.action === "stop_verified_complete" && step < stepLimit) {
+      events.onStatus?.("Mission plan complete; asking model for final synthesis...");
+      tools = [];
+      allowedToolNames = new Set();
+      messages.push({
+        role: "system" as const,
+        content:
+          "The mission plan is complete. Do not request more tools. Provide the final answer now using the gathered evidence and receipts.",
+      });
+      continue;
+    }
     if (
       loopDecision.action === "force_final_no_tools" &&
       pendingRequiredWriteToolsAfterToolUse.length === 0 &&
       (!completedAnyWrite || !missionComplete) &&
       step < stepLimit
     ) {
+      if (isRepeatedToolBudgetSpent()) {
+        await stopRepeatedToolBudget();
+        return;
+      }
       const preserveToolsForStreamingWriteback =
         pendingStreamingWriteback && streamingWritebackKind !== null;
       events.onStatus?.(
@@ -2910,8 +7028,6 @@ export type FinalEmissionMode =
   | "streaming_writeback"
   | "none";
 
-type StreamingWritebackKind = "append" | "replace" | "edit";
-
 const LIVE_FLUSH_CHAR_THRESHOLD = 120;
 const LIVE_FLUSH_MS = 150;
 const LIVE_FLUSH_TIMER_MS = 75;
@@ -2921,6 +7037,8 @@ type OperationGoal =
   | "web_search"
   | "web_fetch"
   | "current_note_title"
+  | "current_note_highlight"
+  | "current_note_restore"
   | "current_note_content"
   | "current_note_replace"
   | "current_section_edit"
@@ -3031,11 +7149,12 @@ async function runObservedTool({
   });
 
   if (!result.ok) {
-    events.onStatus?.(`Tool returned error: ${name}`);
+    const failureStatus = formatObservedToolFailureStatus(name, result);
+    events.onStatus?.(failureStatus);
     events.onToolDone?.({
       ...toolEventBase,
       ok: false,
-      message: `Tool returned error: ${name}`,
+      message: failureStatus,
       error: result.error,
     });
     events.onTrace?.({
@@ -3043,11 +7162,11 @@ async function runObservedTool({
       kind: "tool_result",
       step,
       toolName: name,
-      message: `Tool returned error: ${name}`,
+      message: failureStatus,
       error: result.error,
       outputPreview: truncateTracePayload(result),
     });
-    throw new Error(result.error?.message ?? `Tool returned error: ${name}`);
+    throw new Error(result.error?.message ?? failureStatus);
   }
 
   const successMessage = emitToolSuccessStatus(name, result.output, events);
@@ -3259,7 +7378,7 @@ async function buildCheckpointResumeContext({
   activeIntentPrompt: string;
   toolContext: ToolExecutionContext;
   events: AgentRunEvents;
-}): Promise<string | null> {
+}): Promise<CheckpointResumeState | null> {
   if (
     !hasCheckpointResumeIntent(prompt) &&
     !hasCheckpointResumeIntent(activeIntentPrompt)
@@ -3274,21 +7393,86 @@ async function buildCheckpointResumeContext({
       toolContext,
     });
     if (missionResume) {
+      const storedRuntime = await readMissionRuntimeSnapshotByRunId(
+        toolContext,
+        missionResume.ledger.runId,
+      );
+      const continuationBundle = buildContinuationMemoryBundle({
+        ledger: missionResume.ledger,
+        ledgerPath: missionResume.path,
+        now: toolContext.now?.() ?? new Date(),
+      });
+      const hypothesisHint =
+        toolContext.settings.researchMemoryEnabled === true
+          ? buildHypothesisSystemHintFromIndex(
+              toolContext.getResearchMemoryIndex?.() ?? [],
+              missionResume.ledger.mission,
+            )
+          : null;
+      const resumeItemSummary = getResumeItemSummary(missionResume.promptContext);
       events.onStatus?.(`Loaded mission ledger ${missionResume.path} for resume context...`);
+      if (resumeItemSummary) {
+        events.onStatus?.(resumeItemSummary);
+      }
+      events.onTrace?.(recordContinuationLoad(continuationBundle));
       events.onTrace?.({
         id: "mission-ledger-resume",
         kind: "status",
         path: missionResume.path,
-        message: `Loaded mission ledger ${missionResume.path} for resume context.`,
+        message: resumeItemSummary
+          ? `Loaded mission ledger ${missionResume.path} for resume context. ${resumeItemSummary}`
+          : `Loaded mission ledger ${missionResume.path} for resume context.`,
         outputPreview: {
           runId: missionResume.ledger.runId,
           status: missionResume.ledger.status,
           evidenceCount: missionResume.ledger.evidence.length,
           nextActions: missionResume.ledger.nextActions,
           plan: missionResume.plan,
+          proofDebt: missionResume.plan.proofDebt,
         },
       });
-      return missionResume.promptContext;
+      return {
+        promptContext: [
+          missionResume.promptContext,
+          formatContinuationBundleForPrompt(continuationBundle, {
+            ledger: missionResume.ledger,
+            includeProofDebt: true,
+          }),
+          hypothesisHint,
+          storedRuntime
+            ? `Runtime snapshot v${storedRuntime.snapshot.version} revision ${storedRuntime.snapshot.revision} loaded from ${storedRuntime.path}.`
+            : "No runtime snapshot was available; resuming from the mission ledger.",
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join("\n\n"),
+        missionResume,
+        runtimeSnapshot: storedRuntime?.snapshot,
+      };
+    }
+
+    const requestedRunId =
+      extractRequestedRunId(prompt) ?? extractRequestedRunId(activeIntentPrompt);
+    if (requestedRunId) {
+      const checkpoint = await readAgentRunCheckpointByRunId(
+        toolContext,
+        requestedRunId,
+      );
+      if (checkpoint) {
+        events.onStatus?.(
+          `Loaded exact checkpoint ${checkpoint.path} for resume context...`,
+        );
+        return { promptContext: formatCheckpointResumeContext(checkpoint) };
+      }
+      events.onTrace?.({
+        id: "checkpoint-resume:requested-missing",
+        kind: "error",
+        message: `Requested run ${requestedRunId} has no exact durable checkpoint.`,
+        error: {
+          code: "requested_run_checkpoint_missing",
+          message: `Requested run ${requestedRunId} has no exact durable checkpoint.`,
+        },
+      });
+      return { promptContext: "", missingRequestedRunId: requestedRunId };
     }
 
     const checkpoint = await readLatestAgentRunCheckpoint(toolContext);
@@ -3302,8 +7486,10 @@ async function buildCheckpointResumeContext({
     }
 
     events.onStatus?.(`Loaded checkpoint ${checkpoint.path} for resume context...`);
-    return formatCheckpointResumeContext(checkpoint);
+    return { promptContext: formatCheckpointResumeContext(checkpoint) };
   } catch (error) {
+    const requestedRunId =
+      extractRequestedRunId(prompt) ?? extractRequestedRunId(activeIntentPrompt);
     events.onTrace?.({
       id: "checkpoint-resume:error",
       kind: "error",
@@ -3313,8 +7499,19 @@ async function buildCheckpointResumeContext({
         message: getUnknownErrorMessage(error),
       },
     });
-    return null;
+    return requestedRunId
+      ? { promptContext: "", missingRequestedRunId: requestedRunId }
+      : null;
   }
+}
+
+function getResumeItemSummary(promptContext: string): string | null {
+  return (
+    promptContext
+      .split(/\r?\n/u)
+      .find((line) => line.startsWith("Resume first incomplete research item:")) ??
+    null
+  );
 }
 
 function formatCheckpointResumeContext(
@@ -3378,6 +7575,7 @@ function buildRunConfigEvent({
   activeThink,
   modelOptions,
   writeAutonomy,
+  chatOnlyOverride,
   missionIntent,
   currentNoteContext,
   runPlan,
@@ -3385,6 +7583,10 @@ function buildRunConfigEvent({
   directCurrentNoteWritebackKind,
   missionLedger,
   reflexOutput,
+  estimatedPromptChars,
+  contextBudgetChars,
+  performanceGates,
+  noteOutputPlan,
 }: {
   runId: string;
   toolContext: ToolExecutionContext;
@@ -3392,13 +7594,18 @@ function buildRunConfigEvent({
   activeThink: ModelThink | undefined;
   modelOptions: ModelRequestOptions | undefined;
   writeAutonomy: boolean;
+  chatOnlyOverride: boolean;
   missionIntent: MissionIntent;
   currentNoteContext: boolean;
-  runPlan: RunPlan;
+  runPlan: RunPlanDecision;
   streamingWritebackKind: StreamingWritebackKind | null;
   directCurrentNoteWritebackKind: StreamingWritebackKind | null;
   missionLedger?: MissionLedgerSummary;
   reflexOutput?: AgenticReflexOutput;
+  estimatedPromptChars?: number;
+  contextBudgetChars?: number;
+  performanceGates?: PerformanceGateResult[];
+  noteOutputPlan?: NoteOutputPlan;
 }): AgentRunConfigEvent {
   const settings = toolContext.settings;
   const vaultContext =
@@ -3425,15 +7632,22 @@ function buildRunConfigEvent({
       streamingWritebackKind,
       directCurrentNoteWritebackKind,
     }),
+    chatOnlyOverride,
+    ...(noteOutputPlan ? { noteOutputPlan } : {}),
     route: runPlan.route,
     expectedTimeClass: runPlan.expectedTimeClass,
     maxStepsForRun: runPlan.maxStepsForRun,
     slowPathReason: runPlan.slowPathReason,
+    allowedToolNames: runPlan.allowedToolNames,
+    routeTraceReasons: runPlan.traceReasons,
+    budgetProfile: runPlan.budgetProfile,
     englishGuard: runPlan.requiresEnglishGuard,
     temperature: modelOptions?.temperature,
     topK: modelOptions?.top_k,
     topP: modelOptions?.top_p,
     numCtx: modelOptions?.num_ctx,
+    estimatedPromptChars,
+    contextBudgetChars,
     writeAutonomy,
     missionMode,
     contextScope: getRunContextScope({
@@ -3444,6 +7658,12 @@ function buildRunConfigEvent({
     vaultContext,
     maxSteps: getConfiguredMaxAgentSteps(settings),
     autonomyScope: missionIntent.autonomyScope,
+    dependencyStatus: buildDependencyStatus({
+      toolContext,
+      runPlan,
+      missionIntent,
+    }),
+    performanceGates,
     ...(missionLedger ? { missionLedger } : {}),
     ...(settings?.agenticReflexDiagnosticsEnabled !== false && reflexOutput
       ? {
@@ -3457,6 +7677,272 @@ function buildRunConfigEvent({
         }
       : {}),
   };
+}
+
+function buildDependencyStatus({
+  toolContext,
+  runPlan,
+  missionIntent,
+}: {
+  toolContext: ToolExecutionContext;
+  runPlan: RunPlanDecision;
+  missionIntent: MissionIntent;
+}): MissionDependencyStatus[] {
+  const settings = toolContext.settings;
+  const allowedTools = new Set(runPlan.allowedToolNames);
+  const checkedAt = toolContext.now?.().toISOString();
+  const webNeeded = allowedTools.has("web_search") || allowedTools.has("web_fetch");
+  const semanticNeeded =
+    allowedTools.has("semantic_search_notes") ||
+    allowedTools.has("inspect_semantic_index") ||
+    missionIntent.vaultContext;
+  const browserNeeded = [...allowedTools].some((name) => name.startsWith("browser_"));
+  const provider = settings?.modelProvider ?? "ollama";
+  const baseUrl = getProviderBaseUrl(settings);
+  const providerMissingKey =
+    provider === "openai_compatible"
+      ? !settings?.openAiCompatibleApiKey?.trim()
+      : isOllamaCloudApiBaseUrl(baseUrl) && !settings?.ollamaApiKey?.trim();
+  const hasVaultApi = hasObsidianVaultApi(toolContext);
+  const timeoutMs = settings?.requestTimeoutMs;
+
+  return [
+    {
+      category: "provider_auth",
+      status: providerMissingKey ? "blocked" : "ok",
+      capability: "model requests",
+      summary: providerMissingKey
+        ? formatFailureCopy(
+            providerAuthFailureCopy(
+              `${provider} model auth is missing required API credentials.`,
+            ),
+          )
+        : `${provider} model auth is configured for this run.`,
+      nextAction: providerMissingKey
+        ? "Add the provider API key in plugin settings before retrying."
+        : "No user action needed.",
+      checkedAt,
+    },
+    {
+      category: "model_timeout",
+      status:
+        timeoutMs === undefined
+          ? "ok"
+          : timeoutMs <= 0
+            ? "blocked"
+            : timeoutMs < 60_000
+              ? "degraded"
+              : "ok",
+      capability: "long model calls",
+      summary:
+        timeoutMs === undefined
+          ? "Model request timeout is using the provider default."
+          : timeoutMs <= 0
+          ? formatFailureCopy(
+              modelTimeoutFailureCopy(
+                "A non-positive timeout blocks long model calls before the loop starts.",
+              ),
+            )
+          : `Model request timeout is ${timeoutMs}ms.`,
+      nextAction:
+        timeoutMs === undefined
+          ? "No user action needed."
+          : timeoutMs <= 0
+          ? "Set a positive request timeout in plugin settings."
+          : timeoutMs < 60_000
+            ? "Use at least 60000ms for long research or writeback runs."
+            : "No user action needed.",
+      checkedAt,
+    },
+    {
+      category: "web_fetch",
+      status:
+        webNeeded && toolContext.app && typeof toolContext.httpTransport !== "function"
+          ? "blocked"
+          : webNeeded && typeof toolContext.httpTransport !== "function"
+            ? "unknown"
+          : "ok",
+      capability: "web search and fetch",
+      summary: webNeeded
+        ? typeof toolContext.httpTransport === "function"
+          ? "Web tools are available for this mission."
+          : "Web transport availability is unknown in this runtime."
+        : "Web tools are not requested for this mission.",
+      nextAction:
+        webNeeded && toolContext.app && typeof toolContext.httpTransport !== "function"
+          ? "Retry with the plugin web transport available."
+          : "No user action needed.",
+      checkedAt,
+    },
+    {
+      category: "semantic_retrieval",
+      status:
+        settings?.semanticSearchEnabled === false && semanticNeeded
+          ? "blocked"
+          : !toolContext.semanticEmbeddingProvider && !toolContext.semanticIndexService
+            ? "degraded"
+            : settings?.semanticIndexEnabled === false || !toolContext.semanticIndexService
+              ? "degraded"
+              : "ok",
+      capability: "semantic vault retrieval",
+      summary:
+        settings?.semanticSearchEnabled === false
+          ? "Semantic search is disabled; exact vault tools remain available."
+          : !toolContext.semanticEmbeddingProvider && !toolContext.semanticIndexService
+            ? "Semantic embeddings and persisted index are unavailable; lexical fallback may be used."
+            : settings?.semanticIndexEnabled === false || !toolContext.semanticIndexService
+              ? "Persisted semantic index is unavailable; live retrieval or fallback may be used."
+              : "Semantic vault retrieval has an embedding provider or fresh index path.",
+      nextAction:
+        settings?.semanticSearchEnabled === false && semanticNeeded
+          ? "Enable semantic search in settings or ask for exact path/text retrieval."
+          : !toolContext.semanticEmbeddingProvider && !toolContext.semanticIndexService
+            ? "Install/enable the embedding provider or rebuild the semantic index for stronger vault synthesis."
+            : settings?.semanticIndexEnabled === false || !toolContext.semanticIndexService
+              ? "Rebuild or enable the semantic index when large-vault coverage matters."
+              : "No user action needed.",
+      checkedAt,
+    },
+    {
+      category: "companion_browser",
+      status:
+        browserNeeded && settings?.browserToolsEnabled !== true
+          ? "blocked"
+          : browserNeeded
+            ? "unknown"
+            : "ok",
+      capability: "companion browser automation",
+      summary: browserNeeded
+        ? settings?.browserToolsEnabled === true
+          ? "Browser tools are enabled; companion health is checked when browser tools run."
+          : "Browser tools are disabled in settings."
+        : "Browser tools are not requested for this mission.",
+      nextAction:
+        browserNeeded && settings?.browserToolsEnabled !== true
+          ? "Enable browser tools and start the companion service, or choose a non-browser alternative."
+          : browserNeeded
+            ? "Start the companion service if a browser tool reports unavailable."
+            : "No user action needed.",
+      checkedAt,
+    },
+    {
+      category: "obsidian_vault",
+      status: hasVaultApi ? "ok" : toolContext.app ? "blocked" : "unknown",
+      capability: "Obsidian vault API",
+      summary: hasVaultApi
+        ? "Obsidian vault APIs are available."
+        : toolContext.app
+          ? "Obsidian vault APIs are unavailable."
+          : "Obsidian vault API availability is unknown in this runtime.",
+      nextAction: hasVaultApi
+        ? "No user action needed."
+        : toolContext.app
+          ? "Run inside Obsidian with an active vault before retrying."
+          : "No user action needed.",
+      checkedAt,
+    },
+  ];
+}
+
+function normalizeInvocationToolCallLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
+function getFatalDependencyRowsForPreflight({
+  rows,
+  missionIntent,
+  runPlan,
+  shouldReadCurrentNote,
+  streamingWritebackKind,
+  directCurrentNoteWritebackKind,
+}: {
+  rows: MissionDependencyStatus[];
+  missionIntent: MissionIntent;
+  runPlan: RunPlanDecision;
+  shouldReadCurrentNote: boolean;
+  streamingWritebackKind: StreamingWritebackKind | null;
+  directCurrentNoteWritebackKind: StreamingWritebackKind | null;
+}): MissionDependencyStatus[] {
+  const needsVault =
+    shouldReadCurrentNote ||
+    missionIntent.vaultContext ||
+    missionIntent.explicitMutation ||
+    missionIntent.requireWriteCompletion ||
+    streamingWritebackKind !== null ||
+    directCurrentNoteWritebackKind !== null ||
+    runPlan.slowPathReason === "needs_current_note" ||
+    runPlan.slowPathReason === "needs_vault_context" ||
+    runPlan.slowPathReason === "needs_graph_context" ||
+    runPlan.allowedToolNames.some((name) =>
+      /current_file|read_file|markdown|vault|semantic|graph|append|replace|rename|highlight|delete|trash|restore|template|design|memory/.test(name),
+    );
+  return rows.filter((row) => {
+    if (row.status !== "blocked") {
+      return true;
+    }
+    if (row.category === "obsidian_vault") {
+      return needsVault;
+    }
+    if (row.category === "web_fetch") {
+      return runPlan.allowedToolNames.includes("web_search") ||
+        runPlan.allowedToolNames.includes("web_fetch");
+    }
+    if (row.category === "semantic_retrieval") {
+      return missionIntent.vaultContext ||
+        runPlan.allowedToolNames.includes("semantic_search_notes") ||
+        runPlan.allowedToolNames.includes("inspect_semantic_index");
+    }
+    if (row.category === "companion_browser") {
+      return runPlan.allowedToolNames.some((name) => name.startsWith("browser_"));
+    }
+    return true;
+  });
+}
+
+function classifyBlockerCategory(blocker: string): MissionBlockerCategory {
+  const text = blocker.toLowerCase();
+  if (/\b(auth|api key|credential|401|403)\b/.test(text)) {
+    return "provider_auth";
+  }
+  if (/\b(timeout|timed out|aborted)\b/.test(text)) {
+    return "model_timeout";
+  }
+  if (/\b(web|fetch|source|url|http)\b/.test(text)) {
+    return "web_fetch";
+  }
+  if (/\bsemantic|embedding|index|retrieval\b/.test(text)) {
+    return "semantic_retrieval";
+  }
+  if (/\bbrowser|companion\b/.test(text)) {
+    return "companion_browser";
+  }
+  if (/\bvault|obsidian|file|folder|note\b/.test(text)) {
+    return "obsidian_vault";
+  }
+  if (/\bsafety|approval|blocked|destructive|credential|payment|upload|download\b/.test(text)) {
+    return "safety_policy";
+  }
+  if (/\bunavailable tool|unknown tool|tool unavailable|was not available|is not available|not available for\b/.test(text)) {
+    return "tool_unavailable";
+  }
+  return "unknown";
+}
+
+function hasObsidianVaultApi(toolContext: ToolExecutionContext): boolean {
+  const vault = toolContext.app?.vault;
+  return Boolean(
+    vault &&
+      typeof vault.read === "function" &&
+      typeof vault.modify === "function" &&
+      typeof vault.getFileByPath === "function",
+  );
+}
+
+function isOllamaCloudApiBaseUrl(baseUrl: string): boolean {
+  return /(^|\.)ollama\.com\b/i.test(baseUrl);
 }
 
 function getProviderBaseUrl(settings: ToolExecutionContext["settings"]): string {
@@ -3718,7 +8204,7 @@ function extractInlineJsonObjectSnippets(content: string): string[] {
     }
 
     const snippet = content.slice(start, end + 1);
-    if (/"name"\s*:/.test(snippet)) {
+    if (/"(?:name|tool|tool_name)"\s*:/.test(snippet)) {
       snippets.push(snippet);
     }
     searchStart = end + 1;
@@ -3818,7 +8304,7 @@ function parseToolCallRecord(
   knownToolNames: Set<string>,
   index: number,
 ): ModelToolCall | null {
-  const name = getString(value.name);
+  const name = getRecoveredToolName(value);
   if (!name || !knownToolNames.has(name)) {
     return null;
   }
@@ -3841,8 +8327,7 @@ function parseRecoveredToolArguments(
     value.arguments ??
     value.args ??
     value.parameters ??
-    value.input ??
-    {};
+    value.input;
 
   if (isRecord(args)) {
     return args;
@@ -3855,7 +8340,48 @@ function parseRecoveredToolArguments(
     }
   }
 
-  return {};
+  return extractTopLevelRecoveredToolArguments(value);
+}
+
+function getRecoveredToolName(value: Record<string, unknown>): string | undefined {
+  const direct =
+    getString(value.name) ??
+    getString(value.tool) ??
+    getString(value.tool_name);
+  if (direct) {
+    return direct;
+  }
+
+  if (isRecord(value.function)) {
+    return getString(value.function.name);
+  }
+
+  return undefined;
+}
+
+function extractTopLevelRecoveredToolArguments(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  const reservedKeys = new Set([
+    "name",
+    "tool",
+    "tool_name",
+    "arguments",
+    "args",
+    "parameters",
+    "input",
+    "function",
+    "id",
+    "index",
+    "type",
+  ]);
+  const args: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!reservedKeys.has(key)) {
+      args[key] = item;
+    }
+  }
+  return args;
 }
 
 function normalizeRecoveredToolArguments(
@@ -3970,40 +8496,6 @@ function formatBaseUrlCategory(baseUrl: string): string {
   } catch {
     return "invalid";
   }
-}
-
-export function resolveThinkingMode(
-  settings: ToolExecutionContext["settings"] | undefined,
-): ModelThink | undefined {
-  const mode = settings?.thinkingMode ?? "auto";
-
-  if (mode === "off") {
-    return undefined;
-  }
-
-  if (mode !== "auto") {
-    return mode;
-  }
-
-  const model = settings?.model?.trim().toLowerCase() ?? "";
-
-  if (!model) {
-    return undefined;
-  }
-
-  if (model.startsWith("gpt-oss")) {
-    return "medium";
-  }
-
-  if (
-    model.startsWith("qwen3") ||
-    model.startsWith("deepseek-r1") ||
-    model.startsWith("deepseek-v3.1")
-  ) {
-    return true;
-  }
-
-  return undefined;
 }
 
 function emitModelCallTrace(
@@ -4122,10 +8614,25 @@ async function chatForAgentStep(
   });
 
   try {
-    const response = await withModelWaitStatus(
-      () => modelClient.chat(request),
-      events,
-      "model API response",
+    const response = await withModelRetry(
+      () =>
+        withModelWaitStatus(
+          () => modelClient.chat(request),
+          events,
+          "model API response",
+        ),
+      {
+        policy: request.think !== undefined ? { maxAttempts: 2 } : undefined,
+        abortSignal: request.abortSignal,
+        onRetry: (attempt, error, delayMs) => {
+          events.onStatus?.(
+            "Transient model provider error; retrying model step...",
+          );
+          events.onStatus?.(
+            `Transient model provider error; retrying model step ${step} (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
+          );
+        },
+      },
     );
     emitMetricEvent(events, {
       kind: "model_chat",
@@ -4142,10 +8649,21 @@ async function chatForAgentStep(
     if (request.think !== undefined && isThinkingUnsupportedError(error)) {
       onThinkingUnsupported();
       const retryRequest = { ...request, think: undefined };
-      const retryResponse = await withModelWaitStatus(
-        () => modelClient.chat(retryRequest),
-        events,
-        "model API retry",
+      const retryResponse = await withModelRetry(
+        () =>
+          withModelWaitStatus(
+            () => modelClient.chat(retryRequest),
+            events,
+            "model API retry",
+          ),
+        {
+          abortSignal: retryRequest.abortSignal,
+          onRetry: (attempt, retryError, delayMs) => {
+            events.onStatus?.(
+              `Transient model provider error; retrying model step ${step} without thinking (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(retryError)}`,
+            );
+          },
+        },
       );
       emitMetricEvent(events, {
         kind: "model_chat",
@@ -4160,6 +8678,46 @@ async function chatForAgentStep(
       });
       emitThinking(retryResponse.message.thinking, events);
       return retryResponse;
+    }
+
+    if (request.think !== undefined && isTransientModelError(error)) {
+      events.onStatus?.(
+        "Transient model provider error persisted; retrying without thinking mode...",
+      );
+      onThinkingUnsupported();
+      const noThinkRequest = { ...request, think: undefined };
+      const noThinkResponse = await withModelRetry(
+        () =>
+          withModelWaitStatus(
+            () => modelClient.chat(noThinkRequest),
+            events,
+            "model API retry without thinking",
+          ),
+        {
+          abortSignal: noThinkRequest.abortSignal,
+          onRetry: (attempt, retryError, delayMs) => {
+            events.onStatus?.(
+              "Transient model provider error; retrying model step...",
+            );
+            events.onStatus?.(
+              `Transient model provider error; retrying model step ${step} without thinking (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(retryError)}`,
+            );
+          },
+        },
+      );
+      emitMetricEvent(events, {
+        kind: "model_chat",
+        name: "agent_step",
+        step,
+        durationMs: elapsedMs(startedAt),
+        requestChars: measureSerializedChars(noThinkRequest),
+        responseChars: measureSerializedChars(
+          noThinkResponse.raw ?? noThinkResponse.message,
+        ),
+        ...extractTokenUsageFields(noThinkResponse.raw),
+      });
+      emitThinking(noThinkResponse.message.thinking, events);
+      return noThinkResponse;
     }
 
     emitMetricEvent(events, {
@@ -4233,6 +8791,7 @@ async function emitFinalAnswer({
   options,
   abortSignal,
   onThinkingUnsupported,
+  deferVisibleOutput = false,
 }: {
   modelClient: ModelClient;
   messages: ModelChatMessage[];
@@ -4246,15 +8805,20 @@ async function emitFinalAnswer({
   options?: ModelRequestOptions;
   abortSignal?: AbortSignal;
   onThinkingUnsupported: () => void;
+  deferVisibleOutput?: boolean;
 }): Promise<ModelChatResponse | null> {
   if (!enableStreaming) {
-    emitDirectAssistantAnswer(fallbackContent, events);
+    if (!deferVisibleOutput) {
+      emitDirectAssistantAnswer(fallbackContent, events);
+    }
     return null;
   }
 
   emitStatus(events, "Drafting final answer...", "final_answer");
-  events.onFinalStart?.();
-  events.onAssistantMessageStart?.();
+  if (!deferVisibleOutput) {
+    events.onFinalStart?.();
+    events.onAssistantMessageStart?.();
+  }
 
   let emittedContent = "";
   let observedContent = false;
@@ -4274,6 +8838,9 @@ async function emitFinalAnswer({
   const lifecycle = createStreamLifecycleTracker(events, startedAt);
   let response: ModelChatResponse;
   const emitVisibleFinalDelta = (content: string) => {
+    if (deferVisibleOutput) {
+      return;
+    }
     if (englishGuard) {
       assertEnglishOnlyVisibleOutput(content, events);
     }
@@ -4428,8 +8995,22 @@ async function emitFinalAnswer({
     );
   }
 
-  events.onFinalDone?.();
-  events.onAssistantMessageDone?.();
+  // The sanitizer and relevance gate define the candidate that was actually
+  // released (or held for proof verification). Always return and persist that
+  // exact candidate rather than the provider's raw message.
+  response = {
+    ...response,
+    message: {
+      role: "assistant",
+      content: emittedContent,
+    },
+    toolCalls: [],
+  };
+
+  if (!deferVisibleOutput) {
+    events.onFinalDone?.();
+    events.onAssistantMessageDone?.();
+  }
   messages.push(withoutThinking(response.message));
   return response;
 }
@@ -4470,6 +9051,7 @@ interface RelevanceProfile {
   minOutputChars: number;
   expectedEnglish: boolean;
   acceptsCodeOutput: boolean;
+  acceptsNumericOutput: boolean;
 }
 
 function createFinalAnswerRelevanceGate(
@@ -4585,6 +9167,7 @@ function buildRelevanceProfile(prompt: string): RelevanceProfile | null {
     minOutputChars: 360,
     expectedEnglish: isLikelyEnglishPrompt(prompt),
     acceptsCodeOutput: hasCodeAnswerIntent(prompt),
+    acceptsNumericOutput: hasWordCountIntent(prompt),
   };
 }
 
@@ -4593,6 +9176,9 @@ function isTopicallyRelevant(
   content: string,
 ): boolean {
   if (profile.acceptsCodeOutput && looksLikeCodeAnswer(content)) {
+    return true;
+  }
+  if (profile.acceptsNumericOutput && /\b\d[\d,]*(?:\.\d+)?\b/.test(content)) {
     return true;
   }
 
@@ -4784,10 +9370,21 @@ async function streamChatWithThinkingFallback({
   onThinkingUnsupported: () => void;
 }): Promise<ModelChatResponse> {
   try {
-    return await withModelWaitStatus(
-      () => modelClient.streamChat(request, streamEvents),
-      events,
-      "streaming model response",
+    return await withModelRetry(
+      () =>
+        withModelWaitStatus(
+          () => modelClient.streamChat(request, streamEvents),
+          events,
+          "streaming model response",
+        ),
+      {
+        abortSignal: request.abortSignal,
+        onRetry: (attempt, error, delayMs) => {
+          events.onStatus?.(
+            `Transient streaming model error; retrying stream (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(error)}`,
+          );
+        },
+      },
     );
   } catch (error) {
     if (request.think === undefined || !isThinkingUnsupportedError(error)) {
@@ -4795,10 +9392,22 @@ async function streamChatWithThinkingFallback({
     }
 
     onThinkingUnsupported();
-    return withModelWaitStatus(
-      () => modelClient.streamChat({ ...request, think: undefined }, streamEvents),
-      events,
-      "streaming model retry",
+    const retryRequest = { ...request, think: undefined };
+    return withModelRetry(
+      () =>
+        withModelWaitStatus(
+          () => modelClient.streamChat(retryRequest, streamEvents),
+          events,
+          "streaming model retry",
+        ),
+      {
+        abortSignal: retryRequest.abortSignal,
+        onRetry: (attempt, retryError, delayMs) => {
+          events.onStatus?.(
+            `Transient streaming model error; retrying stream without thinking (attempt ${attempt}) after ${delayMs}ms: ${getUnknownErrorMessage(retryError)}`,
+          );
+        },
+      },
     );
   }
 }
@@ -4881,8 +9490,10 @@ const READ_NAV_TOOL_NAMES = new Set([
 const WRITE_TOOL_NAMES = new Set([
   "open_web_source",
   "create_design_canvas",
+  "update_design_canvas",
   "create_svg_design",
   "create_design_package",
+  "export_workspace_artifact",
   "memory_write_observation",
   "memory_write_task_summary",
   "memory_write_procedural",
@@ -4890,6 +9501,7 @@ const WRITE_TOOL_NAMES = new Set([
   "seed_default_templates",
   "create_template",
   "fill_template",
+  "create_research_pack",
   "create_folder",
   "create_file",
   "append_file",
@@ -4897,8 +9509,11 @@ const WRITE_TOOL_NAMES = new Set([
   "move_path",
   "append_to_current_file",
   "append_to_current_section",
+  "highlight_current_file_phrase",
+  "restore_current_file_from_backup",
   "append_research_memory",
   "compact_research_memory",
+  "rename_current_file",
   "retitle_current_file",
   "prepare_edit_current_section",
   "edit_current_section",
@@ -4918,6 +9533,8 @@ const ALL_OPERATION_GOALS: OperationGoal[] = [
   "web_search",
   "web_fetch",
   "current_note_title",
+  "current_note_highlight",
+  "current_note_restore",
   "current_note_content",
   "current_note_replace",
   "current_section_edit",
@@ -4929,16 +9546,34 @@ const ALL_OPERATION_GOALS: OperationGoal[] = [
   "current_note_delete",
 ];
 
+const CURRENT_NOTE_RESUME_GOALS: OperationGoal[] = [
+  "read_current_note",
+  "current_note_title",
+  "current_note_highlight",
+  "current_note_restore",
+  "current_note_content",
+  "current_note_replace",
+  "current_section_edit",
+  "current_note_delete",
+];
+
 const TOOL_GOALS: Partial<Record<string, OperationGoal[]>> = {
   read_current_file: ["read_current_note"],
   web_search: ["web_search"],
   web_fetch: ["web_fetch"],
+  rename_current_file: ["current_note_title"],
   retitle_current_file: ["current_note_title"],
+  highlight_current_file_phrase: ["current_note_highlight"],
+  restore_current_file_from_backup: ["current_note_restore"],
   append_to_current_file: ["current_note_content"],
   append_to_current_section: ["current_note_content"],
   replace_current_file: ["current_note_replace"],
   prepare_edit_current_section: ["current_section_edit"],
   edit_current_section: ["current_section_edit"],
+  seed_default_templates: ["path_create"],
+  create_template: ["path_create"],
+  fill_template: ["path_create"],
+  create_research_pack: ["path_create"],
   create_file: ["path_create"],
   create_folder: ["path_create"],
   append_file: ["path_append"],
@@ -4948,7 +9583,17 @@ const TOOL_GOALS: Partial<Record<string, OperationGoal[]>> = {
   delete_current_file: ["current_note_delete"],
 };
 
-const CODE_TOOL_NAMES = new Set(["run_code_block", "render_html_preview"]);
+const CODE_TOOL_NAMES = new Set([
+  "run_code_block",
+  "render_html_preview",
+  "write_workspace_file",
+  "read_workspace_file",
+  "list_workspace_files",
+  "replace_workspace_text",
+  "preview_workspace_html",
+  "export_workspace_artifact",
+  "install_code_dependency",
+]);
 const BROWSER_TOOL_NAMES = new Set([
   "browser_open_page",
   "browser_observe",
@@ -4994,6 +9639,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   seed_default_templates: "write",
   create_template: "write",
   fill_template: "write",
+  create_research_pack: "write",
   create_folder: "write",
   create_file: "write",
   append_file: "write",
@@ -5001,8 +9647,11 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   move_path: "edit",
   append_to_current_file: "write",
   append_to_current_section: "write",
+  highlight_current_file_phrase: "edit",
+  restore_current_file_from_backup: "edit",
   append_research_memory: "write",
   compact_research_memory: "edit",
+  rename_current_file: "edit",
   retitle_current_file: "edit",
   prepare_edit_current_section: "edit",
   edit_current_section: "edit",
@@ -5013,6 +9662,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   delete_research_memory_entry: "delete",
   web_search: "web",
   web_fetch: "web",
+  read_source_section: "web",
   open_web_source: "web",
   browser_open_page: "web",
   browser_observe: "web",
@@ -5024,7 +9674,15 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   browser_extract_markdown: "web",
   run_code_block: "code",
   render_html_preview: "code",
+  write_workspace_file: "code",
+  read_workspace_file: "code",
+  list_workspace_files: "code",
+  replace_workspace_text: "code",
+  preview_workspace_html: "code",
+  export_workspace_artifact: "code",
+  install_code_dependency: "code",
   create_design_canvas: "write",
+  update_design_canvas: "write",
   create_svg_design: "write",
   create_design_package: "write",
   memory_search: "read",
@@ -5050,36 +9708,54 @@ function getAllowedToolDefinitions(
   const allowDeletePath = hasDeletePathIntent(prompt);
   const allowWholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
   const allowEdit = hasEditIntent(prompt) && !allowWholeNoteReplace;
+  const allowHighlight = hasHighlightIntent(prompt);
+  const allowRestore = hasRestoreIntent(prompt);
   const allowReplace =
     hasReplaceIntent(prompt) && (!allowEdit || allowWholeNoteReplace) && !allowDelete;
-  const allowRetitle = hasTitleIntent(prompt);
+  const allowMarkdownRetitle = hasMarkdownTitleContentIntent(prompt);
+  const allowVisibleRename =
+    isExplicitVisibleFileRenameIntent(prompt) ||
+    (isVisibleTitleRenameIntent(prompt) && isTitleOnlyIntent(prompt));
+  const allowRetitle = allowMarkdownRetitle || allowVisibleRename;
+  const allowResume =
+    hasCheckpointResumeIntent(prompt) || hasMissionResumeIntent(prompt);
   const allowReflexReadRouting =
     !missionIntent.explicitMutation && !missionIntent.explicitDelete;
   const hasReflexReadLabel = (labels: ReflexDecision["label"][]) =>
     allowReflexReadRouting && hasSafeReflexLabel(reflex, labels);
+  const allowParallelVaultInspection = hasParallelVaultReadIntent(prompt);
   const allowWebSearch =
-    shouldAllowWebSearch(prompt, missionIntent) || hasReflexReadLabel(["web_research"]);
+    shouldAllowWebSearch(prompt, missionIntent) ||
+    allowResume ||
+    hasReflexReadLabel(["web_research"]);
   const allowCurrentNoteRead =
-    hasCurrentNoteReadIntent(prompt) || hasCurrentNoteSectionTarget(prompt);
+    hasCurrentNoteReadIntent(prompt) || hasCurrentNoteSectionTarget(prompt) || allowResume;
   const allowWordCount =
-    hasWordCountIntent(prompt) || hasReflexReadLabel(["word_count"]);
+    hasWordCountIntent(prompt) ||
+    allowParallelVaultInspection ||
+    hasReflexReadLabel(["word_count"]);
   const allowGraphContext =
-    hasGraphConnectionIntent(prompt) || hasReflexReadLabel(["graph_context"]);
+    hasGraphConnectionIntent(prompt) ||
+    allowParallelVaultInspection ||
+    hasReflexReadLabel(["graph_context"]);
   const allowGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
   const allowTemplateTools = hasTemplateIntent(prompt);
   const allowTemplateSeed = hasTemplateSeedIntent(prompt);
   const allowTemplateCreate = hasTemplateCreateIntent(prompt);
   const allowTemplateFill = hasTemplateFillIntent(prompt);
+  const allowResearchPack = hasResearchPackIntent(prompt);
   const allowResearchMemory = hasResearchMemoryIntent(prompt);
   const allowResearchMemoryWrite = hasResearchMemoryWriteIntent(prompt);
   const allowVaultIndex = hasVaultIndexIntent(prompt);
   const allowSemanticSearch =
     isSemanticSearchEnabled(settings) &&
-    (hasConceptualVaultSearchIntent(prompt) ||
+    (allowResume ||
+      hasConceptualVaultSearchIntent(prompt) ||
       hasReflexReadLabel(["semantic_vault_search", "graph_context"]));
   const allowSemanticIndexInspect =
     isSemanticIndexEnabled(settings) &&
-    (hasConceptualVaultSearchIntent(prompt) ||
+    (allowResume ||
+      hasConceptualVaultSearchIntent(prompt) ||
       hasReflexReadLabel(["semantic_vault_search", "graph_context"]));
   const allowSemanticIndexMaintenance =
     isSemanticIndexEnabled(settings) && hasSemanticIndexMaintenanceIntent(prompt);
@@ -5099,9 +9775,12 @@ function getAllowedToolDefinitions(
       hasResearchMemoryIntent(prompt));
   const allowCanvasDesign = hasCanvasDesignIntent(prompt);
   const allowSvgDesign = hasSvgDesignIntent(prompt);
+  const linearIntent = detectLinearIntent(prompt);
   const allowVaultBrowse =
     missionIntent.vaultContext ||
+    allowResume ||
     hasVaultBrowseIntent(prompt) ||
+    allowParallelVaultInspection ||
     allowGraphContext ||
     allowVaultIndex ||
     hasReflexReadLabel(["vault_search", "semantic_vault_search"]);
@@ -5111,7 +9790,7 @@ function getAllowedToolDefinitions(
   const allowPathAppend = hasAppendIntent(prompt) && hasPathTargetIntent(prompt);
   const allowPathReplace = hasReplaceIntent(prompt) && hasPathTargetIntent(prompt);
   const allowMovePath = hasMovePathIntent(prompt);
-  const preferPathTarget = hasPathTargetIntent(prompt) && !hasCurrentNoteTarget(prompt);
+  const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
   const allowCurrentNoteOutput = noteOutputIntent && !preferPathTarget;
   const allowAutonomousAppend =
     allowCurrentNoteOutput &&
@@ -5120,14 +9799,28 @@ function getAllowedToolDefinitions(
     !allowDelete &&
     (!allowRetitle || !hasTitleOnlyIntent(prompt));
 
-  return toolRegistry.getDefinitions().filter((definition) => {
+  const filtered = toolRegistry.getDefinitions().filter((definition) => {
     const name = definition.function.name;
+
+    if (name.startsWith("linear_")) {
+      if (settings?.linearEnabled !== true || !linearIntent.explicit) {
+        return false;
+      }
+      return (
+        name !== "linear_delete_issue_permanently" ||
+        hasExplicitPermanentLinearDeleteIntent(prompt)
+      );
+    }
 
     if (!isAllowedForMission(name, prompt, missionIntent, reflex)) {
       return false;
     }
 
-    if (name === "web_search" || name === "web_fetch") {
+    if (
+      name === "web_search" ||
+      name === "web_fetch" ||
+      name === "read_source_section"
+    ) {
       return allowWebSearch;
     }
 
@@ -5143,16 +9836,20 @@ function getAllowedToolDefinitions(
       return allowExperienceMemory;
     }
 
-    if (name === "run_code_block") {
-      return allowCodeExecution;
-    }
-
     if (name === "render_html_preview") {
       return allowHtmlPreview;
     }
 
+    if (CODE_TOOL_NAMES.has(name)) {
+      return allowCodeExecution;
+    }
+
     if (name === "create_design_canvas") {
       return allowDesignTools && allowCanvasDesign && !allowDesignPackage;
+    }
+
+    if (name === "update_design_canvas") {
+      return hasReviseDesignIntent(prompt) && allowCanvasDesign;
     }
 
     if (name === "create_svg_design") {
@@ -5165,9 +9862,10 @@ function getAllowedToolDefinitions(
 
     if (name === "read_current_file") {
       return (
-        missionIntent.vaultContext ||
-        allowCurrentNoteRead ||
-        allowCurrentNoteOutput
+        !allowRestore &&
+        (missionIntent.vaultContext ||
+          allowCurrentNoteRead ||
+          allowCurrentNoteOutput)
       );
     }
 
@@ -5259,6 +9957,10 @@ function getAllowedToolDefinitions(
       return allowTemplateFill;
     }
 
+    if (name === "create_research_pack") {
+      return allowResearchPack;
+    }
+
     if (name === "create_folder") {
       return allowCreateFolder;
     }
@@ -5291,19 +9993,43 @@ function getAllowedToolDefinitions(
       return allowSectionAppend && !preferPathTarget && !allowDelete;
     }
 
+    if (name === "highlight_current_file_phrase") {
+      return allowHighlight && !preferPathTarget && !allowDelete;
+    }
+
+    if (name === "restore_current_file_from_backup") {
+      return allowRestore && !preferPathTarget && !allowDelete;
+    }
+
     if (name === "append_to_current_file") {
       return (
         (allowAppend || allowAutonomousAppend) &&
         !preferPathTarget &&
         !hasTitleOnlyIntent(prompt) &&
         !allowSectionAppend &&
+        !allowHighlight &&
+        !allowRestore &&
         !allowEdit &&
         !allowDelete
       );
     }
 
     if (name === "retitle_current_file") {
-      return allowRetitle && !preferPathTarget && !allowEdit && !allowDelete;
+      return (
+        allowMarkdownRetitle &&
+        !preferPathTarget &&
+        !allowEdit &&
+        !allowDelete
+      );
+    }
+
+    if (name === "rename_current_file") {
+      return (
+        allowVisibleRename &&
+        !preferPathTarget &&
+        !allowEdit &&
+        !allowDelete
+      );
     }
 
     if (name === "edit_current_section") {
@@ -5327,6 +10053,21 @@ function getAllowedToolDefinitions(
 
     return true;
   });
+
+  // Explicit parallel vault-read missions must keep a multi-tool read batch
+  // available even when mutation intent would otherwise narrow the allowlist.
+  if (allowParallelVaultInspection) {
+    return addToolDefinitions(filtered, toolRegistry, [
+      "read_current_file",
+      "count_words",
+      "get_note_graph_context",
+      "find_related_notes",
+      "list_markdown_files",
+      "append_to_current_file",
+    ]);
+  }
+
+  return filtered;
 }
 
 function isAllowedForMission(
@@ -5335,7 +10076,7 @@ function isAllowedForMission(
   intent: MissionIntent,
   reflex: ReflexDecision | null = null,
 ): boolean {
-  if (!isToolWithinAutonomyScope(name, intent, reflex)) {
+  if (!isToolWithinAutonomyScope(name, prompt, intent, reflex)) {
     return false;
   }
 
@@ -5343,6 +10084,7 @@ function isAllowedForMission(
     return (
       intent.vaultContext ||
       hasVaultBrowseIntent(prompt) ||
+      hasParallelVaultReadIntent(prompt) ||
       hasSpecificFileReadIntent(prompt) ||
       hasCurrentNoteReadIntent(prompt) ||
       hasWordCountIntent(prompt) ||
@@ -5354,6 +10096,8 @@ function isAllowedForMission(
       hasVaultIndexIntent(prompt) ||
       hasDesignIntent(prompt) ||
       hasBrowserAutomationIntent(prompt) ||
+      hasCheckpointResumeIntent(prompt) ||
+      hasMissionResumeIntent(prompt) ||
       hasSafeReflexLabel(reflex, [
         "vault_search",
         "semantic_vault_search",
@@ -5386,6 +10130,14 @@ function isAllowedForMission(
       return hasDesignIntent(prompt);
     }
 
+    if (name === "update_design_canvas") {
+      return hasReviseDesignIntent(prompt);
+    }
+
+    if (name === "export_workspace_artifact") {
+      return hasCodeExecutionIntent(prompt) || hasHtmlPreviewIntent(prompt);
+    }
+
     if (MEMORY_TOOL_NAMES.has(name)) {
       return hasExperienceMemoryIntent(prompt) || hasResearchMemoryWriteIntent(prompt);
     }
@@ -5397,8 +10149,17 @@ function isAllowedForMission(
     return intent.noteOutput || intent.explicitMutation || hasResearchMemoryWriteIntent(prompt);
   }
 
-  if (name === "web_search" || name === "web_fetch") {
-    return hasWebSearchIntent(prompt) || hasSafeReflexLabel(reflex, ["web_research"]);
+  if (
+    name === "web_search" ||
+    name === "web_fetch" ||
+    name === "read_source_section"
+  ) {
+    return (
+      hasWebSearchIntent(prompt) ||
+      hasCheckpointResumeIntent(prompt) ||
+      hasMissionResumeIntent(prompt) ||
+      hasSafeReflexLabel(reflex, ["web_research"])
+    );
   }
 
   if (BROWSER_TOOL_NAMES.has(name)) {
@@ -5441,6 +10202,7 @@ function isSemanticIndexEnabled(
 
 function isToolWithinAutonomyScope(
   name: string,
+  prompt: string,
   intent: MissionIntent,
   reflex: ReflexDecision | null = null,
 ): boolean {
@@ -5449,8 +10211,17 @@ function isToolWithinAutonomyScope(
     return !WRITE_TOOL_NAMES.has(name) && !DELETE_TOOL_NAMES.has(name);
   }
 
-  if (name === "web_search" || name === "web_fetch") {
-    return scope.read.web || hasSafeReflexLabel(reflex, ["web_research"]);
+  if (
+    name === "web_search" ||
+    name === "web_fetch" ||
+    name === "read_source_section"
+  ) {
+    return (
+      scope.read.web ||
+      hasCheckpointResumeIntent(prompt) ||
+      hasMissionResumeIntent(prompt) ||
+      hasSafeReflexLabel(reflex, ["web_research"])
+    );
   }
 
   if (name === "append_research_memory" || name === "compact_research_memory") {
@@ -5464,10 +10235,15 @@ function isToolWithinAutonomyScope(
   if (
     name === "open_web_source" ||
     name === "create_design_canvas" ||
+    name === "update_design_canvas" ||
     name === "create_svg_design" ||
     name === "create_design_package"
   ) {
     return scope.write.artifacts;
+  }
+
+  if (name === "export_workspace_artifact") {
+    return scope.write.artifacts || hasCodeExecutionIntent(prompt);
   }
 
   if (BROWSER_TOOL_NAMES.has(name)) {
@@ -5493,8 +10269,11 @@ function isToolWithinAutonomyScope(
   if (
     name === "append_to_current_file" ||
     name === "append_to_current_section" ||
+    name === "highlight_current_file_phrase" ||
+    name === "restore_current_file_from_backup" ||
     name === "prepare_edit_current_section" ||
     name === "edit_current_section" ||
+    name === "rename_current_file" ||
     name === "retitle_current_file" ||
     name === "link_related_notes_in_current_file"
   ) {
@@ -5512,11 +10291,13 @@ function createMissionOperationGoals({
   prompt,
   allowedToolNames,
   requiredWriteTools,
+  researchPlan,
   streamingWritebackKind,
 }: {
   prompt: string;
   allowedToolNames: Set<string>;
   requiredWriteTools: string[];
+  researchPlan?: ResearchPlan | null;
   streamingWritebackKind: StreamingWritebackKind | null;
 }): MissionOperationGoals {
   const goals = Object.fromEntries(
@@ -5533,6 +10314,8 @@ function createMissionOperationGoals({
     allowedToolNames,
     executedWebSearchTool: false,
     executedWebFetchTool: false,
+    researchPlan,
+    missionEvidence: [],
   })) {
     if (toolName === "web_search") {
       requestGoal("web_search");
@@ -5577,6 +10360,7 @@ function shouldTrackStreamingAppendContent(
       "append_file",
       "create_file",
       "fill_template",
+      "create_research_pack",
       "append_research_memory",
       "create_design_canvas",
       "create_svg_design",
@@ -5608,7 +10392,10 @@ function markOperationGoalFailed(
   operationGoals: MissionOperationGoals,
   goal: OperationGoal,
 ) {
-  if (operationGoals.goals[goal] !== "not_requested") {
+  if (
+    operationGoals.goals[goal] !== "not_requested" &&
+    operationGoals.goals[goal] !== "done"
+  ) {
     operationGoals.goals[goal] = "failed";
   }
 }
@@ -5644,6 +10431,10 @@ function markOperationGoalsForTool({
       markOperationGoalFailed(operationGoals, goal);
     }
   }
+
+  if (ok && toolName === "replace_current_file") {
+    markOperationGoalDone(operationGoals, "current_note_content");
+  }
 }
 
 function markStreamingWritebackGoalDone(
@@ -5654,6 +10445,7 @@ function markStreamingWritebackGoalDone(
     markOperationGoalDone(operationGoals, "current_note_content");
   } else if (kind === "replace") {
     markOperationGoalDone(operationGoals, "current_note_replace");
+    markOperationGoalDone(operationGoals, "current_note_content");
   } else {
     markOperationGoalDone(operationGoals, "current_section_edit");
   }
@@ -5663,6 +10455,10 @@ function isMissionComplete(operationGoals: MissionOperationGoals): boolean {
   return Object.values(operationGoals.goals).every(
     (state) => state === "not_requested" || state === "done",
   );
+}
+
+function hasPendingOperationGoals(operationGoals: MissionOperationGoals): boolean {
+  return Object.values(operationGoals.goals).some((state) => state === "pending");
 }
 
 function hasPendingStreamingWritebackGoal(
@@ -5689,7 +10485,18 @@ function getPendingRequiredWriteToolNames(
   requiredWriteTools: string[],
 ): string[] {
   const completed = new Set(operationGoals.completedTools);
-  return requiredWriteTools.filter((toolName) => !completed.has(toolName));
+  return requiredWriteTools.filter((toolName) => {
+    if (completed.has(toolName)) {
+      return false;
+    }
+
+    const goals = TOOL_GOALS[toolName] ?? [];
+    if (goals.length === 0) {
+      return true;
+    }
+
+    return goals.some((goal) => operationGoals.goals[goal] === "pending");
+  });
 }
 
 function getRequiredWriteToolNames(
@@ -5702,7 +10509,7 @@ function getRequiredWriteToolNames(
   const wholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
   const noteOutputIntent = missionIntent.noteOutput;
 
-  const preferPathTarget = hasPathTargetIntent(prompt) && !hasCurrentNoteTarget(prompt);
+  const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
 
   if (streamingWritebackKind === "edit") {
     requiredToolNames.push("prepare_edit_current_section");
@@ -5710,6 +10517,14 @@ function getRequiredWriteToolNames(
 
   if (hasSectionAppendIntent(prompt)) {
     requiredToolNames.push("append_to_current_section");
+  }
+
+  if (hasHighlightIntent(prompt)) {
+    requiredToolNames.push("highlight_current_file_phrase");
+  }
+
+  if (hasRestoreIntent(prompt)) {
+    requiredToolNames.push("restore_current_file_from_backup");
   }
 
   if (hasResearchMemoryWriteIntent(prompt)) {
@@ -5729,6 +10544,8 @@ function getRequiredWriteToolNames(
     !preferPathTarget &&
     !wholeNoteReplace &&
     !hasSectionAppendIntent(prompt) &&
+    !hasHighlightIntent(prompt) &&
+    !hasRestoreIntent(prompt) &&
     !hasEditIntent(prompt) &&
     !hasDeleteIntent(prompt) &&
     streamingWritebackKind !== "append"
@@ -5758,20 +10575,38 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("fill_template");
   }
 
-  if (hasDesignIntent(prompt)) {
-    if (hasDesignPackageIntent(prompt)) {
+  if (hasResearchPackIntent(prompt)) {
+    requiredToolNames.push("create_research_pack");
+  }
+
+  if (hasDesignIntent(prompt) || hasReviseDesignIntent(prompt)) {
+    if (hasReviseDesignIntent(prompt) && hasCanvasDesignIntent(prompt)) {
+      requiredToolNames.push("update_design_canvas");
+      if (
+        /\b(create|draw|make|generate|build|draft)\b/i.test(prompt) &&
+        !/\b(only|just)\s+revise\b/i.test(prompt)
+      ) {
+        requiredToolNames.push("create_design_canvas");
+      }
+    } else if (hasDesignPackageIntent(prompt)) {
       requiredToolNames.push("create_design_package");
     } else if (hasCanvasDesignIntent(prompt)) {
       requiredToolNames.push("create_design_canvas");
     }
 
-    if (hasSvgDesignIntent(prompt)) {
+    if (hasSvgDesignIntent(prompt) && !hasReviseDesignIntent(prompt)) {
       requiredToolNames.push("create_svg_design");
     }
   }
 
-  if (hasTitleIntent(prompt) && !preferPathTarget) {
+  if (hasMarkdownTitleContentIntent(prompt) && !preferPathTarget) {
     requiredToolNames.push("retitle_current_file");
+  } else if (
+    !preferPathTarget &&
+    (isExplicitVisibleFileRenameIntent(prompt) ||
+      (isVisibleTitleRenameIntent(prompt) && isTitleOnlyIntent(prompt)))
+  ) {
+    requiredToolNames.push("rename_current_file");
   }
 
   if (hasCreateFolderIntent(prompt)) {
@@ -5910,22 +10745,177 @@ function getLatestToolOutput(
 }
 
 function getFirstWebSearchResultUrl(output: unknown): string | null {
+  return getWebSearchResultUrls(output)[0] ?? null;
+}
+
+function getWebSearchResultUrls(output: unknown): string[] {
   if (!isRecord(output) || !Array.isArray(output.results)) {
-    return null;
+    return [];
   }
 
+  const urls: string[] = [];
   for (const result of output.results) {
     if (!isRecord(result) || typeof result.url !== "string") {
       continue;
     }
 
     const url = result.url.trim();
-    if (/^https?:\/\//i.test(url)) {
-      return url;
+    if (/^https?:\/\//i.test(url) && !urls.includes(url)) {
+      urls.push(url);
     }
   }
 
-  return null;
+  return urls;
+}
+
+function rankWebSearchResultUrls(output: unknown, query: string): string[] {
+  if (!isRecord(output) || !Array.isArray(output.results)) {
+    return [];
+  }
+  const queryTerms = getSourceRankingTerms(query);
+  return output.results
+    .map((result, index) => {
+      if (!isRecord(result) || typeof result.url !== "string") return null;
+      const url = result.url.trim();
+      if (!/^https?:\/\//i.test(url)) return null;
+      const text = [result.title, result.snippet, result.content, url]
+        .filter((value): value is string => typeof value === "string")
+        .join(" ")
+        .toLowerCase();
+      const relevance = queryTerms.reduce(
+        (score, term) => score + (text.includes(term) ? 1 : 0),
+        0,
+      );
+      const authority = /(?:\.gov|\.edu|doi\.org|arxiv\.org|docs?\.)/i.test(url)
+        ? 0.25
+        : 0;
+      return { url, index, score: relevance + authority };
+    })
+    .filter(
+      (item): item is { url: string; index: number; score: number } => item !== null,
+    )
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map((item) => item.url)
+    .filter((url, index, urls) => urls.indexOf(url) === index);
+}
+
+function getSourceRankingTerms(value: string): string[] {
+  const stopWords = new Set([
+    "about",
+    "after",
+    "before",
+    "cite",
+    "cited",
+    "citation",
+    "current",
+    "include",
+    "multiple",
+    "research",
+    "source",
+    "sources",
+    "that",
+    "their",
+    "this",
+    "verify",
+    "with",
+  ]);
+  return [
+    ...new Set(
+      (value.toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) ?? []).filter(
+        (term) => !stopWords.has(term),
+      ),
+    ),
+  ].slice(0, 40);
+}
+
+function selectDomainDiverseUrls(
+  candidateUrls: string[],
+  alreadyFetchedUrls: string[],
+  limit: number,
+): string[] {
+  if (limit <= 0) {
+    return [];
+  }
+
+  const fetched = new Set(alreadyFetchedUrls);
+  const usedDomains = new Set(
+    alreadyFetchedUrls
+      .map(getUrlHostname)
+      .filter((domain): domain is string => Boolean(domain)),
+  );
+  const selected: string[] = [];
+  const deferred: string[] = [];
+
+  for (const url of candidateUrls) {
+    if (fetched.has(url)) {
+      continue;
+    }
+    const hostname = getUrlHostname(url);
+    if (hostname && !usedDomains.has(hostname)) {
+      selected.push(url);
+      usedDomains.add(hostname);
+    } else {
+      deferred.push(url);
+    }
+    if (selected.length >= limit) {
+      return selected;
+    }
+  }
+
+  for (const url of deferred) {
+    if (selected.length >= limit) {
+      break;
+    }
+    if (!selected.includes(url)) {
+      selected.push(url);
+    }
+  }
+
+  return selected;
+}
+
+function getFetchedWebSourceUrls(evidence: MissionEvidence[]): string[] {
+  return [
+    ...new Set(
+      evidence
+        .filter((item) => item.kind === "web_source" || Boolean(item.url))
+        .map((item) => item.url)
+        .filter((url): url is string => Boolean(url)),
+    ),
+  ];
+}
+
+function getUrlHostname(url: string): string | null {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function shouldExpandVaultRetrievalCoverage(
+  output: unknown,
+  researchPlan: ResearchPlan | null,
+): boolean {
+  if (
+    !researchPlan ||
+    (researchPlan.mode !== "deep_vault" && researchPlan.mode !== "deep_hybrid")
+  ) {
+    return false;
+  }
+  if (!isRecord(output)) {
+    return false;
+  }
+  const coverage = isRecord(output.coverage) ? output.coverage : null;
+  const confidence = coverage ? getString(coverage.confidence) : undefined;
+  const mode = coverage ? getString(coverage.mode) : undefined;
+  return (
+    output.fallbackUsed === true ||
+    coverage?.truncated === true ||
+    mode === "sampled" ||
+    mode === "fallback" ||
+    confidence === "low"
+  );
 }
 
 function buildUnavailableToolCorrectionPrompt(
@@ -5946,9 +10936,22 @@ function shouldObserveCurrentNote(
   missionIntent: MissionIntent,
 ): boolean {
   void missionIntent;
+  // Keep read_current_file model-callable for explicit parallel inspection so
+  // it can batch with other read-only tools instead of being prefetched away.
+  if (hasParallelVaultReadIntent(prompt)) {
+    return false;
+  }
   return (
     allowedToolNames.has("read_current_file") &&
     requiresCurrentNoteContent(prompt)
+  );
+}
+
+function hasParallelVaultReadIntent(prompt: string): boolean {
+  return (
+    /\bparallel\b[\s\S]{0,100}\b(?:vault\s+)?reads?\b/i.test(prompt) ||
+    /\b(?:vault\s+)?reads?\b[\s\S]{0,100}\bparallel\b/i.test(prompt) ||
+    /\bparallel\s+(?:read[-\s]?only\s+)?tools?\b/i.test(prompt)
   );
 }
 
@@ -5981,6 +10984,30 @@ function removeToolDefinition(
   return tools.filter((tool) => tool.function.name !== name);
 }
 
+function addToolDefinitions(
+  tools: ModelToolDefinition[],
+  toolRegistry: ToolRegistry,
+  names: string[],
+): ModelToolDefinition[] {
+  const next = [...tools];
+  const existing = new Set(next.map((tool) => tool.function.name));
+  const definitions = new Map(
+    toolRegistry.getDefinitions().map((tool) => [tool.function.name, tool]),
+  );
+  for (const name of names) {
+    if (existing.has(name)) {
+      continue;
+    }
+    const definition = definitions.get(name);
+    if (!definition) {
+      continue;
+    }
+    next.push(definition);
+    existing.add(name);
+  }
+  return next;
+}
+
 function shouldOmitCurrentNoteReadForTargetOnlyWrite(
   prompt: string,
   missionIntent: MissionIntent,
@@ -6011,7 +11038,11 @@ function getDirectCurrentNoteWritebackKind({
     missionIntent.explicitDelete ||
     promptRequiresToolLoop(prompt) ||
     requiresCurrentNoteContent(prompt) ||
-    (hasPathTargetIntent(prompt) && !hasCurrentNoteTarget(prompt))
+    hasExplicitNonCurrentNoteWriteTarget(prompt) ||
+    // Title/rename must stay on the tool loop so rename_current_file can run
+    // before (or with) streamed content writeback.
+    hasTitleIntent(prompt) ||
+    isVisibleTitleRenameIntent(prompt)
   ) {
     return null;
   }
@@ -6023,242 +11054,6 @@ function createRuntimeCache(): AgentRuntimeCache {
   return {
     toolResults: new Map(),
   };
-}
-
-function createRunPlan({
-  prompt,
-  missionIntent,
-  tools,
-  settings,
-  streamingWritebackKind,
-  directCurrentNoteWritebackKind,
-  reflex,
-}: {
-  prompt: string;
-  missionIntent: MissionIntent;
-  tools: ModelToolDefinition[];
-  settings: ToolExecutionContext["settings"];
-  streamingWritebackKind: StreamingWritebackKind | null;
-  directCurrentNoteWritebackKind: StreamingWritebackKind | null;
-  reflex?: ReflexDecision | null;
-}): RunPlan {
-  const requiresEnglishGuard = isLikelyEnglishPrompt(prompt);
-  const configuredMaxSteps = getConfiguredMaxAgentSteps(settings);
-  const explicitModelStepTarget = parseExplicitModelStepTarget(prompt);
-  const allowReflexReadRouting =
-    !missionIntent.explicitMutation && !missionIntent.explicitDelete;
-  const hasReflexReadLabel = (labels: ReflexDecision["label"][]) =>
-    allowReflexReadRouting && hasSafeReflexLabel(reflex ?? null, labels);
-  const capSteps = (steps: number) =>
-    estimateLoopBudget({
-      route: "tool_required",
-      configuredMaxSteps,
-      requestedSteps: steps,
-    });
-  const applyExplicitModelStepTarget = (steps: number) =>
-    explicitModelStepTarget === null ? steps : capSteps(explicitModelStepTarget);
-
-  const plan = ({
-    route,
-    maxStepsForRun,
-    thinking,
-    allowedTools,
-    slowPathReason,
-    expectedTimeClass,
-  }: Omit<RunPlan, "requiresEnglishGuard">): RunPlan => ({
-    route,
-    maxStepsForRun,
-    thinking,
-    allowedTools,
-    slowPathReason,
-    expectedTimeClass,
-    requiresEnglishGuard,
-  });
-
-  const grounded = (
-    slowPathReason: SlowPathReason,
-    expectedTimeClass: RunPlan["expectedTimeClass"] = "long",
-  ) => {
-    const generated = analyzeGeneratedOutputPrompt(prompt);
-    const loopBudget = planLoopBudget({
-      prompt,
-      route: "grounded_workflow",
-      generated,
-      configuredMaxSteps,
-    });
-    return plan({
-      route: "grounded_workflow",
-      maxStepsForRun: applyExplicitModelStepTarget(
-        Math.max(
-          1,
-          Math.min(
-            loopBudget.hardCap,
-            hasLongResearchIntent(prompt)
-              ? loopBudget.hardCap
-              : loopBudget.toolStepBudget + loopBudget.finalizationReserve,
-          ),
-        ),
-      ),
-      thinking: resolveThinkingMode(settings),
-      allowedTools: tools,
-      slowPathReason,
-      expectedTimeClass,
-    });
-  };
-
-  if (hasSimpleDateTimePrompt(prompt)) {
-    return plan({
-      route: "instant_local",
-      maxStepsForRun: 0,
-      thinking: undefined,
-      allowedTools: [],
-      slowPathReason: "none",
-      expectedTimeClass: "quick",
-    });
-  }
-
-  if (directCurrentNoteWritebackKind !== null) {
-    return plan({
-      route: "direct_writeback",
-      maxStepsForRun: capSteps(1),
-      thinking: undefined,
-      allowedTools: [],
-      slowPathReason: "none",
-      expectedTimeClass: "quick",
-    });
-  }
-
-  if (hasGraphConnectionIntent(prompt) || hasReflexReadLabel(["graph_context"])) {
-    return grounded("needs_graph_context", "normal");
-  }
-
-  if (shouldPrefetchVaultFolderAnswer(prompt, missionIntent)) {
-    return plan({
-      route:
-        missionIntent.noteOutput && streamingWritebackKind === "append"
-          ? "prefetched_vault_writeback"
-          : "prefetched_vault_answer",
-      maxStepsForRun: capSteps(1),
-      thinking: undefined,
-      allowedTools: [],
-      slowPathReason: "needs_vault_context",
-      expectedTimeClass: "quick",
-    });
-  }
-
-  if (
-    hasVaultContextQuestionIntent(prompt) ||
-    hasVaultBrowseIntent(prompt) ||
-    hasReflexReadLabel(["vault_search", "semantic_vault_search"])
-  ) {
-    return grounded("needs_vault_context", "normal");
-  }
-
-  if (hasWebSearchIntent(prompt) || hasReflexReadLabel(["web_research"])) {
-    return grounded("needs_web_sources", "long");
-  }
-
-  if (hasLongResearchIntent(prompt) || hasBrowserAutomationIntent(prompt)) {
-    return grounded("needs_model_planning", "long");
-  }
-
-  if (
-    hasDesignIntent(prompt) ||
-    hasCodeExecutionIntent(prompt) ||
-    hasHtmlPreviewIntent(prompt) ||
-    hasOpenWebSourceIntent(prompt)
-  ) {
-    const generated = analyzeGeneratedOutputPrompt(prompt);
-    const loopBudget = planLoopBudget({
-      prompt,
-      route: "grounded_workflow",
-      generated,
-      configuredMaxSteps,
-    });
-    return plan({
-      route: "grounded_workflow",
-      maxStepsForRun: applyExplicitModelStepTarget(
-        Math.max(
-          1,
-          Math.min(
-            loopBudget.hardCap,
-            loopBudget.toolStepBudget + loopBudget.finalizationReserve,
-          ),
-        ),
-      ),
-      thinking: resolveThinkingMode(settings),
-      allowedTools: tools,
-      slowPathReason: "needs_model_planning",
-      expectedTimeClass: "normal",
-    });
-  }
-
-  if (hasWordCountIntent(prompt) || hasReflexReadLabel(["word_count"])) {
-    return plan({
-      route: "tool_required",
-      maxStepsForRun: capSteps(3),
-      thinking: undefined,
-      allowedTools: tools,
-      slowPathReason: "needs_word_count",
-      expectedTimeClass: "quick",
-    });
-  }
-
-  if (hasResearchMemoryReadIntent(prompt)) {
-    return plan({
-      route: "tool_required",
-      maxStepsForRun: capSteps(2),
-      thinking: undefined,
-      allowedTools: tools,
-      slowPathReason: "needs_vault_context",
-      expectedTimeClass: "quick",
-    });
-  }
-
-  if (requiresCurrentNoteContent(prompt)) {
-    return plan({
-      route: "tool_required",
-      maxStepsForRun: capSteps(2),
-      thinking: undefined,
-      allowedTools: tools,
-      slowPathReason: "needs_current_note",
-      expectedTimeClass: "quick",
-    });
-  }
-
-  if (streamingWritebackKind !== null) {
-    return plan({
-      route: "single_model_writeback",
-      maxStepsForRun: capSteps(streamingWritebackKind === "edit" ? 3 : 1),
-      thinking: undefined,
-      allowedTools: tools,
-      slowPathReason:
-        streamingWritebackKind === "edit" ? "needs_edit_or_replace" : "none",
-      expectedTimeClass: streamingWritebackKind === "edit" ? "normal" : "quick",
-    });
-  }
-
-  if (missionIntent.explicitMutation || missionIntent.requireWriteCompletion) {
-    return plan({
-      route: "tool_required",
-      maxStepsForRun: capSteps(3),
-      thinking: undefined,
-      allowedTools: tools,
-      slowPathReason: missionIntent.explicitMutation
-        ? "needs_edit_or_replace"
-        : "needs_model_planning",
-      expectedTimeClass: "normal",
-    });
-  }
-
-  return plan({
-    route: "single_model_answer",
-    maxStepsForRun: applyExplicitModelStepTarget(capSteps(2)),
-    thinking: undefined,
-    allowedTools: tools,
-    slowPathReason: "none",
-    expectedTimeClass: "quick",
-  });
 }
 
 function parseExplicitModelStepTarget(prompt: string): number | null {
@@ -6538,6 +11333,7 @@ function requiresVaultTraversalBeforeFinalAnswer(
     runPlan.slowPathReason === "needs_vault_context" &&
     hasFolderContentQuestionIntent(prompt) &&
     hasAnyAllowedTool(allowedToolNames, [
+      "inspect_vault_context",
       "list_current_folder",
       "list_markdown_files",
       "search_markdown_files",
@@ -6554,13 +11350,25 @@ function getMissingRequiredWebToolNames({
   allowedToolNames,
   executedWebSearchTool,
   executedWebFetchTool,
+  researchPlan,
+  missionEvidence = [],
 }: {
   prompt: string;
   allowedToolNames: Set<string>;
   executedWebSearchTool: boolean;
   executedWebFetchTool: boolean;
+  researchPlan?: ResearchPlan | null;
+  missionEvidence?: MissionEvidence[];
 }): string[] {
-  if (!hasWebSearchIntent(prompt)) {
+  const minFetchedSources = researchPlan?.sourceRequirements.minFetchedSources ?? 0;
+  const fetchedSourceCount = countFetchedWebSources(missionEvidence);
+  const requiresWeb =
+    hasWebSearchIntent(prompt) ||
+    (researchPlan !== null &&
+      researchPlan !== undefined &&
+      (researchPlan.mode === "deep_web" || researchPlan.mode === "deep_hybrid"));
+
+  if (!requiresWeb) {
     return [];
   }
 
@@ -6569,9 +11377,10 @@ function getMissingRequiredWebToolNames({
     missing.push("web_search");
   }
   if (
-    shouldRequireWebFetchBeforeFinalAnswer(prompt) &&
+    (shouldRequireWebFetchBeforeFinalAnswer(prompt) ||
+      minFetchedSources > fetchedSourceCount) &&
     allowedToolNames.has("web_fetch") &&
-    !executedWebFetchTool
+    (!executedWebFetchTool || fetchedSourceCount < minFetchedSources)
   ) {
     missing.push("web_fetch");
   }
@@ -6580,7 +11389,21 @@ function getMissingRequiredWebToolNames({
 }
 
 function shouldRequireWebFetchBeforeFinalAnswer(prompt: string): boolean {
-  return hasFetchedWebSourceIntent(prompt);
+  return (
+    hasWebSearchIntent(prompt) ||
+    hasFetchedWebSourceIntent(prompt) ||
+    hasDeepResearchIntent(prompt) ||
+    hasCurrentWebFactIntent(prompt)
+  );
+}
+
+function countFetchedWebSources(evidence: MissionEvidence[]): number {
+  return new Set(
+    evidence
+      .filter((item) => item.kind === "web_source" || Boolean(item.url))
+      .map((item) => item.url)
+      .filter((url): url is string => Boolean(url)),
+  ).size;
 }
 
 function areLoopRequiredToolsSatisfied(
@@ -6680,7 +11503,7 @@ function getStreamingWritebackKind(
     return null;
   }
 
-  const preferPathTarget = hasPathTargetIntent(prompt) && !hasCurrentNoteTarget(prompt);
+  const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
 
   if (preferPathTarget) {
     return null;
@@ -6692,7 +11515,14 @@ function getStreamingWritebackKind(
       : "append";
   }
 
-  if (hasWholeNoteReplaceIntent(prompt)) {
+  if (isNamedSectionEditIntent(prompt)) {
+    return "edit";
+  }
+
+  if (
+    prefersStreamedReplaceForEditOrganize(prompt) ||
+    hasWholeNoteReplaceIntent(prompt)
+  ) {
     return "replace";
   }
 
@@ -6714,8 +11544,7 @@ function getStreamingWritebackKind(
 
   if (
     hasNoteOutputIntent(prompt) ||
-    (toolContext.missionIntent?.noteOutput &&
-      (hasStaticGenerationIntent(prompt) || hasGeneratedWritingIntent(prompt)))
+    toolContext.missionIntent?.noteOutput
   ) {
     return "append";
   }
@@ -6730,15 +11559,21 @@ function classifyMissionIntent(prompt: string): MissionIntent {
   const explicitTemplateWrite =
     hasTemplateSeedIntent(prompt) ||
     hasTemplateCreateIntent(prompt) ||
-    hasTemplateFillIntent(prompt);
+    hasTemplateFillIntent(prompt) ||
+    hasResearchPackIntent(prompt);
   const explicitResearchMemoryWrite = hasResearchMemoryWriteIntent(prompt);
   const explicitDesignWrite = hasDesignIntent(prompt);
+  const explicitHighlightWrite = hasHighlightIntent(prompt);
+  const explicitRestoreWrite = hasRestoreIntent(prompt);
+  const chatOnlyResponse = hasChatOnlyResponseIntent(prompt);
   const explicitPersistence =
-    hasExplicitWritePersistenceIntent(prompt) ||
+    (!chatOnlyResponse && hasExplicitWritePersistenceIntent(prompt)) ||
     explicitGraphLinkWrite ||
     explicitTemplateWrite ||
     explicitResearchMemoryWrite ||
-    explicitDesignWrite;
+    explicitDesignWrite ||
+    explicitHighlightWrite ||
+    explicitRestoreWrite;
   const explicitDelete =
     resetAction.kind !== "replace_current_note" &&
     (hasDeleteIntent(prompt) || hasDeletePathIntent(prompt));
@@ -6748,9 +11583,13 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     hasCreateFolderIntent(prompt) ||
     hasMovePathIntent(prompt) ||
     hasWholeNoteRevisionIntent(prompt) ||
+    isCurrentNoteEditOrganizeIntent(prompt) ||
+    isWholeNoteEditIntent(prompt) ||
     hasReplaceIntent(prompt) ||
     hasEditIntent(prompt) ||
     hasSectionAppendIntent(prompt) ||
+    explicitHighlightWrite ||
+    explicitRestoreWrite ||
     hasTitleIntent(prompt) ||
     explicitGraphLinkWrite ||
     explicitTemplateWrite ||
@@ -6760,6 +11599,7 @@ function classifyMissionIntent(prompt: string): MissionIntent {
   const vaultContext =
     hasVaultContextQuestionIntent(prompt) ||
     hasResearchMemoryReadIntent(prompt) ||
+    isVaultWideOrganizeIntent(prompt) ||
     (!explicitMutation && hasVaultBrowseIntent(prompt));
   const webAnswerOnly =
     hasWebSearchIntent(prompt) &&
@@ -6768,10 +11608,12 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     !hasCurrentPageWritebackIntent(prompt) &&
     !hasPathTargetIntent(prompt);
   const noteOutput =
-    !vaultContext &&
     !explicitResearchMemoryWrite &&
     !webAnswerOnly &&
+    !isVaultWideOrganizeIntent(prompt) &&
     (hasNoteOutputIntent(prompt) ||
+      isCurrentNoteEditOrganizeIntent(prompt) ||
+      isWholeNoteEditIntent(prompt) ||
       generated.target === "current_note_append" ||
       generated.target === "current_note_replace");
 
@@ -6788,11 +11630,29 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     });
   }
 
+  // Vault-wide organize without targets: clarify/scope — do not force
+  // requireWriteCompletion alone (avoids write_receipt dead-ends).
+  if (isVaultWideOrganizeIntent(prompt) && !isCurrentNoteEditOrganizeIntent(prompt)) {
+    return buildMissionIntent(prompt, {
+      mode: "vault_context_answer",
+      vaultContext: true,
+      noteOutput: false,
+      explicitPersistence: false,
+      explicitMutation: false,
+      explicitDelete: false,
+      allowAutonomousWrite: false,
+      requireWriteCompletion: false,
+    });
+  }
+
   if (explicitMutation) {
     return buildMissionIntent(prompt, {
       mode: "explicit_file_mutation",
       vaultContext,
-      noteOutput,
+      noteOutput:
+        noteOutput ||
+        isCurrentNoteEditOrganizeIntent(prompt) ||
+        isWholeNoteEditIntent(prompt),
       explicitPersistence,
       explicitMutation: true,
       explicitDelete: false,
@@ -6847,6 +11707,147 @@ function buildMissionIntent(
   };
 }
 
+function normalizeInvocationStepLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.max(1, Math.floor(value));
+}
+
+function suppressNoteWritebackForChatOnly(
+  prompt: string,
+  intent: MissionIntent,
+): MissionIntent {
+  return buildMissionIntent(prompt, {
+    mode: intent.vaultContext ? "vault_context_answer" : "chat_only",
+    vaultContext: intent.vaultContext,
+    noteOutput: false,
+    explicitPersistence: false,
+    explicitMutation: false,
+    explicitDelete: false,
+    allowAutonomousWrite: false,
+    requireWriteCompletion: false,
+  });
+}
+
+function applyDefaultActiveNoteWriteback({
+  prompt,
+  missionIntent,
+  toolContext,
+  enableStreaming,
+  forceChatOnly,
+}: {
+  prompt: string;
+  missionIntent: MissionIntent;
+  toolContext: ToolExecutionContext;
+  enableStreaming: boolean;
+  forceChatOnly: boolean;
+}): MissionIntent {
+  if (
+    !shouldDefaultToActiveNoteWriteback({
+      prompt,
+      missionIntent,
+      toolContext,
+      enableStreaming,
+      forceChatOnly,
+    })
+  ) {
+    return missionIntent;
+  }
+
+  return buildMissionIntent(prompt, {
+    ...missionIntent,
+    mode: missionIntent.vaultContext ? "vault_context_answer" : "note_output",
+    noteOutput: true,
+    explicitPersistence: missionIntent.explicitPersistence,
+    explicitMutation: missionIntent.explicitMutation,
+    explicitDelete: false,
+    allowAutonomousWrite: true,
+    requireWriteCompletion: true,
+  });
+}
+
+function shouldDefaultToActiveNoteWriteback({
+  prompt,
+  missionIntent,
+  toolContext,
+  enableStreaming,
+  forceChatOnly,
+}: {
+  prompt: string;
+  missionIntent: MissionIntent;
+  toolContext: ToolExecutionContext;
+  enableStreaming: boolean;
+  forceChatOnly: boolean;
+}): boolean {
+  if (
+    forceChatOnly ||
+    hasChatOnlyResponseIntent(prompt) ||
+    !enableStreaming ||
+    toolContext.settings?.streamWritebackMode !==
+      "all_current_note_content_writes" ||
+    missionIntent.explicitDelete
+  ) {
+    return false;
+  }
+
+  const outputProfile = resolveOutputProfile(toolContext.settings);
+  const hasActive = hasActiveCurrentMarkdownFile(toolContext);
+  if (!hasActive) {
+    if (outputProfile !== "active_or_new_note") {
+      return false;
+    }
+    // Auto-create notes for plain content answers, not tool-first web/code/browser runs.
+    if (
+      hasWebSearchIntent(prompt) ||
+      hasBrowserAutomationIntent(prompt) ||
+      hasCodeExecutionIntent(prompt) ||
+      hasOpenWebSourceIntent(prompt)
+    ) {
+      return false;
+    }
+  }
+
+  if (
+    hasPriorAssistantResponseWritebackIntent(prompt) ||
+    hasResearchMemoryWriteIntent(prompt) ||
+    hasTemplateIntent(prompt) ||
+    hasDesignIntent(prompt) ||
+    hasCodeExecutionIntent(prompt) ||
+    hasWordCountIntent(prompt) ||
+    hasHtmlPreviewIntent(prompt) ||
+    hasOpenWebSourceIntent(prompt) ||
+    hasBrowserAutomationIntent(prompt) ||
+    hasExperienceMemoryIntent(prompt) ||
+    hasCreateFileIntent(prompt) ||
+    hasCreateFolderIntent(prompt) ||
+    hasMovePathIntent(prompt) ||
+    hasDeleteIntent(prompt) ||
+    hasDeletePathIntent(prompt) ||
+    hasTitleIntent(prompt) ||
+    hasHighlightIntent(prompt) ||
+    hasRestoreIntent(prompt) ||
+    hasGraphLinkWriteIntent(prompt) ||
+    hasSemanticIndexMaintenanceIntent(prompt)
+  ) {
+    return false;
+  }
+
+  if (hasExplicitNonCurrentNoteWriteTarget(prompt)) {
+    return false;
+  }
+
+  if (missionIntent.explicitMutation && !missionIntent.noteOutput) {
+    return false;
+  }
+
+  if (missionIntent.vaultContext || missionIntent.noteOutput) {
+    return true;
+  }
+
+  return missionIntent.mode === "chat_only";
+}
+
 function applySafeReflexIntent({
   prompt,
   missionIntent,
@@ -6889,18 +11890,127 @@ function shouldFallbackGeneratedNoteOutputToChat(
   prompt: string,
   missionIntent: MissionIntent,
   toolContext: ToolExecutionContext,
+  enableStreaming = true,
 ): boolean {
   if (!missionIntent.noteOutput || hasActiveCurrentMarkdownFile(toolContext)) {
     return false;
   }
 
-  const generated = analyzeGeneratedOutputPrompt(prompt);
-  return (
-    generated.target === "current_note_append" &&
-    !hasExplicitWritePersistenceIntent(prompt) &&
-    !hasCurrentPageWritebackIntent(prompt) &&
-    !hasPathTargetIntent(prompt)
-  );
+  const outputProfile = resolveOutputProfile(toolContext.settings);
+  const canLazyCreateNote =
+    outputProfile === "active_or_new_note" &&
+    enableStreaming &&
+    toolContext.settings?.streamWritebackMode ===
+      "all_current_note_content_writes";
+
+  // Without a creatable note target, keep the legacy generated-append chat fallback.
+  if (!canLazyCreateNote) {
+    const generated = analyzeGeneratedOutputPrompt(prompt);
+    return (
+      generated.target === "current_note_append" &&
+      !hasExplicitWritePersistenceIntent(prompt) &&
+      !hasCurrentPageWritebackIntent(prompt) &&
+      !hasPathTargetIntent(prompt)
+    );
+  }
+
+  // Tool-first research without explicit note write stays in chat even when
+  // active_or_new_note would otherwise create a note.
+  if (
+    (hasWebSearchIntent(prompt) ||
+      hasBrowserAutomationIntent(prompt) ||
+      hasCodeExecutionIntent(prompt) ||
+      hasOpenWebSourceIntent(prompt)) &&
+    !hasNoteOutputIntent(prompt) &&
+    !hasCurrentPageWritebackIntent(prompt)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function resolveOutputProfile(
+  settings: ToolExecutionContext["settings"] | undefined,
+): OutputProfile {
+  if (
+    settings?.outputProfile === "active_or_new_note" ||
+    settings?.outputProfile === "active_note_only" ||
+    settings?.outputProfile === "chat_first"
+  ) {
+    return settings.outputProfile;
+  }
+  if (
+    settings?.enableStreaming === false ||
+    settings?.streamWritebackMode === "off"
+  ) {
+    return "chat_first";
+  }
+  return "active_or_new_note";
+}
+
+function buildMissionNoteOutputPlan(input: {
+  prompt: string;
+  missionIntent: MissionIntent;
+  toolContext: ToolExecutionContext;
+  enableStreaming: boolean;
+  forceChatOnly: boolean;
+}): NoteOutputPlan {
+  const activeFile =
+    input.toolContext.getCurrentMarkdownFile?.() ??
+    input.toolContext.app?.workspace?.getActiveFile?.() ??
+    null;
+  const hasActive =
+    Boolean(activeFile && (activeFile as { extension?: string }).extension === "md");
+  const specialized =
+    hasPriorAssistantResponseWritebackIntent(input.prompt) ||
+    hasResearchMemoryWriteIntent(input.prompt) ||
+    hasTemplateIntent(input.prompt) ||
+    hasDesignIntent(input.prompt) ||
+    hasCodeExecutionIntent(input.prompt) ||
+    hasBrowserAutomationIntent(input.prompt) ||
+    hasCreateFileIntent(input.prompt) ||
+    hasCreateFolderIntent(input.prompt) ||
+    hasMovePathIntent(input.prompt) ||
+    hasDeleteIntent(input.prompt) ||
+    hasDeletePathIntent(input.prompt) ||
+    hasTitleIntent(input.prompt) ||
+    hasHighlightIntent(input.prompt) ||
+    hasRestoreIntent(input.prompt) ||
+    hasGraphLinkWriteIntent(input.prompt) ||
+    hasSemanticIndexMaintenanceIntent(input.prompt) ||
+    hasExplicitNonCurrentNoteWriteTarget(input.prompt) ||
+    ((hasWebSearchIntent(input.prompt) || hasOpenWebSourceIntent(input.prompt)) &&
+      !hasCurrentPageWritebackIntent(input.prompt) &&
+      !hasExplicitWritePersistenceIntent(input.prompt) &&
+      !hasActive) ||
+    input.missionIntent.explicitDelete ||
+    (input.missionIntent.explicitMutation && !input.missionIntent.noteOutput);
+
+  return resolveNoteOutputPlan({
+    prompt: input.prompt,
+    forceChatOnly: input.forceChatOnly,
+    hasActiveMarkdownNote: hasActive,
+    activeNoteIsPlaceholder: hasActive
+      ? isPlaceholderNoteBasename(
+          (activeFile as { basename?: string }).basename ?? "",
+        )
+      : true,
+    outputProfile: resolveOutputProfile(input.toolContext.settings),
+    enableStreaming: input.enableStreaming,
+    streamWritebackMode:
+      input.toolContext.settings?.streamWritebackMode ??
+      "all_current_note_content_writes",
+    autoTitleOnWrite: input.toolContext.settings?.autoTitleOnWrite !== false,
+    specializedRoute: specialized,
+    contentProducing: input.missionIntent.noteOutput
+      ? true
+      : input.missionIntent.vaultContext ||
+          input.missionIntent.explicitDelete ||
+          specialized
+        ? false
+        : undefined,
+  });
 }
 
 function hasActiveCurrentMarkdownFile(
@@ -6925,6 +12035,12 @@ function hasVaultContextQuestionIntent(prompt: string): boolean {
 
 function hasExplicitWritePersistenceIntent(prompt: string): boolean {
   return /\b(append|save|write|update|add|insert|copy|paste|put|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b[\s\S]{0,100}\b(note|file|markdown|vault|folder|directory|path|page|document)\b|\b(note|file|markdown|vault|folder|directory|path|page|document)\b[\s\S]{0,100}\b(append|save|write|update|add|insert|copy|paste|put|record|persist|create|make|replace|rewrite|edit|revise|rename|move|delete|remove|trash)\b|\.md\b/i.test(
+    prompt,
+  );
+}
+
+function hasChatOnlyResponseIntent(prompt: string): boolean {
+  return /\b(chat\s+only|only\s+in\s+chat|answer\s+in\s+chat|respond\s+in\s+chat|do\s+not\s+(?:write|append|save)\s+(?:to|in|into)\s+(?:the\s+)?(?:note|page|document|file))\b/i.test(
     prompt,
   );
 }
@@ -6972,8 +12088,10 @@ function hasHtmlPreviewIntent(prompt: string): boolean {
 }
 
 function hasDesignIntent(prompt: string): boolean {
-  return /\b(create|make|draw|generate|build|draft|render|save|write|map|package)\b[\s\S]{0,160}\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b|\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b[\s\S]{0,160}\b(create|make|draw|generate|build|draft|render|save|write|map|package)\b/i.test(
-    prompt,
+  return (
+    /\b(create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust)\b[\s\S]{0,160}\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b|\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b[\s\S]{0,160}\b(create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust)\b/i.test(
+      prompt,
+    )
   );
 }
 
@@ -7049,17 +12167,7 @@ function hasCreateNoteFromTemplateIntent(prompt: string): boolean {
 }
 
 function hasCheckpointResumeIntent(prompt: string): boolean {
-  return (
-    /^\s*(continue|keep\s+going|resume|carry\s+on|pick\s+up)\b/i.test(
-      prompt,
-    ) ||
-    /\b(resume|continue|keep\s+going|carry\s+on|pick\s+up)\b[\s\S]{0,120}\b(agent\s+run|mission|checkpoint|previous\s+run|prior\s+run|last\s+run)\b/i.test(
-      prompt,
-    ) ||
-    /\b(agent\s+run|mission|checkpoint|previous\s+run|prior\s+run|last\s+run)\b[\s\S]{0,120}\b(resume|continue|keep\s+going|carry\s+on|pick\s+up)\b/i.test(
-      prompt,
-    )
-  );
+  return hasMissionResumeIntent(prompt);
 }
 
 function hasCurrentNoteReadIntent(prompt: string): boolean {
@@ -7248,6 +12356,33 @@ function hasPathTargetIntent(prompt: string): boolean {
   );
 }
 
+function hasResearchPackIntent(prompt: string): boolean {
+  return /\b(create|make|build|generate|save)\b[\s\S]{0,120}\b(research\s+pack|research\s+brief|sources?\s+index|synthesis\s+pack|transactional\s+pack)\b|\b(research\s+pack|research\s+brief|sources?\s+index|synthesis\s+pack|transactional\s+pack)\b[\s\S]{0,120}\b(create|make|build|generate|save)\b/i.test(
+    prompt,
+  );
+}
+
+function hasExplicitNonCurrentPathTarget(prompt: string): boolean {
+  return (
+    !hasCurrentNoteTarget(prompt) &&
+    /(?:^|[\s"'`])[\w .@()-]+\/[\w .@()/-]+|\.md\b|\b(vault file|vault folder|file named|note named|named file|named note|another file|specific file|existing file)\b/i.test(
+      prompt,
+    )
+  );
+}
+
+function hasExplicitNonCurrentNoteWriteTarget(prompt: string): boolean {
+  return (
+    hasExplicitNonCurrentPathTarget(prompt) &&
+    (hasAppendIntent(prompt) ||
+      hasReplaceIntent(prompt) ||
+      hasCreateFileIntent(prompt) ||
+      hasCreateFolderIntent(prompt) ||
+      hasMovePathIntent(prompt) ||
+      hasDeletePathIntent(prompt))
+  );
+}
+
 function hasCurrentNoteTarget(prompt: string): boolean {
   return /\b(current|this|active)\s+(note|file|markdown|document|page)\b|\b(note|file|markdown|document|page)\b[\s\S]{0,40}\b(current|this|active)\b/i.test(
     prompt,
@@ -7255,6 +12390,10 @@ function hasCurrentNoteTarget(prompt: string): boolean {
 }
 
 function hasNoteOutputIntent(prompt: string): boolean {
+  if (hasChatOnlyResponseIntent(prompt)) {
+    return false;
+  }
+
   const generated = analyzeGeneratedOutputPrompt(prompt);
   if (
     generated.target === "current_note_append" ||
@@ -7268,6 +12407,7 @@ function hasNoteOutputIntent(prompt: string): boolean {
     hasWholeNoteRevisionIntent(prompt) ||
     hasReplaceIntent(prompt) ||
     hasTitleIntent(prompt) ||
+    hasHighlightIntent(prompt) ||
     hasEditIntent(prompt) ||
     hasSectionAppendIntent(prompt) ||
     hasResearchMemoryWriteIntent(prompt) ||
@@ -7306,7 +12446,10 @@ function hasReplaceIntent(prompt: string): boolean {
 }
 
 function hasWholeNoteReplaceIntent(prompt: string): boolean {
-  if (hasWholeNoteRevisionIntent(prompt)) {
+  if (
+    isCurrentNoteReplaceResetPrompt(prompt) ||
+    hasWholeNoteRevisionIntent(prompt)
+  ) {
     return true;
   }
 
@@ -7329,6 +12472,17 @@ function hasClearPageAndWriteIntent(prompt: string): boolean {
 }
 
 function hasWholeNoteRevisionIntent(prompt: string): boolean {
+  if (isNamedSectionEditIntent(prompt)) {
+    return false;
+  }
+
+  if (
+    isWholeNoteEditIntent(prompt) ||
+    isCurrentNoteEditOrganizeIntent(prompt)
+  ) {
+    return true;
+  }
+
   const sectionTarget =
     /\b(section|heading)\b/i.test(prompt) &&
     !/\b(essay|draft|article|paragraphs?|body|content|document)\b/i.test(
@@ -7355,9 +12509,7 @@ function hasWholeNoteRevisionIntent(prompt: string): boolean {
 }
 
 function hasEditIntent(prompt: string): boolean {
-  return /\b(edit|revise|update|replace|rewrite)\b[\s\S]{0,80}\b(section|heading)\b|\b(section|heading)\b[\s\S]{0,80}\b(edit|revise|update|replace|rewrite)\b/i.test(
-    prompt,
-  );
+  return isNamedSectionEditIntent(prompt);
 }
 
 function hasDeleteIntent(prompt: string): boolean {
@@ -7379,9 +12531,47 @@ function hasDeletePathIntent(prompt: string): boolean {
 }
 
 function hasMovePathIntent(prompt: string): boolean {
-  return /\b(move|relocate)\b[\s\S]{0,100}\b(path|file|folder|note|vault|\.md)\b|\b(rename)\b[\s\S]{0,100}\b(path|file|folder|note|vault|\.md)\b|\b(path|file|folder|note|vault|\.md)\b[\s\S]{0,100}\b(move|relocate|rename)\b/i.test(
-    prompt,
-  );
+  const explicitPathSyntax =
+    /(?:^|[\s"'`])[\w .@()-]+\/[\w .@()/-]+|\.md\b|\b(path|folder|directory|vault\s+(?:file|folder)|file\s+named|note\s+named|named\s+(?:file|note))\b/i.test(
+      prompt,
+    );
+  if (
+    isVisibleTitleRenameIntent(prompt) &&
+    hasCurrentNoteTarget(prompt) &&
+    !/\b(move|relocate)\b/i.test(prompt) &&
+    !explicitPathSyntax
+  ) {
+    return false;
+  }
+
+  const explicitRelocation =
+    /\b(move|relocate)\b[\s\S]{0,100}\b(path|file|folder|note|vault|\.md)\b|\b(path|file|folder|note|vault|\.md)\b[\s\S]{0,100}\b(move|relocate)\b/i.test(
+      prompt,
+    );
+  if (explicitRelocation) {
+    return true;
+  }
+
+  const renamePath =
+    /\brename\b[\s\S]{0,100}\b(path|file|folder|note|vault|\.md)\b|\b(path|file|folder|note|vault|\.md)\b[\s\S]{0,100}\brename\b/i.test(
+      prompt,
+    );
+  if (!renamePath) {
+    return false;
+  }
+
+  // Renaming the visible title of the active note is owned by
+  // rename_current_file. Do not also create a generic move_path obligation
+  // merely because the phrase "rename the current note" contains "note".
+  if (
+    isVisibleTitleRenameIntent(prompt) &&
+    hasCurrentNoteTarget(prompt) &&
+    !explicitPathSyntax
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function hasWebSearchIntent(prompt: string): boolean {
@@ -7397,7 +12587,15 @@ function hasWebSearchIntent(prompt: string): boolean {
     return false;
   }
 
+  if (hasHighlightIntent(prompt)) {
+    return false;
+  }
+
   if (/\b(search|use|check|consult)\s+(?:the\s+)?web\b/i.test(prompt)) {
+    return true;
+  }
+
+  if (hasCurrentWebFactIntent(prompt)) {
     return true;
   }
 
@@ -7422,6 +12620,12 @@ function hasFetchedWebSourceIntent(prompt: string): boolean {
   );
 }
 
+function hasCurrentWebFactIntent(prompt: string): boolean {
+  return /\b(?:latest|recent|current|up[-\s]?to[-\s]?date)\b[\s\S]{0,100}\b(?:events?|news|information|info|data|facts?|research|reports?|papers?|studies?|market|markets?|industry|industries|trends?|prices?|rates?|status|versions?|law|policy|policies)\b/i.test(
+    prompt,
+  );
+}
+
 function hasDeepResearchIntent(prompt: string): boolean {
   return /\b(deep\s+research|in[-\s]?depth(?:\s+(?:research|analysis|investigation|report))?|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
     prompt,
@@ -7435,7 +12639,9 @@ function hasExplicitWebSearchIntent(prompt: string): boolean {
 }
 
 function hasSimpleDateTimePrompt(prompt: string): boolean {
-  return /^\s*(what(?:'s| is)?|tell me|give me|show me)?\s*(today'?s\s+)?(current\s+)?(date|time|day)(\s+(today|now|right now))?\??\s*$/i.test(
+  return /^\s*(?:(?:what(?:'s| is)?|tell me|give me|show me)\s+)?(?:today'?s\s+)?(?:current\s+)?(?:date|time|day)(?:\s+(?:today|now|right now))?\??\s*$/i.test(
+    prompt,
+  ) || /^\s*what\s+(?:date|time|day)\s+is\s+it(?:\s+(?:today|now|right now))?\??\s*$/i.test(
     prompt,
   );
 }
@@ -7462,17 +12668,27 @@ function hasStaticGenerationIntent(prompt: string): boolean {
 }
 
 function hasTitleIntent(prompt: string): boolean {
-  return /\b(retitle|rename|title|heading|h1)\b|\bcall\s+(?:this|the)\s+note\b|\b(note|file)\b[\s\S]{0,80}\b(organize|restructure|improve)\b|\b(organize|restructure|improve)\b[\s\S]{0,80}\b(note|file)\b/i.test(
+  return isMarkdownTitleContentIntent(prompt) || isVisibleTitleRenameIntent(prompt);
+}
+
+function hasMarkdownTitleContentIntent(prompt: string): boolean {
+  return isMarkdownTitleContentIntent(prompt);
+}
+
+function hasHighlightIntent(prompt: string): boolean {
+  return /\b(find|search|locate|show)\b[\s\S]{0,120}\b(highlight|mark)\b|\b(highlight|mark)\b[\s\S]{0,120}\b(word|phrase|text|where|current\s+(?:note|file|page))\b/i.test(
+    prompt,
+  );
+}
+
+function hasRestoreIntent(prompt: string): boolean {
+  return /\b(undo|restore|revert|rollback|roll\s+back)\b[\s\S]{0,140}\b(agent|last|previous|backup|current\s+(?:note|file|page)|this\s+(?:note|file|page))\b|\b(agent|last|previous|backup|current\s+(?:note|file|page)|this\s+(?:note|file|page))\b[\s\S]{0,140}\b(undo|restore|revert|rollback|roll\s+back)\b/i.test(
     prompt,
   );
 }
 
 function hasTitleOnlyIntent(prompt: string): boolean {
-  if (!hasTitleIntent(prompt)) {
-    return false;
-  }
-
-  return !/\b(append|add|insert|write|draft|compose|generate|create|stream|essay|article|paragraph|report|brief|summary|analysis|content)\b/i.test(prompt);
+  return isTitleOnlyIntent(prompt);
 }
 
 function emitStatus(
@@ -7654,6 +12870,10 @@ function getToolPreparationStatus(toolName: string): string | null {
     return "Filling template...";
   }
 
+  if (toolName === "create_research_pack") {
+    return "Creating and verifying research pack...";
+  }
+
   if (toolName === "create_folder") {
     return "Creating folder...";
   }
@@ -7688,6 +12908,18 @@ function getToolPreparationStatus(toolName: string): string | null {
 
   if (toolName === "retitle_current_file") {
     return "Retitling current note...";
+  }
+
+  if (toolName === "rename_current_file") {
+    return "Renaming current note file...";
+  }
+
+  if (toolName === "highlight_current_file_phrase") {
+    return "Highlighting phrase in current note...";
+  }
+
+  if (toolName === "restore_current_file_from_backup") {
+    return "Restoring current note from backup...";
   }
 
   if (toolName === "prepare_edit_current_section") {
@@ -7814,6 +13046,14 @@ function emitToolSuccessStatus(
 
   if (toolName === "delete_path" && isRecord(output)) {
     const message = `Trashed ${String(output.path ?? "vault path")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "restore_current_file_from_backup" && isRecord(output)) {
+    const message = `Restored ${String(
+      output.path ?? "current note",
+    )} from ${String(output.restoredFromBackupPath ?? "backup")}.`;
     events.onStatus?.(message);
     return message;
   }
@@ -7974,6 +13214,17 @@ function emitToolSuccessStatus(
     return message;
   }
 
+  if (toolName === "create_research_pack" && isRecord(output)) {
+    const createdCount = Array.isArray(output.createdPaths)
+      ? output.createdPaths.length
+      : 0;
+    const message = `Created verified research pack ${String(
+      output.path ?? "vault folder",
+    )}${createdCount ? ` with ${createdCount} notes` : ""}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
   if (toolName === "append_to_current_file" && isRecord(output)) {
     const message = `Appended result to ${String(output.path ?? "current note")}.`;
     events.onStatus?.(message);
@@ -7994,6 +13245,26 @@ function emitToolSuccessStatus(
     const message = `Updated note title in ${String(
       output.path ?? "current note",
     )}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "rename_current_file" && isRecord(output)) {
+    const message = `Renamed current note from ${String(
+      output.path ?? "current note",
+    )} to ${String(output.toPath ?? "new title")}.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "highlight_current_file_phrase" && isRecord(output)) {
+    const count = getNumber(output.matchCount) ?? 0;
+    const message =
+      count > 0
+        ? `Highlighted ${count} match${count === 1 ? "" : "es"} in ${String(
+            output.path ?? "current note",
+          )}; backup saved to ${String(output.backupPath ?? "backup")}.`
+        : `No matching phrase found in ${String(output.path ?? "current note")}.`;
     events.onStatus?.(message);
     return message;
   }
@@ -8056,6 +13327,190 @@ function emitToolSuccessStatus(
   return message;
 }
 
+function buildReceiptFromToolExecution(
+  toolName: string,
+  result: ToolExecutionResult,
+  descriptor: ToolDescriptor | null = null,
+): AgentRunReceipt | null {
+  if (result.receipt) {
+    return canonicalActionReceiptToAgentRunReceipt(result.receipt, result.output);
+  }
+  const legacyReceipt = buildReceipt(toolName, result.output);
+  if (legacyReceipt) {
+    return descriptor
+      ? {
+          ...legacyReceipt,
+          resource: buildDescriptorResourceRef(
+            descriptor,
+            result.output,
+            legacyReceipt.path,
+          ),
+        }
+      : legacyReceipt;
+  }
+  if (
+    !descriptor ||
+    descriptor.effect === "read" ||
+    !descriptor.durability.receipt ||
+    !isRecord(result.output) ||
+    result.output.status === "requires_approval" ||
+    result.output.status === "blocked"
+  ) {
+    return null;
+  }
+  const resource = buildDescriptorResourceRef(descriptor, result.output);
+  return {
+    toolName,
+    operation: descriptor.capability.action,
+    message: `${descriptor.capability.action} ${resource.id}`,
+    resource,
+    path: resource.system === "vault" ? resource.path : undefined,
+    bytesWritten: getNumber(result.output.bytesWritten),
+    bytesDeleted: getNumber(result.output.bytesDeleted),
+    affectedCount: getNumber(result.output.affectedCount),
+    output: result.output,
+  };
+}
+
+function buildDescriptorResourceRef(
+  descriptor: ToolDescriptor,
+  output: unknown,
+  fallbackPath?: string,
+): ResourceRef {
+  const record = isRecord(output) ? output : {};
+  const path = getString(record.path) ?? fallbackPath;
+  const id =
+    getString(record.id) ??
+    getString(record.identifier) ??
+    getString(record.packageName) ??
+    path ??
+    `${descriptor.name}:result`;
+  return {
+    system: descriptor.capability.system,
+    resourceType: descriptor.capability.resourceType,
+    id,
+    identifier: getString(record.identifier),
+    path,
+    url: getString(record.url),
+    revision: getString(record.revision) ?? getString(record.updatedAt),
+  };
+}
+
+function hasVaultWriteReceipt(receipts: AgentRunReceipt[]): boolean {
+  return receipts.some((receipt) => {
+    if (
+      ["read", "list", "search", "validate"].includes(receipt.operation)
+    ) {
+      return false;
+    }
+    return receipt.resource
+      ? receipt.resource.system === "vault"
+      : Boolean(receipt.path);
+  });
+}
+
+function sameAgentRunReceiptIdentity(
+  left: AgentRunReceipt,
+  right: AgentRunReceipt,
+): boolean {
+  if (left.id && right.id) {
+    return left.id === right.id;
+  }
+  return (
+    left.toolName === right.toolName &&
+    left.operation === right.operation &&
+    left.path === right.path &&
+    left.toPath === right.toPath &&
+    left.resource?.system === right.resource?.system &&
+    left.resource?.id === right.resource?.id &&
+    left.message === right.message
+  );
+}
+
+function hasExternalActionReceipt(receipts: AgentRunReceipt[]): boolean {
+  return receipts.some(
+    (receipt) =>
+      (receipt.resource?.system === "linear" ||
+        receipt.resource?.system === "github") &&
+      !["read", "list", "search"].includes(receipt.operation),
+  );
+}
+
+function hasRequiredActionReceipt(
+  plan: MissionPlan | null | undefined,
+  receipts: AgentRunReceipt[],
+): boolean {
+  const proofKinds = new Set(
+    plan?.tasks.flatMap((task) => task.completionContract.requiredProof) ?? [],
+  );
+  const requiresExternal = proofKinds.has("external_action_receipt");
+  const vaultProofKinds: MissionPlanProofKind[] = [
+    "write_receipt",
+    "rename_receipt",
+    "highlight_receipt",
+  ];
+  const requiresVault = vaultProofKinds.some((proof) => proofKinds.has(proof));
+  if (requiresExternal && !hasExternalActionReceipt(receipts)) {
+    return false;
+  }
+  if (requiresVault && !hasVaultWriteReceipt(receipts)) {
+    return false;
+  }
+  if (requiresExternal || requiresVault) {
+    return true;
+  }
+  return hasVaultWriteReceipt(receipts) || hasExternalActionReceipt(receipts);
+}
+
+function canonicalActionReceiptToAgentRunReceipt(
+  receipt: ActionReceipt,
+  output?: unknown,
+): AgentRunReceipt {
+  const outputRecord = isRecord(output) ? output : null;
+  return {
+    version: 1,
+    id: receipt.id,
+    toolName: receipt.toolName,
+    operation: receipt.operation,
+    message: receipt.message,
+    actionId: receipt.actionId,
+    resource: { ...receipt.resource },
+    relatedResources: receipt.relatedResources?.map((resource) => ({
+      ...resource,
+    })),
+    payloadFingerprint: receipt.payloadFingerprint,
+    grantId: receipt.grantId,
+    idempotencyKey: receipt.idempotencyKey,
+    providerRequestId: receipt.providerRequestId,
+    startedAt: receipt.startedAt,
+    committedAt: receipt.committedAt,
+    commitKind: receipt.commitKind,
+    readback: { ...receipt.readback },
+    effects: receipt.effects
+      ? {
+          ...receipt.effects,
+          changedFields: receipt.effects.changedFields
+            ? [...receipt.effects.changedFields]
+            : undefined,
+        }
+      : undefined,
+    path:
+      receipt.resource.system === "vault"
+        ? receipt.resource.path
+        : typeof outputRecord?.path === "string"
+          ? outputRecord.path
+          : undefined,
+    backupPath:
+      typeof outputRecord?.backupPath === "string"
+        ? outputRecord.backupPath
+        : undefined,
+    bytesWritten: receipt.effects?.bytesWritten,
+    bytesDeleted: receipt.effects?.bytesDeleted,
+    affectedCount: receipt.effects?.affectedCount,
+    output,
+  };
+}
+
 function buildReceipt(
   toolName: string,
   output: unknown,
@@ -8067,9 +13522,11 @@ function buildReceipt(
   const path = getString(output.path);
   const toPath = getString(output.toPath);
   const backupPath = getString(output.backupPath);
+  const restoredFromBackupPath = getString(output.restoredFromBackupPath);
   const bytesWritten = getNumber(output.bytesWritten);
   const bytesDeleted = getNumber(output.bytesDeleted);
   const affectedCount = getNumber(output.affectedCount);
+  const matchCount = getNumber(output.matchCount);
   const operation = getReceiptOperation(toolName);
   const messageParts = [`${operation} ${path || "current note"}`];
 
@@ -8081,8 +13538,16 @@ function buildReceipt(
     messageParts.push(`backup: ${backupPath}`);
   }
 
+  if (restoredFromBackupPath) {
+    messageParts.push(`restored_from: ${restoredFromBackupPath}`);
+  }
+
   if (affectedCount !== undefined) {
     messageParts.push(`affected: ${affectedCount}`);
+  }
+
+  if (matchCount !== undefined) {
+    messageParts.push(`matches: ${matchCount}`);
   }
 
   return {
@@ -8091,9 +13556,10 @@ function buildReceipt(
     path,
     toPath,
     backupPath,
+    restoredFromBackupPath,
     bytesWritten,
     bytesDeleted,
-    affectedCount,
+    affectedCount: affectedCount ?? matchCount,
     output,
     message: messageParts.join("; "),
   };
@@ -8105,6 +13571,7 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
     toolName === "create_design_canvas" ||
     toolName === "create_svg_design" ||
     toolName === "create_design_package" ||
+    toolName === "export_workspace_artifact" ||
     toolName === "seed_default_templates"
   ) {
     return "create";
@@ -8112,7 +13579,8 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
 
   if (
     toolName === "create_template" ||
-    toolName === "fill_template"
+    toolName === "fill_template" ||
+    toolName === "create_research_pack"
   ) {
     return "create";
   }
@@ -8165,6 +13633,18 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
     return "retitle";
   }
 
+  if (toolName === "rename_current_file") {
+    return "rename_current_file";
+  }
+
+  if (toolName === "highlight_current_file_phrase") {
+    return "highlight";
+  }
+
+  if (toolName === "restore_current_file_from_backup") {
+    return "restore";
+  }
+
   if (toolName === "edit_current_section") {
     return "edit";
   }
@@ -8191,9 +13671,11 @@ function isWriteToolName(toolName: string): boolean {
     toolName === "create_design_canvas" ||
     toolName === "create_svg_design" ||
     toolName === "create_design_package" ||
+    toolName === "export_workspace_artifact" ||
     toolName === "seed_default_templates" ||
     toolName === "create_template" ||
     toolName === "fill_template" ||
+    toolName === "create_research_pack" ||
     toolName === "create_file" ||
     toolName === "append_file" ||
     toolName === "replace_file" ||
@@ -8201,9 +13683,12 @@ function isWriteToolName(toolName: string): boolean {
     toolName === "delete_path" ||
     toolName === "append_to_current_file" ||
     toolName === "append_to_current_section" ||
+    toolName === "highlight_current_file_phrase" ||
+    toolName === "restore_current_file_from_backup" ||
     toolName === "append_research_memory" ||
     toolName === "compact_research_memory" ||
     toolName === "delete_research_memory_entry" ||
+    toolName === "rename_current_file" ||
     toolName === "retitle_current_file" ||
     toolName === "edit_current_section" ||
     toolName === "replace_current_file" ||
@@ -8306,6 +13791,12 @@ function getNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+function getStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+}
+
 function emitDirectAssistantAnswer(
   content: string,
   events: AgentRunEvents,
@@ -8388,6 +13879,11 @@ async function streamCurrentNoteWriteback({
   options,
   abortSignal,
   onThinkingUnsupported,
+  onPartialReceipt,
+  stagedContent,
+  missionPrompt,
+  lazyCreatePath,
+  onNoteCreated,
 }: {
   kind: StreamingWritebackKind;
   preparedSectionEdit: PreparedStreamingSectionEdit | null;
@@ -8401,12 +13897,30 @@ async function streamCurrentNoteWriteback({
   options?: ModelRequestOptions;
   abortSignal?: AbortSignal;
   onThinkingUnsupported: () => void;
+  onPartialReceipt?: (receipt: AgentRunReceipt) => void;
+  /** Exact sanitized content that has already passed proof verification. */
+  stagedContent?: string;
+  missionPrompt?: string;
+  lazyCreatePath?: string | null;
+  onNoteCreated?: (file: { path: string; basename: string }) => void;
 }): Promise<AgentRunReceipt> {
   const writer = await createStreamingNoteWriter({
     kind,
     toolContext,
     preparedSectionEdit,
+    lazyCreatePath,
+    onNoteCreated,
   });
+  const activeBasename =
+    toolContext.getCurrentMarkdownFile?.()?.basename ??
+    toolContext.app.workspace.getActiveFile()?.basename ??
+    (lazyCreatePath
+      ? lazyCreatePath.replace(/^.*\//, "").replace(/\.md$/i, "")
+      : undefined);
+  const writebackPromptOptions = {
+    missionPrompt: missionPrompt ?? toolContext.originalPrompt,
+    activeBasename,
+  };
 
   emitStatus(events, "Streaming writeback to note...", "final_answer");
   events.onFinalStart?.();
@@ -8427,6 +13941,7 @@ async function streamCurrentNoteWriteback({
       kind,
       preparedSectionEdit,
       retry,
+      writebackPromptOptions,
     );
     const streamRequest: ModelChatRequest = {
       messages: [
@@ -8571,6 +14086,23 @@ async function streamCurrentNoteWriteback({
   };
 
   try {
+    if (stagedContent !== undefined) {
+      if (!stagedContent.trim()) {
+        throw new Error(EMPTY_STREAMING_WRITEBACK_MESSAGE);
+      }
+      emitStatus(events, "Committing verified writeback to note...", "final_answer");
+      // No unverified draft was released, so the verified candidate is the
+      // first visible content and should be emitted once as a normal delta.
+      events.onFinalDelta?.(stagedContent);
+      events.onAssistantDelta?.(stagedContent);
+      writer.replaceContent(stagedContent);
+      await writer.finish({ force: true });
+      events.onFinalDone?.();
+      events.onAssistantMessageDone?.();
+      events.onStatus?.("Verified writeback complete.");
+      return writer.buildReceipt(false);
+    }
+
     let retryUsed = false;
     let attempt: Awaited<ReturnType<typeof streamAttempt>>;
     try {
@@ -8699,6 +14231,7 @@ async function streamCurrentNoteWriteback({
 
     if (writer.hasWritableContent()) {
       const receipt = writer.buildReceipt(true);
+      onPartialReceipt?.(receipt);
       events.onReceipt?.(receipt);
       events.onStatus?.(
         "Streaming writeback interrupted; partial content may have been written.",
@@ -8712,45 +14245,132 @@ function buildStreamingWritebackPrompt(
   kind: StreamingWritebackKind,
   preparedSectionEdit: PreparedStreamingSectionEdit | null,
   retry = false,
+  options: {
+    missionPrompt?: string;
+    activeBasename?: string;
+  } = {},
 ): string {
   const retryPrefix = retry
     ? [
-        "The previous writeback stream returned no writable markdown or incomplete markdown.",
-        "Return the complete requested markdown content now.",
+        "Previous stream failed the output contract or returned no writable markdown.",
+        "Re-emit the FULL answer using the OUTPUT CONTRACT. First character must be #.",
       ]
     : [];
 
-  if (kind === "append") {
+  if (kind === "edit") {
     return [
       ...retryPrefix,
-      "Write the markdown content to append to the current note now.",
+      `Write the replacement markdown body for the section "${preparedSectionEdit?.heading ?? "target section"}" now.`,
+      "Do not include the heading line itself.",
       "Use English unless the user explicitly requested another language in the current mission.",
       FINAL_ENGLISH_ONLY_RULE,
-      "Return only the markdown that should be appended.",
+      "Return only the markdown body that belongs under that heading.",
       "Do not include preambles, explanations, receipts, or thinking traces.",
     ].join(" ");
   }
 
-  if (kind === "replace") {
-    return [
-      ...retryPrefix,
-      "Write the full replacement markdown for the current note now.",
-      "Use English unless the user explicitly requested another language in the current mission.",
-      FINAL_ENGLISH_ONLY_RULE,
-      "Return only the complete replacement note content.",
-      "Do not include preambles, explanations, receipts, or thinking traces.",
-    ].join(" ");
-  }
+  const basename = options.activeBasename?.trim() || "current note";
+  const isPlaceholder = isPlaceholderNoteBasename(basename);
+  const mission =
+    typeof options.missionPrompt === "string" && options.missionPrompt.trim()
+      ? truncateForPromptAnchor(options.missionPrompt)
+      : "";
+  const pluginBehavior = isPlaceholder
+    ? [
+        "PLUGIN BEHAVIOR (do not re-implement):",
+        "- The plugin appends/replaces this markdown into the active note.",
+        "- If the active note is a placeholder (Untitled / Untitled N), the plugin renames the file from your leading H1 after writeback.",
+        "- Do not call rename_current_file, retitle_current_file, or any tool during this writeback turn.",
+      ].join("\n")
+    : [
+        "PLUGIN BEHAVIOR (do not re-implement):",
+        "- The plugin appends/replaces this markdown into the active note.",
+        "- Do not rename the file; the note already has a real title.",
+        "- Do not call rename_current_file, retitle_current_file, or any tool during this writeback turn.",
+      ].join("\n");
+
+  const actionLine =
+    kind === "replace"
+      ? "Write the full replacement markdown for the current note now."
+      : "Write the markdown content to append to the current note now.";
 
   return [
     ...retryPrefix,
-    `Write the replacement markdown body for the section "${preparedSectionEdit?.heading ?? "target section"}" now.`,
-    "Do not include the heading line itself.",
+    actionLine,
+    "OUTPUT CONTRACT (follow exactly):",
+    "1. Line 1 MUST be exactly one Markdown H1: # <Title>",
+    "2. Line 2 MUST be blank.",
+    "3. Line 3+ is the note body only.",
+    '4. Return ONLY that markdown. No preamble, no tool JSON, no receipts, no "here is", no thinking.',
+    "TITLE RULES:",
+    "- <Title> is a short human note title (about 3-8 words), derived from the user mission.",
+    '- Do not use Untitled, Untitled N, or generic titles like "Notes" / "Response" / "Answer".',
+    "- Do not put the title only as ## H2 or bold text; the first line must be # H1.",
+    "- Do not repeat the same H1 later in the body.",
+    pluginBehavior,
+    `ACTIVE NOTE: ${basename}`,
+    mission ? `USER MISSION: ${JSON.stringify(mission)}` : "",
+    "GOOD:",
+    "# Hello World in TypeScript",
+    "",
+    'console.log("Hello, world!");',
+    "BAD:",
+    "Here is the content:",
+    "# Hello World in TypeScript",
+    "BAD:",
+    "## Hello World in TypeScript",
+    "BAD:",
+    '{"tool":"rename_current_file","title":"..."}',
     "Use English unless the user explicitly requested another language in the current mission.",
     FINAL_ENGLISH_ONLY_RULE,
-    "Return only the markdown body that belongs under that heading.",
-    "Do not include preambles, explanations, receipts, or thinking traces.",
-  ].join(" ");
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** Exported for unit tests of the Grok writeback contract. */
+export function buildStreamingWritebackPromptForTests(
+  kind: StreamingWritebackKind,
+  options: {
+    retry?: boolean;
+    missionPrompt?: string;
+    activeBasename?: string;
+    preparedSectionEdit?: PreparedStreamingSectionEdit | null;
+  } = {},
+): string {
+  return buildStreamingWritebackPrompt(
+    kind,
+    options.preparedSectionEdit ?? null,
+    options.retry ?? false,
+    {
+      missionPrompt: options.missionPrompt,
+      activeBasename: options.activeBasename,
+    },
+  );
+}
+
+function shouldEmitPlaceholderTitleWriteHint(input: {
+  missionIntent: MissionIntent;
+  streamingWritebackKind: StreamingWritebackKind | null;
+  allowedToolNames: Set<string>;
+  activeBasename?: string;
+}): boolean {
+  if (input.streamingWritebackKind !== null) {
+    return false;
+  }
+  if (!input.missionIntent.noteOutput && !input.missionIntent.requireWriteCompletion) {
+    return false;
+  }
+  const hasWriteTool =
+    input.allowedToolNames.has("append_to_current_file") ||
+    input.allowedToolNames.has("replace_current_file");
+  if (!hasWriteTool) {
+    return false;
+  }
+  return (
+    !input.activeBasename ||
+    isPlaceholderNoteBasename(input.activeBasename)
+  );
 }
 
 interface WordCountTarget {
@@ -9301,26 +14921,57 @@ async function createStreamingNoteWriter({
   kind,
   toolContext,
   preparedSectionEdit,
+  lazyCreatePath,
+  onNoteCreated,
 }: {
   kind: StreamingWritebackKind;
   toolContext: ToolExecutionContext;
   preparedSectionEdit: PreparedStreamingSectionEdit | null;
+  lazyCreatePath?: string | null;
+  onNoteCreated?: (file: { path: string; basename: string }) => void;
 }) {
-  const file = getActiveMarkdownFile(toolContext);
-  const current =
-    toolContext.getCurrentMarkdownContent?.(file) ??
-    (await toolContext.app.vault.read(file));
+  let file: ReturnType<typeof getActiveMarkdownFile> | null = null;
+  let current = "";
+  let createReceiptPath: string | null = null;
+  const ensureFile = async () => {
+    if (file) {
+      return file;
+    }
+    if (lazyCreatePath) {
+      const created = await createAutonomousNoteTarget({
+        app: toolContext.app,
+        path: lazyCreatePath,
+        initialContent: "",
+      });
+      file = created.file;
+      current = "";
+      createReceiptPath = created.path;
+      onNoteCreated?.({ path: created.path, basename: created.file.basename });
+      return file;
+    }
+    file = getActiveMarkdownFile(toolContext);
+    current =
+      toolContext.getCurrentMarkdownContent?.(file) ??
+      (await toolContext.app.vault.read(file));
+    return file;
+  };
+  if (!lazyCreatePath) {
+    file = getActiveMarkdownFile(toolContext);
+    current =
+      toolContext.getCurrentMarkdownContent?.(file) ??
+      (await toolContext.app.vault.read(file));
+  }
   const makeAppendBase = (content: string) =>
     `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}`;
   const getLatestAppendBaseSource = () =>
-    toolContext.getCurrentMarkdownContent?.(file) ?? current;
+    (file && toolContext.getCurrentMarkdownContent?.(file)) ?? current;
   const makeRetitledAppendBase = (title: string) =>
     makeAppendBase(retitleNoteMarkdown(getLatestAppendBaseSource(), title));
   let baseContent = kind === "append" ? makeAppendBase(current) : "";
   let baseContentChanged = false;
   let leadingTitleBuffer: string | null = kind === "append" ? "" : null;
   const backupPath =
-    kind === "replace"
+    kind === "replace" && file
       ? await backupActiveFile(toolContext, file, current)
       : kind === "edit"
         ? requirePreparedSectionEdit(preparedSectionEdit).backupPath
@@ -9331,6 +14982,7 @@ async function createStreamingNoteWriter({
   let lastFlushAt = nowMs();
   let flushChain = Promise.resolve();
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let hasQueuedWrite = false;
 
   const render = () => {
     if (kind === "append") {
@@ -9349,8 +15001,9 @@ async function createStreamingNoteWriter({
   const hasWritableContent = () => streamedContent.trim().length > 0;
   const hasNoteMutation = () => baseContentChanged || hasWritableContent();
   const writeContent = async (content: string) => {
-    toolContext.setCurrentMarkdownContent?.(file, content);
-    await toolContext.app.vault.modify(file, content);
+    const target = await ensureFile();
+    toolContext.setCurrentMarkdownContent?.(target, content);
+    await toolContext.app.vault.modify(target, content);
   };
   const consumeAppendTitleIfPresent = (
     delta: string,
@@ -9384,6 +15037,7 @@ async function createStreamingNoteWriter({
     pendingChars = 0;
     lastFlushAt = nowMs();
     const nextContent = render();
+    hasQueuedWrite = true;
     flushChain = flushChain.then(() => writeContent(nextContent));
   };
 
@@ -9459,19 +15113,20 @@ async function createStreamingNoteWriter({
       }
       if (
         hasNoteMutation() &&
-        (options.force || pendingChars > 0)
+        (pendingChars > 0 || (options.force && !hasQueuedWrite))
       ) {
         queueFlush();
       }
       await flushChain;
     },
     buildReceipt(partial: boolean): AgentRunReceipt {
+      const resolvedPath = file?.path ?? lazyCreatePath ?? "unknown";
       const operation =
         kind === "append" ? "append" : kind === "replace" ? "replace" : "edit";
       const bytesWritten =
         kind === "append" ? getByteLength(streamedContent) : getByteLength(render());
       const output = {
-        path: file.path,
+        path: resolvedPath,
         operation,
         backupPath,
         bytesWritten,
@@ -9479,9 +15134,13 @@ async function createStreamingNoteWriter({
         partial,
         heading: section?.heading,
         level: section?.level,
+        ...(createReceiptPath ? { createdPath: createReceiptPath } : {}),
       };
 
-      const messageParts = [`${operation} ${file.path}`];
+      const messageParts = [`${operation} ${resolvedPath}`];
+      if (createReceiptPath) {
+        messageParts.push(`created: ${createReceiptPath}`);
+      }
       if (backupPath) {
         messageParts.push(`backup: ${backupPath}`);
       }
@@ -9497,7 +15156,7 @@ async function createStreamingNoteWriter({
               ? "replace_current_file"
               : "edit_current_section",
         operation,
-        path: file.path,
+        path: resolvedPath,
         backupPath,
         bytesWritten: output.bytesWritten,
         output,
@@ -9757,6 +15416,7 @@ function completeRun(
   step: number,
   runStartedAt?: number,
   maxSteps = MAX_AGENT_STEPS,
+  autoContinuation?: AutoContinuationDecision,
 ) {
   const message = getStopReasonMessage(stopReason);
   emitStatus(
@@ -9770,6 +15430,12 @@ function completeRun(
     step,
     maxSteps,
     stopReason,
+    ...(autoContinuation
+      ? {
+          autoContinueRecommended: autoContinuation.recommended,
+          autoContinueReason: autoContinuation.reason,
+        }
+      : {}),
   });
   events.onTrace?.({
     id: `final-${stopReason}`,
@@ -9780,6 +15446,8 @@ function completeRun(
       step,
       maxSteps,
       stopReason,
+      autoContinueRecommended: autoContinuation?.recommended ?? false,
+      autoContinueReason: autoContinuation?.reason ?? "not_budget",
     },
   });
   if (runStartedAt !== undefined) {
@@ -9808,6 +15476,190 @@ function getStopReasonMessage(stopReason: AgentRunStopReason): string {
     default:
       return "Done.";
   }
+}
+
+function formatDurableEvidenceForWriteback(evidence: MissionEvidence[]): string {
+  const entries = evidence.slice(-12).map((item) => {
+    const citationIds = [
+      item.passageId,
+      ...(item.passageIds ?? []),
+      item.sourceId,
+    ]
+      .filter((value, index, values): value is string =>
+        Boolean(value) && values.indexOf(value) === index,
+      )
+      .slice(0, 24);
+    const locator = item.url ?? item.path ?? item.id;
+    const citations =
+      citationIds.length > 0
+        ? ` Citation identifiers: ${citationIds.join(", ")}.`
+        : "";
+    return `- ${item.title} (${locator}): ${item.summary.slice(0, 800)}${citations}`;
+  });
+  return [
+    "Verified durable mission evidence available for writeback.",
+    "Use these exact source and passage identifiers when the final output requires citations. Do not invent identifiers.",
+    ...entries,
+  ].join("\n");
+}
+
+function hasRuntimeSnapshotPersistence(context: ToolExecutionContext): boolean {
+  const vault = context.app?.vault;
+  return Boolean(
+    vault &&
+      typeof vault.getFileByPath === "function" &&
+      typeof vault.create === "function" &&
+      typeof vault.modify === "function" &&
+      typeof vault.read === "function" &&
+      typeof vault.getFolderByPath === "function" &&
+      typeof vault.createFolder === "function",
+  );
+}
+
+function isBlockingPreWriteProof(item: string): boolean {
+  return /web_evidence|source_coverage|source_domains|citation_coverage|fetched_sources|distinct_domains|vault_evidence|word_count|code_execution|research_plan_items/i.test(
+    item,
+  );
+}
+
+function isContentWriteToolThatNeedsEvidence(toolName: string): boolean {
+  return [
+    "create_file",
+    "append_file",
+    "replace_file",
+    "append_to_current_file",
+    "append_to_current_section",
+    "edit_current_section",
+    "replace_current_file",
+    "link_related_notes_in_current_file",
+    "fill_template",
+    "create_template",
+    "create_research_pack",
+    "create_design_canvas",
+    "create_svg_design",
+    "create_design_package",
+    "export_workspace_artifact",
+  ].includes(toolName);
+}
+
+function getStreamingWritebackToolName(
+  kind: StreamingWritebackKind,
+): "append_to_current_file" | "replace_current_file" | "edit_current_section" {
+  return kind === "append"
+    ? "append_to_current_file"
+    : kind === "replace"
+      ? "replace_current_file"
+      : "edit_current_section";
+}
+
+function requiresVerifiedFinalOutput(
+  missionPlan: MissionPlan | null,
+  researchPlan: ResearchPlan | null,
+): boolean {
+  return Boolean(
+    researchPlan ||
+      missionPlan?.tasks.some((task) =>
+        task.completionContract.citationMode !== undefined,
+      ),
+  );
+}
+
+function isRepairableFinalOutputProof(item: string): boolean {
+  return (
+    item === "final_output" ||
+    item === "citation_url_coverage" ||
+    item === "limitations_section" ||
+    item === "confidence_section" ||
+    item === "unanswered_questions" ||
+    item.startsWith("subquestion_citation_coverage:") ||
+    item.startsWith("verifier:citation_coverage:") ||
+    item === "verifier:final_output" ||
+    item === "verifier:final_relevance" ||
+    item.includes("claim_grounding") ||
+    /^verifier:[^:]+:final_relevance$/u.test(item) ||
+    /^plan:[^:]+:final_relevance$/u.test(item)
+  );
+}
+
+function getProofGatedWritebackCandidateAcceptance(
+  acceptance: MissionAcceptanceResult,
+  requiredWriteTools: string[],
+): MissionAcceptanceResult {
+  const requiredWrites = new Set(requiredWriteTools);
+  const missing = acceptance.missing.filter((item) => {
+    if (item === "write_receipt") {
+      return false;
+    }
+    if (item.startsWith("tool:")) {
+      return !requiredWrites.has(item.slice("tool:".length));
+    }
+    if (item.startsWith("pending_goal:")) {
+      // The candidate is intentionally checked before its single journaled
+      // commit, so the current-note write goal must still be pending here.
+      return false;
+    }
+    if (
+      /^verifier:[^:]+:(?:write_receipt|artifact_receipt|rename_receipt|highlight_receipt)$/u.test(
+        item,
+      ) ||
+      /^plan:[^:]+:(?:write_receipt|artifact_receipt|rename_receipt|highlight_receipt)$/u.test(
+        item,
+      )
+    ) {
+      return false;
+    }
+    return true;
+  });
+  return {
+    ...acceptance,
+    status: missing.length === 0 ? "pass" : acceptance.status,
+    missing,
+    reasons:
+      missing.length === 0
+        ? [...new Set([...acceptance.reasons, "candidate_proof_verified_before_commit"])]
+        : acceptance.reasons,
+  };
+}
+
+function buildFinalOutputVerificationCorrectionPrompt(
+  acceptance: MissionAcceptanceResult,
+  rejectedCandidate: string,
+  missionPrompt = "",
+): string {
+  const requirePassageIds = shouldRequireClaimGrounding(missionPrompt);
+  const citationMissing = acceptance.missing.some(
+    (item) =>
+      item === "citation_url_coverage" ||
+      item.startsWith("subquestion_citation_coverage:") ||
+      item.startsWith("verifier:citation_coverage:") ||
+      item.includes("claim_grounding"),
+  );
+  return [
+    `The draft failed final-output verification: ${acceptance.missing.join(", ")}.`,
+    "Revise it before it can be shown to the user.",
+    citationMissing || requirePassageIds
+      ? requirePassageIds
+        ? "Cite exact source-scoped passage identifiers already present in the evidence context (source:<id>:passage:<start>-<end>). Every material claim must include at least one persisted passage id. Do not invent identifiers or rely on bare URLs alone."
+        : "Cite the bound source URL or exact source-scoped passage identifiers already present in the evidence context. Ground each material claim to a persisted passage id."
+      : "",
+    acceptance.missing.some((item) => item.includes("open_evidence_conflicts"))
+      ? "Resolve or explicitly acknowledge open evidence conflicts with a Limitations note before finalizing."
+      : "",
+    acceptance.missing.includes("limitations_section")
+      ? "Include an explicit Limitations section."
+      : "",
+    acceptance.missing.includes("confidence_section")
+      ? "Include an explicit Confidence section."
+      : "",
+    acceptance.missing.some((item) =>
+      item.includes("claim_grounding:missing_quote") ||
+      item.includes("claim_grounding:quote_"),
+    )
+      ? "For quotation work, include at least one direct quote copied character-for-character from the cited passage. Every other quoted span must also appear verbatim in its cited passage; remove or paraphrase unsupported quotation marks. Paraphrased material claims still need persisted passage ids."
+      : "",
+    "Return only the corrected final answer. Do not request tools or repeat this instruction.",
+    `Rejected draft for revision:\n${truncateForTrace(rejectedCandidate, 6000)}`,
+  ].filter(Boolean).join("\n\n");
 }
 
 function getMissionLedgerStatusForStopReason(
@@ -9928,6 +15780,102 @@ const CACHEABLE_TOOL_NAMES = new Set([
   "suggest_note_links",
 ]);
 
+async function executePreparedToolWithMetrics({
+  toolRegistry,
+  preparedAction,
+  authorization,
+  toolContext,
+  events,
+  step,
+}: {
+  toolRegistry: ToolRegistry;
+  preparedAction: PreparedAction;
+  authorization: AuthorizedActionContext;
+  toolContext: ToolExecutionContext;
+  events: AgentRunEvents;
+  step?: number;
+}): Promise<ToolExecutionResult> {
+  const startedAt = nowMs();
+  const inputChars = measureSerializedChars(preparedAction.normalizedArgs);
+  if (!toolRegistry.executePrepared) {
+    return {
+      ok: false,
+      toolName: preparedAction.toolName,
+      mutationState: "not_applied",
+      error: {
+        code: "prepared_execution_unavailable",
+        message: "The tool registry does not support prepared execution.",
+      },
+    };
+  }
+  try {
+    const result = await toolRegistry.executePrepared(
+      preparedAction,
+      toolContext,
+      authorization,
+    );
+    emitMetricEvent(events, {
+      kind: "tool",
+      name: preparedAction.toolName,
+      step,
+      durationMs: elapsedMs(startedAt),
+      inputChars,
+      outputChars: measureSerializedChars(result),
+    });
+    return result;
+  } catch (error) {
+    emitMetricEvent(events, {
+      kind: "tool",
+      name: preparedAction.toolName,
+      step,
+      durationMs: elapsedMs(startedAt),
+      inputChars,
+    });
+    throw error;
+  }
+}
+
+function isPreparedActionWithinRunnerScope({
+  toolName,
+  descriptor,
+  action,
+  allowedToolNames,
+  policyRouted,
+  missionIntent,
+  writeAutonomy,
+}: {
+  toolName: string;
+  descriptor: ToolDescriptor;
+  action: PreparedAction;
+  allowedToolNames: Set<string>;
+  policyRouted: RoutedMissionIntent;
+  missionIntent: MissionIntent;
+  writeAutonomy: boolean;
+}): boolean {
+  if (
+    !allowedToolNames.has(toolName) ||
+    action.toolName !== toolName ||
+    action.target.system !== descriptor.capability.system ||
+    action.target.resourceType !== descriptor.capability.resourceType
+  ) {
+    return false;
+  }
+  if (descriptor.effect === "read") {
+    return true;
+  }
+  if (descriptor.capability.system === "vault") {
+    return (
+      policyRouted.writeScope !== "none" ||
+      writeAutonomy ||
+      missionIntent.explicitMutation ||
+      missionIntent.noteOutput
+    );
+  }
+  // External and workspace tools reach this point only after the mission
+  // allowlist's explicit integration/code/browser intent gates accepted them.
+  return descriptor.capability.system !== "web";
+}
+
 async function executeToolWithMetrics({
   toolRegistry,
   toolCall,
@@ -9980,6 +15928,45 @@ async function executeToolWithMetrics({
       inputChars,
       outputChars: measureSerializedChars(result),
     });
+    if (result.ok && step === undefined) {
+      const receipt = buildReceiptFromToolExecution(
+        toolCall.name,
+        result,
+        toolRegistry.getDescriptor?.(toolCall.name) ?? null,
+      );
+      if (receipt) {
+        const traceStep = step ?? 0;
+        events.onTrace?.({
+          id: `local:${traceStep}:${toolCall.name}:transaction:validated`,
+          kind: "status",
+          step: traceStep,
+          toolName: toolCall.name,
+          message: "Vault transaction validated.",
+          outputPreview: truncateTracePayload(result.output),
+        });
+        events.onTrace?.({
+          id: `local:${traceStep}:${toolCall.name}:transaction:applied`,
+          kind: "status",
+          step: traceStep,
+          toolName: toolCall.name,
+          message: "Vault transaction applied.",
+          outputPreview: truncateTracePayload(result.output),
+        });
+        events.onReceipt?.(receipt);
+        events.onTrace?.({
+          id: `local:${traceStep}:${toolCall.name}:transaction:committed`,
+          kind: "receipt",
+          step: traceStep,
+          toolName: toolCall.name,
+          operation: receipt.operation,
+          path: receipt.path,
+          toPath: receipt.toPath,
+          backupPath: receipt.backupPath,
+          message: "Vault transaction committed.",
+          outputPreview: truncateTracePayload(receipt.output ?? receipt),
+        });
+      }
+    }
     return result;
   } catch (error) {
     emitMetricEvent(events, {
@@ -9993,12 +15980,139 @@ async function executeToolWithMetrics({
   }
 }
 
+interface ToolApprovalRequestInfo {
+  action: string;
+  reason: string;
+  policyTags: string[];
+  timeoutMs?: number;
+}
+
+function getToolApprovalRequestInfo(
+  toolCall: ModelToolCall,
+  result: ToolExecutionResult,
+): ToolApprovalRequestInfo | null {
+  if (!result.ok || !isRecord(result.output)) {
+    return null;
+  }
+
+  if (result.output.status !== "requires_approval") {
+    return null;
+  }
+
+  const approval = isRecord(result.output.approval)
+    ? result.output.approval
+    : undefined;
+  const safetyDecision = isRecord(result.output.safetyDecision)
+    ? result.output.safetyDecision
+    : undefined;
+  const action = getString(approval?.action) ?? getString(result.output.operation) ?? toolCall.name;
+  const reason =
+    getString(approval?.reason) ??
+    getString(result.output.reason) ??
+    getString(safetyDecision?.reason) ??
+    `${toolCall.name} requires approval.`;
+  const tags = [
+    ...getStringArray(safetyDecision?.policyTags),
+    ...getStringArray(approval?.policyTags),
+  ];
+  const timeoutMs =
+    getNumber(approval?.expiresInMs) ?? getNumber(result.output.expiresInMs);
+
+  return {
+    action,
+    reason,
+    policyTags: tags.length ? tags : ["approval_required"],
+    timeoutMs,
+  };
+}
+
+function compareRouterWithRegex(
+  routed: RoutedMissionIntent,
+  regexIntent: MissionIntent,
+): "agree" | "disagree" {
+  const routerWrite = routed.writeScope !== "none";
+  const regexWrite = regexIntent.noteOutput || regexIntent.explicitMutation;
+  const routerRead = routed.needsVaultContext || routed.mode === "vault_read";
+  const regexRead = regexIntent.vaultContext;
+  const routerWeb =
+    routed.needsWebEvidence ||
+    routed.mode === "web_research" ||
+    routed.mode === "deep_research";
+  const regexWeb = regexIntent.autonomyScope.read.web;
+  const routerCode = routed.needsCodeExecution || routed.mode === "code_workflow";
+  const regexCode = regexIntent.autonomyScope.write.artifacts;
+
+  return routerWrite === regexWrite &&
+    routerRead === regexRead &&
+    routerWeb === regexWeb &&
+    routerCode === regexCode
+    ? "agree"
+    : "disagree";
+}
+
+function buildToolCallFallbackId(
+  runId: string,
+  step: number,
+  toolIndex: number | string,
+  toolName: string,
+): string {
+  return `call_${runId}_${step}_${toolIndex}_${toolName}`.replace(
+    /[^A-Za-z0-9_-]/g,
+    "_",
+  );
+}
+
+function formatObservedToolFailureStatus(
+  toolName: string,
+  result: ToolExecutionResult,
+): string {
+  const detail = result.error?.message?.trim();
+  if (result.error?.code === "policy_blocked") {
+    if (detail?.startsWith("What: ")) {
+      return detail;
+    }
+    const phaseMatch = /during research (\w+) phase/i.exec(detail ?? "");
+    if (phaseMatch || /research_phase_gate|phase gate/i.test(detail ?? "")) {
+      return formatFailureCopy(
+        phaseGateFailureCopy(phaseMatch?.[1], detail),
+      );
+    }
+    return formatFailureCopy(policyBlockFailureCopy(toolName, detail));
+  }
+  if (
+    result.error?.code?.startsWith("approval_") ||
+    /approval (denied|expired|aborted)/i.test(detail ?? "")
+  ) {
+    const decision =
+      result.error?.code?.replace(/^approval_/, "") ||
+      /approval (denied|expired|aborted)/i.exec(detail ?? "")?.[1] ||
+      "denied";
+    return formatFailureCopy(approvalDeniedFailureCopy(toolName, decision));
+  }
+  if (toolName === "web_fetch" || toolName === "web_search") {
+    return formatWebFetchToolFailureCopy(detail);
+  }
+  return detail?.startsWith("What: ")
+    ? detail
+    : `Tool returned error: ${toolName}${detail ? ` (${detail})` : ""}`;
+}
+
 function getToolCacheKey(name: string, args: Record<string, unknown>): string {
   return `${name}:${stableStringify(args)}`;
 }
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(stableNormalize(value));
+}
+
+function hashOperationInput(value: unknown): string {
+  const input = stableStringify(value);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `fnv1a32:${hash.toString(16).padStart(8, "0")}`;
 }
 
 function stableNormalize(value: unknown): unknown {
@@ -10016,6 +16130,124 @@ function stableNormalize(value: unknown): unknown {
       output[key] = stableNormalize(value[key]);
       return output;
     }, {});
+}
+
+function runtimeReceiptToAgentRunReceipt(
+  receipt: MissionRuntimeReceipt,
+): AgentRunReceipt | null {
+  if (!isAgentRunReceiptOperation(receipt.operation)) {
+    return null;
+  }
+  return {
+    version: receipt.version,
+    id: receipt.id,
+    toolName: receipt.toolName,
+    operation: receipt.operation,
+    message: receipt.message,
+    actionId: receipt.actionId,
+    resource: receipt.resource ? { ...receipt.resource } : undefined,
+    relatedResources: receipt.relatedResources?.map((resource) => ({
+      ...resource,
+    })),
+    payloadFingerprint: receipt.payloadFingerprint,
+    grantId: receipt.grantId,
+    idempotencyKey: receipt.idempotencyKey,
+    providerRequestId: receipt.providerRequestId,
+    startedAt: receipt.startedAt,
+    committedAt: receipt.committedAt,
+    commitKind: receipt.commitKind,
+    readback: receipt.readback ? { ...receipt.readback } : undefined,
+    effects: receipt.effects
+      ? {
+          ...receipt.effects,
+          changedFields: receipt.effects.changedFields
+            ? [...receipt.effects.changedFields]
+            : undefined,
+        }
+      : undefined,
+    path: receipt.path,
+    toPath: receipt.toPath,
+    backupPath: receipt.backupPath,
+    restoredFromBackupPath: receipt.restoredFromBackupPath,
+    bytesWritten: receipt.bytesWritten,
+    bytesDeleted: receipt.bytesDeleted,
+    affectedCount: receipt.affectedCount,
+    output: receipt.output,
+  };
+}
+
+function missionLedgerStatusToRuntimeStatus(
+  status: MissionLedgerStatus,
+): MissionRuntimeStatus {
+  switch (status) {
+    case "complete":
+      return "complete";
+    case "blocked":
+      return "blocked";
+    case "stopped":
+      return "stopped";
+    case "budget":
+      return "paused";
+    case "running":
+    default:
+      return "running";
+  }
+}
+
+function normalizeRuntimeAcceptance(
+  acceptance: MissionLedger["acceptance"],
+): MissionAcceptanceResult | undefined {
+  if (
+    !acceptance ||
+    (acceptance.status !== "pass" &&
+      acceptance.status !== "fail" &&
+      acceptance.status !== "needs_more_work")
+  ) {
+    return undefined;
+  }
+  return {
+    status: acceptance.status,
+    confidence: acceptance.confidence,
+    missing: [...acceptance.missing],
+    reasons: [...acceptance.reasons],
+    nextAction: acceptance.nextAction,
+  };
+}
+
+function isAgentRunReceiptOperation(
+  operation: string,
+): operation is AgentRunReceipt["operation"] {
+  return (
+    operation === "create" ||
+    operation === "create_folder" ||
+    operation === "append" ||
+    operation === "replace" ||
+    operation === "edit" ||
+    operation === "highlight" ||
+    operation === "restore" ||
+    operation === "retitle" ||
+    operation === "rename_current_file" ||
+    operation === "link_related_notes" ||
+    operation === "move" ||
+    operation === "trash" ||
+    operation === "delete"
+    || operation === "read"
+    || operation === "list"
+    || operation === "search"
+    || operation === "update"
+    || operation === "archive"
+    || operation === "unarchive"
+    || operation === "unlink"
+    || operation === "validate"
+    || operation === "promote"
+    || operation === "merge"
+    || operation === "execute"
+    || operation === "install"
+    || operation === "commit"
+    || operation === "integrate"
+    || operation === "publish"
+    || operation === "link"
+  );
 }
 
 function nowMs(): number {

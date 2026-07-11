@@ -5,7 +5,9 @@ import {
   formatMissionAcceptanceCorrection,
   type MissionAcceptanceReceiptLike,
 } from "../src/agent/missionAcceptance";
+import { deriveAutonomyScope } from "../src/agent/missionScope";
 import type { MissionIntent } from "../src/tools/types";
+import type { ResearchPlan } from "../src/agent/researchPlan";
 
 const baseIntent: MissionIntent = {
   mode: "chat_only",
@@ -99,6 +101,187 @@ test("mission acceptance passes when evidence and receipts satisfy the mission",
   assert.equal(result.confidence, 0.92);
 });
 
+test("mission acceptance accepts a scoped persistent artifact receipt without treating it as vault proof", () => {
+  const result = evaluateMissionAcceptance({
+    prompt: "Draw a three-block architecture diagram.",
+    missionIntent: {
+      ...baseIntent,
+      explicitMutation: true,
+      requireWriteCompletion: true,
+      autonomyScope: {
+        ...baseIntent.autonomyScope,
+        write: {
+          ...baseIntent.autonomyScope.write,
+          artifacts: true,
+        },
+      },
+    },
+    requiredTools: ["create_design_canvas"],
+    successfulTools: ["create_design_canvas"],
+    failedTools: [],
+    evidence: [],
+    receipts: [
+      {
+        toolName: "create_design_canvas",
+        operation: "create",
+        path: "Designs/architecture.canvas",
+        bytesWritten: 1_024,
+        resource: { system: "workspace", resourceType: "markdown" },
+      },
+    ],
+    operationGoals: {},
+    finalOutput: "Created the requested diagram.",
+  });
+
+  assert.equal(result.status, "pass");
+  assert.ok(!result.missing.includes("write_receipt"));
+});
+
+test("mission acceptance does not let an external receipt satisfy artifact or vault proof", () => {
+  const result = evaluateMissionAcceptance({
+    prompt: "Draw a three-block architecture diagram.",
+    missionIntent: {
+      ...baseIntent,
+      explicitMutation: true,
+      requireWriteCompletion: true,
+      autonomyScope: {
+        ...baseIntent.autonomyScope,
+        write: {
+          ...baseIntent.autonomyScope.write,
+          artifacts: true,
+        },
+      },
+    },
+    requiredTools: ["create_design_canvas"],
+    successfulTools: ["create_design_canvas"],
+    failedTools: [],
+    evidence: [],
+    receipts: [
+      {
+        toolName: "linear_create_issue",
+        operation: "create",
+        path: "Designs/architecture.canvas",
+        resource: { system: "linear", resourceType: "issue", id: "LIN-1" },
+      },
+    ],
+    operationGoals: {},
+    finalOutput: "Created the requested diagram.",
+  });
+
+  assert.equal(result.status, "fail");
+  assert.ok(result.missing.includes("write_receipt"));
+});
+
+test("mission acceptance accepts a matching external mutation receipt only for that external action", () => {
+  const result = evaluateMissionAcceptance({
+    prompt: "Create the approved Linear issue.",
+    missionIntent: {
+      ...baseIntent,
+      explicitMutation: true,
+      requireWriteCompletion: true,
+    },
+    requiredTools: ["linear_create_issue"],
+    successfulTools: ["linear_create_issue"],
+    failedTools: [],
+    evidence: [],
+    receipts: [
+      {
+        toolName: "linear_create_issue",
+        operation: "create",
+        resource: { system: "linear", resourceType: "issue", id: "LIN-2" },
+      },
+    ],
+    operationGoals: {},
+    finalOutput: "Created Linear issue LIN-2.",
+  });
+
+  assert.equal(result.status, "pass");
+  assert.ok(!result.missing.includes("write_receipt"));
+});
+
+test("mission acceptance treats broad unscoped mutations as blocked scope requests", () => {
+  const prompt = "Update my whole vault with this project summary.";
+  const result = evaluateMissionAcceptance({
+    prompt,
+    missionIntent: {
+      ...baseIntent,
+      mode: "explicit_file_mutation",
+      vaultContext: true,
+      explicitMutation: true,
+      allowAutonomousWrite: false,
+      requireWriteCompletion: false,
+      autonomyScope: deriveAutonomyScope(prompt, {
+        noteOutput: true,
+        explicitMutation: true,
+        explicitPersistence: true,
+      }),
+    },
+    requiredTools: [],
+    successfulTools: [],
+    failedTools: [],
+    evidence: [],
+    receipts: [],
+    operationGoals: {},
+    finalOutput: "Explicit file or folder scope is required.",
+  });
+
+  assert.equal(result.status, "pass");
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.reasons, [
+    "broad_unscoped_mutation_requires_explicit_scope",
+  ]);
+});
+
+test("visible title missions require a rename receipt", () => {
+  const result = evaluateMissionAcceptance({
+    prompt: "Rename the current note to Purple Horizon.",
+    missionIntent: { ...baseIntent, requireWriteCompletion: true },
+    requiredTools: ["rename_current_file"],
+    successfulTools: [],
+    failedTools: [],
+    evidence: [],
+    receipts: [
+      {
+        toolName: "append_to_current_file",
+        path: "Untitled.md",
+        operation: "append",
+        bytesWritten: 100,
+      },
+    ],
+    operationGoals: { current_note_title: "pending" },
+    finalOutput: "Done.",
+  });
+
+  assert.equal(result.status, "needs_more_work");
+  assert.ok(result.missing.includes("visible_title_rename"));
+  assert.equal(result.nextAction, "Rename the visible current note title and produce a receipt.");
+});
+
+test("highlight missions require a highlight receipt with matches", () => {
+  const result = evaluateMissionAcceptance({
+    prompt: "Find and highlight silver lantern in the current note.",
+    missionIntent: { ...baseIntent, requireWriteCompletion: true },
+    requiredTools: ["highlight_current_file_phrase"],
+    successfulTools: ["highlight_current_file_phrase"],
+    failedTools: [],
+    evidence: [],
+    receipts: [
+      {
+        toolName: "highlight_current_file_phrase",
+        path: "Current.md",
+        operation: "highlight",
+        affectedCount: 0,
+      },
+    ],
+    operationGoals: { current_note_highlight: "done" },
+    finalOutput: "Highlighted.",
+  });
+
+  assert.equal(result.status, "needs_more_work");
+  assert.ok(result.missing.includes("highlight_receipt"));
+  assert.equal(result.nextAction, "Highlight the requested phrase in the current note and produce a receipt.");
+});
+
 test("mission acceptance correction names missing tools that are still available", () => {
   const correction = formatMissionAcceptanceCorrection(
     {
@@ -113,4 +296,117 @@ test("mission acceptance correction names missing tools that are still available
 
   assert.match(correction, /Mission acceptance is incomplete/);
   assert.match(correction, /web_fetch/);
+});
+
+test("deep research acceptance requires fetched sources and final quality sections", () => {
+  const researchPlan: ResearchPlan = {
+    version: 1,
+    mode: "deep_web",
+    sourceRequirements: { minFetchedSources: 3, minDistinctDomains: 2 },
+    coverageRequirements: {
+      minVaultCoverageConfidence: "medium",
+      expandWhenSampledOrTruncated: true,
+    },
+    subquestions: [
+      {
+        id: "rq-1",
+        question: "Gather sources.",
+        requiredEvidenceType: "web_source",
+        minEvidence: 3,
+        status: "in_progress",
+        evidenceIds: ["web:1"],
+      },
+    ],
+    evidenceIds: ["web:1"],
+    status: "in_progress",
+  };
+
+  const result = evaluateMissionAcceptance({
+    prompt: "Do deep research with sources.",
+    missionIntent: baseIntent,
+    requiredTools: [],
+    successfulTools: ["web_fetch"],
+    failedTools: [],
+    evidence: [
+      {
+        id: "web:1",
+        kind: "web_source",
+        title: "One",
+        url: "https://alpha.example.com/source",
+        passageId: "source:alpha:passage:0-100",
+        passageIds: ["source:alpha:passage:0-100"],
+        usableSource: true,
+        summary: "one",
+        confidence: "high",
+      },
+    ],
+    receipts: [],
+    operationGoals: {},
+    researchPlan,
+    finalOutput: "One source only.",
+  });
+
+  assert.equal(result.status, "needs_more_work");
+  assert.ok(result.missing.includes("fetched_sources:1/3"));
+  assert.ok(result.missing.includes("research_plan_items"));
+  assert.ok(result.missing.includes("citation_url_coverage"));
+  assert.ok(result.missing.includes("limitations_section"));
+  assert.ok(result.missing.includes("confidence_section"));
+});
+
+test("deep research acceptance passes with source coverage, limitations, and confidence", () => {
+  const urls = [
+    "https://alpha.example.com/source",
+    "https://beta.example.org/source",
+    "https://gamma.example.net/source",
+  ];
+  const researchPlan: ResearchPlan = {
+    version: 1,
+    mode: "deep_web",
+    sourceRequirements: { minFetchedSources: 3, minDistinctDomains: 2 },
+    coverageRequirements: {
+      minVaultCoverageConfidence: "medium",
+      expandWhenSampledOrTruncated: true,
+    },
+    subquestions: [
+      {
+        id: "rq-1",
+        question: "Gather sources.",
+        requiredEvidenceType: "web_source",
+        minEvidence: 3,
+        status: "complete",
+        evidenceIds: ["web:1", "web:2", "web:3"],
+      },
+    ],
+    evidenceIds: ["web:1", "web:2", "web:3"],
+    status: "complete",
+  };
+
+  const result = evaluateMissionAcceptance({
+    prompt: "Do deep research with sources.",
+    missionIntent: baseIntent,
+    requiredTools: [],
+    successfulTools: ["web_fetch"],
+    failedTools: [],
+    evidence: urls.map((url, index) => ({
+      id: `web:${index + 1}`,
+      kind: "web_source" as const,
+      title: `Source ${index + 1}`,
+      url,
+      passageId: `source:${index + 1}:passage:0-100`,
+      passageIds: [`source:${index + 1}:passage:0-100`],
+      usableSource: true,
+      summary: "source",
+      confidence: "high" as const,
+    })),
+    receipts: [],
+    operationGoals: {},
+    researchPlan,
+    finalOutput: `Sources: ${urls.join(" ")} ${urls
+      .map((_url, index) => `source:${index + 1}:passage:0-100`)
+      .join(" ")}\n\nLimitations: e2e.\n\nConfidence: high.`,
+  });
+
+  assert.equal(result.status, "pass");
+  assert.deepEqual(result.missing, []);
 });

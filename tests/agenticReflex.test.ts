@@ -4,6 +4,7 @@ import { AgenticReflexController } from "../src/agent/reflex/AgenticReflexContro
 import { evaluateCompletion } from "../src/agent/reflex/completionEvaluator";
 import { evaluateProgress } from "../src/agent/reflex/progressMonitor";
 import type { AgenticReflexInput } from "../src/agent/reflex/types";
+import { deriveAutonomyScope } from "../src/agent/missionScope";
 import type { SemanticEmbeddingProvider } from "../src/embeddings/types";
 import type { MissionIntent } from "../src/tools/types";
 import type { AgentSettings } from "../src/settings";
@@ -139,6 +140,9 @@ test("completion evaluator requires vault evidence and write receipts", () => {
     input({
       missionIntent: {
         ...missionIntent,
+        mode: "note_output",
+        noteOutput: true,
+        allowAutonomousWrite: true,
         requireWriteCompletion: true,
       },
       prompt: "Search my notes and write the answer to the note.",
@@ -160,4 +164,35 @@ test("completion evaluator recommends available recovery tools before final answ
   assert.equal(completion.complete, false);
   assert.equal(completion.mustContinue, true);
   assert.equal(completion.recommendedNextTool, "web_fetch");
+});
+
+test("completion evaluator accepts broad unscoped mutation as a safety blocker", () => {
+  const prompt = "Update my whole vault with this project summary.";
+  const completion = evaluateCompletion(
+    input({
+      prompt,
+      missionIntent: {
+        ...missionIntent,
+        mode: "explicit_file_mutation",
+        vaultContext: true,
+        explicitMutation: true,
+        allowAutonomousWrite: false,
+        requireWriteCompletion: false,
+        autonomyScope: deriveAutonomyScope(prompt, {
+          noteOutput: true,
+          explicitMutation: true,
+          explicitPersistence: true,
+        }),
+      },
+      allowedToolNames: new Set(["list_markdown_files", "read_file"]),
+    }),
+  );
+
+  assert.equal(completion.complete, true);
+  assert.deepEqual(completion.missing, []);
+  assert.equal(completion.mustContinue, false);
+  assert.equal(
+    completion.reason,
+    "broad_unscoped_mutation_requires_explicit_scope",
+  );
 });

@@ -155,6 +155,16 @@ export function retitleNoteMarkdown(markdown: string, title: string): string {
   return insertH1AfterFrontmatter(withFrontmatterTitle, title);
 }
 
+/** Safe Obsidian note basename from a free-form title (no path separators). */
+export function sanitizeFileBasename(title: string): string {
+  return title
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/\.+$/g, "")
+    .trim();
+}
+
 function findFrontmatterTitleLine(
   markdown: string,
   frontmatter: FrontmatterBlock,

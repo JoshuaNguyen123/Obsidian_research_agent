@@ -6,10 +6,18 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "node --import tsx --test tests/**/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 tests/**/*.test.ts",
+    "test:companion": "python -m pytest companion/tests -q",
+    "check:path-hygiene": "node scripts/check-path-hygiene.mjs",
+    "test:ci": "npm run check:path-hygiene && npm test && npm run build",
     "sync:test-vault": "node scripts/sync-test-vault.mjs",
-    "test:e2e": "npm run build && npm run sync:test-vault && playwright test",
-    "test:e2e:headed": "npm run build && npm run sync:test-vault && playwright test --headed"
+    "e2e:preflight": "node scripts/e2e-preflight.mjs",
+    "test:e2e": "node scripts/run-e2e-exclusive.mjs --real-ai",
+    "test:e2e:mock": "node scripts/run-e2e-exclusive.mjs --mock-ai",
+    "test:e2e:long": "node scripts/run-e2e-exclusive.mjs --real-ai --grep \"long-running|auto-continue|wall-clock|panel detach|pane reattach|approval|proof-gated|resume|overnight|scheduled|parallel\"",
+    "test:e2e:real:long": "node scripts/run-e2e-exclusive.mjs --real-ai --grep \"real ai\"",
+    "test:e2e:real:xhigh": "node scripts/run-e2e-exclusive.mjs --real-ai --grep \"real ai\"",
+    "test:e2e:headed": "node scripts/run-e2e-exclusive.mjs --real-ai --headed"
   },
   "keywords": [
     "obsidian",

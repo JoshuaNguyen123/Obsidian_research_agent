@@ -1,12 +1,37 @@
 import type { TFile } from "obsidian";
 import type { LoopBudgetPlan } from "./loopPlanner";
+import {
+  normalizeClaimLedger,
+  type ClaimLedger,
+  type ClaimPassageRef,
+} from "./claimLedger";
+import {
+  normalizeEvidenceConflicts,
+  type EvidenceConflict,
+} from "./evidenceConflicts";
+import {
+  normalizeResearchPlan,
+  researchPlanToTaskStatus,
+  type ResearchPlan,
+} from "./researchPlan";
+import {
+  normalizeMissionPlan,
+  type MissionPlan,
+} from "./missionPlan";
 import type { ToolExecutionContext } from "../tools/types";
 import { normalizeVaultPath } from "../tools/validation";
+import { withSerializedRunWrite } from "./runStore";
+import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
+import { normalizeOrchestratorSnapshot } from "../orchestrator/orchestratorStore";
+
+const MAX_CLAIM_PASSAGES = 64;
 
 const AGENT_RUNS_FOLDER = "Agent Runs";
+export const MISSION_LEDGER_SCHEMA_VERSION = 2 as const;
 const LEDGER_HEADING = "## Mission Ledger";
 const LEDGER_BLOCK_PATTERN =
   /## Mission Ledger\r?\n```json\r?\n[\s\S]*?\r?\n```/;
+const MAX_PASSAGE_IDS_PER_EVIDENCE = 24;
 
 export type MissionLedgerStatus =
   | "running"
@@ -39,6 +64,34 @@ export type MissionStage =
   | "memory_reflection"
   | "next_action";
 
+export type MissionBlockerCategory =
+  | "provider_auth"
+  | "model_timeout"
+  | "web_fetch"
+  | "semantic_retrieval"
+  | "companion_browser"
+  | "obsidian_vault"
+  | "safety_policy"
+  | "tool_unavailable"
+  | "unknown";
+
+export interface MissionDependencyStatus {
+  category: MissionBlockerCategory;
+  status: "ok" | "degraded" | "blocked" | "unknown";
+  capability: string;
+  summary: string;
+  nextAction: string;
+  checkedAt?: string;
+}
+
+export interface MissionApprovalRecord {
+  id: string;
+  toolName: string;
+  action: string;
+  decision: "approved" | "denied" | "expired" | "aborted";
+  decidedAt: string;
+}
+
 export interface MissionTask {
   id: string;
   title: string;
@@ -54,6 +107,12 @@ export interface MissionEvidence {
   title: string;
   path?: string;
   url?: string;
+  sourceId?: string;
+  passageId?: string;
+  passageIds?: string[];
+  /** True only when fetched content produced persistable evidence passages. */
+  usableSource?: boolean;
+  parserStatus?: "parsed" | "empty" | "missing_content" | "legacy_unknown";
   summary: string;
   confidence: "low" | "medium" | "high";
 }
@@ -74,6 +133,8 @@ export interface MissionMilestone {
 }
 
 export interface MissionLedger {
+  schemaVersion: typeof MISSION_LEDGER_SCHEMA_VERSION;
+  revision: number;
   runId: string;
   mission: string;
   route: string;
@@ -99,25 +160,72 @@ export interface MissionLedger {
   evidence: MissionEvidence[];
   receipts: string[];
   blockers: string[];
+  blockerCategory?: MissionBlockerCategory;
+  dependencyStatus: MissionDependencyStatus[];
+  approvals: MissionApprovalRecord[];
+  wallClockExpired?: boolean;
   nextActions: string[];
   remainingActions: string[];
+  researchPlan?: ResearchPlan;
+  missionPlan?: MissionPlan;
+  /** Operational two-agent projection; excluded from conversation history. */
+  orchestrator?: OrchestratorSnapshotV1;
+  /** Latest claim-grounding ledger for deep/cited research acceptance. */
+  claimLedger?: ClaimLedger;
+  /** Dossier passage texts used for claim binding (preferred over evidence summaries). */
+  claimPassages?: ClaimPassageRef[];
+  /** First-class evidence conflicts (open / resolved / acknowledged_limitation). */
+  evidenceConflicts?: EvidenceConflict[];
+  iterationCount: number;
+  progressScore: number;
+  stalledCount: number;
+  activeTaskId?: string;
+  lastMeaningfulAction?: string;
   resumeCount: number;
   lastSafeStep: number;
+  continuationCommand: string;
   continuationPrompt?: string;
 }
 
 export interface MissionLedgerWriteResult {
   path: string;
   bytesWritten: number;
+  revision: number;
 }
 
 export interface MissionLedgerSummary {
   runId: string;
   status: MissionLedgerStatus;
+  acceptance?: {
+    status: string;
+    confidence: number;
+    missing: string[];
+    reasons: string[];
+    nextAction?: string;
+    checkedAt: string;
+  };
   evidenceCount: number;
   receiptCount: number;
   expectedTools: string[];
   nextAction: string;
+  remainingActions: string[];
+  continuationCommand: string;
+  canResume: boolean;
+  blockerCategory?: MissionBlockerCategory;
+  dependencyStatus: MissionDependencyStatus[];
+  missionPlan?: {
+    status: string;
+    activeTaskId: string | null;
+    progressScore: number;
+    stalledCount: number;
+    remainingTasks: number;
+    nextAction: string;
+  };
+  iterationCount: number;
+  progressScore: number;
+  stalledCount: number;
+  activeTaskId?: string;
+  lastMeaningfulAction?: string;
 }
 
 export function createMissionLedger({
@@ -125,16 +233,39 @@ export function createMissionLedger({
   mission,
   route,
   loopBudget,
+  researchPlan,
   now = new Date(),
 }: {
   runId: string;
   mission: string;
   route: string;
   loopBudget: LoopBudgetPlan;
+  researchPlan?: ResearchPlan | null;
   now?: Date;
 }): MissionLedger {
   const timestamp = now.toISOString();
+  const tasks = researchPlan
+    ? researchPlan.subquestions.map((item) => ({
+        id: item.id,
+        title: item.question,
+        status: researchPlanToTaskStatus(item.status),
+        toolNames: [],
+        evidenceIds: [...item.evidenceIds],
+        notes: item.unansweredReason ?? "",
+      }))
+    : [
+        {
+          id: "task-1",
+          title: "Complete requested mission",
+          status: "in_progress" as const,
+          toolNames: [],
+          evidenceIds: [],
+          notes: "",
+        },
+      ];
   return {
+    schemaVersion: MISSION_LEDGER_SCHEMA_VERSION,
+    revision: 0,
     runId,
     mission,
     route,
@@ -147,16 +278,7 @@ export function createMissionLedger({
       finalizationReserve: loopBudget.finalizationReserve,
       expectedTools: [...loopBudget.expectedTools],
     },
-    tasks: [
-      {
-        id: "task-1",
-        title: "Complete requested mission",
-        status: "in_progress",
-        toolNames: [],
-        evidenceIds: [],
-        notes: "",
-      },
-    ],
+    tasks,
     milestones: [
       {
         id: "milestone-1",
@@ -175,10 +297,19 @@ export function createMissionLedger({
     evidence: [],
     receipts: [],
     blockers: [],
+    dependencyStatus: [],
+    approvals: [],
     nextActions: [],
-    remainingActions: [],
+    remainingActions: researchPlan?.nextAction?.reason
+      ? [researchPlan.nextAction.reason]
+      : [],
+    ...(researchPlan ? { researchPlan } : {}),
+    iterationCount: 0,
+    progressScore: 0,
+    stalledCount: 0,
     resumeCount: 0,
     lastSafeStep: 0,
+    continuationCommand: getContinuationCommand(runId),
   };
 }
 
@@ -230,13 +361,77 @@ export function upsertLedgerEvidence(
   evidence: MissionEvidence,
   now = new Date(),
 ) {
-  const index = ledger.evidence.findIndex((item) => item.id === evidence.id);
-  if (index >= 0) {
-    ledger.evidence[index] = evidence;
-  } else {
-    ledger.evidence.push(evidence);
-  }
+  upsertMissionEvidenceRecord(ledger.evidence, evidence);
   ledger.updatedAt = now.toISOString();
+}
+
+/**
+ * Upserts evidence while retaining all passage ranges gathered from repeated
+ * reads of the same web source. This is shared by the durable ledger and the
+ * runner's in-memory evidence list so research binding sees the same record.
+ */
+export function upsertMissionEvidenceRecord<T extends MissionEvidence>(
+  records: T[],
+  evidence: T,
+): T {
+  const index = records.findIndex((item) => item.id === evidence.id);
+  if (index < 0) {
+    records.push(evidence);
+    return evidence;
+  }
+  const merged = mergeMissionEvidence(records[index], evidence);
+  records[index] = merged;
+  return merged;
+}
+
+export function mergeMissionEvidence<T extends MissionEvidence>(
+  existing: T,
+  incoming: T,
+): T {
+  if (!isSameWebSourceEvidence(existing, incoming)) {
+    return incoming;
+  }
+  const passageIds = [...new Set([
+    ...(existing.passageId ? [existing.passageId] : []),
+    ...(existing.passageIds ?? []),
+    ...(incoming.passageId ? [incoming.passageId] : []),
+    ...(incoming.passageIds ?? []),
+  ])].slice(-MAX_PASSAGE_IDS_PER_EVIDENCE);
+  const merged = {
+    ...existing,
+    ...incoming,
+    ...(existing.url || incoming.url
+      ? { url: existing.url ?? incoming.url }
+      : {}),
+    ...(existing.sourceId || incoming.sourceId
+      ? { sourceId: existing.sourceId ?? incoming.sourceId }
+      : {}),
+    ...(existing.passageId || incoming.passageId || passageIds[0]
+      ? { passageId: existing.passageId ?? incoming.passageId ?? passageIds[0] }
+      : {}),
+    ...(passageIds.length > 0 ? { passageIds } : {}),
+  };
+  return merged as T;
+}
+
+function isSameWebSourceEvidence(
+  existing: MissionEvidence,
+  incoming: MissionEvidence,
+): boolean {
+  if (existing.kind !== "web_source" || incoming.kind !== "web_source") {
+    return false;
+  }
+  if (
+    existing.sourceId &&
+    incoming.sourceId &&
+    existing.sourceId !== incoming.sourceId
+  ) {
+    return false;
+  }
+  if (existing.url && incoming.url && existing.url !== incoming.url) {
+    return false;
+  }
+  return existing.id === incoming.id;
 }
 
 export function markLedgerToolUsed(
@@ -272,11 +467,47 @@ export function addLedgerReceipt(
 export function addLedgerBlocker(
   ledger: MissionLedger,
   blocker: string,
+  category: MissionBlockerCategory = "unknown",
   now = new Date(),
 ) {
   if (blocker.trim() && !ledger.blockers.includes(blocker.trim())) {
     ledger.blockers.push(blocker.trim());
   }
+  ledger.blockerCategory = category;
+  ledger.updatedAt = now.toISOString();
+}
+
+export function setLedgerDependencyStatus(
+  ledger: MissionLedger,
+  dependencyStatus: MissionDependencyStatus[],
+  now = new Date(),
+) {
+  ledger.dependencyStatus = dependencyStatus.map((item) => ({ ...item }));
+  const blocked = dependencyStatus.find((item) => item.status === "blocked");
+  if (blocked) {
+    ledger.blockerCategory = blocked.category;
+  }
+  ledger.updatedAt = now.toISOString();
+}
+
+export function addLedgerApproval(
+  ledger: MissionLedger,
+  approval: Omit<MissionApprovalRecord, "decidedAt">,
+  now = new Date(),
+) {
+  const decidedAt = now.toISOString();
+  ledger.approvals.push({
+    ...approval,
+    decidedAt,
+  });
+  ledger.updatedAt = decidedAt;
+}
+
+export function setLedgerWallClockExpired(
+  ledger: MissionLedger,
+  now = new Date(),
+) {
+  ledger.wallClockExpired = true;
   ledger.updatedAt = now.toISOString();
 }
 
@@ -286,6 +517,41 @@ export function setLedgerNextAction(
   now = new Date(),
 ) {
   ledger.nextActions = action.trim() ? [action.trim()] : [];
+  ledger.updatedAt = now.toISOString();
+}
+
+export function setLedgerResearchPlan(
+  ledger: MissionLedger,
+  researchPlan: ResearchPlan | null | undefined,
+  now = new Date(),
+) {
+  if (!researchPlan) {
+    delete ledger.researchPlan;
+    return;
+  }
+
+  ledger.researchPlan = researchPlan;
+  for (const subquestion of researchPlan.subquestions) {
+    let task = ledger.tasks.find((candidate) => candidate.id === subquestion.id);
+    if (!task) {
+      task = {
+        id: subquestion.id,
+        title: subquestion.question,
+        status: researchPlanToTaskStatus(subquestion.status),
+        toolNames: [],
+        evidenceIds: [],
+        notes: "",
+      };
+      ledger.tasks.push(task);
+    }
+    task.title = subquestion.question;
+    task.status = researchPlanToTaskStatus(subquestion.status);
+    task.evidenceIds = [...subquestion.evidenceIds];
+    task.notes = subquestion.unansweredReason ?? task.notes ?? "";
+  }
+  ledger.remainingActions = researchPlan.nextAction?.reason
+    ? [researchPlan.nextAction.reason]
+    : [];
   ledger.updatedAt = now.toISOString();
 }
 
@@ -311,6 +577,81 @@ export function setLedgerAcceptance(
   ledger.updatedAt = timestamp;
 }
 
+export function setLedgerClaimLedger(
+  ledger: MissionLedger,
+  claimLedger: ClaimLedger | null | undefined,
+  now = new Date(),
+) {
+  if (!claimLedger) {
+    delete ledger.claimLedger;
+    ledger.updatedAt = now.toISOString();
+    return;
+  }
+  const normalized = normalizeClaimLedger(claimLedger);
+  if (!normalized) {
+    delete ledger.claimLedger;
+    ledger.updatedAt = now.toISOString();
+    return;
+  }
+  ledger.claimLedger = normalized;
+  ledger.updatedAt = now.toISOString();
+}
+
+export function setLedgerClaimPassages(
+  ledger: MissionLedger,
+  passages: ClaimPassageRef[] | null | undefined,
+  now = new Date(),
+) {
+  if (!passages || passages.length === 0) {
+    delete ledger.claimPassages;
+    ledger.updatedAt = now.toISOString();
+    return;
+  }
+  ledger.claimPassages = normalizeClaimPassages(passages);
+  ledger.updatedAt = now.toISOString();
+}
+
+export function setLedgerEvidenceConflicts(
+  ledger: MissionLedger,
+  conflicts: EvidenceConflict[] | null | undefined,
+  now = new Date(),
+) {
+  const normalized = normalizeEvidenceConflicts(conflicts);
+  if (normalized.length === 0) {
+    delete ledger.evidenceConflicts;
+    ledger.updatedAt = now.toISOString();
+    return;
+  }
+  ledger.evidenceConflicts = normalized;
+  ledger.updatedAt = now.toISOString();
+}
+
+export function setLedgerMissionPlan(
+  ledger: MissionLedger,
+  missionPlan: MissionPlan | null | undefined,
+  now = new Date(),
+) {
+  if (!missionPlan) {
+    delete ledger.missionPlan;
+    delete ledger.activeTaskId;
+    delete ledger.lastMeaningfulAction;
+    ledger.progressScore = 0;
+    ledger.stalledCount = 0;
+    ledger.updatedAt = now.toISOString();
+    return;
+  }
+
+  ledger.missionPlan = missionPlan;
+  ledger.activeTaskId = missionPlan.activeTaskId ?? undefined;
+  ledger.progressScore = missionPlan.progress.score;
+  ledger.stalledCount = missionPlan.progress.stalledCount;
+  ledger.lastMeaningfulAction = missionPlan.progress.lastMeaningfulAction;
+  ledger.remainingActions = missionPlan.nextAction?.summary
+    ? [missionPlan.nextAction.summary]
+    : ledger.remainingActions;
+  ledger.updatedAt = now.toISOString();
+}
+
 export function markLedgerResumeLoaded(
   ledger: MissionLedger,
   continuationPrompt: string,
@@ -318,6 +659,7 @@ export function markLedgerResumeLoaded(
 ) {
   ledger.resumeCount += 1;
   ledger.continuationPrompt = continuationPrompt;
+  ledger.continuationCommand = getContinuationCommand(ledger.runId);
   ledger.updatedAt = now.toISOString();
 }
 
@@ -327,20 +669,54 @@ export function setLedgerLastSafeStep(
   now = new Date(),
 ) {
   ledger.lastSafeStep = Math.max(ledger.lastSafeStep, step);
+  ledger.iterationCount = Math.max(ledger.iterationCount ?? 0, step);
   ledger.updatedAt = now.toISOString();
 }
 
 export function summarizeMissionLedger(
   ledger: MissionLedger,
 ): MissionLedgerSummary {
-  return {
+  const canResume = !isTerminalCompleteLedger(ledger);
+  const summary: MissionLedgerSummary = {
     runId: ledger.runId,
     status: ledger.status,
+    acceptance: ledger.acceptance
+      ? {
+          ...ledger.acceptance,
+          missing: [...ledger.acceptance.missing],
+          reasons: [...ledger.acceptance.reasons],
+        }
+      : undefined,
     evidenceCount: ledger.evidence.length,
     receiptCount: ledger.receipts.length,
     expectedTools: [...ledger.loopBudget.expectedTools],
     nextAction: ledger.nextActions[0] ?? "none",
+    remainingActions: [...ledger.remainingActions],
+    continuationCommand: ledger.continuationCommand || getContinuationCommand(ledger.runId),
+    canResume,
+    blockerCategory: ledger.blockerCategory,
+    dependencyStatus: ledger.dependencyStatus.map((item) => ({ ...item })),
+    iterationCount: ledger.iterationCount ?? 0,
+    progressScore: ledger.progressScore ?? ledger.missionPlan?.progress.score ?? 0,
+    stalledCount: ledger.stalledCount ?? ledger.missionPlan?.progress.stalledCount ?? 0,
   };
+  if (ledger.missionPlan) {
+    summary.missionPlan = {
+      status: ledger.missionPlan.status,
+      activeTaskId: ledger.missionPlan.activeTaskId,
+      progressScore: ledger.missionPlan.progress.score,
+      stalledCount: ledger.missionPlan.progress.stalledCount,
+      remainingTasks: ledger.missionPlan.progress.remainingTasks,
+      nextAction: ledger.missionPlan.nextAction?.summary ?? "none",
+    };
+  }
+  if (ledger.activeTaskId) {
+    summary.activeTaskId = ledger.activeTaskId;
+  }
+  if (ledger.lastMeaningfulAction) {
+    summary.lastMeaningfulAction = ledger.lastMeaningfulAction;
+  }
+  return summary;
 }
 
 export async function writeMissionLedger(
@@ -352,37 +728,56 @@ export async function writeMissionLedger(
   }
 
   const vault = context.app.vault;
-  const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
-  const path = getMissionLedgerPath(ledger.runId);
-  const block = formatMissionLedgerBlock(ledger);
+  const requestedLedger = cloneMissionLedger(ledger);
+  return withSerializedRunWrite(vault, ledger.runId, async () => {
+    const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
+    const path = getMissionLedgerPath(requestedLedger.runId);
 
-  if (!vault.getFolderByPath(folderPath)) {
-    try {
-      await vault.createFolder(folderPath);
-    } catch (error) {
-      if (!isAlreadyExistsError(error)) {
-        throw error;
+    if (!vault.getFolderByPath(folderPath)) {
+      try {
+        await vault.createFolder(folderPath);
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) {
+          throw error;
+        }
       }
     }
-  }
 
-  const file = vault.getFileByPath(path);
-  if (!file) {
-    const content = `# Agent Run ${sanitizeRunId(ledger.runId)}\n\n${block}`;
-    await vault.create(path, content);
+    const file = vault.getFileByPath(path);
+    let current = "";
+    let persistedRevision = 0;
+    if (file) {
+      current = await vault.read(file as TFile);
+      persistedRevision = parseMissionLedgerFromMarkdown(current)?.revision ?? 0;
+    }
+
+    requestedLedger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
+    requestedLedger.revision =
+      Math.max(requestedLedger.revision, persistedRevision) + 1;
+    const block = formatMissionLedgerBlock(requestedLedger);
+
+    if (!file) {
+      const content = `# Agent Run ${sanitizeRunId(requestedLedger.runId)}\n\n${block}`;
+      await vault.create(path, content);
+      ledger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
+      ledger.revision = Math.max(ledger.revision, requestedLedger.revision);
+      return {
+        path,
+        bytesWritten: getByteLength(content),
+        revision: requestedLedger.revision,
+      };
+    }
+
+    const next = replaceMissionLedgerBlock(current, block);
+    await vault.modify(file as TFile, next);
+    ledger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
+    ledger.revision = Math.max(ledger.revision, requestedLedger.revision);
     return {
       path,
-      bytesWritten: getByteLength(content),
+      bytesWritten: getByteLength(block),
+      revision: requestedLedger.revision,
     };
-  }
-
-  const current = await vault.read(file as TFile);
-  const next = replaceMissionLedgerBlock(current, block);
-  await vault.modify(file as TFile, next);
-  return {
-    path,
-    bytesWritten: getByteLength(block),
-  };
+  });
 }
 
 export async function readMissionLedgerByRunId(
@@ -417,19 +812,25 @@ export async function readLatestMissionLedger(
     .filter((file) => /^Agent Runs\/[^/]+\.md$/i.test(file.path))
     .sort((left, right) => (right.stat?.mtime ?? 0) - (left.stat?.mtime ?? 0));
 
+  let terminalFallback: { path: string; ledger: MissionLedger; mtime: number } | null = null;
+
   for (const file of candidates) {
     const content = await context.app.vault.read(file);
     const ledger = parseMissionLedgerFromMarkdown(content);
     if (ledger) {
-      return {
+      const loaded = {
         path: file.path,
         ledger,
         mtime: file.stat?.mtime ?? 0,
       };
+      if (!isTerminalCompleteLedger(ledger)) {
+        return loaded;
+      }
+      terminalFallback ??= loaded;
     }
   }
 
-  return null;
+  return terminalFallback;
 }
 
 export function parseMissionLedgerFromMarkdown(
@@ -469,6 +870,16 @@ export function formatMissionLedgerBlock(ledger: MissionLedger): string {
     `- Acceptance: ${ledger.acceptance?.status ?? "unchecked"}`,
     `- Next action: ${ledger.nextActions[0] ?? "none"}`,
     `- Remaining actions: ${ledger.remainingActions.join("; ") || "none"}`,
+    `- Continuation command: ${ledger.continuationCommand || getContinuationCommand(ledger.runId)}`,
+    `- Blocker category: ${ledger.blockerCategory ?? "none"}`,
+    `- Dependency status: ${formatDependencyStatusSummary(ledger.dependencyStatus)}`,
+    `- Approvals: ${ledger.approvals.length}`,
+    `- Wall clock expired: ${ledger.wallClockExpired ? "yes" : "no"}`,
+    `- Mission plan: ${ledger.missionPlan?.status ?? "none"}`,
+    `- Active task: ${ledger.activeTaskId ?? ledger.missionPlan?.activeTaskId ?? "none"}`,
+    `- Progress score: ${ledger.progressScore ?? ledger.missionPlan?.progress.score ?? 0}`,
+    `- Stalled count: ${ledger.stalledCount ?? ledger.missionPlan?.progress.stalledCount ?? 0}`,
+    `- Iterations: ${ledger.iterationCount ?? 0}`,
     "",
   ].join("\n");
 }
@@ -513,7 +924,10 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
     return null;
   }
 
+  const missionPlan = normalizeMissionPlan(value.missionPlan);
   return {
+    schemaVersion: MISSION_LEDGER_SCHEMA_VERSION,
+    revision: Math.max(0, Math.floor(getNumber(value.revision) ?? 0)),
     runId,
     mission,
     route,
@@ -540,11 +954,106 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
       : [],
     receipts: getStringArray(value.receipts),
     blockers: getStringArray(value.blockers),
+    blockerCategory: getBlockerCategory(value.blockerCategory),
+    dependencyStatus: Array.isArray(value.dependencyStatus)
+      ? value.dependencyStatus
+          .map(normalizeDependencyStatus)
+          .filter(isDependencyStatus)
+      : [],
+    approvals: Array.isArray(value.approvals)
+      ? value.approvals
+          .map(normalizeApprovalRecord)
+          .filter(isApprovalRecord)
+      : [],
+    wallClockExpired: value.wallClockExpired === true,
     nextActions: getStringArray(value.nextActions),
     remainingActions: getStringArray(value.remainingActions),
+    researchPlan: normalizeResearchPlan(value.researchPlan),
+    missionPlan,
+    ...(() => {
+      const orchestrator = normalizeOrchestratorSnapshot(value.orchestrator, {
+        fallbackRunId: runId,
+      });
+      return orchestrator ? { orchestrator } : {};
+    })(),
+    ...(() => {
+      const claimLedger = normalizeClaimLedger(value.claimLedger);
+      const claimPassages = normalizeClaimPassages(value.claimPassages);
+      const evidenceConflicts = normalizeEvidenceConflicts(value.evidenceConflicts);
+      return {
+        ...(claimLedger ? { claimLedger } : {}),
+        ...(claimPassages ? { claimPassages } : {}),
+        ...(evidenceConflicts.length > 0 ? { evidenceConflicts } : {}),
+      };
+    })(),
+    iterationCount: getNumber(value.iterationCount) ?? getNumber(value.lastSafeStep) ?? 0,
+    progressScore:
+      getNumber(value.progressScore) ?? missionPlan?.progress.score ?? 0,
+    stalledCount:
+      getNumber(value.stalledCount) ?? missionPlan?.progress.stalledCount ?? 0,
+    activeTaskId: getString(value.activeTaskId) ?? missionPlan?.activeTaskId ?? undefined,
+    lastMeaningfulAction:
+      getString(value.lastMeaningfulAction) ??
+      missionPlan?.progress.lastMeaningfulAction,
     resumeCount: getNumber(value.resumeCount) ?? 0,
     lastSafeStep: getNumber(value.lastSafeStep) ?? 0,
+    continuationCommand:
+      getString(value.continuationCommand) ?? getContinuationCommand(runId),
     continuationPrompt: getString(value.continuationPrompt),
+  };
+}
+
+function normalizeApprovalRecord(value: unknown): MissionApprovalRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = getString(value.id);
+  const toolName = getString(value.toolName);
+  const action = getString(value.action);
+  const decision = getApprovalDecision(value.decision);
+  const decidedAt = getString(value.decidedAt);
+  if (!id || !toolName || !action || !decision || !decidedAt) {
+    return null;
+  }
+  return { id, toolName, action, decision, decidedAt };
+}
+
+function isApprovalRecord(
+  value: MissionApprovalRecord | null,
+): value is MissionApprovalRecord {
+  return value !== null;
+}
+
+function getApprovalDecision(
+  value: unknown,
+): MissionApprovalRecord["decision"] | null {
+  return value === "approved" ||
+    value === "denied" ||
+    value === "expired" ||
+    value === "aborted"
+    ? value
+    : null;
+}
+
+function normalizeDependencyStatus(value: unknown): MissionDependencyStatus | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const category = getBlockerCategory(value.category);
+  const status = getDependencyHealthStatus(value.status);
+  const capability = getString(value.capability);
+  const summary = getString(value.summary);
+  const nextAction = getString(value.nextAction);
+  if (!category || !status || !capability || !summary || !nextAction) {
+    return null;
+  }
+  return {
+    category,
+    status,
+    capability,
+    summary,
+    nextAction,
+    checkedAt: getString(value.checkedAt),
   };
 }
 
@@ -636,12 +1145,31 @@ function normalizeMissionEvidence(value: unknown): MissionEvidence | null {
   if (!id || !kind || !title || !summary || !confidence) {
     return null;
   }
+  const sourceId = getString(value.sourceId);
+  const passageId = getString(value.passageId);
+  const passageIds = [...new Set(getStringArray(value.passageIds))].slice(
+    -MAX_PASSAGE_IDS_PER_EVIDENCE,
+  );
+  const parserStatus =
+    value.parserStatus === "parsed" ||
+    value.parserStatus === "empty" ||
+    value.parserStatus === "missing_content" ||
+    value.parserStatus === "legacy_unknown"
+      ? value.parserStatus
+      : undefined;
   return {
     id,
     kind,
     title,
     ...(getString(value.path) ? { path: getString(value.path) } : {}),
     ...(getString(value.url) ? { url: getString(value.url) } : {}),
+    ...(sourceId ? { sourceId } : {}),
+    ...(passageId ? { passageId } : {}),
+    ...(passageIds.length > 0 ? { passageIds } : {}),
+    ...(typeof value.usableSource === "boolean"
+      ? { usableSource: value.usableSource }
+      : {}),
+    ...(parserStatus ? { parserStatus } : {}),
     summary,
     confidence,
   };
@@ -656,6 +1184,12 @@ function isMissionEvidence(value: MissionEvidence | null): value is MissionEvide
 }
 
 function isMissionMilestone(value: MissionMilestone | null): value is MissionMilestone {
+  return value !== null;
+}
+
+function isDependencyStatus(
+  value: MissionDependencyStatus | null,
+): value is MissionDependencyStatus {
   return value !== null;
 }
 
@@ -702,10 +1236,66 @@ function getMissionStage(value: unknown): MissionStage | null {
     : null;
 }
 
+function getBlockerCategory(value: unknown): MissionBlockerCategory | undefined {
+  return value === "provider_auth" ||
+    value === "model_timeout" ||
+    value === "web_fetch" ||
+    value === "semantic_retrieval" ||
+    value === "companion_browser" ||
+    value === "obsidian_vault" ||
+    value === "safety_policy" ||
+    value === "tool_unavailable" ||
+    value === "unknown"
+    ? value
+    : undefined;
+}
+
+function getDependencyHealthStatus(
+  value: unknown,
+): MissionDependencyStatus["status"] | null {
+  return value === "ok" ||
+    value === "degraded" ||
+    value === "blocked" ||
+    value === "unknown"
+    ? value
+    : null;
+}
+
 function getConfidence(value: unknown): MissionEvidence["confidence"] | null {
   return value === "low" || value === "medium" || value === "high"
     ? value
     : null;
+}
+
+function normalizeClaimPassages(value: unknown): ClaimPassageRef[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const passages: ClaimPassageRef[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const id = getString(item.id);
+    const text = getString(item.text);
+    if (!id || text === undefined) {
+      continue;
+    }
+    passages.push({
+      id,
+      text,
+      ...(getString(item.evidenceId)
+        ? { evidenceId: getString(item.evidenceId) }
+        : {}),
+      ...(getString(item.subquestionId)
+        ? { subquestionId: getString(item.subquestionId) }
+        : {}),
+    });
+    if (passages.length >= MAX_CLAIM_PASSAGES) {
+      break;
+    }
+  }
+  return passages.length > 0 ? passages : undefined;
 }
 
 function hasLedgerVaultApi(context: ToolExecutionContext): boolean {
@@ -735,8 +1325,33 @@ function sanitizeRunId(runId: string): string {
   );
 }
 
+function getContinuationCommand(runId: string): string {
+  return `continue run ${runId}`;
+}
+
+function isTerminalCompleteLedger(ledger: MissionLedger): boolean {
+  return ledger.status === "complete" && ledger.acceptance?.status === "pass";
+}
+
+function formatDependencyStatusSummary(statuses: MissionDependencyStatus[]): string {
+  if (statuses.length === 0) {
+    return "none";
+  }
+  return statuses
+    .map((item) => `${item.category}:${item.status}`)
+    .join("; ");
+}
+
 function getByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
+}
+
+function cloneMissionLedger(ledger: MissionLedger): MissionLedger {
+  const cloned = normalizeMissionLedger(JSON.parse(JSON.stringify(ledger)));
+  if (!cloned) {
+    throw new Error("Cannot serialize invalid mission ledger state.");
+  }
+  return cloned;
 }
 
 function getString(value: unknown): string | undefined {
