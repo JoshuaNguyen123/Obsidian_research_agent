@@ -21,21 +21,21 @@ import {
 import type { AgentConversationMessage } from "../src/conversationHistory";
 import type { ToolExecutionContext } from "../src/tools/types";
 
-test("run budget keeps quick routes small and raises grounded cap to 60", () => {
-  assert.equal(MAX_AGENT_STEPS, 60);
+test("run budget keeps quick routes small and raises grounded cap to 100", () => {
+  assert.equal(MAX_AGENT_STEPS, 100);
   assert.equal(CHECKPOINT_EVERY_STEPS, 5);
   assert.equal(LONG_RUN_STEP_WARN_AT, 15);
   assert.equal(
     estimateLoopBudget({
       route: "instant_local",
-      configuredMaxSteps: 99,
+      configuredMaxSteps: 100,
     }),
     0,
   );
   assert.equal(
     estimateLoopBudget({
       route: "direct_writeback",
-      configuredMaxSteps: 99,
+      configuredMaxSteps: 100,
     }),
     1,
   );
@@ -43,7 +43,7 @@ test("run budget keeps quick routes small and raises grounded cap to 60", () => 
     estimateLoopBudget({
       route: "single_model_answer",
       expectedTimeClass: "quick",
-      configuredMaxSteps: 99,
+      configuredMaxSteps: 100,
     }),
     2,
   );
@@ -52,16 +52,17 @@ test("run budget keeps quick routes small and raises grounded cap to 60", () => 
       route: "grounded_workflow",
       expectedTimeClass: "long",
       slowPathReason: "needs_web_sources",
-      configuredMaxSteps: 99,
+      configuredMaxSteps: 100,
     }),
-    60,
+    100,
   );
 });
 
 test("configured max agent steps remains a true upper cap", () => {
-  assert.equal(resolveConfiguredMaxAgentSteps(99), 60);
+  assert.equal(resolveConfiguredMaxAgentSteps(999), 100);
+  assert.equal(resolveConfiguredMaxAgentSteps(99), 99);
   assert.equal(resolveConfiguredMaxAgentSteps(4), 4);
-  assert.equal(resolveConfiguredMaxAgentSteps(null), 60);
+  assert.equal(resolveConfiguredMaxAgentSteps(null), 100);
   assert.equal(
     estimateLoopBudget({
       route: "grounded_workflow",

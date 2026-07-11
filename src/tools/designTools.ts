@@ -22,6 +22,7 @@ import {
   type SvgWireframeShape,
 } from "../design/svgDesign";
 import { createDesignPackageTool } from "../agent/design/CreateDesignPackageTool";
+import { hasReviseDesignIntent } from "../agent/codeDesignIntent";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 import {
@@ -37,7 +38,12 @@ const DESIGN_INTENT_PATTERN =
   /\b(create|make|draw|generate|build|draft|render|save|write)\b[\s\S]{0,120}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b[\s\S]{0,120}\b(create|make|draw|generate|build|draft|render|save|write)\b/i;
 
 export function createDesignTools(): AgentTool[] {
-  return [createDesignCanvasTool, createSvgDesignTool, createDesignPackageTool];
+  return [
+    createDesignCanvasTool,
+    updateDesignCanvasTool,
+    createSvgDesignTool,
+    createDesignPackageTool,
+  ];
 }
 
 export const createDesignCanvasTool: AgentTool = {
@@ -154,6 +160,128 @@ export const createDesignCanvasTool: AgentTool = {
       edgeCount: verification.edgeCount,
       summary: canvasSummary,
       opened,
+    };
+  },
+};
+
+export const updateDesignCanvasTool: AgentTool = {
+  name: "update_design_canvas",
+  description:
+    "Revise an existing Obsidian JSON Canvas artifact with backup, read-back verification, and a receipt. Requires explicit revise/update design intent.",
+  parameters: {
+    type: "object",
+    required: ["path"],
+    properties: {
+      path: {
+        type: "string",
+        description: "Vault-relative .canvas path to update.",
+      },
+      title: {
+        type: "string",
+        description: "Optional title used when generating layout nodes.",
+      },
+      canvas: {
+        type: "object",
+        description: "Optional complete JSON Canvas object with nodes and edges arrays.",
+      },
+      nodes: {
+        type: "array",
+        items: { type: "object" },
+        description: "Optional JSON Canvas nodes.",
+      },
+      edges: {
+        type: "array",
+        items: { type: "object" },
+        description: "Optional JSON Canvas edges.",
+      },
+      items: {
+        type: "array",
+        items: { type: "object" },
+        description: "Optional layout items with title/text/kind/lane/url/file/color.",
+      },
+      diagramType: {
+        type: "string",
+        enum: [
+          "sequence",
+          "user_flow",
+          "ui_flow",
+          "logistics_system",
+          "service_blueprint",
+          "project_ideation",
+          "architecture",
+          "mind_map",
+        ],
+      },
+      direction: {
+        type: "string",
+        enum: ["row", "column", "grid"],
+      },
+      connect: {
+        type: "string",
+        enum: ["none", "sequence"],
+      },
+      connections: {
+        type: "array",
+        items: { type: "object" },
+      },
+      open: {
+        type: "boolean",
+        description: "Open the updated file in Obsidian after writing.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    if (!hasReviseDesignIntent(context.originalPrompt)) {
+      throw new ToolExecutionError(
+        "intent_required",
+        "update_design_canvas requires explicit revise/update/edit design intent.",
+      );
+    }
+    const path = normalizeArtifactPath(getRequiredString(args, "path"), ".canvas");
+    const open = getOptionalBoolean(args, "open") ?? false;
+    const file = context.app.vault.getFileByPath(path);
+    if (!file) {
+      throw new Error(`Canvas not found: ${path}`);
+    }
+
+    const previous = await context.app.vault.read(file);
+    const backupPath = await backupDesignArtifact(context, path, previous);
+    reportProgress(context, `Updating canvas design for ${path}...`);
+    const canvas = getCanvasFromArgs(args);
+    const diagramType = getDiagramType(args.diagramType);
+    const canvasSummary = summarizeCanvas(canvas, diagramType);
+    reportProgress(context, canvasSummary);
+    const content = stringifyJsonCanvas(canvas);
+    const preflight = verifyCanvasArtifact(content);
+    if (!preflight.ok) {
+      throw new Error(`Canvas preflight verification failed: ${preflight.errors.join(" ")}`);
+    }
+
+    await context.app.vault.modify(file, content);
+    const readBack = await context.app.vault.read(file);
+    const verification = verifyCanvasArtifact(readBack);
+    if (!verification.ok) {
+      throw new Error(`Canvas read-back verification failed: ${verification.errors.join(" ")}`);
+    }
+
+    const opened = open ? await openCreatedFile(context, file) : false;
+    return {
+      path,
+      operation: "update",
+      diagramType,
+      bytesWritten: getByteLength(content),
+      nodeCount: verification.nodeCount,
+      edgeCount: verification.edgeCount,
+      summary: canvasSummary,
+      backupPath,
+      opened,
+      receipt: {
+        operation: "update",
+        path,
+        backupPath,
+        bytesWritten: getByteLength(content),
+      },
     };
   },
 };
@@ -718,6 +846,24 @@ function assertPathDoesNotExist(context: ToolExecutionContext, path: string) {
   }
 }
 
+async function backupDesignArtifact(
+  context: ToolExecutionContext,
+  path: string,
+  content: string,
+): Promise<string> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const basename = path.split("/").pop() ?? "design.canvas";
+  const backupPath = `.agent-backups/${basename}.${stamp}.bak`;
+  await ensureParentFolder(context, backupPath, true);
+  const existing = context.app.vault.getFileByPath(backupPath);
+  if (existing) {
+    await context.app.vault.modify(existing, content);
+  } else {
+    await context.app.vault.create(backupPath, content);
+  }
+  return backupPath;
+}
+
 async function ensureParentFolder(
   context: ToolExecutionContext,
   path: string,
@@ -754,7 +900,22 @@ async function ensureFolderPath(
     }
 
     if (!context.app.vault.getFolderByPath(currentPath)) {
-      await context.app.vault.createFolder(currentPath);
+      try {
+        await context.app.vault.createFolder(currentPath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // Obsidian can race adapter vs metadata cache; treat existing folder as ok.
+        if (
+          /already exists/i.test(message) &&
+          context.app.vault.getFolderByPath(currentPath)
+        ) {
+          continue;
+        }
+        if (/already exists/i.test(message)) {
+          continue;
+        }
+        throw error;
+      }
     }
   }
 }

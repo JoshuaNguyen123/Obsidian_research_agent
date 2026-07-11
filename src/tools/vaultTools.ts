@@ -1,5 +1,15 @@
 import type { TFile } from "obsidian";
 import {
+  sha256Fingerprint,
+  verifyPreparedActionFingerprint,
+  withPreparedActionFingerprint,
+  type ActionReceipt,
+  type JsonValue,
+  type PreparedAction,
+  type PreparedActionResult,
+  type ResourceAction,
+} from "../agent/actions";
+import {
   BACKUP_FOLDER,
   MAX_BATCH_READ_CHARS_PER_FILE,
   MAX_BATCH_READ_FILES,
@@ -11,6 +21,7 @@ import {
 import {
   ToolExecutionError,
   type AgentTool,
+  type AgentToolActionExecution,
   type ResearchMemoryIndexEntry,
   type ToolExecutionContext,
 } from "./types";
@@ -37,17 +48,42 @@ import { createGraphTools } from "./graphTools";
 import { countMarkdownVisibleText } from "./wordCount";
 import { getProjectMemoryLocation } from "../agent/projectMemory";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
+import {
+  analyzeTemplateDocument,
+  discoverAndRankTemplates,
+  dryRenderTemplate,
+  suggestCollisionFreeTemplatePath,
+  verifyRenderedTemplate,
+  type TemplateMetadata,
+} from "../orchestrator/templateIntelligence";
+import {
+  buildTransactionalResearchPackPlan,
+  createResearchTemplateWorkflow,
+  reduceResearchTemplateWorkflow,
+  stableContentHash,
+  verifyTransactionalResearchPack,
+  type ResearchTemplateWorkflowEvent,
+  type ResearchTemplateWorkflowV1,
+  type TemplateResearchFinding,
+  type TransactionalResearchPackPlan,
+} from "../orchestrator/researchTemplateWorkflow";
+
+const PREPARED_VAULT_ACTION_TTL_MS = 5 * 60 * 1_000;
 
 const CREATE_INTENT_PATTERN = /\b(create|creating|new|make)\b/i;
 const REPLACE_INTENT_PATTERN =
-  /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\b(edit(?:ing)?|revise|revising|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail)\b[\s\S]{0,120}\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown))\b|\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown))\b[\s\S]{0,120}\b(edit(?:ing)?|revise|revising|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail)\b|\b(update|updating)\b[\s\S]{0,120}\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire)\s+(?:note|page|file|markdown))\b|\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire)\s+(?:note|page|file|markdown))\b[\s\S]{0,120}\b(update|updating)\b|\b(clear|delete|remove|empty)\s+all\s+(?:of\s+)?(?:the\s+)?(?:notes?|contents?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)?\s*(?:page|note|document|file)?\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i;
+  /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\b(edit(?:ing)?|revise|revising|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail)\b[\s\S]{0,120}\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown))\b|\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown))\b[\s\S]{0,120}\b(edit(?:ing)?|revise|revising|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail)\b|\b(update|updating)\b[\s\S]{0,120}\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire)\s+(?:note|page|file|markdown))\b|\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire)\s+(?:note|page|file|markdown))\b[\s\S]{0,120}\b(update|updating)\b|\b(clear|delete|remove|empty)\s+all\s+(?:of\s+)?(?:the\s+)?(?:notes?|contents?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)?\s*(?:page|note|document|file)?\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\b(clear|delete|remove|empty)\b[\s\S]{0,80}\b(?:current|this|active|whole|entire)\s+(?:note|page|document|file)\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i;
 const APPEND_INTENT_PATTERN =
   /\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,80}\b(note|file|markdown|vault|page|document)\b|\b(note|file|markdown|vault|page|document)\b[\s\S]{0,80}\b(append|save|write|update|add|insert|copy|paste|put)\b|\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,120}\.md\b/i;
 const SECTION_APPEND_INTENT_PATTERN =
   /\b(write|draft|compose|generate|append|add|insert|put)\b[\s\S]{0,160}\b(?:below|under|after|beneath|inside)\b[\s\S]{0,80}\b(?:section|heading)\b|\b(?:below|under|after|beneath|inside)\b[\s\S]{0,80}\b(?:section|heading)\b[\s\S]{0,160}\b(write|draft|compose|generate|append|add|insert|put)\b/i;
 const MOVE_INTENT_PATTERN = /\b(move|rename|relocate)\b/i;
 const TITLE_INTENT_PATTERN =
-  /\b(retitle|rename|title|heading|h1)\b|\bcall\s+(?:this|the)\s+note\b|\b(note|file)\b[\s\S]{0,80}\b(organize|restructure|improve)\b|\b(organize|restructure|improve)\b[\s\S]{0,80}\b(note|file)\b/i;
+  /\b(retitle|rename|title|heading|h1)\b|\bcall\s+(?:this|the)\s+note\b|\b(note|file)\b[\s\S]{0,80}\b(organize|restructure|improve)\b|\b(organize|restructure|improve)\b[\s\S]{0,80}\b(note|file)\b|\btarget\s+\S+[\s\S]{0,80}\bchange\s+(?:that|it|this)\b/i;
+const HIGHLIGHT_INTENT_PATTERN =
+  /\b(find|search|locate|show)\b[\s\S]{0,120}\b(highlight|mark)\b|\b(highlight|mark)\b[\s\S]{0,120}\b(word|phrase|text|where|current\s+(?:note|file|page))\b/i;
+const RESTORE_INTENT_PATTERN =
+  /\b(undo|restore|revert|rollback|roll\s+back)\b[\s\S]{0,140}\b(agent|last|previous|backup|current\s+(?:note|file|page)|this\s+(?:note|file|page))\b|\b(agent|last|previous|backup|current\s+(?:note|file|page)|this\s+(?:note|file|page))\b[\s\S]{0,140}\b(undo|restore|revert|rollback|roll\s+back)\b/i;
 const EDIT_INTENT_PATTERN =
   /\b(edit|revise|update|replace|rewrite)\b[\s\S]{0,80}\b(section|heading|part|paragraph|content)\b|\b(section|heading|part|paragraph|content)\b[\s\S]{0,80}\b(edit|revise|update|replace|rewrite)\b/i;
 const DELETE_INTENT_PATTERN =
@@ -63,6 +99,8 @@ const TEMPLATE_FILL_INTENT_PATTERN =
   /\b(fill|use|apply|complete|populate|render)\b[\s\S]{0,100}\b(template|form|boilerplate)\b|\b(template|form|boilerplate)\b[\s\S]{0,100}\b(fill|use|apply|complete|populate|render)\b/i;
 const TEMPLATE_SEED_INTENT_PATTERN =
   /\b(seed|install|create|make|add)\b[\s\S]{0,120}\b(default|starter|example|sample|built[-\s]?in)\b[\s\S]{0,80}\btemplates?\b|\b(default|starter|example|sample|built[-\s]?in)\b[\s\S]{0,80}\btemplates?\b[\s\S]{0,120}\b(seed|install|create|make|add)\b/i;
+const RESEARCH_PACK_INTENT_PATTERN =
+  /\b(create|make|build|generate|save)\b[\s\S]{0,120}\b(research\s+pack|research\s+brief|sources?\s+index|synthesis\s+pack|transactional\s+pack)\b|\b(research\s+pack|research\s+brief|sources?\s+index|synthesis\s+pack|transactional\s+pack)\b[\s\S]{0,120}\b(create|make|build|generate|save)\b/i;
 
 const DEFAULT_FOLDER_LIST_LIMIT = 100;
 const DEFAULT_RECURSIVE_DEPTH = 3;
@@ -114,18 +152,22 @@ export function createVaultTools(): AgentTool[] {
     seedDefaultTemplatesTool,
     createTemplateTool,
     fillTemplateTool,
+    createResearchPackTool,
     createFolderTool,
     createFileTool,
     appendFileTool,
     replaceFileTool,
     movePathTool,
     deletePathTool,
+    renameCurrentFileTool,
     retitleCurrentFileTool,
+    highlightCurrentFilePhraseTool,
     prepareEditCurrentSectionTool,
     editCurrentSectionTool,
     appendToCurrentSectionTool,
     appendToCurrentFileTool,
     replaceCurrentFileTool,
+    restoreCurrentFileFromBackupTool,
     deleteCurrentFileTool,
   ];
 }
@@ -1051,6 +1093,8 @@ export const appendResearchMemoryTool: AgentTool = {
         sourceUrls,
         contentHash,
         updateCount: (existingIndexEntry?.updateCount ?? 0) + 1,
+        targetId: existingIndexEntry?.targetId ?? topic,
+        verificationState: "unverified",
       },
     );
     await context.setResearchMemoryIndex?.(nextIndex);
@@ -1173,6 +1217,8 @@ export const compactResearchMemoryTool: AgentTool = {
         sourceUrls: indexed?.sourceUrls ?? [],
         contentHash: hashResearchMemoryText(summary),
         updateCount: (indexed?.updateCount ?? 0) + 1,
+        targetId: indexed?.targetId ?? indexed?.topic ?? topic,
+        verificationState: "unverified",
       },
     );
     await context.setResearchMemoryIndex?.(nextIndex);
@@ -1199,30 +1245,12 @@ export const deleteResearchMemoryEntryTool: AgentTool = {
     },
     additionalProperties: false,
   },
-  async execute(args, context) {
-    assertResearchMemoryEnabled(context);
-    if (!/\b(delete|remove|trash)\b/i.test(context.originalPrompt)) {
-      throw new Error("delete_research_memory_entry requires explicit delete, remove, or trash intent.");
-    }
-    const topic = getRequiredString(args, "topic").trim();
-    const indexed = findResearchMemoryIndexEntry(context, topic);
-    const path = indexed?.path ?? buildResearchMemoryPath(context, topic);
-    const file = getMarkdownFileByPath(context, path);
-    const current = await context.app.vault.read(file);
-    const backupPath = await backupCurrentFile(context, file, current);
-    await trashVaultPath(context, file);
-    const nextIndex = (context.getResearchMemoryIndex?.() ?? []).filter(
-      (entry) => entry.path !== path,
-    );
-    await context.setResearchMemoryIndex?.(nextIndex);
-    return {
-      path,
-      operation: "trash",
-      topic: indexed?.topic ?? topic,
-      backupPath,
-      bytesDeleted: getByteLength(current),
-    };
+  async execute() {
+    refuseUnpreparedVaultExecution("delete_research_memory_entry");
   },
+  prepare: (args, context) => prepareDeleteResearchMemoryEntry(args, context),
+  executePrepared: (action, context) =>
+    executePreparedDeleteResearchMemoryEntry(action, context),
 };
 
 export const listTemplatesTool: AgentTool = {
@@ -1240,6 +1268,14 @@ export const listTemplatesTool: AgentTool = {
         type: "boolean",
         description: "When true, include {{field}} placeholder names for each template.",
       },
+      query: {
+        type: "string",
+        description: "Optional intent query used to rank template candidates.",
+      },
+      kind: {
+        type: "string",
+        description: "Optional template kind used for metadata-aware ranking.",
+      },
     },
     additionalProperties: false,
   },
@@ -1253,11 +1289,46 @@ export const listTemplatesTool: AgentTool = {
     );
     const includePlaceholders =
       getOptionalBoolean(args, "includePlaceholders") ?? false;
+    const query = getOptionalString(args, "query")?.trim();
+    const requestedKind = getOptionalString(args, "kind")?.trim();
     const templateFiles = getVaultEntries(context)
       .filter((entry) => getEntryExtension(entry) === "md")
       .filter((entry) => isPathInFolder(entry.path, templateFolder))
       .filter((entry) => !isBlockedSystemPath(entry.path))
       .sort((a, b) => a.path.localeCompare(b.path));
+    if (query || requestedKind) {
+      const documents = await Promise.all(
+        templateFiles.map(async (entry) => {
+          const content = await context.app.vault.cachedRead(
+            getMarkdownFileByPath(context, entry.path),
+          );
+          return {
+            path: entry.path,
+            content,
+            metadata: parseTemplateMetadata(content),
+          };
+        }),
+      );
+      const ranked = discoverAndRankTemplates(documents, {
+        query: query ?? "",
+        kind: requestedKind,
+      });
+      return {
+        templateFolder,
+        templates: ranked.slice(0, limit).map((candidate) => ({
+          path: candidate.path,
+          basename: candidate.title,
+          ...(includePlaceholders
+            ? { placeholders: candidate.placeholders }
+            : {}),
+          fields: candidate.fields,
+          score: candidate.score,
+          reasons: candidate.reasons,
+        })),
+        ranked: true,
+        truncated: ranked.length > limit,
+      };
+    }
     const templates = [];
 
     for (const entry of templateFiles.slice(0, limit)) {
@@ -1471,6 +1542,21 @@ export const fillTemplateTool: AgentTool = {
         type: "boolean",
         description: "When true, create missing parent folders first.",
       },
+      useBuiltins: {
+        type: "boolean",
+        description:
+          "Resolve safe date/time/title/frontmatter built-ins. Defaults to false.",
+      },
+      previewOnly: {
+        type: "boolean",
+        description: "Dry-render the template without creating a note.",
+      },
+      collisionPolicy: {
+        type: "string",
+        enum: ["error", "suffix"],
+        description:
+          "Use suffix to choose a collision-free path; error preserves strict no-overwrite behavior.",
+      },
     },
     additionalProperties: false,
   },
@@ -1497,21 +1583,111 @@ export const fillTemplateTool: AgentTool = {
       templatePath !== undefined
         ? await context.app.vault.cachedRead(getMarkdownFileByPath(context, templatePath))
         : templateTextArg ?? "";
-    const fill = fillTemplateText(templateText, values);
-    const targetPath = normalizeTemplateTargetPath({
+    const useBuiltins = getOptionalBoolean(args, "useBuiltins") ?? false;
+    const previewOnly = getOptionalBoolean(args, "previewOnly") ?? false;
+    const collisionPolicy = args.collisionPolicy === "suffix" ? "suffix" : "error";
+    const analyzed = analyzeTemplateDocument({
+      path: templatePath ?? "Ad hoc template.md",
+      content: templateText,
+      metadata: parseTemplateMetadata(templateText),
+    });
+    const intelligentPreview = useBuiltins
+      ? dryRenderTemplate(analyzed, {
+          values,
+          title:
+            values.title ||
+            values.noteTitle ||
+            values.note_title ||
+            values.name ||
+            values.topic ||
+            getTemplateTitleFromPath(templatePath),
+          now: context.now?.() ?? new Date(),
+        })
+      : null;
+    if (intelligentPreview && !intelligentPreview.canCreate) {
+      const grouped = intelligentPreview.missingFieldGroups
+        .map(
+          (group) =>
+            `${group.group}: ${group.fields.map((field) => field.name).join(", ")}`,
+        )
+        .join("; ");
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        `fill_template needs grouped field values${grouped ? ` (${grouped})` : ""}.`,
+      );
+    }
+    const fill = intelligentPreview
+      ? { content: intelligentPreview.content, placeholders: analyzed.placeholders }
+      : fillTemplateText(templateText, values);
+    const desiredTargetPath = normalizeTemplateTargetPath({
       context,
       explicitTargetPath: getOptionalString(args, "targetPath"),
       values,
       templatePath,
     });
+    const targetPath =
+      collisionPolicy === "suffix"
+        ? suggestCollisionFreeTemplatePath(
+            desiredTargetPath,
+            getVaultEntries(context).map((entry) => entry.path),
+          )
+        : desiredTargetPath;
     const createFolders = getOptionalBoolean(args, "createFolders") ?? true;
 
     if (getAbstractPath(context, targetPath)) {
       throw new Error(`Path already exists: ${targetPath}`);
     }
 
+    if (previewOnly) {
+      return {
+        path: targetPath,
+        operation: "preview",
+        templateSource,
+        templatePath,
+        placeholders: fill.placeholders,
+        missingFieldGroups: intelligentPreview?.missingFieldGroups ?? [],
+        unresolvedPlaceholders:
+          intelligentPreview?.unresolvedPlaceholders ?? [],
+        content: fill.content,
+        bytes: getByteLength(fill.content),
+      };
+    }
+
     await ensureParentFolder(context, targetPath, createFolders);
     await context.app.vault.create(targetPath, fill.content);
+    let verification: ReturnType<typeof verifyRenderedTemplate>;
+    try {
+      const actualContent = await context.app.vault.cachedRead(
+        getMarkdownFileByPath(context, targetPath),
+      );
+      verification = verifyRenderedTemplate(fill.content, actualContent);
+      if (!verification.passed) {
+        throw new ToolExecutionError(
+          "template_verification_failed",
+          verification.reasons.join(" ") || "Template read-back verification failed.",
+        );
+      }
+    } catch (error) {
+      const created = getAbstractPath(context, targetPath);
+      let rollback = "created note was already absent";
+      if (created) {
+        try {
+          await trashVaultPath(context, created);
+          rollback = "created note moved to Obsidian trash";
+        } catch (rollbackError) {
+          throw new ToolExecutionError(
+            "template_verification_rollback_failed",
+            `${getErrorMessage(error)} Rollback also failed: ${getErrorMessage(rollbackError)}`,
+          );
+        }
+      }
+      throw new ToolExecutionError(
+        error instanceof ToolExecutionError
+          ? error.code
+          : "template_verification_failed",
+        `${getErrorMessage(error)} Transaction rolled back: ${rollback}.`,
+      );
+    }
 
     return {
       path: targetPath,
@@ -1521,7 +1697,203 @@ export const fillTemplateTool: AgentTool = {
       placeholders: fill.placeholders,
       valuesApplied: Object.keys(values).sort(),
       bytesWritten: getByteLength(fill.content),
+      ...(useBuiltins || collisionPolicy === "suffix"
+        ? { collisionPolicy, verification }
+        : {}),
     };
+  },
+};
+
+export const createResearchPackTool: AgentTool = {
+  name: "create_research_pack",
+  description:
+    "Create and read-back verify a collision-safe transactional research pack containing Brief, Sources, Synthesis, and linked Index notes. All created notes are moved to Obsidian trash if any creation or verification step fails.",
+  parameters: {
+    type: "object",
+    required: ["baseFolder", "title", "brief", "sources", "synthesis"],
+    properties: {
+      baseFolder: {
+        type: "string",
+        description: "Safe vault-relative parent folder for the research pack.",
+      },
+      title: { type: "string" },
+      brief: { type: "string" },
+      sources: {
+        type: "array",
+        minItems: 1,
+        maxItems: 50,
+        items: {
+          type: "object",
+          required: ["id", "title"],
+          properties: {
+            id: { type: "string" },
+            title: { type: "string" },
+            url: { type: "string" },
+            passage: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+      },
+      synthesis: { type: "string" },
+      previewOnly: {
+        type: "boolean",
+        description: "Return the deterministic pack plan without creating notes.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    if (!RESEARCH_PACK_INTENT_PATTERN.test(context.originalPrompt)) {
+      throw new ToolExecutionError(
+        "intent_required",
+        "create_research_pack requires an explicit request to create a research pack, brief, source index, or synthesis pack.",
+      );
+    }
+    const baseFolder = normalizeResearchPackFolder(
+      getRequiredString(args, "baseFolder"),
+    );
+    const title = getRequiredString(args, "title").trim();
+    const brief = getRequiredString(args, "brief").trim();
+    const synthesis = getRequiredString(args, "synthesis").trim();
+    if (!title || !brief || !synthesis) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        "Research pack title, brief, and synthesis cannot be empty.",
+      );
+    }
+    const sources = getResearchPackSources(args.sources);
+    const now = context.now?.() ?? new Date();
+    const runId = context.runId?.trim() || `research-pack-${now.getTime()}`;
+    const transactionId = `${runId}:${stableContentHash(`${baseFolder}\n${title}`).slice(-8)}`;
+    const plan = buildTransactionalResearchPackPlan({
+      transactionId,
+      baseFolder,
+      title,
+      brief,
+      sources,
+      synthesis,
+      existingPaths: getVaultEntries(context).map((entry) => entry.path),
+    });
+    const findings: TemplateResearchFinding[] = sources.map((source, index) => ({
+      id: source.id || `source-${index + 1}`,
+      summary: source.passage?.trim() || source.title,
+      sourceIds: [source.id, source.url].filter(isNonEmptyString),
+      confidence: source.passage?.trim() ? "high" : "medium",
+    }));
+    const previewContent = plan.artifacts
+      .map((artifact) => `<!-- ${artifact.path} -->\n${artifact.content}`)
+      .join("\n");
+    let workflow = createResearchTemplateWorkflow({
+      id: transactionId,
+      runId,
+      now,
+    });
+    workflow = applyResearchPackEvent(workflow, {
+      kind: "template_selected",
+      templatePath: "Research Pack.md",
+    }, now);
+    workflow = applyResearchPackEvent(workflow, {
+      kind: "research_completed",
+      findings,
+    }, now);
+    workflow = applyResearchPackEvent(workflow, {
+      kind: "fields_resolved",
+      values: { baseFolder, title, brief, synthesis },
+    }, now);
+    workflow = applyResearchPackEvent(workflow, {
+      kind: "preview_prepared",
+      content: previewContent,
+    }, now);
+    const previewHash = stableContentHash(previewContent);
+    if (getOptionalBoolean(args, "previewOnly") ?? false) {
+      return {
+        operation: "preview_research_pack",
+        path: plan.rootPath,
+        transactionId,
+        previewHash,
+        plan,
+        workflow,
+      };
+    }
+    workflow = applyResearchPackEvent(workflow, {
+      kind: "preview_approved",
+      approvedHash: previewHash,
+    }, now);
+
+    const createdPaths: string[] = [];
+    try {
+      for (const artifactId of plan.createOrder) {
+        const artifact = plan.artifacts.find((item) => item.id === artifactId);
+        if (!artifact) throw new Error(`Research pack artifact is missing: ${artifactId}`);
+        if (getAbstractPath(context, artifact.path)) {
+          throw new Error(`Research pack path already exists: ${artifact.path}`);
+        }
+        await ensureParentFolder(context, artifact.path, true);
+        await context.app.vault.create(artifact.path, artifact.content);
+        createdPaths.push(artifact.path);
+      }
+      workflow = applyResearchPackEvent(workflow, {
+        kind: "pack_created",
+        plan,
+        createdPaths,
+      }, now);
+      const readBack: Record<string, string | undefined> = Object.create(null);
+      for (const path of plan.verifyPaths) {
+        const file = getMarkdownFileByPath(context, path);
+        readBack[path] = await context.app.vault.cachedRead(file);
+      }
+      const verification = verifyTransactionalResearchPack(plan, readBack);
+      workflow = applyResearchPackEvent(workflow, {
+        kind: "verification_completed",
+        passed: verification.passed,
+        verifiedPaths: verification.passed ? plan.verifyPaths : [],
+        blocker: verification.passed
+          ? undefined
+          : `Missing: ${verification.missingPaths.join(", ")}; mismatched: ${verification.mismatchedPaths.join(", ")}`,
+      }, now);
+      if (!verification.passed) {
+        throw new ToolExecutionError(
+          "research_pack_verification_failed",
+          workflow.blocker || "Research pack read-back verification failed.",
+        );
+      }
+      return {
+        operation: "create_research_pack",
+        path: plan.rootPath,
+        transactionId,
+        previewHash,
+        createdPaths,
+        bytesWritten: plan.artifacts.reduce(
+          (total, artifact) => total + getByteLength(artifact.content),
+          0,
+        ),
+        verification,
+        workflow,
+      };
+    } catch (error) {
+      const rollbackFailures: string[] = [];
+      for (const path of [...createdPaths].reverse()) {
+        const created = getAbstractPath(context, path);
+        if (!created) continue;
+        try {
+          await trashVaultPath(context, created);
+        } catch (rollbackError) {
+          rollbackFailures.push(`${path}: ${getErrorMessage(rollbackError)}`);
+        }
+      }
+      if (rollbackFailures.length > 0) {
+        throw new ToolExecutionError(
+          "research_pack_rollback_failed",
+          `${getErrorMessage(error)} Rollback failures: ${rollbackFailures.join(" | ")}`,
+        );
+      }
+      throw new ToolExecutionError(
+        error instanceof ToolExecutionError
+          ? error.code
+          : "research_pack_transaction_failed",
+        `${getErrorMessage(error)} Transaction rolled back ${createdPaths.length} created note(s).`,
+      );
+    }
   },
 };
 
@@ -1662,25 +2034,11 @@ export const replaceFileTool: AgentTool = {
     },
     additionalProperties: false,
   },
-  async execute(args, context) {
-    assertReplaceIntent(context, "replace_file");
-    const path = normalizeVaultPath(getRequiredString(args, "path"), {
-      requireMarkdown: true,
-    });
-    const text = getString(args, "text");
-    const file = getMarkdownFileByPath(context, path);
-    const current = await context.app.vault.read(file);
-    const backupPath = await backupCurrentFile(context, file, current);
-
-    await context.app.vault.modify(file, text);
-
-    return {
-      path: file.path,
-      operation: "replace",
-      backupPath,
-      bytesWritten: getByteLength(text),
-    };
+  async execute() {
+    refuseUnpreparedVaultExecution("replace_file");
   },
+  prepare: (args, context) => prepareReplaceFile(args, context),
+  executePrepared: (action, context) => executePreparedReplaceFile(action, context),
 };
 
 export const movePathTool: AgentTool = {
@@ -1748,37 +2106,11 @@ export const deletePathTool: AgentTool = {
     },
     additionalProperties: false,
   },
-  async execute(args, context) {
-    assertDeletePathIntent(context, "delete_path");
-    const path = normalizeVaultPath(getRequiredString(args, "path"));
-    const recursive = getOptionalBoolean(args, "recursive") ?? false;
-    const target = getAbstractPath(context, path);
-
-    if (!target) {
-      throw new Error(`Path not found: ${path}`);
-    }
-
-    const type = getPathType(target);
-    const affectedCount =
-      type === "folder" ? getDescendantEntries(context, path).length : 1;
-    const bytesDeleted =
-      type === "file" && getEntryExtension(target) === "md"
-        ? getByteLength(await context.app.vault.read(target as TFile))
-        : undefined;
-
-    if (type === "folder" && affectedCount > 0 && !recursive) {
-      throw new Error("delete_path requires recursive=true for non-empty folders.");
-    }
-
-    await trashVaultPath(context, target);
-
-    return {
-      path,
-      operation: "trash",
-      bytesDeleted,
-      affectedCount,
-    };
+  async execute() {
+    refuseUnpreparedVaultExecution("delete_path");
   },
+  prepare: (args, context) => prepareDeletePath(args, context),
+  executePrepared: (action, context) => executePreparedDeletePath(action, context),
 };
 
 export const appendToCurrentFileTool: AgentTool = {
@@ -1813,6 +2145,77 @@ export const appendToCurrentFileTool: AgentTool = {
     return {
       path: file.path,
       bytesWritten: getByteLength(appendedText),
+    };
+  },
+};
+
+export const renameCurrentFileTool: AgentTool = {
+  name: "rename_current_file",
+  description:
+    "Rename the active markdown note file so the visible Obsidian file explorer entry and active tab/page title change. Does not edit frontmatter or H1 content.",
+  parameters: {
+    type: "object",
+    required: ["title"],
+    properties: {
+      title: {
+        type: "string",
+        description: "New visible note/file title. The tool creates a safe .md filename from this title.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const title = getRequiredString(args, "title").trim();
+    if (!title) {
+      throw new Error("rename_current_file requires a non-empty title.");
+    }
+
+    if (
+      context.autoTitleAuthorized !== true &&
+      !TITLE_INTENT_PATTERN.test(context.originalPrompt) &&
+      !MOVE_INTENT_PATTERN.test(context.originalPrompt)
+    ) {
+      throw new Error(
+        "rename_current_file requires the user to explicitly ask for a title, rename, retitle, move, organize, restructure, or improve operation.",
+      );
+    }
+
+    const file = getActiveMarkdownFile(context);
+    const safeBasename = sanitizeFileBasename(title);
+    if (!safeBasename) {
+      throw new Error("rename_current_file could not derive a safe markdown filename from the requested title.");
+    }
+    const fromPath = file.path;
+    const previousTitle = file.basename;
+    const suggested = getSuggestedFileRename(file, title);
+    if (!suggested) {
+      return {
+        path: fromPath,
+        toPath: fromPath,
+        title,
+        previousTitle,
+        changed: false,
+        operation: "rename_current_file",
+        bytesWritten: 0,
+      };
+    }
+
+    const toPath = normalizeVaultPath(suggested.to, { requireMarkdown: true });
+    if (getAbstractPath(context, toPath)) {
+      throw new Error(`Destination already exists: ${toPath}`);
+    }
+
+    await ensureParentFolder(context, toPath, false);
+    await renameVaultPath(context, file, toPath);
+
+    return {
+      path: fromPath,
+      toPath,
+      title,
+      previousTitle,
+      changed: true,
+      operation: "rename_current_file",
+      bytesWritten: 0,
     };
   },
 };
@@ -1865,6 +2268,84 @@ export const retitleCurrentFileTool: AgentTool = {
       changed,
       suggestedFileRename: getSuggestedFileRename(file, title),
       bytesWritten: changed ? getByteLength(updated) : 0,
+    };
+  },
+};
+
+export const highlightCurrentFilePhraseTool: AgentTool = {
+  name: "highlight_current_file_phrase",
+  description:
+    "Find a word or phrase in the active markdown note and persistently highlight matches with Obsidian ==highlight== syntax after creating a backup.",
+  parameters: {
+    type: "object",
+    required: ["phrase"],
+    properties: {
+      phrase: {
+        type: "string",
+        description: "Word or phrase to highlight exactly in the active markdown note.",
+      },
+      caseSensitive: {
+        type: "boolean",
+        description: "When true, match case exactly. Defaults to false.",
+      },
+      occurrence: {
+        type: "string",
+        enum: ["first", "all"],
+        description: "Highlight the first match or all matches. Defaults to first.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    if (!HIGHLIGHT_INTENT_PATTERN.test(context.originalPrompt)) {
+      throw new Error(
+        "highlight_current_file_phrase requires the user to explicitly ask to find, mark, or highlight text in the current note.",
+      );
+    }
+
+    const phrase = getRequiredString(args, "phrase").trim();
+    if (!phrase) {
+      throw new Error("highlight_current_file_phrase requires a non-empty phrase.");
+    }
+
+    const occurrence = getOptionalString(args, "occurrence") ?? "first";
+    if (occurrence !== "first" && occurrence !== "all") {
+      throw new Error("highlight_current_file_phrase occurrence must be first or all.");
+    }
+
+    const file = getActiveMarkdownFile(context);
+    const current =
+      context.getCurrentMarkdownContent?.(file) ??
+      (await context.app.vault.read(file));
+    const highlighted = highlightMarkdownPhrase(current, {
+      phrase,
+      caseSensitive: getOptionalBoolean(args, "caseSensitive") ?? false,
+      occurrence,
+    });
+
+    if (highlighted.matchCount === 0) {
+      return {
+        path: file.path,
+        operation: "highlight",
+        phrase,
+        matchCount: 0,
+        changed: false,
+        bytesWritten: 0,
+      };
+    }
+
+    const backupPath = await backupCurrentFile(context, file, current);
+    context.setCurrentMarkdownContent?.(file, highlighted.markdown);
+    await context.app.vault.modify(file, highlighted.markdown);
+
+    return {
+      path: file.path,
+      operation: "highlight",
+      phrase,
+      matchCount: highlighted.matchCount,
+      backupPath,
+      changed: true,
+      bytesWritten: getByteLength(highlighted.markdown),
     };
   },
 };
@@ -1929,6 +2410,46 @@ export const editCurrentSectionTool: AgentTool = {
       level: edit.level,
       bytesWritten: getByteLength(edit.updated),
       replacedChars: edit.replacedChars,
+    };
+  },
+};
+
+export const restoreCurrentFileFromBackupTool: AgentTool = {
+  name: "restore_current_file_from_backup",
+  description:
+    "Restore the active markdown note from a prior .agent-backups markdown backup. Creates a fresh backup of the current state first.",
+  parameters: {
+    type: "object",
+    properties: {
+      backupPath: {
+        type: "string",
+        description:
+          "Optional .agent-backups markdown path to restore from. When omitted, the latest matching backup for the active note is used.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    assertRestoreIntent(context, "restore_current_file_from_backup");
+    const file = getActiveMarkdownFile(context);
+    const backupPath =
+      getOptionalBackupPath(args) ??
+      (await findLatestBackupPathForCurrentFile(context, file));
+
+    const current =
+      context.getCurrentMarkdownContent?.(file) ??
+      (await context.app.vault.read(file));
+    const restored = await readBackupMarkdown(context, backupPath);
+    const preRestoreBackupPath = await backupCurrentFile(context, file, current);
+    context.setCurrentMarkdownContent?.(file, restored);
+    await context.app.vault.modify(file, restored);
+
+    return {
+      path: file.path,
+      operation: "restore",
+      restoredFromBackupPath: backupPath,
+      backupPath: preRestoreBackupPath,
+      bytesWritten: getByteLength(restored),
     };
   },
 };
@@ -2068,25 +2589,12 @@ export const replaceCurrentFileTool: AgentTool = {
     },
     additionalProperties: false,
   },
-  async execute(args, context) {
-    const text = getString(args, "text");
-    if (!REPLACE_INTENT_PATTERN.test(context.originalPrompt)) {
-      throw new Error(
-        "replace_current_file requires the user to explicitly ask for rewrite, replace, clean up, reset, start fresh, or overwrite.",
-      );
-    }
-
-    const file = getActiveMarkdownFile(context);
-    const current = await context.app.vault.read(file);
-    const backupPath = await backupCurrentFile(context, file, current);
-    await context.app.vault.modify(file, text);
-
-    return {
-      path: file.path,
-      backupPath,
-      bytesWritten: getByteLength(text),
-    };
+  async execute() {
+    refuseUnpreparedVaultExecution("replace_current_file");
   },
+  prepare: (args, context) => prepareReplaceCurrentFile(args, context),
+  executePrepared: (action, context) =>
+    executePreparedReplaceCurrentFile(action, context),
 };
 
 export const deleteCurrentFileTool: AgentTool = {
@@ -2097,27 +2605,12 @@ export const deleteCurrentFileTool: AgentTool = {
     properties: {},
     additionalProperties: false,
   },
-  async execute(args, context) {
-    expectNoArgs(args, "delete_current_file");
-    if (!DELETE_INTENT_PATTERN.test(context.originalPrompt)) {
-      throw new Error(
-        "delete_current_file requires the user to explicitly ask to delete, remove, or trash the current note.",
-      );
-    }
-
-    const file = getActiveMarkdownFile(context);
-    const current = await context.app.vault.read(file);
-    const backupPath = await backupCurrentFile(context, file, current);
-
-    await trashVaultPath(context, file);
-
-    return {
-      path: file.path,
-      operation: "trash",
-      backupPath,
-      bytesDeleted: getByteLength(current),
-    };
+  async execute() {
+    refuseUnpreparedVaultExecution("delete_current_file");
   },
+  prepare: (args, context) => prepareDeleteCurrentFile(args, context),
+  executePrepared: (action, context) =>
+    executePreparedDeleteCurrentFile(action, context),
 };
 
 type VaultPathType = "file" | "folder";
@@ -2204,6 +2697,12 @@ function assertAppendIntent(context: ToolExecutionContext, toolName: string) {
 function assertReplaceIntent(context: ToolExecutionContext, toolName: string) {
   if (!REPLACE_INTENT_PATTERN.test(context.originalPrompt)) {
     throw new Error(`${toolName} requires the user to explicitly ask to rewrite, replace, reset, clean up, start fresh, or overwrite a file.`);
+  }
+}
+
+function assertRestoreIntent(context: ToolExecutionContext, toolName: string) {
+  if (!RESTORE_INTENT_PATTERN.test(context.originalPrompt)) {
+    throw new Error(`${toolName} requires the user to explicitly ask to undo, restore, revert, or roll back the current note from a backup.`);
   }
 }
 
@@ -2328,6 +2827,16 @@ function upsertResearchMemoryIndexEntry(
     ]).slice(0, 24),
     contentHash: entry.contentHash ?? byPath.get(entry.path)?.contentHash,
     updateCount: entry.updateCount ?? byPath.get(entry.path)?.updateCount,
+    targetId: entry.targetId ?? byPath.get(entry.path)?.targetId,
+    verificationState:
+      entry.verificationState ?? byPath.get(entry.path)?.verificationState,
+    verifiedAt: entry.verifiedAt ?? byPath.get(entry.path)?.verifiedAt,
+    staleAt: entry.staleAt ?? byPath.get(entry.path)?.staleAt,
+    supersededAt:
+      entry.supersededAt ?? byPath.get(entry.path)?.supersededAt,
+    supersededById:
+      entry.supersededById ?? byPath.get(entry.path)?.supersededById,
+    sourceHashes: entry.sourceHashes ?? byPath.get(entry.path)?.sourceHashes,
   });
 
   return [...byPath.values()]
@@ -2561,6 +3070,67 @@ function extractTemplatePlaceholders(templateText: string): string[] {
   return placeholders;
 }
 
+function parseTemplateMetadata(templateText: string): TemplateMetadata | undefined {
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(templateText)?.[1];
+  if (!frontmatter) {
+    return undefined;
+  }
+  const values = new Map<string, unknown>();
+  for (const line of frontmatter.split(/\r?\n/)) {
+    const match = /^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/.exec(line);
+    if (!match) continue;
+    const key = match[1].toLowerCase();
+    const raw = match[2].trim();
+    let value: unknown = raw;
+    if (raw.startsWith("[") || raw.startsWith("{") || raw.startsWith('"')) {
+      try {
+        value = JSON.parse(raw);
+      } catch {
+        value = raw;
+      }
+    }
+    values.set(key, value);
+  }
+  const array = (value: unknown): string[] | undefined => {
+    if (Array.isArray(value)) {
+      const items = value.filter((item): item is string => typeof item === "string");
+      return items.length > 0 ? items : undefined;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const items = value.split(",").map((item) => item.trim()).filter(Boolean);
+      return items.length > 0 ? items : undefined;
+    }
+    return undefined;
+  };
+  const rawFields = values.get("template_fields");
+  const fields = Array.isArray(rawFields)
+    ? rawFields.filter(
+        (field): field is NonNullable<TemplateMetadata["fields"]>[number] =>
+          isRecord(field) && typeof field.name === "string",
+      )
+    : undefined;
+  const metadata: TemplateMetadata = {
+    kind:
+      typeof values.get("template_kind") === "string"
+        ? String(values.get("template_kind"))
+        : undefined,
+    description:
+      typeof values.get("template_description") === "string"
+        ? String(values.get("template_description"))
+        : undefined,
+    tags: array(values.get("tags")),
+    aliases: array(values.get("aliases")),
+    fields,
+  };
+  return metadata.kind ||
+    metadata.description ||
+    metadata.tags ||
+    metadata.aliases ||
+    metadata.fields
+    ? metadata
+    : undefined;
+}
+
 function fillTemplateText(
   templateText: string,
   values: Record<string, string>,
@@ -2626,6 +3196,128 @@ function getOptionalStringMap(
   }
 
   return output;
+}
+
+function normalizeResearchPackFolder(value: string): string {
+  const normalized = normalizeVaultPath(value);
+  if (
+    !normalized ||
+    normalized.toLowerCase().endsWith(".md") ||
+    isBlockedSystemPath(normalized)
+  ) {
+    throw new ToolExecutionError(
+      "unsafe_path",
+      "Research pack baseFolder must be a non-system vault-relative folder.",
+    );
+  }
+  return normalized;
+}
+
+function getResearchPackSources(value: unknown): Array<{
+  id: string;
+  title: string;
+  url?: string;
+  passage?: string;
+}> {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 50) {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      "Research pack sources must contain between 1 and 50 source records.",
+    );
+  }
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        `Research pack source ${index + 1} must be an object.`,
+      );
+    }
+    const id = typeof item.id === "string" ? item.id.trim() : "";
+    const title = typeof item.title === "string" ? item.title.trim() : "";
+    if (!id || !title) {
+      throw new ToolExecutionError(
+        "invalid_arguments",
+        `Research pack source ${index + 1} requires non-empty id and title.`,
+      );
+    }
+    const url = normalizeOptionalResearchSourceUrl(item.url, index + 1);
+    const passage = typeof item.passage === "string" ? item.passage.trim() : undefined;
+    return {
+      id: id.replace(/[^a-zA-Z0-9._:-]/g, "-").slice(0, 120),
+      title: title.replace(/\s+/g, " ").slice(0, 300),
+      ...(url ? { url } : {}),
+      ...(passage ? { passage: passage.slice(0, 12_000) } : {}),
+    };
+  });
+}
+
+function normalizeOptionalResearchSourceUrl(
+  value: unknown,
+  index: number,
+): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      `Research pack source ${index} URL must be a string.`,
+    );
+  }
+  try {
+    const url = new URL(value.trim());
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.username ||
+      url.password
+    ) {
+      throw new Error("unsafe URL");
+    }
+    url.hash = "";
+    return url.toString();
+  } catch {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      `Research pack source ${index} URL must be a credential-free HTTP or HTTPS URL.`,
+    );
+  }
+}
+
+type ResearchPackWorkflowEventInput =
+  | { kind: "template_selected"; templatePath: string }
+  | { kind: "research_completed"; findings: TemplateResearchFinding[] }
+  | {
+      kind: "fields_resolved";
+      values: Record<string, string>;
+      missingFieldGroups?: Record<string, string[]>;
+    }
+  | { kind: "preview_prepared"; content: string }
+  | { kind: "preview_approved"; approvedHash: string }
+  | {
+      kind: "pack_created";
+      plan: TransactionalResearchPackPlan;
+      createdPaths: string[];
+    }
+  | {
+      kind: "verification_completed";
+      passed: boolean;
+      verifiedPaths: string[];
+      blocker?: string;
+    };
+
+function applyResearchPackEvent(
+  workflow: ResearchTemplateWorkflowV1,
+  event: ResearchPackWorkflowEventInput,
+  now: Date,
+): ResearchTemplateWorkflowV1 {
+  return reduceResearchTemplateWorkflow(workflow, {
+    ...event,
+    runId: workflow.runId,
+    sequence: workflow.sequence + 1,
+    occurredAt: now.toISOString(),
+  } as ResearchTemplateWorkflowEvent);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isPathInFolder(path: string, folder: string): boolean {
@@ -3528,6 +4220,199 @@ function formatSectionAppendBody(
   return `${leading}${body}${trailing}`;
 }
 
+function highlightMarkdownPhrase(
+  markdown: string,
+  {
+    phrase,
+    caseSensitive,
+    occurrence,
+  }: { phrase: string; caseSensitive: boolean; occurrence: "first" | "all" },
+): { markdown: string; matchCount: number } {
+  const needle = caseSensitive ? phrase : phrase.toLowerCase();
+  let inFence = false;
+  let matchCount = 0;
+  let output = "";
+  let index = 0;
+
+  while (index < markdown.length) {
+    const lineEnd = findLineEnd(markdown, index);
+    const line = markdown.slice(index, lineEnd);
+    const nextIndex = consumeLineBreak(markdown, lineEnd);
+    const lineBreak = markdown.slice(lineEnd, nextIndex);
+    const trimmed = line.trimStart();
+
+    if (/^(```|~~~)/.test(trimmed)) {
+      inFence = !inFence;
+      output += line + lineBreak;
+      index = nextIndex;
+      continue;
+    }
+
+    if (inFence || (occurrence === "first" && matchCount > 0)) {
+      output += line + lineBreak;
+      index = nextIndex;
+      continue;
+    }
+
+    output += highlightLinePhrase(line, needle, phrase.length, caseSensitive, () => {
+      if (occurrence === "first" && matchCount > 0) {
+        return false;
+      }
+      matchCount += 1;
+      return true;
+    }) + lineBreak;
+    index = nextIndex;
+  }
+
+  return { markdown: output, matchCount };
+}
+
+function highlightLinePhrase(
+  line: string,
+  needle: string,
+  phraseLength: number,
+  caseSensitive: boolean,
+  onMatch: () => boolean,
+): string {
+  const haystack = caseSensitive ? line : line.toLowerCase();
+  let output = "";
+  let offset = 0;
+
+  while (offset < line.length) {
+    const matchIndex = haystack.indexOf(needle, offset);
+    if (matchIndex < 0) {
+      output += line.slice(offset);
+      break;
+    }
+
+    if (isInsideMarkdownHighlight(line, matchIndex)) {
+      output += line.slice(offset, matchIndex + phraseLength);
+      offset = matchIndex + phraseLength;
+      continue;
+    }
+
+    output += line.slice(offset, matchIndex);
+    if (!onMatch()) {
+      output += line.slice(matchIndex);
+      break;
+    }
+
+    output += `==${line.slice(matchIndex, matchIndex + phraseLength)}==`;
+    offset = matchIndex + phraseLength;
+  }
+
+  return output;
+}
+
+function isInsideMarkdownHighlight(line: string, index: number): boolean {
+  const before = line.slice(0, index);
+  const openIndex = before.lastIndexOf("==");
+  if (openIndex < 0) {
+    return false;
+  }
+
+  const closeBefore = before.indexOf("==", openIndex + 2);
+  if (closeBefore >= 0) {
+    return false;
+  }
+
+  return line.indexOf("==", index) >= 0;
+}
+
+function findLineEnd(markdown: string, start: number): number {
+  const nextNewline = markdown.indexOf("\n", start);
+  return nextNewline < 0 ? markdown.length : nextNewline;
+}
+
+function consumeLineBreak(markdown: string, lineEnd: number): number {
+  return lineEnd < markdown.length ? lineEnd + 1 : lineEnd;
+}
+
+function getOptionalBackupPath(args: Record<string, unknown>): string | undefined {
+  const rawPath = getOptionalString(args, "backupPath")?.trim();
+  if (!rawPath) {
+    return undefined;
+  }
+
+  const backupPath = normalizeVaultPath(rawPath, {
+    requireMarkdown: true,
+    blockSystemPaths: false,
+  });
+  if (!backupPath.startsWith(`${BACKUP_FOLDER}/`)) {
+    throw new ToolExecutionError(
+      "unsafe_path",
+      `Backup path must live under ${BACKUP_FOLDER}.`,
+    );
+  }
+  return backupPath;
+}
+
+async function findLatestBackupPathForCurrentFile(
+  context: ToolExecutionContext,
+  file: TFile,
+): Promise<string> {
+  const backupBasename = sanitizeBackupBasename(file.basename);
+  const backupPattern = new RegExp(
+    `^${escapeRegExp(BACKUP_FOLDER)}/(\\d+)-${escapeRegExp(backupBasename)}(?:-\\d+)?\\.md$`,
+    "i",
+  );
+  const matchesByPath = new Map<string, number>();
+  const addCandidate = (path: string) => {
+    const match = backupPattern.exec(path);
+    if (!match) {
+      return;
+    }
+
+    matchesByPath.set(path, Number.parseInt(match[1] ?? "0", 10));
+  };
+
+  for (const candidate of context.app.vault.getFiles()) {
+    addCandidate(candidate.path);
+  }
+
+  try {
+    const listed = await context.app.vault.adapter.list(BACKUP_FOLDER);
+    for (const rawPath of listed.files) {
+      const backupPath = normalizeVaultPath(rawPath, {
+        requireMarkdown: true,
+        blockSystemPaths: false,
+      });
+      addCandidate(backupPath);
+    }
+  } catch {
+    // The backup folder may not exist yet, or the adapter may refuse hidden folders.
+  }
+
+  const matches = [...matchesByPath.entries()]
+    .map(([path, timestamp]) => ({ path, timestamp }))
+    .sort((a, b) => b.timestamp - a.timestamp || b.path.localeCompare(a.path));
+
+  if (!matches[0]) {
+    throw new Error(`No matching backups found under ${BACKUP_FOLDER} for ${file.path}.`);
+  }
+
+  return matches[0].path;
+}
+
+async function readBackupMarkdown(
+  context: ToolExecutionContext,
+  backupPath: string,
+): Promise<string> {
+  const backupFile = context.app.vault.getFileByPath(backupPath);
+  if (backupFile) {
+    if (backupFile.extension !== "md") {
+      throw new Error(`Backup markdown file not found: ${backupPath}`);
+    }
+    return context.app.vault.read(backupFile);
+  }
+
+  try {
+    return await context.app.vault.adapter.read(backupPath);
+  } catch {
+    throw new Error(`Backup markdown file not found: ${backupPath}`);
+  }
+}
+
 function getAvailableBackupPath(
   context: ToolExecutionContext,
   file: TFile,
@@ -3552,6 +4437,10 @@ function isFolderAlreadyExistsError(error: unknown): boolean {
 function sanitizeBackupBasename(basename: string): string {
   const sanitized = basename.trim().replace(/[^a-zA-Z0-9._-]+/g, "-");
   return sanitized || "untitled";
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function getSuggestedFileRename(file: TFile, title: string) {
@@ -3584,3 +4473,778 @@ function getFolderPath(path: string): string {
 function getByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
 }
+
+function refuseUnpreparedVaultExecution(toolName: string): never {
+  throw new ToolExecutionError(
+    "prepared_action_required",
+    `Tool ${toolName} must be prepared and authorized before execution.`,
+    { mutationState: "not_applied" },
+  );
+}
+
+function vaultNow(context: ToolExecutionContext): Date {
+  return context.now?.() ?? new Date();
+}
+
+function requireVaultRunId(context: ToolExecutionContext): string {
+  const runId = context.runId?.trim();
+  if (runId) {
+    return runId;
+  }
+  return `vault-run-${vaultRandomToken()}`;
+}
+
+function requireVaultToolCallId(context: ToolExecutionContext): string {
+  const toolCallId = context.operationId?.trim();
+  if (toolCallId) {
+    return toolCallId;
+  }
+  return `vault-call-${vaultRandomToken()}`;
+}
+
+let vaultFallbackSequence = 0;
+function vaultRandomToken(): string {
+  const randomUuid = globalThis.crypto?.randomUUID?.();
+  if (randomUuid) {
+    return randomUuid;
+  }
+  vaultFallbackSequence += 1;
+  return `${Date.now().toString(36)}-${vaultFallbackSequence.toString(36)}`;
+}
+
+function prepareVaultFailure(error: unknown): Extract<PreparedActionResult, { ok: false }> {
+  return {
+    ok: false,
+    error: {
+      code: error instanceof ToolExecutionError ? error.code : "vault_preparation_failed",
+      message: getErrorMessage(error),
+    },
+  };
+}
+
+async function buildVaultActionId(input: {
+  runId: string;
+  toolCallId: string;
+  toolName: string;
+}): Promise<string> {
+  const hash = await sha256Fingerprint(input);
+  return `vault-action-${hash.slice("sha256:".length, 39)}`;
+}
+
+async function assertVaultPreparedBinding(
+  toolName: string,
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<void> {
+  if (action.toolName !== toolName || !(await verifyPreparedActionFingerprint(action))) {
+    throw new ToolExecutionError(
+      "fingerprint_mismatch",
+      "Prepared vault action identity or fingerprint is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const authorized = context.authorizedAction;
+  if (
+    !authorized ||
+    authorized.preparedActionId !== action.id ||
+    authorized.payloadFingerprint !== action.payloadFingerprint ||
+    !authorized.grantId.trim()
+  ) {
+    throw new ToolExecutionError(
+      "authorization_mismatch",
+      "Prepared vault action lacks its exact authority binding.",
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
+function requirePreparedString(
+  args: Record<string, JsonValue>,
+  key: string,
+): string {
+  const value = args[key];
+  if (typeof value !== "string" || !value) {
+    throw new ToolExecutionError(
+      "invalid_prepared_action",
+      `Prepared vault action is missing ${key}.`,
+      { mutationState: "not_applied" },
+    );
+  }
+  return value;
+}
+
+async function createVaultActionReceipt(input: {
+  action: PreparedAction;
+  context: ToolExecutionContext;
+  operation: ResourceAction;
+  message: string;
+  startedAt: string;
+  committedAt: string;
+  effects?: ActionReceipt["effects"];
+  observedRevision?: string;
+  readbackStatus?: ActionReceipt["readback"]["status"];
+}): Promise<ActionReceipt> {
+  const grantId = input.context.authorizedAction!.grantId;
+  const receiptHash = await sha256Fingerprint({
+    actionId: input.action.id,
+    commitKind: "committed",
+    observedRevision: input.observedRevision ?? null,
+  });
+  return {
+    version: 1,
+    id: `vault-receipt-${receiptHash.slice("sha256:".length, 39)}`,
+    runId: input.action.runId,
+    actionId: input.action.id,
+    toolName: input.action.toolName,
+    operation: input.operation,
+    resource: { ...input.action.target },
+    relatedResources: input.action.relatedResources,
+    message: input.message,
+    payloadFingerprint: input.action.payloadFingerprint,
+    grantId,
+    idempotencyKey: input.action.idempotencyKey,
+    startedAt: input.startedAt,
+    committedAt: input.committedAt,
+    commitKind: "committed",
+    readback: {
+      status: input.readbackStatus ?? "verified",
+      checkedAt: input.committedAt,
+      ...(input.observedRevision
+        ? {
+            observedRevision: input.observedRevision,
+            observedFingerprint: input.observedRevision,
+          }
+        : {}),
+    },
+    effects: input.effects,
+  };
+}
+
+async function buildPreparedVaultAction(input: {
+  context: ToolExecutionContext;
+  toolName: string;
+  targetPath: string;
+  normalizedArgs: Record<string, JsonValue>;
+  preview: {
+    summary: string;
+    destination: string;
+    before?: Record<string, JsonValue>;
+    after?: Record<string, JsonValue>;
+    outboundPayload?: Record<string, JsonValue>;
+    warnings: string[];
+    outboundBytes: number;
+  };
+  expectedTargetRevision?: string;
+}): Promise<PreparedAction> {
+  const preparedAt = vaultNow(input.context);
+  const runId = requireVaultRunId(input.context);
+  const toolCallId = requireVaultToolCallId(input.context);
+  return withPreparedActionFingerprint({
+    version: 1,
+    id: await buildVaultActionId({
+      runId,
+      toolCallId,
+      toolName: input.toolName,
+    }),
+    runId,
+    toolCallId,
+    toolName: input.toolName,
+    target: {
+      system: "vault",
+      resourceType: "markdown",
+      id: input.targetPath,
+      path: input.targetPath,
+    },
+    relatedResources: [],
+    normalizedArgs: input.normalizedArgs,
+    preview: input.preview,
+    ...(input.expectedTargetRevision
+      ? { expectedTargetRevision: input.expectedTargetRevision }
+      : {}),
+    idempotencyKey: `${runId}:${toolCallId}:${input.toolName}`,
+    preparedAt: preparedAt.toISOString(),
+    expiresAt: new Date(
+      preparedAt.getTime() + PREPARED_VAULT_ACTION_TTL_MS,
+    ).toISOString(),
+  });
+}
+
+async function assertVaultContentRevision(
+  current: string,
+  action: PreparedAction,
+  expectedRevision: string,
+): Promise<void> {
+  const currentRevision = await sha256Fingerprint(current);
+  if (
+    currentRevision !== expectedRevision ||
+    action.expectedTargetRevision !== expectedRevision
+  ) {
+    throw new ToolExecutionError(
+      "vault_precondition_changed",
+      "The vault target changed after preparation; prepare the action again.",
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
+async function prepareReplaceCurrentFile(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    const text = getString(args, "text");
+    if (!REPLACE_INTENT_PATTERN.test(context.originalPrompt)) {
+      throw new Error(
+        "replace_current_file requires the user to explicitly ask for rewrite, replace, clean up, reset, start fresh, overwrite, or clear/delete current note content and then write new content.",
+      );
+    }
+    const file = getActiveMarkdownFile(context);
+    const current = await context.app.vault.read(file);
+    const contentRevision = await sha256Fingerprint(current);
+    const outboundBytes = getByteLength(text);
+    const action = await buildPreparedVaultAction({
+      context,
+      toolName: "replace_current_file",
+      targetPath: file.path,
+      normalizedArgs: {
+        path: file.path,
+        text,
+        contentRevision,
+      },
+      preview: {
+        summary: `Replace ${file.path} after creating a backup.`,
+        destination: file.path,
+        before: { path: file.path, bytes: getByteLength(current) },
+        after: { path: file.path, bytes: outboundBytes },
+        outboundPayload: { text },
+        warnings: ["Replacement creates a backup then overwrites the note."],
+        outboundBytes,
+      },
+      expectedTargetRevision: contentRevision,
+    });
+    return { ok: true, action };
+  } catch (error) {
+    return prepareVaultFailure(error);
+  }
+}
+
+async function executePreparedReplaceCurrentFile(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertVaultPreparedBinding("replace_current_file", action, context);
+  const path = requirePreparedString(action.normalizedArgs, "path");
+  const text = typeof action.normalizedArgs.text === "string"
+    ? action.normalizedArgs.text
+    : (() => {
+        throw new ToolExecutionError(
+          "invalid_prepared_action",
+          "Prepared vault action is missing text.",
+          { mutationState: "not_applied" },
+        );
+      })();
+  const contentRevision = requirePreparedString(
+    action.normalizedArgs,
+    "contentRevision",
+  );
+  const file = getActiveMarkdownFile(context);
+  if (file.path !== path) {
+    throw new ToolExecutionError(
+      "vault_precondition_changed",
+      "The active note changed after preparation; prepare the action again.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const current = await context.app.vault.read(file);
+  await assertVaultContentRevision(current, action, contentRevision);
+  const startedAt = vaultNow(context).toISOString();
+  const backupPath = await backupCurrentFile(context, file, current);
+  await context.app.vault.modify(file, text);
+  const observed = await context.app.vault.read(file);
+  if (observed !== text) {
+    throw new ToolExecutionError(
+      "vault_readback_failed",
+      "Vault replace acknowledged, but readback did not match the approved content.",
+      { mutationState: "may_have_applied" },
+    );
+  }
+  const committedAt = vaultNow(context).toISOString();
+  const bytesWritten = getByteLength(text);
+  return {
+    output: {
+      path: file.path,
+      backupPath,
+      bytesWritten,
+    },
+    mutationState: "applied",
+    receipt: await createVaultActionReceipt({
+      action,
+      context,
+      operation: "replace",
+      message: `Replaced ${file.path} after backup.`,
+      startedAt,
+      committedAt,
+      effects: { bytesWritten },
+      observedRevision: await sha256Fingerprint(observed),
+    }),
+  };
+}
+
+async function prepareReplaceFile(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    assertReplaceIntent(context, "replace_file");
+    const path = normalizeVaultPath(getRequiredString(args, "path"), {
+      requireMarkdown: true,
+    });
+    const text = getString(args, "text");
+    const file = getMarkdownFileByPath(context, path);
+    const current = await context.app.vault.read(file);
+    const contentRevision = await sha256Fingerprint(current);
+    const outboundBytes = getByteLength(text);
+    const action = await buildPreparedVaultAction({
+      context,
+      toolName: "replace_file",
+      targetPath: file.path,
+      normalizedArgs: {
+        path: file.path,
+        text,
+        contentRevision,
+      },
+      preview: {
+        summary: `Replace ${file.path} after creating a backup.`,
+        destination: file.path,
+        before: { path: file.path, bytes: getByteLength(current) },
+        after: { path: file.path, bytes: outboundBytes },
+        outboundPayload: { path: file.path, text },
+        warnings: ["Replacement creates a backup then overwrites the file."],
+        outboundBytes,
+      },
+      expectedTargetRevision: contentRevision,
+    });
+    return { ok: true, action };
+  } catch (error) {
+    return prepareVaultFailure(error);
+  }
+}
+
+async function executePreparedReplaceFile(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertVaultPreparedBinding("replace_file", action, context);
+  const path = requirePreparedString(action.normalizedArgs, "path");
+  const text = typeof action.normalizedArgs.text === "string"
+    ? action.normalizedArgs.text
+    : (() => {
+        throw new ToolExecutionError(
+          "invalid_prepared_action",
+          "Prepared vault action is missing text.",
+          { mutationState: "not_applied" },
+        );
+      })();
+  const contentRevision = requirePreparedString(
+    action.normalizedArgs,
+    "contentRevision",
+  );
+  const file = getMarkdownFileByPath(context, path);
+  const current = await context.app.vault.read(file);
+  await assertVaultContentRevision(current, action, contentRevision);
+  const startedAt = vaultNow(context).toISOString();
+  const backupPath = await backupCurrentFile(context, file, current);
+  await context.app.vault.modify(file, text);
+  const observed = await context.app.vault.read(file);
+  if (observed !== text) {
+    throw new ToolExecutionError(
+      "vault_readback_failed",
+      "Vault replace acknowledged, but readback did not match the approved content.",
+      { mutationState: "may_have_applied" },
+    );
+  }
+  const committedAt = vaultNow(context).toISOString();
+  const bytesWritten = getByteLength(text);
+  return {
+    output: {
+      path: file.path,
+      operation: "replace",
+      backupPath,
+      bytesWritten,
+    },
+    mutationState: "applied",
+    receipt: await createVaultActionReceipt({
+      action,
+      context,
+      operation: "replace",
+      message: `Replaced ${file.path} after backup.`,
+      startedAt,
+      committedAt,
+      effects: { bytesWritten },
+      observedRevision: await sha256Fingerprint(observed),
+    }),
+  };
+}
+
+async function prepareDeleteCurrentFile(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    expectNoArgs(args, "delete_current_file");
+    if (!DELETE_INTENT_PATTERN.test(context.originalPrompt)) {
+      throw new Error(
+        "delete_current_file requires the user to explicitly ask to delete, remove, or trash the current note.",
+      );
+    }
+    const file = getActiveMarkdownFile(context);
+    const current = await context.app.vault.read(file);
+    const contentRevision = await sha256Fingerprint(current);
+    const bytesDeleted = getByteLength(current);
+    const action = await buildPreparedVaultAction({
+      context,
+      toolName: "delete_current_file",
+      targetPath: file.path,
+      normalizedArgs: {
+        path: file.path,
+        contentRevision,
+        bytesDeleted,
+      },
+      preview: {
+        summary: `Trash ${file.path} after creating a backup.`,
+        destination: file.path,
+        before: { path: file.path, bytes: bytesDeleted },
+        after: { path: file.path, present: false },
+        outboundPayload: { path: file.path },
+        warnings: [
+          "This deletes the current note into Obsidian trash after backup and requires double confirmation.",
+        ],
+        outboundBytes: 0,
+      },
+      expectedTargetRevision: contentRevision,
+    });
+    return { ok: true, action };
+  } catch (error) {
+    return prepareVaultFailure(error);
+  }
+}
+
+async function executePreparedDeleteCurrentFile(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertVaultPreparedBinding("delete_current_file", action, context);
+  const path = requirePreparedString(action.normalizedArgs, "path");
+  const contentRevision = requirePreparedString(
+    action.normalizedArgs,
+    "contentRevision",
+  );
+  const file = getActiveMarkdownFile(context);
+  if (file.path !== path) {
+    throw new ToolExecutionError(
+      "vault_precondition_changed",
+      "The active note changed after preparation; prepare the action again.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const current = await context.app.vault.read(file);
+  await assertVaultContentRevision(current, action, contentRevision);
+  const startedAt = vaultNow(context).toISOString();
+  const backupPath = await backupCurrentFile(context, file, current);
+  await trashVaultPath(context, file);
+  if (getAbstractPath(context, path)) {
+    throw new ToolExecutionError(
+      "vault_readback_failed",
+      "Vault trash was requested, but the note is still present.",
+      { mutationState: "may_have_applied" },
+    );
+  }
+  const committedAt = vaultNow(context).toISOString();
+  const bytesDeleted = getByteLength(current);
+  const observedRevision = await sha256Fingerprint({ absent: true, id: path });
+  return {
+    output: {
+      path,
+      operation: "trash",
+      backupPath,
+      bytesDeleted,
+    },
+    mutationState: "applied",
+    receipt: await createVaultActionReceipt({
+      action,
+      context,
+      operation: "delete",
+      message: `Trashed ${path} after backup.`,
+      startedAt,
+      committedAt,
+      effects: { bytesDeleted, affectedCount: 1 },
+      observedRevision,
+    }),
+  };
+}
+
+async function prepareDeletePath(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    assertDeletePathIntent(context, "delete_path");
+    const path = normalizeVaultPath(getRequiredString(args, "path"));
+    const recursive = getOptionalBoolean(args, "recursive") ?? false;
+    const target = getAbstractPath(context, path);
+    if (!target) {
+      throw new Error(`Path not found: ${path}`);
+    }
+    const type = getPathType(target);
+    const affectedCount =
+      type === "folder" ? getDescendantEntries(context, path).length : 1;
+    if (type === "folder" && affectedCount > 0 && !recursive) {
+      throw new Error("delete_path requires recursive=true for non-empty folders.");
+    }
+    const current =
+      type === "file" && getEntryExtension(target) === "md"
+        ? await context.app.vault.read(target as TFile)
+        : null;
+    const contentRevision = current
+      ? await sha256Fingerprint(current)
+      : await sha256Fingerprint({
+          path,
+          type,
+          recursive,
+          descendants: type === "folder"
+            ? getDescendantEntries(context, path).map((entry) => entry.path).sort()
+            : [],
+        });
+    const bytesDeleted = current ? getByteLength(current) : undefined;
+    const action = await buildPreparedVaultAction({
+      context,
+      toolName: "delete_path",
+      targetPath: path,
+      normalizedArgs: {
+        path,
+        recursive,
+        pathType: type,
+        contentRevision,
+        ...(bytesDeleted === undefined ? {} : { bytesDeleted }),
+        affectedCount,
+      },
+      preview: {
+        summary: `Trash vault ${type} ${path}${recursive ? " recursively" : ""}.`,
+        destination: path,
+        before: {
+          path,
+          type,
+          affectedCount,
+          ...(bytesDeleted === undefined ? {} : { bytes: bytesDeleted }),
+        },
+        after: { path, present: false },
+        outboundPayload: { path, recursive },
+        warnings: [
+          "This moves the path into Obsidian trash and requires double confirmation.",
+        ],
+        outboundBytes: 0,
+      },
+      expectedTargetRevision: contentRevision,
+    });
+    return { ok: true, action };
+  } catch (error) {
+    return prepareVaultFailure(error);
+  }
+}
+
+async function executePreparedDeletePath(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertVaultPreparedBinding("delete_path", action, context);
+  const path = requirePreparedString(action.normalizedArgs, "path");
+  const contentRevision = requirePreparedString(
+    action.normalizedArgs,
+    "contentRevision",
+  );
+  const recursive = action.normalizedArgs.recursive === true;
+  const pathType = requirePreparedString(action.normalizedArgs, "pathType");
+  const target = getAbstractPath(context, path);
+  if (!target) {
+    throw new ToolExecutionError(
+      "vault_precondition_changed",
+      "The vault path is no longer present; prepare the action again.",
+      { mutationState: "not_applied" },
+    );
+  }
+  if (getPathType(target) !== pathType) {
+    throw new ToolExecutionError(
+      "vault_precondition_changed",
+      "The vault path type changed after preparation; prepare the action again.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const current =
+    pathType === "file" && getEntryExtension(target) === "md"
+      ? await context.app.vault.read(target as TFile)
+      : null;
+  const currentRevision = current
+    ? await sha256Fingerprint(current)
+    : await sha256Fingerprint({
+        path,
+        type: pathType,
+        recursive,
+        descendants: pathType === "folder"
+          ? getDescendantEntries(context, path).map((entry) => entry.path).sort()
+          : [],
+      });
+  if (
+    currentRevision !== contentRevision ||
+    action.expectedTargetRevision !== contentRevision
+  ) {
+    throw new ToolExecutionError(
+      "vault_precondition_changed",
+      "The vault target changed after preparation; prepare the action again.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const startedAt = vaultNow(context).toISOString();
+  await trashVaultPath(context, target);
+  if (getAbstractPath(context, path)) {
+    throw new ToolExecutionError(
+      "vault_readback_failed",
+      "Vault trash was requested, but the path is still present.",
+      { mutationState: "may_have_applied" },
+    );
+  }
+  const committedAt = vaultNow(context).toISOString();
+  const bytesDeleted =
+    typeof action.normalizedArgs.bytesDeleted === "number"
+      ? action.normalizedArgs.bytesDeleted
+      : undefined;
+  const affectedCount =
+    typeof action.normalizedArgs.affectedCount === "number"
+      ? action.normalizedArgs.affectedCount
+      : 1;
+  const observedRevision = await sha256Fingerprint({ absent: true, id: path });
+  return {
+    output: {
+      path,
+      operation: "trash",
+      bytesDeleted,
+      affectedCount,
+    },
+    mutationState: "applied",
+    receipt: await createVaultActionReceipt({
+      action,
+      context,
+      operation: "delete",
+      message: `Trashed ${path}.`,
+      startedAt,
+      committedAt,
+      effects: {
+        ...(bytesDeleted === undefined ? {} : { bytesDeleted }),
+        affectedCount,
+      },
+      observedRevision,
+    }),
+  };
+}
+
+async function prepareDeleteResearchMemoryEntry(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    assertResearchMemoryEnabled(context);
+    if (!/\b(delete|remove|trash)\b/i.test(context.originalPrompt)) {
+      throw new Error(
+        "delete_research_memory_entry requires explicit delete, remove, or trash intent.",
+      );
+    }
+    const topic = getRequiredString(args, "topic").trim();
+    const indexed = findResearchMemoryIndexEntry(context, topic);
+    const path = indexed?.path ?? buildResearchMemoryPath(context, topic);
+    const file = getMarkdownFileByPath(context, path);
+    const current = await context.app.vault.read(file);
+    const contentRevision = await sha256Fingerprint(current);
+    const bytesDeleted = getByteLength(current);
+    const resolvedTopic = indexed?.topic ?? topic;
+    const action = await buildPreparedVaultAction({
+      context,
+      toolName: "delete_research_memory_entry",
+      targetPath: path,
+      normalizedArgs: {
+        topic: resolvedTopic,
+        path,
+        contentRevision,
+        bytesDeleted,
+      },
+      preview: {
+        summary: `Trash research memory note ${path} and remove its index entry.`,
+        destination: path,
+        before: { path, topic: resolvedTopic, bytes: bytesDeleted },
+        after: { path, present: false },
+        outboundPayload: { topic: resolvedTopic, path },
+        warnings: [
+          "This trashes a research memory note after backup and requires double confirmation.",
+        ],
+        outboundBytes: 0,
+      },
+      expectedTargetRevision: contentRevision,
+    });
+    return { ok: true, action };
+  } catch (error) {
+    return prepareVaultFailure(error);
+  }
+}
+
+async function executePreparedDeleteResearchMemoryEntry(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertVaultPreparedBinding("delete_research_memory_entry", action, context);
+  assertResearchMemoryEnabled(context);
+  const path = requirePreparedString(action.normalizedArgs, "path");
+  const topic = requirePreparedString(action.normalizedArgs, "topic");
+  const contentRevision = requirePreparedString(
+    action.normalizedArgs,
+    "contentRevision",
+  );
+  const file = getMarkdownFileByPath(context, path);
+  const current = await context.app.vault.read(file);
+  await assertVaultContentRevision(current, action, contentRevision);
+  const startedAt = vaultNow(context).toISOString();
+  const backupPath = await backupCurrentFile(context, file, current);
+  await trashVaultPath(context, file);
+  const nextIndex = (context.getResearchMemoryIndex?.() ?? []).filter(
+    (entry) => entry.path !== path,
+  );
+  await context.setResearchMemoryIndex?.(nextIndex);
+  if (getAbstractPath(context, path)) {
+    throw new ToolExecutionError(
+      "vault_readback_failed",
+      "Vault trash was requested, but the research memory note is still present.",
+      { mutationState: "may_have_applied" },
+    );
+  }
+  const committedAt = vaultNow(context).toISOString();
+  const bytesDeleted = getByteLength(current);
+  const observedRevision = await sha256Fingerprint({ absent: true, id: path });
+  return {
+    output: {
+      path,
+      operation: "trash",
+      topic,
+      backupPath,
+      bytesDeleted,
+    },
+    mutationState: "applied",
+    receipt: await createVaultActionReceipt({
+      action,
+      context,
+      operation: "delete",
+      message: `Trashed research memory ${path} after backup.`,
+      startedAt,
+      committedAt,
+      effects: { bytesDeleted, affectedCount: 1 },
+      observedRevision,
+    }),
+  };
+}
+

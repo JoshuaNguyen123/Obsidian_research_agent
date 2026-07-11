@@ -7,6 +7,7 @@ export interface E2EAiConfig {
   firstChunkTimeoutMs: number;
   completionTimeoutMs: number;
   interCallPauseMs: number;
+  reasoningEffort?: string;
 }
 
 export interface E2ESemanticEmbeddingConfig {
@@ -17,6 +18,8 @@ export interface E2ESemanticEmbeddingConfig {
 }
 
 export function getE2EAiConfig(): E2EAiConfig {
+  // Package scripts: `test:e2e` / `test:e2e:long` pass --real-ai (gpt-oss:120b-cloud);
+  // `test:e2e:mock` passes --mock-ai for deterministic playwright-e2e-mock runs.
   const mode = process.env.E2E_AI_MODE === "real" ? "real" : "mock";
 
   return {
@@ -28,6 +31,7 @@ export function getE2EAiConfig(): E2EAiConfig {
     firstChunkTimeoutMs: readTimeout("E2E_FIRST_CHUNK_TIMEOUT_MS", 180_000),
     completionTimeoutMs: readTimeout("E2E_COMPLETION_TIMEOUT_MS", 600_000),
     interCallPauseMs: readTimeout("E2E_AI_CALL_PAUSE_MS", 30_000),
+    reasoningEffort: process.env.E2E_REASONING_EFFORT?.trim() || undefined,
   };
 }
 

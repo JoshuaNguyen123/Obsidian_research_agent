@@ -10,10 +10,12 @@ import {
 } from "./validation";
 import type {
   SemanticIndexNote,
+  SemanticIndexNoteMeta,
   SemanticVaultIndex,
 } from "../embeddings/semanticIndexTypes";
 import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
+import { isVaultPathExcluded } from "./vaultExclusions";
 
 const DEFAULT_SEMANTIC_LIMIT = 8;
 const MAX_SEMANTIC_LIMIT = 20;
@@ -25,7 +27,6 @@ const DEFAULT_CHUNK_MIN_TOKENS = 300;
 const DEFAULT_CHUNK_TARGET_TOKENS = 500;
 const DEFAULT_CHUNK_MAX_TOKENS = 700;
 const DEFAULT_CHUNK_OVERLAP_TOKENS = 80;
-const SYSTEM_PATH_PATTERN = /^(?:\.agent-backups|\.obsidian|\.trash|trash)(?:\/|$)/i;
 const STOP_TERMS = new Set([
   "the",
   "and",
@@ -126,6 +127,23 @@ export const semanticSearchNotesTool: AgentTool = {
         type: "integer",
         description: "Maximum snippet characters per result.",
       },
+      mode: {
+        type: "string",
+        enum: ["standard", "deep"],
+        description: "Use deep for larger internal candidate search while keeping returned results compact.",
+      },
+      candidateLimit: {
+        type: "integer",
+        description: "Internal candidate count for indexed semantic search. Deep mode defaults higher.",
+      },
+      minScore: {
+        type: "number",
+        description: "Optional minimum score threshold between 0 and 1.",
+      },
+      cursor: {
+        type: "string",
+        description: "Optional cursor from a previous semantic_search_notes result.",
+      },
     },
     additionalProperties: false,
   },
@@ -149,6 +167,15 @@ export const semanticSearchNotesTool: AgentTool = {
       MAX_SNIPPET_CHARS,
     );
     const folder = normalizeOptionalFolder(getOptionalString(args, "folder"));
+    const mode = getOptionalString(args, "mode") === "deep" ? "deep" : "standard";
+    const candidateLimit = clampInteger(
+      getOptionalInteger(args, "candidateLimit") ??
+        (mode === "deep" ? Math.max(64, limit * 8) : limit * 4),
+      limit,
+      500,
+    );
+    const minScore = normalizeOptionalScore(args.minScore);
+    const cursor = getOptionalString(args, "cursor")?.trim() || null;
     const chunking = getSemanticChunkingOptions(context);
     const indexed = await searchSemanticIndexFirst({
       context,
@@ -156,6 +183,10 @@ export const semanticSearchNotesTool: AgentTool = {
       limit,
       folder,
       maxSnippetChars,
+      mode,
+      candidateLimit,
+      minScore,
+      cursor,
     });
     if (indexed) {
       return indexed;
@@ -199,10 +230,13 @@ export const semanticSearchNotesTool: AgentTool = {
       scored = scoreLexicalChunks(chunks, queryTerms);
     }
 
-    const results = collapseChunksToNotes(scored, queryTerms, maxSnippetChars).slice(
-      0,
-      limit,
-    );
+    const collapsed = collapseChunksToNotes(scored, queryTerms, maxSnippetChars)
+      .filter((result) => minScore === undefined || result.score >= minScore);
+    const offset = parseCursorOffset(cursor);
+    const results = collapsed.slice(offset, offset + limit);
+    const nextCursor = offset + results.length < collapsed.length
+      ? String(offset + results.length)
+      : null;
 
     return {
       operation: "semantic_search_notes",
@@ -214,6 +248,8 @@ export const semanticSearchNotesTool: AgentTool = {
       chunking,
       fallbackUsed,
       fallbackReason,
+      candidateLimit,
+      nextCursor,
       resultCount: results.length,
       results,
       coverage: buildRetrievalCoverage({
@@ -221,7 +257,7 @@ export const semanticSearchNotesTool: AgentTool = {
         considered: chunks.length,
         read: results.length,
         skipped: Math.max(0, chunks.length - results.length),
-        truncated: results.length < chunks.length,
+        truncated: nextCursor !== null || results.length < chunks.length,
         fallbackUsed,
         reasons: [
           fallbackUsed ? String(fallbackReason ?? "lexical_fallback") : "live_semantic_search",
@@ -310,7 +346,7 @@ export const inspectSemanticIndexTool: AgentTool = {
       model: index.model,
       dim: index.dim,
       noteCount: index.notes.length,
-      chunkCount: index.notes.reduce((sum, note) => sum + note.chunks.length, 0),
+      chunkCount: getIndexChunkCount(index),
       concepts: summarizeIndexConcepts(index, limit),
       results: summarizeIndexNotes(index.notes, limit),
     };
@@ -351,12 +387,20 @@ async function searchSemanticIndexFirst({
   limit,
   folder,
   maxSnippetChars,
+  mode,
+  candidateLimit,
+  minScore,
+  cursor,
 }: {
   context: ToolExecutionContext;
   query: string;
   limit: number;
   folder: string | null;
   maxSnippetChars: number;
+  mode: "standard" | "deep";
+  candidateLimit: number;
+  minScore?: number;
+  cursor: string | null;
 }) {
   if (!context.settings.semanticIndexEnabled || !context.semanticIndexService) {
     return null;
@@ -367,6 +411,10 @@ async function searchSemanticIndexFirst({
     limit,
     folder,
     maxSnippetChars,
+    mode,
+    candidateLimit,
+    minScore,
+    cursor,
   });
 
   if (!search.ok) {
@@ -383,6 +431,8 @@ async function searchSemanticIndexFirst({
     dim: search.dim,
     fallbackUsed: false,
     fallbackReason: null,
+    candidateLimit,
+    nextCursor: search.nextCursor ?? null,
     resultCount: search.results.length,
     results: search.results.map((result) => ({
       ...result,
@@ -392,10 +442,10 @@ async function searchSemanticIndexFirst({
     })),
     coverage: buildRetrievalCoverage({
       mode: "indexed",
-      considered: search.results.length,
+      considered: search.candidateCount ?? search.results.length,
       read: search.results.length,
-      skipped: 0,
-      truncated: false,
+      skipped: Math.max(0, (search.candidateCount ?? search.results.length) - search.results.length),
+      truncated: Boolean(search.nextCursor),
       fallbackUsed: false,
       reasons: ["fresh_persisted_semantic_index"],
     }),
@@ -494,7 +544,7 @@ async function buildSemanticChunkProfiles(
   const files = context.app.vault
     .getFiles()
     .filter((file) => file.extension === "md")
-    .filter((file) => !SYSTEM_PATH_PATTERN.test(file.path))
+    .filter((file) => !isVaultPathExcluded(file.path))
     .filter((file) => isFileInFolder(file.path, folder))
     .slice(0, MAX_LISTED_FILES);
   const chunks: SemanticChunkProfile[] = [];
@@ -950,6 +1000,21 @@ function clampInteger(value: number, min: number, max: number): number {
   return Math.min(Math.max(Math.trunc(value), min), max);
 }
 
+function normalizeOptionalScore(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return Math.min(1, Math.max(0, value));
+}
+
+function parseCursorOffset(cursor: string | null): number {
+  if (!cursor) {
+    return 0;
+  }
+  const parsed = Number.parseInt(cursor, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
 function dedupeStrings(values: string[]): string[] {
   return [...new Set(values)];
 }
@@ -962,7 +1027,7 @@ function summarizeIndexConcepts(index: SemanticVaultIndex, limit: number) {
         note.title,
         note.tags.join(" "),
         note.headings.join(" "),
-        note.chunks[0]?.snippet ?? "",
+        getNoteFirstSnippet(note),
       ].join(" "),
     );
     for (const term of terms) {
@@ -989,12 +1054,27 @@ function summarizeIndexConcepts(index: SemanticVaultIndex, limit: number) {
     .slice(0, limit);
 }
 
-function summarizeIndexNotes(notes: SemanticIndexNote[], limit: number) {
+function summarizeIndexNotes(
+  notes: Array<SemanticIndexNote | SemanticIndexNoteMeta>,
+  limit: number,
+) {
   return notes.slice(0, limit).map((note) => ({
     path: note.path,
     title: note.title,
     tags: note.tags,
     headings: note.headings.slice(0, 6),
-    snippet: note.chunks[0]?.snippet ?? "",
+    snippet: getNoteFirstSnippet(note),
   }));
+}
+
+function getIndexChunkCount(index: SemanticVaultIndex): number {
+  return index.version === 2
+    ? index.totalRows
+    : index.notes.reduce((sum, note) => sum + note.chunks.length, 0);
+}
+
+function getNoteFirstSnippet(
+  note: SemanticIndexNote | SemanticIndexNoteMeta,
+): string {
+  return "firstSnippet" in note ? note.firstSnippet : note.chunks[0]?.snippet ?? "";
 }

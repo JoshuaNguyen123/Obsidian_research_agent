@@ -1,22 +1,75 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
 import type { ModelProvider } from "./model/types";
-import { MAX_AGENT_STEPS } from "./tools/constants";
+import { MAX_AGENT_STEPS, MAX_CODE_RUNS_PER_MISSION } from "./tools/constants";
+import {
+  normalizeScheduledMissions,
+  type ScheduledMission,
+} from "./agent/missionScheduler";
+import type { ModelRouterMode } from "./agent/missionRouter";
+import { normalizeModelRouterMode } from "./agent/missionRouter";
+import { runDependencyPreflight } from "./agent/dependencyPreflight";
+import type { MissionDependencyStatus } from "./agent/missionLedger";
+import { applyRecommendedAutomaticDefaults } from "./agent/settingsNormalize";
+import type { NormalizableAgentSettings } from "./agent/settingsNormalize";
 
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
 export type BrowserMissionMode = "supervised" | "extract_only";
+export type AutonomyProfile = "automatic" | "conservative" | "custom";
+export type OutputProfile =
+  | "active_or_new_note"
+  | "active_note_only"
+  | "chat_first";
+export type { ModelRouterMode };
 
 export interface AgentSettings {
+  /** Settings schema version for profile migration. */
+  settingsSchemaVersion?: number;
+  /** High-level autonomy profile; Custom preserves legacy per-feature flags. */
+  autonomyProfile?: AutonomyProfile;
+  /** Default note vs chat output behavior for content-producing missions. */
+  outputProfile?: OutputProfile;
   modelProvider: ModelProvider;
   ollamaApiKey: string;
   ollamaBaseUrl: string;
   openAiCompatibleApiKey: string;
   openAiCompatibleBaseUrl: string;
   model: string;
+  utilityModel?: string;
+  utilityModelProvider?: ModelProvider;
+  /** @deprecated Prefer modelRouterMode. true maps to shadow. */
+  modelRouterEnabled?: boolean;
+  /** Experimental: off (default) | shadow | authority. */
+  modelRouterMode?: ModelRouterMode;
   enableStreaming: boolean;
   requestTimeoutMs: number;
   maxAgentSteps: number;
+  maxRunMinutes?: number | null;
+  autoContinueLongRuns?: boolean;
+  maxLongRunSegments?: number;
+  /** Soft multi-segment loops until acceptance + proof debt clear (default on). */
+  completionDrivenLoops?: boolean;
+  /** Max soft 100-step segments when completionDrivenLoops is on (clamped 4–48). */
+  maxCompletionSegments?: number;
+  overnightRunsEnabled?: boolean;
+  overnightRunHours?: number;
+  overnightMaxSegments?: number;
+  autoResumeOvernightRuns?: boolean;
+  keepAwakeDuringOvernightRuns?: boolean;
+  /** Opt-in Lead + Worker orchestration and Orchestrator tab. */
+  orchestratorPreviewEnabled?: boolean;
+  /** Lead + Worker team runtime. Defaults on; migrate from orchestratorPreviewEnabled. */
+  orchestratorEnabled?: boolean;
+  /** Permit guarded fast-forward promotion after isolated integration is green. */
+  orchestratorAutoMergeGreen?: boolean;
+  orchestratorWorkerMaxSteps?: number;
+  orchestratorWorkerMaxToolCalls?: number;
+  orchestratorWorkerMaxMinutes?: number;
+  /** After note writeback, auto-rename Untitled/generic notes from H1/mission. */
+  autoTitleOnWrite?: boolean;
+  /** Cap run_code_block executions per mission (defaults to MAX_CODE_RUNS_PER_MISSION). */
+  maxCodeRunsPerMission?: number;
   thinkingMode: ThinkingMode;
   streamWritebackMode: StreamWritebackMode;
   templateFolder: string;
@@ -47,18 +100,56 @@ export interface AgentSettings {
   topK: number | null;
   topP: number | null;
   numCtx: number | null;
+  /** Fixed-operation Linear integration. Credentials are plugin-owned state. */
+  linearEnabled?: boolean;
+  /** Highest fully validated Linear resource gate available to the runtime. */
+  linearCapabilityGate?: 0 | 1 | 2 | 3 | 4 | 5;
+  linearDefaultTeamId?: string;
+  linearQueueEnabled?: boolean;
+  linearQueueProjectId?: string;
+  linearStartedStateId?: string;
+  linearCompletedStateId?: string;
+  linearBlockedStateId?: string;
+  /** Intentionally fixed at 15 minutes for the local-first polling release. */
+  linearScanIntervalMinutes?: 15;
+  scheduledMissions?: ScheduledMission[];
 }
 
 export const DEFAULT_SETTINGS: AgentSettings = {
+  settingsSchemaVersion: 2,
+  autonomyProfile: "automatic",
+  outputProfile: "active_or_new_note",
   modelProvider: "ollama",
   ollamaApiKey: "",
   ollamaBaseUrl: "https://ollama.com/api",
   openAiCompatibleApiKey: "",
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
-  model: "gpt-oss:120b",
+  model: "gpt-oss:120b-cloud",
+  utilityModel: "",
+  utilityModelProvider: "ollama",
+  modelRouterEnabled: false,
+  modelRouterMode: "off",
   enableStreaming: true,
   requestTimeoutMs: 180000,
   maxAgentSteps: MAX_AGENT_STEPS,
+  maxRunMinutes: null,
+  autoContinueLongRuns: true,
+  maxLongRunSegments: 4,
+  completionDrivenLoops: true,
+  maxCompletionSegments: 24,
+  overnightRunsEnabled: true,
+  overnightRunHours: 10,
+  overnightMaxSegments: 24,
+  autoResumeOvernightRuns: true,
+  keepAwakeDuringOvernightRuns: false,
+  orchestratorPreviewEnabled: true,
+  orchestratorEnabled: true,
+  orchestratorAutoMergeGreen: true,
+  orchestratorWorkerMaxSteps: 20,
+  orchestratorWorkerMaxToolCalls: 24,
+  orchestratorWorkerMaxMinutes: 15,
+  autoTitleOnWrite: true,
+  maxCodeRunsPerMission: undefined,
   thinkingMode: "auto",
   streamWritebackMode: "all_current_note_content_writes",
   templateFolder: "Templates",
@@ -69,7 +160,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   browserToolsEnabled: false,
   experienceMemoryEnabled: false,
   defaultBrowserMissionMode: "supervised",
-  agenticReflexEnabled: false,
+  agenticReflexEnabled: true,
   agenticReflexDiagnosticsEnabled: true,
   semanticSearchEnabled: true,
   semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
@@ -83,12 +174,22 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   semanticIndexEnabled: true,
   semanticIndexFolder: "Agent Memory",
   semanticIndexDebounceMs: 3000,
-  semanticIndexMaxFiles: 1000,
+  semanticIndexMaxFiles: 10000,
   semanticIndexPersistVectors: true,
   temperature: null,
   topK: null,
   topP: null,
   numCtx: null,
+  linearEnabled: false,
+  linearCapabilityGate: 0,
+  linearDefaultTeamId: "",
+  linearQueueEnabled: false,
+  linearQueueProjectId: "",
+  linearStartedStateId: "",
+  linearCompletedStateId: "",
+  linearBlockedStateId: "",
+  linearScanIntervalMinutes: 15,
+  scheduledMissions: [],
 };
 
 export class AgentSettingTab extends PluginSettingTab {
@@ -106,86 +207,77 @@ export class AgentSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "Agentic Researcher" });
     containerEl.createEl("p", {
-      text: "These settings configure model providers, local tools, and native Obsidian agent behavior.",
+      text: "Native right-side co-researcher for Obsidian. Basic settings stay compact; tuning lives under Advanced. Overnight and long runs require Obsidian to stay open — this is not a background daemon.",
       cls: "setting-item-description",
     });
 
-    new Setting(containerEl)
+    this.renderBasicSection(containerEl);
+    this.renderCapabilityStatus(containerEl);
+    this.renderAdvancedSections(containerEl);
+  }
+
+  private renderBasicSection(containerEl: HTMLElement): void {
+    const basicEl = containerEl.createDiv({ cls: "agentic-settings-basic" });
+    basicEl.createEl("h3", { text: "Basic" });
+
+    const provider = this.plugin.settings.modelProvider;
+
+    new Setting(basicEl)
       .setName("Model provider")
-      .setDesc("Provider adapter for chat, tool calling, and streaming. The agent loop stays provider-agnostic.")
+      .setDesc(
+        "Provider adapter for chat, tool calling, and streaming. The agent loop stays provider-agnostic.",
+      )
       .addDropdown((dropdown) =>
         dropdown
           .addOption("ollama", "Ollama-compatible")
           .addOption("openai_compatible", "GPT/OpenAI-compatible")
-          .setValue(this.plugin.settings.modelProvider)
+          .setValue(provider)
           .onChange(async (value) => {
             this.plugin.settings.modelProvider = isModelProvider(value)
               ? value
               : DEFAULT_SETTINGS.modelProvider;
             await this.plugin.saveSettings();
+            this.display();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Ollama API key")
-      .setDesc("Used for Ollama Cloud or any Ollama-compatible endpoint that requires a bearer token.")
-      .addText((text) => {
-        text
-          .setPlaceholder("ollama_...")
-          .setValue(this.plugin.settings.ollamaApiKey)
-          .onChange(async (value) => {
-            this.plugin.settings.ollamaApiKey = value.trim();
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.type = "password";
-      });
+    if (provider === "openai_compatible") {
+      new Setting(basicEl)
+        .setName("GPT/OpenAI-compatible API key")
+        .setDesc(
+          "Bearer token for OpenAI Chat Completions or an OpenAI-compatible gateway.",
+        )
+        .addText((text) => {
+          text
+            .setPlaceholder("sk-...")
+            .setValue(this.plugin.settings.openAiCompatibleApiKey)
+            .onChange(async (value) => {
+              this.plugin.settings.openAiCompatibleApiKey = value.trim();
+              await this.plugin.saveSettings();
+            });
+          text.inputEl.type = "password";
+        });
+    } else {
+      new Setting(basicEl)
+        .setName("Ollama API key")
+        .setDesc(
+          "Used for Ollama Cloud or any Ollama-compatible endpoint that requires a bearer token.",
+        )
+        .addText((text) => {
+          text
+            .setPlaceholder("ollama_...")
+            .setValue(this.plugin.settings.ollamaApiKey)
+            .onChange(async (value) => {
+              this.plugin.settings.ollamaApiKey = value.trim();
+              await this.plugin.saveSettings();
+            });
+          text.inputEl.type = "password";
+        });
+    }
 
-    new Setting(containerEl)
-      .setName("Ollama base URL")
-      .setDesc("Base URL for the Ollama-compatible /chat API.")
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.ollamaBaseUrl)
-          .setValue(this.plugin.settings.ollamaBaseUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.ollamaBaseUrl =
-              value.trim() || DEFAULT_SETTINGS.ollamaBaseUrl;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("GPT/OpenAI-compatible API key")
-      .setDesc("Bearer token for OpenAI Chat Completions or an OpenAI-compatible gateway.")
-      .addText((text) => {
-        text
-          .setPlaceholder("sk-...")
-          .setValue(this.plugin.settings.openAiCompatibleApiKey)
-          .onChange(async (value) => {
-            this.plugin.settings.openAiCompatibleApiKey = value.trim();
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.type = "password";
-      });
-
-    new Setting(containerEl)
-      .setName("GPT/OpenAI-compatible base URL")
-      .setDesc("Base URL ending at /v1 for Chat Completions-compatible APIs.")
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.openAiCompatibleBaseUrl)
-          .setValue(this.plugin.settings.openAiCompatibleBaseUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.openAiCompatibleBaseUrl =
-              normalizeProviderBaseUrl(value) ??
-              DEFAULT_SETTINGS.openAiCompatibleBaseUrl;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
+    new Setting(basicEl)
       .setName("Model")
-      .setDesc("Default model for the future agent runtime.")
+      .setDesc("Default model for agent missions.")
       .addText((text) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS.model)
@@ -196,21 +288,226 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Stream final answers")
-      .setDesc("Streams final prose when available; planning and tool selection use standard chat for reliability.")
+    const endpointDetails = basicEl.createEl("details", {
+      cls: "agentic-settings-disclosure",
+    });
+    endpointDetails.createEl("summary", { text: "Custom endpoint" });
+    if (provider === "openai_compatible") {
+      new Setting(endpointDetails)
+        .setName("GPT/OpenAI-compatible base URL")
+        .setDesc("Base URL ending at /v1 for Chat Completions-compatible APIs.")
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.openAiCompatibleBaseUrl)
+            .setValue(this.plugin.settings.openAiCompatibleBaseUrl)
+            .onChange(async (value) => {
+              this.plugin.settings.openAiCompatibleBaseUrl =
+                normalizeProviderBaseUrl(value) ??
+                DEFAULT_SETTINGS.openAiCompatibleBaseUrl;
+              await this.plugin.saveSettings();
+            }),
+        );
+    } else {
+      new Setting(endpointDetails)
+        .setName("Ollama base URL")
+        .setDesc("Base URL for the Ollama-compatible /chat API.")
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.ollamaBaseUrl)
+            .setValue(this.plugin.settings.ollamaBaseUrl)
+            .onChange(async (value) => {
+              this.plugin.settings.ollamaBaseUrl =
+                value.trim() || DEFAULT_SETTINGS.ollamaBaseUrl;
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
+
+    this.renderConnectionStatusRow(basicEl);
+
+    new Setting(basicEl)
+      .setName("Autonomy profile")
+      .setDesc(
+        "Automatic uses safe note-first defaults. Conservative prefers chat. Custom keeps per-feature Advanced overrides.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("automatic", "Automatic (recommended)")
+          .addOption("conservative", "Conservative")
+          .addOption("custom", "Custom")
+          .setValue(this.plugin.settings.autonomyProfile ?? "automatic")
+          .onChange(async (value) => {
+            await this.applyAutonomyProfileChange(value);
+          }),
+      );
+
+    new Setting(basicEl)
+      .setName("Output profile")
+      .setDesc(
+        "Where content-producing missions write by default. Explicit chat-only and specialized routes still win.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("active_or_new_note", "Smart note - stream and title")
+          .addOption("active_note_only", "Active note only")
+          .addOption("chat_first", "Chat first")
+          .setValue(this.plugin.settings.outputProfile ?? "active_or_new_note")
+          .onChange(async (value) => {
+            await this.applyOutputProfileChange(value);
+          }),
+      );
+
+    new Setting(basicEl)
+      .setName("Research memory")
+      .setDesc(
+        "Consent to store durable topic memory as markdown notes. Clear chat does not remove this memory.",
+      )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.enableStreaming)
+          .setValue(this.plugin.settings.researchMemoryEnabled)
           .onChange(async (value) => {
-            this.plugin.settings.enableStreaming = value;
+            this.plugin.settings.researchMemoryEnabled = value;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(basicEl)
+      .setName("Experience memory")
+      .setDesc(
+        "Consent for explicit local companion memories (observations, sources, procedures).",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.experienceMemoryEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.experienceMemoryEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(basicEl)
+      .setName("Recommended defaults")
+      .setDesc(
+        "Reset autonomy and output profiles to Automatic / Smart note without clearing credentials.",
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Use recommended automatic defaults")
+          .setCta()
+          .onClick(async () => {
+            Object.assign(
+              this.plugin.settings,
+              applyRecommendedAutomaticDefaults(
+                this.plugin.settings as NormalizableAgentSettings,
+              ),
+            );
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+  }
+
+  private renderConnectionStatusRow(containerEl: HTMLElement): void {
+    const rows = buildSettingsDependencyRows(this.plugin.settings);
+    const preflight = runDependencyPreflight(rows);
+    const summary = rows
+      .map((row) => `${formatDependencyRowName(row)} — ${row.summary}`)
+      .join(" ");
+
+    const setting = new Setting(containerEl)
+      .setName("Connection status")
+      .setDesc(
+        `Advisory only (status: ${preflight.status}). ${summary}`,
+      );
+    setting.addButton((button) =>
+      button.setButtonText("Test").onClick(() => {
+        this.display();
+      }),
+    );
+  }
+
+  private renderCapabilityStatus(containerEl: HTMLElement): void {
+    const statusEl = containerEl.createDiv({
+      cls: "agentic-capability-status",
+    });
+    statusEl.createEl("h3", { text: "Capability status" });
+    statusEl.createEl("p", {
+      text: "Read-only readiness from current settings. Open Advanced to configure.",
+      cls: "setting-item-description",
+    });
+
+    for (const row of buildCapabilityStatusRows(this.plugin)) {
+      new Setting(statusEl)
+        .setName(row.name)
+        .setDesc(`${row.status} — ${row.detail}`);
+    }
+  }
+
+  private renderAdvancedSections(containerEl: HTMLElement): void {
+    const advancedRoot = containerEl.createDiv({
+      cls: "agentic-settings-advanced",
+    });
+    advancedRoot.createEl("h3", { text: "Advanced" });
+    advancedRoot.createEl("p", {
+      text: "Collapsed tuning for power users. Legacy router/orchestrator boolean switches stay out of the UI; use router mode and Orchestrator team runtime instead.",
+      cls: "setting-item-description",
+    });
+
+    this.renderAdvancedModelRouting(advancedRoot);
+    this.renderAdvancedOutputOverrides(advancedRoot);
+    this.renderAdvancedAutonomyBudgets(advancedRoot);
+    this.renderAdvancedSemantic(advancedRoot);
+    this.renderAdvancedBrowserIntegrations(advancedRoot);
+    this.renderAdvancedDiagnostics(advancedRoot);
+  }
+
+  private createAdvancedDetails(
+    parent: HTMLElement,
+    title: string,
+  ): HTMLDetailsElement {
+    const details = parent.createEl("details", {
+      cls: "agentic-settings-advanced-section",
+    });
+    details.createEl("summary", { text: title });
+    return details;
+  }
+
+  private renderAdvancedModelRouting(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(
+      parent,
+      "Model routing and sampling",
+    );
+
+    new Setting(section)
+      .setName("Structured model router (experimental)")
+      .setDesc(
+        "Experimental opt-in. Off (default) keeps regex routing only. Shadow logs a JSON-schema classification beside regex without changing policy. Authority may use a high-confidence model route for mode/needs flags, but never widens destructive write scope beyond regex+policy.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("off", "Off (default)")
+          .addOption("shadow", "Shadow (log only)")
+          .addOption("authority", "Authority (opt-in)")
+          .setValue(
+            normalizeModelRouterMode(
+              this.plugin.settings.modelRouterMode,
+              this.plugin.settings.modelRouterEnabled,
+            ),
+          )
+          .onChange(async (value) => {
+            const mode = normalizeModelRouterMode(value);
+            this.plugin.settings.modelRouterMode = mode;
+            this.plugin.settings.modelRouterEnabled = mode !== "off";
+            this.plugin.settings.autonomyProfile = "custom";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
       .setName("Thinking mode")
-      .setDesc("Uses Ollama thinking for supported models. Auto enables known thinking-capable families.")
+      .setDesc(
+        "Uses Ollama thinking for supported models. Auto enables known thinking-capable families.",
+      )
       .addDropdown((dropdown) =>
         dropdown
           .addOption("auto", "Auto")
@@ -228,9 +525,196 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
+      .setName("Temperature")
+      .setDesc("Optional sampling temperature. Leave blank for provider default.")
+      .addText((text) =>
+        text
+          .setPlaceholder("default")
+          .setValue(formatOptionalNumber(this.plugin.settings.temperature))
+          .onChange(async (value) => {
+            this.plugin.settings.temperature = parseOptionalNumber(value, {
+              min: 0,
+            });
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Top K")
+      .setDesc("Optional top_k value. Leave blank for provider default.")
+      .addText((text) =>
+        text
+          .setPlaceholder("default")
+          .setValue(formatOptionalNumber(this.plugin.settings.topK))
+          .onChange(async (value) => {
+            this.plugin.settings.topK = parseOptionalInteger(value, { min: 1 });
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Top P")
+      .setDesc("Optional top_p value. Leave blank for provider default.")
+      .addText((text) =>
+        text
+          .setPlaceholder("default")
+          .setValue(formatOptionalNumber(this.plugin.settings.topP))
+          .onChange(async (value) => {
+            this.plugin.settings.topP = parseOptionalNumber(value, {
+              min: 0,
+              max: 1,
+            });
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Context window")
+      .setDesc("Optional num_ctx value. Leave blank for provider default.")
+      .addText((text) =>
+        text
+          .setPlaceholder("default")
+          .setValue(formatOptionalNumber(this.plugin.settings.numCtx))
+          .onChange(async (value) => {
+            this.plugin.settings.numCtx = parseOptionalInteger(value, {
+              min: 1,
+            });
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Request timeout")
+      .setDesc(
+        "Maximum time to wait for model and web requests, in milliseconds. Default is 180000 (3 minutes).",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.requestTimeoutMs))
+          .setValue(String(this.plugin.settings.requestTimeoutMs))
+          .onChange(async (value) => {
+            const parsed = Number.parseInt(value.trim(), 10);
+            this.plugin.settings.requestTimeoutMs =
+              Number.isFinite(parsed) && parsed > 0
+                ? parsed
+                : DEFAULT_SETTINGS.requestTimeoutMs;
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
+
+  private renderAdvancedOutputOverrides(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(parent, "Output overrides");
+
+    new Setting(section)
+      .setName("Stream final answers")
+      .setDesc(
+        "Streams final prose when available; planning and tool selection use standard chat for reliability.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.enableStreaming)
+          .onChange(async (value) => {
+            this.plugin.settings.enableStreaming = value;
+            this.plugin.settings.autonomyProfile = "custom";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Stream note writeback")
+      .setDesc(
+        "Streams content-producing current-note writes directly into the note.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption(
+            "all_current_note_content_writes",
+            "All current-note content writes",
+          )
+          .addOption("off", "Off")
+          .setValue(this.plugin.settings.streamWritebackMode)
+          .onChange(async (value) => {
+            this.plugin.settings.streamWritebackMode = isStreamWritebackMode(
+              value,
+            )
+              ? value
+              : DEFAULT_SETTINGS.streamWritebackMode;
+            this.plugin.settings.autonomyProfile = "custom";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Auto-title on write")
+      .setDesc(
+        "After substantial note writeback, rename Untitled or generic notes from a leading H1 or short mission phrase.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.autoTitleOnWrite !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.autoTitleOnWrite = value;
+            this.plugin.settings.autonomyProfile = "custom";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Template folder")
+      .setDesc(
+        "Vault folder for reusable markdown templates with {{field}} placeholders.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.templateFolder)
+          .setValue(this.plugin.settings.templateFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.templateFolder =
+              value.trim() || DEFAULT_SETTINGS.templateFolder;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Template output folder")
+      .setDesc(
+        "Optional default vault folder for notes created from filled templates. Blank uses the active note's project folder.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("active project folder")
+          .setValue(this.plugin.settings.templateOutputFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.templateOutputFolder = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Research memory folder")
+      .setDesc("Vault folder for durable topic memory notes.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.researchMemoryFolder)
+          .setValue(this.plugin.settings.researchMemoryFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.researchMemoryFolder =
+              value.trim() || DEFAULT_SETTINGS.researchMemoryFolder;
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
+
+  private renderAdvancedAutonomyBudgets(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(parent, "Autonomy and budgets");
+
+    new Setting(section)
       .setName("Maximum agent steps")
-      .setDesc(`Upper bound for autonomous planning/tool loops. The hard safety ceiling is ${MAX_AGENT_STEPS}.`)
+      .setDesc(
+        `Upper bound for autonomous planning/tool loops. The hard safety ceiling is ${MAX_AGENT_STEPS}.`,
+      )
       .addText((text) =>
         text
           .setPlaceholder(String(DEFAULT_SETTINGS.maxAgentSteps))
@@ -246,167 +730,321 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Stream note writeback")
-      .setDesc("Streams content-producing current-note writes directly into the note.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("all_current_note_content_writes", "All current-note content writes")
-          .addOption("off", "Off")
-          .setValue(this.plugin.settings.streamWritebackMode)
-          .onChange(async (value) => {
-            this.plugin.settings.streamWritebackMode = isStreamWritebackMode(value)
-              ? value
-              : DEFAULT_SETTINGS.streamWritebackMode;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Template folder")
-      .setDesc("Vault folder for reusable markdown templates with {{field}} placeholders.")
+    new Setting(section)
+      .setName("Maximum run minutes")
+      .setDesc(
+        "Optional wall-clock budget. Blank means no wall-clock limit; step budget still applies.",
+      )
       .addText((text) =>
         text
-          .setPlaceholder(DEFAULT_SETTINGS.templateFolder)
-          .setValue(this.plugin.settings.templateFolder)
+          .setPlaceholder("unlimited")
+          .setValue(formatOptionalNumber(this.plugin.settings.maxRunMinutes))
           .onChange(async (value) => {
-            this.plugin.settings.templateFolder =
-              value.trim() || DEFAULT_SETTINGS.templateFolder;
+            this.plugin.settings.maxRunMinutes = parseOptionalNumber(value, {
+              min: 0.1,
+            });
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Template output folder")
-      .setDesc("Optional default vault folder for notes created from filled templates. Blank uses the active note's project folder.")
+    new Setting(section)
+      .setName("Max code runs per mission")
+      .setDesc(
+        `Upper bound for run_code_block executions in one mission. Blank uses the default of ${MAX_CODE_RUNS_PER_MISSION}.`,
+      )
       .addText((text) =>
         text
-          .setPlaceholder("active project folder")
-          .setValue(this.plugin.settings.templateOutputFolder)
+          .setPlaceholder(String(MAX_CODE_RUNS_PER_MISSION))
+          .setValue(
+            formatOptionalNumber(this.plugin.settings.maxCodeRunsPerMission),
+          )
           .onChange(async (value) => {
-            this.plugin.settings.templateOutputFolder = value.trim();
+            this.plugin.settings.maxCodeRunsPerMission =
+              parseOptionalNumber(value, { min: 1, max: 64 }) ?? undefined;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Research memory")
-      .setDesc("Stores durable topic memory as markdown notes in the vault. Clear chat does not remove this memory.")
+    new Setting(section)
+      .setName("Auto-continue long research")
+      .setDesc(
+        "When a prompt explicitly asks for deep or long-running research, continue from the durable run snapshot after a segment reaches its step budget.",
+      )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.researchMemoryEnabled)
+          .setValue(this.plugin.settings.autoContinueLongRuns !== false)
           .onChange(async (value) => {
-            this.plugin.settings.researchMemoryEnabled = value;
+            this.plugin.settings.autoContinueLongRuns = value;
+            this.plugin.settings.autonomyProfile = "custom";
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Research memory folder")
-      .setDesc("Vault folder for durable topic memory notes.")
+    new Setting(section)
+      .setName("Maximum long-run segments")
+      .setDesc(
+        "Used only when completion-driven loops are off. Bounded number of soft 100-step segments for explicit long research missions (1–8).",
+      )
       .addText((text) =>
         text
-          .setPlaceholder(DEFAULT_SETTINGS.researchMemoryFolder)
-          .setValue(this.plugin.settings.researchMemoryFolder)
+          .setPlaceholder(String(DEFAULT_SETTINGS.maxLongRunSegments))
+          .setValue(
+            String(
+              this.plugin.settings.maxLongRunSegments ??
+                DEFAULT_SETTINGS.maxLongRunSegments,
+            ),
+          )
           .onChange(async (value) => {
-            this.plugin.settings.researchMemoryFolder =
-              value.trim() || DEFAULT_SETTINGS.researchMemoryFolder;
+            this.plugin.settings.maxLongRunSegments =
+              parseOptionalInteger(value, { min: 1, max: 8 }) ??
+              DEFAULT_SETTINGS.maxLongRunSegments;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Companion service URL")
-      .setDesc("Local companion URL for desktop browser automation and explicit experience memory.")
+    new Setting(section)
+      .setName("Completion-driven long loops")
+      .setDesc(
+        "When on (default), explicit long research continues soft 100-step segments until acceptance passes and proof debt is clear, up to the completion segment cap.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.completionDrivenLoops !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.completionDrivenLoops = value;
+            this.plugin.settings.autonomyProfile = "custom";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Maximum completion segments")
+      .setDesc(
+        "Soft cap on 100-step segments when completion-driven loops are on (4–48).",
+      )
       .addText((text) =>
         text
-          .setPlaceholder(DEFAULT_SETTINGS.companionBaseUrl)
-          .setValue(this.plugin.settings.companionBaseUrl)
+          .setPlaceholder(String(DEFAULT_SETTINGS.maxCompletionSegments))
+          .setValue(
+            String(
+              this.plugin.settings.maxCompletionSegments ??
+                DEFAULT_SETTINGS.maxCompletionSegments,
+            ),
+          )
           .onChange(async (value) => {
-            this.plugin.settings.companionBaseUrl =
-              normalizeCompanionBaseUrl(value) ?? DEFAULT_SETTINGS.companionBaseUrl;
+            this.plugin.settings.maxCompletionSegments =
+              parseOptionalInteger(value, { min: 4, max: 48 }) ??
+              DEFAULT_SETTINGS.maxCompletionSegments;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Browser tools")
-      .setDesc("Enable desktop-only browser observation and supervised interaction through the local companion service.")
+    new Setting(section)
+      .setName("Enable overnight research")
+      .setDesc(
+        "Not a background daemon. Allow explicit overnight or 8–12 hour prompts to use durable multi-segment execution only while Obsidian remains open.",
+      )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.browserToolsEnabled)
+          .setValue(this.plugin.settings.overnightRunsEnabled !== false)
           .onChange(async (value) => {
-            this.plugin.settings.browserToolsEnabled = value;
+            this.plugin.settings.overnightRunsEnabled = value;
+            this.plugin.settings.autonomyProfile = "custom";
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Default overnight hours")
+      .setDesc(
+        "Maximum wall-clock window for an overnight mission. Explicit prompt durations override this value within 8-12 hours.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.overnightRunHours))
+          .setValue(
+            String(
+              this.plugin.settings.overnightRunHours ??
+                DEFAULT_SETTINGS.overnightRunHours,
+            ),
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.overnightRunHours =
+              parseOptionalInteger(value, { min: 8, max: 12 }) ??
+              DEFAULT_SETTINGS.overnightRunHours;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Experience memory")
-      .setDesc("Enable explicit local companion memories for observations, sources, task summaries, and reusable procedures.")
+    new Setting(section)
+      .setName("Maximum overnight segments")
+      .setDesc(
+        "Additional hard bound for overnight work. Each segment remains limited to 100 agent steps.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.overnightMaxSegments))
+          .setValue(
+            String(
+              this.plugin.settings.overnightMaxSegments ??
+                DEFAULT_SETTINGS.overnightMaxSegments,
+            ),
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.overnightMaxSegments =
+              parseOptionalInteger(value, { min: 1, max: 24 }) ??
+              DEFAULT_SETTINGS.overnightMaxSegments;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Resume overnight runs after reload")
+      .setDesc(
+        "Resume the newest safe overnight mission after a plugin reload or crash. Explicitly stopped missions never resume automatically.",
+      )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.experienceMemoryEnabled)
+          .setValue(this.plugin.settings.autoResumeOvernightRuns !== false)
           .onChange(async (value) => {
-            this.plugin.settings.experienceMemoryEnabled = value;
+            this.plugin.settings.autoResumeOvernightRuns = value;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Default browser mission mode")
-      .setDesc("Supervised mode allows safety-gated actions; extract-only limits browser work to page observation and markdown extraction.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("supervised", "Supervised")
-          .addOption("extract_only", "Extract only")
-          .setValue(this.plugin.settings.defaultBrowserMissionMode)
-          .onChange(async (value) => {
-            this.plugin.settings.defaultBrowserMissionMode =
-              isBrowserMissionMode(value)
-                ? value
-                : DEFAULT_SETTINGS.defaultBrowserMissionMode;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Agentic reflex layer")
-      .setDesc("Uses local embeddings and deterministic checks for safer route hints, next-action scoring, loop detection, and completion checks.")
+    new Setting(section)
+      .setName("Keep computer awake during overnight runs (experimental)")
+      .setDesc(
+        "Experimental desktop-only opt-in (default off). Best-effort prevention of application suspension while an overnight mission is active.",
+      )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.agenticReflexEnabled)
+          .setValue(this.plugin.settings.keepAwakeDuringOvernightRuns === true)
           .onChange(async (value) => {
-            this.plugin.settings.agenticReflexEnabled = value;
+            this.plugin.settings.keepAwakeDuringOvernightRuns = value;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Reflex diagnostics")
-      .setDesc("Shows inferred intent, confidence, action, progress, loop risk, and completion checks in Run Details.")
+    new Setting(section)
+      .setName("Orchestrator team runtime")
+      .setDesc(
+        "On by default. Eligible deep research / sources / verify prompts and explicit code-team requests use Lead + Worker. Turn off to force single-agent.",
+      )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.agenticReflexDiagnosticsEnabled)
+          .setValue(this.plugin.settings.orchestratorEnabled !== false)
           .onChange(async (value) => {
-            this.plugin.settings.agenticReflexDiagnosticsEnabled = value;
+            this.plugin.settings.orchestratorEnabled = value;
+            this.plugin.settings.orchestratorPreviewEnabled = value;
+            this.plugin.settings.autonomyProfile = "custom";
+            await this.plugin.saveSettings();
+            this.plugin.refreshAgentView();
+            this.display();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Auto-merge green orchestrator worktrees")
+      .setDesc(
+        "After an approved coding mission, fast-forward only when the isolated integration worktree is green and the base checkout is still clean.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.orchestratorAutoMergeGreen === true)
+          .onChange(async (value) => {
+            this.plugin.settings.orchestratorAutoMergeGreen = value;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
+      .setName("Orchestrator worker max steps")
+      .setDesc("Per-worker step budget for Lead + Worker missions.")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.orchestratorWorkerMaxSteps))
+          .setValue(
+            String(
+              this.plugin.settings.orchestratorWorkerMaxSteps ??
+                DEFAULT_SETTINGS.orchestratorWorkerMaxSteps,
+            ),
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.orchestratorWorkerMaxSteps =
+              parseOptionalInteger(value, { min: 1, max: MAX_AGENT_STEPS }) ??
+              DEFAULT_SETTINGS.orchestratorWorkerMaxSteps;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Orchestrator worker max tool calls")
+      .setDesc("Per-worker tool-call budget for Lead + Worker missions.")
+      .addText((text) =>
+        text
+          .setPlaceholder(
+            String(DEFAULT_SETTINGS.orchestratorWorkerMaxToolCalls),
+          )
+          .setValue(
+            String(
+              this.plugin.settings.orchestratorWorkerMaxToolCalls ??
+                DEFAULT_SETTINGS.orchestratorWorkerMaxToolCalls,
+            ),
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.orchestratorWorkerMaxToolCalls =
+              parseOptionalInteger(value, { min: 1, max: 128 }) ??
+              DEFAULT_SETTINGS.orchestratorWorkerMaxToolCalls;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Orchestrator worker max minutes")
+      .setDesc("Per-worker wall-clock budget in minutes.")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_SETTINGS.orchestratorWorkerMaxMinutes))
+          .setValue(
+            String(
+              this.plugin.settings.orchestratorWorkerMaxMinutes ??
+                DEFAULT_SETTINGS.orchestratorWorkerMaxMinutes,
+            ),
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.orchestratorWorkerMaxMinutes =
+              parseOptionalInteger(value, { min: 1, max: 240 }) ??
+              DEFAULT_SETTINGS.orchestratorWorkerMaxMinutes;
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
+
+  private renderAdvancedSemantic(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(
+      parent,
+      "Semantic retrieval tuning",
+    );
+
+    new Setting(section)
       .setName("Semantic search")
-      .setDesc("Adds local FastEmbed-powered conceptual vault search as a read-only tool.")
+      .setDesc(
+        "Adds local FastEmbed-powered conceptual vault search as a read-only tool.",
+      )
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.semanticSearchEnabled)
           .onChange(async (value) => {
             this.plugin.settings.semanticSearchEnabled = value;
+            this.plugin.settings.autonomyProfile = "custom";
             await this.plugin.saveSettings();
+            this.display();
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic embedding model")
       .setDesc("FastEmbed model used for semantic_search_notes.")
       .addText((text) =>
@@ -420,9 +1058,11 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic embedding dimension")
-      .setDesc("Matryoshka truncation dimension. Use 512 for quality or 256 for a smaller/faster search footprint.")
+      .setDesc(
+        "Matryoshka truncation dimension. Use 512 for quality or 256 for a smaller/faster search footprint.",
+      )
       .addDropdown((dropdown) =>
         dropdown
           .addOption("512", "512")
@@ -435,9 +1075,11 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    const semanticChunkSetting = new Setting(containerEl)
+    const semanticChunkSetting = new Setting(section)
       .setName("Semantic chunk tokens")
-      .setDesc("Token estimates for markdown chunks. These control semantic search and the derived semantic index.");
+      .setDesc(
+        "Token estimates for markdown chunks. These control semantic search and the derived semantic index.",
+      );
     semanticChunkSetting.settingEl.addClass(
       "agentic-researcher-semantic-chunk-setting",
     );
@@ -493,9 +1135,11 @@ export class AgentSettingTab extends PluginSettingTab {
       },
     });
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic Python command")
-      .setDesc("Optional Python command for FastEmbed. Leave blank to try python, then py.")
+      .setDesc(
+        "Optional Python command for FastEmbed. Leave blank to try python, then py.",
+      )
       .addText((text) =>
         text
           .setPlaceholder("python")
@@ -506,7 +1150,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic model cache folder")
       .setDesc("Optional local folder for downloaded FastEmbed model files.")
       .addText((text) =>
@@ -519,9 +1163,11 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic index")
-      .setDesc("Maintains a derived Markdown map and local JSON vector index for faster conceptual vault search.")
+      .setDesc(
+        "Maintains a derived Markdown map and local JSON vector index for faster conceptual vault search.",
+      )
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.semanticIndexEnabled)
@@ -531,25 +1177,30 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic index folder")
-      .setDesc("Vault folder for Semantic Vault Index.md and semantic-vault-index.json.")
+      .setDesc(
+        "Vault folder for Semantic Vault Index.md and semantic-vault-index.json.",
+      )
       .addText((text) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS.semanticIndexFolder)
           .setValue(this.plugin.settings.semanticIndexFolder)
           .onChange(async (value) => {
-            this.plugin.settings.semanticIndexFolder = normalizeVaultFolderSetting(
-              value,
-              DEFAULT_SETTINGS.semanticIndexFolder,
-            );
+            this.plugin.settings.semanticIndexFolder =
+              normalizeVaultFolderSetting(
+                value,
+                DEFAULT_SETTINGS.semanticIndexFolder,
+              );
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic index debounce")
-      .setDesc("Milliseconds to wait before indexing changed markdown files after vault events.")
+      .setDesc(
+        "Milliseconds to wait before indexing changed markdown files after vault events.",
+      )
       .addText((text) =>
         text
           .setPlaceholder(String(DEFAULT_SETTINGS.semanticIndexDebounceMs))
@@ -562,9 +1213,11 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Semantic index max files")
-      .setDesc("Maximum markdown files to include in the derived semantic index.")
+      .setDesc(
+        "Maximum markdown files to include in the derived semantic index.",
+      )
       .addText((text) =>
         text
           .setPlaceholder(String(DEFAULT_SETTINGS.semanticIndexMaxFiles))
@@ -577,9 +1230,11 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    new Setting(section)
       .setName("Persist semantic vectors")
-      .setDesc("Stores local embedding vectors in semantic-vault-index.json. Vectors are never shown to the model.")
+      .setDesc(
+        "Stores local embedding vectors in semantic-vault-index.json. Vectors are never shown to the model.",
+      )
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.semanticIndexPersistVectors)
@@ -588,80 +1243,377 @@ export class AgentSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+  }
 
-    new Setting(containerEl)
-      .setName("Temperature")
-      .setDesc("Optional Ollama sampling temperature. Leave blank for provider default.")
+  private renderAdvancedBrowserIntegrations(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(
+      parent,
+      "Browser and integrations",
+    );
+
+    new Setting(section)
+      .setName("Companion service URL")
+      .setDesc(
+        "Local companion URL for desktop browser automation and explicit experience memory.",
+      )
       .addText((text) =>
         text
-          .setPlaceholder("default")
-          .setValue(formatOptionalNumber(this.plugin.settings.temperature))
+          .setPlaceholder(DEFAULT_SETTINGS.companionBaseUrl)
+          .setValue(this.plugin.settings.companionBaseUrl)
           .onChange(async (value) => {
-            this.plugin.settings.temperature = parseOptionalNumber(value, {
-              min: 0,
-            });
+            this.plugin.settings.companionBaseUrl =
+              normalizeCompanionBaseUrl(value) ??
+              DEFAULT_SETTINGS.companionBaseUrl;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Top K")
-      .setDesc("Optional Ollama top_k value. Leave blank for provider default.")
-      .addText((text) =>
-        text
-          .setPlaceholder("default")
-          .setValue(formatOptionalNumber(this.plugin.settings.topK))
+    new Setting(section)
+      .setName("Browser tools")
+      .setDesc(
+        "Enable desktop-only browser observation and supervised interaction through the local companion service.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.browserToolsEnabled)
           .onChange(async (value) => {
-            this.plugin.settings.topK = parseOptionalInteger(value, { min: 1 });
+            this.plugin.settings.browserToolsEnabled = value;
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    if (
+      this.plugin.settings.browserToolsEnabled ||
+      this.plugin.settings.companionBaseUrl.trim() !==
+        DEFAULT_SETTINGS.companionBaseUrl
+    ) {
+      new Setting(section)
+        .setName("Default browser mission mode")
+        .setDesc(
+          "Supervised mode allows safety-gated actions; extract-only limits browser work to page observation and markdown extraction.",
+        )
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("supervised", "Supervised")
+            .addOption("extract_only", "Extract only")
+            .setValue(this.plugin.settings.defaultBrowserMissionMode)
+            .onChange(async (value) => {
+              this.plugin.settings.defaultBrowserMissionMode =
+                isBrowserMissionMode(value)
+                  ? value
+                  : DEFAULT_SETTINGS.defaultBrowserMissionMode;
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
+
+    section.createEl("h4", { text: "Linear integration" });
+    section.createEl("p", {
+      text: "Optional private-workspace integration using fixed Linear GraphQL operations. The personal API key is stored unencrypted in this plugin's data.json and is never sent to agent workers.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(section)
+      .setName("Enable Linear")
+      .setDesc(
+        "Expose validated Linear tools only for prompts with explicit Linear intent.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.linearEnabled === true)
+          .onChange(async (value) => {
+            this.plugin.settings.linearEnabled = value;
+            if (!value) {
+              this.plugin.settings.linearQueueEnabled = false;
+            }
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Top P")
-      .setDesc("Optional Ollama top_p value. Leave blank for provider default.")
-      .addText((text) =>
-        text
-          .setPlaceholder("default")
-          .setValue(formatOptionalNumber(this.plugin.settings.topP))
+    const linearKeySetting = new Setting(section)
+      .setName("Linear personal API key")
+      .setDesc(
+        this.plugin.hasLinearApiKey()
+          ? "A key is configured. Enter a replacement or use Clear key."
+          : "No key is configured.",
+      );
+    linearKeySetting.addText((text) => {
+      text.inputEl.type = "password";
+      text
+        .setPlaceholder(
+          this.plugin.hasLinearApiKey()
+            ? "Key configured"
+            : "Paste a personal API key",
+        )
+        .setValue("")
+        .onChange(async (value) => {
+          if (value.trim()) {
+            await this.plugin.setLinearApiKey(value);
+          }
+        });
+    });
+    linearKeySetting.addButton((button) =>
+      button.setButtonText("Clear key").onClick(async () => {
+        await this.plugin.clearLinearApiKey();
+        this.display();
+      }),
+    );
+    linearKeySetting.addButton((button) =>
+      button
+        .setButtonText("Test connection")
+        .setDisabled(!this.plugin.hasLinearApiKey())
+        .onClick(async () => {
+          button.setDisabled(true);
+          button.setButtonText("Testing...");
+          const result = await this.plugin.testLinearConnection();
+          button.setButtonText(result.ok ? "Connected" : "Test failed");
+          linearKeySetting.setDesc(result.message);
+          window.setTimeout(() => {
+            button.setButtonText("Test connection");
+            button.setDisabled(!this.plugin.hasLinearApiKey());
+          }, 2_000);
+        }),
+    );
+
+    if (this.plugin.hasLinearApiKey()) {
+      new Setting(section)
+        .setName("Default Linear team ID")
+        .setDesc(
+          "Stable Linear team UUID used when a prepared action omits a team.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("Team UUID")
+            .setValue(this.plugin.settings.linearDefaultTeamId ?? "")
+            .onChange(async (value) => {
+              this.plugin.settings.linearDefaultTeamId = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(section)
+        .setName("Linear queue project ID")
+        .setDesc(
+          "Only issues in this project can enter the automatic execution queue.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("Project UUID")
+            .setValue(this.plugin.settings.linearQueueProjectId ?? "")
+            .onChange(async (value) => {
+              this.plugin.settings.linearQueueProjectId = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      for (const state of [
+        {
+          name: "Started workflow state ID",
+          key: "linearStartedStateId" as const,
+          description: "State applied only after a claim comment is verified.",
+        },
+        {
+          name: "Completed workflow state ID",
+          key: "linearCompletedStateId" as const,
+          description: "State applied only after the proof contract passes.",
+        },
+        {
+          name: "Blocked workflow state ID",
+          key: "linearBlockedStateId" as const,
+          description:
+            "Optional. Leave blank to keep blocked work in its current state.",
+        },
+      ]) {
+        new Setting(section)
+          .setName(state.name)
+          .setDesc(state.description)
+          .addText((text) =>
+            text
+              .setPlaceholder("Workflow state UUID")
+              .setValue(this.plugin.settings[state.key] ?? "")
+              .onChange(async (value) => {
+                this.plugin.settings[state.key] = value.trim();
+                await this.plugin.saveSettings();
+              }),
+          );
+      }
+    }
+
+    new Setting(section)
+      .setName("Automatic Linear queue")
+      .setDesc(
+        this.plugin.settings.linearCapabilityGate === 5
+          ? "Scan at most ten updated issues every 15 minutes while Obsidian is open. A live scoped grant is still required."
+          : `Unavailable until Linear capability gate 5 is validated (current gate: ${this.plugin.settings.linearCapabilityGate}).`,
+      )
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.linearQueueEnabled === true)
+          .setDisabled(this.plugin.settings.linearCapabilityGate !== 5)
           .onChange(async (value) => {
-            this.plugin.settings.topP = parseOptionalNumber(value, {
-              min: 0,
-              max: 1,
-            });
+            this.plugin.settings.linearQueueEnabled =
+              this.plugin.settings.linearCapabilityGate === 5 && value;
+            await this.plugin.saveSettings();
+            this.display();
+          });
+      });
+
+    const queueGrant = this.plugin.getLinearQueueGrantStatus();
+    const queueGrantSetting = new Setting(section)
+      .setName("Queue authority")
+      .setDesc(
+        queueGrant.active
+          ? `Explicit bounded authority is active until ${queueGrant.expiresAt}. It never covers permanent deletion or GitHub publication.`
+          : "No live queue authority. Ready tickets cannot execute until you explicitly authorize a four-hour bounded grant.",
+      );
+    queueGrantSetting.addButton((button) =>
+      button
+        .setButtonText(queueGrant.active ? "Renew 4 hours" : "Authorize 4 hours")
+        .setCta()
+        .setDisabled(this.plugin.settings.linearQueueEnabled !== true)
+        .onClick(async () => {
+          button.setDisabled(true).setButtonText("Authorizing...");
+          const result = await this.plugin.authorizeLinearQueueForFourHours();
+          queueGrantSetting.setDesc(result.message);
+          button.setButtonText(result.ok ? "Authorized" : "Not authorized");
+          window.setTimeout(() => this.display(), 1_500);
+        }),
+    );
+    queueGrantSetting.addButton((button) =>
+      button
+        .setButtonText("Revoke")
+        .setDisabled(!queueGrant.active)
+        .onClick(async () => {
+          await this.plugin.revokeLinearQueueAuthority();
+          this.display();
+        }),
+    );
+
+    new Setting(section)
+      .setName("Scheduled missions")
+      .setDesc(
+        "JSON array of recurring missions. Standard fields: id, prompt, cadence hourly/daily/weekly, hourLocal, weekday, targetNotePath, enabled. Continuous research also supports mode=continuous_research, pinnedTargetIds, and quietHours {startMinute,endMinute}.",
+      )
+      .addTextArea((text) => {
+        text.inputEl.rows = 8;
+        text.inputEl.addClass("agentic-researcher-scheduled-missions-input");
+        text
+          .setPlaceholder(
+            '[{"id":"daily-review","prompt":"Summarize today","cadence":"daily","hourLocal":8,"enabled":true}]',
+          )
+          .setValue(
+            JSON.stringify(this.plugin.settings.scheduledMissions ?? [], null, 2),
+          )
+          .onChange(async (value) => {
+            const parsed = parseScheduledMissionsJson(value);
+            if (parsed === null) {
+              return;
+            }
+            this.plugin.settings.scheduledMissions = parsed;
+            await this.plugin.saveSettings();
+          });
+      });
+  }
+
+  private renderAdvancedDiagnostics(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(parent, "Diagnostics");
+    const s = this.plugin.settings;
+    const provider = s.modelProvider ?? "ollama";
+    const base =
+      provider === "openai_compatible"
+        ? s.openAiCompatibleBaseUrl
+        : s.ollamaBaseUrl;
+
+    section.createEl("p", {
+      text: `Effective profile: autonomy=${s.autonomyProfile ?? "automatic"}, output=${s.outputProfile ?? "active_or_new_note"}, schema=${s.settingsSchemaVersion ?? 1}. Provider=${provider}, model=${s.model}, base=${base}. Streaming=${s.enableStreaming ? "on" : "off"}, note_stream=${s.streamWritebackMode}, auto_title=${s.autoTitleOnWrite !== false ? "on" : "off"}, orchestrator=${s.orchestratorEnabled !== false ? "on" : "off"}, router=${normalizeModelRouterMode(s.modelRouterMode, s.modelRouterEnabled)}, reflex=${s.agenticReflexEnabled ? "on" : "off"}.`,
+      cls: "setting-item-description agentic-settings-diagnostics-summary",
+    });
+
+    this.renderDependencyPreflight(section);
+
+    new Setting(section)
+      .setName("Agentic reflex layer")
+      .setDesc(
+        "Uses local embeddings and deterministic checks for safer route hints, next-action scoring, loop detection, and completion checks.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.agenticReflexEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.agenticReflexEnabled = value;
+            this.plugin.settings.autonomyProfile = "custom";
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Context window")
-      .setDesc("Optional Ollama num_ctx value. Leave blank for provider default.")
-      .addText((text) =>
-        text
-          .setPlaceholder("default")
-          .setValue(formatOptionalNumber(this.plugin.settings.numCtx))
+    new Setting(section)
+      .setName("Reflex diagnostics")
+      .setDesc(
+        "Shows inferred intent, confidence, action, progress, loop risk, and completion checks in Run Details.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.agenticReflexDiagnosticsEnabled)
           .onChange(async (value) => {
-            this.plugin.settings.numCtx = parseOptionalInteger(value, { min: 1 });
+            this.plugin.settings.agenticReflexDiagnosticsEnabled = value;
             await this.plugin.saveSettings();
           }),
       );
+  }
 
-    new Setting(containerEl)
-      .setName("Request timeout")
-      .setDesc("Maximum time to wait for model and web requests, in milliseconds. Default is 180000 (3 minutes).")
-      .addText((text) =>
-        text
-          .setPlaceholder(String(DEFAULT_SETTINGS.requestTimeoutMs))
-          .setValue(String(this.plugin.settings.requestTimeoutMs))
-          .onChange(async (value) => {
-            const parsed = Number.parseInt(value.trim(), 10);
-            this.plugin.settings.requestTimeoutMs =
-              Number.isFinite(parsed) && parsed > 0
-                ? parsed
-                : DEFAULT_SETTINGS.requestTimeoutMs;
-            await this.plugin.saveSettings();
-          }),
-      );
+  private async applyAutonomyProfileChange(value: string): Promise<void> {
+    if (value === "automatic") {
+      this.plugin.settings.autonomyProfile = "automatic";
+      this.plugin.settings.outputProfile = "active_or_new_note";
+      this.plugin.settings.enableStreaming = true;
+      this.plugin.settings.streamWritebackMode =
+        "all_current_note_content_writes";
+      this.plugin.settings.autoTitleOnWrite = true;
+    } else if (value === "conservative") {
+      this.plugin.settings.autonomyProfile = "conservative";
+      this.plugin.settings.outputProfile = "chat_first";
+      this.plugin.settings.enableStreaming = true;
+      this.plugin.settings.streamWritebackMode = "off";
+      this.plugin.settings.autoTitleOnWrite = false;
+    } else {
+      this.plugin.settings.autonomyProfile = "custom";
+    }
+    await this.plugin.saveSettings();
+    this.display();
+  }
+
+  private async applyOutputProfileChange(value: string): Promise<void> {
+    const profile: OutputProfile = isOutputProfile(value)
+      ? value
+      : "active_or_new_note";
+    this.plugin.settings.outputProfile = profile;
+
+    if (profile === "active_or_new_note") {
+      this.plugin.settings.enableStreaming = true;
+      this.plugin.settings.streamWritebackMode =
+        "all_current_note_content_writes";
+      this.plugin.settings.autoTitleOnWrite = true;
+    } else if (profile === "chat_first") {
+      this.plugin.settings.enableStreaming = true;
+      this.plugin.settings.streamWritebackMode = "off";
+      this.plugin.settings.autoTitleOnWrite = false;
+    } else {
+      this.plugin.settings.enableStreaming = true;
+      this.plugin.settings.streamWritebackMode =
+        "all_current_note_content_writes";
+    }
+
+    const autonomy = this.plugin.settings.autonomyProfile ?? "automatic";
+    if (
+      (autonomy === "automatic" && profile !== "active_or_new_note") ||
+      (autonomy === "conservative" && profile !== "chat_first")
+    ) {
+      this.plugin.settings.autonomyProfile = "custom";
+    }
+
+    await this.plugin.saveSettings();
+    this.display();
   }
 
   private addSemanticChunkNumberField(
@@ -709,7 +1661,156 @@ export class AgentSettingTab extends PluginSettingTab {
       await this.plugin.saveSettings();
     });
   }
+
+  /** Advisory-only dependency status for Settings (does not block runs). */
+  private renderDependencyPreflight(containerEl: HTMLElement): void {
+    const rows = buildSettingsDependencyRows(this.plugin.settings);
+    const preflight = runDependencyPreflight(rows);
+
+    containerEl.createEl("h4", { text: "Dependency preflight" });
+    containerEl.createEl("p", {
+      text: `Advisory only (status: ${preflight.status}). Missing keys or embeddings degrade capabilities; they do not block opening Settings.`,
+      cls: "setting-item-description",
+    });
+
+    for (const row of preflight.rows) {
+      new Setting(containerEl)
+        .setName(formatDependencyRowName(row))
+        .setDesc(`${row.summary} — ${row.nextAction}`);
+    }
+  }
 }
+
+type CapabilityUiStatus =
+  | "Ready"
+  | "Degraded"
+  | "Needs setup"
+  | "Approval required";
+
+function buildCapabilityStatusRows(
+  plugin: AgenticResearcherPlugin,
+): Array<{ name: string; status: CapabilityUiStatus; detail: string }> {
+  const settings = plugin.settings;
+  const output = settings.outputProfile ?? "active_or_new_note";
+  const vaultStatus: CapabilityUiStatus =
+    output === "chat_first"
+      ? "Ready"
+      : settings.enableStreaming === false ||
+          settings.streamWritebackMode === "off"
+        ? "Degraded"
+        : "Ready";
+  const vaultDetail =
+    output === "active_or_new_note"
+      ? "Smart note output (active or new) with stream/title policy."
+      : output === "active_note_only"
+        ? "Active note only; falls back to chat when no Markdown note is open."
+        : "Chat-first default; explicit note writes still work.";
+
+  let semanticStatus: CapabilityUiStatus = "Needs setup";
+  let semanticDetail = "Semantic search is disabled.";
+  if (settings.semanticSearchEnabled) {
+    if (!settings.semanticEmbeddingModel?.trim()) {
+      semanticStatus = "Degraded";
+      semanticDetail = "Enabled but no embedding model is set.";
+    } else {
+      semanticStatus = "Ready";
+      semanticDetail = `Model ${settings.semanticEmbeddingModel}; index ${settings.semanticIndexEnabled ? "on" : "off"}.`;
+    }
+  }
+
+  let browserStatus: CapabilityUiStatus = "Needs setup";
+  let browserDetail = "Browser tools are off.";
+  if (settings.browserToolsEnabled) {
+    browserStatus = "Approval required";
+    browserDetail =
+      "Companion tools enabled; click/type/submit remain SafetyPolicy gated.";
+  }
+
+  const overnightOn = settings.overnightRunsEnabled !== false;
+  const longRunStatus: CapabilityUiStatus = overnightOn ? "Ready" : "Needs setup";
+  const longRunDetail = overnightOn
+    ? `Overnight on (${settings.overnightRunHours ?? 10}h); auto-resume ${settings.autoResumeOvernightRuns !== false ? "on" : "off"}.`
+    : "Overnight research is disabled.";
+
+  const orchestratorOn = settings.orchestratorEnabled !== false;
+  const orchestratorStatus: CapabilityUiStatus = orchestratorOn
+    ? "Ready"
+    : "Needs setup";
+  const orchestratorDetail = orchestratorOn
+    ? "Lead + Worker routing available for eligible missions."
+    : "Orchestrator is off; missions stay single-agent.";
+
+  let linearStatus: CapabilityUiStatus = "Needs setup";
+  let linearDetail = "Linear is disabled or missing a key.";
+  if (settings.linearEnabled === true) {
+    if (!plugin.hasLinearApiKey()) {
+      linearStatus = "Needs setup";
+      linearDetail = "Enabled but no API key is configured.";
+    } else if (settings.linearQueueEnabled === true) {
+      const grant = plugin.getLinearQueueGrantStatus();
+      if (!grant.active) {
+        linearStatus = "Approval required";
+        linearDetail =
+          "Queue enabled; authorize a bounded four-hour grant to execute.";
+      } else {
+        linearStatus = "Ready";
+        linearDetail = `Queue authority active until ${grant.expiresAt}.`;
+      }
+    } else if ((settings.linearCapabilityGate ?? 0) < 5) {
+      linearStatus = "Degraded";
+      linearDetail = `Key present; capability gate ${settings.linearCapabilityGate ?? 0}/5.`;
+    } else {
+      linearStatus = "Ready";
+      linearDetail = "Connected; automatic queue is off.";
+    }
+  }
+
+  const schedules = settings.scheduledMissions ?? [];
+  const enabledSchedules = schedules.filter((mission) => mission.enabled);
+  const scheduleStatus: CapabilityUiStatus =
+    enabledSchedules.length > 0 ? "Ready" : "Needs setup";
+  const scheduleDetail =
+    enabledSchedules.length > 0
+      ? `${enabledSchedules.length} enabled schedule(s).`
+      : schedules.length > 0
+        ? `${schedules.length} schedule(s) configured but none enabled.`
+        : "No scheduled missions configured.";
+
+  return [
+    {
+      name: "Vault / note output",
+      status: vaultStatus,
+      detail: vaultDetail,
+    },
+    {
+      name: "Semantic retrieval",
+      status: semanticStatus,
+      detail: semanticDetail,
+    },
+    {
+      name: "Browser companion",
+      status: browserStatus,
+      detail: browserDetail,
+    },
+    {
+      name: "Long-run / overnight",
+      status: longRunStatus,
+      detail: longRunDetail,
+    },
+    {
+      name: "Orchestrator",
+      status: orchestratorStatus,
+      detail: orchestratorDetail,
+    },
+    { name: "Linear", status: linearStatus, detail: linearDetail },
+    {
+      name: "Scheduled missions",
+      status: scheduleStatus,
+      detail: scheduleDetail,
+    },
+  ];
+}
+
 
 function isThinkingMode(value: string): value is ThinkingMode {
   return (
@@ -719,6 +1820,14 @@ function isThinkingMode(value: string): value is ThinkingMode {
     value === "medium" ||
     value === "high" ||
     value === "max"
+  );
+}
+
+function isOutputProfile(value: string): value is OutputProfile {
+  return (
+    value === "active_or_new_note" ||
+    value === "active_note_only" ||
+    value === "chat_first"
   );
 }
 
@@ -774,6 +1883,18 @@ function parseOptionalInteger(
   return parsed === null ? null : Math.trunc(parsed);
 }
 
+function parseScheduledMissionsJson(value: string): ScheduledMission[] | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return [];
+  }
+  try {
+    return normalizeScheduledMissions(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
+}
+
 function normalizeVaultFolderSetting(value: string, fallback: string): string {
   const trimmed = value.trim().replace(/\/+$/, "");
   if (!trimmed) {
@@ -794,6 +1915,63 @@ function normalizeVaultFolderSetting(value: string, fallback: string): string {
   }
 
   return trimmed;
+}
+
+function buildSettingsDependencyRows(
+  settings: AgentSettings,
+): MissionDependencyStatus[] {
+  const checkedAt = new Date().toISOString();
+  const provider = settings.modelProvider ?? "ollama";
+  const baseUrl =
+    provider === "openai_compatible"
+      ? settings.openAiCompatibleBaseUrl
+      : settings.ollamaBaseUrl;
+  const providerMissingKey =
+    provider === "openai_compatible"
+      ? !settings.openAiCompatibleApiKey?.trim()
+      : /ollama\.com/i.test(baseUrl) && !settings.ollamaApiKey?.trim();
+  const embeddingDegraded =
+    settings.semanticSearchEnabled === true &&
+    !settings.semanticEmbeddingModel?.trim();
+
+  return [
+    {
+      category: "provider_auth",
+      status: providerMissingKey ? "degraded" : "ok",
+      capability: "model requests",
+      summary: providerMissingKey
+        ? `${provider} API key looks missing for the configured endpoint.`
+        : `${provider} credentials look configured.`,
+      nextAction: providerMissingKey
+        ? "Add the provider API key above if cloud models fail."
+        : "No action needed.",
+      checkedAt,
+    },
+    {
+      category: "semantic_retrieval",
+      status: embeddingDegraded ? "degraded" : "ok",
+      capability: "semantic search / embeddings",
+      summary: embeddingDegraded
+        ? "Semantic search is enabled but no embedding model is set."
+        : settings.semanticSearchEnabled
+          ? `Embedding model: ${settings.semanticEmbeddingModel}.`
+          : "Semantic search is disabled.",
+      nextAction: embeddingDegraded
+        ? "Set a semantic embedding model or disable semantic search."
+        : "No action needed.",
+      checkedAt,
+    },
+  ];
+}
+
+function formatDependencyRowName(row: MissionDependencyStatus): string {
+  const label =
+    row.category === "provider_auth"
+      ? "API key"
+      : row.category === "semantic_retrieval"
+        ? "Embedding"
+        : row.category;
+  return `${label}: ${row.status}`;
 }
 
 function normalizeCompanionBaseUrl(value: string): string | null {

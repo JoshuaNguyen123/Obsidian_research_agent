@@ -6,6 +6,11 @@ dist/
 .cache/
 *.tsbuildinfo
 
+# Python/runtime caches at any depth
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+
 # Logs
 npm-debug.log*
 yarn-debug.log*
@@ -48,9 +53,11 @@ skills/
 companion/.venv/
 companion/__pycache__/
 companion/**/__pycache__/
-*.pyc
 companion/.pytest_cache/
 companion/data/*
 !companion/data/.gitkeep
 !companion/data/README.md
 companion/test-results/
+
+# Local project documentation (kept on disk, not published to GitHub)
+docs/

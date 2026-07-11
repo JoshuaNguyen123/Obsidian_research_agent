@@ -5,9 +5,12 @@ import {
   resolveThinkingMode,
   runAgentMission,
   sanitizeAssistantContent,
+  buildStreamingWritebackPromptForTests,
+  type AgentRunCompleteEvent,
   type AgentRunConfigEvent,
   type AgentRunMetricEvent,
   type AgentRunReceipt,
+  type AgentTraceEvent,
 } from "../src/AgentRunner";
 import { ModelClientError } from "../src/model/types";
 import type {
@@ -33,6 +36,19 @@ import {
   MAX_INITIAL_CURRENT_NOTE_CHARS,
 } from "../src/tools/constants";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
+import {
+  ApprovalBroker,
+  type ApprovalRequest,
+} from "../src/agent/approvalBroker";
+import { __setCodeToolsDesktopAppForTests } from "../src/tools/codeTools";
+import { extractEvidencePassages } from "../src/agent/researchDossier";
+import {
+  withPreparedActionFingerprint,
+  type ToolDescriptor,
+} from "../src/agent/actions";
+import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
+import type { AgentTool } from "../src/tools/types";
+import { parseMissionRuntimeSnapshotFromMarkdown } from "../src/agent/runStore";
 
 test("observes the current note before the first model planning step", async () => {
   const chatRequests: ModelChatRequest[] = [];
@@ -208,12 +224,20 @@ test("tool-loop turns use chat only and emit direct final answer without synthes
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "WW2 causes" }),
       () => responseWithToolCall("web_search", { query: "WW2 battles" }),
-      () => responseWithContent("Final WW2 answer", "thinking from final"),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/source",
+        }),
+      () =>
+        responseWithContent(
+          "Final WW2 answer. Source: https://example.com/source",
+          "thinking from final",
+        ),
     ],
   });
 
   await runAgentMission({
-    prompt: "Search the web and give me an in depth analysis of WW2.",
+    prompt: "Search the web and give me a short overview of WW2.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
@@ -224,11 +248,11 @@ test("tool-loop turns use chat only and emit direct final answer without synthes
     },
   });
 
-  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests.length, 4);
   assert.equal(streamRequests.length, 0);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search", "web_search"],
+    ["web_search", "web_search", "web_fetch"],
   );
   assert.deepEqual(
     executedCalls
@@ -236,7 +260,9 @@ test("tool-loop turns use chat only and emit direct final answer without synthes
       .map((call) => call.arguments.query),
     ["WW2 causes", "WW2 battles"],
   );
-  assert.deepEqual(deltas, ["Final WW2 answer"]);
+  assert.deepEqual(deltas, [
+    "Final WW2 answer. Source: https://example.com/source",
+  ]);
   assert.deepEqual(thinkingDeltas, ["thinking from final"]);
 });
 
@@ -285,6 +311,36 @@ test("assistant JSON tool blocks are recovered and executed as tool calls", asyn
     statuses.some((message) =>
       message.includes("Recovered text tool request: list_current_folder"),
     ),
+  );
+});
+
+test("assistant compact tool JSON recovers tool field and top-level arguments", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithContent(
+          '{"tool":"rename_current_file","title":"History Snapshot"}',
+        ),
+      () => responseWithContent("Renamed."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "No, you need to target Untitled and then change that.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {},
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => [call.name, call.arguments.title]),
+    [["read_current_file", undefined], ["rename_current_file", "History Snapshot"]],
   );
 });
 
@@ -488,6 +544,336 @@ test("static essay prompts stream to chat and append to the current note", async
   assert.ok(statuses.includes("Streaming writeback to note..."));
 });
 
+test("plain Q&A defaults to streamed current-note writeback when an active note exists", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const finalDeltas: string[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const vault = createRunnerVaultContext({
+    prompt: "What is 2+2?",
+    content: "# Scratch\n\n",
+  });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["2+2 equals ", "4."]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "What is 2+2?",
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.equal(vault.content.get("Current.md"), "# Scratch\n\n2+2 equals 4.");
+  assert.equal(finalDeltas.join(""), "2+2 equals 4.");
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].operation, "append");
+  assert.equal((receipts[0].output as { streamed?: boolean }).streamed, true);
+  assert.equal(configs[0].writebackMode, "streaming_current_note");
+  assert.equal(configs[0].chatOnlyOverride, false);
+});
+
+test("prompt-level chat-only wording leaves the active note unchanged", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const assistantDeltas: string[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const original = "Original note";
+  const prompt = "What is 2+2? Answer in chat only; do not write to the note.";
+  const vault = createRunnerVaultContext({ prompt, content: original });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["In chat only: 2+2 equals 4."]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.deepEqual(assistantDeltas, ["In chat only: 2+2 equals 4."]);
+  assert.equal(vault.content.get("Current.md"), original);
+  assert.equal(receipts.length, 0);
+  assert.equal(configs[0].writebackMode, "off");
+  assert.equal(configs[0].chatOnlyOverride, false);
+});
+
+test("forceChatOnly leaves the active note unchanged without mutating the prompt", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const original = "Original note";
+  const prompt = "What is 2+2?";
+  const vault = createRunnerVaultContext({ prompt, content: original });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["2+2 equals 4."]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    forceChatOnly: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.equal(streamRequests[0].messages.at(-1)?.content, prompt);
+  assert.equal(vault.content.get("Current.md"), original);
+  assert.equal(receipts.length, 0);
+  assert.equal(configs[0].writebackMode, "off");
+  assert.equal(configs[0].chatOnlyOverride, true);
+});
+
+test("vault folder synthesis defaults to streamed note writeback after reads", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const prompt = "Synthesize what the notes in the Other folder say.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Synthesis\n\n",
+  });
+  vault.folders.add("Other");
+  vault.content.set("Other/alpha.md", "The Other folder mentions quasarflux.");
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["Other notes mention quasarflux."]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["inspect_vault_context"],
+  );
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.equal(vault.content.get("Current.md"), "# Synthesis\n\nOther notes mention quasarflux.");
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].operation, "append");
+  assert.equal(configs.at(-1)?.writebackMode, "streaming_current_note");
+  assert.equal(configs.at(-1)?.route, "prefetched_vault_writeback");
+});
+
+test("plain Q&A creates a new note when no active markdown note exists", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const assistantDeltas: string[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const vault = createRunnerVaultContext({
+    prompt: "What is 2+2?",
+    content: "",
+  });
+  // No active markdown note — force autonomous create path.
+  (vault.context.app.workspace as { getActiveFile: () => null }).getActiveFile =
+    () => null;
+  vault.context.getCurrentMarkdownFile = () => null;
+  (vault.context.app as { fileManager?: unknown }).fileManager = {
+    getNewFileParent: () => ({ path: "" }),
+    renameFile: async (
+      file: { path: string; basename?: string },
+      newPath: string,
+    ) => {
+      await vault.context.app.vault.rename(file as never, newPath);
+    },
+  };
+  vault.context.settings = createRunnerSettings({
+    outputProfile: "active_or_new_note",
+    autonomyProfile: "automatic",
+  });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["# Answer\n\n2+2 equals 4."]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "What is 2+2?",
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.ok(assistantDeltas.join("").includes("2+2 equals 4."));
+  assert.ok(receipts.length >= 1);
+  const planEvent = configs.find((event) => event.noteOutputPlan);
+  assert.equal(planEvent?.noteOutputPlan?.destination, "new_note");
+  assert.ok(
+    [...vault.content.keys()].some(
+      (path) =>
+        path.endsWith(".md") &&
+        !path.startsWith("Agent Runs/") &&
+        (path.includes("Untitled") || path.includes("Answer")),
+    ),
+  );
+});
+
+test("plain Q&A falls back to chat when output profile is chat_first and no note is active", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const assistantDeltas: string[] = [];
+  const receipts: AgentRunReceipt[] = [];
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () => responseWithContentDeltas(["2+2 equals 4."]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "What is 2+2?",
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: {
+      app: {
+        workspace: {
+          getActiveFile: () => null,
+        },
+        vault: {},
+      } as never,
+      settings: createRunnerSettings({
+        outputProfile: "chat_first",
+        streamWritebackMode: "off",
+      }),
+      originalPrompt: "What is 2+2?",
+      httpTransport: async () => ({
+        status: 500,
+        headers: {},
+        json: { error: "not mocked" },
+      }),
+    },
+    enableStreaming: true,
+    events: {
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 1);
+  assert.deepEqual(assistantDeltas, ["2+2 equals 4."]);
+  assert.equal(receipts.length, 0);
+});
+
+test("artifact path destructive code and browser prompts are not coerced into current-note append", async () => {
+  const cases = [
+    "Create a design canvas for onboarding.",
+    "Create a note at Projects/Test.md with hello.",
+    "Delete the current note.",
+    "Run this JavaScript code: console.log(1).",
+    "Open the browser and inspect https://example.com.",
+  ];
+
+  for (const prompt of cases) {
+    const chatRequests: ModelChatRequest[] = [];
+    const streamRequests: ModelChatRequest[] = [];
+    const receipts: AgentRunReceipt[] = [];
+    const configs: AgentRunConfigEvent[] = [];
+    const original = "Original note";
+    const vault = createRunnerVaultContext({ prompt, content: original });
+    vault.context.settings = createRunnerSettings({
+      browserToolsEnabled: true,
+    });
+    const client = createClient({
+      chatRequests,
+      streamRequests,
+      chatResponders: Array.from(
+        { length: MAX_AGENT_STEPS },
+        () => () => responseWithContent("Handled in chat/tool routing."),
+      ),
+    });
+
+    await runAgentMission({
+      prompt,
+      modelClient: client,
+      toolRegistry: createDefaultToolRegistry(),
+      toolContext: vault.context,
+      enableStreaming: true,
+      events: {
+        onReceipt: (receipt) => receipts.push(receipt),
+        onRunConfig: (event) => configs.push(event),
+      },
+    });
+
+    assert.equal(vault.content.get("Current.md"), original, prompt);
+    assert.equal(streamRequests.length, 0, prompt);
+    assert.equal(receipts.length, 0, prompt);
+    assert.notEqual(configs[0].writebackMode, "streaming_current_note", prompt);
+  }
+});
+
 test("word-target generation writeback performs one internal correction pass", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
@@ -636,6 +1022,36 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
     prompt: "Read the prompt on the page",
     content: notePrompt,
   });
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "The Grapes of Wrath source",
+              url: "https://example.com/grapes-of-wrath",
+              snippet: "Steinbeck and the Joad family during the Depression.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "The Grapes of Wrath source",
+          content:
+            "Steinbeck's novel follows the Joad family under Depression-era pressure.",
+          links: [],
+        },
+      };
+    }
+    return { status: 404, headers: {}, json: { error: "not mocked" } };
+  };
 
   const client = createClient({
     chatRequests,
@@ -645,14 +1061,21 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
         responseWithToolCall("web_search", {
           query: "The Grapes of Wrath Steinbeck sources",
         }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/grapes-of-wrath",
+        }),
       () => responseWithContent("Ready to write the cited essay."),
     ],
     streamResponders: [
-      () =>
-        responseWithContentDeltas([
+      (request) => {
+        const passageId = getPassageCitationIds(request)[0];
+        assert.ok(passageId, "streamed writeback must receive a fetched passage id");
+        return responseWithContentDeltas([
           "Steinbeck's novel follows the Joad family under Depression-era pressure. ",
-          "Source: https://example.com/grapes-of-wrath",
-        ]),
+          `Source: https://example.com/grapes-of-wrath Passage evidence: [${passageId}]`,
+        ]);
+      },
     ],
   });
 
@@ -667,7 +1090,7 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 1);
   const firstStepToolNames =
     chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
@@ -689,7 +1112,7 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
   );
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "web_search"],
+    ["read_current_file", "web_search", "web_fetch"],
   );
   assert.equal(
     executedCalls.filter((call) => call.name === "read_current_file").length,
@@ -703,7 +1126,7 @@ test("prompt-on-page citation prompts use tools before streamed writeback", asyn
   );
   assert.equal(
     vault.content.get("Current.md"),
-    `${notePrompt}\nSteinbeck's novel follows the Joad family under Depression-era pressure. Source: https://example.com/grapes-of-wrath`,
+    `${notePrompt}\nSteinbeck's novel follows the Joad family under Depression-era pressure. Source: https://example.com/grapes-of-wrath Passage evidence: [${getPassageCitationIds(streamRequests[0])[0]}]`,
   );
 });
 
@@ -1365,6 +1788,11 @@ test("template prompts expose template tools without generic file creation", asy
       absent: ["seed_default_templates", "create_file", "append_to_current_file"],
     },
     {
+      prompt: "Create a research pack with a brief, sources index, and synthesis.",
+      expected: ["create_research_pack"],
+      absent: ["create_file", "fill_template", "append_to_current_file"],
+    },
+    {
       prompt: "Write a 500 word essay about coral reefs.",
       expected: [],
       absent: [
@@ -1606,6 +2034,65 @@ test("design prompts expose and require native artifact write tools", async () =
     assert.ok(statuses.includes(scenario.expectedStatus), scenario.prompt);
     assert.deepEqual(receipts, [scenario.expectedReceipt]);
   }
+});
+
+test("diagram follow-up after chat answer creates a native canvas artifact", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const receipts: string[] = [];
+  const assistantDeltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("I can describe the diagram in chat."),
+      () => responseWithToolCall("create_design_canvas", {}),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Can you create us the diagram?",
+    conversationHistory: [
+      {
+        role: "assistant",
+        content:
+          "Here is Mermaid diagram text for a literary recommendation flowchart.",
+      },
+      {
+        role: "user",
+        content: "Why can't you create the diagram?",
+      },
+    ],
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onReceipt: (receipt) => receipts.push(receipt.message),
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+    },
+  });
+
+  const firstToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("create_design_canvas"));
+  assert.match(
+    chatRequests[1].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: create_design_canvas/,
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["create_design_canvas"],
+  );
+  assert.ok(
+    statuses.includes("Created canvas Designs/Product Flow.canvas with 2 nodes and 1 edges."),
+  );
+  assert.deepEqual(receipts, ["create Designs/Product Flow.canvas"]);
+  assert.deepEqual(assistantDeltas, [
+    "Done. create Designs/Product Flow.canvas.",
+  ]);
 });
 
 test("explicit web and citation prompts expose web_search and web_fetch", async () => {
@@ -1946,6 +2433,8 @@ test("gather-details folder prompts are classified as vault context answers", as
   assert.equal(configs[0].currentNoteContext, false);
   assert.equal(configs[0].route, "prefetched_vault_answer");
   assert.equal(configs[0].slowPathReason, "needs_vault_context");
+  assert.deepEqual(configs[0].allowedToolNames, []);
+  assert.ok(configs[0].routeTraceReasons.includes("prefetchable_vault_folder_answer"));
   assert.equal(
     chatRequests[0].tools,
     undefined,
@@ -1999,6 +2488,43 @@ test("vault traversal fallback stops after one non-tool correction", async () =>
   );
   assert.match(deltas.join(""), /could not get the model to request vault tools/i);
   assert.deepEqual(completions, ["error"]);
+});
+
+test("model planning errors complete as resumable error stops", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const deltas: string[] = [];
+  const completions: string[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => {
+        throw new Error("mock model transport failure");
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Answer a simple question.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => deltas.push(delta),
+      onRunComplete: (event) => completions.push(event.stopReason),
+    },
+  });
+
+  assert.equal(chatRequests.length, 1);
+  assert.deepEqual(completions, ["error"]);
+  assert.ok(
+    statuses.includes("Model step failed: mock model transport failure"),
+  );
+  assert.match(deltas.join(""), /Model step failed: mock model transport failure/);
+  assert.match(deltas.join(""), /run "continue run run-/);
 });
 
 test("graph connection questions expose read-only graph tools", async () => {
@@ -2079,6 +2605,76 @@ test("word count prompts expose count_words without write tools", async () => {
   assert.ok(!toolNames.includes("append_to_current_file"));
   assert.ok(!toolNames.includes("replace_current_file"));
   assert.deepEqual(executedCalls.map((call) => call.name), ["count_words"]);
+});
+
+test("streaming-mode word count stays read-only and accepts a concise numeric answer", async () => {
+  const prompt = "Use the count_words tool to count the words in the current note.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const deltas: string[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note content",
+  });
+  vault.context.settings = createRunnerSettings({
+    streamWritebackMode: "all_current_note_content_writes",
+  });
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("count_words", {}),
+      () => responseWithContent("3"),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onAssistantDelta: (delta) => deltas.push(delta),
+    },
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("count_words"));
+  assert.ok(!toolNames.includes("append_to_current_file"));
+  assert.deepEqual(executedCalls.map((call) => call.name), ["count_words"]);
+  assert.equal(vault.content.get("Current.md"), "Initial note content");
+  assert.equal(deltas.join(""), "3");
+});
+
+test("chat-only note write negation does not require append receipt", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const deltas: string[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("2+2 equals 4. No note write was needed."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "What is 2+2? Answer in chat only; do not write to the note and do not use tools.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onAssistantDelta: (delta) => deltas.push(delta),
+    },
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(!toolNames.includes("append_to_current_file"));
+  assert.ok(!toolNames.includes("replace_current_file"));
+  assert.deepEqual(executedCalls, []);
+  assert.deepEqual(deltas, ["2+2 equals 4. No note write was needed."]);
 });
 
 test("what did you learn about me can traverse untitled notes before answering", async () => {
@@ -2444,6 +3040,7 @@ test("runner emits structured trace events for intent, tools, receipts, metrics,
     "tool_result",
     "receipt",
     "metric",
+    "acceptance",
     "final",
   ]) {
     assert.ok(traceKinds.includes(kind), kind);
@@ -2557,6 +3154,54 @@ test("run config reports browse-only vault routes as vault context", async () =>
   assert.equal(configs[0].slowPathReason, "needs_vault_context");
 });
 
+test("run config reports structured dependency blockers", async () => {
+  const configs: AgentRunConfigEvent[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [() => responseWithContent("Four.")],
+  });
+
+  await runAgentMission({
+    prompt: "What is 2+2?",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {
+      app: {} as never,
+      settings: createRunnerSettings({
+        modelProvider: "openai_compatible",
+        openAiCompatibleApiKey: "",
+        requestTimeoutMs: 1000,
+      }),
+      originalPrompt: "What is 2+2?",
+      httpTransport: async () => ({
+        status: 500,
+        headers: {},
+        json: {},
+      }),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  const dependencyStatus = configs.at(-1)?.dependencyStatus ?? [];
+  const providerAuth = dependencyStatus.find(
+    (item) => item.category === "provider_auth",
+  );
+  const modelTimeout = dependencyStatus.find(
+    (item) => item.category === "model_timeout",
+  );
+  const vaultApi = dependencyStatus.find(
+    (item) => item.category === "obsidian_vault",
+  );
+  assert.equal(providerAuth?.status, "blocked");
+  assert.match(providerAuth?.nextAction ?? "", /API key/i);
+  assert.equal(modelTimeout?.status, "degraded");
+  assert.equal(vaultApi?.status, "blocked");
+});
+
 test("web append prompts expose web and current-note write tools without path CRUD", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
@@ -2594,7 +3239,168 @@ test("web append prompts expose web and current-note write tools without path CR
   );
 });
 
-test("sourced streaming writeback keeps current-note write tools available after web context", async () => {
+test("mixed current-note rename and web research keeps grounded web tools", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("Research remains incomplete."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      'Rename the current note to "Durable Target", then research with deep web sources.',
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {
+      settings: createRunnerSettings({ maxAgentSteps: 1 }),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+    },
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.equal(configs[0]?.route, "grounded_workflow");
+  assert.ok(toolNames.includes("rename_current_file"));
+  assert.ok(toolNames.includes("web_search"));
+  assert.ok(toolNames.includes("web_fetch"));
+});
+
+test("premature current-note append is rejected until required web fetch completes", async () => {
+  const prompt =
+    "Research MCP servers on the web and append a concise summary with citations to this note.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "Initial note",
+  });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          query: "MCP servers",
+          results: [
+            {
+              title: "MCP overview",
+              snippet: "MCP servers expose tools and resources.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "MCP overview",
+          url: "https://example.com/mcp",
+          content:
+            "MCP servers expose tools and resources through a standard protocol.",
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  const allowedAppend =
+    "MCP servers expose tools and resources through a standard protocol. Source: https://example.com/mcp";
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: "PREMATURE APPEND MUST NEVER REACH THE NOTE",
+        }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/mcp",
+        }),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: allowedAppend,
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch", "append_to_current_file"],
+  );
+  assert.equal(
+    executedCalls.filter((call) => call.name === "append_to_current_file")
+      .length,
+    1,
+  );
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].toolName, "append_to_current_file");
+  assert.equal(receipts[0].path, "Current.md");
+  assert.equal(
+    vault.content.get("Current.md"),
+    `Initial note\n${allowedAppend}`,
+  );
+  assert.doesNotMatch(
+    vault.content.get("Current.md") ?? "",
+    /PREMATURE APPEND/,
+  );
+
+  const rejected = traces.find(
+    (event) =>
+      event.kind === "tool_rejected" &&
+      event.toolName === "append_to_current_file" &&
+      event.error?.code === "plan_dependency_violation",
+  );
+  assert.ok(rejected, "the premature append must produce an observable dependency rejection");
+  assert.match(rejected.message, /task-research-web must complete first/);
+
+  const ledgerMarkdown = [...vault.content.entries()]
+    .filter(([path]) => /^Agent Runs\/.+\.md$/u.test(path))
+    .map(([, content]) => content)
+    .find((content) => /## Mission Ledger/u.test(content));
+  assert.ok(ledgerMarkdown, "the run must persist its mission plan");
+  const ledgerJson = /## Mission Ledger\r?\n```json\r?\n([\s\S]*?)\r?\n```/u.exec(
+    ledgerMarkdown,
+  )?.[1];
+  assert.ok(ledgerJson, "the persisted mission ledger JSON must be readable");
+  const ledger = JSON.parse(ledgerJson) as {
+    missionPlan?: {
+      tasks?: Array<{ id?: string; receiptIds?: string[] }>;
+    };
+  };
+  const taskAct = ledger.missionPlan?.tasks?.find(
+    (task) => task.id === "task-act",
+  );
+  assert.ok(taskAct);
+  assert.equal(taskAct.receiptIds?.length, 2);
+  assert.ok(taskAct.receiptIds?.some((id) => id.startsWith("receipt:")));
+});
+
+test("sourced streaming writeback keeps the write tool visible but stages its payload", async () => {
   const prompt =
     "Research MCP servers and append a concise cited summary with source URLs to this note.";
   const chatRequests: ModelChatRequest[] = [];
@@ -2639,7 +3445,14 @@ test("sourced streaming writeback keeps current-note write tools available after
   assert.ok(writeStepToolNames.includes("append_to_current_file"));
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search", "web_fetch", "append_to_current_file"],
+    ["web_search", "web_fetch"],
+  );
+  assert.ok(
+    statuses.some((message) =>
+      /Held append_to_current_file before mutation.*requires final passage verification/i.test(
+        message,
+      ),
+    ),
   );
   assert.ok(
     !statuses.some((message) =>
@@ -2648,6 +3461,7 @@ test("sourced streaming writeback keeps current-note write tools available after
       ),
     ),
   );
+  assert.equal(vault.content.get("Current.md"), "Current note");
 });
 
 test("broad vault mutation without a target removes write tools and records no write receipt", async () => {
@@ -2699,12 +3513,17 @@ test("runner records tool evidence and receipts into the durable mission ledger"
     prompt: "Search the web for MCP sources and cite one source.",
     content: "Initial note",
   });
+  vault.context.settings.researchMemoryEnabled = false;
   const client = createClient({
     chatRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
       () => responseWithToolCall("web_fetch", { url: "https://example.com/mcp" }),
-      () => responseWithContent("Cited answer with https://example.com/mcp"),
+      () => responseWithContent("Draft answer with https://example.com/mcp"),
+      (request) =>
+        responseWithContent(
+          `Cited answer with https://example.com/mcp ${getPassageCitationIds(request)[0] ?? ""}`.trim(),
+        ),
     ],
   });
 
@@ -2779,7 +3598,16 @@ test("tool-planning preambles stay out of streamed final output", async () => {
           { query: "MCP servers" },
           "Hidden tool preamble",
         ),
-      () => responseWithContent("Ready to answer"),
+      () =>
+        responseWithToolCall(
+          "web_fetch",
+          { url: "https://example.com/source" },
+          "Hidden fetch preamble",
+        ),
+      () =>
+        responseWithContent(
+          "Ready to answer. Source: https://example.com/source",
+        ),
     ],
     streamResponders: [
       () => responseWithContent("Final cited answer"),
@@ -2801,20 +3629,30 @@ test("tool-planning preambles stay out of streamed final output", async () => {
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 0);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search"],
+    ["web_search", "web_fetch"],
   );
-  assert.equal(planningDeltas.length, 2);
+  assert.equal(planningDeltas.length, 3);
   assert.ok(planningDeltas.every((delta) => delta.includes("route=grounded_workflow")));
-  assert.ok(planningDeltas.every((delta) => delta.includes("tools=web_search, web_fetch")));
-  assert.deepEqual(finalDeltas, ["Ready to answer"]);
-  assert.deepEqual(assistantDeltas, ["Ready to answer"]);
+  assert.ok(
+    planningDeltas.slice(0, 2).every((delta) =>
+      delta.includes("tools=web_search, web_fetch"),
+    ),
+  );
+  assert.match(planningDeltas[2], /tools=none/);
+  assert.deepEqual(finalDeltas, [
+    "Ready to answer. Source: https://example.com/source",
+  ]);
+  assert.deepEqual(assistantDeltas, [
+    "Ready to answer. Source: https://example.com/source",
+  ]);
   assert.ok(!assistantDeltas.join("").includes("Hidden tool preamble"));
-  assert.deepEqual(toolStarts, ["web_search"]);
-  assert.deepEqual(toolDone, ["web_search:true"]);
+  assert.ok(!assistantDeltas.join("").includes("Hidden fetch preamble"));
+  assert.deepEqual(toolStarts, ["web_search", "web_fetch"]);
+  assert.deepEqual(toolDone, ["web_search:true", "web_fetch:true"]);
 });
 
 test("streamed final answers strip special tokens split across chunks", async () => {
@@ -2829,6 +3667,10 @@ test("streamed final answers strip special tokens split across chunks", async ()
     streamRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/source",
+        }),
       () => responseWithContent(""),
     ],
     streamResponders: [
@@ -2837,7 +3679,7 @@ test("streamed final answers strip special tokens split across chunks", async ()
           "< | begin",
           "_of_sentence | ><|start_header",
           "_id|>assistant<|end_header",
-          "_id|>\n\nMCP servers final answer<|end",
+          "_id|>\n\nMCP servers final answer. Source: https://example.com/source<|end",
           "_of_sentence|>",
         ]),
     ],
@@ -2855,14 +3697,20 @@ test("streamed final answers strip special tokens split across chunks", async ()
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["web_search"],
+    ["web_search", "web_fetch"],
   );
-  assert.equal(finalDeltas.join(""), "assistant\n\nMCP servers final answer");
-  assert.equal(assistantDeltas.join(""), "assistant\n\nMCP servers final answer");
+  assert.equal(
+    finalDeltas.join(""),
+    "assistant\n\nMCP servers final answer. Source: https://example.com/source",
+  );
+  assert.equal(
+    assistantDeltas.join(""),
+    "assistant\n\nMCP servers final answer. Source: https://example.com/source",
+  );
   assert.ok(!finalDeltas.join("").includes("<|"));
   assert.ok(!finalDeltas.join("").includes("< |"));
 });
@@ -2878,7 +3726,14 @@ test("tool-result final prose skips redundant streaming synthesis", async () => 
     streamRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
-      () => responseWithContent("Ready to answer"),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/source",
+        }),
+      () =>
+        responseWithContent(
+          "Ready to answer. Source: https://example.com/source",
+        ),
     ],
     streamResponders: [
       () => responseWithContentDeltas(["Final ", "answer."]),
@@ -2896,9 +3751,15 @@ test("tool-result final prose skips redundant streaming synthesis", async () => 
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 0);
-  assert.deepEqual(finalDeltas, ["Ready to answer"]);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
+  assert.deepEqual(finalDeltas, [
+    "Ready to answer. Source: https://example.com/source",
+  ]);
 });
 
 test("empty direct model content falls back to streamed final answer", async () => {
@@ -2906,19 +3767,24 @@ test("empty direct model content falls back to streamed final answer", async () 
   const streamRequests: ModelChatRequest[] = [];
   const finalDeltas: string[] = [];
   const assistantDeltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
 
   const client = createClient({
     chatRequests,
     streamRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "The Grapes of Wrath" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/grapes-of-wrath",
+        }),
       () => responseWithContent("", "thinking without final prose"),
     ],
     streamResponders: [
       () =>
         responseWithContentDeltas([
           "Grounded Grapes ",
-          "of Wrath final answer.",
+          "of Wrath final answer. Source: https://example.com/grapes-of-wrath",
         ]),
     ],
   });
@@ -2926,7 +3792,7 @@ test("empty direct model content falls back to streamed final answer", async () 
   await runAgentMission({
     prompt: "Search the web for The Grapes of Wrath and summarize what you find.",
     modelClient: client,
-    toolRegistry: createRegistry([]),
+    toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
     enableStreaming: true,
     events: {
@@ -2935,8 +3801,12 @@ test("empty direct model content falls back to streamed final answer", async () 
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 1);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
   assert.equal(streamRequests[0].messages.at(-1)?.role, "user");
   assert.match(
     streamRequests[0].messages.at(-1)?.content ?? "",
@@ -2955,10 +3825,11 @@ test("empty direct model content falls back to streamed final answer", async () 
     ),
     false,
   );
-  assert.deepEqual(finalDeltas, ["Grounded Grapes ", "of Wrath final answer."]);
+  assert.deepEqual(finalDeltas, [
+    "Grounded Grapes of Wrath final answer. Source: https://example.com/grapes-of-wrath",
+  ]);
   assert.deepEqual(assistantDeltas, [
-    "Grounded Grapes ",
-    "of Wrath final answer.",
+    "Grounded Grapes of Wrath final answer. Source: https://example.com/grapes-of-wrath",
   ]);
 });
 
@@ -2974,6 +3845,10 @@ test("off-topic streamed final answer is stopped before display", async () => {
     streamRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "The Grapes of Wrath" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/grapes-of-wrath",
+        }),
       () => responseWithContent("", "thinking without final prose"),
     ],
     streamResponders: [
@@ -3005,7 +3880,7 @@ test("off-topic streamed final answer is stopped before display", async () => {
     /drifted off topic/,
   );
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(finalDeltas, []);
   assert.deepEqual(assistantDeltas, []);
@@ -3027,10 +3902,18 @@ test("empty tool-result final content falls back to streamed synthesis", async (
     streamRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/source",
+        }),
       () => responseWithContent(""),
     ],
     streamResponders: [
-      () => responseWithContentDeltas(["MCP servers ", "fallback answer."]),
+      () =>
+        responseWithContentDeltas([
+          "MCP servers ",
+          "fallback answer. Source: https://example.com/source",
+        ]),
     ],
   });
 
@@ -3045,10 +3928,16 @@ test("empty tool-result final content falls back to streamed synthesis", async (
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 3);
   assert.equal(streamRequests.length, 1);
   assert.equal(streamRequests[0].think, undefined);
-  assert.deepEqual(finalDeltas, ["MCP servers ", "fallback answer."]);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
+  assert.deepEqual(finalDeltas, [
+    "MCP servers fallback answer. Source: https://example.com/source",
+  ]);
 });
 
 test("metrics are emitted for model, tool, stream fallback, and run timing", async () => {
@@ -3062,10 +3951,17 @@ test("metrics are emitted for model, tool, stream fallback, and run timing", asy
     streamRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/source",
+        }),
       () => responseWithContent(""),
     ],
     streamResponders: [
-      () => responseWithContent("MCP servers fallback answer."),
+      () =>
+        responseWithContent(
+          "MCP servers fallback answer. Source: https://example.com/source",
+        ),
     ],
   });
 
@@ -3080,8 +3976,9 @@ test("metrics are emitted for model, tool, stream fallback, and run timing", asy
     },
   });
 
-  assert.equal(metrics.filter((event) => event.kind === "model_chat").length, 2);
+  assert.equal(metrics.filter((event) => event.kind === "model_chat").length, 3);
   assert.equal(metrics.some((event) => event.kind === "tool" && event.name === "web_search"), true);
+  assert.equal(metrics.some((event) => event.kind === "tool" && event.name === "web_fetch"), true);
   assert.equal(metrics.some((event) => event.kind === "model_stream"), true);
   assert.equal(metrics.some((event) => event.kind === "run"), true);
 
@@ -3161,9 +4058,10 @@ test("stream metrics include token counts from the final raw chunk", async () =>
     modelClient: client,
     toolRegistry: createRegistry([]),
     toolContext: {
-      settings: createRunnerSettings(),
+      settings: createRunnerSettings({ outputProfile: "chat_first" }),
     } as ToolExecutionContext,
     enableStreaming: true,
+    forceChatOnly: true,
     events: {
       onMetric: (event) => metrics.push(event),
     },
@@ -3486,9 +4384,201 @@ test("whole-note replace wins over broad content edit wording", async () => {
   assert.ok(statuses.includes("Replaced Current.md; backup saved to .agent-backups/1-Current.md."));
 });
 
-test("retitle prompts expose retitle and suppress accidental append", async () => {
+test("visible title prompts expose rename_current_file and suppress accidental append", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("rename_current_file", {
+          title: "Native Obsidian Agentic Research",
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Rename the current note to Native Obsidian Agentic Research, then confirm the visible title.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("rename_current_file"));
+  assert.ok(!toolNames.includes("move_path"));
+  assert.ok(!toolNames.includes("retitle_current_file"));
+  assert.ok(!toolNames.includes("append_to_current_file"));
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file", "rename_current_file"],
+  );
+  assert.ok(statuses.includes("Renaming current note file..."));
+  assert.ok(statuses.includes("Renamed current note from Current.md to Renamed.md."));
+});
+
+test("compound long research continues after its current-note rename receipt", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("rename_current_file", {
+          title: "Durable Research Target",
+        }),
+      () =>
+        responseWithToolCall("get_note_graph_context", {
+          path: "Research Context 1.md",
+        }),
+      () =>
+        responseWithToolCall("get_note_graph_context", {
+          path: "Research Context 2.md",
+        }),
+      ...Array.from({ length: 4 }, () => () =>
+        responseWithContent(
+          "Research remains incomplete; continue gathering evidence.",
+        ),
+      ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Perform long-running research. Rename the current note to Durable Research Target, then inspect the current note graph until the segment budget requires continuation.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {
+      settings: createRunnerSettings({ maxAgentSteps: 7 }),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {},
+  });
+
+  const executedNames = executedCalls.map((call) => call.name);
+  assert.deepEqual(executedNames.slice(0, 3), [
+    "read_current_file",
+    "rename_current_file",
+    "get_note_graph_context",
+  ]);
+  assert.ok(chatRequests.length > 1);
+});
+
+test("current-note rename before long research does not require generic move_path", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("rename_current_file", {
+          title: "Long Research Target",
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      'Perform long-running research for E2E_AUTO_SEGMENT_CONTINUATION. Rename the current note to "Long Research Target", then inspect the current note graph and keep reading graph context until the segment budget requires durable continuation.',
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {},
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("rename_current_file"));
+  assert.ok(!toolNames.includes("move_path"));
+});
+
+test("titled generated writing uses append without requiring rename tool", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const vault = createRunnerVaultContext({
+    prompt: "Create a 50 word piece of text with the title Purple Horizon on this page.",
+    path: "Untitled.md",
+    content: "",
+    streamWritebackMode: "off",
+  });
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: "# Purple Horizon\n\nPurple Horizon body text.",
+        }),
+      () => responseWithContent("Done."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Create a 50 word piece of text with the title Purple Horizon on this page.",
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {},
+  });
+
+  const firstToolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("append_to_current_file"));
+  assert.ok(!firstToolNames.includes("rename_current_file"));
+  assert.ok(!firstToolNames.includes("retitle_current_file"));
+  assert.ok(
+    executedCalls.some((call) => call.name === "append_to_current_file"),
+  );
+  assert.ok(
+    !executedCalls.some((call) => call.name === "rename_current_file"),
+  );
+});
+
+test("explicit rename prompts still expose rename_current_file", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const vault = createRunnerVaultContext({
+    prompt: "Rename the current note to Purple Horizon.",
+    path: "Untitled.md",
+    content: "",
+    streamWritebackMode: "off",
+  });
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("rename_current_file", {
+          title: "Purple Horizon",
+        }),
+      () => responseWithContent("Renamed."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Rename the current note to Purple Horizon.",
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {},
+  });
+
+  const firstToolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("rename_current_file"));
+  assert.ok(!firstToolNames.includes("retitle_current_file"));
+});
+
+test("explicit H1 title prompts keep retitle_current_file", async () => {
+  const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
 
   const client = createClient({
@@ -3502,25 +4592,86 @@ test("retitle prompts expose retitle and suppress accidental append", async () =
   });
 
   await runAgentMission({
-    prompt: "Update this note title around native Obsidian agentic research.",
+    prompt: "Change the H1 heading title in this note around native Obsidian agentic research.",
     modelClient: client,
     toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
     enableStreaming: false,
-    events: {
-      onStatus: (message) => statuses.push(message),
-    },
+    events: {},
   });
 
   const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
   assert.ok(toolNames.includes("retitle_current_file"));
-  assert.ok(!toolNames.includes("append_to_current_file"));
+  assert.ok(!toolNames.includes("rename_current_file"));
   assert.deepEqual(
     executedCalls.map((call) => call.name),
     ["read_current_file", "retitle_current_file"],
   );
-  assert.ok(statuses.includes("Retitling current note..."));
-  assert.ok(statuses.includes("Updated note title in Current.md."));
+});
+
+test("highlight prompts expose highlight_current_file_phrase without replacement tools", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("highlight_current_file_phrase", {
+          phrase: "silver lantern",
+        }),
+      () => responseWithContent("Highlighted silver lantern."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Find and highlight silver lantern in the current note.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {},
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("highlight_current_file_phrase"));
+  assert.ok(!toolNames.includes("replace_current_file"));
+  assert.ok(!toolNames.includes("append_to_current_file"));
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["highlight_current_file_phrase"],
+  );
+});
+
+test("restore prompts expose restore_current_file_from_backup without append or replace tools", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("restore_current_file_from_backup", {}),
+      () => responseWithContent("Restored from backup."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Undo the last agent edit in the current note from backup.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {},
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("restore_current_file_from_backup"));
+  assert.ok(!toolNames.includes("append_to_current_file"));
+  assert.ok(!toolNames.includes("replace_current_file"));
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["restore_current_file_from_backup"],
+  );
 });
 
 test("edit prompts expose section edit and suppress other mutation tools", async () => {
@@ -3646,7 +4797,7 @@ test("budget stop uses adaptive web budget and does not synthesize", async () =>
   });
 
   assert.ok(chatRequests.length < MAX_AGENT_STEPS);
-  assert.equal(chatRequests.length, 9);
+  assert.equal(chatRequests.length, 5);
   assert.equal(streamRequests.length, 0);
   assert.equal(
     executedCalls.filter((call) => call.name === "web_search").length,
@@ -3699,7 +4850,7 @@ test("configured max agent steps caps grounded research loops", async () => {
   assert.equal(chatRequests[0].think, "medium");
   assert.equal(
     executedCalls.filter((call) => call.name === "web_search").length,
-    1,
+    2,
   );
   assert.ok(statuses.includes("Stopped at safety limit. Review partial results."));
 });
@@ -3826,13 +4977,15 @@ test("web research can search then fetch a source before answering", async () =>
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const deltas: string[] = [];
-
   const client = createClient({
     chatRequests,
     chatResponders: [
       () => responseWithToolCall("web_search", { query: "MCP servers" }),
       () => responseWithToolCall("web_fetch", { url: "https://example.com/mcp" }),
-      () => responseWithContent("Cited answer with https://example.com/mcp"),
+      (request) =>
+        responseWithContent(
+          `Cited answer with https://example.com/mcp ${getPassageCitationIds(request)[0] ?? ""}`.trim(),
+        ),
     ],
   });
 
@@ -3855,7 +5008,9 @@ test("web research can search then fetch a source before answering", async () =>
     executedCalls.map((call) => call.name),
     ["web_search", "web_fetch"],
   );
-  assert.deepEqual(deltas, ["Cited answer with https://example.com/mcp"]);
+  assert.equal(deltas.length, 1);
+  assert.match(deltas[0], /Cited answer with https:\/\/example\.com\/mcp/);
+  assert.match(deltas[0], /source:[a-z0-9]+:passage:\d+-\d+/i);
 });
 
 test("low-cap sourced generated essay finalizes with note writeback", async () => {
@@ -3864,6 +5019,8 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
   const executedCalls: ModelToolCall[] = [];
   const statuses: string[] = [];
   const finalDeltas: string[] = [];
+  const grapesEvidenceText =
+    'The Grapes of Wrath source says Steinbeck frames "solidarity through the Joad family" as quoted textual pressure.';
   const vault = createRunnerVaultContext({
     prompt:
       "Write me a 1000 word essay on Grapes of Wrath. Use text level quotation and citations.",
@@ -3873,10 +5030,38 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
     maxAgentSteps: 5,
     streamWritebackMode: "all_current_note_content_writes",
   });
-  const essayDraft = [
-    "The Grapes of Wrath argues for solidarity with cited textual evidence.",
-    ...Array.from({ length: 920 }, (_, index) => `solidarity${index}`),
-  ].join(" ");
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "Grapes source",
+              url: "https://example.com/grapes",
+              snippet: "Steinbeck quotation context.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "Grapes source",
+          url: "https://example.com/grapes",
+          content: grapesEvidenceText,
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+  const essayDraft = grapesEvidenceText;
+  let verifiedEssayDraft = "";
 
   const client = createClient({
     chatRequests,
@@ -3893,7 +5078,15 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
       () => responseWithContent("Ready to write the sourced essay."),
     ],
     streamResponders: [
-      () => responseWithContentDeltas([essayDraft]),
+      (request) => {
+        const passageId = getPassageCitationIds(request)[0];
+        const citedSentence =
+          `${essayDraft} Source: https://example.com/grapes Evidence: ${passageId ?? ""}`.trim();
+        verifiedEssayDraft = Array.from({ length: 40 }, () => citedSentence).join(
+          " ",
+        );
+        return responseWithContentDeltas([verifiedEssayDraft]);
+      },
     ],
   });
 
@@ -3901,7 +5094,7 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
     prompt:
       "Write me a 1000 word essay on Grapes of Wrath. Use text level quotation and citations.",
     modelClient: client,
-    toolRegistry: createRegistry(executedCalls),
+    toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
     events: {
@@ -3922,10 +5115,10 @@ test("low-cap sourced generated essay finalizes with note writeback", async () =
     ),
   );
   assert.ok(!statuses.includes("Stopped at safety limit. Review partial results."));
-  assert.deepEqual(finalDeltas, [essayDraft]);
+  assert.deepEqual(finalDeltas, [verifiedEssayDraft]);
   assert.equal(
     vault.content.get("Current.md"),
-    `Essay prompt\n${essayDraft}`,
+    `Essay prompt\n${verifiedEssayDraft}`,
   );
 });
 
@@ -3934,6 +5127,8 @@ test("explicit stream-to-page essay uses live writeback instead of append tool",
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const receipts: AgentRunReceipt[] = [];
+  const statuses: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
   const prompt =
     "Write me a 1000 word essay on grapes of wrath and stream it to the page.";
   const vault = createRunnerVaultContext({
@@ -3966,6 +5161,8 @@ test("explicit stream-to-page essay uses live writeback instead of append tool",
     enableStreaming: true,
     events: {
       onReceipt: (receipt) => receipts.push(receipt),
+      onStatus: (message) => statuses.push(message),
+      onRunComplete: (event) => completions.push(event),
     },
   });
 
@@ -3982,6 +5179,231 @@ test("explicit stream-to-page essay uses live writeback instead of append tool",
     (note.match(/^# The Harvest of Injustice: Grapes of Wrath/gm) ?? []).length,
     1,
   );
+  assert.equal(
+    completions.at(-1)?.stopReason,
+    "write_completed",
+    statuses.join("\n"),
+  );
+  assert.ok(!statuses.includes("Stopped at safety limit. Review partial results."));
+  assert.ok(!statuses.some((message) => /Completion held for verification/.test(message)));
+});
+
+test("streaming writeback prompt includes Grok title output contract", () => {
+  const prompt = buildStreamingWritebackPromptForTests("append", {
+    missionPrompt: "Write Hello World in TypeScript on this page.",
+    activeBasename: "Untitled 1",
+  });
+  assert.match(prompt, /OUTPUT CONTRACT/);
+  assert.match(prompt, /PLUGIN BEHAVIOR/);
+  assert.match(prompt, /ACTIVE NOTE: Untitled 1/);
+  assert.match(prompt, /# Hello World in TypeScript/);
+  assert.match(prompt, /Do not call rename_current_file/);
+  assert.match(prompt, /plugin renames the file from your leading H1/);
+
+  const retryPrompt = buildStreamingWritebackPromptForTests("append", {
+    retry: true,
+    activeBasename: "Untitled",
+  });
+  assert.match(retryPrompt, /First character must be #/);
+
+  const namedPrompt = buildStreamingWritebackPromptForTests("append", {
+    activeBasename: "Existing Note",
+  });
+  assert.match(namedPrompt, /Do not rename the file; the note already has a real title/);
+});
+
+test("streamed append onto Untitled 1 auto-renames visible title from leading H1", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const statuses: string[] = [];
+  const prompt =
+    "Write Hello World in TypeScript on this page and stream it to the note.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    path: "Untitled 1.md",
+    content: "",
+  });
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# Hello World in TypeScript\n\n",
+          '```ts\nconsole.log("Hello, world!");\n```\n',
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry([]),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(streamRequests.length, 1);
+  assert.match(
+    streamRequests[0].messages.at(-1)?.content ?? "",
+    /OUTPUT CONTRACT/,
+  );
+  assert.ok(
+    receipts.some((receipt) => receipt.toolName === "append_to_current_file"),
+  );
+  const renameReceipt = receipts.find(
+    (receipt) => receipt.toolName === "rename_current_file",
+  );
+  assert.ok(renameReceipt, statuses.join("\n"));
+  assert.equal(renameReceipt?.path, "Untitled 1.md");
+  assert.equal(renameReceipt?.toPath, "Hello World in TypeScript.md");
+  assert.equal(vault.content.has("Untitled 1.md"), false);
+  assert.match(
+    vault.content.get("Hello World in TypeScript.md") ?? "",
+    /Hello, world!/,
+  );
+  assert.ok(
+    statuses.some((message) =>
+      /Renamed placeholder note to Hello World in TypeScript/i.test(message),
+    ),
+  );
+});
+
+test("streamed append onto named notes does not auto-rename", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const prompt = "Write a short note about grapes and stream it to the page.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    path: "Research.md",
+    content: "# Research\n\n",
+  });
+  const client = createClient({
+    chatRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# Grapes Notes\n\n",
+          "Grapes grow on vines.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.ok(
+    receipts.some((receipt) => receipt.toolName === "append_to_current_file"),
+  );
+  assert.ok(
+    !receipts.some((receipt) => receipt.toolName === "rename_current_file"),
+  );
+  assert.ok(vault.content.has("Research.md"));
+  assert.equal(vault.content.has("Grapes Notes.md"), false);
+});
+
+test("tool-path append onto Untitled auto-renames without model rename call", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const statuses: string[] = [];
+  const prompt = "Append a titled hello world note to this page.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    path: "Untitled.md",
+    content: "",
+    streamWritebackMode: "off",
+  });
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: "# Hello World in TypeScript\n\nconsole.log('hi');\n",
+        }),
+      () => responseWithContent("Appended the titled note."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.ok(
+    executedCalls.some((call) => call.name === "append_to_current_file"),
+    statuses.join("\n"),
+  );
+  assert.ok(
+    !executedCalls.some((call) => call.name === "rename_current_file"),
+  );
+  const renameReceipt = receipts.find(
+    (receipt) => receipt.toolName === "rename_current_file",
+  );
+  assert.ok(renameReceipt, `receipts=${JSON.stringify(receipts)}\n${statuses.join("\n")}`);
+  assert.equal(renameReceipt?.toPath, "Hello World in TypeScript.md");
+  assert.equal(vault.content.has("Untitled.md"), false);
+  assert.ok(vault.content.has("Hello World in TypeScript.md"));
+});
+
+test("placeholder auto-rename uses numeric suffix on collision", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const prompt = "Write Hello World in TypeScript on this page.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    path: "Untitled.md",
+    content: "",
+  });
+  vault.content.set("Hello World in TypeScript.md", "existing\n");
+  const client = createClient({
+    chatRequests,
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# Hello World in TypeScript\n\n",
+          "body text",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  const renameReceipt = receipts.find(
+    (receipt) => receipt.toolName === "rename_current_file",
+  );
+  assert.equal(renameReceipt?.toPath, "Hello World in TypeScript 2.md");
+  assert.ok(vault.content.has("Hello World in TypeScript 2.md"));
+  assert.ok(vault.content.has("Hello World in TypeScript.md"));
 });
 
 test("streamed writeback does not reuse an older generated word target", async () => {
@@ -4171,7 +5593,7 @@ test("compound title and essay prompt retitles then streams essay content", asyn
     streamRequests,
     chatResponders: [
       () =>
-        responseWithToolCall("retitle_current_file", {
+        responseWithToolCall("rename_current_file", {
           title: "The Harvest of Injustice",
         }),
       () => responseWithContent("Ready to write the essay."),
@@ -4195,12 +5617,12 @@ test("compound title and essay prompt retitles then streams essay content", asyn
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file", "retitle_current_file"],
+    ["read_current_file", "rename_current_file"],
   );
   assert.equal(streamRequests.length, 1);
   assert.equal(
-    vault.content.get("Current.md"),
-    "# The Harvest of Injustice\n\nThe Grapes of Wrath presents survival as a collective duty.",
+    vault.content.get("The Harvest of Injustice.md"),
+    "# Untitled\n\nThe Grapes of Wrath presents survival as a collective duty.",
   );
 });
 
@@ -4211,6 +5633,7 @@ test("citation writeback falls back to required web tools when model answers ear
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const vault = createRunnerVaultContext({ prompt, content: "Prompt" });
+  let fetchedUrl = "";
   vault.context.httpTransport = async (request) => {
     if (request.url.endsWith("/web_search")) {
       return {
@@ -4218,6 +5641,11 @@ test("citation writeback falls back to required web tools when model answers ear
         headers: {},
         json: {
           results: [
+            {
+              title: "Unrelated gardening result",
+              url: "https://example.com/gardening",
+              snippet: "Tomato planting calendar",
+            },
             {
               title: "Grapes source",
               url: "https://example.com/grapes",
@@ -4229,12 +5657,16 @@ test("citation writeback falls back to required web tools when model answers ear
     }
 
     if (request.url.endsWith("/web_fetch")) {
+      fetchedUrl = JSON.parse(
+        typeof request.body === "string" ? request.body : "{}",
+      )?.url ?? "";
       return {
         status: 200,
         headers: {},
         json: {
           title: "Fetched Grapes source",
-          content: "Fetched page about The Grapes of Wrath.",
+          content:
+            'The Grapes of Wrath source says "collective survival" names hardship as a public failure.',
           links: [],
         },
       };
@@ -4249,18 +5681,22 @@ test("citation writeback falls back to required web tools when model answers ear
       () => responseWithContent("I can answer without tools."),
       () => responseWithContent("Still answering without tools."),
       () => responseWithContent("Ready to write from sources."),
-      () =>
+      (request) =>
         responseWithContent(
           "The Grapes of Wrath uses the Joads to argue for collective survival with cited evidence. " +
             "Steinbeck frames hardship as a public failure, not a private weakness. " +
-            "The corrected draft keeps the source-backed claim while expanding the paragraph enough for the bounded correction pass.",
+            "The corrected draft keeps the source-backed claim while expanding the paragraph enough for the bounded correction pass. " +
+            (getPassageCitationIds(request)[0] ?? ""),
         ),
     ],
     streamResponders: [
-      () =>
-        responseWithContentDeltas([
-          "The Grapes of Wrath uses the Joads to argue for collective survival with cited evidence.",
-        ]),
+      (request) => {
+        const citedSentence =
+          `The Grapes of Wrath source says "collective survival" names hardship as a public failure. Source: https://example.com/grapes ${getPassageCitationIds(request)[0] ?? ""}`.trim();
+        return responseWithContentDeltas([
+          Array.from({ length: 14 }, () => citedSentence).join(" "),
+        ]);
+      },
     ],
   });
 
@@ -4277,8 +5713,560 @@ test("citation writeback falls back to required web tools when model answers ear
     executedCalls.map((call) => call.name),
     ["web_search", "web_fetch"],
   );
+  assert.equal(fetchedUrl, "https://example.com/grapes");
   assert.equal(streamRequests.length, 1);
   assert.match(vault.content.get("Current.md") ?? "", /collective survival/);
+});
+
+test("proof-gated cited writeback stages one correction before one note commit", async () => {
+  const prompt =
+    "Research MCP servers on the web and append a concise summary with passage citations to this note.";
+  const originalNote = "Original note must remain byte-identical while drafts are checked.";
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const statuses: string[] = [];
+  const verificationTraces: Array<{ message: string; outputPreview?: unknown }> = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: originalNote,
+  });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          query: "MCP servers",
+          results: [
+            {
+              title: "MCP overview",
+              snippet: "MCP servers expose tools and resources.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "MCP overview",
+          url: "https://example.com/mcp",
+          content:
+            "MCP servers expose tools and resources through a standard protocol.",
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  const invalidDraft =
+    "INVALID UNVERIFIED WRITEBACK: MCP servers expose tools, but this draft has no bound citation.";
+  let correctedDraft = "";
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/mcp",
+        }),
+      () => responseWithContent("Ready to write the cited summary."),
+    ],
+    streamResponders: [
+      () => {
+        assert.equal(vault.content.get("Current.md"), originalNote);
+        assert.equal(
+          vault.operations.filter((item) => item === "modify:Current.md").length,
+          0,
+        );
+        return responseWithContentDeltas([invalidDraft]);
+      },
+      (request) => {
+        assert.equal(vault.content.get("Current.md"), originalNote);
+        assert.equal(
+          vault.operations.filter((item) => item === "modify:Current.md").length,
+          0,
+        );
+        const passageId = getPassageCitationIds(request)[0];
+        assert.ok(passageId, "the correction must retain the fetched passage id");
+        correctedDraft =
+          "MCP servers expose tools and resources through a standard protocol. " +
+          `Source: https://example.com/mcp Passage evidence: [${passageId}]`;
+        return responseWithContentDeltas([correctedDraft]);
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => {
+        if (event.kind === "verification") {
+          verificationTraces.push({
+            message: event.message ?? "",
+            outputPreview: event.outputPreview,
+          });
+        }
+      },
+    },
+  });
+
+  assert.equal(executedCalls[0]?.name, "web_search");
+  assert.ok(executedCalls.slice(1).every((call) => call.name === "web_fetch"));
+  assert.ok(executedCalls.filter((call) => call.name === "web_fetch").length >= 1);
+  assert.equal(
+    streamRequests.length,
+    2,
+    JSON.stringify({ statuses, note: vault.content.get("Current.md") }),
+  );
+  assert.ok(
+    statuses.some((message) =>
+      /Writeback draft held for verification.*Requesting one correction/i.test(
+        message,
+      ),
+    ),
+    JSON.stringify(statuses),
+  );
+  assert.ok(
+    verificationTraces.some((trace) =>
+      /claim_grounding/i.test(trace.message),
+    ),
+    JSON.stringify(verificationTraces.map((trace) => trace.message)),
+  );
+  assert.ok(
+    statuses.some((message) => /claim_grounding/i.test(message)) ||
+      verificationTraces.some((trace) => {
+        const preview =
+          trace.outputPreview &&
+          typeof trace.outputPreview === "object" &&
+          trace.outputPreview !== null
+            ? (trace.outputPreview as { missing?: string[] }).missing
+            : undefined;
+        return Array.isArray(preview)
+          ? preview.some((item) => item.includes("claim_grounding"))
+          : false;
+      }) ||
+      statuses.some((message) =>
+        /Writeback draft held for verification/i.test(message),
+      ),
+    "expected claim grounding or citation hold before correction",
+  );
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].toolName, "append_to_current_file");
+  assert.equal(
+    vault.operations.filter((item) => item === "modify:Current.md").length,
+    1,
+  );
+  assert.equal(
+    vault.content.get("Current.md"),
+    `${originalNote}\n${correctedDraft}`,
+  );
+  assert.doesNotMatch(vault.content.get("Current.md") ?? "", /INVALID UNVERIFIED/);
+});
+
+test("proof-sensitive direct write tools are staged before the single verified mutation", async () => {
+  const prompt =
+    "Research MCP servers on the web and append a concise summary with passage citations to this note.";
+  const originalNote = "Original note must not receive an unverified direct tool payload.";
+  const directDraft = "DIRECT UNVERIFIED WRITE TOOL PAYLOAD";
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const rejectionCodes: string[] = [];
+  const vault = createRunnerVaultContext({ prompt, content: originalNote });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "MCP overview",
+              snippet: "MCP servers expose tools and resources.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "MCP overview",
+          url: "https://example.com/mcp",
+          content:
+            "MCP servers expose tools and resources through a standard protocol.",
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  let correctedDraft = "";
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/mcp",
+        }),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: directDraft,
+        }),
+      () => responseWithContent("Ready for runner-owned verified writeback."),
+    ],
+    streamResponders: [
+      (request) => {
+        assert.equal(vault.content.get("Current.md"), originalNote);
+        const passageId = getPassageCitationIds(request)[0];
+        assert.ok(passageId);
+        correctedDraft =
+          `MCP servers expose tools and resources through a standard protocol. Source: https://example.com/mcp [${passageId}]`;
+        return responseWithContentDeltas([correctedDraft]);
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onTrace: (event) => {
+        if (event.error?.code) {
+          rejectionCodes.push(event.error.code);
+        }
+      },
+    },
+  });
+
+  assert.deepEqual(executedCalls.map((call) => call.name), [
+    "web_search",
+    "web_fetch",
+  ]);
+  assert.ok(rejectionCodes.includes("proof_gated_writeback_required"));
+  assert.equal(receipts.length, 1);
+  assert.equal(
+    vault.operations.filter((item) => item === "modify:Current.md").length,
+    1,
+  );
+  assert.equal(vault.content.get("Current.md"), `${originalNote}\n${correctedDraft}`);
+  assert.doesNotMatch(vault.content.get("Current.md") ?? "", /DIRECT UNVERIFIED/);
+});
+
+test("repeated invalid proof-gated writeback leaves the note byte-identical", async () => {
+  const prompt =
+    "Research MCP servers on the web and append a concise summary with citations to this note.";
+  const originalNote = "Original note bytes must survive rejected research drafts.\n";
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const assistantDeltas: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: originalNote,
+  });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          query: "MCP servers",
+          results: [
+            {
+              title: "MCP overview",
+              snippet: "MCP servers expose tools and resources.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "MCP overview",
+          url: "https://example.com/mcp",
+          content:
+            "MCP servers expose tools and resources through a standard protocol.",
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  const invalidDraft =
+    "INVALID UNVERIFIED WRITEBACK: relevant research prose without a bound passage citation.";
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "MCP servers" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/mcp",
+        }),
+      () => responseWithContent("Ready to write the cited summary."),
+    ],
+    streamResponders: [
+      () => {
+        assert.equal(vault.content.get("Current.md"), originalNote);
+        return responseWithContentDeltas([invalidDraft]);
+      },
+      () => {
+        assert.equal(vault.content.get("Current.md"), originalNote);
+        return responseWithContentDeltas([
+          `${invalidDraft} The single correction is still uncited.`,
+        ]);
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.deepEqual(executedCalls.slice(0, 2).map((call) => call.name), [
+    "web_search",
+    "web_fetch",
+  ]);
+  assert.ok(
+    executedCalls.slice(1).every((call) => call.name === "web_fetch"),
+    JSON.stringify(executedCalls.map((call) => call.name)),
+  );
+  assert.equal(
+    streamRequests.length,
+    2,
+    JSON.stringify({
+      assistantDeltas,
+      note: vault.content.get("Current.md"),
+      operations: vault.operations,
+    }),
+  );
+  assert.deepEqual(receipts, []);
+  assert.equal(vault.content.get("Current.md"), originalNote);
+  assert.equal(
+    vault.operations.filter((item) => item === "modify:Current.md").length,
+    0,
+  );
+  assert.doesNotMatch(assistantDeltas.join(""), /INVALID UNVERIFIED/);
+  assert.match(
+    assistantDeltas.join(""),
+    /Note writeback was not applied because proof verification is incomplete/i,
+  );
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].stopReason, "budget");
+});
+
+test("current market note writeback falls back to web tools before writing", async () => {
+  const prompt = [
+    "I want you to write on this note.",
+    "",
+    "Start by titling it Software project.",
+    "",
+    "I want you to find and organize information about the current online dating market and also the social media market.",
+    "",
+    "Write in a business type, market research format.",
+  ].join("\n");
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const assistantDeltas: string[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Untitled\n\n",
+  });
+  const marketSources = [
+    {
+      title: "Dating market source",
+      url: "https://example.com/dating-market",
+      snippet: "Current online dating market data.",
+    },
+    {
+      title: "Social media market source",
+      url: "https://example.org/social-media-market",
+      snippet: "Current social media market data.",
+    },
+    {
+      title: "Consumer platform source",
+      url: "https://example.net/platform-market",
+      snippet: "Current consumer platform market data.",
+    },
+  ];
+  let marketFetchIndex = 0;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: marketSources,
+        },
+      };
+    }
+
+    if (request.url.endsWith("/web_fetch")) {
+      const source = marketSources[
+        Math.min(marketFetchIndex, marketSources.length - 1)
+      ];
+      marketFetchIndex += 1;
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: source.title,
+          url: source.url,
+          content: `${source.snippet} Fetched current market source content with market sizing, retention, and monetization evidence.`,
+          links: [],
+        },
+      };
+    }
+
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () => responseWithContent("I can draft this without tools."),
+      () => responseWithContent("Still drafting without tools."),
+      () => responseWithContent("Ready to write from current market sources."),
+    ],
+    streamResponders: [
+      (request) => {
+        const passageIds = getPassageCitationIds(request).slice(0, 3);
+        const cited = passageIds.length > 0 ? ` [${passageIds.join("] [")}]` : "";
+        const body = [
+          "# Software project",
+          "",
+          "## Market Overview",
+          "",
+          `Current online dating market data and social media market data both show retention and monetization pressure across consumer platforms.${cited}`,
+          "",
+          `Source URLs: ${marketSources.map((source) => source.url).join(" ")}`,
+          "",
+          "## Limitations",
+          "Evidence is limited to the fetched market pages in this run.",
+          "",
+          "## Confidence",
+          "Medium confidence based on three fetched sources.",
+        ].join("\n");
+        return responseWithContentDeltas([body]);
+      },
+      (request) => {
+        const passageIds = getPassageCitationIds(request).slice(0, 3);
+        const cited = passageIds.length > 0 ? ` [${passageIds.join("] [")}]` : "";
+        const body = [
+          "# Software project",
+          "",
+          "## Market Overview",
+          "",
+          `Current online dating market data and social media market data both show retention and monetization pressure across consumer platforms.${cited}`,
+          "",
+          `Source URLs: ${marketSources.map((source) => source.url).join(" ")}`,
+          "",
+          "## Limitations",
+          "Evidence is limited to the fetched market pages in this run.",
+          "",
+          "## Confidence",
+          "Medium confidence based on three fetched sources.",
+        ].join("\n");
+        return responseWithContentDeltas([body]);
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+    },
+  });
+
+  const firstStepToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstStepToolNames.includes("web_search"));
+  assert.ok(firstStepToolNames.includes("web_fetch"));
+  assert.equal(executedCalls[0]?.name, "web_search");
+  assert.ok(
+    executedCalls.slice(1).every((call) => call.name === "web_fetch"),
+  );
+  assert.ok(
+    executedCalls.filter((call) => call.name === "web_fetch").length >= 1,
+  );
+  assert.ok(
+    streamRequests.length >= 1,
+    JSON.stringify({
+      statuses,
+      assistantDeltas,
+      chatRequestCount: chatRequests.length,
+      executed: executedCalls.map((call) => call.name),
+      note: vault.content.get("Current.md") ?? "",
+      streamRequests: streamRequests.length,
+    }),
+  );
+  assert.ok(
+    statuses.some((message) =>
+      /Model did not request required web tools; running read-only web fallback/.test(
+        message,
+      ),
+    ),
+  );
+  assert.ok(
+    !assistantDeltas.some((delta) =>
+      /I could not get the model to request the required read tools/i.test(delta),
+    ),
+  );
+  const note = vault.content.get("Current.md") ?? "";
+  assert.match(
+    note,
+    /^# Software project/m,
+    JSON.stringify({ statuses, assistantDeltas, note, streamRequests: streamRequests.length }),
+  );
+  assert.match(note, /current online dating market/i);
+  assert.match(note, /social media market/i);
 });
 
 test("model can return multiple tool calls in one step for compound create mission", async () => {
@@ -4409,15 +6397,77 @@ test("delete then write replaces current note instead of trashing it", async () 
   assert.equal(vault.content.has("Current.md"), true);
 });
 
+test("non-streaming delete-current-note then write accepts replace receipt as the content write", async () => {
+  const prompt =
+    "Delete the current note. Ensure that the space is empty. I want you to write now, a 300 word essay on Grapes of Wrath. Include E2E_DELETE_CURRENT_WRITE_UNIT.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Old E2E Page\n\nE2E_DELETE_CURRENT_OLD_UNIT\n",
+  });
+  const broker = new ApprovalBroker();
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("replace_current_file", {
+          text: "# Grapes of Wrath\n\nE2E_DELETE_CURRENT_WRITE_UNIT\n",
+        }),
+      () =>
+        responseWithContent(
+          "Done. Replaced the current note with the requested Grapes of Wrath essay.",
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: false,
+    approvalBroker: broker,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onRunComplete: (event) => completions.push(event),
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file", "replace_current_file"],
+  );
+  assert.equal(
+    completions.at(-1)?.stopReason,
+    "write_completed",
+    statuses.join("\n"),
+  );
+  assert.ok(!statuses.includes("Stopped at safety limit. Review partial results."));
+  assert.ok(!statuses.some((message) => /tool:append_to_current_file/.test(message)));
+});
+
 test("web append payload stays compact with capped note and source context", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
+  const compactStatuses: string[] = [];
   const baseRegistry = createDefaultToolRegistry();
   const vault = createRunnerVaultContext({
     prompt: "Research MCP servers and append a concise cited summary to this note.",
     content: "n".repeat(12000),
   });
+  const fetchedSourceContent =
+    "MCP servers research cited summary explains MCP servers and source context. " +
+    "f".repeat(6000);
+  const compactPassageId = extractEvidencePassages(fetchedSourceContent, {
+    sourceLocator: "https://example.com/1",
+  }).passages[0]?.id;
 
   const registry: ToolRegistry = {
     getDefinitions: () => baseRegistry.getDefinitions(),
@@ -4460,7 +6510,7 @@ test("web append payload stays compact with capped note and source context", asy
           output: {
             title: "Fetched source",
             url: call.arguments.url,
-            content: "f".repeat(6000),
+            content: fetchedSourceContent,
             links: [],
           },
         };
@@ -4483,7 +6533,13 @@ test("web append payload stays compact with capped note and source context", asy
       () => responseWithContent("Ready to append the sourced summary."),
     ],
     streamResponders: [
-      () => responseWithContentDeltas(["MCP server research cited summary."]),
+      () => responseWithContentDeltas(["MCP servers research cited summary."]),
+      (request) => {
+        const evidence = getPassageCitationIds(request).join(" ") || compactPassageId || "";
+        return responseWithContentDeltas([
+          `MCP servers research cited summary. This concise summary covers MCP servers. Source: https://example.com/1 ${evidence}`.trim(),
+        ]);
+      },
     ],
   });
 
@@ -4493,23 +6549,33 @@ test("web append payload stays compact with capped note and source context", asy
     toolRegistry: registry,
     toolContext: vault.context,
     enableStreaming: true,
+    events: {
+      onStatus: (message) => compactStatuses.push(message),
+    },
   });
 
-  assert.deepEqual(
-    executedCalls.map((call) => call.name),
-    ["web_search", "web_fetch"],
+  assert.equal(executedCalls[0]?.name, "web_search");
+  assert.ok(executedCalls.slice(1).every((call) => call.name === "web_fetch"));
+  assert.ok(executedCalls.filter((call) => call.name === "web_fetch").length >= 1);
+  assert.equal(streamRequests.length, 2);
+  const writtenNote = vault.content.get("Current.md") ?? "";
+  assert.ok(writtenNote.startsWith("n".repeat(12000)));
+  assert.match(
+    writtenNote,
+    /MCP servers research cited summary/,
+    JSON.stringify(compactStatuses),
   );
-  assert.equal(streamRequests.length, 1);
-  assert.equal(
-    vault.content.get("Current.md"),
-    `${"n".repeat(12000)}\nMCP server research cited summary.`,
-  );
+  assert.match(writtenNote, /https:\/\/example\.com\/1/);
+  assert.match(writtenNote, /source:[a-z0-9]+:passage:\d+-\d+/i);
   const maxRequestChars = Math.max(
     ...[...chatRequests, ...streamRequests].map((request) =>
       JSON.stringify(request).length,
     ),
   );
-  assert.ok(maxRequestChars < 30000, `request was ${maxRequestChars} chars`);
+  assert.ok(
+    maxRequestChars < 30000,
+    `request was ${maxRequestChars} chars; chat=${chatRequests.map((request) => JSON.stringify(request).length).join(",")}; stream=${streamRequests.map((request) => JSON.stringify(request).length).join(",")}`,
+  );
 });
 
 test("simple date prompts avoid vault and web tools", async () => {
@@ -4673,6 +6739,7 @@ test("unsupported thinking retries once without think and completes", async () =
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const deltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
   const client = createClient({
     chatRequests,
     chatResponders: [
@@ -4680,14 +6747,21 @@ test("unsupported thinking retries once without think and completes", async () =
         throw new ModelClientError("api", "thinking is unsupported by this model");
       },
       () => responseWithToolCall("web_search", { query: "MCP servers status" }),
-      () => responseWithContent("Fallback answer"),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/source",
+        }),
+      () =>
+        responseWithContent(
+          "Fallback answer. Source: https://example.com/source",
+        ),
     ],
   });
 
   await runAgentMission({
-    prompt: "Look up the current status of MCP servers.",
+    prompt: "Search the web for MCP servers.",
     modelClient: client,
-    toolRegistry: createRegistry([]),
+    toolRegistry: createRegistry(executedCalls),
     toolContext: {
       settings: createRunnerSettings({ model: "gpt-oss:120b" }),
     } as ToolExecutionContext,
@@ -4698,12 +6772,130 @@ test("unsupported thinking retries once without think and completes", async () =
     },
   });
 
-  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests.length, 4);
   assert.equal(chatRequests[0].think, "medium");
   assert.equal(chatRequests[1].think, undefined);
   assert.equal(chatRequests[2].think, undefined);
+  assert.equal(chatRequests[3].think, undefined);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
   assert.ok(statuses.includes("Thinking unsupported; using standard loop."));
-  assert.deepEqual(deltas, ["Fallback answer"]);
+  assert.deepEqual(deltas, [
+    "Fallback answer. Source: https://example.com/source",
+  ]);
+});
+
+test("transient model API errors retry before blocking", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const deltas: string[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => {
+        const error = new Error("Internal Server Error (ref: retry-once)") as Error & {
+          category?: string;
+          status?: number;
+        };
+        error.name = "ModelClientError";
+        error.category = "api";
+        error.status = 500;
+        throw error;
+      },
+      () => responseWithContent("Recovered answer"),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Give me a concise answer about planning.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {
+      settings: createRunnerSettings({ model: "llama3.1:8b" }),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => deltas.push(delta),
+    },
+  });
+
+  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests[0].think, undefined);
+  assert.equal(chatRequests[1].think, undefined);
+  assert.ok(
+    statuses.includes("Transient model provider error; retrying model step..."),
+  );
+  assert.deepEqual(deltas, ["Recovered answer"]);
+});
+
+test("repeated transient model API errors retry without thinking mode", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const deltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const transientError = () => {
+    throw new ModelClientError(
+      "api",
+      "Internal Server Error (ref: retry-without-thinking)",
+      { status: 500 },
+    );
+  };
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      transientError,
+      transientError,
+      () => responseWithToolCall("web_search", { query: "MCP servers status" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/source",
+        }),
+      () =>
+        responseWithContent(
+          "Recovered web answer. Source: https://example.com/source",
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Search the web for MCP servers.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {
+      settings: createRunnerSettings({ model: "gpt-oss:120b" }),
+    } as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => deltas.push(delta),
+    },
+  });
+
+  assert.equal(chatRequests.length, 5);
+  assert.equal(chatRequests[0].think, "medium");
+  assert.equal(chatRequests[1].think, "medium");
+  assert.equal(chatRequests[2].think, undefined);
+  assert.equal(chatRequests[3].think, undefined);
+  assert.equal(chatRequests[4].think, undefined);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
+  assert.ok(
+    statuses.includes("Transient model provider error; retrying model step..."),
+  );
+  assert.ok(
+    statuses.includes(
+      "Transient model provider error persisted; retrying without thinking mode...",
+    ),
+  );
+  assert.ok(statuses.includes("Thinking unsupported; using standard loop."));
+  assert.deepEqual(deltas, [
+    "Recovered web answer. Source: https://example.com/source",
+  ]);
 });
 
 test("english-only direct answers repair CJK before display", async () => {
@@ -5786,6 +7978,14 @@ function createClient({
   };
 }
 
+function getPassageCitationIds(request: ModelChatRequest): string[] {
+  const matches = request.messages
+    .flatMap((message) =>
+      message.content.match(/source:[a-z0-9]+:passage:\d+-\d+/giu) ?? [],
+    );
+  return [...new Set(matches)];
+}
+
 function cloneRequest(request: ModelChatRequest): ModelChatRequest {
   return {
     ...request,
@@ -5798,6 +7998,9 @@ function createRunnerSettings(
   overrides: Partial<AgentSettings> = {},
 ): AgentSettings {
   return {
+    settingsSchemaVersion: 2,
+    autonomyProfile: "automatic",
+    outputProfile: "active_or_new_note",
     modelProvider: "ollama",
     ollamaApiKey: "test-key",
     ollamaBaseUrl: "https://ollama.com/api",
@@ -5807,6 +8010,7 @@ function createRunnerSettings(
     enableStreaming: true,
     thinkingMode: "auto",
     streamWritebackMode: "all_current_note_content_writes",
+    autoTitleOnWrite: true,
     maxAgentSteps: MAX_AGENT_STEPS,
     companionBaseUrl: "http://127.0.0.1:8765",
     browserToolsEnabled: false,
@@ -5866,21 +8070,25 @@ function createReflexSemanticEmbeddingProvider(): SemanticEmbeddingProvider {
 function createRunnerVaultContext(options: {
   prompt?: string;
   content?: string;
+  path?: string;
   now?: Date;
   model?: string;
   thinkingMode?: ThinkingMode;
   streamWritebackMode?: StreamWritebackMode;
   liveEditorWrite?: boolean;
 } = {}) {
+  const notePath = options.path ?? "Current.md";
+  const noteName = notePath.split("/").pop() ?? notePath;
+  const noteBasename = noteName.replace(/\.[^.]+$/i, "");
   const content = new Map<string, string>([
-    ["Current.md", options.content ?? "Initial note"],
+    [notePath, options.content ?? "Initial note"],
   ]);
   const folders = new Set<string>();
   const operations: string[] = [];
   const activeFile = {
-    path: "Current.md",
-    name: "Current.md",
-    basename: "Current",
+    path: notePath,
+    name: noteName,
+    basename: noteBasename,
     extension: "md",
   };
 
@@ -5947,6 +8155,15 @@ function createRunnerVaultContext(options: {
         content.set(path, data);
         return getFile(path);
       },
+      rename: async (file: { path: string; name?: string; basename?: string }, newPath: string) => {
+        operations.push(`rename:${file.path}:${newPath}`);
+        const value = content.get(file.path) ?? "";
+        content.delete(file.path);
+        content.set(newPath, value);
+        file.path = newPath;
+        file.name = newPath.split("/").pop() ?? newPath;
+        file.basename = file.name.replace(/\.[^.]+$/i, "");
+      },
     },
   };
 
@@ -5981,8 +8198,29 @@ function createRunnerVaultContext(options: {
 
 function createCollectingRegistry(executedCalls: ModelToolCall[]): ToolRegistry {
   const baseRegistry = createDefaultToolRegistry();
+  const prepare = baseRegistry.prepare?.bind(baseRegistry);
+  const executePrepared = baseRegistry.executePrepared?.bind(baseRegistry);
+  const getDescriptor = baseRegistry.getDescriptor?.bind(baseRegistry);
   return {
     getDefinitions: () => baseRegistry.getDefinitions(),
+    getDescriptor: getDescriptor
+      ? (toolName) => getDescriptor(toolName)
+      : undefined,
+    prepare: prepare
+      ? (call, context) => prepare(call, context)
+      : undefined,
+    executePrepared: executePrepared
+      ? async (action, context, authorization) => {
+          executedCalls.push({
+            name: action.toolName,
+            arguments:
+              action.normalizedArgs && typeof action.normalizedArgs === "object"
+                ? (action.normalizedArgs as Record<string, unknown>)
+                : {},
+          });
+          return executePrepared(action, context, authorization);
+        }
+      : undefined,
     execute: async (call, context) => {
       executedCalls.push(call);
       return baseRegistry.execute(call, context);
@@ -6170,6 +8408,13 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "create_research_pack",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "create_folder",
           parameters: { type: "object", properties: {} },
         },
@@ -6240,7 +8485,28 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "rename_current_file",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "retitle_current_file",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "highlight_current_file_phrase",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "restore_current_file_from_backup",
           parameters: { type: "object", properties: {} },
         },
       },
@@ -6544,6 +8810,13 @@ function createRegistry(
                   valuesApplied: ["title"],
                   bytesWritten: 12,
                 }
+            : call.name === "create_research_pack"
+              ? {
+                  path: call.arguments.baseFolder ?? "Research/Pack",
+                  operation: "create_research_pack",
+                  createdPaths: ["Brief.md", "Sources.md", "Synthesis.md", "Index.md"],
+                  bytesWritten: 48,
+                }
             : call.name === "create_folder"
               ? { path: call.arguments.path, operation: "create_folder" }
             : call.name === "create_file"
@@ -6579,6 +8852,15 @@ function createRegistry(
                 }
             : call.name === "append_to_current_file"
               ? { path: "Current.md", bytesWritten: 9 }
+            : call.name === "rename_current_file"
+              ? {
+                  path: "Current.md",
+                  toPath: "Renamed.md",
+                  title: call.arguments.title,
+                  changed: true,
+                  operation: "rename_current_file",
+                  bytesWritten: 0,
+                }
             : call.name === "retitle_current_file"
               ? {
                   path: "Current.md",
@@ -6588,6 +8870,24 @@ function createRegistry(
                     from: "Current.md",
                     to: "Native Obsidian Agentic Research.md",
                   },
+                }
+            : call.name === "highlight_current_file_phrase"
+              ? {
+                  path: "Current.md",
+                  operation: "highlight",
+                  phrase: call.arguments.phrase,
+                  matchCount: 1,
+                  backupPath: ".agent-backups/1-Current.md",
+                  changed: true,
+                  bytesWritten: 24,
+                }
+            : call.name === "restore_current_file_from_backup"
+              ? {
+                  path: "Current.md",
+                  operation: "restore",
+                  restoredFromBackupPath: ".agent-backups/1-Current.md",
+                  backupPath: ".agent-backups/2-Current.md",
+                  bytesWritten: 24,
                 }
             : call.name === "edit_current_section"
               ? {
@@ -6723,3 +9023,795 @@ function responseWithContentDeltas(
     streamError: options.streamError,
   };
 }
+
+function createCodeToolsRegistry(
+  executedCalls: ModelToolCall[],
+  executedContexts: ToolExecutionContext[] = [],
+): ToolRegistry {
+  const toolNames = [
+    "read_current_file",
+    "run_code_block",
+    "install_code_dependency",
+    "write_workspace_file",
+  ];
+  return {
+    getDefinitions: () =>
+      toolNames.map((name) => ({
+        type: "function" as const,
+        function: {
+          name,
+          parameters: { type: "object" as const, properties: {} },
+        },
+      })),
+    execute: async (call, context): Promise<ToolExecutionResult> => {
+      executedCalls.push(call);
+      executedContexts.push(context);
+      if (call.name === "read_current_file") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: { path: "Current.md", content: "Initial note" },
+        };
+      }
+      if (call.name === "run_code_block") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            language: "python",
+            operation: "run",
+            result: { exitCode: 0, stdout: "ok", stderr: "", timedOut: false },
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: { ok: true, toolName: call.name },
+      };
+    },
+  };
+}
+
+test("accepted web research runs auto-save durable research memory", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const prompt =
+    "Search the web for the Ollama structured outputs documentation and summarize it.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-07T12:00:00.000Z"),
+  });
+
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      ["read_current_file", "web_search", "web_fetch", "append_research_memory"].map(
+        (name) => ({
+          type: "function" as const,
+          function: {
+            name,
+            parameters: { type: "object" as const, properties: {} },
+          },
+        }),
+      ),
+    execute: async (call): Promise<ToolExecutionResult> => {
+      executedCalls.push(call);
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: [
+              {
+                title: "Router roundup",
+                url: "https://example.com/routers",
+                snippet: "Local LLM routers compared.",
+              },
+            ],
+          },
+        };
+      }
+      if (call.name === "web_fetch") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            title: "Router roundup",
+            url: "https://example.com/routers",
+            content: "Detailed comparison of local LLM routers.",
+            links: [],
+          },
+        };
+      }
+      if (call.name === "append_research_memory") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            path: "Agent Research Memory/latest-local-llm-routers.md",
+            operation: "create",
+            topic: call.arguments.topic,
+            bytesWritten: 256,
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: { path: "Current.md", content: "Initial note" },
+      };
+    },
+  };
+
+  const finalAnswer =
+    "Ollama structured outputs constrain responses to a JSON schema. Source: https://example.com/routers";
+  const citedFinalAnswer = (request: ModelChatRequest) => {
+    const passageId = getPassageCitationIds(request)[0];
+    assert.ok(passageId, "fetched passage id must be visible to final synthesis");
+    return responseWithContent(`${finalAnswer}\nPassage evidence: [${passageId}]`);
+  };
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("web_search", {
+          query: "Ollama structured outputs documentation",
+        }),
+      () => responseWithToolCall("web_fetch", { url: "https://example.com/routers" }),
+      citedFinalAnswer,
+      citedFinalAnswer,
+      citedFinalAnswer,
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  const memoryCall = executedCalls.find(
+    (call) => call.name === "append_research_memory",
+  );
+  assert.ok(memoryCall, "accepted research run must auto-save research memory");
+  assert.ok(String(memoryCall.arguments.topic).length > 0);
+  assert.match(String(memoryCall.arguments.text), /Mission:/);
+  assert.match(String(memoryCall.arguments.text), /https:\/\/example\.com\/routers/);
+  assert.deepEqual(memoryCall.arguments.sourceUrls, [
+    "https://example.com/routers",
+  ]);
+  assert.ok(
+    statuses.some((message) => /Saved research memory:/.test(message)),
+    JSON.stringify(statuses),
+  );
+});
+
+test("proof-sensitive streamed final holds the invalid draft and emits the exact sanitized correction", async () => {
+  const prompt =
+    "Search the web for Ollama structured outputs documentation and summarize it with citations.";
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const finalDeltas: string[] = [];
+  const assistantDeltas: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "Ollama structured outputs",
+              url: "https://example.com/ollama-structured-outputs",
+              snippet: "Ollama can constrain generated output with a JSON schema.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "Ollama structured outputs",
+          content:
+            "Ollama structured outputs accept a JSON schema and constrain model responses to that schema.",
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  let correctedCandidate = "";
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("web_search", {
+          query: "Ollama structured outputs documentation",
+        }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/ollama-structured-outputs",
+        }),
+      () => responseWithContent(""),
+      () => responseWithContent(""),
+    ],
+    streamResponders: [
+      () =>
+        responseWithContentDeltas(
+          [
+            "<|begin_of_sentence|>INVALID UNVERIFIED DRAFT: Ollama structured outputs constrain JSON, but this draft cites no bound passage.<|end_of_sentence|>",
+          ],
+          "RAW FIRST PROVIDER CONTENT MUST NOT LEAK",
+        ),
+      (request) => {
+        const passageId = getPassageCitationIds(request)[0];
+        assert.ok(
+          passageId,
+          "the correction request must retain the fetched passage identifier",
+        );
+        correctedCandidate =
+          "Ollama structured outputs constrain responses with a JSON schema. " +
+          `Source: https://example.com/ollama-structured-outputs Passage evidence: [${passageId}]`;
+        return responseWithContentDeltas(
+          [
+            `<|begin_of_sentence|>${correctedCandidate}<|end_of_sentence|>`,
+          ],
+          "RAW SECOND PROVIDER CONTENT MUST NOT LEAK",
+        );
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onFinalDelta: (delta) => finalDeltas.push(delta),
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
+  assert.equal(streamRequests.length, 2);
+  assert.ok(
+    [...chatRequests, ...streamRequests].some((request) =>
+      request.messages.some((message) =>
+        /draft failed final-output verification/i.test(message.content),
+      ),
+    ),
+    "the second candidate must be prompted by the proof correction gate",
+  );
+  assert.ok(
+    statuses.some((message) => /(?:Draft|Writeback draft) held for verification/.test(message)),
+    JSON.stringify(statuses),
+  );
+  assert.equal(finalDeltas.join(""), correctedCandidate);
+  assert.equal(assistantDeltas.join(""), correctedCandidate);
+  assert.doesNotMatch(finalDeltas.join(""), /INVALID UNVERIFIED DRAFT/);
+  assert.doesNotMatch(finalDeltas.join(""), /RAW (?:FIRST|SECOND) PROVIDER/);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].stopReason, "write_completed");
+});
+
+test("repeated proof-sensitive candidate failures emit only a resumable blocker", async () => {
+  const prompt =
+    "Search the web for Ollama structured outputs documentation and summarize it with citations.";
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
+  const assistantDeltas: string[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.settings.maxAgentSteps = 4;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "Ollama structured outputs",
+              url: "https://example.com/ollama-structured-outputs",
+              snippet: "Ollama can constrain generated output with a JSON schema.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: "Ollama structured outputs",
+          content:
+            "Ollama structured outputs accept a JSON schema and constrain model responses to that schema.",
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  const invalidCandidate =
+    "INVALID UNVERIFIED DRAFT: Ollama structured outputs constrain JSON without citing the bound passage.";
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("web_search", {
+          query: "Ollama structured outputs documentation",
+        }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/ollama-structured-outputs",
+        }),
+      () => responseWithContent(""),
+      () => responseWithContent(""),
+    ],
+    streamResponders: [
+      () => responseWithContentDeltas([invalidCandidate]),
+      () =>
+        responseWithContentDeltas(
+          [`${invalidCandidate} This second attempt is still uncited.`],
+          "RAW REPEATED FAILURE MUST NOT LEAK",
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search", "web_fetch"],
+  );
+  assert.equal(streamRequests.length, 2);
+  assert.doesNotMatch(assistantDeltas.join(""), /INVALID UNVERIFIED DRAFT/);
+  assert.doesNotMatch(assistantDeltas.join(""), /RAW REPEATED FAILURE/);
+  assert.match(
+    assistantDeltas.join(""),
+    /Note writeback was not applied because proof verification is incomplete/i,
+  );
+  assert.ok(
+    statuses.some((message) =>
+      /Note writeback was not applied because proof verification is incomplete/i.test(
+        message,
+      ),
+    ),
+    JSON.stringify(statuses),
+  );
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].stopReason, "budget");
+});
+
+test("policy engine requires approval before install_code_dependency executes", async () => {
+  __setCodeToolsDesktopAppForTests(true);
+  try {
+    const chatRequests: ModelChatRequest[] = [];
+    const executedCalls: ModelToolCall[] = [];
+    const approvalRequests: ApprovalRequest[] = [];
+    const resolvedDecisions: string[] = [];
+    const broker = new ApprovalBroker();
+
+    const client = createClient({
+      chatRequests,
+      chatResponders: [
+        () =>
+          responseWithToolCall("install_code_dependency", {
+            manager: "pip",
+            packageName: "requests",
+          }),
+        () => responseWithContent("Stopped: the dependency install was denied."),
+        () => responseWithContent("Stopped: the dependency install was denied."),
+        () => responseWithContent("Stopped: the dependency install was denied."),
+      ],
+    });
+
+    await runAgentMission({
+      prompt: "Run the python code snippet after installing the requests package.",
+      modelClient: client,
+      toolRegistry: createCodeToolsRegistry(executedCalls),
+      toolContext: {} as ToolExecutionContext,
+      enableStreaming: false,
+      approvalBroker: broker,
+      events: {
+        onApprovalRequest: (request) => {
+          approvalRequests.push(request);
+          broker.resolve(request.id, "denied");
+        },
+        onApprovalResolved: ({ decision }) => {
+          resolvedDecisions.push(decision);
+        },
+      },
+    });
+
+    assert.equal(approvalRequests.length, 1);
+    assert.equal(approvalRequests[0].toolName, "install_code_dependency");
+    assert.ok(approvalRequests[0].policyTags.includes("dependency_install"));
+    assert.deepEqual(resolvedDecisions, ["denied"]);
+    assert.ok(
+      !executedCalls.some((call) => call.name === "install_code_dependency"),
+      "denied install must never reach the tool registry",
+    );
+  } finally {
+    __setCodeToolsDesktopAppForTests(null);
+  }
+});
+
+test("policy engine approval allows install_code_dependency with granted context", async () => {
+  __setCodeToolsDesktopAppForTests(true);
+  try {
+    const chatRequests: ModelChatRequest[] = [];
+    const executedCalls: ModelToolCall[] = [];
+    const executedContexts: ToolExecutionContext[] = [];
+    const broker = new ApprovalBroker();
+    let requestCheckpointPersisted = false;
+    let resolutionCheckpointPersisted = false;
+    const baseRegistry = createCodeToolsRegistry(executedCalls, executedContexts);
+    const orderedRegistry: ToolRegistry = {
+      getDefinitions: () => baseRegistry.getDefinitions(),
+      execute: async (call, context) => {
+        if (call.name === "install_code_dependency") {
+          assert.equal(requestCheckpointPersisted, true);
+          assert.equal(resolutionCheckpointPersisted, true);
+        }
+        return baseRegistry.execute(call, context);
+      },
+    };
+
+    const client = createClient({
+      chatRequests,
+      chatResponders: [
+        () =>
+          responseWithToolCall("install_code_dependency", {
+            manager: "pip",
+            packageName: "requests",
+          }),
+        () =>
+          responseWithToolCall("run_code_block", {
+            language: "python",
+            code: "print('ok')",
+          }),
+        () => responseWithContent("Installed requests and ran the snippet."),
+        () => responseWithContent("Installed requests and ran the snippet."),
+      ],
+    });
+
+    await runAgentMission({
+      prompt: "Run the python code snippet after installing the requests package.",
+      modelClient: client,
+      toolRegistry: orderedRegistry,
+      toolContext: {} as ToolExecutionContext,
+      enableStreaming: false,
+      approvalBroker: broker,
+      events: {
+        onApprovalRequest: async (request) => {
+          await Promise.resolve();
+          requestCheckpointPersisted = true;
+          broker.resolve(request.id, "approved");
+        },
+        onApprovalResolved: async () => {
+          assert.equal(requestCheckpointPersisted, true);
+          await Promise.resolve();
+          resolutionCheckpointPersisted = true;
+        },
+      },
+    });
+
+    const installIndex = executedCalls.findIndex(
+      (call) => call.name === "install_code_dependency",
+    );
+    assert.ok(installIndex >= 0, "approved install must execute");
+    assert.equal(
+      executedContexts[installIndex]?.userApprovalGranted,
+      true,
+      "approved install runs with approval-granted context",
+    );
+    assert.ok(executedCalls.some((call) => call.name === "run_code_block"));
+  } finally {
+    __setCodeToolsDesktopAppForTests(null);
+  }
+});
+
+test("required prepared actions bind double approval before one external execution", async () => {
+  const prompt = "Create a Linear issue titled Research follow-up.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-11T12:00:00.000Z"),
+  });
+  vault.context.settings.linearEnabled = true;
+  const broker = new ApprovalBroker();
+  const approvalRequests: ApprovalRequest[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  let prepareCalls = 0;
+  let legacyExecutions = 0;
+  let preparedExecutions = 0;
+  const descriptor: ToolDescriptor = {
+    version: 1,
+    name: "linear_create_issue",
+    capability: { system: "linear", resourceType: "issue", action: "create" },
+    effect: "reversible_mutation",
+    risk: "high",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: true,
+      fallback: "double_exact",
+    },
+    execution: {
+      preparation: "required",
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "required",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    receiptKind: "external_action",
+  };
+  const tool: AgentTool = {
+    name: descriptor.name,
+    description: "Create one Linear issue.",
+    parameters: {
+      type: "object",
+      properties: { title: { type: "string" } },
+      required: ["title"],
+    },
+    descriptor,
+    execute: async () => {
+      legacyExecutions += 1;
+      return { bypassed: true };
+    },
+    prepare: async (args, context) => {
+      prepareCalls += 1;
+      return {
+        ok: true,
+        action: await withPreparedActionFingerprint({
+          version: 1,
+          id: "linear-action-1",
+          runId: context.runId!,
+          toolCallId: "linear-call-1",
+          toolName: descriptor.name,
+          target: {
+            system: "linear",
+            resourceType: "issue",
+            id: "new:linear-call-1",
+            teamId: "team-1",
+          },
+          relatedResources: [],
+          normalizedArgs: { title: String(args.title ?? "") },
+          preview: {
+            summary: "Create Linear issue Research follow-up",
+            destination: "Linear team team-1",
+            outboundPayload: { title: String(args.title ?? "") },
+            warnings: [],
+            outboundBytes: 18,
+          },
+          idempotencyKey: `${context.runId}:linear-call-1`,
+          preparedAt: "2026-07-11T12:00:00.000Z",
+          expiresAt: "2026-07-11T12:05:00.000Z",
+        }),
+      };
+    },
+    executePrepared: async (action, context) => {
+      preparedExecutions += 1;
+      const authorized = context.authorizedAction!;
+      return {
+        mutationState: "applied",
+        output: { identifier: "RES-123" },
+        receipt: {
+          version: 1,
+          id: "linear-receipt-1",
+          runId: action.runId,
+          actionId: action.id,
+          toolName: action.toolName,
+          operation: "create",
+          resource: {
+            system: "linear",
+            resourceType: "issue",
+            id: "issue-123",
+            identifier: "RES-123",
+            teamId: "team-1",
+          },
+          message: "Created Linear issue RES-123",
+          payloadFingerprint: action.payloadFingerprint,
+          grantId: authorized.grantId,
+          idempotencyKey: action.idempotencyKey,
+          startedAt: "2026-07-11T12:00:01.000Z",
+          committedAt: "2026-07-11T12:00:03.000Z",
+          commitKind: "committed",
+          readback: {
+            status: "verified",
+            checkedAt: "2026-07-11T12:00:02.000Z",
+            observedRevision: "updated-at-1",
+          },
+          effects: { affectedCount: 1, changedFields: ["title"] },
+        },
+      };
+    },
+  };
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () =>
+        responseWithToolCall("linear_create_issue", {
+          title: "Research follow-up",
+        }),
+      () => responseWithContent("Created Linear issue RES-123."),
+      () => responseWithContent("Created Linear issue RES-123."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: new DefaultToolRegistry([tool]),
+    toolContext: vault.context,
+    enableStreaming: false,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        approvalRequests.push(request);
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.equal(prepareCalls, 1);
+  assert.equal(legacyExecutions, 0);
+  assert.equal(preparedExecutions, 1);
+  assert.deepEqual(
+    approvalRequests.map((request) => request.confirmationIndex),
+    [1, 2],
+  );
+  assert.ok(
+    approvalRequests.every(
+      (request) =>
+        request.requiredConfirmations === 2 &&
+        request.payloadFingerprint ===
+          approvalRequests[0].payloadFingerprint &&
+        request.preparedAction?.id === "linear-action-1",
+    ),
+  );
+  assert.equal(receipts[0]?.resource?.system, "linear");
+  assert.equal(receipts[0]?.path, undefined);
+  assert.match(receipts[0]?.grantId ?? "", /^grant:approval-/);
+  const runtimeSnapshot = [...vault.content.values()]
+    .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
+    .find((snapshot) => snapshot?.operationJournal.some(
+      (record) => record.toolName === "linear_create_issue",
+    ));
+  const actionRecord = runtimeSnapshot?.operationJournal.find(
+    (record) => record.toolName === "linear_create_issue",
+  );
+  assert.equal(actionRecord?.version, 2);
+  assert.equal(actionRecord?.state, "committed");
+  assert.equal(
+    actionRecord?.preparedAction?.payloadFingerprint,
+    approvalRequests[0].payloadFingerprint,
+  );
+  assert.match(actionRecord?.authorization?.grantId ?? "", /^grant:approval-/);
+  assert.equal(actionRecord?.receipt?.resource?.system, "linear");
+});
+
+test("optional legacy tools keep execution policy while descriptors drive WAL classification", async () => {
+  const prompt = "Promote workspace item item-1.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-11T12:00:00.000Z"),
+  });
+  let executions = 0;
+  const descriptor: ToolDescriptor = {
+    version: 1,
+    name: "promote_workspace_item",
+    capability: {
+      system: "workspace",
+      resourceType: "work_item",
+      action: "promote",
+    },
+    effect: "reversible_mutation",
+    risk: "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: true,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "optional",
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "optional",
+      reconciliation: "optional",
+    },
+    allowedPrincipals: ["single_agent"],
+  };
+  const registry = new DefaultToolRegistry([
+    {
+      name: descriptor.name,
+      description: "Promote a workspace item.",
+      parameters: { type: "object", properties: {} },
+      descriptor,
+      execute: async () => {
+        executions += 1;
+        return { status: "ok", id: "item-1", affectedCount: 1 };
+      },
+    },
+  ]);
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () => responseWithToolCall(descriptor.name, {}),
+      () => responseWithContent("Promoted workspace item item-1."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {},
+  });
+
+  assert.equal(executions, 1);
+  const runtimeSnapshot = [...vault.content.values()]
+    .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
+    .find((snapshot) => snapshot?.operationJournal.some(
+      (record) => record.toolName === descriptor.name,
+    ));
+  const journal = runtimeSnapshot?.operationJournal.find(
+    (record) => record.toolName === descriptor.name,
+  );
+  assert.equal(journal?.version, 2);
+  assert.equal(journal?.state, "committed");
+  assert.equal(journal?.descriptor?.capability.action, "promote");
+  assert.equal(journal?.preparedAction, undefined);
+  assert.equal(journal?.receipt?.resource?.system, "workspace");
+});

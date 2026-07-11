@@ -1,9 +1,33 @@
 import type { AgenticReflexInput, CompletionSignal } from "./types";
+import { isBroadUnscopedVaultMutation } from "../missionScope";
+import {
+  WRITE_RECEIPT_MISSING,
+  receiptsSatisfyWriteProof,
+} from "../editOrganizeIntent";
+
+export { WRITE_RECEIPT_MISSING, receiptsSatisfyWriteProof };
 
 export function evaluateCompletion(input: AgenticReflexInput): CompletionSignal {
+  if (isBlockedBroadUnscopedMutation(input)) {
+    return {
+      complete: true,
+      confidence: 0.9,
+      missing: [],
+      reason: "broad_unscoped_mutation_requires_explicit_scope",
+      mustContinue: false,
+    };
+  }
+
   const missing: string[] = [];
-  if (input.missionIntent.requireWriteCompletion && input.receipts.length === 0) {
-    missing.push("write_receipt");
+  // write_receipt: requireWriteCompletion missions must produce at least one
+  // live write receipt (tool or streamed). Prefer write-tool recovery first.
+  // forceChatOnly / chat_only missions must never demand write_receipt.
+  if (
+    input.missionIntent.mode !== "chat_only" &&
+    input.missionIntent.requireWriteCompletion &&
+    !receiptsSatisfyWriteProof(input.receipts)
+  ) {
+    missing.push(WRITE_RECEIPT_MISSING);
   }
   if (requiresVaultEvidence(input.prompt) && !hasVaultEvidence(input)) {
     missing.push("vault_evidence");
@@ -35,6 +59,13 @@ export function evaluateCompletion(input: AgenticReflexInput): CompletionSignal 
 export function requiresVaultEvidence(prompt: string): boolean {
   return /\b(vault|my notes|across notes|related notes|semantic search|what do my notes say|search my notes)\b/i.test(
     prompt,
+  );
+}
+
+function isBlockedBroadUnscopedMutation(input: AgenticReflexInput): boolean {
+  return (
+    input.missionIntent.explicitMutation &&
+    isBroadUnscopedVaultMutation(input.missionIntent.autonomyScope)
   );
 }
 
@@ -77,6 +108,15 @@ function getRecommendedNextTool(
   input: AgenticReflexInput,
   missing: string[],
 ): string | undefined {
+  // Prefer write tools when write_receipt is missing so edit/organize missions
+  // recover into a vault mutation instead of looping on read-only evidence.
+  if (missing.includes(WRITE_RECEIPT_MISSING)) {
+    const writeTool = getRecommendedWriteTool(input);
+    if (writeTool) {
+      return writeTool;
+    }
+  }
+
   if (missing.includes("web_evidence")) {
     return input.allowedToolNames.has("web_fetch")
       ? "web_fetch"
@@ -103,23 +143,24 @@ function getRecommendedNextTool(
     return "count_words";
   }
 
-  if (missing.includes("write_receipt")) {
-    for (const toolName of [
-      "append_to_current_file",
-      "replace_current_file",
-      "edit_current_section",
-      "create_file",
-      "append_file",
-      "replace_file",
-      "create_design_canvas",
-      "create_svg_design",
-      "create_design_package",
-    ]) {
-      if (input.allowedToolNames.has(toolName)) {
-        return toolName;
-      }
+  return undefined;
+}
+
+function getRecommendedWriteTool(input: AgenticReflexInput): string | undefined {
+  for (const toolName of [
+    "replace_current_file",
+    "append_to_current_file",
+    "edit_current_section",
+    "create_file",
+    "append_file",
+    "replace_file",
+    "create_design_canvas",
+    "create_svg_design",
+    "create_design_package",
+  ]) {
+    if (input.allowedToolNames.has(toolName)) {
+      return toolName;
     }
   }
-
   return undefined;
 }

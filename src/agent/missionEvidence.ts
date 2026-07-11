@@ -1,7 +1,21 @@
+import type { ClaimPassageRef } from "./claimLedger";
 import type { MissionEvidence } from "./missionLedger";
 import type { ToolExecutionResult } from "../tools/types";
+import {
+  createEvidenceSourceId,
+  extractEvidencePassages,
+  type EvidencePassage,
+} from "./researchDossier";
+import {
+  evaluateSourceUsability,
+  normalizeSourceParserStatus,
+} from "./sourceUsability";
+
+const MAX_CLAIM_PASSAGES_PER_TOOL = 6;
 
 export interface MissionReceiptLike {
+  id?: string;
+  version?: 1;
   toolName?: string;
   operation: string;
   message?: string;
@@ -11,6 +25,14 @@ export interface MissionReceiptLike {
   bytesWritten?: number;
   bytesDeleted?: number;
   affectedCount?: number;
+  payloadFingerprint?: string;
+  resource?: {
+    system: string;
+    resourceType?: string;
+    id: string;
+    path?: string;
+    url?: string;
+  };
 }
 
 export function evidenceFromToolResult(
@@ -21,16 +43,46 @@ export function evidenceFromToolResult(
     return null;
   }
 
-  if (toolName === "web_fetch" && isRecord(result.output)) {
-    const url = getString(result.output.url) ?? "";
+  if (
+    (toolName === "web_fetch" || toolName === "read_source_section") &&
+    isRecord(result.output)
+  ) {
+    const url =
+      getString(result.output.url) ??
+      getString(result.output.normalizedUrl) ??
+      "";
     const title = getString(result.output.title) ?? (url || "Web source");
+    const sourceLocator =
+      getString(result.output.normalizedUrl) ||
+      url ||
+      getString(result.output.path) ||
+      title;
+    const content = getString(result.output.content) ?? "";
+    const sourceUsability = evaluateSourceUsability({
+      content,
+      query: getString(result.output.query),
+      sourceLocator,
+      parserStatus: getString(result.output.parserStatus),
+      baseOffset: getNumber(result.output.sourceStartChar),
+    });
+    if (!sourceUsability.usable) {
+      return null;
+    }
+    const passageIds = sourceUsability.passageIds;
     return {
-      id: `web:${hashEvidenceKey(url || title)}`,
+      id: `web:${hashEvidenceKey(sourceLocator)}`,
       kind: "web_source",
       title,
       ...(url ? { url } : {}),
-      summary: summarizeText(getString(result.output.content) ?? ""),
+      sourceId: createEvidenceSourceId(sourceLocator),
+      ...(passageIds[0] ? { passageId: passageIds[0] } : {}),
+      ...(passageIds.length > 0 ? { passageIds } : {}),
+      summary: summarizeText(content),
       confidence: "high",
+      usableSource: true,
+      parserStatus: normalizeSourceParserStatus(
+        getString(result.output.parserStatus),
+      ),
     };
   }
 
@@ -52,20 +104,57 @@ export function evidenceFromToolResult(
     };
   }
 
+  if (toolName === "browser_extract_markdown" && isRecord(result.output)) {
+    const url = getString(result.output.url) ?? "";
+    const title = getString(result.output.title) ?? (url || "Browser source");
+    const content = getString(result.output.markdown) ?? "";
+    const sourceUsability = evaluateSourceUsability({
+      content,
+      sourceLocator: url || title,
+      parserStatus: content.trim() ? "parsed" : "empty",
+    });
+    if (!url || !sourceUsability.usable) {
+      return null;
+    }
+    return {
+      id: `web:${hashEvidenceKey(url)}`,
+      kind: "web_source",
+      title,
+      url,
+      sourceId: createEvidenceSourceId(url),
+      passageId: sourceUsability.passageIds[0],
+      passageIds: sourceUsability.passageIds,
+      summary: summarizeText(content),
+      confidence: "high",
+      usableSource: true,
+      parserStatus: "parsed",
+    };
+  }
+
   if (toolName === "read_file" && isRecord(result.output)) {
     const path = getString(result.output.path) ?? "";
+    const content = getString(result.output.content) ?? "";
+    const contentEvidence = extractEvidencePassages(content, {
+      query: getString(result.output.query),
+      sourceLocator: path || "vault_note",
+    });
+    const passageIds = contentEvidence.passages.map((passage) => passage.id);
     return {
       id: `vault:${hashEvidenceKey(path)}`,
       kind: "vault_note",
       title: path || "Vault note",
       ...(path ? { path } : {}),
-      summary: summarizeText(getString(result.output.content) ?? ""),
+      sourceId: createEvidenceSourceId(path || "vault_note"),
+      ...(passageIds[0] ? { passageId: passageIds[0] } : {}),
+      ...(passageIds.length > 0 ? { passageIds } : {}),
+      summary: summarizeText(content),
       confidence: "high",
     };
   }
 
   if (toolName === "read_markdown_files" && isRecord(result.output)) {
     const files = Array.isArray(result.output.files) ? result.output.files : [];
+    const output = result.output;
     const paths = files
       .filter(isRecord)
       .map((file) => getString(file.path))
@@ -73,12 +162,25 @@ export function evidenceFromToolResult(
     if (paths.length === 0) {
       return null;
     }
+    const passageIds: string[] = [];
     const summary = files
       .filter(isRecord)
       .map((file) => {
         const path = getString(file.path) ?? "note";
-        const content = summarizeText(getString(file.content) ?? "", 220);
-        return `${path}: ${content}`;
+        const content = getString(file.content) ?? "";
+        const contentEvidence = extractEvidencePassages(content, {
+          query: getString(output.query),
+          sourceLocator: path,
+          maxPassages: 2,
+          maxPassageChars: 320,
+          maxTotalChars: 600,
+        });
+        for (const passage of contentEvidence.passages) {
+          if (passage.id && !passageIds.includes(passage.id)) {
+            passageIds.push(passage.id);
+          }
+        }
+        return `${path}: ${summarizeText(content, 220)}`;
       })
       .join("\n");
     return {
@@ -86,6 +188,9 @@ export function evidenceFromToolResult(
       kind: "vault_note",
       title: `${paths.length} vault notes read`,
       path: paths[0],
+      sourceId: createEvidenceSourceId(paths[0] ?? "vault_batch"),
+      ...(passageIds[0] ? { passageId: passageIds[0] } : {}),
+      ...(passageIds.length > 0 ? { passageIds } : {}),
       summary: summarizeText(summary),
       confidence: "high",
     };
@@ -121,12 +226,223 @@ export function evidenceFromToolResult(
   return null;
 }
 
+/**
+ * Prefer dossier passage texts from tool output for claim grounding.
+ * Re-extracts from content when contentEvidence is absent.
+ */
+export function claimPassagesFromToolResult(
+  toolName: string,
+  result: ToolExecutionResult,
+): ClaimPassageRef[] {
+  if (!result.ok || !isRecord(result.output)) {
+    return [];
+  }
+
+  const output = result.output;
+  const evidenceId = evidenceIdForClaimPassages(toolName, output);
+  const fromBundle = passagesFromContentEvidence(
+    output.contentEvidence,
+    evidenceId,
+  );
+  if (fromBundle.length > 0) {
+    return fromBundle.slice(0, MAX_CLAIM_PASSAGES_PER_TOOL);
+  }
+
+  if (
+    toolName === "web_fetch" ||
+    toolName === "read_source_section" ||
+    toolName === "read_file" ||
+    toolName === "browser_extract_markdown"
+  ) {
+    const content =
+      getString(output.content) ?? getString(output.markdown) ?? "";
+    if (!content.trim()) {
+      return [];
+    }
+    const sourceLocator =
+      getString(output.normalizedUrl) ||
+      getString(output.url) ||
+      getString(output.path) ||
+      getString(output.title) ||
+      toolName;
+    if (
+      (toolName === "web_fetch" ||
+        toolName === "read_source_section" ||
+        toolName === "browser_extract_markdown") &&
+      !evaluateSourceUsability({
+        content,
+        query: getString(output.query),
+        sourceLocator,
+        parserStatus: getString(output.parserStatus),
+        baseOffset: getNumber(output.sourceStartChar),
+      }).usable
+    ) {
+      return [];
+    }
+    const bundle = extractEvidencePassages(content, {
+      query: getString(output.query),
+      sourceLocator,
+      baseOffset: getNumber(output.sourceStartChar),
+    });
+    return claimPassageRefsFromEvidencePassages(
+      bundle.passages,
+      evidenceId,
+    ).slice(0, MAX_CLAIM_PASSAGES_PER_TOOL);
+  }
+
+  if (toolName === "read_markdown_files" && Array.isArray(output.files)) {
+    const passages: ClaimPassageRef[] = [];
+    for (const file of output.files) {
+      if (!isRecord(file) || typeof file.content !== "string") {
+        continue;
+      }
+      const path = getString(file.path) ?? "note";
+      const fileEvidenceId = `vault:${hashEvidenceKey(path)}`;
+      const fromFile = passagesFromContentEvidence(
+        file.contentEvidence,
+        fileEvidenceId,
+      );
+      if (fromFile.length > 0) {
+        passages.push(...fromFile);
+      } else {
+        const bundle = extractEvidencePassages(file.content, {
+          query: getString(output.query),
+          sourceLocator: path,
+          maxPassages: 2,
+          maxPassageChars: 320,
+          maxTotalChars: 600,
+        });
+        passages.push(
+          ...claimPassageRefsFromEvidencePassages(
+            bundle.passages,
+            fileEvidenceId,
+          ),
+        );
+      }
+      if (passages.length >= MAX_CLAIM_PASSAGES_PER_TOOL) {
+        break;
+      }
+    }
+    return passages.slice(0, MAX_CLAIM_PASSAGES_PER_TOOL);
+  }
+
+  return [];
+}
+
+export function upsertClaimPassageRefs(
+  records: ClaimPassageRef[],
+  passages: ClaimPassageRef[],
+): void {
+  for (const passage of passages) {
+    if (!passage.id || passage.text === undefined) {
+      continue;
+    }
+    const next: ClaimPassageRef = {
+      id: passage.id,
+      text: passage.text,
+      ...(passage.evidenceId ? { evidenceId: passage.evidenceId } : {}),
+      ...(passage.subquestionId
+        ? { subquestionId: passage.subquestionId }
+        : {}),
+    };
+    const index = records.findIndex((item) => item.id === next.id);
+    if (index >= 0) {
+      records[index] = next;
+    } else {
+      records.push(next);
+    }
+  }
+}
+
+function evidenceIdForClaimPassages(
+  toolName: string,
+  output: Record<string, unknown>,
+): string | undefined {
+  if (
+    toolName === "web_fetch" ||
+    toolName === "read_source_section" ||
+    toolName === "browser_extract_markdown"
+  ) {
+    const sourceLocator =
+      getString(output.normalizedUrl) ||
+      getString(output.url) ||
+      getString(output.path) ||
+      getString(output.title);
+    return sourceLocator
+      ? `web:${hashEvidenceKey(sourceLocator)}`
+      : undefined;
+  }
+  if (toolName === "read_file") {
+    const path = getString(output.path);
+    return path ? `vault:${hashEvidenceKey(path)}` : undefined;
+  }
+  return undefined;
+}
+
+function passagesFromContentEvidence(
+  value: unknown,
+  evidenceId?: string,
+): ClaimPassageRef[] {
+  if (!isRecord(value) || !Array.isArray(value.passages)) {
+    return [];
+  }
+  const passages: EvidencePassage[] = [];
+  for (const item of value.passages) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const id = getString(item.id);
+    const text = getString(item.text);
+    if (!id || text === undefined) {
+      continue;
+    }
+    passages.push({
+      id,
+      text,
+      startChar: getNumber(item.startChar) ?? 0,
+      endChar: getNumber(item.endChar) ?? text.length,
+      selection:
+        item.selection === "query_match" || item.selection === "coverage"
+          ? item.selection
+          : "coverage",
+    });
+  }
+  return claimPassageRefsFromEvidencePassages(passages, evidenceId);
+}
+
+function claimPassageRefsFromEvidencePassages(
+  passages: EvidencePassage[],
+  evidenceId?: string,
+): ClaimPassageRef[] {
+  return passages
+    .filter((passage) => passage.id && passage.text !== undefined)
+    .map((passage) => ({
+      id: passage.id,
+      text: passage.text,
+      ...(evidenceId ? { evidenceId } : {}),
+    }));
+}
+
 export function evidenceFromReceipt(receipt: MissionReceiptLike): MissionEvidence {
+  const system = receipt.resource?.system ?? (receipt.path ? "vault" : "unknown");
+  const domain =
+    system === "linear" || system === "github"
+      ? "external"
+      : system === "vault"
+        ? "vault"
+        : "artifact";
+  const receiptPath =
+    system === "vault"
+      ? receipt.path ?? receipt.resource?.path
+      : undefined;
   const key = [
+    system,
     receipt.operation,
-    receipt.path ?? "",
+    receipt.resource?.id ?? "",
+    receiptPath ?? "",
     receipt.toPath ?? "",
     receipt.backupPath ?? "",
+    receipt.payloadFingerprint ?? "",
   ].join(":");
   const summaryParts = [
     receipt.message,
@@ -143,11 +459,15 @@ export function evidenceFromReceipt(receipt: MissionReceiptLike): MissionEvidenc
   ].filter((part): part is string => Boolean(part));
 
   return {
-    id: `receipt:${hashEvidenceKey(key)}`,
+    id: `receipt:${domain}:${hashEvidenceKey(key)}`,
     kind: "receipt",
-    title: `${receipt.operation} ${receipt.path ?? ""}`.trim(),
-    ...(receipt.path ? { path: receipt.path } : {}),
-    summary: summaryParts.join("; ") || "Vault write receipt emitted.",
+    title: `${system} ${receipt.operation} ${receiptPath ?? receipt.resource?.id ?? ""}`.trim(),
+    ...(receiptPath ? { path: receiptPath } : {}),
+    ...(system !== "vault" && receipt.resource?.url
+      ? { url: receipt.resource.url }
+      : {}),
+    summary:
+      summaryParts.join("; ") || `${system} action receipt emitted.`,
     confidence: "high",
   };
 }

@@ -1,7 +1,7 @@
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import { FINALIZATION_RESERVE_STEPS } from "./AgentBudget";
-import type { RunBudgetRoute } from "./runBudget";
-import { resolveConfiguredMaxAgentSteps } from "./runBudget";
+import type { RunBudgetProfile, RunBudgetRoute } from "./runBudget";
+import { getRunBudgetProfile, resolveConfiguredMaxAgentSteps } from "./runBudget";
 import type { GeneratedOutputPolicy } from "./generatedOutputPolicy";
 
 export interface LoopBudgetPlan {
@@ -10,6 +10,7 @@ export interface LoopBudgetPlan {
   finalizationReserve: number;
   expectedTools: string[];
   stopWhenSatisfied: boolean;
+  routeProfile?: RunBudgetProfile;
 }
 
 export function planLoopBudget(input: {
@@ -20,8 +21,9 @@ export function planLoopBudget(input: {
   requestedSteps?: number | null;
 }): LoopBudgetPlan {
   const hardCap = resolveConfiguredMaxAgentSteps(input.configuredMaxSteps);
+  const routeProfile = getRunBudgetProfile(input.route);
   const expectedTools = getExpectedTools(input.prompt, input.generated);
-  const finalizationReserve = FINALIZATION_RESERVE_STEPS;
+  const finalizationReserve = getFinalizationReserve(hardCap);
   const requestedToolBudget =
     typeof input.requestedSteps === "number" && Number.isFinite(input.requestedSteps)
       ? Math.max(0, Math.trunc(input.requestedSteps) - finalizationReserve)
@@ -43,6 +45,7 @@ export function planLoopBudget(input: {
     toolStepBudget,
     finalizationReserve,
     expectedTools,
+    routeProfile,
     stopWhenSatisfied:
       input.generated.kind !== "general" || input.generated.requiresGrounding,
   };
@@ -68,11 +71,21 @@ function getExpectedTools(
       : ["create_design_canvas"];
   }
 
+  if (hasRunCodeIntent(prompt)) {
+    return ["run_code_block"];
+  }
+
   if (generated.requiresGrounding || /\b(web|online|sources?|citations?)\b/i.test(prompt)) {
     return ["web_search", "web_fetch"];
   }
 
   return [];
+}
+
+function hasRunCodeIntent(prompt: string): boolean {
+  return /\b(run|execute|eval|evaluate|test|compile|debug)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile|debug)\b/i.test(
+    prompt,
+  );
 }
 
 function getRequestedToolBudget({
@@ -126,4 +139,12 @@ function hasLongResearchIntent(prompt: string): boolean {
   return /\b(deep\s+research|long\s+research|in-depth\s+research|deep\s+dive|investigate|compare\s+sources|multi[-\s]?source|strategy|broad\s+constraints|evidence\s+ledger|checkpoint|long[-\s]?running)\b/i.test(
     prompt,
   );
+}
+
+function getFinalizationReserve(hardCap: number): number {
+  if (hardCap <= FINALIZATION_RESERVE_STEPS) {
+    return Math.max(0, hardCap - 2);
+  }
+
+  return FINALIZATION_RESERVE_STEPS;
 }

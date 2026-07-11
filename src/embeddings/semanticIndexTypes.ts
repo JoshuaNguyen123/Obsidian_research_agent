@@ -21,7 +21,7 @@ export interface SemanticIndexNote {
   chunks: SemanticIndexChunk[];
 }
 
-export interface SemanticVaultIndex {
+export interface SemanticVaultIndexV1 {
   version: 1;
   model: string;
   dim: 256 | 512;
@@ -34,6 +34,64 @@ export interface SemanticVaultIndex {
   indexedAt: string;
   notes: SemanticIndexNote[];
 }
+
+export interface SemanticIndexRowMeta {
+  id: string;
+  notePath: string;
+  title: string;
+  heading: string | null;
+  textHash: string;
+  tokenCount: number;
+  snippet: string;
+}
+
+export interface SemanticIndexNoteMeta {
+  path: string;
+  title: string;
+  mtime: number;
+  size: number;
+  contentHash: string;
+  tags: string[];
+  links: string[];
+  headings: string[];
+  chunkCount: number;
+  firstSnippet: string;
+}
+
+export interface SemanticIndexShardRef {
+  id: string;
+  path: string;
+  rowCount: number;
+  vectorEncoding: "float32-base64";
+}
+
+export interface SemanticIndexShardV2 {
+  version: 2;
+  id: string;
+  model: string;
+  dim: 256 | 512;
+  indexedAt: string;
+  rows: SemanticIndexRowMeta[];
+  vectorsBase64: string;
+}
+
+export interface SemanticVaultIndexV2 {
+  version: 2;
+  model: string;
+  dim: 256 | 512;
+  chunking: {
+    minTokens: number;
+    targetTokens: number;
+    maxTokens: number;
+    overlapTokens: number;
+  };
+  indexedAt: string;
+  notes: SemanticIndexNoteMeta[];
+  shards: SemanticIndexShardRef[];
+  totalRows: number;
+}
+
+export type SemanticVaultIndex = SemanticVaultIndexV1 | SemanticVaultIndexV2;
 
 export interface SemanticIndexBuildResult {
   ok: boolean;
@@ -55,6 +113,10 @@ export interface SemanticIndexSearchRequest {
   limit: number;
   folder?: string | null;
   maxSnippetChars?: number;
+  mode?: "standard" | "deep";
+  candidateLimit?: number;
+  minScore?: number;
+  cursor?: string | null;
 }
 
 export interface SemanticIndexSearchResult {
@@ -66,6 +128,8 @@ export interface SemanticIndexSearchResult {
   model: string;
   dim: number;
   indexedAt?: string;
+  candidateCount?: number;
+  nextCursor?: string | null;
   resultCount: number;
   results: SemanticIndexSearchHit[];
   code?: string;

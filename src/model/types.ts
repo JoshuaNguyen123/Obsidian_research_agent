@@ -1,3 +1,5 @@
+import { formatModelFailureCopy } from "../agent/failureCopy";
+
 export type ModelRole = "system" | "user" | "assistant" | "tool";
 export type ModelThink = boolean | "low" | "medium" | "high" | "max";
 export type ModelProvider = "ollama" | "openai_compatible";
@@ -51,6 +53,7 @@ export interface ModelChatRequest {
   model?: string;
   messages: ModelChatMessage[];
   tools?: ModelToolDefinition[];
+  format?: JsonSchemaObject;
   think?: ModelThink;
   options?: ModelRequestOptions;
   abortSignal?: AbortSignal;
@@ -141,11 +144,14 @@ export class ModelClientError extends Error {
 
 export function formatModelClientError(error: unknown): string {
   if (error instanceof ModelClientError) {
-    return error.message;
+    return formatModelFailureCopy({
+      category: error.category,
+      message: error.message,
+    });
   }
 
   if (error instanceof Error) {
-    return error.message;
+    return formatModelFailureCopy({ message: error.message });
   }
 
   return String(error);

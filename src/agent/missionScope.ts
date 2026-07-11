@@ -87,10 +87,10 @@ export function deriveAutonomyScope(
 
   scope.write.currentNote =
     (input.noteOutput === true && !broadVaultWriteTarget) ||
-    /\b(append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect)\b[\s\S]{0,160}\b(note|page|document|file|section|heading)\b/i.test(
+    /\b(append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect|undo|restore|revert|rollback|roll\s+back)\b[\s\S]{0,160}\b(note|page|document|file|section|heading|backup)\b/i.test(
       prompt,
     ) ||
-    /\b(note|page|document|file|section|heading)\b[\s\S]{0,160}\b(append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect)\b/i.test(
+    /\b(note|page|document|file|section|heading|backup)\b[\s\S]{0,160}\b(append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect|undo|restore|revert|rollback|roll\s+back)\b/i.test(
       prompt,
     );
   scope.write.researchMemory =

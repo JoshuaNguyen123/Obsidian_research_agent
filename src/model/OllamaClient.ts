@@ -166,6 +166,7 @@ function buildOllamaChatBody(
     model,
     messages: request.messages.map(toOllamaMessage),
     tools: request.tools,
+    format: request.format,
     think: request.think,
     stream,
   };

@@ -13,7 +13,32 @@ import {
   MAX_WEB_FETCH_CHARS,
   MAX_WEB_SEARCH_SNIPPET_CHARS,
 } from "../src/tools/constants";
-import type { ResearchMemoryIndexEntry, ToolExecutionContext } from "../src/tools/types";
+import type { ResearchMemoryIndexEntry, ToolExecutionContext, ToolExecutionResult, ToolRegistry } from "../src/tools/types";
+
+async function executeAuthorizedPrepared(
+  registry: ToolRegistry,
+  call: { name: string; arguments: Record<string, unknown> },
+  context: ToolExecutionContext,
+): Promise<ToolExecutionResult> {
+  const prepared = await registry.prepare!(call, {
+    ...context,
+    runId: context.runId ?? `test-run-${call.name}`,
+    operationId: context.operationId ?? `test-op-${call.name}-${Date.now()}`,
+  });
+  if (!prepared.ok) {
+    return {
+      ok: false,
+      toolName: call.name,
+      mutationState: "not_applied",
+      error: prepared.error,
+    };
+  }
+  return registry.executePrepared!(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "test-grant",
+  });
+}
 
 test("registry exposes tool definitions and rejects unknown tools", async () => {
   const registry = createDefaultToolRegistry();
@@ -48,6 +73,8 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.ok(definitions.some((tool) => tool.function.name === "compact_research_memory"));
   assert.ok(definitions.some((tool) => tool.function.name === "delete_research_memory_entry"));
   assert.ok(definitions.some((tool) => tool.function.name === "append_to_current_section"));
+  assert.ok(definitions.some((tool) => tool.function.name === "highlight_current_file_phrase"));
+  assert.ok(definitions.some((tool) => tool.function.name === "restore_current_file_from_backup"));
   assert.ok(definitions.some((tool) => tool.function.name === "create_file"));
 
   const result = await registry.execute(
@@ -57,6 +84,71 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
 
   assert.equal(result.ok, false);
   assert.equal(result.error?.code, "unknown_tool");
+});
+
+test("companion browser tool stays blocked when browser setting is disabled", async () => {
+  const registry = createDefaultToolRegistry();
+  const result = await registry.execute(
+    {
+      name: "browser_open_page",
+      arguments: { url: "https://example.com" },
+    },
+    createMockContext({
+      settings: {
+        browserToolsEnabled: false,
+        experienceMemoryEnabled: false,
+      },
+    }).context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal((result.output as { status?: string }).status, "blocked");
+  assert.match(
+    String((result.output as { reason?: string }).reason),
+    /Browser tools are disabled/i,
+  );
+});
+
+test("companion memory tools stay blocked when disabled or unhealthy", async () => {
+  const registry = createDefaultToolRegistry();
+  const disabled = await registry.execute(
+    {
+      name: "memory_search",
+      arguments: { query: "workflow" },
+    },
+    createMockContext({
+      settings: {
+        experienceMemoryEnabled: false,
+      },
+    }).context,
+  );
+
+  assert.equal(disabled.ok, true);
+  assert.equal((disabled.output as { status?: string }).status, "blocked");
+  assert.match(
+    String((disabled.output as { reason?: string }).reason),
+    /Experience memory is disabled/i,
+  );
+
+  const unhealthy = await registry.execute(
+    {
+      name: "memory_search",
+      arguments: { query: "workflow" },
+    },
+    createMockContext({
+      settings: {
+        experienceMemoryEnabled: true,
+        companionBaseUrl: "http://127.0.0.1:1",
+      },
+    }).context,
+  );
+
+  assert.equal(unhealthy.ok, true);
+  assert.equal((unhealthy.output as { status?: string }).status, "blocked");
+  assert.match(
+    String((unhealthy.output as { reason?: string }).reason),
+    /Companion memory service is unavailable/i,
+  );
 });
 
 test("read_file rejects unsafe paths before vault access", async () => {
@@ -717,7 +809,7 @@ test("semantic_search_notes uses a fresh semantic index before live embedding", 
   assert.equal(liveEmbeddingCalled, false);
 });
 
-test("semantic index service rebuild writes JSON vectors and vector-free markdown", async () => {
+test("semantic index service rebuild writes v2 sharded vectors and vector-free markdown", async () => {
   const mock = createMockContext({
     fileStats: {
       "Research/Semantic.md": { mtime: 10, size: 120 },
@@ -771,15 +863,100 @@ test("semantic index service rebuild writes JSON vectors and vector-free markdow
   const json = JSON.parse(
     mock.content.get("Agent Memory/semantic-vault-index.json") ?? "{}",
   ) as {
-    notes: Array<{ path: string; chunks: Array<{ vector: number[] }> }>;
+    version: number;
+    notes: Array<{ path: string; chunkCount: number; firstSnippet: string; chunks?: unknown }>;
+    shards: Array<{ path: string; rowCount: number; vectorEncoding: string }>;
+    totalRows: number;
   };
+  assert.equal(json.version, 2);
   assert.equal(json.notes[0].path, "Research/Semantic.md");
-  assert.equal(json.notes[0].chunks[0].vector.length, 512);
+  assert.equal(json.notes[0].chunkCount, 1);
+  assert.equal(json.notes[0].chunks, undefined);
+  assert.equal(json.totalRows, 1);
+  assert.equal(json.shards[0].rowCount, 1);
+  assert.equal(json.shards[0].vectorEncoding, "float32-base64");
+  const shard = JSON.parse(mock.content.get(json.shards[0].path) ?? "{}") as {
+    rows: unknown[];
+    vectorsBase64?: string;
+  };
+  assert.equal(shard.rows.length, 1);
+  assert.equal(typeof shard.vectorsBase64, "string");
+  assert.ok((shard.vectorsBase64 ?? "").length > 0);
   const markdown = mock.content.get("Agent Memory/Semantic Vault Index.md") ?? "";
   assert.match(markdown, /# Semantic Vault Index/);
   assert.match(markdown, /Research\/Semantic\.md/);
   assert.doesNotMatch(markdown, /"vector"/);
   assert.doesNotMatch(markdown, /Agent Runs\/old\.md/);
+
+  const search = await service.search({
+    query: "local embeddings",
+    limit: 1,
+    mode: "deep",
+    candidateLimit: 16,
+  });
+  assert.equal(search.ok, true);
+  assert.equal(search.results[0].path, "Research/Semantic.md");
+});
+
+test("semantic index v2 updates only changed notes and removes paths without a full re-embed", async () => {
+  const mock = createMockContext();
+  mock.content.clear();
+  mock.content.set("Research/Changed.md", "# Changed\n\nInitial alpha evidence.");
+  mock.content.set("Research/Stable.md", "# Stable\n\nStable beta evidence.");
+  mock.folders.add("Research");
+  const documentBatchSizes: number[] = [];
+  mock.context.semanticEmbeddingProvider = {
+    async embed(request) {
+      if (request.documents.length > 0) {
+        documentBatchSizes.push(request.documents.length);
+      }
+      return {
+        ok: true,
+        model: request.model,
+        dim: request.dim,
+        documents: request.documents.map((_document, documentIndex) =>
+          Array.from({ length: request.dim }, (_value, index) =>
+            index === documentIndex % 2 ? 1 : 0,
+          ),
+        ),
+        queries: request.queries.map(() =>
+          Array.from({ length: request.dim }, (_value, index) =>
+            index === 0 ? 1 : 0,
+          ),
+        ),
+      };
+    },
+  };
+  const service = createSemanticIndexService({
+    app: mock.context.app,
+    getSettings: () => mock.context.settings,
+    getEmbeddingProvider: () => mock.context.semanticEmbeddingProvider!,
+    now: () => new Date("2026-07-10T00:00:00.000Z"),
+  });
+
+  assert.equal((await service.rebuild()).ok, true);
+  documentBatchSizes.splice(0, documentBatchSizes.length);
+  mock.content.set(
+    "Research/Changed.md",
+    "# Changed\n\nUpdated alpha evidence with a new conclusion.",
+  );
+  const update = await service.updatePaths(["Research/Changed.md"]);
+
+  assert.equal(update.ok, true);
+  assert.deepEqual(update.updatedPaths, ["Research/Changed.md"]);
+  assert.deepEqual(documentBatchSizes, [1]);
+  const updatedIndex = await service.load();
+  assert.deepEqual(
+    updatedIndex?.notes.map((note) => note.path),
+    ["Research/Changed.md", "Research/Stable.md"],
+  );
+
+  documentBatchSizes.splice(0, documentBatchSizes.length);
+  mock.content.delete("Research/Stable.md");
+  await service.removePaths(["Research/Stable.md"]);
+  const removedIndex = await service.load();
+  assert.deepEqual(removedIndex?.notes.map((note) => note.path), ["Research/Changed.md"]);
+  assert.deepEqual(documentBatchSizes, []);
 });
 
 test("semantic index excludes unsafe, system, and self paths", () => {
@@ -1125,7 +1302,8 @@ test("path CRUD tools create, append, replace with backup, move, and trash markd
   assert.equal(appended.ok, true);
   assert.equal(mock.content.get("Projects/New/Brief.md"), "# Brief\nNext");
 
-  const replaced = await registry.execute(
+  const replaced = await executeAuthorizedPrepared(
+    registry,
     {
       name: "replace_file",
       arguments: { path: "Projects/New/Brief.md", text: "# Replacement" },
@@ -1155,7 +1333,8 @@ test("path CRUD tools create, append, replace with backup, move, and trash markd
   assert.equal(mock.content.has("Projects/New/Brief.md"), false);
   assert.equal(mock.content.get("Projects/New/Renamed.md"), "# Replacement");
 
-  const trashed = await registry.execute(
+  const trashed = await executeAuthorizedPrepared(
+    registry,
     {
       name: "delete_path",
       arguments: { path: "Projects/New/Renamed.md" },
@@ -1405,6 +1584,140 @@ test("fill_template rejects unresolved placeholders before creating notes", asyn
   assert.equal(mock.content.has("Missing Date.md"), false);
 });
 
+test("fill_template supports safe builtins, collision suffixing, and read-back verification", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Use this template to create a note with safe builtins.",
+    now: new Date("2026-07-04T12:00:00.000Z"),
+  });
+  mock.content.set("Generated/Brief.md", "# Existing");
+
+  const result = await registry.execute(
+    {
+      name: "fill_template",
+      arguments: {
+        templateText: "# {{title}}\n\nDate: {{date}}\n\n{{body}}",
+        values: { title: "Brief", body: "Verified content." },
+        targetPath: "Generated/Brief.md",
+        useBuiltins: true,
+        collisionPolicy: "suffix",
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal((result.output as { path: string }).path, "Generated/Brief 2.md");
+  assert.equal(
+    mock.content.get("Generated/Brief 2.md"),
+    "# Brief\n\nDate: 2026-07-04\n\nVerified content.",
+  );
+  assert.equal(
+    (result.output as { verification: { passed: boolean } }).verification.passed,
+    true,
+  );
+});
+
+test("fill_template trashes a created note when read-back verification fails", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Use this template to create a note.",
+    cachedReadTransform: (path, value) =>
+      path === "Generated/Transactional.md" ? `${value}\ncorrupted` : value,
+  });
+
+  const result = await registry.execute(
+    {
+      name: "fill_template",
+      arguments: {
+        templateText: "# {{title}}\n\n{{body}}",
+        values: { title: "Transactional", body: "Verified body." },
+        targetPath: "Generated/Transactional.md",
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "template_verification_failed");
+  assert.match(result.error?.message ?? "", /rolled back/i);
+  assert.equal(mock.content.has("Generated/Transactional.md"), false);
+  assert.ok(mock.operations.includes("trash:Generated/Transactional.md:false"));
+});
+
+test("create_research_pack creates and verifies a linked four-note transaction", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Create a research pack with a brief, sources index, and synthesis.",
+    now: new Date("2026-07-10T12:00:00.000Z"),
+  });
+  const result = await registry.execute(
+    {
+      name: "create_research_pack",
+      arguments: {
+        baseFolder: "Research",
+        title: "Template Intelligence",
+        brief: "Research how metadata-aware templates should work.",
+        sources: [
+          {
+            id: "source-1",
+            title: "Primary documentation",
+            url: "https://example.com/docs",
+            passage: "The documentation defines required and optional fields.",
+          },
+        ],
+        synthesis: "Metadata should drive discovery, ranking, and validation.",
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  const output = result.output as {
+    createdPaths: string[];
+    workflow: { status: string; phase: string };
+    verification: { passed: boolean };
+  };
+  assert.equal(output.createdPaths.length, 4);
+  assert.equal(output.workflow.status, "complete");
+  assert.equal(output.workflow.phase, "complete");
+  assert.equal(output.verification.passed, true);
+  assert.match(
+    mock.content.get("Research/Template Intelligence/Index.md") ?? "",
+    /\[\[Research\/Template Intelligence\/Synthesis\|Synthesis\]\]/,
+  );
+});
+
+test("create_research_pack rolls back every created note on verification failure", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Create a transactional research pack.",
+    cachedReadTransform: (path, value) =>
+      path.endsWith("/Sources.md") ? `${value}\ncorrupted` : value,
+  });
+  const result = await registry.execute(
+    {
+      name: "create_research_pack",
+      arguments: {
+        baseFolder: "Research",
+        title: "Rollback Pack",
+        brief: "A bounded brief.",
+        sources: [{ id: "source-1", title: "Source" }],
+        synthesis: "A bounded synthesis.",
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "research_pack_verification_failed");
+  assert.match(result.error?.message ?? "", /rolled back 4/i);
+  assert.equal(
+    [...mock.content.keys()].some((path) => path.startsWith("Research/Rollback Pack/")),
+    false,
+  );
+});
+
 test("path CRUD rejects unsafe paths and accidental overwrites", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({
@@ -1430,7 +1743,14 @@ test("path CRUD rejects unsafe paths and accidental overwrites", async () => {
       },
     ],
   ] as const) {
-    const result = await registry.execute({ name, arguments: args }, mock.context);
+    const result =
+      name === "replace_file" || name === "delete_path"
+        ? await executeAuthorizedPrepared(
+            registry,
+            { name, arguments: { ...args } },
+            mock.context,
+          )
+        : await registry.execute({ name, arguments: { ...args } }, mock.context);
     assert.equal(result.ok, false, name);
     assert.equal(result.error?.code, "unsafe_path", name);
   }
@@ -1450,14 +1770,16 @@ test("delete_path requires recursive true for non-empty folders", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({ prompt: "Delete the Projects folder." });
 
-  const blocked = await registry.execute(
+  const blocked = await executeAuthorizedPrepared(
+    registry,
     { name: "delete_path", arguments: { path: "Projects" } },
     mock.context,
   );
   assert.equal(blocked.ok, false);
   assert.match(blocked.error?.message ?? "", /recursive=true/);
 
-  const deleted = await registry.execute(
+  const deleted = await executeAuthorizedPrepared(
+    registry,
     { name: "delete_path", arguments: { path: "Projects", recursive: true } },
     mock.context,
   );
@@ -1490,7 +1812,8 @@ test("reads, appends, and replaces the active markdown file with backup", async 
   assert.equal(append.ok, true);
   assert.equal(mock.content.get("Current.md"), "Initial note\nAppended");
 
-  const replace = await registry.execute(
+  const replace = await executeAuthorizedPrepared(
+    registry,
     { name: "replace_current_file", arguments: { text: "" } },
     mock.context,
   );
@@ -1507,7 +1830,8 @@ test("replace_current_file uses a collision-safe backup path", async () => {
   mock.content.set(".agent-backups/123-Current.md", "Existing backup");
   const registry = createDefaultToolRegistry();
 
-  const result = await registry.execute(
+  const result = await executeAuthorizedPrepared(
+    registry,
     { name: "replace_current_file", arguments: { text: "Replacement" } },
     mock.context,
   );
@@ -1544,7 +1868,8 @@ test("replace_current_file tolerates an already existing backup folder", async (
   };
 
   const registry = createDefaultToolRegistry();
-  const result = await registry.execute(
+  const result = await executeAuthorizedPrepared(
+    registry,
     { name: "replace_current_file", arguments: { text: "Replacement after race" } },
     mock.context,
   );
@@ -1559,7 +1884,8 @@ test("replace_current_file is blocked without explicit replace intent", async ()
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({ prompt: "Summarize this note." });
 
-  const result = await registry.execute(
+  const result = await executeAuthorizedPrepared(
+    registry,
     { name: "replace_current_file", arguments: { text: "New note" } },
     mock.context,
   );
@@ -1645,6 +1971,162 @@ test("append_to_current_section inserts below a heading with backup", async () =
   );
 });
 
+test("highlight_current_file_phrase wraps a matching phrase with backup", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Find and highlight silver lantern in the current note.",
+    now: new Date(456),
+  });
+  const original = "# Highlight Fixture\n\nThe silver lantern stayed on the desk.";
+  mock.content.set("Current.md", original);
+
+  const result = await registry.execute(
+    {
+      name: "highlight_current_file_phrase",
+      arguments: { phrase: "silver lantern" },
+    },
+    mock.context,
+  );
+
+  const expected = "# Highlight Fixture\n\nThe ==silver lantern== stayed on the desk.";
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.get("Current.md"), expected);
+  assert.equal(mock.content.get(".agent-backups/456-Current.md"), original);
+  assert.deepEqual(result.output, {
+    path: "Current.md",
+    operation: "highlight",
+    phrase: "silver lantern",
+    matchCount: 1,
+    backupPath: ".agent-backups/456-Current.md",
+    changed: true,
+    bytesWritten: new TextEncoder().encode(expected).length,
+  });
+});
+
+test("highlight_current_file_phrase skips already highlighted text", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Highlight silver lantern in the current note.",
+    now: new Date(457),
+  });
+  const original = "The ==silver lantern== stayed near another silver lantern.";
+  mock.content.set("Current.md", original);
+
+  const result = await registry.execute(
+    {
+      name: "highlight_current_file_phrase",
+      arguments: { phrase: "silver lantern", occurrence: "all" },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    mock.content.get("Current.md"),
+    "The ==silver lantern== stayed near another ==silver lantern==.",
+  );
+  assert.doesNotMatch(mock.content.get("Current.md") ?? "", /====silver lantern====/);
+});
+
+test("highlight_current_file_phrase returns no-op when phrase is absent", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Find and highlight silver lantern in the current note.",
+    now: new Date(458),
+  });
+  mock.content.set("Current.md", "No matching lamp is here.");
+
+  const result = await registry.execute(
+    {
+      name: "highlight_current_file_phrase",
+      arguments: { phrase: "silver lantern" },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.get("Current.md"), "No matching lamp is here.");
+  assert.equal(mock.content.has(".agent-backups/458-Current.md"), false);
+  assert.deepEqual(result.output, {
+    path: "Current.md",
+    operation: "highlight",
+    phrase: "silver lantern",
+    matchCount: 0,
+    changed: false,
+    bytesWritten: 0,
+  });
+});
+
+test("restore_current_file_from_backup restores latest current-note backup after backing up current state", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Undo the last agent edit in the current note from backup.",
+    now: new Date(200),
+  });
+  mock.content.set("Current.md", "Broken note");
+  mock.content.set(".agent-backups/100-Current.md", "Older note");
+  mock.content.set(".agent-backups/150-Current.md", "Restored note");
+
+  const result = await registry.execute(
+    { name: "restore_current_file_from_backup", arguments: {} },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.output, {
+    path: "Current.md",
+    operation: "restore",
+    restoredFromBackupPath: ".agent-backups/150-Current.md",
+    backupPath: ".agent-backups/200-Current.md",
+    bytesWritten: new TextEncoder().encode("Restored note").length,
+  });
+  assert.equal(mock.content.get("Current.md"), "Restored note");
+  assert.equal(mock.content.get(".agent-backups/200-Current.md"), "Broken note");
+
+  const hiddenBackupMock = createMockContext({
+    prompt: "Undo the last agent edit in the current note from backup.",
+    now: new Date(201),
+  });
+  hiddenBackupMock.content.set("Current.md", "Broken adapter note");
+  hiddenBackupMock.content.set(".agent-backups/175-Current.md", "Adapter restored note");
+  const hiddenVault = hiddenBackupMock.context.app.vault as unknown as {
+    getFiles: () => Array<{ path: string }>;
+    getFileByPath: (path: string) => { path: string } | null;
+  };
+  const originalGetFiles = hiddenVault.getFiles.bind(hiddenVault);
+  const originalGetFileByPath = hiddenVault.getFileByPath.bind(hiddenVault);
+  hiddenVault.getFiles = () =>
+    originalGetFiles().filter((file) => !file.path.startsWith(".agent-backups/"));
+  hiddenVault.getFileByPath = (path) =>
+    path.startsWith(".agent-backups/") ? null : originalGetFileByPath(path);
+
+  const adapterResult = await registry.execute(
+    { name: "restore_current_file_from_backup", arguments: {} },
+    hiddenBackupMock.context,
+  );
+
+  assert.equal(adapterResult.ok, true);
+  assert.deepEqual(adapterResult.output, {
+    path: "Current.md",
+    operation: "restore",
+    restoredFromBackupPath: ".agent-backups/175-Current.md",
+    backupPath: ".agent-backups/201-Current.md",
+    bytesWritten: new TextEncoder().encode("Adapter restored note").length,
+  });
+  assert.equal(hiddenBackupMock.content.get("Current.md"), "Adapter restored note");
+  assert.equal(
+    hiddenBackupMock.content.get(".agent-backups/201-Current.md"),
+    "Broken adapter note",
+  );
+
+  const blocked = await registry.execute(
+    { name: "restore_current_file_from_backup", arguments: {} },
+    createMockContext({ prompt: "Read the current note." }).context,
+  );
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.error?.message ?? "", /explicitly ask to undo/i);
+});
+
 test("replace_current_file allows clear-page-and-write wording", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({
@@ -1653,7 +2135,8 @@ test("replace_current_file allows clear-page-and-write wording", async () => {
     now: new Date(345),
   });
 
-  const result = await registry.execute(
+  const result = await executeAuthorizedPrepared(
+    registry,
     {
       name: "replace_current_file",
       arguments: { text: "# The Renaissance\n\nNew essay." },
@@ -1664,6 +2147,28 @@ test("replace_current_file allows clear-page-and-write wording", async () => {
   assert.equal(result.ok, true);
   assert.equal(mock.content.get("Current.md"), "# The Renaissance\n\nNew essay.");
   assert.equal(mock.content.get(".agent-backups/345-Current.md"), "Initial note");
+});
+
+test("replace_current_file allows delete-current-note-and-write wording", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt:
+      "Delete the current note. Ensure that the space is empty. I want you to write now, a 300 word essay on Grapes of Wrath.",
+    now: new Date(456),
+  });
+
+  const result = await executeAuthorizedPrepared(
+    registry,
+    {
+      name: "replace_current_file",
+      arguments: { text: "# The Grapes of Wrath\n\nNew essay." },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.get("Current.md"), "# The Grapes of Wrath\n\nNew essay.");
+  assert.equal(mock.content.get(".agent-backups/456-Current.md"), "Initial note");
 });
 
 test("research memory tools write markdown source and update index", async () => {
@@ -1835,7 +2340,8 @@ test("research memory review, compact, and delete use backups and index hygiene"
   );
   assert.equal(memoryIndex.find((entry) => entry.topic === "Renaissance Research")?.updateCount, 2);
 
-  const deleted = await registry.execute(
+  const deleted = await executeAuthorizedPrepared(
+    registry,
     {
       name: "delete_research_memory_entry",
       arguments: { topic: "Renaissance Research Copy" },
@@ -1948,6 +2454,39 @@ test("retitle_current_file updates metadata and H1 without renaming the file", a
   });
 });
 
+test("rename_current_file renames active markdown file without changing content", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "No, you need to target Untitled and then change that.",
+  });
+  mock.content.set("Current.md", "# Old Heading\n\nExisting content.");
+
+  const result = await registry.execute(
+    {
+      name: "rename_current_file",
+      arguments: { title: "History Snapshot" },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.has("Current.md"), false);
+  assert.equal(
+    mock.content.get("History Snapshot.md"),
+    "# Old Heading\n\nExisting content.",
+  );
+  assert.ok(mock.operations.includes("rename:Current.md:History Snapshot.md"));
+  assert.deepEqual(result.output, {
+    path: "Current.md",
+    toPath: "History Snapshot.md",
+    title: "History Snapshot",
+    previousTitle: "Current",
+    changed: true,
+    operation: "rename_current_file",
+    bytesWritten: 0,
+  });
+});
+
 test("retitle_current_file is blocked without explicit title intent", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({ prompt: "Summarize this note." });
@@ -1966,10 +2505,14 @@ test("web_search normalizes request and response", async () => {
   let requestBody = "";
   let requestUrl = "";
   let authHeader = "";
+  let requestAbortSignal: AbortSignal | undefined;
+  const controller = new AbortController();
+  mock.context.abortSignal = controller.signal;
   mock.context.httpTransport = async (request) => {
     requestUrl = request.url;
     requestBody = String(request.body);
     authHeader = request.headers?.Authorization ?? "";
+    requestAbortSignal = request.abortSignal;
     return {
       status: 200,
       headers: {},
@@ -1997,6 +2540,7 @@ test("web_search normalizes request and response", async () => {
   assert.equal(result.ok, true);
   assert.equal(requestUrl, "https://ollama.com/api/web_search");
   assert.equal(authHeader, "Bearer test-key");
+  assert.equal(requestAbortSignal, controller.signal);
   assert.equal(JSON.parse(requestBody).max_results, 10);
   assert.deepEqual(result.output, {
     results: [
@@ -2110,12 +2654,66 @@ test("web_fetch normalizes request and response", async () => {
   assert.deepEqual(JSON.parse(requestBody), {
     url: "https://docs.ollama.com/capabilities/web-search",
   });
-  assert.deepEqual(result.output, {
+  const output = result.output as Record<string, unknown>;
+  assert.deepEqual(
+    {
+      title: output.title,
+      url: output.url,
+      content: output.content,
+      links: output.links,
+      fromCache: output.fromCache,
+      totalChars: output.totalChars,
+      section: output.section,
+      sectionCount: output.sectionCount,
+      normalizedUrl: output.normalizedUrl,
+      fetchedAt: output.fetchedAt,
+      sourceChars: output.sourceChars,
+      truncated: output.truncated,
+      parserStatus: output.parserStatus,
+    },
+    {
     title: "Ollama Docs",
     url: "https://docs.ollama.com/capabilities/web-search",
     content: "Fetched page content",
     links: ["https://ollama.com/models"],
-  });
+    fromCache: false,
+    totalChars: 20,
+    section: 1,
+    sectionCount: 1,
+      normalizedUrl: "https://docs.ollama.com/capabilities/web-search",
+      fetchedAt: "1970-01-01T00:00:00.123Z",
+      sourceChars: 20,
+      truncated: false,
+      parserStatus: "parsed",
+    },
+  );
+  assert.match(
+    String(output.cachedPath),
+    /^Agent Sources\/docs\.ollama\.com\/Ollama-Docs-[a-f0-9]{16}\.md$/u,
+  );
+  assert.match(String(output.urlHash), /^[a-f0-9]{16}$/u);
+  assert.match(String(output.contentHash), /^fnv1a32x2:[a-f0-9]{16}$/u);
+});
+
+test("web tools reject work when the run is already cancelled", async () => {
+  const mock = createMockContext();
+  const controller = new AbortController();
+  controller.abort();
+  mock.context.abortSignal = controller.signal;
+  let transportCalled = false;
+  mock.context.httpTransport = async () => {
+    transportCalled = true;
+    return { status: 200, headers: {}, json: { results: [] } };
+  };
+
+  const result = await createDefaultToolRegistry().execute(
+    { name: "web_search", arguments: { query: "cancelled" } },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "operation_cancelled");
+  assert.equal(transportCalled, false);
 });
 
 test("web_fetch returns tool error when transport times out", async () => {
@@ -2428,7 +3026,8 @@ test("delete_current_file creates backup before deleting active note", async () 
   });
   const registry = createDefaultToolRegistry();
 
-  const result = await registry.execute(
+  const result = await executeAuthorizedPrepared(
+    registry,
     { name: "delete_current_file", arguments: {} },
     mock.context,
   );
@@ -2450,7 +3049,8 @@ test("delete_current_file creates backup before deleting active note", async () 
 
 test("delete_current_file rejects arguments and requires delete intent", async () => {
   const registry = createDefaultToolRegistry();
-  const withPath = await registry.execute(
+  const withPath = await executeAuthorizedPrepared(
+    registry,
     { name: "delete_current_file", arguments: { path: "Projects/example.md" } },
     createMockContext({ prompt: "Delete the current note." }).context,
   );
@@ -2459,7 +3059,8 @@ test("delete_current_file rejects arguments and requires delete intent", async (
   assert.equal(withPath.error?.code, "invalid_arguments");
 
   const withoutIntent = createMockContext({ prompt: "Summarize this note." });
-  const result = await registry.execute(
+  const result = await executeAuthorizedPrepared(
+    registry,
     { name: "delete_current_file", arguments: {} },
     withoutIntent.context,
   );
@@ -2526,6 +3127,8 @@ function createMockContext(options: {
   currentMarkdownPath?: string;
   liveContent?: string;
   fileStats?: Record<string, { ctime?: number; mtime?: number; size?: number }>;
+  settings?: Partial<ToolExecutionContext["settings"]>;
+  cachedReadTransform?: (path: string, value: string) => string;
 } = {}) {
   const activePath =
     options.activePath === null ? null : (options.activePath ?? "Current.md");
@@ -2620,12 +3223,40 @@ function createMockContext(options: {
       getActiveFile: () => activeFile,
     },
     vault: {
+      adapter: {
+        list: async (folderPath: string) => {
+          const prefix = folderPath ? `${folderPath}/` : "";
+          const files = [...content.keys()].filter((path) => {
+            if (!path.startsWith(prefix)) {
+              return false;
+            }
+            return !path.slice(prefix.length).includes("/");
+          });
+          const childFolders = [...getKnownFolders()].filter((path) => {
+            if (!path.startsWith(prefix) || path === folderPath) {
+              return false;
+            }
+            return !path.slice(prefix.length).includes("/");
+          });
+          return { files, folders: childFolders };
+        },
+        read: async (path: string) => {
+          const value = content.get(path);
+          if (value === undefined) {
+            throw new Error(`File not found: ${path}`);
+          }
+          return value;
+        },
+      },
       getFiles: () =>
         [...content.keys()]
           .map((path) => getFile(path))
           .filter((file): file is NonNullable<typeof file> => Boolean(file)),
       getAllLoadedFiles,
-      cachedRead: async (file: { path: string }) => content.get(file.path) ?? "",
+      cachedRead: async (file: { path: string }) => {
+        const value = content.get(file.path) ?? "";
+        return options.cachedReadTransform?.(file.path, value) ?? value;
+      },
       read: async (file: { path: string }) => content.get(file.path) ?? "",
       modify: async (file: { path: string }, data: string) => {
         operations.push(`modify:${file.path}`);
@@ -2748,6 +3379,7 @@ function createMockContext(options: {
       topK: null,
       topP: null,
       numCtx: null,
+      ...options.settings,
     },
     originalPrompt: options.prompt ?? "Research this note.",
     httpTransport: async () => ({
