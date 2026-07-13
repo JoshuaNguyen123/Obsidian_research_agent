@@ -1,2 +1,10 @@
 export * from "./GitHubRestClient";
-
+export * from "./GitHubAuth";
+export * from "./TrustedGitHubRepositoryBindingV1";
+export * from "./VerifiedGitPushGateway";
+export * from "./SecureGitPushRuntime";
+export * from "./GitHubReviewRepairCoordinatorV1";
+export * from "./GitHubReviewRepairCheckpointStoreV1";
+export * from "./GitHubReviewRepairProductionHostV1";
+export * from "./GitHubReviewRepairProviderAdapterV1";
+export * from "./GitHubReviewRepairPublisherAdapterV1";

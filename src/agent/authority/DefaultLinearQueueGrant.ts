@@ -10,15 +10,15 @@ export const DEFAULT_LINEAR_QUEUE_DAILY_TICKET_LIMIT = 25;
 /**
  * The queue's separate durable daily-start ledger enforces the 25-ticket cap.
  * These ceilings are sized for that cap's bounded code path: four Linear
- * lifecycle mutations, four local repository operations, and two Linear
- * comment creates per ticket. A vault-note create consumes the same bounded
- * create pool and can therefore reduce the number of writable vault tickets.
+ * lifecycle mutations plus a maximum of 24 profile-scoped workspace,
+ * validation, checkpoint, and verified-commit actions per code ticket. A
+ * vault-note or code-file create consumes the same bounded create pool.
  */
 export const DEFAULT_LINEAR_QUEUE_GRANT_LIMITS: Readonly<AuthorityGrantLimits> =
   Object.freeze({
-    maxActions: DEFAULT_LINEAR_QUEUE_DAILY_TICKET_LIMIT * 8,
+    maxActions: DEFAULT_LINEAR_QUEUE_DAILY_TICKET_LIMIT * 28,
     maxExternalMutations: DEFAULT_LINEAR_QUEUE_DAILY_TICKET_LIMIT * 4,
-    maxCreates: DEFAULT_LINEAR_QUEUE_DAILY_TICKET_LIMIT * 2,
+    maxCreates: DEFAULT_LINEAR_QUEUE_DAILY_TICKET_LIMIT * 12,
     maxDeletes: 0,
     maxOutboundBytes: DEFAULT_LINEAR_QUEUE_DAILY_TICKET_LIMIT * 400_000,
   });
@@ -127,9 +127,27 @@ export async function createDefaultLinearQueueGrant(
   }
   if (repositoryProfileIds.length > 0) {
     rules.push({
+      system: "workspace",
+      resourceTypes: ["code_workspace"],
+      actions: ["create", "update", "append", "move"],
+      selector: { repositoryProfileIds },
+    });
+    rules.push({
+      system: "workspace",
+      resourceTypes: ["validation_run"],
+      actions: ["validate"],
+      selector: { repositoryProfileIds },
+    });
+    rules.push({
+      system: "workspace",
+      resourceTypes: ["code_repair_checkpoint"],
+      actions: ["update"],
+      selector: { repositoryProfileIds },
+    });
+    rules.push({
       system: "git",
-      resourceTypes: ["repository"],
-      actions: ["validate", "commit", "integrate", "promote"],
+      resourceTypes: ["verified_local_commit"],
+      actions: ["commit"],
       selector: { repositoryProfileIds },
     });
   }
@@ -272,7 +290,7 @@ export async function matchDefaultLinearQueueGrant(
   ) {
     return mismatch(
       "repository_scope_not_covered",
-      "Code work requires a host-resolved repository profile covered for local promotion.",
+      "Code work requires a host-resolved repository profile covered for bounded editing, sandbox validation, repair receipts, and one verified local commit.",
     );
   }
 
@@ -332,27 +350,41 @@ function isSafeQueueRule(rule: AuthorityRule, queueProjectId: string): boolean {
       new Set(prefixes).size === prefixes.length
     );
   }
+  if (rule.system === "workspace") {
+    if (!hasExactSelectorKeys(rule, ["repositoryProfileIds"])) return false;
+    const safeShape =
+      (sameValues(rule.resourceTypes, ["code_workspace"]) &&
+        sameValues(rule.actions, ["create", "update", "append", "move"])) ||
+      (sameValues(rule.resourceTypes, ["validation_run"]) &&
+        sameValues(rule.actions, ["validate"])) ||
+      (sameValues(rule.resourceTypes, ["code_repair_checkpoint"]) &&
+        sameValues(rule.actions, ["update"]));
+    if (!safeShape) return false;
+    return hasSafeRepositoryProfileSelector(rule);
+  }
   if (rule.system === "git") {
     if (!hasExactSelectorKeys(rule, ["repositoryProfileIds"])) return false;
-    if (!sameValues(rule.resourceTypes, ["repository"])) return false;
-    if (!sameValues(rule.actions, ["validate", "commit", "integrate", "promote"])) {
-      return false;
-    }
-    const ids = rule.selector.repositoryProfileIds;
-    return (
-      Array.isArray(ids) &&
-      ids.length > 0 &&
-      ids.every((id) => {
-        try {
-          return normalizeRepositoryProfileId(id) === id;
-        } catch {
-          return false;
-        }
-      }) &&
-      new Set(ids).size === ids.length
-    );
+    if (!sameValues(rule.resourceTypes, ["verified_local_commit"])) return false;
+    if (!sameValues(rule.actions, ["commit"])) return false;
+    return hasSafeRepositoryProfileSelector(rule);
   }
   return false;
+}
+
+function hasSafeRepositoryProfileSelector(rule: AuthorityRule): boolean {
+  const ids = rule.selector.repositoryProfileIds;
+  return (
+    Array.isArray(ids) &&
+    ids.length > 0 &&
+    ids.every((id) => {
+      try {
+        return normalizeRepositoryProfileId(id) === id;
+      } catch {
+        return false;
+      }
+    }) &&
+    new Set(ids).size === ids.length
+  );
 }
 
 function hasLinearLifecycleCoverage(
@@ -394,13 +426,24 @@ function hasRepositoryCoverage(
   rules: AuthorityRule[],
   repositoryProfileId: string,
 ): boolean {
-  const required = ["validate", "commit", "integrate", "promote"] as const;
-  return rules.some(
-    (rule) =>
-      rule.system === "git" &&
-      rule.resourceTypes.includes("repository") &&
-      required.every((action) => rule.actions.includes(action)) &&
-      rule.selector.repositoryProfileIds?.includes(repositoryProfileId) === true,
+  const covered = (
+    system: "workspace" | "git",
+    resourceType: string,
+    action: AuthorityRule["actions"][number],
+  ) =>
+    rules.some(
+      (rule) =>
+        rule.system === system &&
+        rule.resourceTypes.includes(resourceType) &&
+        rule.actions.includes(action) &&
+        rule.selector.repositoryProfileIds?.includes(repositoryProfileId) === true,
+    );
+  return (
+    covered("workspace", "code_workspace", "create") &&
+    covered("workspace", "code_workspace", "update") &&
+    covered("workspace", "validation_run", "validate") &&
+    covered("workspace", "code_repair_checkpoint", "update") &&
+    covered("git", "verified_local_commit", "commit")
   );
 }
 
@@ -453,7 +496,7 @@ function requiredBudget(
   executionClass: Exclude<LinearQueueExecutionClass, "human">,
   outboundBytes: number,
 ): AuthorityGrantLimits {
-  const localActions = executionClass === "vault" ? 1 : executionClass === "code" ? 4 : 0;
+  const localActions = executionClass === "vault" ? 1 : executionClass === "code" ? 24 : 0;
   return {
     // Claim comment, started update, result comment, and completed/blocked update.
     maxActions: 4 + localActions,

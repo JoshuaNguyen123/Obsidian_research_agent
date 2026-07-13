@@ -294,6 +294,8 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
     action &&
     ctx.writeAutonomy &&
     descriptor.effect === "reversible_mutation" &&
+    descriptor.risk !== "high" &&
+    descriptor.risk !== "critical" &&
     (descriptor.capability.action === "replace" ||
       descriptor.capability.action === "append" ||
       descriptor.capability.action === "update" ||
@@ -306,23 +308,31 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
     );
   }
 
+  const descriptorConfirmations =
+    descriptor.approval.fallback === "double_exact"
+      ? 2
+      : descriptor.approval.fallback === "exact"
+        ? 1
+        : 0;
+  const requiredConfirmations = Math.max(
+    descriptorConfirmations,
+    action?.requiredConfirmations ?? 0,
+  ) as 0 | 1 | 2;
   if (
     action &&
     descriptor.approval.allowPromptGrant &&
-    (descriptor.approval.fallback === "exact" ||
-      descriptor.approval.fallback === "double_exact")
+    requiredConfirmations > 0
   ) {
-    const requiredConfirmations =
-      descriptor.approval.fallback === "double_exact" ? 2 : 1;
+    const approvalCount: 1 | 2 = requiredConfirmations === 2 ? 2 : 1;
     return {
       action: "require_approval",
       reason:
-        requiredConfirmations === 2
+        approvalCount === 2
           ? "This exact prepared payload requires two confirmations."
           : "This exact prepared payload requires confirmation.",
-      tags: ["exact_payload_approval", `confirmations_${requiredConfirmations}`],
+      tags: ["exact_payload_approval", `confirmations_${approvalCount}`],
       payloadFingerprint: action.payloadFingerprint,
-      requiredConfirmations,
+      requiredConfirmations: approvalCount,
     };
   }
 

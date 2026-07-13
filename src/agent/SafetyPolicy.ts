@@ -1,5 +1,6 @@
 import {
   BrowserClickInput,
+  BrowserKeypressInput,
   BrowserOpenInput,
   BrowserTypeInput,
   SafetyDecision,
@@ -163,6 +164,34 @@ export class SafetyPolicy {
 
     return this.allow("Browser typing allowed as medium-risk supervised action.", "medium", [
       "browser_type",
+    ]);
+  }
+
+  evaluateBrowserKeypress(
+    input: BrowserKeypressInput,
+    ctx: SafetyContext,
+  ): SafetyDecision {
+    const base = this.browserBaseCheck(ctx);
+    if (base.status !== "allow") return base;
+    if (/^(?:Enter|Space| )$/i.test(input.key)) {
+      const text = [ctx.visibleText, ctx.candidateLabel, ctx.candidateRole].filter(Boolean).join("\n");
+      if (this.matchesNeverApprove(text)) {
+        return this.block("Blocked high-risk browser keypress.", ["high_risk_keypress"]);
+      }
+      if (ctx.explicitUserApproval) {
+        return this.allow(
+          "Potential form/action keypress allowed after explicit one-shot approval.",
+          "high",
+          ["mutating_keypress", "explicit_user_approval"],
+        );
+      }
+      return this.requireApproval(
+        "Enter or Space may submit or activate the focused control and requires explicit approval.",
+        ["mutating_keypress"],
+      );
+    }
+    return this.allow("Non-mutating browser keypress allowed.", "medium", [
+      "browser_keypress",
     ]);
   }
 

@@ -17,7 +17,10 @@ import {
   parseMissionRuntimeSnapshotFromMarkdown,
   readLatestIncompleteMissionRuntimeSnapshot,
   readMissionRuntimeSnapshotByRunId,
+  RuntimeSnapshotWriteAmbiguousError,
+  settleRuntimeSnapshotModify,
   transitionOperationJournalRecord,
+  updateMissionRuntimeSnapshotByRunId,
   withSerializedRunWrite,
   writeMissionRuntimeSnapshot,
 } from "../src/agent/runStore";
@@ -144,6 +147,86 @@ test("runtime snapshots persist concurrently without replacing ledgers or checkp
   assert.equal(latestIncomplete?.snapshot.status, "blocked");
 });
 
+test("atomic runtime updates preserve state written after an earlier stale read", async () => {
+  const mock = createRuntimeSnapshotContext();
+  const base = createMissionRuntimeSnapshot({
+    runId: "run-atomic-update",
+    originalMission: "Preserve concurrent durable state.",
+    status: "running",
+    createdAt: new Date("2026-07-10T12:00:00.000Z"),
+  });
+  await writeMissionRuntimeSnapshot(mock.context, base);
+  const stale = await readMissionRuntimeSnapshotByRunId(
+    mock.context,
+    base.runId,
+  );
+  assert.equal(stale?.snapshot.status, "running");
+
+  const concurrent = {
+    ...stale!.snapshot,
+    status: "blocked" as const,
+    notes: ["newer continuation state"],
+  };
+  await writeMissionRuntimeSnapshot(mock.context, concurrent);
+
+  const updated = await updateMissionRuntimeSnapshotByRunId(
+    mock.context,
+    base.runId,
+    (draft) => {
+      assert.equal(draft.status, "blocked");
+      assert.deepEqual(draft.notes, ["newer continuation state"]);
+      draft.notes.push("atomic reconciliation patch");
+      return true;
+    },
+  );
+  assert.equal(updated?.updated, true);
+  assert.equal(updated?.snapshot.status, "blocked");
+  assert.deepEqual(updated?.snapshot.notes, [
+    "newer continuation state",
+    "atomic reconciliation patch",
+  ]);
+  assert.equal(updated?.snapshot.revision, 3);
+});
+
+test("runtime snapshot modify accepts an exact readback when vault acknowledgement stalls", async () => {
+  const expectedMarkdown = "# Agent Run\n\n## Runtime Snapshot\n```json\n{}\n```\n";
+  let persistedMarkdown = "old";
+
+  const proof = await settleRuntimeSnapshotModify({
+    path: "Agent Runs/run-stalled-ack.md",
+    expectedMarkdown,
+    modify: () => {
+      persistedMarkdown = expectedMarkdown;
+      return new Promise<never>(() => undefined);
+    },
+    readback: async () => persistedMarkdown,
+    modifyTimeoutMs: 5,
+    readbackTimeoutMs: 5,
+  });
+
+  assert.equal(proof, "exact_readback");
+});
+
+test("runtime snapshot modify fails closed when acknowledgement and exact readback are unavailable", async () => {
+  await assert.rejects(
+    settleRuntimeSnapshotModify({
+      path: "Agent Runs/run-ambiguous.md",
+      expectedMarkdown: "expected",
+      modify: () => new Promise<never>(() => undefined),
+      readback: async () => "stale",
+      modifyTimeoutMs: 5,
+      readbackTimeoutMs: 5,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof RuntimeSnapshotWriteAmbiguousError);
+      assert.equal(error.code, "runtime_snapshot_write_ambiguous");
+      assert.equal(error.writeOutcome, "timed_out");
+      assert.equal(error.path, "Agent Runs/run-ambiguous.md");
+      return true;
+    },
+  );
+});
+
 test("runtime snapshot v2 round-trips complete resumable mission state", () => {
   const now = new Date("2026-07-10T12:00:00.000Z");
   const missionPlan = createMissionPlanFixture(now);
@@ -256,6 +339,36 @@ test("runtime snapshot v2 round-trips complete resumable mission state", () => {
     parseMissionRuntimeSnapshotFromMarkdown(markdown)?.currentNotePath,
     "Research/Brief.md",
   );
+});
+
+test("runtime snapshots retain a validated link to the canonical mission graph store", () => {
+  const snapshot = createMissionRuntimeSnapshot({
+    runId: "run-graph-link",
+    originalMission: "Resume the canonical graph.",
+    missionGraphRef: {
+      version: 1,
+      missionId: "run-graph-link",
+      path: "Agent Runs/Mission Graphs/run-graph-link.md",
+      storeRevision: 4,
+      graphRevision: 2,
+      recordFingerprint: `sha256:${"a".repeat(64)}`,
+      journalHeadFingerprint: `sha256:${"b".repeat(64)}`,
+    },
+  });
+
+  const restored = normalizeMissionRuntimeSnapshot(
+    JSON.parse(JSON.stringify(snapshot)),
+  );
+  assert.deepEqual(restored?.missionGraphRef, snapshot.missionGraphRef);
+
+  const unsafe = normalizeMissionRuntimeSnapshot({
+    ...snapshot,
+    missionGraphRef: {
+      ...snapshot.missionGraphRef,
+      path: "../outside.md",
+    },
+  });
+  assert.equal(unsafe?.missionGraphRef, undefined);
 });
 
 test("runtime snapshots omit unsafe or non-markdown current note paths", () => {

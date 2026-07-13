@@ -1,0 +1,83 @@
+name: Disposable live external provider smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Disposable provider mutation scope; merge performs a second compensating cleanup merge
+        required: true
+        type: choice
+        options:
+          - linear
+          - github_draft
+          - github_merge
+      disposable_confirmation:
+        description: Type DISPOSABLE_ONLY
+        required: true
+        type: string
+      merge_confirmation:
+        description: For github_merge only, type MERGE_DISPOSABLE_PR
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: disposable-live-external-${{ inputs.provider }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: ${{ inputs.provider }} / mutate, verify, and clean up
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+      - obsidian-e2e
+    timeout-minutes: 45
+    environment: disposable-live-external
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fail-closed disposable-target preflight
+        run: node scripts/live-external-preflight.mjs --provider ${{ inputs.provider }}
+        env:
+          LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: ${{ inputs.disposable_confirmation }}
+          LIVE_EXTERNAL_MERGE_CONFIRMATION: ${{ inputs.merge_confirmation }}
+          LIVE_EXTERNAL_TARGET_LABEL: ${{ vars.LIVE_EXTERNAL_TARGET_LABEL }}
+          AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true"
+          OBSIDIAN_VAULT: ${{ vars.DISPOSABLE_OBSIDIAN_VAULT }}
+          LINEAR_LIVE_TEST_TOKEN: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
+          LINEAR_LIVE_TEST_TEAM_ID: ${{ vars.LINEAR_LIVE_TEST_TEAM_ID }}
+          LINEAR_LIVE_TEST_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
+          GITHUB_LIVE_TEST_TOKEN: ${{ secrets.DISPOSABLE_GITHUB_TOKEN }}
+          E2E_LIVE_GITHUB_REPOSITORY: ${{ vars.DISPOSABLE_GITHUB_REPOSITORY }}
+          E2E_LIVE_LINEAR_PROJECT: ${{ vars.DISPOSABLE_LINEAR_PROJECT_LABEL }}
+          E2E_LIVE_ALLOW_MERGE: ${{ inputs.provider == 'github_merge' && '1' || '0' }}
+
+      - name: Mutate, independently verify, deduplicate, and clean up the disposable provider
+        run: node scripts/run-e2e-exclusive.mjs --live-external --project=disposable-live-external --grep "disposable live external smoke"
+        env:
+          E2E_LIVE_PROVIDER: ${{ inputs.provider }}
+          LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: ${{ inputs.disposable_confirmation }}
+          E2E_LIVE_GITHUB_REPOSITORY: ${{ vars.DISPOSABLE_GITHUB_REPOSITORY }}
+          E2E_LIVE_LINEAR_PROJECT: ${{ vars.DISPOSABLE_LINEAR_PROJECT_LABEL }}
+          LINEAR_LIVE_TEST_TOKEN: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
+          LINEAR_LIVE_TEST_TEAM_ID: ${{ vars.LINEAR_LIVE_TEST_TEAM_ID }}
+          LINEAR_LIVE_TEST_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
+          GITHUB_LIVE_TEST_TOKEN: ${{ secrets.DISPOSABLE_GITHUB_TOKEN }}
+          E2E_LIVE_ALLOW_MERGE: ${{ inputs.provider == 'github_merge' && '1' || '0' }}
+          LIVE_EXTERNAL_MERGE_CONFIRMATION: ${{ inputs.merge_confirmation }}
+          AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true"
+          OBSIDIAN_VAULT: ${{ vars.DISPOSABLE_OBSIDIAN_VAULT }}

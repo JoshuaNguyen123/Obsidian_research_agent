@@ -6,8 +6,24 @@
 const CODE_INTENT =
   /\b(run|execute|code|script|python|javascript|typescript|node|pip|npm|workspace|program|snippet)\b/i;
 
-const DESIGN_INTENT =
-  /\b(create|make|draw|generate|build|draft|render|save|write|update|revise|edit|change)\b[\s\S]{0,120}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b[\s\S]{0,120}\b(create|make|draw|generate|build|draft|render|save|write|update|revise|edit|change)\b/i;
+const DESIGN_ACTION =
+  "create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust|turn|convert|transform";
+
+// Keep bare `graph` out of the general noun list so questions about the
+// Obsidian note graph remain read-only. A graph becomes a design artifact when
+// it is explicitly visual/design-qualified or content is converted into one.
+const DESIGN_ARTIFACT =
+  "canvas|design(?:\\s*package)?|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|user\\s*flows?|ui\\s*flows?|architecture|system\\s+design|software\\s+architecture|service\\s*blueprint|logistics\\s*system|project\\s*ideation|mind\\s*map|(?:design|visual|concept|relationship|knowledge|idea|dependency|process)\\s+graph|graph\\s+(?:design|diagram|visualization|artifact)";
+
+const DESIGN_INTENT = new RegExp(
+  `\\b(?:${DESIGN_ACTION})\\b[\\s\\S]{0,160}\\b(?:${DESIGN_ARTIFACT})\\b|` +
+    `\\b(?:${DESIGN_ARTIFACT})\\b[\\s\\S]{0,160}\\b(?:${DESIGN_ACTION})\\b|` +
+    "\\b(?:turn|convert|transform)\\b[\\s\\S]{0,160}\\bgraph\\b",
+  "i",
+);
+
+const EXPLICIT_CANVAS_DESTINATION_INTENT =
+  /\b(?:put|place|move|send|turn|convert|transform)\b[\s\S]{0,160}\b(?:on|onto|in|into|as|to)\s+(?:an?\s+)?(?:obsidian\s+)?canvas\b|\b(?:want|need|prefer|would\s+like)\b[\s\S]{0,160}\b(?:on|onto|in|into|as)\s+(?:an?\s+)?(?:obsidian\s+)?canvas\b/i;
 
 const HTML_PREVIEW_INTENT =
   /\b(html|css|webpage|web\s*page|preview)\b/i;
@@ -19,7 +35,7 @@ const CODE_TEAM_MAGIC =
   /\b(code\s+team|coding\s+team|orchestrate\s+code|git\s+worktree)\b/i;
 
 const CODE_TEAM_BRIDGE =
-  /\b(repo(?:sitory)?|worktree|pull\s+request|pr\b|fix\s+(?:the\s+)?(?:bug|issue|code)|implement|patch)\b/i;
+  /\b(repo(?:sitory)?|worktree|codebase|project|pull\s+request|pr\b|fix\s+(?:the\s+)?(?:bug|issue|code)|implement|repair|refactor|patch|edit|change|add|create|remove|rename|move|copy|test|validate|build|commit)\b/i;
 
 const REPO_PATH_HINT =
   /(?:repository|repo)\s*:\s*(?:"[^"]+"|`[^`]+`|[^\r\n]+)/i;
@@ -29,7 +45,14 @@ export function hasCodeIntent(prompt: string): boolean {
 }
 
 export function hasDesignIntent(prompt: string): boolean {
-  return DESIGN_INTENT.test(prompt);
+  return (
+    DESIGN_INTENT.test(prompt) ||
+    EXPLICIT_CANVAS_DESTINATION_INTENT.test(prompt)
+  );
+}
+
+export function hasExplicitCanvasDestinationIntent(prompt: string): boolean {
+  return EXPLICIT_CANVAS_DESTINATION_INTENT.test(prompt);
 }
 
 export function hasHtmlPreviewIntent(prompt: string): boolean {
@@ -46,13 +69,12 @@ export function hasExplicitCodeTeamMagicPhrase(prompt: string): boolean {
 }
 
 /**
- * Repo path + fix/implement intent without the explicit code-team magic phrase.
- * Callers must clarify and never auto-create a worktree.
+ * Explicit repository path plus a coding intent. The host uses this only as a
+ * capability gate: the core-owned agent loop must still prepare the exact
+ * repository binding and obtain approval before the code extension creates a
+ * worktree. No magic phrase grants authority.
  */
 export function hasCodeTeamBridgeIntent(prompt: string): boolean {
-  if (hasExplicitCodeTeamMagicPhrase(prompt)) {
-    return false;
-  }
   return REPO_PATH_HINT.test(prompt) && CODE_TEAM_BRIDGE.test(prompt);
 }
 
@@ -65,7 +87,7 @@ export function extractRepositoryPathHint(prompt: string): string | null {
 }
 
 export const CODE_TEAM_CLARIFY_TEMPLATE = [
-  "I found a repository path and a coding/fix intent, but code-team worktrees require explicit approval.",
-  "To run the isolated code team, resend with a magic phrase such as `code team` or `git worktree`, plus `repository: <path>`.",
-  "I will not create a worktree or edit the repo until you confirm.",
+  "Code work requires a trusted repository binding.",
+  "Provide `repository: <path>` for a foreground mission, or select an existing repository profile.",
+  "The exact worktree action will still require approval before any repository bytes change.",
 ].join(" ");

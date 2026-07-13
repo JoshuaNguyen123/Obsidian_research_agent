@@ -1,0 +1,9 @@
+{
+  "name": "@agentic-researcher/integrations-extension",
+  "version": "0.2.0",
+  "private": true,
+  "main": "main.js",
+  "dependencies": {
+    "@agentic-researcher/core-api": "1.2.0"
+  }
+}

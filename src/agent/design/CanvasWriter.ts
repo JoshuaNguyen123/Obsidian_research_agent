@@ -15,6 +15,10 @@ import {
   DesignPackageKind,
 } from "./DesignPackageTypes";
 import { buildDesignPackageBrief } from "./MarkdownBriefWriter";
+import {
+  DiagramArtifactStore,
+  DiagramArtifactStoreError,
+} from "../../design/diagramArtifactStore";
 
 export class CanvasWriter {
   constructor(private readonly vault: Vault) {}
@@ -23,8 +27,6 @@ export class CanvasWriter {
     validateInput(input);
     const folder = normalizeFolder(input.targetFolder ?? "Design Packages");
     const baseName = slugify(input.title);
-    const canvasPath = await this.uniquePath(`${folder}/${baseName}.canvas`);
-    const briefPath = await this.uniquePath(`${folder}/${baseName}.md`);
     const canvas = buildLayoutCanvas({
       title: input.title,
       diagramType: toCanvasDiagramType(input.kind),
@@ -51,33 +53,84 @@ export class CanvasWriter {
       throw new Error(`Canvas preflight verification failed: ${preflight.errors.join(" ")}`);
     }
 
-    const brief = buildDesignPackageBrief(input, canvasPath);
     await ensureFolder(this.vault, folder);
-    await this.vault.create(canvasPath, canvasContent);
-    await this.vault.create(briefPath, brief);
+    let committed:
+      | { canvasPath: string; briefPath: string; bytesWritten: number }
+      | null = null;
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+      const { canvasPath, briefPath } = this.uniquePackagePaths(
+        folder,
+        baseName,
+        attempt,
+      );
+      const brief = buildDesignPackageBrief(input, canvasPath);
+      try {
+        const transaction = await new DiagramArtifactStore(this.vault).createMany([
+          {
+            path: canvasPath,
+            content: canvasContent,
+            validator: ({ content }) => verifyCanvasArtifact(content),
+          },
+          {
+            path: briefPath,
+            content: brief,
+            validator: ({ content }) => ({
+              ok: content.includes(input.title) && content.includes(canvasPath),
+              errors: ["Design brief must retain its title and Canvas link."],
+            }),
+          },
+        ]);
+        if (transaction.status !== "committed") {
+          throw new ToolExecutionError(
+            transaction.status === "rollback_failed"
+              ? "design_package_rollback_failed"
+              : "design_package_rolled_back",
+            transaction.error?.message ??
+              "Design package creation failed and was rolled back.",
+          );
+        }
+        committed = {
+          canvasPath,
+          briefPath,
+          bytesWritten: transaction.artifacts.reduce(
+            (total, artifact) => total + artifact.bytesWritten,
+            0,
+          ),
+        };
+        break;
+      } catch (error) {
+        if (
+          error instanceof DiagramArtifactStoreError &&
+          error.code === "path_exists"
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    if (!committed) {
+      throw new Error(`Unable to allocate unique package paths for ${baseName}.`);
+    }
 
     return {
-      canvasPath,
-      briefPath,
+      canvasPath: committed.canvasPath,
+      briefPath: committed.briefPath,
       itemCount: input.items.length,
       edgeCount: input.edges.length,
-      bytesWritten: getByteLength(canvasContent) + getByteLength(brief),
+      bytesWritten: committed.bytesWritten,
     };
   }
 
-  private async uniquePath(path: string): Promise<string> {
-    if (!this.vault.getAbstractFileByPath(path)) return path;
-
-    const dot = path.lastIndexOf(".");
-    const stem = dot >= 0 ? path.slice(0, dot) : path;
-    const ext = dot >= 0 ? path.slice(dot) : "";
-
-    for (let i = 2; i < 1000; i += 1) {
-      const candidate = `${stem}-${i}${ext}`;
-      if (!this.vault.getAbstractFileByPath(candidate)) return candidate;
-    }
-
-    throw new Error(`Unable to create unique path for ${path}`);
+  private uniquePackagePaths(
+    folder: string,
+    baseName: string,
+    attempt: number,
+  ): { canvasPath: string; briefPath: string } {
+    const suffix = attempt === 0 ? "" : `-${attempt + 1}`;
+    return {
+      canvasPath: `${folder}/${baseName}${suffix}.canvas`,
+      briefPath: `${folder}/${baseName}${suffix}.md`,
+    };
   }
 }
 
@@ -192,8 +245,4 @@ function getLaneForItem(
   }
 
   return undefined;
-}
-
-function getByteLength(text: string): number {
-  return new TextEncoder().encode(text).length;
 }

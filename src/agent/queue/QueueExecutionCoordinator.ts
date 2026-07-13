@@ -61,6 +61,7 @@ export interface QueueExecutionResourceKeyInput {
 
 export type QueueWorkerResult =
   | { status: "completed" }
+  | { status: "waiting_for_publication"; message: string }
   | { status: "blocked"; error: string }
   | { status: "failed"; error: string; retryable: boolean }
   | {
@@ -86,8 +87,10 @@ export interface QueueLeaseLifecycleInput extends QueueExecutionCallbackInput {
     | "start_verification_failed"
     | "resource_conflict"
     | "grant_ineligible"
+    | "preclaim_snapshot_drift"
     | "daily_limit_exhausted"
     | "execution_completed"
+    | "execution_waiting_for_publication"
     | "execution_blocked"
     | "execution_failed"
     | "stopped"
@@ -102,6 +105,12 @@ export interface QueueExecutionCoordinatorOptions {
   reduceDailyStartBudget: DurableQueueDailyStartBudgetReducer;
   /** Re-read the live grant after leases are held and before any Linear write. */
   isExecutionGrantEligible(input: QueueExecutionGrantCheckInput): MaybePromise<boolean>;
+  /**
+   * Re-read the issue and verify project, state, update timestamp, machine
+   * contract, and fingerprint immediately before the first claim mutation.
+   * Required fail-closed for v2 contracts; optional for legacy v1 callers.
+   */
+  verifyCandidateBeforeClaim?(input: QueueExecutionCallbackInput): MaybePromise<boolean>;
   /** Resolve trusted host bindings such as canonical vault-path locks. */
   resolveAdditionalResourceKeys?(
     input: QueueExecutionResourceKeyInput,
@@ -127,6 +136,7 @@ export interface QueueExecutionCoordinatorOptions {
 
 export type QueueCandidateExecutionResult =
   | { issueId: string; status: "completed" }
+  | { issueId: string; status: "waiting_for_publication"; message: string }
   | { issueId: string; status: "blocked"; error: string }
   | {
       issueId: string;
@@ -147,6 +157,7 @@ export type QueueCandidateExecutionResult =
         | "resource_locked"
         | "grant_ineligible"
         | "daily_limit_exhausted"
+        | "preclaim_snapshot_unverified"
         | "claim_comment_unverified"
         | "started_state_unverified";
     }
@@ -370,8 +381,21 @@ export class QueueExecutionCoordinator {
         return { issueId, status: "skipped", reason: "daily_limit_exhausted" };
       }
 
+      const preclaimVerified = this.options.verifyCandidateBeforeClaim
+        ? (await this.options.verifyCandidateBeforeClaim(callbackInput)) === true
+        : callbackInput.candidate.workItem.schemaVersion === 1;
+      if (!preclaimVerified) {
+        await this.releaseAll(
+          callbackInput,
+          resourceKeys,
+          resourceLockToken,
+          "preclaim_snapshot_drift",
+        );
+        return { issueId, status: "skipped", reason: "preclaim_snapshot_unverified" };
+      }
+
       // The durable daily reservation is the final host-local operation before
-      // dispatching the first external claim mutation.
+      // the mandatory remote snapshot re-read and first external claim mutation.
       assertNotAborted(signal);
       const commentDispatch = assertDispatchResult(
         await this.options.createClaimComment(callbackInput),
@@ -462,6 +486,31 @@ export class QueueExecutionCoordinator {
           issueId,
           status: "blocked",
           error: workerResult.error,
+        };
+      }
+      if (workerResult.status === "waiting_for_publication") {
+        const waitingAt = this.nowIso();
+        await this.options.reduceQueueState((current) =>
+          reduceLinearQueue(current, {
+            type: "candidate_waiting_for_publication",
+            expectedRevision: current.revision,
+            at: waitingAt,
+            issueId,
+            ownerId: lease.ownerId,
+            token: lease.token,
+            message: workerResult.message,
+          }),
+        );
+        await this.releaseResourceLockAndNotify(
+          callbackInput,
+          resourceKeys,
+          resourceLockToken,
+          "execution_waiting_for_publication",
+        );
+        return {
+          issueId,
+          status: "waiting_for_publication",
+          message: workerResult.message,
         };
       }
       if (workerResult.status === "completed") {
@@ -801,6 +850,13 @@ function assertWorkerResult(value: QueueWorkerResult): QueueWorkerResult {
     throw new Error("Queue worker returned an invalid result.");
   }
   if (value.status === "completed") {
+    return value;
+  }
+  if (
+    value.status === "waiting_for_publication" &&
+    typeof value.message === "string" &&
+    value.message.trim().length > 0
+  ) {
     return value;
   }
   if (

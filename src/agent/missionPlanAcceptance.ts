@@ -94,7 +94,8 @@ function hasProof(
     case "web_evidence":
       return hasWebCoverage(taskEvidence, minimum, task.completionContract.minDistinctDomains);
     case "vault_evidence":
-      return taskEvidence.filter(isVaultReadEvidence).length >= minimum;
+      return taskHasRecordedProof(task, proof) ||
+        taskEvidence.filter(isVaultReadEvidence).length >= minimum;
     case "write_receipt":
     case "external_action_receipt":
     case "rename_receipt":

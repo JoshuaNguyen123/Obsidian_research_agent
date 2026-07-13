@@ -1,4 +1,4 @@
-import type { WorkItemSpecV1 } from "../../integrations/linear/WorkItemSpecV1";
+import type { ParsedCompatibleWorkItemSpec } from "../../integrations/linear/WorkItemSpecV2";
 
 export const LINEAR_QUEUE_SCHEMA_VERSION = 1 as const;
 
@@ -6,6 +6,7 @@ export type LinearQueueCandidateStatus =
   | "pending"
   | "eligible"
   | "running"
+  | "waiting_for_publication"
   | "blocked"
   | "completed"
   | "failed";
@@ -51,7 +52,9 @@ export interface LinearQueueCandidateV1 {
   issueId: string;
   identifier: string;
   remoteUpdatedAt: string;
-  workItem: WorkItemSpecV1;
+  /** Snapshot used to reject a state drift immediately before claim. */
+  remoteStateId?: string;
+  workItem: ParsedCompatibleWorkItemSpec;
   status: LinearQueueCandidateStatus;
   eligibility: CandidateEligibilityV1 | null;
   lease: LinearQueueLeaseV1 | null;
@@ -83,7 +86,8 @@ export type LinearQueueEventV1 =
       issueId: string;
       identifier: string;
       remoteUpdatedAt: string;
-      workItem: WorkItemSpecV1;
+      remoteStateId?: string;
+      workItem: ParsedCompatibleWorkItemSpec;
     })
   | (LinearQueueEventBaseV1 & {
       type: "candidate_evaluated";
@@ -119,6 +123,29 @@ export type LinearQueueEventV1 =
       issueId: string;
       ownerId: string;
       token: string;
+    })
+  | (LinearQueueEventBaseV1 & {
+      /**
+       * Host-only terminal transition after a previously ambiguous Linear
+       * completed-state mutation is proved by independent provider readback.
+       * The receipt remains in the external receipt ledger; these bindings
+       * prevent that proof from completing a different contract generation.
+       */
+      type: "candidate_reconciliation_completed";
+      issueId: string;
+      contractFingerprint: string;
+      reconciliationReceiptId: string;
+    })
+  | (LinearQueueEventBaseV1 & {
+      type: "candidate_waiting_for_publication";
+      issueId: string;
+      ownerId: string;
+      token: string;
+      message: string;
+    })
+  | (LinearQueueEventBaseV1 & {
+      type: "candidate_publication_completed";
+      issueId: string;
     })
   | (LinearQueueEventBaseV1 & {
       type: "candidate_blocked";

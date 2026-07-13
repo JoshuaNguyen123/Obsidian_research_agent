@@ -1,3 +1,5 @@
+import { hasDesignIntent } from "./codeDesignIntent";
+
 export interface AutonomyScope {
   read: {
     currentNote: boolean;
@@ -102,6 +104,7 @@ export function deriveAutonomyScope(
     ) ||
     /\bresearch memory\b/i.test(prompt);
   scope.write.artifacts =
+    hasDesignIntent(prompt) ||
     /\b(canvas|svg|diagram|wireframe|preview|artifact|source note|templates?|design package|service blueprint|logistics system|project ideation|mind map|ui flow)\b/i.test(
       prompt,
     );

@@ -134,6 +134,12 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
     "totalChars",
     "sourceChars",
     "contentHash",
+    "sha256",
+    "beforeSha256",
+    "afterSha256",
+    "relatedPath",
+    "trashId",
+    "manifestSha256",
     "parserStatus",
     "truncated",
     "section",
@@ -167,6 +173,12 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
       .slice(0, MAX_RESULT_ITEMS)
       .map((item) => summarizeFileItem(item, query));
   }
+  if (isRecord(output.receipt)) {
+    const receipt = slimReceiptForModel(output.receipt);
+    if (Object.keys(receipt).length > 0) {
+      keep.receipt = receipt;
+    }
+  }
   if (typeof output.content === "string" && toolName !== "count_words") {
     keep.contentEvidence = extractEvidencePassages(output.content, {
       query: getEvidenceQuery(output),
@@ -175,6 +187,31 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
     });
   }
   return Object.keys(keep).length > 0 ? keep : undefined;
+}
+
+function slimReceiptForModel(receipt: Record<string, unknown>): Record<string, unknown> {
+  const keep: Record<string, unknown> = {};
+  for (const key of [
+    "id",
+    "workspaceId",
+    "operation",
+    "path",
+    "relatedPath",
+    "beforeSha256",
+    "afterSha256",
+    "bytesWritten",
+    "bytesDeleted",
+    "affectedCount",
+    "trashId",
+    "committedAt",
+    "manifestSha256",
+    "fingerprint",
+  ]) {
+    if (receipt[key] !== undefined) {
+      keep[key] = receipt[key];
+    }
+  }
+  return keep;
 }
 
 function summarizeResultItem(item: unknown): unknown {

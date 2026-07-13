@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
+import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
 import type { ModelProvider } from "./model/types";
 import { MAX_AGENT_STEPS, MAX_CODE_RUNS_PER_MISSION } from "./tools/constants";
 import {
@@ -10,7 +11,10 @@ import type { ModelRouterMode } from "./agent/missionRouter";
 import { normalizeModelRouterMode } from "./agent/missionRouter";
 import { runDependencyPreflight } from "./agent/dependencyPreflight";
 import type { MissionDependencyStatus } from "./agent/missionLedger";
-import { applyRecommendedAutomaticDefaults } from "./agent/settingsNormalize";
+import {
+  applyAutomaticProfileDefaults,
+  applyRecommendedAutomaticDefaults,
+} from "./agent/settingsNormalize";
 import type { NormalizableAgentSettings } from "./agent/settingsNormalize";
 
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
@@ -40,7 +44,7 @@ export interface AgentSettings {
   utilityModelProvider?: ModelProvider;
   /** @deprecated Prefer modelRouterMode. true maps to shadow. */
   modelRouterEnabled?: boolean;
-  /** Experimental: off (default) | shadow | authority. */
+  /** Automatic uses authority; Conservative uses off; Custom may choose any mode. */
   modelRouterMode?: ModelRouterMode;
   enableStreaming: boolean;
   requestTimeoutMs: number;
@@ -102,7 +106,13 @@ export interface AgentSettings {
   numCtx: number | null;
   /** Fixed-operation Linear integration. Credentials are plugin-owned state. */
   linearEnabled?: boolean;
-  /** Highest fully validated Linear resource gate available to the runtime. */
+  /** Non-secret client id from the user's configured Linear OAuth application. */
+  linearOAuthClientId?: string;
+  /** Stable loopback port registered in the Linear OAuth application. */
+  linearOAuthCallbackPort?: number;
+  /** Linear-issued OAuth actor identity; app actor requires persistent secure storage. */
+  linearOAuthActor?: "user" | "app";
+  /** @deprecated Derived from the verified connection-discovery snapshot. */
   linearCapabilityGate?: 0 | 1 | 2 | 3 | 4 | 5;
   linearDefaultTeamId?: string;
   linearQueueEnabled?: boolean;
@@ -112,11 +122,15 @@ export interface AgentSettings {
   linearBlockedStateId?: string;
   /** Intentionally fixed at 15 minutes for the local-first polling release. */
   linearScanIntervalMinutes?: 15;
+  /** Fixed-catalog GitHub integration; credentials are plugin-owned state. */
+  githubEnabled?: boolean;
+  /** Non-secret OAuth application client ID used for device authorization. */
+  githubOAuthClientId?: string;
   scheduledMissions?: ScheduledMission[];
 }
 
 export const DEFAULT_SETTINGS: AgentSettings = {
-  settingsSchemaVersion: 2,
+  settingsSchemaVersion: 3,
   autonomyProfile: "automatic",
   outputProfile: "active_or_new_note",
   modelProvider: "ollama",
@@ -127,8 +141,8 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   model: "gpt-oss:120b-cloud",
   utilityModel: "",
   utilityModelProvider: "ollama",
-  modelRouterEnabled: false,
-  modelRouterMode: "off",
+  modelRouterEnabled: true,
+  modelRouterMode: "authority",
   enableStreaming: true,
   requestTimeoutMs: 180000,
   maxAgentSteps: MAX_AGENT_STEPS,
@@ -181,6 +195,9 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   topP: null,
   numCtx: null,
   linearEnabled: false,
+  linearOAuthClientId: "",
+  linearOAuthCallbackPort: 43119,
+  linearOAuthActor: "user",
   linearCapabilityGate: 0,
   linearDefaultTeamId: "",
   linearQueueEnabled: false,
@@ -189,11 +206,14 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   linearCompletedStateId: "",
   linearBlockedStateId: "",
   linearScanIntervalMinutes: 15,
+  githubEnabled: false,
+  githubOAuthClientId: "",
   scheduledMissions: [],
 };
 
 export class AgentSettingTab extends PluginSettingTab {
   private readonly plugin: AgenticResearcherPlugin;
+  private extensionContributionsEl: HTMLDetailsElement | null = null;
 
   constructor(app: App, plugin: AgenticResearcherPlugin) {
     super(app, plugin);
@@ -203,11 +223,12 @@ export class AgentSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    this.extensionContributionsEl = null;
     containerEl.addClass("agentic-researcher-settings");
 
     containerEl.createEl("h2", { text: "Agentic Researcher" });
     containerEl.createEl("p", {
-      text: "Native right-side co-researcher for Obsidian. Basic settings stay compact; tuning lives under Advanced. Overnight and long runs require Obsidian to stay open — this is not a background daemon.",
+      text: "Native right-side co-researcher for Obsidian. Basic settings stay compact; tuning lives under Advanced. Vault work requires Obsidian; an installed, healthy Companion may continue only already-authorized non-vault operations.",
       cls: "setting-item-description",
     });
 
@@ -328,7 +349,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(basicEl)
       .setName("Autonomy profile")
       .setDesc(
-        "Automatic uses safe note-first defaults. Conservative prefers chat. Custom keeps per-feature Advanced overrides.",
+        "Automatic uses safe note-first defaults for thinking, streaming, and reflex. Conservative prefers chat. Custom keeps per-feature Advanced overrides.",
       )
       .addDropdown((dropdown) =>
         dropdown
@@ -388,7 +409,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(basicEl)
       .setName("Recommended defaults")
       .setDesc(
-        "Reset autonomy and output profiles to Automatic / Smart note without clearing credentials.",
+        "Reset Automatic / Smart note plus thinking, streaming, and reflex defaults without clearing credentials.",
       )
       .addButton((button) =>
         button
@@ -458,6 +479,7 @@ export class AgentSettingTab extends PluginSettingTab {
     this.renderAdvancedAutonomyBudgets(advancedRoot);
     this.renderAdvancedSemantic(advancedRoot);
     this.renderAdvancedBrowserIntegrations(advancedRoot);
+    this.renderAdvancedExtensionContributions(advancedRoot);
     this.renderAdvancedDiagnostics(advancedRoot);
   }
 
@@ -485,9 +507,9 @@ export class AgentSettingTab extends PluginSettingTab {
       )
       .addDropdown((dropdown) =>
         dropdown
-          .addOption("off", "Off (default)")
+          .addOption("off", "Off (Conservative)")
           .addOption("shadow", "Shadow (log only)")
-          .addOption("authority", "Authority (opt-in)")
+          .addOption("authority", "Authority (Automatic)")
           .setValue(
             normalizeModelRouterMode(
               this.plugin.settings.modelRouterMode,
@@ -842,7 +864,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Enable overnight research")
       .setDesc(
-        "Not a background daemon. Allow explicit overnight or 8–12 hour prompts to use durable multi-segment execution only while Obsidian remains open.",
+        "Allow explicit overnight or 8-12 hour prompts to use durable multi-segment execution. Vault nodes wait for Obsidian; eligible pre-authorized non-vault nodes may use the optional secure Companion.",
       )
       .addToggle((toggle) =>
         toggle
@@ -1310,7 +1332,7 @@ export class AgentSettingTab extends PluginSettingTab {
 
     section.createEl("h4", { text: "Linear integration" });
     section.createEl("p", {
-      text: "Optional private-workspace integration using fixed Linear GraphQL operations. The personal API key is stored unencrypted in this plugin's data.json and is never sent to agent workers.",
+      text: "Optional private-workspace integration using fixed Linear GraphQL operations. New keys use the authenticated companion's persistent OS credential store when available; legacy plaintext remains foreground-only until you explicitly migrate it.",
       cls: "setting-item-description",
     });
 
@@ -1331,33 +1353,163 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
+    new Setting(section)
+      .setName("Linear OAuth client ID")
+      .setDesc(
+        "Non-secret client ID from a Linear OAuth application configured with the exact loopback redirect shown below.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("Linear OAuth client ID")
+          .setValue(this.plugin.settings.linearOAuthClientId ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.linearOAuthClientId = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    const oauthCallbackPort = this.plugin.settings.linearOAuthCallbackPort ?? 43119;
+    const oauthRedirectUri =
+      `http://127.0.0.1:${oauthCallbackPort}/oauth/linear/callback`;
+    new Setting(section)
+      .setName("Linear OAuth callback port")
+      .setDesc(
+        `Register this exact redirect URI in the Linear OAuth application before connecting: ${oauthRedirectUri}`,
+      )
+      .addText((text) => {
+        text.inputEl.type = "number";
+        text.inputEl.min = "1024";
+        text.inputEl.max = "65535";
+        text.inputEl.step = "1";
+        return text
+          .setValue(String(oauthCallbackPort))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (!Number.isSafeInteger(parsed) || parsed < 1024 || parsed > 65535) {
+              return;
+            }
+            this.plugin.settings.linearOAuthCallbackPort = parsed;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(section)
+      .setName("Linear OAuth actor")
+      .setDesc(
+        "User acts as the consenting member. App uses the OAuth app actor and fails closed unless the companion proves persistent OS credential storage.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("user", "User")
+          .addOption("app", "App")
+          .setValue(this.plugin.settings.linearOAuthActor ?? "user")
+          .onChange(async (value) => {
+            this.plugin.settings.linearOAuthActor = value === "app" ? "app" : "user";
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    const oauthStatus = this.plugin.getLinearOAuthStatus();
+    const oauthSetting = new Setting(section)
+      .setName("Linear OAuth connection")
+      .setDesc(oauthStatus.message);
+    oauthSetting.addButton((button) =>
+      button
+        .setButtonText(oauthStatus.connected ? "Reconnect OAuth" : "Connect OAuth")
+        .setDisabled(!(this.plugin.settings.linearOAuthClientId ?? "").trim())
+        .onClick(async () => {
+          button.setDisabled(true).setButtonText("Starting...");
+          const result = await this.plugin.startLinearOAuthAuthorization();
+          oauthSetting.setDesc(result.message);
+          if (result.ok && result.authorizationUrl) {
+            const opened = openLinearAuthorizationUrl(result.authorizationUrl);
+            if (!opened) {
+              const copied = await copyTextToClipboard(result.authorizationUrl);
+              oauthSetting.setDesc(
+                copied
+                  ? "The browser could not be opened, so the authorization URL was copied. The loopback listener remains active."
+                  : "The browser could not be opened. Use Open authorization while the loopback listener is active.",
+              );
+            }
+          }
+          window.setTimeout(() => this.display(), 500);
+        }),
+    );
+    if (oauthStatus.authorizationUrl) {
+      oauthSetting.addButton((button) =>
+        button.setButtonText("Open authorization").onClick(async () => {
+          if (!openLinearAuthorizationUrl(oauthStatus.authorizationUrl!)) {
+            const copied = await copyTextToClipboard(oauthStatus.authorizationUrl!);
+            oauthSetting.setDesc(
+              copied
+                ? "Authorization URL copied; paste it into your browser."
+                : "Unable to open or copy the authorization URL.",
+            );
+          }
+        }),
+      );
+    }
+    if (oauthStatus.connected || oauthStatus.waitingForCallback) {
+      oauthSetting.addButton((button) =>
+        button
+          .setButtonText(oauthStatus.connected ? "Revoke OAuth" : "Cancel")
+          .onClick(async () => {
+            button.setDisabled(true).setButtonText("Disconnecting...");
+            const result = await this.plugin.disconnectLinearOAuth();
+            oauthSetting.setDesc(result.message);
+            if (result.ok) this.display();
+          }),
+      );
+    }
+
+    const credentialStatus = this.plugin.getLinearCredentialStatus();
+    let pendingLinearKey = "";
     const linearKeySetting = new Setting(section)
       .setName("Linear personal API key")
-      .setDesc(
-        this.plugin.hasLinearApiKey()
-          ? "A key is configured. Enter a replacement or use Clear key."
-          : "No key is configured.",
-      );
+      .setDesc(credentialStatus.message);
     linearKeySetting.addText((text) => {
       text.inputEl.type = "password";
       text
         .setPlaceholder(
-          this.plugin.hasLinearApiKey()
+          credentialStatus.configured
             ? "Key configured"
             : "Paste a personal API key",
         )
         .setValue("")
-        .onChange(async (value) => {
-          if (value.trim()) {
-            await this.plugin.setLinearApiKey(value);
-          }
+        .onChange((value) => {
+          pendingLinearKey = value;
         });
     });
     linearKeySetting.addButton((button) =>
-      button.setButtonText("Clear key").onClick(async () => {
-        await this.plugin.clearLinearApiKey();
-        this.display();
+      button.setButtonText("Save key").onClick(async () => {
+        button.setDisabled(true).setButtonText("Saving...");
+        const result = await this.plugin.setLinearApiKey(pendingLinearKey);
+        linearKeySetting.setDesc(result.message);
+        button.setButtonText(result.ok ? "Saved" : "Not saved");
+        window.setTimeout(() => this.display(), 1_500);
       }),
+    );
+    if (credentialStatus.configured && !credentialStatus.secure) {
+      linearKeySetting.addButton((button) =>
+        button.setButtonText("Migrate legacy key").onClick(async () => {
+          button.setDisabled(true).setButtonText("Migrating...");
+          const result = await this.plugin.migrateLegacyLinearApiKeyToSecureStore();
+          linearKeySetting.setDesc(result.message);
+          button.setButtonText(result.ok ? "Migrated" : "Migration blocked");
+          window.setTimeout(() => this.display(), 2_000);
+        }),
+      );
+    }
+    linearKeySetting.addButton((button) =>
+      button
+        .setButtonText("Clear key")
+        .setDisabled(!credentialStatus.configured)
+        .onClick(async () => {
+          const result = await this.plugin.clearLinearApiKey();
+          linearKeySetting.setDesc(result.message);
+          if (result.ok) this.display();
+        }),
     );
     linearKeySetting.addButton((button) =>
       button
@@ -1370,90 +1522,144 @@ export class AgentSettingTab extends PluginSettingTab {
           button.setButtonText(result.ok ? "Connected" : "Test failed");
           linearKeySetting.setDesc(result.message);
           window.setTimeout(() => {
-            button.setButtonText("Test connection");
-            button.setDisabled(!this.plugin.hasLinearApiKey());
+            this.display();
           }, 2_000);
         }),
     );
 
-    if (this.plugin.hasLinearApiKey()) {
-      new Setting(section)
-        .setName("Default Linear team ID")
-        .setDesc(
-          "Stable Linear team UUID used when a prepared action omits a team.",
-        )
-        .addText((text) =>
-          text
-            .setPlaceholder("Team UUID")
-            .setValue(this.plugin.settings.linearDefaultTeamId ?? "")
-            .onChange(async (value) => {
-              this.plugin.settings.linearDefaultTeamId = value.trim();
-              await this.plugin.saveSettings();
-            }),
-        );
-
-      new Setting(section)
-        .setName("Linear queue project ID")
-        .setDesc(
-          "Only issues in this project can enter the automatic execution queue.",
-        )
-        .addText((text) =>
-          text
-            .setPlaceholder("Project UUID")
-            .setValue(this.plugin.settings.linearQueueProjectId ?? "")
-            .onChange(async (value) => {
-              this.plugin.settings.linearQueueProjectId = value.trim();
-              await this.plugin.saveSettings();
-            }),
-        );
-
-      for (const state of [
-        {
-          name: "Started workflow state ID",
-          key: "linearStartedStateId" as const,
-          description: "State applied only after a claim comment is verified.",
-        },
-        {
-          name: "Completed workflow state ID",
-          key: "linearCompletedStateId" as const,
-          description: "State applied only after the proof contract passes.",
-        },
-        {
-          name: "Blocked workflow state ID",
-          key: "linearBlockedStateId" as const,
-          description:
-            "Optional. Leave blank to keep blocked work in its current state.",
-        },
-      ]) {
-        new Setting(section)
-          .setName(state.name)
-          .setDesc(state.description)
-          .addText((text) =>
-            text
-              .setPlaceholder("Workflow state UUID")
-              .setValue(this.plugin.settings[state.key] ?? "")
-              .onChange(async (value) => {
-                this.plugin.settings[state.key] = value.trim();
-                await this.plugin.saveSettings();
-              }),
-          );
+    const linearSnapshot = this.plugin.getLinearCapabilitySnapshot();
+    const capabilityReport = section.createDiv({
+      cls: "agentic-linear-capability-report",
+    });
+    capabilityReport.createEl("h5", { text: "Connection capability report" });
+    if (!linearSnapshot) {
+      capabilityReport.createEl("p", {
+        text: "No verified discovery snapshot. Test the connection to load teams, projects, workflow states, and enabled/disabled capability evidence.",
+        cls: "setting-item-description",
+      });
+    } else {
+      capabilityReport.createEl("p", {
+        text: `Workspace: ${linearSnapshot.workspace.name ?? linearSnapshot.workspace.id}. Discovered ${linearSnapshot.discoveredAt}; refresh by testing the connection again.`,
+        cls: "setting-item-description",
+      });
+      for (const capability of linearSnapshot.capabilities) {
+        capabilityReport.createEl("p", {
+          text: `${capability.enabled ? "Enabled" : "Disabled"}: ${capability.summary}`,
+          cls: `setting-item-description agentic-linear-capability-${capability.enabled ? "enabled" : "disabled"}`,
+        });
       }
     }
 
+    if (linearSnapshot) {
+      new Setting(section)
+        .setName("Default Linear team")
+        .setDesc(
+          "Connection-derived team used when a prepared action omits a team.",
+        )
+        .addDropdown((dropdown) => {
+          dropdown.addOption("", "Select a team");
+          for (const team of linearSnapshot.teams) {
+            dropdown.addOption(
+              team.id,
+              `${team.name ?? team.id}${team.key ? ` (${team.key})` : ""}`,
+            );
+          }
+          return dropdown
+            .setValue(this.plugin.settings.linearDefaultTeamId ?? "")
+            .onChange(async (value) => {
+              this.plugin.settings.linearDefaultTeamId = value;
+              await this.plugin.saveSettings();
+              this.display();
+            });
+        });
+
+      const selectedTeamId = this.plugin.settings.linearDefaultTeamId ?? "";
+      const projects = linearSnapshot.projects.filter(
+        (project) =>
+          !selectedTeamId ||
+          project.teamIds.length === 0 ||
+          project.teamIds.includes(selectedTeamId),
+      );
+      new Setting(section)
+        .setName("Linear queue project")
+        .setDesc(
+          "Only issues in this connection-derived project can enter the automatic execution queue.",
+        )
+        .addDropdown((dropdown) => {
+          dropdown.addOption("", "Select a project");
+          for (const project of projects) {
+            dropdown.addOption(project.id, project.name ?? project.id);
+          }
+          return dropdown
+            .setValue(this.plugin.settings.linearQueueProjectId ?? "")
+            .onChange(async (value) => {
+              this.plugin.settings.linearQueueProjectId = value;
+              await this.plugin.saveSettings();
+            });
+        });
+
+      for (const state of [
+        {
+          name: "Started workflow state",
+          key: "linearStartedStateId" as const,
+          description: "State applied only after a claim comment is verified.",
+          allowedTypes: ["started"],
+        },
+        {
+          name: "Completed workflow state",
+          key: "linearCompletedStateId" as const,
+          description: "State applied only after the proof contract passes.",
+          allowedTypes: ["completed"],
+        },
+        {
+          name: "Blocked workflow state",
+          key: "linearBlockedStateId" as const,
+          description:
+            "Optional. Leave blank to keep blocked work in its current state.",
+          allowedTypes: [] as string[],
+        },
+      ]) {
+        const states = linearSnapshot.workflowStates.filter(
+          (candidate) =>
+            (!selectedTeamId ||
+              candidate.teamId === null ||
+              candidate.teamId === selectedTeamId) &&
+            (state.allowedTypes.length === 0 ||
+              (candidate.type !== null && state.allowedTypes.includes(candidate.type))),
+        );
+        new Setting(section)
+          .setName(state.name)
+          .setDesc(state.description)
+          .addDropdown((dropdown) => {
+            dropdown.addOption("", state.allowedTypes.length === 0 ? "No blocked state" : "Select a state");
+            for (const candidate of states) {
+              dropdown.addOption(candidate.id, candidate.name ?? candidate.id);
+            }
+            return dropdown
+              .setValue(this.plugin.settings[state.key] ?? "")
+              .onChange(async (value) => {
+                this.plugin.settings[state.key] = value;
+                await this.plugin.saveSettings();
+              });
+          });
+      }
+    }
+
+    const queueConfiguration = this.plugin.getLinearQueueConfigurationStatus();
     new Setting(section)
       .setName("Automatic Linear queue")
       .setDesc(
-        this.plugin.settings.linearCapabilityGate === 5
+        queueConfiguration.ready
           ? "Scan at most ten updated issues every 15 minutes while Obsidian is open. A live scoped grant is still required."
-          : `Unavailable until Linear capability gate 5 is validated (current gate: ${this.plugin.settings.linearCapabilityGate}).`,
+          : `Unavailable: ${queueConfiguration.reason}`,
       )
       .addToggle((toggle) => {
         toggle
           .setValue(this.plugin.settings.linearQueueEnabled === true)
-          .setDisabled(this.plugin.settings.linearCapabilityGate !== 5)
+          .setDisabled(!queueConfiguration.ready)
           .onChange(async (value) => {
             this.plugin.settings.linearQueueEnabled =
-              this.plugin.settings.linearCapabilityGate === 5 && value;
+              queueConfiguration.ready && value;
             await this.plugin.saveSettings();
             this.display();
           });
@@ -1487,6 +1693,128 @@ export class AgentSettingTab extends PluginSettingTab {
         .onClick(async () => {
           await this.plugin.revokeLinearQueueAuthority();
           this.display();
+        }),
+    );
+
+    section.createEl("h4", { text: "GitHub integration" });
+    section.createEl("p", {
+      text: "Optional fixed-catalog GitHub access. OAuth device flow and fine-grained tokens are verified through /user, stored only in the companion's persistent OS credential backend, and pinned to the returned account identity.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(section)
+      .setName("Enable GitHub")
+      .setDesc(
+        "Expose bounded GitHub capabilities only when the integrations extension is available.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.githubEnabled === true)
+          .onChange(async (value) => {
+            this.plugin.settings.githubEnabled = value;
+            if (!value) this.plugin.cancelGitHubDeviceAuthorization();
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    new Setting(section)
+      .setName("GitHub OAuth client ID")
+      .setDesc(
+        "Non-secret client ID from a GitHub OAuth app with device flow enabled.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("GitHub OAuth client ID")
+          .setValue(this.plugin.settings.githubOAuthClientId ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.githubOAuthClientId = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    const githubStatus = this.plugin.getGitHubCredentialStatus();
+    const githubConnection = new Setting(section)
+      .setName("GitHub connection")
+      .setDesc(githubStatus.message);
+    githubConnection.addButton((button) =>
+      button
+        .setButtonText(githubStatus.connected ? "Reconnect OAuth" : "Connect OAuth")
+        .setDisabled(
+          this.plugin.settings.githubEnabled !== true ||
+            !(this.plugin.settings.githubOAuthClientId ?? "").trim() ||
+            githubStatus.waitingForUser,
+        )
+        .onClick(async () => {
+          button.setDisabled(true).setButtonText("Starting...");
+          const result = await this.plugin.startGitHubDeviceAuthorization();
+          githubConnection.setDesc(result.message);
+          if (result.ok && result.verificationUri) {
+            if (!openGitHubDeviceAuthorizationUrl(result.verificationUri)) {
+              await copyTextToClipboard(result.verificationUri);
+            }
+          }
+          this.display();
+        }),
+    );
+    if (githubStatus.waitingForUser) {
+      githubConnection.addButton((button) =>
+        button.setButtonText("Copy user code").onClick(async () => {
+          const copied = await copyTextToClipboard(githubStatus.userCode ?? "");
+          githubConnection.setDesc(
+            copied
+              ? `Copied ${githubStatus.userCode}. Complete authorization at ${githubStatus.verificationUri}.`
+              : githubStatus.message,
+          );
+        }),
+      );
+      githubConnection.addButton((button) =>
+        button.setButtonText("Cancel").onClick(() => {
+          const result = this.plugin.cancelGitHubDeviceAuthorization();
+          githubConnection.setDesc(result.message);
+          this.display();
+        }),
+      );
+    }
+    if (githubStatus.connected) {
+      githubConnection.addButton((button) =>
+        button.setButtonText("Disconnect").onClick(async () => {
+          button.setDisabled(true).setButtonText("Disconnecting...");
+          const result = await this.plugin.disconnectGitHub();
+          githubConnection.setDesc(result.message);
+          if (result.ok) this.display();
+        }),
+      );
+    }
+
+    let pendingGitHubPat = "";
+    const githubPatSetting = new Setting(section)
+      .setName("GitHub fine-grained personal access token")
+      .setDesc(
+        "Fallback for an account or repository where OAuth device authorization is unavailable. The field is never persisted.",
+      );
+    githubPatSetting.addText((text) => {
+      text.inputEl.type = "password";
+      text
+        .setPlaceholder(githubStatus.connected ? "Credential configured" : "github_pat_...")
+        .setValue("")
+        .onChange((value) => {
+          pendingGitHubPat = value;
+        });
+    });
+    githubPatSetting.addButton((button) =>
+      button
+        .setButtonText("Verify and save")
+        .setDisabled(this.plugin.settings.githubEnabled !== true)
+        .onClick(async () => {
+          button.setDisabled(true).setButtonText("Verifying...");
+          const result = await this.plugin.setGitHubFineGrainedPat(
+            pendingGitHubPat,
+          );
+          pendingGitHubPat = "";
+          githubPatSetting.setDesc(result.message);
+          button.setButtonText(result.ok ? "Saved" : "Not saved");
+          window.setTimeout(() => this.display(), 1_500);
         }),
     );
 
@@ -1526,7 +1854,7 @@ export class AgentSettingTab extends PluginSettingTab {
         : s.ollamaBaseUrl;
 
     section.createEl("p", {
-      text: `Effective profile: autonomy=${s.autonomyProfile ?? "automatic"}, output=${s.outputProfile ?? "active_or_new_note"}, schema=${s.settingsSchemaVersion ?? 1}. Provider=${provider}, model=${s.model}, base=${base}. Streaming=${s.enableStreaming ? "on" : "off"}, note_stream=${s.streamWritebackMode}, auto_title=${s.autoTitleOnWrite !== false ? "on" : "off"}, orchestrator=${s.orchestratorEnabled !== false ? "on" : "off"}, router=${normalizeModelRouterMode(s.modelRouterMode, s.modelRouterEnabled)}, reflex=${s.agenticReflexEnabled ? "on" : "off"}.`,
+      text: `Effective profile: autonomy=${s.autonomyProfile ?? "automatic"}, output=${s.outputProfile ?? "active_or_new_note"}, schema=${s.settingsSchemaVersion ?? 1}. Provider=${provider}, model=${s.model}, thinking=${s.thinkingMode}, base=${base}. Streaming=${s.enableStreaming ? "on" : "off"}, note_stream=${s.streamWritebackMode}, auto_title=${s.autoTitleOnWrite !== false ? "on" : "off"}, orchestrator=${s.orchestratorEnabled !== false ? "on" : "off"}, router=${normalizeModelRouterMode(s.modelRouterMode, s.modelRouterEnabled)}, reflex=${s.agenticReflexEnabled ? "on" : "off"}.`,
       cls: "setting-item-description agentic-settings-diagnostics-summary",
     });
 
@@ -1562,20 +1890,85 @@ export class AgentSettingTab extends PluginSettingTab {
       );
   }
 
+  private renderAdvancedExtensionContributions(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(
+      parent,
+      "Installed extensions (read only)",
+    );
+    this.extensionContributionsEl = section;
+    section.createEl("p", {
+      text: "Live metadata registered through AgenticResearcherCoreApiV1. These rows describe extension-owned settings contracts; core does not edit or persist their values.",
+      cls: "setting-item-description",
+    });
+
+    const contributions = this.plugin.getExtensionSettingsSections();
+    if (contributions.length === 0) {
+      section.createEl("p", {
+        text: "No compatible extension settings contributions are currently registered.",
+        cls: "setting-item-description agentic-extension-settings-empty",
+      });
+      return;
+    }
+
+    for (const contribution of contributions) {
+      section.createEl("h4", {
+        text: contribution.title,
+        cls: "agentic-extension-settings-title",
+      });
+      section.createEl("p", {
+        text: `Owner: ${contribution.extensionId}; contribution: ${contribution.contributionId}.`,
+        cls: "setting-item-description agentic-extension-settings-owner",
+      });
+      for (const field of contribution.fields) {
+        new Setting(section)
+          .setName(field.label)
+          .setDesc(formatExtensionSettingMetadata(field));
+      }
+    }
+  }
+
+  refreshExtensionContributions(): void {
+    const current = this.extensionContributionsEl;
+    const parent = current?.parentElement;
+    if (!current?.isConnected || !parent) {
+      return;
+    }
+    const wasOpen = current.open;
+    const next = current.nextSibling;
+    current.remove();
+    this.renderAdvancedExtensionContributions(parent);
+    const replacement = this.extensionContributionsEl;
+    if (replacement && next) {
+      parent.insertBefore(replacement, next);
+    }
+    if (replacement) {
+      replacement.open = wasOpen;
+    }
+  }
+
   private async applyAutonomyProfileChange(value: string): Promise<void> {
     if (value === "automatic") {
+      applyAutomaticProfileDefaults(
+        this.plugin.settings as NormalizableAgentSettings,
+      );
       this.plugin.settings.autonomyProfile = "automatic";
       this.plugin.settings.outputProfile = "active_or_new_note";
       this.plugin.settings.enableStreaming = true;
       this.plugin.settings.streamWritebackMode =
         "all_current_note_content_writes";
       this.plugin.settings.autoTitleOnWrite = true;
+      this.plugin.settings.thinkingMode = "auto";
+      this.plugin.settings.agenticReflexEnabled = true;
+      this.plugin.settings.modelRouterMode = "authority";
+      this.plugin.settings.modelRouterEnabled = true;
     } else if (value === "conservative") {
       this.plugin.settings.autonomyProfile = "conservative";
       this.plugin.settings.outputProfile = "chat_first";
       this.plugin.settings.enableStreaming = true;
       this.plugin.settings.streamWritebackMode = "off";
       this.plugin.settings.autoTitleOnWrite = false;
+      this.plugin.settings.modelRouterMode = "off";
+      this.plugin.settings.modelRouterEnabled = false;
     } else {
       this.plugin.settings.autonomyProfile = "custom";
     }
@@ -1756,12 +2149,15 @@ function buildCapabilityStatusRows(
         linearStatus = "Ready";
         linearDetail = `Queue authority active until ${grant.expiresAt}.`;
       }
-    } else if ((settings.linearCapabilityGate ?? 0) < 5) {
+    } else if (!plugin.getLinearCapabilitySnapshot()) {
       linearStatus = "Degraded";
-      linearDetail = `Key present; capability gate ${settings.linearCapabilityGate ?? 0}/5.`;
+      linearDetail = "Credential present; test the connection to discover capabilities.";
     } else {
-      linearStatus = "Ready";
-      linearDetail = "Connected; automatic queue is off.";
+      const configuration = plugin.getLinearQueueConfigurationStatus();
+      linearStatus = configuration.ready ? "Ready" : "Degraded";
+      linearDetail = configuration.ready
+        ? "Connected with verified queue bindings; automatic queue is off."
+        : configuration.reason;
     }
   }
 
@@ -1809,6 +2205,26 @@ function buildCapabilityStatusRows(
       detail: scheduleDetail,
     },
   ];
+}
+
+function formatExtensionSettingMetadata(
+  field: ExtensionSettingFieldProjectionV1,
+): string {
+  const defaultValue =
+    field.type === "secret_reference"
+      ? "extension-owned secret reference (value never displayed)"
+      : field.defaultValue === undefined
+        ? "unspecified"
+        : JSON.stringify(field.defaultValue);
+  const options = field.options?.length
+    ? ` Options: ${field.options.map((option) => `${option.label}=${option.value}`).join(", ")}.`
+    : "";
+  return [
+    field.description?.trim(),
+    `Read-only metadata: id=${field.id}, type=${field.type}, declared default=${defaultValue}.${options}`,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(" ");
 }
 
 
@@ -1975,7 +2391,19 @@ function formatDependencyRowName(row: MissionDependencyStatus): string {
 }
 
 function normalizeCompanionBaseUrl(value: string): string | null {
-  return normalizeProviderBaseUrl(value);
+  const normalized = normalizeProviderBaseUrl(value);
+  if (!normalized) return null;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "localhost" ||
+      host === "::1" ||
+      /^127(?:\.\d{1,3}){3}$/.test(host)
+      ? parsed.origin
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeProviderBaseUrl(value: string): string | null {
@@ -1995,5 +2423,49 @@ function normalizeProviderBaseUrl(value: string): string | null {
     return parsed.toString().replace(/\/+$/, "");
   } catch {
     return null;
+  }
+}
+
+function openLinearAuthorizationUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.origin !== "https://linear.app" ||
+      parsed.pathname !== "/oauth/authorize"
+    ) {
+      return false;
+    }
+    return window.open(parsed.toString(), "_blank", "noopener,noreferrer") !== null;
+  } catch {
+    return false;
+  }
+}
+
+function openGitHubDeviceAuthorizationUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.origin !== "https://github.com" ||
+      parsed.pathname !== "/login/device" ||
+      parsed.search ||
+      parsed.hash ||
+      parsed.username ||
+      parsed.password
+    ) {
+      return false;
+    }
+    return window.open(parsed.toString(), "_blank", "noopener,noreferrer") !== null;
+  } catch {
+    return false;
+  }
+}
+
+async function copyTextToClipboard(value: string): Promise<boolean> {
+  try {
+    if (!navigator.clipboard?.writeText) return false;
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    return false;
   }
 }

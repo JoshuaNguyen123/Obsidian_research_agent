@@ -125,6 +125,91 @@ test("run planner keeps thinking mode resolution with planner boundary", () => {
   );
 });
 
+test("compound title and current-note content reserves rename, writeback, and correction steps", () => {
+  const plan = createRunPlan({
+    prompt:
+      "Write a concise summary of the first five laws of power, retitle this document, and generate it onto the page.",
+    missionIntent: missionIntent({
+      mode: "explicit_file_mutation",
+      noteOutput: true,
+      explicitMutation: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: ["read_current_file", "rename_current_file"].map((name) => tool(name)),
+    settings: settings({ maxAgentSteps: 100 }),
+    streamingWritebackKind: "append",
+    directCurrentNoteWritebackKind: null,
+  });
+
+  assert.equal(plan.route, "tool_required");
+  assert.equal(plan.maxStepsForRun, 4);
+  assert.ok(plan.traceReasons.includes("compound_title_writeback"));
+});
+
+test("explicit code workspace tools receive a grounded multi-step budget", () => {
+  const codeTools = [
+    "code_workspace_create",
+    "code_workspace_mkdir",
+    "code_workspace_create_file",
+  ].map((name) => tool(name));
+  const plan = createRunPlan({
+    prompt: [
+      "Create the isolated scratch workspace phase4-crud.",
+      "Use exactly code_workspace_create, code_workspace_mkdir, and code_workspace_create_file.",
+      "Create src/durable-value.txt containing before:phase4.",
+    ].join(" "),
+    missionIntent: missionIntent({
+      mode: "explicit_file_mutation",
+      explicitMutation: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: codeTools,
+    settings: settings({ maxAgentSteps: 40 }),
+    streamingWritebackKind: null,
+    directCurrentNoteWritebackKind: null,
+  });
+
+  assert.equal(plan.route, "grounded_workflow");
+  assert.ok(plan.maxStepsForRun >= 8);
+  assert.deepEqual(plan.allowedToolNames, codeTools.map((item) => item.function.name));
+  assert.ok(plan.traceReasons.includes("code_execution_intent"));
+});
+
+test("explicit code workspace lifecycle budget covers every named tool", () => {
+  const prompt = [
+    "Use code_workspace_create, code_workspace_mkdir, code_workspace_create_file,",
+    "code_workspace_read, code_workspace_write_expected, code_workspace_move,",
+    "code_workspace_trash, and code_workspace_restore.",
+  ].join(" ");
+  const plan = createRunPlan({
+    prompt,
+    missionIntent: missionIntent({
+      mode: "explicit_file_mutation",
+      explicitMutation: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: [
+      "code_workspace_create",
+      "code_workspace_mkdir",
+      "code_workspace_create_file",
+      "code_workspace_read",
+      "code_workspace_write_expected",
+      "code_workspace_move",
+      "code_workspace_trash",
+      "code_workspace_restore",
+    ].map((name) => tool(name)),
+    settings: settings({ maxAgentSteps: 40 }),
+    streamingWritebackKind: null,
+    directCurrentNoteWritebackKind: null,
+  });
+
+  assert.equal(plan.route, "grounded_workflow");
+  assert.ok(plan.maxStepsForRun >= 12);
+});
+
 function tool(name: string): ModelToolDefinition {
   return {
     type: "function",

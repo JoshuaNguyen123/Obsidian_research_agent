@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "python": "3.11",
+  "node": "24.16.0",
+  "requirements": "requirements.txt"
+}
