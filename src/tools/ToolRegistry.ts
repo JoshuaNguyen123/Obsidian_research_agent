@@ -77,6 +77,18 @@ export class DefaultToolRegistry implements ToolRegistry {
     }
 
     try {
+      if (tool.executeResult) {
+        const result = await tool.executeResult(call.arguments, context);
+        if (result.toolName !== tool.name) {
+          return failed(
+            tool.name,
+            "tool_result_identity_mismatch",
+            "Composite tool result identity does not match the registered tool.",
+            "unknown",
+          );
+        }
+        return result;
+      }
       return {
         ok: true,
         toolName: tool.name,

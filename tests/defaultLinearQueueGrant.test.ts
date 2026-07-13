@@ -57,9 +57,27 @@ test("default queue grant is explicit, project-scoped, four-hour, and class-boun
       selector: { pathPrefixes: ["Research/Queue", "Projects/Linear"] },
     },
     {
+      system: "workspace",
+      resourceTypes: ["code_workspace"],
+      actions: ["create", "update", "append", "move"],
+      selector: { repositoryProfileIds: ["research-agent", "companion"] },
+    },
+    {
+      system: "workspace",
+      resourceTypes: ["validation_run"],
+      actions: ["validate"],
+      selector: { repositoryProfileIds: ["research-agent", "companion"] },
+    },
+    {
+      system: "workspace",
+      resourceTypes: ["code_repair_checkpoint"],
+      actions: ["update"],
+      selector: { repositoryProfileIds: ["research-agent", "companion"] },
+    },
+    {
       system: "git",
-      resourceTypes: ["repository"],
-      actions: ["validate", "commit", "integrate", "promote"],
+      resourceTypes: ["verified_local_commit"],
+      actions: ["commit"],
       selector: { repositoryProfileIds: ["research-agent", "companion"] },
     },
   ]);

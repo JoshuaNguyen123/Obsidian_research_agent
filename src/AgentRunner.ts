@@ -30,10 +30,12 @@ import type {
   AgentMissionMode,
   AgentRuntimeCache,
   MissionIntent,
+  NestedToolApprovalRequest,
   ToolExecutionContext,
   ToolExecutionResult,
   ToolRegistry,
 } from "./tools/types";
+import { resolveNestedApprovalBindingV1 } from "./agent/nestedApprovalPolicy";
 import {
   BACKUP_FOLDER,
   CHECKPOINT_EVERY_STEPS,
@@ -50,6 +52,7 @@ import {
   normalizeVaultPath,
   serializeToolResult,
 } from "./tools/validation";
+import { descriptorFor } from "./tools/toolDescriptors";
 import {
   type AgentConversationMessage,
 } from "./conversationHistory";
@@ -69,6 +72,23 @@ import {
   hasExplicitPermanentLinearDeleteIntent,
 } from "./agent/linearIntent";
 import {
+  hasExplicitResearchPublicationIntent,
+  PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+} from "./tools/researchPublicationTool";
+import {
+  hasExplicitGitHubPublicationIntent,
+  PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+} from "./tools/githubPublicationTool";
+import {
+  GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES,
+  GITHUB_CATALOG_MUTATION_TOOL_NAMES,
+  GITHUB_CATALOG_READ_TOOL_NAMES,
+  getExplicitGitHubCatalogMutationToolNames,
+  getGitHubCatalogReadToolNames,
+  hasExplicitGitHubCatalogIntent,
+  isGitHubCatalogToolName,
+} from "./tools/githubCatalogTools";
+import {
   decideAutoContinuation,
   type AutoContinuationDecision,
   type AutoContinuationReason,
@@ -83,7 +103,10 @@ import {
   analyzeCurrentNoteResetPrompt,
   isCurrentNoteReplaceResetPrompt,
 } from "./agent/currentNoteResetPolicy";
-import { planLoopBudget } from "./agent/loopPlanner";
+import {
+  planLoopBudget,
+  type LoopBudgetPlan,
+} from "./agent/loopPlanner";
 import {
   applyResearchPhaseToLoopDecision,
   decideNextLoopAction,
@@ -261,7 +284,11 @@ import {
   type NoteOutputPlan,
   type OutputProfile,
 } from "./agent/noteOutputPolicy";
-import { hasReviseDesignIntent } from "./agent/codeDesignIntent";
+import {
+  hasDesignIntent as hasSharedDesignIntent,
+  hasExplicitCanvasDestinationIntent,
+  hasReviseDesignIntent,
+} from "./agent/codeDesignIntent";
 import {
   classifyMissionWithModel,
   resolveModelRouterMode,
@@ -309,9 +336,19 @@ import {
 import {
   createMissionRuntimeSnapshot,
   buildOperationReconciliationInputs,
+  attachBackgroundCodeDispatchAttemptV1,
+  attachBackgroundGitHubDispatchAttemptV1,
+  attachPreparedBackgroundCodeHandoffV1,
+  attachPreparedBackgroundGitHubActionV1,
+  attachExternalActionDispatchAttemptV1,
+  attachPreparedExternalActionHandoff,
   canPersistMissionRuntimeSnapshot,
   createOperationJournalRecord,
+  isRuntimeSnapshotWriteAmbiguousError,
   readMissionRuntimeSnapshotByRunId,
+  markExternalActionJobSubmittedV1,
+  markBackgroundCodeJobSubmittedV1,
+  markBackgroundGitHubJobSubmittedV1,
   transitionOperationJournalRecord,
   writeMissionRuntimeSnapshot,
   type MissionRuntimeReceipt,
@@ -334,9 +371,47 @@ import type {
   OrchestratorEvent,
   OrchestratorSnapshotV1,
 } from "./orchestrator/types";
+import { isDescriptorApprovedParallelRead } from "../packages/headless-runtime/src/missionScheduler";
+import type {
+  MissionGraphPatchV1,
+  MissionGraphV3,
+} from "../packages/headless-runtime/src/missionGraphV3";
+import {
+  buildHostMissionGraphPlanV1,
+  isExactBackgroundCodeValidationCommitDescriptor,
+  isExactBackgroundGitHubPreparedDescriptor,
+} from "./agent/missionGraphHost";
+import { canonicalMissionGraphId } from "./agent/missionGraphIds";
+import { planMissionGraphV3 } from "./agent/missionGraphPlanner";
+import {
+  MissionGraphSession,
+  resolveMissionGraphEvidenceKind,
+  type MissionGraphToolExecution,
+} from "./agent/missionGraphSession";
+import { canPersistMissionGraphStore } from "./agent/missionGraphStore";
+import {
+  projectMissionGraphToLegacyPlan,
+  projectMissionGraphToOrchestratorSnapshot,
+} from "./agent/missionGraphLegacyProjection";
+import { migrateLegacyPlanWithHostAuthority } from "./agent/missionGraphLegacyHostMigration";
+import { sha256Fingerprint as sha256MissionFingerprint } from "../packages/headless-runtime/src/canonicalize";
+import { buildBackgroundAuthorizationV1 } from "../packages/headless-runtime/src/backgroundContinuation";
+import { buildPreparedLinearIssueStateUpdateHandoffV1 } from "./agent/preparedExternalActionHandoff";
+import {
+  createHostApprovalReceiptEvidenceV1,
+  parseHostApprovalReceiptV1,
+  type HostApprovalReceiptV1,
+} from "../packages/core-api/src/hostApprovalReceiptV1";
+import {
+  dispatchPersistedBackgroundNodesV1,
+  hasExplicitBackgroundContinuationIntent,
+  type BackgroundMissionDispatchPortV1,
+  type BackgroundMissionDispatchSummaryV1,
+} from "./agent/backgroundMissionDispatch";
 
 export { MAX_AGENT_STEPS } from "./tools/constants";
 export { resolveThinkingMode } from "./agent/runPlan";
+export { canonicalMissionGraphId };
 export type { RunPlan, RunRoute, SlowPathReason } from "./agent/runPlan";
 export type { AgentConversationMessage } from "./conversationHistory";
 export type { AgentMissionMode, MissionIntent } from "./tools/types";
@@ -367,6 +442,8 @@ export interface AgentToolRunEvent {
 export interface AgentRunReceipt {
   version?: 1;
   id?: string;
+  /** Durable owner used to keep Run Details receipts scoped to one mission. */
+  runId?: string;
   toolName: string;
   operation:
     | "create"
@@ -595,6 +672,11 @@ export interface AgentRunEvents {
     event: OrchestratorEvent,
     snapshot: OrchestratorSnapshotV1,
   ) => void;
+  /** Canonical observable mission state; never model reasoning or hidden prompts. */
+  onMissionGraphUpdate?: (
+    graph: MissionGraphV3,
+    patch?: MissionGraphPatchV1,
+  ) => void;
 }
 
 interface RunAgentMissionOptions {
@@ -620,6 +702,28 @@ interface RunAgentMissionOptions {
   orchestratorContext?: string;
   orchestratorSnapshot?: OrchestratorSnapshotV1;
   getOrchestratorSnapshot?: () => OrchestratorSnapshotV1 | null;
+  /**
+   * Optional durable authority seam for an already user-approved background
+   * mission. The runner still evaluates the exact prepared action and policy;
+   * the host resolves and atomically consumes the persisted grant. Interactive
+   * missions leave this unset and continue to use the approval broker.
+   */
+  preparedActionAuthority?: {
+    subject: AuthorityGrantV1["subject"];
+    resolve(input: {
+      action: PreparedAction;
+      descriptor: ToolDescriptor;
+    }): Promise<AuthorityGrantV1 | null>;
+    consume(input: {
+      grantId: string;
+      action: PreparedAction;
+      descriptor: ToolDescriptor;
+    }): Promise<AuthorityGrantV1>;
+  };
+  /** Fail closed instead of opening the interactive approval UI. */
+  interactiveApprovals?: boolean;
+  /** Optional, scoped bridge to the authenticated local companion extension. */
+  backgroundContinuation?: BackgroundMissionDispatchPortV1;
 }
 
 interface CheckpointResumeState {
@@ -672,6 +776,14 @@ Operating rules:
 31. When filling a template, prefer fill_template over generic file creation. Use templateText for ad hoc templates supplied in the mission, or templatePath for saved templates. For an explicit multi-note research pack, use create_research_pack so Brief, Sources, Synthesis, and Index are created and verified transactionally.
 32. For conceptual vault questions, first inspect the semantic index when available, then call semantic_search_notes for ranked evidence before broad file reads. Use exact path/title/heading tools for exact requests. Never use semantic index tools for delete, move, replace, or direct write-only requests. Treat index summaries as navigation aids; cite and rely on source note paths.
 33. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
+
+const CODE_WORKFLOW_POLICY = [
+  "Repository workflow policy:",
+  "1. Call code_workspace_create first. A raw repository root is accepted only from the exact foreground user mission; after creation use only the returned workspaceId and trusted repository profile key. Never put ticket/comment text into a path, command, runtime, or validation argument.",
+  "2. Read workspace files and their SHA-256 values before editing. Use create-no-overwrite for new files and fingerprint-bound patch/write/move/copy/trash/restore tools for existing paths. Treat protected manifests, lockfiles, build scripts, wrappers, workflows, hooks, and Git configuration as approval-gated controls.",
+  "3. Generated code may run only through code_validate_* or run_code_block after code_sandbox_status reports a verified provider. If sandbox proof is unavailable, editing may continue but execution, validation, commit, and publication are blocked; never invent or request a native host fallback.",
+  "4. For implementation missions, choose one bounded repairRequestId and reuse it as requestId throughout fast, targeted, full, repair-cycle, status, and commit calls. Use bounded fast validation and repair, then fresh targeted and full sandbox validation. Record repair-cycle evidence and call code_commit_verified only with the exact current diff and validation receipt IDs. Do not claim code completion from model prose, a process exit alone, or an unverified commit.",
+].join("\n");
 
 const ENGLISH_ONLY_POLICY = [
   "You are an English-only research assistant for an Obsidian vault.",
@@ -933,6 +1045,9 @@ export async function runAgentMission({
   orchestratorContext,
   orchestratorSnapshot,
   getOrchestratorSnapshot,
+  preparedActionAuthority,
+  interactiveApprovals = true,
+  backgroundContinuation,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
   const configuredMaxRunMs =
@@ -959,9 +1074,11 @@ export async function runAgentMission({
     },
   });
   const approvalBroker = providedApprovalBroker ?? new ApprovalBroker();
+  const portableHostApprovalReceipts = new Map<string, HostApprovalReceiptV1[]>();
   const maxToolCalls = normalizeInvocationToolCallLimit(providedMaxToolCalls);
   let observedToolCallCount = 0;
   let toolCallBudgetExhausted = false;
+  let missionGraphCapacityExhausted = false;
   let toolCallBudgetNoticeEmitted = false;
   const runtimeCache = createRuntimeCache();
   let activeThink = resolveThinkingMode(toolContext.settings);
@@ -1273,6 +1390,18 @@ export async function runAgentMission({
   let preparedStreamingSectionEdit: PreparedStreamingSectionEdit | null = null;
   let missionLedger: MissionLedger | null = null;
   let missionPlan: MissionPlan | null = null;
+  let missionGraph: MissionGraphV3 | null = null;
+  let missionGraphSession: MissionGraphSession | null = null;
+  let backgroundDispatchSummary: BackgroundMissionDispatchSummaryV1 | null = null;
+  // Once a runtime-snapshot write has an ambiguous outcome, no later ledger or
+  // snapshot write may touch the same Agent Runs artifact in this process. A
+  // retry could race the original unresolved vault operation and overwrite a
+  // newer WAL state. Keep the first typed error so required callers fail with
+  // the original reconciliation evidence while terminal UI state can still be
+  // emitted without another persistence attempt. The synchronous stop path
+  // shares this circuit so cancellation cannot bypass it.
+  let runtimeSnapshotPersistenceBlockedError: unknown = null;
+  let currentNoteContext: unknown = null;
   let researchPlan: ResearchPlan | null = null;
   let researchPhaseDescriptor: ResearchPhaseDescriptor | null = null;
   let lastResearchPhase: ResearchRunPhase | null = null;
@@ -1315,8 +1444,13 @@ export async function runAgentMission({
         "User stopped the run.",
         runToolContext.now?.() ?? new Date(),
       );
-      void writeMissionLedger(runToolContext, missionLedger);
-      if (runtimeSnapshot) {
+      if (runtimeSnapshotPersistenceBlockedError === null) {
+        void writeMissionLedger(runToolContext, missionLedger);
+      }
+      if (
+        runtimeSnapshot &&
+        runtimeSnapshotPersistenceBlockedError === null
+      ) {
         runtimeSnapshot.status = "stopped";
         runtimeSnapshot.lastSafeStep = missionLedger.lastSafeStep;
         runtimeSnapshot.updatedAt = (
@@ -1376,9 +1510,631 @@ export async function runAgentMission({
     outputPreview: tools.map((tool) => tool.function.name),
   });
 
-  const currentNoteContext = shouldReadCurrentNote
-    ? await readInitialCurrentNote(toolRegistry, runToolContext, events)
-    : null;
+  const checkpointResumeContext = await buildCheckpointResumeContext({
+    prompt,
+    activeIntentPrompt,
+    toolContext: runToolContext,
+    events,
+  });
+  if (checkpointResumeContext?.missingRequestedRunId) {
+    const missingRunId = checkpointResumeContext.missingRequestedRunId;
+    const message =
+      `Run ${missingRunId} was requested explicitly, but its exact durable ` +
+      "checkpoint is unavailable. Refusing to continue from a different run.";
+    events.onStatus?.(message);
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
+  const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
+  const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
+  if (resumeLedger && checkpointResumeContext?.missionResume?.plan.canResume === false) {
+    const resumeReason = checkpointResumeContext.missionResume.plan.reason;
+    const message =
+      resumeReason === "proof_debt_blocked"
+        ? `Run ${resumeLedger.runId} has blocking proof debt (approvals, policy, or unresolved mutations). ` +
+          "Resolve the blocker before continuing this run."
+        : `Run ${resumeLedger.runId} is already complete and accepted. ` +
+          "Start a new mission explicitly if you want to repeat or revise that work.";
+    events.onTrace?.({
+      id:
+        resumeReason === "proof_debt_blocked"
+          ? "resume-proof-debt-blocked"
+          : "resume-already-complete",
+      kind: "status",
+      message,
+      outputPreview: {
+        runId: resumeLedger.runId,
+        status: resumeLedger.status,
+        acceptance: resumeLedger.acceptance?.status ?? "unchecked",
+      },
+    });
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(events, "final", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
+  const ambiguousResumeOperations = resumeSnapshot
+    ? buildOperationReconciliationInputs(resumeSnapshot.operationJournal).filter(
+        (item) => item.recommendedAction !== "safe_to_retry",
+      )
+    : [];
+  if (resumeLedger && ambiguousResumeOperations.length > 0) {
+    const targets = ambiguousResumeOperations
+      .map((item) => item.targetPath ?? item.toolName)
+      .filter((item, index, all) => all.indexOf(item) === index)
+      .slice(0, 4);
+    const message =
+      `Run ${resumeLedger.runId} has ${ambiguousResumeOperations.length} unresolved mutation ` +
+      `operation(s) that may already have applied${targets.length > 0 ? ` (${targets.join(", ")})` : ""}. ` +
+      "Automatic replay is blocked. Inspect the target and start a new explicit repair mission.";
+    events.onTrace?.({
+      id: "resume-mutation-reconciliation-required",
+      kind: "error",
+      message,
+      outputPreview: ambiguousResumeOperations,
+      error: { code: "mutation_reconciliation_required", message },
+    });
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
+  const pendingCurrentNoteResumeGoals = resumeSnapshot
+    ? CURRENT_NOTE_RESUME_GOALS.filter((goal) => {
+        const state = resumeSnapshot.operationGoals[goal];
+        return state === "pending" || state === "failed";
+      })
+    : [];
+  const activeResumeNotePath = runToolContext.getCurrentMarkdownFile?.()?.path;
+  if (
+    resumeLedger &&
+    resumeSnapshot?.currentNotePath &&
+    pendingCurrentNoteResumeGoals.length > 0 &&
+    activeResumeNotePath !== resumeSnapshot.currentNotePath
+  ) {
+    const message =
+      `Run ${resumeLedger.runId} was started on ${resumeSnapshot.currentNotePath}, ` +
+      `but the active note is ${activeResumeNotePath ?? "unavailable"}. ` +
+      "Open the original note and continue the run again so current-note work cannot target the wrong file.";
+    events.onTrace?.({
+      id: "resume-current-note-target-mismatch",
+      kind: "status",
+      message,
+      outputPreview: {
+        expectedPath: resumeSnapshot.currentNotePath,
+        activePath: activeResumeNotePath ?? null,
+        pendingGoals: pendingCurrentNoteResumeGoals,
+      },
+    });
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(
+      events,
+      "clarifying_question",
+      0,
+      runStartedAt,
+      runPlan.maxStepsForRun,
+    );
+    return;
+  }
+  const resumedOriginalMission =
+    resumeSnapshot?.originalMission ?? resumeLedger?.mission;
+  if (resumedOriginalMission) {
+    activeIntentPrompt = resumedOriginalMission;
+    missionIntent = classifyMissionIntent(activeIntentPrompt);
+    if (forceChatOnly) {
+      missionIntent = suppressNoteWritebackForChatOnly(
+        activeIntentPrompt,
+        missionIntent,
+      );
+    }
+    writeAutonomy = missionIntent.allowAutonomousWrite;
+    runToolContext = {
+      ...runToolContext,
+      originalPrompt: activeIntentPrompt,
+      writeAutonomy,
+      missionIntent,
+    };
+    routedMissionIntent = null;
+    reflexOutput = await reflexController.evaluate({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      allowedToolNames: new Set(),
+      recentActions,
+      evidence: missionEvidenceRecords,
+      receipts: writeReceipts,
+      settings: runToolContext.settings,
+      embeddingProvider: runToolContext.semanticEmbeddingProvider,
+    });
+    missionIntent = applyDefaultActiveNoteWriteback({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      toolContext: runToolContext,
+      enableStreaming,
+      forceChatOnly,
+    });
+    writeAutonomy = missionIntent.allowAutonomousWrite;
+    runToolContext = { ...runToolContext, writeAutonomy, missionIntent };
+    structuredIntent = classifyStructuredIntent(activeIntentPrompt, missionIntent);
+    streamingWritebackKind = getStreamingWritebackKind(
+      activeIntentPrompt,
+      runToolContext,
+      enableStreaming,
+    );
+    tools = getAllowedToolDefinitions(
+      toolRegistry,
+      activeIntentPrompt,
+      missionIntent,
+      runToolContext.settings,
+      streamingWritebackKind,
+      reflexOutput.intent,
+    );
+    directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      streamingWritebackKind,
+      toolContext: runToolContext,
+    });
+    if (
+      shouldOmitCurrentNoteReadForTargetOnlyWrite(
+        activeIntentPrompt,
+        missionIntent,
+      )
+    ) {
+      tools = removeToolDefinition(tools, "read_current_file");
+    }
+    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    requiredWriteTools = getRequiredWriteToolNames(
+      activeIntentPrompt,
+      allowedToolNames,
+      missionIntent,
+      streamingWritebackKind,
+    );
+    writeRequired =
+      missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
+    requireToolBeforeStreamingWriteback = promptRequiresToolLoop(activeIntentPrompt);
+    shouldReadCurrentNote = shouldObserveCurrentNote(
+      activeIntentPrompt,
+      allowedToolNames,
+      missionIntent,
+    );
+    runPlan = createRunPlan({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      tools,
+      settings: runToolContext.settings,
+      streamingWritebackKind,
+      directCurrentNoteWritebackKind,
+      reflex: reflexOutput.intent,
+    });
+    if (isRunRouteValue(resumeLedger?.route)) {
+      runPlan = { ...runPlan, route: resumeLedger.route };
+    }
+    runPlan.traceReasons = [
+      ...new Set([
+        ...runPlan.traceReasons,
+        `resume_original_route:${resumeLedger?.route ?? runPlan.route}`,
+      ]),
+    ];
+    activeThink = runPlan.thinking;
+    followupIntentContext = null;
+    events.onTrace?.({
+      id: "resume-original-mission-routing",
+      kind: "mission_intent",
+      message: `Restored original mission routing for continuation: ${runPlan.route}.`,
+      outputPreview: {
+        priorRunId: resumeLedger?.runId ?? null,
+        route: runPlan.route,
+        maxStepsForRun: runPlan.maxStepsForRun,
+        toolBudgetPrompt: activeIntentPrompt,
+      },
+    });
+  }
+
+  if (canPersistMissionGraphStore(runToolContext)) {
+    const emitMissionGraph = (
+      graph: MissionGraphV3,
+      patch?: MissionGraphPatchV1,
+    ) => {
+      missionGraph = graph;
+      missionPlan = projectMissionGraphToLegacyPlan(graph);
+      events.onMissionGraphUpdate?.(graph, patch);
+      const projection = projectMissionGraphToOrchestratorSnapshot(graph);
+      events.onOrchestratorEvent?.(
+        {
+          kind: "orchestrator_started",
+          runId: graph.missionId,
+          sequence: graph.revision,
+          occurredAt: graph.updatedAt,
+          mode: projection.mode,
+        },
+        projection,
+      );
+    };
+    const exactResumeRunId = extractRequestedRunId(prompt);
+    const canonicalResumeGraphId =
+      resumeSnapshot?.missionGraphRef?.missionId ??
+      (exactResumeRunId ? canonicalMissionGraphId(exactResumeRunId) : null);
+    try {
+      if (canonicalResumeGraphId) {
+        try {
+          missionGraphSession = await MissionGraphSession.resume({
+            context: runToolContext,
+            missionId: canonicalResumeGraphId,
+            events: { onGraphUpdate: emitMissionGraph },
+          });
+        } catch (error) {
+          if (!/is unavailable/i.test(getUnknownErrorMessage(error))) {
+            throw error;
+          }
+        }
+      }
+
+      if (!missionGraphSession) {
+        let backgroundCapability = null;
+        if (
+          backgroundContinuation &&
+          hasExplicitBackgroundContinuationIntent(activeIntentPrompt)
+        ) {
+          try {
+            backgroundCapability = await backgroundContinuation.readCapabilities();
+          } catch (error) {
+            events.onTrace?.({
+              id: "background-capability-unavailable",
+              kind: "status",
+              message: `Companion capability health is unavailable: ${getUnknownErrorMessage(error)}`,
+            });
+          }
+        }
+        const installedToolNames = new Set(
+          toolRegistry.getDefinitions().map((definition) => definition.function.name),
+        );
+        const postAcceptanceToolNames =
+          runToolContext.settings?.researchMemoryEnabled === true &&
+          hasWebSearchIntent(activeIntentPrompt) &&
+          !missionIntent.requireWriteCompletion &&
+          installedToolNames.has("append_research_memory")
+            ? ["append_research_memory"]
+            : [];
+        const runnerOwnedToolNames = [
+          ...requiredWriteTools,
+          ...(streamingWritebackKind
+            ? [getStreamingWritebackToolName(streamingWritebackKind)]
+            : []),
+        ].filter((name) => installedToolNames.has(name));
+        const hostSafeReadToolNames = [...installedToolNames].filter(
+          (name) => toolRegistry.getDescriptor?.(name)?.effect === "read",
+        );
+        const graphAllowedToolNames = [
+          ...new Set([
+            ...allowedToolNames,
+            ...runnerOwnedToolNames,
+            ...postAcceptanceToolNames,
+            ...hostSafeReadToolNames,
+          ]),
+        ];
+        const bootstrapLoopBudget = planLoopBudget({
+          prompt: activeIntentPrompt,
+          route: runPlan.route,
+          generated: analyzeGeneratedOutputPrompt(activeIntentPrompt),
+          configuredMaxSteps: runToolContext.settings?.maxAgentSteps,
+        });
+        const explicitGraphCodeToolNames = getExplicitCodeToolNames(
+          activeIntentPrompt,
+        ).filter((name) => graphAllowedToolNames.includes(name));
+        const explicitGraphDesignToolNames = hasReviseDesignIntent(activeIntentPrompt)
+          ? [
+              ...(hasMermaidDesignIntent(activeIntentPrompt)
+                ? ["read_mermaid_block", "upsert_mermaid_block"]
+                : []),
+              ...(hasCanvasDesignIntent(activeIntentPrompt) &&
+              !hasSvgDesignIntent(activeIntentPrompt) &&
+              !hasMermaidDesignIntent(activeIntentPrompt)
+                ? ["read_design_canvas", "update_design_canvas"]
+                : []),
+              ...(hasSvgDesignIntent(activeIntentPrompt)
+                ? ["read_svg_design", "update_svg_design"]
+                : []),
+            ].filter((name) => graphAllowedToolNames.includes(name))
+          : [];
+        const explicitGraphWorkflowToolNames =
+          explicitGraphCodeToolNames.length > 0
+            ? explicitGraphCodeToolNames
+            : explicitGraphDesignToolNames;
+        const plannedToolNames = [
+          ...(shouldReadCurrentNote &&
+          explicitGraphDesignToolNames.length === 0 &&
+          graphAllowedToolNames.includes("read_current_file")
+            ? ["read_current_file"]
+            : []),
+          ...(explicitGraphWorkflowToolNames.length > 0
+            ? []
+            : bootstrapLoopBudget.expectedTools),
+          ...runnerOwnedToolNames,
+          ...explicitGraphWorkflowToolNames,
+          ...(explicitGraphWorkflowToolNames.length > 0
+            ? []
+            : selectExplicitEffectfulGraphTools({
+                prompt: activeIntentPrompt,
+                allowedToolNames: graphAllowedToolNames,
+                toolRegistry,
+              })),
+        ].filter((name) => graphAllowedToolNames.includes(name));
+        const graphMissionId = canonicalResumeGraphId ?? canonicalMissionGraphId(runId);
+        let missionBindingOverrides:
+          | Awaited<
+              ReturnType<
+                NonNullable<
+                  BackgroundMissionDispatchPortV1["resolveMissionBindingOverrides"]
+                >
+              >
+            >
+          | undefined;
+        if (backgroundContinuation?.resolveMissionBindingOverrides) {
+          try {
+            missionBindingOverrides =
+              await backgroundContinuation.resolveMissionBindingOverrides({
+                objective: activeIntentPrompt,
+                toolNames: [...graphAllowedToolNames],
+              });
+          } catch (error) {
+            events.onTrace?.({
+              id: `${graphMissionId}:binding-resolution-blocked`,
+              kind: "status",
+              step: 0,
+              message:
+                "Trusted background destination resolution was unavailable; exact background mutations remain fail-closed.",
+              outputPreview: { blocker: getErrorMessage(error) },
+            });
+          }
+        }
+        const hostPlan = await buildHostMissionGraphPlanV1({
+          missionId: graphMissionId,
+          objective: activeIntentPrompt,
+          toolRegistry,
+          allowedToolNames: graphAllowedToolNames,
+          plannedToolNames,
+          postAcceptanceToolNames,
+          currentNotePath: runToolContext.getCurrentMarkdownFile?.()?.path ?? null,
+          maxToolCalls,
+          maxWallClockMs: configuredMaxRunMs ?? 30 * 60_000,
+          now: runToolContext.now?.() ?? new Date(),
+          ...(missionBindingOverrides
+            ? { bindingOverrides: missionBindingOverrides }
+            : {}),
+          ...(backgroundCapability
+            ? {
+                background: {
+                  installedDomains: backgroundCapability.installedDomains,
+                  preferBackground: true,
+                },
+              }
+            : {}),
+        });
+        const legacyResumePlan =
+          resumeSnapshot?.missionPlan?.version === 1
+            ? resumeSnapshot.missionPlan
+            : resumeLedger?.missionPlan?.version === 1
+              ? resumeLedger.missionPlan
+              : null;
+        const migratedLegacyGraph =
+          exactResumeRunId &&
+          !resumeSnapshot?.missionGraphRef &&
+          legacyResumePlan
+            ? await migrateLegacyPlanWithHostAuthority({
+                plan: legacyResumePlan,
+                missionId: graphMissionId,
+                objective: activeIntentPrompt,
+                hostPlan,
+                toolRegistry,
+                evidence: resumeSnapshot?.evidence ?? resumeLedger?.evidence ?? [],
+                receipts: resumeSnapshot?.receipts ?? [],
+              })
+            : null;
+        const graphPlan = migratedLegacyGraph
+          ? {
+              graph: migratedLegacyGraph,
+              source: "deterministic" as const,
+              fallbackReason: "router_mode_off_conservative" as const,
+              modelConfidence: null,
+            }
+          : await planMissionGraphV3({
+              mission: {
+                missionId: graphMissionId,
+                objective: activeIntentPrompt,
+              },
+              routerMode: modelRouterMode,
+              capabilityEnvelope: hostPlan.capabilityEnvelope,
+              deterministicProposal: hostPlan.deterministicProposal,
+              allowedToolDescriptors: hostPlan.allowedToolDescriptors,
+              modelClient:
+                modelRouterMode === "authority" &&
+                routedModelIntent &&
+                !isPromptOnCurrentPageIntent(prompt)
+                  ? modelClient
+                  : null,
+              now: () => (runToolContext.now?.() ?? new Date()).toISOString(),
+            });
+        missionGraphSession = await MissionGraphSession.open({
+          context: runToolContext,
+          initialGraph: graphPlan.graph,
+          events: { onGraphUpdate: emitMissionGraph },
+          resume: Boolean(exactResumeRunId),
+        });
+        events.onTrace?.({
+          id: "mission-graph-authority",
+          kind: "status",
+          message:
+            graphPlan.source === "structured_model"
+              ? "Structured MissionGraphV3 accepted as authoritative."
+              : `Deterministic MissionGraphV3 is authoritative (${graphPlan.fallbackReason ?? "no fallback"}).`,
+          outputPreview: {
+            missionId: graphPlan.graph.missionId,
+            revision: graphPlan.graph.revision,
+            source: graphPlan.source,
+            fallbackReason: graphPlan.fallbackReason,
+            nodeIds: Object.keys(graphPlan.graph.nodes),
+          },
+        });
+      }
+      if (missionGraphSession && backgroundContinuation) {
+        backgroundDispatchSummary = await dispatchPersistedBackgroundNodesV1({
+          session: missionGraphSession,
+          port: backgroundContinuation,
+          now: () => runToolContext.now?.() ?? new Date(),
+        });
+      }
+    } catch (error) {
+      const message = `Mission graph initialization failed before tool execution: ${getUnknownErrorMessage(error)}`;
+      events.onStatus?.(message);
+      events.onTrace?.({
+        id: "mission-graph-initialization-failed",
+        kind: "error",
+        message,
+        error: { code: "mission_graph_initialization_failed", message },
+      });
+      emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+      completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+      return;
+    }
+  } else {
+    events.onTrace?.({
+      id: "mission-graph-persistence-unavailable",
+      kind: "status",
+      message:
+        "Canonical mission graph persistence is unavailable in this host context; tool execution remains subject to the legacy compatibility path.",
+    });
+  }
+
+  const beginMissionGraphTool = async (
+    toolName: string,
+  ): Promise<MissionGraphToolExecution | null> => {
+    if (!missionGraphSession) return null;
+    const started = await missionGraphSession.beginToolExecution(toolName);
+    if (!started.ok) {
+      throw Object.assign(new Error(started.reason), {
+        missionGraphStartCode: started.code,
+      });
+    }
+    return started.execution;
+  };
+  const finishMissionGraphTool = async (
+    execution: MissionGraphToolExecution | null,
+    toolName: string,
+    result: ToolExecutionResult,
+    receipt?: AgentRunReceipt | null,
+  ) => {
+    if (!missionGraphSession || !execution) return;
+    const observedAt = (runToolContext.now?.() ?? new Date()).toISOString();
+    const evidenceFingerprint = await sha256MissionFingerprint({
+      toolName,
+      ok: result.ok,
+      output: serializeToolResult(result),
+    });
+    const node = missionGraphSession.graph.nodes[execution.nodeId];
+    if (
+      node?.status === "blocked" &&
+      result.error?.code.startsWith("approval_") === true
+    ) {
+      // Approval denial/expiry is already a durable graph transition. Do not
+      // reinterpret it as a tool failure or attempt to transition the blocked
+      // node from the stale pre-approval running state.
+      return;
+    }
+    const canonicalEvidence = result.ok
+      ? evidenceFromToolResult(toolName, result)
+      : null;
+    const canonicalEvidenceId = canonicalEvidence?.id;
+    const graphEvidenceId =
+      canonicalEvidenceId &&
+      canonicalEvidenceId.length <= 128 &&
+      /^[a-z0-9](?:[a-z0-9._:-]*[a-z0-9])?$/u.test(canonicalEvidenceId)
+        ? canonicalEvidenceId
+        : missionGraphReferenceId(
+            "evidence",
+            execution.nodeId,
+            missionGraphSession.graph.revision + 1,
+          );
+    const requiredReceiptKind =
+      node?.completionContract.requiredReceiptKinds[0] ?? "action-receipt";
+    await missionGraphSession.finishToolExecution(execution, {
+      ok: result.ok,
+      evidence: result.ok
+          ? {
+            id: graphEvidenceId,
+            kind: resolveMissionGraphEvidenceKind(
+              canonicalEvidence?.kind,
+              node?.completionContract.requiredEvidenceKinds ?? [],
+            ),
+            fingerprint: evidenceFingerprint,
+            observedAt,
+          }
+        : undefined,
+      receipt:
+        result.ok && receipt
+          ? {
+              id: missionGraphReferenceId(
+                "receipt",
+                execution.nodeId,
+                missionGraphSession.graph.revision + 1,
+              ),
+              kind: requiredReceiptKind,
+              fingerprint: await sha256MissionFingerprint(
+                JSON.parse(JSON.stringify(receipt)),
+              ),
+              committedAt: observedAt,
+            }
+          : undefined,
+      failureFingerprint: result.ok ? undefined : evidenceFingerprint,
+      failureMessage: result.error?.message,
+    });
+  };
+
+  if (shouldReadCurrentNote) {
+    let graphExecution: MissionGraphToolExecution | null = null;
+    try {
+      graphExecution = await beginMissionGraphTool("read_current_file");
+      currentNoteContext = await readInitialCurrentNote(
+        toolRegistry,
+        runToolContext,
+        events,
+      );
+      const initialCurrentNoteResult: ToolExecutionResult = {
+        ok: true,
+        toolName: "read_current_file",
+        output: currentNoteContext,
+      };
+      const initialCurrentNoteEvidence = evidenceFromToolResult(
+        "read_current_file",
+        initialCurrentNoteResult,
+      );
+      if (initialCurrentNoteEvidence) {
+        upsertMissionEvidenceRecord(
+          missionEvidenceRecords,
+          initialCurrentNoteEvidence,
+        );
+      }
+      await finishMissionGraphTool(
+        graphExecution,
+        "read_current_file",
+        initialCurrentNoteResult,
+      );
+    } catch (error) {
+      if (graphExecution) {
+        await finishMissionGraphTool(
+          graphExecution,
+          "read_current_file",
+          {
+            ok: false,
+            toolName: "read_current_file",
+            error: {
+              code: "initial_current_note_read_failed",
+              message: getUnknownErrorMessage(error),
+            },
+          },
+        ).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
   if (stopIfRequested(0)) {
     return;
   }
@@ -1544,6 +2300,11 @@ export async function runAgentMission({
       }`,
       outputPreview: tools.map((tool) => tool.function.name),
     });
+    if (missionGraphSession) {
+      await missionGraphSession.refineObjective(activeIntentPrompt);
+      missionGraph = missionGraphSession.graph;
+      missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
+    }
   }
 
   if (
@@ -1565,224 +2326,6 @@ export async function runAgentMission({
     toolContext: runToolContext,
     enableStreaming,
   });
-  const checkpointResumeContext = await buildCheckpointResumeContext({
-    prompt,
-    activeIntentPrompt,
-    toolContext: runToolContext,
-    events,
-  });
-  if (checkpointResumeContext?.missingRequestedRunId) {
-    const missingRunId = checkpointResumeContext.missingRequestedRunId;
-    const message =
-      `Run ${missingRunId} was requested explicitly, but its exact durable ` +
-      "checkpoint is unavailable. Refusing to continue from a different run.";
-    events.onStatus?.(message);
-    emitDirectAssistantAnswer(message, events, true);
-    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
-    return;
-  }
-  const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
-  const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
-  if (resumeLedger && checkpointResumeContext?.missionResume?.plan.canResume === false) {
-    const resumeReason = checkpointResumeContext.missionResume.plan.reason;
-    const message =
-      resumeReason === "proof_debt_blocked"
-        ? `Run ${resumeLedger.runId} has blocking proof debt (approvals, policy, or unresolved mutations). ` +
-          "Resolve the blocker before continuing this run."
-        : `Run ${resumeLedger.runId} is already complete and accepted. ` +
-          "Start a new mission explicitly if you want to repeat or revise that work.";
-    events.onTrace?.({
-      id: resumeReason === "proof_debt_blocked"
-        ? "resume-proof-debt-blocked"
-        : "resume-already-complete",
-      kind: "status",
-      message,
-      outputPreview: {
-        runId: resumeLedger.runId,
-        status: resumeLedger.status,
-        acceptance: resumeLedger.acceptance?.status ?? "unchecked",
-      },
-    });
-    emitDirectAssistantAnswer(message, events, true);
-    completeRun(events, "final", 0, runStartedAt, runPlan.maxStepsForRun);
-    return;
-  }
-  const ambiguousResumeOperations = resumeSnapshot
-    ? buildOperationReconciliationInputs(resumeSnapshot.operationJournal).filter(
-        (item) => item.recommendedAction !== "safe_to_retry",
-      )
-    : [];
-  if (resumeLedger && ambiguousResumeOperations.length > 0) {
-    const targets = ambiguousResumeOperations
-      .map((item) => item.targetPath ?? item.toolName)
-      .filter((item, index, all) => all.indexOf(item) === index)
-      .slice(0, 4);
-    const message =
-      `Run ${resumeLedger.runId} has ${ambiguousResumeOperations.length} unresolved mutation ` +
-      `operation(s) that may already have applied${targets.length > 0 ? ` (${targets.join(", ")})` : ""}. ` +
-      "Automatic replay is blocked. Inspect the target and start a new explicit repair mission.";
-    events.onTrace?.({
-      id: "resume-mutation-reconciliation-required",
-      kind: "error",
-      message,
-      outputPreview: ambiguousResumeOperations,
-      error: {
-        code: "mutation_reconciliation_required",
-        message,
-      },
-    });
-    emitDirectAssistantAnswer(message, events, true);
-    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
-    return;
-  }
-  const pendingCurrentNoteResumeGoals = resumeSnapshot
-    ? CURRENT_NOTE_RESUME_GOALS.filter((goal) => {
-        const state = resumeSnapshot.operationGoals[goal];
-        return state === "pending" || state === "failed";
-      })
-    : [];
-  const activeResumeNotePath = runToolContext.getCurrentMarkdownFile?.()?.path;
-  if (
-    resumeLedger &&
-    resumeSnapshot?.currentNotePath &&
-    pendingCurrentNoteResumeGoals.length > 0 &&
-    activeResumeNotePath !== resumeSnapshot.currentNotePath
-  ) {
-    const message =
-      `Run ${resumeLedger.runId} was started on ${resumeSnapshot.currentNotePath}, ` +
-      `but the active note is ${activeResumeNotePath ?? "unavailable"}. ` +
-      "Open the original note and continue the run again so current-note work cannot target the wrong file.";
-    events.onTrace?.({
-      id: "resume-current-note-target-mismatch",
-      kind: "status",
-      message,
-      outputPreview: {
-        expectedPath: resumeSnapshot.currentNotePath,
-        activePath: activeResumeNotePath ?? null,
-        pendingGoals: pendingCurrentNoteResumeGoals,
-      },
-    });
-    emitDirectAssistantAnswer(message, events, true);
-    completeRun(
-      events,
-      "clarifying_question",
-      0,
-      runStartedAt,
-      runPlan.maxStepsForRun,
-    );
-    return;
-  }
-  const resumedOriginalMission =
-    resumeSnapshot?.originalMission ?? resumeLedger?.mission;
-  if (resumedOriginalMission) {
-    activeIntentPrompt = resumedOriginalMission;
-    missionIntent = classifyMissionIntent(activeIntentPrompt);
-    if (forceChatOnly) {
-      missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
-    }
-    writeAutonomy = missionIntent.allowAutonomousWrite;
-    runToolContext = {
-      ...runToolContext,
-      originalPrompt: activeIntentPrompt,
-      writeAutonomy,
-      missionIntent,
-    };
-    routedMissionIntent = null;
-    reflexOutput = await reflexController.evaluate({
-      prompt: activeIntentPrompt,
-      missionIntent,
-      allowedToolNames: new Set(),
-      recentActions,
-      evidence: missionEvidenceRecords,
-      receipts: writeReceipts,
-      settings: runToolContext.settings,
-      embeddingProvider: runToolContext.semanticEmbeddingProvider,
-    });
-    missionIntent = applyDefaultActiveNoteWriteback({
-      prompt: activeIntentPrompt,
-      missionIntent,
-      toolContext: runToolContext,
-      enableStreaming,
-      forceChatOnly,
-    });
-    writeAutonomy = missionIntent.allowAutonomousWrite;
-    runToolContext = {
-      ...runToolContext,
-      writeAutonomy,
-      missionIntent,
-    };
-    structuredIntent = classifyStructuredIntent(activeIntentPrompt, missionIntent);
-    streamingWritebackKind = getStreamingWritebackKind(
-      activeIntentPrompt,
-      runToolContext,
-      enableStreaming,
-    );
-    tools = getAllowedToolDefinitions(
-      toolRegistry,
-      activeIntentPrompt,
-      missionIntent,
-      runToolContext.settings,
-      streamingWritebackKind,
-      reflexOutput.intent,
-    );
-    directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
-      prompt: activeIntentPrompt,
-      missionIntent,
-      streamingWritebackKind,
-      toolContext: runToolContext,
-    });
-    if (shouldOmitCurrentNoteReadForTargetOnlyWrite(activeIntentPrompt, missionIntent)) {
-      tools = removeToolDefinition(tools, "read_current_file");
-    }
-    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
-    requiredWriteTools = getRequiredWriteToolNames(
-      activeIntentPrompt,
-      allowedToolNames,
-      missionIntent,
-      streamingWritebackKind,
-    );
-    writeRequired =
-      missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
-    requireToolBeforeStreamingWriteback = promptRequiresToolLoop(activeIntentPrompt);
-    shouldReadCurrentNote = shouldObserveCurrentNote(
-      activeIntentPrompt,
-      allowedToolNames,
-      missionIntent,
-    );
-    runPlan = createRunPlan({
-      prompt: activeIntentPrompt,
-      missionIntent,
-      tools,
-      settings: runToolContext.settings,
-      streamingWritebackKind,
-      directCurrentNoteWritebackKind,
-      reflex: reflexOutput.intent,
-    });
-    runPlan.traceReasons = [
-      ...new Set([
-        ...runPlan.traceReasons,
-        `resume_original_route:${resumeLedger?.route ?? runPlan.route}`,
-      ]),
-    ];
-    activeThink = runPlan.thinking;
-    finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
-      activeIntentPrompt,
-      currentNoteContext,
-      conversationHistory,
-    );
-    followupIntentContext = null;
-    events.onTrace?.({
-      id: "resume-original-mission-routing",
-      kind: "mission_intent",
-      message: `Restored original mission routing for continuation: ${runPlan.route}.`,
-      outputPreview: {
-        priorRunId: resumeLedger?.runId ?? null,
-        route: runPlan.route,
-        maxStepsForRun: runPlan.maxStepsForRun,
-        toolBudgetPrompt: activeIntentPrompt,
-      },
-    });
-  }
   const generatedOutputPolicy = analyzeGeneratedOutputPrompt(activeIntentPrompt);
   let loopBudgetPlan = planLoopBudget({
     prompt: activeIntentPrompt,
@@ -1791,6 +2334,20 @@ export async function runAgentMission({
     configuredMaxSteps: getConfiguredMaxAgentSteps(runToolContext.settings),
     requestedSteps: parseExplicitModelStepTarget(activeIntentPrompt),
   });
+  const explicitLoopCodeToolNames = getExplicitCodeToolNames(
+    activeIntentPrompt,
+  ).filter((name) => allowedToolNames.has(name));
+  if (explicitLoopCodeToolNames.length > 0) {
+    loopBudgetPlan = {
+      ...loopBudgetPlan,
+      toolStepBudget: Math.max(
+        loopBudgetPlan.toolStepBudget,
+        explicitLoopCodeToolNames.length,
+      ),
+      expectedTools: explicitLoopCodeToolNames,
+      stopWhenSatisfied: true,
+    };
+  }
   if (resumeLedger) {
     const configuredCap = getConfiguredMaxAgentSteps(runToolContext.settings);
     const inheritedHardCap = Math.max(
@@ -1850,6 +2407,10 @@ export async function runAgentMission({
     researchPlan &&
     researchPlan.sourceRequirements.minFetchedSources > 0
   ) {
+    loopBudgetPlan = ensureResearchSourceLoopBudget(
+      loopBudgetPlan,
+      researchPlan.sourceRequirements.minFetchedSources,
+    );
     tools = addToolDefinitions(tools, toolRegistry, [
       "web_search",
       "web_fetch",
@@ -1893,7 +2454,9 @@ export async function runAgentMission({
     markOperationGoalDone(operationGoals, "read_current_note");
   }
   const resolveOrchestratorSnapshot = () =>
-    getOrchestratorSnapshot?.() ?? orchestratorSnapshot ?? null;
+    missionGraph
+      ? projectMissionGraphToOrchestratorSnapshot(missionGraph)
+      : getOrchestratorSnapshot?.() ?? orchestratorSnapshot ?? null;
   missionLedger = createMissionLedger({
     runId,
     mission: activeIntentPrompt,
@@ -1906,31 +2469,33 @@ export async function runAgentMission({
   if (initialOrchestratorSnapshot) {
     missionLedger.orchestrator = initialOrchestratorSnapshot;
   }
-  missionPlan = createMissionPlan({
-    runId,
-    prompt: activeIntentPrompt,
-    missionIntent,
-    runPlan,
-    requiredTools: [
-      ...new Set([
-        ...loopBudgetPlan.expectedTools,
-        ...requiredWriteTools,
-        ...[
-          streamingWritebackKind,
-          promptOnPageWritebackKind,
-          directCurrentNoteWritebackKind,
-        ]
-          .filter((kind): kind is StreamingWritebackKind => kind !== null)
-          .map(getStreamingWritebackToolName),
-      ]),
-    ],
-    now: runToolContext.now?.() ?? new Date(),
-  });
+  missionPlan = missionGraph
+    ? projectMissionGraphToLegacyPlan(missionGraph)
+    : createMissionPlan({
+        runId,
+        prompt: activeIntentPrompt,
+        missionIntent,
+        runPlan,
+        requiredTools: [
+          ...new Set([
+            ...loopBudgetPlan.expectedTools,
+            ...requiredWriteTools,
+            ...[
+              streamingWritebackKind,
+              promptOnPageWritebackKind,
+              directCurrentNoteWritebackKind,
+            ]
+              .filter((kind): kind is StreamingWritebackKind => kind !== null)
+              .map(getStreamingWritebackToolName),
+          ]),
+        ],
+        now: runToolContext.now?.() ?? new Date(),
+      });
   const restoredMissionPlan =
     resumeSnapshot?.missionPlan?.version === 1
       ? resumeSnapshot.missionPlan
       : resumeLedger?.missionPlan;
-  if (restoredMissionPlan) {
+  if (restoredMissionPlan && !missionGraph) {
     missionPlan = {
       ...JSON.parse(JSON.stringify(restoredMissionPlan)),
       runId,
@@ -1941,6 +2506,23 @@ export async function runAgentMission({
     resumeSnapshot?.evidence ?? resumeLedger?.evidence ?? [];
   for (const evidence of restoredEvidence) {
     upsertMissionEvidenceRecord(missionEvidenceRecords, { ...evidence });
+  }
+  const completedGraphToolNames = new Set(
+    Object.values(missionGraph?.nodes ?? {})
+      .filter((node) => node.status === "complete")
+      .flatMap((node) => node.allowedTools),
+  );
+  if (
+    resumeSnapshot?.operationGoals.web_search === "done" ||
+    completedGraphToolNames.has("web_search")
+  ) {
+    executedWebSearchTool = true;
+  }
+  if (
+    resumeSnapshot?.operationGoals.web_fetch === "done" ||
+    completedGraphToolNames.has("web_fetch")
+  ) {
+    executedWebFetchTool = true;
   }
   const restoredClaimPassages =
     resumeSnapshot?.claimPassages ?? resumeLedger?.claimPassages ?? [];
@@ -2019,7 +2601,7 @@ export async function runAgentMission({
       researchPlan,
       missionPlan,
       claimConflict: buildClaimConflictState(),
-      writeReceiptPresent: hasVaultWriteReceipt(writeReceipts),
+      writeReceiptPresent: hasConcreteWriteReceipt(writeReceipts),
       externalActionReceiptPresent:
         hasExternalActionReceipt(writeReceipts),
       verifyComplete,
@@ -2068,10 +2650,15 @@ export async function runAgentMission({
         operationGoals.goals[goal] = restoredState;
       }
     }
+    // A resumed segment starts with an empty in-memory successful-tool list.
+    // Rebuild completed mutation tools only from durable receipts so later
+    // completion checks retain proven prior work without fabricating success.
     operationGoals.completedTools.push(
-      ...successfulToolNames.filter(
-        (toolName) => !operationGoals.completedTools.includes(toolName),
-      ),
+      ...resumeSnapshot.receipts
+        .map((receipt) => receipt.toolName)
+        .filter(
+          (toolName) => !operationGoals.completedTools.includes(toolName),
+        ),
     );
   }
   if (resumeLedger) {
@@ -2102,6 +2689,7 @@ export async function runAgentMission({
       : resumeLedger
         ? [resumeLedger.runId]
         : [],
+    missionGraphRef: missionGraphSession?.reference,
     missionPlan,
     researchPlan,
     orchestrator: resolveOrchestratorSnapshot(),
@@ -2199,6 +2787,7 @@ export async function runAgentMission({
       status: missionLedgerStatusToRuntimeStatus(missionLedger.status),
       revision: runtimeSnapshot.revision,
       lastSafeStep: missionLedger.lastSafeStep,
+      missionGraphRef: missionGraphSession?.reference,
       missionPlan,
       researchPlan,
       orchestrator: resolveOrchestratorSnapshot(),
@@ -2220,6 +2809,12 @@ export async function runAgentMission({
     traceId: string,
     { required = false }: { required?: boolean } = {},
   ): Promise<boolean> => {
+    if (runtimeSnapshotPersistenceBlockedError !== null) {
+      if (required) {
+        throw runtimeSnapshotPersistenceBlockedError;
+      }
+      return false;
+    }
     if (!runtimeSnapshot) {
       return false;
     }
@@ -2241,6 +2836,7 @@ export async function runAgentMission({
             rootRunId: runtimeSnapshot.lineage.rootRunId,
             segmentIndex: runtimeSnapshot.lineage.segmentIndex,
             lastSafeStep: runtimeSnapshot.lastSafeStep,
+            commitProof: result.commitProof,
           },
         });
         return true;
@@ -2252,16 +2848,22 @@ export async function runAgentMission({
       }
       return false;
     } catch (error) {
+      const ambiguousWrite = isRuntimeSnapshotWriteAmbiguousError(error);
+      if (ambiguousWrite) {
+        runtimeSnapshotPersistenceBlockedError = error;
+      }
       events.onTrace?.({
         id: `${traceId}:runtime:error`,
         kind: "error",
         message: `Could not save runtime snapshot: ${getUnknownErrorMessage(error)}`,
         error: {
-          code: "runtime_snapshot_save_failed",
+          code: ambiguousWrite
+            ? "runtime_snapshot_write_ambiguous"
+            : "runtime_snapshot_save_failed",
           message: getUnknownErrorMessage(error),
         },
       });
-      if (required) {
+      if (required || ambiguousWrite) {
         throw error;
       }
       return false;
@@ -2278,6 +2880,8 @@ export async function runAgentMission({
           ? "replace_current_file"
           : "edit_current_section";
     const operationId = `${runId}:${step}:stream:${input.kind}`;
+    const missionGraphExecution = await beginMissionGraphTool(toolName);
+    let missionGraphFinished = false;
     let activeRecord: OperationJournalRecord | null = null;
     let durableRecord: OperationJournalRecord | null = null;
     let partialReceipt: AgentRunReceipt | null = null;
@@ -2306,8 +2910,16 @@ export async function runAgentMission({
       }
       return persisted;
     };
-
-    if (runtimeSnapshot) {
+    const preparedStreamedReplace =
+      input.kind === "replace" && input.stagedContent !== undefined;
+    const beginStreamMutationJournal = async (
+      preparedAction?: PreparedAction,
+      descriptor?: ToolDescriptor,
+      authorization?: AuthorizedActionContext,
+    ) => {
+      if (!runtimeSnapshot || activeRecord) {
+        return;
+      }
       const targetPath =
         runtimeSnapshot.currentNotePath ??
         runToolContext.getCurrentMarkdownFile?.()?.path;
@@ -2318,12 +2930,17 @@ export async function runAgentMission({
         nodeId: missionPlan?.activeTaskId ?? undefined,
         toolName,
         operation: input.kind,
-        targetPath,
-        inputHash: hashOperationInput({
-          kind: input.kind,
-          targetPath,
-          heading: input.preparedSectionEdit?.heading,
-        }),
+        targetPath: preparedAction?.target.path ?? targetPath,
+        inputHash:
+          preparedAction?.payloadFingerprint ??
+          hashOperationInput({
+            kind: input.kind,
+            targetPath,
+            heading: input.preparedSectionEdit?.heading,
+          }),
+        preparedAction,
+        descriptor,
+        authorization,
         now: runToolContext.now?.() ?? new Date(),
       });
       saveRecord(intentRecord);
@@ -2338,6 +2955,10 @@ export async function runAgentMission({
       );
       saveRecord(applyingRecord);
       await persistRecord(`${operationId}:wal-applying`, true);
+    };
+
+    if (!preparedStreamedReplace) {
+      await beginStreamMutationJournal();
     }
 
     try {
@@ -2372,29 +2993,77 @@ export async function runAgentMission({
         getCurrentMarkdownFile: () =>
           pinnedCreatedFile ?? runToolContext.getCurrentMarkdownFile?.() ?? null,
       };
-      const receipt = await streamCurrentNoteWriteback({
-        ...input,
-        toolContext: writebackToolContext,
-        lazyCreatePath,
-        onNoteCreated: (created) => {
-          pinnedCreatedFile =
-            writebackToolContext.app.vault.getFileByPath(created.path) ??
-            pinnedCreatedFile;
-          if (runtimeSnapshot) {
-            runtimeSnapshot.currentNotePath = created.path;
-          }
-          events.onTrace?.({
-            id: `${operationId}:autonomous-note-created`,
-            kind: "status",
-            path: created.path,
-            message: `Created note target ${created.path} after first safe content.`,
-          });
-        },
-        missionPrompt: activeIntentPrompt,
-        onPartialReceipt: (value) => {
-          partialReceipt = value;
-        },
-      });
+      let receipt: AgentRunReceipt;
+      if (preparedStreamedReplace) {
+        const stagedContent = input.stagedContent ?? "";
+        if (!stagedContent.trim()) {
+          throw new Error(EMPTY_STREAMING_WRITEBACK_MESSAGE);
+        }
+        const replacementCall: ModelToolCall = {
+          id: `${operationId}:prepared-replace`,
+          name: "replace_current_file",
+          arguments: { text: stagedContent },
+        };
+        const result = await executeToolWithRunnerApproval({
+          toolCall: replacementCall,
+          step,
+          operationId,
+          beforeExecute: beginStreamMutationJournal,
+          missionGraphExecution,
+          hostScopeAuthorized: true,
+        });
+        if (!result.ok) {
+          const executionError = new Error(
+            result.error?.message ??
+              "The prepared current-note replacement was not applied.",
+          );
+          (executionError as Error & { code?: string }).code =
+            result.error?.code ?? "prepared_replacement_failed";
+          throw executionError;
+        }
+        const preparedReceipt = buildReceiptFromToolExecution(
+          toolName,
+          result,
+          toolRegistry.getDescriptor?.(toolName) ?? null,
+        );
+        if (!preparedReceipt) {
+          throw new Error(
+            "The prepared current-note replacement completed without a valid receipt.",
+          );
+        }
+        receipt = preparedReceipt;
+        events.onFinalStart?.();
+        events.onAssistantMessageStart?.();
+        events.onFinalDelta?.(stagedContent);
+        events.onAssistantDelta?.(stagedContent);
+        events.onFinalDone?.();
+        events.onAssistantMessageDone?.();
+        events.onStatus?.("Approved replacement writeback complete.");
+      } else {
+        receipt = await streamCurrentNoteWriteback({
+          ...input,
+          toolContext: writebackToolContext,
+          lazyCreatePath,
+          onNoteCreated: (created) => {
+            pinnedCreatedFile =
+              writebackToolContext.app.vault.getFileByPath(created.path) ??
+              pinnedCreatedFile;
+            if (runtimeSnapshot) {
+              runtimeSnapshot.currentNotePath = created.path;
+            }
+            events.onTrace?.({
+              id: `${operationId}:autonomous-note-created`,
+              kind: "status",
+              path: created.path,
+              message: `Created note target ${created.path} after first safe content.`,
+            });
+          },
+          missionPrompt: activeIntentPrompt,
+          onPartialReceipt: (value) => {
+            partialReceipt = value;
+          },
+        });
+      }
       if (activeRecord) {
         const appliedRecord = transitionOperationJournalRecord(
           activeRecord,
@@ -2456,9 +3125,38 @@ export async function runAgentMission({
           throw error;
         }
       }
+      await finishMissionGraphTool(
+        missionGraphExecution,
+        toolName,
+        { ok: true, toolName, output: receipt },
+        receipt,
+      );
+      if (missionLedger && missionPlan) {
+        setLedgerMissionPlan(
+          missionLedger,
+          missionPlan,
+          runToolContext.now?.() ?? new Date(),
+        );
+        await persistMissionLedger(`mission-ledger-graph-stream-${step}`);
+      }
+      missionGraphFinished = true;
       await publishPlaceholderAutoRename(input.kind, step);
       return receipt;
     } catch (error) {
+      if (!missionGraphFinished && missionGraphExecution) {
+        await finishMissionGraphTool(
+          missionGraphExecution,
+          toolName,
+          {
+            ok: false,
+            toolName,
+            error: {
+              code: "streamed_writeback_failed",
+              message: getUnknownErrorMessage(error),
+            },
+          },
+        ).catch(() => undefined);
+      }
       const activeAtFailure = getActiveRecord();
       const durableAtFailure = getDurableRecord();
       if (
@@ -2604,6 +3302,9 @@ export async function runAgentMission({
     if (!missionLedger) {
       return;
     }
+    if (runtimeSnapshotPersistenceBlockedError !== null) {
+      return;
+    }
     const latestOrchestrator = resolveOrchestratorSnapshot();
     if (latestOrchestrator) {
       missionLedger.orchestrator = latestOrchestrator;
@@ -2690,8 +3391,10 @@ export async function runAgentMission({
     step: number,
     summary: string,
   ) => {
-    missionPlan = advance.plan;
-    if (!missionLedger || !advance.changed) {
+    missionPlan = missionGraph
+      ? projectMissionGraphToLegacyPlan(missionGraph)
+      : advance.plan;
+    if (!missionLedger || (!advance.changed && !missionGraph)) {
       return;
     }
     setLedgerMissionPlan(
@@ -3098,6 +3801,7 @@ export async function runAgentMission({
     step: number,
     maxSteps = runPlan.maxStepsForRun,
     nextAction?: string,
+    suppressAutoContinuation = false,
   ) => {
     if (missionPlan && lastFinalOutput.trim()) {
       applyMissionPlanAdvance(
@@ -3110,10 +3814,73 @@ export async function runAgentMission({
         "Mission plan observed final output.",
       );
     }
-    const acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
+    let acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
+    let onlyFinalProjectionProofMissing =
+      acceptance.missing.length > 0 &&
+      acceptance.missing.every(
+        (item) =>
+          item === "final_output" ||
+          /(?:^|:)final_relevance$/u.test(item) ||
+          /(?:^|:)final_output$/u.test(item),
+      );
+    if (
+      stopReason === "final" &&
+      (acceptance.status === "pass" || onlyFinalProjectionProofMissing)
+    ) {
+      await maybeExtractResearchMemory(
+        acceptance.status === "pass"
+          ? acceptance
+          : {
+              ...acceptance,
+              status: "pass",
+              missing: [],
+              reasons: [
+                ...acceptance.reasons,
+                "accepted_before_final_graph_projection",
+              ],
+            },
+        stopReason,
+        step,
+      );
+      if (missionGraphSession) {
+        missionGraph = missionGraphSession.graph;
+        missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
+        acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
+        onlyFinalProjectionProofMissing =
+          acceptance.missing.length > 0 &&
+          acceptance.missing.every(
+            (item) =>
+              item === "final_output" ||
+              /(?:^|:)final_relevance$/u.test(item) ||
+              /(?:^|:)final_output$/u.test(item),
+          );
+      }
+    }
+    if (
+      missionGraphSession &&
+      (stopReason === "final" || stopReason === "write_completed") &&
+      (acceptance.status === "pass" || onlyFinalProjectionProofMissing) &&
+      (lastFinalOutput.trim().length > 0 || writeReceipts.length > 0)
+    ) {
+      await missionGraphSession.completeFinalOutput({
+        outputFingerprint: await sha256MissionFingerprint({
+          finalOutput: lastFinalOutput,
+          receiptIds: writeReceipts.map((receipt) => receipt.id ?? receipt.message),
+        }),
+        observedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+      });
+      missionGraph = missionGraphSession.graph;
+      missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
+      acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
+    }
+    const graphComplete =
+      !missionGraph ||
+      Object.values(missionGraph.nodes).every(
+        (node) => node.status === "complete" || node.status === "cancelled",
+      );
     const effectiveStopReason =
       (stopReason === "final" || stopReason === "write_completed") &&
-        acceptance.status !== "pass"
+        (acceptance.status !== "pass" || !graphComplete)
         ? "budget"
         : stopReason;
     await recordMissionAcceptance(acceptance, step, {
@@ -3125,7 +3892,10 @@ export async function runAgentMission({
     });
     if (effectiveStopReason !== stopReason) {
       events.onStatus?.(
-        `Completion held for verification: ${acceptance.missing.join(", ")}.`,
+        `Completion held for verification: ${[
+          ...acceptance.missing,
+          ...(!graphComplete ? ["mission_graph_incomplete"] : []),
+        ].join(", ")}.`,
       );
       events.onTrace?.({
         id: `terminal-acceptance-gate-${step}`,
@@ -3190,7 +3960,9 @@ export async function runAgentMission({
         outputPreview: completionReflection,
       });
     }
-    const autoContinuation = decideAutoContinuation({
+    const autoContinuation = suppressAutoContinuation
+      ? ({ recommended: false, reason: "not_budget" } as const)
+      : decideAutoContinuation({
       stopReason: effectiveStopReason,
       acceptance,
       blockerCategory: missionLedger?.blockerCategory,
@@ -3220,6 +3992,48 @@ export async function runAgentMission({
       autoContinuation,
     );
   };
+  const backgroundDispatchTerminalCount = backgroundDispatchSummary
+    ? backgroundDispatchSummary.submitted.length +
+      backgroundDispatchSummary.waitingObsidian.length +
+      backgroundDispatchSummary.blocked.length
+    : 0;
+  if (backgroundDispatchSummary && backgroundDispatchTerminalCount > 0) {
+    const nextAction =
+      backgroundDispatchSummary.submitted.length > 0
+        ? "Authorized background work is running. Companion receipts will be reconciled before this mission resumes."
+        : backgroundDispatchSummary.waitingObsidian.length > 0
+          ? "Vault-bound work is waiting for connected Obsidian and was not dispatched."
+          : "Background work is blocked. Inspect Run Details for the exact required action.";
+    events.onStatus?.(nextAction);
+    events.onTrace?.({
+      id: "background-mission-dispatch",
+      kind: "status",
+      message: nextAction,
+      outputPreview: backgroundDispatchSummary,
+    });
+    await finishRun(
+      "budget",
+      0,
+      runPlan.maxStepsForRun,
+      nextAction,
+      true,
+    );
+    return;
+  }
+  if (
+    backgroundDispatchSummary &&
+    backgroundDispatchSummary.awaitingPreparedAction.length > 0
+  ) {
+    const nextAction =
+      "Background external action is awaiting exact preparation, approval, and consumed authority before dispatch.";
+    events.onStatus?.(nextAction);
+    events.onTrace?.({
+      id: "background-mission-awaiting-prepared-action",
+      kind: "status",
+      message: nextAction,
+      outputPreview: backgroundDispatchSummary,
+    });
+  }
   const recordLedgerToolResult = async (
     toolName: string,
     result: ToolExecutionResult,
@@ -3398,6 +4212,7 @@ export async function runAgentMission({
     step: number,
     maxSteps: number,
     source: "model" | "tool",
+    emitVisibleAnswer = true,
   ) => {
     const errorMessage =
       source === "model"
@@ -3426,7 +4241,9 @@ export async function runAgentMission({
       },
     });
     lastFinalOutput = nextAction;
-    emitDirectAssistantAnswer(nextAction, events, runPlan.requiresEnglishGuard);
+    if (emitVisibleAnswer) {
+      emitDirectAssistantAnswer(nextAction, events, runPlan.requiresEnglishGuard);
+    }
     recordLedgerBlocker(message);
     await finishRun("error", step, maxSteps, nextAction);
   };
@@ -3477,7 +4294,12 @@ export async function runAgentMission({
       return null;
     }
 
-    if (!requiresVerifiedFinalOutput(missionPlan, researchPlan)) {
+    const proofVerificationRequired = requiresVerifiedFinalOutput(
+      missionPlan,
+      researchPlan,
+    );
+    const exactReplacementApprovalRequired = input.kind === "replace";
+    if (!proofVerificationRequired && !exactReplacementApprovalRequired) {
       return runStreamedWritebackWithJournal(input, step);
     }
 
@@ -3485,21 +4307,23 @@ export async function runAgentMission({
     // normalize them further. Re-bind the canonical, persisted evidence to the
     // staged writeback request so both the first draft and its single repair
     // pass can cite the exact source and passage ids that acceptance verifies.
-    const verifiedEvidenceContext = formatDurableEvidenceForWriteback(
-      missionEvidenceRecords,
-    );
-    if (
-      missionEvidenceRecords.length > 0 &&
-      !input.messages.some(
-        (message) =>
-          message.role === "system" &&
-          message.content === verifiedEvidenceContext,
-      )
-    ) {
-      input.messages.push({
-        role: "system" as const,
-        content: verifiedEvidenceContext,
-      });
+    if (proofVerificationRequired) {
+      const verifiedEvidenceContext = formatDurableEvidenceForWriteback(
+        missionEvidenceRecords,
+      );
+      if (
+        missionEvidenceRecords.length > 0 &&
+        !input.messages.some(
+          (message) =>
+            message.role === "system" &&
+            message.content === verifiedEvidenceContext,
+        )
+      ) {
+        input.messages.push({
+          role: "system" as const,
+          content: verifiedEvidenceContext,
+        });
+      }
     }
 
     const stageCandidate = async (retry: boolean): Promise<string> => {
@@ -3535,75 +4359,106 @@ export async function runAgentMission({
     };
 
     let candidate = await stageCandidate(false);
-    let candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
-      evaluateCurrentAcceptance(candidate),
-      requiredWriteTools,
-    );
-    events.onTrace?.({
-      id: `proof-gated-writeback-${step}:candidate-1`,
-      kind: "verification",
-      step,
-      message: `Held writeback candidate verification: ${candidateAcceptance.status}.`,
-      outputPreview: candidateAcceptance,
-    });
-
-    if (
-      candidateAcceptance.status !== "pass" &&
-      !finalOutputCorrectionUsed &&
-      candidateAcceptance.missing.length > 0 &&
-      candidateAcceptance.missing.every(isRepairableFinalOutputProof)
-    ) {
-      finalOutputCorrectionUsed = true;
-      events.onStatus?.(
-        `Writeback draft held for verification: ${candidateAcceptance.missing.join(", ")}. Requesting one correction...`,
-      );
-      input.messages.push({
-        role: "system" as const,
-        content: buildFinalOutputVerificationCorrectionPrompt(
-          candidateAcceptance,
-          candidate,
-          activeIntentPrompt,
-        ),
-      });
-      candidate = await stageCandidate(true);
-      candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
+    if (proofVerificationRequired) {
+      let candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
         evaluateCurrentAcceptance(candidate),
         requiredWriteTools,
       );
       events.onTrace?.({
-        id: `proof-gated-writeback-${step}:candidate-2`,
+        id: `proof-gated-writeback-${step}:candidate-1`,
         kind: "verification",
         step,
-        message: `Corrected writeback candidate verification: ${candidateAcceptance.status}.`,
+        message: `Held writeback candidate verification: ${candidateAcceptance.status}.`,
         outputPreview: candidateAcceptance,
+      });
+
+      if (
+        candidateAcceptance.status !== "pass" &&
+        !finalOutputCorrectionUsed &&
+        candidateAcceptance.missing.length > 0 &&
+        candidateAcceptance.missing.every(isRepairableFinalOutputProof)
+      ) {
+        finalOutputCorrectionUsed = true;
+        events.onStatus?.(
+          `Writeback draft held for verification: ${candidateAcceptance.missing.join(", ")}. Requesting one correction...`,
+        );
+        input.messages.push({
+          role: "system" as const,
+          content: buildFinalOutputVerificationCorrectionPrompt(
+            candidateAcceptance,
+            candidate,
+            activeIntentPrompt,
+          ),
+        });
+        candidate = await stageCandidate(true);
+        candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
+          evaluateCurrentAcceptance(candidate),
+          requiredWriteTools,
+        );
+        events.onTrace?.({
+          id: `proof-gated-writeback-${step}:candidate-2`,
+          kind: "verification",
+          step,
+          message: `Corrected writeback candidate verification: ${candidateAcceptance.status}.`,
+          outputPreview: candidateAcceptance,
+        });
+      }
+
+      if (candidateAcceptance.status !== "pass") {
+        lastFinalOutput = "";
+        const message =
+          `Note writeback was not applied because proof verification is incomplete: ${
+            candidateAcceptance.missing.join(", ") || "unknown proof"
+          }. The existing note is unchanged and the run remains resumable.`;
+        events.onStatus?.(message);
+        emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+        await finishRun(
+          "budget",
+          step,
+          maxSteps,
+          candidateAcceptance.nextAction ?? message,
+        );
+        return null;
+      }
+    } else {
+      events.onTrace?.({
+        id: `replacement-writeback-${step}:candidate-held`,
+        kind: "verification",
+        step,
+        toolName: "replace_current_file",
+        message:
+          "Held the complete replacement candidate for exact approval; current note bytes are unchanged.",
+        outputPreview: { bytes: getByteLength(candidate) },
       });
     }
 
-    if (candidateAcceptance.status !== "pass") {
-      lastFinalOutput = "";
-      const message =
-        `Note writeback was not applied because proof verification is incomplete: ${
-          candidateAcceptance.missing.join(", ") || "unknown proof"
-        }. The existing note is unchanged and the run remains resumable.`;
-      events.onStatus?.(message);
-      emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
-      await finishRun(
-        "budget",
-        step,
-        maxSteps,
-        candidateAcceptance.nextAction ?? message,
-      );
-      return null;
+    if (!candidate.trim()) {
+      throw new Error(EMPTY_STREAMING_WRITEBACK_MESSAGE);
     }
 
     lastFinalOutput = candidate;
-    return runStreamedWritebackWithJournal(
-      {
-        ...input,
-        stagedContent: candidate,
-      },
-      step,
-    );
+    try {
+      return await runStreamedWritebackWithJournal(
+        {
+          ...input,
+          stagedContent: candidate,
+        },
+        step,
+      );
+    } catch (error) {
+      const code = isRecord(error) ? getString(error.code) : undefined;
+      if (!code?.startsWith("approval_")) {
+        throw error;
+      }
+      const decision = code.slice("approval_".length) || "not granted";
+      const message =
+        `Replacement approval was ${decision}. The current note and backup tree were left unchanged.`;
+      lastFinalOutput = message;
+      events.onStatus?.(message);
+      emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+      await finishRun("error", step, maxSteps, message);
+      return null;
+    }
   };
   const hasExposedWriteTool = (): boolean => {
     for (const name of allowedToolNames) {
@@ -3623,6 +4478,8 @@ export async function runAgentMission({
     preparedAction,
     confirmationIndex,
     requiredConfirmations,
+    missionGraphExecution,
+    approvalIdentity,
   }: {
     toolCall: ModelToolCall;
     step: number;
@@ -3633,48 +4490,72 @@ export async function runAgentMission({
     preparedAction?: PreparedAction;
     confirmationIndex?: number;
     requiredConfirmations?: 1 | 2;
+    missionGraphExecution?: MissionGraphToolExecution | null;
+    approvalIdentity?: { runId: string; toolName: string };
   }): Promise<{ decision: ApprovalDecision; request: ApprovalRequest }> => {
     let emittedRequest: ApprovalRequest | null = null;
-    const decision = await approvalBroker.request(
-      {
-        runId,
-        toolName: toolCall.name,
-        action,
-        reason,
-        policyTags,
-        ...(preparedAction
-          ? {
-              preparedAction,
-              payloadFingerprint: preparedAction.payloadFingerprint,
-              confirmationIndex: confirmationIndex ?? 1,
-              requiredConfirmations: requiredConfirmations ?? 1,
-            }
-          : {}),
-      },
-      {
-        timeoutMs,
-        abortSignal,
-        onRequest: async (request) => {
-          emittedRequest = request;
-          await events.onApprovalRequest?.(request);
-          events.onTrace?.({
-            id: `${request.id}:requested`,
-            kind: "status",
-            step,
-            toolName: toolCall.name,
-            message: `Approval required for ${toolCall.name}: ${request.reason}`,
-            outputPreview: {
-              action: request.action,
-              policyTags: request.policyTags,
-              expiresAtMs: request.expiresAtMs,
-              payloadFingerprint: request.payloadFingerprint,
-              confirmationIndex: request.confirmationIndex,
-              requiredConfirmations: request.requiredConfirmations,
-            },
-          });
+    const approvalGraphNode =
+      missionGraphSession && missionGraphExecution
+        ? missionGraphSession.graph.nodes[missionGraphExecution.nodeId]
+        : null;
+    const persistApprovalState = approvalGraphNode?.effect !== "read";
+    if (persistApprovalState && missionGraphSession && missionGraphExecution) {
+      await missionGraphSession.waitForToolApproval(missionGraphExecution);
+    }
+    let decision: ApprovalDecision;
+    try {
+      decision = await approvalBroker.request(
+        {
+          runId: approvalIdentity?.runId ?? runId,
+          toolName: approvalIdentity?.toolName ?? toolCall.name,
+          action,
+          reason,
+          policyTags,
+          ...(preparedAction
+            ? {
+                preparedAction,
+                payloadFingerprint: preparedAction.payloadFingerprint,
+                confirmationIndex: confirmationIndex ?? 1,
+                requiredConfirmations: requiredConfirmations ?? 1,
+              }
+            : {}),
         },
-      },
-    );
+        {
+          timeoutMs,
+          abortSignal,
+          onRequest: async (request) => {
+            emittedRequest = request;
+            await events.onApprovalRequest?.(request);
+            events.onTrace?.({
+              id: `${request.id}:requested`,
+              kind: "status",
+              step,
+              toolName: toolCall.name,
+              message: `Approval required for ${toolCall.name}: ${request.reason}`,
+              outputPreview: {
+                action: request.action,
+                policyTags: request.policyTags,
+                expiresAtMs: request.expiresAtMs,
+                payloadFingerprint: request.payloadFingerprint,
+                confirmationIndex: request.confirmationIndex,
+                requiredConfirmations: request.requiredConfirmations,
+              },
+            });
+          },
+        },
+      );
+    } catch (error) {
+      if (persistApprovalState && missionGraphSession && missionGraphExecution) {
+        await missionGraphSession.resolveToolApproval(missionGraphExecution, false);
+      }
+      throw error;
+    }
+    if (persistApprovalState && missionGraphSession && missionGraphExecution) {
+      await missionGraphSession.resolveToolApproval(
+        missionGraphExecution,
+        decision === "approved",
+      );
+    }
     const request =
       emittedRequest ??
       approvalBroker.getPending().find((item) => item.toolName === toolCall.name) ??
@@ -3721,6 +4602,84 @@ export async function runAgentMission({
     });
     return { decision, request };
   };
+  const sealPortableHostApprovalGesture = async (input: {
+    descriptor: ToolDescriptor;
+    graphExecution?: MissionGraphToolExecution | null;
+    preparedAction: PreparedAction;
+    request: ApprovalRequest;
+    confirmationIndex: 1 | 2;
+    requiredConfirmations: 1 | 2;
+  }): Promise<void> => {
+    const node =
+      missionGraphSession && input.graphExecution
+        ? missionGraphSession.graph.nodes[input.graphExecution.nodeId]
+        : null;
+    if (
+      input.descriptor.capability.system !== "github" ||
+      !node ||
+      (node.executionHost !== "companion" &&
+        node.executionHost !== "headless_runtime")
+    ) {
+      return;
+    }
+    const identity =
+      await backgroundContinuation?.readHostApprovalSignerIdentity?.();
+    if (!identity || !backgroundContinuation?.sealHostApprovalReceipt) {
+      throw new Error(
+        "Background GitHub approval signing is unavailable. Explicitly provision the companion approval signing key, reconnect, and approve a fresh action.",
+      );
+    }
+    const actorFingerprint = await sha256MissionFingerprint({
+      version: 1,
+      kind: "local_interactive_approval_actor",
+      hostInstanceFingerprint: identity.signingKeyFingerprint,
+    });
+    const sessionFingerprint = await sha256MissionFingerprint({
+      version: 1,
+      kind: "approval_session",
+      runId,
+      missionId: missionGraphSession?.graph.missionId ?? runId,
+    });
+    const evidence = createHostApprovalReceiptEvidenceV1({
+      id: input.request.id,
+      preparedActionId: input.preparedAction.id,
+      preparedActionFingerprint: input.preparedAction.payloadFingerprint,
+      confirmationOrdinal: input.confirmationIndex,
+      requiredConfirmations: input.requiredConfirmations,
+      decision: "approved",
+      hostInstanceFingerprint: identity.signingKeyFingerprint,
+      actorFingerprint,
+      sessionFingerprint,
+      decidedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+    });
+    const receipt = parseHostApprovalReceiptV1(
+      await backgroundContinuation.sealHostApprovalReceipt(evidence),
+    );
+    if (
+      receipt.evidenceFingerprint !== evidence.evidenceFingerprint ||
+      receipt.signingKeyFingerprint !== identity.signingKeyFingerprint
+    ) {
+      throw new Error(
+        "Companion approval receipt readback did not match the approved gesture.",
+      );
+    }
+    const prior = portableHostApprovalReceipts.get(
+      input.preparedAction.payloadFingerprint,
+    ) ?? [];
+    if (
+      prior.some(
+        (candidate) =>
+          candidate.id === receipt.id ||
+          candidate.confirmationOrdinal === receipt.confirmationOrdinal,
+      )
+    ) {
+      throw new Error("Companion returned a duplicate host approval receipt.");
+    }
+    portableHostApprovalReceipts.set(input.preparedAction.payloadFingerprint, [
+      ...prior,
+      receipt,
+    ]);
+  };
   const buildApprovalDeniedResult = (
     toolCall: ModelToolCall,
     request: ApprovalRequest,
@@ -3748,30 +4707,75 @@ export async function runAgentMission({
     step,
     operationId,
     beforeExecute,
+    missionGraphExecution,
+    hostScopeAuthorized = false,
   }: {
     toolCall: ModelToolCall;
     step: number;
     operationId?: string;
+    missionGraphExecution?: MissionGraphToolExecution | null;
     beforeExecute?: (
       preparedAction?: PreparedAction,
       descriptor?: ToolDescriptor,
       authorization?: AuthorizedActionContext,
-    ) => Promise<void>;
+      approvedGrant?: AuthorityGrantV1,
+      consumedGrant?: AuthorityGrantV1,
+    ) => Promise<ToolExecutionResult | void>;
+    /** Host-owned writeback routes may execute their declared graph tool without exposing it to the model. */
+    hostScopeAuthorized?: boolean;
   }): Promise<ToolExecutionResult> => {
     const runToolNow = async (toolContext: ToolExecutionContext) => {
-      await beforeExecute?.(
+      const intercepted = await beforeExecute?.(
         undefined,
         toolRegistry.getDescriptor?.(toolCall.name) ?? undefined,
       );
+      if (intercepted) return intercepted;
       if (toolCall.name === "run_code_block") {
         executedCodeRunCount += 1;
       }
+      const nestedApprovalContext: ToolExecutionContext = {
+        ...toolContext,
+        requestNestedApproval: async (request) => {
+          const binding = await resolveNestedApprovalBindingV1({
+            outerToolName: toolCall.name,
+            request: request as NestedToolApprovalRequest,
+            toolRegistry,
+          });
+          const approval = await requestRunnerToolApproval({
+            toolCall,
+            step,
+            action: request.action,
+            reason: request.reason,
+            policyTags: [...request.policyTags],
+            timeoutMs: request.timeoutMs,
+            preparedAction: request.preparedAction,
+            confirmationIndex: request.confirmationIndex,
+            requiredConfirmations: request.requiredConfirmations,
+            missionGraphExecution,
+            approvalIdentity: {
+              runId: binding.runId,
+              toolName: binding.toolName,
+            },
+          });
+          if (approval.decision !== "approved") {
+            return { approved: false, reason: approval.decision };
+          }
+          return {
+            approved: true,
+            approvalId: approval.request.id,
+            approvalFingerprint:
+              approval.request.payloadFingerprint ??
+              approval.request.preparedAction?.payloadFingerprint ??
+              "",
+          };
+        },
+      };
       return executeToolWithMetrics({
         toolRegistry,
         toolCall,
         toolContext: operationId
-          ? { ...toolContext, operationId }
-          : toolContext,
+          ? { ...nestedApprovalContext, operationId }
+          : nestedApprovalContext,
         events,
         step,
       });
@@ -3876,6 +4880,60 @@ export async function runAgentMission({
     };
 
     const descriptor = toolRegistry.getDescriptor?.(toolCall.name) ?? null;
+    const exactHeadlessDomain = descriptor
+      ? isExactBackgroundCodeValidationCommitDescriptor(descriptor)
+        ? "code"
+        : isExactBackgroundGitHubPreparedDescriptor(descriptor)
+          ? "github"
+          : null
+      : null;
+    if (exactHeadlessDomain) {
+      const graphNode =
+        missionGraphSession && missionGraphExecution
+          ? missionGraphSession.graph.nodes[missionGraphExecution.nodeId]
+          : null;
+      const requiredEffect = exactHeadlessDomain === "code"
+        ? "execution"
+        : "external_action";
+      const binding = graphNode?.destination
+        ? missionGraphSession?.graph.capabilityEnvelope.bindings[
+            graphNode.destination.bindingId
+          ]
+        : null;
+      const exactHeadlessAuthority = Boolean(
+        graphNode &&
+          (graphNode.executionHost === "companion" ||
+            graphNode.executionHost === "headless_runtime") &&
+          graphNode.effect === requiredEffect &&
+          graphNode.allowedTools.length === 1 &&
+          graphNode.allowedTools[0] === descriptor!.name &&
+          graphNode.destination?.effect === requiredEffect &&
+          binding?.allowedEffects.includes(requiredEffect) &&
+          graphNode.resourceLocks.some(
+            (lock) =>
+              lock.bindingId === binding?.id && lock.mode === "exclusive",
+          ),
+      );
+      if (!exactHeadlessAuthority) {
+        const domainLabel = exactHeadlessDomain === "code" ? "Code" : "GitHub";
+        return {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          output: {
+            status: "blocked",
+            domain: exactHeadlessDomain,
+            foregroundFallback: false,
+          },
+          error: {
+            code: `background_${exactHeadlessDomain}_trusted_binding_required`,
+            message:
+              `${domainLabel} prepared execution requires one exact host-resolved ` +
+              "headless graph binding; foreground execution is forbidden.",
+          },
+        };
+      }
+    }
     if (descriptor?.execution.preparation === "required") {
       if (!toolRegistry.prepare || !toolRegistry.executePrepared) {
         return {
@@ -3905,6 +4963,17 @@ export async function runAgentMission({
         };
       }
       const preparedAction = preparedResult.action;
+      const hostGraphNode =
+        hostScopeAuthorized && missionGraphSession && missionGraphExecution
+          ? missionGraphSession.graph.nodes[missionGraphExecution.nodeId]
+          : null;
+      const hostGraphScopeAuthorized = Boolean(
+        hostGraphNode &&
+          missionGraphExecution?.toolName === toolCall.name &&
+          hostGraphNode.allowedTools.includes(toolCall.name) &&
+          (hostGraphNode.status === "running" ||
+            hostGraphNode.status === "waiting_approval"),
+      );
       const actionPolicyContext = {
         toolName: toolCall.name,
         args: toolCall.arguments,
@@ -3918,15 +4987,17 @@ export async function runAgentMission({
         descriptor,
         preparedAction,
         principal: "single_agent" as const,
-        scopeAllowed: isPreparedActionWithinRunnerScope({
-          toolName: toolCall.name,
-          descriptor,
-          action: preparedAction,
-          allowedToolNames,
-          policyRouted: policyRouted.intent,
-          missionIntent,
-          writeAutonomy,
-        }),
+        scopeAllowed:
+          hostGraphScopeAuthorized ||
+          isPreparedActionWithinRunnerScope({
+            toolName: toolCall.name,
+            descriptor,
+            action: preparedAction,
+            allowedToolNames,
+            policyRouted: policyRouted.intent,
+            missionIntent,
+            writeAutonomy,
+          }),
         now: runToolContext.now?.() ?? new Date(),
       };
       let preparedPolicyDecision = evaluateToolPolicy(actionPolicyContext);
@@ -3935,67 +5006,29 @@ export async function runAgentMission({
       }
 
       let matchingGrant: AuthorityGrantV1 | null = null;
-      if (preparedPolicyDecision.action === "require_approval") {
-        const requiredConfirmations =
-          preparedPolicyDecision.requiredConfirmations ?? 1;
-        let finalApprovalRequest: ApprovalRequest | null = null;
-        for (
-          let confirmationIndex = 1;
-          confirmationIndex <= requiredConfirmations;
-          confirmationIndex += 1
-        ) {
-          const approval = await requestRunnerToolApproval({
-            toolCall,
-            step,
-            action: preparedAction.preview.summary,
-            reason: preparedPolicyDecision.reason,
-            policyTags: preparedPolicyDecision.tags,
-            timeoutMs: 120000,
-            preparedAction,
-            confirmationIndex,
-            requiredConfirmations,
-          });
-          finalApprovalRequest = approval.request;
-          if (approval.decision !== "approved") {
-            return buildApprovalDeniedResult(
-              toolCall,
-              approval.request,
-              approval.decision,
-            );
-          }
-        }
-
+      let durablePreparedGrant = false;
+      if (preparedActionAuthority) {
         try {
-          const grant = await createOneShotGrant({
-            id: `grant:${finalApprovalRequest?.id ?? preparedAction.id}`,
+          const candidate = await preparedActionAuthority.resolve({
             action: preparedAction,
             descriptor,
-            issuedAt: runToolContext.now?.() ?? new Date(),
           });
-          const evaluated = await evaluateAuthorityGrant({
-            grant,
-            action: preparedAction,
-            descriptor,
-            now: runToolContext.now?.() ?? new Date(),
-          });
-          if (!evaluated.allowed) {
-            return {
-              ok: false,
-              toolName: toolCall.name,
-              mutationState: "not_applied",
-              error: {
-                code: "authority_grant_invalid",
-                message: evaluated.reason,
-              },
-            };
-          }
-          matchingGrant = evaluated.grant;
-          preparedPolicyDecision = evaluateToolPolicy({
-            ...actionPolicyContext,
-            matchingGrant,
-          });
-          if (preparedPolicyDecision.action !== "allow") {
-            return buildPolicyBlockedResult(preparedPolicyDecision);
+          if (candidate) {
+            const evaluated = await evaluateAuthorityGrant({
+              grant: candidate,
+              action: preparedAction,
+              descriptor,
+              subject: preparedActionAuthority.subject,
+              now: runToolContext.now?.() ?? new Date(),
+            });
+            if (evaluated.allowed) {
+              matchingGrant = evaluated.grant;
+              durablePreparedGrant = true;
+              preparedPolicyDecision = evaluateToolPolicy({
+                ...actionPolicyContext,
+                matchingGrant,
+              });
+            }
           }
         } catch (error) {
           return {
@@ -4003,11 +5036,134 @@ export async function runAgentMission({
             toolName: toolCall.name,
             mutationState: "not_applied",
             error: {
-              code: "authority_grant_invalid",
+              code: "durable_authority_resolution_failed",
               message: getUnknownErrorMessage(error),
             },
           };
         }
+        if (!matchingGrant && !interactiveApprovals) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "preauthorized_authority_required",
+              message:
+                "This background action is outside the exact persisted authority grant; interactive approval is disabled.",
+            },
+          };
+        }
+      }
+
+      if (preparedPolicyDecision.action === "block") {
+        return buildPolicyBlockedResult(preparedPolicyDecision);
+      }
+      if (preparedPolicyDecision.action === "require_approval") {
+        if (!interactiveApprovals) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "preauthorized_authority_required",
+              message:
+                "The persisted authority grant did not satisfy current policy; interactive approval is disabled.",
+            },
+          };
+        }
+          const requiredConfirmations =
+            preparedPolicyDecision.requiredConfirmations ?? 1;
+          let finalApprovalRequest: ApprovalRequest | null = null;
+          for (
+            let confirmationIndex = 1;
+            confirmationIndex <= requiredConfirmations;
+            confirmationIndex += 1
+          ) {
+            const approval = await requestRunnerToolApproval({
+              toolCall,
+              step,
+              action: preparedAction.preview.summary,
+              reason: preparedPolicyDecision.reason,
+              policyTags: preparedPolicyDecision.tags,
+              timeoutMs: 120000,
+              preparedAction,
+              confirmationIndex,
+              requiredConfirmations,
+              missionGraphExecution,
+            });
+            finalApprovalRequest = approval.request;
+            if (approval.decision !== "approved") {
+              return buildApprovalDeniedResult(
+                toolCall,
+                approval.request,
+                approval.decision,
+              );
+            }
+            try {
+              await sealPortableHostApprovalGesture({
+                descriptor,
+                graphExecution: missionGraphExecution,
+                preparedAction,
+                request: approval.request,
+                confirmationIndex: confirmationIndex as 1 | 2,
+                requiredConfirmations,
+              });
+            } catch (error) {
+              return {
+                ok: false,
+                toolName: toolCall.name,
+                mutationState: "not_applied",
+                error: {
+                  code: "background_github_approval_signer_unavailable",
+                  message: getUnknownErrorMessage(error),
+                },
+              };
+            }
+          }
+
+          try {
+            const grant = await createOneShotGrant({
+              id: `grant:${finalApprovalRequest?.id ?? preparedAction.id}`,
+              action: preparedAction,
+              descriptor,
+              issuedAt: runToolContext.now?.() ?? new Date(),
+            });
+            const evaluated = await evaluateAuthorityGrant({
+              grant,
+              action: preparedAction,
+              descriptor,
+              now: runToolContext.now?.() ?? new Date(),
+            });
+            if (!evaluated.allowed) {
+              return {
+                ok: false,
+                toolName: toolCall.name,
+                mutationState: "not_applied",
+                error: {
+                  code: "authority_grant_invalid",
+                  message: evaluated.reason,
+                },
+              };
+            }
+            matchingGrant = evaluated.grant;
+            preparedPolicyDecision = evaluateToolPolicy({
+              ...actionPolicyContext,
+              matchingGrant,
+            });
+            if (preparedPolicyDecision.action !== "allow") {
+              return buildPolicyBlockedResult(preparedPolicyDecision);
+            }
+          } catch (error) {
+            return {
+              ok: false,
+              toolName: toolCall.name,
+              mutationState: "not_applied",
+              error: {
+                code: "authority_grant_invalid",
+                message: getUnknownErrorMessage(error),
+              },
+            };
+          }
       }
 
       const authorization: AuthorizedActionContext = matchingGrant
@@ -4021,27 +5177,56 @@ export async function runAgentMission({
             payloadFingerprint: preparedAction.payloadFingerprint,
             grantId: "policy:scoped-read",
           };
+      const approvedGrant = matchingGrant;
       if (matchingGrant) {
-        const consumed = await consumeAuthorityGrant({
-          grant: matchingGrant,
-          action: preparedAction,
-          descriptor,
-          now: runToolContext.now?.() ?? new Date(),
-        });
-        if (!consumed.allowed) {
-          return {
-            ok: false,
-            toolName: toolCall.name,
-            mutationState: "not_applied",
-            error: {
-              code: "authority_grant_consumption_failed",
-              message: consumed.reason,
-            },
-          };
+        if (durablePreparedGrant && preparedActionAuthority) {
+          try {
+            matchingGrant = await preparedActionAuthority.consume({
+              grantId: matchingGrant.id,
+              action: preparedAction,
+              descriptor,
+            });
+          } catch (error) {
+            return {
+              ok: false,
+              toolName: toolCall.name,
+              mutationState: "not_applied",
+              error: {
+                code: "authority_grant_consumption_failed",
+                message: getUnknownErrorMessage(error),
+              },
+            };
+          }
+        } else {
+          const consumed = await consumeAuthorityGrant({
+            grant: matchingGrant,
+            action: preparedAction,
+            descriptor,
+            now: runToolContext.now?.() ?? new Date(),
+          });
+          if (!consumed.allowed) {
+            return {
+              ok: false,
+              toolName: toolCall.name,
+              mutationState: "not_applied",
+              error: {
+                code: "authority_grant_consumption_failed",
+                message: consumed.reason,
+              },
+            };
+          }
+          matchingGrant = consumed.grant;
         }
       }
 
-      await beforeExecute?.(preparedAction, descriptor, authorization);
+      const intercepted = await beforeExecute?.(
+        preparedAction,
+        descriptor,
+        authorization,
+        approvedGrant ?? undefined,
+        matchingGrant ?? undefined,
+      );
+      if (intercepted) return intercepted;
       if (toolCall.name === "run_code_block") {
         executedCodeRunCount += 1;
       }
@@ -4089,6 +5274,7 @@ export async function runAgentMission({
         reason: policyDecision.reason,
         policyTags: policyDecision.tags,
         timeoutMs: 120000,
+        missionGraphExecution,
       });
       if (decision !== "approved") {
         return buildApprovalDeniedResult(toolCall, request, decision);
@@ -4113,6 +5299,7 @@ export async function runAgentMission({
       reason: approvalInfo.reason,
       policyTags: approvalInfo.policyTags,
       timeoutMs: approvalInfo.timeoutMs,
+      missionGraphExecution,
     });
     if (decision !== "approved") {
       return buildApprovalDeniedResult(toolCall, request, decision);
@@ -4187,12 +5374,16 @@ export async function runAgentMission({
     step,
     toolIndex,
     recordTranscript = true,
+    prestartedMissionGraphExecution,
+    missionGraphStartPrepared = false,
   }: {
     origin: "model" | "runner";
     toolCall: ModelToolCall;
     step: number;
     toolIndex: number | string;
     recordTranscript?: boolean;
+    prestartedMissionGraphExecution?: MissionGraphToolExecution | null;
+    missionGraphStartPrepared?: boolean;
   }): Promise<ToolExecutionResult> => {
     if (observedToolCallCount >= maxToolCalls) {
       toolCallBudgetExhausted = true;
@@ -4222,6 +5413,61 @@ export async function runAgentMission({
           message: "Per-segment tool-call budget exhausted.",
         },
       };
+    }
+    let missionGraphExecution = prestartedMissionGraphExecution ?? null;
+    try {
+      if (!missionGraphStartPrepared) {
+        missionGraphExecution = await beginMissionGraphTool(toolCall.name);
+      }
+    } catch (error) {
+      if (isMissionGraphCapacityError(error)) {
+        missionGraphCapacityExhausted = true;
+      }
+      const message = `Rejected ${toolCall.name}: ${getUnknownErrorMessage(error)}`;
+      const blockedResult: ToolExecutionResult = {
+        ok: false,
+        toolName: toolCall.name,
+        mutationState: "not_applied",
+        error: {
+          code: "mission_graph_authority_blocked",
+          message,
+        },
+      };
+      events.onStatus?.(message);
+      events.onTrace?.({
+        id: `${step}:${String(toolIndex)}:${toolCall.name}:graph-rejected`,
+        kind: "tool_rejected",
+        step,
+        toolName: toolCall.name,
+        message,
+        error: {
+          code: "mission_graph_authority_blocked",
+          message,
+        },
+      });
+      events.onToolDone?.({
+        id: `${step}:${String(toolIndex)}:${toolCall.name}`,
+        name: toolCall.name,
+        step,
+        ok: false,
+        message,
+        error: blockedResult.error,
+      });
+      if (recordTranscript) {
+        appendToolTranscript({
+          messages,
+          toolCall,
+          resultContent: serializeToolResultForModel(blockedResult),
+          origin,
+          fallbackId: buildToolCallFallbackId(
+            runId,
+            step,
+            toolIndex,
+            toolCall.name,
+          ),
+        });
+      }
+      return blockedResult;
     }
     observedToolCallCount += 1;
     const toolEventBase: AgentToolRunEvent = {
@@ -4279,7 +5525,9 @@ export async function runAgentMission({
       preparedAction?: PreparedAction,
       descriptor?: ToolDescriptor,
       authorization?: AuthorizedActionContext,
-    ) => {
+      approvedGrant?: AuthorityGrantV1,
+      consumedGrant?: AuthorityGrantV1,
+    ): Promise<ToolExecutionResult | void> => {
       if (
         !operationId ||
         operationJournalStarted ||
@@ -4294,7 +5542,8 @@ export async function runAgentMission({
         operationId,
         rootRunId: runtimeSnapshot.lineage.rootRunId,
         segmentId: runtimeSnapshot.lineage.segmentId,
-        nodeId: missionPlan?.activeTaskId ?? undefined,
+        nodeId:
+          missionGraphExecution?.nodeId ?? missionPlan?.activeTaskId ?? undefined,
         toolName: toolCall.name,
         operation: descriptor?.capability.action ?? toolCall.name,
         targetPath:
@@ -4325,6 +5574,466 @@ export async function runAgentMission({
       await persistRuntimeSnapshot(`${toolEventBase.id}:wal-applying`, {
         required: runtimeSnapshotPersistenceAvailable,
       });
+      const graphNode =
+        missionGraphSession && missionGraphExecution
+          ? missionGraphSession.graph.nodes[missionGraphExecution.nodeId]
+          : null;
+      const backgroundLinearStateUpdate = Boolean(
+        preparedAction &&
+          descriptor &&
+          authorization &&
+          approvedGrant &&
+          consumedGrant &&
+          backgroundContinuation &&
+          graphNode &&
+          graphNode.effect === "external_action" &&
+          (graphNode.executionHost === "companion" ||
+            graphNode.executionHost === "headless_runtime") &&
+          toolCall.name === "linear_update_issue",
+      );
+      const backgroundCodeValidationCommit = Boolean(
+        preparedAction &&
+          descriptor &&
+          authorization &&
+          approvedGrant &&
+          consumedGrant &&
+          backgroundContinuation &&
+          graphNode &&
+          graphNode.effect === "execution" &&
+          (graphNode.executionHost === "companion" ||
+            graphNode.executionHost === "headless_runtime") &&
+          toolCall.name === "code_validate_commit_prepared",
+      );
+      const backgroundGitHubAction = Boolean(
+        preparedAction &&
+          descriptor &&
+          authorization &&
+          approvedGrant &&
+          consumedGrant &&
+          backgroundContinuation &&
+          graphNode &&
+          graphNode.effect === "external_action" &&
+          (graphNode.executionHost === "companion" ||
+            graphNode.executionHost === "headless_runtime") &&
+          isPreparedBackgroundGitHubToolName(toolCall.name) &&
+          isExactBackgroundGitHubPreparedDescriptor(descriptor),
+      );
+      if (
+        !backgroundLinearStateUpdate &&
+        !backgroundCodeValidationCommit &&
+        !backgroundGitHubAction
+      ) return;
+
+      if (backgroundGitHubAction) {
+        const sealer = backgroundContinuation!.sealBackgroundGitHubPackage;
+        if (!sealer) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "background_github_sealer_unavailable",
+              message:
+                "Background GitHub publication requires the enabled Integrations extension's trusted package sealer.",
+            },
+          };
+        }
+        const graph = missionGraphSession!.graph;
+        const currentTime = runToolContext.now?.() ?? new Date();
+        const consumedAt = consumedGrant!.usage.lastUsedAt;
+        if (
+          !consumedAt ||
+          consumedGrant!.actionFingerprint !==
+            preparedAction!.payloadFingerprint
+        ) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "background_github_consumed_authority_invalid",
+              message:
+                "Background GitHub publication requires an exact consumed action grant.",
+            },
+          };
+        }
+        const hostApprovalReceipts = portableHostApprovalReceipts.get(
+          preparedAction!.payloadFingerprint,
+        ) ?? [];
+        const requiredConfirmations =
+          toolCall.name === "github_merge_pull_request" ||
+          toolCall.name === "github_enable_auto_merge"
+            ? 2
+            : 1;
+        if (hostApprovalReceipts.length !== requiredConfirmations) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "background_github_signed_approval_required",
+              message:
+                "Background GitHub publication requires every exact approval gesture to have one signed host receipt.",
+            },
+          };
+        }
+        const expiresAt = new Date(
+          Math.min(
+            Date.parse(preparedAction!.expiresAt),
+            Date.parse(consumedGrant!.expiresAt),
+          ),
+        ).toISOString();
+        const backgroundAuthorization = await buildBackgroundAuthorizationV1({
+          graph,
+          nodeId: missionGraphExecution!.nodeId,
+          grantId: `mission-capability-${graph.capabilityEnvelope.fingerprint.slice("sha256:".length, 40)}`,
+          authorizedAt: currentTime.toISOString(),
+          expiresAt,
+          authorizedGraphRevision: graph.revision,
+        });
+        const sealed = await sealer({
+          graph,
+          authorization: backgroundAuthorization,
+          preparedAction: preparedAction!,
+          authority: {
+            id: consumedGrant!.id,
+            authorityFingerprint: consumedGrant!.authorityFingerprint,
+            actionFingerprint: preparedAction!.payloadFingerprint,
+            consumedAt,
+            expiresAt: consumedGrant!.expiresAt,
+          },
+          hostApprovalReceipts,
+        });
+        if (sealed.status === "blocked") {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            output: sealed,
+            error: { code: sealed.code, message: sealed.message },
+          };
+        }
+        let dispatchRecord = await attachPreparedBackgroundGitHubActionV1(
+          applyingRecord,
+          sealed.action,
+          sealed.packageIdentity,
+          runToolContext.now?.() ?? new Date(),
+        );
+        saveOperationJournalRecord(dispatchRecord);
+        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-github-action`, {
+          required: true,
+        });
+        const dispatch = await backgroundContinuation!.submitAuthorizedNode({
+          graph,
+          nodeId: missionGraphExecution!.nodeId,
+          authorization: backgroundAuthorization,
+          hostRuntimeRunId: runId,
+          preparedBackgroundGitHubAction: sealed.action,
+          preparedBackgroundGitHubPackage: sealed.packageIdentity,
+          now: currentTime,
+          beforeSubmit: async (job) => {
+            dispatchRecord = attachBackgroundGitHubDispatchAttemptV1(
+              dispatchRecord,
+              job.id,
+              runToolContext.now?.() ?? new Date(),
+            );
+            saveOperationJournalRecord(dispatchRecord);
+            await persistRuntimeSnapshot(
+              `${toolEventBase.id}:wal-github-remote-attempt`,
+              { required: true },
+            );
+          },
+        });
+        if (dispatch.status !== "submitted") {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: dispatchRecord.backgroundGitHubDispatchAttempt
+              ? "may_have_applied"
+              : "not_applied",
+            output: dispatch,
+            error: {
+              code:
+                dispatch.status === "blocked"
+                  ? dispatch.code
+                  : "background_github_dispatch_waiting",
+              message: dispatch.reason,
+            },
+          };
+        }
+        dispatchRecord = markBackgroundGitHubJobSubmittedV1(
+          dispatchRecord,
+          runToolContext.now?.() ?? new Date(),
+        );
+        saveOperationJournalRecord(dispatchRecord);
+        await persistRuntimeSnapshot(
+          `${toolEventBase.id}:wal-github-job-submitted`,
+          { required: true },
+        );
+        return {
+          ok: true,
+          toolName: toolCall.name,
+          output: {
+            status: "background_submitted",
+            domain: "github",
+            operation: sealed.action.operation,
+            jobId: dispatch.job.id,
+            attemptId:
+              dispatchRecord.backgroundGitHubDispatchAttempt!.attemptId,
+            actionFingerprint: sealed.action.fingerprint,
+            packageIdentityFingerprint: sealed.packageIdentity.fingerprint,
+            packagePersistenceReceiptFingerprint:
+              sealed.packagePersistenceReceipt.fingerprint,
+            message:
+              "Exact GitHub package submitted to the authenticated companion; completion requires full provider readback proof and checkpoint persistence.",
+          },
+        };
+      }
+
+      if (backgroundCodeValidationCommit) {
+        const sealer =
+          backgroundContinuation!.sealBackgroundValidationCommitPackage;
+        if (!sealer) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "background_code_sealer_unavailable",
+              message:
+                "Background Code execution requires the enabled Code extension's trusted package sealer.",
+            },
+          };
+        }
+        const graph = missionGraphSession!.graph;
+        const currentTime = runToolContext.now?.() ?? new Date();
+        const consumedAt = consumedGrant!.usage.lastUsedAt;
+        if (
+          !consumedAt ||
+          consumedGrant!.actionFingerprint !== preparedAction!.payloadFingerprint
+        ) {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "background_code_consumed_authority_invalid",
+              message:
+                "Background Code execution requires an exact consumed action grant.",
+            },
+          };
+        }
+        const expiresAt = new Date(
+          Math.min(
+            Date.parse(preparedAction!.expiresAt),
+            Date.parse(consumedGrant!.expiresAt),
+          ),
+        ).toISOString();
+        const backgroundAuthorization = await buildBackgroundAuthorizationV1({
+          graph,
+          nodeId: missionGraphExecution!.nodeId,
+          grantId: `mission-capability-${graph.capabilityEnvelope.fingerprint.slice("sha256:".length, 40)}`,
+          authorizedAt: currentTime.toISOString(),
+          expiresAt,
+          authorizedGraphRevision: graph.revision,
+        });
+        const sealed = await sealer({
+          graph,
+          authorization: backgroundAuthorization,
+          preparedAction: preparedAction!,
+          authority: {
+            id: consumedGrant!.id,
+            authorityFingerprint: consumedGrant!.authorityFingerprint,
+            actionFingerprint: preparedAction!.payloadFingerprint,
+            consumedAt,
+            expiresAt: consumedGrant!.expiresAt,
+          },
+        });
+        if (sealed.status === "blocked") {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            output: sealed,
+            error: { code: sealed.code, message: sealed.message },
+          };
+        }
+        let dispatchRecord = await attachPreparedBackgroundCodeHandoffV1(
+          applyingRecord,
+          sealed.handoff,
+          sealed.packageIdentity,
+          runToolContext.now?.() ?? new Date(),
+        );
+        saveOperationJournalRecord(dispatchRecord);
+        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-code-handoff`, {
+          required: true,
+        });
+        const dispatch = await backgroundContinuation!.submitAuthorizedNode({
+          graph,
+          nodeId: missionGraphExecution!.nodeId,
+          authorization: backgroundAuthorization,
+          hostRuntimeRunId: runId,
+          preparedBackgroundCodeAction: sealed.handoff,
+          preparedBackgroundCodePackage: sealed.packageIdentity,
+          now: currentTime,
+          beforeSubmit: async (job) => {
+            dispatchRecord = attachBackgroundCodeDispatchAttemptV1(
+              dispatchRecord,
+              job.id,
+              runToolContext.now?.() ?? new Date(),
+            );
+            saveOperationJournalRecord(dispatchRecord);
+            await persistRuntimeSnapshot(
+              `${toolEventBase.id}:wal-code-remote-attempt`,
+              { required: true },
+            );
+          },
+        });
+        if (dispatch.status !== "submitted") {
+          return {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: dispatchRecord.backgroundCodeDispatchAttempt
+              ? "may_have_applied"
+              : "not_applied",
+            output: dispatch,
+            error: {
+              code:
+                dispatch.status === "blocked"
+                  ? dispatch.code
+                  : "background_code_dispatch_waiting",
+              message: dispatch.reason,
+            },
+          };
+        }
+        dispatchRecord = markBackgroundCodeJobSubmittedV1(
+          dispatchRecord,
+          runToolContext.now?.() ?? new Date(),
+        );
+        saveOperationJournalRecord(dispatchRecord);
+        await persistRuntimeSnapshot(
+          `${toolEventBase.id}:wal-code-job-submitted`,
+          { required: true },
+        );
+        return {
+          ok: true,
+          toolName: toolCall.name,
+          output: {
+            status: "background_submitted",
+            domain: "code",
+            jobId: dispatch.job.id,
+            attemptId: dispatchRecord.backgroundCodeDispatchAttempt!.attemptId,
+            handoffFingerprint: sealed.handoff.fingerprint,
+            packageIdentityFingerprint: sealed.packageIdentity.fingerprint,
+            packagePersistenceReceiptFingerprint:
+              sealed.packagePersistenceReceipt.fingerprint,
+            message:
+              "Exact Code validation/readback/commit package submitted to the authenticated companion; completion requires verified commit readback.",
+          },
+        };
+      }
+
+      const credentialReferenceId = await backgroundContinuation!
+        .resolveCredentialReferenceId?.("linear");
+      if (!credentialReferenceId) {
+        return {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: {
+            code: "background_linear_credential_reference_required",
+            message:
+              "Background Linear execution requires a persistent opaque credential reference in the companion secure store.",
+          },
+        };
+      }
+      const graph = missionGraphSession!.graph;
+      const handoff = await buildPreparedLinearIssueStateUpdateHandoffV1({
+        graph,
+        nodeId: missionGraphExecution!.nodeId,
+        preparedAction: preparedAction!,
+        descriptor: descriptor!,
+        approvedGrant: approvedGrant!,
+        consumedGrant: consumedGrant!,
+        credentialReferenceId,
+        now: runToolContext.now?.() ?? new Date(),
+      });
+      let dispatchRecord = await attachPreparedExternalActionHandoff(
+        applyingRecord,
+        handoff,
+        runToolContext.now?.() ?? new Date(),
+      );
+      saveOperationJournalRecord(dispatchRecord);
+      await persistRuntimeSnapshot(`${toolEventBase.id}:wal-handoff`, {
+        required: true,
+      });
+      const authorizedAt = (runToolContext.now?.() ?? new Date()).toISOString();
+      const backgroundAuthorization = await buildBackgroundAuthorizationV1({
+        graph,
+        nodeId: missionGraphExecution!.nodeId,
+        grantId: `mission-capability-${graph.capabilityEnvelope.fingerprint.slice("sha256:".length, 40)}`,
+        authorizedAt,
+        expiresAt: handoff.expiresAt,
+        authorizedGraphRevision: graph.revision,
+      });
+      const dispatch = await backgroundContinuation!.submitAuthorizedNode({
+        graph,
+        nodeId: missionGraphExecution!.nodeId,
+        authorization: backgroundAuthorization,
+        hostRuntimeRunId: runId,
+        preparedExternalActionHandoff: handoff,
+        now: new Date(authorizedAt),
+        beforeSubmit: async (job) => {
+          dispatchRecord = attachExternalActionDispatchAttemptV1(
+            dispatchRecord,
+            job.id,
+            runToolContext.now?.() ?? new Date(),
+          );
+          saveOperationJournalRecord(dispatchRecord);
+          await persistRuntimeSnapshot(`${toolEventBase.id}:wal-remote-attempt`, {
+            required: true,
+          });
+        },
+      });
+      if (dispatch.status !== "submitted") {
+        return {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState:
+            dispatchRecord.externalActionDispatchAttempt
+              ? "may_have_applied"
+              : "not_applied",
+          output: dispatch,
+          error: {
+            code:
+              dispatch.status === "blocked"
+                ? dispatch.code
+                : "background_linear_dispatch_waiting",
+            message: dispatch.reason,
+          },
+        };
+      }
+      dispatchRecord = markExternalActionJobSubmittedV1(
+        dispatchRecord,
+        runToolContext.now?.() ?? new Date(),
+      );
+      saveOperationJournalRecord(dispatchRecord);
+      await persistRuntimeSnapshot(`${toolEventBase.id}:wal-job-submitted`, {
+        required: true,
+      });
+      return {
+        ok: true,
+        toolName: toolCall.name,
+        output: {
+          status: "background_submitted",
+          domain: "linear",
+          jobId: dispatch.job.id,
+          attemptId: dispatchRecord.externalActionDispatchAttempt!.attemptId,
+          handoffFingerprint: handoff.fingerprint,
+          message:
+            "Exact Linear state update submitted to the authenticated companion; completion requires provider readback.",
+        },
+      };
     };
     if (vaultMutation) {
       vaultTransaction = recordTransactionStage(
@@ -4354,9 +6063,29 @@ export async function runAgentMission({
       step,
       operationId,
       beforeExecute: beginOperationJournal,
+      missionGraphExecution,
     });
+    const backgroundSubmitted = Boolean(
+      result.ok &&
+        isRecord(result.output) &&
+        result.output.status === "background_submitted",
+    );
+    const backgroundSubmittedDomain =
+      backgroundSubmitted &&
+      isRecord(result.output) &&
+      (result.output.domain === "linear" || result.output.domain === "code")
+        ? result.output.domain
+        : "external";
     if (operationJournalRecord) {
-      if (result.ok) {
+      if (backgroundSubmitted) {
+        events.onStatus?.(
+          `Background ${backgroundSubmittedDomain} job submitted; reconciliation is pending independent readback.`,
+        );
+        await persistRuntimeSnapshot(
+          `${toolEventBase.id}:wal-background-submitted`,
+          { required: true },
+        );
+      } else if (result.ok) {
         saveOperationJournalRecord(
           transitionOperationJournalRecord(operationJournalRecord, "applied", {
             message: "Mutation tool returned successfully; receipt verification pending.",
@@ -4388,7 +6117,9 @@ export async function runAgentMission({
             formatFailureCopy(walReconcileFailureCopy(reconcileMessage)),
           );
         }
-        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-failed`);
+        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-failed`, {
+          required: runtimeSnapshotPersistenceAvailable,
+        });
       }
     }
     if (vaultTransaction && result.ok) {
@@ -4418,18 +6149,41 @@ export async function runAgentMission({
           fallbackId: buildToolCallFallbackId(runId, step, toolIndex, toolCall.name),
         })
       : toolCall;
-    markOperationGoalsForTool({
-      operationGoals,
-      toolName: recordedToolCall.name,
-      ok: result.ok,
-      streamingWritebackKind,
-    });
+    if (!backgroundSubmitted) {
+      markOperationGoalsForTool({
+        operationGoals,
+        toolName: recordedToolCall.name,
+        ok: result.ok,
+        streamingWritebackKind,
+      });
+    }
     recentActions.push({
       kind: "tool",
       name: recordedToolCall.name,
       ok: result.ok,
       signature: `${recordedToolCall.name}:${stableStringify(recordedToolCall.arguments)}`,
     });
+
+    if (backgroundSubmitted) {
+      const message =
+        `Exact ${backgroundSubmittedDomain} action is running in the authenticated companion; verified readback is pending.`;
+      events.onStatus?.(message);
+      events.onToolDone?.({
+        ...toolEventBase,
+        ok: true,
+        message,
+        output: result.output,
+      });
+      events.onTrace?.({
+        id: `${toolEventBase.id}:background-submitted`,
+        kind: "status",
+        step,
+        toolName: toolCall.name,
+        message,
+        outputPreview: truncateTracePayload(result.output),
+      });
+      return result;
+    }
 
     if (result.ok) {
       successfulToolNames.push(toolCall.name);
@@ -4548,7 +6302,9 @@ export async function runAgentMission({
             },
           );
           saveOperationJournalRecord(committedRecord);
-          await persistRuntimeSnapshot(`${toolEventBase.id}:wal-committed`);
+          await persistRuntimeSnapshot(`${toolEventBase.id}:wal-committed`, {
+            required: runtimeSnapshotPersistenceAvailable,
+          });
         }
       }
       const unresolvedJournalRecord = getOperationJournalRecord();
@@ -4569,7 +6325,9 @@ export async function runAgentMission({
         events.onStatus?.(
           formatFailureCopy(walReconcileFailureCopy(reconcileMessage)),
         );
-        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-reconcile`);
+        await persistRuntimeSnapshot(`${toolEventBase.id}:wal-reconcile`, {
+          required: runtimeSnapshotPersistenceAvailable,
+        });
       }
 
       if (toolCall.name === "prepare_edit_current_section") {
@@ -4609,6 +6367,22 @@ export async function runAgentMission({
       if (vaultMutation) {
         wroteToNote = true;
       }
+      await finishMissionGraphTool(
+        missionGraphExecution,
+        toolCall.name,
+        result,
+        receipt,
+      );
+      if (missionLedger && missionPlan) {
+        setLedgerMissionPlan(
+          missionLedger,
+          missionPlan,
+          runToolContext.now?.() ?? new Date(),
+        );
+        await persistMissionLedger(
+          `mission-ledger-graph-${toolCall.name}-${step}`,
+        );
+      }
       if (origin === "model") {
         await runAutoFollowupsAfterTool({
           toolName: toolCall.name,
@@ -4640,6 +6414,21 @@ export async function runAgentMission({
         outputPreview: truncateTracePayload(result),
       });
       await recordLedgerToolResult(toolCall.name, result, step);
+      await finishMissionGraphTool(
+        missionGraphExecution,
+        toolCall.name,
+        result,
+      );
+      if (missionLedger && missionPlan) {
+        setLedgerMissionPlan(
+          missionLedger,
+          missionPlan,
+          runToolContext.now?.() ?? new Date(),
+        );
+        await persistMissionLedger(
+          `mission-ledger-graph-${toolCall.name}-failed-${step}`,
+        );
+      }
     }
 
     if (origin === "runner") {
@@ -4761,6 +6550,9 @@ export async function runAgentMission({
       role: "system" as const,
       content: SYSTEM_PROMPT,
     },
+    ...([...allowedToolNames].some((name) => name.startsWith("code_"))
+      ? [{ role: "system" as const, content: CODE_WORKFLOW_POLICY }]
+      : []),
     {
       role: "system" as const,
       content: formatRuntimeContext(runToolContext, activeIntentPrompt),
@@ -5203,6 +6995,13 @@ export async function runAgentMission({
       if (stopIfRequested(1)) {
         return;
       }
+      await finishErroredRunFromException(
+        error,
+        1,
+        runPlan.maxStepsForRun,
+        "model",
+        false,
+      );
       throw error;
     }
     if (stopIfRequested(1)) {
@@ -5261,6 +7060,13 @@ export async function runAgentMission({
       if (stopIfRequested(1)) {
         return;
       }
+      await finishErroredRunFromException(
+        error,
+        1,
+        runPlan.maxStepsForRun,
+        "model",
+        false,
+      );
       throw error;
     }
     if (stopIfRequested(1)) {
@@ -5317,6 +7123,13 @@ export async function runAgentMission({
       if (stopIfRequested(1)) {
         return;
       }
+      await finishErroredRunFromException(
+        error,
+        1,
+        runPlan.maxStepsForRun,
+        "model",
+        false,
+      );
       throw error;
     }
     if (stopIfRequested(1)) {
@@ -5691,6 +7504,31 @@ export async function runAgentMission({
     );
 
     if (responseToolCalls.length === 0) {
+      const plannedStreamTool =
+        streamingWritebackKind === "append"
+          ? "append_to_current_file"
+          : streamingWritebackKind === "replace"
+            ? "replace_current_file"
+            : streamingWritebackKind === "edit"
+              ? "edit_current_section"
+              : null;
+      const pendingToolsBeforeStream = pendingRequiredWritesBeforeToolUse.filter(
+        (name) => name !== plannedStreamTool,
+      );
+      if (
+        streamingWritebackKind &&
+        pendingToolsBeforeStream.length > 0 &&
+        step < stepLimit
+      ) {
+        events.onStatus?.(
+          "Required note operation is still pending; asking model to complete it before streamed writeback...",
+        );
+        messages.push({
+          role: "system" as const,
+          content: buildWriteCorrectionPrompt(pendingToolsBeforeStream),
+        });
+        continue;
+      }
       if (
         streamingWritebackKind &&
         (streamingWritebackKind !== "edit" || preparedStreamingSectionEdit)
@@ -6480,8 +8318,14 @@ export async function runAgentMission({
       }
 
       if (
-        streamingWritebackKind !== null &&
-        toolCall.name === getStreamingWritebackToolName(streamingWritebackKind) &&
+        ((streamingWritebackKind !== null &&
+          toolCall.name === getStreamingWritebackToolName(streamingWritebackKind)) ||
+          (enableStreaming &&
+            [
+              "append_to_current_file",
+              "replace_current_file",
+              "edit_current_section",
+            ].includes(toolCall.name))) &&
         requiresVerifiedFinalOutput(missionPlan, researchPlan)
       ) {
         const message =
@@ -6530,7 +8374,11 @@ export async function runAgentMission({
         continue;
       }
 
-      if (READ_ONLY_TOOL_NAMES.has(toolCall.name)) {
+      if (
+        isDescriptorApprovedParallelRead(
+          toolRegistry.getDescriptor?.(toolCall.name),
+        )
+      ) {
         const batch: Array<{ call: ModelToolCall; index: number }> = [];
         for (
           let batchIndex = toolIndex;
@@ -6542,7 +8390,9 @@ export async function runAgentMission({
           const candidate = responseToolCalls[batchIndex];
           if (
             !allowedToolNames.has(candidate.name) ||
-            !READ_ONLY_TOOL_NAMES.has(candidate.name)
+            !isDescriptorApprovedParallelRead(
+              toolRegistry.getDescriptor?.(candidate.name),
+            )
           ) {
             break;
           }
@@ -6554,14 +8404,48 @@ export async function runAgentMission({
             `Running ${batch.length} read-only tools in parallel...`,
           );
           try {
+            // Persist and authorize every graph-node start before launching
+            // any read. MissionGraphSession serializes journal writes, but the
+            // tool executions themselves must begin behind one barrier so a
+            // fast first read cannot finish while later reads are still being
+            // prepared.
+            const graphExecutions: Array<MissionGraphToolExecution | null> = [];
+            try {
+              for (const item of batch) {
+                graphExecutions.push(
+                  await beginMissionGraphTool(item.call.name),
+                );
+              }
+            } catch (error) {
+              for (let index = 0; index < graphExecutions.length; index += 1) {
+                const execution = graphExecutions[index];
+                if (!execution) continue;
+                await finishMissionGraphTool(
+                  execution,
+                  batch[index].call.name,
+                  {
+                    ok: false,
+                    toolName: batch[index].call.name,
+                    mutationState: "not_applied",
+                    error: {
+                      code: "parallel_graph_prepare_failed",
+                      message: getUnknownErrorMessage(error),
+                    },
+                  },
+                ).catch(() => undefined);
+              }
+              throw error;
+            }
             const results = await Promise.all(
-              batch.map(({ call, index }) =>
+              batch.map(({ call, index }, batchIndex) =>
                 runObservedModelToolCall({
                   origin: "model",
                   toolCall: call,
                   step,
                   toolIndex: index,
                   recordTranscript: false,
+                  prestartedMissionGraphExecution: graphExecutions[batchIndex],
+                  missionGraphStartPrepared: true,
                 }),
               ),
             );
@@ -6646,6 +8530,20 @@ export async function runAgentMission({
       toolNames: responseToolCalls.map((toolCall) => toolCall.name),
     });
 
+    if (missionGraphCapacityExhausted && step < stepLimit) {
+      events.onStatus?.(
+        "Mission graph capacity reached; drafting the final result from accepted evidence.",
+      );
+      tools = [];
+      allowedToolNames = new Set();
+      messages.push({
+        role: "system" as const,
+        content:
+          "The host-authorized mission graph has reached its bounded node budget. Do not request more tools. Draft the final answer now from accepted evidence and receipts.",
+      });
+      continue;
+    }
+
     const missionComplete = isMissionComplete(operationGoals);
     const completedAnyWrite = operationGoals.completedTools.some((toolName) =>
       isWriteToolName(toolName),
@@ -6664,6 +8562,108 @@ export async function runAgentMission({
     });
     const pendingStreamingWriteback =
       hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
+    const plannedStreamingWriteTool =
+      streamingWritebackKind === "append"
+        ? "append_to_current_file"
+        : streamingWritebackKind === "replace"
+          ? "replace_current_file"
+          : streamingWritebackKind === "edit"
+            ? "edit_current_section"
+            : null;
+    const pendingNonStreamingWritesAfterToolUse =
+      pendingRequiredWriteToolsAfterToolUse.filter(
+        (name) => name !== plannedStreamingWriteTool,
+      );
+    const completedTitlePrerequisiteThisStep = responseToolCalls.some(
+      (toolCall) =>
+        (toolCall.name === "rename_current_file" ||
+          toolCall.name === "retitle_current_file") &&
+        successfulToolNames.includes(toolCall.name),
+    );
+
+    if (
+      completedTitlePrerequisiteThisStep &&
+      streamingWritebackKind !== null &&
+      (streamingWritebackKind !== "edit" || preparedStreamingSectionEdit) &&
+      pendingStreamingWriteback &&
+      pendingNonStreamingWritesAfterToolUse.length === 0 &&
+      missingRequiredWebToolsAfterToolUse.length === 0
+    ) {
+      if (stopIfRequested(step)) {
+        return;
+      }
+      events.onStatus?.(
+        "Title update complete; starting content-only streamed writeback...",
+      );
+      emitRunDiagnostics({
+        events,
+        toolContext: runToolContext,
+        tools,
+        enableStreaming,
+        finalMode: "streaming_writeback",
+        runPlan,
+      });
+      let receipt: AgentRunReceipt;
+      try {
+        const committedReceipt = await runProofGatedCurrentNoteWriteback(
+          {
+            kind: streamingWritebackKind,
+            preparedSectionEdit: preparedStreamingSectionEdit,
+            modelClient,
+            messages: [
+              ...messages,
+              {
+                role: "user" as const,
+                content:
+                  "The requested title change is complete. Now generate the full requested note body. Return only the final markdown content; do not request another tool and do not return thinking without an answer.",
+              },
+            ],
+            events,
+            toolContext: runToolContext,
+            knownToolNames,
+            relevancePrompt: finalAnswerRelevancePrompt,
+            think: false,
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+          },
+          step,
+          stepLimit,
+        );
+        if (!committedReceipt) {
+          return;
+        }
+        receipt = committedReceipt;
+      } catch (error) {
+        if (stopIfRequested(step)) {
+          return;
+        }
+        await finishErroredRunFromException(error, step, stepLimit, "model");
+        throw error;
+      }
+      if (stopIfRequested(step)) {
+        return;
+      }
+      markStreamingWritebackGoalDone(operationGoals, streamingWritebackKind);
+      writeReceipts.push(receipt);
+      events.onReceipt?.(receipt);
+      await recordLedgerReceipt(receipt);
+      if (!hasPendingOperationGoals(operationGoals)) {
+        await finishRun("write_completed", lastStep, stepLimit);
+        return;
+      }
+      events.onStatus?.(
+        "Streamed write complete; remaining operation goals still pending...",
+      );
+      if (step < stepLimit) {
+        messages.push({
+          role: "system" as const,
+          content:
+            "The title and note body are complete with receipts. Continue with any remaining pending operation goals before finishing.",
+        });
+        continue;
+      }
+    }
     const operationWriteComplete =
       completedAnyWrite &&
       pendingRequiredWriteToolsAfterToolUse.length === 0 &&
@@ -6891,7 +8891,9 @@ export async function runAgentMission({
         });
       }
       if (recoveryDecision.status === "block") {
-        missionPlan = applyRecoveryToPlan(missionPlan, recoveryDecision);
+        missionPlan = missionGraph
+          ? projectMissionGraphToLegacyPlan(missionGraph)
+          : applyRecoveryToPlan(missionPlan, recoveryDecision);
         recordLedgerBlocker(recoveryDecision.blocker ?? "Recovery blocked.");
         await persistMissionLedger(`mission-ledger-recovery-blocked-${step}`);
         if (isRepeatedToolBudgetSpent()) {
@@ -6904,7 +8906,9 @@ export async function runAgentMission({
         return;
       }
       if (recoveryDecision.updatedAction) {
-        missionPlan = applyRecoveryToPlan(missionPlan, recoveryDecision);
+        missionPlan = missionGraph
+          ? projectMissionGraphToLegacyPlan(missionGraph)
+          : applyRecoveryToPlan(missionPlan, recoveryDecision);
         if (missionLedger) {
           setLedgerMissionPlan(
             missionLedger,
@@ -9460,6 +11464,7 @@ function emitThinking(thinking: string | undefined, events: AgentRunEvents) {
 }
 
 const READ_NAV_TOOL_NAMES = new Set([
+  ...GITHUB_CATALOG_READ_TOOL_NAMES,
   "read_current_file",
   "inspect_vault_context",
   "inspect_vault_index",
@@ -9482,16 +11487,28 @@ const READ_NAV_TOOL_NAMES = new Set([
   "memory_search",
   "list_templates",
   "read_template",
+  "read_design_canvas",
+  "read_svg_design",
+  "read_mermaid_block",
   "browser_observe",
   "browser_screenshot",
   "browser_extract_markdown",
 ]);
 
 const WRITE_TOOL_NAMES = new Set([
+  ...GITHUB_CATALOG_MUTATION_TOOL_NAMES.filter(
+    (name) => !GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES.includes(
+      name as (typeof GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES)[number],
+    ),
+  ),
+  PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+  PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
   "open_web_source",
   "create_design_canvas",
   "update_design_canvas",
   "create_svg_design",
+  "update_svg_design",
+  "upsert_mermaid_block",
   "create_design_package",
   "export_workspace_artifact",
   "memory_write_observation",
@@ -9523,6 +11540,7 @@ const WRITE_TOOL_NAMES = new Set([
 ]);
 
 const DELETE_TOOL_NAMES = new Set([
+  ...GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES,
   "delete_path",
   "delete_current_file",
   "delete_research_memory_entry",
@@ -9584,6 +11602,30 @@ const TOOL_GOALS: Partial<Record<string, OperationGoal[]>> = {
 };
 
 const CODE_TOOL_NAMES = new Set([
+  "code_workspace_create",
+  "code_workspace_status",
+  "code_workspace_stat",
+  "code_workspace_list",
+  "code_workspace_read",
+  "code_workspace_search",
+  "code_workspace_mkdir",
+  "code_workspace_create_file",
+  "code_workspace_append",
+  "code_workspace_write_expected",
+  "code_workspace_patch",
+  "code_workspace_move",
+  "code_workspace_copy",
+  "code_workspace_trash",
+  "code_workspace_restore",
+  "code_repository_detect_profile",
+  "code_sandbox_status",
+  "code_validate_fast",
+  "code_validate_targeted",
+  "code_validate_full",
+  "code_repair_status",
+  "code_repair_record_cycle",
+  "code_commit_verified",
+  "code_validate_commit_prepared",
   "run_code_block",
   "render_html_preview",
   "write_workspace_file",
@@ -9593,6 +11635,22 @@ const CODE_TOOL_NAMES = new Set([
   "preview_workspace_html",
   "export_workspace_artifact",
   "install_code_dependency",
+]);
+const CODE_READ_ONLY_TOOL_NAMES = new Set([
+  "code_workspace_create",
+  "code_workspace_status",
+  "code_workspace_stat",
+  "code_workspace_list",
+  "code_workspace_read",
+  "code_workspace_search",
+  "code_repository_detect_profile",
+  "code_sandbox_status",
+  "read_workspace_file",
+  "list_workspace_files",
+  "preview_workspace_html",
+  "export_workspace_artifact",
+  "render_html_preview",
+  "code_repair_status",
 ]);
 const BROWSER_TOOL_NAMES = new Set([
   "browser_open_page",
@@ -9615,6 +11673,15 @@ const MEMORY_TOOL_NAMES = new Set([
 type ToolAuthority = "read" | "write" | "edit" | "delete" | "web" | "code";
 
 const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
+  ...Object.fromEntries(
+    GITHUB_CATALOG_READ_TOOL_NAMES.map((name) => [name, "read" as const]),
+  ),
+  ...Object.fromEntries(
+    GITHUB_CATALOG_MUTATION_TOOL_NAMES.map((name) => [name, "write" as const]),
+  ),
+  ...Object.fromEntries(
+    GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES.map((name) => [name, "delete" as const]),
+  ),
   read_current_file: "read",
   inspect_vault_context: "read",
   inspect_vault_index: "read",
@@ -9636,6 +11703,9 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   review_research_memory: "read",
   list_templates: "read",
   read_template: "read",
+  read_design_canvas: "read",
+  read_svg_design: "read",
+  read_mermaid_block: "read",
   seed_default_templates: "write",
   create_template: "write",
   fill_template: "write",
@@ -9681,9 +11751,34 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   preview_workspace_html: "code",
   export_workspace_artifact: "code",
   install_code_dependency: "code",
+  code_workspace_create: "code",
+  code_workspace_status: "code",
+  code_workspace_stat: "code",
+  code_workspace_list: "code",
+  code_workspace_read: "code",
+  code_workspace_search: "code",
+  code_workspace_mkdir: "code",
+  code_workspace_create_file: "code",
+  code_workspace_append: "code",
+  code_workspace_write_expected: "code",
+  code_workspace_patch: "code",
+  code_workspace_move: "code",
+  code_workspace_copy: "code",
+  code_workspace_trash: "code",
+  code_workspace_restore: "code",
+  code_repository_detect_profile: "code",
+  code_sandbox_status: "code",
+  code_validate_fast: "code",
+  code_validate_targeted: "code",
+  code_validate_full: "code",
+  code_repair_status: "code",
+  code_repair_record_cycle: "code",
+  code_commit_verified: "code",
   create_design_canvas: "write",
   update_design_canvas: "write",
   create_svg_design: "write",
+  update_svg_design: "write",
+  upsert_mermaid_block: "write",
   create_design_package: "write",
   memory_search: "read",
   memory_write_observation: "write",
@@ -9692,6 +11787,69 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   memory_write_source: "write",
   rebuild_semantic_index: "write",
 };
+
+const PREPARED_BACKGROUND_GITHUB_TOOL_NAMES = [
+  "github_publish_verified_branch",
+  "github_create_draft_pull_request",
+  "github_update_owned_branch",
+  "github_merge_pull_request",
+  "github_enable_auto_merge",
+] as const;
+
+type PreparedBackgroundGitHubToolName =
+  (typeof PREPARED_BACKGROUND_GITHUB_TOOL_NAMES)[number];
+
+function isPreparedBackgroundGitHubToolName(
+  value: string,
+): value is PreparedBackgroundGitHubToolName {
+  return PREPARED_BACKGROUND_GITHUB_TOOL_NAMES.includes(
+    value as PreparedBackgroundGitHubToolName,
+  );
+}
+
+function getRequestedPreparedBackgroundGitHubTools(
+  prompt: string,
+): PreparedBackgroundGitHubToolName[] {
+  if (
+    !hasExplicitBackgroundContinuationIntent(prompt) ||
+    !hasExplicitGitHubPublicationIntent(prompt)
+  ) {
+    return [];
+  }
+  const normalized = prompt.toLowerCase();
+  if (/\b(?:enable|turn on)\s+auto[- ]merge\b/u.test(normalized)) {
+    return ["github_enable_auto_merge"];
+  }
+  if (/\b(?:merge|squash)\b[\s\S]{0,80}\b(?:pull request|pr)\b/u.test(normalized)) {
+    return ["github_merge_pull_request"];
+  }
+  if (
+    /\b(?:review repair|address review|requested changes|update owned branch|fast[- ]forward)\b/u.test(
+      normalized,
+    )
+  ) {
+    return ["github_update_owned_branch"];
+  }
+  if (
+    /\b(?:create|open)\b[\s\S]{0,40}\bdraft\s+(?:pull request|pr)\b/u.test(
+      normalized,
+    ) &&
+    !/\bpush\b/u.test(normalized)
+  ) {
+    return ["github_create_draft_pull_request"];
+  }
+  if (
+    /\bpush\b[\s\S]{0,60}\b(?:branch|commit)\b/u.test(normalized) &&
+    !/\b(?:pull request|\bpr\b)\b/u.test(normalized)
+  ) {
+    return ["github_publish_verified_branch"];
+  }
+  // Publication is deliberately two independently approved, reconciled nodes.
+  return [
+    "github_publish_verified_branch",
+    "github_create_draft_pull_request",
+  ];
+}
 
 function getAllowedToolDefinitions(
   toolRegistry: ToolRegistry,
@@ -9750,6 +11908,7 @@ function getAllowedToolDefinitions(
   const allowSemanticSearch =
     isSemanticSearchEnabled(settings) &&
     (allowResume ||
+      allowParallelVaultInspection ||
       hasConceptualVaultSearchIntent(prompt) ||
       hasReflexReadLabel(["semantic_vault_search", "graph_context"]));
   const allowSemanticIndexInspect =
@@ -9761,7 +11920,12 @@ function getAllowedToolDefinitions(
     isSemanticIndexEnabled(settings) && hasSemanticIndexMaintenanceIntent(prompt);
   const allowOpenWebSource = hasOpenWebSourceIntent(prompt);
   const allowCodeExecution = hasCodeExecutionIntent(prompt);
-  const allowHtmlPreview = hasHtmlPreviewIntent(prompt) || allowCodeExecution;
+  const allowCodeWorkspaceRead = hasCodeWorkspaceReadIntent(prompt);
+  const explicitCodeToolNames = getExplicitCodeToolNames(prompt);
+  const allowHtmlPreview =
+    hasHtmlPreviewIntent(prompt) ||
+    allowCodeExecution ||
+    explicitCodeToolNames.includes("render_html_preview");
   const allowDesignTools = hasDesignIntent(prompt);
   const allowDesignPackage = hasDesignPackageIntent(prompt);
   const allowBrowserTools = hasBrowserAutomationIntent(prompt);
@@ -9773,9 +11937,25 @@ function getAllowedToolDefinitions(
       hasBrowserAutomationIntent(prompt) ||
       hasLongResearchIntent(prompt) ||
       hasResearchMemoryIntent(prompt));
-  const allowCanvasDesign = hasCanvasDesignIntent(prompt);
+  const allowCanvasDesign =
+    hasCanvasDesignIntent(prompt) && !/\bsvg\b/i.test(prompt);
   const allowSvgDesign = hasSvgDesignIntent(prompt);
+  const allowMermaidDesign =
+    hasMermaidDesignIntent(prompt) &&
+    !hasExplicitCanvasDestinationIntent(prompt);
   const linearIntent = detectLinearIntent(prompt);
+  const githubCatalogIntent = hasExplicitGitHubCatalogIntent(prompt);
+  const githubCatalogMutationNames = new Set(
+    getExplicitGitHubCatalogMutationToolNames(prompt),
+  );
+  const githubCatalogReadNames = new Set(getGitHubCatalogReadToolNames(prompt));
+  const selectedGitHubCatalogNames =
+    githubCatalogMutationNames.size > 0
+      ? githubCatalogMutationNames
+      : githubCatalogReadNames;
+  const preparedBackgroundGitHubNames = new Set(
+    getRequestedPreparedBackgroundGitHubTools(prompt),
+  );
   const allowVaultBrowse =
     missionIntent.vaultContext ||
     allowResume ||
@@ -9801,6 +11981,33 @@ function getAllowedToolDefinitions(
 
   const filtered = toolRegistry.getDefinitions().filter((definition) => {
     const name = definition.function.name;
+
+    if (name === PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) {
+      return (
+        settings?.linearEnabled === true &&
+        linearIntent.explicit &&
+        hasExplicitResearchPublicationIntent(prompt)
+      );
+    }
+
+    if (name === PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME) {
+      return (
+        hasExplicitGitHubPublicationIntent(prompt) &&
+        preparedBackgroundGitHubNames.size === 0
+      );
+    }
+
+    if (isPreparedBackgroundGitHubToolName(name)) {
+      return preparedBackgroundGitHubNames.has(name);
+    }
+
+    if (isGitHubCatalogToolName(name)) {
+      return (
+        settings?.githubEnabled === true &&
+        githubCatalogIntent &&
+        selectedGitHubCatalogNames.has(name)
+      );
+    }
 
     if (name.startsWith("linear_")) {
       if (settings?.linearEnabled !== true || !linearIntent.explicit) {
@@ -9841,7 +12048,19 @@ function getAllowedToolDefinitions(
     }
 
     if (CODE_TOOL_NAMES.has(name)) {
-      return allowCodeExecution;
+      if (name === "code_validate_commit_prepared") {
+        return hasPreparedBackgroundCodeValidationCommitIntent(prompt);
+      }
+      return (
+        (allowCodeExecution ||
+          allowCodeWorkspaceRead ||
+          explicitCodeToolNames.length > 0) &&
+        isCodeToolAllowedForPrompt(name, prompt)
+      );
+    }
+
+    if (name === "read_design_canvas") {
+      return hasReviseDesignIntent(prompt) && allowCanvasDesign;
     }
 
     if (name === "create_design_canvas") {
@@ -9854,6 +12073,22 @@ function getAllowedToolDefinitions(
 
     if (name === "create_svg_design") {
       return allowDesignTools && allowSvgDesign;
+    }
+
+    if (name === "read_svg_design") {
+      return hasReviseDesignIntent(prompt) && allowSvgDesign;
+    }
+
+    if (name === "update_svg_design") {
+      return hasReviseDesignIntent(prompt) && allowSvgDesign;
+    }
+
+    if (name === "read_mermaid_block") {
+      return hasReviseDesignIntent(prompt) && allowMermaidDesign;
+    }
+
+    if (name === "upsert_mermaid_block") {
+      return hasReviseDesignIntent(prompt) && allowMermaidDesign;
     }
 
     if (name === "create_design_package") {
@@ -10025,6 +12260,7 @@ function getAllowedToolDefinitions(
 
     if (name === "rename_current_file") {
       return (
+        !hasDesignIntent(prompt) &&
         allowVisibleRename &&
         !preferPathTarget &&
         !allowEdit &&
@@ -10033,7 +12269,11 @@ function getAllowedToolDefinitions(
     }
 
     if (name === "edit_current_section") {
-      return allowEdit && streamingWritebackKind !== "edit";
+      return (
+        !hasDesignIntent(prompt) &&
+        allowEdit &&
+        streamingWritebackKind !== "edit"
+      );
     }
 
     if (name === "replace_current_file") {
@@ -10063,6 +12303,7 @@ function getAllowedToolDefinitions(
       "get_note_graph_context",
       "find_related_notes",
       "list_markdown_files",
+      "read_markdown_files",
       "append_to_current_file",
     ]);
   }
@@ -10130,7 +12371,11 @@ function isAllowedForMission(
       return hasDesignIntent(prompt);
     }
 
-    if (name === "update_design_canvas") {
+    if (
+      name === "update_design_canvas" ||
+      name === "update_svg_design" ||
+      name === "upsert_mermaid_block"
+    ) {
       return hasReviseDesignIntent(prompt);
     }
 
@@ -10167,7 +12412,16 @@ function isAllowedForMission(
   }
 
   if (CODE_TOOL_NAMES.has(name)) {
-    return hasCodeExecutionIntent(prompt) || hasHtmlPreviewIntent(prompt);
+    if (name === "code_validate_commit_prepared") {
+      return hasPreparedBackgroundCodeValidationCommitIntent(prompt);
+    }
+    return (
+      (hasCodeExecutionIntent(prompt) ||
+        hasCodeWorkspaceReadIntent(prompt) ||
+        getExplicitCodeToolNames(prompt).length > 0 ||
+        hasHtmlPreviewIntent(prompt)) &&
+      isCodeToolAllowedForPrompt(name, prompt)
+    );
   }
 
   return true;
@@ -10237,6 +12491,8 @@ function isToolWithinAutonomyScope(
     name === "create_design_canvas" ||
     name === "update_design_canvas" ||
     name === "create_svg_design" ||
+    name === "update_svg_design" ||
+    name === "upsert_mermaid_block" ||
     name === "create_design_package"
   ) {
     return scope.write.artifacts;
@@ -10505,6 +12761,38 @@ function getRequiredWriteToolNames(
   missionIntent: MissionIntent,
   streamingWritebackKind: StreamingWritebackKind | null = null,
 ): string[] {
+  if (
+    allowedToolNames.has(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) &&
+    hasExplicitResearchPublicationIntent(prompt)
+  ) {
+    return [PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME];
+  }
+  const preparedBackgroundGitHubTools =
+    getRequestedPreparedBackgroundGitHubTools(prompt).filter((name) =>
+      allowedToolNames.has(name),
+    );
+  if (preparedBackgroundGitHubTools.length > 0) {
+    return preparedBackgroundGitHubTools;
+  }
+  if (
+    allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME) &&
+    hasExplicitGitHubPublicationIntent(prompt)
+  ) {
+    return [PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME];
+  }
+  const explicitGitHubMutationToolNames =
+    getExplicitGitHubCatalogMutationToolNames(prompt).filter((name) =>
+      allowedToolNames.has(name),
+    );
+  if (explicitGitHubMutationToolNames.length > 0) {
+    return explicitGitHubMutationToolNames;
+  }
+  const explicitCodeToolNames = getExplicitCodeToolNames(prompt).filter((name) =>
+    allowedToolNames.has(name),
+  );
+  if (explicitCodeToolNames.length > 0) {
+    return explicitCodeToolNames;
+  }
   const requiredToolNames: string[] = [];
   const wholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
   const noteOutputIntent = missionIntent.noteOutput;
@@ -10580,7 +12868,16 @@ function getRequiredWriteToolNames(
   }
 
   if (hasDesignIntent(prompt) || hasReviseDesignIntent(prompt)) {
-    if (hasReviseDesignIntent(prompt) && hasCanvasDesignIntent(prompt)) {
+    if (hasExplicitCanvasDestinationIntent(prompt)) {
+      requiredToolNames.push("create_design_canvas");
+    } else if (hasReviseDesignIntent(prompt) && hasMermaidDesignIntent(prompt)) {
+      requiredToolNames.push("read_mermaid_block");
+      requiredToolNames.push("upsert_mermaid_block");
+    } else if (hasReviseDesignIntent(prompt) && hasSvgDesignIntent(prompt)) {
+      requiredToolNames.push("read_svg_design");
+      requiredToolNames.push("update_svg_design");
+    } else if (hasReviseDesignIntent(prompt) && hasCanvasDesignIntent(prompt)) {
+      requiredToolNames.push("read_design_canvas");
       requiredToolNames.push("update_design_canvas");
       if (
         /\b(create|draw|make|generate|build|draft)\b/i.test(prompt) &&
@@ -10599,9 +12896,14 @@ function getRequiredWriteToolNames(
     }
   }
 
-  if (hasMarkdownTitleContentIntent(prompt) && !preferPathTarget) {
+  if (
+    !hasDesignIntent(prompt) &&
+    hasMarkdownTitleContentIntent(prompt) &&
+    !preferPathTarget
+  ) {
     requiredToolNames.push("retitle_current_file");
   } else if (
+    !hasDesignIntent(prompt) &&
     !preferPathTarget &&
     (isExplicitVisibleFileRenameIntent(prompt) ||
       (isVisibleTitleRenameIntent(prompt) && isTitleOnlyIntent(prompt)))
@@ -10637,7 +12939,69 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("link_related_notes_in_current_file");
   }
 
+  requiredToolNames.push(...getRequiredCodeWorkflowToolNames(prompt));
+
   return requiredToolNames.filter((name) => allowedToolNames.has(name));
+}
+
+function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
+  const repositoryRead = hasCodeWorkspaceReadIntent(prompt);
+  const repositoryMutation = hasRepositoryCodeMutationIntent(prompt);
+  const explicitToolNames = getExplicitCodeToolNames(prompt);
+  if (explicitToolNames.length > 0) {
+    return explicitToolNames;
+  }
+  if (!repositoryRead && !repositoryMutation) {
+    return [];
+  }
+
+  const tools: string[] = [];
+  if (repositoryMutation) {
+    tools.push("code_sandbox_status");
+  }
+  tools.push("code_workspace_create");
+
+  if (!repositoryMutation) {
+    tools.push(
+      /\b(search|find)\b/i.test(prompt)
+        ? "code_workspace_search"
+        : /\b(stat|metadata|size|hash)\b/i.test(prompt)
+          ? "code_workspace_stat"
+          : /\b(read|open|show)\b[\s\S]{0,80}\b(file|source|path)\b/i.test(prompt)
+            ? "code_workspace_read"
+            : "code_workspace_list",
+    );
+    return tools;
+  }
+
+  if (hasRepositoryCodeEditIntent(prompt)) {
+    const editTool =
+      /\b(create|add|new)\b[\s\S]{0,80}\b(folder|directory)\b/i.test(prompt)
+        ? "code_workspace_mkdir"
+        : /\b(copy|duplicate)\b[\s\S]{0,80}\b(file|folder|directory|path)\b/i.test(prompt)
+          ? "code_workspace_copy"
+          : /\b(rename|move)\b[\s\S]{0,80}\b(file|folder|directory|path)\b/i.test(prompt)
+            ? "code_workspace_move"
+            : /\b(remove|delete|trash)\b[\s\S]{0,80}\b(file|folder|directory|path)\b/i.test(prompt)
+              ? "code_workspace_trash"
+              : /\b(create|add|new)\b[\s\S]{0,80}\b(file|module|component|class|test)\b/i.test(prompt)
+                ? "code_workspace_create_file"
+                : /\bappend\b/i.test(prompt)
+                  ? "code_workspace_append"
+                  : "code_workspace_patch";
+    tools.push(editTool, "code_validate_fast", "code_repair_record_cycle");
+  }
+
+  if (
+    hasRepositoryCodeEditIntent(prompt) ||
+    /\b(validate|test|build|compile|commit)\b/i.test(prompt)
+  ) {
+    tools.push("code_validate_targeted", "code_validate_full");
+  }
+  if (hasRepositoryCodeEditIntent(prompt) || /\bcommit\b/i.test(prompt)) {
+    tools.push("code_commit_verified");
+  }
+  return [...new Set(tools)];
 }
 
 function buildWriteCorrectionPrompt(requiredWriteTools: string[]): string {
@@ -10959,6 +13323,12 @@ function shouldAllowWebSearch(
   prompt: string,
   missionIntent: MissionIntent,
 ): boolean {
+  if (
+    getExplicitCodeToolNames(prompt).length > 0 &&
+    !hasExplicitCodeWebResearchIntent(prompt)
+  ) {
+    return false;
+  }
   if (!hasWebSearchIntent(prompt)) {
     return false;
   }
@@ -11554,6 +13924,21 @@ function getStreamingWritebackKind(
 
 function classifyMissionIntent(prompt: string): MissionIntent {
   const generated = analyzeGeneratedOutputPrompt(prompt);
+  const explicitGitHubCatalogMutation =
+    getExplicitGitHubCatalogMutationToolNames(prompt).length > 0;
+  const explicitCodeToolNames = getExplicitCodeToolNames(prompt);
+  const codeWorkflowIntent =
+    explicitCodeToolNames.length > 0 ||
+    hasRepositoryCodeMutationIntent(prompt) ||
+    hasCodeWorkspaceReadIntent(prompt);
+  const codeWorkflowMutation =
+    hasRepositoryCodeMutationIntent(prompt) ||
+    explicitCodeToolNames.some((name) => !CODE_READ_ONLY_TOOL_NAMES.has(name));
+  const codeWorkflowNoteTarget =
+    hasCurrentPageWritebackIntent(prompt) ||
+    /\b(?:current|this|active)\s+(?:note|page|document|markdown)\b|\b(?:obsidian|vault)\s+(?:note|markdown)\b/i.test(
+      prompt,
+    );
   const resetAction = analyzeCurrentNoteResetPrompt(prompt);
   const explicitGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
   const explicitTemplateWrite =
@@ -11575,9 +13960,13 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     explicitHighlightWrite ||
     explicitRestoreWrite;
   const explicitDelete =
+    !explicitGitHubCatalogMutation &&
     resetAction.kind !== "replace_current_note" &&
+    (!codeWorkflowIntent || codeWorkflowNoteTarget) &&
     (hasDeleteIntent(prompt) || hasDeletePathIntent(prompt));
   const explicitMutation =
+    explicitGitHubCatalogMutation ||
+    codeWorkflowMutation ||
     explicitPersistence ||
     hasCreateFileIntent(prompt) ||
     hasCreateFolderIntent(prompt) ||
@@ -11611,6 +14000,7 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     !explicitResearchMemoryWrite &&
     !webAnswerOnly &&
     !isVaultWideOrganizeIntent(prompt) &&
+    (!codeWorkflowIntent || codeWorkflowNoteTarget) &&
     (hasNoteOutputIntent(prompt) ||
       isCurrentNoteEditOrganizeIntent(prompt) ||
       isWholeNoteEditIntent(prompt) ||
@@ -11691,7 +14081,17 @@ function buildMissionIntent(
   intent: Omit<MissionIntent, "autonomyScope">,
 ): MissionIntent {
   const autonomyScope = deriveAutonomyScope(prompt, intent);
-  if (intent.explicitMutation && isBroadUnscopedVaultMutation(autonomyScope)) {
+  if (
+    getExplicitCodeToolNames(prompt).length > 0 &&
+    !hasExplicitCodeWebResearchIntent(prompt)
+  ) {
+    autonomyScope.read.web = false;
+  }
+  if (
+    intent.explicitMutation &&
+    !getExplicitGitHubCatalogMutationToolNames(prompt).length &&
+    isBroadUnscopedVaultMutation(autonomyScope)
+  ) {
     return {
       ...intent,
       noteOutput: false,
@@ -12076,9 +14476,91 @@ function hasOpenWebSourceIntent(prompt: string): boolean {
 }
 
 function hasCodeExecutionIntent(prompt: string): boolean {
+  return (
+    hasStandaloneCodeExecutionIntent(prompt) ||
+    hasRepositoryCodeMutationIntent(prompt)
+  );
+}
+
+function hasStandaloneCodeExecutionIntent(prompt: string): boolean {
   return /\b(run|execute|eval|evaluate|test|compile)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile)\b/i.test(
     prompt,
   );
+}
+
+export function hasPreparedBackgroundCodeValidationCommitIntent(
+  prompt: string,
+): boolean {
+  if (
+    /\b(?:do\s+not|don't|never)\s+(?:invoke|use|run|execute|dispatch|continue)\b/i.test(
+      prompt,
+    )
+  ) {
+    return false;
+  }
+  const exactToolAction =
+    /\b(?:invoke|use|run|execute|dispatch)\s+(?:only\s+)?code_validate_commit_prepared\b/i.test(
+      prompt,
+    );
+  const explicitBackgroundAction =
+    /\b(?:continue|dispatch|run|execute|perform|start|invoke|use)\b[\s\S]{0,200}\b(?:background|companion|headless)\b|\b(?:background|companion|headless)\b[\s\S]{0,200}\b(?:continue|dispatch|run|execute|perform|start|invoke|use)\b/i.test(
+      prompt,
+    );
+  const trustedTaskMarker =
+    exactToolAction ||
+    /\brepairCheckpointId\b|\brepairRequestId\b|\btrusted\s+workspace\b|\bcontinue\s+run\s+[A-Za-z0-9._:-]+\b|\bexact\s+prepared\s+code\s+validation\s+commit\b/i.test(
+      prompt,
+    );
+  return (
+    trustedTaskMarker &&
+    explicitBackgroundAction &&
+    /\bcode\b/i.test(prompt) &&
+    /\b(?:validate|validation)\b/i.test(prompt) &&
+    /\bcommit\b/i.test(prompt)
+  );
+}
+
+function hasRepositoryCodeMutationIntent(prompt: string): boolean {
+  return /\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b[\s\S]{0,180}\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b|\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b[\s\S]{0,180}\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b/i.test(
+    prompt,
+  );
+}
+
+function hasRepositoryCodeEditIntent(prompt: string): boolean {
+  return hasRepositoryCodeMutationIntent(prompt) &&
+    /\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy)\b/i.test(
+      prompt,
+    );
+}
+
+function hasCodeWorkspaceReadIntent(prompt: string): boolean {
+  return /\b(read|inspect|search|list|find|understand|analy[sz]e|review|explain|summari[sz]e|traverse)\b[\s\S]{0,180}\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b|\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b[\s\S]{0,180}\b(read|inspect|search|list|find|understand|analy[sz]e|review|explain|summari[sz]e|traverse)\b/i.test(
+    prompt,
+  );
+}
+
+function isCodeToolAllowedForPrompt(toolName: string, prompt: string): boolean {
+  if (/\b(install(?:ing|ed)?|dependency|dependencies|lockfile|bootstrap|restore)\b/i.test(prompt) === false &&
+      (toolName === "install_code_dependency")) {
+    return false;
+  }
+  if (hasRepositoryCodeMutationIntent(prompt) || hasStandaloneCodeExecutionIntent(prompt)) {
+    return true;
+  }
+  const explicit = getExplicitCodeToolNames(prompt);
+  if (explicit.length > 0) {
+    return explicit.includes(toolName);
+  }
+  return CODE_READ_ONLY_TOOL_NAMES.has(toolName);
+}
+
+function getExplicitCodeToolNames(prompt: string): string[] {
+  const normalized = prompt.toLowerCase();
+  return [...CODE_TOOL_NAMES]
+    .map((name) => ({ name, index: normalized.indexOf(name) }))
+    .filter((entry) => entry.index >= 0)
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.name);
 }
 
 function hasHtmlPreviewIntent(prompt: string): boolean {
@@ -12088,11 +14570,7 @@ function hasHtmlPreviewIntent(prompt: string): boolean {
 }
 
 function hasDesignIntent(prompt: string): boolean {
-  return (
-    /\b(create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust)\b[\s\S]{0,160}\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b|\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b[\s\S]{0,160}\b(create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust)\b/i.test(
-      prompt,
-    )
-  );
+  return hasSharedDesignIntent(prompt);
 }
 
 function hasDesignPackageIntent(prompt: string): boolean {
@@ -12102,6 +14580,12 @@ function hasDesignPackageIntent(prompt: string): boolean {
 }
 
 function hasCanvasDesignIntent(prompt: string): boolean {
+  if (hasExplicitCanvasDestinationIntent(prompt)) {
+    return true;
+  }
+  if (hasSvgDesignIntent(prompt) || hasMermaidDesignIntent(prompt)) {
+    return false;
+  }
   return (
     /\b(canvas|mind\s*map|concept\s*map|flowchart|workflow|user\s*flows?|ui\s*flows?|process\s*map|research\s*map|architecture\s*diagram|software\s+architecture|system\s+design|dependency\s*map|visual\s*map|diagram)\b/i.test(
       prompt,
@@ -12187,10 +14671,10 @@ function hasGeneratedWritingIntent(prompt: string): boolean {
 
 function hasCurrentPageWritebackIntent(prompt: string): boolean {
   return (
-    /\b(stream|write|append|save|add|insert|put|record)\b[\s\S]{0,120}\b(?:onto|to|into|in|on)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
+    /\b(stream|write|append|save|add|insert|put|record|generate|draft|compose|create)\b[\s\S]{0,120}\b(?:onto|to|into|in|on)\s+(?:this|the|current|active)\s+(?:page|note|document|file)\b/i.test(
       prompt,
     ) ||
-    /\b(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,120}\b(stream|write|append|save|add|insert|put|record)\b/i.test(
+    /\b(?:this|the|current|active)\s+(?:page|note|document|file)\b[\s\S]{0,120}\b(stream|write|append|save|add|insert|put|record|generate|draft|compose|create)\b/i.test(
       prompt,
     )
   );
@@ -12754,7 +15238,13 @@ function getMilestoneStageForTool(
     return "verify";
   }
 
-  if (toolName === "render_html_preview" || toolName === "run_code_block") {
+  if (
+    toolName === "render_html_preview" ||
+    toolName === "run_code_block" ||
+    toolName === "code_validate_fast" ||
+    toolName === "code_validate_targeted" ||
+    toolName === "code_validate_full"
+  ) {
     return "synthesize";
   }
 
@@ -12943,7 +15433,39 @@ function getToolPreparationStatus(toolName: string): string | null {
   }
 
   if (toolName === "run_code_block") {
-    return "Running explicit code block...";
+    return "Running code in the verified sandbox...";
+  }
+
+  if (toolName === "code_workspace_create") {
+    return "Preparing a durable isolated code workspace...";
+  }
+
+  if (toolName.startsWith("code_workspace_")) {
+    return "Working inside the durable code workspace...";
+  }
+
+  if (toolName === "code_repository_detect_profile") {
+    return "Detecting the trusted repository profile...";
+  }
+
+  if (toolName === "code_sandbox_status") {
+    return "Probing sandbox execution boundaries...";
+  }
+
+  if (toolName.startsWith("code_validate_")) {
+    return "Validating the workspace in a fresh sandbox...";
+  }
+
+  if (toolName === "code_repair_status") {
+    return "Reading durable code-repair progress...";
+  }
+
+  if (toolName === "code_repair_record_cycle") {
+    return "Checkpointing the verified repair cycle...";
+  }
+
+  if (toolName === "code_commit_verified") {
+    return "Preparing a verified local commit...";
   }
 
   if (toolName === "render_html_preview") {
@@ -12954,12 +15476,36 @@ function getToolPreparationStatus(toolName: string): string | null {
     return "Creating Obsidian canvas design...";
   }
 
+  if (toolName === "read_design_canvas") {
+    return "Reading the current Obsidian canvas structure...";
+  }
+
+  if (toolName === "update_design_canvas") {
+    return "Applying a hash-bound Canvas patch...";
+  }
+
   if (toolName === "create_design_package") {
     return "Creating design package...";
   }
 
   if (toolName === "create_svg_design") {
     return "Creating SVG design...";
+  }
+
+  if (toolName === "read_svg_design") {
+    return "Reading the current safe SVG structure...";
+  }
+
+  if (toolName === "update_svg_design") {
+    return "Applying a hash-bound SVG patch...";
+  }
+
+  if (toolName === "read_mermaid_block") {
+    return "Reading the selected Mermaid block and note hash...";
+  }
+
+  if (toolName === "upsert_mermaid_block") {
+    return "Applying a hash-bound Mermaid block update...";
   }
 
   if (toolName === "browser_open_page") {
@@ -13104,6 +15650,18 @@ function emitToolSuccessStatus(
 
   if (toolName === "create_svg_design" && isRecord(output)) {
     const message = `Created SVG ${String(output.path ?? "design")} with ${String(output.shapeCount ?? 0)} shapes.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "update_svg_design" && isRecord(output)) {
+    const message = `Updated SVG ${String(output.path ?? "design")} with verified backup and readback.`;
+    events.onStatus?.(message);
+    return message;
+  }
+
+  if (toolName === "upsert_mermaid_block" && isRecord(output)) {
+    const message = `Updated Mermaid block in ${String(output.path ?? "note")} with verified backup and readback.`;
     events.onStatus?.(message);
     return message;
   }
@@ -13396,17 +15954,41 @@ function buildDescriptorResourceRef(
   };
 }
 
-function hasVaultWriteReceipt(receipts: AgentRunReceipt[]): boolean {
+function hasConcreteWriteReceipt(receipts: AgentRunReceipt[]): boolean {
   return receipts.some((receipt) => {
     if (
       ["read", "list", "search", "validate"].includes(receipt.operation)
     ) {
       return false;
     }
-    return receipt.resource
-      ? receipt.resource.system === "vault"
-      : Boolean(receipt.path);
+    if (!receipt.resource) return Boolean(receipt.path);
+    if (receipt.resource.system === "vault") return true;
+    if (
+      receipt.resource.system === "workspace" ||
+      receipt.resource.system === "git"
+    ) {
+      return (
+        (/^(?:code_workspace_|write_workspace_file$|replace_workspace_text$)/u.test(
+          receipt.toolName,
+        ) &&
+          !/^code_workspace_(?:status|stat|list|read|search)$/u.test(
+            receipt.toolName,
+          )) ||
+        receipt.toolName === "code_commit_verified"
+      );
+    }
+    return false;
   });
+}
+
+function hasMermaidDesignIntent(prompt: string): boolean {
+  return /\bmermaid\b/i.test(prompt);
+}
+
+function hasExplicitCodeWebResearchIntent(prompt: string): boolean {
+  return /\b(web|internet|online|search\s+the\s+web|look\s+up|browse|sources?|citations?|cited|cite|urls?|news|up[-\s]?to[-\s]?date|fact[-\s]?check)\b/i.test(
+    prompt,
+  );
 }
 
 function sameAgentRunReceiptIdentity(
@@ -13453,13 +16035,13 @@ function hasRequiredActionReceipt(
   if (requiresExternal && !hasExternalActionReceipt(receipts)) {
     return false;
   }
-  if (requiresVault && !hasVaultWriteReceipt(receipts)) {
+  if (requiresVault && !hasConcreteWriteReceipt(receipts)) {
     return false;
   }
   if (requiresExternal || requiresVault) {
     return true;
   }
-  return hasVaultWriteReceipt(receipts) || hasExternalActionReceipt(receipts);
+  return hasConcreteWriteReceipt(receipts) || hasExternalActionReceipt(receipts);
 }
 
 function canonicalActionReceiptToAgentRunReceipt(
@@ -13605,6 +16187,14 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
     return "move";
   }
 
+  if (
+    toolName === "update_design_canvas" ||
+    toolName === "update_svg_design" ||
+    toolName === "upsert_mermaid_block"
+  ) {
+    return "update";
+  }
+
   if (toolName === "delete_path") {
     return "trash";
   }
@@ -13669,7 +16259,10 @@ function isWriteToolName(toolName: string): boolean {
     toolName === "create_folder" ||
     toolName === "open_web_source" ||
     toolName === "create_design_canvas" ||
+    toolName === "update_design_canvas" ||
     toolName === "create_svg_design" ||
+    toolName === "update_svg_design" ||
+    toolName === "upsert_mermaid_block" ||
     toolName === "create_design_package" ||
     toolName === "export_workspace_artifact" ||
     toolName === "seed_default_templates" ||
@@ -13947,10 +16540,21 @@ async function streamCurrentNoteWriteback({
       messages: [
         ...messages,
         {
-          role: "system" as const,
+          // A late system-only handoff is unreliable for agentic providers such
+          // as Kimi after the main mission prompt/tool transcript: the provider
+          // can stop after a tiny thinking-only response even with `think:false`.
+          // Make the concrete content-generation handoff a user turn so the
+          // provider emits the requested Markdown while the plugin still owns
+          // validation, streaming, and the vault mutation.
+          role: "user" as const,
           content: instruction,
         },
       ],
+      // `undefined` lets Ollama Cloud choose the model default. Some reasoning
+      // models then spend the whole response on thinking and return no content.
+      // Streamed writeback is already a content-only finalization turn, so make
+      // the non-thinking default explicit and force retries to stay content-only.
+      think: retry ? false : (think ?? false),
       options,
       abortSignal,
     };
@@ -15267,6 +17871,170 @@ function formatStreamingSectionBody(content: string, suffix: string): string {
 
 function getByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
+}
+
+function selectExplicitEffectfulGraphTools({
+  prompt,
+  allowedToolNames,
+  toolRegistry,
+}: {
+  prompt: string;
+  allowedToolNames: string[];
+  toolRegistry: ToolRegistry;
+}): string[] {
+  const promptTokens = new Set(intentMatchTokens(prompt));
+  const byAction = new Map<
+    string,
+    Array<{ name: string; score: number; explicitName: boolean }>
+  >();
+  for (const name of allowedToolNames) {
+    let descriptor: ToolDescriptor;
+    try {
+      descriptor = toolRegistry.getDescriptor?.(name) ?? descriptorFor(name);
+    } catch {
+      continue;
+    }
+    if (descriptor.effect === "read") continue;
+    const actionTokens = intentMatchTokens(descriptor.capability.action);
+    if (
+      actionTokens.length === 0 ||
+      !actionTokens.every((token) => promptTokens.has(token))
+    ) {
+      continue;
+    }
+    const systemMatches = intentMatchTokens(descriptor.capability.system).filter(
+      (token) => promptTokens.has(token),
+    ).length;
+    const resourceMatches = intentMatchTokens(
+      descriptor.capability.resourceType ?? "",
+    ).filter(
+      (token) =>
+        !actionTokens.includes(token) && promptTokens.has(token),
+    ).length;
+    const nameTokens = intentMatchTokens(name);
+    const nameMatches = nameTokens.filter((token) => promptTokens.has(token)).length;
+    const explicitName =
+      nameTokens.length > 1 && nameTokens.every((token) => promptTokens.has(token));
+    if (
+      descriptor.execution.preparation === "required" &&
+      !explicitName &&
+      systemMatches + resourceMatches === 0
+    ) {
+      continue;
+    }
+    const score =
+      100 + systemMatches * 20 + resourceMatches * 10 + nameMatches * 2;
+    const key = actionTokens.join("-");
+    const candidates = byAction.get(key) ?? [];
+    candidates.push({ name, score, explicitName });
+    byAction.set(key, candidates);
+  }
+
+  const selected: string[] = [];
+  for (const candidates of byAction.values()) {
+    candidates.sort(
+      (left, right) =>
+        Number(right.explicitName) - Number(left.explicitName) ||
+        right.score - left.score ||
+        left.name.localeCompare(right.name),
+    );
+    const best = candidates[0];
+    const next = candidates[1];
+    if (
+      best &&
+      (!next ||
+        best.explicitName !== next.explicitName ||
+        best.score > next.score)
+    ) {
+      selected.push(best.name);
+    }
+  }
+  return selected;
+}
+
+function intentMatchTokens(value: string): string[] {
+  return [
+    ...new Set(
+      (value.toLowerCase().match(/[a-z0-9]+/gu) ?? [])
+        .map((token) =>
+          token.length > 3 && token.endsWith("s") ? token.slice(0, -1) : token,
+        )
+        .filter(
+          (token) =>
+            token.length > 1 &&
+            ![
+              "to",
+              "current",
+              "tool",
+              "action",
+              "markdown",
+            ].includes(token),
+        ),
+    ),
+  ];
+}
+
+function isRunRouteValue(value: unknown): value is RunRoute {
+  return typeof value === "string" && [
+    "instant_local",
+    "direct_writeback",
+    "prefetched_vault_answer",
+    "prefetched_vault_writeback",
+    "single_model_answer",
+    "single_model_writeback",
+    "tool_required",
+    "grounded_workflow",
+  ].includes(value);
+}
+
+function missionGraphReferenceId(
+  kind: "evidence" | "receipt" | "final",
+  nodeId: string,
+  revision: number,
+): string {
+  const suffix = nodeId
+    .toLowerCase()
+    .replace(/[^a-z0-9._:-]+/g, "-")
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "") || "node";
+  return `${kind}:${Math.max(0, Math.trunc(revision))}:${suffix}`.slice(0, 128);
+}
+
+export function ensureResearchSourceLoopBudget(
+  loopBudgetPlan: LoopBudgetPlan,
+  minFetchedSources: number,
+): LoopBudgetPlan {
+  if (!Number.isFinite(minFetchedSources) || minFetchedSources <= 0) {
+    return loopBudgetPlan;
+  }
+
+  const maxToolSteps = Math.max(
+    0,
+    loopBudgetPlan.hardCap - loopBudgetPlan.finalizationReserve,
+  );
+  return {
+    ...loopBudgetPlan,
+    toolStepBudget: Math.min(
+      maxToolSteps,
+      Math.max(loopBudgetPlan.toolStepBudget, 2),
+    ),
+    expectedTools: [
+      ...new Set([
+        ...loopBudgetPlan.expectedTools,
+        "web_search",
+        "web_fetch",
+      ]),
+    ],
+    stopWhenSatisfied: true,
+  };
+}
+
+function isMissionGraphCapacityError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { missionGraphStartCode?: unknown }).missionGraphStartCode ===
+      "budget_exhausted"
+  );
 }
 
 export function sanitizeAssistantContent(content: string): string {

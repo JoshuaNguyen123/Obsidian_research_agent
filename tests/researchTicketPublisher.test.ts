@@ -88,6 +88,39 @@ test("publisher rebuilds, fingerprints, renders, and bounds synthesized ticket i
   );
 });
 
+test("publisher preview builds and deduplicates without preparing or dispatching a mutation", async () => {
+  let prepareCount = 0;
+  let executeCount = 0;
+  const publisher = publisherFixture(
+    emptyReadClient(),
+    fakeExecutor({
+      onPrepare: () => {
+        prepareCount += 1;
+      },
+      onExecute: () => {
+        executeCount += 1;
+      },
+    }),
+  );
+
+  const preview = await publisher.preview({
+    context: requestFixture().context,
+    sections: SECTIONS,
+    draft: DRAFT,
+  });
+
+  assert.equal(preview.ok, true);
+  if (!preview.ok) return;
+  assert.equal(preview.status, "create");
+  assert.equal(preview.duplicate, null);
+  assert.match(
+    preview.ticket.description,
+    /agentic-researcher:work-item:v1:start/u,
+  );
+  assert.equal(prepareCount, 0);
+  assert.equal(executeCount, 0);
+});
+
 test("publisher deduplicates only an exact signed contract in the pinned queue project", async () => {
   let executeCalls = 0;
   const searches: Array<Record<string, unknown>> = [];

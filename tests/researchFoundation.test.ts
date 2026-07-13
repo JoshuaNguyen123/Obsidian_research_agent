@@ -21,6 +21,10 @@ import {
 } from "../src/tools/sourceCache";
 import type { ToolExecutionContext } from "../src/tools/types";
 import { webFetchTool } from "../src/tools/webTools";
+import {
+  createSessionBootstrapTokenLeaseV1,
+  installCompanionBootstrapSessionV1,
+} from "../packages/headless-runtime/src";
 
 test("model payload selects bounded query-relevant passages beyond the prefix", () => {
   const content = [
@@ -62,6 +66,57 @@ test("model payload selects bounded query-relevant passages beyond the prefix", 
   const serialized = serializeToolResultForModel(result);
   assert.ok(serialized.length <= 8000);
   assert.doesNotThrow(() => JSON.parse(serialized));
+});
+
+test("model payload preserves bounded workspace hashes and trash receipts", () => {
+  const hashA = `sha256:${"a".repeat(64)}`;
+  const hashB = `sha256:${"b".repeat(64)}`;
+  const readPayload = summarizeToolOutput("code_workspace_read", {
+    ok: true,
+    toolName: "code_workspace_read",
+    output: {
+      path: "src/value.txt",
+      sha256: hashA,
+      content: "before\n",
+    },
+  });
+  assert.equal(
+    (readPayload.output as { sha256: string }).sha256,
+    hashA,
+  );
+
+  const mutationPayload = summarizeToolOutput("code_workspace_trash", {
+    ok: true,
+    toolName: "code_workspace_trash",
+    output: {
+      operation: "trash",
+      path: "src/value.txt",
+      receipt: {
+        id: "workspace-receipt-1",
+        workspaceId: "workspace-1",
+        operation: "trash",
+        path: "src/value.txt",
+        beforeSha256: hashB,
+        afterSha256: null,
+        trashId: "trash-1",
+        manifestSha256: hashA,
+        ignoredSecret: "must-not-reach-model",
+      },
+    },
+  });
+  assert.deepEqual(
+    (mutationPayload.output as { receipt: Record<string, unknown> }).receipt,
+    {
+      id: "workspace-receipt-1",
+      workspaceId: "workspace-1",
+      operation: "trash",
+      path: "src/value.txt",
+      beforeSha256: hashB,
+      afterSha256: null,
+      trashId: "trash-1",
+      manifestSha256: hashA,
+    },
+  );
 });
 
 test("web evidence persists the same source-scoped passage ids shown to the model", () => {
@@ -340,10 +395,21 @@ test("web_fetch exposes freshness controls and auto-refreshes latest missions", 
 
 test("web_fetch uses the provider-neutral companion fallback for an unparsed page", async () => {
   const originalFetch = globalThis.fetch;
+  const bootstrapToken = "research-fallback-bootstrap-token-0123456789abcdef";
+  const disconnectCompanion = installCompanionBootstrapSessionV1({
+    version: 1,
+    baseUrl: "http://127.0.0.1:8765",
+    credential: createSessionBootstrapTokenLeaseV1(bootstrapToken),
+    connectedAt: "2026-07-10T12:00:00.000Z",
+  });
   const companionCalls: string[] = [];
-  globalThis.fetch = (async (input: string | URL | Request) => {
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     companionCalls.push(url);
+    assert.equal(
+      new Headers(init?.headers).get("authorization"),
+      `Bearer ${bootstrapToken}`,
+    );
     if (url.endsWith("/health")) {
       return new Response(
         JSON.stringify({
@@ -356,17 +422,22 @@ test("web_fetch uses the provider-neutral companion fallback for an unparsed pag
       );
     }
     if (url.endsWith("/browser/open")) {
+      assertSignedBrowserRequest(init, "navigate");
       return new Response(
         JSON.stringify({
           url: "https://example.com/unparsed",
           title: "Fallback source",
           text: "",
           candidates: [],
+          pageStateHints: [],
+          observedAt: "2026-07-10T12:00:00.000Z",
+          observationFingerprint: `sha256:${"d".repeat(64)}`,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
     if (url.endsWith("/browser/extract_markdown")) {
+      assertSignedBrowserRequest(init, "extract");
       return new Response(
         JSON.stringify({
           url: "https://example.com/unparsed",
@@ -418,9 +489,25 @@ test("web_fetch uses the provider-neutral companion fallback for an unparsed pag
     assert.match(result.content, /companion browser extracted/i);
     assert.ok(companionCalls.some((url) => url.endsWith("/browser/extract_markdown")));
   } finally {
+    disconnectCompanion();
     globalThis.fetch = originalFetch;
   }
 });
+
+function assertSignedBrowserRequest(init: RequestInit | undefined, action: string): void {
+  const body = JSON.parse(String(init?.body ?? "{}")) as {
+    safetyDecision?: {
+      action?: string;
+      payloadFingerprint?: string;
+      policyFingerprint?: string;
+      signature?: string;
+    };
+  };
+  assert.equal(body.safetyDecision?.action, action);
+  assert.match(body.safetyDecision?.payloadFingerprint ?? "", /^sha256:[a-f0-9]{64}$/u);
+  assert.match(body.safetyDecision?.policyFingerprint ?? "", /^sha256:[a-f0-9]{64}$/u);
+  assert.match(body.safetyDecision?.signature ?? "", /^hmac-sha256:[a-f0-9]{64}$/u);
+}
 
 function createWebContext(
   now: () => Date,

@@ -105,6 +105,43 @@ test("double-exact fallback requires two confirmations", async () => {
   assert.equal(decision.requiredConfirmations, 2);
 });
 
+test("a fingerprinted prepared action can escalate exact approval to double exact", async () => {
+  const descriptor = descriptorFixture();
+  const action = await actionFixture(2);
+  const decision = evaluateActionPolicy({
+    toolName: descriptor.name,
+    descriptor,
+    preparedAction: action,
+    principal: "single_agent",
+    scopeAllowed: true,
+    isDesktop: true,
+    now: new Date("2026-07-11T12:01:00.000Z"),
+  });
+
+  assert.equal(decision.action, "require_approval");
+  assert.equal(decision.requiredConfirmations, 2);
+  assert.equal(decision.payloadFingerprint, action.payloadFingerprint);
+});
+
+test("high-risk reversible mutations still require exact approval under write autonomy", async () => {
+  const descriptor = descriptorFixture();
+  descriptor.risk = "high";
+  const action = await actionFixture();
+  const decision = evaluateActionPolicy({
+    toolName: descriptor.name,
+    descriptor,
+    preparedAction: action,
+    principal: "single_agent",
+    scopeAllowed: true,
+    writeAutonomy: true,
+    isDesktop: true,
+    now: new Date("2026-07-11T12:01:00.000Z"),
+  });
+  assert.equal(decision.action, "require_approval");
+  assert.equal(decision.requiredConfirmations, 1);
+  assert.equal(decision.payloadFingerprint, action.payloadFingerprint);
+});
+
 test("in-scope descriptor reads do not require a mutation grant", () => {
   const descriptor: ToolDescriptor = {
     ...descriptorFixture(),
@@ -139,7 +176,9 @@ test("in-scope descriptor reads do not require a mutation grant", () => {
   assert.ok(decision.tags.includes("read_only"));
 });
 
-async function actionFixture(): Promise<PreparedAction> {
+async function actionFixture(
+  requiredConfirmations?: 1 | 2,
+): Promise<PreparedAction> {
   return withPreparedActionFingerprint({
     version: 1,
     id: "action-1",
@@ -161,6 +200,7 @@ async function actionFixture(): Promise<PreparedAction> {
       warnings: [],
       outboundBytes: 6,
     },
+    ...(requiredConfirmations ? { requiredConfirmations } : {}),
     preparedAt: "2026-07-11T12:00:00.000Z",
     expiresAt: "2026-07-11T12:05:00.000Z",
   });

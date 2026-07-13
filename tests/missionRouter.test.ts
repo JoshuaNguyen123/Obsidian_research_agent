@@ -322,3 +322,30 @@ test("authority cannot widen replace/delete beyond regex append-only scope", () 
   });
   assert.equal(clamped.intent.writeScope, "none");
 });
+
+test("authority unions read needs but intersects generated-code execution", () => {
+  const model = normalizeRoutedMissionIntent(routedJson({
+    mode: "deep_research",
+    needsWebEvidence: true,
+    needsVaultContext: false,
+    needsCodeExecution: true,
+  }));
+  const deterministic = normalizeRoutedMissionIntent(routedJson({
+    mode: "vault_read",
+    needsWebEvidence: false,
+    needsVaultContext: true,
+    needsCodeExecution: false,
+  }));
+  assert.ok(model);
+  assert.ok(deterministic);
+
+  const resolved = resolveRoutedMissionIntent({
+    mode: "authority",
+    modelIntent: model,
+    regexIntent: deterministic,
+  });
+
+  assert.equal(resolved.intent.needsWebEvidence, true);
+  assert.equal(resolved.intent.needsVaultContext, true);
+  assert.equal(resolved.intent.needsCodeExecution, false);
+});

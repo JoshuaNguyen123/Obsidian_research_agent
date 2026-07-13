@@ -1,0 +1,239 @@
+import { spawn } from "node:child_process";
+import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  PLUGIN_ARTIFACTS,
+  PLUGIN_CATALOG,
+  validatePluginCatalog,
+} from "./plugin-catalog.mjs";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const CORE_API_PACKAGE = "@agentic-researcher/core-api";
+const HEADLESS_PACKAGE = "@agentic-researcher/headless-runtime";
+
+const RELEASE_GATES = Object.freeze({
+  core: Object.freeze({
+    builtMarkers: ["agentic-researcher:core-ready", "publish_verified_code_to_github"],
+    tests: [
+      "tests/coreExtensionApi.test.ts",
+      "tests/extensionCapabilities.test.ts",
+      "tests/extensionCapabilityGating.test.ts",
+      "tests/extensionHealthProjection.test.ts",
+      "tests/extensionToolAdapter.test.ts",
+      "tests/pluginDataV3Migration.test.ts",
+      "tests/legacyExtensionMigration.test.ts",
+    ],
+  }),
+  code: Object.freeze({
+    builtMarkers: ["code_workspace_create", "code_commit_verified"],
+    tests: [
+      "tests/codeExtensionRuntimeV2.test.ts",
+      "tests/codeExtensionWorkspaceTools.test.ts",
+      "tests/codeRepairCoordinator.test.ts",
+      "tests/codeRepairLiveAdapters.test.ts",
+      "tests/codeRepairProductionAdapters.test.ts",
+      "tests/codeRepairToolRuntime.test.ts",
+      "tests/repositoryProfileV2.test.ts",
+      "tests/sandboxManager.test.ts",
+      "tests/workspaceManagerV2.test.ts",
+    ],
+  }),
+  integrations: Object.freeze({
+    builtMarkers: ["agentic-researcher-integrations", "secure_credentials"],
+    tests: [
+      "tests/githubAuth.test.ts",
+      "tests/githubClient.test.ts",
+      "tests/githubPublicationCheckpointStore.test.ts",
+      "tests/githubPublicationTool.test.ts",
+      "tests/githubPublicationWorkflow.test.ts",
+      "tests/gitPushAttemptStore.test.ts",
+      "tests/linearCapabilityDiscovery.test.ts",
+      "tests/linearDurableContracts.test.ts",
+      "tests/linearOAuth.test.ts",
+      "tests/linearOAuthLoopback.test.ts",
+      "tests/linearOAuthRuntimeState.test.ts",
+      "tests/pendingExternalActionStateV2.test.ts",
+      "tests/researchPublicationWorkflow.test.ts",
+      "tests/secretStoreV1.test.ts",
+      "tests/secureGitPushRuntime.test.ts",
+      "tests/verifiedGitPushGateway.test.ts",
+      "tests/workItemV2Queue.test.ts",
+    ],
+  }),
+  companion: Object.freeze({
+    builtMarkers: ["agentic-researcher-companion", "background_continuation"],
+    tests: [
+      "tests/companionExtensionPersistence.test.ts",
+      "tests/companionMissionReconciliation.test.ts",
+      "tests/companionServiceController.test.ts",
+      "tests/companionWorkerCoordinator.test.ts",
+      "tests/headlessCompanionRuntime.test.ts",
+    ],
+  }),
+});
+
+async function main() {
+  const options = parseArguments(process.argv.slice(2));
+  const catalog = await validatePluginCatalog(repoRoot);
+  const selected = options.component === "all"
+    ? [...catalog]
+    : catalog.filter((plugin) => plugin.key === options.component);
+  if (selected.length === 0) {
+    throw new Error(`Unknown release component: ${options.component}.`);
+  }
+
+  const [rootPackage, coreApiPackage, headlessPackage, contractsSource] = await Promise.all([
+    readJson(path.join(repoRoot, "package.json")),
+    readJson(path.join(repoRoot, "packages", "core-api", "package.json")),
+    readJson(path.join(repoRoot, "packages", "headless-runtime", "package.json")),
+    readFile(path.join(repoRoot, "packages", "core-api", "src", "contracts.ts"), "utf8"),
+  ]);
+  assertWorkspaceCatalog(rootPackage, catalog);
+  assertCoreApiVersion(coreApiPackage, contractsSource);
+
+  for (const plugin of selected) {
+    await assertComponent(plugin, coreApiPackage.version, headlessPackage.version);
+  }
+
+  if (!options.skipTests) {
+    const tests = [
+      ...new Set(selected.flatMap((plugin) => RELEASE_GATES[plugin.key].tests)),
+    ];
+    await runNodeTests(tests);
+  }
+
+  console.log(
+    `Independent release gate passed for ${selected.map((plugin) => `${plugin.id}@${plugin.expectedVersion}`).join(", ")}${options.skipTests ? " (static checks only)" : ""}.`,
+  );
+}
+
+async function assertComponent(plugin, coreApiVersion, headlessVersion) {
+  const gate = RELEASE_GATES[plugin.key];
+  if (!gate) throw new Error(`No independent release gate is declared for ${plugin.key}.`);
+  const sourceRoot = path.resolve(repoRoot, plugin.sourceDir);
+  const [packageJson, source, built] = await Promise.all([
+    readJson(path.join(sourceRoot, "package.json")),
+    readFile(path.resolve(repoRoot, plugin.entry), "utf8"),
+    readFile(path.resolve(repoRoot, plugin.outfile), "utf8"),
+  ]);
+  for (const artifact of PLUGIN_ARTIFACTS) {
+    const artifactPath = path.join(sourceRoot, artifact);
+    const artifactStat = await stat(artifactPath).catch(() => null);
+    if (!artifactStat?.isFile() || artifactStat.size < 1) {
+      throw new Error(`Release artifact is missing or empty: ${plugin.id}/${artifact}.`);
+    }
+  }
+  if (!built.startsWith("/*\nTHIS IS A GENERATED/BUNDLED FILE BY ESBUILD\n*/")) {
+    throw new Error(`Built artifact lacks the generated banner: ${plugin.outfile}.`);
+  }
+  for (const marker of gate.builtMarkers) {
+    if (!built.includes(marker)) {
+      throw new Error(`Built capability marker ${marker} is missing from ${plugin.outfile}.`);
+    }
+  }
+  if (plugin.key === "core") return;
+  if (packageJson.dependencies?.[CORE_API_PACKAGE] !== coreApiVersion) {
+    throw new Error(
+      `${plugin.id} must pin ${CORE_API_PACKAGE} exactly to ${coreApiVersion}.`,
+    );
+  }
+  if (!source.includes("registerSoftDependentExtension")) {
+    throw new Error(`${plugin.id} does not use the core-ready registration handshake.`);
+  }
+  if (!source.includes(`id: "${plugin.id}"`) || !built.includes(plugin.expectedVersion)) {
+    throw new Error(`${plugin.id} source registration identity/version drifted from the catalog.`);
+  }
+  if (
+    (plugin.key === "code" || plugin.key === "companion") &&
+    packageJson.dependencies?.[HEADLESS_PACKAGE] !== headlessVersion
+  ) {
+    throw new Error(
+      `${plugin.id} must pin ${HEADLESS_PACKAGE} exactly to ${headlessVersion}.`,
+    );
+  }
+  for (const testFile of gate.tests) {
+    const testStat = await stat(path.join(repoRoot, testFile)).catch(() => null);
+    if (!testStat?.isFile()) {
+      throw new Error(`${plugin.id} capability gate is missing ${testFile}.`);
+    }
+  }
+}
+
+function assertWorkspaceCatalog(rootPackage, catalog) {
+  const workspaces = Array.isArray(rootPackage.workspaces) ? rootPackage.workspaces : [];
+  for (const expected of ["packages/*", "extensions/*"]) {
+    if (!workspaces.includes(expected)) {
+      throw new Error(`Root npm workspaces are missing ${expected}.`);
+    }
+  }
+  if (catalog.length !== Object.keys(RELEASE_GATES).length) {
+    throw new Error("Every catalog component must have exactly one independent release gate.");
+  }
+}
+
+function assertCoreApiVersion(packageJson, source) {
+  const major = source.match(/AGENTIC_RESEARCHER_CORE_API_MAJOR\s*=\s*(\d+)/u)?.[1];
+  const minor = source.match(/AGENTIC_RESEARCHER_CORE_API_MINOR\s*=\s*(\d+)/u)?.[1];
+  if (!major || !minor || packageJson.version !== `${major}.${minor}.0`) {
+    throw new Error(
+      `Core API package ${String(packageJson.version)} does not match its ${String(major)}.${String(minor)} runtime handshake.`,
+    );
+  }
+}
+
+function runNodeTests(files) {
+  return run(process.execPath, [
+    "--import",
+    "tsx",
+    "--test",
+    "--test-concurrency=1",
+    ...files,
+  ]);
+}
+
+function run(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: repoRoot,
+      env: process.env,
+      shell: false,
+      stdio: "inherit",
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${command} exited with code ${String(code)}.`));
+    });
+  });
+}
+
+function parseArguments(args) {
+  let component = "all";
+  let skipTests = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--component") {
+      component = args[index + 1] ?? "";
+      index += 1;
+    } else if (argument === "--skip-tests") {
+      skipTests = true;
+    } else {
+      throw new Error(`Unknown release-gate argument: ${argument}.`);
+    }
+  }
+  if (!["all", ...Object.keys(RELEASE_GATES)].includes(component)) {
+    throw new Error(`Release component must be all, core, code, integrations, or companion.`);
+  }
+  return { component, skipTests };
+}
+
+async function readJson(filePath) {
+  return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});

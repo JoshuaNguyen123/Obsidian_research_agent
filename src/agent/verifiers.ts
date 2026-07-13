@@ -585,7 +585,8 @@ function hasProof(
           : isAnyWebEvidence(item),
       ).length >= minimum;
     case "vault_evidence":
-      return taskEvidence.filter(isVaultReadEvidence).length >= minimum;
+      return taskHasRecordedProof(task, proof) ||
+        taskEvidence.filter(isVaultReadEvidence).length >= minimum;
     case "write_receipt":
     case "external_action_receipt":
     case "rename_receipt":

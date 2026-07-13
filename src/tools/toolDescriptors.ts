@@ -23,6 +23,9 @@ const VAULT_READS = new Set([
   "read_markdown_files",
   "read_research_memory",
   "read_template",
+  "read_design_canvas",
+  "read_svg_design",
+  "read_mermaid_block",
   "review_research_memory",
   "search_markdown_files",
   "search_research_memory",
@@ -85,6 +88,8 @@ const UPDATE_TOOLS = new Set([
   "replace_workspace_text",
   "retitle_current_file",
   "update_design_canvas",
+  "update_svg_design",
+  "upsert_mermaid_block",
   "write_workspace_file",
 ]);
 const REPLACE_TOOLS = new Set(["replace_current_file", "replace_file"]);

@@ -4,7 +4,10 @@ import { validateJsonCanvas } from "../src/design/jsonCanvas";
 import {
   createDesignCanvasTool,
   createSvgDesignTool,
+  readDesignCanvasTool,
+  updateDesignCanvasTool,
 } from "../src/tools/designTools";
+import { sha256DiagramContent } from "../src/design/diagramArtifactStore";
 import { openWebSourceTool } from "../src/tools/webViewerTools";
 import {
   __setCodeToolsDesktopAppForTests,
@@ -76,8 +79,9 @@ test("create_design_canvas creates and verifies a canvas artifact", async () => 
     nodeCount: 3,
     edgeCount: 2,
     summary: "Canvas sequence planned: 3 nodes, 2 edges.",
-    opened: false,
+    opened: true,
   });
+  assert.ok(mock.operations.includes("open:Designs/workflow.canvas"));
   assert.equal(mock.folders.has("Designs"), true);
   assert.match(mock.content.get("Designs/workflow.canvas") ?? "", /Read context/);
   assert.ok(mock.progress.includes("Planning canvas design for Designs/workflow.canvas..."));
@@ -217,6 +221,127 @@ test("create_svg_design creates an escaped SVG artifact", async () => {
       "SVG design planned: 4 shapes (rect, diamond, cylinder, ellipse).",
     ),
   );
+});
+
+test("Canvas read and prepared patch preserve unrelated structure with exact hashes", async () => {
+  const mock = createMockContext({
+    prompt: "Revise the existing Canvas diagram title without replacing unrelated nodes.",
+    now: new Date("2026-07-12T18:00:00.000Z"),
+  });
+  const path = "Designs/existing.canvas";
+  mock.folders.add("Designs");
+  const initial = JSON.stringify({
+    nodes: [
+      {
+        id: "title",
+        type: "text",
+        x: 0,
+        y: 0,
+        width: 720,
+        height: 120,
+        text: "# Original title",
+      },
+      {
+        id: "sentinel",
+        type: "text",
+        x: 0,
+        y: 240,
+        width: 360,
+        height: 180,
+        text: "Unrelated sentinel",
+        futureField: { preserved: true },
+      },
+    ],
+    edges: [
+      {
+        id: "title-to-sentinel",
+        fromNode: "title",
+        toNode: "sentinel",
+        label: "preserve me",
+      },
+    ],
+    futureTopLevel: { preserved: true },
+  }, null, 2);
+  mock.content.set(path, initial);
+
+  const read = await readDesignCanvasTool.execute({ path }, mock.context) as {
+    sha256: string;
+    canvas: { nodes: Array<{ id: string }> };
+  };
+  assert.equal(read.sha256, await sha256DiagramContent(initial));
+  assert.deepEqual(read.canvas.nodes.map((node) => node.id), ["title", "sentinel"]);
+
+  const context = {
+    ...mock.context,
+    runId: "run-canvas-patch",
+    operationId: "call-canvas-patch",
+  };
+  const prepared = await updateDesignCanvasTool.prepare!(
+    {
+      path,
+      baseHash: read.sha256,
+      operations: [
+        { op: "update_node", id: "title", changes: { text: "# Revised title" } },
+      ],
+    },
+    context,
+  );
+  if (!prepared.ok) assert.fail(prepared.error.message);
+  assert.equal(prepared.action.expectedTargetRevision, read.sha256);
+  assert.equal(prepared.action.preview.before?.sha256, read.sha256);
+  const executed = await updateDesignCanvasTool.executePrepared!(
+    prepared.action,
+    {
+      ...context,
+      authorizedAction: {
+        preparedActionId: prepared.action.id,
+        payloadFingerprint: prepared.action.payloadFingerprint,
+        grantId: "grant-canvas-patch",
+      },
+    },
+  );
+  const persisted = JSON.parse(mock.content.get(path) ?? "null") as any;
+  assert.equal(persisted.nodes[0].text, "# Revised title");
+  assert.deepEqual(persisted.nodes[1].futureField, { preserved: true });
+  assert.deepEqual(persisted.futureTopLevel, { preserved: true });
+  assert.equal(persisted.edges[0].label, "preserve me");
+  assert.equal(executed.receipt.operation, "update");
+  assert.equal(executed.receipt.readback.status, "verified");
+  const output = executed.output as {
+    beforeSha256: string;
+    afterSha256: string;
+    backupPath: string;
+    backupSha256: string;
+  };
+  assert.equal(output.beforeSha256, read.sha256);
+  assert.equal(output.afterSha256, await sha256DiagramContent(mock.content.get(path) ?? ""));
+  assert.equal(output.backupSha256, read.sha256);
+  assert.equal(mock.content.get(output.backupPath), initial);
+});
+
+test("Canvas patch preparation rejects a stale base hash without changing bytes", async () => {
+  const mock = createMockContext({
+    prompt: "Update the existing Canvas diagram safely.",
+  });
+  const path = "Designs/stale.canvas";
+  mock.folders.add("Designs");
+  const content = JSON.stringify({
+    nodes: [{ id: "a", type: "text", x: 0, y: 0, width: 300, height: 160, text: "A" }],
+    edges: [],
+  });
+  mock.content.set(path, content);
+  const operationsBefore = [...mock.operations];
+  const prepared = await updateDesignCanvasTool.prepare!(
+    {
+      path,
+      baseHash: `sha256:${"0".repeat(64)}`,
+      operations: [{ op: "update_node", id: "a", changes: { text: "changed" } }],
+    },
+    { ...mock.context, runId: "run-stale", operationId: "call-stale" },
+  );
+  assert.equal(prepared.ok, false);
+  assert.equal(mock.content.get(path), content);
+  assert.deepEqual(mock.operations, operationsBefore);
 });
 
 test("open_web_source creates a source note and returns fallback when window is unavailable", async () => {

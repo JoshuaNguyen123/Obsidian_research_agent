@@ -75,6 +75,14 @@ function getExpectedTools(
     return ["run_code_block"];
   }
 
+  // "Evidence" is not synonymous with "the public web". A mission that
+  // explicitly scopes deep research to the user's vault must plan local
+  // retrieval proof, otherwise the authoritative graph reserves a web-fetch
+  // node that can never be satisfied by a vault-only run.
+  if (hasVaultOnlyGroundingIntent(prompt)) {
+    return ["semantic_search_notes", "read_markdown_files"];
+  }
+
   if (generated.requiresGrounding || /\b(web|online|sources?|citations?)\b/i.test(prompt)) {
     return ["web_search", "web_fetch"];
   }
@@ -139,6 +147,18 @@ function hasLongResearchIntent(prompt: string): boolean {
   return /\b(deep\s+research|long\s+research|in-depth\s+research|deep\s+dive|investigate|compare\s+sources|multi[-\s]?source|strategy|broad\s+constraints|evidence\s+ledger|checkpoint|long[-\s]?running)\b/i.test(
     prompt,
   );
+}
+
+function hasVaultOnlyGroundingIntent(prompt: string): boolean {
+  const vaultSignal =
+    /\b(?:my\s+)?vault\b|\b(?:my|local)\s+notes?\b|\bacross\s+(?:my\s+)?notes?\b|\bsemantic(?:ally|\s+search)?\b/i.test(
+      prompt,
+    );
+  const explicitWebSignal =
+    /\bweb\b|\bonline\b|\bexternal\s+sources?\b|\bsource\s+urls?\b|\bcitations?\b|\blatest\b|\bcurrent\s+(?:events?|news|information|data)\b|https?:\/\//i.test(
+      prompt,
+    );
+  return vaultSignal && !explicitWebSignal;
 }
 
 function getFinalizationReserve(hardCap: number): number {

@@ -2,12 +2,14 @@ import {
   parseRepositoryProfileRegistry,
   type RepositoryProfileRegistryV1,
 } from "../repositories/RepositoryProfile";
-import {
-  parseWorkItemSpecV1,
-  type WorkItemExecutionClass,
-  type WorkItemRiskClass,
-  type WorkItemSpecV1,
+import type {
+  WorkItemExecutionClass,
+  WorkItemRiskClass,
 } from "../../integrations/linear/WorkItemSpecV1";
+import {
+  parseCompatibleWorkItemSpec,
+  type ParsedCompatibleWorkItemSpec,
+} from "../../integrations/linear/WorkItemSpecV2";
 import { fingerprintCanonicalJson } from "./fingerprint";
 import type {
   CandidateEligibilityV1,
@@ -47,7 +49,7 @@ export function createCandidateEligibilityPolicy(
 }
 
 export function evaluateCandidateEligibility(
-  value: WorkItemSpecV1,
+  value: ParsedCompatibleWorkItemSpec,
   input: {
     policy: CandidateEligibilityPolicyV1;
     repositories: RepositoryProfileRegistryV1;
@@ -61,9 +63,9 @@ export function evaluateCandidateEligibility(
   const at = expectIsoTimestamp(input.at, "eligibility evaluation time");
   const policyFingerprint = fingerprintCanonicalJson(input.policy);
   const reasons: CandidateIneligibilityReason[] = [];
-  let workItem: WorkItemSpecV1 | null = null;
+  let workItem: ParsedCompatibleWorkItemSpec | null = null;
   try {
-    workItem = parseWorkItemSpecV1(value);
+    workItem = parseCompatibleWorkItemSpec(value);
   } catch {
     reasons.push("invalid_work_item");
   }
@@ -105,7 +107,10 @@ export function evaluateCandidateEligibility(
   if (workItem.acceptanceCriteria.length === 0) {
     reasons.push("missing_acceptance_criteria");
   }
-  if (workItem.validationRequirements.length === 0) {
+  const validationRequirementKeys = workItem.schemaVersion === 2
+    ? workItem.validationRequirementKeys
+    : workItem.validationRequirements;
+  if (validationRequirementKeys.length === 0) {
     reasons.push("missing_validation_requirements");
   }
   if (input.policy.requireEvidence && workItem.evidenceRefs.length === 0) {

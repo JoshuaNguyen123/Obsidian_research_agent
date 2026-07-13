@@ -26,18 +26,51 @@ import type { ToolExecutionContext } from "../tools/types";
 import { normalizeVaultPath } from "../tools/validation";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
 import { normalizeOrchestratorSnapshot } from "../orchestrator/orchestratorStore";
-import type {
-  ActionReceipt,
-  AuthorizedActionContext,
-  PreparedAction,
-  ResourceRef,
-  ToolDescriptor,
+import {
+  sha256Fingerprint,
+  verifyPreparedActionFingerprint,
+  type ActionReceipt,
+  type AuthorizedActionContext,
+  type PreparedAction,
+  type ResourceRef,
+  type ToolDescriptor,
 } from "./actions";
+import {
+  linearIssueStateUpdateAttemptIdV1,
+  parsePreparedExternalActionHandoffV1,
+  type PreparedExternalActionHandoffV1,
+} from "../../packages/core-api/src/preparedExternalActionHandoffV1";
+import {
+  backgroundCodeContinuationAttemptIdV1,
+  parsePreparedBackgroundCodeActionV1,
+  type PreparedBackgroundCodeActionV1,
+} from "../../packages/core-api/src/preparedBackgroundCodeActionV1";
+import {
+  parsePreparedBackgroundCodePackageIdentityV1,
+  type PreparedBackgroundCodePackageIdentityV1,
+} from "../../packages/core-api/src/preparedBackgroundCodePackageIdentityV1";
+import {
+  backgroundGitHubActionAttemptIdV1,
+  parsePreparedBackgroundGitHubActionV1,
+  type PreparedBackgroundGitHubActionV1,
+  type PreparedBackgroundGitHubOperationV1,
+} from "../../packages/core-api/src/preparedBackgroundGitHubActionV1";
+import {
+  parsePreparedBackgroundGitHubPackageIdentityV1,
+  type PreparedBackgroundGitHubPackageIdentityV1,
+} from "../../packages/core-api/src/preparedBackgroundGitHubPackageIdentityV1";
+import {
+  parseBackgroundGitHubVerifiedResultV1,
+  type BackgroundGitHubVerifiedResultV1,
+} from "../../packages/core-api/src/backgroundGitHubVerifiedResultV1";
 
 export const MISSION_RUNTIME_SNAPSHOT_VERSION = 2 as const;
 export const ACTION_JOURNAL_RECORD_VERSION = 2 as const;
 export const MAX_RUNTIME_RECEIPTS = 256;
 export const MAX_OPERATION_JOURNAL_RECORDS = 256;
+export const MAX_EXTERNAL_ACTION_RUNTIME_LOOKUP_FILES = 256;
+export const RUNTIME_SNAPSHOT_MODIFY_TIMEOUT_MS = 15_000;
+export const RUNTIME_SNAPSHOT_READBACK_TIMEOUT_MS = 5_000;
 const MAX_CLAIM_PASSAGES = 64;
 
 const AGENT_RUNS_FOLDER = "Agent Runs";
@@ -59,6 +92,16 @@ export interface MissionRunLineage {
   segmentIndex: number;
   parentSegmentId?: string;
   priorSegmentIds: string[];
+}
+
+export interface MissionGraphStoreReferenceV1 {
+  version: 1;
+  missionId: string;
+  path: string;
+  storeRevision: number;
+  graphRevision: number;
+  recordFingerprint: string;
+  journalHeadFingerprint: string | null;
 }
 
 export interface MissionRuntimeReceipt {
@@ -94,6 +137,9 @@ export interface MissionRuntimeReceipt {
 export type OperationJournalState =
   | "intent_recorded"
   | "applying"
+  | "dispatched"
+  | "ambiguous"
+  | "readback_verified"
   | "applied"
   | "verified"
   | "committed"
@@ -104,6 +150,76 @@ export interface OperationJournalTransition {
   state: OperationJournalState;
   at: string;
   message: string;
+}
+
+export interface ExternalActionDispatchAttemptV1 {
+  version: 1;
+  provider: "linear";
+  operation: "linear_issue_state_update_v1";
+  jobId: string;
+  attemptId: string;
+  handoffFingerprint: string;
+  status:
+    | "prepared"
+    | "job_submitted"
+    | "dispatched"
+    | "ambiguous"
+    | "readback_verified";
+  preparedAt: string;
+  submittedAt: string | null;
+  dispatchedReceiptFingerprint: string | null;
+  ambiguousReceiptFingerprint: string | null;
+  verifiedReceiptFingerprint: string | null;
+  updatedAt: string;
+}
+
+export interface BackgroundCodeDispatchAttemptV1 {
+  version: 1;
+  provider: "code";
+  operation: "prepared_code_validation_commit_v1";
+  jobId: string;
+  attemptId: string;
+  handoffFingerprint: string;
+  packageFingerprint: string;
+  packageIdentityFingerprint: string;
+  status:
+    | "prepared"
+    | "job_submitted"
+    | "dispatched"
+    | "ambiguous"
+    | "readback_verified";
+  preparedAt: string;
+  submittedAt: string | null;
+  dispatchedReceiptFingerprint: string | null;
+  ambiguousReceiptFingerprint: string | null;
+  verifiedReceiptFingerprint: string | null;
+  verifiedCommitReceiptFingerprint: string | null;
+  commitSha: string | null;
+  updatedAt: string;
+}
+
+export interface BackgroundGitHubDispatchAttemptV1 {
+  version: 1;
+  provider: "github";
+  operation: PreparedBackgroundGitHubOperationV1;
+  jobId: string;
+  attemptId: string;
+  actionFingerprint: string;
+  packageFingerprint: string;
+  packageIdentityFingerprint: string;
+  status:
+    | "prepared"
+    | "job_submitted"
+    | "dispatched"
+    | "ambiguous"
+    | "readback_verified";
+  preparedAt: string;
+  submittedAt: string | null;
+  dispatchedReceiptFingerprint: string | null;
+  ambiguousReceiptFingerprint: string | null;
+  verifiedReceiptFingerprint: string | null;
+  verifiedResultFingerprint: string | null;
+  updatedAt: string;
 }
 
 /**
@@ -127,6 +243,14 @@ export interface ActionJournalRecord {
   preparedAction?: PreparedAction;
   descriptor?: ToolDescriptor;
   authorization?: AuthorizedActionContext;
+  preparedExternalActionHandoff?: PreparedExternalActionHandoffV1;
+  externalActionDispatchAttempt?: ExternalActionDispatchAttemptV1;
+  preparedBackgroundCodeAction?: PreparedBackgroundCodeActionV1;
+  preparedBackgroundCodePackage?: PreparedBackgroundCodePackageIdentityV1;
+  backgroundCodeDispatchAttempt?: BackgroundCodeDispatchAttemptV1;
+  preparedBackgroundGitHubAction?: PreparedBackgroundGitHubActionV1;
+  preparedBackgroundGitHubPackage?: PreparedBackgroundGitHubPackageIdentityV1;
+  backgroundGitHubDispatchAttempt?: BackgroundGitHubDispatchAttemptV1;
   state: OperationJournalState;
   mutationMayHaveApplied: boolean;
   receipt?: MissionRuntimeReceipt;
@@ -161,6 +285,14 @@ export interface OperationReconciliationInput {
   preparedAction?: PreparedAction;
   descriptor?: ToolDescriptor;
   authorization?: AuthorizedActionContext;
+  preparedExternalActionHandoff?: PreparedExternalActionHandoffV1;
+  externalActionDispatchAttempt?: ExternalActionDispatchAttemptV1;
+  preparedBackgroundCodeAction?: PreparedBackgroundCodeActionV1;
+  preparedBackgroundCodePackage?: PreparedBackgroundCodePackageIdentityV1;
+  backgroundCodeDispatchAttempt?: BackgroundCodeDispatchAttemptV1;
+  preparedBackgroundGitHubAction?: PreparedBackgroundGitHubActionV1;
+  preparedBackgroundGitHubPackage?: PreparedBackgroundGitHubPackageIdentityV1;
+  backgroundGitHubDispatchAttempt?: BackgroundGitHubDispatchAttemptV1;
   receipt?: MissionRuntimeReceipt;
   mutationMayHaveApplied: boolean;
   recommendedAction: OperationReconciliationAction;
@@ -177,6 +309,8 @@ export interface MissionRuntimeSnapshotV2 {
   createdAt: string;
   updatedAt: string;
   lastSafeStep: number;
+  /** Canonical graph state lives in the CAS/WAL graph store; this is a verified link. */
+  missionGraphRef?: MissionGraphStoreReferenceV1;
   missionPlan?: MissionPlanLike;
   researchPlan?: ResearchPlan;
   /** Operational two-agent projection; never enters conversation history. */
@@ -197,11 +331,102 @@ export interface MissionRuntimeSnapshotWriteResult {
   path: string;
   bytesWritten: number;
   revision: number;
+  commitProof: "vault_acknowledged" | "exact_readback";
+}
+
+export class RuntimeSnapshotWriteAmbiguousError extends Error {
+  readonly code = "runtime_snapshot_write_ambiguous";
+  readonly path: string;
+  readonly writeOutcome: "rejected" | "timed_out";
+
+  constructor({
+    path,
+    writeOutcome,
+    cause,
+  }: {
+    path: string;
+    writeOutcome: "rejected" | "timed_out";
+    cause?: unknown;
+  }) {
+    super(
+      `Mission runtime snapshot write is ambiguous for ${path}: the vault write ${
+        writeOutcome === "timed_out" ? "did not settle in time" : "was rejected"
+      } and exact readback did not match. Reconcile the run artifact before resuming.`,
+    );
+    this.name = "RuntimeSnapshotWriteAmbiguousError";
+    this.path = path;
+    this.writeOutcome = writeOutcome;
+    if (cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = cause;
+    }
+  }
+}
+
+export function isRuntimeSnapshotWriteAmbiguousError(
+  value: unknown,
+): value is RuntimeSnapshotWriteAmbiguousError {
+  return (
+    value instanceof RuntimeSnapshotWriteAmbiguousError ||
+    (isRecord(value) && value.code === "runtime_snapshot_write_ambiguous")
+  );
+}
+
+export async function settleRuntimeSnapshotModify({
+  path,
+  expectedMarkdown,
+  modify,
+  readback,
+  modifyTimeoutMs = RUNTIME_SNAPSHOT_MODIFY_TIMEOUT_MS,
+  readbackTimeoutMs = RUNTIME_SNAPSHOT_READBACK_TIMEOUT_MS,
+}: {
+  path: string;
+  expectedMarkdown: string;
+  modify: () => Promise<unknown>;
+  readback: () => Promise<string>;
+  modifyTimeoutMs?: number;
+  readbackTimeoutMs?: number;
+}): Promise<"vault_acknowledged" | "exact_readback"> {
+  const modifyOutcome = await settleBounded(
+    Promise.resolve().then(modify),
+    modifyTimeoutMs,
+  );
+  if (modifyOutcome.kind === "resolved") {
+    return "vault_acknowledged";
+  }
+
+  const readbackOutcome = await settleBounded(
+    Promise.resolve().then(readback),
+    readbackTimeoutMs,
+  );
+  if (
+    readbackOutcome.kind === "resolved" &&
+    readbackOutcome.value === expectedMarkdown
+  ) {
+    return "exact_readback";
+  }
+
+  throw new RuntimeSnapshotWriteAmbiguousError({
+    path,
+    writeOutcome:
+      modifyOutcome.kind === "timed_out" ? "timed_out" : "rejected",
+    cause:
+      modifyOutcome.kind === "rejected"
+        ? modifyOutcome.value
+        : readbackOutcome.kind === "rejected"
+          ? readbackOutcome.value
+          : undefined,
+  });
 }
 
 export interface StoredMissionRuntimeSnapshot {
   path: string;
   snapshot: MissionRuntimeSnapshotV2;
+}
+
+export interface MissionRuntimeSnapshotUpdateResult
+  extends StoredMissionRuntimeSnapshot {
+  updated: boolean;
+  writeResult: MissionRuntimeSnapshotWriteResult | null;
 }
 
 export interface LatestIncompleteMissionRuntimeSnapshot
@@ -221,6 +446,7 @@ export interface CreateMissionRuntimeSnapshotInput {
   status?: MissionRuntimeStatus;
   revision?: number;
   lastSafeStep?: number;
+  missionGraphRef?: MissionGraphStoreReferenceV1 | null;
   missionPlan?: MissionPlanLike | null;
   researchPlan?: ResearchPlan | null;
   orchestrator?: OrchestratorSnapshotV1 | null;
@@ -250,6 +476,7 @@ export function createMissionRuntimeSnapshot({
   status = "running",
   revision = 0,
   lastSafeStep = 0,
+  missionGraphRef,
   missionPlan,
   researchPlan,
   orchestrator,
@@ -273,6 +500,9 @@ export function createMissionRuntimeSnapshot({
     : null;
   const normalizedClaimPassages = normalizeClaimPassages(claimPassages);
   const normalizedConflicts = normalizeEvidenceConflicts(evidenceConflicts);
+  const normalizedMissionGraphRef = normalizeMissionGraphStoreReference(
+    missionGraphRef,
+  );
   return {
     version: MISSION_RUNTIME_SNAPSHOT_VERSION,
     revision: normalizeNonNegativeInteger(revision),
@@ -290,6 +520,9 @@ export function createMissionRuntimeSnapshot({
     createdAt: created,
     updatedAt: updated,
     lastSafeStep: normalizeNonNegativeInteger(lastSafeStep),
+    ...(normalizedMissionGraphRef
+      ? { missionGraphRef: normalizedMissionGraphRef }
+      : {}),
     missionPlan: missionPlan ?? undefined,
     researchPlan: researchPlan ?? undefined,
     ...(normalizeOrchestratorSnapshot(orchestrator, { fallbackRunId: runId })
@@ -354,6 +587,9 @@ export function normalizeMissionRuntimeSnapshot(
   }
 
   const missionPlan = normalizeMissionPlanLike(value.missionPlan);
+  const missionGraphRef = normalizeMissionGraphStoreReference(
+    value.missionGraphRef,
+  );
   const researchPlan = normalizeResearchPlan(value.researchPlan);
   const orchestrator = normalizeOrchestratorSnapshot(value.orchestrator, {
     fallbackRunId: runId,
@@ -383,6 +619,7 @@ export function normalizeMissionRuntimeSnapshot(
     createdAt,
     updatedAt,
     lastSafeStep: normalizeNonNegativeInteger(value.lastSafeStep),
+    ...(missionGraphRef ? { missionGraphRef } : {}),
     missionPlan,
     researchPlan,
     ...(orchestrator ? { orchestrator } : {}),
@@ -462,54 +699,139 @@ export async function writeMissionRuntimeSnapshot(
   }
 
   const vault = context.app.vault;
-  return withSerializedRunWrite(vault, requested.runId, async () => {
-    const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
-    if (!vault.getFolderByPath(folderPath)) {
-      try {
-        await vault.createFolder(folderPath);
-      } catch (error) {
-        if (!isAlreadyExistsError(error)) {
-          throw error;
-        }
-      }
-    }
+  return withSerializedRunWrite(vault, requested.runId, () =>
+    persistMissionRuntimeSnapshotUnlocked(context, requested, snapshot),
+  );
+}
 
-    const path = getMissionRuntimeSnapshotPath(requested.runId);
+/**
+ * Atomically patches the latest durable runtime snapshot under the same
+ * per-vault/run serialization boundary used by ordinary writes. The updater
+ * never receives a stale pre-lock object, so a companion reconciliation cannot
+ * overwrite a newer continuation or journal update with an older snapshot.
+ */
+export async function updateMissionRuntimeSnapshotByRunId(
+  context: ToolExecutionContext,
+  runId: string,
+  updater: (draft: MissionRuntimeSnapshotV2) => boolean,
+): Promise<MissionRuntimeSnapshotUpdateResult | null> {
+  if (!hasRuntimeSnapshotVaultApi(context)) {
+    return null;
+  }
+  const vault = context.app.vault;
+  return withSerializedRunWrite(vault, runId, async () => {
+    const path = getMissionRuntimeSnapshotPath(runId);
     const file = vault.getFileByPath(path);
-    let current = "";
-    let persistedRevision = 0;
-    if (file) {
-      current = await vault.read(file as TFile);
-      persistedRevision =
-        parseMissionRuntimeSnapshotFromMarkdown(current)?.revision ?? 0;
-    }
-
-    requested.revision = Math.max(requested.revision, persistedRevision) + 1;
-    requested.updatedAt = (context.now?.() ?? new Date()).toISOString();
-    const block = formatMissionRuntimeSnapshotBlock(requested);
-
     if (!file) {
-      const content = `# Agent Run ${sanitizeRunId(requested.runId)}\n\n${block}`;
-      await vault.create(path, content);
-      snapshot.revision = Math.max(snapshot.revision, requested.revision);
-      snapshot.updatedAt = requested.updatedAt;
+      return null;
+    }
+    const current = parseMissionRuntimeSnapshotFromMarkdown(
+      await vault.read(file as TFile),
+    );
+    if (!current || current.runId !== runId) {
+      throw new Error(
+        "The runtime snapshot changed identity before its atomic update.",
+      );
+    }
+    const draft = normalizeMissionRuntimeSnapshot(
+      JSON.parse(JSON.stringify(current)),
+    );
+    if (!draft) {
+      throw new Error("The current runtime snapshot cannot be updated safely.");
+    }
+    if (!updater(draft)) {
       return {
         path,
-        bytesWritten: getByteLength(content),
-        revision: requested.revision,
+        snapshot: current,
+        updated: false,
+        writeResult: null,
       };
     }
-
-    const next = replaceRuntimeSnapshotBlock(current, block);
-    await vault.modify(file as TFile, next);
-    snapshot.revision = Math.max(snapshot.revision, requested.revision);
-    snapshot.updatedAt = requested.updatedAt;
+    const requested = normalizeMissionRuntimeSnapshot(
+      JSON.parse(JSON.stringify(draft)),
+    );
+    if (!requested || requested.runId !== runId) {
+      throw new Error("The runtime snapshot updater produced invalid state.");
+    }
+    const writeResult = await persistMissionRuntimeSnapshotUnlocked(
+      context,
+      requested,
+      requested,
+    );
     return {
-      path,
-      bytesWritten: getByteLength(block),
-      revision: requested.revision,
+      path: writeResult.path,
+      snapshot: requested,
+      updated: true,
+      writeResult,
     };
   });
+}
+
+async function persistMissionRuntimeSnapshotUnlocked(
+  context: ToolExecutionContext,
+  requested: MissionRuntimeSnapshotV2,
+  revisionTarget: MissionRuntimeSnapshotV2,
+): Promise<MissionRuntimeSnapshotWriteResult> {
+  const vault = context.app.vault;
+  const folderPath = normalizeVaultPath(AGENT_RUNS_FOLDER);
+  if (!vault.getFolderByPath(folderPath)) {
+    try {
+      await vault.createFolder(folderPath);
+    } catch (error) {
+      if (!isAlreadyExistsError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  const path = getMissionRuntimeSnapshotPath(requested.runId);
+  const file = vault.getFileByPath(path);
+  let current = "";
+  let persistedRevision = 0;
+  if (file) {
+    current = await vault.read(file as TFile);
+    persistedRevision =
+      parseMissionRuntimeSnapshotFromMarkdown(current)?.revision ?? 0;
+  }
+
+  requested.revision = Math.max(requested.revision, persistedRevision) + 1;
+  requested.updatedAt = (context.now?.() ?? new Date()).toISOString();
+  const block = formatMissionRuntimeSnapshotBlock(requested);
+
+  if (!file) {
+    const content = `# Agent Run ${sanitizeRunId(requested.runId)}\n\n${block}`;
+    await vault.create(path, content);
+    revisionTarget.revision = Math.max(
+      revisionTarget.revision,
+      requested.revision,
+    );
+    revisionTarget.updatedAt = requested.updatedAt;
+    return {
+      path,
+      bytesWritten: getByteLength(content),
+      revision: requested.revision,
+      commitProof: "vault_acknowledged",
+    };
+  }
+
+  const next = replaceRuntimeSnapshotBlock(current, block);
+  const commitProof = await settleRuntimeSnapshotModify({
+    path,
+    expectedMarkdown: next,
+    modify: () => vault.modify(file as TFile, next),
+    readback: () => vault.read(file as TFile),
+  });
+  revisionTarget.revision = Math.max(
+    revisionTarget.revision,
+    requested.revision,
+  );
+  revisionTarget.updatedAt = requested.updatedAt;
+  return {
+    path,
+    bytesWritten: getByteLength(block),
+    revision: requested.revision,
+    commitProof,
+  };
 }
 
 export function canPersistMissionRuntimeSnapshot(
@@ -536,6 +858,128 @@ export async function readMissionRuntimeSnapshotByRunId(
     const snapshot = parseMissionRuntimeSnapshotFromMarkdown(markdown);
     return snapshot ? { path, snapshot } : null;
   });
+}
+
+/**
+ * Resolves the core WAL for one effectful companion lineage without deriving a
+ * runtime-note path from the canonical MissionGraph id. Every identity must
+ * match exactly and zero or multiple matches fail closed.
+ */
+export async function readMissionRuntimeSnapshotByExternalActionLineageV1(
+  context: ToolExecutionContext,
+  input: {
+    missionId: string;
+    jobId: string;
+    handoffFingerprint: string;
+    hostRuntimeRunId?: string | null;
+  },
+): Promise<StoredMissionRuntimeSnapshot> {
+  return readMissionRuntimeSnapshotByCompanionLineageV1(context, {
+    ...input,
+    kind: "linear",
+  });
+}
+
+export async function readMissionRuntimeSnapshotByCompanionLineageV1(
+  context: ToolExecutionContext,
+  input: {
+    kind: "linear" | "code" | "github";
+    missionId: string;
+    jobId: string;
+    handoffFingerprint: string;
+    hostRuntimeRunId?: string | null;
+  },
+): Promise<StoredMissionRuntimeSnapshot> {
+  if (!hasRuntimeSnapshotVaultApi(context)) {
+    throw new Error(
+      "Exact external-action runtime lookup requires the vault runtime API.",
+    );
+  }
+  if (
+    !input.missionId.trim() ||
+    !input.jobId.trim() ||
+    !/^sha256:[0-9a-f]{64}$/u.test(input.handoffFingerprint)
+  ) {
+    throw new Error("External-action runtime lookup identity is invalid.");
+  }
+  const vault = context.app.vault;
+  const exactMatch = (snapshot: MissionRuntimeSnapshotV2 | null): boolean =>
+    Boolean(
+      snapshot?.missionGraphRef?.missionId === input.missionId &&
+        snapshot.operationJournal.some(
+          (record) => {
+            if (input.kind === "linear") {
+              return (
+                record.externalActionDispatchAttempt?.jobId === input.jobId &&
+                record.preparedExternalActionHandoff?.fingerprint ===
+                  input.handoffFingerprint
+              );
+            }
+            if (input.kind === "code") {
+              return (
+                record.backgroundCodeDispatchAttempt?.jobId === input.jobId &&
+                record.preparedBackgroundCodeAction?.fingerprint ===
+                  input.handoffFingerprint
+              );
+            }
+            return (
+              record.backgroundGitHubDispatchAttempt?.jobId === input.jobId &&
+              record.preparedBackgroundGitHubAction?.fingerprint ===
+                input.handoffFingerprint
+            );
+          },
+        ),
+    );
+  if (input.hostRuntimeRunId) {
+    const direct = await readMissionRuntimeSnapshotByRunId(
+      context,
+      input.hostRuntimeRunId,
+    );
+    if (!direct || !exactMatch(direct.snapshot)) {
+      throw new Error(
+        "The persisted host runtime does not match the exact companion mission, job, and handoff lineage.",
+      );
+    }
+    return direct;
+  }
+  if (typeof vault.getFiles !== "function") {
+    throw new Error(
+      "Legacy external-action runtime lookup requires bounded vault file enumeration.",
+    );
+  }
+  // Legacy lineage written before hostRuntimeRunId existed may use only this
+  // bounded scan. New effectful dispatch always takes the direct path above.
+  const candidates = vault
+    .getFiles()
+    .filter((file) => file.extension === "md")
+    .filter((file) => /^Agent Runs\/[^/]+\.md$/u.test(file.path))
+    .sort((left, right) => (right.stat?.mtime ?? 0) - (left.stat?.mtime ?? 0))
+    .slice(0, MAX_EXTERNAL_ACTION_RUNTIME_LOOKUP_FILES);
+  const matches: StoredMissionRuntimeSnapshot[] = [];
+  for (const file of candidates) {
+    const snapshot = await withSerializedRunWrite(
+      vault,
+      file.basename || file.path,
+      async () =>
+        parseMissionRuntimeSnapshotFromMarkdown(await vault.read(file as TFile)),
+    );
+    if (!snapshot || !exactMatch(snapshot)) {
+      continue;
+    }
+    matches.push({ path: file.path, snapshot });
+    if (matches.length > 1) break;
+  }
+  if (matches.length === 0) {
+    throw new Error(
+      "No core ActionJournal matches the exact companion mission, job, and handoff lineage.",
+    );
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      "Multiple core ActionJournals match the exact companion lineage; reconciliation is ambiguous.",
+    );
+  }
+  return matches[0];
 }
 
 export async function readLatestIncompleteMissionRuntimeSnapshot(
@@ -711,6 +1155,9 @@ export function transitionOperationJournalRecord(
       mutationMayHaveApplied ??
       (record.mutationMayHaveApplied ||
         state === "applied" ||
+        state === "dispatched" ||
+        state === "ambiguous" ||
+        state === "readback_verified" ||
         state === "verified" ||
         state === "committed" ||
         state === "reconcile_required"),
@@ -720,6 +1167,1427 @@ export function transitionOperationJournalRecord(
       { state, at: timestamp, message: message.trim() || state },
     ].slice(-32),
   };
+}
+
+/**
+ * Binds a validated prepared external action to the existing write-ahead
+ * record. Callers must persist the returned record before any remote dispatch.
+ * This function intentionally does not introduce a dispatch transition: until
+ * that state has readback reconciliation semantics, the action remains local.
+ */
+export async function attachPreparedExternalActionHandoff(
+  record: OperationJournalRecord,
+  value: PreparedExternalActionHandoffV1,
+  now = new Date(),
+): Promise<OperationJournalRecord> {
+  const handoff = clonePreparedExternalActionHandoff(value);
+  const descriptorFingerprint = record.descriptor
+    ? await sha256Fingerprint(record.descriptor)
+    : null;
+  const preparedActionFingerprintValid = record.preparedAction
+    ? await verifyPreparedActionFingerprint(record.preparedAction)
+    : false;
+  if (
+    (record.state !== "intent_recorded" && record.state !== "applying") ||
+    record.mutationMayHaveApplied ||
+    !record.preparedAction ||
+    !record.descriptor ||
+    !record.authorization ||
+    !preparedActionFingerprintValid ||
+    descriptorFingerprint !== handoff.descriptorFingerprint ||
+    record.nodeId !== handoff.nodeId ||
+    record.toolName !== handoff.toolName ||
+    record.preparedAction.id !== handoff.preparedActionId ||
+    record.preparedAction.payloadFingerprint !==
+      handoff.preparedActionFingerprint ||
+    record.authorization.grantId !== handoff.authority.id ||
+    record.authorization.payloadFingerprint !==
+      handoff.preparedActionFingerprint
+  ) {
+    throw new Error(
+      "Prepared external action handoff does not match the pending operation journal record.",
+    );
+  }
+  if (
+    record.preparedExternalActionHandoff &&
+    record.preparedExternalActionHandoff.fingerprint !== handoff.fingerprint
+  ) {
+    throw new Error(
+      "Operation journal already contains a different prepared external action handoff.",
+    );
+  }
+  return {
+    ...record,
+    preparedExternalActionHandoff: handoff,
+    updatedAt: now.toISOString(),
+  };
+}
+
+/**
+ * Binds one closed Code continuation action and its local-only package identity
+ * to the core WAL. The executable package body remains in application data;
+ * only its exact readback identity is persisted in the vault runtime record.
+ */
+export async function attachPreparedBackgroundCodeHandoffV1(
+  record: OperationJournalRecord,
+  value: PreparedBackgroundCodeActionV1,
+  packageIdentityValue: PreparedBackgroundCodePackageIdentityV1,
+  now = new Date(),
+): Promise<OperationJournalRecord> {
+  const handoff = parsePreparedBackgroundCodeActionV1(value);
+  const packageIdentity = parsePreparedBackgroundCodePackageIdentityV1(
+    packageIdentityValue,
+  );
+  const descriptorFingerprint = record.descriptor
+    ? await sha256Fingerprint(record.descriptor)
+    : null;
+  const preparedActionFingerprintValid = record.preparedAction
+    ? await verifyPreparedActionFingerprint(record.preparedAction)
+    : false;
+  if (
+    (record.state !== "intent_recorded" && record.state !== "applying") ||
+    record.mutationMayHaveApplied ||
+    !record.preparedAction ||
+    !record.descriptor ||
+    !record.authorization ||
+    !preparedActionFingerprintValid ||
+    descriptorFingerprint !== handoff.descriptorFingerprint ||
+    record.nodeId !== handoff.nodeId ||
+    record.toolName !== handoff.toolName ||
+    record.preparedAction.id !== handoff.preparedActionId ||
+    record.preparedAction.payloadFingerprint !==
+      handoff.preparedActionFingerprint ||
+    record.authorization.grantId !== handoff.authority.id ||
+    record.authorization.payloadFingerprint !==
+      handoff.preparedActionFingerprint ||
+    packageIdentity.handoffFingerprint !== handoff.fingerprint ||
+    packageIdentity.workspaceId !== handoff.binding.workspaceId ||
+    packageIdentity.workspaceBindingFingerprint !==
+      handoff.payload.workspaceBindingFingerprint ||
+    packageIdentity.repositoryProfileKey !==
+      handoff.binding.repositoryProfileKey ||
+    packageIdentity.repositoryProfileFingerprint !==
+      handoff.payload.repositoryProfileFingerprint ||
+    packageIdentity.consumedActionAuthorityFingerprint !==
+      handoff.authority.authorityFingerprint ||
+    packageIdentity.preparedAt !== handoff.preparedAt ||
+    packageIdentity.expiresAt !== handoff.expiresAt
+  ) {
+    throw new Error(
+      "Prepared background Code handoff does not match the pending operation journal record and package identity.",
+    );
+  }
+  if (
+    (record.preparedBackgroundCodeAction &&
+      record.preparedBackgroundCodeAction.fingerprint !== handoff.fingerprint) ||
+    (record.preparedBackgroundCodePackage &&
+      record.preparedBackgroundCodePackage.fingerprint !==
+        packageIdentity.fingerprint)
+  ) {
+    throw new Error(
+      "Operation journal already contains a different prepared background Code package.",
+    );
+  }
+  return {
+    ...record,
+    preparedBackgroundCodeAction: handoff,
+    preparedBackgroundCodePackage: packageIdentity,
+    updatedAt: now.toISOString(),
+  };
+}
+
+/**
+ * Binds one integrations-sealed GitHub action and its readback-verified local
+ * package identity to the core WAL. The executable package body and credential
+ * reference remain outside the vault runtime snapshot.
+ */
+export async function attachPreparedBackgroundGitHubActionV1(
+  record: OperationJournalRecord,
+  actionValue: PreparedBackgroundGitHubActionV1,
+  packageIdentityValue: PreparedBackgroundGitHubPackageIdentityV1,
+  now = new Date(),
+): Promise<OperationJournalRecord> {
+  const action = parsePreparedBackgroundGitHubActionV1(actionValue);
+  const packageIdentity = parsePreparedBackgroundGitHubPackageIdentityV1(
+    packageIdentityValue,
+  );
+  const descriptorFingerprint = record.descriptor
+    ? await sha256Fingerprint(record.descriptor)
+    : null;
+  const preparedActionFingerprintValid = record.preparedAction
+    ? await verifyPreparedActionFingerprint(record.preparedAction)
+    : false;
+  if (
+    (record.state !== "intent_recorded" && record.state !== "applying") ||
+    record.mutationMayHaveApplied ||
+    !record.preparedAction ||
+    !record.descriptor ||
+    !record.authorization ||
+    !preparedActionFingerprintValid ||
+    descriptorFingerprint !== action.descriptorFingerprint ||
+    record.nodeId !== action.nodeId ||
+    record.toolName !== action.toolName ||
+    record.preparedAction.id !== action.preparedActionId ||
+    record.preparedAction.payloadFingerprint !==
+      action.preparedActionFingerprint ||
+    record.authorization.grantId !== action.authority.id ||
+    record.authorization.payloadFingerprint !==
+      action.preparedActionFingerprint ||
+    action.authority.actionFingerprint !==
+      action.preparedActionFingerprint ||
+    packageIdentity.actionFingerprint !== action.fingerprint ||
+    packageIdentity.preparedActionFingerprint !==
+      action.preparedActionFingerprint ||
+    packageIdentity.operation !== action.operation ||
+    packageIdentity.publicationId !== action.payload.publicationId ||
+    packageIdentity.repositoryBindingFingerprint !==
+      action.binding.repositoryBindingFingerprint ||
+    packageIdentity.repositoryProfileFingerprint !==
+      action.binding.repositoryProfileFingerprint ||
+    packageIdentity.verifiedAccountId !== action.binding.verifiedAccountId ||
+    packageIdentity.preparedAt !== action.preparedAt ||
+    packageIdentity.expiresAt !== action.expiresAt
+  ) {
+    throw new Error(
+      "Prepared background GitHub action does not match the pending operation journal record and package identity.",
+    );
+  }
+  if (
+    (record.preparedBackgroundGitHubAction &&
+      record.preparedBackgroundGitHubAction.fingerprint !== action.fingerprint) ||
+    (record.preparedBackgroundGitHubPackage &&
+      record.preparedBackgroundGitHubPackage.fingerprint !==
+        packageIdentity.fingerprint)
+  ) {
+    throw new Error(
+      "Operation journal already contains a different prepared background GitHub package.",
+    );
+  }
+  return {
+    ...record,
+    preparedBackgroundGitHubAction: action,
+    preparedBackgroundGitHubPackage: packageIdentity,
+    updatedAt: now.toISOString(),
+  };
+}
+
+export interface ExternalActionCompanionReceiptV1 {
+  id: string;
+  provider: string;
+  operation: string;
+  status: "prepared" | "dispatched" | "verified" | "ambiguous" | "failed";
+  fingerprint: string;
+  payload: Record<string, unknown>;
+  committedAt: string;
+}
+
+export type BackgroundCodeCompanionReceiptV1 =
+  ExternalActionCompanionReceiptV1;
+export type BackgroundGitHubCompanionReceiptV1 =
+  ExternalActionCompanionReceiptV1;
+
+/** Persist deterministic Code job and package identity before remote submit. */
+export function attachBackgroundCodeDispatchAttemptV1(
+  record: OperationJournalRecord,
+  jobId: string,
+  now = new Date(),
+): OperationJournalRecord {
+  const handoff = record.preparedBackgroundCodeAction;
+  const packageIdentity = record.preparedBackgroundCodePackage;
+  if (
+    !handoff ||
+    !packageIdentity ||
+    (record.state !== "intent_recorded" && record.state !== "applying") ||
+    record.mutationMayHaveApplied ||
+    !jobId.trim()
+  ) {
+    throw new Error(
+      "Background Code dispatch requires a non-applied journaled package.",
+    );
+  }
+  const attemptId = backgroundCodeContinuationAttemptIdV1(jobId, handoff);
+  const existing = record.backgroundCodeDispatchAttempt;
+  if (
+    existing &&
+    (existing.jobId !== jobId ||
+      existing.attemptId !== attemptId ||
+      existing.handoffFingerprint !== handoff.fingerprint ||
+      existing.packageFingerprint !== packageIdentity.packageFingerprint ||
+      existing.packageIdentityFingerprint !== packageIdentity.fingerprint)
+  ) {
+    throw new Error(
+      "Operation journal is already bound to another background Code attempt.",
+    );
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...record,
+    backgroundCodeDispatchAttempt:
+      existing ?? {
+        version: 1,
+        provider: "code",
+        operation: "prepared_code_validation_commit_v1",
+        jobId,
+        attemptId,
+        handoffFingerprint: handoff.fingerprint,
+        packageFingerprint: packageIdentity.packageFingerprint,
+        packageIdentityFingerprint: packageIdentity.fingerprint,
+        status: "prepared",
+        preparedAt: timestamp,
+        submittedAt: null,
+        dispatchedReceiptFingerprint: null,
+        ambiguousReceiptFingerprint: null,
+        verifiedReceiptFingerprint: null,
+        verifiedCommitReceiptFingerprint: null,
+        commitSha: null,
+        updatedAt: timestamp,
+      },
+    updatedAt: timestamp,
+  };
+}
+
+/** Remote submission is uncertain until the companion receipt WAL is read. */
+export function markBackgroundCodeJobSubmittedV1(
+  record: OperationJournalRecord,
+  now = new Date(),
+): OperationJournalRecord {
+  const attempt = record.backgroundCodeDispatchAttempt;
+  if (!attempt || !["applying", "dispatched", "ambiguous"].includes(record.state)) {
+    throw new Error("Background Code job submission is not bound to a prepared attempt.");
+  }
+  if (attempt.status !== "prepared" && attempt.status !== "job_submitted") {
+    return record;
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...record,
+    mutationMayHaveApplied: true,
+    backgroundCodeDispatchAttempt: {
+      ...attempt,
+      status: "job_submitted",
+      submittedAt: attempt.submittedAt ?? timestamp,
+      updatedAt: timestamp,
+    },
+    updatedAt: timestamp,
+  };
+}
+
+/** Persist deterministic GitHub job, action, and package identity before submit. */
+export function attachBackgroundGitHubDispatchAttemptV1(
+  record: OperationJournalRecord,
+  jobId: string,
+  now = new Date(),
+): OperationJournalRecord {
+  const action = record.preparedBackgroundGitHubAction;
+  const packageIdentity = record.preparedBackgroundGitHubPackage;
+  if (
+    !action ||
+    !packageIdentity ||
+    (record.state !== "intent_recorded" && record.state !== "applying") ||
+    record.mutationMayHaveApplied ||
+    !jobId.trim()
+  ) {
+    throw new Error(
+      "Background GitHub dispatch requires a non-applied journaled package.",
+    );
+  }
+  const attemptId = backgroundGitHubActionAttemptIdV1(jobId, action);
+  const existing = record.backgroundGitHubDispatchAttempt;
+  if (
+    existing &&
+    (existing.jobId !== jobId ||
+      existing.attemptId !== attemptId ||
+      existing.operation !== action.operation ||
+      existing.actionFingerprint !== action.fingerprint ||
+      existing.packageFingerprint !== packageIdentity.packageFingerprint ||
+      existing.packageIdentityFingerprint !== packageIdentity.fingerprint)
+  ) {
+    throw new Error(
+      "Operation journal is already bound to another background GitHub attempt.",
+    );
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...record,
+    backgroundGitHubDispatchAttempt:
+      existing ?? {
+        version: 1,
+        provider: "github",
+        operation: action.operation,
+        jobId,
+        attemptId,
+        actionFingerprint: action.fingerprint,
+        packageFingerprint: packageIdentity.packageFingerprint,
+        packageIdentityFingerprint: packageIdentity.fingerprint,
+        status: "prepared",
+        preparedAt: timestamp,
+        submittedAt: null,
+        dispatchedReceiptFingerprint: null,
+        ambiguousReceiptFingerprint: null,
+        verifiedReceiptFingerprint: null,
+        verifiedResultFingerprint: null,
+        updatedAt: timestamp,
+      },
+    updatedAt: timestamp,
+  };
+}
+
+/** Remote submission is uncertain until the exact companion proof is replayed. */
+export function markBackgroundGitHubJobSubmittedV1(
+  record: OperationJournalRecord,
+  now = new Date(),
+): OperationJournalRecord {
+  const attempt = record.backgroundGitHubDispatchAttempt;
+  if (!attempt || !["applying", "dispatched", "ambiguous"].includes(record.state)) {
+    throw new Error(
+      "Background GitHub job submission is not bound to a prepared attempt.",
+    );
+  }
+  if (attempt.status !== "prepared" && attempt.status !== "job_submitted") {
+    return record;
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...record,
+    mutationMayHaveApplied: true,
+    backgroundGitHubDispatchAttempt: {
+      ...attempt,
+      status: "job_submitted",
+      submittedAt: attempt.submittedAt ?? timestamp,
+      updatedAt: timestamp,
+    },
+    updatedAt: timestamp,
+  };
+}
+
+/**
+ * Persist the deterministic companion job and provider-attempt identity before
+ * the job is submitted. Retrying this function with the same identity is
+ * idempotent; a different identity is rejected.
+ */
+export function attachExternalActionDispatchAttemptV1(
+  record: OperationJournalRecord,
+  jobId: string,
+  now = new Date(),
+): OperationJournalRecord {
+  const handoff = record.preparedExternalActionHandoff;
+  if (
+    !handoff ||
+    (record.state !== "intent_recorded" && record.state !== "applying") ||
+    record.mutationMayHaveApplied ||
+    !jobId.trim()
+  ) {
+    throw new Error(
+      "External dispatch attempt requires a non-applied journaled handoff.",
+    );
+  }
+  const attemptId = linearIssueStateUpdateAttemptIdV1(jobId, handoff);
+  const existing = record.externalActionDispatchAttempt;
+  if (
+    existing &&
+    (existing.jobId !== jobId ||
+      existing.attemptId !== attemptId ||
+      existing.handoffFingerprint !== handoff.fingerprint)
+  ) {
+    throw new Error(
+      "Operation journal is already bound to another remote dispatch attempt.",
+    );
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...record,
+    externalActionDispatchAttempt:
+      existing ?? {
+        version: 1,
+        provider: "linear",
+        operation: "linear_issue_state_update_v1",
+        jobId,
+        attemptId,
+        handoffFingerprint: handoff.fingerprint,
+        status: "prepared",
+        preparedAt: timestamp,
+        submittedAt: null,
+        dispatchedReceiptFingerprint: null,
+        ambiguousReceiptFingerprint: null,
+        verifiedReceiptFingerprint: null,
+        updatedAt: timestamp,
+      },
+    updatedAt: timestamp,
+  };
+}
+
+/** Marks only companion job submission; it does not claim provider dispatch. */
+export function markExternalActionJobSubmittedV1(
+  record: OperationJournalRecord,
+  now = new Date(),
+): OperationJournalRecord {
+  const attempt = record.externalActionDispatchAttempt;
+  if (!attempt || !["applying", "dispatched", "ambiguous"].includes(record.state)) {
+    throw new Error("External job submission is not bound to a prepared attempt.");
+  }
+  if (attempt.status !== "prepared" && attempt.status !== "job_submitted") {
+    return record;
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...record,
+    // The provider call has not been proven yet, but the independently leased
+    // remote worker may execute it after this process stops. Restart must
+    // reconcile the exact job and can never classify this record as retryable.
+    mutationMayHaveApplied: true,
+    externalActionDispatchAttempt: {
+      ...attempt,
+      status: "job_submitted",
+      submittedAt: attempt.submittedAt ?? timestamp,
+      updatedAt: timestamp,
+    },
+    updatedAt: timestamp,
+  };
+}
+
+/**
+ * Project the companion's provider-specific receipt WAL into the core action
+ * journal. A dispatched/ambiguous receipt can never become retryable; only a
+ * verified readback receipt can advance the action toward commit.
+ */
+export function reconcileExternalActionDispatchAttemptV1(
+  record: OperationJournalRecord,
+  receipts: ExternalActionCompanionReceiptV1[],
+  now = new Date(),
+): OperationJournalRecord {
+  const attempt = record.externalActionDispatchAttempt;
+  const handoff = record.preparedExternalActionHandoff;
+  if (!attempt || !handoff) {
+    throw new Error("External action reconciliation lacks its persisted attempt.");
+  }
+  assertExternalActionAttemptIdentity(attempt, handoff);
+  const relevant = receipts
+    .map((receipt, index) => ({ receipt, index }))
+    .filter(({ receipt }) => {
+      if (
+        receipt.provider !== "linear" ||
+        receipt.operation !== "linear_issue_state_update_v1"
+      ) {
+        return false;
+      }
+      const sameAttempt = receipt.payload.attemptId === attempt.attemptId;
+      const sameHandoff =
+        receipt.payload.handoffFingerprint === handoff.fingerprint;
+      if (sameAttempt !== sameHandoff) {
+        throw new Error(
+          "External action receipt identity partially matches the persisted attempt.",
+        );
+      }
+      if (!sameAttempt) return false;
+      assertLinearStateUpdateReceiptSemantics(receipt, handoff);
+      return true;
+    });
+  const dispatchedEntries = relevant.filter(
+    ({ receipt }) => receipt.status === "dispatched",
+  );
+  const verifiedEntries = relevant.filter(
+    ({ receipt }) => receipt.status === "verified",
+  );
+  if (dispatchedEntries.length > 1 || verifiedEntries.length > 1) {
+    throw new Error(
+      "External action receipt sequence contains duplicate dispatch or verification markers.",
+    );
+  }
+  const dispatchedEntry = dispatchedEntries[0];
+  const ambiguousEntry = [...relevant]
+    .reverse()
+    .find(({ receipt }) => receipt.status === "ambiguous");
+  const verifiedEntry = verifiedEntries[0];
+  const dispatched = dispatchedEntry?.receipt;
+  const ambiguous = ambiguousEntry?.receipt;
+  const verified = verifiedEntry?.receipt;
+  if ((ambiguous || verified) && !dispatched) {
+    throw new Error(
+      "External readback receipt is missing the durable pre-dispatch marker.",
+    );
+  }
+  if (
+    dispatchedEntry &&
+    relevant.some(
+      ({ receipt, index }) =>
+        receipt.status !== "dispatched" && index <= dispatchedEntry.index,
+    )
+  ) {
+    throw new Error(
+      "External readback receipt precedes its durable pre-dispatch marker.",
+    );
+  }
+  if (
+    verifiedEntry &&
+    relevant.some(
+      ({ receipt, index }) =>
+        receipt.status === "ambiguous" && index >= verifiedEntry.index,
+    )
+  ) {
+    throw new Error(
+      "External action receipt sequence continued ambiguously after verified readback.",
+    );
+  }
+  assertMonotonicExternalReceiptTimes(relevant.map(({ receipt }) => receipt));
+  let next = record;
+  if (dispatched && next.state === "applying") {
+    next = transitionOperationJournalRecord(next, "dispatched", {
+      message:
+        "Companion receipt proves the provider dispatch marker was durable before the Linear call.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  if (
+    ambiguous &&
+    (next.state === "dispatched" || next.state === "reconcile_required")
+  ) {
+    next = transitionOperationJournalRecord(next, "ambiguous", {
+      message:
+        "Linear dispatch is ambiguous; only independent issue readback may continue.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  if (
+    verified &&
+    (next.state === "dispatched" ||
+      next.state === "ambiguous" ||
+      next.state === "reconcile_required")
+  ) {
+    next = transitionOperationJournalRecord(next, "readback_verified", {
+      message:
+        "Independent Linear issue readback verified the exact approved target state.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...next,
+    externalActionDispatchAttempt: {
+      ...attempt,
+      status: verified
+        ? "readback_verified"
+        : ambiguous
+          ? "ambiguous"
+          : dispatched
+            ? "dispatched"
+            : attempt.status,
+      dispatchedReceiptFingerprint:
+        dispatched?.fingerprint ?? attempt.dispatchedReceiptFingerprint,
+      ambiguousReceiptFingerprint:
+        ambiguous?.fingerprint ?? attempt.ambiguousReceiptFingerprint,
+      verifiedReceiptFingerprint:
+        verified?.fingerprint ?? attempt.verifiedReceiptFingerprint,
+      updatedAt: timestamp,
+    },
+    updatedAt: timestamp,
+  };
+}
+
+/**
+ * Projects the companion Code receipt WAL into the core ActionJournal. A
+ * commit ambiguity is terminally readback-only; only a verified local-commit
+ * receipt bound to the exact handoff can advance to readback_verified.
+ */
+export function reconcileBackgroundCodeDispatchAttemptV1(
+  record: OperationJournalRecord,
+  receipts: BackgroundCodeCompanionReceiptV1[],
+  now = new Date(),
+): OperationJournalRecord {
+  const attempt = record.backgroundCodeDispatchAttempt;
+  const handoff = record.preparedBackgroundCodeAction;
+  const packageIdentity = record.preparedBackgroundCodePackage;
+  if (!attempt || !handoff || !packageIdentity) {
+    throw new Error("Background Code reconciliation lacks its persisted package attempt.");
+  }
+  assertBackgroundCodeAttemptIdentity(attempt, handoff, packageIdentity);
+  const relevant = receipts
+    .map((receipt, index) => ({ receipt, index }))
+    .filter(({ receipt }) => {
+      if (
+        receipt.provider !== "code" ||
+        receipt.operation !== "prepared_code_validation_commit_v1"
+      ) {
+        return false;
+      }
+      const sameAttempt = receipt.payload.attemptId === attempt.attemptId;
+      const sameHandoff =
+        receipt.payload.handoffFingerprint === handoff.fingerprint;
+      const sameCheckpoint =
+        receipt.payload.repairCheckpointId ===
+        handoff.payload.repairCheckpointId;
+      if (
+        [sameAttempt, sameHandoff, sameCheckpoint].some(Boolean) &&
+        !(sameAttempt && sameHandoff && sameCheckpoint)
+      ) {
+        throw new Error(
+          "Background Code receipt identity partially matches the persisted attempt.",
+        );
+      }
+      if (!sameAttempt) return false;
+      assertBackgroundCodeReceiptSemantics(receipt, handoff);
+      return true;
+    });
+  const dispatchedEntries = relevant.filter(
+    ({ receipt }) => receipt.status === "dispatched",
+  );
+  const ambiguousEntries = relevant.filter(
+    ({ receipt }) => receipt.status === "ambiguous",
+  );
+  const verifiedEntries = relevant.filter(
+    ({ receipt }) => receipt.status === "verified",
+  );
+  if (
+    dispatchedEntries.length > 1 ||
+    ambiguousEntries.length > 1 ||
+    verifiedEntries.length > 1
+  ) {
+    throw new Error(
+      "Background Code receipt sequence contains duplicate durable markers.",
+    );
+  }
+  const dispatchedEntry = dispatchedEntries[0];
+  const ambiguousEntry = ambiguousEntries[0];
+  const verifiedEntry = verifiedEntries[0];
+  if (
+    verifiedEntry &&
+    !dispatchedEntry &&
+    !ambiguousEntry &&
+    attempt.status !== "dispatched" &&
+    attempt.status !== "ambiguous" &&
+    attempt.status !== "readback_verified"
+  ) {
+    throw new Error(
+      "Verified Code commit receipt is missing a durable dispatch or ambiguity marker.",
+    );
+  }
+  if (
+    verifiedEntry &&
+    relevant.some(
+      ({ receipt, index }) =>
+        receipt.status === "ambiguous" && index >= verifiedEntry.index,
+    )
+  ) {
+    throw new Error(
+      "Background Code receipt sequence continued ambiguously after commit verification.",
+    );
+  }
+  assertMonotonicExternalReceiptTimes(relevant.map(({ receipt }) => receipt));
+  const dispatched = dispatchedEntry?.receipt;
+  const ambiguous = ambiguousEntry?.receipt;
+  const verified = verifiedEntry?.receipt;
+  if (
+    verified &&
+    attempt.status === "readback_verified" &&
+    (attempt.verifiedReceiptFingerprint !== verified.fingerprint ||
+      attempt.verifiedCommitReceiptFingerprint !==
+        verified.payload.verifiedCommitReceiptFingerprint ||
+      attempt.commitSha !== verified.payload.commitSha)
+  ) {
+    throw new Error(
+      "Verified background Code receipt drifted from the already-applied commit proof.",
+    );
+  }
+  let next = record;
+  if (dispatched && next.state === "applying") {
+    next = transitionOperationJournalRecord(next, "dispatched", {
+      message:
+        "Companion receipt proves the Code continuation marker was durable before validation or commit.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  if (
+    ambiguous &&
+    (next.state === "applying" ||
+      next.state === "dispatched" ||
+      next.state === "reconcile_required")
+  ) {
+    next = transitionOperationJournalRecord(next, "ambiguous", {
+      message:
+        "The local commit outcome is ambiguous; every later attempt is readback-only.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  if (
+    verified &&
+    (next.state === "dispatched" ||
+      next.state === "ambiguous" ||
+      next.state === "reconcile_required")
+  ) {
+    next = transitionOperationJournalRecord(next, "readback_verified", {
+      message:
+        "Independent Git object readback verified the exact prepared local commit.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...next,
+    backgroundCodeDispatchAttempt: {
+      ...attempt,
+      status: verified
+        ? "readback_verified"
+        : ambiguous
+          ? "ambiguous"
+          : dispatched
+            ? "dispatched"
+            : attempt.status,
+      dispatchedReceiptFingerprint:
+        dispatched?.fingerprint ?? attempt.dispatchedReceiptFingerprint,
+      ambiguousReceiptFingerprint:
+        ambiguous?.fingerprint ?? attempt.ambiguousReceiptFingerprint,
+      verifiedReceiptFingerprint:
+        verified?.fingerprint ?? attempt.verifiedReceiptFingerprint,
+      verifiedCommitReceiptFingerprint:
+        (typeof verified?.payload.verifiedCommitReceiptFingerprint === "string"
+          ? verified.payload.verifiedCommitReceiptFingerprint
+          : null) ?? attempt.verifiedCommitReceiptFingerprint,
+      commitSha:
+        (typeof verified?.payload.commitSha === "string"
+          ? verified.payload.commitSha
+          : null) ?? attempt.commitSha,
+      updatedAt: timestamp,
+    },
+    updatedAt: timestamp,
+  };
+}
+
+/**
+ * Projects one closed GitHub companion proof into the core WAL. A result hash
+ * alone is never sufficient: the complete verified result is re-parsed and
+ * checked against the exact action, package, account, repository, operation,
+ * and provider target before the record reaches readback_verified.
+ */
+export function reconcileBackgroundGitHubDispatchAttemptV1(
+  record: OperationJournalRecord,
+  receipts: BackgroundGitHubCompanionReceiptV1[],
+  now = new Date(),
+): OperationJournalRecord {
+  const attempt = record.backgroundGitHubDispatchAttempt;
+  const action = record.preparedBackgroundGitHubAction;
+  const packageIdentity = record.preparedBackgroundGitHubPackage;
+  if (!attempt || !action || !packageIdentity) {
+    throw new Error(
+      "Background GitHub reconciliation lacks its persisted package attempt.",
+    );
+  }
+  assertBackgroundGitHubAttemptIdentity(attempt, action, packageIdentity);
+  const relevant = receipts
+    .map((receipt, index) => ({ receipt, index }))
+    .filter(({ receipt }) => {
+      if (
+        receipt.provider !== "github" ||
+        receipt.operation !== action.operation
+      ) {
+        return false;
+      }
+      const sameAttempt = receipt.payload.attemptId === attempt.attemptId;
+      const sameAction =
+        receipt.payload.actionFingerprint === action.fingerprint;
+      const samePackage =
+        receipt.payload.packageFingerprint ===
+        packageIdentity.packageFingerprint;
+      if (
+        [sameAttempt, sameAction, samePackage].some(Boolean) &&
+        !(sameAttempt && sameAction && samePackage)
+      ) {
+        throw new Error(
+          "Background GitHub receipt identity partially matches the persisted attempt.",
+        );
+      }
+      if (!sameAttempt) return false;
+      assertBackgroundGitHubReceiptSemantics(receipt, action);
+      return receipt.status === "ambiguous" || receipt.status === "verified";
+    });
+  const ambiguousEntries = relevant.filter(
+    ({ receipt }) => receipt.status === "ambiguous",
+  );
+  const verifiedEntries = relevant.filter(
+    ({ receipt }) => receipt.status === "verified",
+  );
+  if (ambiguousEntries.length > 1 || verifiedEntries.length > 1) {
+    throw new Error(
+      "Background GitHub receipt sequence contains duplicate durable outcomes.",
+    );
+  }
+  const ambiguousEntry = ambiguousEntries[0];
+  const verifiedEntry = verifiedEntries[0];
+  if (
+    verifiedEntry &&
+    ambiguousEntry &&
+    ambiguousEntry.index >= verifiedEntry.index
+  ) {
+    throw new Error(
+      "Background GitHub receipt sequence continued ambiguously after verified readback.",
+    );
+  }
+  assertMonotonicExternalReceiptTimes(relevant.map(({ receipt }) => receipt));
+  const ambiguous = ambiguousEntry?.receipt;
+  const verified = verifiedEntry?.receipt;
+  const result = verified
+    ? parseBackgroundGitHubVerifiedResultV1(verified.payload.verifiedResult)
+    : null;
+  if (verified && result) {
+    if (verified.payload.resultFingerprint !== result.fingerprint) {
+      throw new Error(
+        "Background GitHub receipt result fingerprint does not match its complete proof.",
+      );
+    }
+    assertBackgroundGitHubVerifiedResultSemantics(result, action);
+  }
+  if (
+    result &&
+    attempt.status === "readback_verified" &&
+    (attempt.verifiedReceiptFingerprint !== verified!.fingerprint ||
+      attempt.verifiedResultFingerprint !== result.fingerprint)
+  ) {
+    throw new Error(
+      "Verified background GitHub proof drifted from the already-applied result.",
+    );
+  }
+  let next = record;
+  const outcomeReceipt = verified ?? ambiguous;
+  if (outcomeReceipt && next.state === "applying") {
+    next = transitionOperationJournalRecord(next, "dispatched", {
+      message:
+        "The authenticated companion persisted a GitHub provider outcome for the exact sealed package.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  if (
+    ambiguous &&
+    (next.state === "dispatched" || next.state === "reconcile_required")
+  ) {
+    next = transitionOperationJournalRecord(next, "ambiguous", {
+      message:
+        "The GitHub mutation outcome is ambiguous; the same provider WAL must reconcile by independent readback.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  if (
+    verified &&
+    result &&
+    (next.state === "dispatched" ||
+      next.state === "ambiguous" ||
+      next.state === "reconcile_required")
+  ) {
+    next = transitionOperationJournalRecord(next, "readback_verified", {
+      message:
+        "Independent GitHub readback verified the exact prepared action, repository, account, and target state.",
+      mutationMayHaveApplied: true,
+      now,
+    });
+  }
+  const timestamp = now.toISOString();
+  return {
+    ...next,
+    backgroundGitHubDispatchAttempt: {
+      ...attempt,
+      status: verified
+        ? "readback_verified"
+        : ambiguous
+          ? "ambiguous"
+          : attempt.status,
+      dispatchedReceiptFingerprint:
+        outcomeReceipt?.fingerprint ?? attempt.dispatchedReceiptFingerprint,
+      ambiguousReceiptFingerprint:
+        ambiguous?.fingerprint ?? attempt.ambiguousReceiptFingerprint,
+      verifiedReceiptFingerprint:
+        verified?.fingerprint ?? attempt.verifiedReceiptFingerprint,
+      verifiedResultFingerprint:
+        result?.fingerprint ?? attempt.verifiedResultFingerprint,
+      updatedAt: timestamp,
+    },
+    updatedAt: timestamp,
+  };
+}
+
+export function isBackgroundGitHubProofVerifiedV1(
+  record: OperationJournalRecord,
+  input: {
+    jobId: string;
+    actionFingerprint: string;
+    packageIdentityFingerprint: string;
+    verifiedReceiptFingerprint: string;
+    verifiedResultFingerprint: string;
+  },
+): boolean {
+  const action = record.preparedBackgroundGitHubAction;
+  const packageIdentity = record.preparedBackgroundGitHubPackage;
+  const attempt = record.backgroundGitHubDispatchAttempt;
+  if (!action || !packageIdentity || !attempt) return false;
+  try {
+    assertBackgroundGitHubAttemptIdentity(attempt, action, packageIdentity);
+  } catch {
+    return false;
+  }
+  return (
+    attempt.jobId === input.jobId &&
+    action.fingerprint === input.actionFingerprint &&
+    packageIdentity.fingerprint === input.packageIdentityFingerprint &&
+    attempt.status === "readback_verified" &&
+    attempt.verifiedReceiptFingerprint === input.verifiedReceiptFingerprint &&
+    attempt.verifiedResultFingerprint === input.verifiedResultFingerprint &&
+    (record.state === "readback_verified" ||
+      (record.state === "committed" &&
+        record.transitions.some(
+          (transition) => transition.state === "readback_verified",
+        )))
+  );
+}
+
+export function isBackgroundCodeCommitProofVerifiedV1(
+  record: OperationJournalRecord,
+  input: {
+    jobId: string;
+    handoffFingerprint: string;
+    packageIdentityFingerprint: string;
+    verifiedReceiptFingerprint: string;
+    verifiedCommitReceiptFingerprint: string;
+    commitSha: string;
+  },
+): boolean {
+  const handoff = record.preparedBackgroundCodeAction;
+  const packageIdentity = record.preparedBackgroundCodePackage;
+  const attempt = record.backgroundCodeDispatchAttempt;
+  if (!handoff || !packageIdentity || !attempt) return false;
+  try {
+    assertBackgroundCodeAttemptIdentity(attempt, handoff, packageIdentity);
+  } catch {
+    return false;
+  }
+  return (
+    attempt.jobId === input.jobId &&
+    handoff.fingerprint === input.handoffFingerprint &&
+    packageIdentity.fingerprint === input.packageIdentityFingerprint &&
+    attempt.status === "readback_verified" &&
+    attempt.verifiedReceiptFingerprint === input.verifiedReceiptFingerprint &&
+    attempt.verifiedCommitReceiptFingerprint ===
+      input.verifiedCommitReceiptFingerprint &&
+    attempt.commitSha === input.commitSha &&
+    (record.state === "readback_verified" ||
+      (record.state === "committed" &&
+        record.transitions.some(
+          (transition) => transition.state === "readback_verified",
+        )))
+  );
+}
+
+/**
+ * A companion completion may enter the MissionGraph only after the core WAL
+ * proves the exact deterministic attempt reached independent readback. The
+ * committed state is accepted for idempotent replay only when its transition
+ * history proves it passed through readback_verified first.
+ */
+export function isExternalActionReadbackVerifiedV1(
+  record: OperationJournalRecord,
+  input: {
+    jobId: string;
+    handoffFingerprint: string;
+    verifiedReceiptFingerprint: string;
+  },
+): boolean {
+  const handoff = record.preparedExternalActionHandoff;
+  const attempt = record.externalActionDispatchAttempt;
+  if (!handoff || !attempt) return false;
+  try {
+    assertExternalActionAttemptIdentity(attempt, handoff);
+  } catch {
+    return false;
+  }
+  return (
+    attempt.jobId === input.jobId &&
+    handoff.fingerprint === input.handoffFingerprint &&
+    attempt.handoffFingerprint === input.handoffFingerprint &&
+    attempt.status === "readback_verified" &&
+    attempt.verifiedReceiptFingerprint === input.verifiedReceiptFingerprint &&
+    (record.state === "readback_verified" || record.state === "committed") &&
+    record.transitions.some(
+      (transition) => transition.state === "readback_verified",
+    )
+  );
+}
+
+function assertExternalActionAttemptIdentity(
+  attempt: ExternalActionDispatchAttemptV1,
+  handoff: PreparedExternalActionHandoffV1,
+): void {
+  if (
+    attempt.provider !== "linear" ||
+    attempt.operation !== "linear_issue_state_update_v1" ||
+    attempt.handoffFingerprint !== handoff.fingerprint ||
+    attempt.attemptId !==
+      linearIssueStateUpdateAttemptIdV1(attempt.jobId, handoff)
+  ) {
+    throw new Error(
+      "External action attempt identity drifted from its prepared handoff.",
+    );
+  }
+}
+
+function assertLinearStateUpdateReceiptSemantics(
+  receipt: ExternalActionCompanionReceiptV1,
+  handoff: PreparedExternalActionHandoffV1,
+): void {
+  if (!/^sha256:[a-f0-9]{64}$/u.test(receipt.fingerprint)) {
+    throw new Error("External action receipt fingerprint is invalid.");
+  }
+  const dispatchedKeys = [
+    "attemptId",
+    "handoffFingerprint",
+    "issueId",
+    "preconditionFingerprint",
+    "preparedActionFingerprint",
+    "targetStateId",
+  ].sort();
+  const transitionKeys = [
+    ...dispatchedKeys,
+    "observedStateId",
+    "observedUpdatedAt",
+    "readbackFingerprint",
+    "reconciliationMode",
+  ].sort();
+  const expectedKeys =
+    receipt.status === "dispatched" ? dispatchedKeys : transitionKeys;
+  if (
+    !["dispatched", "ambiguous", "verified"].includes(receipt.status) ||
+    Object.keys(receipt.payload).sort().join("\0") !== expectedKeys.join("\0")
+  ) {
+    throw new Error(
+      "External action receipt does not match the closed Linear state-update contract.",
+    );
+  }
+  if (
+    receipt.payload.handoffFingerprint !== handoff.fingerprint ||
+    receipt.payload.preparedActionFingerprint !==
+      handoff.preparedActionFingerprint ||
+    receipt.payload.issueId !== handoff.payload.issueId ||
+    receipt.payload.targetStateId !== handoff.payload.stateId ||
+    receipt.payload.preconditionFingerprint !==
+      handoff.payload.preconditionFingerprint
+  ) {
+    throw new Error(
+      "External action receipt payload drifted from the exact prepared action.",
+    );
+  }
+  if (receipt.status === "dispatched") return;
+  if (
+    (receipt.payload.reconciliationMode !== "dispatch" &&
+      receipt.payload.reconciliationMode !== "readback_only") ||
+    (receipt.payload.observedStateId !== null &&
+      typeof receipt.payload.observedStateId !== "string") ||
+    (receipt.payload.observedUpdatedAt !== null &&
+      (typeof receipt.payload.observedUpdatedAt !== "string" ||
+        !Number.isFinite(Date.parse(receipt.payload.observedUpdatedAt)))) ||
+    (receipt.payload.readbackFingerprint !== null &&
+      (typeof receipt.payload.readbackFingerprint !== "string" ||
+        !/^sha256:[a-f0-9]{64}$/u.test(receipt.payload.readbackFingerprint)))
+  ) {
+    throw new Error("External action readback receipt is malformed.");
+  }
+  if (
+    receipt.status === "verified" &&
+    (receipt.payload.observedStateId !== handoff.payload.stateId ||
+      typeof receipt.payload.observedUpdatedAt !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(
+        String(receipt.payload.readbackFingerprint),
+      ))
+  ) {
+    throw new Error(
+      "External action verification receipt does not prove the approved target state.",
+    );
+  }
+}
+
+function assertBackgroundCodeAttemptIdentity(
+  attempt: BackgroundCodeDispatchAttemptV1,
+  handoff: PreparedBackgroundCodeActionV1,
+  packageIdentity: PreparedBackgroundCodePackageIdentityV1,
+): void {
+  if (
+    attempt.provider !== "code" ||
+    attempt.operation !== "prepared_code_validation_commit_v1" ||
+    attempt.handoffFingerprint !== handoff.fingerprint ||
+    attempt.packageFingerprint !== packageIdentity.packageFingerprint ||
+    attempt.packageIdentityFingerprint !== packageIdentity.fingerprint ||
+    packageIdentity.handoffFingerprint !== handoff.fingerprint ||
+    attempt.attemptId !==
+      backgroundCodeContinuationAttemptIdV1(attempt.jobId, handoff)
+  ) {
+    throw new Error(
+      "Background Code attempt identity drifted from its prepared package.",
+    );
+  }
+}
+
+function assertBackgroundCodeReceiptSemantics(
+  receipt: BackgroundCodeCompanionReceiptV1,
+  handoff: PreparedBackgroundCodeActionV1,
+): void {
+  if (!/^sha256:[a-f0-9]{64}$/u.test(receipt.fingerprint)) {
+    throw new Error("Background Code receipt fingerprint is invalid.");
+  }
+  const prefix = [
+    "attemptId",
+    "handoffFingerprint",
+    "repairCheckpointId",
+  ];
+  const dispatchKeys = [
+    ...prefix,
+    "checkpointSequence",
+    "repairRequestFingerprint",
+  ].sort();
+  const ambiguousFailureKeys = [
+    ...prefix,
+    "checkpointSequence",
+    "failureFingerprint",
+  ].sort();
+  const verifiedKeys = [
+    ...prefix,
+    "checkpointSequence",
+    "verifiedCommitReceiptFingerprint",
+    "commitSha",
+    "workspaceBindingFingerprint",
+    "repositoryProfileFingerprint",
+    "sandboxCapabilityFingerprint",
+  ].sort();
+  const keys = Object.keys(receipt.payload).sort();
+  const exact = (expected: string[]) => keys.join("\0") === expected.join("\0");
+  const shapeMatches =
+    receipt.status === "dispatched"
+      ? exact(dispatchKeys)
+      : receipt.status === "ambiguous"
+        ? exact(dispatchKeys) || exact(ambiguousFailureKeys)
+        : receipt.status === "verified"
+          ? exact(verifiedKeys)
+          : false;
+  if (!shapeMatches) {
+    throw new Error(
+      "Background Code receipt does not match the closed validation-commit contract.",
+    );
+  }
+  if (
+    receipt.payload.handoffFingerprint !== handoff.fingerprint ||
+    receipt.payload.repairCheckpointId !==
+      handoff.payload.repairCheckpointId ||
+    !Number.isSafeInteger(receipt.payload.checkpointSequence) ||
+    Number(receipt.payload.checkpointSequence) <
+      handoff.payload.preparedCheckpointSequence
+  ) {
+    throw new Error(
+      "Background Code receipt payload drifted from the exact repair checkpoint.",
+    );
+  }
+  if ("repairRequestFingerprint" in receipt.payload) {
+    if (
+      receipt.payload.repairRequestFingerprint !==
+      handoff.payload.repairRequestFingerprint
+    ) {
+      throw new Error(
+        "Background Code receipt request fingerprint drifted.",
+      );
+    }
+  }
+  if (
+    "failureFingerprint" in receipt.payload &&
+    !/^sha256:[a-f0-9]{64}$/u.test(String(receipt.payload.failureFingerprint))
+  ) {
+    throw new Error("Background Code ambiguity fingerprint is invalid.");
+  }
+  if (receipt.status !== "verified") return;
+  if (
+    !/^[a-f0-9]{40}$/u.test(String(receipt.payload.commitSha)) ||
+    !/^sha256:[a-f0-9]{64}$/u.test(
+      String(receipt.payload.verifiedCommitReceiptFingerprint),
+    ) ||
+    receipt.payload.workspaceBindingFingerprint !==
+      handoff.payload.workspaceBindingFingerprint ||
+    receipt.payload.repositoryProfileFingerprint !==
+      handoff.payload.repositoryProfileFingerprint ||
+    receipt.payload.sandboxCapabilityFingerprint !==
+      handoff.payload.sandboxCapabilityFingerprint
+  ) {
+    throw new Error(
+      "Background Code verification receipt does not prove the exact prepared commit.",
+    );
+  }
+}
+
+function assertBackgroundGitHubAttemptIdentity(
+  attempt: BackgroundGitHubDispatchAttemptV1,
+  action: PreparedBackgroundGitHubActionV1,
+  packageIdentity: PreparedBackgroundGitHubPackageIdentityV1,
+): void {
+  if (
+    attempt.provider !== "github" ||
+    attempt.operation !== action.operation ||
+    attempt.actionFingerprint !== action.fingerprint ||
+    attempt.packageFingerprint !== packageIdentity.packageFingerprint ||
+    attempt.packageIdentityFingerprint !== packageIdentity.fingerprint ||
+    packageIdentity.actionFingerprint !== action.fingerprint ||
+    packageIdentity.preparedActionFingerprint !==
+      action.preparedActionFingerprint ||
+    packageIdentity.operation !== action.operation ||
+    packageIdentity.publicationId !== action.payload.publicationId ||
+    packageIdentity.repositoryBindingFingerprint !==
+      action.binding.repositoryBindingFingerprint ||
+    packageIdentity.repositoryProfileFingerprint !==
+      action.binding.repositoryProfileFingerprint ||
+    packageIdentity.verifiedAccountId !== action.binding.verifiedAccountId ||
+    attempt.attemptId !==
+      backgroundGitHubActionAttemptIdV1(attempt.jobId, action)
+  ) {
+    throw new Error(
+      "Background GitHub attempt identity drifted from its prepared package.",
+    );
+  }
+}
+
+function assertBackgroundGitHubReceiptSemantics(
+  receipt: BackgroundGitHubCompanionReceiptV1,
+  action: PreparedBackgroundGitHubActionV1,
+): void {
+  if (!/^sha256:[a-f0-9]{64}$/u.test(receipt.fingerprint)) {
+    throw new Error("Background GitHub receipt fingerprint is invalid.");
+  }
+  const baseKeys = [
+    "attemptId",
+    "actionFingerprint",
+    "packageFingerprint",
+  ].sort();
+  const verifiedKeys = [
+    ...baseKeys,
+    "resultFingerprint",
+    "verifiedResult",
+  ].sort();
+  const expectedKeys = receipt.status === "verified" ? verifiedKeys : baseKeys;
+  if (
+    !["ambiguous", "failed", "verified"].includes(receipt.status) ||
+    Object.keys(receipt.payload).sort().join("\0") !== expectedKeys.join("\0")
+  ) {
+    throw new Error(
+      "Background GitHub receipt does not match the closed provider-result contract.",
+    );
+  }
+  if (receipt.payload.actionFingerprint !== action.fingerprint) {
+    throw new Error(
+      "Background GitHub receipt action fingerprint drifted from the sealed action.",
+    );
+  }
+  if (receipt.status !== "verified") return;
+  if (
+    !/^sha256:[a-f0-9]{64}$/u.test(
+      String(receipt.payload.resultFingerprint),
+    ) ||
+    !receipt.payload.verifiedResult ||
+    typeof receipt.payload.verifiedResult !== "object" ||
+    Array.isArray(receipt.payload.verifiedResult)
+  ) {
+    throw new Error(
+      "Background GitHub verified receipt is missing its complete result proof.",
+    );
+  }
+}
+
+function assertBackgroundGitHubVerifiedResultSemantics(
+  result: BackgroundGitHubVerifiedResultV1,
+  action: PreparedBackgroundGitHubActionV1,
+): void {
+  if (
+    result.operation !== action.operation ||
+    result.publicationId !== action.payload.publicationId ||
+    result.repositoryBindingFingerprint !==
+      action.binding.repositoryBindingFingerprint ||
+    result.verifiedAccountId !== action.binding.verifiedAccountId
+  ) {
+    throw new Error(
+      "Background GitHub verified result drifted from its exact operation, publication, repository, or account.",
+    );
+  }
+  switch (action.operation) {
+    case "github_verified_branch_push_v1":
+      if (
+        result.headSha !== action.payload.headSha ||
+        result.pullRequestNumber !== null ||
+        result.mergeSha !== null ||
+        result.autoMergeEnabled
+      ) {
+        throw new Error(
+          "Background GitHub push proof does not prove the exact approved branch head.",
+        );
+      }
+      break;
+    case "github_draft_pull_request_v1":
+      if (
+        result.headSha !== action.payload.headSha ||
+        result.pullRequestNumber === null ||
+        result.mergeSha !== null ||
+        result.autoMergeEnabled
+      ) {
+        throw new Error(
+          "Background GitHub draft-PR proof does not prove the exact approved head.",
+        );
+      }
+      break;
+    case "github_review_repair_fast_forward_v1":
+      if (
+        result.headSha !== action.payload.newHeadSha ||
+        result.pullRequestNumber !== action.payload.pullRequestNumber ||
+        result.mergeSha !== null ||
+        result.autoMergeEnabled
+      ) {
+        throw new Error(
+          "Background GitHub review-repair proof does not prove the exact fast-forward head.",
+        );
+      }
+      break;
+    case "github_pull_request_merge_v1":
+      if (
+        result.headSha !== action.payload.headSha ||
+        result.pullRequestNumber !== action.payload.pullRequestNumber ||
+        result.mergeSha === null ||
+        result.autoMergeEnabled
+      ) {
+        throw new Error(
+          "Background GitHub merge proof does not prove the exact approved pull request.",
+        );
+      }
+      break;
+    case "github_pull_request_auto_merge_v1":
+      if (
+        result.headSha !== action.payload.headSha ||
+        result.pullRequestNumber !== action.payload.pullRequestNumber ||
+        result.mergeSha !== null ||
+        !result.autoMergeEnabled
+      ) {
+        throw new Error(
+          "Background GitHub auto-merge proof does not prove enablement for the exact approved pull request.",
+        );
+      }
+      break;
+  }
+}
+
+function assertMonotonicExternalReceiptTimes(
+  receipts: ExternalActionCompanionReceiptV1[],
+): void {
+  let previous = Number.NEGATIVE_INFINITY;
+  for (const receipt of receipts) {
+    const committedAt = Date.parse(receipt.committedAt);
+    if (!Number.isFinite(committedAt) || committedAt < previous) {
+      throw new Error(
+        "External action receipts are not in durable commit order.",
+      );
+    }
+    previous = committedAt;
+  }
 }
 
 export function buildOperationReconciliationInputs(
@@ -746,6 +2614,40 @@ export function buildOperationReconciliationInputs(
         : undefined,
       authorization: record.authorization
         ? { ...record.authorization }
+        : undefined,
+      preparedExternalActionHandoff: record.preparedExternalActionHandoff
+        ? clonePreparedExternalActionHandoff(
+            record.preparedExternalActionHandoff,
+          )
+        : undefined,
+      externalActionDispatchAttempt: record.externalActionDispatchAttempt
+        ? { ...record.externalActionDispatchAttempt }
+        : undefined,
+      preparedBackgroundCodeAction: record.preparedBackgroundCodeAction
+        ? parsePreparedBackgroundCodeActionV1(
+            record.preparedBackgroundCodeAction,
+          )
+        : undefined,
+      preparedBackgroundCodePackage: record.preparedBackgroundCodePackage
+        ? parsePreparedBackgroundCodePackageIdentityV1(
+            record.preparedBackgroundCodePackage,
+          )
+        : undefined,
+      backgroundCodeDispatchAttempt: record.backgroundCodeDispatchAttempt
+        ? { ...record.backgroundCodeDispatchAttempt }
+        : undefined,
+      preparedBackgroundGitHubAction: record.preparedBackgroundGitHubAction
+        ? parsePreparedBackgroundGitHubActionV1(
+            record.preparedBackgroundGitHubAction,
+          )
+        : undefined,
+      preparedBackgroundGitHubPackage: record.preparedBackgroundGitHubPackage
+        ? parsePreparedBackgroundGitHubPackageIdentityV1(
+            record.preparedBackgroundGitHubPackage,
+          )
+        : undefined,
+      backgroundGitHubDispatchAttempt: record.backgroundGitHubDispatchAttempt
+        ? { ...record.backgroundGitHubDispatchAttempt }
         : undefined,
       receipt: record.receipt
         ? cloneRuntimeReceipt(record.receipt)
@@ -976,6 +2878,38 @@ function normalizeOperationJournalRecord(
     descriptor: normalizeToolDescriptor(value.descriptor) ?? undefined,
     authorization:
       normalizeAuthorizedActionContext(value.authorization) ?? undefined,
+    preparedExternalActionHandoff:
+      normalizePreparedExternalActionHandoff(
+        value.preparedExternalActionHandoff,
+      ) ?? undefined,
+    externalActionDispatchAttempt:
+      normalizeExternalActionDispatchAttempt(
+        value.externalActionDispatchAttempt,
+      ) ?? undefined,
+    preparedBackgroundCodeAction:
+      normalizePreparedBackgroundCodeAction(
+        value.preparedBackgroundCodeAction,
+      ) ?? undefined,
+    preparedBackgroundCodePackage:
+      normalizePreparedBackgroundCodePackage(
+        value.preparedBackgroundCodePackage,
+      ) ?? undefined,
+    backgroundCodeDispatchAttempt:
+      normalizeBackgroundCodeDispatchAttempt(
+        value.backgroundCodeDispatchAttempt,
+      ) ?? undefined,
+    preparedBackgroundGitHubAction:
+      normalizePreparedBackgroundGitHubAction(
+        value.preparedBackgroundGitHubAction,
+      ) ?? undefined,
+    preparedBackgroundGitHubPackage:
+      normalizePreparedBackgroundGitHubPackage(
+        value.preparedBackgroundGitHubPackage,
+      ) ?? undefined,
+    backgroundGitHubDispatchAttempt:
+      normalizeBackgroundGitHubDispatchAttempt(
+        value.backgroundGitHubDispatchAttempt,
+      ) ?? undefined,
     state,
     mutationMayHaveApplied: value.mutationMayHaveApplied === true,
     receipt: normalizeRuntimeReceipt(value.receipt, 0, updatedAt) ?? undefined,
@@ -1059,6 +2993,320 @@ function normalizeAuthorizedActionContext(
     : null;
 }
 
+function normalizePreparedExternalActionHandoff(
+  value: unknown,
+): PreparedExternalActionHandoffV1 | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  try {
+    return parsePreparedExternalActionHandoffV1(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeExternalActionDispatchAttempt(
+  value: unknown,
+): ExternalActionDispatchAttemptV1 | null {
+  if (!isRecord(value)) return null;
+  const status = value.status;
+  const jobId = getNonEmptyString(value.jobId);
+  const attemptId = getNonEmptyString(value.attemptId);
+  const handoffFingerprint = getNonEmptyString(value.handoffFingerprint);
+  const preparedAt = getNonEmptyString(value.preparedAt);
+  const updatedAt = getNonEmptyString(value.updatedAt);
+  if (
+    value.version !== 1 ||
+    value.provider !== "linear" ||
+    value.operation !== "linear_issue_state_update_v1" ||
+    ![
+      "prepared",
+      "job_submitted",
+      "dispatched",
+      "ambiguous",
+      "readback_verified",
+    ].includes(String(status)) ||
+    !jobId ||
+    !attemptId ||
+    !handoffFingerprint ||
+    !preparedAt ||
+    !updatedAt ||
+    !/^sha256:[0-9a-f]{64}$/u.test(attemptId) ||
+    !/^sha256:[0-9a-f]{64}$/u.test(handoffFingerprint)
+  ) {
+    return null;
+  }
+  const nullableFingerprint = (candidate: unknown) => {
+    if (candidate === null) return null;
+    const text = getNonEmptyString(candidate);
+    return text && /^sha256:[0-9a-f]{64}$/u.test(text) ? text : undefined;
+  };
+  const dispatchedReceiptFingerprint = nullableFingerprint(
+    value.dispatchedReceiptFingerprint,
+  );
+  const ambiguousReceiptFingerprint = nullableFingerprint(
+    value.ambiguousReceiptFingerprint,
+  );
+  const verifiedReceiptFingerprint = nullableFingerprint(
+    value.verifiedReceiptFingerprint,
+  );
+  if (
+    dispatchedReceiptFingerprint === undefined ||
+    ambiguousReceiptFingerprint === undefined ||
+    verifiedReceiptFingerprint === undefined
+  ) {
+    return null;
+  }
+  const submittedAt =
+    value.submittedAt === null ? null : getNonEmptyString(value.submittedAt);
+  if (value.submittedAt !== null && !submittedAt) return null;
+  return {
+    version: 1,
+    provider: "linear",
+    operation: "linear_issue_state_update_v1",
+    jobId,
+    attemptId,
+    handoffFingerprint,
+    status: status as ExternalActionDispatchAttemptV1["status"],
+    preparedAt,
+    submittedAt: submittedAt ?? null,
+    dispatchedReceiptFingerprint,
+    ambiguousReceiptFingerprint,
+    verifiedReceiptFingerprint,
+    updatedAt,
+  };
+}
+
+function normalizePreparedBackgroundCodeAction(
+  value: unknown,
+): PreparedBackgroundCodeActionV1 | null {
+  if (value === undefined || value === null) return null;
+  try {
+    return parsePreparedBackgroundCodeActionV1(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizePreparedBackgroundCodePackage(
+  value: unknown,
+): PreparedBackgroundCodePackageIdentityV1 | null {
+  if (value === undefined || value === null) return null;
+  try {
+    return parsePreparedBackgroundCodePackageIdentityV1(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeBackgroundCodeDispatchAttempt(
+  value: unknown,
+): BackgroundCodeDispatchAttemptV1 | null {
+  if (!isRecord(value)) return null;
+  const status = value.status;
+  const jobId = getNonEmptyString(value.jobId);
+  const attemptId = getNonEmptyString(value.attemptId);
+  const handoffFingerprint = getNonEmptyString(value.handoffFingerprint);
+  const packageFingerprint = getNonEmptyString(value.packageFingerprint);
+  const packageIdentityFingerprint = getNonEmptyString(
+    value.packageIdentityFingerprint,
+  );
+  const preparedAt = getNonEmptyString(value.preparedAt);
+  const updatedAt = getNonEmptyString(value.updatedAt);
+  const sha = (candidate: string | undefined) =>
+    Boolean(candidate && /^sha256:[0-9a-f]{64}$/u.test(candidate));
+  if (
+    value.version !== 1 ||
+    value.provider !== "code" ||
+    value.operation !== "prepared_code_validation_commit_v1" ||
+    ![
+      "prepared",
+      "job_submitted",
+      "dispatched",
+      "ambiguous",
+      "readback_verified",
+    ].includes(String(status)) ||
+    !jobId ||
+    !sha(attemptId) ||
+    !sha(handoffFingerprint) ||
+    !sha(packageFingerprint) ||
+    !sha(packageIdentityFingerprint) ||
+    !preparedAt ||
+    !updatedAt
+  ) {
+    return null;
+  }
+  const nullableSha = (candidate: unknown): string | null | undefined => {
+    if (candidate === null) return null;
+    const text = getNonEmptyString(candidate);
+    return text && /^sha256:[0-9a-f]{64}$/u.test(text) ? text : undefined;
+  };
+  const dispatchedReceiptFingerprint = nullableSha(
+    value.dispatchedReceiptFingerprint,
+  );
+  const ambiguousReceiptFingerprint = nullableSha(
+    value.ambiguousReceiptFingerprint,
+  );
+  const verifiedReceiptFingerprint = nullableSha(
+    value.verifiedReceiptFingerprint,
+  );
+  const verifiedCommitReceiptFingerprint = nullableSha(
+    value.verifiedCommitReceiptFingerprint,
+  );
+  if (
+    dispatchedReceiptFingerprint === undefined ||
+    ambiguousReceiptFingerprint === undefined ||
+    verifiedReceiptFingerprint === undefined ||
+    verifiedCommitReceiptFingerprint === undefined
+  ) {
+    return null;
+  }
+  const submittedAt =
+    value.submittedAt === null ? null : getNonEmptyString(value.submittedAt);
+  const commitSha =
+    value.commitSha === null ? null : getNonEmptyString(value.commitSha);
+  if (
+    (value.submittedAt !== null && !submittedAt) ||
+    (value.commitSha !== null && !/^[a-f0-9]{40}$/u.test(commitSha ?? ""))
+  ) {
+    return null;
+  }
+  return {
+    version: 1,
+    provider: "code",
+    operation: "prepared_code_validation_commit_v1",
+    jobId,
+    attemptId: attemptId!,
+    handoffFingerprint: handoffFingerprint!,
+    packageFingerprint: packageFingerprint!,
+    packageIdentityFingerprint: packageIdentityFingerprint!,
+    status: status as BackgroundCodeDispatchAttemptV1["status"],
+    preparedAt,
+    submittedAt: submittedAt ?? null,
+    dispatchedReceiptFingerprint,
+    ambiguousReceiptFingerprint,
+    verifiedReceiptFingerprint,
+    verifiedCommitReceiptFingerprint,
+    commitSha: commitSha ?? null,
+    updatedAt,
+  };
+}
+
+function normalizePreparedBackgroundGitHubAction(
+  value: unknown,
+): PreparedBackgroundGitHubActionV1 | null {
+  if (value === undefined || value === null) return null;
+  try {
+    return parsePreparedBackgroundGitHubActionV1(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizePreparedBackgroundGitHubPackage(
+  value: unknown,
+): PreparedBackgroundGitHubPackageIdentityV1 | null {
+  if (value === undefined || value === null) return null;
+  try {
+    return parsePreparedBackgroundGitHubPackageIdentityV1(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeBackgroundGitHubDispatchAttempt(
+  value: unknown,
+): BackgroundGitHubDispatchAttemptV1 | null {
+  if (!isRecord(value)) return null;
+  const status = value.status;
+  const jobId = getNonEmptyString(value.jobId);
+  const attemptId = getNonEmptyString(value.attemptId);
+  const actionFingerprint = getNonEmptyString(value.actionFingerprint);
+  const packageFingerprint = getNonEmptyString(value.packageFingerprint);
+  const packageIdentityFingerprint = getNonEmptyString(
+    value.packageIdentityFingerprint,
+  );
+  const preparedAt = getNonEmptyString(value.preparedAt);
+  const updatedAt = getNonEmptyString(value.updatedAt);
+  const sha = (candidate: string | undefined) =>
+    Boolean(candidate && /^sha256:[0-9a-f]{64}$/u.test(candidate));
+  const operations: PreparedBackgroundGitHubOperationV1[] = [
+    "github_verified_branch_push_v1",
+    "github_draft_pull_request_v1",
+    "github_review_repair_fast_forward_v1",
+    "github_pull_request_merge_v1",
+    "github_pull_request_auto_merge_v1",
+  ];
+  if (
+    value.version !== 1 ||
+    value.provider !== "github" ||
+    !operations.includes(value.operation as PreparedBackgroundGitHubOperationV1) ||
+    ![
+      "prepared",
+      "job_submitted",
+      "dispatched",
+      "ambiguous",
+      "readback_verified",
+    ].includes(String(status)) ||
+    !jobId ||
+    !sha(attemptId) ||
+    !sha(actionFingerprint) ||
+    !sha(packageFingerprint) ||
+    !sha(packageIdentityFingerprint) ||
+    !preparedAt ||
+    !updatedAt
+  ) {
+    return null;
+  }
+  const nullableSha = (candidate: unknown): string | null | undefined => {
+    if (candidate === null) return null;
+    const text = getNonEmptyString(candidate);
+    return text && /^sha256:[0-9a-f]{64}$/u.test(text) ? text : undefined;
+  };
+  const dispatchedReceiptFingerprint = nullableSha(
+    value.dispatchedReceiptFingerprint,
+  );
+  const ambiguousReceiptFingerprint = nullableSha(
+    value.ambiguousReceiptFingerprint,
+  );
+  const verifiedReceiptFingerprint = nullableSha(
+    value.verifiedReceiptFingerprint,
+  );
+  const verifiedResultFingerprint = nullableSha(
+    value.verifiedResultFingerprint,
+  );
+  if (
+    dispatchedReceiptFingerprint === undefined ||
+    ambiguousReceiptFingerprint === undefined ||
+    verifiedReceiptFingerprint === undefined ||
+    verifiedResultFingerprint === undefined
+  ) {
+    return null;
+  }
+  const submittedAt =
+    value.submittedAt === null ? null : getNonEmptyString(value.submittedAt);
+  if (value.submittedAt !== null && !submittedAt) return null;
+  return {
+    version: 1,
+    provider: "github",
+    operation: value.operation as PreparedBackgroundGitHubOperationV1,
+    jobId,
+    attemptId: attemptId!,
+    actionFingerprint: actionFingerprint!,
+    packageFingerprint: packageFingerprint!,
+    packageIdentityFingerprint: packageIdentityFingerprint!,
+    status: status as BackgroundGitHubDispatchAttemptV1["status"],
+    preparedAt,
+    submittedAt: submittedAt ?? null,
+    dispatchedReceiptFingerprint,
+    ambiguousReceiptFingerprint,
+    verifiedReceiptFingerprint,
+    verifiedResultFingerprint,
+    updatedAt,
+  };
+}
+
 function normalizeResourceRef(value: unknown): ResourceRef | null {
   if (!isRecord(value) || !isResourceSystem(value.system)) {
     return null;
@@ -1129,6 +3377,14 @@ function cloneToolDescriptor(descriptor: ToolDescriptor): ToolDescriptor {
   return JSON.parse(JSON.stringify(descriptor)) as ToolDescriptor;
 }
 
+function clonePreparedExternalActionHandoff(
+  handoff: PreparedExternalActionHandoffV1,
+): PreparedExternalActionHandoffV1 {
+  return parsePreparedExternalActionHandoffV1(
+    JSON.parse(JSON.stringify(handoff)),
+  );
+}
+
 function cloneRuntimeReceipt(receipt: MissionRuntimeReceipt): MissionRuntimeReceipt {
   return JSON.parse(JSON.stringify(receipt)) as MissionRuntimeReceipt;
 }
@@ -1151,12 +3407,26 @@ function isAllowedJournalTransition(
 ): boolean {
   const allowed: Record<OperationJournalState, OperationJournalState[]> = {
     intent_recorded: ["applying", "failed"],
-    applying: ["applied", "failed", "reconcile_required"],
+    applying: ["applied", "dispatched", "failed", "reconcile_required"],
+    dispatched: [
+      "ambiguous",
+      "readback_verified",
+      "failed",
+      "reconcile_required",
+    ],
+    ambiguous: ["readback_verified", "failed", "reconcile_required"],
+    readback_verified: ["committed", "failed", "reconcile_required"],
     applied: ["verified", "failed", "reconcile_required"],
     verified: ["committed", "failed", "reconcile_required"],
     committed: [],
     failed: ["reconcile_required"],
-    reconcile_required: ["verified", "committed", "failed"],
+    reconcile_required: [
+      "ambiguous",
+      "readback_verified",
+      "verified",
+      "committed",
+      "failed",
+    ],
   };
   return allowed[from].includes(to);
 }
@@ -1167,11 +3437,17 @@ function getReconciliationAction(
   if (record.state === "intent_recorded" && !record.mutationMayHaveApplied) {
     return "safe_to_retry";
   }
+  if (record.state === "readback_verified") {
+    return "verify_receipt";
+  }
   if (record.receipt && record.state !== "committed") {
     return "verify_receipt";
   }
   if (
-    record.preparedAction &&
+    (record.preparedAction ||
+      record.externalActionDispatchAttempt ||
+      record.backgroundCodeDispatchAttempt ||
+      record.backgroundGitHubDispatchAttempt) &&
     record.descriptor?.durability.reconciliation !== "none" &&
     record.mutationMayHaveApplied
   ) {
@@ -1306,6 +3582,9 @@ function normalizeRuntimeStatus(value: unknown): MissionRuntimeStatus | null {
 function normalizeJournalState(value: unknown): OperationJournalState | null {
   return value === "intent_recorded" ||
     value === "applying" ||
+    value === "dispatched" ||
+    value === "ambiguous" ||
+    value === "readback_verified" ||
     value === "applied" ||
     value === "verified" ||
     value === "committed" ||
@@ -1362,9 +3641,89 @@ function dedupeStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim()))];
 }
 
+export function normalizeMissionGraphStoreReference(
+  value: unknown,
+): MissionGraphStoreReferenceV1 | null {
+  if (!isRecord(value) || value.version !== 1) {
+    return null;
+  }
+  const missionId = getNonEmptyString(value.missionId);
+  const path = getNonEmptyString(value.path);
+  const recordFingerprint = getNonEmptyString(value.recordFingerprint);
+  const journalHeadFingerprint = value.journalHeadFingerprint === null
+    ? null
+    : getNonEmptyString(value.journalHeadFingerprint);
+  if (
+    !missionId ||
+    !path ||
+    !recordFingerprint ||
+    !/^sha256:[a-f0-9]{64}$/.test(recordFingerprint) ||
+    journalHeadFingerprint === undefined ||
+    (journalHeadFingerprint !== null &&
+      !/^sha256:[a-f0-9]{64}$/.test(journalHeadFingerprint))
+  ) {
+    return null;
+  }
+  let normalizedPath: string;
+  try {
+    normalizedPath = normalizeVaultPath(path, { requireMarkdown: true });
+  } catch {
+    return null;
+  }
+  if (!/^Agent Runs\/Mission Graphs\/[^/]+\.md$/i.test(normalizedPath)) {
+    return null;
+  }
+  const storeRevision = normalizeNonNegativeInteger(value.storeRevision);
+  const graphRevision = normalizeNonNegativeInteger(value.graphRevision);
+  if (storeRevision < 1) {
+    return null;
+  }
+  return {
+    version: 1,
+    missionId,
+    path: normalizedPath,
+    storeRevision,
+    graphRevision,
+    recordFingerprint,
+    journalHeadFingerprint,
+  };
+}
+
 function parseDateOrNow(value: string): Date {
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? new Date(timestamp) : new Date();
+}
+
+type BoundedSettlement<T> =
+  | { kind: "resolved"; value: T }
+  | { kind: "rejected"; value: unknown }
+  | { kind: "timed_out" };
+
+async function settleBounded<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<BoundedSettlement<T>> {
+  const boundedTimeoutMs = Math.max(1, Math.floor(timeoutMs));
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutResult = new Promise<BoundedSettlement<T>>((resolve) => {
+    timeout = setTimeout(
+      () => resolve({ kind: "timed_out" }),
+      boundedTimeoutMs,
+    );
+  });
+  const settled = promise
+    .then<BoundedSettlement<T>>((value) => ({ kind: "resolved", value }))
+    .catch<BoundedSettlement<T>>((value: unknown) => ({
+      kind: "rejected",
+      value,
+    }));
+  try {
+    return await Promise.race([settled, timeoutResult]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function replaceRuntimeSnapshotBlock(current: string, block: string): string {

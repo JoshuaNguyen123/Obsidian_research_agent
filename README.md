@@ -11,7 +11,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 ## Features
 
 - Native Obsidian view with a minimal green-on-black mission console.
-- Conditional `Orchestrator` tab for a live two-agent task tree, evidence handoffs, Git worktrees, validation, merge, and replay while preserving the original Chat and Run Details surfaces.
+- A durable `MissionGraphV3` is the authoritative plan; the conditional `Orchestrator` tab is a projection of that graph, while Chat and Run Details remain the primary surfaces.
 - Ollama-compatible model client for local model chat and streaming.
 - Agent loop with bounded steps, tool validation, and run receipts.
 - Vault tools for reading markdown files, inspecting folders, editing sections, appending to notes, replacing notes with backups, moving paths, and Obsidian-safe trash flows.
@@ -20,10 +20,13 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Web search and fetch tools for sourced research when enabled by the mission.
 - Truthful source gating rejects empty/unparsed pages as proof and supports cache, provider, and safety-gated browser extraction fallbacks.
 - Metadata-aware template ranking, dry rendering, safe built-ins, collision handling, and read-back verification.
-- Approval-gated code-team worktrees with a shell-free code worker and guarded green auto-promotion.
+- Optional Code extension with durable scratch folders and trusted Git worktrees, bounded file CRUD, repository profiles, sandbox-only validation, repair checkpoints, and verified local commits.
+- Native Canvas, SVG, and Mermaid read/patch tools with optimistic concurrency, transactional design packages, structural QA, bounded layout repair, readback, and receipts.
 - A descriptor-based external-action kernel with prepared-action fingerprints, scoped authority grants, exact approval previews, canonical receipts, readback, and reconciliation.
 - Fixed Linear GraphQL tools through capability gates 0-5; the model cannot submit arbitrary GraphQL, credentials remain host-owned, and Linear tools appear only for explicit Linear intent.
 - A durable Linear queue scanner/coordinator with strict executable-ticket contracts, four-hour grants, two-ticket concurrency, project/resource locks, and a 25-start UTC-day limit.
+- Optional Integrations extension with explicit research-to-note-to-Linear publication, reverse Linear work-item execution, secure credential references, a bounded GitHub catalog, verified Git push, draft pull requests, review handling, and separately approved merge.
+- Optional authenticated loopback Companion service with SQLite jobs, leases, event replay, OS service lifecycle commands, and a shared TypeScript headless worker. Vault operations always wait for connected Obsidian.
 - Pinned continuous-research schedules with quiet hours, retry state, source hashes, and verified/stale/superseded memory states.
 - Persisted chat history capped to useful user and assistant messages only.
 - `Run Details` diagnostics for model config, status, planning, tool timeline, receipts, and trace logs.
@@ -94,50 +97,59 @@ npm run sync:test-vault
 Run the Obsidian desktop e2e tests (Obsidian must be closed first):
 
 ```bash
-npm run test:e2e:mock   # deterministic playwright-e2e-mock
-npm run test:e2e        # live gpt-oss:120b-cloud (--real-ai)
-npm run test:e2e:real:long
+npm run test:e2e                       # default deterministic core-mock lane
+npm run test:e2e:deterministic-matrix  # core, integration, sandbox, and companion-restart lanes
+npm run test:e2e:integration           # deterministic Linear/GitHub integration mocks
+npm run test:e2e:sandbox               # deterministic sandbox boundary lane
+npm run test:e2e:companion             # deterministic companion restart lane
+npm run test:e2e:real                  # opt-in real-AI lane
+npm run test:e2e:live                  # opt-in disposable external-provider mutation lane
 ```
 
-The e2e harness builds the plugin, syncs only `main.js`, `manifest.json`, and `styles.css` into the live test vault plugin folder, launches a controlled Obsidian process, and verifies real missions against seeded notes. By default it resolves the vault as `%USERPROFILE%\OneDrive\Desktop\test_vault_obsidian_ai`; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
+`npm run test:e2e` is deterministic by default and does not call a live model. The deterministic matrix runs the core mock, integration mock, sandbox, and companion-restart Playwright projects. `npm run test:e2e:real` is the explicit real-model lane. `npm run test:e2e:live` is a guarded, credentialed disposable-provider lane: Linear creates, reads, duplicate-searches, comments on, and trashes one test issue; GitHub pushes a local-worktree commit with ephemeral askpass, verifies a draft PR, and cleans up its PR/branch. Live merge requires a separate exact confirmation and performs a compensating cleanup merge.
 
-**Honest limits:** overnight / long multi-segment runs require Obsidian to stay open (not a background daemon). Keep-awake and the structured model router are opt-in / experimental.
+The e2e harness builds all plugin artifacts, syncs each lane's required extensions into the test vault without overwriting any existing `data.json`, launches a controlled Obsidian process, and verifies missions against seeded notes. By default it resolves the vault as `%USERPROFILE%\OneDrive\Desktop\test_vault_obsidian_ai`; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
+
+**Honest limits:** ordinary vault work and any unapproved external mutation still require Obsidian to remain open. The optional companion can resume only installed, already-authorized non-vault operations; vault nodes stop in `waiting_obsidian`. A secure persistent OS credential backend and explicit service installation are mandatory for unattended work. Generated-code execution stays disabled until a Docker, Podman, dedicated WSL2, or bubblewrap provider passes the boundary probe. The structured model router is authoritative only in the automatic autonomy profile; conservative mode remains deterministic.
 
 ## Linear-First Work Queue
 
-Linear is an optional, disabled-by-default work-item handoff between research and execution. Configure `Enable Linear`, a personal API key, the default team, queue project, and started/completed workflow state IDs in plugin settings. The connection test is read-only. The key is masked in the UI but stored unencrypted in the plugin's vault-local `data.json`; it is retained by the host and is never included in worker settings or prompts.
+Linear is an optional, disabled-by-default work-item handoff between research and execution. Configure `Enable Linear`, OAuth or a personal API credential, and choose connection-derived team, project, and workflow states in plugin settings. The connection test is read-only. New credentials are stored through an opaque `SecretStoreV1` reference when the authenticated secure companion is available. A pre-existing plaintext key remains in explicit foreground compatibility mode until the user runs the verified migration action; it is never silently copied or cleared, and it is never included in prompts or worker settings.
 
 The automatic queue can be enabled only when the internal Linear capability gate is 5. While Obsidian is open, it scans at most ten project issues every 15 minutes from a durable updated-since cursor. Execution also requires a separate user-authorized four-hour grant. The coordinator rechecks that grant, reserves the daily budget, acquires durable issue/repository locks, posts and verifies a claim comment, and verifies the started-state update before routing work. Ambiguous mutations enter reconciliation instead of being retried blindly.
 
-Current execution support is intentionally narrower than the queue contract:
+Current execution support is bounded by trusted logical bindings:
 
 - `research` tickets run through the Researcher/Lead path with a web-read-only scoped registry and chat-only output, then must include the ticket's acceptance IDs and evidence references before Linear can be completed.
-- `vault` tickets remain ineligible because no trusted automatic vault-target binding is installed.
-- `code` tickets may resolve only a trusted local `repositoryKey`, but queue-to-Code-Worker execution/promotion remains blocked pending compatibility e2e proof. The separate, manually approved code-team path is unchanged.
+- `vault` tickets require the exact `current-vault` binding and can create only the host-derived note `Agent Work/Linear Queue/<work-item-fingerprint>.md`; issue text cannot supply a path, command, or new authority.
+- `code` tickets resolve only a trusted `repositoryKey`, run through the Code extension's durable worktree/sandbox/repair path, and remain `waiting_for_publication` after a verified local commit until their required GitHub and backlink proof exists.
 - `human` tickets are never covered by the automatic grant.
-- The GitHub REST client is only a host-side scaffold for repository, pull-request, and check reads plus draft-PR creation. GitHub tools, credentials, branch push, publication receipts, and queue completion proof are not registered yet.
+- GitHub exposes only a fixed catalog against a host-resolved trusted repository profile. Source changes remain local-worktree-only. Push uses ephemeral askpass, remote-SHA readback, and no force-push; draft publication and merge use separate exact approval snapshots, with merge requiring two confirmations.
+
+While Obsidian is open, the reverse queue performs a mandatory fresh issue read before claiming work and reconciles ambiguous provider mutations by readback. The companion currently runs only operations advertised by its installed executor catalog; unsupported effectful background work is persisted as a resumable blocker rather than retried or simulated.
 
 See local `docs/plans/linear-first-unified-agent.md` for the detailed delivery graph, invariants, and remaining promotion gates.
 
 ## Project Layout
 
 ```text
-main.ts                    Plugin entrypoint
-src/AgentView.ts           Right-side Obsidian UI
-src/AgentRunner.ts         Agent loop and model/tool orchestration
-src/model/                 Ollama-compatible model client
-src/tools/                 Vault, web, validation, and registry tools
-src/orchestrator/          Two-agent runtime, evidence, templates, worktrees, continuous research
-src/integrations/linear/   Fixed Linear transport, tools, contracts, durability, and reconciliation
-src/integrations/github/   Host-side GitHub REST scaffold (not registered as agent tools)
-src/agent/actions/         Versioned descriptors, prepared actions, and canonical receipts
-src/agent/authority/       Scoped grants and durable usage accounting
-src/agent/queue/           Linear scanner, leases, locks, daily limits, and coordinator
-src/conversationHistory.ts Persisted bounded chat memory
-tests/                     Node test suite
-e2e/                       Playwright Obsidian desktop tests
-scripts/                   Local helper scripts for vault sync and validation
-docs/                      Local-only specs, plans, and technical details (gitignored)
+main.ts                         Core plugin entrypoint and extension host
+src/AgentView.ts                Right-side Obsidian UI
+src/AgentRunner.ts              Model loop and MissionGraph orchestration
+src/model/                      Ollama-compatible model client
+src/tools/                      Core vault, web, diagram, and integration adapters
+src/agent/missionGraph*.ts      Canonical graph planning, persistence, projection, and resume
+src/integrations/linear/        Linear contracts, OAuth, publication, queue lineage, and reconciliation
+src/integrations/github/        GitHub auth, fixed transport, secure push, publication, and checkpoints
+packages/core-api/              Versioned extension registration and shared contracts
+packages/headless-runtime/      Environment-neutral mission and companion worker runtime
+extensions/code/                Durable workspaces, repository profiles, sandbox, repair, and commit
+extensions/integrations/        Optional Linear/GitHub extension boundary
+extensions/companion/           Optional authenticated local background coordinator
+tests/                          Node test suite
+e2e/                            Native Obsidian Playwright projects and fixtures
+scripts/                        Build, sync, release-gate, and validation helpers
+docs/                           Local-only specs, plans, and technical details (gitignored)
 ```
 
 ## Technical Documentation

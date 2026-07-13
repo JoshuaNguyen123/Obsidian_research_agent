@@ -250,7 +250,15 @@ export function intersectAuthoritativeIntent(
 ): RoutedMissionIntent {
   return {
     ...model,
+    // Read authority is additive: either planner may identify grounding that
+    // is useful, while the installed tool catalog and budgets remain the host
+    // boundary. Execution stays intersected so model output cannot grant it.
+    needsWebEvidence: model.needsWebEvidence || regex.needsWebEvidence,
+    needsVaultContext: model.needsVaultContext || regex.needsVaultContext,
+    needsCodeExecution:
+      model.needsCodeExecution && regex.needsCodeExecution,
     writeScope: saferWriteScope(model.writeScope, regex.writeScope),
+    wordTarget: regex.wordTarget ?? model.wordTarget,
   };
 }
 

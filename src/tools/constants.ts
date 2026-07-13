@@ -1,3 +1,5 @@
+import { GITHUB_CATALOG_READ_TOOL_NAMES } from "./githubCatalogTools";
+
 export const MAX_AGENT_STEPS = 100;
 export const FINALIZATION_RESERVE_STEPS = 4;
 export const CHECKPOINT_EVERY_STEPS = 5;
@@ -17,8 +19,9 @@ export const MAX_WEB_SEARCH_SNIPPET_CHARS = 800;
 export const MAX_WEB_FETCH_CHARS = 6000;
 export const DEFAULT_WEB_RESULTS = 3;
 export const MAX_CODE_RUNS_PER_MISSION = 16;
-export const MAX_PARALLEL_TOOL_CALLS = 4;
+export const MAX_PARALLEL_TOOL_CALLS = 3;
 export const READ_ONLY_TOOL_NAMES = new Set([
+  ...GITHUB_CATALOG_READ_TOOL_NAMES,
   "read_current_file",
   "inspect_vault_context",
   "inspect_vault_index",

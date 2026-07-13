@@ -10,6 +10,9 @@ import type { ToolExecutionContext } from "../src/tools/types";
 import {
   HostLinearActionExecutor,
   LinearClientError,
+  createPendingLinearReconciliationState,
+  upsertUncertainLinearReconciliation,
+  recordLinearReconciliationOutcome,
   type LinearAuthoritySubject,
   type LinearIssueRecord,
   type LinearOperationResult,
@@ -204,6 +207,101 @@ test("ambiguous Linear dispatch surfaces reconcile_required and never retries", 
   assert.equal(reconciled.receipt?.commitKind, "reconciled");
   assert.equal(reconciled.receipt?.grantId, grant.id);
   assert.equal(mutationCount, 1);
+});
+
+test("finalization-style prepared action survives commit-then-transport-loss and reconciles after restart without duplicate create", async () => {
+  const grant = await queueGrant(SUBJECT, "grant-finalization-crash");
+  const store = new AuthorityGrantStore(
+    createAuthorityGrantStoreState(new Date("2026-07-11T11:00:00.000Z")),
+    async () => undefined,
+  );
+  await store.upsert(grant, new Date("2026-07-11T11:01:00.000Z"));
+  let mutationCount = 0;
+  let createdInput: Record<string, unknown> | undefined;
+  const client: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.get" && !createdInput) throw notFound(operationKey);
+      if (operationKey === "issues.create") {
+        mutationCount += 1;
+        createdInput = variables.input as Record<string, unknown>;
+        throw new LinearClientError(
+          "linear_timeout",
+          "Provider committed before the transport was lost.",
+          { operationKey },
+        );
+      }
+      if (operationKey === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+        });
+      }
+      throw new Error(`Unexpected Linear operation ${operationKey}`);
+    },
+  };
+  const executor = new HostLinearActionExecutor({
+    client,
+    gate: 1,
+    activeGrants: () => store.snapshot().grants,
+    authorizeAndConsume: (request) => store.authorizeAndConsume(request),
+  });
+  const context = contextFixture("run-finalization", "github-linear-link-publication-1");
+  const prepared = await executor.prepare({
+    toolName: "linear_create_issue",
+    arguments: { teamId: "team-1", title: "Publication linkage fixture" },
+    runId: "run-finalization",
+    toolCallId: "github-linear-link-publication-1",
+    context,
+  });
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  let pending = await upsertUncertainLinearReconciliation(
+    createPendingLinearReconciliationState(new Date("2026-07-11T12:00:00.000Z")),
+    {
+      expectedRevision: 0,
+      action: prepared.action,
+      grantId: grant.id,
+      issueId: "issue-origin",
+      queueStage: "manual",
+      authoritySubject: SUBJECT,
+      at: "2026-07-11T12:01:00.000Z",
+      error: {
+        code: "linear_finalization_dispatch_prepared",
+        message: "Prepared before provider dispatch.",
+      },
+    },
+  );
+  const executed = await executor.executePrepared({
+    action: prepared.action,
+    runId: "run-finalization",
+    toolCallId: "github-linear-link-publication-1",
+    context,
+    subject: SUBJECT,
+    preferredGrantId: grant.id,
+  });
+  assert.equal(executed.ok, false);
+  if (executed.ok) return;
+  assert.equal(executed.status, "reconcile_required");
+
+  const persisted = pending.pendingByActionId[prepared.action.id]!;
+  const reconciled = await executor.reconcile({
+    action: persisted.action,
+    runId: persisted.action.runId,
+    toolCallId: persisted.action.toolCallId,
+    grantId: persisted.grantId,
+    context,
+  });
+  assert.equal(reconciled.outcome, "committed");
+  assert.equal(reconciled.receipt?.commitKind, "reconciled");
+  assert.equal(mutationCount, 1);
+  pending = await recordLinearReconciliationOutcome(pending, {
+    expectedRevision: pending.revision,
+    actionId: prepared.action.id,
+    outcome: "committed",
+    at: "2026-07-11T12:02:00.000Z",
+  });
+  assert.equal(Object.keys(pending.pendingByActionId).length, 0);
 });
 
 test("fixed mutation boundary rejects reads, generic GraphQL names, and query arguments", async () => {

@@ -17,6 +17,31 @@ const DESIGN_PACKAGE_INTENT_PATTERN =
 
 export const createDesignPackageTool: AgentTool = {
   name: "create_design_package",
+  descriptor: {
+    version: 1,
+    name: "create_design_package",
+    capability: {
+      system: "vault",
+      resourceType: "design_package",
+      action: "create",
+    },
+    effect: "reversible_mutation",
+    risk: "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: false,
+      fallback: "exact",
+    },
+    execution: { preparation: "optional", cacheable: false, parallelSafe: false },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "optional",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    receiptKind: "artifact",
+  },
   description:
     "Create a paired Obsidian Canvas plus markdown brief for UI flows, logistics systems, service blueprints, architecture maps, project ideation, or mind maps.",
   parameters: {

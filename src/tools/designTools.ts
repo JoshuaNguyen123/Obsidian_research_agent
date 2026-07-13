@@ -1,5 +1,17 @@
 import type { TFile } from "obsidian";
 import {
+  sha256Fingerprint,
+  verifyPreparedActionFingerprint,
+  withPreparedActionFingerprint,
+} from "../agent/actions/canonicalize";
+import type {
+  ActionReceipt,
+  JsonValue,
+  PreparedAction,
+  PreparedActionResult,
+  ToolDescriptor,
+} from "../agent/actions";
+import {
   verifyCanvasArtifact,
   verifySvgArtifact,
 } from "../agent/verification";
@@ -18,12 +30,36 @@ import {
   type JsonCanvas,
 } from "../design/jsonCanvas";
 import {
+  applyCanvasPatch,
+  parseCanvasPatchOperations,
+} from "../design/canvasPatch";
+import {
+  DiagramArtifactStore,
+  sha256DiagramContent,
+} from "../design/diagramArtifactStore";
+import {
+  MAX_CANVAS_QA_REPAIR_PASSES,
+  runCanvasQa,
+} from "../design/diagramQa";
+import {
   renderSvgWireframe,
   type SvgWireframeShape,
 } from "../design/svgDesign";
+import {
+  applySafeSvgPatch,
+  parseSafeSvg,
+  parseSvgPatchOperations,
+} from "../design/svgPatch";
 import { createDesignPackageTool } from "../agent/design/CreateDesignPackageTool";
-import { hasReviseDesignIntent } from "../agent/codeDesignIntent";
-import type { AgentTool, ToolExecutionContext } from "./types";
+import {
+  hasDesignIntent,
+  hasReviseDesignIntent,
+} from "../agent/codeDesignIntent";
+import type {
+  AgentTool,
+  AgentToolActionExecution,
+  ToolExecutionContext,
+} from "./types";
 import { ToolExecutionError } from "./types";
 import {
   getOptionalBoolean,
@@ -34,22 +70,27 @@ import {
   normalizeVaultPath,
 } from "./validation";
 
-const DESIGN_INTENT_PATTERN =
-  /\b(create|make|draw|generate|build|draft|render|save|write)\b[\s\S]{0,120}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flow|architecture)\b[\s\S]{0,120}\b(create|make|draw|generate|build|draft|render|save|write)\b/i;
-
 export function createDesignTools(): AgentTool[] {
   return [
     createDesignCanvasTool,
+    readDesignCanvasTool,
     updateDesignCanvasTool,
     createSvgDesignTool,
+    readSvgDesignTool,
+    updateSvgDesignTool,
     createDesignPackageTool,
   ];
 }
 
 export const createDesignCanvasTool: AgentTool = {
   name: "create_design_canvas",
+  descriptor: designArtifactMutationDescriptor(
+    "create_design_canvas",
+    "canvas",
+    "create",
+  ),
   description:
-    "Create a new Obsidian JSON Canvas artifact for diagrams, user flows, or architecture maps.",
+    "Create and open a new Obsidian JSON Canvas artifact for diagrams, user flows, or architecture maps.",
   parameters: {
     type: "object",
     required: ["path"],
@@ -116,7 +157,7 @@ export const createDesignCanvasTool: AgentTool = {
       },
       open: {
         type: "boolean",
-        description: "Open the created file in Obsidian after writing.",
+        description: "Open the created file in Obsidian after writing. Defaults to true.",
       },
     },
     additionalProperties: false,
@@ -125,7 +166,7 @@ export const createDesignCanvasTool: AgentTool = {
     assertDesignIntent(context, "create_design_canvas");
     const path = normalizeArtifactPath(getRequiredString(args, "path"), ".canvas");
     const createFolders = getOptionalBoolean(args, "createFolders") ?? true;
-    const open = getOptionalBoolean(args, "open") ?? false;
+    const open = getOptionalBoolean(args, "open") ?? true;
 
     assertPathDoesNotExist(context, path);
     await ensureParentFolder(context, path, createFolders);
@@ -164,65 +205,85 @@ export const createDesignCanvasTool: AgentTool = {
   },
 };
 
-export const updateDesignCanvasTool: AgentTool = {
-  name: "update_design_canvas",
+export const readDesignCanvasTool: AgentTool = {
+  name: "read_design_canvas",
+  descriptor: designArtifactReadDescriptor("read_design_canvas", "canvas"),
   description:
-    "Revise an existing Obsidian JSON Canvas artifact with backup, read-back verification, and a receipt. Requires explicit revise/update design intent.",
+    "Read an existing Obsidian JSON Canvas as normalized structure with its exact SHA-256 precondition hash.",
   parameters: {
     type: "object",
     required: ["path"],
     properties: {
       path: {
         type: "string",
+        description: "Vault-relative .canvas path to read.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const path = normalizeArtifactPath(getRequiredString(args, "path"), ".canvas");
+    const artifact = await new DiagramArtifactStore(context.app.vault).read(path);
+    const canvas = JSON.parse(artifact.content) as unknown;
+    assertValidJsonCanvas(canvas);
+    return {
+      path,
+      operation: "read",
+      sha256: artifact.sha256,
+      bytes: artifact.bytes,
+      nodeCount: canvas.nodes.length,
+      edgeCount: canvas.edges.length,
+      canvas,
+    };
+  },
+};
+
+export const updateDesignCanvasTool: AgentTool = {
+  name: "update_design_canvas",
+  descriptor: {
+    version: 1,
+    name: "update_design_canvas",
+    capability: { system: "vault", resourceType: "canvas", action: "update" },
+    effect: "reversible_mutation",
+    risk: "high",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: false,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "required",
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "optional",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    receiptKind: "artifact",
+  },
+  description:
+    "Patch an existing Obsidian JSON Canvas by stable node/edge ids. Requires a fresh baseHash, exact approval, backup, read-back verification, and rollback on failure.",
+  parameters: {
+    type: "object",
+    required: ["path", "baseHash", "operations"],
+    properties: {
+      path: {
+        type: "string",
         description: "Vault-relative .canvas path to update.",
       },
-      title: {
+      baseHash: {
         type: "string",
-        description: "Optional title used when generating layout nodes.",
+        description: "Exact SHA-256 returned by read_design_canvas.",
       },
-      canvas: {
-        type: "object",
-        description: "Optional complete JSON Canvas object with nodes and edges arrays.",
-      },
-      nodes: {
+      operations: {
         type: "array",
         items: { type: "object" },
-        description: "Optional JSON Canvas nodes.",
-      },
-      edges: {
-        type: "array",
-        items: { type: "object" },
-        description: "Optional JSON Canvas edges.",
-      },
-      items: {
-        type: "array",
-        items: { type: "object" },
-        description: "Optional layout items with title/text/kind/lane/url/file/color.",
-      },
-      diagramType: {
-        type: "string",
-        enum: [
-          "sequence",
-          "user_flow",
-          "ui_flow",
-          "logistics_system",
-          "service_blueprint",
-          "project_ideation",
-          "architecture",
-          "mind_map",
-        ],
-      },
-      direction: {
-        type: "string",
-        enum: ["row", "column", "grid"],
-      },
-      connect: {
-        type: "string",
-        enum: ["none", "sequence"],
-      },
-      connections: {
-        type: "array",
-        items: { type: "object" },
+        description:
+          "Stable-id add/update/remove node or edge operations, or deterministic auto_layout.",
       },
       open: {
         type: "boolean",
@@ -231,63 +292,25 @@ export const updateDesignCanvasTool: AgentTool = {
     },
     additionalProperties: false,
   },
-  async execute(args, context) {
-    if (!hasReviseDesignIntent(context.originalPrompt)) {
-      throw new ToolExecutionError(
-        "intent_required",
-        "update_design_canvas requires explicit revise/update/edit design intent.",
-      );
-    }
-    const path = normalizeArtifactPath(getRequiredString(args, "path"), ".canvas");
-    const open = getOptionalBoolean(args, "open") ?? false;
-    const file = context.app.vault.getFileByPath(path);
-    if (!file) {
-      throw new Error(`Canvas not found: ${path}`);
-    }
-
-    const previous = await context.app.vault.read(file);
-    const backupPath = await backupDesignArtifact(context, path, previous);
-    reportProgress(context, `Updating canvas design for ${path}...`);
-    const canvas = getCanvasFromArgs(args);
-    const diagramType = getDiagramType(args.diagramType);
-    const canvasSummary = summarizeCanvas(canvas, diagramType);
-    reportProgress(context, canvasSummary);
-    const content = stringifyJsonCanvas(canvas);
-    const preflight = verifyCanvasArtifact(content);
-    if (!preflight.ok) {
-      throw new Error(`Canvas preflight verification failed: ${preflight.errors.join(" ")}`);
-    }
-
-    await context.app.vault.modify(file, content);
-    const readBack = await context.app.vault.read(file);
-    const verification = verifyCanvasArtifact(readBack);
-    if (!verification.ok) {
-      throw new Error(`Canvas read-back verification failed: ${verification.errors.join(" ")}`);
-    }
-
-    const opened = open ? await openCreatedFile(context, file) : false;
-    return {
-      path,
-      operation: "update",
-      diagramType,
-      bytesWritten: getByteLength(content),
-      nodeCount: verification.nodeCount,
-      edgeCount: verification.edgeCount,
-      summary: canvasSummary,
-      backupPath,
-      opened,
-      receipt: {
-        operation: "update",
-        path,
-        backupPath,
-        bytesWritten: getByteLength(content),
-      },
-    };
+  async execute() {
+    throw new ToolExecutionError(
+      "preparation_required",
+      "update_design_canvas must be prepared and exactly approved before mutation.",
+      { mutationState: "not_applied" },
+    );
   },
+  prepare: (args, context) => prepareDesignCanvasUpdate(args, context),
+  executePrepared: (action, context) =>
+    executePreparedDesignCanvasUpdate(action, context),
 };
 
 export const createSvgDesignTool: AgentTool = {
   name: "create_svg_design",
+  descriptor: designArtifactMutationDescriptor(
+    "create_svg_design",
+    "svg",
+    "create",
+  ),
   description:
     "Create a new escaped SVG diagram or wireframe from structured shape instructions.",
   parameters: {
@@ -374,8 +397,791 @@ export const createSvgDesignTool: AgentTool = {
   },
 };
 
+export const readSvgDesignTool: AgentTool = {
+  name: "read_svg_design",
+  descriptor: designArtifactReadDescriptor("read_svg_design", "svg"),
+  description:
+    "Read an existing safe SVG diagram as normalized structure with its exact SHA-256 precondition hash.",
+  parameters: {
+    type: "object",
+    required: ["path"],
+    properties: {
+      path: {
+        type: "string",
+        description: "Vault-relative .svg path to read.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const path = normalizeArtifactPath(getRequiredString(args, "path"), ".svg");
+    const artifact = await new DiagramArtifactStore(context.app.vault).read(path);
+    const document = parseSafeSvg(artifact.content);
+    return {
+      path,
+      operation: "read",
+      sha256: artifact.sha256,
+      bytes: artifact.bytes,
+      elementCount: document.elementCount,
+      stableIds: document.stableIds,
+      qa: document.qa,
+      document,
+    };
+  },
+};
+
+export const updateSvgDesignTool: AgentTool = {
+  name: "update_svg_design",
+  descriptor: {
+    version: 1,
+    name: "update_svg_design",
+    capability: { system: "vault", resourceType: "svg", action: "update" },
+    effect: "reversible_mutation",
+    risk: "high",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: false,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "required",
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "optional",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    receiptKind: "artifact",
+  },
+  description:
+    "Patch an existing safe SVG by stable element ids. Requires a fresh baseHash, exact approval, backup, read-back verification, and rollback on failure.",
+  parameters: {
+    type: "object",
+    required: ["path", "baseHash", "operations"],
+    properties: {
+      path: {
+        type: "string",
+        description: "Vault-relative .svg path to update.",
+      },
+      baseHash: {
+        type: "string",
+        description: "Exact SHA-256 returned by read_svg_design.",
+      },
+      operations: {
+        type: "array",
+        items: { type: "object" },
+        description:
+          "Stable-id update_text, update_attributes, remove_element, or add_shape operations.",
+      },
+      open: {
+        type: "boolean",
+        description: "Open the updated SVG in Obsidian after writing.",
+      },
+    },
+    additionalProperties: false,
+  },
+  async execute() {
+    throw new ToolExecutionError(
+      "preparation_required",
+      "update_svg_design must be prepared and exactly approved before mutation.",
+      { mutationState: "not_applied" },
+    );
+  },
+  prepare: (args, context) => prepareSvgDesignUpdate(args, context),
+  executePrepared: (action, context) => executePreparedSvgDesignUpdate(action, context),
+};
+
+async function prepareDesignCanvasUpdate(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    if (!hasReviseDesignIntent(context.originalPrompt)) {
+      throw new ToolExecutionError(
+        "intent_required",
+        "update_design_canvas requires explicit revise/update/edit design intent.",
+      );
+    }
+    const path = normalizeArtifactPath(getRequiredString(args, "path"), ".canvas");
+    const baseHash = getRequiredString(args, "baseHash");
+    const operations = parseCanvasPatchOperations(args.operations);
+    const open = getOptionalBoolean(args, "open") ?? false;
+    const store = new DiagramArtifactStore(context.app.vault);
+    const current = await store.read(path);
+    if (current.sha256 !== baseHash) {
+      throw new ToolExecutionError(
+        "vault_precondition_changed",
+        "Canvas baseHash no longer matches the persisted artifact; read it again before preparing a patch.",
+        { mutationState: "not_applied" },
+      );
+    }
+    const canvas = JSON.parse(current.content) as unknown;
+    assertValidJsonCanvas(canvas);
+    const patch = applyCanvasPatch(canvas, operations);
+    const qa = runCanvasQa(patch.canvas, {
+      autoRepair: true,
+      maxRepairPasses: MAX_CANVAS_QA_REPAIR_PASSES,
+    });
+    const blockingQaIssues = qa.issues.filter((issue) => issue.severity === "error");
+    if (blockingQaIssues.length > 0) {
+      throw new ToolExecutionError(
+        "canvas_qa_failed",
+        `Canvas QA still has blocking issues after ${qa.passCount} repair pass(es): ${blockingQaIssues.map((issue) => issue.message).join(" ")}`,
+        { mutationState: "not_applied" },
+      );
+    }
+    const content = stringifyJsonCanvas(qa.canvas);
+    const verification = verifyCanvasArtifact(content);
+    if (!verification.ok) {
+      throw new ToolExecutionError(
+        "canvas_patch_invalid",
+        `Canvas patch preflight failed: ${verification.errors.join(" ")}`,
+        { mutationState: "not_applied" },
+      );
+    }
+    const expectedAfterSha256 = await sha256DiagramContent(content);
+    const normalizedOperations = JSON.parse(
+      JSON.stringify(operations),
+    ) as JsonValue;
+    const preservation = JSON.parse(
+      JSON.stringify(patch.preservation),
+    ) as JsonValue;
+    const qaReport = JSON.parse(JSON.stringify({
+      issues: qa.issues,
+      repairs: qa.repairs,
+      passCount: qa.passCount,
+    })) as JsonValue;
+    const preparedAt = designNow(context);
+    const runId = context.runId?.trim() || `design-run-${designToken()}`;
+    const toolCallId = context.operationId?.trim() || `design-call-${designToken()}`;
+    const actionIdHash = await sha256Fingerprint({
+      runId,
+      toolCallId,
+      toolName: "update_design_canvas",
+      path,
+      baseHash,
+      expectedAfterSha256,
+    });
+    const action = await withPreparedActionFingerprint({
+      version: 1,
+      id: `design-action-${actionIdHash.slice(7, 39)}`,
+      runId,
+      toolCallId,
+      toolName: "update_design_canvas",
+      target: {
+        system: "vault",
+        resourceType: "canvas",
+        id: path,
+        path,
+        revision: baseHash,
+      },
+      relatedResources: [],
+      normalizedArgs: {
+        path,
+        baseHash,
+        operations: normalizedOperations,
+        content,
+        expectedAfterSha256,
+        preservation,
+        qa: qaReport,
+        open,
+      },
+      preview: {
+        summary: `Apply ${operations.length} stable-id Canvas patch operation(s) to ${path}.`,
+        destination: path,
+        before: {
+          sha256: baseHash,
+          nodes: canvas.nodes.length,
+          edges: canvas.edges.length,
+        },
+        after: {
+          sha256: expectedAfterSha256,
+          nodes: qa.canvas.nodes.length,
+          edges: qa.canvas.edges.length,
+        },
+        outboundPayload: { operations: normalizedOperations },
+        warnings: [
+          "The current Canvas hash is checked again immediately before mutation.",
+          "A verified backup is created and failed readback or validation is rolled back.",
+          ...qa.issues
+            .filter((issue) => issue.severity === "warning")
+            .map((issue) => `Canvas QA warning: ${issue.message}`),
+        ],
+        outboundBytes: getByteLength(content),
+      },
+      expectedTargetRevision: baseHash,
+      idempotencyKey: `${runId}:${toolCallId}:update_design_canvas`,
+      reconciliationKey: `vault:canvas:${path}`,
+      preparedAt: preparedAt.toISOString(),
+      expiresAt: new Date(preparedAt.getTime() + 120_000).toISOString(),
+    });
+    return { ok: true, action };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code: error instanceof ToolExecutionError
+          ? error.code
+          : "canvas_patch_preparation_failed",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+async function executePreparedDesignCanvasUpdate(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertPreparedDesignBinding(action, context);
+  const path = requirePreparedDesignString(action, "path");
+  const baseHash = requirePreparedDesignString(action, "baseHash");
+  const content = requirePreparedDesignString(action, "content");
+  const expectedAfterSha256 = requirePreparedDesignString(
+    action,
+    "expectedAfterSha256",
+  );
+  const startedAt = designNow(context).toISOString();
+  const store = new DiagramArtifactStore(context.app.vault, {
+    onStage: (stage) => reportProgress(
+      context,
+      `Canvas transaction: ${stage.replace(/_/gu, " ")}.`,
+    ),
+  });
+  const update = await store.update({
+    path,
+    expectedSha256: baseHash,
+    content,
+    validator: ({ content: persisted }) => validatePersistedCanvas(persisted),
+  });
+  if (update.status !== "committed" || update.afterSha256 !== expectedAfterSha256) {
+    throw new ToolExecutionError(
+      update.status === "rollback_failed"
+        ? "canvas_patch_rollback_failed"
+        : "canvas_patch_rolled_back",
+      update.error?.message ?? "Canvas patch did not commit and was rolled back.",
+      {
+        mutationState:
+          update.status === "rollback_failed" ? "may_have_applied" : "not_applied",
+        details: {
+          path,
+          backupPath: update.backupPath,
+          rollbackStatus: update.rollbackStatus,
+          finalSha256: update.finalSha256,
+        },
+      },
+    );
+  }
+  const file = context.app.vault.getFileByPath(path);
+  const open = action.normalizedArgs.open === true;
+  const opened = open && file ? await openCreatedFile(context, file) : false;
+  const committedAt = designNow(context).toISOString();
+  const receipt = await createDesignActionReceipt({
+    action,
+    context,
+    startedAt,
+    committedAt,
+    observedRevision: update.afterSha256,
+    backupPath: update.backupPath,
+    bytesWritten: update.bytesWritten,
+  });
+  return {
+    mutationState: "applied",
+    receipt,
+    output: {
+      path,
+      operation: "update",
+      beforeSha256: update.beforeSha256,
+      afterSha256: update.afterSha256,
+      backupPath: update.backupPath,
+      backupSha256: update.backupSha256,
+      bytesWritten: update.bytesWritten,
+      preservation: action.normalizedArgs.preservation,
+      qa: action.normalizedArgs.qa,
+      rollbackStatus: update.rollbackStatus,
+      opened,
+      receipt: update,
+    },
+  };
+}
+
+async function prepareSvgDesignUpdate(
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<PreparedActionResult> {
+  try {
+    if (!hasReviseDesignIntent(context.originalPrompt)) {
+      throw new ToolExecutionError(
+        "intent_required",
+        "update_svg_design requires explicit revise/update/edit design intent.",
+      );
+    }
+    const path = normalizeArtifactPath(getRequiredString(args, "path"), ".svg");
+    const baseHash = getRequiredString(args, "baseHash");
+    const operations = parseSvgPatchOperations(args.operations);
+    const open = getOptionalBoolean(args, "open") ?? false;
+    const store = new DiagramArtifactStore(context.app.vault);
+    const current = await store.read(path);
+    if (current.sha256 !== baseHash) {
+      throw new ToolExecutionError(
+        "vault_precondition_changed",
+        "SVG baseHash no longer matches the persisted artifact; read it again before preparing a patch.",
+        { mutationState: "not_applied" },
+      );
+    }
+    const before = parseSafeSvg(current.content);
+    const patch = applySafeSvgPatch(current.content, operations);
+    const blockingQaIssues = patch.document.qa.issues.filter(
+      (issue) => issue.severity === "error",
+    );
+    if (blockingQaIssues.length > 0) {
+      throw new ToolExecutionError(
+        "svg_qa_failed",
+        `SVG QA has blocking issues: ${blockingQaIssues.map((issue) => issue.message).join(" ")}`,
+        { mutationState: "not_applied" },
+      );
+    }
+    const content = patch.content;
+    const expectedAfterSha256 = await sha256DiagramContent(content);
+    const normalizedOperations = JSON.parse(JSON.stringify(operations)) as JsonValue;
+    const preservation = JSON.parse(JSON.stringify(patch.preservation)) as JsonValue;
+    const qaReport = JSON.parse(JSON.stringify(patch.document.qa)) as JsonValue;
+    const preparedAt = designNow(context);
+    const runId = context.runId?.trim() || `design-run-${designToken()}`;
+    const toolCallId = context.operationId?.trim() || `design-call-${designToken()}`;
+    const actionIdHash = await sha256Fingerprint({
+      runId,
+      toolCallId,
+      toolName: "update_svg_design",
+      path,
+      baseHash,
+      expectedAfterSha256,
+    });
+    const action = await withPreparedActionFingerprint({
+      version: 1,
+      id: `design-action-${actionIdHash.slice(7, 39)}`,
+      runId,
+      toolCallId,
+      toolName: "update_svg_design",
+      target: {
+        system: "vault",
+        resourceType: "svg",
+        id: path,
+        path,
+        revision: baseHash,
+      },
+      relatedResources: [],
+      normalizedArgs: {
+        path,
+        baseHash,
+        operations: normalizedOperations,
+        content,
+        expectedAfterSha256,
+        preservation,
+        qa: qaReport,
+        open,
+      },
+      preview: {
+        summary: `Apply ${operations.length} stable-id SVG patch operation(s) to ${path}.`,
+        destination: path,
+        before: {
+          sha256: baseHash,
+          elements: before.elementCount,
+          stableIds: before.stableIds.length,
+        },
+        after: {
+          sha256: expectedAfterSha256,
+          elements: patch.document.elementCount,
+          stableIds: patch.document.stableIds.length,
+        },
+        outboundPayload: { operations: normalizedOperations },
+        warnings: [
+          "The current SVG hash is checked again immediately before mutation.",
+          "A verified backup is created and failed readback or validation is rolled back.",
+          ...patch.document.qa.issues
+            .filter((issue) => issue.severity === "warning")
+            .map((issue) => `SVG QA warning: ${issue.message}`),
+        ],
+        outboundBytes: getByteLength(content),
+      },
+      expectedTargetRevision: baseHash,
+      idempotencyKey: `${runId}:${toolCallId}:update_svg_design`,
+      reconciliationKey: `vault:svg:${path}`,
+      preparedAt: preparedAt.toISOString(),
+      expiresAt: new Date(preparedAt.getTime() + 120_000).toISOString(),
+    });
+    return { ok: true, action };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code: error instanceof ToolExecutionError
+          ? error.code
+          : "svg_patch_preparation_failed",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+async function executePreparedSvgDesignUpdate(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<AgentToolActionExecution> {
+  await assertPreparedSvgBinding(action, context);
+  const path = requirePreparedDesignString(action, "path");
+  const baseHash = requirePreparedDesignString(action, "baseHash");
+  const content = requirePreparedDesignString(action, "content");
+  const expectedAfterSha256 = requirePreparedDesignString(
+    action,
+    "expectedAfterSha256",
+  );
+  const startedAt = designNow(context).toISOString();
+  const store = new DiagramArtifactStore(context.app.vault);
+  const update = await store.update({
+    path,
+    expectedSha256: baseHash,
+    content,
+    validator: ({ content: persisted }) => validatePersistedSvg(persisted),
+  });
+  if (update.status !== "committed" || update.afterSha256 !== expectedAfterSha256) {
+    throw new ToolExecutionError(
+      update.status === "rollback_failed"
+        ? "svg_patch_rollback_failed"
+        : "svg_patch_rolled_back",
+      update.error?.message ?? "SVG patch did not commit and was rolled back.",
+      {
+        mutationState:
+          update.status === "rollback_failed" ? "may_have_applied" : "not_applied",
+        details: {
+          path,
+          backupPath: update.backupPath,
+          rollbackStatus: update.rollbackStatus,
+          finalSha256: update.finalSha256,
+        },
+      },
+    );
+  }
+  const file = context.app.vault.getFileByPath(path);
+  const open = action.normalizedArgs.open === true;
+  const opened = open && file ? await openCreatedFile(context, file) : false;
+  const committedAt = designNow(context).toISOString();
+  const receipt = await createSvgActionReceipt({
+    action,
+    context,
+    startedAt,
+    committedAt,
+    observedRevision: update.afterSha256,
+    backupPath: update.backupPath,
+    bytesWritten: update.bytesWritten,
+  });
+  return {
+    mutationState: "applied",
+    receipt,
+    output: {
+      path,
+      operation: "update",
+      beforeSha256: update.beforeSha256,
+      afterSha256: update.afterSha256,
+      backupPath: update.backupPath,
+      backupSha256: update.backupSha256,
+      bytesWritten: update.bytesWritten,
+      preservation: action.normalizedArgs.preservation,
+      qa: action.normalizedArgs.qa,
+      rollbackStatus: update.rollbackStatus,
+      opened,
+      receipt: update,
+    },
+  };
+}
+
+async function assertPreparedSvgBinding(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<void> {
+  if (
+    action.toolName !== "update_svg_design" ||
+    !(await verifyPreparedActionFingerprint(action))
+  ) {
+    throw new ToolExecutionError(
+      "fingerprint_mismatch",
+      "Prepared SVG patch identity or fingerprint is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const authorization = context.authorizedAction;
+  if (
+    !authorization ||
+    authorization.preparedActionId !== action.id ||
+    authorization.payloadFingerprint !== action.payloadFingerprint ||
+    !authorization.grantId.trim()
+  ) {
+    throw new ToolExecutionError(
+      "authorization_mismatch",
+      "Prepared SVG patch lacks its exact authority binding.",
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
+async function createSvgActionReceipt(input: {
+  action: PreparedAction;
+  context: ToolExecutionContext;
+  startedAt: string;
+  committedAt: string;
+  observedRevision: string;
+  backupPath: string;
+  bytesWritten: number;
+}): Promise<ActionReceipt> {
+  const receiptHash = await sha256Fingerprint({
+    actionId: input.action.id,
+    observedRevision: input.observedRevision,
+  });
+  return {
+    version: 1,
+    id: `design-receipt-${receiptHash.slice(7, 39)}`,
+    runId: input.action.runId,
+    actionId: input.action.id,
+    toolName: input.action.toolName,
+    operation: "update",
+    resource: { ...input.action.target },
+    relatedResources: [
+      {
+        system: "vault",
+        resourceType: "svg_backup",
+        id: input.backupPath,
+        path: input.backupPath,
+      },
+    ],
+    message: `Patched ${input.action.target.path} with exact hash readback and verified backup.`,
+    payloadFingerprint: input.action.payloadFingerprint,
+    grantId: input.context.authorizedAction!.grantId,
+    idempotencyKey: input.action.idempotencyKey,
+    startedAt: input.startedAt,
+    committedAt: input.committedAt,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: input.committedAt,
+      observedRevision: input.observedRevision,
+      observedFingerprint: input.observedRevision,
+    },
+    effects: {
+      bytesWritten: input.bytesWritten,
+      affectedCount: 1,
+      changedFields: [input.action.target.path ?? "svg"],
+    },
+  };
+}
+
+async function assertPreparedDesignBinding(
+  action: PreparedAction,
+  context: ToolExecutionContext,
+): Promise<void> {
+  if (
+    action.toolName !== "update_design_canvas" ||
+    !(await verifyPreparedActionFingerprint(action))
+  ) {
+    throw new ToolExecutionError(
+      "fingerprint_mismatch",
+      "Prepared Canvas patch identity or fingerprint is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const authorization = context.authorizedAction;
+  if (
+    !authorization ||
+    authorization.preparedActionId !== action.id ||
+    authorization.payloadFingerprint !== action.payloadFingerprint ||
+    !authorization.grantId.trim()
+  ) {
+    throw new ToolExecutionError(
+      "authorization_mismatch",
+      "Prepared Canvas patch lacks its exact authority binding.",
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
+function requirePreparedDesignString(
+  action: PreparedAction,
+  key: string,
+): string {
+  const value = action.normalizedArgs[key];
+  if (typeof value !== "string" || !value) {
+    throw new ToolExecutionError(
+      "invalid_prepared_action",
+      `Prepared Canvas patch is missing ${key}.`,
+      { mutationState: "not_applied" },
+    );
+  }
+  return value;
+}
+
+async function createDesignActionReceipt(input: {
+  action: PreparedAction;
+  context: ToolExecutionContext;
+  startedAt: string;
+  committedAt: string;
+  observedRevision: string;
+  backupPath: string;
+  bytesWritten: number;
+}): Promise<ActionReceipt> {
+  const receiptHash = await sha256Fingerprint({
+    actionId: input.action.id,
+    observedRevision: input.observedRevision,
+  });
+  return {
+    version: 1,
+    id: `design-receipt-${receiptHash.slice(7, 39)}`,
+    runId: input.action.runId,
+    actionId: input.action.id,
+    toolName: input.action.toolName,
+    operation: "update",
+    resource: { ...input.action.target },
+    relatedResources: [
+      {
+        system: "vault",
+        resourceType: "canvas_backup",
+        id: input.backupPath,
+        path: input.backupPath,
+      },
+    ],
+    message: `Patched ${input.action.target.path} with exact hash readback and verified backup.`,
+    payloadFingerprint: input.action.payloadFingerprint,
+    grantId: input.context.authorizedAction!.grantId,
+    idempotencyKey: input.action.idempotencyKey,
+    startedAt: input.startedAt,
+    committedAt: input.committedAt,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: input.committedAt,
+      observedRevision: input.observedRevision,
+      observedFingerprint: input.observedRevision,
+    },
+    effects: {
+      bytesWritten: input.bytesWritten,
+      affectedCount: 1,
+      changedFields: [input.action.target.path ?? "canvas"],
+    },
+  };
+}
+
+function designArtifactReadDescriptor(
+  name: string,
+  resourceType: string,
+): ToolDescriptor {
+  return {
+    version: 1,
+    name,
+    capability: { system: "vault", resourceType, action: "read" },
+    effect: "read",
+    risk: "low",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: true,
+      fallback: "none",
+    },
+    execution: { preparation: "none", cacheable: true, parallelSafe: true },
+    durability: {
+      journal: false,
+      receipt: false,
+      readback: "none",
+      reconciliation: "none",
+    },
+    allowedPrincipals: ["single_agent", "lead", "researcher"],
+  };
+}
+
+function designArtifactMutationDescriptor(
+  name: string,
+  resourceType: string,
+  action: "create" | "update",
+): ToolDescriptor {
+  return {
+    version: 1,
+    name,
+    capability: { system: "vault", resourceType, action },
+    effect: "reversible_mutation",
+    risk: "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: false,
+      fallback: "exact",
+    },
+    execution: { preparation: "optional", cacheable: false, parallelSafe: false },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "optional",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    receiptKind: "artifact",
+  };
+}
+
+function designNow(context: ToolExecutionContext): Date {
+  return context.now?.() ?? new Date();
+}
+
+let designSequence = 0;
+function designToken(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return uuid;
+  designSequence += 1;
+  return `${Date.now().toString(36)}-${designSequence.toString(36)}`;
+}
+
+function validatePersistedCanvas(content: string): {
+  ok: boolean;
+  errors: string[];
+} {
+  const structural = verifyCanvasArtifact(content);
+  if (!structural.ok) {
+    return { ok: false, errors: structural.errors };
+  }
+  try {
+    const canvas = JSON.parse(content) as unknown;
+    assertValidJsonCanvas(canvas);
+    const qa = runCanvasQa(canvas);
+    const errors = qa.issues
+      .filter((issue) => issue.severity === "error")
+      .map((issue) => issue.message);
+    return { ok: errors.length === 0, errors };
+  } catch (error) {
+    return {
+      ok: false,
+      errors: [error instanceof Error ? error.message : String(error)],
+    };
+  }
+}
+
+function validatePersistedSvg(content: string): {
+  ok: boolean;
+  errors: string[];
+} {
+  try {
+    const document = parseSafeSvg(content);
+    const errors = document.qa.issues
+      .filter((issue) => issue.severity === "error")
+      .map((issue) => issue.message);
+    return { ok: errors.length === 0, errors };
+  } catch (error) {
+    return {
+      ok: false,
+      errors: [error instanceof Error ? error.message : String(error)],
+    };
+  }
+}
+
 function assertDesignIntent(context: ToolExecutionContext, toolName: string) {
-  if (!DESIGN_INTENT_PATTERN.test(context.originalPrompt)) {
+  if (!hasDesignIntent(context.originalPrompt)) {
     throw new ToolExecutionError(
       "intent_required",
       `${toolName} requires explicit design, canvas, diagram, wireframe, layout, or SVG creation intent.`,
