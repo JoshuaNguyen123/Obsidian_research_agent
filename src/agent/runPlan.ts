@@ -19,6 +19,7 @@ import {
   isWholeNoteEditIntent,
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
+import { hasDesignIntent as hasSharedDesignIntent } from "./codeDesignIntent";
 
 export type RunRoute =
   | "instant_local"
@@ -246,7 +247,10 @@ export function createRunPlan({
     ]);
   }
 
-  if (hasWebSearchIntent(prompt) || hasReflexReadLabel(["web_research"])) {
+  if (
+    (hasWebSearchIntent(prompt) && countExplicitCodeToolNames(prompt) === 0) ||
+    hasReflexReadLabel(["web_research"])
+  ) {
     return grounded("needs_web_sources", "long", [
       hasWebSearchIntent(prompt) ? "web_search_intent" : "reflex_web_research",
     ]);
@@ -271,6 +275,11 @@ export function createRunPlan({
       generated,
       configuredMaxSteps,
     });
+    const explicitCodeToolCount = countExplicitCodeToolNames(prompt);
+    const codeToolStepBudget = Math.max(
+      loopBudget.toolStepBudget,
+      explicitCodeToolCount,
+    );
     return plan({
       route: "grounded_workflow",
       maxStepsForRun: applyExplicitModelStepTarget(
@@ -278,7 +287,7 @@ export function createRunPlan({
           1,
           Math.min(
             loopBudget.hardCap,
-            loopBudget.toolStepBudget + loopBudget.finalizationReserve,
+            codeToolStepBudget + loopBudget.finalizationReserve,
           ),
         ),
       ),
@@ -357,14 +366,25 @@ export function createRunPlan({
   }
 
   if (requiresCurrentNoteContent(prompt)) {
+    const compoundTitleWriteback =
+      hasTitleIntent(prompt) &&
+      missionIntent.noteOutput &&
+      streamingWritebackKind !== null;
     return plan({
       route: "tool_required",
-      maxStepsForRun: capSteps(2),
+      // A compound title + body mission needs room to observe the note,
+      // obtain the explicit rename/retitle tool call, and hand the body to
+      // runner-owned streamed writeback. Keep one bounded correction step so
+      // a model that first answers with prose is not stopped before mutation.
+      maxStepsForRun: capSteps(compoundTitleWriteback ? 4 : 2),
       thinking: undefined,
       allowedTools: tools,
       slowPathReason: "needs_current_note",
       expectedTimeClass: "quick",
-      traceReasons: ["requires_current_note_content"],
+      traceReasons: [
+        "requires_current_note_content",
+        ...(compoundTitleWriteback ? ["compound_title_writeback"] : []),
+      ],
     });
   }
 
@@ -605,9 +625,25 @@ function hasOpenWebSourceIntent(prompt: string): boolean {
 }
 
 function hasCodeExecutionIntent(prompt: string): boolean {
-  return /\b(run|execute|eval|evaluate|test|compile)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile)\b/i.test(
-    prompt,
+  return (
+    /\b(run|execute|eval|evaluate|test|compile)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile)\b/i.test(
+      prompt,
+    ) ||
+    /\b(?:code_workspace_[a-z0-9_]+|code_validate_(?:fast|targeted|full)|code_repair_(?:status|record_cycle)|code_commit_verified|install_code_dependency)\b/i.test(
+      prompt,
+    ) ||
+    /\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b[\s\S]{0,180}\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b|\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b[\s\S]{0,180}\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b/i.test(
+      prompt,
+    )
   );
+}
+
+function countExplicitCodeToolNames(prompt: string): number {
+  return new Set(
+    prompt.toLowerCase().match(
+      /\b(?:code_workspace_[a-z0-9_]+|code_validate_(?:fast|targeted|full)|code_repair_(?:status|record_cycle)|code_commit_verified|install_code_dependency|run_code_block|render_html_preview)\b/gu,
+    ) ?? [],
+  ).size;
 }
 
 function hasHtmlPreviewIntent(prompt: string): boolean {
@@ -617,9 +653,7 @@ function hasHtmlPreviewIntent(prompt: string): boolean {
 }
 
 function hasDesignIntent(prompt: string): boolean {
-  return /\b(create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust)\b[\s\S]{0,160}\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b|\b(canvas|design|design\s*package|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map)\b[\s\S]{0,160}\b(create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust)\b/i.test(
-    prompt,
-  );
+  return hasSharedDesignIntent(prompt);
 }
 
 function hasBrowserAutomationIntent(prompt: string): boolean {

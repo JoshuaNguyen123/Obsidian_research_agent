@@ -58,6 +58,7 @@ export interface BrowserOpenInput {
 export interface BrowserClickInput {
   candidateId?: string;
   selector?: string;
+  candidateFingerprint?: string;
   x?: number;
   y?: number;
   button?: "left" | "middle" | "right";
@@ -66,12 +67,16 @@ export interface BrowserClickInput {
 export interface BrowserTypeInput {
   candidateId?: string;
   selector?: string;
+  candidateFingerprint?: string;
   text: string;
   clearFirst?: boolean;
 }
 
 export interface BrowserKeypressInput {
   key: string;
+  candidateId: string;
+  selector: string;
+  candidateFingerprint: string;
 }
 
 export interface BrowserScrollInput {
@@ -94,8 +99,12 @@ export interface ClickableCandidate {
   role?: string;
   tagName?: string;
   selector?: string;
+  candidateFingerprint: string;
   href?: string;
+  formAction?: string;
+  inputType?: string;
   text?: string;
+  focused?: boolean;
   enabled: boolean;
   visible: boolean;
   bounds?: {
@@ -116,6 +125,7 @@ export interface BrowserObservation {
   candidates: ClickableCandidate[];
   pageStateHints: string[];
   observedAt: string;
+  observationFingerprint: string;
 }
 
 export type MemoryKind = "episodic" | "semantic" | "procedural" | "source";
@@ -127,7 +137,7 @@ export interface MemoryWriteInput {
   tags?: string[];
   sourceUrl?: string;
   sourceTitle?: string;
-  vaultPath?: string;
+  noteReceiptFingerprint?: string;
   evidenceRefs?: ArtifactRef[];
   taskId?: string;
 }
@@ -149,6 +159,6 @@ export interface MemorySearchResult {
   tags: string[];
   sourceUrl?: string;
   sourceTitle?: string;
-  vaultPath?: string;
+  noteReceiptFingerprint?: string;
   createdAt: string;
 }

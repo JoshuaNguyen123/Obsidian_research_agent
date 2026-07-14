@@ -17,7 +17,9 @@ import {
   createLinearQueueState,
   createResourceLockState,
   evaluateCandidateEligibility,
+  normalizeLinearQueueState,
   recordCandidateEligibility,
+  reduceLinearQueue,
   reserveQueueDailyStart,
   upsertLinearQueueCandidate,
   type DurableQueueDailyStartBudgetReducer,
@@ -540,6 +542,75 @@ test("ambiguous worker publication retains leases without completing or failing 
   await coordinator.stop();
 });
 
+test("verified local code proof waits durably for publication without replaying execution", async () => {
+  const durable = createDurableRuntime(1);
+  const releases: string[] = [];
+  let executions = 0;
+  const coordinator = new QueueExecutionCoordinator({
+    ownerId: "worker-1",
+    clock: new IncrementingClock("2026-07-11T13:00:00.000Z"),
+    reduceQueueState: durable.reduceQueueState,
+    reduceResourceLocks: durable.reduceResourceLocks,
+    reduceDailyStartBudget: durable.reduceDailyStartBudget,
+    isExecutionGrantEligible: () => true,
+    createClaimComment: async () => ({ status: "applied" }),
+    verifyClaimComment: async () => true,
+    moveIssueToStarted: async () => ({ status: "applied" }),
+    verifyIssueStarted: async () => true,
+    execute: async () => {
+      executions += 1;
+      return {
+        status: "waiting_for_publication",
+        message: "Verified local commit is durable; draft PR and merge proof remain.",
+      };
+    },
+    retainLease: () => undefined,
+    releaseLease: ({ reason }) => {
+      releases.push(reason);
+    },
+  });
+
+  const result = await coordinator.runCandidate("issue-1");
+  assert.deepEqual(result, {
+    issueId: "issue-1",
+    status: "waiting_for_publication",
+    message: "Verified local commit is durable; draft PR and merge proof remain.",
+  });
+  const waiting = durable.queue().candidates["issue-1"];
+  assert.equal(waiting.status, "waiting_for_publication");
+  assert.equal(waiting.completedAt, null);
+  assert.equal(waiting.lease, null);
+  assert.equal(
+    waiting.lastError,
+    "Verified local commit is durable; draft PR and merge proof remain.",
+  );
+  assert.deepEqual(Object.keys(durable.locks().locks), []);
+  assert.deepEqual(releases, ["execution_waiting_for_publication"]);
+
+  const restored = normalizeLinearQueueState(
+    JSON.parse(JSON.stringify(durable.queue())),
+  );
+  assert.equal(restored.candidates["issue-1"].status, "waiting_for_publication");
+  assert.deepEqual(await coordinator.runCandidate("issue-1"), {
+    issueId: "issue-1",
+    status: "skipped",
+    reason: "terminal",
+  });
+  assert.equal(executions, 1);
+
+  const completedAt = new Date(Date.parse(restored.updatedAt) + 1_000).toISOString();
+  const completed = reduceLinearQueue(restored, {
+    type: "candidate_publication_completed",
+    expectedRevision: restored.revision,
+    at: completedAt,
+    issueId: "issue-1",
+  });
+  assert.equal(completed.candidates["issue-1"].status, "completed");
+  assert.equal(completed.candidates["issue-1"].completedAt, completedAt);
+  assert.equal(completed.candidates["issue-1"].lastError, null);
+  await coordinator.stop();
+});
+
 test("worker-blocked tickets stay dormant until their contract fingerprint changes", async () => {
   const durable = createDurableRuntime(1);
   const releases: string[] = [];
@@ -594,6 +665,9 @@ test("worker-blocked tickets stay dormant until their contract fingerprint chang
   );
   assert.equal(durable.queue().candidates["issue-1"].status, "blocked");
 
+  if (blocked.workItem.schemaVersion !== 1) {
+    assert.fail("Legacy blocker fixture must remain a v1 work item.");
+  }
   const { fingerprint: _fingerprint, ...unsignedWorkItem } = blocked.workItem;
   const changedWorkItem = createWorkItemSpecV1({
     ...unsignedWorkItem,

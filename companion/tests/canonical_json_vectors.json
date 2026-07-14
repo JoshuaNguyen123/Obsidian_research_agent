@@ -1,0 +1,30 @@
+[
+  {
+    "name": "utf16-key-order",
+    "value": {
+      "\ue000": 1,
+      "\ud800\udc00": 2
+    },
+    "canonical": "{\"\ud800\udc00\":2,\"\ue000\":1}"
+  },
+  {
+    "name": "safe-integer-positive-boundary",
+    "value": 9007199254740991,
+    "canonical": "9007199254740991"
+  },
+  {
+    "name": "safe-integer-negative-boundary",
+    "value": -9007199254740991,
+    "canonical": "-9007199254740991"
+  },
+  {
+    "name": "unsafe-integer-positive-boundary",
+    "value": 9007199254740992,
+    "error": "Unsafe integer"
+  },
+  {
+    "name": "unsafe-integer-negative-boundary",
+    "value": -9007199254740992,
+    "error": "Unsafe integer"
+  }
+]

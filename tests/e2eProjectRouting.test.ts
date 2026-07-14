@@ -1,0 +1,162 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+
+// @ts-ignore The production runner is an intentionally unbundled Node ESM script.
+import { applyE2eAiMode, applyE2eLane, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
+// @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
+import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
+
+test("Phase 6 Linear scenarios are owned by the dedicated file-routed spec", () => {
+  const phase6 = readFileSync(
+    new URL("../e2e/phase6-linear.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const monolith = readFileSync(
+    new URL("../e2e/obsidian-agent.spec.ts", import.meta.url),
+    "utf8",
+  );
+  for (const title of [
+    "ordinary Linear-looking text does not expose or execute Linear tools",
+    "accepted research is note-backed before exact Linear approval and persists verified lineage",
+    "rereads claims executes vault work and reconciles completion without replay",
+  ]) {
+    assert.equal(phase6.includes(title), true, `missing Phase 6 title: ${title}`);
+    assert.equal(monolith.includes(title), false, `duplicate monolith title: ${title}`);
+  }
+});
+
+test("exclusive E2E runner defaults to deterministic core mock routing", () => {
+  const normalized = normalizeExclusiveArgs(["--mock-ai"]);
+  assert.deepEqual(normalized, {
+    playwrightArgs: ["--project=deterministic-core-mock"],
+    aiMode: "mock",
+    liveExternal: false,
+    projects: ["deterministic-core-mock"],
+  });
+});
+
+test("exclusive E2E runner permits the bounded deterministic matrix", () => {
+  const normalized = normalizeExclusiveArgs([
+    "--mock-ai",
+    "--project=deterministic-core-mock",
+    "--project",
+    "integration-mock",
+    "--project=integration-mock-legacy",
+    "--project=sandbox",
+    "--project=companion-restart",
+  ]);
+  assert.deepEqual(normalized.projects, [
+    "deterministic-core-mock",
+    "integration-mock",
+    "integration-mock-legacy",
+    "sandbox",
+    "companion-restart",
+  ]);
+  assert.equal(normalized.aiMode, "mock");
+});
+
+test("Windows installed matrix explicitly trusts only its created disposable vault", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /\$vault = Join-Path \$env:RUNNER_TEMP "agentic-researcher-e2e-vault"/u,
+  );
+  assert.match(
+    workflow,
+    /- name: Deterministic Obsidian Playwright matrix\s+env:\s+(?:#[^\r\n]*\s+)*E2E_TRUST_DISPOSABLE_VAULT: "1"\s+run: npm run test:e2e:deterministic-matrix/u,
+  );
+});
+
+test("real AI and live external flags cannot widen into other projects", () => {
+  assert.throws(
+    () => normalizeExclusiveArgs(["--real-ai", "--project=deterministic-core-mock"]),
+    /restricted to the opt-in real-ai/u,
+  );
+  assert.throws(
+    () => normalizeExclusiveArgs(["--live-external", "--project=integration-mock"]),
+    /restricted to the disposable-live-external/u,
+  );
+  assert.throws(
+    () => normalizeExclusiveArgs(["--project=unknown-lane"]),
+    /Unknown E2E project/u,
+  );
+});
+
+test("live external routing is single-project and explicitly exported", () => {
+  const normalized = normalizeExclusiveArgs([
+    "--live-external",
+    "--project=disposable-live-external",
+  ]);
+  assert.equal(normalized.liveExternal, true);
+  assert.deepEqual(normalized.projects, ["disposable-live-external"]);
+  const env: NodeJS.ProcessEnv = {};
+  applyE2eLane(normalized, env);
+  assert.deepEqual(env, {
+    E2E_PLAYWRIGHT_LANE: "disposable-live-external",
+    E2E_LIVE_EXTERNAL: "1",
+  });
+});
+
+test("runner mode exports explicit child-process environment without secrets", () => {
+  const env: NodeJS.ProcessEnv = {};
+  applyE2eAiMode("real", env);
+  applyE2eLane({ liveExternal: false, projects: ["real-ai"] }, env);
+  assert.deepEqual(env, {
+    E2E_AI_MODE: "real",
+    E2E_REAL_AI: "1",
+    E2E_AI_MODEL: "gpt-oss:120b-cloud",
+    E2E_PLAYWRIGHT_LANE: "real-ai",
+    E2E_LIVE_EXTERNAL: "0",
+  });
+});
+
+test("live external preflight validates authority without returning credentials", () => {
+  const linear = validateLiveExternalPreflight("linear", liveEnvironment());
+  assert.deepEqual(linear, {
+    provider: "linear",
+    mergeAuthorized: false,
+  });
+  const draft = validateLiveExternalPreflight("github_draft", liveEnvironment());
+  assert.deepEqual(draft, {
+    provider: "github_draft",
+    mergeAuthorized: false,
+  });
+
+  assert.throws(
+    () => validateLiveExternalPreflight("github_merge", {
+      ...liveEnvironment(),
+      E2E_LIVE_ALLOW_MERGE: "1",
+    }),
+    /separate exact confirmation/u,
+  );
+  const merge = validateLiveExternalPreflight("github_merge", {
+    ...liveEnvironment(),
+    E2E_LIVE_ALLOW_MERGE: "1",
+    LIVE_EXTERNAL_MERGE_CONFIRMATION: "MERGE_DISPOSABLE_PR",
+  });
+  assert.deepEqual(merge, {
+    provider: "github_merge",
+    mergeAuthorized: true,
+  });
+  assert.equal(JSON.stringify(merge).includes("fixture-token"), false);
+});
+
+function liveEnvironment(): NodeJS.ProcessEnv {
+  return {
+    LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: "DISPOSABLE_ONLY",
+    LIVE_EXTERNAL_TARGET_LABEL: "agentic-disposable-e2e",
+    AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true",
+    OBSIDIAN_VAULT: "C:/e2e/agentic-disposable-vault",
+    E2E_LIVE_GITHUB_REPOSITORY: "example/agentic-disposable-e2e",
+    E2E_LIVE_LINEAR_PROJECT: "agentic-disposable-e2e",
+    E2E_LIVE_ALLOW_MERGE: "0",
+    GITHUB_LIVE_TEST_TOKEN: "fixture-token-never-returned-1234567890",
+    LINEAR_LIVE_TEST_TOKEN: "fixture-token-never-returned-0987654321",
+    LINEAR_LIVE_TEST_TEAM_ID: "team-fixture",
+    LINEAR_LIVE_TEST_PROJECT_ID: "project-fixture",
+  };
+}

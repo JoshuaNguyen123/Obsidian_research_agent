@@ -86,6 +86,29 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.equal(result.error?.code, "unknown_tool");
 });
 
+test("registry marks invalid mutation arguments as definitely not applied", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Create a malformed canvas.",
+  });
+
+  const result = await registry.execute(
+    {
+      name: "create_design_canvas",
+      arguments: {
+        path: "Designs/invalid.canvas",
+        items: [{ title: "Invalid", kind: { unexpected: true } }],
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "invalid_arguments");
+  assert.equal(result.mutationState, "not_applied");
+  assert.equal(mock.content.has("Designs/invalid.canvas"), false);
+});
+
 test("companion browser tool stays blocked when browser setting is disabled", async () => {
   const registry = createDefaultToolRegistry();
   const result = await registry.execute(

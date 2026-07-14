@@ -13,6 +13,16 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_WAIT_MS = 30_000;
 const DEFAULT_POLL_MS = 250;
+const DEFAULT_PLAYWRIGHT_PROJECT = "deterministic-core-mock";
+const PLAYWRIGHT_PROJECTS = new Set([
+  DEFAULT_PLAYWRIGHT_PROJECT,
+  "integration-mock",
+  "integration-mock-legacy",
+  "sandbox",
+  "companion-restart",
+  "real-ai",
+  "disposable-live-external",
+]);
 const SIGNAL_EXIT_CODES = {
   SIGHUP: 129,
   SIGINT: 130,
@@ -166,8 +176,10 @@ export function isProcessAlive(pid) {
 }
 
 async function main() {
-  const { playwrightArgs, aiMode } = normalizeExclusiveArgs(process.argv.slice(2));
+  const normalized = normalizeExclusiveArgs(process.argv.slice(2));
+  const { playwrightArgs, aiMode, liveExternal, projects } = normalized;
   applyE2eAiMode(aiMode);
+  applyE2eLane({ liveExternal, projects });
   installSignalHandlers();
 
   try {
@@ -180,6 +192,9 @@ async function main() {
     );
     console.log(
       `E2E AI mode=${process.env.E2E_AI_MODE} model=${process.env.E2E_AI_MODEL || "(unset)"}`,
+    );
+    console.log(
+      `E2E lane=${process.env.E2E_PLAYWRIGHT_LANE} live_external=${process.env.E2E_LIVE_EXTERNAL === "1" ? "enabled" : "disabled"}`,
     );
     const exitCode = await runE2ePipeline(playwrightArgs);
     process.exitCode = interruptedSignal
@@ -424,9 +439,10 @@ function normalizePlaywrightArgs(args) {
   return args[0] === "--" ? args.slice(1) : args;
 }
 
-function normalizeExclusiveArgs(rawArgs) {
+export function normalizeExclusiveArgs(rawArgs) {
   const args = normalizePlaywrightArgs(rawArgs);
   let aiMode = null;
+  let liveExternal = false;
   const playwrightArgs = [];
   for (const arg of args) {
     if (arg === "--real-ai") {
@@ -437,9 +453,39 @@ function normalizeExclusiveArgs(rawArgs) {
       aiMode = "mock";
       continue;
     }
+    if (arg === "--live-external") {
+      liveExternal = true;
+      continue;
+    }
     playwrightArgs.push(arg);
   }
-  return { playwrightArgs, aiMode };
+  let projects = readRequestedProjects(playwrightArgs);
+  if (projects.length === 0) {
+    playwrightArgs.push(`--project=${DEFAULT_PLAYWRIGHT_PROJECT}`);
+    projects = [DEFAULT_PLAYWRIGHT_PROJECT];
+  }
+  for (const project of projects) {
+    if (!PLAYWRIGHT_PROJECTS.has(project)) {
+      throw new Error(
+        `Unknown E2E project ${project}. Allowed projects: ${[...PLAYWRIGHT_PROJECTS].join(", ")}.`,
+      );
+    }
+  }
+  if (aiMode === "real" && projects.some((project) => project !== "real-ai")) {
+    throw new Error("--real-ai is restricted to the opt-in real-ai Playwright project.");
+  }
+  if (
+    liveExternal &&
+    (projects.length !== 1 || projects[0] !== "disposable-live-external")
+  ) {
+    throw new Error(
+      "--live-external is restricted to the disposable-live-external Playwright project.",
+    );
+  }
+  if (liveExternal && aiMode === "real") {
+    throw new Error("The disposable live external provider lane cannot also enable real-AI model calls.");
+  }
+  return { playwrightArgs, aiMode, liveExternal, projects };
 }
 
 /**
@@ -447,19 +493,49 @@ function normalizeExclusiveArgs(rawArgs) {
  * leave any caller-provided E2E_AI_* env vars alone. Default package scripts
  * pass --real-ai (gpt-oss:120b-cloud) or --mock-ai for deterministic runs.
  */
-function applyE2eAiMode(aiMode) {
+export function applyE2eAiMode(aiMode, env = process.env) {
   if (aiMode === "real") {
-    process.env.E2E_AI_MODE = "real";
-    process.env.E2E_REAL_AI = "1";
-    if (!process.env.E2E_AI_MODEL?.trim()) {
-      process.env.E2E_AI_MODEL = "gpt-oss:120b-cloud";
+    env.E2E_AI_MODE = "real";
+    env.E2E_REAL_AI = "1";
+    if (!env.E2E_AI_MODEL?.trim()) {
+      env.E2E_AI_MODEL = "gpt-oss:120b-cloud";
     }
     return;
   }
   if (aiMode === "mock") {
-    process.env.E2E_AI_MODE = "mock";
-    process.env.E2E_REAL_AI = "0";
+    env.E2E_AI_MODE = "mock";
+    env.E2E_REAL_AI = "0";
   }
+}
+
+export function applyE2eLane(
+  { liveExternal, projects },
+  env = process.env,
+) {
+  env.E2E_PLAYWRIGHT_LANE = projects.join(",");
+  env.E2E_LIVE_EXTERNAL = liveExternal ? "1" : "0";
+}
+
+function readRequestedProjects(args) {
+  const projects = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--project") {
+      const project = args[index + 1];
+      if (!project || project.startsWith("-")) {
+        throw new Error("--project requires a Playwright project name.");
+      }
+      projects.push(project);
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--project=")) {
+      const project = argument.slice("--project=".length).trim();
+      if (!project) throw new Error("--project requires a Playwright project name.");
+      projects.push(project);
+    }
+  }
+  return [...new Set(projects)];
 }
 
 function delay(ms) {

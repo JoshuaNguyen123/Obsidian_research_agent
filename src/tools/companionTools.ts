@@ -2,6 +2,9 @@ import { CompanionClient, type CompanionHealth } from "../agent/CompanionClient"
 import { SafetyPolicy, type SafetyContext } from "../agent/SafetyPolicy";
 import type {
   BrowserClickInput,
+  BrowserKeypressInput,
+  BrowserObservation,
+  ClickableCandidate,
   BrowserOpenInput,
   BrowserTypeInput,
   MemoryKind,
@@ -68,7 +71,7 @@ export const browserOpenPageTool: AgentTool = {
     const observation = await client(context).open({
       ...input,
       missionMode: input.missionMode ?? context.settings.defaultBrowserMissionMode,
-    });
+    }, safety);
     return {
       status: "ok",
       safetyDecision: safety,
@@ -98,7 +101,7 @@ const browserObserveTool: AgentTool = {
     return {
       status: "ok",
       safetyDecision: safety,
-      ...(await client(context).observe()),
+      ...(await client(context).observe(safety)),
     };
   },
 };
@@ -134,9 +137,30 @@ const browserClickTool: AgentTool = {
           : "left",
     };
     const health = await getHealth(context);
+    const companion = client(context);
+    const observationSafety = safetyPolicy.evaluateLowRiskObservation(
+      buildSafetyContext(context, health),
+    );
+    if (observationSafety.status !== "allow") {
+      return blockedOutput("browser_click", observationSafety);
+    }
+    const observation = await companion.observe(observationSafety);
+    const trusted = resolveTrustedCandidate(input, observation);
+    if (!trusted) {
+      return {
+        status: "blocked",
+        reason: "The requested click target is not present in the trusted current observation.",
+      };
+    }
     const safety = safetyPolicy.evaluateBrowserClick(
-      input,
-      buildSafetyContext(context, health, args),
+      trusted.input,
+      buildSafetyContext(context, health, {
+        currentUrl: observation.url,
+        visibleText: observation.visibleText,
+        candidateLabel: trusted.candidate.label,
+        candidateRole: trusted.candidate.role,
+        candidateHref: trusted.candidate.href,
+      }),
     );
     if (safety.status !== "allow") {
       return blockedOutput("browser_click", safety);
@@ -145,7 +169,7 @@ const browserClickTool: AgentTool = {
     return {
       status: "ok",
       safetyDecision: safety,
-      ...(await client(context).click(input)),
+      ...(await companion.click(trusted.input, observation, safety)),
     };
   },
 };
@@ -176,9 +200,36 @@ const browserTypeTool: AgentTool = {
       clearFirst: getOptionalBoolean(args, "clearFirst") ?? false,
     };
     const health = await getHealth(context);
+    const companion = client(context);
+    const observationSafety = safetyPolicy.evaluateLowRiskObservation(
+      buildSafetyContext(context, health),
+    );
+    if (observationSafety.status !== "allow") {
+      return blockedOutput("browser_type", observationSafety);
+    }
+    const observation = await companion.observe(observationSafety);
+    const trusted = resolveTrustedCandidate(input, observation);
+    if (!trusted) {
+      return {
+        status: "blocked",
+        reason: "The requested typing target is not present in the trusted current observation.",
+      };
+    }
+    const trustedInput: BrowserTypeInput = {
+      candidateId: trusted.input.candidateId,
+      selector: trusted.input.selector,
+      text: input.text,
+      clearFirst: input.clearFirst,
+    };
     const safety = safetyPolicy.evaluateBrowserType(
-      input,
-      buildSafetyContext(context, health, args),
+      trustedInput,
+      buildSafetyContext(context, health, {
+        currentUrl: observation.url,
+        visibleText: observation.visibleText,
+        candidateLabel: trusted.candidate.label,
+        candidateRole: trusted.candidate.role,
+        candidateHref: trusted.candidate.href,
+      }),
     );
     if (safety.status !== "allow") {
       return blockedOutput("browser_type", safety);
@@ -187,7 +238,7 @@ const browserTypeTool: AgentTool = {
     return {
       status: "ok",
       safetyDecision: safety,
-      ...(await client(context).type(input)),
+      ...(await companion.type(trustedInput, observation, safety)),
     };
   },
 };
@@ -205,8 +256,37 @@ const browserKeypressTool: AgentTool = {
   },
   async execute(args, context) {
     const health = await getHealth(context);
-    const safety = safetyPolicy.evaluateLowRiskObservation(
+    const companion = client(context);
+    const observationSafety = safetyPolicy.evaluateLowRiskObservation(
       buildSafetyContext(context, health),
+    );
+    if (observationSafety.status !== "allow") {
+      return blockedOutput("browser_keypress", observationSafety);
+    }
+    const observation = await companion.observe(observationSafety);
+    const key = getRequiredString(args, "key");
+    const focused = resolveTrustedFocusedCandidate(observation);
+    if (!focused) {
+      return {
+        status: "blocked",
+        reason: "No single focused control is bound to the trusted current observation.",
+      };
+    }
+    const input: BrowserKeypressInput = {
+      key,
+      candidateId: focused.id,
+      selector: focused.selector!,
+      candidateFingerprint: focused.candidateFingerprint,
+    };
+    const safety = safetyPolicy.evaluateBrowserKeypress(
+      input,
+      buildSafetyContext(context, health, {
+        currentUrl: observation.url,
+        visibleText: observation.visibleText,
+        candidateLabel: focused.label,
+        candidateRole: focused.role,
+        candidateHref: focused.href,
+      }),
     );
     if (safety.status !== "allow") {
       return blockedOutput("browser_keypress", safety);
@@ -215,7 +295,7 @@ const browserKeypressTool: AgentTool = {
     return {
       status: "ok",
       safetyDecision: safety,
-      ...(await client(context).keypress({ key: getRequiredString(args, "key") })),
+      ...(await companion.keypress(input, observation, safety)),
     };
   },
 };
@@ -248,7 +328,7 @@ const browserScrollTool: AgentTool = {
       ...(await client(context).scroll({
         direction,
         amount: getOptionalInteger(args, "amount"),
-      })),
+      }, safety)),
     };
   },
 };
@@ -277,7 +357,7 @@ const browserScreenshotTool: AgentTool = {
       safetyDecision: safety,
       ...(await client(context).screenshot({
         fullPage: getOptionalBoolean(args, "fullPage") ?? false,
-      })),
+      }, safety)),
     };
   },
 };
@@ -308,7 +388,7 @@ export const browserExtractMarkdownTool: AgentTool = {
       ...(await client(context).extractMarkdown({
         includeLinks: getOptionalBoolean(args, "includeLinks") ?? true,
         maxChars: getOptionalInteger(args, "maxChars"),
-      })),
+      }, safety)),
     };
   },
 };
@@ -389,7 +469,6 @@ function createMemoryWriteTool(
         tags: { type: "array", items: { type: "string" } },
         sourceUrl: { type: "string" },
         sourceTitle: { type: "string" },
-        vaultPath: { type: "string" },
         taskId: { type: "string" },
       },
       additionalProperties: false,
@@ -407,7 +486,6 @@ function createMemoryWriteTool(
         tags: getOptionalStringList(args.tags),
         sourceUrl: getOptionalString(args, "sourceUrl"),
         sourceTitle: getOptionalString(args, "sourceTitle"),
-        vaultPath: getOptionalString(args, "vaultPath"),
         taskId: getOptionalString(args, "taskId"),
       };
 
@@ -464,6 +542,67 @@ function buildSafetyContext(
     candidateHref: getOptionalString(args, "candidateHref"),
     explicitUserApproval: context.userApprovalGranted === true,
   };
+}
+
+function resolveTrustedCandidate(
+  input: {
+    candidateId?: string;
+    selector?: string;
+    x?: number;
+    y?: number;
+    button?: "left" | "middle" | "right";
+  },
+  observation: BrowserObservation,
+): { candidate: ClickableCandidate; input: BrowserClickInput } | null {
+  const requestedIdentity = Boolean(input.candidateId || input.selector);
+  const requestedPoint = Number.isFinite(input.x) && Number.isFinite(input.y);
+  if (!requestedIdentity && !requestedPoint) return null;
+  const candidate = observation.candidates.find((item) => {
+    if (!isBoundCandidate(item)) return false;
+    if (input.candidateId && item.id !== input.candidateId) return false;
+    if (input.selector && item.selector !== input.selector) return false;
+    if (requestedPoint) {
+      const bounds = item.bounds;
+      if (
+        !bounds ||
+        input.x! < bounds.x ||
+        input.y! < bounds.y ||
+        input.x! > bounds.x + bounds.width ||
+        input.y! > bounds.y + bounds.height
+      ) {
+        return false;
+      }
+    }
+    return true;
+  });
+  if (!candidate) return null;
+  return {
+    candidate,
+    input: {
+      candidateId: candidate.id,
+      selector: candidate.selector,
+      candidateFingerprint: candidate.candidateFingerprint,
+      button: input.button ?? "left",
+    },
+  };
+}
+
+function resolveTrustedFocusedCandidate(
+  observation: BrowserObservation,
+): ClickableCandidate | null {
+  const focused = observation.candidates.filter(
+    (candidate) => candidate.focused === true && isBoundCandidate(candidate),
+  );
+  return focused.length === 1 ? focused[0] : null;
+}
+
+function isBoundCandidate(candidate: ClickableCandidate): boolean {
+  return Boolean(
+    candidate.visible &&
+      candidate.enabled &&
+      candidate.selector &&
+      /^sha256:[a-f0-9]{64}$/.test(candidate.candidateFingerprint),
+  );
 }
 
 function isDesktopRuntime(): boolean {

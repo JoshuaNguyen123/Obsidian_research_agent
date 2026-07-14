@@ -7,9 +7,9 @@ import type {
   LinearAuthoritySubject,
 } from "./HostLinearActionExecutor";
 import type { LinearToolClient } from "./LinearTools";
-import { parseRenderedWorkItemSpecV1 } from "./WorkItemParser";
+import { parseRenderedCompatibleWorkItemSpec } from "./WorkItemParser";
 import {
-  renderWorkItemSpecV1,
+  renderCompatibleWorkItemSpec,
   type WorkItemRenderDetailsV1,
 } from "./WorkItemRenderer";
 import {
@@ -18,6 +18,13 @@ import {
   type WorkItemSpecV1,
   type WorkItemSpecV1Unsigned,
 } from "./WorkItemSpecV1";
+import {
+  createWorkItemSpecV2,
+  parseCompatibleWorkItemSpec,
+  type ParsedCompatibleWorkItemSpec,
+  type WorkItemSpecV2,
+  type WorkItemSpecV2Unsigned,
+} from "./WorkItemSpecV2";
 import {
   LinearClientError,
   type LinearIssueRecord,
@@ -55,6 +62,14 @@ export type ResearchTicketWorkItemDraftV1 = WorkItemSpecV1Unsigned & {
   fingerprint?: unknown;
 };
 
+export type ResearchTicketWorkItemDraftV2 = WorkItemSpecV2Unsigned & {
+  fingerprint?: unknown;
+};
+
+export type ResearchTicketWorkItemDraft =
+  | ResearchTicketWorkItemDraftV1
+  | ResearchTicketWorkItemDraftV2;
+
 export interface BuiltResearchTicketV1 {
   spec: WorkItemSpecV1;
   title: string;
@@ -62,16 +77,47 @@ export interface BuiltResearchTicketV1 {
   deterministicIssueId: string;
 }
 
+export interface BuiltResearchTicketV2 {
+  spec: WorkItemSpecV2;
+  title: string;
+  description: string;
+  deterministicIssueId: string;
+}
+
+export type BuiltResearchTicket = BuiltResearchTicketV1 | BuiltResearchTicketV2;
+
 export interface ResearchTicketPublishRequest {
   runId: string;
   toolCallId: string;
   subject: LinearAuthoritySubject;
   context: ToolExecutionContext;
   sections: SynthesizedResearchTicketSectionsV1;
-  draft: ResearchTicketWorkItemDraftV1;
+  draft: ResearchTicketWorkItemDraft;
   activeGrants?: readonly AuthorityGrantV1[];
   preferredGrantId?: string;
 }
+
+export interface ResearchTicketPreviewRequest {
+  context: ToolExecutionContext;
+  sections: SynthesizedResearchTicketSectionsV1;
+  draft: ResearchTicketWorkItemDraft;
+}
+
+export type ResearchTicketPreviewResult =
+  | {
+      ok: true;
+      status: "create" | "deduplicated";
+      ticket: BuiltResearchTicket;
+      duplicate: LinearIssueRecord | null;
+      candidatesExamined: number;
+    }
+  | {
+      ok: false;
+      status: "rejected";
+      error: { code: string; message: string; details?: Record<string, unknown> };
+      ticket?: BuiltResearchTicket;
+      candidatesExamined: number;
+    };
 
 export interface ResearchTicketPublisherOptions {
   readClient: LinearToolClient;
@@ -89,14 +135,14 @@ export type ResearchTicketPublishResult =
   | {
       ok: true;
       status: "deduplicated";
-      ticket: BuiltResearchTicketV1;
+      ticket: BuiltResearchTicket;
       issue: LinearIssueRecord;
       candidatesExamined: number;
     }
   | {
       ok: true;
       status: "created";
-      ticket: BuiltResearchTicketV1;
+      ticket: BuiltResearchTicket;
       issue: LinearIssueRecord;
       action: PreparedAction;
       receipt: ActionReceipt;
@@ -111,7 +157,7 @@ export type ResearchTicketPublishResult =
         message: string;
         details?: Record<string, unknown>;
       };
-      ticket?: BuiltResearchTicketV1;
+      ticket?: BuiltResearchTicket;
       action?: PreparedAction;
       grantId?: string;
       candidatesExamined: number;
@@ -145,7 +191,19 @@ export class ResearchTicketPublisher {
   build(
     sections: SynthesizedResearchTicketSectionsV1,
     draft: ResearchTicketWorkItemDraftV1,
-  ): BuiltResearchTicketV1 {
+  ): BuiltResearchTicketV1;
+  build(
+    sections: SynthesizedResearchTicketSectionsV1,
+    draft: ResearchTicketWorkItemDraftV2,
+  ): BuiltResearchTicketV2;
+  build(
+    sections: SynthesizedResearchTicketSectionsV1,
+    draft: ResearchTicketWorkItemDraft,
+  ): BuiltResearchTicket;
+  build(
+    sections: SynthesizedResearchTicketSectionsV1,
+    draft: ResearchTicketWorkItemDraft,
+  ): BuiltResearchTicket {
     const normalizedSections = normalizeSections(sections);
     const spec = createSpecWithoutTrustingFingerprint(draft);
     const renderDetails: WorkItemRenderDetailsV1 = {
@@ -156,7 +214,7 @@ export class ResearchTicketPublisher {
       scope: normalizedSections.scope,
       dependencies: normalizedSections.dependencies,
     };
-    const description = renderWorkItemSpecV1(spec, renderDetails);
+    const description = renderCompatibleWorkItemSpec(spec, renderDetails);
     if (description.length > MAX_RENDERED_DESCRIPTION_CHARS) {
       throw new ResearchTicketPublisherError(
         "research_ticket_description_too_large",
@@ -164,19 +222,61 @@ export class ResearchTicketPublisher {
       );
     }
     // Validate the exact serialized contract before it can reach an adapter.
-    const parsed = parseRenderedWorkItemSpecV1(description);
+    const parsed = parseRenderedCompatibleWorkItemSpec(description);
     if (parsed.spec.fingerprint !== spec.fingerprint) {
       throw new ResearchTicketPublisherError(
         "research_ticket_contract_mismatch",
         "Rendered research ticket changed its machine-contract fingerprint.",
       );
     }
-    return {
-      spec: parseWorkItemSpecV1(parsed.spec),
+    const parsedSpec = parseCompatibleWorkItemSpec(parsed.spec);
+    const built = {
       title: normalizedSections.title,
       description,
       deterministicIssueId: deterministicIssueUuid(spec.fingerprint),
     };
+    return parsedSpec.schemaVersion === 1
+      ? { ...built, spec: parsedSpec }
+      : { ...built, spec: parsedSpec };
+  }
+
+  /**
+   * Builds the exact outbound description and completes bounded duplicate
+   * search without preparing or dispatching any Linear mutation. The host can
+   * therefore show this preview before requesting exact approval.
+   */
+  async preview(
+    request: ResearchTicketPreviewRequest,
+  ): Promise<ResearchTicketPreviewResult> {
+    let ticket: BuiltResearchTicket;
+    try {
+      ticket = this.build(request.sections, request.draft);
+    } catch (error) {
+      return {
+        ok: false,
+        status: "rejected",
+        error: publisherError(error, "research_ticket_invalid"),
+        candidatesExamined: 0,
+      };
+    }
+    try {
+      const duplicate = await this.findDuplicate(ticket.spec, request.context);
+      return {
+        ok: true,
+        status: duplicate.issue ? "deduplicated" : "create",
+        ticket,
+        duplicate: duplicate.issue,
+        candidatesExamined: duplicate.candidatesExamined,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status: "rejected",
+        error: publisherError(error, "research_ticket_duplicate_search_failed"),
+        ticket,
+        candidatesExamined: 0,
+      };
+    }
   }
 
   async publish(
@@ -192,37 +292,16 @@ export class ResearchTicketPublisher {
       };
     }
 
-    let ticket: BuiltResearchTicketV1;
-    try {
-      ticket = this.build(request.sections, request.draft);
-    } catch (error) {
-      return {
-        ok: false,
-        status: "rejected",
-        error: publisherError(error, "research_ticket_invalid"),
-        candidatesExamined: 0,
-      };
-    }
-
-    let duplicate: DuplicateSearchResult;
-    try {
-      duplicate = await this.findDuplicate(ticket.spec, request.context);
-    } catch (error) {
-      return {
-        ok: false,
-        status: "rejected",
-        error: publisherError(error, "research_ticket_duplicate_search_failed"),
-        ticket,
-        candidatesExamined: 0,
-      };
-    }
-    if (duplicate.issue) {
+    const preview = await this.preview(request);
+    if (!preview.ok) return preview;
+    const { ticket } = preview;
+    if (preview.duplicate) {
       return {
         ok: true,
         status: "deduplicated",
         ticket,
-        issue: duplicate.issue,
-        candidatesExamined: duplicate.candidatesExamined,
+        issue: preview.duplicate,
+        candidatesExamined: preview.candidatesExamined,
       };
     }
 
@@ -245,7 +324,7 @@ export class ResearchTicketPublisher {
         status: "rejected",
         error: prepared.error,
         ticket,
-        candidatesExamined: duplicate.candidatesExamined,
+        candidatesExamined: preview.candidatesExamined,
       };
     }
 
@@ -259,7 +338,7 @@ export class ResearchTicketPublisher {
       preferredGrantId: request.preferredGrantId,
     });
     if (!execution.ok) {
-      return executionFailure(execution, ticket, duplicate.candidatesExamined);
+      return executionFailure(execution, ticket, preview.candidatesExamined);
     }
 
     // The adapter's mutation readback proves its field-level postcondition. A
@@ -276,7 +355,7 @@ export class ResearchTicketPublisher {
         ticket,
         action: execution.action,
         grantId: execution.grantId,
-        candidatesExamined: duplicate.candidatesExamined,
+        candidatesExamined: preview.candidatesExamined,
       };
     }
     const mismatch = ticketReadbackMismatch(
@@ -295,7 +374,7 @@ export class ResearchTicketPublisher {
         ticket,
         action: execution.action,
         grantId: execution.grantId,
-        candidatesExamined: duplicate.candidatesExamined,
+        candidatesExamined: preview.candidatesExamined,
       };
     }
 
@@ -307,12 +386,12 @@ export class ResearchTicketPublisher {
       action: execution.action,
       receipt: execution.receipt,
       grantId: execution.grantId,
-      candidatesExamined: duplicate.candidatesExamined,
+      candidatesExamined: preview.candidatesExamined,
     };
   }
 
   private async findDuplicate(
-    spec: WorkItemSpecV1,
+    spec: ParsedCompatibleWorkItemSpec,
     context: ToolExecutionContext,
   ): Promise<DuplicateSearchResult> {
     const candidates = new Map<string, LinearIssueRecord>();
@@ -389,9 +468,12 @@ export class ResearchTicketPublisherError extends Error {
 }
 
 function createSpecWithoutTrustingFingerprint(
-  value: ResearchTicketWorkItemDraftV1,
-): WorkItemSpecV1 {
+  value: ResearchTicketWorkItemDraft,
+): ParsedCompatibleWorkItemSpec {
   const record = expectPlainRecord(value, "work item draft");
+  if (record.schemaVersion === 2) {
+    return createSpecV2WithoutTrustingFingerprint(record);
+  }
   assertAllowedKeys(
     record,
     [
@@ -432,6 +514,57 @@ function createSpecWithoutTrustingFingerprint(
       : {}),
   };
   return createWorkItemSpecV1(unsigned);
+}
+
+function createSpecV2WithoutTrustingFingerprint(
+  record: Record<string, unknown>,
+): WorkItemSpecV2 {
+  assertAllowedKeys(
+    record,
+    [
+      "schemaVersion",
+      "ready",
+      "executionClass",
+      "objective",
+      "repositoryKey",
+      "vaultBindingKey",
+      "acceptanceCriteria",
+      "validationRequirementKeys",
+      "evidenceRefs",
+      "riskClass",
+      "originRunId",
+      "acceptedResearchArtifactFingerprint",
+      "parentIssueId",
+      "generation",
+      "fingerprint",
+    ],
+    "work item v2 draft",
+  );
+  const unsigned: WorkItemSpecV2Unsigned = {
+    schemaVersion: record.schemaVersion as WorkItemSpecV2Unsigned["schemaVersion"],
+    ready: record.ready as WorkItemSpecV2Unsigned["ready"],
+    executionClass: record.executionClass as WorkItemSpecV2Unsigned["executionClass"],
+    objective: record.objective as string,
+    acceptanceCriteria:
+      record.acceptanceCriteria as WorkItemSpecV2Unsigned["acceptanceCriteria"],
+    validationRequirementKeys: record.validationRequirementKeys as string[],
+    evidenceRefs: record.evidenceRefs as string[],
+    riskClass: record.riskClass as WorkItemSpecV2Unsigned["riskClass"],
+    originRunId: record.originRunId as string,
+    acceptedResearchArtifactFingerprint:
+      record.acceptedResearchArtifactFingerprint as string,
+    generation: record.generation as number,
+    ...(Object.prototype.hasOwnProperty.call(record, "repositoryKey")
+      ? { repositoryKey: record.repositoryKey as string }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(record, "vaultBindingKey")
+      ? { vaultBindingKey: record.vaultBindingKey as string }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(record, "parentIssueId")
+      ? { parentIssueId: record.parentIssueId as string }
+      : {}),
+  };
+  return createWorkItemSpecV2(unsigned);
 }
 
 function normalizeSections(
@@ -591,7 +724,7 @@ function deterministicIssueUuid(fingerprint: string): string {
 
 function ticketReadbackMismatch(
   issue: LinearIssueRecord,
-  expected: WorkItemSpecV1,
+  expected: ParsedCompatibleWorkItemSpec,
   queueProjectId: string,
 ): string | null {
   if (issue.project?.id !== queueProjectId) {
@@ -601,7 +734,7 @@ function ticketReadbackMismatch(
     return "Linear issue readback does not contain the rendered ticket contract.";
   }
   try {
-    const parsed = parseRenderedWorkItemSpecV1(issue.description);
+    const parsed = parseRenderedCompatibleWorkItemSpec(issue.description);
     if (parsed.spec.fingerprint !== expected.fingerprint) {
       return "Linear issue readback contains a different contract fingerprint.";
     }
@@ -621,7 +754,7 @@ function hasExactContractFingerprint(
   if (typeof issue.description !== "string") return false;
   try {
     return (
-      parseRenderedWorkItemSpecV1(issue.description).spec.fingerprint === fingerprint
+      parseRenderedCompatibleWorkItemSpec(issue.description).spec.fingerprint === fingerprint
     );
   } catch {
     return false;
@@ -664,7 +797,7 @@ function isLinearIssueRecord(value: unknown): value is LinearIssueRecord {
 
 function executionFailure(
   execution: Extract<HostLinearActionExecution, { ok: false }>,
-  ticket: BuiltResearchTicketV1,
+  ticket: BuiltResearchTicket,
   candidatesExamined: number,
 ): ResearchTicketPublishResult {
   return {

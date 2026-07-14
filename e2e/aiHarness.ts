@@ -18,8 +18,8 @@ export interface E2ESemanticEmbeddingConfig {
 }
 
 export function getE2EAiConfig(): E2EAiConfig {
-  // Package scripts: `test:e2e` / `test:e2e:long` pass --real-ai (gpt-oss:120b-cloud);
-  // `test:e2e:mock` passes --mock-ai for deterministic playwright-e2e-mock runs.
+  // The default `test:e2e` lane is deterministic and passes --mock-ai.
+  // Opt-in `test:e2e:real*` lanes pass --real-ai (gpt-oss:120b-cloud).
   const mode = process.env.E2E_AI_MODE === "real" ? "real" : "mock";
 
   return {

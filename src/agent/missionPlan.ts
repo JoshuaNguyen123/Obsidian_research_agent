@@ -191,9 +191,11 @@ export function createMissionPlan({
     // Streaming current-note writes are runner-owned and may be intentionally
     // absent from the model-facing tool list. They still belong in the
     // persisted task authority when they are required mission operations.
+    // Keep required tools first because each task has a bounded tool catalog;
+    // broad read routes must not truncate the tools needed to satisfy proof.
     allowedTools: dedupeStrings([
-      ...runPlan.allowedToolNames,
       ...requiredTools,
+      ...runPlan.allowedToolNames,
     ]),
     requiredTools,
   });
@@ -766,7 +768,9 @@ export function isWebEvidence(evidence: MissionEvidence): boolean {
 export function isVaultReadEvidence(evidence: MissionEvidence): boolean {
   return (
     evidence.kind === "vault_note" &&
-    (evidence.id.startsWith("vault:") || evidence.id.startsWith("vault_batch:"))
+    (evidence.id.startsWith("vault:") ||
+      evidence.id.startsWith("vault_batch:") ||
+      evidence.id.startsWith("vault_search:"))
   );
 }
 
@@ -852,6 +856,13 @@ export function receiptSatisfiesProof(
         !["read", "list", "search"].includes(operation)
       );
     case "write_receipt":
+      if (
+        receipt.resource &&
+        (receipt.resource.system === "workspace" || receipt.resource.system === "git")
+      ) {
+        return isCodeChangeTool(toolName) &&
+          !["read", "list", "search", "validate"].includes(operation);
+      }
       if (receipt.resource && receipt.resource.system !== "vault") {
         return false;
       }
@@ -1406,8 +1417,16 @@ function isGenericWriteTool(tool: string): boolean {
 
 function isExternalActionTool(tool: string): boolean {
   return (
-    /^(?:linear|github)_/u.test(tool) &&
+    (tool === "publish_research_to_linear" || /^(?:linear|github)_/u.test(tool)) &&
     !/_(?:read|get|list|search|find|inspect|resolve)(?:_|$)/u.test(tool)
+  );
+}
+
+function isCodeChangeTool(tool: string): boolean {
+  return (
+    (/^(?:code_workspace_|write_workspace_file$|replace_workspace_text$)/u.test(tool) &&
+      !/^code_workspace_(?:status|stat|list|read|search)$/u.test(tool)) ||
+    tool === "code_commit_verified"
   );
 }
 

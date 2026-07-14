@@ -48,6 +48,144 @@ test("run coordinator replays buffered events to a replacement view", async () =
   assert.deepEqual(seen, ["working", "final"]);
 });
 
+test("run coordinator retains and replays the latest canonical mission graph", async () => {
+  const coordinator = new RunCoordinator();
+  const graph = {
+    schemaVersion: 3,
+    missionId: "mission-graph-run",
+    objective: "Inspect and update the active note",
+    revision: 2,
+    nodes: {},
+  } as never;
+
+  await coordinator.start(async (_signal, events) => {
+    events.onMissionGraphUpdate?.(graph);
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const seen: string[] = [];
+  coordinator.subscribe(
+    {
+      onMissionGraphUpdate: (snapshot) => seen.push(snapshot.objective),
+    },
+    { replay: true },
+  );
+
+  assert.equal(coordinator.getSnapshot().runId, "mission-graph-run");
+  assert.deepEqual(coordinator.getSnapshot().lastMissionGraph, graph);
+  assert.deepEqual(seen, ["Inspect and update the active note"]);
+});
+
+test("run coordinator hydrates and replays an idle persisted mission projection", () => {
+  const coordinator = new RunCoordinator();
+  const graph = {
+    schemaVersion: 3,
+    missionId: "mission-persisted",
+    objective: "Resume the durable mission",
+    revision: 2,
+    nodes: {},
+  } as never;
+  const hydrated = coordinator.hydratePersistedMission({
+    runId: "run-persisted",
+    runtimeSnapshotPath: "Agent Runs/run-persisted.md",
+    missionLedgerPath: "Agent Runs/run-persisted.md",
+    graphStorePath: "Agent Runs/Mission Graphs/mission-persisted.md",
+    graphReference: {
+      version: 1,
+      missionId: "mission-persisted",
+      path: "Agent Runs/Mission Graphs/mission-persisted.md",
+      storeRevision: 7,
+      graphRevision: 2,
+      recordFingerprint: `sha256:${"a".repeat(64)}`,
+      journalHeadFingerprint: `sha256:${"b".repeat(64)}`,
+    },
+    missionLedger: {
+      runId: "run-persisted",
+      status: "blocked",
+      evidenceCount: 1,
+      receiptCount: 1,
+      expectedTools: ["append_to_current_file"],
+      nextAction: "Verify the final artifact.",
+      remainingActions: ["Verify the final artifact."],
+      continuationCommand: "continue run run-persisted",
+      canResume: true,
+      dependencyStatus: [],
+      iterationCount: 2,
+      progressScore: 0.5,
+      stalledCount: 0,
+    },
+    missionGraph: graph,
+  });
+
+  assert.equal(hydrated, true);
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.isRunning, false);
+  assert.equal(snapshot.lastMissionLedger?.canResume, true);
+  assert.equal(snapshot.persistedProjection?.graphReference.storeRevision, 7);
+  assert.deepEqual(snapshot.lastMissionGraph, graph);
+
+  const replayed: string[] = [];
+  coordinator.subscribe(
+    {
+      onMissionGraphUpdate: (value) => replayed.push(value.objective),
+    },
+    { replay: true },
+  );
+  assert.deepEqual(replayed, ["Resume the durable mission"]);
+});
+
+test("starting a new run clears the persisted restart projection", async () => {
+  const coordinator = new RunCoordinator();
+  coordinator.hydratePersistedMission({
+    runId: "run-old",
+    runtimeSnapshotPath: "Agent Runs/run-old.md",
+    missionLedgerPath: "Agent Runs/run-old.md",
+    graphStorePath: "Agent Runs/Mission Graphs/run-old.md",
+    graphReference: {
+      version: 1,
+      missionId: "run-old",
+      path: "Agent Runs/Mission Graphs/run-old.md",
+      storeRevision: 1,
+      graphRevision: 0,
+      recordFingerprint: `sha256:${"a".repeat(64)}`,
+      journalHeadFingerprint: null,
+    },
+    missionLedger: {
+      runId: "run-old",
+      status: "running",
+      evidenceCount: 0,
+      receiptCount: 0,
+      expectedTools: [],
+      nextAction: "Continue.",
+      remainingActions: ["Continue."],
+      continuationCommand: "continue run run-old",
+      canResume: true,
+      dependencyStatus: [],
+      iterationCount: 0,
+      progressScore: 0,
+      stalledCount: 0,
+    },
+    missionGraph: {
+      schemaVersion: 3,
+      missionId: "run-old",
+      objective: "Old mission",
+      revision: 0,
+      nodes: {},
+    } as never,
+  });
+
+  await coordinator.start(async (_signal, events) => {
+    events.onRunConfig?.({ runId: "run-new" } as never);
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.runId, "run-new");
+  assert.equal(snapshot.persistedProjection, null);
+  assert.equal(snapshot.lastMissionLedger, null);
+  assert.equal(snapshot.lastMissionGraph, null);
+});
+
 test("run coordinator cancellation reaches the active executor", async () => {
   const coordinator = new RunCoordinator();
   const active = coordinator.start(async (signal, events) => {

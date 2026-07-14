@@ -174,3 +174,73 @@ test("completion-driven auto continuation continues unpaid debt within segment b
     { recommended: false, reason: "segment_cap" },
   );
 });
+
+test("completion-driven budget stop continues a recoverable incomplete final output", () => {
+  const acceptance = {
+    status: "fail",
+    missing: ["final_output", "tool:web_search"],
+    reasons: ["concrete_required_output_missing"],
+  };
+  const debt = computeProofDebt({ status: "budget", acceptance });
+  const reflection = reflectMissionCompletion({
+    prompt: "Continue bounded overnight research.",
+    acceptance,
+    proofDebt: debt,
+    writeReceiptCount: 1,
+  });
+
+  assert.equal(debt.empty, false);
+  assert.equal(debt.blocked, false);
+  assert.equal(reflection.done, false);
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance,
+      proofDebt: debt,
+      completionDriven: true,
+      reflection,
+      segmentsUsed: 1,
+      maxSegments: 2,
+    }),
+    { recommended: true, reason: "budget_exhausted" },
+  );
+});
+
+test("completion-driven budget stop still refuses non-recoverable acceptance failures", () => {
+  for (const acceptance of [
+    {
+      status: "fail",
+      missing: ["failed_goal:delete_path"],
+      reasons: ["concrete_required_output_missing"],
+    },
+    {
+      status: "fail",
+      missing: ["final_output"],
+      reasons: ["broad_unscoped_mutation_blocker_missing"],
+    },
+    {
+      status: "fail",
+      missing: ["verifier:write_safety:Notes/risky.md"],
+      reasons: ["verifier_checks_incomplete"],
+    },
+  ]) {
+    const debt = computeProofDebt({ status: "budget", acceptance });
+    assert.deepEqual(
+      decideAutoContinuation({
+        stopReason: "budget",
+        acceptance,
+        proofDebt: debt,
+        completionDriven: true,
+        reflection: {
+          done: false,
+          confidence: 0.2,
+          reason: "acceptance_fail",
+          remainingActions: [...acceptance.missing],
+        },
+        segmentsUsed: 1,
+        maxSegments: 2,
+      }),
+      { recommended: false, reason: "acceptance_failed" },
+    );
+  }
+});

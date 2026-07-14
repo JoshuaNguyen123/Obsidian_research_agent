@@ -103,7 +103,10 @@ export function decideAutoContinuation({
     return { recommended: false, reason: "blocked" };
   }
 
-  if (acceptance?.status === "fail") {
+  if (
+    acceptance?.status === "fail" &&
+    (!completionDriven || hasNonRecoverableAcceptanceFailure(acceptance))
+  ) {
     return { recommended: false, reason: "acceptance_failed" };
   }
 
@@ -138,4 +141,20 @@ export function decideAutoContinuation({
   }
 
   return { recommended: true, reason: "budget_exhausted" };
+}
+
+function hasNonRecoverableAcceptanceFailure(
+  acceptance: NonNullable<AutoContinuationDecisionInput["acceptance"]>,
+): boolean {
+  const missing = acceptance.missing ?? [];
+  const reasons = acceptance.reasons ?? [];
+  return (
+    missing.some(
+      (item) =>
+        item.startsWith("failed_goal:") ||
+        item.startsWith("mission_plan_blocker:") ||
+        item.startsWith("verifier:write_safety:"),
+    ) ||
+    reasons.includes("broad_unscoped_mutation_blocker_missing")
+  );
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -28,3 +29,41 @@ def test_memory_write_and_search(tmp_path):
         assert results[0].tags == ["lecture", "history"]
     finally:
         store.close()
+
+
+def test_legacy_vault_path_metadata_is_securely_removed_during_migration(tmp_path):
+    database = tmp_path / "memory.sqlite3"
+    conn = sqlite3.connect(database)
+    conn.executescript(
+        """
+        CREATE TABLE memories (
+          id TEXT PRIMARY KEY, kind TEXT NOT NULL, content TEXT NOT NULL,
+          confidence REAL NOT NULL, tags_json TEXT NOT NULL, source_url TEXT,
+          source_title TEXT, vault_path TEXT, evidence_json TEXT NOT NULL,
+          task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        INSERT INTO memories VALUES (
+          'legacy', 'episodic', 'safe content', 1.0, '[]', NULL, NULL,
+          'Private/Vault/Secrets.md', '[]', NULL,
+          '2026-07-12T00:00:00+00:00', '2026-07-12T00:00:00+00:00'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(database)
+    store.initialize()
+    try:
+        columns = {
+            row["name"]
+            for row in store.conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        assert "vault_path" not in columns
+        assert "note_receipt_fingerprint" in columns
+        assert store.conn.execute(
+            "SELECT note_receipt_fingerprint FROM memories WHERE id = 'legacy'"
+        ).fetchone()[0] is None
+    finally:
+        store.close()
+    assert b"Private/Vault/Secrets.md" not in database.read_bytes()
