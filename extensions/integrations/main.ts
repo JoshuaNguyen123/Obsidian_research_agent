@@ -35,7 +35,7 @@ export default class AgenticResearcherIntegrationsExtension extends Plugin {
         createScaffoldSettingsContribution({
           id: "agentic-researcher-integrations",
           displayName: "Agentic Researcher Integrations",
-          title: "Integrations extension",
+          title: "Integrations capability",
           fields: [
             {
               id: "linear_state",

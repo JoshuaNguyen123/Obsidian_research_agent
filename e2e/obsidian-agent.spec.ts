@@ -91,134 +91,59 @@ test("controlled Obsidian teardown drains before the next launch", async () => {
   });
 });
 
-test("phase-1 optional extensions register, unload, and reconcile through core", async () => {
-  const extensionDataBefore = await Promise.all(
-    OPTIONAL_EXTENSION_IDS.map(async (pluginId) => ({
-      pluginId,
-      data: await readOptionalFile(
-        path.join(vaultRoot, ".obsidian", "plugins", pluginId, "data.json"),
-      ),
-    })),
-  );
-
-  try {
-    await withE2EHarness(
-      "phase1-extension-soft-dependency",
-      async ({ page, notePath, noteFilePath, input }) => {
-        const registrationFailures: string[] = [];
-        const onConsole = (message: { type(): string; text(): string }) => {
-          const text = message.text();
-          if (
-            ["warning", "error"].includes(message.type()) &&
-            /(?:duplicate|already registered|unable to register .*agentic researcher core)/iu.test(
-              text,
-            )
-          ) {
-            registrationFailures.push(`${message.type()}: ${text}`);
-          }
-        };
-        page.on("console", onConsole);
-
-        try {
-          for (const pluginId of OPTIONAL_EXTENSION_IDS) {
-            await setOptionalExtensionEnabled(page, pluginId, false);
-          }
-          await expectRegisteredExtensions(page, []);
-          for (const pluginId of OPTIONAL_EXTENSION_IDS) {
-            await expectExtensionStatus(page, pluginId, "missing");
-          }
-
-          for (const pluginId of OPTIONAL_EXTENSION_IDS) {
-            await setOptionalExtensionEnabled(page, pluginId, true);
-          }
-          expect(
-            registrationFailures,
-            "optional extension registration should not log a compatibility or duplicate error",
-          ).toEqual([]);
-          await expectRegisteredExtensions(page, [...OPTIONAL_EXTENSION_IDS]);
-          for (const pluginId of OPTIONAL_EXTENSION_IDS) {
-            await expectExtensionStatus(page, pluginId, "registered");
-          }
-          const migratedState = await expectVerifiedExtensionMigration(page);
-          expect(migratedState.mode).toMatch(/^(?:legacy_v2|new_install)$/u);
-          const extensionSnapshotHashes = new Map<string, string>();
-          for (const pluginId of OPTIONAL_EXTENSION_IDS) {
-            const persisted = await readPersistedExtensionMigration(page, pluginId);
-            expect(persisted.migrationId).toBe(migratedState.migrationId);
-            expect(persisted.acknowledgedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
-            expect(persisted.snapshotHash).toBe(
-              migratedState.namespaceHashes[persisted.namespace],
-            );
-            expect(persisted.serialized).not.toContain("linearApiKey");
-            expect(persisted.serialized).not.toContain("openAiCompatibleApiKey");
-            expect(persisted.serialized).not.toContain("ollamaApiKey");
-            extensionSnapshotHashes.set(pluginId, persisted.snapshotHash);
-          }
-          const allExtensionTools = await readCoreToolNames(page);
-          expect(allExtensionTools).toContain("run_code_block");
-          expect(allExtensionTools).toContain("write_workspace_file");
-          expect(allExtensionTools).toContain("browser_open_page");
-
-          const temporarilyDisabled = "agentic-researcher-code";
-          await setOptionalExtensionEnabled(page, temporarilyDisabled, false);
-          await expectRegisteredExtensions(
-            page,
-            OPTIONAL_EXTENSION_IDS.filter((pluginId) => pluginId !== temporarilyDisabled),
-          );
-          await expectExtensionStatus(page, temporarilyDisabled, "missing");
-          await expectExtensionStatus(
-            page,
-            "agentic-researcher-integrations",
-            "registered",
-          );
-          await expectExtensionStatus(page, "agentic-researcher-companion", "registered");
-          const codeDisabledTools = await readCoreToolNames(page);
-          expect(codeDisabledTools).not.toContain("run_code_block");
-          expect(codeDisabledTools).not.toContain("write_workspace_file");
-          expect(codeDisabledTools).toContain("browser_open_page");
-          expect(codeDisabledTools).toContain("read_current_file");
-          expect(codeDisabledTools).toContain("create_design_canvas");
-
-          await page.getByRole("tab", { name: "Chat" }).click();
-          await expect(page.locator("textarea.agentic-researcher-prompt")).toBeVisible();
-          await expect(page.locator("button.agentic-researcher-run")).toBeEnabled();
-          await submitMission(
-            page,
-            `Append this exact E2E marker to the current note: ${input.marker}`,
-          );
-          await expectNoteToContain(
-            noteFilePath,
-            input.marker,
-            "core vault write should remain functional while the code extension is disabled",
-          );
-
-          await setOptionalExtensionEnabled(page, temporarilyDisabled, true);
-          await expectRegisteredExtensions(page, [...OPTIONAL_EXTENSION_IDS]);
-          await expectExtensionStatus(page, temporarilyDisabled, "registered");
-          const reconciled = await readPersistedExtensionMigration(
-            page,
-            temporarilyDisabled,
-          );
-          expect(reconciled.acknowledgedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
-          expect(reconciled.snapshotHash).toBe(
-            extensionSnapshotHashes.get(temporarilyDisabled),
-          );
-          expect(await readCoreToolNames(page)).toContain("run_code_block");
-          expect(registrationFailures).toEqual([]);
-        } finally {
-          page.off("console", onConsole);
-          await deleteVaultFixture(page, notePath);
-        }
-      },
-    );
-  } finally {
-    for (const { pluginId, data } of extensionDataBefore) {
-      await restoreOptionalFile(
-        path.join(vaultRoot, ".obsidian", "plugins", pluginId, "data.json"),
-        data,
+test("one installed plugin exposes Code, Companion, and Integrations as built-in capabilities", async () => {
+  await withE2EHarness(
+    "unified-plugin-capabilities",
+    async ({ page, notePath, noteFilePath, input }) => {
+      const projection = await page.evaluate(
+        ({ corePluginId, capabilityIds }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const core = app?.plugins?.plugins?.[corePluginId];
+          const installedAgenticIds = Object.keys(
+            app?.plugins?.manifests ?? {},
+          )
+            .filter((id) => id.startsWith("agentic-researcher"))
+            .sort();
+          return {
+            installedAgenticIds,
+            bundled: capabilityIds.map((id) => ({
+              id,
+              present: Boolean(core?.getBundledCapability?.(id)),
+            })),
+            statusLines: core?.getExtensionStatusLines?.() ?? [],
+          };
+        },
+        { corePluginId: PLUGIN_ID, capabilityIds: [...OPTIONAL_EXTENSION_IDS] },
       );
-    }
-  }
+
+      expect(projection.installedAgenticIds).toEqual([PLUGIN_ID]);
+      expect(projection.bundled).toEqual(
+        OPTIONAL_EXTENSION_IDS.map((id) => ({ id, present: true })),
+      );
+      for (const capabilityId of OPTIONAL_EXTENSION_IDS) {
+        const key = capabilityId.replace("agentic-researcher-", "");
+        expect(projection.statusLines.join("\n")).toContain(
+          `extension_${key}=registered`,
+        );
+      }
+      const tools = await readCoreToolNames(page);
+      expect(tools).toContain("run_code_block");
+      expect(tools).toContain("write_workspace_file");
+      expect(tools).toContain("browser_open_page");
+
+      await page.getByRole("tab", { name: "Chat" }).click();
+      await submitMission(
+        page,
+        `Append this exact E2E marker to the current note: ${input.marker}`,
+      );
+      await expectNoteToContain(
+        noteFilePath,
+        input.marker,
+        "the unified plugin should preserve normal vault writeback",
+      );
+      await deleteVaultFixture(page, notePath);
+    },
+  );
 });
 
 test("clear chat allows prompt click type submit", async () => {
@@ -4817,7 +4742,7 @@ test.describe("phase-3 authenticated companion continuation", () => {
           vaultRoot,
           ".obsidian",
           "plugins",
-          "agentic-researcher-companion",
+          PLUGIN_ID,
           "data.json",
         );
         const installedCompanionBundle = await readFile(
@@ -4825,7 +4750,7 @@ test.describe("phase-3 authenticated companion continuation", () => {
             vaultRoot,
             ".obsidian",
             "plugins",
-            "agentic-researcher-companion",
+            PLUGIN_ID,
             "main.js",
           ),
           "utf8",
@@ -4851,7 +4776,8 @@ test.describe("phase-3 authenticated companion continuation", () => {
                 authorization,
               } = payload;
               const app = (window as typeof window & { app?: any }).app;
-              const extension = app?.plugins?.plugins?.[companionPluginId];
+              const extension = app?.plugins?.plugins?.[payload.corePluginId]
+                ?.getBundledCapability?.(companionPluginId);
               if (
                 !extension?.pairForegroundCompanion ||
                 !extension?.companionCoordinator?.submitAuthorizedNode
@@ -4884,6 +4810,7 @@ test.describe("phase-3 authenticated companion continuation", () => {
               };
             },
             {
+              corePluginId: PLUGIN_ID,
               companionPluginId: "agentic-researcher-companion",
               baseUrl: worker.baseUrl,
               bootstrapToken: worker.bootstrapToken,
@@ -4940,11 +4867,6 @@ test.describe("phase-3 authenticated companion continuation", () => {
               .toBe(false);
             coreDisabled = true;
 
-            await setOptionalExtensionEnabled(
-              page,
-              "agentic-researcher-companion",
-              false,
-            );
             worker.releaseExecutor();
             const terminal = await worker.waitForTerminal(jobId);
             expect(terminal.state).toBe("complete");
@@ -4972,16 +4894,20 @@ test.describe("phase-3 authenticated companion continuation", () => {
               "queued",
             );
 
-            await setOptionalExtensionEnabled(
-              page,
-              "agentic-researcher-companion",
-              true,
-            );
+            await restartCorePluginWithHarnessMock(page);
+            coreDisabled = false;
             const observed = await page.evaluate<any, any>(
               async (payload) => {
-                const { companionPluginId, baseUrl, bootstrapToken, jobId } = payload;
+                const {
+                  corePluginId,
+                  companionPluginId,
+                  baseUrl,
+                  bootstrapToken,
+                  jobId,
+                } = payload;
                 const extension = (window as typeof window & { app?: any }).app
-                  ?.plugins?.plugins?.[companionPluginId];
+                  ?.plugins?.plugins?.[corePluginId]
+                  ?.getBundledCapability?.(companionPluginId);
                 if (
                   !extension?.pairForegroundCompanion ||
                   !extension?.companionCoordinator?.reconcilePersistedJobs
@@ -5004,6 +4930,7 @@ test.describe("phase-3 authenticated companion continuation", () => {
                 };
               },
               {
+                corePluginId: PLUGIN_ID,
                 companionPluginId: "agentic-researcher-companion",
                 baseUrl: worker.baseUrl,
                 bootstrapToken: worker.bootstrapToken,
@@ -5015,15 +4942,6 @@ test.describe("phase-3 authenticated companion continuation", () => {
             expect(observed.lineage.missionId).toBe(contract.graph.missionId);
             expect(observed.lineage.nodeId).toBe("research");
             expect(observed.lineage.lastObservedEventSequence).toBe(6);
-            // Core may legitimately acknowledge the accepted/leased/started/
-            // progress prefix before it is disabled. The receipt and terminal
-            // completion events are produced only after both plugins are
-            // disconnected, so neither sequence 5 nor 6 may be applied until
-            // core reconnects and verifies the terminal proof.
-            expect(observed.lineage.lastAppliedEventSequence).toBeLessThan(5);
-            expect(observed.lineage.lastAppliedEventSequence).toBeLessThan(
-              observed.lineage.lastObservedEventSequence,
-            );
             expect(observed.lineage.receiptFingerprints).toHaveLength(1);
             expect(observed.lineage.resultFingerprint).toMatch(
               /^sha256:[a-f0-9]{64}$/u,
@@ -5036,8 +4954,6 @@ test.describe("phase-3 authenticated companion continuation", () => {
               vaultBeforeDisconnect,
             );
 
-            await restartCorePluginWithHarnessMock(page);
-            coreDisabled = false;
             await expect
               .poll(
                 async () => {
@@ -5056,19 +4972,35 @@ test.describe("phase-3 authenticated companion continuation", () => {
               )
               .toEqual({ research: "complete", vault: "ready" });
 
-            const applied = await page.evaluate<any, any>(
-              ({ companionPluginId, jobId }) => {
-                const extension = (window as typeof window & { app?: any }).app
-                  ?.plugins?.plugins?.[companionPluginId];
-                return extension?.companionCoordinator?.getRuntimeState?.().jobs?.[jobId];
-              },
-              {
-                companionPluginId: "agentic-researcher-companion",
-                jobId,
-              },
-            );
-            expect(applied.lastObservedEventSequence).toBe(6);
-            expect(applied.lastAppliedEventSequence).toBe(6);
+            await expect
+              .poll(
+                () =>
+                  page.evaluate<any, any>(
+                    ({ corePluginId, companionPluginId, jobId }) => {
+                      const extension = (
+                        window as typeof window & { app?: any }
+                      ).app?.plugins?.plugins?.[corePluginId]
+                        ?.getBundledCapability?.(companionPluginId);
+                      const lineage = extension?.companionCoordinator
+                        ?.getRuntimeState?.().jobs?.[jobId];
+                      return {
+                        observed: lineage?.lastObservedEventSequence ?? null,
+                        applied: lineage?.lastAppliedEventSequence ?? null,
+                      };
+                    },
+                    {
+                      corePluginId: PLUGIN_ID,
+                      companionPluginId: "agentic-researcher-companion",
+                      jobId,
+                    },
+                  ),
+                {
+                  message:
+                    "the unified Companion capability should durably apply the terminal cursor",
+                  timeout: 30_000,
+                },
+              )
+              .toEqual({ observed: 6, applied: 6 });
 
             const reconciledGraph = await readPersistedMissionGraphRecord(
               contract.graph.missionId,
@@ -5191,11 +5123,6 @@ test.describe("phase-3 authenticated companion continuation", () => {
             if (coreDisabled) {
               await restartCorePluginWithHarnessMock(page).catch(() => undefined);
             }
-            await setOptionalExtensionEnabled(
-              page,
-              "agentic-researcher-companion",
-              true,
-            ).catch(() => undefined);
           }
         } finally {
           await worker.close();
@@ -5394,6 +5321,49 @@ test("design graph conversion creates a native canvas instead of appending a ren
 
       const currentNote = (await readOptionalFile(noteFilePath)) ?? "";
       expect(currentNote).not.toContain("Since I cannot render a visual image");
+    },
+  );
+});
+
+test("government branch diagram creates and opens a native canvas", async () => {
+  test.setTimeout(240_000);
+  await withE2EHarness(
+    "government-branch-canvas",
+    async ({ page, input }) => {
+      const canvasFilePath = path.join(
+        vaultRoot,
+        ...input.designCanvasPath.split("/"),
+      );
+
+      await submitMission(
+        page,
+        "E2E_GOVERNMENT_BRANCH_CANVAS Can you draw me a diagram of the United States branches of government?",
+        { timeout: 120_000 },
+      );
+
+      for (const term of ["Legislative", "Executive", "Judicial"]) {
+        await expectFileToContain(
+          canvasFilePath,
+          term,
+          `government canvas should contain ${term}`,
+        );
+      }
+      await expectFileToContain(
+        canvasFilePath,
+        "_branch_",
+        "government canvas should preserve branch visual metadata",
+      );
+      await expectToolRun(page, "create_design_canvas");
+      await expectReceipt(page, input.designCanvasPath);
+      await expectVerification(page, "Canvas verified");
+
+      const canvasView = page.locator(
+        '.workspace-leaf-content[data-type="canvas"]',
+      ).last();
+      await expect(canvasView).toBeVisible({ timeout: 30_000 });
+      await expect(canvasView).toContainText("Legislative");
+      await expect(canvasView).toContainText("Executive");
+      await expect(canvasView).toContainText("Judicial");
     },
   );
 });
@@ -5875,14 +5845,6 @@ async function withE2EHarness(
 
   const dataBefore = await readOptionalFile(pluginDataPath);
   const ownedArtifactsBefore = await snapshotOwnedE2EArtifacts(vaultRoot);
-  const optionalExtensionDataBefore = await Promise.all(
-    OPTIONAL_EXTENSION_IDS.map(async (pluginId) => ({
-      pluginId,
-      data: await readOptionalFile(
-        path.join(vaultRoot, ".obsidian", "plugins", pluginId, "data.json"),
-      ),
-    })),
-  );
   const communityPluginsBefore = await readOptionalFile(communityPluginsPath);
   const obsidianAppStateBefore = await readOptionalFile(obsidianAppStatePath);
   const input = createE2EInput(label);
@@ -5905,9 +5867,6 @@ async function withE2EHarness(
       options.conversationHistory ?? [],
     );
     await ensureCommunityPluginEnabled(communityPluginsPath, PLUGIN_ID);
-    for (const pluginId of OPTIONAL_EXTENSION_IDS) {
-      await ensureCommunityPluginEnabled(communityPluginsPath, pluginId);
-    }
     obsidianProcess = await launchObsidian();
     await waitForCdp(cdpPort, obsidianProcess, 45_000);
 
@@ -5999,12 +5958,6 @@ async function withE2EHarness(
       await restoreOwnedE2EArtifacts(ownedArtifactsBefore);
       await restoreOptionalFile(obsidianAppStatePath, obsidianAppStateBefore);
       await restoreOptionalFile(pluginDataPath, dataBefore);
-      for (const { pluginId, data } of optionalExtensionDataBefore) {
-        await restoreOptionalFile(
-          path.join(vaultRoot, ".obsidian", "plugins", pluginId, "data.json"),
-          data,
-        );
-      }
       await restoreOptionalFile(communityPluginsPath, communityPluginsBefore);
     } catch (error) {
       teardownError ??= error;
@@ -9891,6 +9844,64 @@ async function setupVaultNoteAndMockModel(
             };
           }
 
+          if (latestUserText.includes("E2E_GOVERNMENT_BRANCH_CANVAS")) {
+            if (!toolNames.includes("create_design_canvas")) {
+              throw new Error(
+                `create_design_canvas was not available for a government branch diagram. Tools: ${toolNames.join(", ")}`,
+              );
+            }
+
+            const toolCall = {
+              id: "playwright-e2e-government-branch-canvas",
+              index: 0,
+              name: "create_design_canvas",
+              arguments: {
+                path: designCanvasPath,
+                title: "United States Branches of Government",
+                diagramType: "architecture",
+                direction: "row",
+                items: [
+                  {
+                    id: "legislative",
+                    title: "Legislative",
+                    text: "Congress writes laws and controls appropriations.",
+                    kind: "branch",
+                    lane: "Article I",
+                  },
+                  {
+                    id: "executive",
+                    title: "Executive",
+                    text: "The President executes and enforces laws.",
+                    kind: "branch",
+                    lane: "Article II",
+                  },
+                  {
+                    id: "judicial",
+                    title: "Judicial",
+                    text: "Federal courts interpret laws and the Constitution.",
+                    kind: "branch",
+                    lane: "Article III",
+                  },
+                ],
+                connections: [
+                  { from: "legislative", to: "executive", label: "checks" },
+                  { from: "executive", to: "judicial", label: "checks" },
+                  { from: "judicial", to: "legislative", label: "checks" },
+                ],
+              },
+            };
+
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                toolCalls: [toolCall],
+              },
+              toolCalls: [toolCall],
+              raw: { playwrightE2E: true },
+            };
+          }
+
           if (latestUserText.includes("E2E_DESIGN_GRAPH")) {
             if (!toolNames.includes("create_design_canvas")) {
               throw new Error(
@@ -13755,201 +13766,6 @@ async function ensureCommunityPluginEnabled(filePath: string, pluginId: string) 
   }
 
   await writeFile(filePath, `${JSON.stringify(pluginIds, null, 2)}\n`, "utf8");
-}
-
-async function setOptionalExtensionEnabled(
-  page: Page,
-  pluginId: (typeof OPTIONAL_EXTENSION_IDS)[number],
-  enabled: boolean,
-) {
-  await page.evaluate(
-    async ({ requestedPluginId, shouldEnable }) => {
-      const app = (window as typeof window & { app?: any }).app;
-      if (!app?.plugins) {
-        throw new Error("Obsidian plugin manager is unavailable.");
-      }
-      if (
-        !app.plugins.manifests?.[requestedPluginId] &&
-        typeof app.plugins.loadManifests === "function"
-      ) {
-        await app.plugins.loadManifests();
-      }
-      if (!app.plugins.manifests?.[requestedPluginId]) {
-        throw new Error(`Optional extension is not installed: ${requestedPluginId}`);
-      }
-
-      if (shouldEnable) {
-        if (!app.plugins.plugins?.[requestedPluginId]) {
-          if (typeof app.plugins.enablePlugin !== "function") {
-            throw new Error("Obsidian enablePlugin API is unavailable.");
-          }
-          await app.plugins.enablePlugin(requestedPluginId);
-        }
-        return;
-      }
-
-      if (app.plugins.plugins?.[requestedPluginId]) {
-        if (typeof app.plugins.disablePlugin !== "function") {
-          throw new Error("Obsidian disablePlugin API is unavailable.");
-        }
-        await app.plugins.disablePlugin(requestedPluginId);
-      }
-    },
-    { requestedPluginId: pluginId, shouldEnable: enabled },
-  );
-
-  await expect
-    .poll(
-      () =>
-        page.evaluate(
-          ({ requestedPluginId }) =>
-            Boolean(
-              (window as typeof window & { app?: any }).app?.plugins?.plugins?.[
-                requestedPluginId
-              ],
-            ),
-          { requestedPluginId: pluginId },
-        ),
-      {
-        message: `${pluginId} should be ${enabled ? "loaded" : "unloaded"}`,
-        timeout: 10_000,
-      },
-    )
-    .toBe(enabled);
-}
-
-async function expectRegisteredExtensions(
-  page: Page,
-  expectedPluginIds: ReadonlyArray<(typeof OPTIONAL_EXTENSION_IDS)[number]>,
-) {
-  const expected = [...expectedPluginIds].sort();
-  await expect
-    .poll(
-      () =>
-        page.evaluate(({ corePluginId }) => {
-          const core = (window as typeof window & { app?: any }).app?.plugins
-            ?.plugins?.[corePluginId];
-          const registered = core?.coreApiHost?.getRegisteredExtensionIds?.();
-          if (!Array.isArray(registered)) {
-            throw new Error("Core extension registry diagnostics are unavailable.");
-          }
-          return [...registered].sort();
-        }, { corePluginId: PLUGIN_ID }),
-      {
-        message: `core should expose exactly these registered extensions: ${expected.join(", ") || "none"}`,
-        timeout: 10_000,
-      },
-    )
-    .toEqual(expected);
-}
-
-async function expectExtensionStatus(
-  page: Page,
-  pluginId: (typeof OPTIONAL_EXTENSION_IDS)[number],
-  availability: "missing" | "registered",
-) {
-  await page.getByRole("tab", { name: "Run Details" }).click();
-  const statusKey = pluginId.replace(/^agentic-researcher-/u, "");
-  const statusLine = page.locator(".agentic-researcher-config-line", {
-    hasText: `extension_${statusKey}=`,
-  });
-  await expect(statusLine).toHaveCount(1);
-  await expect(statusLine).toContainText(`extension_${statusKey}=${availability}`);
-
-  if (availability === "registered") {
-    const manifestVersion = await page.evaluate(
-      ({ requestedPluginId }) =>
-        String(
-          (window as typeof window & { app?: any }).app?.plugins?.manifests?.[
-            requestedPluginId
-          ]?.version ?? "",
-        ),
-      { requestedPluginId: pluginId },
-    );
-    expect(manifestVersion).toMatch(/^\d+\.\d+\.\d+(?:[-+].+)?$/u);
-    await expect(statusLine).toContainText(`version=${manifestVersion}`);
-  } else {
-    await expect(statusLine).not.toContainText("version=");
-  }
-}
-
-async function expectVerifiedExtensionMigration(page: Page): Promise<{
-  migrationId: string;
-  mode: string;
-  namespaceHashes: Record<string, string>;
-}> {
-  const read = () =>
-    page.evaluate(({ corePluginId }) => {
-      const core = (window as typeof window & { app?: any }).app?.plugins
-        ?.plugins?.[corePluginId];
-      const plan = core?.extensionStateMigration;
-      if (!plan?.namespaces) return null;
-      const namespaceHashes = Object.fromEntries(
-        Object.entries(plan.namespaces).map(([namespace, value]: [string, any]) => [
-          namespace,
-          String(value?.snapshotHash ?? ""),
-        ]),
-      );
-      const statuses = Object.fromEntries(
-        Object.entries(plan.namespaces).map(([namespace, value]: [string, any]) => [
-          namespace,
-          String(value?.status ?? ""),
-        ]),
-      );
-      return {
-        migrationId: String(plan.migrationId ?? ""),
-        mode: String(plan.mode ?? ""),
-        namespaceHashes,
-        statuses,
-      };
-    }, { corePluginId: PLUGIN_ID });
-
-  await expect
-    .poll(read, {
-      message: "all extension namespaces should be hash-verified by core",
-      timeout: 15_000,
-    })
-    .toMatchObject({
-      statuses: {
-        code: "verified",
-        integrations: "verified",
-        companion: "verified",
-      },
-    });
-  const state = await read();
-  if (!state) throw new Error("Core extension migration state is unavailable.");
-  return state;
-}
-
-async function readPersistedExtensionMigration(
-  page: Page,
-  pluginId: (typeof OPTIONAL_EXTENSION_IDS)[number],
-): Promise<{
-  migrationId: string;
-  namespace: string;
-  snapshotHash: string;
-  acknowledgedAt: string;
-  serialized: string;
-}> {
-  return page.evaluate(async ({ requestedPluginId }) => {
-    const plugin = (window as typeof window & { app?: any }).app?.plugins
-      ?.plugins?.[requestedPluginId];
-    if (!plugin?.loadData) {
-      throw new Error(`Extension data API is unavailable: ${requestedPluginId}`);
-    }
-    const data = await plugin.loadData();
-    const migration = data?.extensionStateMigration;
-    if (!migration?.snapshot) {
-      throw new Error(`Extension migration snapshot is missing: ${requestedPluginId}`);
-    }
-    return {
-      migrationId: String(migration.migrationId ?? ""),
-      namespace: String(migration.namespace ?? ""),
-      snapshotHash: String(migration.snapshotHash ?? ""),
-      acknowledgedAt: String(migration.acknowledgedAt ?? ""),
-      serialized: JSON.stringify(data),
-    };
-  }, { requestedPluginId: pluginId });
 }
 
 async function readCoreToolNames(page: Page): Promise<string[]> {

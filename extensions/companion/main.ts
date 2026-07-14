@@ -334,7 +334,7 @@ export default class AgenticResearcherCompanionExtension extends Plugin {
   }
 }
 
-function createCompanionStatusContribution(
+export function createCompanionStatusContribution(
   coordinator: CompanionExtensionCoordinatorV1,
 ): ExtensionContributionV1 {
   return {
@@ -393,7 +393,7 @@ function createCompanionStatusContribution(
   };
 }
 
-function createCompanionReplayContribution(
+export function createCompanionReplayContribution(
   coordinator: CompanionExtensionCoordinatorV1,
 ): ExtensionContributionV1 {
   return {

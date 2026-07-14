@@ -95,7 +95,7 @@ export default class AgenticResearcherCodeExtension extends Plugin {
     return core.runMission(prompt, []);
   }
 
-  /** Core requests a path-free approval payload; the Code extension resolves
+  /** Core requests a path-free approval payload; the Code capability resolves
    * every trusted local execution input from its own durable stores. */
   async prepareBackgroundValidationCommitApproval(
     input: PrepareBackgroundValidationCommitApprovalInputV1,
@@ -267,7 +267,7 @@ export default class AgenticResearcherCodeExtension extends Plugin {
   }
 }
 
-class SandboxProviderConfigurationModal extends Modal {
+export class SandboxProviderConfigurationModal extends Modal {
   private kind: SandboxProviderKindV2 = "docker";
   private runtimeReference = "";
   private runtimeDigest = "";

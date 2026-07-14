@@ -67,7 +67,7 @@ test.describe("background Code companion continuation", () => {
     const active = harness;
     test.skip(
       !(await active.readyFixtureAvailable()),
-      "The installed Code extension has no bounded deterministic E2E preparation seam; ready success is not simulated.",
+      "The built-in Code capability has no bounded deterministic E2E preparation seam; ready success is not simulated.",
     );
 
     await active.submitMission();

@@ -19,6 +19,7 @@ export type CanvasLayoutDiagramType =
 export type CanvasConnectionMode = "none" | "sequence";
 export type CanvasLayoutItemKind =
   | "step"
+  | "branch"
   | "persona"
   | "actor"
   | "screen"
@@ -369,6 +370,7 @@ function getDefaultCanvasColor(
   }
 
   if (
+    item.kind === "branch" ||
     item.kind === "database" ||
     item.kind === "queue" ||
     item.kind === "resource" ||

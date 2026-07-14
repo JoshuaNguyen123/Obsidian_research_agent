@@ -15,11 +15,6 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_CDP_PORT = 11223;
 
 export const NATIVE_CORE_PLUGIN_ID = "agentic-researcher";
-export const NATIVE_OPTIONAL_PLUGIN_IDS = [
-  "agentic-researcher-code",
-  "agentic-researcher-integrations",
-  "agentic-researcher-companion",
-] as const;
 
 export interface NativeObsidianSetupContext {
   page: Page;
@@ -47,8 +42,8 @@ export interface StartNativeObsidianHarnessOptions {
 /**
  * Starts one controlled Obsidian process against the isolated test vault.
  *
- * The fixture snapshots and restores every installed Agentic Researcher
- * plugin's data.json, Obsidian's open-vault state, community plugin enablement,
+ * The fixture snapshots and restores the unified Agentic Researcher plugin's
+ * data.json, Obsidian's open-vault state, community plugin enablement,
  * and bounded test-owned artifacts. Phase fixtures own only page setup and
  * scenario cleanup; they never need to duplicate the native lifecycle.
  */
@@ -72,7 +67,7 @@ export async function startNativeObsidianHarness(
   }
 
   const requestedPluginIds = uniqueStrings(
-    options.pluginIds ?? [NATIVE_CORE_PLUGIN_ID, ...NATIVE_OPTIONAL_PLUGIN_IDS],
+    options.pluginIds ?? [NATIVE_CORE_PLUGIN_ID],
   );
   if (!requestedPluginIds.includes(NATIVE_CORE_PLUGIN_ID)) {
     throw new Error("The native Obsidian harness requires the core plugin.");

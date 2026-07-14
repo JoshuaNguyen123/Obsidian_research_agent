@@ -360,9 +360,17 @@ async function installBackgroundGitHubPageHarness(
         throw new Error(`Plugin did not become ready: ${pluginId}`);
       };
       const core = await waitForPlugin(corePluginId);
-      const code = await waitForPlugin(codePluginId);
-      const integrations = await waitForPlugin(integrationsPluginId);
-      const companion = await waitForPlugin(companionPluginId);
+      const waitForCapability = async (capabilityId: string) => {
+        for (let attempt = 0; attempt < 240; attempt += 1) {
+          const capability = core.getBundledCapability?.(capabilityId);
+          if (capability) return capability;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`Built-in capability did not become ready: ${capabilityId}`);
+      };
+      const code = await waitForCapability(codePluginId);
+      const integrations = await waitForCapability(integrationsPluginId);
+      const companion = await waitForCapability(companionPluginId);
       if (
         core?.agenticResearcherApi?.state !== "ready" ||
         typeof integrations.synchronizeBackgroundGitHubHostState !== "function" ||
@@ -542,7 +550,8 @@ async function installBackgroundGitHubPageHarness(
       installCodeFixtureBridge(code);
 
       const synchronizeHostOnce = async () => {
-        const activeIntegrations = app.plugins.plugins?.[integrationsPluginId];
+        const activeIntegrations = app.plugins.plugins?.[corePluginId]
+          ?.getBundledCapability?.(integrationsPluginId);
         if (!activeIntegrations) {
           throw new Error("Integrations disappeared before GitHub host synchronization.");
         }
@@ -807,8 +816,9 @@ async function installBackgroundGitHubPageHarness(
 
       state.installMocks = () => {
         const activeCore = app.plugins.plugins?.[corePluginId];
-        const activeCode = app.plugins.plugins?.[codePluginId];
-        const activeIntegrations = app.plugins.plugins?.[integrationsPluginId];
+        const activeCode = activeCore?.getBundledCapability?.(codePluginId);
+        const activeIntegrations = activeCore
+          ?.getBundledCapability?.(integrationsPluginId);
         installCodeFixtureBridge(activeCode);
         installCoreDependencies(activeCore);
         installModel(activeCore);
@@ -1405,8 +1415,9 @@ async function disconnectAndRestartCoreIntegrations(page: Page): Promise<void> {
       };
       const app = harnessWindow.app;
       const state = harnessWindow.__e2eBackgroundGitHub;
-      app?.plugins?.plugins?.[companionPluginId]?.companionCoordinator?.clearSession?.();
-      await app.plugins.disablePlugin(integrationsPluginId);
+      app?.plugins?.plugins?.[corePluginId]
+        ?.getBundledCapability?.(companionPluginId)
+        ?.companionCoordinator?.clearSession?.();
       await app.plugins.disablePlugin(corePluginId);
       await app.plugins.enablePlugin(corePluginId);
       for (let attempt = 0; attempt < 240; attempt += 1) {
@@ -1421,13 +1432,11 @@ async function disconnectAndRestartCoreIntegrations(page: Page): Promise<void> {
       state?.installMocks?.();
       await app.plugins.plugins?.[corePluginId]?.activateView?.();
       state?.installMocks?.();
-      await app.plugins.enablePlugin(integrationsPluginId);
       for (let attempt = 0; attempt < 240; attempt += 1) {
         const activeCore = app.plugins.plugins?.[corePluginId];
         if (
-          app.plugins.plugins?.[integrationsPluginId] &&
-          activeCore?.agenticResearcherApi
-            ?.getRegisteredExtensionIds?.()
+          activeCore?.getBundledCapability?.(integrationsPluginId) &&
+          activeCore?.getRegisteredCapabilityIds?.()
             ?.includes(integrationsPluginId)
         ) {
           break;
@@ -1471,12 +1480,13 @@ async function setProofMode(
 }
 
 async function reconnectCompanion(page: Page): Promise<void> {
-  await page.evaluate(async ({ companionPluginId }) => {
+  await page.evaluate(async ({ corePluginId, companionPluginId }) => {
     const harnessWindow = window as typeof window & {
       app?: any;
       __e2eBackgroundGitHub?: any;
     };
-    const companion = harnessWindow.app?.plugins?.plugins?.[companionPluginId];
+    const companion = harnessWindow.app?.plugins?.plugins?.[corePluginId]
+      ?.getBundledCapability?.(companionPluginId);
     const state = harnessWindow.__e2eBackgroundGitHub;
     if (!companion?.pairForegroundCompanion || !state?.fetchImpl) {
       throw new Error("Companion reconnect fixture is unavailable.");
@@ -1487,7 +1497,10 @@ async function reconnectCompanion(page: Page): Promise<void> {
         "background-github-companion-bootstrap-token-0123456789abcdef",
       fetchImpl: state.fetchImpl,
     });
-  }, { companionPluginId: COMPANION_PLUGIN_ID });
+  }, {
+    corePluginId: NATIVE_CORE_PLUGIN_ID,
+    companionPluginId: COMPANION_PLUGIN_ID,
+  });
 }
 
 async function requestReconciliation(page: Page): Promise<void> {
@@ -1538,21 +1551,21 @@ async function readSnapshot(
         (record: any) => record.toolName === backgroundTool,
       );
       const graphNode = await state.readGraphNode?.(runtime);
-      const integrations = app?.plugins?.plugins?.[integrationsPluginId];
+      const core = app?.plugins?.plugins?.[corePluginId];
+      const integrations = core?.getBundledCapability?.(integrationsPluginId);
       const integrationsState = integrations?.readBackgroundGitHubHostState?.();
       const resolvedPublicationId =
         expectedPublicationId || state.fixture?.publicationId || "";
       const integrationsCheckpoint = resolvedPublicationId
         ? integrationsState?.checkpoints?.checkpoints?.[resolvedPublicationId] ?? null
         : null;
-      const core = app?.plugins?.plugins?.[corePluginId];
       const coreCheckpoint = resolvedPublicationId
         ? await core?.githubPublicationCheckpointStore
             ?.get?.(resolvedPublicationId)
             .catch(() => null)
         : null;
       const lineage = jobId
-        ? app?.plugins?.plugins?.[companionPluginId]?.companionCoordinator
+        ? core?.getBundledCapability?.(companionPluginId)?.companionCoordinator
             ?.getRuntimeState?.()?.jobs?.[jobId] ?? null
         : null;
       return {

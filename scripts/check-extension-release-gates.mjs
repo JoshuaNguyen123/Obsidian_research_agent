@@ -15,7 +15,16 @@ const HEADLESS_PACKAGE = "@agentic-researcher/headless-runtime";
 
 const RELEASE_GATES = Object.freeze({
   core: Object.freeze({
-    builtMarkers: ["agentic-researcher:core-ready", "publish_verified_code_to_github"],
+    builtMarkers: [
+      "agentic-researcher:core-ready",
+      "agentic-researcher-code",
+      "agentic-researcher-integrations",
+      "agentic-researcher-companion",
+      "code_workspace_create",
+      "code_commit_verified",
+      "publish_verified_code_to_github",
+      "background_continuation",
+    ],
     tests: [
       "tests/coreExtensionApi.test.ts",
       "tests/extensionCapabilities.test.ts",
@@ -24,11 +33,7 @@ const RELEASE_GATES = Object.freeze({
       "tests/extensionToolAdapter.test.ts",
       "tests/pluginDataV3Migration.test.ts",
       "tests/legacyExtensionMigration.test.ts",
-    ],
-  }),
-  code: Object.freeze({
-    builtMarkers: ["code_workspace_create", "code_commit_verified"],
-    tests: [
+      "tests/bundledCapabilityData.test.ts",
       "tests/codeExtensionRuntimeV2.test.ts",
       "tests/codeExtensionWorkspaceTools.test.ts",
       "tests/codeRepairCoordinator.test.ts",
@@ -38,11 +43,6 @@ const RELEASE_GATES = Object.freeze({
       "tests/repositoryProfileV2.test.ts",
       "tests/sandboxManager.test.ts",
       "tests/workspaceManagerV2.test.ts",
-    ],
-  }),
-  integrations: Object.freeze({
-    builtMarkers: ["agentic-researcher-integrations", "secure_credentials"],
-    tests: [
       "tests/githubAuth.test.ts",
       "tests/githubClient.test.ts",
       "tests/githubPublicationCheckpointStore.test.ts",
@@ -60,11 +60,6 @@ const RELEASE_GATES = Object.freeze({
       "tests/secureGitPushRuntime.test.ts",
       "tests/verifiedGitPushGateway.test.ts",
       "tests/workItemV2Queue.test.ts",
-    ],
-  }),
-  companion: Object.freeze({
-    builtMarkers: ["agentic-researcher-companion", "background_continuation"],
-    tests: [
       "tests/companionExtensionPersistence.test.ts",
       "tests/companionMissionReconciliation.test.ts",
       "tests/companionServiceController.test.ts",
@@ -105,13 +100,13 @@ async function main() {
   }
 
   console.log(
-    `Independent release gate passed for ${selected.map((plugin) => `${plugin.id}@${plugin.expectedVersion}`).join(", ")}${options.skipTests ? " (static checks only)" : ""}.`,
+    `Unified plugin release gate passed for ${selected.map((plugin) => `${plugin.id}@${plugin.expectedVersion}`).join(", ")}${options.skipTests ? " (static checks only)" : ""}.`,
   );
 }
 
 async function assertComponent(plugin, coreApiVersion, headlessVersion) {
   const gate = RELEASE_GATES[plugin.key];
-  if (!gate) throw new Error(`No independent release gate is declared for ${plugin.key}.`);
+  if (!gate) throw new Error(`No unified release gate is declared for ${plugin.key}.`);
   const sourceRoot = path.resolve(repoRoot, plugin.sourceDir);
   const [packageJson, source, built] = await Promise.all([
     readJson(path.join(sourceRoot, "package.json")),
@@ -131,6 +126,12 @@ async function assertComponent(plugin, coreApiVersion, headlessVersion) {
   for (const marker of gate.builtMarkers) {
     if (!built.includes(marker)) {
       throw new Error(`Built capability marker ${marker} is missing from ${plugin.outfile}.`);
+    }
+  }
+  for (const testFile of gate.tests) {
+    const testStat = await stat(path.join(repoRoot, testFile)).catch(() => null);
+    if (!testStat?.isFile()) {
+      throw new Error(`${plugin.id} capability gate is missing ${testFile}.`);
     }
   }
   if (plugin.key === "core") return;
@@ -153,12 +154,6 @@ async function assertComponent(plugin, coreApiVersion, headlessVersion) {
       `${plugin.id} must pin ${HEADLESS_PACKAGE} exactly to ${headlessVersion}.`,
     );
   }
-  for (const testFile of gate.tests) {
-    const testStat = await stat(path.join(repoRoot, testFile)).catch(() => null);
-    if (!testStat?.isFile()) {
-      throw new Error(`${plugin.id} capability gate is missing ${testFile}.`);
-    }
-  }
 }
 
 function assertWorkspaceCatalog(rootPackage, catalog) {
@@ -169,7 +164,7 @@ function assertWorkspaceCatalog(rootPackage, catalog) {
     }
   }
   if (catalog.length !== Object.keys(RELEASE_GATES).length) {
-    throw new Error("Every catalog component must have exactly one independent release gate.");
+    throw new Error("The unified catalog must have exactly one release gate.");
   }
 }
 
@@ -224,7 +219,7 @@ function parseArguments(args) {
     }
   }
   if (!["all", ...Object.keys(RELEASE_GATES)].includes(component)) {
-    throw new Error(`Release component must be all, core, code, integrations, or companion.`);
+    throw new Error(`Release component must be all or core.`);
   }
   return { component, skipTests };
 }

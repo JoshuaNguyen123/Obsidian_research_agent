@@ -6,6 +6,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,6 +20,11 @@ import {
 } from "./plugin-catalog.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const LEGACY_PLUGIN_IDS = Object.freeze([
+  "agentic-researcher-code",
+  "agentic-researcher-integrations",
+  "agentic-researcher-companion",
+]);
 
 async function main() {
   await validatePluginCatalog(repoRoot);
@@ -26,6 +32,7 @@ async function main() {
   const vaultRoot = path.join(fixtureRoot, "vault");
   const pluginsRoot = path.join(vaultRoot, ".obsidian", "plugins");
   const dataJson = new Map();
+  const legacyDataJson = new Map();
   try {
     for (const [index, plugin] of PLUGIN_CATALOG.entries()) {
       const pluginRoot = path.join(pluginsRoot, plugin.id);
@@ -38,8 +45,41 @@ async function main() {
       await writeFile(path.join(pluginRoot, "main.js"), "stale fixture\n", { flag: "wx" });
       dataJson.set(plugin.id, content);
     }
+    for (const pluginId of LEGACY_PLUGIN_IDS) {
+      const pluginRoot = path.join(pluginsRoot, pluginId);
+      await mkdir(pluginRoot, { recursive: true });
+      const content = Buffer.from(
+        JSON.stringify({ fixture: pluginId, preserve: true }, null, 2),
+        "utf8",
+      );
+      await writeFile(path.join(pluginRoot, "data.json"), content, { flag: "wx" });
+      await writeFile(
+        path.join(pluginRoot, "manifest.json"),
+        JSON.stringify({ id: pluginId, version: "0.2.0" }),
+        { flag: "wx" },
+      );
+      await writeFile(path.join(pluginRoot, "main.js"), "legacy fixture\n", {
+        flag: "wx",
+      });
+      legacyDataJson.set(pluginId, content);
+    }
+    await writeFile(
+      path.join(vaultRoot, ".obsidian", "community-plugins.json"),
+      `${JSON.stringify(["unrelated-plugin", ...LEGACY_PLUGIN_IDS], null, 2)}\n`,
+      "utf8",
+    );
 
     await runSync(vaultRoot);
+
+    const enabled = JSON.parse(
+      await readFile(path.join(vaultRoot, ".obsidian", "community-plugins.json"), "utf8"),
+    );
+    if (
+      JSON.stringify(enabled) !==
+      JSON.stringify([PLUGIN_CATALOG[0].id, "unrelated-plugin"])
+    ) {
+      throw new Error(`Community plugin registry was not consolidated: ${JSON.stringify(enabled)}.`);
+    }
 
     for (const plugin of PLUGIN_CATALOG) {
       const sourceRoot = path.resolve(repoRoot, plugin.sourceDir);
@@ -65,8 +105,24 @@ async function main() {
         );
       }
     }
+    for (const pluginId of LEGACY_PLUGIN_IDS) {
+      const activeRoot = path.join(pluginsRoot, pluginId);
+      const activeStat = await stat(activeRoot).catch(() => null);
+      if (activeStat) {
+        throw new Error(`Legacy plugin remained installed: ${pluginId}.`);
+      }
+      const retiredRoot = path.join(
+        pluginsRoot,
+        ".agentic-researcher-retired",
+        pluginId,
+      );
+      const preserved = await readFile(path.join(retiredRoot, "data.json"));
+      if (!preserved.equals(legacyDataJson.get(pluginId))) {
+        throw new Error(`Retiring ${pluginId} changed its data.json.`);
+      }
+    }
     console.log(
-      `Installed-artifact freshness passed for ${PLUGIN_CATALOG.length} plugins; ${PLUGIN_CATALOG.length} data.json files were byte-identical after sync.`,
+      `Installed-artifact freshness passed for one unified plugin; ${LEGACY_PLUGIN_IDS.length} legacy data stores were retired byte-identically.`,
     );
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });

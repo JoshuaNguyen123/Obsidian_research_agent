@@ -179,7 +179,7 @@ export interface ApplyVerifiedBackgroundGitHubResultInputV1 {
   verifiedReceiptFingerprint: string;
 }
 
-interface CodePublicationBridgeV1 {
+export interface CodePublicationBridgeV1 {
   resolveVerifiedCodePublicationHandoff(
     profileKey: string,
   ): Promise<VerifiedCodePublicationHandoffV1 | null>;
@@ -213,12 +213,18 @@ export class PreparedBackgroundGitHubHostV1 {
   private state: BackgroundGitHubHostStateV1 | null = null;
   private readonly packages: PreparedBackgroundGitHubPackageStoreV1;
   private readonly now: () => Date;
+  private readonly resolveCodeBridge?: () => CodePublicationBridgeV1 | null;
 
   constructor(
     private readonly plugin: Plugin,
-    options: { applicationDataRoot?: string; now?: () => Date } = {},
+    options: {
+      applicationDataRoot?: string;
+      now?: () => Date;
+      resolveCodeBridge?: () => CodePublicationBridgeV1 | null;
+    } = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.resolveCodeBridge = options.resolveCodeBridge;
     this.packages = new PreparedBackgroundGitHubPackageStoreV1({
       applicationDataRoot:
         options.applicationDataRoot ?? defaultIntegrationsApplicationDataRootV1(),
@@ -606,7 +612,7 @@ export class PreparedBackgroundGitHubHostV1 {
       fail(
         "background_github_code_handoff_unavailable",
         "The exact RepositoryProfileV2 and verified local commit handoff are unavailable.",
-        "Complete fresh local validation and commit in the Code extension.",
+        "Complete fresh local validation and commit with the built-in Code capability.",
       );
     }
     const profile = parseRepositoryProfileV2(profileValue);
@@ -715,6 +721,8 @@ export class PreparedBackgroundGitHubHostV1 {
   }
 
   private getCodeBridge(): CodePublicationBridgeV1 {
+    const bundledBridge = this.resolveCodeBridge?.() ?? null;
+    if (bundledBridge) return bundledBridge;
     const plugins = (this.plugin.app as unknown as {
       plugins?: { plugins?: Record<string, unknown> };
     }).plugins?.plugins;
@@ -727,8 +735,8 @@ export class PreparedBackgroundGitHubHostV1 {
     ) {
       fail(
         "background_github_code_extension_unavailable",
-        "The compatible Code extension publication bridge is unavailable.",
-        "Enable the Agentic Researcher Code extension and resume.",
+        "The built-in Code publication bridge is unavailable.",
+        "Check the unified Agentic Researcher capability health and resume.",
       );
     }
     return code as CodePublicationBridgeV1;
@@ -1944,7 +1952,7 @@ function blocked(error: unknown): BackgroundGitHubHostBlockedV1 {
     code: "background_github_host_failed",
     message: safeError(error),
     requiredAction:
-      "Inspect Integrations and Code extension health, then resume from the same durable mission.",
+      "Inspect the built-in Integrations and Code capability health, then resume from the same durable mission.",
   };
 }
 

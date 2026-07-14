@@ -1500,7 +1500,7 @@ function assertOwnedByPinnedAccount(
 
 function assertAvailable(options: CreateGitHubCatalogToolsOptionsV1): void {
   if (!options.isAvailable()) {
-    throw notApplied("extension_unavailable", "GitHub catalog capability is disabled or its integrations/code extension is unavailable.");
+    throw notApplied("extension_unavailable", "GitHub catalog capability is disabled or its built-in integrations/code capability is unavailable.");
   }
 }
 

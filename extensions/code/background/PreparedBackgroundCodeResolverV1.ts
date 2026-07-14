@@ -1146,7 +1146,7 @@ function blockedResult(
     status: "blocked",
     code: "background_code_trusted_state_invalid",
     message:
-      "The Code extension could not verify the exact durable checkpoint, workspace, profile, sandbox, and diff proof chain.",
+      "The built-in Code capability could not verify the exact durable checkpoint, workspace, profile, sandbox, and diff proof chain.",
     requiredAction:
       "Inspect the foreground Code repair checkpoint and prepare a fresh exact action.",
   };

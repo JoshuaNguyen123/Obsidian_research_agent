@@ -61,7 +61,7 @@ jobs:
       - name: Path hygiene
         run: npm run check:path-hygiene
 
-      - name: Build all plugin artifacts
+      - name: Build the unified plugin artifact
         run: npm run build
 
       - name: Companion tests
@@ -72,7 +72,7 @@ jobs:
         env:
           AGENTIC_SANDBOX_CI_PROVIDER: ${{ matrix.sandbox_provider }}
 
-      - name: Independent extension compatibility and artifact gates
+      - name: Unified capability and artifact gates
         run: node scripts/check-extension-release-gates.mjs --component all --skip-tests
 
       - name: Installed artifact freshness and data preservation

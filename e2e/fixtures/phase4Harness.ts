@@ -49,11 +49,6 @@ export const PHASE4_REQUIRED_REPAIR_TOOLS = [
 
 const DEFAULT_CDP_PORT = 11223;
 const PHASE4_MISSION_STOP_TIMEOUT_MS = 10_000;
-const OPTIONAL_PLUGIN_IDS = [
-  PHASE4_CODE_PLUGIN_ID,
-  "agentic-researcher-integrations",
-  "agentic-researcher-companion",
-] as const;
 
 export interface Phase4ToolCatalogEntry {
   name: string;
@@ -96,8 +91,8 @@ export interface Phase4Harness {
     prompt?: string;
     error?: string;
   }>;
-  restartCoreAndCode(): Promise<void>;
-  setCodeExtensionEnabled(enabled: boolean): Promise<void>;
+  restartUnifiedPlugin(): Promise<void>;
+  setUnifiedPluginEnabled(enabled: boolean): Promise<void>;
   stopActiveMission(timeoutMs?: number): Promise<boolean>;
   close(): Promise<void>;
 }
@@ -119,7 +114,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
     getPhase4WorkspaceRoot(),
   );
   const communityPluginsPath = path.join(vaultRoot, ".obsidian", "community-plugins.json");
-  const pluginDataPaths = [PHASE4_CORE_PLUGIN_ID, ...OPTIONAL_PLUGIN_IDS].map(
+  const pluginDataPaths = [PHASE4_CORE_PLUGIN_ID].map(
     (pluginId) => path.join(vaultRoot, ".obsidian", "plugins", pluginId, "data.json"),
   );
   const [obsidianStateBefore, communityPluginsBefore, ...pluginDataBefore] =
@@ -142,13 +137,11 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
   try {
     await forceOnlyVaultOpen(obsidianStatePath, obsidianStateBefore, vaultRoot);
     // The test owns this launch and restores the exact prior bytes on close.
-    // Keep the verified extension-migration readback while clearing only the
+    // Keep the verified capability-migration readback while clearing only the
     // host-specific sandbox binding. Core deliberately rejects an already-
-    // verified extension whose migration receipt disappears.
-    await writeCodePluginSandboxReset(pluginDataPaths[1], pluginDataBefore[1]);
-    for (const pluginId of [PHASE4_CORE_PLUGIN_ID, ...OPTIONAL_PLUGIN_IDS]) {
-      await ensureCommunityPluginEnabled(communityPluginsPath, pluginId);
-    }
+    // verified capability whose migration receipt disappears.
+    await writeCodeCapabilitySandboxReset(pluginDataPaths[0], pluginDataBefore[0]);
+    await ensureCommunityPluginEnabled(communityPluginsPath, PHASE4_CORE_PLUGIN_ID);
     processHandle = spawn(
       obsidianExe,
       [
@@ -187,7 +180,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
         },
         {
           timeout: 30_000,
-          message: "The installed Code extension did not register its production tools.",
+          message: "The built-in Code capability did not register its production tools.",
         },
       )
       .toEqual([]);
@@ -236,10 +229,10 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
         ),
       probeTrustedQueueCodeBridge: (input) =>
         probeTrustedQueueCodeBridge(activePage, PHASE4_CODE_PLUGIN_ID, input),
-      restartCoreAndCode: () =>
-        restartCoreAndCode(activePage, PHASE4_CORE_PLUGIN_ID, PHASE4_CODE_PLUGIN_ID),
-      setCodeExtensionEnabled: (enabled) =>
-        setPluginEnabled(activePage, PHASE4_CODE_PLUGIN_ID, enabled),
+      restartUnifiedPlugin: () =>
+        restartUnifiedPlugin(activePage, PHASE4_CORE_PLUGIN_ID, PHASE4_CODE_PLUGIN_ID),
+      setUnifiedPluginEnabled: (enabled) =>
+        setPluginEnabled(activePage, PHASE4_CORE_PLUGIN_ID, enabled),
       stopActiveMission: (timeoutMs = PHASE4_MISSION_STOP_TIMEOUT_MS) =>
         stopActiveMissionForTeardown(
           activePage,
@@ -311,7 +304,8 @@ async function probeTrustedQueueCodeBridge(
 ): Promise<{ available: boolean; prompt?: string; error?: string }> {
   return page.evaluate(async ({ codePluginId, input }) => {
     const app = (window as typeof window & { app?: any }).app;
-    const plugin = app?.plugins?.plugins?.[codePluginId];
+    const plugin = app?.plugins?.plugins?.["agentic-researcher"]
+      ?.getBundledCapability?.(codePluginId);
     if (typeof plugin?.createTrustedQueueCodeMissionPrompt !== "function") {
       return { available: false };
     }
@@ -333,22 +327,17 @@ async function runSandboxBoundaryProbe(
 ): Promise<Record<string, unknown> | null> {
   return page.evaluate(async ({ codePluginId }) => {
     const app = (window as typeof window & { app?: any }).app;
-    const plugin = app?.plugins?.plugins?.[codePluginId];
-    const commandId = `${codePluginId}:probe-sandbox-boundaries`;
-    if (!plugin || !app?.commands?.commands?.[commandId]) return null;
-    const beforeData = await plugin.loadData?.();
-    const beforeProbe = beforeData?.codeRuntimeState?.sandbox?.lastProbe ?? null;
+    const plugin = app?.plugins?.plugins?.["agentic-researcher"]
+      ?.getBundledCapability?.(codePluginId);
+    if (typeof plugin?.probeConfiguredSandboxProviders !== "function") return null;
+    const beforeProbe = plugin.readState?.()?.sandbox?.lastProbe ?? null;
     const beforeJson = JSON.stringify(beforeProbe);
-    app.commands.executeCommandById(commandId);
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      const data = await plugin.loadData?.();
-      const probe = data?.codeRuntimeState?.sandbox?.lastProbe ?? null;
-      if (probe && JSON.stringify(probe) !== beforeJson) {
-        return JSON.parse(JSON.stringify(probe));
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    const status = await plugin.probeConfiguredSandboxProviders();
+    const probe = plugin.readState?.()?.sandbox?.lastProbe ?? null;
+    if (!probe || JSON.stringify(probe) === beforeJson) {
+      throw new Error("Sandbox boundary probe did not persist a fresh result.");
     }
-    throw new Error(`Sandbox boundary command ${commandId} did not persist a probe result.`);
+    return JSON.parse(JSON.stringify(probe ?? status));
   }, { codePluginId });
 }
 
@@ -399,7 +388,13 @@ async function installPhase4PageHarness(
       throw new Error(`Plugin did not load: ${pluginId}`);
     };
     const core = await ensurePlugin(corePluginId);
-    await ensurePlugin(codePluginId);
+    for (let attempt = 0; attempt < 160; attempt += 1) {
+      if (core.getBundledCapability?.(codePluginId)) break;
+      if (attempt === 159) {
+        throw new Error(`Built-in capability did not load: ${codePluginId}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const ensureFolder = async (folderPath: string) => {
       let current = "";
       for (const part of folderPath.split("/").filter(Boolean)) {
@@ -691,7 +686,8 @@ async function runPublicRepairWithApprovals(
           error?: { code: string; message: string };
         };
       };
-      const plugin = phase4Window.app?.plugins?.plugins?.[codePluginId];
+      const plugin = phase4Window.app?.plugins?.plugins?.["agentic-researcher"]
+        ?.getBundledCapability?.(codePluginId);
       const candidates: Array<{ owner: any; method: unknown }> = [
         { owner: plugin, method: plugin?.runCodeRepair },
         { owner: plugin, method: plugin?.executeCodeRepair },
@@ -927,7 +923,7 @@ async function submitMissionWithApprovals(
   throw new Error(`Timed out waiting for Phase 4 mission: ${prompt}`);
 }
 
-async function restartCoreAndCode(
+async function restartUnifiedPlugin(
   page: Page,
   corePluginId: string,
   codePluginId: string,
@@ -941,7 +937,6 @@ async function restartCoreAndCode(
     if (!app?.plugins?.disablePlugin || !app?.plugins?.enablePlugin) {
       throw new Error("Obsidian plugin restart APIs are unavailable.");
     }
-    await app.plugins.disablePlugin(codePluginId);
     await app.plugins.disablePlugin(corePluginId);
     await app.plugins.enablePlugin(corePluginId);
     for (let attempt = 0; attempt < 160; attempt += 1) {
@@ -953,12 +948,11 @@ async function restartCoreAndCode(
     phase4Window.__phase4InstallMock?.();
     await app.plugins.plugins?.[corePluginId]?.activateView?.();
     phase4Window.__phase4InstallMock?.();
-    await app.plugins.enablePlugin(codePluginId);
     for (let attempt = 0; attempt < 160; attempt += 1) {
       const core = app.plugins.plugins?.[corePluginId];
       if (
-        app.plugins.plugins?.[codePluginId] &&
-        core?.agenticResearcherApi?.getRegisteredExtensionIds?.().includes(codePluginId)
+        core?.getBundledCapability?.(codePluginId) &&
+        core?.getRegisteredCapabilityIds?.().includes(codePluginId)
       ) {
         break;
       }
@@ -1190,7 +1184,7 @@ async function readOptionalFile(filePath: string): Promise<string | null> {
   });
 }
 
-async function writeCodePluginSandboxReset(
+async function writeCodeCapabilitySandboxReset(
   filePath: string,
   content: string | null,
 ): Promise<void> {
@@ -1198,23 +1192,41 @@ async function writeCodePluginSandboxReset(
   if (content !== null) {
     const parsed = JSON.parse(content) as unknown;
     if (!isRecord(parsed)) {
-      throw new Error("Code extension data.json must contain a JSON object.");
+      throw new Error("Unified plugin data.json must contain a JSON object.");
     }
     data = parsed;
   }
-  const runtime = data.codeRuntimeState;
+  const bundledData = data.bundledCapabilityData;
+  const modules = isRecord(bundledData) && isRecord(bundledData.modules)
+    ? bundledData.modules
+    : null;
+  const codeModule = modules && isRecord(modules.code) ? modules.code : null;
+  const codeState = codeModule && isRecord(codeModule.state) ? codeModule.state : null;
+  const runtime = codeState?.codeRuntimeState;
   if (runtime !== undefined) {
     if (!isRecord(runtime) || !isRecord(runtime.sandbox)) {
-      throw new Error("Code extension runtime sandbox state is invalid.");
+      throw new Error("Built-in Code runtime sandbox state is invalid.");
     }
     data = {
       ...data,
-      codeRuntimeState: {
-        ...runtime,
-        sandbox: {
-          ...runtime.sandbox,
-          providerConfigs: [],
-          lastProbe: null,
+      bundledCapabilityData: {
+        ...(isRecord(bundledData) ? bundledData : {}),
+        modules: {
+          ...modules,
+          code: {
+            ...codeModule,
+            state: {
+              ...codeState,
+              codeRuntimeState: {
+                ...runtime,
+                sandbox: {
+                  ...runtime.sandbox,
+                  providerConfigs: [],
+                  lastProbe: null,
+                },
+              },
+            },
+          },
         },
       },
     };

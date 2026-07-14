@@ -190,6 +190,23 @@ import {
   type PluginDataV3MigrationRecord,
 } from "./src/extensions/pluginDataV3Migration";
 import {
+  BUNDLED_CAPABILITY_NAMESPACES,
+  LEGACY_CAPABILITY_PLUGIN_IDS,
+  createEmptyBundledCapabilityData,
+  importLegacyBundledCapabilityData,
+  parseBundledCapabilityData,
+  readBundledCapabilityState,
+  writeBundledCapabilityState,
+  type BundledCapabilityDataV1,
+  type BundledCapabilityNamespace,
+} from "./src/extensions/bundledCapabilityData";
+import {
+  BundledCodeCapability,
+  BundledCompanionCapability,
+  BundledIntegrationsCapability,
+  type BundledCapabilitiesV1,
+} from "./src/extensions/BundledCapabilityRuntime";
+import {
   AGENTIC_RESEARCHER_CORE_READY_EVENT,
   AGENTIC_RESEARCHER_CORE_UNLOADING_EVENT,
   AGENTIC_RESEARCHER_COMPANION_RECONCILE_EVENT,
@@ -464,7 +481,7 @@ function resolveLinearQueueVaultTargetPath(
 interface RunMissionOptions {
   durableManifest?: DurableMissionManifestV1;
   forceChatOnly?: boolean;
-  /** Prevents the trusted Code extension's child mission from re-entering the review route. */
+  /** Prevents the trusted Code capability's child mission from re-entering the review route. */
   skipGitHubReviewRepairRouting?: boolean;
 }
 
@@ -640,6 +657,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
   private extensionStateMigration: ExtensionStateMigrationPlanV1 | null = null;
   private pluginDataV3Migration: PluginDataV3MigrationRecord | null = null;
+  private bundledCapabilityData: BundledCapabilityDataV1 =
+    createEmptyBundledCapabilityData(new Date().toISOString());
+  /** Public test/diagnostic surface; these are modules, not installed plugins. */
+  readonly bundledCapabilities: Partial<BundledCapabilitiesV1> = {};
   private lastGitHubReviewRepairCodeOutcome: RunOutcome | null = null;
   /** Serializes whole-file data.json writes so settings and integration state cannot race. */
   private pluginDataSaveTail: Promise<void> = Promise.resolve();
@@ -863,6 +884,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.agentSettingTab = new AgentSettingTab(this.app, this);
     this.addSettingTab(this.agentSettingTab);
     this.coreApiHost.markReady();
+    this.startupPhase = "initializing_bundled_capabilities";
+    await this.initializeBundledCapabilities();
     this.startupPhase = "ready";
     this.app.workspace.trigger(AGENTIC_RESEARCHER_CORE_READY_EVENT);
     this.refreshAgentView();
@@ -891,6 +914,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       clearTimeout(this.extensionHealthPostMigrationTimer);
       this.extensionHealthPostMigrationTimer = null;
     }
+    this.disposeBundledCapabilities();
     this.coreApiHost.beginUnload();
     this.app.workspace.trigger(AGENTIC_RESEARCHER_CORE_UNLOADING_EVENT);
     if (this.durableResumeTimer) {
@@ -983,12 +1007,26 @@ export default class AgenticResearcherPlugin extends Plugin {
       queueDailyStartBudgetState: rawQueueDailyStartBudgetState,
       repositoryProfileRegistry: rawRepositoryProfileRegistry,
       authorityGrantStoreState: rawAuthorityGrantStoreState,
+      bundledCapabilityData: rawBundledCapabilityData,
       extensionStateMigration: _rawExtensionStateMigration,
       pluginDataV3Migration: _rawPluginDataV3Migration,
       ...settingsData
     } = record;
     void _rawExtensionStateMigration;
     void _rawPluginDataV3Migration;
+
+    const bundledDataLoadedAt = new Date().toISOString();
+    this.bundledCapabilityData = parseBundledCapabilityData(
+      rawBundledCapabilityData,
+      bundledDataLoadedAt,
+    );
+    const legacyCapabilityData = await this.readLegacyCapabilityPluginData();
+    const bundledImport = importLegacyBundledCapabilityData({
+      current: this.bundledCapabilityData,
+      legacy: legacyCapabilityData,
+      importedAt: bundledDataLoadedAt,
+    });
+    this.bundledCapabilityData = bundledImport.data;
 
     const loadedMigration = await loadOrPrepareExtensionStateMigration({
       rawData: record,
@@ -1347,7 +1385,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     if (
       loadedMigration.needsPersistence ||
-      loadedPluginDataMigration.needsPersistence
+      loadedPluginDataMigration.needsPersistence ||
+      bundledImport.imported.length > 0
     ) {
       await this.savePluginData();
     }
@@ -1415,7 +1454,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (!this.getOptionalExtensionCapabilities().integrations) {
       return {
         ok: false,
-        message: "Enable Agentic Researcher Integrations before connecting Linear OAuth.",
+        message: "The built-in Integrations capability is not ready. Check Run Details before connecting Linear OAuth.",
       };
     }
     const clientId = normalizeLinearOAuthClientIdV1(
@@ -1578,7 +1617,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (!this.getOptionalExtensionCapabilities().integrations) {
       return {
         ok: false,
-        message: "Enable Agentic Researcher Integrations before connecting GitHub.",
+        message: "The built-in Integrations capability is not ready. Check Run Details before connecting GitHub.",
       };
     }
     const clientId = normalizeGitHubOAuthClientIdSetting(
@@ -1644,7 +1683,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (!this.getOptionalExtensionCapabilities().integrations) {
       return {
         ok: false,
-        message: "Enable Agentic Researcher Integrations before connecting GitHub.",
+        message: "The built-in Integrations capability is not ready. Check Run Details before connecting GitHub.",
       };
     }
     const store = this.createCompanionSecretStore();
@@ -2066,7 +2105,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       return {
         ok: false,
         message:
-          "Agentic Researcher Integrations is not registered. Enable the extension before testing Linear.",
+          "The built-in Integrations capability is not ready. Reload Agentic Researcher before testing Linear.",
       };
     }
     if (!this.hasLinearApiKey()) {
@@ -3059,7 +3098,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (!bridge || !grantStore || !this.getOptionalExtensionCapabilities().code) {
       return {
         ok: false,
-        error: "The trusted Code extension or durable authority store is unavailable.",
+        error: "The built-in Code capability or durable authority store is unavailable.",
       };
     }
     const legacyProfile = this.repositoryProfileRegistry.profiles[item.repositoryKey];
@@ -3068,7 +3107,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
     const profile = await bridge.resolveTrustedRepositoryProfile(legacyProfile.key);
     if (!profile || profile.key !== legacyProfile.key) {
-      return { ok: false, error: "The Code extension cannot resolve the exact trusted repository profile." };
+      return { ok: false, error: "The built-in Code capability cannot resolve the exact trusted repository profile." };
     }
     const trustedValidationIds = new Set(profile.validationCatalog.map((command) => command.id));
     const unknownValidationIds = item.validationRequirementKeys.filter(
@@ -3279,7 +3318,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       });
     }
     if (!input.registry.prepare || !input.registry.executePrepared) {
-      throw new Error("The Code extension does not expose prepared workspace creation.");
+      throw new Error("The built-in Code capability does not expose prepared workspace creation.");
     }
     const createCall = {
       id: `${input.workspaceId}:create`,
@@ -3852,12 +3891,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   private getCompanionRuntimePlugin(): CompanionRuntimePluginV1 | null {
-    const plugins = (this.app as typeof this.app & {
-      plugins?: { plugins?: Record<string, unknown> };
-    }).plugins?.plugins;
-    return (plugins?.["agentic-researcher-companion"] as
-      | CompanionRuntimePluginV1
-      | undefined) ?? null;
+    return this.getCapabilityRuntime<CompanionRuntimePluginV1>(
+      "agentic-researcher-companion",
+    );
   }
 
   private async buildDesiredCompanionLinearQueueConfiguration(): Promise<
@@ -4724,12 +4760,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     | BackgroundGitHubIntegrationsBridgeV1
     | null {
     if (!this.getOptionalExtensionCapabilities().integrations) return null;
-    const plugins = (this.app as typeof this.app & {
-      plugins?: { plugins?: Record<string, unknown> };
-    }).plugins?.plugins;
-    const integrations = plugins?.["agentic-researcher-integrations"] as
-      | Partial<BackgroundGitHubIntegrationsBridgeV1>
-      | undefined;
+    const integrations = this.getCapabilityRuntime<
+      Partial<BackgroundGitHubIntegrationsBridgeV1>
+    >("agentic-researcher-integrations");
     if (
       typeof integrations?.synchronizeBackgroundGitHubHostState !==
         "function" ||
@@ -4767,7 +4800,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     const credential = this.githubCredential;
     if (!bridge || !credential) {
       throw new Error(
-        "A compatible Integrations extension and verified opaque GitHub credential are required.",
+        "The built-in Integrations capability and a verified opaque GitHub credential are required.",
       );
     }
     const handoff = await this.resolveGitHubPublicationHandoff(profileKey);
@@ -4839,12 +4872,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   private createBackgroundMissionDispatchPort():
     | BackgroundMissionDispatchPortV1
     | undefined {
-    const plugins = (this.app as typeof this.app & {
-      plugins?: { plugins?: Record<string, unknown> };
-    }).plugins?.plugins;
-    const companion = plugins?.["agentic-researcher-companion"] as
-      | CompanionRuntimePluginV1
-      | undefined;
+    const companion = this.getCapabilityRuntime<CompanionRuntimePluginV1>(
+      "agentic-researcher-companion",
+    );
     const coordinator = companion?.companionCoordinator;
     if (!coordinator?.submitAuthorizedNode || !coordinator.refreshHealth) {
       return undefined;
@@ -4873,8 +4903,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           toolNames.includes("code_validate_commit_prepared") &&
           this.getOptionalExtensionCapabilities().code
         ) {
-          const code = plugins?.["agentic-researcher-code"] as
-            | {
+          const code = this.getCapabilityRuntime<{
                 resolveBackgroundMissionBinding?: (input: {
                   objective: string;
                   toolName: "code_validate_commit_prepared";
@@ -4884,8 +4913,7 @@ export default class AgenticResearcherPlugin extends Plugin {
                   destinationFingerprint: string;
                   allowedEffects: ["read", "execution"];
                 } | null>;
-              }
-            | undefined;
+              }>("agentic-researcher-code");
           if (typeof code?.resolveBackgroundMissionBinding === "function") {
             const binding = await code.resolveBackgroundMissionBinding({
               objective,
@@ -4975,13 +5003,12 @@ export default class AgenticResearcherPlugin extends Plugin {
             status: "blocked",
             code: "background_code_extension_unavailable",
             message:
-              "The Code extension is disabled or incompatible, so no trusted background Code package can be sealed.",
+              "The built-in Code capability is unavailable, so no trusted background Code package can be sealed.",
             requiredAction:
-              "Enable a compatible Agentic Researcher Code extension and resume the same mission.",
+              "Reload Agentic Researcher, inspect built-in Code health, and resume the same mission.",
           };
         }
-        const code = plugins?.["agentic-researcher-code"] as
-          | {
+        const code = this.getCapabilityRuntime<{
               sealBackgroundValidationCommitPackage?: (
                 value: Parameters<
                   NonNullable<
@@ -4993,16 +5020,15 @@ export default class AgenticResearcherPlugin extends Plugin {
                   BackgroundMissionDispatchPortV1["sealBackgroundValidationCommitPackage"]
                 >
               >;
-            }
-          | undefined;
+            }>("agentic-researcher-code");
         if (typeof code?.sealBackgroundValidationCommitPackage !== "function") {
           return {
             status: "blocked",
             code: "background_code_sealer_unavailable",
             message:
-              "The installed Code extension does not expose the compatible trusted package sealer.",
+              "The built-in Code capability does not expose the compatible trusted package sealer.",
             requiredAction:
-              "Upgrade or re-enable the Code extension, then resume without changing the approved diff.",
+              "Reload or upgrade Agentic Researcher, then resume without changing the approved diff.",
           };
         }
         try {
@@ -5013,7 +5039,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             code: "background_code_package_seal_failed",
             message: sanitizeExtensionRuntimeError(error),
             requiredAction:
-              "Inspect Code extension health in Run Details and resume only after its trusted stores are available.",
+              "Inspect built-in Code health in Run Details and resume only after its trusted stores are available.",
           };
         }
       },
@@ -5054,6 +5080,141 @@ export default class AgenticResearcherPlugin extends Plugin {
         );
       },
     };
+  }
+
+  private async readLegacyCapabilityPluginData(): Promise<
+    Partial<Record<BundledCapabilityNamespace, unknown>>
+  > {
+    const result: Partial<Record<BundledCapabilityNamespace, unknown>> = {};
+    const adapter = this.app.vault.adapter;
+    for (const namespace of BUNDLED_CAPABILITY_NAMESPACES) {
+      const pluginId = LEGACY_CAPABILITY_PLUGIN_IDS[namespace];
+      const dataPaths = [
+        `${this.app.vault.configDir}/plugins/${pluginId}/data.json`,
+        `${this.app.vault.configDir}/plugins/.agentic-researcher-retired/${pluginId}/data.json`,
+      ];
+      try {
+        let dataPath: string | null = null;
+        for (const candidate of dataPaths) {
+          if (await adapter.exists(candidate)) {
+            dataPath = candidate;
+            break;
+          }
+        }
+        if (!dataPath) continue;
+        const content = await adapter.read(dataPath);
+        if (content.length > 5 * 1024 * 1024) {
+          console.warn(
+            `Skipped oversized legacy capability data for ${pluginId}; the original file was not changed.`,
+          );
+          continue;
+        }
+        const parsed = JSON.parse(content) as unknown;
+        if (isRecord(parsed)) result[namespace] = parsed;
+      } catch (error) {
+        console.warn(
+          `Unable to import legacy capability data for ${pluginId}; the original file was not changed.`,
+          error,
+        );
+      }
+    }
+    return result;
+  }
+
+  private createBundledCapabilityDataPlugin(
+    namespace: BundledCapabilityNamespace,
+  ): Plugin {
+    return {
+      app: this.app,
+      loadData: async () =>
+        readBundledCapabilityState(this.bundledCapabilityData, namespace),
+      saveData: async (state: unknown) => {
+        this.bundledCapabilityData = writeBundledCapabilityState({
+          current: this.bundledCapabilityData,
+          namespace,
+          state,
+          updatedAt: new Date().toISOString(),
+        });
+        await this.savePluginData();
+      },
+    } as Plugin;
+  }
+
+  private async initializeBundledCapabilities(): Promise<void> {
+    const api = this.agenticResearcherApi;
+    const code = new BundledCodeCapability({
+      api,
+      host: this,
+      dataPlugin: this.createBundledCapabilityDataPlugin("code"),
+      migrationOffer: this.getExtensionStateMigrationOffer(
+        "agentic-researcher-code",
+      ),
+      runMission: (prompt) => this.runMission(prompt, []),
+      runReviewRepairMission: (prompt) =>
+        this.runReviewRepairCodeMission(prompt, []),
+    });
+    const companion = new BundledCompanionCapability({
+      api,
+      host: this,
+      dataPlugin: this.createBundledCapabilityDataPlugin("companion"),
+      migrationOffer: this.getExtensionStateMigrationOffer(
+        "agentic-researcher-companion",
+      ),
+    });
+    const integrations = new BundledIntegrationsCapability({
+      api,
+      code,
+      dataPlugin: this.createBundledCapabilityDataPlugin("integrations"),
+      migrationOffer: this.getExtensionStateMigrationOffer(
+        "agentic-researcher-integrations",
+      ),
+    });
+    try {
+      await code.initialize();
+      this.bundledCapabilities["agentic-researcher-code"] = code;
+      await companion.initialize();
+      this.bundledCapabilities["agentic-researcher-companion"] = companion;
+      await integrations.initialize();
+      this.bundledCapabilities["agentic-researcher-integrations"] = integrations;
+    } catch (error) {
+      integrations.dispose();
+      companion.dispose();
+      code.dispose();
+      for (const key of Object.keys(this.bundledCapabilities)) {
+        delete this.bundledCapabilities[key as keyof BundledCapabilitiesV1];
+      }
+      throw error;
+    }
+  }
+
+  private disposeBundledCapabilities(): void {
+    this.bundledCapabilities["agentic-researcher-integrations"]?.dispose();
+    this.bundledCapabilities["agentic-researcher-companion"]?.dispose();
+    this.bundledCapabilities["agentic-researcher-code"]?.dispose();
+    for (const key of Object.keys(this.bundledCapabilities)) {
+      delete this.bundledCapabilities[key as keyof BundledCapabilitiesV1];
+    }
+  }
+
+  getBundledCapability<T = unknown>(extensionId: string): T | null {
+    return (
+      (this.bundledCapabilities as Record<string, unknown>)[extensionId] as
+        | T
+        | undefined
+    ) ?? null;
+  }
+
+  getRegisteredCapabilityIds(): readonly string[] {
+    return this.coreApiHost.getRegisteredExtensionIds();
+  }
+
+  private getCapabilityRuntime<T>(extensionId: string): T | null {
+    const bundled = this.getBundledCapability<T>(extensionId);
+    if (bundled) return bundled;
+    const plugins = (this.app as typeof this.app & {
+      plugins?: { plugins?: Record<string, unknown> };
+    }).plugins?.plugins;
+    return (plugins?.[extensionId] as T | undefined) ?? null;
   }
 
   private getOptionalExtensionCapabilities() {
@@ -5346,6 +5507,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           queueDailyStartBudgetState: this.queueDailyStartBudgetState,
           repositoryProfileRegistry: this.repositoryProfileRegistry,
           authorityGrantStoreState: this.authorityGrantStoreState,
+          bundledCapabilityData: this.bundledCapabilityData,
           extensionStateMigration: this.extensionStateMigration,
           pluginDataV3Migration: this.pluginDataV3Migration,
         });
@@ -5689,7 +5851,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   /**
-   * Called only by the trusted Code extension after the outer explicit review
+   * Called only by the trusted Code capability after the outer explicit review
    * route has verified GitHub evidence and durable workspace identity.
    */
   async runReviewRepairCodeMission(
@@ -8179,10 +8341,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       requestId: string;
     }): Promise<VerifiedCodePublicationHandoffV1 | null>;
   } | null {
-    const plugins = (this.app as unknown as {
-      plugins?: { plugins?: Record<string, unknown> };
-    }).plugins?.plugins;
-    const code = plugins?.["agentic-researcher-code"] as {
+    const code = this.getCapabilityRuntime<{
       resolveVerifiedCodePublicationHandoff?: (
         profileKey: string,
       ) => Promise<VerifiedCodePublicationHandoffV1 | null>;
@@ -8205,7 +8364,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       resolveVerifiedReviewRepairBase?: CodeExtensionReviewRepairBridgeV1["resolveVerifiedReviewRepairBase"];
       resolveVerifiedReviewRepairResult?: CodeExtensionReviewRepairBridgeV1["resolveVerifiedReviewRepairResult"];
       runVerifiedReviewRepairPipeline?: CodeExtensionReviewRepairBridgeV1["runVerifiedReviewRepairPipeline"];
-    } | undefined;
+    }>("agentic-researcher-code");
     if (
       typeof code?.resolveVerifiedCodePublicationHandoff !== "function" ||
       typeof code.resolveTrustedRepositoryProfile !== "function" ||

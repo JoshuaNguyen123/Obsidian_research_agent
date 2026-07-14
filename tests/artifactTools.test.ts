@@ -223,6 +223,60 @@ test("create_svg_design creates an escaped SVG artifact", async () => {
   );
 });
 
+test("create_design_canvas supports government branch layout items", async () => {
+  const mock = createMockContext({
+    prompt: "Draw the three branches of the United States government on a canvas.",
+  });
+
+  await createDesignCanvasTool.execute(
+    {
+      path: "Designs/US Government.canvas",
+      title: "United States Government",
+      diagramType: "architecture",
+      items: [
+        { id: "government", title: "United States Government", kind: "government" },
+        { id: "legislative", title: "Legislative", kind: "branch", lane: "Congress" },
+        { id: "executive", title: "Executive", kind: "branch", lane: "President" },
+        { id: "judicial", title: "Judicial", kind: "branch", lane: "Courts" },
+      ],
+      connections: [
+        { from: "legislative", to: "executive", label: "checks" },
+        { from: "executive", to: "judicial", label: "checks" },
+        { from: "judicial", to: "legislative", label: "checks" },
+      ],
+    },
+    mock.context,
+  );
+
+  const canvas = mock.content.get("Designs/US Government.canvas") ?? "";
+  assert.match(canvas, /Legislative/);
+  assert.match(canvas, /Executive/);
+  assert.match(canvas, /Judicial/);
+  assert.match(canvas, /_branch_/);
+  assert.match(canvas, /_note_/);
+});
+
+test("create_design_canvas validates layout arguments before creating folders", async () => {
+  const mock = createMockContext({
+    prompt: "Create a canvas with malformed visual metadata.",
+  });
+
+  await assert.rejects(
+    () =>
+      createDesignCanvasTool.execute(
+        {
+          path: "New Folder/invalid.canvas",
+          items: [{ title: "Invalid", kind: { unsafe: true } }],
+        },
+        mock.context,
+      ),
+    /items\[0\]\.kind/,
+  );
+
+  assert.equal(mock.folders.has("New Folder"), false);
+  assert.equal(mock.content.has("New Folder/invalid.canvas"), false);
+});
+
 test("Canvas read and prepared patch preserve unrelated structure with exact hashes", async () => {
   const mock = createMockContext({
     prompt: "Revise the existing Canvas diagram title without replacing unrelated nodes.",

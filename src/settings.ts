@@ -1705,7 +1705,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Enable GitHub")
       .setDesc(
-        "Expose bounded GitHub capabilities only when the integrations extension is available.",
+        "Expose bounded GitHub capabilities only after the built-in integrations capability is configured and verified.",
       )
       .addToggle((toggle) =>
         toggle
@@ -1893,18 +1893,18 @@ export class AgentSettingTab extends PluginSettingTab {
   private renderAdvancedExtensionContributions(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
-      "Installed extensions (read only)",
+      "Built-in capabilities (read only)",
     );
     this.extensionContributionsEl = section;
     section.createEl("p", {
-      text: "Live metadata registered through AgenticResearcherCoreApiV1. These rows describe extension-owned settings contracts; core does not edit or persist their values.",
+      text: "Code, background service, and integrations ship inside this one plugin. Their internal contracts remain isolated and are shown here for health and migration diagnostics.",
       cls: "setting-item-description",
     });
 
     const contributions = this.plugin.getExtensionSettingsSections();
     if (contributions.length === 0) {
       section.createEl("p", {
-        text: "No compatible extension settings contributions are currently registered.",
+        text: "Built-in capability metadata is not ready. Reload Agentic Researcher and inspect Run Details for the startup blocker.",
         cls: "setting-item-description agentic-extension-settings-empty",
       });
       return;

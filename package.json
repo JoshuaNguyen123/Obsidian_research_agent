@@ -1,12 +1,12 @@
 {
   "name": "agentic-researcher",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "workspaces": [
     "packages/*",
     "extensions/*"
   ],
-  "description": "Minimal Obsidian plugin shell for an agentic research assistant.",
+  "description": "Single-install native Obsidian agentic research, code, companion, and integrations plugin.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",

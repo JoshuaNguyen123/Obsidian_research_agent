@@ -180,7 +180,7 @@ async function installCompanionLinearQueueFixture(
       let companion: any = null;
       for (let attempt = 0; attempt < 200; attempt += 1) {
         core = app.plugins.plugins?.[corePluginId] ?? null;
-        companion = app.plugins.plugins?.[companionPluginId] ?? null;
+        companion = core?.getBundledCapability?.(companionPluginId) ?? null;
         if (
           core?.agenticResearcherApi?.state === "ready" &&
           core?.testLinearConnection &&
@@ -1064,8 +1064,7 @@ async function readCompanionLinearQueueSnapshot(
       };
       const state = fixtureWindow.__e2eCompanionLinearQueue;
       const core = fixtureWindow.app?.plugins?.plugins?.[corePluginId];
-      const companion =
-        fixtureWindow.app?.plugins?.plugins?.[companionPluginId];
+      const companion = core?.getBundledCapability?.(companionPluginId);
       if (!state || !core || !companion?.companionCoordinator) {
         throw new Error("The companion Linear queue snapshot is unavailable.");
       }
@@ -1140,8 +1139,7 @@ async function uninstallCompanionLinearQueueFixture(page: Page): Promise<void> {
       };
       const state = fixtureWindow.__e2eCompanionLinearQueue;
       const core = fixtureWindow.app?.plugins?.plugins?.[corePluginId];
-      const companion =
-        fixtureWindow.app?.plugins?.plugins?.[companionPluginId];
+      const companion = core?.getBundledCapability?.(companionPluginId);
       await core?.stopLinearQueueRuntime?.().catch(() => undefined);
       if (core && state?.originalRestart) {
         core.restartLinearQueueRuntime = state.originalRestart;
