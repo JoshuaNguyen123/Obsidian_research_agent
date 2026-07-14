@@ -56,6 +56,21 @@ test("exclusive E2E runner permits the bounded deterministic matrix", () => {
   assert.equal(normalized.aiMode, "mock");
 });
 
+test("Windows installed matrix explicitly trusts only its created disposable vault", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /\$vault = Join-Path \$env:RUNNER_TEMP "agentic-researcher-e2e-vault"/u,
+  );
+  assert.match(
+    workflow,
+    /- name: Deterministic Obsidian Playwright matrix\s+env:\s+(?:#[^\r\n]*\s+)*E2E_TRUST_DISPOSABLE_VAULT: "1"\s+run: npm run test:e2e:deterministic-matrix/u,
+  );
+});
+
 test("real AI and live external flags cannot widen into other projects", () => {
   assert.throws(
     () => normalizeExclusiveArgs(["--real-ai", "--project=deterministic-core-mock"]),
