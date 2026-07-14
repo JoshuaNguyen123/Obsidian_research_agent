@@ -61,10 +61,15 @@ export async function readSafeCompanionFileV1(input: {
     if ((error as NodeJS.ErrnoException).code === "ENOENT" && input.allowMissing) return null;
     throw error;
   }
+  // Windows can report nlink=0 after a peer unlinks an already-open file. For
+  // an explicitly optional read that state is equivalent to ENOENT; no bytes
+  // from the detached handle are accepted. Multiple links remain unsafe.
+  if (stats.nlink === BigInt(0) && input.allowMissing) return null;
   assertRegularPrivateFile(stats, filePath);
   const handle = await fs.open(filePath, "r");
   try {
     const opened = await handle.stat({ bigint: true });
+    if (opened.nlink === BigInt(0) && input.allowMissing) return null;
     assertRegularPrivateFile(opened, filePath);
     if (opened.size > BigInt(input.maximumBytes)) {
       fail("unsafe_file_type", "Companion app-data file exceeds its byte limit.");
