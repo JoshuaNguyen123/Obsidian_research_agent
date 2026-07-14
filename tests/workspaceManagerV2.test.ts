@@ -37,6 +37,54 @@ test("WorkspaceManifestV2 exact parser round-trips and rejects contract drift", 
   }
 });
 
+test("metadata boundary permits a system alias above its root and rejects aliases inside it", async (t) => {
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), "workspace-v2-alias-"));
+  const realParent = path.join(fixtureRoot, "real-parent");
+  const aliasParent = path.join(fixtureRoot, "system-alias");
+  const applicationRoot = path.join(realParent, "application-data");
+  try {
+    await mkdir(applicationRoot, { recursive: true });
+    try {
+      await symlink(
+        realParent,
+        aliasParent,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    } catch {
+      t.skip("directory symlink creation is unavailable");
+      return;
+    }
+
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(aliasParent, "application-data"),
+    });
+    const manifest = await manager.createScratchWorkspace({
+      workspaceId: "through-system-alias",
+      ownerRunId: "run-through-system-alias",
+    });
+    assert.equal(manifest.workspaceId, "through-system-alias");
+
+    const outside = path.join(fixtureRoot, "outside-metadata");
+    await mkdir(outside);
+    await symlink(
+      outside,
+      path.join(manager.metadataRoot, "inside-alias"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    await assert.rejects(
+      manager.createScratchWorkspace({
+        workspaceId: "inside-alias",
+        ownerRunId: "run-inside-alias",
+      }),
+      (error: unknown) =>
+        error instanceof WorkspaceManagerErrorV2 &&
+        error.code === "metadata_reparse",
+    );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("durable scratch CRUD survives manager restart with hashes, receipts, trash, and restore", async () => {
   const fixture = await fixtureManager("crud");
   try {

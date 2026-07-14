@@ -38,7 +38,7 @@ test.describe("Phase 4 built-in Code capability production boundaries", () => {
     await harness?.close();
   });
 
-  test("durable folder and file CRUD survives restart with hashes and trash/restore receipts", async () => {
+  test("managed metadata boundary supports durable CRUD and restart with hashes and trash/restore receipts", async () => {
     test.setTimeout(SUITE_TIMEOUT_MS);
     const active = requireHarness(harness);
     const catalog = await active.readToolCatalog();
@@ -119,6 +119,19 @@ test.describe("Phase 4 built-in Code capability production boundaries", () => {
         toolOutput(initialStatusResult),
         "workspace status before restart",
       );
+      const initialManifest = requireRecord(
+        cleanupStatus.manifest,
+        "workspace manifest before restart",
+      );
+      const canonicalRoot = requireString(
+        initialManifest.canonicalRoot,
+        "workspace canonical root before restart",
+      );
+      expect(path.basename(canonicalRoot).toLowerCase()).toBe("root");
+      expect(path.basename(path.dirname(canonicalRoot))).toBe(workspaceId);
+      expect(
+        path.basename(path.dirname(path.dirname(canonicalRoot))).toLowerCase(),
+      ).toBe("workspaces-v2");
 
       await active.restartUnifiedPlugin();
       const catalogAfterRestart = await active.readToolCatalog();
@@ -460,6 +473,13 @@ function isRecord(value: unknown): value is Record<string, any> {
 function requireSha256(value: unknown, label: string): string {
   if (typeof value !== "string" || !SHA256_PATTERN.test(value)) {
     throw new Error(`${label} was not a lowercase SHA-256 fingerprint.`);
+  }
+  return value;
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`${label} was not a non-empty string.`);
   }
   return value;
 }

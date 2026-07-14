@@ -1270,21 +1270,24 @@ export class WorkspaceManagerV2 {
   }
 
   private async assertMetadataBoundary(candidate: string, allowMissing: boolean): Promise<void> {
-    if (!inside(this.applicationDataRoot, path.resolve(candidate))) throw new WorkspaceManagerErrorV2("metadata_escape", "Workspace metadata escaped application data.");
+    const applicationRoot = path.resolve(this.applicationDataRoot);
     let cursor = path.resolve(candidate);
-    while (!await existsPath(cursor)) {
-      if (!allowMissing) throw new WorkspaceManagerErrorV2("metadata_missing", "Workspace metadata path is missing.");
-      const parent = path.dirname(cursor);
-      if (parent === cursor) break;
-      cursor = parent;
-    }
+    if (!inside(applicationRoot, cursor)) throw new WorkspaceManagerErrorV2("metadata_escape", "Workspace metadata escaped application data.");
     while (true) {
       if (await existsPath(cursor)) {
         const stat = await fs.lstat(cursor);
         if (stat.isSymbolicLink()) throw new WorkspaceManagerErrorV2("metadata_reparse", "Workspace metadata rejects symlinks, junctions, and reparse points.");
+      } else if (!allowMissing) {
+        throw new WorkspaceManagerErrorV2("metadata_missing", "Workspace metadata path is missing.");
       }
+      // Only this application-owned tree is an authority boundary. System
+      // paths above it may have stable aliases (macOS /var -> /private/var),
+      // which do not grant a writable reparse point inside workspace metadata.
+      if (samePath(cursor, applicationRoot)) break;
       const parent = path.dirname(cursor);
-      if (parent === cursor) break;
+      if (parent === cursor || !inside(applicationRoot, parent)) {
+        throw new WorkspaceManagerErrorV2("metadata_escape", "Workspace metadata escaped application data.");
+      }
       cursor = parent;
     }
   }
