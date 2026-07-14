@@ -137,6 +137,10 @@ jobs:
           "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Deterministic Obsidian Playwright matrix
+        env:
+          # This job creates the vault above from trusted checked-out artifacts.
+          # Keep the first-open trust opt-in scoped to that disposable vault run.
+          E2E_TRUST_DISPOSABLE_VAULT: "1"
         run: npm run test:e2e:deterministic-matrix
 
       - name: Upload Playwright diagnostics
