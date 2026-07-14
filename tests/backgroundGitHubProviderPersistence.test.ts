@@ -9,40 +9,42 @@ import { BackgroundGitHubProviderPersistenceV1 } from "../extensions/integration
 import type { GitPushAttemptNamespaceV1 } from "../src/integrations/github/GitPushAttemptStore";
 
 test("independent provider instances elect one different next revision and the loser returns false", async (t) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "background-github-provider-cas-"));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const left = new BackgroundGitHubProviderPersistenceV1(root, {
-    randomId: () => `left-${Math.random().toString(16).slice(2)}`,
-  }).gitPushAttempts();
-  const right = new BackgroundGitHubProviderPersistenceV1(root, {
-    randomId: () => `right-${Math.random().toString(16).slice(2)}`,
-  }).gitPushAttempts();
-  const leftNamespace = namespace("left");
-  const rightNamespace = namespace("right");
+  await Promise.all(Array.from({ length: 8 }, async (_, index) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "background-github-provider-cas-"));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const left = new BackgroundGitHubProviderPersistenceV1(root, {
+      randomId: () => `left-${Math.random().toString(16).slice(2)}`,
+    }).gitPushAttempts();
+    const right = new BackgroundGitHubProviderPersistenceV1(root, {
+      randomId: () => `right-${Math.random().toString(16).slice(2)}`,
+    }).gitPushAttempts();
+    const leftNamespace = namespace(`left-${index}`);
+    const rightNamespace = namespace(`right-${index}`);
 
-  const settled = await Promise.allSettled([
-    left.write(leftNamespace, 0),
-    right.write(rightNamespace, 0),
-  ]);
-  const rejected = settled.find(
-    (entry): entry is PromiseRejectedResult => entry.status === "rejected",
-  );
-  if (rejected) {
-    assert.fail(rejected.reason instanceof Error ? rejected.reason.stack : String(rejected.reason));
-  }
-  const results = settled.map((entry) => (entry as PromiseFulfilledResult<boolean>).value);
+    const settled = await Promise.allSettled([
+      left.write(leftNamespace, 0),
+      right.write(rightNamespace, 0),
+    ]);
+    const rejected = settled.find(
+      (entry): entry is PromiseRejectedResult => entry.status === "rejected",
+    );
+    if (rejected) {
+      assert.fail(rejected.reason instanceof Error ? rejected.reason.stack : String(rejected.reason));
+    }
+    const results = settled.map((entry) => (entry as PromiseFulfilledResult<boolean>).value);
 
-  assert.equal(results.filter(Boolean).length, 1, JSON.stringify(results));
-  const winner = results[0] ? leftNamespace : rightNamespace;
-  assert.deepEqual(await left.read(), winner);
-  assert.deepEqual(await right.read(), winner);
-  const directory = path.join(root, "background-github-provider-v1");
-  const names = await fs.readdir(directory);
-  assert.equal(names.some((name) => name.endsWith(".lock")), false);
-  assert.equal(
-    names.filter((name) => name.endsWith(".revision-1.claim.json")).length,
-    1,
-  );
+    assert.equal(results.filter(Boolean).length, 1, JSON.stringify(results));
+    const winner = results[0] ? leftNamespace : rightNamespace;
+    assert.deepEqual(await left.read(), winner);
+    assert.deepEqual(await right.read(), winner);
+    const directory = path.join(root, "background-github-provider-v1");
+    const names = await fs.readdir(directory);
+    assert.equal(names.some((name) => name.endsWith(".lock")), false);
+    assert.equal(
+      names.filter((name) => name.endsWith(".revision-1.claim.json")).length,
+      1,
+    );
+  }));
 });
 
 test("a crash-after-claim is completed from WAL and replay survives WAL cleanup", async (t) => {
