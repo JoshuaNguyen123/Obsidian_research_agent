@@ -1,8 +1,8 @@
+import type { WorkItemRiskClass } from "../../integrations/linear/WorkItemSpecV1";
 import {
-  parseWorkItemSpecV1,
-  type WorkItemRiskClass,
-  type WorkItemSpecV1,
-} from "../../integrations/linear/WorkItemSpecV1";
+  parseCompatibleWorkItemSpec,
+  type ParsedCompatibleWorkItemSpec,
+} from "../../integrations/linear/WorkItemSpecV2";
 import { fingerprintCanonicalJson } from "./fingerprint";
 import {
   LINEAR_QUEUE_SCHEMA_VERSION,
@@ -99,6 +99,7 @@ export function reduceLinearQueue(
       return updateCandidate(current, event.issueId, at, (candidate) => {
         if (
           candidate.status === "running" ||
+          candidate.status === "waiting_for_publication" ||
           candidate.status === "completed" ||
           candidate.status === "failed" ||
           isLeaseActive(candidate.lease, at)
@@ -123,7 +124,11 @@ export function reduceLinearQueue(
         if (!candidate.eligibility?.eligible) {
           throw new Error("Cannot lease an ineligible queue candidate.");
         }
-        if (candidate.status === "completed" || candidate.status === "failed") {
+        if (
+          candidate.status === "waiting_for_publication" ||
+          candidate.status === "completed" ||
+          candidate.status === "failed"
+        ) {
           throw new Error("Cannot lease a terminal queue candidate.");
         }
         if (isLeaseActive(candidate.lease, at)) {
@@ -192,6 +197,65 @@ export function reduceLinearQueue(
           updatedAt: at,
         };
       });
+    case "candidate_reconciliation_completed":
+      return updateCandidate(current, event.issueId, at, (candidate) => {
+        const contractFingerprint = expectToken(
+          event.contractFingerprint,
+          "reconciled candidate contract fingerprint",
+        );
+        expectIdentifier(
+          event.reconciliationReceiptId,
+          "reconciled candidate receipt id",
+        );
+        if (candidate.workItem.fingerprint !== contractFingerprint) {
+          throw new Error(
+            "Reconciled completion proof belongs to a different work-item contract.",
+          );
+        }
+        if (candidate.status !== "running" && candidate.status !== "completed") {
+          throw new Error(
+            "Only a running or already completed candidate can accept reconciled completion proof.",
+          );
+        }
+        return {
+          ...candidate,
+          status: "completed",
+          lease: null,
+          completedAt: candidate.completedAt ?? at,
+          lastError: null,
+          updatedAt: at,
+        };
+      });
+    case "candidate_waiting_for_publication":
+      return updateCandidate(current, event.issueId, at, (candidate) => {
+        if (candidate.status !== "running") {
+          throw new Error("Only a running candidate can wait for publication.");
+        }
+        assertMatchingActiveLease(candidate, event.ownerId, event.token, at);
+        return {
+          ...candidate,
+          status: "waiting_for_publication",
+          lease: null,
+          completedAt: null,
+          lastError: expectText(event.message, "candidate publication wait", 2_000),
+          updatedAt: at,
+        };
+      });
+    case "candidate_publication_completed":
+      return updateCandidate(current, event.issueId, at, (candidate) => {
+        if (candidate.status !== "waiting_for_publication" || candidate.lease) {
+          throw new Error(
+            "Only a publication-waiting candidate without a lease can finalize.",
+          );
+        }
+        return {
+          ...candidate,
+          status: "completed",
+          completedAt: at,
+          lastError: null,
+          updatedAt: at,
+        };
+      });
     case "candidate_blocked":
       return updateCandidate(current, event.issueId, at, (candidate) => {
         if (candidate.status !== "running") {
@@ -239,7 +303,8 @@ export function upsertLinearQueueCandidate(
     issueId: string;
     identifier: string;
     remoteUpdatedAt: string;
-    workItem: WorkItemSpecV1;
+    remoteStateId?: string;
+    workItem: ParsedCompatibleWorkItemSpec;
   },
 ): LinearQueueStateV1 {
   return reduceLinearQueue(state, {
@@ -299,6 +364,7 @@ export function acquireLinearQueueLease(
   }
   if (
     candidate.status === "blocked" ||
+    candidate.status === "waiting_for_publication" ||
     candidate.status === "completed" ||
     candidate.status === "failed"
   ) {
@@ -378,7 +444,7 @@ function applyCandidateUpsert(
   const issueId = expectIdentifier(event.issueId, "Linear issue id");
   const identifier = expectIssueIdentifier(event.identifier);
   const remoteUpdatedAt = expectIsoTimestamp(event.remoteUpdatedAt, "Linear issue update time");
-  const workItem = parseWorkItemSpecV1(event.workItem);
+  const workItem = parseCompatibleWorkItemSpec(event.workItem);
   const existing = current.candidates[issueId];
   if (existing && Date.parse(remoteUpdatedAt) < Date.parse(existing.remoteUpdatedAt)) {
     throw new Error("Linear candidate update would regress its remote timestamp.");
@@ -399,6 +465,7 @@ function applyCandidateUpsert(
         ...existing,
         identifier,
         remoteUpdatedAt,
+        ...(event.remoteStateId ? { remoteStateId: expectIdentifier(event.remoteStateId, "Linear state id") } : {}),
         workItem,
         ...(contractChanged
           ? {
@@ -415,6 +482,7 @@ function applyCandidateUpsert(
         issueId,
         identifier,
         remoteUpdatedAt,
+        ...(event.remoteStateId ? { remoteStateId: expectIdentifier(event.remoteStateId, "Linear state id") } : {}),
         workItem,
         status: "pending",
         eligibility: null,
@@ -478,6 +546,7 @@ function parseCandidate(value: unknown): LinearQueueCandidateV1 {
     "issueId",
     "identifier",
     "remoteUpdatedAt",
+    ...(record.remoteStateId === undefined ? [] : ["remoteStateId"]),
     "workItem",
     "status",
     "eligibility",
@@ -509,6 +578,14 @@ function parseCandidate(value: unknown): LinearQueueCandidateV1 {
   if (status === "running" && !lease) {
     throw new Error("Running queue candidate lacks a lease.");
   }
+  if (
+    status === "waiting_for_publication" &&
+    (!eligibility?.eligible || lease || completedAt || !lastError)
+  ) {
+    throw new Error(
+      "Publication-waiting queue candidate lacks its durable wait state.",
+    );
+  }
   if (status === "completed" && !completedAt) {
     throw new Error("Completed queue candidate lacks a completion time.");
   }
@@ -516,7 +593,10 @@ function parseCandidate(value: unknown): LinearQueueCandidateV1 {
     issueId: expectIdentifier(record.issueId, "Linear issue id"),
     identifier: expectIssueIdentifier(record.identifier),
     remoteUpdatedAt: expectIsoTimestamp(record.remoteUpdatedAt, "Linear issue update time"),
-    workItem: parseWorkItemSpecV1(record.workItem),
+    ...(record.remoteStateId === undefined
+      ? {}
+      : { remoteStateId: expectIdentifier(record.remoteStateId, "Linear state id") }),
+    workItem: parseCompatibleWorkItemSpec(record.workItem),
     status,
     eligibility,
     lease,
@@ -644,6 +724,7 @@ function expectStatus(value: unknown): LinearQueueCandidateStatus {
     "pending",
     "eligible",
     "running",
+    "waiting_for_publication",
     "blocked",
     "completed",
     "failed",

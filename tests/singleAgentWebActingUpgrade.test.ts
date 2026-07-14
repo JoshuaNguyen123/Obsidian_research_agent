@@ -11,6 +11,9 @@ import {
 } from "../src/agent/missionLedger";
 import { CanvasWriter } from "../src/agent/design/CanvasWriter";
 import type { ToolExecutionContext } from "../src/tools/types";
+import { createSessionBootstrapTokenLeaseV1 } from "../packages/headless-runtime/src/backgroundContinuation";
+
+const COMPANION_TEST_TOKEN = "companion-test-bootstrap-token-0123456789abcdef";
 
 test("agent budget clamps explicit requests to 100 and preserves reserve", () => {
   const budget = createAgentBudget({
@@ -93,6 +96,10 @@ test("safety policy requires approval for reversible high-risk actions and block
 
 test("companion client parses health, browser observation, and memory responses", async () => {
   const fetchImpl: typeof fetch = async (url, init) => {
+    assert.equal(
+      new Headers(init?.headers).get("authorization"),
+      `Bearer ${COMPANION_TEST_TOKEN}`,
+    );
     const path = String(url).replace("http://127.0.0.1:8765", "");
     if (path === "/health") {
       return jsonResponse({
@@ -109,6 +116,7 @@ test("companion client parses health, browser observation, and memory responses"
         candidates: [],
         pageStateHints: [],
         observedAt: "2026-07-05T00:00:00Z",
+        observationFingerprint: `sha256:${"a".repeat(64)}`,
       });
     }
     if (path === "/memory/write") {
@@ -121,9 +129,24 @@ test("companion client parses health, browser observation, and memory responses"
     return new Response("missing", { status: 404 });
   };
 
-  const client = new CompanionClient("http://127.0.0.1:8765", 100, fetchImpl);
+  const client = new CompanionClient(
+    "http://127.0.0.1:8765",
+    100,
+    fetchImpl,
+    createSessionBootstrapTokenLeaseV1(COMPANION_TEST_TOKEN),
+  );
   assert.equal((await client.health()).ok, true);
-  assert.equal((await client.observe()).title, "Example");
+  assert.equal(
+    (
+      await client.observe({
+        status: "allow",
+        risk: "low",
+        reason: "test observation",
+        policyTags: ["test"],
+      })
+    ).title,
+    "Example",
+  );
   assert.deepEqual(
     await client.writeMemory({
       kind: "episodic",
@@ -136,10 +159,29 @@ test("companion client parses health, browser observation, and memory responses"
 });
 
 test("companion client formats HTTP errors and aborts timed out requests", async () => {
-  const failing = new CompanionClient("http://127.0.0.1:8765", 100, async () =>
-    new Response("bad gateway", { status: 502 }),
+  const failing = new CompanionClient(
+    "http://127.0.0.1:8765",
+    100,
+    async () => new Response("bad gateway", { status: 502 }),
+    createSessionBootstrapTokenLeaseV1(COMPANION_TEST_TOKEN),
   );
   await assert.rejects(() => failing.health(), /Companion request failed: 502 bad gateway/);
+
+  const authenticationFailure = new CompanionClient(
+    "http://127.0.0.1:8765",
+    100,
+    async () =>
+      new Response(`Bearer ${COMPANION_TEST_TOKEN} was rejected`, { status: 401 }),
+    createSessionBootstrapTokenLeaseV1(COMPANION_TEST_TOKEN),
+  );
+  await assert.rejects(
+    () => authenticationFailure.health(),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "Companion authentication failed.");
+      assert.equal((error as Error).message.includes(COMPANION_TEST_TOKEN), false);
+      return true;
+    },
+  );
 
   const hanging = new CompanionClient(
     "http://127.0.0.1:8765",
@@ -148,6 +190,7 @@ test("companion client formats HTTP errors and aborts timed out requests", async
       new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
       }),
+    createSessionBootstrapTokenLeaseV1(COMPANION_TEST_TOKEN),
   );
   await assert.rejects(() => hanging.health(), /aborted/);
 });
@@ -237,19 +280,20 @@ function jsonResponse(value: unknown): Response {
 function createMockVault() {
   const files = new Map<string, string>();
   const folders = new Set<string>();
+  const fileFor = (path: string) => files.has(path)
+    ? { path, extension: path.split(".").pop() ?? "" }
+    : null;
   const vault = {
     getAbstractFileByPath(path: string) {
-      if (files.has(path)) {
-        return {
-          path,
-          extension: path.split(".").pop() ?? "",
-        };
-      }
+      const file = fileFor(path);
+      if (file) return file;
       if (folders.has(path)) {
         return { path };
       }
       return null;
     },
+    getFileByPath: fileFor,
+    getFolderByPath: (path: string) => folders.has(path) ? { path } : null,
     createFolder: async (path: string) => {
       folders.add(path);
     },
@@ -259,6 +303,13 @@ function createMockVault() {
         path,
         extension: path.split(".").pop() ?? "",
       };
+    },
+    read: async (file: { path: string }) => files.get(file.path) ?? "",
+    trash: async (file: { path: string }) => {
+      files.delete(file.path);
+    },
+    delete: async (file: { path: string }) => {
+      files.delete(file.path);
     },
   };
   return { vault, files, folders };

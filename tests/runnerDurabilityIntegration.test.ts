@@ -290,15 +290,20 @@ test("accepted web research auto-memory uses observed tool events and commits WA
 
 test("required WAL persistence failure stops before mutation with a resumable error", async () => {
   let blockedWalWrite = false;
+  let runArtifactWritesAfterAmbiguity = 0;
   const vault = createVaultHarness({
     beforeModify(path, _files, nextContent) {
+      const isDirectRunArtifact = /^Agent Runs\/[^/]+\.md$/u.test(path);
       if (
         !blockedWalWrite &&
-        /^Agent Runs\/[^/]+\.md$/u.test(path) &&
+        isDirectRunArtifact &&
         /"state": "intent_recorded"/u.test(nextContent)
       ) {
         blockedWalWrite = true;
         throw new Error("Simulated required WAL snapshot persistence failure.");
+      }
+      if (blockedWalWrite && isDirectRunArtifact) {
+        runArtifactWritesAfterAmbiguity += 1;
       }
     },
   });
@@ -337,14 +342,19 @@ test("required WAL persistence failure stops before mutation with a resumable er
   assert.equal(vault.files.get("Current.md"), "Initial note");
   assert.equal(completions.length, 1);
   assert.equal(completions[0].stopReason, "error");
+  assert.equal(
+    runArtifactWritesAfterAmbiguity,
+    0,
+    "error finalization must not enqueue another direct run-artifact write",
+  );
   assert.match(assistant.join(""), /Tool execution failed:/i);
   assert.match(assistant.join(""), /continue run/i);
   assert.ok(
     traces.some(
       (trace) =>
         trace.kind === "error" &&
-        trace.error?.code === "runtime_snapshot_save_failed" &&
-        /required WAL snapshot persistence failure/i.test(
+        trace.error?.code === "runtime_snapshot_write_ambiguous" &&
+        /reconcile the run artifact before resuming/i.test(
           trace.error.message,
         ),
     ),
@@ -355,13 +365,20 @@ test("required WAL persistence failure stops before mutation with a resumable er
     .map(([, markdown]) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
     .find((snapshot) => snapshot !== null);
   assert.ok(resumableSnapshot);
-  assert.equal(resumableSnapshot.status, "blocked");
+  assert.equal(
+    resumableSnapshot.status,
+    "running",
+    "the last acknowledged snapshot remains authoritative after an ambiguous write",
+  );
   assert.equal(
     resumableSnapshot.originalMission,
     "Append WAL failure proof to the current note.",
   );
-  assert.equal(resumableSnapshot.operationJournal.length, 1);
-  assert.equal(resumableSnapshot.operationJournal[0].state, "intent_recorded");
+  assert.equal(
+    resumableSnapshot.operationJournal.length,
+    0,
+    "terminal error handling must not overwrite the last acknowledged snapshot",
+  );
 });
 
 test("streamed current-note writeback persists applying WAL before mutation and commits afterward", async () => {
@@ -1047,6 +1064,74 @@ test("continue run hydrates plan, evidence, goals, and lineage into a new segmen
     ),
     "the hydrated evidence should also be visible to the resumed model segment",
   );
+});
+
+test("continue run restores receipt-backed completed title work", async () => {
+  const vault = createVaultHarness();
+  const seedRunId = "run-resume-completed-title";
+  const originalMission =
+    "Retitle the current note to Durable Title, then list the markdown files.";
+  const ledger = createMissionLedger({
+    runId: seedRunId,
+    mission: originalMission,
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 8,
+      toolStepBudget: 4,
+      finalizationReserve: 4,
+      expectedTools: ["retitle_current_file", "list_markdown_files"],
+      stopWhenSatisfied: true,
+    },
+  });
+  ledger.status = "budget";
+  await writeMissionLedger(vault.context, ledger);
+  await writeMissionRuntimeSnapshot(
+    vault.context,
+    createMissionRuntimeSnapshot({
+      runId: seedRunId,
+      originalMission,
+      currentNotePath: "Current.md",
+      status: "paused",
+      operationGoals: { current_note_title: "done" },
+      receipts: [
+        {
+          id: "receipt-completed-title",
+          toolName: "retitle_current_file",
+          operation: "retitle",
+          message: "Visible note title updated.",
+          path: "Current.md",
+          createdAt: "2026-07-10T12:00:00.000Z",
+        },
+      ],
+    }),
+  );
+
+  const traces: AgentTraceEvent[] = [];
+  const toolStarts: string[] = [];
+  await runAgentMission({
+    prompt: `continue run ${seedRunId}`,
+    modelClient: createModelClient([
+      responseWithToolCall("list_markdown_files", {}),
+      responseWithContent("The completed title was preserved and the files were listed."),
+    ]),
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    events: {
+      onToolStart: (event) => toolStarts.push(event.name),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  assert.deepEqual(toolStarts, ["list_markdown_files"]);
+  const goalTrace = traces.find((event) => event.id.startsWith("operation-goals:"));
+  assert.ok(goalTrace);
+  const goalState = goalTrace.outputPreview as {
+    goals?: Record<string, string>;
+    completedTools?: string[];
+  };
+  assert.equal(goalState.goals?.current_note_title, "done");
+  assert.ok(goalState.completedTools?.includes("retitle_current_file"));
 });
 
 test("continue run refuses an already accepted terminal mutation mission", async () => {

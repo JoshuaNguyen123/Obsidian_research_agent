@@ -26,7 +26,10 @@ import {
 import { formatModelClientError } from "./model/types";
 import { renderSandboxedHtmlPreview } from "./ui/htmlPreview";
 import { getConnectedRegistryElement } from "./ui/connectedElementRegistry";
-import { readLatestMissionLedger } from "./agent/missionLedger";
+import {
+  readLatestMissionLedger,
+  type MissionLedgerSummary,
+} from "./agent/missionLedger";
 import { buildMissionResumePlan } from "./agent/missionResume";
 import {
   computeProofDebt,
@@ -40,6 +43,10 @@ import {
   OrchestratorTab,
   type OrchestratorDetailsTarget,
 } from "./ui/OrchestratorTab";
+import {
+  projectMissionGraphRunDetails,
+  type MissionGraphRunDetailsProjectionV1,
+} from "../packages/headless-runtime/src/missionGraphProjection";
 
 export const AGENT_VIEW_TYPE = "agentic-researcher-view";
 
@@ -89,6 +96,7 @@ export class AgentView extends ItemView {
   private runStatusTextEl: HTMLElement | null = null;
   private statusStreamEl: HTMLElement | null = null;
   private modelConfigEl: HTMLElement | null = null;
+  private missionGraphEl: HTMLElement | null = null;
   private planningStreamEl: HTMLElement | null = null;
   private toolTimelineEl: HTMLElement | null = null;
   private finalStreamEl: HTMLElement | null = null;
@@ -129,6 +137,7 @@ export class AgentView extends ItemView {
   private chatMessageSequence = 0;
   private currentRunChatId: string | null = null;
   private runConfig: AgentRunConfigEvent | null = null;
+  private missionGraphProjection: MissionGraphRunDetailsProjectionV1 | null = null;
   private usageTotals = this.createEmptyUsageTotals();
 
   constructor(leaf: WorkspaceLeaf, plugin: AgenticResearcherPlugin) {
@@ -153,6 +162,7 @@ export class AgentView extends ItemView {
     const coordinatorSnapshot = this.plugin.getMissionRunSnapshot();
     const missionRunningAtOpen = coordinatorSnapshot.isRunning;
     this.render();
+    this.refreshDurableMissionProjection();
     this.pendingAssistantContent = "";
     if (missionRunningAtOpen) {
       this.stopRequested = coordinatorSnapshot.state === "stopping";
@@ -169,7 +179,11 @@ export class AgentView extends ItemView {
     this.unsubscribeRunEvents?.();
     this.unsubscribeRunEvents = this.plugin.subscribeMissionEvents(
       this.createRunEventHandlers(),
-      { replay: missionRunningAtOpen },
+      {
+        replay:
+          missionRunningAtOpen ||
+          coordinatorSnapshot.lastMissionGraph !== null,
+      },
     );
     if (this.plugin.isMissionRunning()) {
       this.setRunning(true, "SYS> reattached to active mission");
@@ -192,7 +206,15 @@ export class AgentView extends ItemView {
   }
 
   refreshExternalActionReceipts(): void {
+    const snapshot = this.plugin.getMissionRunSnapshot();
+    const visibleRunId =
+      this.runConfig?.runId?.trim() ||
+      (snapshot.persistedProjection ? snapshot.runId?.trim() : null) ||
+      null;
     for (const receipt of this.plugin.getExternalActionReceipts()) {
+      if (visibleRunId && receipt.runId !== visibleRunId) {
+        continue;
+      }
       this.appendReceipt({ ...receipt, output: receipt });
     }
   }
@@ -203,6 +225,38 @@ export class AgentView extends ItemView {
 
   refreshConversationLog() {
     this.renderConversationLog();
+  }
+
+  /** Refreshes the restart-safe Run Details projection from coordinator state. */
+  refreshDurableMissionProjection(): void {
+    const snapshot = this.plugin.getMissionRunSnapshot();
+    const persistedRunId = snapshot.persistedProjection
+      ? snapshot.runId?.trim() || null
+      : null;
+    const visibleRunChanged = Boolean(
+      persistedRunId &&
+        ((this.runConfig && this.runConfig.runId !== persistedRunId) ||
+          (this.missionGraphProjection &&
+            this.missionGraphProjection.missionId !== persistedRunId)),
+    );
+    if (visibleRunChanged) {
+      // A persisted projection can arrive while this panel remains mounted.
+      // Never combine the reconciled graph/ledger with a previous run's local
+      // config or receipt DOM.
+      this.runConfig = null;
+      this.missionSubmittedSinceOpen = false;
+      this.receiptKeys.clear();
+      this.setSectionPlaceholder(this.receiptsEl, "No receipts yet.");
+    }
+    this.missionGraphProjection = snapshot.lastMissionGraph
+      ? projectMissionGraphRunDetails(snapshot.lastMissionGraph)
+      : null;
+    this.renderMissionGraph();
+    this.renderModelConfig();
+    this.renderMissionAcceptance(
+      snapshot.lastMissionLedger?.acceptance ?? null,
+      "ledger",
+    );
   }
 
   /** Keeps the Orchestrator tab mounted; Chat remains the landing tab. */
@@ -587,20 +641,22 @@ export class AgentView extends ItemView {
       const controlsEl = this.resumeBannerEl.createDiv({
         cls: "agentic-researcher-resume-banner-controls",
       });
-      const continueButton = controlsEl.createEl("button", {
-        text: "Continue",
-        cls: "agentic-researcher-secondary-action",
-        attr: { type: "button" },
-      });
+      if (!debt.resumeBlocked) {
+        const continueButton = controlsEl.createEl("button", {
+          text: "Continue",
+          cls: "agentic-researcher-secondary-action",
+          attr: { type: "button" },
+        });
+        continueButton.addEventListener("click", (event) => {
+          event.preventDefault();
+          this.hideStartupResumeBanner();
+          void this.submitContinuationPrompt(plan.continuationCommand);
+        });
+      }
       const dismissButton = controlsEl.createEl("button", {
         text: "Dismiss",
         cls: "agentic-researcher-secondary-action",
         attr: { type: "button" },
-      });
-      continueButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        this.hideStartupResumeBanner();
-        void this.submitContinuationPrompt(plan.continuationCommand);
       });
       dismissButton.addEventListener("click", (event) => {
         event.preventDefault();
@@ -640,6 +696,11 @@ export class AgentView extends ItemView {
       dashboardEl,
       "Model config",
       "model-config",
+    );
+    this.missionGraphEl = this.createDashboardSection(
+      dashboardEl,
+      "Mission",
+      "mission-graph",
     );
     this.statusStreamEl = this.createDashboardSection(
       dashboardEl,
@@ -724,6 +785,7 @@ export class AgentView extends ItemView {
     this.runLogEl = this.createDashboardSection(dashboardEl, "Run log", "run-log");
 
     this.setSectionPlaceholder(this.modelConfigEl, "No run yet.");
+    this.setSectionPlaceholder(this.missionGraphEl, "No mission graph yet.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.planningStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
@@ -871,6 +933,10 @@ export class AgentView extends ItemView {
         this.renderApprovalResolved(event.request, event.decision),
       onCodeOutput: (event) => this.appendCodeOutput(event),
       onTrace: (event) => this.appendTraceEvent(event),
+      onMissionGraphUpdate: (graph) => {
+        this.missionGraphProjection = projectMissionGraphRunDetails(graph);
+        this.renderMissionGraph();
+      },
       onOrchestratorEvent: (_event, snapshot) => {
         if (!this.shouldAcceptOrchestratorSnapshot(snapshot)) {
           return;
@@ -1004,12 +1070,14 @@ export class AgentView extends ItemView {
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
     this.runConfig = null;
+    this.missionGraphProjection = null;
     this.usageTotals = this.createEmptyUsageTotals();
     this.updatePhase("idle", "Queued");
     this.setMetric(this.stepValueEl, this.formatStepMetric(0));
     this.setMetric(this.activeToolValueEl, "None");
     this.setMetric(this.activityValueEl, "Queued");
     this.setSectionPlaceholder(this.modelConfigEl, "Starting run.");
+    this.setSectionPlaceholder(this.missionGraphEl, "Building mission graph.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.planningStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
@@ -1750,6 +1818,10 @@ export class AgentView extends ItemView {
       },
     });
     receiptEl.dataset.receiptId = stableReceiptId;
+    const receiptRunId = receipt.runId?.trim() || this.runConfig?.runId?.trim() || "";
+    if (receiptRunId) {
+      receiptEl.dataset.runId = receiptRunId;
+    }
     this.bindTraceNavigation(receiptEl, this.currentRunChatId);
     const headerEl = receiptEl.createDiv({
       cls: "agentic-researcher-receipt-header",
@@ -1791,6 +1863,7 @@ export class AgentView extends ItemView {
 
   private getReceiptKey(receipt: AgentRunReceipt): string {
     return [
+      receipt.runId ?? this.runConfig?.runId ?? "",
       receipt.toolName,
       receipt.operation,
       receipt.path ?? "",
@@ -1887,20 +1960,35 @@ export class AgentView extends ItemView {
     }
 
     const snapshot = this.plugin.getMissionRunSnapshot();
-    for (const receipt of snapshot.lastReceipts) {
-      this.appendReceipt(receipt);
-    }
-    this.refreshExternalActionReceipts();
-
-    if (!this.runConfig) {
+    const awaitingLiveRunConfig =
+      this.missionSubmittedSinceOpen && this.runConfig === null;
+    if (!awaitingLiveRunConfig && !this.runConfig) {
       const snapshotConfig = snapshot.lastConfig;
       if (snapshotConfig) {
         this.runConfig = snapshotConfig;
       }
     }
 
+    // A newly submitted run resets the dashboard before its live config event
+    // arrives. Replaying the previous snapshot in that window leaks historical
+    // receipts into the active mission. Active runs receive their vault
+    // receipts from live/replayed events; durable external receipts are
+    // rehydrated only when their runId matches the visible run.
+    if (!this.isRunning) {
+      for (const receipt of snapshot.lastReceipts) {
+        this.appendReceipt(receipt);
+      }
+    }
+    if (!awaitingLiveRunConfig) {
+      this.refreshExternalActionReceipts();
+    }
+
     if (!this.runConfig) {
-      this.renderModelConfigFallback();
+      if (snapshot.lastMissionLedger) {
+        this.renderPersistedMissionConfig(snapshot.lastMissionLedger);
+      } else {
+        this.renderModelConfigFallback();
+      }
       return;
     }
 
@@ -1953,6 +2041,7 @@ export class AgentView extends ItemView {
       ...this.runConfig.dependencyStatus.map((dependency) =>
         this.formatDependencyStatusLine(dependency),
       ),
+      ...this.plugin.getExtensionStatusLines(),
       ...((this.runConfig.performanceGates ?? [])
         .filter((gate) => gate.status !== "pass")
         .map((gate) => `performance_gate=${gate.name}:${gate.status}:${gate.observed}/${gate.threshold}`)),
@@ -2011,6 +2100,86 @@ export class AgentView extends ItemView {
     this.renderContinuationAction(this.modelConfigEl, ledger);
   }
 
+  private renderPersistedMissionConfig(ledger: MissionLedgerSummary): void {
+    if (!this.modelConfigEl) {
+      return;
+    }
+    this.modelConfigEl.empty();
+    for (const line of [
+      `run_id=${ledger.runId}`,
+      "run_config=restored_from_durable_state",
+      `ledger_status=${ledger.status}`,
+      `ledger_acceptance_status=${ledger.acceptance?.status ?? "unchecked"}`,
+      `ledger_acceptance_missing=${this.formatScopeList(ledger.acceptance?.missing ?? [])}`,
+      `ledger_evidence=${ledger.evidenceCount}`,
+      `ledger_receipts=${ledger.receiptCount}`,
+      `ledger_expected_tools=${this.formatScopeList(ledger.expectedTools)}`,
+      `ledger_iterations=${ledger.iterationCount}`,
+      `ledger_progress=${this.formatOptionalNumber(ledger.progressScore)}`,
+      `ledger_last_action=${ledger.lastMeaningfulAction ?? "none"}`,
+      `ledger_next_action=${ledger.nextAction}`,
+      `ledger_remaining_actions=${this.formatScopeList(ledger.remainingActions)}`,
+      `ledger_continuation=${ledger.continuationCommand}`,
+      `ledger_can_resume=${ledger.canResume ? "on" : "off"}`,
+      `ledger_blocker=${ledger.blockerCategory ?? "none"}`,
+      ...this.plugin.getExtensionStatusLines(),
+    ]) {
+      this.modelConfigEl.createDiv({
+        text: line,
+        cls: "agentic-researcher-config-line",
+      });
+    }
+    this.renderContinuationAction(this.modelConfigEl, ledger);
+  }
+
+  private renderMissionGraph() {
+    if (!this.missionGraphEl) {
+      return;
+    }
+    const projection = this.missionGraphProjection;
+    if (!projection) {
+      this.setSectionPlaceholder(this.missionGraphEl, "No mission graph yet.");
+      return;
+    }
+
+    this.missionGraphEl.empty();
+    const active = projection.activeNode;
+    const lines: Array<[string, string]> = [
+      ["mission_id", projection.missionId],
+      ["objective", projection.objective],
+      ["graph_revision", String(projection.revision)],
+      ["routing_source", projection.routingSource],
+      ["routing_fallback", projection.routingFallbackReason ?? "none"],
+      ["active_node", active?.id ?? "none"],
+      ["active_objective", active?.objective ?? "none"],
+      ["executor", active?.executorId ?? "none"],
+      ["execution_host", active?.executionHost ?? "none"],
+      ["status", active?.status ?? "terminal"],
+      [
+        "attempts",
+        active ? `${active.attempts}/${active.maxAttempts}` : "none",
+      ],
+      ["evidence", active?.evidenceIds.join(", ") || "none"],
+      ["receipts", active?.receiptIds.join(", ") || "none"],
+      ["blocker_code", active?.blocker?.code ?? "none"],
+      ["blocker_message", active?.blocker?.message ?? "none"],
+      ["required_action", active?.blocker?.requiredAction ?? "none"],
+      ["next_action", projection.nextAction],
+      [
+        "progress",
+        `${projection.completedNodeCount}/${projection.totalNodeCount}`,
+      ],
+    ];
+
+    for (const [key, value] of lines) {
+      this.missionGraphEl.createDiv({
+        text: `${key}=${value}`,
+        cls: "agentic-researcher-config-line agentic-researcher-mission-graph-line",
+        attr: { "data-mission-field": key },
+      });
+    }
+  }
+
   private renderModelConfigFallback() {
     if (!this.modelConfigEl) {
       return;
@@ -2026,12 +2195,17 @@ export class AgentView extends ItemView {
       `provider=${provider}`,
       `base=${base}`,
       "run_config=not_started_or_unavailable",
+      ...this.plugin.getExtensionStatusLines(),
     ]) {
       this.modelConfigEl.createDiv({
         text: line,
         cls: "agentic-researcher-config-line",
       });
     }
+  }
+
+  refreshExtensionCapabilities(): void {
+    this.renderModelConfig();
   }
 
   private formatDependencyStatusLine(

@@ -5,6 +5,11 @@ export interface ProjectMemoryLocation {
   researchNotesFolder: string;
 }
 
+export interface ProjectMemoryLoadSnapshot {
+  generation: number;
+  location: ProjectMemoryLocation;
+}
+
 const PROJECT_MEMORY_FOLDER = "Agent Memory";
 
 export function getProjectMemoryLocation(
@@ -19,6 +24,25 @@ export function getProjectMemoryLocation(
     researchIndexPath: joinVaultPath(memoryFolder, "research-memory-index.json"),
     researchNotesFolder: joinVaultPath(memoryFolder, "Research"),
   };
+}
+
+/**
+ * Latest-request-wins guard for asynchronous project-memory hydration.
+ *
+ * Obsidian can emit overlapping file-open and active-leaf-change events. A
+ * completed read may update in-memory state only when no newer hydration has
+ * started and the active note still resolves to the captured project.
+ */
+export function canApplyProjectMemoryLoad(
+  snapshot: ProjectMemoryLoadSnapshot,
+  latestGeneration: number,
+  currentLocation: ProjectMemoryLocation,
+): boolean {
+  return (
+    snapshot.generation === latestGeneration &&
+    snapshot.location.conversationPath === currentLocation.conversationPath &&
+    snapshot.location.researchIndexPath === currentLocation.researchIndexPath
+  );
 }
 
 function getProjectRoot(activeFilePath: string | null): string {

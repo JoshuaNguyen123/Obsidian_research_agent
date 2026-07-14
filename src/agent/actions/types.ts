@@ -128,6 +128,8 @@ export interface PreparedAction {
   expectedTargetRevision?: string;
   idempotencyKey?: string;
   reconciliationKey?: string;
+  /** Host-enforced escalation for this exact fingerprinted payload. */
+  requiredConfirmations?: 1 | 2;
   preparedAt: string;
   expiresAt: string;
 }

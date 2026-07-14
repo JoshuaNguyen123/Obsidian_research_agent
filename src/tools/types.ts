@@ -73,6 +73,14 @@ export interface ToolExecutionContext {
     stream: "stdout" | "stderr";
     chunk: string;
   }) => void;
+  /**
+   * A tool-owned multi-stage workflow may request a fingerprint-bound approval
+   * only through this host callback. AgentRunner wires it to the same broker,
+   * UI events, ledger, and abort signal as ordinary tool approvals.
+   */
+  requestNestedApproval?: (
+    request: NestedToolApprovalRequest,
+  ) => Promise<NestedToolApprovalDecision>;
   userApprovalGranted?: boolean;
   /** Exact grant binding for descriptor-aware prepared action execution. */
   authorizedAction?: AuthorizedActionContext;
@@ -109,6 +117,32 @@ export interface ToolExecutionResult {
   };
 }
 
+export interface NestedToolApprovalRequest {
+  toolName: string;
+  action: string;
+  reason: string;
+  policyTags: string[];
+  /**
+   * Approval-display carrier only. AgentRunner sends it to ApprovalBroker/UI
+   * and never to ToolRegistry.prepare/executePrepared.
+   */
+  preparedAction?: PreparedAction;
+  timeoutMs?: number;
+  confirmationIndex?: number;
+  requiredConfirmations?: 1 | 2;
+}
+
+export type NestedToolApprovalDecision =
+  | {
+      approved: true;
+      approvalId: string;
+      approvalFingerprint: string;
+    }
+  | {
+      approved: false;
+      reason: "denied" | "expired" | "aborted";
+    };
+
 export interface AgentRuntimeCache {
   toolResults: Map<string, ToolExecutionResult>;
   semanticProfiles?: Map<string, unknown>;
@@ -124,6 +158,11 @@ export interface AgentTool {
     args: Record<string, unknown>,
     context: ToolExecutionContext,
   ): Promise<unknown>;
+  /** Optional direct result path for composite tools that own a verified receipt. */
+  executeResult?(
+    args: Record<string, unknown>,
+    context: ToolExecutionContext,
+  ): Promise<ToolExecutionResult>;
   prepare?(
     args: Record<string, unknown>,
     context: ToolExecutionContext,

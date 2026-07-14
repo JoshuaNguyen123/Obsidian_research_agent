@@ -14,6 +14,7 @@ import {
   advanceMissionPlanFromToolResult,
 } from "../src/agent/missionPlanAdvance";
 import { evaluateMissionPlanAcceptance } from "../src/agent/missionPlanAcceptance";
+import { runMissionVerifiers } from "../src/agent/verifiers";
 import {
   createMissionLedger,
   setLedgerMissionPlan,
@@ -60,6 +61,35 @@ test("mission plan infers proof contract and next action from the mission", () =
     toolName: "web_search",
     summary: "Gather required web evidence.",
   });
+});
+
+test("mission plan retains required mutation tools when route reads fill the task cap", () => {
+  const routeReadTools = Array.from(
+    { length: 14 },
+    (_, index) => `read_tool_${index + 1}`,
+  );
+  const requiredTools = ["rename_current_file", "append_to_current_file"];
+  const plan = createMissionPlan({
+    runId: "run:test",
+    prompt: "Rename the current note and append the completed research summary.",
+    missionIntent: createIntent(true),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_model_planning",
+      allowedToolNames: routeReadTools,
+    },
+    requiredTools,
+    now: new Date("2026-07-07T12:00:00.000Z"),
+  });
+
+  assert.equal(plan.tasks[0].allowedTools.length, 12);
+  assert.deepEqual(plan.tasks[0].allowedTools.slice(0, 2), requiredTools);
+  assert.ok(plan.tasks[0].allowedTools.includes("rename_current_file"));
+  assert.ok(plan.tasks[0].allowedTools.includes("append_to_current_file"));
+  assert.deepEqual(plan.tasks[0].completionContract.requiredProof, [
+    "write_receipt",
+    "rename_receipt",
+  ]);
 });
 
 test("external action receipts are domain-specific and never prove a vault write", () => {
@@ -118,6 +148,51 @@ test("external action receipts are domain-specific and never prove a vault write
   });
   assert.equal(
     accepted.missing.some((item) => item.includes("external_action_receipt")),
+    false,
+  );
+});
+
+test("workspace mutations satisfy write proof while reads and external actions do not", () => {
+  const workspaceMutation = {
+    toolName: "code_workspace_create_file",
+    operation: "create",
+    path: "src/value.txt",
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "workspace:test",
+    },
+  };
+  assert.equal(
+    receiptSatisfiesProof("write_receipt", workspaceMutation),
+    true,
+  );
+  assert.equal(
+    receiptSatisfiesProof("write_receipt", {
+      ...workspaceMutation,
+      toolName: "code_workspace_write_expected",
+      operation: "replace",
+    }),
+    true,
+  );
+  assert.equal(
+    receiptSatisfiesProof("write_receipt", {
+      ...workspaceMutation,
+      toolName: "code_workspace_read",
+      operation: "read",
+    }),
+    false,
+  );
+  assert.equal(
+    receiptSatisfiesProof("write_receipt", {
+      toolName: "github_create_pull_request",
+      operation: "create",
+      resource: {
+        system: "github",
+        resourceType: "pull_request",
+        id: "owner/repo#1",
+      },
+    }),
     false,
   );
 });
@@ -205,6 +280,105 @@ test("mission plan acceptance treats count_words as word-count proof", () => {
   });
 
   assert.equal(acceptance.status, "pass");
+});
+
+test("mission plan acceptance recognizes semantic vault-search evidence", () => {
+  const plan = createTestPlan(
+    "Research across my notes about local retrieval coverage.",
+    ["semantic_search_notes"],
+  );
+  const taskId = plan.tasks[0].id;
+  plan.tasks[0] = {
+    ...plan.tasks[0],
+    status: "complete",
+    evidenceIds: ["vault_search:local-retrieval"],
+    completionContract: {
+      ...plan.tasks[0].completionContract,
+      requiredProof: ["vault_evidence"],
+    },
+  };
+  plan.activeTaskId = null;
+
+  const acceptance = evaluateMissionPlanAcceptance({
+    prompt: "Research across my notes about local retrieval coverage.",
+    missionIntent: createIntent(false),
+    successfulTools: ["semantic_search_notes"],
+    failedTools: [],
+    requiredTools: ["semantic_search_notes"],
+    receipts: [],
+    evidence: [
+      {
+        id: "vault_search:local-retrieval",
+        kind: "vault_note",
+        title: "Semantic vault results",
+        path: "Notes/Retrieval.md",
+        summary: "Local retrieval evidence.",
+        confidence: "high",
+      },
+    ],
+    operationGoals: {},
+    finalOutput: "Local retrieval evidence is present in the vault.",
+    plan,
+  });
+
+  assert.equal(taskId.length > 0, true);
+  assert.equal(
+    acceptance.missing.some((item) => item.includes("vault_evidence")),
+    false,
+  );
+});
+
+test("projected graph-context proof survives ledger evidence ID normalization", () => {
+  const plan = createTestPlan(
+    "Inspect the current note graph before answering.",
+    ["get_note_graph_context"],
+  );
+  plan.tasks[0] = {
+    ...plan.tasks[0],
+    status: "complete",
+    // MissionGraph's generic read projection classifies graph context as
+    // vault proof even though the canonical ledger retains graph:*.
+    evidenceIds: ["vault:graph:local-context"],
+    completionContract: {
+      ...plan.tasks[0].completionContract,
+      requiredProof: ["vault_evidence"],
+    },
+  };
+  const evidence: MissionEvidence[] = [{
+    id: "graph:local-context",
+    kind: "tool_result",
+    title: "Graph context",
+    summary: "Bounded local note graph context.",
+    confidence: "medium",
+  }];
+
+  const acceptance = evaluateMissionPlanAcceptance({
+    prompt: "Inspect the current note graph before answering.",
+    missionIntent: createIntent(false),
+    successfulTools: ["get_note_graph_context"],
+    failedTools: [],
+    requiredTools: ["get_note_graph_context"],
+    receipts: [],
+    evidence,
+    operationGoals: {},
+    finalOutput: "The bounded note graph context was inspected.",
+    plan,
+  });
+  const verification = runMissionVerifiers({
+    plan,
+    evidence,
+    receipts: [],
+    finalOutput: "The bounded note graph context was inspected.",
+  });
+
+  assert.equal(
+    acceptance.missing.some((item) => item.includes("vault_evidence")),
+    false,
+  );
+  assert.equal(
+    verification.missing.some((item) => item.includes("vault_evidence")),
+    false,
+  );
 });
 
 test("mission plan expects blocker proof for broad unscoped vault mutation", () => {

@@ -1,0 +1,154 @@
+name: Cross-platform CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: ${{ matrix.os }} / ${{ matrix.sandbox_provider }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            sandbox_provider: wsl2
+          - os: macos-latest
+            sandbox_provider: podman
+          - os: ubuntu-latest
+            sandbox_provider: bubblewrap
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: companion/requirements.txt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install companion dependencies
+        run: python -m pip install --disable-pip-version-check -r companion/requirements.txt
+
+      - name: Unit tests
+        run: npm test
+
+      - name: TypeScript
+        run: npx tsc --noEmit --skipLibCheck
+
+      - name: Path hygiene
+        run: npm run check:path-hygiene
+
+      - name: Build the unified plugin artifact
+        run: npm run build
+
+      - name: Companion tests
+        run: npm run test:companion
+
+      - name: Platform sandbox boundary fixture
+        run: node --import tsx scripts/ci-sandbox-boundary.ts
+        env:
+          AGENTIC_SANDBOX_CI_PROVIDER: ${{ matrix.sandbox_provider }}
+
+      - name: Unified capability and artifact gates
+        run: node scripts/check-extension-release-gates.mjs --component all --skip-tests
+
+      - name: Installed artifact freshness and data preservation
+        run: node scripts/verify-installed-artifacts.mjs
+
+  windows-obsidian-e2e:
+    name: Windows / installed Obsidian deterministic matrix
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: companion/requirements.txt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install companion dependencies
+        run: python -m pip install --disable-pip-version-check -r companion/requirements.txt
+
+      - name: Install Obsidian and export its executable path
+        shell: pwsh
+        run: |
+          choco install obsidian -y --no-progress
+          $candidates = @(
+            (Join-Path $env:LOCALAPPDATA "Programs\Obsidian\Obsidian.exe")
+            (Join-Path $env:LOCALAPPDATA "Obsidian\Obsidian.exe")
+            (Join-Path $env:ProgramFiles "Obsidian\Obsidian.exe")
+          )
+          $obsidianExe = $candidates |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+          if (-not $obsidianExe) {
+            $obsidianExe = Get-ChildItem -LiteralPath $env:LOCALAPPDATA -Filter Obsidian.exe -File -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $obsidianExe) {
+            throw "Chocolatey completed, but Obsidian.exe could not be located."
+          }
+          "OBSIDIAN_EXE=$obsidianExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create isolated Obsidian vault
+        shell: pwsh
+        run: |
+          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-e2e-vault"
+          New-Item -ItemType Directory -Force -Path (Join-Path $vault ".obsidian\plugins") | Out-Null
+          Set-Content -LiteralPath (Join-Path $vault ".obsidian\community-plugins.json") -Value "[]" -Encoding utf8
+          "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Deterministic Obsidian Playwright matrix
+        env:
+          # This job creates the vault above from trusted checked-out artifacts.
+          # Keep the first-open trust opt-in scoped to that disposable vault run.
+          E2E_TRUST_DISPOSABLE_VAULT: "1"
+        run: npm run test:e2e:deterministic-matrix
+
+      - name: Upload Playwright diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-obsidian-playwright-diagnostics
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore

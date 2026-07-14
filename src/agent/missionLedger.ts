@@ -31,6 +31,8 @@ export const MISSION_LEDGER_SCHEMA_VERSION = 2 as const;
 const LEDGER_HEADING = "## Mission Ledger";
 const LEDGER_BLOCK_PATTERN =
   /## Mission Ledger\r?\n```json\r?\n[\s\S]*?\r?\n```/;
+const GENERATED_MISSION_SUMMARY_PATTERN =
+  /^(?:\r?\n){1,2}### Mission Summary\r?\n(?:- [^\r\n]*(?:\r?\n|$))+/;
 const MAX_PASSAGE_IDS_PER_EVIDENCE = 24;
 
 export type MissionLedgerStatus =
@@ -891,8 +893,24 @@ export function getMissionLedgerPath(runId: string): string {
 }
 
 function replaceMissionLedgerBlock(current: string, block: string): string {
-  if (LEDGER_BLOCK_PATTERN.test(current)) {
-    return current.replace(LEDGER_BLOCK_PATTERN, block.trimEnd());
+  const existingBlock = LEDGER_BLOCK_PATTERN.exec(current);
+  if (existingBlock) {
+    const before = current.slice(0, existingBlock.index);
+    let after = current.slice(existingBlock.index + existingBlock[0].length);
+
+    // Older writes replaced only the JSON fence even though `block` also
+    // contains the rendered summary. Each checkpoint consequently retained
+    // the previous generated summary and inserted another one ahead of it.
+    // Remove only the exact adjacent bullet-only summaries that this writer
+    // owns; preserve checkpoints and any hand-authored trailing sections.
+    while (GENERATED_MISSION_SUMMARY_PATTERN.test(after)) {
+      after = after.replace(GENERATED_MISSION_SUMMARY_PATTERN, "");
+    }
+
+    const trailingContent = after.replace(/^(?:\r?\n)+/, "");
+    return trailingContent
+      ? `${before}${block.trimEnd()}\n\n${trailingContent}`
+      : `${before}${block}`;
   }
 
   const separator = current.endsWith("\n") ? "\n" : "\n\n";

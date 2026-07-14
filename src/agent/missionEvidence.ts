@@ -131,7 +131,10 @@ export function evidenceFromToolResult(
     };
   }
 
-  if (toolName === "read_file" && isRecord(result.output)) {
+  if (
+    (toolName === "read_file" || toolName === "read_current_file") &&
+    isRecord(result.output)
+  ) {
     const path = getString(result.output.path) ?? "";
     const content = getString(result.output.content) ?? "";
     const contentEvidence = extractEvidencePassages(content, {

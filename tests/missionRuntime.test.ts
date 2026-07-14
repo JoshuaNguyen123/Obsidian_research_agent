@@ -153,6 +153,7 @@ test("mission ledger creates, updates, serializes, parses, and summarizes durabl
   );
   const file = mock.files.get("Agent Runs/run-test.md") ?? "";
   assert.equal((file.match(/## Mission Ledger/g) ?? []).length, 1);
+  assert.equal((file.match(/### Mission Summary/g) ?? []).length, 1);
   assert.match(file, /"status": "complete"/);
   assert.match(file, /"revision": 4/);
   assert.deepEqual(summarizeMissionLedger(ledger), {
@@ -187,6 +188,42 @@ test("mission ledger creates, updates, serializes, parses, and summarizes durabl
     progressScore: 0,
     stalledCount: 0,
   });
+});
+
+test("mission ledger save coalesces legacy generated summaries and preserves trailing sections", async () => {
+  const mock = createMissionLedgerContext();
+  const ledger = createTestLedger();
+  await writeMissionLedger(mock.context, ledger);
+
+  const path = "Agent Runs/run-test.md";
+  const first = mock.files.get(path) ?? "";
+  const summaryStart = first.indexOf("### Mission Summary");
+  assert.ok(summaryStart >= 0);
+  const generatedSummary = first.slice(summaryStart).trimEnd();
+  mock.files.set(
+    path,
+    [
+      first.trimEnd(),
+      "",
+      generatedSummary,
+      "",
+      "## Step 1 - retained checkpoint",
+      "",
+      "This checkpoint must survive summary repair.",
+      "",
+    ].join("\n"),
+  );
+
+  ledger.status = "complete";
+  const result = await writeMissionLedger(mock.context, ledger);
+  const repaired = mock.files.get(path) ?? "";
+
+  assert.equal(result?.revision, 2);
+  assert.equal((repaired.match(/## Mission Ledger/g) ?? []).length, 1);
+  assert.equal((repaired.match(/### Mission Summary/g) ?? []).length, 1);
+  assert.match(repaired, /- Status: complete/);
+  assert.match(repaired, /## Step 1 - retained checkpoint/);
+  assert.match(repaired, /This checkpoint must survive summary repair\./);
 });
 
 test("mission evidence converts web, vault, artifact, and receipt outputs and dedupes by id", () => {

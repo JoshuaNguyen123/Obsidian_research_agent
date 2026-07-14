@@ -19,6 +19,40 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA secure_delete=ON")
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "vault_path" in columns:
+            self.conn.executescript(
+                """
+                ALTER TABLE memories RENAME TO memories_legacy_vault_paths;
+                CREATE TABLE memories (
+                  id TEXT PRIMARY KEY,
+                  kind TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  confidence REAL NOT NULL,
+                  tags_json TEXT NOT NULL,
+                  source_url TEXT,
+                  source_title TEXT,
+                  note_receipt_fingerprint TEXT,
+                  evidence_json TEXT NOT NULL,
+                  task_id TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                INSERT INTO memories (
+                  id, kind, content, confidence, tags_json, source_url, source_title,
+                  note_receipt_fingerprint, evidence_json, task_id, created_at, updated_at
+                )
+                SELECT id, kind, content, confidence, tags_json, source_url, source_title,
+                       NULL, evidence_json, task_id, created_at, updated_at
+                FROM memories_legacy_vault_paths;
+                DROP TABLE memories_legacy_vault_paths;
+                """
+            )
+            self.conn.execute("VACUUM")
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS memories (
@@ -29,7 +63,7 @@ class MemoryStore:
               tags_json TEXT NOT NULL,
               source_url TEXT,
               source_title TEXT,
-              vault_path TEXT,
+              note_receipt_fingerprint TEXT,
               evidence_json TEXT NOT NULL,
               task_id TEXT,
               created_at TEXT NOT NULL,
@@ -58,12 +92,14 @@ class MemoryStore:
         memory_id = str(uuid.uuid4())
         now = dt.datetime.now(dt.UTC).isoformat()
         tags_json = json.dumps(request.tags)
-        evidence_json = json.dumps(request.evidenceRefs)
+        evidence_json = json.dumps(
+            [reference.model_dump() for reference in request.evidenceRefs]
+        )
         conn.execute(
             """
             INSERT INTO memories (
               id, kind, content, confidence, tags_json, source_url, source_title,
-              vault_path, evidence_json, task_id, created_at, updated_at
+              note_receipt_fingerprint, evidence_json, task_id, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -75,7 +111,7 @@ class MemoryStore:
                 tags_json,
                 request.sourceUrl,
                 request.sourceTitle,
-                request.vaultPath,
+                request.noteReceiptFingerprint,
                 evidence_json,
                 request.taskId,
                 now,
@@ -136,7 +172,7 @@ class MemoryStore:
                     tags=json.loads(row["tags_json"]),
                     sourceUrl=row["source_url"],
                     sourceTitle=row["source_title"],
-                    vaultPath=row["vault_path"],
+                    noteReceiptFingerprint=row["note_receipt_fingerprint"],
                     createdAt=row["created_at"],
                 )
             )

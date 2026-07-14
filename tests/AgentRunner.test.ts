@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_AGENT_STEPS,
+  canonicalMissionGraphId,
+  ensureResearchSourceLoopBudget,
+  hasPreparedBackgroundCodeValidationCommitIntent,
   resolveThinkingMode,
   runAgentMission,
   sanitizeAssistantContent,
@@ -43,12 +46,110 @@ import {
 import { __setCodeToolsDesktopAppForTests } from "../src/tools/codeTools";
 import { extractEvidencePassages } from "../src/agent/researchDossier";
 import {
+  sha256Fingerprint,
   withPreparedActionFingerprint,
   type ToolDescriptor,
 } from "../src/agent/actions";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
 import type { AgentTool } from "../src/tools/types";
 import { parseMissionRuntimeSnapshotFromMarkdown } from "../src/agent/runStore";
+import { buildOperationReconciliationInputs } from "../src/agent/runStore";
+import { parseMissionGraphStoreRecordFromMarkdown } from "../src/agent/missionGraphStore";
+import { parseMissionLedgerFromMarkdown } from "../src/agent/missionLedger";
+import {
+  prepareCompanionJobV1,
+  type CompanionJobV1,
+} from "../packages/headless-runtime/src/backgroundContinuation";
+import type { CompanionRemoteJobV1 } from "../packages/headless-runtime/src/companionCoordinatorClient";
+import { createPreparedBackgroundCodeActionV1 } from "../packages/core-api/src/preparedBackgroundCodeActionV1";
+import { createPreparedBackgroundCodePackageIdentityV1 } from "../packages/core-api/src/preparedBackgroundCodePackageIdentityV1";
+import type { BackgroundMissionDispatchPortV1 } from "../src/agent/backgroundMissionDispatch";
+import {
+  consumeAuthorityGrant,
+  createBoundedGrant,
+} from "../src/agent/authority";
+
+test("prepared background Code intent requires an affirmative scoped continuation", () => {
+  assert.equal(
+    hasPreparedBackgroundCodeValidationCommitIntent(
+      "Continue the exact prepared Code validation commit in the background.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasPreparedBackgroundCodeValidationCommitIntent(
+      "Invoke only code_validate_commit_prepared for repairRequestId bg1, then continue this Code validation and commit in the background.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasPreparedBackgroundCodeValidationCommitIntent(
+      "Explain how background Code validation commit execution works.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasPreparedBackgroundCodeValidationCommitIntent(
+      "Do not run the exact prepared Code validation commit in the background; only describe it.",
+    ),
+    false,
+  );
+});
+
+test("canonical mission graph ids normalize generated run ids and bounded suffixes", () => {
+  assert.equal(
+    canonicalMissionGraphId("run-2026-07-13T03-23-36.470Z-ABC123"),
+    "run-2026-07-13t03-23-36.470z-abc123",
+  );
+  const bounded = canonicalMissionGraphId(`${"a".repeat(127)}--lead`);
+  assert.equal(bounded.length, 127);
+  assert.match(bounded, /^[a-z0-9](?:[a-z0-9._:-]*[a-z0-9])?$/u);
+});
+
+test("research plans reserve web search and fetch in the authoritative loop budget", () => {
+  const updated = ensureResearchSourceLoopBudget(
+    {
+      hardCap: 10,
+      toolStepBudget: 1,
+      finalizationReserve: 2,
+      expectedTools: ["append_to_current_file", "web_search"],
+      stopWhenSatisfied: false,
+    },
+    3,
+  );
+
+  assert.equal(updated.toolStepBudget, 2);
+  assert.deepEqual(updated.expectedTools, [
+    "append_to_current_file",
+    "web_search",
+    "web_fetch",
+  ]);
+  assert.equal(updated.stopWhenSatisfied, true);
+});
+
+test("research source budget augmentation is bounded and skips vault-only plans", () => {
+  const vaultOnly = {
+    hardCap: 4,
+    toolStepBudget: 1,
+    finalizationReserve: 1,
+    expectedTools: ["semantic_search_notes"],
+    stopWhenSatisfied: true,
+  };
+  assert.equal(ensureResearchSourceLoopBudget(vaultOnly, 0), vaultOnly);
+
+  const constrained = ensureResearchSourceLoopBudget(
+    {
+      hardCap: 2,
+      toolStepBudget: 0,
+      finalizationReserve: 1,
+      expectedTools: [],
+      stopWhenSatisfied: false,
+    },
+    1,
+  );
+  assert.equal(constrained.toolStepBudget, 1);
+  assert.deepEqual(constrained.expectedTools, ["web_search", "web_fetch"]);
+});
 
 test("observes the current note before the first model planning step", async () => {
   const chatRequests: ModelChatRequest[] = [];
@@ -532,7 +633,7 @@ test("static essay prompts stream to chat and append to the current note", async
   assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 1);
   assert.equal(streamRequests[0].tools, undefined);
-  assert.equal(streamRequests[0].think, undefined);
+  assert.equal(streamRequests[0].think, false);
   assert.deepEqual(planningDeltas, []);
   assert.deepEqual(finalDeltas, ["A 300 word Mexican-American War essay."]);
   assert.deepEqual(assistantDeltas, ["A 300 word Mexican-American War essay."]);
@@ -974,7 +1075,7 @@ test("prompt-on-page generation streams the extracted answer into the current no
   assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 1);
   assert.equal(streamRequests[0].tools, undefined);
-  assert.equal(streamRequests[0].think, undefined);
+  assert.equal(streamRequests[0].think, false);
   assert.ok(
     streamRequests[0].messages.some((message) =>
       /Current note context/.test(message.content),
@@ -1183,7 +1284,7 @@ test("notepage prompt wrapper routes to prefetched vault writeback", async () =>
   assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 1);
   assert.equal(streamRequests[0].tools, undefined);
-  assert.equal(streamRequests[0].think, undefined);
+  assert.equal(streamRequests[0].think, false);
   assert.equal(configs.at(-1)?.route, "prefetched_vault_writeback");
   assert.equal(configs.at(-1)?.writebackMode, "streaming_current_note");
   assert.ok(
@@ -1409,6 +1510,7 @@ test("delete all notes on the page routes to replace-current-page with backup", 
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
   const prompt =
     "I want you to delete all the notes on the page and then write a 300 word essay on the renaissance.";
   const vault = createRunnerVaultContext({
@@ -1454,14 +1556,22 @@ test("delete all notes on the page routes to replace-current-page with backup", 
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
+    approvalBroker: broker,
     events: {
+      onApprovalRequest: (request) => {
+        assert.equal(
+          vault.content.get("Current.md"),
+          "# Old Notes\n\nOld Renaissance notes to remove.",
+        );
+        broker.resolve(request.id, "approved");
+      },
       onReceipt: (receipt) => receipts.push(receipt),
     },
   });
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file"],
+    ["read_current_file", "replace_current_file"],
   );
   assert.equal(streamRequests.length, 1);
   assert.equal(
@@ -2036,6 +2146,179 @@ test("design prompts expose and require native artifact write tools", async () =
   }
 });
 
+test("existing Canvas revisions require read then patch without injecting current-note rename", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const path = "Designs/Product Flow.canvas";
+  const baseHash = `sha256:${"a".repeat(64)}`;
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("read_design_canvas", { path }),
+      () => responseWithContent("I updated the diagram title."),
+      () =>
+        responseWithToolCall("update_design_canvas", {
+          path,
+          baseHash,
+          operations: [
+            {
+              op: "update_node",
+              id: "canvas-title",
+              patch: { text: "Revised Canvas Title" },
+            },
+          ],
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Update the title in my existing Obsidian Canvas diagram at Designs/Product Flow.canvas.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+  });
+
+  const firstToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("read_design_canvas"));
+  assert.ok(firstToolNames.includes("update_design_canvas"));
+  assert.ok(!firstToolNames.includes("rename_current_file"));
+  assert.match(
+    chatRequests[2].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: update_design_canvas/,
+  );
+  const executedDesignCalls = executedCalls
+    .map((call) => call.name)
+    .filter((name) =>
+      name === "read_design_canvas" || name === "update_design_canvas",
+    );
+  assert.deepEqual(executedDesignCalls, [
+    "read_design_canvas",
+    "update_design_canvas",
+  ]);
+  assert.ok(
+    !executedCalls.some((call) => call.name === "rename_current_file"),
+  );
+});
+
+test("existing SVG revisions require safe read then hash-bound patch", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const path = "Designs/Settings.svg";
+  const baseHash = `sha256:${"c".repeat(64)}`;
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("read_svg_design", { path }),
+      () => responseWithContent("I described the revised SVG in chat only."),
+      () => responseWithToolCall("update_svg_design", {
+        path,
+        baseHash,
+        operations: [{ op: "update_text", id: "title", text: "Revised SVG" }],
+      }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Update the title in my existing SVG diagram at Designs/Settings.svg.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+  });
+
+  const firstToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("read_svg_design"));
+  assert.ok(firstToolNames.includes("update_svg_design"));
+  assert.ok(!firstToolNames.includes("read_design_canvas"));
+  assert.ok(!firstToolNames.includes("update_design_canvas"));
+  assert.match(
+    chatRequests[2].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: update_svg_design/,
+  );
+  assert.deepEqual(
+    executedCalls
+      .map((call) => call.name)
+      .filter((name) => name === "read_svg_design" || name === "update_svg_design"),
+    ["read_svg_design", "update_svg_design"],
+  );
+});
+
+test("existing Mermaid revisions expose only the read then upsert artifact workflow", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const path = "Designs/System.md";
+  const baseHash = `sha256:${"e".repeat(64)}`;
+  const selector = { kind: "heading", heading: "Architecture" };
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("read_mermaid_block", { path, selector }),
+      () => responseWithContent("I described the revised Mermaid diagram."),
+      () =>
+        responseWithToolCall("upsert_mermaid_block", {
+          path,
+          baseHash,
+          selector,
+          mermaid: "flowchart LR\n  A[Research] --> B[Verified note]",
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Revise the Mermaid diagram under the Architecture heading in Designs/System.md.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+  });
+
+  const firstToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("read_mermaid_block"));
+  assert.ok(firstToolNames.includes("upsert_mermaid_block"));
+  for (const unrelatedTool of [
+    "create_design_canvas",
+    "read_design_canvas",
+    "update_design_canvas",
+    "create_svg_design",
+    "read_svg_design",
+    "update_svg_design",
+    "rename_current_file",
+    "retitle_current_file",
+    "append_to_current_file",
+    "append_to_current_section",
+    "prepare_edit_current_section",
+    "edit_current_section",
+    "replace_current_file",
+    "create_file",
+    "replace_file",
+  ]) {
+    assert.ok(
+      !firstToolNames.includes(unrelatedTool),
+      `${unrelatedTool} must not leak into an explicit Mermaid revision`,
+    );
+  }
+  assert.match(
+    chatRequests[2].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: upsert_mermaid_block/,
+  );
+  assert.deepEqual(
+    executedCalls
+      .map((call) => call.name)
+      .filter(
+        (name) =>
+          name === "read_mermaid_block" || name === "upsert_mermaid_block",
+      ),
+    ["read_mermaid_block", "upsert_mermaid_block"],
+  );
+});
+
 test("diagram follow-up after chat answer creates a native canvas artifact", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
@@ -2093,6 +2376,102 @@ test("diagram follow-up after chat answer creates a native canvas artifact", asy
   assert.deepEqual(assistantDeltas, [
     "Done. create Designs/Product Flow.canvas.",
   ]);
+});
+
+test("turn content into a design graph requires a native canvas instead of note prose", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const receipts: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithContent(
+          "Since I cannot render a visual image, paste this Mermaid text elsewhere.",
+        ),
+      () => responseWithToolCall("create_design_canvas", {}),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Can you turn those 5 laws into a design graph?",
+    conversationHistory: [
+      {
+        role: "assistant",
+        content:
+          "The first five laws cover the master, friends, intentions, silence, and reputation.",
+      },
+    ],
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt.message),
+    },
+  });
+
+  const firstToolNames =
+    chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes("create_design_canvas"));
+  assert.ok(!firstToolNames.includes("append_to_current_file"));
+  assert.match(
+    chatRequests[1].messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: create_design_canvas/,
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["create_design_canvas"],
+  );
+  assert.deepEqual(receipts, ["create Designs/Product Flow.canvas"]);
+});
+
+test("explicit Canvas destination overrides Mermaid source wording and note writeback", async () => {
+  for (const prompt of [
+    "I want this to be on a canvas.",
+    "Move this Mermaid diagram into an Obsidian Canvas.",
+  ]) {
+    const chatRequests: ModelChatRequest[] = [];
+    const executedCalls: ModelToolCall[] = [];
+    const client = createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithToolCall("create_design_canvas", {}),
+      ],
+    });
+
+    await runAgentMission({
+      prompt,
+      conversationHistory: [
+        {
+          role: "assistant",
+          content:
+            "```mermaid\ngraph TD\n  Goal --> Law1\n  Goal --> Law2\n```",
+        },
+      ],
+      modelClient: client,
+      toolRegistry: createRegistry(executedCalls),
+      toolContext: {} as ToolExecutionContext,
+      enableStreaming: false,
+    });
+
+    const firstToolNames =
+      chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+    assert.ok(firstToolNames.includes("create_design_canvas"), prompt);
+    for (const wrongDestination of [
+      "append_to_current_file",
+      "read_mermaid_block",
+      "upsert_mermaid_block",
+    ]) {
+      assert.ok(!firstToolNames.includes(wrongDestination), `${prompt}: ${wrongDestination}`);
+    }
+    assert.deepEqual(
+      executedCalls.map((call) => call.name),
+      ["create_design_canvas"],
+      prompt,
+    );
+  }
 });
 
 test("explicit web and citation prompts expose web_search and web_fetch", async () => {
@@ -2748,6 +3127,31 @@ test("vault context search prompts expose search and batch read tools", async ()
   assert.ok(!toolNames.includes("append_to_current_file"));
 });
 
+test("parallel vault plan reads remain callable by the model", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithContent("The bounded parallel inspection is not complete yet."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt:
+      "Inspect the current note with parallel vault reads, then append the verified marker to this note.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    maxSteps: 1,
+  });
+
+  const toolNames = chatRequests[0].tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(toolNames.includes("semantic_search_notes"));
+  assert.ok(toolNames.includes("read_markdown_files"));
+  assert.ok(toolNames.includes("append_to_current_file"));
+});
+
 test("conceptual vault prompts expose semantic search as a read tool", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
@@ -3376,7 +3780,10 @@ test("premature current-note append is rejected until required web fetch complet
       event.error?.code === "plan_dependency_violation",
   );
   assert.ok(rejected, "the premature append must produce an observable dependency rejection");
-  assert.match(rejected.message, /task-research-web must complete first/);
+  assert.match(
+    rejected.message,
+    /(?:task-research-web|tool-02-web_fetch) must complete first/,
+  );
 
   const ledgerMarkdown = [...vault.content.entries()]
     .filter(([path]) => /^Agent Runs\/.+\.md$/u.test(path))
@@ -3389,11 +3796,17 @@ test("premature current-note append is rejected until required web fetch complet
   assert.ok(ledgerJson, "the persisted mission ledger JSON must be readable");
   const ledger = JSON.parse(ledgerJson) as {
     missionPlan?: {
-      tasks?: Array<{ id?: string; receiptIds?: string[] }>;
+      tasks?: Array<{
+        id?: string;
+        allowedTools?: string[];
+        receiptIds?: string[];
+      }>;
     };
   };
   const taskAct = ledger.missionPlan?.tasks?.find(
-    (task) => task.id === "task-act",
+    (task) =>
+      task.id === "task-act" ||
+      task.allowedTools?.includes("append_to_current_file"),
   );
   assert.ok(taskAct);
   assert.equal(taskAct.receiptIds?.length, 2);
@@ -3538,8 +3951,9 @@ test("runner records tool evidence and receipts into the durable mission ledger"
     },
   });
 
-  const ledgerEntry = [...vault.content.entries()].find(([path]) =>
-    /^Agent Runs\/.+\.md$/.test(path),
+  const ledgerEntry = [...vault.content.entries()].find(
+    ([path, content]) =>
+      /^Agent Runs\/.+\.md$/.test(path) && /## Mission Ledger/u.test(content),
   );
   assert.ok(ledgerEntry);
   assert.match(ledgerEntry[1], /"kind": "web_source"/);
@@ -3569,8 +3983,9 @@ test("runner records tool evidence and receipts into the durable mission ledger"
     },
   });
 
-  const appendLedgerEntry = [...appendVault.content.entries()].find(([path]) =>
-    /^Agent Runs\/.+\.md$/.test(path),
+  const appendLedgerEntry = [...appendVault.content.entries()].find(
+    ([path, content]) =>
+      /^Agent Runs\/.+\.md$/.test(path) && /## Mission Ledger/u.test(content),
   );
   assert.equal(appendReceipts.length, 1);
   assert.ok(appendLedgerEntry);
@@ -5249,6 +5664,7 @@ test("streamed append onto Untitled 1 auto-renames visible title from leading H1
   });
 
   assert.equal(streamRequests.length, 1);
+  assert.equal(streamRequests[0].messages.at(-1)?.role, "user");
   assert.match(
     streamRequests[0].messages.at(-1)?.content ?? "",
     /OUTPUT CONTRACT/,
@@ -5584,6 +6000,7 @@ test("compound title and essay prompt retitles then streams essay content", asyn
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
+  const statuses: string[] = [];
   const vault = createRunnerVaultContext({
     prompt,
     content: "# Untitled\n\n",
@@ -5592,6 +6009,7 @@ test("compound title and essay prompt retitles then streams essay content", asyn
     chatRequests,
     streamRequests,
     chatResponders: [
+      () => responseWithContent("I will retitle the note before writing."),
       () =>
         responseWithToolCall("rename_current_file", {
           title: "The Harvest of Injustice",
@@ -5612,14 +6030,30 @@ test("compound title and essay prompt retitles then streams essay content", asyn
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
-    events: {},
+    events: {
+      onStatus: (message) => statuses.push(message),
+    },
   });
 
   assert.deepEqual(
     executedCalls.map((call) => call.name),
     ["read_current_file", "rename_current_file"],
   );
+  assert.equal(chatRequests.length, 2);
   assert.equal(streamRequests.length, 1);
+  assert.equal(streamRequests[0].think, false);
+  assert.ok(
+    streamRequests[0].messages.some(
+      (message) =>
+        message.role === "user" &&
+        message.content.includes("requested title change is complete"),
+    ),
+  );
+  assert.ok(
+    statuses.includes(
+      "Title update complete; starting content-only streamed writeback...",
+    ),
+  );
   assert.equal(
     vault.content.get("The Harvest of Injustice.md"),
     "# Untitled\n\nThe Grapes of Wrath presents survival as a collective duty.",
@@ -5875,6 +6309,84 @@ test("proof-gated cited writeback stages one correction before one note commit",
     `${originalNote}\n${correctedDraft}`,
   );
   assert.doesNotMatch(vault.content.get("Current.md") ?? "", /INVALID UNVERIFIED/);
+});
+
+test("generic commit marker cannot add prepared background Code authority to a research graph", async () => {
+  const prompt =
+    "E2E_PROOF_GATED_COMMIT_MARKER: Research MCP servers on the web and append a cited summary to this note.";
+  const vault = createRunnerVaultContext({ prompt, content: "Original research note." });
+  vault.context.settings.researchMemoryEnabled = false;
+  const baseRegistry = createDefaultToolRegistry();
+  const descriptor = backgroundCodeValidationDescriptor();
+  let preparedCodeExecutions = 0;
+  const basePrepare = baseRegistry.prepare?.bind(baseRegistry);
+  const baseExecutePrepared = baseRegistry.executePrepared?.bind(baseRegistry);
+  const registry: ToolRegistry = {
+    getDefinitions: () => [
+      ...baseRegistry.getDefinitions(),
+      {
+        type: "function" as const,
+        function: {
+          name: descriptor.name,
+          description: "Execute one exact prepared background Code validation commit.",
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+        },
+      },
+    ],
+    getDescriptor: (name) =>
+      name === descriptor.name
+        ? descriptor
+        : (baseRegistry.getDescriptor?.(name) ?? null),
+    prepare: basePrepare
+      ? (call, context) => basePrepare(call, context)
+      : undefined,
+    executePrepared: baseExecutePrepared
+      ? (action, context, authorization) =>
+          baseExecutePrepared(action, context, authorization)
+      : undefined,
+    execute: async (call, context) => {
+      if (call.name === descriptor.name) {
+        preparedCodeExecutions += 1;
+        return {
+          ok: false,
+          toolName: descriptor.name,
+          error: { code: "unexpected_execution", message: "Unexpected execution." },
+        };
+      }
+      return baseRegistry.execute(call, context);
+    },
+  };
+  const configs: AgentRunConfigEvent[] = [];
+  const graphs: Array<{ nodes: Record<string, { allowedTools: string[] }> }> = [];
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [() => responseWithContent("Research still requires its web evidence.")],
+    }),
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 1,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+      onMissionGraphUpdate: (graph) => graphs.push(graph),
+    },
+  });
+
+  assert.equal(
+    configs[0]?.allowedToolNames.includes("code_validate_commit_prepared"),
+    false,
+  );
+  assert.ok(graphs.length > 0);
+  assert.equal(
+    Object.values(graphs.at(-1)?.nodes ?? {}).some((node) =>
+      node.allowedTools.includes("code_validate_commit_prepared"),
+    ),
+    false,
+  );
+  assert.equal(preparedCodeExecutions, 0);
 });
 
 test("proof-sensitive direct write tools are staged before the single verified mutation", async () => {
@@ -6353,6 +6865,7 @@ test("delete then write replaces current note instead of trashing it", async () 
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
   const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
   const vault = createRunnerVaultContext({
     prompt:
       "Delete the current note. Ensure the space is empty. I want you to write now, a 1000 word essay on Grapes of Wrath.",
@@ -6379,7 +6892,12 @@ test("delete then write replaces current note instead of trashing it", async () 
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
+    approvalBroker: broker,
     events: {
+      onApprovalRequest: (request) => {
+        assert.equal(vault.content.get("Current.md"), "Old essay");
+        broker.resolve(request.id, "approved");
+      },
       onReceipt: (receipt) => receipts.push(receipt),
     },
   });
@@ -6388,7 +6906,7 @@ test("delete then write replaces current note instead of trashing it", async () 
   assert.equal(streamRequests.length, 1);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file"],
+    ["read_current_file", "replace_current_file"],
   );
   assert.equal(vault.content.get("Current.md"), essayDraft);
   assert.equal(receipts.length, 1);
@@ -7002,7 +7520,7 @@ test("append writeback streams final markdown into the current note only", async
 
   assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 1);
-  assert.equal(streamRequests[0].think, undefined);
+  assert.equal(streamRequests[0].think, false);
   assert.deepEqual(
     executedCalls.map((call) => call.name),
     [],
@@ -7264,6 +7782,7 @@ test("thinking-only writeback retries once and fails without a receipt", async (
   const streamRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const receipts: Array<Record<string, unknown>> = [];
+  const completions: AgentRunCompleteEvent[] = [];
   const prompt = "Append 2 action items to this note.";
   const vault = createRunnerVaultContext({
     prompt,
@@ -7291,6 +7810,7 @@ test("thinking-only writeback retries once and fails without a receipt", async (
           onStatus: (message) => statuses.push(message),
           onReceipt: (receipt) =>
             receipts.push(receipt.output as Record<string, unknown>),
+          onRunComplete: (event) => completions.push(event),
         },
       }),
     /The model returned no writable content\. Nothing was written\./,
@@ -7298,10 +7818,21 @@ test("thinking-only writeback retries once and fails without a receipt", async (
 
   assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 2);
-  assert.equal(streamRequests[0].think, undefined);
-  assert.equal(streamRequests[1].think, undefined);
+  assert.equal(streamRequests[0].think, false);
+  assert.equal(streamRequests[1].think, false);
   assert.equal(vault.content.get("Current.md"), "Initial note");
   assert.deepEqual(receipts, []);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].stopReason, "error");
+  const runMarkdown = [...vault.content.entries()].find(
+    ([path]) => /^Agent Runs\/run-[^/]+\.md$/u.test(path),
+  )?.[1];
+  assert.ok(runMarkdown);
+  assert.equal(parseMissionLedgerFromMarkdown(runMarkdown)?.status, "blocked");
+  assert.equal(
+    parseMissionRuntimeSnapshotFromMarkdown(runMarkdown)?.status,
+    "blocked",
+  );
   assert.ok(
     statuses.includes(
       "No writable content received; retrying content-only writeback...",
@@ -7492,8 +8023,8 @@ test("writeback retry writes content from the second stream", async () => {
 
   assert.equal(chatRequests.length, 0);
   assert.equal(streamRequests.length, 2);
-  assert.equal(streamRequests[0].think, undefined);
-  assert.equal(streamRequests[1].think, undefined);
+  assert.equal(streamRequests[0].think, false);
+  assert.equal(streamRequests[1].think, false);
   assert.deepEqual(finalDeltas, ["- First\n", "- Second\n"]);
   assert.equal(vault.content.get("Current.md"), "Initial note\n- First\n- Second\n");
   assert.equal(receipts.length, 1);
@@ -7542,9 +8073,9 @@ test("empty replace writeback does not erase the current note", async () => {
     /The model returned no writable content\. Nothing was written\./,
   );
 
-  assert.equal(streamRequests.length, 2);
+  assert.equal(streamRequests.length, 1);
   assert.equal(vault.content.get("Current.md"), "Original note");
-  assert.equal(vault.content.get(".agent-backups/654-Current.md"), "Original note");
+  assert.equal(vault.content.has(".agent-backups/654-Current.md"), false);
   assert.equal(vault.operations.includes("modify:Current.md"), false);
   assert.deepEqual(receipts, []);
 });
@@ -7552,7 +8083,9 @@ test("empty replace writeback does not erase the current note", async () => {
 test("replace writeback creates a backup before streaming replacement content", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
-  const receipts: Array<Record<string, unknown>> = [];
+  const receipts: AgentRunReceipt[] = [];
+  const approvals: ApprovalRequest[] = [];
+  const broker = new ApprovalBroker();
   const prompt = "Replace this note with a clean project brief.";
   const vault = createRunnerVaultContext({
     prompt,
@@ -7574,8 +8107,15 @@ test("replace writeback creates a backup before streaming replacement content", 
     toolRegistry: createDefaultToolRegistry(),
     toolContext: vault.context,
     enableStreaming: true,
+    approvalBroker: broker,
     events: {
-      onReceipt: (receipt) => receipts.push(receipt.output as Record<string, unknown>),
+      onApprovalRequest: (request) => {
+        approvals.push(request);
+        assert.equal(vault.content.get("Current.md"), "Old note");
+        assert.equal(vault.content.has(".agent-backups/456-Current.md"), false);
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
     },
   });
 
@@ -7590,7 +8130,12 @@ test("replace writeback creates a backup before streaming replacement content", 
     vault.operations.indexOf("create:.agent-backups/456-Current.md") <
       vault.operations.indexOf("modify:Current.md"),
   );
-  assert.equal(receipts[0].streamed, true);
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].toolName, "replace_current_file");
+  assert.equal(
+    approvals[0].payloadFingerprint,
+    approvals[0].preparedAction?.payloadFingerprint,
+  );
   assert.equal(receipts[0].backupPath, ".agent-backups/456-Current.md");
   assert.equal(receipts[0].operation, "replace");
 });
@@ -7599,7 +8144,8 @@ test("direct essay edit routes to whole-note replace instead of section edit", a
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
-  const receipts: Array<Record<string, unknown>> = [];
+  const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
   const prompt = "Edit the essay and add more detail to the paragraphs.";
   const original = "# Essay\n\nThin original paragraph.\n";
   const vault = createRunnerVaultContext({
@@ -7626,9 +8172,12 @@ test("direct essay edit routes to whole-note replace instead of section edit", a
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
+    approvalBroker: broker,
     events: {
-      onReceipt: (receipt) =>
-        receipts.push(receipt.output as Record<string, unknown>),
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
     },
   });
 
@@ -7639,7 +8188,7 @@ test("direct essay edit routes to whole-note replace instead of section edit", a
   assert.ok(!firstStepToolNames.includes("edit_current_section"));
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file"],
+    ["read_current_file", "replace_current_file"],
   );
   assert.equal(streamRequests.length, 1);
   assert.equal(
@@ -7655,7 +8204,9 @@ test("revision approval follow-up inherits prior assistant edit intent", async (
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const executedCalls: ModelToolCall[] = [];
-  const receipts: Array<Record<string, unknown>> = [];
+  const receipts: AgentRunReceipt[] = [];
+  const approvals: ApprovalRequest[] = [];
+  const broker = new ApprovalBroker();
   const prompt = "Go ahead and revise";
   const original = "# Essay\n\nThin original paragraph.\n";
   const vault = createRunnerVaultContext({
@@ -7689,9 +8240,14 @@ test("revision approval follow-up inherits prior assistant edit intent", async (
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
+    approvalBroker: broker,
     events: {
-      onReceipt: (receipt) =>
-        receipts.push(receipt.output as Record<string, unknown>),
+      onApprovalRequest: (request) => {
+        approvals.push(request);
+        assert.equal(vault.content.get("Current.md"), original);
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
     },
   });
 
@@ -7709,9 +8265,12 @@ test("revision approval follow-up inherits prior assistant edit intent", async (
   );
   assert.deepEqual(
     executedCalls.map((call) => call.name),
-    ["read_current_file"],
+    ["read_current_file", "replace_current_file"],
   );
   assert.equal(streamRequests.length, 1);
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].toolName, "replace_current_file");
+  assert.match(approvals[0].preparedAction?.preview.summary ?? "", /Replace Current\.md/);
   assert.equal(
     vault.content.get("Current.md"),
     "# Essay\n\nExpanded follow-up revision with additional detail.",
@@ -7719,6 +8278,60 @@ test("revision approval follow-up inherits prior assistant edit intent", async (
   assert.equal(vault.content.get(".agent-backups/322-Current.md"), original);
   assert.equal(receipts[0].operation, "replace");
   assert.equal(receipts[0].backupPath, ".agent-backups/322-Current.md");
+});
+
+test("denied streamed replacement approval preserves exact note bytes and creates no backup", async () => {
+  const prompt = "Replace this note with a clean project brief.";
+  const original = "# Original\n\nDo not change before exact approval.\n";
+  const executedCalls: ModelToolCall[] = [];
+  const approvals: ApprovalRequest[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: original,
+    now: new Date(323),
+  });
+  const client = createClient({
+    chatRequests: [],
+    streamRequests: [],
+    chatResponders: [() => responseWithContent("Ready to replace.")],
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# Clean Project Brief\n\nReplacement project brief body.\n",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        approvals.push(request);
+        assert.equal(vault.content.get("Current.md"), original);
+        assert.equal(vault.content.has(".agent-backups/323-Current.md"), false);
+        broker.resolve(request.id, "denied");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].toolName, "replace_current_file");
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["read_current_file"],
+  );
+  assert.equal(vault.content.get("Current.md"), original);
+  assert.equal(vault.content.has(".agent-backups/323-Current.md"), false);
+  assert.equal(vault.operations.includes("modify:Current.md"), false);
+  assert.deepEqual(receipts, []);
 });
 
 test("section edit writeback prepares heading and preserves surrounding content", async () => {
@@ -7806,7 +8419,7 @@ test("section edit writeback prepares heading and preserves surrounding content"
   assert.equal(receipts[0].heading, "Goals");
 });
 
-test("interrupted streamed replace emits a partial receipt and keeps backup", async () => {
+test("interrupted replacement candidate stream preserves the current note before approval", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const receipts: Array<Record<string, unknown>> = [];
@@ -7845,16 +8458,10 @@ test("interrupted streamed replace emits a partial receipt and keeps backup", as
   );
 
   assert.equal(streamRequests.length, 1);
-  assert.equal(vault.content.get(".agent-backups/987-Current.md"), "Original note");
-  assert.equal(vault.content.get("Current.md"), "# Partial brief");
-  assert.ok(
-    vault.operations.indexOf("create:.agent-backups/987-Current.md") <
-      vault.operations.indexOf("modify:Current.md"),
-  );
-  assert.equal(receipts.length, 1);
-  assert.equal(receipts[0].streamed, true);
-  assert.equal(receipts[0].partial, true);
-  assert.equal(receipts[0].backupPath, ".agent-backups/987-Current.md");
+  assert.equal(vault.content.has(".agent-backups/987-Current.md"), false);
+  assert.equal(vault.content.get("Current.md"), "Original note");
+  assert.equal(vault.operations.includes("modify:Current.md"), false);
+  assert.deepEqual(receipts, []);
 });
 
 test("interrupted streamed replace before content preserves the current note", async () => {
@@ -7895,7 +8502,7 @@ test("interrupted streamed replace before content preserves the current note", a
   );
 
   assert.equal(streamRequests.length, 1);
-  assert.equal(vault.content.get(".agent-backups/988-Current.md"), "Original note");
+  assert.equal(vault.content.has(".agent-backups/988-Current.md"), false);
   assert.equal(vault.content.get("Current.md"), "Original note");
   assert.equal(vault.operations.includes("modify:Current.md"), false);
   assert.deepEqual(receipts, []);
@@ -8063,6 +8670,50 @@ function createReflexSemanticEmbeddingProvider(): SemanticEmbeddingProvider {
         documents: request.documents.map(classify),
         queries: request.queries.map(classify),
       };
+    },
+  };
+}
+
+function githubRunnerFixtureTool(
+  name: string,
+  executedCalls: ModelToolCall[] = [],
+): AgentTool {
+  return {
+    name,
+    description: `Test-only bounded GitHub catalog fixture for ${name}.`,
+    parameters: {
+      type: "object",
+      properties: {
+        profileKey: { type: "string" },
+        number: { type: "integer" },
+        reference: { type: "string" },
+      },
+      required: ["profileKey"],
+      additionalProperties: false,
+    },
+    descriptor: {
+      version: 1,
+      name,
+      capability: { system: "github", resourceType: "fixture", action: "read" },
+      effect: "read",
+      risk: "low",
+      approval: {
+        allowPromptGrant: true,
+        allowPersistentGrant: false,
+        fallback: "none",
+      },
+      execution: { preparation: "none", cacheable: false, parallelSafe: false },
+      durability: {
+        journal: false,
+        receipt: false,
+        readback: "none",
+        reconciliation: "none",
+      },
+      allowedPrincipals: ["single_agent"],
+    },
+    async execute(args) {
+      executedCalls.push({ id: `${name}-fixture`, name, arguments: args });
+      return { source: "github_provider_untrusted", authority: false, ok: true };
     },
   };
 }
@@ -8555,7 +9206,49 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "read_design_canvas",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "update_design_canvas",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "create_svg_design",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "read_svg_design",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "update_svg_design",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "read_mermaid_block",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "upsert_mermaid_block",
           parameters: { type: "object", properties: {} },
         },
       },
@@ -8947,12 +9640,82 @@ function createRegistry(
                     edges: [{ id: "edge" }],
                   },
                 }
+            : call.name === "read_design_canvas"
+              ? {
+                  path: call.arguments.path,
+                  sha256: `sha256:${"a".repeat(64)}`,
+                  bytes: 256,
+                  nodeCount: 2,
+                  edgeCount: 1,
+                  canvas: {
+                    nodes: [
+                      { id: "canvas-title", type: "text", text: "Original" },
+                      { id: "sentinel", type: "text", text: "Preserve me" },
+                    ],
+                    edges: [{ id: "edge" }],
+                  },
+                }
+            : call.name === "update_design_canvas"
+              ? {
+                  path: call.arguments.path,
+                  operation: "update",
+                  beforeSha256: call.arguments.baseHash,
+                  afterSha256: `sha256:${"b".repeat(64)}`,
+                  backupPath: ".agent-backups/1-Product Flow.canvas",
+                  backupSha256: call.arguments.baseHash,
+                  changedNodeIds: ["canvas-title"],
+                  changedEdgeIds: [],
+                  preservedNodeIds: ["sentinel"],
+                  preservedEdgeIds: ["edge"],
+                  rollbackStatus: "not_needed",
+                }
             : call.name === "create_svg_design"
               ? {
                   path: "Designs/settings-wireframe.svg",
                   operation: "create",
                   shapeCount: 3,
                   svg: "<svg><rect/><text>Settings</text></svg>",
+                }
+            : call.name === "read_svg_design"
+              ? {
+                  path: call.arguments.path,
+                  operation: "read",
+                  sha256: `sha256:${"c".repeat(64)}`,
+                  bytes: 180,
+                  elementCount: 3,
+                  stableIds: ["root", "title", "sentinel"],
+                }
+            : call.name === "update_svg_design"
+              ? {
+                  path: call.arguments.path,
+                  operation: "update",
+                  beforeSha256: call.arguments.baseHash,
+                  afterSha256: `sha256:${"d".repeat(64)}`,
+                  backupPath: ".agent-backups/diagrams/Settings.svg",
+                  backupSha256: call.arguments.baseHash,
+                  rollbackStatus: "not_required",
+                }
+            : call.name === "read_mermaid_block"
+              ? {
+                  path: call.arguments.path,
+                  operation: "read",
+                  sha256: `sha256:${"e".repeat(64)}`,
+                  bytes: 220,
+                  selector: call.arguments.selector,
+                  matched: true,
+                  mermaid: "flowchart LR\n  A --> B",
+                  metadata: { heading: "Architecture" },
+                }
+            : call.name === "upsert_mermaid_block"
+              ? {
+                  path: call.arguments.path,
+                  operation: "update",
+                  beforeSha256: call.arguments.baseHash,
+                  afterSha256: `sha256:${"f".repeat(64)}`,
+                  backupPath: ".agent-backups/diagrams/System.md",
+                  backupSha256: call.arguments.baseHash,
+                  selector: call.arguments.selector,
+                  rollbackStatus: "not_required",
                 }
               : { value: call.name, args: call.arguments },
       };
@@ -8987,6 +9750,84 @@ function responseWithToolCalls(
       toolCalls: calls,
     },
     toolCalls: calls,
+  };
+}
+
+function backgroundCodeValidationDescriptor(): ToolDescriptor {
+  return {
+    version: 1,
+    name: "code_validate_commit_prepared",
+    capability: {
+      system: "git",
+      resourceType: "prepared_validation_commit",
+      action: "commit",
+    },
+    effect: "execution",
+    risk: "high",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: false,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "required",
+      desktopOnly: true,
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "required",
+    },
+    allowedPrincipals: ["host", "single_agent", "lead", "code_worker"],
+    receiptKind: "code_change",
+  };
+}
+
+function testFingerprint(character: string): string {
+  return `sha256:${character.repeat(64).slice(0, 64)}`;
+}
+
+function companionRemoteJobFromPrepared(
+  job: CompanionJobV1,
+): CompanionRemoteJobV1 {
+  return {
+    id: job.id,
+    missionId: job.missionId,
+    nodeId: job.nodeId,
+    executionHost: job.domain,
+    state: "queued",
+    payload: {
+      version: job.version,
+      graphRevision: job.graphRevision,
+      executionHost: job.executionHost,
+      objective: job.objective,
+      inputs: job.inputs,
+      allowedTools: job.allowedTools,
+      requiredCapabilities: job.requiredCapabilities,
+      bindings: job.bindings,
+      authorization: job.authorization,
+      preparedExternalActionHandoff:
+        job.preparedExternalActionHandoff ?? null,
+      preparedBackgroundCodeAction:
+        job.preparedBackgroundCodeAction ?? null,
+      preparedBackgroundCodePackage:
+        job.preparedBackgroundCodePackage ?? null,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    } as never,
+    capabilityEnvelope: {
+      fingerprint: job.capabilityEnvelopeFingerprint,
+      authorizationFingerprint: job.authorization.fingerprint,
+    },
+    idempotencyKey: job.idempotencyKey,
+    ownerCoordinatorId: null,
+    leaseExpiresAt: null,
+    attempts: 0,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
   };
 }
 
@@ -9070,6 +9911,268 @@ function createCodeToolsRegistry(
         output: { ok: true, toolName: call.name },
       };
     },
+  };
+}
+
+test("repository read intent exposes only workspace read capabilities", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const prompt = "Inspect repository: C:/trusted/project and summarize the codebase.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-12T12:00:00.000Z"),
+  });
+  const registry = createCodeV2RoutingRegistry();
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("Repository inspection is pending.")],
+    }),
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 1,
+  });
+
+  const names = new Set(
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [],
+  );
+  assert.ok(names.has("code_workspace_create"));
+  assert.ok(names.has("code_workspace_list"));
+  assert.ok(names.has("code_workspace_read"));
+  assert.equal(names.has("code_workspace_patch"), false);
+  assert.equal(names.has("code_validate_full"), false);
+  assert.equal(names.has("code_commit_verified"), false);
+});
+
+test("repository implementation intent plans sandbox validation and verified commit tools", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const prompt = "Fix the bug in repository: C:/trusted/project, validate it, and commit the verified change.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-12T12:05:00.000Z"),
+  });
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("Implementation is pending.")],
+    }),
+    toolRegistry: createCodeV2RoutingRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 1,
+  });
+
+  const names = new Set(
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [],
+  );
+  for (const required of [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_patch",
+    "code_validate_fast",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_repair_record_cycle",
+    "code_commit_verified",
+  ]) {
+    assert.ok(names.has(required), `missing ${required}`);
+  }
+  assert.equal(names.has("install_code_dependency"), false);
+});
+
+test("explicit scratch workspace workflow stays out of note-output routing", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const prompt = [
+    "Create the isolated scratch workspace phase4-crud.",
+    "Use exactly code_workspace_create, code_workspace_mkdir, and code_workspace_create_file.",
+    "Create src/durable-value.txt containing before:phase4 and report receipts.",
+  ].join(" ");
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-12T12:10:00.000Z"),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("Workspace execution is pending.")],
+    }),
+    toolRegistry: createCodeV2RoutingRegistry(),
+    toolContext: {
+      ...vault.context,
+      settings: { ...vault.context.settings, maxAgentSteps: 40 },
+    },
+    enableStreaming: false,
+    maxSteps: 1,
+    events: { onRunConfig: (event) => configs.push(event) },
+  });
+
+  assert.equal(configs[0]?.missionMode, "explicit_file_mutation");
+  assert.equal(configs[0]?.writebackMode, "tool_write");
+  assert.equal(configs[0]?.route, "grounded_workflow");
+  assert.ok((configs[0]?.maxStepsForRun ?? 0) >= 8);
+  assert.equal(configs[0]?.allowedToolNames.includes("append_to_current_file"), false);
+  for (const required of [
+    "code_workspace_create",
+    "code_workspace_mkdir",
+    "code_workspace_create_file",
+  ]) {
+    assert.ok(configs[0]?.allowedToolNames.includes(required), `missing ${required}`);
+  }
+});
+
+test("explicit workspace lifecycle keeps its leading read in the mission graph", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const prompt = [
+    "Operate on the durable workspace phase4-crud as a new mission.",
+    "Use code_workspace_read, code_workspace_write_expected, code_workspace_move,",
+    "code_workspace_trash, code_workspace_restore, then code_workspace_read.",
+    "Replace src/value.txt, move it, trash it, restore it, and verify final bytes.",
+  ].join(" ");
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-12T12:15:00.000Z"),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("Workspace lifecycle is pending.")],
+    }),
+    toolRegistry: createCodeV2RoutingRegistry(),
+    toolContext: {
+      ...vault.context,
+      settings: { ...vault.context.settings, maxAgentSteps: 40 },
+    },
+    enableStreaming: false,
+    maxSteps: 1,
+    events: { onRunConfig: (event) => configs.push(event) },
+  });
+
+  assert.equal(configs[0]?.missionMode, "explicit_file_mutation");
+  assert.equal(configs[0]?.allowedToolNames.includes("delete_path"), false);
+  const firstTools = new Set(
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [],
+  );
+  assert.ok(firstTools.has("code_workspace_read"));
+  assert.ok(firstTools.has("code_workspace_write_expected"));
+  assert.ok(firstTools.has("code_workspace_restore"));
+  assert.equal(firstTools.has("web_search"), false);
+  assert.equal(firstTools.has("web_fetch"), false);
+  assert.equal(firstTools.has("code_sandbox_status"), false);
+  assert.equal(firstTools.has("code_workspace_create"), false);
+  assert.equal(firstTools.has("code_commit_verified"), false);
+  assert.equal(configs[0]?.allowedToolNames.includes("web_search"), false);
+});
+
+function createCodeV2RoutingRegistry(): ToolRegistry {
+  const readNames = new Set([
+    "code_workspace_status",
+    "code_workspace_stat",
+    "code_workspace_list",
+    "code_workspace_read",
+    "code_workspace_search",
+    "code_repository_detect_profile",
+    "code_sandbox_status",
+    "code_repair_status",
+  ]);
+  const names = [
+    "code_workspace_create",
+    ...readNames,
+    "code_workspace_mkdir",
+    "code_workspace_create_file",
+    "code_workspace_append",
+    "code_workspace_write_expected",
+    "code_workspace_patch",
+    "code_workspace_move",
+    "code_workspace_copy",
+    "code_workspace_trash",
+    "code_workspace_restore",
+    "code_validate_fast",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_repair_record_cycle",
+    "code_commit_verified",
+    "install_code_dependency",
+  ];
+  const descriptors = new Map<string, ToolDescriptor>(
+    names.map((name) => {
+      const read = readNames.has(name);
+      const action = name.startsWith("code_validate_")
+        ? "validate"
+        : name === "code_commit_verified"
+          ? "commit"
+          : name === "install_code_dependency"
+            ? "install"
+            : name === "code_workspace_trash"
+              ? "trash"
+              : read
+                ? "read"
+                : "update";
+      return [
+        name,
+        {
+          version: 1,
+          name,
+          capability: {
+            system: name === "code_commit_verified" ? "git" : "workspace",
+            resourceType: "code_workspace",
+            action,
+          },
+          effect: read
+            ? "read"
+            : name.startsWith("code_validate_") ||
+                name === "code_commit_verified" ||
+                name === "install_code_dependency"
+              ? "execution"
+              : name === "code_workspace_trash"
+                ? "destructive_mutation"
+                : "reversible_mutation",
+          risk: read ? "low" : "high",
+          approval: {
+            allowPromptGrant: true,
+            allowPersistentGrant: read,
+            fallback: read ? "none" : "exact",
+          },
+          execution: {
+            preparation: read ? "none" : "required",
+            desktopOnly: true,
+            cacheable: read,
+            parallelSafe: read,
+          },
+          durability: {
+            journal: !read,
+            receipt: !read,
+            readback: read ? "none" : "required",
+            reconciliation: read ? "none" : "required",
+          },
+          allowedPrincipals: ["host", "single_agent", "lead"],
+          ...(read ? {} : { receiptKind: "code_change" as const }),
+        },
+      ];
+    }),
+  );
+  return {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: {
+          name,
+          parameters: { type: "object" as const, properties: {} },
+        },
+      })),
+    getDescriptor: (name) => descriptors.get(name) ?? null,
+    execute: async (call) => ({
+      ok: true,
+      toolName: call.name,
+      output: { status: "ok" },
+    }),
   };
 }
 
@@ -9477,12 +10580,429 @@ test("policy engine requires approval before install_code_dependency executes", 
   }
 });
 
+test("composite tools route nested exact approval through the real broker and UI events", async () => {
+  const prompt = "Publish this accepted research report to Linear.";
+  const broker = new ApprovalBroker();
+  const approvalRequests: ApprovalRequest[] = [];
+  const approvalDecisions: string[] = [];
+  const nestedDecisions: unknown[] = [];
+  const chatRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const vault = createRunnerVaultContext({ prompt, content: "# Research\n" });
+  vault.context.settings.linearEnabled = true;
+  const carrier = await withPreparedActionFingerprint({
+    version: 1 as const,
+    id: "research-publication-preview-1",
+    runId: "nested-approval-run",
+    toolCallId: "nested-call-1",
+    toolName: "publish_research_to_linear",
+    target: { system: "linear" as const, resourceType: "issue", id: "pending-issue" },
+    relatedResources: [],
+    normalizedArgs: {},
+    preview: {
+      summary: "Create Linear issue: Accepted research",
+      destination: "Linear team=team-1 project=project-1",
+      outboundPayload: { title: "Accepted research" },
+      warnings: [],
+      outboundBytes: 100,
+    },
+    preparedAt: "2026-07-12T20:00:00.000Z",
+    expiresAt: "2026-07-12T20:05:00.000Z",
+  });
+  const tool: AgentTool = {
+    name: "publish_research_to_linear",
+    description: "Test nested publication approval.",
+    parameters: { type: "object", additionalProperties: false },
+    descriptor: {
+      version: 1,
+      name: "publish_research_to_linear",
+      capability: { system: "linear", resourceType: "issue", action: "publish" },
+      effect: "publish",
+      risk: "high",
+      approval: { allowPromptGrant: false, allowPersistentGrant: false, fallback: "exact" },
+      execution: { preparation: "none", cacheable: false, parallelSafe: false },
+      durability: { journal: true, receipt: true, readback: "required", reconciliation: "required" },
+      allowedPrincipals: ["single_agent"],
+      receiptKind: "external_action",
+    },
+    execute: async (_args, context) => {
+      assert.ok(context.requestNestedApproval);
+      const decision = await context.requestNestedApproval!({
+        toolName: "publish_research_to_linear",
+        action: "Create exact Linear issue",
+        reason: "Approve exact research publication preview.",
+        policyTags: ["linear_research_publication", "exact_preview"],
+        preparedAction: carrier,
+      });
+      nestedDecisions.push(decision);
+      return { status: decision.approved ? "complete" : "denied" };
+    },
+  };
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () => responseWithToolCall("publish_research_to_linear", {}),
+      () => responseWithContent("Published the accepted research to Linear."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    runId: "nested-approval-run",
+    modelClient: client,
+    toolRegistry: new DefaultToolRegistry([tool]),
+    toolContext: vault.context,
+    enableStreaming: false,
+    approvalBroker: broker,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onApprovalRequest: (request) => {
+        approvalRequests.push(request);
+        broker.resolve(request.id, "approved");
+      },
+      onApprovalResolved: ({ decision }) => {
+        approvalDecisions.push(decision);
+      },
+    },
+  });
+
+  assert.equal(
+    approvalRequests.length,
+    1,
+    `tools=${chatRequests[0]?.tools?.map((item) => item.function.name).join(",")}; statuses=${statuses.join(" | ")}`,
+  );
+  assert.equal(approvalRequests[0].preparedAction?.preview.outboundPayload?.title, "Accepted research");
+  assert.equal(approvalRequests[0].payloadFingerprint, carrier.payloadFingerprint);
+  assert.deepEqual(approvalDecisions, ["approved"]);
+  assert.deepEqual(nestedDecisions, [{
+    approved: true,
+    approvalId: approvalRequests[0].id,
+    approvalFingerprint: carrier.payloadFingerprint,
+  }]);
+});
+
+test("composite GitHub merge routes two distinct nested approvals through the real broker", async () => {
+  const prompt = "Merge the verified GitHub pull request after fresh checks pass.";
+  const broker = new ApprovalBroker();
+  const approvalRequests: ApprovalRequest[] = [];
+  const vault = createRunnerVaultContext({ prompt, content: "# Code publication\n" });
+  vault.context.settings.githubEnabled = true;
+  const carrier = await withPreparedActionFingerprint({
+    version: 1 as const,
+    id: "github-merge-preview-1",
+    runId: "nested-github-merge-run",
+    toolCallId: "nested-github-merge-call",
+    toolName: "publish_verified_code_to_github",
+    target: {
+      system: "github" as const,
+      resourceType: "pull_request",
+      id: "acme/research-agent#12",
+    },
+    relatedResources: [],
+    normalizedArgs: { action: "merge", profileKey: "fixture" },
+    preview: {
+      summary: "Merge pull request #12 at the verified head",
+      destination: "GitHub acme/research-agent PR #12",
+      outboundPayload: {
+        pullRequestNumber: 12,
+        sha: "b".repeat(40),
+        mergeMethod: "squash",
+      },
+      warnings: ["Any head or check drift invalidates approval."],
+      outboundBytes: 100,
+    },
+    preparedAt: "2026-07-13T20:00:00.000Z",
+    expiresAt: "2026-07-13T20:05:00.000Z",
+    requiredConfirmations: 2,
+  });
+  const descriptor: ToolDescriptor = {
+    version: 1,
+    name: "publish_verified_code_to_github",
+    capability: {
+      system: "github",
+      resourceType: "pull_request",
+      action: "merge",
+    },
+    effect: "publish",
+    risk: "critical",
+    approval: {
+      allowPromptGrant: false,
+      allowPersistentGrant: false,
+      fallback: "double_exact",
+    },
+    execution: { preparation: "none", cacheable: false, parallelSafe: false },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "required",
+    },
+    allowedPrincipals: ["single_agent"],
+    receiptKind: "external_action",
+  };
+  const tool: AgentTool = {
+    name: descriptor.name,
+    description: "Test composite double-exact GitHub merge approval.",
+    parameters: { type: "object", additionalProperties: false },
+    descriptor,
+    execute: async (_args, context) => {
+      assert.ok(context.requestNestedApproval);
+      for (const confirmationIndex of [1, 2] as const) {
+        const decision = await context.requestNestedApproval!({
+          toolName: descriptor.name,
+          action: carrier.preview.summary,
+          reason: "Approve the exact fresh PR head and check snapshot.",
+          policyTags: ["github_publication", "merge", "double_exact"],
+          preparedAction: carrier,
+          confirmationIndex,
+          requiredConfirmations: 2,
+        });
+        assert.equal(decision.approved, true);
+      }
+      return { status: "complete" };
+    },
+  };
+  await runAgentMission({
+    prompt,
+    runId: "nested-github-merge-run",
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [
+        () => responseWithToolCall(descriptor.name, {}),
+        () => responseWithContent("The exact GitHub merge was approved."),
+      ],
+    }),
+    toolRegistry: new DefaultToolRegistry([tool]),
+    toolContext: vault.context,
+    enableStreaming: false,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        approvalRequests.push(request);
+        broker.resolve(request.id, "approved");
+      },
+    },
+  });
+
+  assert.deepEqual(
+    approvalRequests.map((request) => request.confirmationIndex),
+    [1, 2],
+  );
+  assert.equal(
+    new Set(approvalRequests.map((request) => request.id)).size,
+    2,
+  );
+  assert.equal(
+    approvalRequests.every(
+      (request) =>
+        request.requiredConfirmations === 2 &&
+        request.payloadFingerprint === carrier.payloadFingerprint,
+    ),
+    true,
+  );
+});
+
+test("explicit verified-code GitHub publication intent exposes and requires the bounded publication tool", async () => {
+  const prompt =
+    "Push the latest verified local commit for profile trusted-repository to GitHub and open a draft PR.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const publicationToolName = "publish_verified_code_to_github";
+  const publicationTool: AgentTool = {
+    name: publicationToolName,
+    description: "Test-only host-resolved verified code publication bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["publish_draft"] },
+        profileKey: { type: "string" },
+      },
+      required: ["action", "profileKey"],
+      additionalProperties: false,
+    },
+    descriptor: {
+      version: 1,
+      name: publicationToolName,
+      capability: { system: "github", resourceType: "pull_request", action: "read" },
+      effect: "read",
+      risk: "low",
+      approval: {
+        allowPromptGrant: true,
+        allowPersistentGrant: false,
+        fallback: "none",
+      },
+      execution: { preparation: "none", cacheable: false, parallelSafe: false },
+      durability: {
+        journal: false,
+        receipt: false,
+        readback: "none",
+        reconciliation: "none",
+      },
+      allowedPrincipals: ["single_agent"],
+    },
+    execute: async (args) => {
+      executedCalls.push({ id: "github-publication-fixture", name: publicationToolName, arguments: args });
+      return { status: "draft_pr_verified" };
+    },
+  };
+  const registry = createDefaultToolRegistry({
+    githubPublicationTool: publicationTool,
+    optionalCapabilities: { code: false, integrations: true, companion: false },
+    isOptionalCapabilityAvailable: (capability) => capability === "integrations",
+    legacyCompatibility: { code: false, companion: false },
+  });
+  const vault = createRunnerVaultContext({ prompt });
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithContent("The draft pull request is ready."),
+        () =>
+          responseWithToolCall(publicationToolName, {
+            action: "publish_draft",
+            profileKey: "trusted-repository",
+          }),
+        () => responseWithContent("The verified commit was published as a draft pull request."),
+      ],
+    }),
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+  });
+
+  const firstToolNames =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(firstToolNames.includes(publicationToolName));
+  assert.match(
+    chatRequests[1]?.messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: publish_verified_code_to_github/u,
+  );
+  assert.deepEqual(executedCalls.map((call) => call.name), [publicationToolName]);
+});
+
+test("ordinary GitHub read prompts do not expose the verified-code publication tool", async () => {
+  const prompt = "Read the GitHub pull request status and summarize the checks without changing anything.";
+  const chatRequests: ModelChatRequest[] = [];
+  const publicationTool: AgentTool = {
+    name: "publish_verified_code_to_github",
+    description: "Test-only publication bridge.",
+    parameters: { type: "object", additionalProperties: false },
+    descriptor: {
+      version: 1,
+      name: "publish_verified_code_to_github",
+      capability: { system: "github", resourceType: "pull_request", action: "publish" },
+      effect: "publish",
+      risk: "critical",
+      approval: {
+        allowPromptGrant: false,
+        allowPersistentGrant: false,
+        fallback: "exact",
+      },
+      execution: { preparation: "required", cacheable: false, parallelSafe: false },
+      durability: {
+        journal: true,
+        receipt: true,
+        readback: "required",
+        reconciliation: "required",
+      },
+      allowedPrincipals: ["single_agent"],
+      receiptKind: "external_action",
+    },
+    execute: async () => {
+      assert.fail("ordinary GitHub reads must not execute the publication tool");
+    },
+  };
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.githubEnabled = true;
+  const catalogReads: AgentTool[] = [
+    githubRunnerFixtureTool("github_get_pull_request"),
+    githubRunnerFixtureTool("github_list_check_runs"),
+    githubRunnerFixtureTool("github_get_combined_status"),
+    githubRunnerFixtureTool("github_get_issue"),
+  ];
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("No GitHub mutation was requested.")],
+    }),
+    toolRegistry: createDefaultToolRegistry({
+      githubPublicationTool: publicationTool,
+      githubCatalogTools: catalogReads,
+      optionalCapabilities: { code: false, integrations: true, companion: false },
+      isOptionalCapabilityAvailable: (capability) => capability === "integrations",
+      legacyCompatibility: { code: false, companion: false },
+    }),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 1,
+  });
+
+  const firstToolNames =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.equal(firstToolNames.includes("publish_verified_code_to_github"), false);
+  assert.deepEqual(
+    firstToolNames.filter((name) => name.startsWith("github_")),
+    [
+      "github_get_pull_request",
+      "github_list_check_runs",
+      "github_get_combined_status",
+    ],
+  );
+});
+
+test("explicit GitHub issue mutation exposes and requires only the requested catalog mutation", async () => {
+  const prompt = "Close GitHub issue 12 in repository profile trusted-repository.";
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const closeTool = githubRunnerFixtureTool("github_close_issue", executedCalls);
+  const unrelatedTool = githubRunnerFixtureTool("github_create_issue", executedCalls);
+  const readTool = githubRunnerFixtureTool("github_get_issue", executedCalls);
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.githubEnabled = true;
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithContent("The issue is closed."),
+        () => responseWithToolCall("github_close_issue", {
+          profileKey: "trusted-repository",
+          number: 12,
+        }),
+        () => responseWithContent("Closed GitHub issue 12."),
+      ],
+    }),
+    toolRegistry: createDefaultToolRegistry({
+      githubCatalogTools: [closeTool, unrelatedTool, readTool],
+      optionalCapabilities: { code: false, integrations: true, companion: false },
+      isOptionalCapabilityAvailable: (capability) => capability === "integrations",
+      legacyCompatibility: { code: false, companion: false },
+    }),
+    toolContext: vault.context,
+    enableStreaming: false,
+  });
+
+  const firstToolNames = chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.deepEqual(firstToolNames.filter((name) => name.startsWith("github_")), ["github_close_issue"]);
+  assert.match(
+    chatRequests[1]?.messages.at(-1)?.content ?? "",
+    /Request one of these allowed write tools now: github_close_issue/u,
+  );
+  assert.deepEqual(executedCalls.map((call) => call.name), ["github_close_issue"]);
+});
+
 test("policy engine approval allows install_code_dependency with granted context", async () => {
   __setCodeToolsDesktopAppForTests(true);
   try {
     const chatRequests: ModelChatRequest[] = [];
     const executedCalls: ModelToolCall[] = [];
     const executedContexts: ToolExecutionContext[] = [];
+    const statuses: string[] = [];
     const broker = new ApprovalBroker();
     let requestCheckpointPersisted = false;
     let resolutionCheckpointPersisted = false;
@@ -9524,6 +11044,7 @@ test("policy engine approval allows install_code_dependency with granted context
       enableStreaming: false,
       approvalBroker: broker,
       events: {
+        onStatus: (message) => statuses.push(message),
         onApprovalRequest: async (request) => {
           await Promise.resolve();
           requestCheckpointPersisted = true;
@@ -9540,7 +11061,10 @@ test("policy engine approval allows install_code_dependency with granted context
     const installIndex = executedCalls.findIndex(
       (call) => call.name === "install_code_dependency",
     );
-    assert.ok(installIndex >= 0, "approved install must execute");
+    assert.ok(
+      installIndex >= 0,
+      `approved install must execute; offered=${chatRequests[0]?.tools?.map((tool) => tool.function.name).join(",") ?? "none"}; ${statuses.join(" | ")}`,
+    );
     assert.equal(
       executedContexts[installIndex]?.userApprovalGranted,
       true,
@@ -9718,6 +11242,34 @@ test("required prepared actions bind double approval before one external executi
   assert.equal(receipts[0]?.resource?.system, "linear");
   assert.equal(receipts[0]?.path, undefined);
   assert.match(receipts[0]?.grantId ?? "", /^grant:approval-/);
+  const graphMarkdown = [...vault.content.entries()].find(([path]) =>
+    path.startsWith("Agent Runs/Mission Graphs/"),
+  )?.[1];
+  assert.ok(graphMarkdown, "canonical mission graph should be persisted");
+  const graphRecord = await parseMissionGraphStoreRecordFromMarkdown(graphMarkdown);
+  assert.ok(graphRecord);
+  const graphStatusOperations = graphRecord.journal.flatMap(
+    (entry) => entry.patch.operations,
+  );
+  assert.equal(
+    graphStatusOperations.filter(
+      (operation) =>
+        operation.op === "set_status" &&
+        operation.status === "waiting_approval",
+    ).length,
+    2,
+    "each exact confirmation must be persisted before its approval UI opens",
+  );
+  assert.equal(
+    graphStatusOperations.filter(
+      (operation) =>
+        operation.op === "set_status" &&
+        operation.expectedStatus === "waiting_approval" &&
+        operation.status === "running",
+    ).length,
+    2,
+    "approved confirmations must durably resume the same prepared execution",
+  );
   const runtimeSnapshot = [...vault.content.values()]
     .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
     .find((snapshot) => snapshot?.operationJournal.some(
@@ -9734,6 +11286,850 @@ test("required prepared actions bind double approval before one external executi
   );
   assert.match(actionRecord?.authorization?.grantId ?? "", /^grant:approval-/);
   assert.equal(actionRecord?.receipt?.resource?.system, "linear");
+});
+
+test("background Linear submission short-circuits foreground prepared execution", async () => {
+  const prompt =
+    "Continue in the background while Obsidian is closed: update Linear issue issue-42 to state state-done.";
+  const runId = "background-linear-short-circuit-1";
+  const now = new Date("2026-07-13T12:00:00.000Z");
+  const vault = createRunnerVaultContext({ prompt, now });
+  vault.context.settings.linearEnabled = true;
+  vault.context.settings.modelRouterMode = "off";
+  const descriptor: ToolDescriptor = {
+    version: 1,
+    name: "linear_update_issue",
+    capability: { system: "linear", resourceType: "issue", action: "update" },
+    effect: "reversible_mutation",
+    risk: "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: true,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "required",
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "required",
+    },
+    allowedPrincipals: ["single_agent", "lead", "researcher"],
+    receiptKind: "external_action",
+  };
+  let legacyExecutions = 0;
+  let preparedExecutions = 0;
+  let submissions = 0;
+  let beforeSubmitCalls = 0;
+  const submittedJobs: string[] = [];
+  const tool: AgentTool = {
+    name: descriptor.name,
+    description: "Update one exact Linear issue.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        stateId: { type: "string" },
+      },
+      required: ["id", "stateId"],
+      additionalProperties: false,
+    },
+    descriptor,
+    execute: async () => {
+      legacyExecutions += 1;
+      return { bypassed: true };
+    },
+    prepare: async (_args, context) => ({
+      ok: true,
+      action: await withPreparedActionFingerprint({
+        version: 1,
+        id: "linear-action-background-42",
+        runId: context.runId!,
+        toolCallId: "linear-call-background-42",
+        toolName: descriptor.name,
+        target: {
+          system: "linear",
+          resourceType: "issue",
+          id: "issue-42",
+          identifier: "PLAT-42",
+          teamId: "team-platform",
+          projectId: "project-platform",
+        },
+        relatedResources: [
+          { system: "linear", resourceType: "state", id: "state-done" },
+        ],
+        normalizedArgs: {
+          operationKey: "issues.update",
+          readbackOperationKey: "issues.get",
+          mutationKind: "issue_update",
+          variables: { id: "issue-42", input: { stateId: "state-done" } },
+          preconditionHash: `sha256:${"a".repeat(64)}`,
+          expectedAbsent: false,
+          changedFields: ["stateId"],
+        },
+        preview: {
+          summary: "Move PLAT-42 to Done",
+          destination: "Linear issue PLAT-42",
+          before: { stateId: "state-started" },
+          after: { stateId: "state-done" },
+          outboundPayload: {
+            id: "issue-42",
+            input: { stateId: "state-done" },
+          },
+          warnings: [],
+          outboundBytes: 58,
+        },
+        expectedTargetRevision: `sha256:${"a".repeat(64)}`,
+        idempotencyKey: `${context.runId}:linear-state-update:issue-42`,
+        reconciliationKey: `${context.runId}:linear-state-update:issue-42`,
+        preparedAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
+      }),
+    }),
+    executePrepared: async () => {
+      preparedExecutions += 1;
+      throw new Error("Foreground executePrepared must be short-circuited.");
+    },
+  };
+  const backgroundContinuation: BackgroundMissionDispatchPortV1 = {
+    readCapabilities: async () => ({
+      configured: true,
+      backgroundEnabled: true,
+      installedDomains: ["linear"],
+      blocker: null,
+    }),
+    resolveCredentialReferenceId: async () => "credential_linear1234",
+    submitAuthorizedNode: async (input) => {
+      submissions += 1;
+      const prepared = await prepareCompanionJobV1({
+        graph: input.graph,
+        nodeId: input.nodeId,
+        authorization: input.authorization,
+        preparedExternalActionHandoff: input.preparedExternalActionHandoff,
+        now: input.now,
+      });
+      assert.equal(prepared.status, "ready");
+      if (prepared.status !== "ready") throw new Error("Job preparation failed.");
+      await input.beforeSubmit?.(prepared.job);
+      beforeSubmitCalls += 1;
+      submittedJobs.push(prepared.job.id);
+      return {
+        status: "submitted",
+        job: {
+          id: prepared.job.id,
+          missionId: prepared.job.missionId,
+          nodeId: prepared.job.nodeId,
+          executionHost: prepared.job.domain,
+          state: "queued",
+          payload: {
+            version: prepared.job.version,
+            graphRevision: prepared.job.graphRevision,
+            executionHost: prepared.job.executionHost,
+            objective: prepared.job.objective,
+            inputs: prepared.job.inputs,
+            allowedTools: prepared.job.allowedTools,
+            requiredCapabilities: prepared.job.requiredCapabilities,
+            bindings: prepared.job.bindings,
+            authorization: prepared.job.authorization,
+            preparedExternalActionHandoff:
+              prepared.job.preparedExternalActionHandoff ?? null,
+            createdAt: prepared.job.createdAt,
+            updatedAt: prepared.job.updatedAt,
+          } as never,
+          capabilityEnvelope: {
+            fingerprint: prepared.job.capabilityEnvelopeFingerprint,
+            authorizationFingerprint: prepared.job.authorization.fingerprint,
+          },
+          idempotencyKey: prepared.job.idempotencyKey,
+          ownerCoordinatorId: null,
+          leaseExpiresAt: null,
+          attempts: 0,
+          createdAt: prepared.job.createdAt,
+          updatedAt: prepared.job.updatedAt,
+        },
+      };
+    },
+  };
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () =>
+        responseWithToolCall(descriptor.name, {
+          id: "issue-42",
+          stateId: "state-done",
+        }),
+      () => responseWithContent("The approved background update is pending readback."),
+      () => responseWithContent("The approved background update is pending readback."),
+    ],
+  });
+  const broker = new ApprovalBroker();
+  const statuses: string[] = [];
+  let approvalRequests = 0;
+
+  await runAgentMission({
+    prompt,
+    runId,
+    modelClient: client,
+    toolRegistry: new DefaultToolRegistry([tool]),
+    toolContext: vault.context,
+    enableStreaming: false,
+    approvalBroker: broker,
+    backgroundContinuation,
+    maxSteps: 2,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onApprovalRequest: (request) => {
+        approvalRequests += 1;
+        broker.resolve(request.id, "approved");
+      },
+    },
+  });
+
+  assert.equal(approvalRequests, 1, statuses.join(" | "));
+  assert.equal(submissions, 1);
+  assert.equal(beforeSubmitCalls, 1);
+  assert.equal(submittedJobs.length, 1);
+  assert.equal(legacyExecutions, 0);
+  assert.equal(
+    preparedExecutions,
+    0,
+    "companion submission must short-circuit the foreground executePrepared path",
+  );
+  assert.equal(
+    statuses.some((message) => /mutation tool failed/iu.test(message)),
+    false,
+    statuses.join(" | "),
+  );
+  assert.equal(
+    statuses.some((message) => /reconciliation is pending/iu.test(message)),
+    true,
+    statuses.join(" | "),
+  );
+
+  const runtimeSnapshot = [...vault.content.values()]
+    .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
+    .find((snapshot) =>
+      snapshot?.operationJournal.some(
+        (record) => record.toolName === descriptor.name,
+      ),
+    );
+  const journal = runtimeSnapshot?.operationJournal.find(
+    (record) => record.toolName === descriptor.name,
+  );
+  assert.ok(journal);
+  assert.equal(journal.state, "applying");
+  assert.equal(journal.mutationMayHaveApplied, true);
+  assert.equal(journal.externalActionDispatchAttempt?.status, "job_submitted");
+  assert.equal(journal.externalActionDispatchAttempt?.jobId, submittedJobs[0]);
+  assert.equal(
+    journal.transitions.some(
+      (transition) =>
+        transition.state === "failed" || transition.state === "reconcile_required",
+    ),
+    false,
+  );
+  assert.equal(
+    buildOperationReconciliationInputs([journal])[0]?.recommendedAction,
+    "provider_reconcile",
+  );
+
+  const graphMarkdown = [...vault.content.entries()].find(([path]) =>
+    path.startsWith("Agent Runs/Mission Graphs/"),
+  )?.[1];
+  assert.ok(graphMarkdown);
+  const graphRecord = await parseMissionGraphStoreRecordFromMarkdown(graphMarkdown);
+  const graphNode = Object.values(graphRecord?.graph.nodes ?? {}).find(
+    (node) => node.allowedTools.includes(descriptor.name),
+  );
+  assert.ok(graphNode);
+  assert.equal(graphNode.executionHost, "headless_runtime");
+  assert.equal(graphNode.effect, "external_action");
+  assert.equal(graphNode.status, "running");
+});
+
+test("background Code sealing journals the exact package before POST and never executes in foreground", async (t) => {
+  __setCodeToolsDesktopAppForTests(true);
+  t.after(() => __setCodeToolsDesktopAppForTests(null));
+  const prompt =
+    "Invoke only code_validate_commit_prepared for repairCheckpointId code-checkpoint-1 and continue this exact prepared Code validation and local commit in the background while Obsidian is closed.";
+  const runId = "background-code-production-dispatch-1";
+  const now = new Date("2026-07-13T12:00:00.000Z");
+  const vault = createRunnerVaultContext({ prompt, now });
+  vault.context.settings.modelRouterMode = "off";
+  const descriptor = backgroundCodeValidationDescriptor();
+  let foregroundExecutions = 0;
+  let sealCalls = 0;
+  let postCalls = 0;
+  let approvalRequests = 0;
+  const submittedJobs: string[] = [];
+  const tool: AgentTool = {
+    name: descriptor.name,
+    description: "Seal one trusted prepared Code validation and commit package.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    descriptor,
+    execute: async () => {
+      foregroundExecutions += 1;
+      throw new Error("Legacy foreground execution must not run.");
+    },
+    prepare: async (_args, context) => ({
+      ok: true,
+      action: await withPreparedActionFingerprint({
+        version: 1,
+        id: "prepared-background-code-production-1",
+        runId: context.runId!,
+        toolCallId: "background-code-call-1",
+        toolName: descriptor.name,
+        target: {
+          system: "git",
+          resourceType: "prepared_validation_commit",
+          id: "workspace-background-code-production-1",
+          workspaceId: "workspace-background-code-production-1",
+          repositoryProfileId: "profile-1",
+        },
+        relatedResources: [],
+        normalizedArgs: {
+          repairCheckpointId: "code-checkpoint-1",
+          diffFingerprint: testFingerprint("1"),
+          fastValidationFingerprint: testFingerprint("2"),
+        },
+        preview: {
+          summary: "Validate the exact approved diff and create one local commit",
+          destination: "Trusted Code workspace",
+          before: { baseSha: "a".repeat(40) },
+          after: { diffFingerprint: testFingerprint("1") },
+          warnings: ["Sandbox-only execution."],
+          outboundBytes: 0,
+        },
+        idempotencyKey: `${context.runId}:background-code:checkpoint-1`,
+        reconciliationKey: `${context.runId}:background-code:checkpoint-1`,
+        preparedAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 10 * 60_000).toISOString(),
+      }),
+    }),
+    executePrepared: async () => {
+      foregroundExecutions += 1;
+      throw new Error("Foreground executePrepared must be short-circuited.");
+    },
+  };
+  const backgroundContinuation: BackgroundMissionDispatchPortV1 = {
+    readCapabilities: async () => ({
+      configured: true,
+      backgroundEnabled: true,
+      installedDomains: ["code"],
+      blocker: null,
+    }),
+    resolveMissionBindingOverrides: async (input) => {
+      assert.equal(input.objective, prompt);
+      assert.equal(input.toolNames.includes(descriptor.name), true);
+      return {
+        [descriptor.name]: {
+          id: "workspace-background-code-production-1",
+          kind: "prepared_validation_commit",
+          destinationFingerprint: testFingerprint("5"),
+          allowedEffects: ["read", "execution"],
+        },
+      };
+    },
+    sealBackgroundValidationCommitPackage: async (input) => {
+      sealCalls += 1;
+      assert.equal(input.preparedAction.toolName, descriptor.name);
+      assert.equal(
+        input.authority.actionFingerprint,
+        input.preparedAction.payloadFingerprint,
+      );
+      const node = input.graph.nodes[
+        Object.keys(input.graph.nodes).find(
+          (id) => input.graph.nodes[id].allowedTools[0] === descriptor.name,
+        )!
+      ];
+      assert.equal(node.status, "running");
+      const binding = input.graph.capabilityEnvelope.bindings[
+        node.destination!.bindingId
+      ];
+      assert.equal(binding.id, "workspace-background-code-production-1");
+      assert.equal(binding.destinationFingerprint, testFingerprint("5"));
+      const preparedAt = input.authority.consumedAt;
+      const handoff = createPreparedBackgroundCodeActionV1({
+        id: "background-code-handoff-production-1",
+        missionId: input.graph.missionId,
+        graphRevision: input.graph.revision,
+        capabilityEnvelopeFingerprint:
+          input.graph.capabilityEnvelope.fingerprint,
+        nodeId: node.id,
+        nodeFingerprint: testFingerprint("3"),
+        executionHost: "headless_runtime",
+        descriptorFingerprint: await sha256Fingerprint(descriptor),
+        preparedActionId: input.preparedAction.id,
+        preparedActionFingerprint: input.preparedAction.payloadFingerprint,
+        binding: {
+          workspaceId: binding.id,
+          repositoryProfileKey: "profile-1",
+          destinationFingerprint: binding.destinationFingerprint,
+        },
+        authority: input.authority,
+        payload: {
+          repairCheckpointId: "code-checkpoint-1",
+          repairRequestFingerprint: testFingerprint("4"),
+          preparedCheckpointSequence: 5,
+          workspaceBindingFingerprint: testFingerprint("5"),
+          repositoryProfileFingerprint: testFingerprint("6"),
+          sandboxCapabilityFingerprint: testFingerprint("7"),
+        },
+        idempotencyKey: `${runId}:background-code:checkpoint-1`,
+        reconciliationKey: `${runId}:background-code:checkpoint-1`,
+        preparedAt,
+        expiresAt: input.authority.expiresAt,
+      });
+      const packageIdentity = createPreparedBackgroundCodePackageIdentityV1({
+        packageId: "background-code-package-production-1",
+        packageFingerprint: testFingerprint("8"),
+        executionPlanFingerprint: testFingerprint("9"),
+        handoffFingerprint: handoff.fingerprint,
+        workspaceId: handoff.binding.workspaceId,
+        workspaceBindingFingerprint:
+          handoff.payload.workspaceBindingFingerprint,
+        repositoryProfileKey: handoff.binding.repositoryProfileKey,
+        repositoryProfileFingerprint:
+          handoff.payload.repositoryProfileFingerprint,
+        consumedActionAuthorityFingerprint:
+          handoff.authority.authorityFingerprint,
+        backgroundAuthorizationFingerprint: input.authorization.fingerprint,
+        preparedAt: handoff.preparedAt,
+        expiresAt: handoff.expiresAt,
+      });
+      return {
+        status: "ready",
+        handoff,
+        packageIdentity,
+        packagePersistenceReceipt: {
+          fingerprint: testFingerprint("a"),
+          readbackVerified: true,
+        },
+      };
+    },
+    submitAuthorizedNode: async (input) => {
+      const prepared = await prepareCompanionJobV1(input);
+      assert.equal(prepared.status, "ready");
+      if (prepared.status !== "ready") throw new Error("Expected Code job.");
+      await input.beforeSubmit?.(prepared.job);
+      const snapshotBeforePost = [...vault.content.values()]
+        .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
+        .find((snapshot) => snapshot?.operationJournal.some(
+          (record) => record.toolName === descriptor.name,
+        ));
+      const wal = snapshotBeforePost?.operationJournal.find(
+        (record) => record.toolName === descriptor.name,
+      );
+      assert.equal(wal?.state, "applying");
+      assert.equal(wal?.mutationMayHaveApplied, false);
+      assert.equal(
+        wal?.preparedBackgroundCodeAction?.fingerprint,
+        prepared.job.preparedBackgroundCodeAction?.fingerprint,
+      );
+      assert.equal(
+        wal?.preparedBackgroundCodePackage?.fingerprint,
+        prepared.job.preparedBackgroundCodePackage?.fingerprint,
+      );
+      assert.equal(wal?.backgroundCodeDispatchAttempt?.jobId, prepared.job.id);
+      assert.equal(wal?.backgroundCodeDispatchAttempt?.status, "prepared");
+      postCalls += 1;
+      submittedJobs.push(prepared.job.id);
+      return {
+        status: "submitted",
+        job: companionRemoteJobFromPrepared(prepared.job),
+      };
+    },
+  };
+  const broker = new ApprovalBroker();
+  const statuses: string[] = [];
+  await runAgentMission({
+    prompt,
+    runId,
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [
+        () => responseWithToolCall(descriptor.name, {}),
+        () => responseWithContent("The prepared Code package is pending verified readback."),
+      ],
+    }),
+    toolRegistry: new DefaultToolRegistry([tool]),
+    toolContext: vault.context,
+    enableStreaming: false,
+    approvalBroker: broker,
+    backgroundContinuation,
+    maxSteps: 2,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onApprovalRequest: (request) => {
+        approvalRequests += 1;
+        broker.resolve(request.id, "approved");
+      },
+    },
+  });
+
+  assert.equal(approvalRequests, 1, statuses.join(" | "));
+  assert.equal(sealCalls, 1);
+  assert.equal(postCalls, 1);
+  assert.equal(foregroundExecutions, 0);
+  assert.equal(submittedJobs.length, 1);
+  assert.equal(
+    statuses.some((message) => /Background code job submitted/iu.test(message)),
+    true,
+    statuses.join(" | "),
+  );
+  const committedWal = [...vault.content.values()]
+    .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
+    .find((snapshot) => snapshot?.operationJournal.some(
+      (record) => record.toolName === descriptor.name,
+    ))?.operationJournal.find((record) => record.toolName === descriptor.name);
+  assert.equal(committedWal?.backgroundCodeDispatchAttempt?.status, "job_submitted");
+  assert.equal(committedWal?.mutationMayHaveApplied, true);
+  assert.equal(
+    buildOperationReconciliationInputs([committedWal!])[0]?.recommendedAction,
+    "provider_reconcile",
+  );
+
+  await runAgentMission({
+    prompt: `continue run ${runId} and continue the exact background Code validation commit`,
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [
+        () => responseWithToolCall(descriptor.name, {}),
+        () => responseWithContent("The existing Code job is still pending readback."),
+      ],
+    }),
+    toolRegistry: new DefaultToolRegistry([tool]),
+    toolContext: vault.context,
+    enableStreaming: false,
+    approvalBroker: broker,
+    backgroundContinuation,
+    maxSteps: 2,
+  });
+  assert.equal(postCalls, 1, "restart must not submit a second companion job");
+  assert.equal(sealCalls, 1, "restart must not reseal an already-running node");
+});
+
+test("background Code unbound, denial, and package blocker paths fail closed before companion submission", async (t) => {
+  __setCodeToolsDesktopAppForTests(true);
+  t.after(() => __setCodeToolsDesktopAppForTests(null));
+  for (const outcome of ["unbound", "denied", "blocked"] as const) {
+    const prompt = `Continue the exact prepared Code validation commit in the background (${outcome}).`;
+    const runId = `background-code-${outcome}-1`;
+    const now = new Date("2026-07-13T13:00:00.000Z");
+    const vault = createRunnerVaultContext({ prompt, now });
+    vault.context.settings.modelRouterMode = "off";
+    const descriptor = backgroundCodeValidationDescriptor();
+    let sealCalls = 0;
+    let submitCalls = 0;
+    let foregroundExecutions = 0;
+    let approvalRequests = 0;
+    const toolErrorCodes: string[] = [];
+    const tool: AgentTool = {
+      name: descriptor.name,
+      description: "Seal one trusted prepared Code validation and commit package.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      descriptor,
+      execute: async () => {
+        foregroundExecutions += 1;
+        return {};
+      },
+      prepare: async (_args, context) => ({
+        ok: true,
+        action: await withPreparedActionFingerprint({
+          version: 1,
+          id: `prepared-code-${outcome}`,
+          runId: context.runId!,
+          toolCallId: `call-code-${outcome}`,
+          toolName: descriptor.name,
+          target: {
+            system: "git",
+            resourceType: "prepared_validation_commit",
+            id: `checkpoint-${outcome}`,
+            workspaceId: "binding-git-prepared-validation-commit",
+          },
+          relatedResources: [],
+          normalizedArgs: { checkpointId: `checkpoint-${outcome}` },
+          preview: {
+            summary: `Validate exact diff for ${outcome}`,
+            destination: "Trusted Code workspace",
+            warnings: [],
+            outboundBytes: 0,
+          },
+          idempotencyKey: `${runId}:code`,
+          reconciliationKey: `${runId}:code`,
+          preparedAt: now.toISOString(),
+          expiresAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
+        }),
+      }),
+      executePrepared: async () => {
+        foregroundExecutions += 1;
+        throw new Error("Foreground Code execution must remain unreachable.");
+      },
+    };
+    const backgroundContinuation: BackgroundMissionDispatchPortV1 = {
+      readCapabilities: async () => ({
+        configured: true,
+        backgroundEnabled: true,
+        installedDomains: ["code"],
+        blocker: null,
+      }),
+      resolveMissionBindingOverrides: async () => outcome === "unbound"
+        ? {}
+        : {
+            [descriptor.name]: {
+              id: "binding-git-prepared-validation-commit",
+              kind: "prepared_validation_commit",
+              destinationFingerprint: testFingerprint("5"),
+              allowedEffects: ["read", "execution"],
+            },
+          },
+      sealBackgroundValidationCommitPackage: async () => {
+        sealCalls += 1;
+        return {
+          status: "blocked",
+          code: "background_code_package_resolution_not_wired",
+          message: "Trusted Code package resolution is not wired.",
+          requiredAction: "Complete the commit in foreground.",
+        };
+      },
+      submitAuthorizedNode: async () => {
+        submitCalls += 1;
+        throw new Error("Blocked or denied Code work must never submit.");
+      },
+    };
+    const broker = new ApprovalBroker();
+    await runAgentMission({
+      prompt,
+      runId,
+      modelClient: createClient({
+        chatRequests: [],
+        chatResponders: [
+          () => responseWithToolCall(descriptor.name, {}),
+          () => responseWithContent("The Code action remains blocked."),
+        ],
+      }),
+      toolRegistry: new DefaultToolRegistry([tool]),
+      toolContext: vault.context,
+      enableStreaming: false,
+      approvalBroker: broker,
+      backgroundContinuation,
+      maxSteps: 2,
+      events: {
+        onApprovalRequest: (request) => {
+          approvalRequests += 1;
+          broker.resolve(
+            request.id,
+            outcome === "denied" ? "denied" : "approved",
+          );
+        },
+        onToolDone: (event) => {
+          if (event.error?.code) toolErrorCodes.push(event.error.code);
+        },
+      },
+    });
+    assert.equal(submitCalls, 0, `${outcome} must not submit`);
+    assert.equal(foregroundExecutions, 0);
+    assert.equal(sealCalls, outcome === "blocked" ? 1 : 0);
+    assert.equal(approvalRequests, outcome === "unbound" ? 0 : 1);
+    if (outcome === "unbound") {
+      assert.equal(
+        toolErrorCodes.includes("background_code_trusted_binding_required"),
+        true,
+      );
+    }
+    const wal = [...vault.content.values()]
+      .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
+      .find((snapshot) => snapshot?.operationJournal.some(
+        (record) => record.toolName === descriptor.name,
+      ))?.operationJournal.find((record) => record.toolName === descriptor.name);
+    if (outcome === "blocked") {
+      assert.equal(wal?.state, "failed");
+      assert.equal(wal?.mutationMayHaveApplied, false);
+      assert.equal(wal?.backgroundCodeDispatchAttempt, undefined);
+    } else {
+      assert.equal(
+        wal,
+        undefined,
+        `${outcome} occurs before mutation WAL execution starts`,
+      );
+    }
+  }
+});
+
+test("prepared actions consume a persisted schedule grant without opening interactive approval", async () => {
+  const prompt = "Create the trusted repository workspace for this approved queue task.";
+  const now = new Date("2026-07-11T12:00:00.000Z");
+  const vault = createRunnerVaultContext({ prompt, now });
+  const subject = { type: "schedule" as const, id: "linear-queue-project:project-1" };
+  const descriptor: ToolDescriptor = {
+    version: 1,
+    name: "code_workspace_create",
+    capability: { system: "workspace", resourceType: "code_workspace", action: "create" },
+    effect: "reversible_mutation",
+    risk: "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: true,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "required",
+      desktopOnly: true,
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "required",
+      reconciliation: "required",
+    },
+    allowedPrincipals: ["single_agent"],
+    receiptKind: "code_change",
+  };
+  let preparedExecutions = 0;
+  let approvalRequests = 0;
+  let consumedActions = 0;
+  const statuses: string[] = [];
+  const tool: AgentTool = {
+    name: descriptor.name,
+    description: "Create one trusted repository workspace.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    descriptor,
+    execute: async () => ({ status: "blocked" }),
+    prepare: async (_args, context) => ({
+      ok: true,
+      action: await withPreparedActionFingerprint({
+        version: 1,
+        id: "queue-workspace-action",
+        runId: context.runId!,
+        toolCallId: "queue-workspace-call",
+        toolName: descriptor.name,
+        target: {
+          system: "workspace",
+          resourceType: "code_workspace",
+          id: "workspace-1",
+          workspaceId: "workspace-1",
+          repositoryProfileId: "repository-1",
+        },
+        relatedResources: [],
+        normalizedArgs: { workspaceId: "workspace-1", profileKey: "repository-1" },
+        preview: {
+          summary: "Create trusted workspace workspace-1.",
+          destination: "workspace-1",
+          warnings: [],
+          outboundBytes: 0,
+        },
+        idempotencyKey: "queue-workspace-action",
+        requiredConfirmations: 1,
+        preparedAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
+      }),
+    }),
+    executePrepared: async (action, context) => {
+      preparedExecutions += 1;
+      return {
+        mutationState: "applied",
+        output: { workspaceId: "workspace-1" },
+        receipt: {
+          version: 1,
+          id: "queue-workspace-receipt",
+          runId: action.runId,
+          actionId: action.id,
+          toolName: action.toolName,
+          operation: "create",
+          resource: action.target,
+          message: "Created trusted queue workspace.",
+          payloadFingerprint: action.payloadFingerprint,
+          grantId: context.authorizedAction!.grantId,
+          idempotencyKey: action.idempotencyKey,
+          startedAt: now.toISOString(),
+          committedAt: new Date(now.getTime() + 1_000).toISOString(),
+          commitKind: "committed",
+          readback: {
+            status: "verified",
+            checkedAt: new Date(now.getTime() + 1_000).toISOString(),
+          },
+          effects: { affectedCount: 1 },
+        },
+      };
+    },
+  };
+  let grant = await createBoundedGrant({
+    id: "queue-grant-1",
+    kind: "scheduled_bounded",
+    subject,
+    rules: [{
+      system: "workspace",
+      resourceTypes: ["code_workspace"],
+      actions: ["create"],
+      selector: { repositoryProfileIds: ["repository-1"] },
+    }],
+    limits: {
+      maxActions: 4,
+      maxExternalMutations: 0,
+      maxCreates: 4,
+      maxDeletes: 0,
+      maxOutboundBytes: 1_000,
+    },
+    issuer: "user_approval",
+    issuedAt: now,
+    expiresAt: new Date(now.getTime() + 60 * 60_000),
+  });
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () => responseWithToolCall(descriptor.name, {}),
+      () => responseWithContent("Trusted queue workspace created."),
+    ],
+  });
+
+  __setCodeToolsDesktopAppForTests(true);
+  try {
+    await runAgentMission({
+      prompt,
+      runId: "queue-run-1",
+      modelClient: client,
+      toolRegistry: new DefaultToolRegistry([tool]),
+      toolContext: vault.context,
+      enableStreaming: false,
+      preparedActionAuthority: {
+        subject,
+        resolve: async () => grant,
+        consume: async ({ action }) => {
+          const result = await consumeAuthorityGrant({
+            grant,
+            action,
+            descriptor,
+            subject,
+            now,
+          });
+          if (!result.allowed) throw new Error("Fixture schedule grant did not authorize the prepared action.");
+          grant = result.grant;
+          consumedActions += 1;
+          return grant;
+        },
+      },
+      interactiveApprovals: false,
+      events: {
+        onStatus: (message) => statuses.push(message),
+        onApprovalRequest: () => {
+          approvalRequests += 1;
+        },
+      },
+    });
+  } finally {
+    __setCodeToolsDesktopAppForTests(null);
+  }
+
+  assert.equal(preparedExecutions, 1, statuses.join(" | "));
+  assert.equal(consumedActions, 1);
+  assert.equal(approvalRequests, 0);
+  assert.equal(grant.usage.actions, 1);
 });
 
 test("optional legacy tools keep execution policy while descriptors drive WAL classification", async () => {
@@ -9814,4 +12210,113 @@ test("optional legacy tools keep execution policy while descriptors drive WAL cl
   assert.equal(journal?.descriptor?.capability.action, "promote");
   assert.equal(journal?.preparedAction, undefined);
   assert.equal(journal?.receipt?.resource?.system, "workspace");
+});
+
+test("ambiguous WAL snapshot persistence keeps a racing stop fail-closed", async () => {
+  const prompt = "Promote workspace item item-1.";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-11T12:00:00.000Z"),
+  });
+  const descriptor: ToolDescriptor = {
+    version: 1,
+    name: "promote_workspace_item",
+    capability: {
+      system: "workspace",
+      resourceType: "work_item",
+      action: "promote",
+    },
+    effect: "reversible_mutation",
+    risk: "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: true,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "optional",
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: true,
+      receipt: true,
+      readback: "optional",
+      reconciliation: "optional",
+    },
+    allowedPrincipals: ["single_agent"],
+  };
+  let executions = 0;
+  const registry = new DefaultToolRegistry([
+    {
+      name: descriptor.name,
+      description: "Promote a workspace item.",
+      parameters: { type: "object", properties: {} },
+      descriptor,
+      execute: async () => {
+        executions += 1;
+        return { status: "ok", id: "item-1", affectedCount: 1 };
+      },
+    },
+  ]);
+  const originalModify = vault.context.app.vault.modify.bind(
+    vault.context.app.vault,
+  );
+  const abortController = new AbortController();
+  let injectedAmbiguousWrite = false;
+  let runArtifactWritesAfterAmbiguity = 0;
+  vault.context.app.vault.modify = (async (file, data, options) => {
+    const isDirectRunArtifact =
+      file.path.startsWith("Agent Runs/") &&
+      !file.path.startsWith("Agent Runs/Mission Graphs/");
+    if (
+      !injectedAmbiguousWrite &&
+      isDirectRunArtifact &&
+      data.includes('"toolName": "promote_workspace_item"') &&
+      data.includes('"state": "applying"')
+    ) {
+      injectedAmbiguousWrite = true;
+      abortController.abort(new Error("stop raced ambiguous WAL persistence"));
+      throw new Error("injected vault acknowledgement failure");
+    }
+    if (injectedAmbiguousWrite && isDirectRunArtifact) {
+      runArtifactWritesAfterAmbiguity += 1;
+    }
+    return originalModify(file, data, options);
+  }) as typeof vault.context.app.vault.modify;
+
+  const traces: AgentTraceEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [
+        () => responseWithToolCall(descriptor.name, {}),
+        () => responseWithContent("Promoted workspace item item-1."),
+      ],
+    }),
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    abortSignal: abortController.signal,
+    events: {
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => completions.push(event),
+    },
+  });
+
+  assert.equal(injectedAmbiguousWrite, true);
+  assert.equal(executions, 0, "the tool must not run without durable applying WAL");
+  assert.equal(
+    runArtifactWritesAfterAmbiguity,
+    0,
+    "terminal error handling must not retry the ambiguous Agent Runs write",
+  );
+  assert.ok(
+    traces.some(
+      (event) => event.error?.code === "runtime_snapshot_write_ambiguous",
+    ),
+  );
+  assert.equal(completions.at(-1)?.stopReason, "user_stopped");
 });

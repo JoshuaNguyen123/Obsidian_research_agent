@@ -77,6 +77,18 @@ export class DefaultToolRegistry implements ToolRegistry {
     }
 
     try {
+      if (tool.executeResult) {
+        const result = await tool.executeResult(call.arguments, context);
+        if (result.toolName !== tool.name) {
+          return failed(
+            tool.name,
+            "tool_result_identity_mismatch",
+            "Composite tool result identity does not match the registered tool.",
+            "unknown",
+          );
+        }
+        return result;
+      }
       return {
         ok: true,
         toolName: tool.name,
@@ -384,10 +396,15 @@ function failureFromError(
   fallbackMutationState?: ToolExecutionResult["mutationState"],
 ): ToolExecutionResult {
   if (error instanceof ToolExecutionError) {
+    // invalid_arguments is raised while parsing a call, before a tool is
+    // allowed to mutate its target. Preserve that fact for the mutation WAL
+    // so a corrected call can be retried without false reconciliation blocks.
+    const inferredMutationState =
+      error.code === "invalid_arguments" ? "not_applied" : fallbackMutationState;
     return {
       ok: false,
       toolName,
-      mutationState: error.mutationState ?? fallbackMutationState,
+      mutationState: error.mutationState ?? inferredMutationState,
       error: {
         code: error.code,
         message: error.message,

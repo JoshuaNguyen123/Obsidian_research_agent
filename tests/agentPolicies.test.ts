@@ -8,7 +8,10 @@ import {
 } from "../src/agent/currentNoteResetPolicy";
 import { planLoopBudget } from "../src/agent/loopPlanner";
 import { decideNextLoopAction } from "../src/agent/loopDecision";
-import { getProjectMemoryLocation } from "../src/agent/projectMemory";
+import {
+  canApplyProjectMemoryLoad,
+  getProjectMemoryLocation,
+} from "../src/agent/projectMemory";
 
 test("generated output policy classifies prompt matrix targets", () => {
   const revolutionary = analyzeGeneratedOutputPrompt(
@@ -122,6 +125,22 @@ test("loop planner reserves finalization for grounded generated writing", () => 
   assert.deepEqual(budget.expectedTools, ["web_search", "web_fetch"]);
 });
 
+test("loop planner keeps vault-only evidence research off the web", () => {
+  const prompt =
+    "Do deep research across my notes about local retrieval coverage and synthesize the relevant evidence.";
+  const budget = planLoopBudget({
+    prompt,
+    route: "grounded_workflow",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 12,
+  });
+
+  assert.deepEqual(budget.expectedTools, [
+    "semantic_search_notes",
+    "read_markdown_files",
+  ]);
+});
+
 test("loop decision forces final answer after required tools are satisfied", () => {
   const decision = decideNextLoopAction(
     {
@@ -161,4 +180,28 @@ test("project memory paths live under the active note folder", () => {
     researchIndexPath: "Agent Memory/research-memory-index.json",
     researchNotesFolder: "Agent Memory/Research",
   });
+});
+
+test("project memory hydration is latest-request-wins and project-bound", () => {
+  const firstProject = getProjectMemoryLocation("Projects/Alpha/Note.md");
+  const secondProject = getProjectMemoryLocation("Projects/Beta/Note.md");
+  const firstLoad = { generation: 1, location: firstProject };
+  const secondLoad = { generation: 2, location: secondProject };
+
+  assert.equal(
+    canApplyProjectMemoryLoad(firstLoad, 2, secondProject),
+    false,
+    "an older read must not overwrite the latest project hydration",
+  );
+  assert.equal(
+    canApplyProjectMemoryLoad(secondLoad, 2, firstProject),
+    false,
+    "a completed read must not cross the captured project boundary",
+  );
+  assert.equal(canApplyProjectMemoryLoad(secondLoad, 2, secondProject), true);
+  assert.equal(
+    canApplyProjectMemoryLoad(secondLoad, 3, secondProject),
+    false,
+    "a newer in-memory mutation invalidates an in-flight hydration",
+  );
 });

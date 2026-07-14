@@ -1,13 +1,17 @@
 import {
-  parseRenderedWorkItemSpecV1,
+  parseRenderedCompatibleWorkItemSpec,
 } from "../../integrations/linear/WorkItemParser";
+import {
+  LINEAR_QUEUE_SCAN_INTERVAL_MS,
+  LINEAR_QUEUE_SCAN_LIMIT,
+} from "../../../packages/core-api/src/linearQueuePolicyV1";
 import type {
   LinearBaseRecord,
   LinearIssueRecord,
   LinearOperationResult,
   LinearRequestOptions,
 } from "../../integrations/linear/types";
-import type { WorkItemSpecV1 } from "../../integrations/linear/WorkItemSpecV1";
+import type { ParsedCompatibleWorkItemSpec } from "../../integrations/linear/WorkItemSpecV2";
 import {
   advanceLinearQueueCursor,
   compareLinearQueueCursors,
@@ -21,8 +25,10 @@ import type {
   LinearQueueStateV1,
 } from "./types";
 
-export const LINEAR_QUEUE_SCAN_INTERVAL_MS = 15 * 60_000;
-export const LINEAR_QUEUE_SCAN_LIMIT = 10;
+export {
+  LINEAR_QUEUE_SCAN_INTERVAL_MS,
+  LINEAR_QUEUE_SCAN_LIMIT,
+} from "../../../packages/core-api/src/linearQueuePolicyV1";
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -54,7 +60,7 @@ export type DurableLinearQueueReducer = (
 export interface QueueCandidateGrantInput {
   issueId: string;
   identifier: string;
-  workItem: WorkItemSpecV1;
+  workItem: ParsedCompatibleWorkItemSpec;
   signal: AbortSignal;
 }
 
@@ -179,6 +185,52 @@ export class LinearQueueSupervisor {
     return this.started && !this.stopped;
   }
 
+  /**
+   * Re-read the exact issue snapshot immediately before a claim mutation.
+   * Project, state, update timestamp, signed contract, and fingerprint must all
+   * still match the durable queue candidate.
+   */
+  async verifyCandidateBeforeClaim(input: {
+    candidate: LinearQueueCandidateV1;
+    signal: AbortSignal;
+  }): Promise<boolean> {
+    const { candidate, signal } = input;
+    if (!candidate.remoteStateId) {
+      return false;
+    }
+    assertNotAborted(signal);
+    const result = await this.options.client.execute(
+      "issues.get",
+      { id: candidate.issueId },
+      { abortSignal: signal },
+    );
+    assertNotAborted(signal);
+    if (!isIssueRecord(result)) {
+      return false;
+    }
+    if (
+      result.id !== candidate.issueId ||
+      result.project?.id !== this.options.queueProjectId ||
+      result.state?.id !== candidate.remoteStateId ||
+      result.updatedAt !== candidate.remoteUpdatedAt ||
+      result.trashed ||
+      result.archivedAt ||
+      result.completedAt ||
+      result.canceledAt ||
+      typeof result.description !== "string"
+    ) {
+      return false;
+    }
+    try {
+      return (
+        parseRenderedCompatibleWorkItemSpec(result.description).spec.fingerprint ===
+        candidate.workItem.fingerprint
+      );
+    } catch {
+      return false;
+    }
+  }
+
   private async performScan(signal: AbortSignal): Promise<LinearQueueScanResult> {
     if (!(await this.options.isConnectionEligible({ signal }))) {
       return { status: "skipped", reason: "connection_ineligible" };
@@ -223,6 +275,7 @@ export class LinearQueueSupervisor {
           issueId: issue.id,
           identifier: issue.identifier,
           remoteUpdatedAt: issue.updatedAt!,
+          remoteStateId: issue.state.id,
           workItem,
         }),
       );
@@ -329,21 +382,26 @@ function readIssuePage(result: LinearOperationResult): LinearIssueRecord[] {
   return result.items.filter(isIssueRecord);
 }
 
-function isIssueRecord(value: LinearBaseRecord): value is LinearIssueRecord {
+function isIssueRecord(
+  value: LinearOperationResult | LinearBaseRecord,
+): value is LinearIssueRecord {
+  const record = value as Partial<LinearIssueRecord>;
   return (
-    value.resourceType === "issue" &&
-    typeof value.id === "string" &&
-    typeof value.identifier === "string" &&
-    typeof value.updatedAt === "string"
+    record.resourceType === "issue" &&
+    typeof record.id === "string" &&
+    typeof record.identifier === "string" &&
+    typeof record.updatedAt === "string" &&
+    record.state !== undefined &&
+    typeof record.state.id === "string"
   );
 }
 
-function parseIssueWorkItem(issue: LinearIssueRecord): WorkItemSpecV1 | null {
+function parseIssueWorkItem(issue: LinearIssueRecord): ParsedCompatibleWorkItemSpec | null {
   if (!issue.description) {
     return null;
   }
   try {
-    return parseRenderedWorkItemSpecV1(issue.description).spec;
+    return parseRenderedCompatibleWorkItemSpec(issue.description).spec;
   } catch {
     return null;
   }

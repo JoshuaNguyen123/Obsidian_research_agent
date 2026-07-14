@@ -1,0 +1,593 @@
+import {
+  withPreparedActionFingerprint,
+  type ActionReceipt,
+  type JsonValue,
+  type PreparedAction,
+  type PreparedActionInput,
+  type ToolDescriptor,
+} from "../agent/actions";
+import type { JsonSchemaObject } from "../model/types";
+import type { AuthorityGrantV1 } from "../agent/authority";
+import {
+  ResearchPublicationWorkflow,
+  type AcceptedResearchNotePackageV1,
+  type ResearchPublicationDestinationV1,
+  type ResearchPublicationExactApprovalRequestV1,
+  type ResearchPublicationLineagePortV1,
+  type ResearchPublicationPublisherPortV1,
+} from "../integrations/linear";
+import { AcceptedResearchNoteWriter } from "../integrations/linear";
+import type { AgentTool, ToolExecutionContext } from "./types";
+import { ToolExecutionError } from "./types";
+
+export const PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME = "publish_research_to_linear";
+
+export interface ResearchPublicationGrantInputV1 {
+  runId: string;
+  approvalId: string;
+  destination: ResearchPublicationDestinationV1;
+}
+
+export interface CreateResearchPublicationToolOptionsV1 {
+  noteWriter: Pick<AcceptedResearchNoteWriter, "writeAcceptedPackage" | "appendLinearBacklink">;
+  publisher: ResearchPublicationPublisherPortV1;
+  lineage: ResearchPublicationLineagePortV1;
+  destination: ResearchPublicationDestinationV1;
+  vaultBindingKey: string;
+  resolveNotePath(input: {
+    requestedPath?: string;
+    originalPrompt: string;
+    runId: string;
+  }): string;
+  validateTrustedBindings(package_: AcceptedResearchNotePackageV1): void;
+  mintOneActionGrant(input: ResearchPublicationGrantInputV1): Promise<AuthorityGrantV1>;
+  persistExternalReceipt(receipt: ActionReceipt): Promise<void>;
+  isAvailable?: () => boolean;
+  now?: () => Date;
+}
+
+export function createResearchPublicationTool(
+  options: CreateResearchPublicationToolOptionsV1,
+): AgentTool {
+  const tool: AgentTool = {
+    name: PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+    description:
+      "Write a host-accepted research package to an Obsidian note, show an exact Linear preview for approval, create or reuse the issue, verify readback, persist lineage, and append the backlink. Use only when the user explicitly asks to publish or send accepted research to Linear.",
+    parameters: RESEARCH_PUBLICATION_PARAMETERS,
+    descriptor: RESEARCH_PUBLICATION_DESCRIPTOR,
+    async execute(args, context) {
+      if (options.isAvailable?.() === false) {
+        throw new ToolExecutionError(
+          "research_publication_unavailable",
+          "Research publication is unavailable because the integrations extension, credential, or discovered Linear destination is no longer available.",
+          { mutationState: "not_applied" },
+        );
+      }
+      if (!hasExplicitResearchPublicationIntent(context.originalPrompt)) {
+        throw new ToolExecutionError(
+          "research_publication_explicit_user_mission_required",
+          "Publishing research to Linear requires an explicit user mission naming Linear publication.",
+          { mutationState: "not_applied" },
+        );
+      }
+      const runId = requireIdentity(context.runId, "run id");
+      const toolCallId = requireIdentity(context.operationId, "tool call id");
+      const note = parseToolArguments({
+        value: args,
+        runId,
+        toolCallId,
+        originalPrompt: context.originalPrompt,
+        vaultBindingKey: options.vaultBindingKey,
+        resolveNotePath: options.resolveNotePath,
+        validateTrustedBindings: options.validateTrustedBindings,
+        nowProvider: options.now ?? context.now,
+      });
+      if (!context.requestNestedApproval) {
+        throw new ToolExecutionError(
+          "research_publication_approval_unavailable",
+          "The host approval surface is unavailable for this research publication.",
+          { mutationState: "not_applied" },
+        );
+      }
+      const workflow = new ResearchPublicationWorkflow({
+        noteWriter: options.noteWriter,
+        publisher: options.publisher,
+        lineage: options.lineage,
+        now: options.now ?? context.now,
+        approval: {
+          requestExactApproval: async (request) => {
+            const action = await buildApprovalPreparedAction(
+              request,
+              options.now ?? context.now,
+            );
+            const decision = await context.requestNestedApproval!({
+              toolName: PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+              action:
+                request.proposedAction === "create"
+                  ? `Create Linear issue in ${request.destination.teamId}/${request.destination.projectId}: ${request.title}`
+                  : `Reuse verified duplicate Linear issue: ${request.duplicate?.identifier ?? request.title}`,
+              reason:
+                "Approve the exact research note hash, Linear destination, title, description, machine contract, and duplicate decision shown below.",
+              policyTags: [
+                "linear_research_publication",
+                "exact_preview",
+                request.proposedAction,
+              ],
+              preparedAction: action,
+              timeoutMs: 120_000,
+              confirmationIndex: 1,
+              requiredConfirmations: 1,
+            });
+            if (!decision.approved) {
+              return { approved: false, reason: decision.reason };
+            }
+            if (decision.approvalFingerprint !== action.payloadFingerprint) {
+              return { approved: false, reason: "Approval fingerprint mismatch." };
+            }
+            if (request.proposedAction === "reuse_duplicate") {
+              return {
+                approved: true,
+                approvalId: decision.approvalId,
+                approvalFingerprint: request.approvalFingerprint,
+              };
+            }
+            const grant = await options.mintOneActionGrant({
+              runId,
+              approvalId: decision.approvalId,
+              destination: request.destination,
+            });
+            return {
+              approved: true,
+              approvalId: decision.approvalId,
+              approvalFingerprint: request.approvalFingerprint,
+              activeGrants: [grant],
+              preferredGrantId: grant.id,
+            };
+          },
+        },
+      });
+
+      const result = await workflow.execute({
+        explicitUserMission: true,
+        runId,
+        toolCallId,
+        subject: { type: "run", id: runId },
+        context,
+        note,
+        destination: options.destination,
+      });
+      if (!result.ok && result.status !== "waiting_obsidian") {
+        throw new ToolExecutionError(
+          result.status === "denied" ? "approval_denied" : result.error.code,
+          result.error.message,
+          {
+            mutationState:
+              result.status === "reconcile_required"
+                ? "may_have_applied"
+                : "not_applied",
+          },
+        );
+      }
+      return result;
+    },
+  };
+  tool.executeResult = async (args, context) => {
+    const output = await tool.execute(args, context) as Awaited<
+      ReturnType<ResearchPublicationWorkflow["execute"]>
+    >;
+    let receipt: ActionReceipt | undefined;
+    if ((output.ok && output.status === "complete") || output.status === "waiting_obsidian") {
+      receipt = output.receipt ?? createDeduplicatedReadbackReceipt(output);
+      await options.persistExternalReceipt(receipt);
+    }
+    return {
+      ok: true,
+      toolName: PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+      output,
+      ...(receipt ? { receipt, mutationState: "applied" as const } : {}),
+    };
+  };
+  return tool;
+}
+
+export function hasExplicitResearchPublicationIntent(prompt: string): boolean {
+  const normalized = typeof prompt === "string" ? prompt : "";
+  return (
+    /\b(?:publish|send|create|post|sync|file|open)\b[\s\S]{0,120}\b(?:research|findings|report|note|ticket|issue)\b[\s\S]{0,120}\b(?:to|in|on)\s+linear\b/iu.test(normalized) ||
+    /\b(?:research|findings|report|note)\b[\s\S]{0,120}\b(?:publish|send|create|post|sync)\b[\s\S]{0,120}\blinear\b/iu.test(normalized)
+  );
+}
+
+function parseToolArguments(input: {
+  value: Record<string, unknown>;
+  runId: string;
+  toolCallId: string;
+  originalPrompt: string;
+  vaultBindingKey: string;
+  resolveNotePath: CreateResearchPublicationToolOptionsV1["resolveNotePath"];
+  validateTrustedBindings: CreateResearchPublicationToolOptionsV1["validateTrustedBindings"];
+  nowProvider?: () => Date;
+}) {
+  const { value, runId } = input;
+  assertExactKeys(value, ["mode", "package"], ["notePath", "baseHash"]);
+  const packageRecord = expectRecord(value.package, "accepted research package");
+  assertExactKeys(
+    packageRecord,
+    [
+      "schemaVersion",
+      "title",
+      "problemImpact",
+      "evidence",
+      "confidenceLimitations",
+      "proposedWork",
+      "nonGoals",
+      "scope",
+      "dependencies",
+      "acceptanceCriteria",
+      "validationRequirementKeys",
+      "riskClass",
+      "executionClass",
+      "objective",
+    ],
+    ["repositoryKey"],
+  );
+  if (packageRecord.schemaVersion !== 1) {
+    throw new ToolExecutionError(
+      "research_publication_run_binding_mismatch",
+      "The accepted research package must use schema version 1.",
+      { mutationState: "not_applied" },
+    );
+  }
+  if (value.mode !== "create" && value.mode !== "append") {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      "Research note mode must be create or append.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const mode: "create" | "append" = value.mode;
+  if (mode === "append" && typeof value.baseHash !== "string") {
+    throw new ToolExecutionError(
+      "research_publication_base_hash_required",
+      "Appending an accepted research package requires the current note SHA-256 hash.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const acceptedAt = canonicalNow(input.nowProvider);
+  const requestedPath = value.notePath === undefined
+    ? undefined
+    : requireText(value.notePath, "note path", 1_000);
+  if (mode === "append" && !requestedPath) {
+    throw new ToolExecutionError(
+      "research_publication_note_path_required",
+      "Appending requires a vault-safe Markdown path explicitly present in the user mission.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const package_ = {
+    ...packageRecord,
+    vaultBindingKey: requireLogicalKey(input.vaultBindingKey, "host vault binding key"),
+    originRunId: runId,
+  } as unknown as AcceptedResearchNotePackageV1;
+  input.validateTrustedBindings(package_);
+  return {
+    path: input.resolveNotePath({
+      ...(requestedPath ? { requestedPath } : {}),
+      originalPrompt: input.originalPrompt,
+      runId,
+    }),
+    mode,
+    ...(typeof value.baseHash === "string"
+      ? { baseHash: requireSha256(value.baseHash, "base hash") }
+      : {}),
+    artifactId: requireLogicalKey(
+      `accepted-${runId}-${input.toolCallId}`.replace(/[^A-Za-z0-9._-]+/gu, "-"),
+      "artifact id",
+    ),
+    acceptedAt,
+    package: package_,
+  };
+}
+
+async function buildApprovalPreparedAction(
+  request: ResearchPublicationExactApprovalRequestV1,
+  nowProvider?: () => Date,
+): Promise<PreparedAction> {
+  const preparedAt = canonicalNow(nowProvider);
+  const duplicateCandidates = request.duplicate
+    ? [{
+        system: "linear" as const,
+        resourceType: "issue",
+        id: request.duplicate.id,
+        identifier: request.duplicate.identifier,
+        url: request.duplicate.url,
+        workspaceId: request.destination.workspaceId,
+        teamId: request.destination.teamId,
+        projectId: request.destination.projectId,
+      }]
+    : [];
+  const outboundPayload: Record<string, JsonValue> = {
+    proposedAction: request.proposedAction,
+    title: request.title,
+    description: request.description,
+    artifactFingerprint: request.artifactFingerprint,
+    noteSha256: request.noteSha256,
+    workItemFingerprint: request.workItemFingerprint,
+  };
+  const outboundBytes = new TextEncoder().encode(
+    `${request.title}\n${request.description}`,
+  ).byteLength;
+  const action: PreparedActionInput = {
+    version: 1,
+    id: `research-publication-preview-${request.approvalFingerprint.slice(7, 31)}`,
+    runId: request.runId,
+    toolCallId: request.toolCallId,
+    toolName: PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+    target: {
+      system: "linear",
+      resourceType: "issue",
+      id: request.duplicate?.id ?? `pending-${request.workItemFingerprint.slice(7, 31)}`,
+      ...(request.duplicate?.identifier
+        ? { identifier: request.duplicate.identifier }
+        : {}),
+      ...(request.duplicate?.url ? { url: request.duplicate.url } : {}),
+      workspaceId: request.destination.workspaceId,
+      teamId: request.destination.teamId,
+      projectId: request.destination.projectId,
+    },
+    relatedResources: [],
+    normalizedArgs: {
+      approvalFingerprint: request.approvalFingerprint,
+      artifactFingerprint: request.artifactFingerprint,
+      noteSha256: request.noteSha256,
+      workItemFingerprint: request.workItemFingerprint,
+      proposedAction: request.proposedAction,
+    },
+    preview: {
+      summary:
+        request.proposedAction === "create"
+          ? `Create Linear issue: ${request.title}`
+          : `Reuse Linear issue: ${request.duplicate?.identifier ?? request.title}`,
+      destination:
+        `Linear workspace=${request.destination.workspaceId} ` +
+        `team=${request.destination.teamId} project=${request.destination.projectId}`,
+      outboundPayload,
+      duplicateCandidates,
+      warnings: request.proposedAction === "reuse_duplicate"
+        ? ["No Linear mutation or authority grant will be created for this exact duplicate."]
+        : [],
+      outboundBytes,
+    },
+    idempotencyKey: `research-publication:${request.workItemFingerprint}`,
+    reconciliationKey: `linear-research-publication:${request.workItemFingerprint}`,
+    preparedAt,
+    expiresAt: new Date(Date.parse(preparedAt) + 120_000).toISOString(),
+    requiredConfirmations: 1,
+  };
+  return withPreparedActionFingerprint(action);
+}
+
+function createDeduplicatedReadbackReceipt(output: {
+  artifact: { originRunId: string };
+  approvalFingerprint: string;
+  binding: {
+    verifiedAt: string;
+    workItemFingerprint: string;
+  };
+  issue: {
+    id: string;
+    identifier: string;
+    url: string;
+    updatedAt?: string;
+    snapshotHash: string;
+    team: { id: string };
+    project?: { id: string };
+  };
+}): ActionReceipt {
+  const startedAt = output.issue.updatedAt ?? output.binding.verifiedAt;
+  return {
+    version: 1,
+    id: `linear-research-readback-${output.issue.id}`,
+    runId: output.artifact.originRunId,
+    actionId: `linear-readback-${output.issue.id}`,
+    toolName: "linear_read_issue",
+    operation: "read",
+    resource: {
+      system: "linear",
+      resourceType: "issue",
+      id: output.issue.id,
+      identifier: output.issue.identifier,
+      url: output.issue.url,
+      teamId: output.issue.team.id,
+      ...(output.issue.project?.id ? { projectId: output.issue.project.id } : {}),
+      ...(output.issue.updatedAt ? { revision: output.issue.updatedAt } : {}),
+    },
+    message: `Verified exact duplicate Linear issue ${output.issue.identifier}; no mutation grant was created or consumed.`,
+    payloadFingerprint: output.approvalFingerprint,
+    grantId: "linear-deduplicated-readback",
+    idempotencyKey: `research-publication:${output.binding.workItemFingerprint}`,
+    startedAt,
+    committedAt: output.binding.verifiedAt,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: output.binding.verifiedAt,
+      ...(output.issue.updatedAt ? { observedRevision: output.issue.updatedAt } : {}),
+      observedFingerprint: output.issue.snapshotHash,
+    },
+  };
+}
+
+const RESEARCH_PUBLICATION_DESCRIPTOR: ToolDescriptor = {
+  version: 1,
+  name: PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+  capability: { system: "linear", resourceType: "issue", action: "publish" },
+  effect: "publish",
+  risk: "high",
+  approval: {
+    allowPromptGrant: false,
+    allowPersistentGrant: false,
+    fallback: "exact",
+  },
+  execution: {
+    preparation: "none",
+    cacheable: false,
+    parallelSafe: false,
+  },
+  durability: {
+    journal: true,
+    receipt: true,
+    readback: "required",
+    reconciliation: "required",
+  },
+  allowedPrincipals: ["single_agent"],
+  receiptKind: "external_action",
+  operationGoals: ["linear_publication"],
+};
+
+const STRING: JsonSchemaObject = { type: "string" };
+const STRING_ARRAY: JsonSchemaObject = { type: "array", items: STRING, maxItems: 50 };
+const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    notePath: { type: "string", description: "Vault-relative Markdown note path." },
+    mode: { type: "string", enum: ["create", "append"] },
+    baseHash: { type: "string", description: "Required SHA-256 when appending." },
+    package: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        schemaVersion: { type: "integer", enum: [1] },
+        title: STRING,
+        problemImpact: STRING,
+        evidence: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              id: STRING,
+              kind: { type: "string", enum: ["web", "vault", "user"] },
+              reference: STRING,
+              contentSha256: STRING,
+              label: STRING,
+              summary: STRING,
+            },
+            required: ["id", "kind", "reference", "contentSha256", "label", "summary"],
+          },
+        },
+        confidenceLimitations: STRING,
+        proposedWork: STRING_ARRAY,
+        nonGoals: STRING_ARRAY,
+        scope: STRING_ARRAY,
+        dependencies: STRING_ARRAY,
+        acceptanceCriteria: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: { id: STRING, text: STRING },
+            required: ["id", "text"],
+          },
+        },
+        validationRequirementKeys: STRING_ARRAY,
+        riskClass: { type: "string", enum: ["low", "medium", "high"] },
+        executionClass: { type: "string", enum: ["research", "vault", "code", "human"] },
+        objective: STRING,
+        repositoryKey: STRING,
+      },
+      required: [
+        "schemaVersion", "title", "problemImpact", "evidence",
+        "confidenceLimitations", "proposedWork", "nonGoals", "scope",
+        "dependencies", "acceptanceCriteria", "validationRequirementKeys",
+        "riskClass", "executionClass", "objective",
+      ],
+    },
+  },
+  required: ["mode", "package"],
+};
+
+function assertExactKeys(
+  record: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const allowed = new Set([...required, ...optional]);
+  const unknown = Object.keys(record).filter((key) => !allowed.has(key));
+  const missing = required.filter((key) => !Object.prototype.hasOwnProperty.call(record, key));
+  if (unknown.length || missing.length) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `Research publication fields are invalid (unknown: ${unknown.join(", ") || "none"}; missing: ${missing.join(", ") || "none"}).`,
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
+function expectRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `${label} must be an object.`,
+      { mutationState: "not_applied" },
+    );
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireText(value: unknown, label: string, maximum: number): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text || text.length > maximum) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `${label} must contain safe bounded text.`,
+      { mutationState: "not_applied" },
+    );
+  }
+  return text;
+}
+
+function requireIdentity(value: unknown, label: string): string {
+  return requireText(value, label, 256);
+}
+
+function requireLogicalKey(value: unknown, label: string): string {
+  const text = requireText(value, label, 160);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(text)) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `${label} must be a logical key.`,
+      { mutationState: "not_applied" },
+    );
+  }
+  return text;
+}
+
+function requireSha256(value: unknown, label: string): string {
+  const text = requireText(value, label, 71);
+  if (!/^sha256:[a-f0-9]{64}$/u.test(text)) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      `${label} must be a SHA-256 fingerprint.`,
+      { mutationState: "not_applied" },
+    );
+  }
+  return text;
+}
+
+function canonicalNow(provider?: () => Date): string {
+  const now = provider?.() ?? new Date();
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_clock",
+      "Research publication clock is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+  return now.toISOString();
+}

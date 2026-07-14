@@ -197,8 +197,8 @@ export function evaluateMissionAcceptance(
  * Non-vault proof remains domain-specific. A receipt can satisfy the global
  * concrete-output requirement only when its exact tool was both required and
  * successfully executed in this run. Artifact proof additionally requires an
- * explicit artifact-write scope. Linear/GitHub proof can complete its matching
- * external action but can never prove a vault mutation.
+ * explicit artifact-write scope. Workspace/Git mutation receipts satisfy the
+ * compatibility write proof; Linear/GitHub actions remain external-only.
  */
 function receiptsSatisfyMatchingNonVaultProof(
   input: MissionAcceptanceInput,
@@ -221,7 +221,8 @@ function receiptsSatisfyMatchingNonVaultProof(
       ) {
         return true;
       }
-      return receiptSatisfiesProof("external_action_receipt", receipt);
+      return receiptSatisfiesProof("external_action_receipt", receipt) ||
+        receiptSatisfiesProof("write_receipt", receipt);
     },
   );
 }

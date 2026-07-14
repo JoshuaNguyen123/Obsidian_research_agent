@@ -10,7 +10,30 @@ import { deriveOutputProfileFromLegacy } from "./noteOutputPolicy";
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 
-export const SETTINGS_SCHEMA_VERSION = 2;
+export const SETTINGS_SCHEMA_VERSION = 3;
+
+export type SupportedSettingsSchemaVersion = 1 | 2 | 3;
+
+/** Missing version is the original schema-1 representation. */
+export function parseSupportedSettingsSchemaVersion(
+  value: unknown,
+): SupportedSettingsSchemaVersion {
+  if (value === undefined || value === 1 || value === 2 || value === 3) {
+    return (value ?? 1) as SupportedSettingsSchemaVersion;
+  }
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 1
+  ) {
+    throw new Error(
+      "settingsSchemaVersion must be one of the supported integer schemas: 1, 2, or 3.",
+    );
+  }
+  throw new Error(
+    `Unsupported future settings schema ${value}; this core supports schemas 1 through ${SETTINGS_SCHEMA_VERSION}.`,
+  );
+}
 
 export type AutonomyProfileSetting = AutonomyProfile;
 export type OutputProfileSetting = OutputProfile;
@@ -92,6 +115,8 @@ export interface NormalizableAgentSettings {
   linearCompletedStateId?: string;
   linearBlockedStateId?: string;
   linearScanIntervalMinutes?: 15;
+  githubEnabled?: boolean;
+  githubOAuthClientId?: string;
   scheduledMissions?: unknown[];
   [key: string]: unknown;
 }
@@ -108,8 +133,8 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   model: "gpt-oss:120b-cloud",
   utilityModel: "",
   utilityModelProvider: "ollama",
-  modelRouterEnabled: false,
-  modelRouterMode: "off",
+  modelRouterEnabled: true,
+  modelRouterMode: "authority",
   enableStreaming: true,
   requestTimeoutMs: 180000,
   maxAgentSteps: MAX_AGENT_STEPS,
@@ -169,6 +194,8 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   linearCompletedStateId: "",
   linearBlockedStateId: "",
   linearScanIntervalMinutes: 15,
+  githubEnabled: false,
+  githubOAuthClientId: "",
   scheduledMissions: [],
 };
 
@@ -222,8 +249,17 @@ export function normalizeAgentSettings(
   merged.scheduledMissions = normalizeScheduledMissions(
     merged.scheduledMissions,
   );
+  merged.companionBaseUrl = normalizeCompanionLoopbackBaseUrl(
+    merged.companionBaseUrl,
+  );
+  merged.githubEnabled = merged.githubEnabled === true;
+  merged.githubOAuthClientId = normalizeGitHubOAuthClientIdSetting(
+    merged.githubOAuthClientId,
+  );
 
-  const schemaVersion = coerceSchemaVersion(data.settingsSchemaVersion);
+  const schemaVersion = parseSupportedSettingsSchemaVersion(
+    data.settingsSchemaVersion,
+  );
   const explicitProfile = coerceAutonomyProfile(data.autonomyProfile);
   const explicitOutput = coerceOutputProfile(data.outputProfile);
 
@@ -233,10 +269,15 @@ export function normalizeAgentSettings(
   if (installKind === "new_install" && schemaVersion < 2) {
     autonomyProfile = "automatic";
     outputProfile = "active_or_new_note";
-    applyAutomaticOutputDefaults(merged);
-  } else if (explicitProfile && explicitOutput) {
-    autonomyProfile = explicitProfile;
-    outputProfile = explicitOutput;
+    applyAutomaticProfileDefaults(merged);
+  } else if (explicitProfile === "automatic") {
+    autonomyProfile = "automatic";
+    outputProfile = "active_or_new_note";
+    applyAutomaticProfileDefaults(merged);
+  } else if (explicitProfile === "conservative") {
+    autonomyProfile = "conservative";
+    outputProfile = "chat_first";
+    applyConservativeOutputDefaults(merged);
   } else if (explicitProfile === "custom" || hasConflictingLegacyOutput(merged)) {
     autonomyProfile = "custom";
     outputProfile =
@@ -246,18 +287,10 @@ export function normalizeAgentSettings(
         streamWritebackMode: merged.streamWritebackMode,
         autoTitleOnWrite: merged.autoTitleOnWrite !== false,
       });
-  } else if (explicitProfile === "conservative") {
-    autonomyProfile = "conservative";
-    outputProfile = explicitOutput ?? "chat_first";
-    if (!explicitOutput) {
-      applyConservativeOutputDefaults(merged);
-    }
-  } else if (explicitProfile === "automatic" || installKind === "new_install") {
+  } else if (installKind === "new_install") {
     autonomyProfile = "automatic";
-    outputProfile = explicitOutput ?? "active_or_new_note";
-    if (!explicitOutput) {
-      applyAutomaticOutputDefaults(merged);
-    }
+    outputProfile = "active_or_new_note";
+    applyAutomaticProfileDefaults(merged);
   } else {
     outputProfile =
       explicitOutput ??
@@ -276,7 +309,7 @@ export function normalizeAgentSettings(
   }
 
   if (autonomyProfile === "automatic" && outputProfile === "active_or_new_note") {
-    applyAutomaticOutputDefaults(merged);
+    applyAutomaticProfileDefaults(merged);
   } else if (
     autonomyProfile === "conservative" &&
     outputProfile === "chat_first"
@@ -302,11 +335,7 @@ export function applyRecommendedAutomaticDefaults(
     outputProfile: "active_or_new_note" as const,
     settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
   };
-  applyAutomaticOutputDefaults(next);
-  next.agenticReflexEnabled = true;
-  next.enableStreaming = true;
-  next.streamWritebackMode = "all_current_note_content_writes";
-  next.autoTitleOnWrite = true;
+  applyAutomaticProfileDefaults(next);
   next.orchestratorEnabled = true;
   next.orchestratorPreviewEnabled = true;
   next.semanticSearchEnabled = true;
@@ -316,16 +345,57 @@ export function applyRecommendedAutomaticDefaults(
   return normalizeAgentSettings(next, "existing_install");
 }
 
-function applyAutomaticOutputDefaults(settings: NormalizableAgentSettings): void {
+export function applyAutomaticProfileDefaults(
+  settings: NormalizableAgentSettings,
+): void {
   settings.enableStreaming = true;
   settings.streamWritebackMode = "all_current_note_content_writes";
   settings.autoTitleOnWrite = true;
+  settings.thinkingMode = "auto";
+  settings.agenticReflexEnabled = true;
+  settings.modelRouterMode = "authority";
+  settings.modelRouterEnabled = true;
+}
+
+/** Normalize the public OAuth application identifier without accepting secrets. */
+export function normalizeGitHubOAuthClientIdSetting(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._-]{3,256}$/.test(trimmed) ? trimmed : "";
+}
+
+export function normalizeCompanionLoopbackBaseUrl(value: unknown): string {
+  if (typeof value !== "string") return BASE_DEFAULTS.companionBaseUrl;
+  try {
+    const parsed = new URL(value.trim());
+    const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const loopback =
+      host === "localhost" ||
+      host === "::1" ||
+      /^127(?:\.\d{1,3}){3}$/.test(host);
+    if (
+      !loopback ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash ||
+      (parsed.pathname !== "/" && parsed.pathname !== "")
+    ) {
+      return BASE_DEFAULTS.companionBaseUrl;
+    }
+    return parsed.origin;
+  } catch {
+    return BASE_DEFAULTS.companionBaseUrl;
+  }
 }
 
 function applyConservativeOutputDefaults(settings: NormalizableAgentSettings): void {
   settings.enableStreaming = true;
   settings.streamWritebackMode = "off";
   settings.autoTitleOnWrite = false;
+  settings.modelRouterMode = "off";
+  settings.modelRouterEnabled = false;
 }
 
 function hasConflictingLegacyOutput(settings: NormalizableAgentSettings): boolean {
@@ -380,13 +450,6 @@ function coerceThinkingMode(value: unknown): ThinkingMode {
     return value as ThinkingMode;
   }
   return BASE_DEFAULTS.thinkingMode;
-}
-
-function coerceSchemaVersion(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-    return Math.floor(value);
-  }
-  return 1;
 }
 
 function coerceAutonomyProfile(value: unknown): AutonomyProfileSetting | null {

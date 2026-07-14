@@ -5,6 +5,9 @@ import type {
   AgentRunReceipt,
   AgentRunStopReason,
 } from "../AgentRunner";
+import type { MissionGraphV3 } from "../../packages/headless-runtime/src/missionGraphV3";
+import type { MissionLedgerSummary } from "./missionLedger";
+import type { MissionGraphStoreReferenceV1 } from "./runStore";
 
 const MAX_BUFFERED_RUN_EVENTS = 800;
 const MAX_BUFFERED_RUN_EVENT_CHARS = 2_000_000;
@@ -30,8 +33,30 @@ export interface RunCoordinatorSnapshot {
   startedAtMs: number | null;
   lastActivityAtMs: number | null;
   lastConfig: AgentRunConfigEvent | null;
+  lastMissionGraph: MissionGraphV3 | null;
+  /**
+   * Durable ledger projection restored from the latest integrity-checked
+   * runtime snapshot. This is display/resume state only; the Agent Runs files
+   * remain authoritative.
+   */
+  lastMissionLedger: MissionLedgerSummary | null;
+  persistedProjection: PersistedMissionRunProjectionMetadata | null;
   lastReceipts: AgentRunReceipt[];
   lastComplete: AgentRunCompleteEvent | null;
+}
+
+export interface PersistedMissionRunProjectionMetadata {
+  runtimeSnapshotPath: string;
+  missionLedgerPath: string;
+  graphStorePath: string;
+  graphReference: MissionGraphStoreReferenceV1;
+}
+
+export interface PersistedMissionRunProjection
+  extends PersistedMissionRunProjectionMetadata {
+  runId: string;
+  missionLedger: MissionLedgerSummary;
+  missionGraph: MissionGraphV3;
 }
 
 export class RunAlreadyActiveError extends Error {
@@ -67,6 +92,9 @@ export class RunCoordinator {
   private state: RunCoordinatorState = "idle";
   private runId: string | null = null;
   private lastConfig: AgentRunConfigEvent | null = null;
+  private lastMissionGraph: MissionGraphV3 | null = null;
+  private lastMissionLedger: MissionLedgerSummary | null = null;
+  private persistedProjection: PersistedMissionRunProjectionMetadata | null = null;
   private readonly lastReceipts: AgentRunReceipt[] = [];
   private lastComplete: AgentRunCompleteEvent | null = null;
   private bufferedEventChars = 0;
@@ -91,6 +119,15 @@ export class RunCoordinator {
       startedAtMs: this.startedAtMs,
       lastActivityAtMs: this.lastActivityAtMs,
       lastConfig: this.lastConfig ? { ...this.lastConfig } : null,
+      lastMissionGraph: this.lastMissionGraph
+        ? structuredCloneValue(this.lastMissionGraph)
+        : null,
+      lastMissionLedger: this.lastMissionLedger
+        ? structuredCloneValue(this.lastMissionLedger)
+        : null,
+      persistedProjection: this.persistedProjection
+        ? structuredCloneValue(this.persistedProjection)
+        : null,
       lastReceipts: this.lastReceipts.map((receipt) => ({ ...receipt })),
       lastComplete: this.lastComplete ? { ...this.lastComplete } : null,
     };
@@ -104,6 +141,16 @@ export class RunCoordinator {
     if (options.replay === true) {
       for (const event of this.bufferedEvents) {
         dispatchRunEvent(listener, event);
+      }
+      if (
+        this.lastMissionGraph &&
+        !this.bufferedEvents.some(
+          (event) => event.key === "onMissionGraphUpdate",
+        )
+      ) {
+        listener.onMissionGraphUpdate?.(
+          structuredCloneValue(this.lastMissionGraph),
+        );
       }
     }
     return () => {
@@ -125,6 +172,9 @@ export class RunCoordinator {
     this.eventSequence = 0;
     this.runId = null;
     this.lastConfig = null;
+    this.lastMissionGraph = null;
+    this.lastMissionLedger = null;
+    this.persistedProjection = null;
     this.lastReceipts.splice(0, this.lastReceipts.length);
     this.lastComplete = null;
     this.activeController = new AbortController();
@@ -193,6 +243,34 @@ export class RunCoordinator {
     return promise;
   }
 
+  /**
+   * Restores the restart-safe Run Details projection without pretending that a
+   * mission is currently executing. The caller must first verify the runtime
+   * snapshot's exact graph-store reference; this method never performs or
+   * persists an authority transition.
+   */
+  hydratePersistedMission(projection: PersistedMissionRunProjection): boolean {
+    if (this.activePromise) {
+      return false;
+    }
+    this.runId = projection.runId;
+    this.lastConfig = null;
+    this.lastMissionGraph = structuredCloneValue(projection.missionGraph);
+    this.lastMissionLedger = structuredCloneValue(projection.missionLedger);
+    this.persistedProjection = structuredCloneValue({
+      runtimeSnapshotPath: projection.runtimeSnapshotPath,
+      missionLedgerPath: projection.missionLedgerPath,
+      graphStorePath: projection.graphStorePath,
+      graphReference: projection.graphReference,
+    });
+    this.lastReceipts.splice(0, this.lastReceipts.length);
+    this.lastComplete = null;
+    this.state = "idle";
+    this.startedAtMs = null;
+    this.lastActivityAtMs = Date.now();
+    return true;
+  }
+
   requestStop(): boolean {
     if (!this.activeController || this.activeController.signal.aborted) {
       return false;
@@ -234,6 +312,15 @@ export class RunCoordinator {
       const config = args[0] as AgentRunConfigEvent | undefined;
       this.runId = config?.runId ?? this.runId;
       this.lastConfig = config ? { ...config } : this.lastConfig;
+      this.lastMissionLedger = config?.missionLedger
+        ? structuredCloneValue(config.missionLedger)
+        : this.lastMissionLedger;
+    } else if (key === "onMissionGraphUpdate") {
+      const graph = args[0] as MissionGraphV3 | undefined;
+      if (graph) {
+        this.runId = graph.missionId || this.runId;
+        this.lastMissionGraph = structuredCloneValue(graph);
+      }
     } else if (key === "onOrchestratorEvent") {
       const snapshot = args[1] as { runId?: string } | undefined;
       this.runId = snapshot?.runId ?? this.runId;
@@ -282,6 +369,10 @@ export class RunCoordinator {
       dispatchRunEvent(listener, event);
     }
   }
+}
+
+function structuredCloneValue<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function estimateRunEventChars(args: unknown[]): number {
