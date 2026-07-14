@@ -5634,7 +5634,7 @@ export async function runAgentMission({
             error: {
               code: "background_github_sealer_unavailable",
               message:
-                "Background GitHub publication requires the enabled Integrations extension's trusted package sealer.",
+                "Background GitHub publication requires the built-in Integrations capability's trusted package sealer.",
             },
           };
         }
@@ -5801,7 +5801,7 @@ export async function runAgentMission({
             error: {
               code: "background_code_sealer_unavailable",
               message:
-                "Background Code execution requires the enabled Code extension's trusted package sealer.",
+                "Background Code execution requires the built-in Code capability's trusted package sealer.",
             },
           };
         }

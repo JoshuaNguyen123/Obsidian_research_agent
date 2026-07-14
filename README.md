@@ -1,6 +1,8 @@
 # Agentic Researcher
 
-Agentic Researcher is a native Obsidian community plugin that adds a right-side research assistant inside Obsidian. It is built around a prompt-first chat surface, a `Run Mission` action, and a `Run Details` view for planning, tool activity, receipts, and diagnostics.
+Agentic Researcher is one desktop Obsidian community plugin that adds a right-side research assistant, bounded code workspace, authenticated companion controls, and Linear/GitHub integrations. It is built around a prompt-first chat surface, a `Run Mission` action, and a `Run Details` view for planning, tool activity, receipts, and diagnostics.
+
+Code, Companion, and Integrations are internal capability modules, not separately installed Obsidian plugins. Upgrading from the earlier split development build imports each legacy `data.json` namespace into core with hash provenance; development sync moves the old plugin folders into `.obsidian/plugins/.agentic-researcher-retired/` so their data remains recoverable while Obsidian lists only `Agentic Researcher`.
 
 The plugin is intended to run real research and note-writing workflows inside an Obsidian vault:
 
@@ -20,13 +22,13 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Web search and fetch tools for sourced research when enabled by the mission.
 - Truthful source gating rejects empty/unparsed pages as proof and supports cache, provider, and safety-gated browser extraction fallbacks.
 - Metadata-aware template ranking, dry rendering, safe built-ins, collision handling, and read-back verification.
-- Optional Code extension with durable scratch folders and trusted Git worktrees, bounded file CRUD, repository profiles, sandbox-only validation, repair checkpoints, and verified local commits.
+- Built-in Code capability with durable scratch folders and trusted Git worktrees, bounded file CRUD, repository profiles, sandbox-only validation, repair checkpoints, and verified local commits.
 - Native Canvas, SVG, and Mermaid read/patch tools with optimistic concurrency, transactional design packages, structural QA, bounded layout repair, readback, and receipts.
 - A descriptor-based external-action kernel with prepared-action fingerprints, scoped authority grants, exact approval previews, canonical receipts, readback, and reconciliation.
 - Fixed Linear GraphQL tools through capability gates 0-5; the model cannot submit arbitrary GraphQL, credentials remain host-owned, and Linear tools appear only for explicit Linear intent.
 - A durable Linear queue scanner/coordinator with strict executable-ticket contracts, four-hour grants, two-ticket concurrency, project/resource locks, and a 25-start UTC-day limit.
-- Optional Integrations extension with explicit research-to-note-to-Linear publication, reverse Linear work-item execution, secure credential references, a bounded GitHub catalog, verified Git push, draft pull requests, review handling, and separately approved merge.
-- Optional authenticated loopback Companion service with SQLite jobs, leases, event replay, OS service lifecycle commands, and a shared TypeScript headless worker. Vault operations always wait for connected Obsidian.
+- Built-in Integrations capability with explicit research-to-note-to-Linear publication, reverse Linear work-item execution, secure credential references, a bounded GitHub catalog, verified Git push, draft pull requests, review handling, and separately approved merge.
+- Built-in Companion controller for an authenticated loopback service with SQLite jobs, leases, event replay, OS service lifecycle commands, and a shared TypeScript headless worker. The service remains a separate local process; it is not another Obsidian plugin. Vault operations always wait for connected Obsidian.
 - Pinned continuous-research schedules with quiet hours, retry state, source hashes, and verified/stale/superseded memory states.
 - Persisted chat history capped to useful user and assistant messages only.
 - `Run Details` diagnostics for model config, status, planning, tool timeline, receipts, and trace logs.
@@ -41,7 +43,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 ## Requirements
 
-- Obsidian 1.5.0 or newer.
+- Obsidian Desktop 1.5.0 or newer. Version 0.4.0 is desktop-only because the unified Code and Companion modules require guarded Node/Electron capabilities.
 - Node.js and npm.
 - A local or compatible Ollama API endpoint if you want model-backed runs.
 
@@ -108,7 +110,7 @@ npm run test:e2e:live                  # opt-in disposable external-provider mut
 
 `npm run test:e2e` is deterministic by default and does not call a live model. The deterministic matrix runs the core mock, integration mock, sandbox, and companion-restart Playwright projects. `npm run test:e2e:real` is the explicit real-model lane. `npm run test:e2e:live` is a guarded, credentialed disposable-provider lane: Linear creates, reads, duplicate-searches, comments on, and trashes one test issue; GitHub pushes a local-worktree commit with ephemeral askpass, verifies a draft PR, and cleans up its PR/branch. Live merge requires a separate exact confirmation and performs a compensating cleanup merge.
 
-The e2e harness builds all plugin artifacts, syncs each lane's required extensions into the test vault without overwriting any existing `data.json`, launches a controlled Obsidian process, and verifies missions against seeded notes. By default it resolves the vault as `%USERPROFILE%\OneDrive\Desktop\test_vault_obsidian_ai`; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
+The e2e harness builds the one plugin artifact set, syncs it without overwriting core `data.json`, safely retires split-plugin folders with their data intact, launches a controlled Obsidian process, and verifies missions against seeded notes. By default it resolves the vault as `%USERPROFILE%\OneDrive\Desktop\test_vault_obsidian_ai`; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
 
 **Honest limits:** ordinary vault work and any unapproved external mutation still require Obsidian to remain open. The optional companion can resume only installed, already-authorized non-vault operations; vault nodes stop in `waiting_obsidian`. A secure persistent OS credential backend and explicit service installation are mandatory for unattended work. Generated-code execution stays disabled until a Docker, Podman, dedicated WSL2, or bubblewrap provider passes the boundary probe. The structured model router is authoritative only in the automatic autonomy profile; conservative mode remains deterministic.
 
@@ -122,7 +124,7 @@ Current execution support is bounded by trusted logical bindings:
 
 - `research` tickets run through the Researcher/Lead path with a web-read-only scoped registry and chat-only output, then must include the ticket's acceptance IDs and evidence references before Linear can be completed.
 - `vault` tickets require the exact `current-vault` binding and can create only the host-derived note `Agent Work/Linear Queue/<work-item-fingerprint>.md`; issue text cannot supply a path, command, or new authority.
-- `code` tickets resolve only a trusted `repositoryKey`, run through the Code extension's durable worktree/sandbox/repair path, and remain `waiting_for_publication` after a verified local commit until their required GitHub and backlink proof exists.
+- `code` tickets resolve only a trusted `repositoryKey`, run through the built-in Code capability's durable worktree/sandbox/repair path, and remain `waiting_for_publication` after a verified local commit until their required GitHub and backlink proof exists.
 - `human` tickets are never covered by the automatic grant.
 - GitHub exposes only a fixed catalog against a host-resolved trusted repository profile. Source changes remain local-worktree-only. Push uses ephemeral askpass, remote-SHA readback, and no force-push; draft publication and merge use separate exact approval snapshots, with merge requiring two confirmations.
 
@@ -133,7 +135,7 @@ See local `docs/plans/linear-first-unified-agent.md` for the detailed delivery g
 ## Project Layout
 
 ```text
-main.ts                         Core plugin entrypoint and extension host
+main.ts                         Unified plugin entrypoint and capability host
 src/AgentView.ts                Right-side Obsidian UI
 src/AgentRunner.ts              Model loop and MissionGraph orchestration
 src/model/                      Ollama-compatible model client
@@ -143,9 +145,9 @@ src/integrations/linear/        Linear contracts, OAuth, publication, queue line
 src/integrations/github/        GitHub auth, fixed transport, secure push, publication, and checkpoints
 packages/core-api/              Versioned extension registration and shared contracts
 packages/headless-runtime/      Environment-neutral mission and companion worker runtime
-extensions/code/                Durable workspaces, repository profiles, sandbox, repair, and commit
-extensions/integrations/        Optional Linear/GitHub extension boundary
-extensions/companion/           Optional authenticated local background coordinator
+extensions/code/                Internal durable workspaces, sandbox, repair, and commit module
+extensions/integrations/        Internal Linear/GitHub prepared-action module
+extensions/companion/           Internal authenticated background-service controller module
 tests/                          Node test suite
 e2e/                            Native Obsidian Playwright projects and fixtures
 scripts/                        Build, sync, release-gate, and validation helpers

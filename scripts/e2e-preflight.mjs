@@ -36,6 +36,7 @@ for (const plugin of PLUGIN_CATALOG) {
   if (!expectedPluginIds.has(plugin.id)) continue;
   await verifyInstalledPlugin(plugin);
 }
+await assertLegacyPluginsRetired();
 
 console.log(
   `E2E preflight passed for ${vaultRoot}; lanes=${playwrightLanes.join(",")}; verified ${[...expectedPluginIds].join(", ")}`,
@@ -53,22 +54,12 @@ async function resolveExpectedPluginIds() {
 
   const requiredByLane = {
     "deterministic-core-mock": [],
-    "integration-mock": [
-      "agentic-researcher-code",
-      "agentic-researcher-integrations",
-    ],
-    "integration-mock-legacy": [
-      "agentic-researcher-code",
-      "agentic-researcher-integrations",
-    ],
-    sandbox: ["agentic-researcher-code"],
-    "companion-restart": ["agentic-researcher-companion"],
+    "integration-mock": [],
+    "integration-mock-legacy": [],
+    sandbox: [],
+    "companion-restart": [],
     "real-ai": [],
-    "disposable-live-external": [
-      "agentic-researcher-code",
-      "agentic-researcher-integrations",
-      "agentic-researcher-companion",
-    ],
+    "disposable-live-external": [],
   };
   for (const lane of playwrightLanes) {
     const lanePlugins = requiredByLane[lane];
@@ -91,6 +82,24 @@ async function resolveExpectedPluginIds() {
     }
   }
   return expected;
+}
+
+async function assertLegacyPluginsRetired() {
+  for (const pluginId of [
+    "agentic-researcher-code",
+    "agentic-researcher-integrations",
+    "agentic-researcher-companion",
+  ]) {
+    const manifestPath = path.join(pluginsRoot, pluginId, "manifest.json");
+    try {
+      await access(manifestPath, constants.F_OK);
+    } catch {
+      continue;
+    }
+    throw new Error(
+      `Legacy plugin is still installed separately: ${pluginId}. Run npm run sync:test-vault to retire it safely.`,
+    );
+  }
 }
 
 async function readEnabledCommunityPlugins() {

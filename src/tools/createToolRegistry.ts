@@ -272,7 +272,7 @@ function guardCompatibilityTools(
     if (!isAvailable(capability)) {
       throw new ToolExecutionError(
         "extension_unavailable",
-        `Optional extension capability is unavailable: ${capability}`,
+        `Built-in capability is unavailable: ${capability}`,
         { mutationState: "not_applied" },
       );
     }

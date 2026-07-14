@@ -225,7 +225,7 @@ interface RepositoryInventoryV2 {
 }
 
 /**
- * Production owner for the optional code extension. It owns no model, vault,
+ * Production owner for the built-in Code capability. It owns no model, vault,
  * or credential handle. Every filesystem mutation remains workspace-scoped,
  * and every generated-code process remains behind SandboxManagerV2.
  */
@@ -1494,7 +1494,7 @@ export class CodeExtensionRuntimeV2 {
         version: 1,
         kind: "settings",
         id: `${EXTENSION_ID}:settings-v2`,
-        displayName: "Code extension settings",
+        displayName: "Code capability settings",
       },
       section: {
         id: EXTENSION_ID,
@@ -1798,7 +1798,7 @@ function parsePersistedExtensionMigration(value: unknown): PersistedExtensionMig
   if (snapshot.schemaVersion !== 1) throw new Error("Unsupported code extension migration snapshot version.");
   const snapshotHash = fingerprint(record.snapshotHash, "migration snapshot hash");
   if (sha256Canonical(snapshot) !== snapshotHash) {
-    throw new Error("Code extension migration snapshot does not match its verified hash.");
+    throw new Error("Code capability migration snapshot does not match its verified hash.");
   }
   return {
     migrationId: fingerprint(record.migrationId, "migration id"),
@@ -2023,7 +2023,7 @@ function assertRequiredCodeContributions(contributions: readonly ExtensionContri
     PREPARED_BACKGROUND_CODE_TOOL_NAME_V1,
   ];
   const missing = required.filter((name) => !tools.has(name));
-  if (missing.length > 0) throw new Error(`Code extension is missing required tool contributions: ${missing.join(", ")}.`);
+  if (missing.length > 0) throw new Error(`Code capability is missing required tool contributions: ${missing.join(", ")}.`);
 }
 
 function topLevelRecord(value: unknown): Record<string, unknown> {

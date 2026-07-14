@@ -1,10 +1,10 @@
 {
   "id": "agentic-researcher",
   "name": "Agentic Researcher",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minAppVersion": "1.5.0",
-  "description": "Native right-side Obsidian co-researcher: plan, use approved tools, write notes with receipts. Overnight needs Obsidian open (not a daemon); keep-awake and model router are opt-in.",
+  "description": "Single-install native Obsidian agent: research, approved code work, background companion, Linear/GitHub, note writeback, and receipts.",
   "author": "Josh",
   "authorUrl": "",
-  "isDesktopOnly": false
+  "isDesktopOnly": true
 }

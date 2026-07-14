@@ -38,7 +38,7 @@ export class CompanionServiceControllerV1 {
   readonly baseUrl: string;
   readonly controlScriptPath: string;
   readonly dataDir: string;
-  /** Pinned sibling used by the Code extension and the standalone worker. */
+  /** Pinned sibling used by the Code capability and the standalone worker. */
   readonly codeApplicationDataRoot: string;
   readonly runtimeRoot: string;
   readonly bundleHash: string;

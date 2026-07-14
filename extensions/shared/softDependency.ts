@@ -186,7 +186,7 @@ export async function withPluginDataLock<TResult>(
   }
 }
 
-async function persistMigrationSnapshot(
+export async function persistMigrationSnapshot(
   plugin: Plugin,
   offer: ExtensionStateMigrationOfferV1,
 ): Promise<PersistedExtensionMigrationV1> {
@@ -275,7 +275,7 @@ async function persistMigrationSnapshotUnlocked(
   };
 }
 
-function createMigrationStatusContribution(
+export function createMigrationStatusContribution(
   extensionId: string,
   read: () => { status: string; message: string },
 ): ExtensionContributionV1 {

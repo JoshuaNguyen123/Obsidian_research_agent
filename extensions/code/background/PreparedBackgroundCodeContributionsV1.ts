@@ -121,7 +121,7 @@ function preparationUnavailable() {
     error: {
       code: "prepared_background_code_host_package_required",
       message:
-        "This capability can be prepared only by the Code extension host after durable checkpoint readback.",
+        "This capability can be prepared only by the built-in Code host after durable checkpoint readback.",
     },
   };
 }

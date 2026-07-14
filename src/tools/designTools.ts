@@ -119,8 +119,46 @@ export const createDesignCanvasTool: AgentTool = {
       },
       items: {
         type: "array",
-        items: { type: "object" },
-        description: "Optional layout items with title/text/kind/lane/url/file/color.",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            type: {
+              type: "string",
+              enum: ["text", "file", "link", "group"],
+            },
+            kind: {
+              type: "string",
+              enum: [
+                "step",
+                "branch",
+                "persona",
+                "actor",
+                "screen",
+                "decision",
+                "service",
+                "resource",
+                "database",
+                "queue",
+                "milestone",
+                "risk",
+                "metric",
+                "dependency",
+                "note",
+                "external",
+              ],
+            },
+            title: { type: "string" },
+            text: { type: "string" },
+            file: { type: "string" },
+            url: { type: "string" },
+            lane: { type: "string" },
+            color: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+        description:
+          "Optional layout items. kind is visual metadata; use branch for government or organizational branches.",
       },
       diagramType: {
         type: "string",
@@ -168,19 +206,23 @@ export const createDesignCanvasTool: AgentTool = {
     const createFolders = getOptionalBoolean(args, "createFolders") ?? true;
     const open = getOptionalBoolean(args, "open") ?? true;
 
-    assertPathDoesNotExist(context, path);
-    await ensureParentFolder(context, path, createFolders);
-
-    reportProgress(context, `Planning canvas design for ${path}...`);
+    // Parse and verify every model-provided field before touching the vault.
+    // This keeps invalid arguments provably retryable instead of leaving a
+    // failed mutation intent that continuation must conservatively reconcile.
     const canvas = getCanvasFromArgs(args);
     const diagramType = getDiagramType(args.diagramType);
     const canvasSummary = summarizeCanvas(canvas, diagramType);
-    reportProgress(context, canvasSummary);
     const content = stringifyJsonCanvas(canvas);
     const preflight = verifyCanvasArtifact(content);
     if (!preflight.ok) {
       throw new Error(`Canvas preflight verification failed: ${preflight.errors.join(" ")}`);
     }
+
+    assertPathDoesNotExist(context, path);
+    await ensureParentFolder(context, path, createFolders);
+
+    reportProgress(context, `Planning canvas design for ${path}...`);
+    reportProgress(context, canvasSummary);
     reportProgress(context, "Canvas structure validated; writing artifact...");
 
     const file = await context.app.vault.create(path, content);
@@ -1389,30 +1431,39 @@ function getItemKind(value: unknown, index: number): CanvasLayoutItemKind | unde
     return undefined;
   }
 
-  if (
-    value === "step" ||
-    value === "persona" ||
-    value === "actor" ||
-    value === "screen" ||
-    value === "decision" ||
-    value === "service" ||
-    value === "resource" ||
-    value === "database" ||
-    value === "queue" ||
-    value === "milestone" ||
-    value === "risk" ||
-    value === "metric" ||
-    value === "dependency" ||
-    value === "note" ||
-    value === "external"
-  ) {
-    return value;
+  if (typeof value !== "string") {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      `items[${index}].kind must be a string when provided.`,
+    );
   }
 
-  throw new ToolExecutionError(
-    "invalid_arguments",
-    `items[${index}].kind must be step, persona, actor, screen, decision, service, resource, database, queue, milestone, risk, metric, dependency, note, or external.`,
-  );
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (
+    normalized === "step" ||
+    normalized === "branch" ||
+    normalized === "persona" ||
+    normalized === "actor" ||
+    normalized === "screen" ||
+    normalized === "decision" ||
+    normalized === "service" ||
+    normalized === "resource" ||
+    normalized === "database" ||
+    normalized === "queue" ||
+    normalized === "milestone" ||
+    normalized === "risk" ||
+    normalized === "metric" ||
+    normalized === "dependency" ||
+    normalized === "note" ||
+    normalized === "external"
+  ) {
+    return normalized;
+  }
+
+  // Visual kind affects only labels and colors, not Canvas authority or data
+  // safety. Provider-created semantic labels such as "government" should not
+  // abort an otherwise valid artifact; render them with the neutral note style.
+  return "note";
 }
 
 function getShapes(args: Record<string, unknown>): SvgWireframeShape[] {

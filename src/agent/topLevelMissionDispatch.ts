@@ -69,7 +69,7 @@ export function resolveTopLevelMissionDispatchV1(
       message:
         "Code work is unavailable because Agentic Researcher Code is not registered. Enable the code extension, verify its migration status in Run Details, and retry this mission.",
       requiredAction:
-        "Enable a compatible Agentic Researcher Code extension and retry the explicit mission.",
+        "Reload Agentic Researcher, verify built-in Code health, and retry the explicit mission.",
     };
   }
   if (hasCodeIntent) {

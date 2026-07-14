@@ -181,7 +181,7 @@ export async function startBackgroundCodeCompanionHarness(
         binding = await readWorkspaceBinding(native.page).catch(() => null);
         await native.stopActiveMission(10_000).catch(() => false);
         if (binding) {
-          await native.setCodeExtensionEnabled(false).catch(() => undefined);
+          await native.setUnifiedPluginEnabled(false).catch(() => undefined);
         }
       }
       if (binding) {
@@ -244,8 +244,16 @@ async function installBackgroundCodePageHarness(
         throw new Error(`Plugin did not become ready: ${pluginId}`);
       };
       const core = await waitForPlugin(corePluginId);
-      const code = await waitForPlugin(codePluginId);
-      const companion = await waitForPlugin(companionPluginId);
+      const waitForCapability = async (capabilityId: string) => {
+        for (let attempt = 0; attempt < 240; attempt += 1) {
+          const capability = core.getBundledCapability?.(capabilityId);
+          if (capability) return capability;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`Built-in capability did not become ready: ${capabilityId}`);
+      };
+      const code = await waitForCapability(codePluginId);
+      const companion = await waitForCapability(companionPluginId);
       if (!code.runtime?.workspaceManager || !companion.pairForegroundCompanion) {
         throw new Error("Code or Companion production runtime is unavailable.");
       }
@@ -502,7 +510,7 @@ async function installBackgroundCodePageHarness(
       const installRuntimeInstrumentation = () => {
         const activeCore = app.plugins.plugins?.[corePluginId];
         instrumentRegistry(activeCore);
-        instrumentCodePlugin(app.plugins.plugins?.[codePluginId]);
+        instrumentCodePlugin(activeCore?.getBundledCapability?.(codePluginId));
         for (const leaf of app.workspace.getLeavesOfType?.(
           "agentic-researcher-view",
         ) ?? []) {
@@ -623,7 +631,8 @@ async function installBackgroundCodePageHarness(
       };
 
       const seedRepairCheckpoint = async () => {
-        const activeCode = app.plugins.plugins?.[codePluginId];
+        const activeCode = app.plugins.plugins?.[corePluginId]
+          ?.getBundledCapability?.(codePluginId);
         const runtime = activeCode?.runtime;
         if (!runtime?.workspaceManager) {
           throw new Error("Code runtime disappeared before checkpoint seeding.");
@@ -889,7 +898,8 @@ async function installBackgroundCodePageHarness(
         if (state.checkpointId) return state.checkpointId;
         if (state.fixturePromise) return state.fixturePromise;
         state.fixturePromise = (async () => {
-          const activeCode = app.plugins.plugins?.[codePluginId];
+          const activeCode = app.plugins.plugins?.[corePluginId]
+            ?.getBundledCapability?.(codePluginId);
           const runtime = activeCode?.runtime;
           const manager = runtime?.workspaceManager;
           if (!runtime || !manager) {
@@ -1654,9 +1664,9 @@ async function disconnectAndRestartCoreCode(page: Page): Promise<void> {
       };
       const app = harnessWindow.app;
       const state = harnessWindow.__e2eBackgroundCode;
-      const companion = app?.plugins?.plugins?.[companionPluginId];
+      const companion = app?.plugins?.plugins?.[corePluginId]
+        ?.getBundledCapability?.(companionPluginId);
       companion?.companionCoordinator?.clearSession?.();
-      await app.plugins.disablePlugin(codePluginId);
       await app.plugins.disablePlugin(corePluginId);
       await app.plugins.enablePlugin(corePluginId);
       for (let attempt = 0; attempt < 240; attempt += 1) {
@@ -1668,13 +1678,11 @@ async function disconnectAndRestartCoreCode(page: Page): Promise<void> {
       state.installMocks?.();
       await app.plugins.plugins?.[corePluginId]?.activateView?.();
       state.installMocks?.();
-      await app.plugins.enablePlugin(codePluginId);
       for (let attempt = 0; attempt < 240; attempt += 1) {
         const core = app.plugins.plugins?.[corePluginId];
         if (
-          app.plugins.plugins?.[codePluginId] &&
-          core?.agenticResearcherApi
-            ?.getRegisteredExtensionIds?.()
+          core?.getBundledCapability?.(codePluginId) &&
+          core?.getRegisteredCapabilityIds?.()
             ?.includes(codePluginId)
         ) {
           break;
@@ -1695,12 +1703,13 @@ async function disconnectAndRestartCoreCode(page: Page): Promise<void> {
 }
 
 async function reconnectCompanion(page: Page): Promise<void> {
-  await page.evaluate(async ({ companionPluginId }) => {
+  await page.evaluate(async ({ corePluginId, companionPluginId }) => {
     const harnessWindow = window as typeof window & {
       app?: any;
       __e2eBackgroundCode?: any;
     };
-    const companion = harnessWindow.app?.plugins?.plugins?.[companionPluginId];
+    const companion = harnessWindow.app?.plugins?.plugins?.[corePluginId]
+      ?.getBundledCapability?.(companionPluginId);
     const state = harnessWindow.__e2eBackgroundCode;
     if (!companion?.pairForegroundCompanion || !state?.fetchImpl) {
       throw new Error("Companion reconnect fixture is unavailable.");
@@ -1711,7 +1720,10 @@ async function reconnectCompanion(page: Page): Promise<void> {
         "background-code-companion-bootstrap-token-0123456789abcdef",
       fetchImpl: state.fetchImpl,
     });
-  }, { companionPluginId: COMPANION_PLUGIN_ID });
+  }, {
+    corePluginId: PHASE4_CORE_PLUGIN_ID,
+    companionPluginId: COMPANION_PLUGIN_ID,
+  });
 }
 
 async function requestReconciliation(page: Page): Promise<void> {
@@ -1742,7 +1754,7 @@ async function readPageSnapshot(
   commitSha: string | null;
 }> {
   return page.evaluate(
-    async ({ codePluginId, companionPluginId }) => {
+    async ({ corePluginId, codePluginId, companionPluginId }) => {
       const harnessWindow = window as typeof window & {
         app?: any;
         __e2eBackgroundCode?: any;
@@ -1782,13 +1794,14 @@ async function readPageSnapshot(
       const graphBinding = graphBindingId
         ? graphRecord?.graph?.capabilityEnvelope?.bindings?.[graphBindingId] ?? null
         : null;
+      const code = app.plugins.plugins?.[corePluginId]
+        ?.getBundledCapability?.(codePluginId);
       const workspaceManifest = state?.workspaceId
-        ? await app.plugins.plugins?.[codePluginId]?.runtime?.workspaceManager
+        ? await code?.runtime?.workspaceManager
             ?.loadManifest?.(state.workspaceId)
             .catch(() => null)
         : null;
-      const status = app.plugins.plugins?.[codePluginId]?.runtime
-        ?.sandboxManager?.readStatus?.();
+      const status = code?.runtime?.sandboxManager?.readStatus?.();
       return {
         blockerCode: state?.blockerCode ?? null,
         sandboxMode: state?.sandboxMode ?? status?.mode ?? null,
@@ -1895,6 +1908,7 @@ async function readPageSnapshot(
       };
     },
     {
+      corePluginId: PHASE4_CORE_PLUGIN_ID,
       codePluginId: PHASE4_CODE_PLUGIN_ID,
       companionPluginId: COMPANION_PLUGIN_ID,
     },
@@ -1979,7 +1993,7 @@ const OWNED_BACKGROUND_WORKSPACE =
 /**
  * Interrupted desktop runs can end before Phase4Harness restores its byte
  * snapshot. Remove only this harness's exact marker namespace before Obsidian
- * loads the Code extension; a malformed owned checkpoint must not make every
+ * loads the built-in Code capability; a malformed owned checkpoint must not make every
  * later native launch fail. User profiles, checkpoints, settings, and history
  * remain byte-for-byte represented in the rewritten object.
  */

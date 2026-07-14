@@ -387,7 +387,7 @@ export class GitHubReviewRepairCoordinatorV1 {
       if (!resolved || !sameHandoff(resolved, request.originalHandoff)) {
         return result(await this.block(checkpoint, {
           code: "github_review_workspace_handoff_invalid",
-          message: "The Code extension could not resolve the exact verified workspace and handoff that produced the pull-request head.",
+          message: "The built-in Code capability could not resolve the exact verified workspace and handoff that produced the pull-request head.",
           evidenceFingerprint: request.originalHandoff.fingerprint,
         }));
       }

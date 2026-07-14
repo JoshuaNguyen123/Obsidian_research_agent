@@ -106,7 +106,7 @@ async function installEffectfulPageHarness(context: {
       let companion: any = null;
       for (let attempt = 0; attempt < 200; attempt += 1) {
         core = app.plugins.plugins?.[corePluginId] ?? null;
-        companion = app.plugins.plugins?.[companionPluginId] ?? null;
+        companion = core?.getBundledCapability?.(companionPluginId) ?? null;
         if (
           core?.agenticResearcherApi?.state === "ready" &&
           companion?.pairForegroundCompanion &&
@@ -698,14 +698,15 @@ async function waitForRemoteSubmission(page: Page): Promise<void> {
 }
 
 async function readDispatchDiagnostics(page: Page): Promise<unknown> {
-  return page.evaluate(async ({ companionPluginId }) => {
+  return page.evaluate(async ({ corePluginId, companionPluginId }) => {
     const effectfulWindow = window as typeof window & {
       app?: any;
       __e2ePhase3Effectful?: any;
     };
     const app = effectfulWindow.app;
     const state = effectfulWindow.__e2ePhase3Effectful;
-    const companion = app?.plugins?.plugins?.[companionPluginId];
+    const companion = app?.plugins?.plugins?.[corePluginId]
+      ?.getBundledCapability?.(companionPluginId);
     const matchingArtifacts: Array<Record<string, unknown>> = [];
     for (const file of app?.vault?.getMarkdownFiles?.() ?? []) {
       if (!/^Agent Runs\/.+\.md$/iu.test(file.path)) continue;
@@ -750,7 +751,10 @@ async function readDispatchDiagnostics(page: Page): Promise<unknown> {
         document.querySelector(".agentic-researcher-view")?.textContent?.slice(-12_000) ??
         null,
     };
-  }, { companionPluginId: COMPANION_PLUGIN_ID });
+  }, {
+    corePluginId: NATIVE_CORE_PLUGIN_ID,
+    companionPluginId: COMPANION_PLUGIN_ID,
+  });
 }
 
 async function submitMission(page: Page, prompt: string): Promise<void> {
@@ -788,23 +792,27 @@ async function approve(page: Page, approval: Locator): Promise<void> {
 }
 
 async function disconnectCompanion(page: Page): Promise<void> {
-  await page.evaluate(({ companionPluginId }) => {
+  await page.evaluate(({ corePluginId, companionPluginId }) => {
     const extension = (window as typeof window & { app?: any }).app?.plugins
-      ?.plugins?.[companionPluginId];
+      ?.plugins?.[corePluginId]?.getBundledCapability?.(companionPluginId);
     if (!extension?.companionCoordinator) {
       throw new Error("Companion coordinator is unavailable for disconnect.");
     }
     extension.companionCoordinator.clearSession();
-  }, { companionPluginId: COMPANION_PLUGIN_ID });
+  }, {
+    corePluginId: NATIVE_CORE_PLUGIN_ID,
+    companionPluginId: COMPANION_PLUGIN_ID,
+  });
 }
 
 async function reconnectCompanion(page: Page): Promise<void> {
-  await page.evaluate(async ({ companionPluginId }) => {
+  await page.evaluate(async ({ corePluginId, companionPluginId }) => {
     const effectfulWindow = window as typeof window & {
       app?: any;
       __e2ePhase3Effectful?: any;
     };
-    const extension = effectfulWindow.app?.plugins?.plugins?.[companionPluginId];
+    const extension = effectfulWindow.app?.plugins?.plugins?.[corePluginId]
+      ?.getBundledCapability?.(companionPluginId);
     const state = effectfulWindow.__e2ePhase3Effectful;
     if (!extension?.pairForegroundCompanion || !state?.fetchImpl) {
       throw new Error("Companion reconnect fixture is unavailable.");
@@ -815,7 +823,10 @@ async function reconnectCompanion(page: Page): Promise<void> {
         "phase3-effectful-companion-bootstrap-token-0123456789abcdef",
       fetchImpl: state.fetchImpl,
     });
-  }, { companionPluginId: COMPANION_PLUGIN_ID });
+  }, {
+    corePluginId: NATIVE_CORE_PLUGIN_ID,
+    companionPluginId: COMPANION_PLUGIN_ID,
+  });
 }
 
 async function readEffectfulCounter(
@@ -839,7 +850,7 @@ async function readRemoteState(page: Page): Promise<string | null> {
 }
 
 async function readSnapshot(page: Page): Promise<Phase3EffectfulSnapshot> {
-  return page.evaluate(async ({ companionPluginId }) => {
+  return page.evaluate(async ({ corePluginId, companionPluginId }) => {
     const effectfulWindow = window as typeof window & {
       app?: any;
       __e2ePhase3Effectful?: any;
@@ -865,7 +876,8 @@ async function readSnapshot(page: Page): Promise<Phase3EffectfulSnapshot> {
       }
     }
     const lineage = (window as typeof window & { app?: any }).app?.plugins
-      ?.plugins?.[companionPluginId]?.companionCoordinator?.getRuntimeState?.()
+      ?.plugins?.[corePluginId]?.getBundledCapability?.(companionPluginId)
+      ?.companionCoordinator?.getRuntimeState?.()
       ?.jobs?.[jobId];
     const receipts = jobId ? state.receipts[jobId] ?? [] : [];
     const verified = receipts.find((receipt: any) => receipt.status === "verified");
@@ -921,5 +933,8 @@ async function readSnapshot(page: Page): Promise<Phase3EffectfulSnapshot> {
           }
         : null,
     };
-  }, { companionPluginId: COMPANION_PLUGIN_ID });
+  }, {
+    corePluginId: NATIVE_CORE_PLUGIN_ID,
+    companionPluginId: COMPANION_PLUGIN_ID,
+  });
 }

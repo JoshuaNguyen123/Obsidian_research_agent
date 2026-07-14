@@ -24,7 +24,7 @@ const MISSION_TIMEOUT_MS = 240_000;
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 
-test.describe("Phase 4 Code extension production boundaries", () => {
+test.describe("Phase 4 built-in Code capability production boundaries", () => {
   test.describe.configure({ timeout: SUITE_TIMEOUT_MS });
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
 
@@ -48,7 +48,7 @@ test.describe("Phase 4 Code extension production boundaries", () => {
       registrationGap(
         "durable workspace CRUD",
         missing,
-        "the installed Code extension did not expose the required production workspace contracts",
+        "the built-in Code capability did not expose the required production workspace contracts",
       ),
     ).toEqual([]);
 
@@ -120,7 +120,7 @@ test.describe("Phase 4 Code extension production boundaries", () => {
         "workspace status before restart",
       );
 
-      await active.restartCoreAndCode();
+      await active.restartUnifiedPlugin();
       const catalogAfterRestart = await active.readToolCatalog();
       expect(missingTools(catalogAfterRestart, PHASE4_REQUIRED_CRUD_TOOLS)).toEqual([]);
 
@@ -152,7 +152,7 @@ test.describe("Phase 4 Code extension production boundaries", () => {
       registrationGap(
         "sandbox failure proof",
         missing,
-        "the installed Code extension did not expose the required production sandbox contracts",
+        "the built-in Code capability did not expose the required production sandbox contracts",
       ),
     );
 
@@ -168,7 +168,7 @@ test.describe("Phase 4 Code extension production boundaries", () => {
       const persistedProbe = await active.runSandboxBoundaryProbe();
       test.skip(
         persistedProbe === null,
-        "Missing production command agentic-researcher-code:probe-sandbox-boundaries; code_sandbox_status is intentionally read-only and cannot prove a completed boundary probe by itself.",
+        "The built-in Code boundary-probe seam is unavailable; code_sandbox_status is intentionally read-only and cannot prove a completed boundary probe by itself.",
       );
       if (!persistedProbe) {
         throw new Error("Sandbox probe command did not return persisted status.");
@@ -232,7 +232,7 @@ test.describe("Phase 4 Code extension production boundaries", () => {
       const missing = missingTools(catalog, PHASE4_REQUIRED_REPAIR_TOOLS);
       expect(
         missing,
-        "The installed Code extension must atomically register its workspace, sandbox, repair, and verified-commit tools before repair e2e can proceed.",
+        "The unified plugin must atomically register its Code workspace, sandbox, repair, and verified-commit tools before repair e2e can proceed.",
       ).toEqual([]);
 
       await active.configureScenario("repository-create", {
@@ -299,7 +299,7 @@ test.describe("Phase 4 Code extension production boundaries", () => {
       });
       expect(
         queueBridge.available,
-        "The installed Code extension must expose the host-only trusted queue bridge.",
+        "The built-in Code capability must expose the host-only trusted queue bridge.",
       ).toBe(true);
       if (sandboxStatus.executionAvailable !== true) {
         expect(queueBridge.error).toMatch(/sandbox execution is unavailable/iu);
@@ -396,60 +396,32 @@ test.describe("Phase 4 Code extension production boundaries", () => {
     }
   });
 
-  test("disabling the Code extension leaves core Chat and Run Details healthy", async () => {
+  test("Code is an atomic built-in capability of the one installed plugin", async () => {
     test.setTimeout(SUITE_TIMEOUT_MS);
     const active = requireHarness(harness);
-    const before = await readExtensionState(active);
-    expect(before.loaded).toBe(true);
+    const state = await readExtensionState(active);
+    expect(state).toEqual({
+      loaded: true,
+      registered: true,
+      separateManifestInstalled: false,
+      separatelyEnabled: false,
+    });
 
-    await active.setCodeExtensionEnabled(false);
-    try {
-      await expect
-        .poll(async () => readExtensionState(active), { timeout: 30_000 })
-        .toMatchObject({ loaded: false, registered: false });
-
-      const catalog = await active.readToolCatalog();
-      const names = catalog.map((entry) => entry.name);
-      expect(names).toContain("read_current_file");
-      for (const name of [
-        ...PHASE4_REQUIRED_CRUD_TOOLS,
-        ...PHASE4_REQUIRED_SANDBOX_TOOLS,
-        ...PHASE4_REQUIRED_REPAIR_TOOLS,
-      ]) {
-        expect(names, `${name} must disappear with the Code extension`).not.toContain(name);
-      }
-
-      await expect(active.page.getByRole("tab", { name: "Chat" })).toBeVisible();
-      await expect(active.page.getByRole("tab", { name: "Run Details" })).toBeVisible();
-      await expect(active.page.locator("textarea.agentic-researcher-prompt")).toBeEnabled();
-      await expect(active.page.locator("button.agentic-researcher-run")).toBeEnabled();
-
-      await active.configureScenario("core-health");
-      const approvals = await active.submitMissionWithApprovals(
-        `Confirm core Chat health while the Code extension is disabled. Return the fixture marker ${active.marker}.`,
-        { timeoutMs: MISSION_TIMEOUT_MS },
-      );
-      expect(approvals).toEqual([]);
-      await active.page.getByRole("tab", { name: "Chat" }).click();
-      await expect(
-        active.page.locator(
-          ".agentic-researcher-log-assistant .agentic-researcher-log-message",
-          { hasText: `PHASE4_CORE_HEALTH_OK ${active.marker}` },
-        ),
-      ).toBeVisible();
-
-      await active.page.getByRole("tab", { name: "Run Details" }).click();
-      await expect(active.page.locator(".agentic-researcher-details-panel")).toBeVisible();
-      await expect(active.page.locator(".agentic-researcher-run-status-text")).toHaveText(
-        "Idle",
-      );
-      await expect(active.page.locator(".agentic-researcher-tool-item")).toHaveCount(0);
-    } finally {
-      await active.setCodeExtensionEnabled(true);
-      await expect
-        .poll(async () => readExtensionState(active), { timeout: 30_000 })
-        .toMatchObject({ loaded: true });
+    const catalog = await active.readToolCatalog();
+    const names = catalog.map((entry) => entry.name);
+    expect(names).toContain("read_current_file");
+    for (const name of [
+      ...PHASE4_REQUIRED_CRUD_TOOLS,
+      ...PHASE4_REQUIRED_SANDBOX_TOOLS,
+      ...PHASE4_REQUIRED_REPAIR_TOOLS,
+    ]) {
+      expect(names, `${name} must ship with the unified plugin`).toContain(name);
     }
+
+    await expect(active.page.getByRole("tab", { name: "Chat" })).toBeVisible();
+    await expect(active.page.getByRole("tab", { name: "Run Details" })).toBeVisible();
+    await expect(active.page.locator("textarea.agentic-researcher-prompt")).toBeEnabled();
+    await expect(active.page.locator("button.agentic-researcher-run")).toBeEnabled();
   });
 });
 
@@ -508,16 +480,22 @@ function nestedString(
 async function readExtensionState(active: Phase4Harness): Promise<{
   loaded: boolean;
   registered: boolean;
+  separateManifestInstalled: boolean;
+  separatelyEnabled: boolean;
 }> {
   return active.page.evaluate(({ codePluginId }) => {
     const app = (window as typeof window & { app?: any }).app;
     const core = app?.plugins?.plugins?.["agentic-researcher"];
     return {
-      loaded: Boolean(app?.plugins?.plugins?.[codePluginId]),
+      loaded: Boolean(core?.getBundledCapability?.(codePluginId)),
       registered: Boolean(
-        core?.agenticResearcherApi
-          ?.getRegisteredExtensionIds?.()
+        core?.getRegisteredCapabilityIds?.()
           ?.includes(codePluginId),
+      ),
+      separateManifestInstalled: Boolean(app?.plugins?.manifests?.[codePluginId]),
+      separatelyEnabled: Boolean(
+        app?.plugins?.enabledPlugins?.has?.(codePluginId) ||
+          app?.plugins?.enabledPlugins?.includes?.(codePluginId),
       ),
     };
   }, { codePluginId: PHASE4_CODE_PLUGIN_ID });
@@ -575,11 +553,11 @@ async function cleanupOwnedScratchWorkspace(
     return;
   }
   const wasEnabled = (await readExtensionState(active)).loaded;
-  if (wasEnabled) await active.setCodeExtensionEnabled(false);
+  if (wasEnabled) await active.setUnifiedPluginEnabled(false);
   try {
     await rm(verifiedContainer, { recursive: true, force: true });
   } finally {
-    if (wasEnabled) await active.setCodeExtensionEnabled(true);
+    if (wasEnabled) await active.setUnifiedPluginEnabled(true);
   }
 }
 
@@ -627,7 +605,7 @@ async function cleanupOwnedRepositoryWorkspace(
     return;
   }
   const wasEnabled = (await readExtensionState(active)).loaded;
-  if (wasEnabled) await active.setCodeExtensionEnabled(false);
+  if (wasEnabled) await active.setUnifiedPluginEnabled(false);
   try {
     await fixture
       .removeOwnedWorktree(binding.worktreeRoot, binding.branch)
@@ -658,7 +636,7 @@ async function cleanupOwnedRepositoryWorkspace(
       await rm(verifiedContainer, { recursive: true, force: true });
     }
   } finally {
-    if (wasEnabled) await active.setCodeExtensionEnabled(true);
+    if (wasEnabled) await active.setUnifiedPluginEnabled(true);
   }
 }
 
