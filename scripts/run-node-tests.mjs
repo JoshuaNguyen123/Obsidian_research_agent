@@ -4,15 +4,14 @@ import { spawnSync } from "node:child_process";
 
 const env = { ...process.env };
 
-// macOS exposes its temporary directory through /var while realpath resolves
-// the same files under /private/var. Give every test fixture one canonical
-// identity before strict workspace/profile fingerprints are constructed.
-if (process.platform === "darwin") {
-  const canonicalTemp = realpathSync(tmpdir());
-  env.TMPDIR = canonicalTemp;
-  env.TMP = canonicalTemp;
-  env.TEMP = canonicalTemp;
-}
+// Hosted platforms may expose their temporary directory through an alias:
+// macOS /var -> /private/var and Windows 8.3 RUNNER~1 -> runneradmin are both
+// real examples. Give every fixture one canonical identity before strict
+// workspace/profile fingerprints are constructed.
+const canonicalTemp = realpathSync(tmpdir());
+env.TMPDIR = canonicalTemp;
+env.TMP = canonicalTemp;
+env.TEMP = canonicalTemp;
 
 const result = spawnSync(
   process.execPath,
