@@ -31,7 +31,13 @@ export interface Phase4GitFixture {
 export async function createPhase4GitFixture(
   marker: string,
 ): Promise<Phase4GitFixture> {
-  const root = await mkdtemp(path.join(tmpdir(), "agentic-phase4-git-"));
+  // The trusted prompt binding and the workspace manager compare canonical
+  // repository authority. Canonicalize at fixture creation so Windows 8.3
+  // temp aliases and macOS /var aliases cannot make the prompt describe a
+  // different root than the production tool verifies.
+  const root = await realpath(
+    await mkdtemp(path.join(tmpdir(), "agentic-phase4-git-")),
+  );
   const sourcePath = path.join(root, "src", "value.mjs");
   const testPath = path.join(root, "test", "value.test.mjs");
   await mkdir(path.dirname(sourcePath), { recursive: true });

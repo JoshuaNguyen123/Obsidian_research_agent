@@ -1092,7 +1092,7 @@ async function installBackgroundCodePageHarness(
         });
         state.events[jobId] = events;
       };
-      const transitionAmbiguous = async (jobId: string) => {
+      const transitionAmbiguousOnce = async (jobId: string) => {
         const remote = state.jobs[jobId];
         if (!remote || remote.state === "complete") return;
         const handoff = remote.payload.preparedBackgroundCodeAction;
@@ -1135,7 +1135,13 @@ async function installBackgroundCodePageHarness(
             cwd: state.worktreeRoot,
             args: ["commit", "-m", "fix: background Code E2E addition"],
           });
-          if (commit.exitCode !== 0) throw new Error("Fake companion could not commit fixture bytes.");
+          if (commit.exitCode !== 0) {
+            throw new Error(
+              `Fake companion could not commit fixture bytes: ${String(
+                commit.stderr || commit.stdout || `exit ${commit.exitCode}`,
+              ).trim()}`,
+            );
+          }
           const head = await state.gitRunner.run({
             cwd: state.worktreeRoot,
             args: ["rev-parse", "HEAD"],
@@ -1172,6 +1178,23 @@ async function installBackgroundCodePageHarness(
             status: "ambiguous",
             fingerprint: ambiguous.fingerprint,
           });
+        }
+      };
+      const ambiguousTransitions = new Map<string, Promise<void>>();
+      const transitionAmbiguous = async (jobId: string) => {
+        const existing = ambiguousTransitions.get(jobId);
+        if (existing) {
+          await existing;
+          return;
+        }
+        const pending = transitionAmbiguousOnce(jobId);
+        ambiguousTransitions.set(jobId, pending);
+        try {
+          await pending;
+        } finally {
+          if (ambiguousTransitions.get(jobId) === pending) {
+            ambiguousTransitions.delete(jobId);
+          }
         }
       };
       const transitionComplete = async (jobId: string) => {
@@ -1381,8 +1404,32 @@ async function installBackgroundCodePageHarness(
           state.events[body.id] = [];
           appendEvent(body.id, "job_accepted", {});
           appendEvent(body.id, "job_started", {});
-          setTimeout(() => void transitionAmbiguous(body.id), 800);
-          setTimeout(() => void transitionComplete(body.id), 2_000);
+          const scheduleTransition = (
+            transition: (jobId: string) => Promise<void>,
+            delayMs: number,
+          ) => {
+            setTimeout(() => {
+              void transition(body.id).catch((error) => {
+                const message =
+                  error instanceof Error ? error.message : String(error);
+                state.remoteTransitionError = message;
+                const failed = state.jobs[body.id];
+                if (failed) {
+                  failed.state = "failed";
+                  failed.output = {
+                    status: "failed",
+                    blocker: {
+                      code: "e2e_remote_transition_failed",
+                      message,
+                    },
+                  };
+                  failed.updatedAt = new Date().toISOString();
+                }
+              });
+            }, delayMs);
+          };
+          scheduleTransition(transitionAmbiguous, 800);
+          scheduleTransition(transitionComplete, 2_000);
           return jsonResponse(remote);
         }
         const segments = url.pathname.split("/").filter(Boolean);
@@ -1743,6 +1790,9 @@ async function readRemoteState(page: Page): Promise<string | null> {
     const state = (
       window as typeof window & { __e2eBackgroundCode?: any }
     ).__e2eBackgroundCode;
+    if (state?.remoteTransitionError) {
+      return `failed:${String(state.remoteTransitionError)}`;
+    }
     const jobId = Object.keys(state?.jobs ?? {})[0];
     return jobId ? String(state.jobs[jobId]?.state ?? "") : null;
   });

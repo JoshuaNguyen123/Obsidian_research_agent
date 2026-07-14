@@ -5313,7 +5313,11 @@ test("design graph conversion creates a native canvas instead of appending a ren
       await expect(canvasView.locator(".canvas-node")).toHaveCount(7, {
         timeout: 30_000,
       });
-      await expect(canvasView).toContainText("Power & Control");
+      // Obsidian intentionally elides text-node bodies when a larger Canvas is
+      // zoomed to fit, while retaining edge labels in the mounted DOM. The
+      // file assertions above prove the requested semantic labels; this check
+      // proves the native Canvas opened with its visible relationship layer.
+      await expect(canvasView).toContainText("requires");
       await expectRenderedScreenshotState(canvasView, "design-graph-canvas-render", {
         minimumWidth: 240,
         minimumHeight: 160,
@@ -5875,7 +5879,10 @@ async function withE2EHarness(
     const trustVaultButton = page.getByRole("button", {
       name: "Trust author and enable plugins",
     });
-    if (await trustVaultButton.isVisible().catch(() => false)) {
+    const trustDisposableVaultIfPrompted = async (): Promise<boolean> => {
+      if (!(await trustVaultButton.isVisible().catch(() => false))) {
+        return false;
+      }
       if (process.env.E2E_TRUST_DISPOSABLE_VAULT !== "1") {
         throw new Error(
           "Obsidian opened this vault in Restricted Mode. Set E2E_TRUST_DISPOSABLE_VAULT=1 only for a controlled disposable vault containing trusted local plugin artifacts.",
@@ -5883,7 +5890,9 @@ async function withE2EHarness(
       }
       await trustVaultButton.click();
       await expect(trustVaultButton).toBeHidden({ timeout: 30_000 });
-    }
+      return true;
+    };
+    await trustDisposableVaultIfPrompted();
     const aiConfig = options.aiConfig ?? getE2EAiConfig();
     const aiMode = options.aiMode ?? aiConfig.mode;
     const setupDiagnostics: string[] = [];
@@ -5904,13 +5913,29 @@ async function withE2EHarness(
     page.on("pageerror", capturePageError);
     let setupResult: { activeFilePath: string; pluginId: string };
     try {
-      setupResult = await setupVaultNoteAndMockModel(
-        page,
-        input,
-        aiMode,
-        aiConfig,
-        options.semanticEmbeddingConfig ?? getE2ESemanticEmbeddingConfig(),
-      );
+      try {
+        setupResult = await setupVaultNoteAndMockModel(
+          page,
+          input,
+          aiMode,
+          aiConfig,
+          options.semanticEmbeddingConfig ?? getE2ESemanticEmbeddingConfig(),
+        );
+      } catch (error) {
+        // A first-open prompt can mount after the renderer's CDP endpoint and
+        // plugin manager become visible. Retry setup only when the explicitly
+        // authorized disposable-vault prompt actually appeared.
+        if (!(await trustDisposableVaultIfPrompted())) {
+          throw error;
+        }
+        setupResult = await setupVaultNoteAndMockModel(
+          page,
+          input,
+          aiMode,
+          aiConfig,
+          options.semanticEmbeddingConfig ?? getE2ESemanticEmbeddingConfig(),
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -6213,6 +6238,7 @@ async function assertHarnessMockReady(page: Page) {
               ?? [];
           return {
             model: plugin?.settings?.model ?? "",
+            ollamaBaseUrl: plugin?.settings?.ollamaBaseUrl ?? "",
             mockInstalled: Boolean(plugin?.__playwrightE2EMockInstalled),
             clientMock: Boolean(client?.playwrightE2EMock),
             viewMockInstalled: viewPlugins.every((viewPlugin: any) =>
@@ -6224,6 +6250,7 @@ async function assertHarnessMockReady(page: Page) {
     )
     .toEqual({
       model: "playwright-e2e-mock",
+      ollamaBaseUrl: "http://127.0.0.1:11434",
       mockInstalled: true,
       clientMock: true,
       viewMockInstalled: true,
@@ -7056,6 +7083,11 @@ async function setupVaultNoteAndMockModel(
       enableStreaming: false,
       thinkingMode: "off",
       model: "playwright-e2e-mock",
+      // Mock web tools must never depend on a credential preserved in an
+      // established test vault. A loopback base URL exercises the injected
+      // transport without triggering Ollama Cloud's real API-key precondition.
+      ollamaBaseUrl: "http://127.0.0.1:11434",
+      ollamaApiKey: "",
       semanticEmbeddingModel:
         semanticEmbeddingConfig.mode === "ollama"
           ? semanticEmbeddingConfig.model
@@ -11190,6 +11222,8 @@ Confidence: high for deterministic workflow coverage.
         enableStreaming: false,
         thinkingMode: "off",
         model: "playwright-e2e-mock",
+        ollamaBaseUrl: "http://127.0.0.1:11434",
+        ollamaApiKey: "",
         semanticEmbeddingModel:
           semanticEmbeddingConfig.mode === "ollama"
             ? semanticEmbeddingConfig.model
@@ -11888,6 +11922,8 @@ Confidence: high for deterministic workflow coverage.
         enableStreaming: false,
         thinkingMode: "off",
         model: "playwright-e2e-mock",
+        ollamaBaseUrl: "http://127.0.0.1:11434",
+        ollamaApiKey: "",
         // Keep single-agent mock paths stable; research-team e2e opts in explicitly.
         orchestratorEnabled: false,
         orchestratorPreviewEnabled: false,
@@ -12183,6 +12219,8 @@ async function reloadAssistantPanel(page: Page) {
         enableStreaming: false,
         thinkingMode: "off",
         model: "playwright-e2e-mock",
+        ollamaBaseUrl: "http://127.0.0.1:11434",
+        ollamaApiKey: "",
         maxAgentSteps: 100,
         streamWritebackMode: "off",
       };
@@ -12255,6 +12293,8 @@ async function setStreamingMode(
           config.apiKey || mutable.settings?.ollamaApiKey;
       } else {
         nextSettings.model = "playwright-e2e-mock";
+        nextSettings.ollamaBaseUrl = "http://127.0.0.1:11434";
+        nextSettings.ollamaApiKey = "";
       }
       mutable.settings = {
         ...nextSettings,
