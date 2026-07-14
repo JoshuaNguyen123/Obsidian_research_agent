@@ -1153,10 +1153,15 @@ function fixtureFor(
   operation: PreparedBackgroundGitHubOperationV1,
   options: { expectedRemoteSha?: string | null; canonicalProof?: boolean } = {},
 ) {
+  const repositoryRoot = path.join(
+    path.parse(process.cwd()).root,
+    "repos",
+    "fixture",
+  );
   const profile = detectRepositoryProfileV2({
     key: "fixture",
     displayName: "Fixture",
-    repositoryRoot: "C:\\repos\\fixture",
+    repositoryRoot,
     defaultBranch: "main",
     files: ["package.json", "package-lock.json"],
     requiredGitHubChecks: ["ci"],
