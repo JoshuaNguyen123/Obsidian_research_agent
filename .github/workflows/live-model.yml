@@ -18,9 +18,13 @@ jobs:
       E2E_AI_MODEL: ${{ vars.E2E_AI_MODEL || 'gpt-oss:120b-cloud' }}
       E2E_OLLAMA_BASE_URL: ${{ vars.E2E_OLLAMA_BASE_URL || 'https://ollama.com/api' }}
       E2E_TRUST_DISPOSABLE_VAULT: "1"
-      OBSIDIAN_VAULT: ${{ runner.temp }}\agentic-researcher-live-vault
     steps:
       - uses: actions/checkout@v4
+      - name: Configure isolated vault path
+        shell: powershell
+        run: |
+          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-live-vault"
+          "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: actions/setup-node@v4
         with:
           node-version: 20

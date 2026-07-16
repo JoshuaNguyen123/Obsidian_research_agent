@@ -82,6 +82,37 @@ test("Windows installed matrix explicitly trusts only its created disposable vau
   assert.doesNotMatch(workflow, /choco install obsidian/u);
 });
 
+test("live Windows workflows publish runner-temp vault paths from a step", () => {
+  for (const [file, vaultName] of [
+    ["live-model.yml", "agentic-researcher-live-vault"],
+    [
+      "protected-release-vertical.yml",
+      "agentic-researcher-disposable-release-vault",
+    ],
+  ] as const) {
+    const workflow = readFileSync(
+      new URL(`../.github/workflows/${file}`, import.meta.url),
+      "utf8",
+    );
+    assert.doesNotMatch(
+      workflow,
+      /OBSIDIAN_VAULT:\s*\$\{\{\s*runner\.temp\s*\}\}/u,
+      `${file} must not use the unavailable runner context in job-level env`,
+    );
+    assert.match(
+      workflow,
+      new RegExp(
+        `\\$vault = Join-Path \\$env:RUNNER_TEMP "${vaultName}"`,
+        "u",
+      ),
+    );
+    assert.match(
+      workflow,
+      /"OBSIDIAN_VAULT=\$vault" \| Out-File -FilePath \$env:GITHUB_ENV/u,
+    );
+  }
+});
+
 test("real AI and live external flags cannot widen into other projects", () => {
   assert.throws(
     () => normalizeExclusiveArgs(["--real-ai", "--project=deterministic-core-mock"]),

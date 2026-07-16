@@ -49,12 +49,16 @@ jobs:
       AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION: ${{ vars.AGENTIC_SANDBOX_CI_WSL2_DISTRIBUTION }}
       AGENTIC_SANDBOX_CI_RUNTIME_ROOT: ${{ vars.AGENTIC_SANDBOX_CI_WSL2_RUNTIME_ROOT }}
       E2E_TRUST_DISPOSABLE_VAULT: "1"
-      OBSIDIAN_VAULT: ${{ runner.temp }}\agentic-researcher-disposable-release-vault
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
+      - name: Configure isolated vault path
+        shell: powershell
+        run: |
+          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-disposable-release-vault"
+          "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify exact SHA
         shell: powershell
         run: |
