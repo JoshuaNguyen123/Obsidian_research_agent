@@ -68,10 +68,11 @@ test("automatic planning accepts a high-confidence semantic DAG without trusting
     { bindingId: "note-main", mode: "exclusive" },
   ]);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].think, "max");
+  assert.equal(requests[0].think, false);
   assert.equal(requests[0].options?.temperature, 0);
   assert.equal(requests[0].format?.additionalProperties, false);
   assert.match(requests[0].messages[0].content, /Do not invent paths, commands, bindings/);
+  assert.match(requests[0].messages[0].content, /hostDependencyIds/);
 });
 
 test("conservative mode never calls the model and records the intentional fallback", async () => {
@@ -181,6 +182,79 @@ test("authority distinguishes invalid JSON, invalid schema, and low confidence",
   });
   assert.equal(lowConfidence.fallbackReason, "structured_model_low_confidence");
   assert.equal(lowConfidence.modelConfidence, 0.4);
+});
+
+test("structured planner repairs invalid JSON exactly once", async () => {
+  const fixture = await createFixture();
+  const requests: ModelChatRequest[] = [];
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: clientFrom(async (request) => {
+      requests.push(request);
+      return response(
+        requests.length === 1
+          ? "not-json"
+          : structuredJson([
+              semanticNode("context", "Read context."),
+              semanticNode("write", "Append verified output.", ["context"]),
+            ]),
+      );
+    }),
+  });
+  assert.equal(result.source, "structured_model");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].evidencePhase, "graph_planner");
+  assert.equal(requests[1].evidencePhase, "retry");
+});
+
+test("structured planner repairs an invalid DAG exactly once", async () => {
+  const fixture = await createFixture();
+  const requests: ModelChatRequest[] = [];
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: clientFrom(async (request) => {
+      requests.push(request);
+      return response(
+        requests.length === 1
+          ? structuredJson([
+              semanticNode("context", "Read context.", ["write"]),
+              semanticNode("write", "Append verified output.", ["context"]),
+            ])
+          : structuredJson([
+              semanticNode("context", "Read context."),
+              semanticNode("write", "Append verified output.", ["context"]),
+            ]),
+      );
+    }),
+  });
+  assert.equal(result.source, "structured_model");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].evidencePhase, "graph_planner");
+  assert.equal(requests[1].evidencePhase, "retry");
+  assert.match(requests[1].messages.at(-1)?.content ?? "", /DAG repair/);
+  assert.match(
+    requests[1].messages.at(-1)?.content ?? "",
+    /Every dependencyId must also have its own node entry/,
+  );
+});
+
+test("structured planner accepts one complete fenced JSON object", async () => {
+  const fixture = await createFixture();
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: clientFrom(async () =>
+      response(
+        `\`\`\`json\n${structuredJson([
+          semanticNode("context", "Read context."),
+          semanticNode("write", "Append verified output.", ["context"]),
+        ])}\n\`\`\``,
+      ),
+    ),
+  });
+  assert.equal(result.source, "structured_model");
 });
 
 test("unknown delete or mutation selection is rejected as authority widening", async () => {

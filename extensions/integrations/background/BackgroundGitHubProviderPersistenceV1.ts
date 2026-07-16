@@ -462,7 +462,13 @@ async function readSafeWalAllowCommittedCleanup(input: {
     // A peer may complete the same immutable claim and unlink only its
     // content-addressed WAL between our safe lstat and open. The caller must
     // prove the canonical revision/hash before accepting this as committed.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (
+      code === "ENOENT" ||
+      (process.platform === "win32" && code === "EPERM")
+    ) {
+      return null;
+    }
     throw error;
   }
 }

@@ -2,6 +2,9 @@ import type {
   AgentRunCompleteEvent,
   AgentRunConfigEvent,
   AgentRunEvents,
+  ModelCallEvidenceV1,
+  ModelUsageAggregateV1,
+  MissionEvidenceAttestationV1,
   AgentRunReceipt,
   AgentRunStopReason,
 } from "../AgentRunner";
@@ -33,6 +36,10 @@ export interface RunCoordinatorSnapshot {
   startedAtMs: number | null;
   lastActivityAtMs: number | null;
   lastConfig: AgentRunConfigEvent | null;
+  modelCallEvidence: ModelCallEvidenceV1[];
+  missionEvidence: MissionEvidenceAttestationV1[];
+  diagnosticAttestations: RunDiagnosticAttestationV1[];
+  providerUsage: ModelUsageAggregateV1;
   lastMissionGraph: MissionGraphV3 | null;
   /**
    * Durable ledger projection restored from the latest integrity-checked
@@ -43,6 +50,17 @@ export interface RunCoordinatorSnapshot {
   persistedProjection: PersistedMissionRunProjectionMetadata | null;
   lastReceipts: AgentRunReceipt[];
   lastComplete: AgentRunCompleteEvent | null;
+}
+
+export interface RunDiagnosticAttestationV1 {
+  schemaVersion: 1;
+  id: string;
+  kind: string;
+  step?: number;
+  toolName?: string;
+  message: string;
+  errorCode?: string;
+  missing: string[];
 }
 
 export interface PersistedMissionRunProjectionMetadata {
@@ -92,6 +110,10 @@ export class RunCoordinator {
   private state: RunCoordinatorState = "idle";
   private runId: string | null = null;
   private lastConfig: AgentRunConfigEvent | null = null;
+  private readonly modelCallEvidence: ModelCallEvidenceV1[] = [];
+  private readonly missionEvidence: MissionEvidenceAttestationV1[] = [];
+  private readonly diagnosticAttestations: RunDiagnosticAttestationV1[] = [];
+  private providerUsage: ModelUsageAggregateV1 = emptyProviderUsage();
   private lastMissionGraph: MissionGraphV3 | null = null;
   private lastMissionLedger: MissionLedgerSummary | null = null;
   private persistedProjection: PersistedMissionRunProjectionMetadata | null = null;
@@ -119,6 +141,16 @@ export class RunCoordinator {
       startedAtMs: this.startedAtMs,
       lastActivityAtMs: this.lastActivityAtMs,
       lastConfig: this.lastConfig ? { ...this.lastConfig } : null,
+      modelCallEvidence: this.modelCallEvidence.map((item) => ({ ...item })),
+      missionEvidence: this.missionEvidence.map((item) => ({
+        ...item,
+        passageIds: [...item.passageIds],
+      })),
+      diagnosticAttestations: this.diagnosticAttestations.map((item) => ({
+        ...item,
+        missing: [...item.missing],
+      })),
+      providerUsage: { ...this.providerUsage },
       lastMissionGraph: this.lastMissionGraph
         ? structuredCloneValue(this.lastMissionGraph)
         : null,
@@ -172,6 +204,10 @@ export class RunCoordinator {
     this.eventSequence = 0;
     this.runId = null;
     this.lastConfig = null;
+    this.modelCallEvidence.splice(0, this.modelCallEvidence.length);
+    this.missionEvidence.splice(0, this.missionEvidence.length);
+    this.diagnosticAttestations.splice(0, this.diagnosticAttestations.length);
+    this.providerUsage = emptyProviderUsage();
     this.lastMissionGraph = null;
     this.lastMissionLedger = null;
     this.persistedProjection = null;
@@ -264,6 +300,8 @@ export class RunCoordinator {
       graphReference: projection.graphReference,
     });
     this.lastReceipts.splice(0, this.lastReceipts.length);
+    this.missionEvidence.splice(0, this.missionEvidence.length);
+    this.diagnosticAttestations.splice(0, this.diagnosticAttestations.length);
     this.lastComplete = null;
     this.state = "idle";
     this.startedAtMs = null;
@@ -321,6 +359,63 @@ export class RunCoordinator {
         this.runId = graph.missionId || this.runId;
         this.lastMissionGraph = structuredCloneValue(graph);
       }
+    } else if (key === "onModelCallEvidence") {
+      const evidence = args[0] as ModelCallEvidenceV1 | undefined;
+      if (evidence) {
+        this.modelCallEvidence.push({ ...evidence });
+        if (this.modelCallEvidence.length > 256) this.modelCallEvidence.shift();
+        this.providerUsage.modelCallCount += 1;
+        this.providerUsage.successfulCallCount += evidence.outcome === "success" ? 1 : 0;
+        this.providerUsage.failedCallCount += evidence.outcome === "error" ? 1 : 0;
+        this.providerUsage.reportedTokens += evidence.tokenUsageReported
+          ? evidence.totalTokens
+          : 0;
+        this.providerUsage.estimatedTokens += evidence.tokenUsageReported
+          ? 0
+          : Math.max(0, Math.ceil(evidence.responseChars / 4));
+        this.providerUsage.retries += evidence.phase === "retry" ? 1 : 0;
+        this.providerUsage.wallClockMs += evidence.durationMs;
+      }
+    } else if (key === "onMissionEvidence") {
+      const evidence = args[0] as MissionEvidenceAttestationV1 | undefined;
+      if (evidence) {
+        const copied = { ...evidence, passageIds: [...evidence.passageIds] };
+        const existingIndex = this.missionEvidence.findIndex(
+          (item) => item.id === evidence.id,
+        );
+        if (existingIndex >= 0) {
+          this.missionEvidence[existingIndex] = copied;
+        } else {
+          this.missionEvidence.push(copied);
+        }
+      }
+    } else if (key === "onTrace") {
+      const trace = args[0] as
+        | {
+            id?: string;
+            kind?: string;
+            step?: number;
+            toolName?: string;
+            message?: string;
+            error?: { code?: string };
+            outputPreview?: unknown;
+          }
+        | undefined;
+      if (trace?.id && isAttestedDiagnosticTraceId(trace.id)) {
+        this.diagnosticAttestations.push({
+          schemaVersion: 1,
+          id: trace.id,
+          kind: trace.kind ?? "status",
+          ...(trace.step === undefined ? {} : { step: trace.step }),
+          ...(trace.toolName ? { toolName: trace.toolName } : {}),
+          message: trace.message ?? "",
+          ...(trace.error?.code ? { errorCode: trace.error.code } : {}),
+          missing: extractDiagnosticMissing(trace.outputPreview),
+        });
+        if (this.diagnosticAttestations.length > 128) {
+          this.diagnosticAttestations.shift();
+        }
+      }
     } else if (key === "onOrchestratorEvent") {
       const snapshot = args[1] as { runId?: string } | undefined;
       this.runId = snapshot?.runId ?? this.runId;
@@ -369,6 +464,50 @@ export class RunCoordinator {
       dispatchRunEvent(listener, event);
     }
   }
+}
+
+function emptyProviderUsage(): ModelUsageAggregateV1 {
+  return {
+    schemaVersion: 1,
+    modelCallCount: 0,
+    successfulCallCount: 0,
+    failedCallCount: 0,
+    reportedTokens: 0,
+    estimatedTokens: 0,
+    retries: 0,
+    wallClockMs: 0,
+  };
+}
+
+function isAttestedDiagnosticTraceId(id: string): boolean {
+  return (
+    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|operation-goals:)/u.test(
+      id,
+    ) ||
+    id.endsWith(":proof-gated-writeback-rejected") ||
+    id.endsWith(":rejected") ||
+    id.endsWith(":append_to_current_file:result") ||
+    id.endsWith(":append_to_current_file:graph-rejected")
+  );
+}
+
+function extractDiagnosticMissing(outputPreview: unknown): string[] {
+  if (!isRecord(outputPreview)) return [];
+  const direct = outputPreview.missing;
+  if (Array.isArray(direct)) {
+    return direct.filter((item): item is string => typeof item === "string");
+  }
+  const acceptance = outputPreview.acceptance;
+  if (isRecord(acceptance) && Array.isArray(acceptance.missing)) {
+    return acceptance.missing.filter(
+      (item): item is string => typeof item === "string",
+    );
+  }
+  return [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function structuredCloneValue<T>(value: T): T {

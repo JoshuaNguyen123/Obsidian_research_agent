@@ -106,7 +106,9 @@ export function detectEvidenceConflicts(
       }
 
       const sharedTerms = getSharedClaimTerms(left.text, right.text);
-      if (sharedTerms.length < 2) {
+      // Require three shared claim terms before polarity/numeric conflict fires.
+      // Two-term overlaps produced frequent false positives that stalled analyze.
+      if (sharedTerms.length < 3) {
         continue;
       }
 
@@ -141,6 +143,38 @@ export function acknowledgeEvidenceConflict(
     status: "acknowledged_limitation",
     ...(note ? { resolutionNote: note } : {}),
   };
+}
+
+/**
+ * Project candidate-scoped acknowledgements without mutating durable conflict
+ * state. An accepted answer must contain both an explicit limitations-style
+ * section and clear source-disagreement language; a generic caveat paragraph
+ * cannot silently discharge contradictory evidence.
+ */
+export function projectEvidenceConflictAcknowledgements(
+  conflicts: EvidenceConflict[] | null | undefined,
+  finalOutput: string,
+): EvidenceConflict[] {
+  const output = finalOutput.trim();
+  const hasExplicitLimitationsSection =
+    /(?:^|\n)\s{0,3}(?:(?:#{1,6}\s+)|\*\*)?(?:limitations?|uncertaint(?:y|ies)|conflicting\s+evidence|source\s+disagreements?|open\s+questions?)(?:\*\*)?(?:\s*:|\s*(?:\n|$))/imu.test(
+      output,
+    );
+  const explicitlyDescribesConflict =
+    /\b(?:conflicting?|contradict(?:s|ed|ion|ions|ory)?|disagree(?:s|d|ment|ments)?|inconsistent|sources?\s+(?:differ|conflict|disagree))\b/iu.test(
+      output,
+    );
+  if (!hasExplicitLimitationsSection || !explicitlyDescribesConflict) {
+    return (conflicts ?? []).map((conflict) => ({ ...conflict }));
+  }
+  return (conflicts ?? []).map((conflict) =>
+    conflict.status === "open"
+      ? acknowledgeEvidenceConflict(
+          conflict,
+          "Accepted output explicitly records the source disagreement as a limitation.",
+        )
+      : { ...conflict },
+  );
 }
 
 export function resolveEvidenceConflict(
@@ -306,20 +340,23 @@ function hasOpposingPolarity(
 }
 
 function hasNegationNearTerms(text: string, terms: string[]): boolean {
-  const lower = text.toLowerCase();
   if (!NEGATION_MARKERS.test(text)) {
     return false;
   }
-  // Require at least one shared term to appear near a negation window.
+  // High precision: require a claim-shaped overlap in the negation window.
+  // Two generic shared nouns (for example "tool authority" near "does not
+  // widen") are an operational caveat, not evidence that another passage's
+  // substantive claim is contradicted. Real polarity examples retain at
+  // least three shared subject/predicate terms near the negation.
   const windows = [...text.matchAll(
     /(?:not|no|never|neither|nor|false|incorrect|denied|refutes?|contradicts?|disproves?|without|lacking|fails?\s+to|does\s+not|do\s+not|did\s+not|cannot|can't)[\s\S]{0,48}/gi,
   )];
   if (windows.length === 0) {
-    return NEGATION_MARKERS.test(text) && terms.some((term) => lower.includes(term));
+    return false;
   }
   return windows.some((match) => {
     const window = match[0].toLowerCase();
-    return terms.some((term) => window.includes(term));
+    return terms.filter((term) => window.includes(term)).length >= 3;
   });
 }
 
@@ -420,10 +457,21 @@ function getSharedClaimTerms(left: string, right: string): string[] {
 
 function tokenize(value: string): string[] {
   return dedupe(
-    (value.toLowerCase().match(/[a-z][a-z0-9_-]{2,}/g) ?? []).filter(
-      (term) => !STOP_TERMS.has(term) && !NEGATION_MARKERS.test(term),
-    ),
+    (value.toLowerCase().match(/[a-z][a-z0-9_-]{2,}/g) ?? [])
+      .filter((term) => !STOP_TERMS.has(term) && !NEGATION_MARKERS.test(term))
+      .map(normalizeClaimTerm),
   );
+}
+
+function normalizeClaimTerm(term: string): string {
+  // Only normalize the low-risk third-person/plural suffix needed for claim
+  // overlap ("improves" vs "improve", "rates" vs "rate"). Avoid a broad
+  // language stemmer: conflict detection must remain deterministic and high
+  // precision across arbitrary source prose.
+  if (term.length > 4 && term.endsWith("s") && !term.endsWith("ss")) {
+    return term.slice(0, -1);
+  }
+  return term;
 }
 
 function getConflictStatus(value: unknown): EvidenceConflictStatus | null {

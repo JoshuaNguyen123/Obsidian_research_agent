@@ -222,6 +222,7 @@ test("delete_path prepare to executePrepared uses fingerprint-bound trash", asyn
   assert.equal(executed.ok, true);
   assert.equal(mock.content.has("Projects/example.md"), false);
   assert.ok(mock.operations.includes("trash:Projects/example.md:false"));
+  assert.equal(executed.receipt?.operation, "delete");
   assert.equal(executed.receipt?.payloadFingerprint, prepared.action.payloadFingerprint);
 });
 

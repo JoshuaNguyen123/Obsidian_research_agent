@@ -230,7 +230,7 @@ test.describe("Phase 4 built-in Code capability production boundaries", () => {
     }
   });
 
-  test("fixture Git repair commits only after targeted and fresh-full validation, or exposes a durable production blocker", async () => {
+  test("DU-03 fixture Git repair commits only after targeted and fresh-full validation, or exposes a durable production blocker", async () => {
     test.setTimeout(SUITE_TIMEOUT_MS);
     const active = requireHarness(harness);
     const fixture = await createPhase4GitFixture(active.marker);

@@ -90,3 +90,30 @@ test("generate-with-title is visible title intent but not explicit rename", () =
     true,
   );
 });
+
+test("artifact title revisions do not require a visible note rename", () => {
+  assert.equal(
+    isExplicitVisibleFileRenameIntent(
+      "Revise Designs/System.canvas and update the diagram title.",
+    ),
+    false,
+  );
+  assert.equal(
+    isVisibleTitleRenameIntent(
+      "Revise Designs/System.canvas and update the diagram title.",
+    ),
+    false,
+  );
+  assert.equal(
+    isTitleOnlyIntent(
+      "Revise Designs/System.canvas and update the diagram title.",
+    ),
+    false,
+  );
+  assert.equal(
+    isExplicitVisibleFileRenameIntent(
+      "Update the diagram title, then rename the note title to Architecture.",
+    ),
+    true,
+  );
+});

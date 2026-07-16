@@ -12,6 +12,17 @@ import {
   canApplyProjectMemoryLoad,
   getProjectMemoryLocation,
 } from "../src/agent/projectMemory";
+import {
+  deriveAutonomyScope,
+  extractMarkdownPathMentions,
+  hasExplicitCurrentNoteMutationIntent,
+} from "../src/agent/missionScope";
+import {
+  hasExplicitNoWebIntent,
+  hasExplicitPublicWebSignal,
+  requiresWebEvidenceProof,
+} from "../src/agent/evidenceIntent";
+import type { MissionIntent } from "../src/tools/types";
 
 test("generated output policy classifies prompt matrix targets", () => {
   const revolutionary = analyzeGeneratedOutputPrompt(
@@ -139,6 +150,136 @@ test("loop planner keeps vault-only evidence research off the web", () => {
     "semantic_search_notes",
     "read_markdown_files",
   ]);
+});
+
+test("loop planner uses exact file reads for explicitly named markdown sources", () => {
+  const prompt =
+    "Read Sources/Alpha.md and Sources/Beta.md, then append two findings to the current note without replacing it.";
+  const budget = planLoopBudget({
+    prompt,
+    route: "grounded_workflow",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 12,
+  });
+
+  assert.deepEqual(budget.expectedTools, ["read_file", "read_file"]);
+});
+
+test("loop planner does not treat a markdown creation target as a read source", () => {
+  const prompt =
+    "Create folder Projects/New and create note Projects/New/Brief.md.";
+  const budget = planLoopBudget({
+    prompt,
+    route: "tool_required",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 12,
+  });
+
+  assert.deepEqual(budget.expectedTools, []);
+});
+
+test("generated count_words verification is local metadata proof, not web proof", () => {
+  const prompt =
+    "Write approximately 180 words to this note, then use count_words to verify the generated note length.";
+  const budget = planLoopBudget({
+    prompt,
+    route: "tool_required",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 12,
+  });
+
+  assert.deepEqual(budget.expectedTools, ["count_words"]);
+  assert.equal(
+    requiresWebEvidenceProof(prompt, {
+      explicitMutation: true,
+      requireWriteCompletion: true,
+    } as MissionIntent),
+    false,
+  );
+});
+
+test("explicit vault-only scope outranks incidental negated web language", () => {
+  const prompt =
+    "Investigate my vault with semantic retrieval and batch reads. Do not use web or memory tools.";
+  const intent = {
+    explicitMutation: true,
+    requireWriteCompletion: true,
+  } as MissionIntent;
+
+  assert.equal(hasExplicitNoWebIntent(prompt), true);
+  assert.equal(hasExplicitPublicWebSignal(prompt), false);
+  assert.equal(requiresWebEvidenceProof(prompt, intent), false);
+});
+
+test("vault paths containing source do not manufacture public-web intent", () => {
+  const prompt =
+    "Create E2E Agent Tests/crud-source-marker.md, read it back, then move it to E2E Agent Tests/crud-moved-marker.md.";
+  const intent = {
+    explicitMutation: true,
+    requireWriteCompletion: true,
+  } as MissionIntent;
+  assert.equal(hasExplicitPublicWebSignal(prompt), false);
+  assert.equal(requiresWebEvidenceProof(prompt, intent), false);
+  assert.equal(
+    hasExplicitPublicWebSignal(`${prompt} Then verify claims on the web.`),
+    true,
+  );
+});
+
+test("autonomy scope extracts a labeled spaced markdown path without preceding prose", () => {
+  const target =
+    "E2E Agent Tests/Mission Graph Guard/restart-complete-marker.md";
+  const prompt = [
+    "Append this exact marker to the current note: CURRENT_MARKER.",
+    `Then append it to the existing markdown file ${target}: COMPLETE_MARKER.`,
+  ].join(" ");
+  const scope = deriveAutonomyScope(prompt, {
+    noteOutput: true,
+    explicitMutation: true,
+    explicitPersistence: true,
+  });
+
+  assert.deepEqual(scope.read.files, [target]);
+  assert.deepEqual(scope.write.files, [target]);
+  assert.deepEqual(scope.write.folders, [
+    "E2E Agent Tests/Mission Graph Guard",
+  ]);
+});
+
+test("autonomy scope binds mutation-led spaced paths without widening current-note writes", () => {
+  const allowedPath =
+    "E2E Agent Tests/Mission Graph Guard/allowed-marker.md";
+  const movedPath =
+    "E2E Agent Tests/Mission Graph Guard/moved-marker.md";
+  const prompt = [
+    "Read the current note,",
+    `create ${allowedPath} with an exact marker,`,
+    `move it to ${movedPath}, then trash ${movedPath}.`,
+  ].join(" ");
+
+  assert.deepEqual(extractMarkdownPathMentions(prompt), [allowedPath, movedPath]);
+  const scope = deriveAutonomyScope(prompt, {
+    noteOutput: true,
+    explicitMutation: true,
+    explicitPersistence: true,
+    explicitDelete: true,
+  });
+  assert.equal(scope.write.currentNote, false);
+  assert.deepEqual(scope.write.files, [allowedPath, movedPath]);
+});
+
+test("delete-then-write keeps explicit current-note replacement authority", () => {
+  const prompt =
+    "Delete the current note. Ensure that the space is empty. Write a replacement essay now.";
+
+  assert.equal(hasExplicitCurrentNoteMutationIntent(prompt), true);
+  const scope = deriveAutonomyScope(prompt, {
+    noteOutput: true,
+    explicitMutation: true,
+    explicitPersistence: true,
+    explicitDelete: true,
+  });
+  assert.equal(scope.write.currentNote, true);
 });
 
 test("loop decision forces final answer after required tools are satisfied", () => {

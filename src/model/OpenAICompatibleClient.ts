@@ -7,6 +7,7 @@ import type {
   ModelChatResponse,
   ModelChatStreamEvents,
   ModelClient,
+  ModelClientDescriptor,
   ModelRequestOptions,
   ModelRole,
   ModelToolCall,
@@ -15,6 +16,7 @@ import type {
   StreamingHttpTransport,
 } from "./types";
 import { ModelClientError } from "./types";
+import { parseRetryAfterMs } from "./retry";
 
 interface OpenAICompatibleClientOptions {
   baseUrl: string;
@@ -33,6 +35,7 @@ interface OpenAIToolCallAccumulator {
 }
 
 export class OpenAICompatibleClient implements ModelClient {
+  readonly descriptor: ModelClientDescriptor;
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly model: string;
@@ -47,6 +50,12 @@ export class OpenAICompatibleClient implements ModelClient {
     this.transport = options.transport;
     this.streamingTransport = options.streamingTransport;
     this.requestTimeoutMs = options.requestTimeoutMs;
+    this.descriptor = {
+      provider: "openai_compatible",
+      model: options.model.trim(),
+      endpointCategory: isLocalBaseUrl(options.baseUrl) ? "local" : "custom",
+      transportKind: "production",
+    };
   }
 
   async chat(request: ModelChatRequest): Promise<ModelChatResponse> {
@@ -78,7 +87,7 @@ export class OpenAICompatibleClient implements ModelClient {
     }
 
     if (response.status >= 400) {
-      throw mapOpenAIHttpError(response.status, getResponseBody(response));
+      throw mapOpenAIHttpError(response.status, getResponseBody(response), response.headers);
     }
 
     return parseOpenAIChatResponse(getResponseBody(response));
@@ -123,7 +132,11 @@ export class OpenAICompatibleClient implements ModelClient {
     }
 
     if (response.status >= 400) {
-      throw mapOpenAIHttpError(response.status, await readStreamBody(response.body));
+      throw mapOpenAIHttpError(
+        response.status,
+        await readStreamBody(response.body),
+        response.headers,
+      );
     }
 
     return parseOpenAIChatStream(response.body, events);
@@ -136,6 +149,15 @@ export class OpenAICompatibleClient implements ModelClient {
       headers.Authorization = `Bearer ${apiKey}`;
     }
     return headers;
+  }
+}
+
+function isLocalBaseUrl(baseUrl: string): boolean {
+  try {
+    const hostname = new URL(baseUrl.trim()).hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  } catch {
+    return false;
   }
 }
 
@@ -535,7 +557,11 @@ export function normalizeOpenAIBaseUrl(baseUrl: string): string {
   return trimmed;
 }
 
-function mapOpenAIHttpError(status: number, body: unknown): ModelClientError {
+function mapOpenAIHttpError(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): ModelClientError {
   const detail = getErrorDetail(body);
   if (status === 401 || status === 403) {
     return new ModelClientError(
@@ -548,13 +574,13 @@ function mapOpenAIHttpError(status: number, body: unknown): ModelClientError {
     return new ModelClientError(
       "rate_limit",
       detail || "OpenAI-compatible API rate limit reached. Try again later.",
-      { status, details: body },
+      { status, details: { body, retryAfterMs: parseRetryAfterMs(headers) } },
     );
   }
   return new ModelClientError(
     "api",
     detail || `OpenAI-compatible API request failed with status ${status}.`,
-    { status, details: body },
+    { status, details: { body, retryAfterMs: parseRetryAfterMs(headers) } },
   );
 }
 

@@ -122,6 +122,27 @@ export function replaceFirstH1(markdown: string, title: string): string {
   )}`;
 }
 
+/** Removes the first real H1 while preserving frontmatter and body spacing. */
+export function removeFirstH1(markdown: string): string {
+  const heading = getFirstH1(markdown);
+  if (!heading) {
+    return markdown;
+  }
+
+  const eol = getEol(markdown);
+  const before = markdown
+    .slice(0, heading.start)
+    .replace(/[ \t]*(?:(?:\r\n|\n|\r)[ \t]*)*$/, "");
+  const after = markdown
+    .slice(heading.end)
+    .replace(/^(?:[ \t]*(?:\r\n|\n|\r))+/, "");
+
+  if (!before) {
+    return after;
+  }
+  return after ? `${before}${eol}${eol}${after}` : `${before}${eol}`;
+}
+
 export function insertH1AfterFrontmatter(
   markdown: string,
   title: string,

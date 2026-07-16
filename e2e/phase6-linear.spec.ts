@@ -106,7 +106,7 @@ test.describe("Phase 6 Linear integration", () => {
     }
   });
 
-  test("accepted research is note-backed before exact Linear approval and persists verified lineage", async () => {
+  test("DU-04 accepted research is note-backed before exact Linear approval and persists verified lineage", async () => {
     let harness: Phase6LinearHarness | null = null;
     let acceptedNotePath = "";
     try {

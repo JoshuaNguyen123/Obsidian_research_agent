@@ -1,0 +1,56 @@
+name: Live model contract
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  live-contract:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      E2E_OLLAMA_API_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
+      E2E_AI_MODEL: ${{ vars.E2E_AI_MODEL || 'gpt-oss:120b-cloud' }}
+      E2E_OLLAMA_BASE_URL: ${{ vars.E2E_OLLAMA_BASE_URL || 'https://ollama.com/api' }}
+      E2E_TRUST_DISPOSABLE_VAULT: "1"
+      OBSIDIAN_VAULT: ${{ runner.temp }}\agentic-researcher-live-vault
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm ci
+      - name: Install semantic embedding runtime
+        run: python -m pip install --disable-pip-version-check fastembed==0.8.0
+      - name: Install Obsidian desktop
+        shell: powershell
+        run: winget install --id Obsidian.Obsidian --exact --silent --accept-package-agreements --accept-source-agreements
+      - name: Create isolated vault
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:OBSIDIAN_VAULT | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:OBSIDIAN_VAULT ".obsidian") | Out-Null
+          Set-Content -LiteralPath (Join-Path $env:OBSIDIAN_VAULT ".obsidian\community-plugins.json") -Value '[]' -Encoding utf8
+      - name: Live provider contract pack
+        run: npm run test:e2e
+      - name: Live provider autonomy soak
+        run: npm run test:e2e:real:soak
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-model-failure-${{ github.sha }}
+          path: |
+            playwright-report
+            test-results
+          retention-days: 14
+          if-no-files-found: ignore

@@ -5,11 +5,19 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { terminateControlledObsidian } from "../../scripts/obsidian-process-lifecycle";
+import {
+  terminateControlledObsidian,
+  waitForWindowsProcessExit,
+} from "../../scripts/obsidian-process-lifecycle";
 import {
   restoreOwnedE2EArtifacts,
   snapshotOwnedE2EArtifacts,
 } from "./ownedE2EArtifacts";
+import {
+  createPluginDataBackup,
+  recoverStalePluginDataBackup,
+  restorePluginDataSnapshot,
+} from "./pluginDataBackup";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CDP_PORT = 11223;
@@ -35,6 +43,8 @@ export interface NativeObsidianHarness {
 export interface StartNativeObsidianHarnessOptions {
   label: string;
   pluginIds?: readonly string[];
+  /** Node-side settings seed; useful for credentials that must never enter traces. */
+  corePluginDataOverrides?: Readonly<Record<string, unknown>>;
   setup(context: NativeObsidianSetupContext): Promise<void>;
   beforeClose?(context: NativeObsidianSetupContext): Promise<void>;
 }
@@ -86,6 +96,12 @@ export async function startNativeObsidianHarness(
   const pluginDataPaths = pluginIds.map((pluginId) =>
     path.join(vaultRoot, ".obsidian", "plugins", pluginId, "data.json"),
   );
+  // Recover a prior hard-killed harness before reading the next baseline. The
+  // backup stays beside data.json, never enters Playwright, and is removed only
+  // after an exact restore succeeds.
+  for (const pluginDataPath of pluginDataPaths) {
+    await recoverStalePluginDataBackup(pluginDataPath);
+  }
   const [obsidianStateBefore, communityPluginsBefore, ...pluginDataBefore] =
     await Promise.all([
       readOptionalText(obsidianStatePath),
@@ -113,7 +129,12 @@ export async function startNativeObsidianHarness(
 
   try {
     await forceOnlyVaultOpen(obsidianStatePath, obsidianStateBefore, vaultRoot);
-    await seedCorePluginData(pluginDataPaths[0], pluginDataBefore[0]);
+    await createPluginDataBackup(pluginDataPaths[0], pluginDataBefore[0] ?? null);
+    await seedCorePluginData(
+      pluginDataPaths[0],
+      pluginDataBefore[0],
+      options.corePluginDataOverrides,
+    );
     for (const pluginId of pluginIds) {
       await ensureCommunityPluginEnabled(communityPluginsPath, pluginId);
     }
@@ -146,7 +167,11 @@ export async function startNativeObsidianHarness(
         closed = true;
         let teardownError: unknown = null;
         if (options.beforeClose && !activePage.isClosed()) {
-          await options.beforeClose({ ...setupContext, page: activePage }).catch(
+          await withTimeout(
+            options.beforeClose({ ...setupContext, page: activePage }),
+            5_000,
+            "Native Obsidian beforeClose hook",
+          ).catch(
             (error) => {
               teardownError = error;
             },
@@ -155,7 +180,10 @@ export async function startNativeObsidianHarness(
         await terminateObsidian(processHandle, cdpPort).catch((error) => {
           teardownError ??= error;
         });
-        await browser?.close().catch(() => undefined);
+        if (browser) {
+          await withTimeout(browser.close(), 5_000, "Playwright CDP close")
+            .catch(() => undefined);
+        }
         await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch((error) => {
           teardownError ??= error;
         });
@@ -165,7 +193,7 @@ export async function startNativeObsidianHarness(
           },
         );
         for (const [index, pluginDataPath] of pluginDataPaths.entries()) {
-          await restoreOptionalText(
+          await restorePluginDataSnapshot(
             pluginDataPath,
             pluginDataBefore[index] ?? null,
           ).catch((error) => {
@@ -183,16 +211,23 @@ export async function startNativeObsidianHarness(
     };
   } catch (error) {
     if (page && options.beforeClose && !page.isClosed()) {
-      await options.beforeClose({ ...setupContext, page }).catch(() => undefined);
+      await withTimeout(
+        options.beforeClose({ ...setupContext, page }),
+        5_000,
+        "Native Obsidian failed-start beforeClose hook",
+      ).catch(() => undefined);
     }
     await terminateObsidian(processHandle, cdpPort).catch(() => undefined);
-    await browser?.close().catch(() => undefined);
+    if (browser) {
+      await withTimeout(browser.close(), 5_000, "Playwright failed-start CDP close")
+        .catch(() => undefined);
+    }
     await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch(() => undefined);
     await restoreOptionalText(obsidianStatePath, obsidianStateBefore).catch(
       () => undefined,
     );
     for (const [index, pluginDataPath] of pluginDataPaths.entries()) {
-      await restoreOptionalText(
+      await restorePluginDataSnapshot(
         pluginDataPath,
         pluginDataBefore[index] ?? null,
       ).catch(() => undefined);
@@ -224,9 +259,31 @@ async function restoreOptionalText(
   await writeFile(filePath, content, "utf8");
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs} ms.`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== null) clearTimeout(timeout);
+  }
+}
+
 async function seedCorePluginData(
   filePath: string,
   existingContent: string | null,
+  overrides: Readonly<Record<string, unknown>> = {},
 ): Promise<void> {
   const parsed = parseObject(existingContent) ?? {};
   await mkdir(path.dirname(filePath), { recursive: true });
@@ -260,6 +317,7 @@ async function seedCorePluginData(
         githubApiToken: "",
         githubCredential: null,
         conversationHistory: [],
+        ...overrides,
       },
       null,
       2,
@@ -399,31 +457,10 @@ async function terminateObsidian(
         () => processHandle.kill(),
       );
     },
-    waitForOwnedExit: () => waitForChildClose(processHandle, 10_000),
+    waitForOwnedExit: () =>
+      waitForWindowsProcessExit(processHandle.pid!, 30_000),
     waitForNoRunningProcess: () => waitForNoObsidian(30_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
-  });
-}
-
-async function waitForChildClose(
-  processHandle: ChildProcessWithoutNullStreams,
-  timeoutMs: number,
-): Promise<boolean> {
-  if (processHandle.exitCode !== null || processHandle.signalCode !== null) {
-    return true;
-  }
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      processHandle.off("close", onClose);
-      resolve(result);
-    };
-    const onClose = () => finish(true);
-    const timeout = setTimeout(() => finish(false), timeoutMs);
-    processHandle.once("close", onClose);
   });
 }
 

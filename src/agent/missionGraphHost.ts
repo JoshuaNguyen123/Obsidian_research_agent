@@ -3,6 +3,7 @@ import type { ToolDescriptor } from "./actions";
 import { descriptorFor } from "../tools/toolDescriptors";
 import {
   buildMissionCapabilityEnvelopeV1,
+  MISSION_GRAPH_MAX_DEPTH,
   type MissionAuthorityEffectV1,
   type MissionBindingGrantV1,
   type MissionCapabilityEnvelopeV1,
@@ -18,18 +19,23 @@ import {
   INSTALLED_HEADLESS_TOOL_BY_DOMAIN_V1,
   type BackgroundExecutionDomainV1,
 } from "../../packages/headless-runtime/src";
+import { extractMarkdownPathMentions } from "./missionScope";
 
 export interface BuildHostMissionGraphPlanInput {
   missionId: string;
   objective: string;
   toolRegistry: ToolRegistry;
   allowedToolNames: Iterable<string>;
+  /** Read tools actually exposed to the model on the current route. */
+  modelVisibleToolNames?: Iterable<string>;
   plannedToolNames: Iterable<string>;
   /** Host-owned actions that may run only after result acceptance. */
   postAcceptanceToolNames?: Iterable<string>;
   currentNotePath?: string | null;
   maxToolCalls: number;
   maxWallClockMs: number;
+  /** Bounded depth already required by a trusted persisted legacy plan. */
+  minimumGraphDepth?: number;
   maxAttemptsPerNode?: number;
   now?: Date;
   background?: {
@@ -62,9 +68,37 @@ export async function buildHostMissionGraphPlanV1(
   const descriptorByName = new Map(
     descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
   );
-  const plannedNames = unique([...input.plannedToolNames]).filter((name) =>
-    descriptorByName.has(name),
+  const modelVisibleNames = new Set(
+    input.modelVisibleToolNames === undefined
+      ? allowedNames
+      : [...input.modelVisibleToolNames].filter((name) =>
+          descriptorByName.has(name),
+        ),
   );
+  // Preserve deliberate read multiplicity: two bounded source fetches are two
+  // separately budgeted graph nodes even though they use the same descriptor.
+  // Effectful tools remain deduplicated except for the explicit Mermaid
+  // upsert -> readback -> upsert revision lifecycle. The intervening readback
+  // makes the second mutation a distinct, observable action rather than an
+  // accidental duplicate introduced by overlapping host/router requirements.
+  const seenEffectfulPlannedNames = new Set<string>();
+  const plannedNames: string[] = [];
+  for (const name of input.plannedToolNames) {
+    const descriptor = descriptorByName.get(name);
+    if (!descriptor) continue;
+    if (descriptor.effect === "read") {
+      plannedNames.push(name);
+      continue;
+    }
+    const isVerifiedMermaidRevision =
+      name === "upsert_mermaid_block" &&
+      plannedNames.at(-1) === "read_mermaid_block";
+    if (seenEffectfulPlannedNames.has(name) && !isVerifiedMermaidRevision) {
+      continue;
+    }
+    seenEffectfulPlannedNames.add(name);
+    plannedNames.push(name);
+  }
   const plannedSet = new Set(plannedNames);
   const maxToolNodes = 15;
   const selectedPlanned = plannedNames.slice(0, maxToolNodes);
@@ -86,6 +120,11 @@ export async function buildHostMissionGraphPlanV1(
   );
   const optionalReadNames = allowedNames
     .filter((name) => !plannedSet.has(name) && !postAcceptanceNames.includes(name))
+    // The capability envelope deliberately contains every host-safe read so a
+    // later, journaled recovery/reclassification node can use it. Do not let
+    // the structured planner select one of those dormant grants unless the
+    // current route actually exposes the corresponding model tool.
+    .filter((name) => modelVisibleNames.has(name))
     .filter((name) => descriptorByName.get(name)?.effect === "read")
     .slice(0, Math.max(0, toolCallCapacity - selectedPlanned.length));
 
@@ -199,20 +238,32 @@ export async function buildHostMissionGraphPlanV1(
           ]),
       ),
     },
-    verifiers: descriptors.some(
-      (descriptor) =>
-        headlessToolNames.has(descriptor.name) &&
-        (isExactBackgroundLinearStateUpdateDescriptor(descriptor) ||
-          isExactBackgroundCodeValidationCommitDescriptor(descriptor) ||
-          isExactBackgroundGitHubPreparedDescriptor(descriptor)),
-    )
-      ? ["companion-external-result-v1"]
-      : [],
+    verifiers: sortedUnique([
+      "host-acceptance-v1",
+      ...(descriptors.some(
+        (descriptor) =>
+          headlessToolNames.has(descriptor.name) &&
+          (isExactBackgroundLinearStateUpdateDescriptor(descriptor) ||
+            isExactBackgroundCodeValidationCommitDescriptor(descriptor) ||
+            isExactBackgroundGitHubPreparedDescriptor(descriptor)),
+      )
+        ? ["companion-external-result-v1"]
+        : []),
+    ]),
     tools,
     bindings,
     budgets: {
       maxNodes,
-      maxDepth: 4,
+      // Depth is route-derived rather than a permissive global constant. A
+      // linear lifecycle may use one layer per planned tool plus finalization,
+      // but can never exceed the immutable graph node ceiling.
+      maxDepth: Math.min(
+        MISSION_GRAPH_MAX_DEPTH,
+        Math.max(
+          selectedPlanned.length + 1,
+          input.minimumGraphDepth ?? 1,
+        ),
+      ),
       maxConcurrentReadNodes: 3,
       maxTotalToolCalls: totalCatalogToolCalls,
       maxExternalActions: descriptors.filter(
@@ -228,6 +279,7 @@ export async function buildHostMissionGraphPlanV1(
 
   const deterministicNodes = buildToolNodeProposals({
     names: selectedPlanned,
+    objective: input.objective,
     descriptorByName,
     currentNotePath: input.currentNotePath ?? null,
     maxAttempts: capabilityEnvelope.budgets.maxAttemptsPerNode,
@@ -316,6 +368,7 @@ function addPostAcceptanceNodes(input: {
 
 function buildToolNodeProposals(input: {
   names: string[];
+  objective: string;
   descriptorByName: ReadonlyMap<string, ToolDescriptor>;
   currentNotePath: string | null;
   maxAttempts: number;
@@ -326,6 +379,7 @@ function buildToolNodeProposals(input: {
 }): Record<string, MissionGraphNodeProposalV1> {
   const result: Record<string, MissionGraphNodeProposalV1> = {};
   const readNodeIds: string[] = [];
+  const plannedReadNodes: Array<{ id: string; name: string }> = [];
   const effectfulNodeIds: string[] = [];
   const githubEffectfulNodeIds: string[] = [];
   input.names.forEach((name, index) => {
@@ -336,9 +390,12 @@ function buildToolNodeProposals(input: {
       effect === "read"
         ? effectfulNodeIds.length > 0
           ? [effectfulNodeIds.at(-1)!]
-          : []
+          : plannedReadPrerequisiteIds(name, plannedReadNodes)
         : sortedUnique([
             ...readNodeIds,
+            ...(effectfulNodeIds.length > 0
+              ? [effectfulNodeIds.at(-1)!]
+              : []),
             ...(isExactBackgroundGitHubPreparedDescriptor(descriptor) &&
             githubEffectfulNodeIds.length > 0
               ? [githubEffectfulNodeIds.at(-1)!]
@@ -354,8 +411,16 @@ function buildToolNodeProposals(input: {
       headlessToolNames: input.headlessToolNames,
       preferBackground: input.preferBackground,
       bindingId: input.bindingIdByTool.get(name) ?? null,
+      selector: explicitVaultSelector({
+        toolName: name,
+        objective: input.objective,
+        currentNotePath: input.currentNotePath,
+      }),
     });
-    if (effect === "read") readNodeIds.push(nodeId);
+    if (effect === "read") {
+      readNodeIds.push(nodeId);
+      plannedReadNodes.push({ id: nodeId, name });
+    }
     else {
       effectfulNodeIds.push(nodeId);
       if (isExactBackgroundGitHubPreparedDescriptor(descriptor)) {
@@ -364,6 +429,21 @@ function buildToolNodeProposals(input: {
     }
   });
   return result;
+}
+
+function plannedReadPrerequisiteIds(
+  toolName: string,
+  priorReads: ReadonlyArray<{ id: string; name: string }>,
+): string[] {
+  const prerequisiteNames =
+    toolName === "read_markdown_files"
+      ? new Set(["semantic_search_notes"])
+      : toolName === "web_fetch"
+        ? new Set(["web_search"])
+      : new Set<string>();
+  return priorReads
+    .filter((candidate) => prerequisiteNames.has(candidate.name))
+    .map((candidate) => candidate.id);
 }
 
 function buildOptionalReadNodeProposals(input: {
@@ -408,13 +488,14 @@ function proposalForTool(input: {
   headlessToolNames: ReadonlySet<string>;
   preferBackground: boolean;
   bindingId: string | null;
+  selector?: string | null;
 }): MissionGraphNodeProposalV1 {
   const effect = graphEffect(input.descriptor);
   const bindingId = input.bindingId;
-  const selector =
-    input.descriptor.capability.system === "vault"
+  const selector = input.selector ??
+    (input.descriptor.capability.system === "vault"
       ? input.currentNotePath ?? "prompt-scoped-vault-target"
-      : `prompt-scoped-${input.descriptor.capability.system}-target`;
+      : `prompt-scoped-${input.descriptor.capability.system}-target`);
   const needsDestination = effect !== "read";
   const backgroundDomain = backgroundDomainForTool(input.descriptor.name);
   const runHeadless =
@@ -522,6 +603,26 @@ function proposalForTool(input: {
   };
 }
 
+function explicitVaultSelector(input: {
+  toolName: string;
+  objective: string;
+  currentNotePath: string | null;
+}): string | null {
+  const paths = extractMarkdownPathMentions(input.objective);
+  if (paths.length === 0) return input.currentNotePath;
+  if (input.toolName === "delete_path") return paths.at(-1)!;
+  if (
+    input.toolName === "create_file" ||
+    input.toolName === "read_file" ||
+    input.toolName === "append_file" ||
+    input.toolName === "replace_file" ||
+    input.toolName === "move_path"
+  ) {
+    return paths[0]!;
+  }
+  return input.currentNotePath;
+}
+
 function addFinalNode(
   nodes: Record<string, MissionGraphNodeProposalV1>,
   missionObjective: string,
@@ -550,7 +651,7 @@ function addFinalNode(
       requiredEvidenceKinds: ["final-output"],
       minimumReceipts: 0,
       requiredReceiptKinds: [],
-      verifierId: null,
+      verifierId: "host-acceptance-v1",
     },
   };
 }

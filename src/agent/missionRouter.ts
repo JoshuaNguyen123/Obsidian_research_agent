@@ -3,6 +3,8 @@ import type {
   ModelChatMessage,
   ModelClient,
 } from "../model/types";
+import { ModelClientError } from "../model/types";
+import { withModelRetry } from "../model/retry";
 
 /** Opt-in structured router mode. Default remains off. */
 export type ModelRouterMode = "off" | "shadow" | "authority";
@@ -82,6 +84,16 @@ export const MISSION_ROUTER_SCHEMA: JsonSchemaObject = {
   },
 };
 
+export const MISSION_ROUTER_SYSTEM_PROMPT = [
+  "Classify the user mission for an Obsidian plugin agent.",
+  "Return exactly one JSON object with these eight keys and no others:",
+  '{"mode":"vault_write","writeScope":"current_note_append","needsWebEvidence":false,"needsVaultContext":true,"needsCodeExecution":false,"wordTarget":null,"confidence":0.9,"rationale":"brief reason"}',
+  'mode must be one of: "chat_answer", "vault_read", "vault_write", "web_research", "deep_research", "code_workflow", "design_artifact", "browser_mission".',
+  'writeScope must be one of: "none", "current_note_append", "current_note_replace", "current_note_section", "vault_files", "title_rename".',
+  "The three needs* values must be JSON booleans. wordTarget must be a JSON number or null. confidence must be a JSON number from 0 through 1. rationale must be a short JSON string.",
+  "Prefer safe read-only classifications when uncertain. Return JSON only: no markdown fence, prose, or alternate property names.",
+].join("\n");
+
 export async function classifyMissionWithModel({
   client,
   prompt,
@@ -93,13 +105,49 @@ export async function classifyMissionWithModel({
   recentAssistant?: string;
   timeoutMs?: number;
 }): Promise<RoutedMissionIntent | null> {
+  return (
+    await classifyMissionWithModelDetailed({
+      client,
+      prompt,
+      recentAssistant,
+      timeoutMs,
+    })
+  ).intent;
+}
+
+export type RouterModelFailureReason =
+  | "router_timeout"
+  | "router_invalid_response_after_repair"
+  | "router_auth"
+  | "router_provider_unavailable";
+
+export interface RouterModelClassificationResult {
+  intent: RoutedMissionIntent | null;
+  failureReason: RouterModelFailureReason | null;
+  attempts: number;
+}
+
+export async function classifyMissionWithModelDetailed({
+  client,
+  prompt,
+  recentAssistant,
+  timeoutMs = 10_000,
+}: {
+  client: ModelClient;
+  prompt: string;
+  recentAssistant?: string;
+  timeoutMs?: number;
+}): Promise<RouterModelClassificationResult> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   const messages: ModelChatMessage[] = [
     {
       role: "system",
-      content:
-        "Classify the user mission for an Obsidian plugin agent. Return only JSON matching the schema. Prefer safe read-only classifications when uncertain.",
+      content: MISSION_ROUTER_SYSTEM_PROMPT,
     },
     ...(recentAssistant
       ? [
@@ -113,15 +161,54 @@ export async function classifyMissionWithModel({
   ];
 
   try {
-    const response = await client.chat({
-      messages,
-      format: MISSION_ROUTER_SCHEMA,
-      abortSignal: controller.signal,
-      options: { temperature: 0 },
-    });
-    return normalizeRoutedMissionIntent(response.message.content);
-  } catch {
-    return null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const request = {
+        messages,
+        format: MISSION_ROUTER_SCHEMA,
+        abortSignal: controller.signal,
+        evidencePhase: attempt === 1 ? "router" : "retry",
+        think: false,
+        options: { temperature: 0 },
+      } satisfies Parameters<ModelClient["chat"]>[0];
+      const response = await withModelRetry(() => client.chat(request), {
+        policy: { maxAttempts: 2 },
+        abortSignal: controller.signal,
+      });
+      const normalized = normalizeRoutedMissionIntent(response.message.content);
+      if (normalized) return { intent: normalized, failureReason: null, attempts: attempt };
+      if (attempt === 1) {
+        messages.push(
+          { role: "assistant", content: response.message.content.slice(0, 4_000) },
+          {
+            role: "system",
+            content:
+              `Schema repair: the previous value was invalid. ${MISSION_ROUTER_SYSTEM_PROMPT}`,
+          },
+        );
+      }
+    }
+    return {
+      intent: null,
+      failureReason: "router_invalid_response_after_repair",
+      attempts: 2,
+    };
+  } catch (error) {
+    if (
+      error instanceof ModelClientError &&
+      error.category === "provider_budget_exhausted"
+    ) {
+      throw error;
+    }
+    return {
+      intent: null,
+      failureReason: timedOut
+        ? "router_timeout"
+        : error instanceof ModelClientError &&
+            (error.category === "auth" || error.category === "missing_api_key")
+          ? "router_auth"
+          : "router_provider_unavailable",
+      attempts: 1,
+    };
   } finally {
     clearTimeout(timeout);
   }
@@ -321,10 +408,17 @@ export function normalizeRoutedMissionIntent(
 }
 
 function parseJson(value: string): unknown {
+  const trimmed = value.trim();
   try {
-    return JSON.parse(value);
+    return JSON.parse(trimmed);
   } catch {
-    return null;
+    const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/iu.exec(trimmed);
+    if (!fenced) return null;
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch {
+      return null;
+    }
   }
 }
 

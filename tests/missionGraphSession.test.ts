@@ -158,7 +158,7 @@ test("successful proof completes a node, promotes dependencies, and persists app
   assert.deepEqual(stored.record.resourceLocks.locks, {});
 });
 
-test("concurrent mutation starts serialize through one CAS stream and one exclusive lock", async () => {
+test("concurrent mutation starts serialize through the graph frontier and one exclusive lock", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({
     missionId: "session-concurrent-mutations",
@@ -176,7 +176,7 @@ test("concurrent mutation starts serialize through one CAS stream and one exclus
   ]);
   const appendExecution = requireExecution(appendStart);
   assert.equal(replaceStart.ok, false);
-  if (!replaceStart.ok) assert.match(replaceStart.reason, /lock is unavailable/i);
+  if (!replaceStart.ok) assert.match(replaceStart.reason, /not ready/i);
 
   const locked = await requireStored(harness.context, graph.missionId);
   const activeLocks = Object.values(locked.record.resourceLocks.locks);
@@ -421,6 +421,46 @@ test("read continuation fails closed when a full envelope has no mutable reserve
   assert.equal(
     session.graph.capabilityEnvelope.fingerprint,
     graph.capabilityEnvelope.fingerprint,
+  );
+});
+
+test("exact workflow authority refuses to mint a dynamic read continuation", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-exact-read-frontier",
+    allowedTools: ["read_current_file"],
+    plannedTools: ["read_current_file"],
+    maxToolCalls: 3,
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const first = requireExecution(
+    await session.beginToolExecution("read_current_file", {
+      allowDynamicReadContinuation: false,
+    }),
+  );
+  await session.finishToolExecution(first, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[first.nodeId],
+      "a",
+      harness.nextTimestamp(),
+    ),
+  });
+  const before = session.graph;
+
+  const denied = await session.beginToolExecution("read_current_file", {
+    allowDynamicReadContinuation: false,
+  });
+
+  assert.equal(denied.ok, false);
+  if (!denied.ok) assert.match(denied.reason, /exact authoritative mission graph/iu);
+  assert.deepEqual(session.graph, before);
+  assert.equal(
+    Object.keys(session.graph.nodes).some((id) => id.startsWith("retry-")),
+    false,
   );
 });
 

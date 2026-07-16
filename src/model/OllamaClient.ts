@@ -9,9 +9,11 @@ import {
   ModelChatStreamEvents,
   ModelRole,
   ModelToolCall,
+  ModelClientDescriptor,
   StreamingHttpResponse,
   StreamingHttpTransport,
 } from "./types";
+import { parseRetryAfterMs } from "./retry";
 
 interface OllamaClientOptions {
   baseUrl: string;
@@ -31,6 +33,7 @@ interface OllamaMessage {
 }
 
 export class OllamaClient implements ModelClient {
+  readonly descriptor: ModelClientDescriptor;
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly model: string;
@@ -45,6 +48,16 @@ export class OllamaClient implements ModelClient {
     this.transport = options.transport;
     this.streamingTransport = options.streamingTransport;
     this.requestTimeoutMs = options.requestTimeoutMs;
+    this.descriptor = {
+      provider: "ollama",
+      model: options.model.trim(),
+      endpointCategory: isOllamaCloudBaseUrl(options.baseUrl)
+        ? "ollama_cloud"
+        : isLocalBaseUrl(options.baseUrl)
+          ? "local"
+          : "custom",
+      transportKind: "production",
+    };
   }
 
   async chat(request: ModelChatRequest): Promise<ModelChatResponse> {
@@ -85,7 +98,7 @@ export class OllamaClient implements ModelClient {
     }
 
     if (response.status >= 400) {
-      throw mapOllamaHttpError(response.status, getResponseBody(response));
+      throw mapOllamaHttpError(response.status, getResponseBody(response), response.headers);
     }
 
     return parseOllamaChatResponse(getResponseBody(response));
@@ -139,7 +152,11 @@ export class OllamaClient implements ModelClient {
     }
 
     if (response.status >= 400) {
-      throw mapOllamaHttpError(response.status, await readStreamBody(response.body));
+      throw mapOllamaHttpError(
+        response.status,
+        await readStreamBody(response.body),
+        response.headers,
+      );
     }
 
     return parseOllamaChatStream(response.body, events);
@@ -154,6 +171,15 @@ export class OllamaClient implements ModelClient {
     }
 
     return headers;
+  }
+}
+
+function isLocalBaseUrl(baseUrl: string): boolean {
+  try {
+    const hostname = new URL(normalizeOllamaBaseUrl(baseUrl)).hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  } catch {
+    return false;
   }
 }
 
@@ -453,7 +479,11 @@ function parseToolArguments(args: unknown): Record<string, unknown> {
   );
 }
 
-function mapOllamaHttpError(status: number, body: unknown): ModelClientError {
+function mapOllamaHttpError(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): ModelClientError {
   const detail = getErrorDetail(body);
 
   if (status === 401 || status === 403) {
@@ -468,14 +498,14 @@ function mapOllamaHttpError(status: number, body: unknown): ModelClientError {
     return new ModelClientError(
       "rate_limit",
       detail || "Ollama rate limit reached. Try again later.",
-      { status, details: body },
+      { status, details: { body, retryAfterMs: parseRetryAfterMs(headers) } },
     );
   }
 
   return new ModelClientError(
     "api",
     detail || `Ollama API request failed with status ${status}.`,
-    { status, details: body },
+    { status, details: { body, retryAfterMs: parseRetryAfterMs(headers) } },
   );
 }
 

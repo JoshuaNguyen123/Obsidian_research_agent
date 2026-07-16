@@ -57,10 +57,12 @@ export function projectMissionGraphToLegacyPlan(
   graph: MissionGraphV3,
 ): MissionPlan {
   const ordered = topologicallyOrderGraphNodes(graph);
+  const projectedCitationMode = resolveProjectedCitationMode(graph.objective);
   let citationContractProjected = false;
   const tasks = ordered.map((node) => {
     const task = projectGraphNodeToLegacyTask(node);
     if (
+      projectedCitationMode !== undefined &&
       !citationContractProjected &&
       !node.id.startsWith("retry-") &&
       task.completionContract.requiredProof.includes("web_evidence") &&
@@ -73,7 +75,7 @@ export function projectMissionGraphToLegacyPlan(
         ...task,
         completionContract: {
           ...task.completionContract,
-          citationMode: "source" as const,
+          citationMode: projectedCitationMode,
         },
       };
     }
@@ -104,6 +106,27 @@ export function projectMissionGraphToLegacyPlan(
     createdAt: graph.createdAt,
     updatedAt: graph.updatedAt,
   };
+}
+
+/**
+ * MissionGraphV3 deliberately keeps provider-facing prose out of its proof
+ * contract. The legacy verifier view still needs to preserve whether the user
+ * requested URL-level citation or claim-to-passage grounding, however. This
+ * projection is one-way and read-only: it may strengthen verification, but it
+ * never mutates graph authority or invents evidence.
+ */
+function resolveProjectedCitationMode(
+  objective: string,
+): "source" | "passage" | undefined {
+  if (/\b(?:passage|passages|passage[-\s]?level|claim[-\s]?(?:grounding|verification)|ground(?:ed|ing)?|fact[-\s]?check|verify|verified|verification|quote|quoted|quotation|quotations)\b/iu.test(
+    objective,
+  )) {
+    return "passage";
+  }
+  if (/\b(?:cite|cited|citation|citations|source|sources|reference|references|url|urls|link|links)\b/iu.test(objective)) {
+    return "source";
+  }
+  return undefined;
 }
 
 /** Stable, projection-only bridge for the existing Orchestrator UI. */
@@ -610,6 +633,9 @@ function projectLegacyEvidenceId(
   if (evidence.kind === "final-output") {
     return FINAL_OUTPUT_RELEVANT_EVIDENCE_ID;
   }
+  if (/web|source/i.test(evidence.kind)) {
+    return evidence.id.startsWith("web:") ? evidence.id : `web:${evidence.id}`;
+  }
   if (evidence.kind === "tool-result") {
     if (node.allowedTools.some((toolName) => toolName === "count_words")) {
       return "tool:count_words";
@@ -645,7 +671,6 @@ function projectLegacyCompletionContract(
     ...node.completionContract.requiredReceiptKinds.map(
       projectReceiptKindToLegacyProof,
     ),
-    ...(node.completionContract.verifierId ? ["final_relevance" as const] : []),
   ]);
   return {
     requiredProof,
@@ -674,15 +699,29 @@ function projectEvidenceKindToLegacyProof(
     ) {
       return ["web_evidence"];
     }
+    // Search alone is not fetch proof; leave empty so acceptance still requires
+    // a real fetched-source evidence kind instead of inventing vault proof.
     if (node.allowedTools.some((toolName) => /web_search/i.test(toolName))) {
       return [];
     }
-    return ["vault_evidence"];
+    if (
+      node.allowedTools.some((toolName) =>
+        /read_file|read_current_file|list_markdown|semantic_search|note_graph|related_notes/i.test(
+          toolName,
+        ),
+      )
+    ) {
+      return ["vault_evidence"];
+    }
+    return [];
   }
   if (/vault|note|graph/i.test(kind)) return ["vault_evidence"];
   if (/word.?count/i.test(kind)) return ["word_count"];
   if (/code|execution|test/i.test(kind)) return ["code_execution"];
   if (/final|relevance/i.test(kind)) return ["final_relevance"];
+  if (/web|fetch|source|passage|citation/i.test(kind)) return ["web_evidence"];
+  // Preserve prior behavior for unrecognized evidence kinds that still represent
+  // retrieved sources; never invent vault proof from a bare tool-result above.
   return ["web_evidence"];
 }
 

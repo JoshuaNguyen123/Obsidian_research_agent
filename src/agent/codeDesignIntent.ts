@@ -29,7 +29,7 @@ const HTML_PREVIEW_INTENT =
   /\b(html|css|webpage|web\s*page|preview)\b/i;
 
 const REVISE_DESIGN_INTENT =
-  /\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b[\s\S]{0,80}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mockup|map|sketch)\b[\s\S]{0,80}\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b/i;
+  /\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b[\s\S]{0,80}\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|block)\b|\b(canvas|design|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|block)\b[\s\S]{0,80}\b(update|revise|edit|change|modify|improve|tweak|fix|adjust)\b/i;
 
 const CODE_TEAM_MAGIC =
   /\b(code\s+team|coding\s+team|orchestrate\s+code|git\s+worktree)\b/i;

@@ -19,6 +19,8 @@ describe("settingsNormalize", () => {
   it("new installs resolve to Automatic and active_or_new_note", () => {
     assert.equal(detectInstallKind({}), "new_install");
     const settings = normalizeAgentSettings({}, "new_install");
+    assert.equal(settings.workingMode, "automatic");
+    assert.equal(settings.memoryMode, "research");
     assert.equal(settings.autonomyProfile, "automatic");
     assert.equal(settings.outputProfile, "active_or_new_note");
     assert.equal(settings.thinkingMode, "auto");
@@ -81,6 +83,7 @@ describe("settingsNormalize", () => {
       "existing_install",
     );
     const recommended = applyRecommendedAutomaticDefaults(custom);
+    assert.equal(recommended.workingMode, "automatic");
     assert.equal(recommended.autonomyProfile, "automatic");
     assert.equal(recommended.outputProfile, "active_or_new_note");
     assert.equal(recommended.thinkingMode, "auto");
@@ -108,6 +111,7 @@ describe("settingsNormalize", () => {
       "existing_install",
     );
     assert.equal(settings.autonomyProfile, "automatic");
+    assert.equal(settings.workingMode, "automatic");
     assert.equal(settings.outputProfile, "active_or_new_note");
     assert.equal(settings.thinkingMode, "auto");
     assert.equal(settings.enableStreaming, true);
@@ -201,8 +205,8 @@ describe("settingsNormalize", () => {
     assert.equal(settings.modelRouterEnabled, true);
   });
 
-  it("accepts schemas 1 through 3 and rejects malformed or future schemas", () => {
-    for (const schema of [1, 2, 3] as const) {
+  it("accepts schemas 1 through 4 and rejects malformed or future schemas", () => {
+    for (const schema of [1, 2, 3, 4] as const) {
       const settings = normalizeAgentSettings(
         { settingsSchemaVersion: schema, ollamaApiKey: "keep-me" },
         "existing_install",
@@ -214,19 +218,76 @@ describe("settingsNormalize", () => {
     assert.throws(
       () =>
         normalizeAgentSettings(
-          { settingsSchemaVersion: 4 },
+          { settingsSchemaVersion: 5 },
           "existing_install",
         ),
-      /unsupported future settings schema 4/i,
+      /unsupported future settings schema 5/i,
     );
     assert.throws(
       () =>
         normalizeAgentSettings(
-          { settingsSchemaVersion: "3" },
+          { settingsSchemaVersion: "4" },
           "existing_install",
         ),
       /supported integer schemas/i,
     );
+  });
+
+  it("migrates legacy autonomy and memory flags into canonical modes", () => {
+    const chatOnly = normalizeAgentSettings(
+      {
+        settingsSchemaVersion: 3,
+        autonomyProfile: "conservative",
+        outputProfile: "chat_first",
+        researchMemoryEnabled: false,
+        experienceMemoryEnabled: false,
+      },
+      "existing_install",
+    );
+    assert.equal(chatOnly.workingMode, "chat_only");
+    assert.equal(chatOnly.memoryMode, "off");
+    assert.equal(chatOnly.streamWritebackMode, "off");
+
+    const memories = normalizeAgentSettings(
+      {
+        settingsSchemaVersion: 3,
+        autonomyProfile: "custom",
+        outputProfile: "active_note_only",
+        researchMemoryEnabled: false,
+        experienceMemoryEnabled: true,
+      },
+      "existing_install",
+    );
+    assert.equal(memories.workingMode, "custom");
+    assert.equal(memories.memoryMode, "research_and_experience");
+    assert.equal(memories.researchMemoryEnabled, true);
+    assert.equal(memories.experienceMemoryEnabled, true);
+  });
+
+  it("canonical working and memory modes derive all compatibility fields", () => {
+    const settings = normalizeAgentSettings(
+      {
+        settingsSchemaVersion: 4,
+        workingMode: "automatic",
+        memoryMode: "research_and_experience",
+        autonomyProfile: "custom",
+        outputProfile: "chat_first",
+        enableStreaming: false,
+        streamWritebackMode: "off",
+        autoTitleOnWrite: false,
+        researchMemoryEnabled: false,
+        experienceMemoryEnabled: false,
+      },
+      "existing_install",
+    );
+    assert.equal(settings.workingMode, "automatic");
+    assert.equal(settings.autonomyProfile, "automatic");
+    assert.equal(settings.outputProfile, "active_or_new_note");
+    assert.equal(settings.enableStreaming, true);
+    assert.equal(settings.autoTitleOnWrite, true);
+    assert.equal(settings.memoryMode, "research_and_experience");
+    assert.equal(settings.researchMemoryEnabled, true);
+    assert.equal(settings.experienceMemoryEnabled, true);
   });
 });
 

@@ -4,6 +4,7 @@ import { deriveAutonomyScope } from "../src/agent/missionScope";
 import {
   createMissionPlan,
   getNextMissionPlanAction,
+  isFinalOutputRelevant,
   isMissionPlanComplete,
   receiptSatisfiesProof,
   type MissionPlan,
@@ -90,6 +91,43 @@ test("mission plan retains required mutation tools when route reads fill the tas
     "write_receipt",
     "rename_receipt",
   ]);
+});
+
+test("final relevance requires an explicitly requested high-entropy literal anchor", () => {
+  const marker = "E2E_MARKER_1784032223212_560187";
+  const plan = createTestPlan(
+    `Explore the vault and append a synthesis. Include the marker ${marker}.`,
+    ["semantic_search_notes", "append_to_current_file"],
+  );
+
+  assert.equal(
+    isFinalOutputRelevant(
+      plan,
+      "A generic vault synthesis that omits the requested literal.",
+    ),
+    false,
+  );
+  assert.equal(
+    isFinalOutputRelevant(
+      plan,
+      `A grounded vault synthesis containing ${marker}.`,
+    ),
+    true,
+  );
+});
+
+test("named vault source paths do not create a public-web proof obligation", () => {
+  const plan = createTestPlan(
+    "Read the named vault notes Sources/Alpha.md and Sources/Beta.md, synthesize two findings, and append them to the current note.",
+    ["read_file", "append_to_current_file"],
+  );
+  const proof = plan.tasks.flatMap(
+    (task) => task.completionContract.requiredProof,
+  );
+
+  assert.equal(proof.includes("web_evidence"), false);
+  assert.equal(proof.includes("vault_evidence"), true);
+  assert.equal(proof.includes("write_receipt"), true);
 });
 
 test("external action receipts are domain-specific and never prove a vault write", () => {

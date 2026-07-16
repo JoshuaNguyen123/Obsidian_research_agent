@@ -5,6 +5,8 @@ import type {
   ModelChatRequest,
   ModelClient,
 } from "../model/types";
+import { ModelClientError } from "../model/types";
+import { withModelRetry } from "../model/retry";
 import {
   MissionGraphValidationError,
   parseMissionCapabilityEnvelopeV1,
@@ -126,7 +128,8 @@ type StructuredModelCallResult =
   | { kind: "timeout" }
   | { kind: "unavailable" }
   | { kind: "invalid_json" }
-  | { kind: "invalid_schema" };
+  | { kind: "invalid_schema" }
+  | { kind: "invalid_dag" };
 
 /**
  * Plans a fresh MissionGraphV3 without persisting or dispatching it. Host code
@@ -153,6 +156,15 @@ export async function planMissionGraphV3(
         mission: input.mission,
         context,
         timeoutMs: input.timeoutMs ?? MISSION_GRAPH_PLANNER_DEFAULT_TIMEOUT_MS,
+        validateDag: async (proposal) => {
+          const candidate = await resolveAuthoritativeMissionGraphV3({
+            deterministicGraph: context.deterministicGraph,
+            optionalReadNodes: context.optionalReadNodes,
+            structuredProposal: proposal,
+            decidedAt,
+          });
+          return candidate.ok || candidate.reason !== "structured_model_invalid_dag";
+        },
       })
     : ({ kind: "unavailable" } as const);
 
@@ -473,11 +485,13 @@ async function requestStructuredMissionGraph({
   mission,
   context,
   timeoutMs,
+  validateDag,
 }: {
   client: ModelClient;
   mission: ExplicitMissionV1;
   context: PreparedPlanningContextV1;
   timeoutMs: number;
+  validateDag?: (proposal: StructuredMissionGraphProposalV1) => Promise<boolean>;
 }): Promise<StructuredModelCallResult> {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) {
     throw new Error("Mission graph planner timeout must be between 1 and 120000 ms.");
@@ -490,17 +504,23 @@ async function requestStructuredMissionGraph({
       effect: node.effect,
       hostObjective: node.objective,
       allowedTools: node.allowedTools,
+      hostDependencyIds: node.dependencyIds,
     };
   });
   const messages: ModelChatMessage[] = [
     {
       role: "system",
       content: [
-        "Propose only the semantic DAG for this mission and return JSON matching the schema.",
+        "Propose only the semantic DAG for this mission and return exactly one JSON object with keys confidence and nodes.",
+        'Use this exact shape: {"confidence":0.9,"nodes":[{"id":"catalog-node-id","objective":"semantic objective","dependencyIds":[]}]}',
+        "confidence must be a JSON number from 0 through 1. nodes must be a JSON array. Every node must contain exactly id, objective, and dependencyIds; dependencyIds must be an array of catalog node ID strings.",
         "Use only host-catalogued node IDs. Required nodes remain in the graph even if omitted.",
+        "Include every required=true catalog node exactly once. If dependencyIds references an optional node, include that optional node exactly once too.",
+        "hostDependencyIds are immutable prerequisite edges. Never add an edge that reverses or cycles through those host edges; no node may depend on final.",
         "You may add optional read-only nodes when they improve grounding.",
         "Do not invent paths, commands, bindings, tools, destinations, capabilities, hosts, budgets, or authority.",
-        "Dependencies express semantic prerequisites. Keep the graph at depth four or less.",
+        "Dependencies express semantic prerequisites. Keep graph depth within the supplied route-derived envelope.",
+        "Return JSON only: no markdown fence, prose, authority fields, or alternate property names.",
         `Host node catalog: ${JSON.stringify(catalog)}`,
       ].join("\n"),
     },
@@ -509,36 +529,75 @@ async function requestStructuredMissionGraph({
   const controller = new AbortController();
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-  const request: ModelChatRequest = {
-    messages,
-    format: createMissionGraphPlannerSchema(context.catalogNodeIds),
-    abortSignal: controller.signal,
-    think: "max",
-    options: { temperature: 0 },
-  };
   try {
-    const response = await Promise.race([
-      client.chat(request),
-      new Promise<never>((_resolve, reject) => {
-        timeoutHandle = setTimeout(() => {
-          timedOut = true;
-          controller.abort();
-          reject(new Error("mission_graph_planner_timeout"));
-        }, timeoutMs);
-      }),
-    ]);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(response.message.content) as unknown;
-    } catch {
-      return { kind: "invalid_json" };
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    let lastInvalidKind: "invalid_json" | "invalid_schema" | "invalid_dag" = "invalid_json";
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const request: ModelChatRequest = {
+        messages,
+        format: createMissionGraphPlannerSchema(context.catalogNodeIds),
+        abortSignal: controller.signal,
+        evidencePhase: attempt === 1 ? "graph_planner" : "retry",
+        think: false,
+        options: { temperature: 0 },
+      };
+      const response = await withModelRetry(() => client.chat(request), {
+        policy: { maxAttempts: 2 },
+        abortSignal: controller.signal,
+      });
+      const parsed = parseStructuredJson(response.message.content);
+      if (parsed === null) lastInvalidKind = "invalid_json";
+      const proposal = normalizeStructuredMissionGraphProposalV1(parsed);
+      if (proposal && (!validateDag || await validateDag(proposal))) {
+        return { kind: "ok", proposal };
+      }
+      if (proposal) {
+        lastInvalidKind = "invalid_dag";
+      } else if (parsed !== null) {
+        lastInvalidKind = "invalid_schema";
+      }
+      if (attempt === 1) {
+        messages.push(
+          { role: "assistant", content: response.message.content.slice(0, 8_000) },
+          {
+            role: "system",
+            content:
+              lastInvalidKind === "invalid_dag"
+                ? "DAG repair: return the same exact JSON schema using only catalog node IDs. Include every required=true node exactly once. Every dependencyId must also have its own node entry. Preserve the direction of hostDependencyIds, remove self/cyclic/reversed/unknown dependencies, never make a node depend on final, and keep dependency depth at four or less. Return JSON only."
+                : "Schema repair: return only a valid JSON object matching the supplied schema. Use only catalog node IDs, include all required fields, and produce an acyclic dependency graph.",
+          },
+        );
+      }
     }
-    const proposal = normalizeStructuredMissionGraphProposalV1(parsed);
-    return proposal ? { kind: "ok", proposal } : { kind: "invalid_schema" };
-  } catch {
+    return { kind: lastInvalidKind };
+  } catch (error) {
+    if (
+      error instanceof ModelClientError &&
+      error.category === "provider_budget_exhausted"
+    ) {
+      throw error;
+    }
     return timedOut ? { kind: "timeout" } : { kind: "unavailable" };
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+function parseStructuredJson(value: string): unknown | null {
+  const trimmed = value.trim();
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/iu.exec(trimmed);
+    if (!fenced) return null;
+    try {
+      return JSON.parse(fenced[1].trim()) as unknown;
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -749,6 +808,8 @@ function modelCallFallbackReason(
       return "structured_model_invalid_json";
     case "invalid_schema":
       return "structured_model_invalid_schema";
+    case "invalid_dag":
+      return "structured_model_invalid_dag";
     case "unavailable":
       return "structured_model_unavailable";
   }

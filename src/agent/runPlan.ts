@@ -20,6 +20,7 @@ import {
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
 import { hasDesignIntent as hasSharedDesignIntent } from "./codeDesignIntent";
+import { hasExplicitNoWebIntent } from "./evidenceIntent";
 
 export type RunRoute =
   | "instant_local"
@@ -83,6 +84,8 @@ export function createRunPlan({
   const explicitModelStepTarget = parseExplicitModelStepTarget(prompt);
   const allowReflexReadRouting =
     !missionIntent.explicitMutation && !missionIntent.explicitDelete;
+  const explicitWebSearchIntent =
+    hasWebSearchIntent(prompt) && countExplicitCodeToolNames(prompt) === 0;
   const hasReflexReadLabel = (labels: ReflexDecision["label"][]) =>
     allowReflexReadRouting && hasSafeReflexLabel(reflex ?? null, labels);
   const capSteps = (steps: number) =>
@@ -236,7 +239,8 @@ export function createRunPlan({
   if (
     hasVaultContextQuestionIntent(prompt) ||
     hasVaultBrowseIntent(prompt) ||
-    hasReflexReadLabel(["vault_search", "semantic_vault_search"])
+    (!explicitWebSearchIntent &&
+      hasReflexReadLabel(["vault_search", "semantic_vault_search"]))
   ) {
     return grounded("needs_vault_context", "normal", [
       hasVaultContextQuestionIntent(prompt)
@@ -248,7 +252,7 @@ export function createRunPlan({
   }
 
   if (
-    (hasWebSearchIntent(prompt) && countExplicitCodeToolNames(prompt) === 0) ||
+    explicitWebSearchIntent ||
     hasReflexReadLabel(["web_research"])
   ) {
     return grounded("needs_web_sources", "long", [
@@ -613,9 +617,17 @@ function hasWordCountIntent(prompt: string): boolean {
 }
 
 function hasGraphConnectionIntent(prompt: string): boolean {
+  // Vault paths are opaque resource identifiers, not natural-language intent.
+  // A path such as `Mission Graph Guard/restart.md` must not silently route an
+  // append mission through graph retrieval merely because its folder name
+  // contains "graph" and the path itself ends in a Markdown file.
+  const intentText = prompt.replace(
+    /[A-Za-z0-9 .@()[\]_-]+(?:\/[A-Za-z0-9 .@()[\]_-]+)+\.md\b/giu,
+    " [markdown-path] ",
+  );
   return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
-    prompt,
-  ) && /\b(note|notes|file|files|vault|current|this|active|markdown)\b/i.test(prompt);
+    intentText,
+  ) && /\b(note|notes|file|files|vault|current|this|active|markdown)\b/i.test(intentText);
 }
 
 function hasOpenWebSourceIntent(prompt: string): boolean {
@@ -819,6 +831,9 @@ function hasDeletePathIntent(prompt: string): boolean {
 }
 
 function hasWebSearchIntent(prompt: string): boolean {
+  if (hasExplicitNoWebIntent(prompt)) {
+    return false;
+  }
   if (hasSimpleDateTimePrompt(prompt)) {
     return false;
   }

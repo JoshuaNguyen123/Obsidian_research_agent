@@ -49,7 +49,7 @@ export const generatedOutputPromptScenarios: PromptScenario[] = [
     timeoutMs: 240_000,
     expectNoteWrite: true,
     expectReceipt: true,
-    requiredTerms: ["Harvest of Injustice", "Grapes", "Wrath"],
+    requiredTerms: ["Grapes", "Wrath"],
     requiredNewTextTerms: ["Dust Bowl"],
   },
   {

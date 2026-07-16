@@ -4,8 +4,41 @@ import {
   detectFrontmatter,
   getFirstH1,
   getFrontmatterTitle,
+  removeFirstH1,
   retitleNoteMarkdown,
 } from "../src/tools/noteTitles";
+
+test("removeFirstH1 consumes a generated title without leaving body spacing", () => {
+  assert.equal(
+    removeFirstH1("# Generated Note Title\n\nBody paragraph.\n"),
+    "Body paragraph.\n",
+  );
+});
+
+test("removeFirstH1 preserves frontmatter while removing its following title", () => {
+  assert.equal(
+    removeFirstH1(
+      [
+        "---",
+        "tags: [research]",
+        "---",
+        "",
+        "# Generated Note Title",
+        "",
+        "Body paragraph.",
+        "",
+      ].join("\n"),
+    ),
+    [
+      "---",
+      "tags: [research]",
+      "---",
+      "",
+      "Body paragraph.",
+      "",
+    ].join("\n"),
+  );
+});
 
 test("retitleNoteMarkdown inserts an H1 when there is no frontmatter or H1", () => {
   const input = "These are rough notes about building an Obsidian plugin.";

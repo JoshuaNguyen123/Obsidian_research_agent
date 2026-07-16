@@ -74,7 +74,7 @@ test("Windows installed matrix explicitly trusts only its created disposable vau
 test("real AI and live external flags cannot widen into other projects", () => {
   assert.throws(
     () => normalizeExclusiveArgs(["--real-ai", "--project=deterministic-core-mock"]),
-    /restricted to the opt-in real-ai/u,
+    /restricted to attested live-provider/u,
   );
   assert.throws(
     () => normalizeExclusiveArgs(["--live-external", "--project=integration-mock"]),
@@ -104,14 +104,39 @@ test("live external routing is single-project and explicitly exported", () => {
 test("runner mode exports explicit child-process environment without secrets", () => {
   const env: NodeJS.ProcessEnv = {};
   applyE2eAiMode("real", env);
-  applyE2eLane({ liveExternal: false, projects: ["real-ai"] }, env);
+  applyE2eLane({ liveExternal: false, projects: ["real-ai-contract"] }, env);
   assert.deepEqual(env, {
     E2E_AI_MODE: "real",
     E2E_REAL_AI: "1",
     E2E_AI_MODEL: "gpt-oss:120b-cloud",
-    E2E_PLAYWRIGHT_LANE: "real-ai",
+    E2E_PLAYWRIGHT_LANE: "real-ai-contract",
     E2E_LIVE_EXTERNAL: "0",
   });
+});
+
+test("standard E2E command is the live contract and live projects disable reruns", () => {
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  assert.match(packageJson.scripts["test:e2e"], /--real-ai --project=real-ai-contract/u);
+  assert.match(packageJson.scripts["test:e2e:mock"], /deterministic-core-mock/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use-mock/u);
+  assert.equal(
+    packageJson.scripts["test:e2e:daily-use:mock"],
+    "npm run test:e2e:daily-use",
+  );
+  assert.match(packageJson.scripts["test:e2e:daily-use:live-model"], /DU-02/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:code"], /DU-03/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:linear"], /DU-04/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:github"], /DU-05/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:compound"], /DU-06/u);
+  const config = readFileSync(new URL("../playwright.config.ts", import.meta.url), "utf8");
+  for (const project of ["real-ai-contract", "real-ai-soak", "provider-canary", "release-vertical"]) {
+    assert.match(
+      config,
+      new RegExp(`name: "${project}"[\\s\\S]{0,160}retries: 0`, "u"),
+    );
+  }
 });
 
 test("live external preflight validates authority without returning credentials", () => {
@@ -143,6 +168,22 @@ test("live external preflight validates authority without returning credentials"
     mergeAuthorized: true,
   });
   assert.equal(JSON.stringify(merge).includes("fixture-token"), false);
+});
+
+test("live external secret leases stay within the production boundary", () => {
+  const source = readFileSync(
+    new URL("../e2e/disposable-live-external.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const requestedTtls = Array.from(
+    source.matchAll(/ttlSeconds:\s*(\d+)/gu),
+    (match) => Number.parseInt(match[1] ?? "0", 10),
+  );
+  assert.equal(requestedTtls.length > 0, true);
+  assert.equal(
+    requestedTtls.every((ttlSeconds) => ttlSeconds >= 1 && ttlSeconds <= 300),
+    true,
+  );
 });
 
 function liveEnvironment(): NodeJS.ProcessEnv {

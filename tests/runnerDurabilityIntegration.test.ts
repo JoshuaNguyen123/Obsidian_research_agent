@@ -61,6 +61,7 @@ test("write mission persists WAL intent before mutation and commits the receipt 
     },
   });
   const configs: AgentRunConfigEvent[] = [];
+  const receipts: AgentRunReceipt[] = [];
   const client = createModelClient([
     responseWithToolCall("append_to_current_file", {
       text: "Durable mutation proof",
@@ -75,6 +76,7 @@ test("write mission persists WAL intent before mutation and commits the receipt 
     enableStreaming: false,
     events: {
       onRunConfig: (event) => configs.push(event),
+      onReceipt: (receipt) => receipts.push(receipt),
     },
   });
 
@@ -400,6 +402,7 @@ test("streamed current-note writeback persists applying WAL before mutation and 
   vault.context.settings.streamWritebackMode =
     "all_current_note_content_writes";
   const configs: AgentRunConfigEvent[] = [];
+  const receipts: AgentRunReceipt[] = [];
   const streamedContent =
     "Durable autonomous agents preserve mutation intent before writing and retain a committed receipt afterward.";
 
@@ -412,6 +415,7 @@ test("streamed current-note writeback persists applying WAL before mutation and 
     enableStreaming: true,
     events: {
       onRunConfig: (event) => configs.push(event),
+      onReceipt: (receipt) => receipts.push(receipt),
     },
   });
 
@@ -446,6 +450,16 @@ test("streamed current-note writeback persists applying WAL before mutation and 
     "append_to_current_file",
   );
   assert.equal(finalSnapshot.operationJournal[0].receipt?.path, "Current.md");
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].readback?.status, "verified");
+  assert.match(
+    receipts[0].readback?.observedFingerprint ?? "",
+    /^fnv1a32:[a-f0-9]{8}$/u,
+  );
+  assert.deepEqual(
+    finalSnapshot.operationJournal[0].receipt?.readback,
+    receipts[0].readback,
+  );
 });
 
 test("resumed sourced writeback uses durable read proof and commits exactly once", async () => {
@@ -576,6 +590,7 @@ test("resumed sourced writeback uses durable read proof and commits exactly once
   const receipts: AgentRunReceipt[] = [];
   const toolStarts: string[] = [];
   const completions: AgentRunCompleteEvent[] = [];
+  const statuses: string[] = [];
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const candidate =
@@ -604,11 +619,19 @@ test("resumed sourced writeback uses durable read proof and commits exactly once
       onReceipt: (receipt) => receipts.push(receipt),
       onToolStart: (event) => toolStarts.push(event.name),
       onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
     },
   });
 
-  assert.equal(chatRequests.length, 1);
-  assert.equal(streamRequests.length, 1);
+  assert.ok(
+    chatRequests.length >= 1 && chatRequests.length <= 2,
+    "the resumed writeback may perform bounded planning but must not replay completed tools",
+  );
+  assert.equal(
+    streamRequests.length,
+    1,
+    JSON.stringify({ statuses, completions, receipts, toolStarts }),
+  );
   assert.ok(
     streamRequests[0].messages.some((message) =>
       message.content.includes(passageId),
@@ -1123,7 +1146,11 @@ test("continue run restores receipt-backed completed title work", async () => {
     },
   });
 
-  assert.deepEqual(toolStarts, ["list_markdown_files"]);
+  assert.deepEqual(
+    toolStarts,
+    ["list_markdown_files"],
+    JSON.stringify(traces.map((event) => ({ id: event.id, message: event.message }))),
+  );
   const goalTrace = traces.find((event) => event.id.startsWith("operation-goals:"));
   assert.ok(goalTrace);
   const goalState = goalTrace.outputPreview as {
@@ -1355,6 +1382,12 @@ test("resumed receipts do not spend the child segment tool budget or erase new g
           message: "Prior segment receipt.",
           path: "Agent Research Memory/prior.md",
           createdAt: "2026-07-10T12:00:00.000Z",
+          readback: {
+            status: "verified",
+            checkedAt: "2026-07-10T12:00:00.000Z",
+            observedRevision: "fnv1a32:01234567",
+            observedFingerprint: "fnv1a32:89abcdef",
+          },
         },
       ],
       operationGoals: { current_note_content: "not_requested" },
@@ -1363,6 +1396,7 @@ test("resumed receipts do not spend the child segment tool budget or erase new g
 
   const requests: ModelChatRequest[] = [];
   const toolStarts: string[] = [];
+  const receipts: AgentRunReceipt[] = [];
   await runAgentMission({
     prompt: `continue run ${seedRunId}`,
     modelClient: createModelClient(
@@ -1379,11 +1413,28 @@ test("resumed receipts do not spend the child segment tool budget or erase new g
     enableStreaming: false,
     events: {
       onToolStart: (event) => toolStarts.push(event.name),
+      onReceipt: (receipt) => receipts.push(receipt),
     },
   });
 
   assert.ok(requests.length >= 1);
   assert.ok(toolStarts.includes("append_to_current_file"));
+  assert.deepEqual(
+    receipts.map((receipt) => receipt.id),
+    ["receipt-prior", receipts.at(-1)?.id],
+  );
+  assert.deepEqual(receipts[0].readback, {
+    status: "verified",
+    checkedAt: "2026-07-10T12:00:00.000Z",
+    observedRevision: "fnv1a32:01234567",
+    observedFingerprint: "fnv1a32:89abcdef",
+  });
+  assert.equal(receipts.at(-1)?.toolName, "append_to_current_file");
+  assert.equal(receipts.at(-1)?.readback?.status, "verified");
+  assert.match(
+    receipts.at(-1)?.readback?.observedFingerprint ?? "",
+    /^(?:fnv1a32:[a-f0-9]{8}|sha256:[a-f0-9]{64})$/u,
+  );
   assert.equal(vault.files.get("Current.md"), "Initial note\nchild segment proof");
   const childMarkdown = [...vault.files.entries()].find(
     ([path]) =>

@@ -1,5 +1,9 @@
 import type { ClaimPassageRef } from "../agent/claimLedger";
 import {
+  detectEvidenceConflicts,
+  listOpenEvidenceConflicts,
+} from "../agent/evidenceConflicts";
+import {
   mergeMissionEvidence,
   type MissionEvidence,
 } from "../agent/missionLedger";
@@ -50,6 +54,14 @@ export function mergeResearchWorkerResult(input: {
   }
 
   const now = (input.now ?? new Date()).toISOString();
+  const openConflicts = listOpenEvidenceConflicts(
+    detectEvidenceConflicts(
+      claimPassages.map((passage) => ({
+        id: passage.id,
+        text: passage.text,
+      })),
+    ),
+  ).length;
   const handoff: WorkerHandoff = {
     ...input.worker.handoff,
     status: accepted + deduplicated > 0 ? "accepted" : "rejected",
@@ -61,7 +73,7 @@ export function mergeResearchWorkerResult(input: {
     evidenceAccepted: accepted + deduplicated,
     evidenceRejected: rejected,
     evidenceDeduplicated: deduplicated,
-    conflicts: 0,
+    conflicts: openConflicts,
     commitShas: [],
     verificationStatus:
       accepted + deduplicated > 0 ? "pending" : "blocked",
@@ -120,6 +132,11 @@ export function formatHandoffForLead(
       : []),
     "Evidence:",
     ...evidenceLines,
+    "Lead-only completion contract:",
+    "- The Researcher is read-only. Only the Lead may request the authorized write.",
+    "- Cite each factual claim with the accepted passage identifier in the exact form [passage:<id>].",
+    "- Include explicit ## Limitations and ## Confidence sections before final acceptance.",
+    "- When the mission requests current-note append, append exactly once with append_to_current_file after the synthesis passes verification.",
   ].join("\n");
 }
 

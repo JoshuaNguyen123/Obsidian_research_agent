@@ -45,6 +45,21 @@ def matryoshka(values, dim):
     return l2_norm(normalized[:dim])
 
 
+def iter_vectors(values):
+    for item in values:
+        raw = item.tolist() if hasattr(item, "tolist") else item
+        if raw is None:
+            continue
+        raw = list(raw)
+        if not raw:
+            continue
+        if isinstance(raw[0], (int, float)):
+            yield raw
+            continue
+        for vector in raw:
+            yield vector
+
+
 def main():
     try:
         request = json.loads(sys.stdin.read())
@@ -89,13 +104,15 @@ def main():
         document_vectors = []
         query_vectors = []
         if document_inputs:
-            for batch in embedding_model.embed(document_inputs, batch_size=16):
-                for vector in batch:
-                    document_vectors.append(matryoshka(vector, dim))
+            for vector in iter_vectors(
+                embedding_model.embed(document_inputs, batch_size=16)
+            ):
+                document_vectors.append(matryoshka(vector, dim))
         if query_inputs:
-            for batch in embedding_model.embed(query_inputs, batch_size=16):
-                for vector in batch:
-                    query_vectors.append(matryoshka(vector, dim))
+            for vector in iter_vectors(
+                embedding_model.embed(query_inputs, batch_size=16)
+            ):
+                query_vectors.append(matryoshka(vector, dim))
     except Exception as error:
         fail("embed_failed", str(error), model, dim)
         return

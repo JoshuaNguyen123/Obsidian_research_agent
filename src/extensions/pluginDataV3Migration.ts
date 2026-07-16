@@ -13,6 +13,7 @@ import {
 } from "./legacyExtensionMigration";
 
 export const PLUGIN_DATA_MIGRATION_RECORD_VERSION = 1 as const;
+export const PLUGIN_DATA_SCHEMA_VERSION = 3 as const;
 export const MISSION_LEDGER_CONTRACT_VERSION = 2 as const;
 export const MISSION_RUNTIME_SNAPSHOT_CONTRACT_VERSION = 2 as const;
 export const REPOSITORY_PROFILE_CONTRACT_VERSION = 1 as const;
@@ -24,7 +25,7 @@ export {
 
 export interface PluginDataV3MigrationRecord {
   recordVersion: typeof PLUGIN_DATA_MIGRATION_RECORD_VERSION;
-  pluginDataSchemaVersion: typeof SETTINGS_SCHEMA_VERSION;
+  pluginDataSchemaVersion: typeof PLUGIN_DATA_SCHEMA_VERSION;
   sourceSettingsSchemaVersion: SupportedSettingsSchemaVersion;
   migratedAt: string;
   dispositions: {
@@ -32,7 +33,7 @@ export interface PluginDataV3MigrationRecord {
       owner: "core";
       strategy: "eager";
       fromVersion: SupportedSettingsSchemaVersion;
-      toVersion: typeof SETTINGS_SCHEMA_VERSION;
+      toVersion: SupportedSettingsSchemaVersion;
       verification: "normalized_target_hashed";
       targetHash: string;
     };
@@ -102,9 +103,9 @@ export function loadOrPreparePluginDataV3Migration(
   );
 
   if (hasOwn(rawData, "pluginDataV3Migration")) {
-    if (observedSettingsSchema !== SETTINGS_SCHEMA_VERSION) {
+    if (observedSettingsSchema < 3) {
       throw new Error(
-        "Persisted plugin data migration requires settingsSchemaVersion 3.",
+        "Persisted plugin data migration requires settingsSchemaVersion 3 or newer.",
       );
     }
     const record = parsePluginDataV3MigrationRecord(
@@ -131,7 +132,9 @@ export function loadOrPreparePluginDataV3Migration(
       normalizedSettings.settingsSchemaVersion,
     ) !== SETTINGS_SCHEMA_VERSION
   ) {
-    throw new Error("Normalized settings must target settings schema 3.");
+    throw new Error(
+      `Normalized settings must target settings schema ${SETTINGS_SCHEMA_VERSION}.`,
+    );
   }
 
   const copiedRepositoryProfiles =
@@ -153,7 +156,7 @@ export function loadOrPreparePluginDataV3Migration(
 
   const payload: Omit<PluginDataV3MigrationRecord, "integrityHash"> = {
     recordVersion: PLUGIN_DATA_MIGRATION_RECORD_VERSION,
-    pluginDataSchemaVersion: SETTINGS_SCHEMA_VERSION,
+    pluginDataSchemaVersion: PLUGIN_DATA_SCHEMA_VERSION,
     sourceSettingsSchemaVersion: observedSettingsSchema,
     migratedAt,
     dispositions: {
@@ -227,7 +230,7 @@ export function parsePluginDataV3MigrationRecord(
   if (record.recordVersion !== PLUGIN_DATA_MIGRATION_RECORD_VERSION) {
     throw new Error("Unsupported plugin data migration record version.");
   }
-  if (record.pluginDataSchemaVersion !== SETTINGS_SCHEMA_VERSION) {
+  if (record.pluginDataSchemaVersion !== PLUGIN_DATA_SCHEMA_VERSION) {
     throw new Error("Plugin data migration record must target schema 3.");
   }
   const sourceSettingsSchemaVersion = parseSupportedSettingsSchemaVersion(
@@ -244,7 +247,7 @@ export function parsePluginDataV3MigrationRecord(
   );
   const parsed: PluginDataV3MigrationRecord = {
     recordVersion: PLUGIN_DATA_MIGRATION_RECORD_VERSION,
-    pluginDataSchemaVersion: SETTINGS_SCHEMA_VERSION,
+    pluginDataSchemaVersion: PLUGIN_DATA_SCHEMA_VERSION,
     sourceSettingsSchemaVersion,
     migratedAt,
     dispositions,
@@ -283,10 +286,15 @@ function parseDispositions(
     settings.owner !== "core" ||
     settings.strategy !== "eager" ||
     settings.fromVersion !== sourceSettingsSchemaVersion ||
-    settings.toVersion !== SETTINGS_SCHEMA_VERSION ||
     settings.verification !== "normalized_target_hashed"
   ) {
     throw new Error("Settings migration disposition is invalid.");
+  }
+  const settingsTargetVersion = parseSupportedSettingsSchemaVersion(
+    settings.toVersion,
+  );
+  if (settingsTargetVersion < 3) {
+    throw new Error("Settings migration disposition must target schema 3 or newer.");
   }
 
   const missionLedger = parseLazyCoreDisposition(
@@ -358,7 +366,7 @@ function parseDispositions(
       owner: "core",
       strategy: "eager",
       fromVersion: sourceSettingsSchemaVersion,
-      toVersion: SETTINGS_SCHEMA_VERSION,
+      toVersion: settingsTargetVersion,
       verification: "normalized_target_hashed",
       targetHash: expectFingerprint(settings.targetHash, "settings target hash"),
     },

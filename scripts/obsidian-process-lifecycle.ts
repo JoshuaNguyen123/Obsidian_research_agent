@@ -1,3 +1,8 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
 export interface ControlledProcessHandle {
   readonly pid?: number;
   readonly exitCode: number | null;
@@ -52,6 +57,34 @@ export async function terminateControlledObsidian(
   throw new Error(
     `Controlled Obsidian teardown did not drain cleanly (${details.join("; ")}).`,
   );
+}
+
+export async function waitForWindowsProcessExit(
+  pid: number,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await isWindowsProcessIdRunning(pid))) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !(await isWindowsProcessIdRunning(pid));
+}
+
+export function tasklistContainsProcessId(output: string, pid: number): boolean {
+  const escapedPid = String(pid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^"[^"]+","${escapedPid}",`, "imu").test(output);
+}
+
+async function isWindowsProcessIdRunning(pid: number): Promise<boolean> {
+  const { stdout } = await execFileAsync(
+    "tasklist",
+    ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
+    { windowsHide: true },
+  );
+  return tasklistContainsProcessId(String(stdout), pid);
 }
 
 async function runProbe(

@@ -45,6 +45,10 @@ test("shouldRequireClaimGrounding skips chat answers and ordinary summaries", ()
     shouldRequireQuoteSpans("Verify and quote the source text for this claim."),
     true,
   );
+  assert.equal(
+    shouldRequireQuoteSpans("Verify two claims against fetched passages."),
+    false,
+  );
 });
 
 test("uncited deep-research draft fails claim grounding", () => {

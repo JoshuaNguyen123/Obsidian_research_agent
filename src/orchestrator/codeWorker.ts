@@ -136,6 +136,7 @@ export async function runCodeWorker(input: {
       tools: CODE_WORKER_TOOL_DEFINITIONS,
       think: false,
       abortSignal: input.abortSignal,
+      evidencePhase: "worker",
     });
     messages.push(response.message);
     if (response.toolCalls.length === 0) {

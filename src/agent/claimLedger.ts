@@ -139,7 +139,7 @@ export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
 
 export function shouldRequireQuoteSpans(promptOrMode: string): boolean {
   const value = promptOrMode.replace(/\s+/g, " ").trim();
-  return /\b(?:quote|quoted|quotations?|text[-\s]?level\s+quotation|verify|fact[-\s]?check)\b/i.test(
+  return /\b(?:quote|quoted|quotations?|text[-\s]?level\s+quotation)\b/i.test(
     value,
   );
 }

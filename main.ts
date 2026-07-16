@@ -8,6 +8,11 @@ import {
 } from "obsidian";
 import { AgentView, AGENT_VIEW_TYPE } from "./src/AgentView";
 import {
+  buildSelectionResearchPrompt,
+  isUsableEditorSelection,
+  type SelectionResearchMode,
+} from "./src/agent/selectionResearchPrompt";
+import {
   appendConversationMessage,
   normalizeConversationHistory,
   type AgentConversationMessage,
@@ -24,8 +29,12 @@ import {
 } from "./src/embeddings/semanticIndex";
 import type { SemanticIndexService } from "./src/embeddings/semanticIndexTypes";
 import type { SemanticEmbeddingProvider } from "./src/embeddings/types";
-import type { ModelClient } from "./src/model/types";
+import { formatModelClientError, type ModelClient } from "./src/model/types";
 import { AgentSettings, AgentSettingTab, DEFAULT_SETTINGS } from "./src/settings";
+import type {
+  CapabilitySetupTarget,
+  PendingCapabilityResume,
+} from "./src/agent/capabilitySetup";
 import {
   detectInstallKind,
   normalizeAgentSettings,
@@ -132,6 +141,7 @@ import {
 } from "./src/agent/failureCopy";
 import { createObsidianDurableMissionRepository } from "./src/agent/obsidianDurableMissionRepository";
 import { classifyOvernightMissionIntent } from "./src/agent/overnightIntent";
+import { detectChatOnlyIntent } from "./src/agent/noteOutputPolicy";
 import { buildDurableOutcomeFromAgentRunner } from "./src/agent/agentRunnerDurableAdapter";
 import { seedDurableChildRun } from "./src/agent/durableChildSeed";
 import { planDurableResumeScan } from "./src/agent/durableResumeSelection";
@@ -223,7 +233,10 @@ import type {
 } from "./src/tools/types";
 import { ScopedToolRegistry } from "./src/tools/ScopedToolRegistry";
 import type { OrchestratorSnapshotV1 } from "./src/orchestrator/types";
-import { normalizeOrchestratorSnapshot } from "./src/orchestrator/orchestratorStore";
+import {
+  normalizeOrchestratorSnapshot,
+  reconcileOrphanedOrchestratorSnapshot,
+} from "./src/orchestrator/orchestratorStore";
 import {
   OrchestratorRuntime,
   createCodeTeamScaffold,
@@ -528,6 +541,15 @@ interface CompanionLinearQueueRunDetailsProjectionV1 {
   } | null;
 }
 
+export interface ModelConnectionStatusV1 {
+  status: "untested" | "testing" | "ready" | "error";
+  message: string;
+  checkedAt: string | null;
+  latencyMs: number | null;
+  provider: AgentSettings["modelProvider"];
+  model: string;
+}
+
 export default class AgenticResearcherPlugin extends Plugin {
   private readonly coreApiHost = new CoreApiHost({
     toolNameReservations: getCoreToolNameReservations(),
@@ -547,6 +569,15 @@ export default class AgenticResearcherPlugin extends Plugin {
   private semanticIndexService: SemanticIndexService | null = null;
   private activeAgentView: AgentView | null = null;
   private agentSettingTab: AgentSettingTab | null = null;
+  private pendingCapabilityResume: PendingCapabilityResume | null = null;
+  private modelConnectionStatus: ModelConnectionStatusV1 = {
+    status: "untested",
+    message: "Connection not tested in this session.",
+    checkedAt: null,
+    latencyMs: null,
+    provider: DEFAULT_SETTINGS.modelProvider,
+    model: DEFAULT_SETTINGS.model,
+  };
   private missionScheduler: MissionScheduler | null = null;
   private scheduledRunActive = false;
   private semanticIndexQueuedPaths = new Set<string>();
@@ -792,6 +823,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     await this.loadProjectMemoryData();
     this.startupPhase = "hydrating_mission_projection";
     await this.hydrateLatestMissionRunProjection();
+    await this.reconcilePersistedOrchestratorProjection();
 
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
@@ -843,6 +875,87 @@ export default class AgenticResearcherPlugin extends Plugin {
         void this.activateView();
       },
     });
+
+    this.addCommand({
+      id: "research-selection-web",
+      name: "Research selection (web)",
+      editorCheckCallback: (checking, editor, ctx) => {
+        const selection = editor?.getSelection?.() ?? "";
+        if (!isUsableEditorSelection(selection)) {
+          return false;
+        }
+        if (checking) {
+          return true;
+        }
+        const notePath =
+          ctx?.file instanceof TFile ? ctx.file.path : this.resolveCurrentMarkdownPath();
+        void this.runSelectionResearch({
+          selection,
+          notePath,
+          mode: "stream_page",
+        });
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "research-selection-chat-only",
+      name: "Research selection (chat only)",
+      editorCheckCallback: (checking, editor, ctx) => {
+        const selection = editor?.getSelection?.() ?? "";
+        if (!isUsableEditorSelection(selection)) {
+          return false;
+        }
+        if (checking) {
+          return true;
+        }
+        const notePath =
+          ctx?.file instanceof TFile ? ctx.file.path : this.resolveCurrentMarkdownPath();
+        void this.runSelectionResearch({
+          selection,
+          notePath,
+          mode: "chat_only",
+        });
+        return true;
+      },
+    });
+
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor, info) => {
+        const selection = editor?.getSelection?.() ?? "";
+        if (!isUsableEditorSelection(selection)) {
+          return;
+        }
+        const notePath =
+          info?.file instanceof TFile
+            ? info.file.path
+            : this.resolveCurrentMarkdownPath();
+        menu.addItem((item) => {
+          item
+            .setTitle("Research selection (web)")
+            .setIcon("search")
+            .onClick(() => {
+              void this.runSelectionResearch({
+                selection,
+                notePath,
+                mode: "stream_page",
+              });
+            });
+        });
+        menu.addItem((item) => {
+          item
+            .setTitle("Research selection (chat only)")
+            .setIcon("message-square")
+            .onClick(() => {
+              void this.runSelectionResearch({
+                selection,
+                notePath,
+                mode: "chat_only",
+              });
+            });
+        });
+      }),
+    );
 
     this.addCommand({
       id: "rebuild-semantic-vault-index",
@@ -980,6 +1093,201 @@ export default class AgenticResearcherPlugin extends Plugin {
     await this.app.workspace.revealLeaf(leaf);
   }
 
+  getPendingCapabilityResume(): PendingCapabilityResume | null {
+    return this.pendingCapabilityResume
+      ? { ...this.pendingCapabilityResume }
+      : null;
+  }
+
+  clearPendingCapabilityResume(): void {
+    this.pendingCapabilityResume = null;
+  }
+
+  getModelConnectionStatus(): ModelConnectionStatusV1 {
+    return { ...this.modelConnectionStatus };
+  }
+
+  invalidateModelConnectionStatus(): void {
+    this.modelConnectionStatus = {
+      status: "untested",
+      message: "Connection changed; test it before starting important work.",
+      checkedAt: null,
+      latencyMs: null,
+      provider: this.settings.modelProvider,
+      model: this.settings.model,
+    };
+  }
+
+  async testModelConnection(): Promise<ModelConnectionStatusV1> {
+    const provider = this.settings.modelProvider;
+    const model = this.settings.model;
+    this.modelConnectionStatus = {
+      status: "testing",
+      message: `Testing ${provider} without exposing credentials...`,
+      checkedAt: null,
+      latencyMs: null,
+      provider,
+      model,
+    };
+    const startedAt = Date.now();
+    try {
+      const response = await this.createModelClient().chat({
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "This is a connection health check. Reply with a short acknowledgement and do not call tools.",
+          },
+          { role: "user", content: "Connection health check." },
+        ],
+        options: { temperature: 0 },
+        evidencePhase: "unknown",
+      });
+      if (response.message.role !== "assistant") {
+        throw new Error("Provider returned an invalid health-check role.");
+      }
+      const latencyMs = Math.max(0, Date.now() - startedAt);
+      this.modelConnectionStatus = {
+        status: "ready",
+        message: `Connected to ${provider} model ${model} in ${latencyMs}ms.`,
+        checkedAt: new Date().toISOString(),
+        latencyMs,
+        provider,
+        model,
+      };
+    } catch (error) {
+      this.modelConnectionStatus = {
+        status: "error",
+        message: `Connection failed: ${formatModelClientError(error)}`,
+        checkedAt: new Date().toISOString(),
+        latencyMs: Math.max(0, Date.now() - startedAt),
+        provider,
+        model,
+      };
+    }
+    return this.getModelConnectionStatus();
+  }
+
+  async openCapabilitySetup(
+    target: CapabilitySetupTarget,
+    pending?: Omit<PendingCapabilityResume, "target" | "requestedAt">,
+  ): Promise<void> {
+    this.pendingCapabilityResume = pending
+      ? {
+          ...pending,
+          target,
+          requestedAt: new Date().toISOString(),
+        }
+      : null;
+    const setting = (
+      this.app as typeof this.app & {
+        setting?: {
+          open(): void;
+          openTabById(id: string): Promise<void> | void;
+        };
+      }
+    ).setting;
+    if (!setting) {
+      new Notice("Obsidian settings are unavailable.");
+      return;
+    }
+    setting.open();
+    await setting.openTabById(this.manifest.id);
+    this.agentSettingTab?.focusCapability(target);
+  }
+
+  async resumePendingCapabilityMission(): Promise<boolean> {
+    const pending = this.pendingCapabilityResume;
+    if (!pending) return false;
+    const setting = (
+      this.app as typeof this.app & { setting?: { close(): void } }
+    ).setting;
+    setting?.close();
+    await this.activateView();
+    const view = this.activeAgentView;
+    if (!view) {
+      new Notice("Unable to resume the mission because the assistant panel did not open.");
+      return false;
+    }
+    this.pendingCapabilityResume = null;
+    await view.submitMissionContinuation(pending.continuationCommand);
+    return true;
+  }
+
+  private resolveCurrentMarkdownPath(): string {
+    return this.resolveCurrentMarkdownFile()?.path ?? "current note";
+  }
+
+  async runSelectionResearch(input: {
+    selection: string;
+    notePath: string;
+    mode: SelectionResearchMode;
+  }): Promise<void> {
+    if (!isUsableEditorSelection(input.selection)) {
+      new Notice("Select text in a markdown note before researching.");
+      return;
+    }
+    if (this.isMissionRunning()) {
+      new Notice("A mission is already running. Stop it or wait, then research the selection.");
+      return;
+    }
+
+    const built = buildSelectionResearchPrompt({
+      selection: input.selection,
+      notePath: input.notePath,
+      mode: input.mode,
+    });
+    if (built.truncated) {
+      new Notice("Selection was truncated for the research mission.");
+    }
+
+    // Pin the selection's note as the current markdown target before revealing
+    // the side panel, so streamed writeback still lands on the same page.
+    const selectionNote = this.app.vault.getFileByPath(input.notePath.trim());
+    if (selectionNote && selectionNote.extension === "md") {
+      this.updateLastActiveMarkdownFile(selectionNote);
+      const markdownLeaf =
+        this.app.workspace
+          .getLeavesOfType("markdown")
+          .find((leaf) => getMarkdownFileFromLeaf(leaf)?.path === selectionNote.path) ??
+        this.app.workspace.getMostRecentLeaf();
+      if (markdownLeaf) {
+        await markdownLeaf.openFile(selectionNote);
+      }
+    }
+
+    await this.activateView();
+    let view =
+      this.activeAgentView ??
+      (this.app.workspace.getLeavesOfType(AGENT_VIEW_TYPE)[0]?.view instanceof
+      AgentView
+        ? (this.app.workspace.getLeavesOfType(AGENT_VIEW_TYPE)[0].view as AgentView)
+        : null);
+    if (!view) {
+      // Newly created leaves finish onOpen slightly after setViewState resolves.
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+      view =
+        this.activeAgentView ??
+        (this.app.workspace.getLeavesOfType(AGENT_VIEW_TYPE)[0]?.view instanceof
+        AgentView
+          ? (this.app.workspace.getLeavesOfType(AGENT_VIEW_TYPE)[0]
+              .view as AgentView)
+          : null);
+    }
+    if (!view) {
+      new Notice("Unable to open Agentic Researcher for selection research.");
+      return;
+    }
+
+    const outcome = await view.submitMissionPrompt(built.prompt, {
+      forceChatOnly: input.mode === "chat_only",
+    });
+    if (!outcome) {
+      new Notice("Could not start selection research (mission busy or panel not ready).");
+    }
+  }
+
   async loadSettings() {
     const data = await this.loadData();
     const record = isRecord(data) ? data : {};
@@ -1014,6 +1322,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     } = record;
     void _rawExtensionStateMigration;
     void _rawPluginDataV3Migration;
+    // Preserve the exact persisted compatibility inputs before any extension
+    // migration preparation or runtime-default sanitation occurs.
+    const persistedSettingsData = { ...settingsData };
 
     const bundledDataLoadedAt = new Date().toISOString();
     this.bundledCapabilityData = parseBundledCapabilityData(
@@ -1250,10 +1561,12 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
 
     const normalizedProfiles = normalizeAgentSettings(
-      settings,
-      detectInstallKind(settingsData),
+      persistedSettingsData,
+      detectInstallKind(persistedSettingsData),
     );
     settings.settingsSchemaVersion = normalizedProfiles.settingsSchemaVersion;
+    settings.workingMode = normalizedProfiles.workingMode;
+    settings.memoryMode = normalizedProfiles.memoryMode;
     settings.autonomyProfile = normalizedProfiles.autonomyProfile;
     settings.outputProfile = normalizedProfiles.outputProfile;
     settings.enableStreaming = normalizedProfiles.enableStreaming;
@@ -1263,6 +1576,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     settings.agenticReflexEnabled = normalizedProfiles.agenticReflexEnabled;
     settings.modelRouterMode = normalizedProfiles.modelRouterMode;
     settings.modelRouterEnabled = normalizedProfiles.modelRouterEnabled;
+    settings.researchMemoryEnabled = normalizedProfiles.researchMemoryEnabled;
+    settings.experienceMemoryEnabled = normalizedProfiles.experienceMemoryEnabled;
 
     this.settings = settings;
     this.linearApiKey =
@@ -1290,6 +1605,13 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.githubAuthStatusMessage = this.githubCredential
       ? `Connected as ${this.githubCredential.account.login}; the token is stored as an opaque secure reference.`
       : "GitHub is not connected.";
+    // A verified credential is the connection switch. The legacy booleans stay
+    // as internal runtime gates, but no longer require a second user setting.
+    this.settings.linearEnabled =
+      this.linearOAuthRuntimeState !== null ||
+      this.linearApiKey.length > 0 ||
+      this.linearCredentialReference !== null;
+    this.settings.githubEnabled = this.githubCredential !== null;
     this.githubPublicationCheckpointNamespace =
       parseGitHubPublicationCheckpointNamespaceV1(
         rawGitHubPublicationCheckpoints,
@@ -1555,6 +1877,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.linearOAuthDeferredCleanupReferenceIds = [];
       this.linearOAuthStatusMessage = "Linear OAuth tokens were revoked and disconnected.";
       if (!this.hasLinearPersonalCredential()) {
+        this.settings.linearEnabled = false;
         this.linearCapabilitySnapshot = null;
         this.settings.linearCapabilityGate = 0;
         this.settings.linearQueueEnabled = false;
@@ -1611,9 +1934,6 @@ export default class AgenticResearcherPlugin extends Plugin {
     userCode?: string;
     verificationUri?: string;
   }> {
-    if (this.settings.githubEnabled !== true) {
-      return { ok: false, message: "Enable GitHub before connecting an account." };
-    }
     if (!this.getOptionalExtensionCapabilities().integrations) {
       return {
         ok: false,
@@ -1677,9 +1997,6 @@ export default class AgenticResearcherPlugin extends Plugin {
   async setGitHubFineGrainedPat(
     token: string,
   ): Promise<{ ok: boolean; message: string }> {
-    if (this.settings.githubEnabled !== true) {
-      return { ok: false, message: "Enable GitHub before saving a credential." };
-    }
     if (!this.getOptionalExtensionCapabilities().integrations) {
       return {
         ok: false,
@@ -1722,10 +2039,12 @@ export default class AgenticResearcherPlugin extends Plugin {
       return { ok: false, message: this.githubAuthStatusMessage };
     }
     this.githubCredential = null;
+    this.settings.githubEnabled = false;
     try {
       await this.savePluginData();
     } catch (error) {
       this.githubCredential = credential;
+      this.settings.githubEnabled = true;
       this.githubAuthStatusMessage =
         "GitHub plugin state could not be updated; the credential was retained.";
       return { ok: false, message: this.githubAuthStatusMessage };
@@ -1909,6 +2228,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.linearApiKey = apiKey;
       this.persistLegacyLinearApiKey = true;
     }
+    this.settings.linearEnabled = true;
     this.linearApiKeyRevision += 1;
     await this.savePluginData();
     void this.restartLinearQueueRuntime(false).catch((error) =>
@@ -1968,6 +2288,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.persistLegacyLinearApiKey = false;
     this.linearCredentialReference = null;
     if (!this.linearOAuthRuntimeState) {
+      this.settings.linearEnabled = false;
       this.linearCapabilitySnapshot = null;
       this.settings.linearCapabilityGate = 0;
       this.settings.linearQueueEnabled = false;
@@ -3547,10 +3868,12 @@ export default class AgenticResearcherPlugin extends Plugin {
 
     const previous = this.githubCredential;
     this.githubCredential = credential;
+    this.settings.githubEnabled = true;
     try {
       await this.savePluginData();
     } catch (error) {
       this.githubCredential = previous;
+      this.settings.githubEnabled = previous !== null;
       await auth.removeCredential(credential).catch(() => false);
       throw error;
     }
@@ -3617,6 +3940,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         credential,
       });
       this.linearOAuthRuntimeState = nextState;
+      this.settings.linearEnabled = true;
       this.linearCapabilitySnapshot = null;
       this.settings.linearCapabilityGate = 0;
       this.settings.linearQueueEnabled = false;
@@ -5449,6 +5773,17 @@ export default class AgenticResearcherPlugin extends Plugin {
   ): Promise<void> {
     this.latestOrchestratorSnapshot = normalizeOrchestratorSnapshot(snapshot);
     await this.savePluginData();
+    this.activeAgentView?.refreshOrchestratorAvailability();
+  }
+
+  private async reconcilePersistedOrchestratorProjection(): Promise<void> {
+    const snapshot = this.latestOrchestratorSnapshot;
+    if (!snapshot || snapshot.status !== "running") return;
+    const coordinator = this.runCoordinator.getSnapshot();
+    if (coordinator.isRunning && coordinator.runId === snapshot.runId) return;
+    const reconciled = reconcileOrphanedOrchestratorSnapshot(snapshot);
+    if (!reconciled) return;
+    await this.setLatestOrchestratorSnapshot(reconciled);
   }
 
   async appendConversationMessage(message: AgentConversationMessage) {
@@ -5926,11 +6261,14 @@ export default class AgenticResearcherPlugin extends Plugin {
       (this.settings.overnightRunsEnabled !== false && overnightIntent.requested
         ? this.createDurableMission(prompt, overnightIntent.durationHours)
         : null);
+    const completionDrivenLoops =
+      this.settings.completionDrivenLoops !== false &&
+      options.forceChatOnly !== true &&
+      !detectChatOnlyIntent(prompt);
     const autoContinueLongRun =
       !durableManifest &&
       this.settings.autoContinueLongRuns !== false &&
-      isExplicitLongRunningResearchPrompt(prompt);
-    const completionDrivenLoops = this.settings.completionDrivenLoops !== false;
+      (completionDrivenLoops || isExplicitLongRunningResearchPrompt(prompt));
     const maxSegments = autoContinueLongRun
       ? completionDrivenLoops
         ? Math.min(
@@ -6454,6 +6792,27 @@ export default class AgenticResearcherPlugin extends Plugin {
       16,
       MAX_AGENT_STEPS * 2 - workerMaxToolCalls,
     );
+    // Keep bounded continuation slices inside the existing Lead budget.
+    // A monolithic segment can spend its final turn establishing that more
+    // work is required but cannot consume the durable continuation it just
+    // produced. Partitioning the same cap gives that proof-bearing resume a
+    // real execution window without increasing root autonomy.
+    const leadContinuationSteps =
+      leadMaxSteps >= 24 ? Math.min(24, Math.floor(leadMaxSteps / 3)) : 0;
+    const leadInitialSegmentSteps = leadContinuationSteps > 0
+      ? leadMaxSteps - leadContinuationSteps
+      : leadMaxSteps;
+    const leadContinuationToolCalls =
+      leadMaxToolCalls >= 24
+        ? Math.min(32, Math.floor(leadMaxToolCalls / 3))
+        : 0;
+    const leadInitialSegmentToolCalls = leadContinuationToolCalls > 0
+      ? leadMaxToolCalls - leadContinuationToolCalls
+      : leadMaxToolCalls;
+    const leadMaxSegments = Math.min(
+      24,
+      Math.max(4, this.settings.maxCompletionSegments ?? 24),
+    );
     let operationalSnapshot: OrchestratorSnapshotV1 | null = null;
     const runtime = new OrchestratorRuntime({
       runId,
@@ -6682,6 +7041,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     const leadCompletion: { current: AgentRunCompleteEvent | null } = {
       current: null,
     };
+    let leadModelSteps = 0;
     let leadToolCalls = 0;
     let leadEventQueue = Promise.resolve();
     const enqueueLeadEvent = (operation: () => Promise<unknown>) => {
@@ -6740,33 +7100,98 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
     const leadStartedAt = Date.now();
     try {
-      await runAgentMission({
-        prompt: input.prompt,
-        runId: `${runId}-lead`,
-        conversationHistory: input.conversationHistory,
-        modelClient: this.createModelClient(),
-        toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
-        toolContext: this.createToolExecutionContext(input.prompt),
-        enableStreaming: this.settings.enableStreaming,
-        abortSignal: rootDeadline.signal,
-        approvalBroker: this.approvalBroker,
-        forceChatOnly: input.forceChatOnly === true,
-        events: leadEvents,
-        maxSteps: leadMaxSteps,
-        maxToolCalls: leadMaxToolCalls,
-        seedMissionEvidence: seedEvidence,
-        seedClaimPassages,
-        orchestratorContext: handoffContext,
-        orchestratorSnapshot: runtime.getSnapshot() ?? undefined,
-        getOrchestratorSnapshot: () => runtime.getSnapshot(),
-      });
+      let leadPrompt = input.prompt;
+      let leadHistory = input.conversationHistory;
+      let leadSegmentRunId = `${runId}-lead`;
+      for (
+        let segmentIndex = 0;
+        segmentIndex < leadMaxSegments &&
+        leadModelSteps < leadMaxSteps &&
+        leadToolCalls < leadMaxToolCalls;
+        segmentIndex += 1
+      ) {
+        let continueLead = false;
+        let segmentToolCalls = 0;
+        leadCompletion.current = null;
+        const segmentStepBudget = segmentIndex === 0
+          ? leadInitialSegmentSteps
+          : Math.min(24, leadMaxSteps - leadModelSteps);
+        const segmentToolCallBudget = segmentIndex === 0
+          ? leadInitialSegmentToolCalls
+          : Math.min(32, leadMaxToolCalls - leadToolCalls);
+        const segmentEvents = createSegmentEventProxy(leadEvents, {
+          bufferAssistantUntilComplete:
+            segmentIndex + 1 < leadMaxSegments,
+          onRunConfig: (event) => {
+            leadSegmentRunId = event.runId;
+            leadEvents.onRunConfig?.(event);
+          },
+          observeToolStart: () => {
+            segmentToolCalls += 1;
+          },
+          onRunComplete: (event) => {
+            leadCompletion.current = event;
+            leadModelSteps += Math.max(1, event.step);
+            continueLead =
+              event.stopReason === "budget" &&
+              event.autoContinueRecommended === true &&
+              leadModelSteps < leadMaxSteps &&
+              leadToolCalls < leadMaxToolCalls &&
+              segmentIndex + 1 < leadMaxSegments &&
+              !rootDeadline.signal.aborted;
+            return continueLead;
+          },
+        });
+        await runAgentMission({
+          prompt: leadPrompt,
+          ...(segmentIndex === 0 ? { runId: leadSegmentRunId } : {}),
+          conversationHistory: leadHistory,
+          modelClient: this.createModelClient(),
+          toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
+          toolContext: this.createToolExecutionContext(leadPrompt),
+          enableStreaming: this.settings.enableStreaming,
+          abortSignal: rootDeadline.signal,
+          approvalBroker: this.approvalBroker,
+          forceChatOnly: input.forceChatOnly === true,
+          events: segmentEvents,
+          maxSteps: segmentStepBudget,
+          maxToolCalls: segmentToolCallBudget,
+          ...(segmentIndex === 0
+            ? { seedMissionEvidence: seedEvidence, seedClaimPassages }
+            : {}),
+          orchestratorContext: handoffContext,
+          orchestratorSnapshot: runtime.getSnapshot() ?? undefined,
+          getOrchestratorSnapshot: () => runtime.getSnapshot(),
+        });
+        await leadEventQueue;
+        if (!continueLead) {
+          break;
+        }
+        input.events.onStatus?.(
+          "ORCH> Lead reached its first bounded segment and is continuing from the durable mission snapshot.",
+        );
+        input.events.onTrace?.({
+          id: `orchestrator-lead-continuation-${segmentIndex + 1}`,
+          kind: "status",
+          message: `Lead continuation resumed from ${leadSegmentRunId}.`,
+          outputPreview: {
+            completedSegment: segmentIndex + 1,
+            maxSegments: leadMaxSegments,
+            continuationCommand: `continue run ${leadSegmentRunId}`,
+            usedStepBudget: leadModelSteps,
+            remainingStepBudget: Math.max(0, leadMaxSteps - leadModelSteps),
+            segmentToolCalls,
+          },
+        });
+        leadPrompt = `continue run ${leadSegmentRunId}`;
+        leadHistory = [];
+      }
       await leadEventQueue;
       const leadComplete = leadCompletion.current;
-      const leadSteps = leadComplete?.step ?? 1;
       await runtime.consumeOrThrow(
         "lead",
         "modelSteps",
-        Math.max(1, leadSteps),
+        Math.max(1, leadModelSteps),
         true,
       );
       if (leadToolCalls > 0) {

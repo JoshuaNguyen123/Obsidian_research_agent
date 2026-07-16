@@ -20,6 +20,7 @@ describe("pluginDataV3Migration", () => {
     assert.equal(parseSupportedSettingsSchemaVersion(1), 1);
     assert.equal(parseSupportedSettingsSchemaVersion(2), 2);
     assert.equal(parseSupportedSettingsSchemaVersion(3), 3);
+    assert.equal(parseSupportedSettingsSchemaVersion(4), 4);
 
     for (const malformed of [null, "3", 0, -1, 1.5, Number.NaN]) {
       assert.throws(
@@ -28,8 +29,8 @@ describe("pluginDataV3Migration", () => {
       );
     }
     assert.throws(
-      () => parseSupportedSettingsSchemaVersion(4),
-      /unsupported future settings schema 4/i,
+      () => parseSupportedSettingsSchemaVersion(5),
+      /unsupported future settings schema 5/i,
     );
   });
 
@@ -85,7 +86,7 @@ describe("pluginDataV3Migration", () => {
       owner: "core",
       strategy: "eager",
       fromVersion: 2,
-      toVersion: 3,
+      toVersion: 4,
       verification: "normalized_target_hashed",
       targetHash: loaded.record.dispositions.settings.targetHash,
     });
@@ -198,7 +199,7 @@ describe("pluginDataV3Migration", () => {
       () =>
         loadOrPreparePluginDataV3Migration({
           rawData: {
-            settingsSchemaVersion: 4,
+            settingsSchemaVersion: 5,
             pluginDataV3Migration: first.record,
             extensionStateMigration,
           },
@@ -206,7 +207,7 @@ describe("pluginDataV3Migration", () => {
           extensionStateMigration,
           migratedAt: "2026-07-12T00:00:00.000Z",
         }),
-      /unsupported future settings schema 4/i,
+      /unsupported future settings schema 5/i,
     );
     assert.throws(
       () =>
@@ -272,7 +273,7 @@ function normalizedSettings(
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
-    settingsSchemaVersion: 3,
+    settingsSchemaVersion: 4,
     modelProvider: "ollama",
     ollamaApiKey: "",
     ...extra,

@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { terminateControlledObsidian } from "../scripts/obsidian-process-lifecycle";
+import {
+  tasklistContainsProcessId,
+  terminateControlledObsidian,
+} from "../scripts/obsidian-process-lifecycle";
+
+test("owned process readback matches only the exact tasklist PID row", () => {
+  const tasklist = [
+    '"Obsidian.exe","1234","Console","1","100,000 K"',
+    '"Obsidian.exe","91234","Console","1","100,000 K"',
+  ].join("\r\n");
+  assert.equal(tasklistContainsProcessId(tasklist, 1234), true);
+  assert.equal(tasklistContainsProcessId(tasklist, 234), false);
+  assert.equal(tasklistContainsProcessId(tasklist, 91234), true);
+  assert.equal(
+    tasklistContainsProcessId("INFO: No tasks are running which match the specified criteria.", 1234),
+    false,
+  );
+});
 
 test("controlled Obsidian teardown targets only its owned PID and rejects an incomplete drain", async () => {
   const calls: string[] = [];

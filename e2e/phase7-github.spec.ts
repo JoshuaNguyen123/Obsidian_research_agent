@@ -18,7 +18,7 @@ const PHASE7_TIMEOUT_MS = 120_000;
 test.describe("Phase 7 verified code publication", () => {
   test.describe.configure({ timeout: PHASE7_TIMEOUT_MS });
 
-  test("verified push, review repair, stale approval rejection, and double-approved merge retain receipts", async () => {
+  test("DU-05 verified push, review repair, stale approval rejection, and double-approved merge retain receipts", async () => {
     const harness = await createPhase7GitHubHarness(`PW-${Date.now()}`);
     try {
       const firstRequest = harness.request({

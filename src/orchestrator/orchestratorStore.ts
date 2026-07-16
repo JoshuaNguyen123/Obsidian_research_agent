@@ -30,6 +30,8 @@ export const MAX_ORCHESTRATOR_NODES = 512;
 export const MAX_ORCHESTRATOR_PARTICIPANTS = 8;
 export const MAX_ORCHESTRATOR_WORKTREES = 64;
 export const MAX_ORCHESTRATOR_HANDOFFS = 128;
+export const ORPHANED_ORCHESTRATOR_BLOCKER =
+  "Run is no longer active after an Obsidian or plugin restart. Continue from Run Details to resume safely.";
 
 export interface NormalizeOrchestratorSnapshotOptions {
   fallbackRunId?: string;
@@ -152,6 +154,98 @@ export function normalizeOrchestratorSnapshot(
     createdAt,
     updatedAt,
   };
+}
+
+/**
+ * A persisted projection is display state, not proof that an executor still
+ * owns the run. On startup the in-memory coordinator begins idle, so an old
+ * `running` snapshot must stop its live clock and expose a resumable blocker
+ * instead of looking active forever.
+ */
+export function reconcileOrphanedOrchestratorSnapshot(
+  value: unknown,
+  options: { now?: Date; blocker?: string } = {},
+): OrchestratorSnapshotV1 | null {
+  const snapshot = normalizeOrchestratorSnapshot(value, { now: options.now });
+  if (!snapshot || snapshot.status !== "running") return snapshot;
+
+  const requestedNowMs = options.now?.getTime();
+  const priorUpdatedAtMs = Date.parse(snapshot.updatedAt);
+  const fallbackNowMs = Date.now();
+  const updatedAtMs = Math.max(
+    Number.isFinite(requestedNowMs) ? requestedNowMs! : fallbackNowMs,
+    Number.isFinite(priorUpdatedAtMs) ? priorUpdatedAtMs + 1 : fallbackNowMs,
+  );
+  const updatedAt = new Date(updatedAtMs).toISOString();
+  const blocker = options.blocker?.trim() || ORPHANED_ORCHESTRATOR_BLOCKER;
+  const activeNodeStatuses = new Set<WorkNodeStatus>([
+    "queued",
+    "ready",
+    "running",
+    "waiting",
+  ]);
+  const activeParticipantStatuses = new Set<AgentParticipantStatus>([
+    "queued",
+    "planning",
+    "researching",
+    "coding",
+    "waiting",
+    "handoff",
+    "merging",
+    "verifying",
+  ]);
+
+  const nodes = Object.fromEntries(
+    Object.entries(snapshot.nodes).map(([id, node]) => [
+      id,
+      activeNodeStatuses.has(node.status)
+        ? {
+            ...node,
+            status: "blocked" as const,
+            lastAction: blocker,
+            blocker,
+            updatedAt,
+          }
+        : node,
+    ]),
+  );
+  const participants = Object.fromEntries(
+    Object.entries(snapshot.participants).map(([id, participant]) => [
+      id,
+      activeParticipantStatuses.has(participant.status)
+        ? {
+            ...participant,
+            status: "blocked" as const,
+            lastAction: blocker,
+            blocker,
+            updatedAt,
+          }
+        : participant,
+    ]),
+  );
+  const merge =
+    snapshot.merge.status === "running"
+      ? {
+          ...snapshot.merge,
+          status: "blocked" as const,
+          verificationStatus:
+            snapshot.merge.verificationStatus === "pending"
+              ? "blocked" as const
+              : snapshot.merge.verificationStatus,
+          blocker,
+          updatedAt,
+        }
+      : snapshot.merge;
+
+  return normalizeOrchestratorSnapshot({
+    ...snapshot,
+    status: "blocked",
+    nodes,
+    participants,
+    merge,
+    sequence: Math.min(Number.MAX_SAFE_INTEGER, snapshot.sequence + 1),
+    updatedAt,
+  });
 }
 
 export function serializeOrchestratorSnapshot(

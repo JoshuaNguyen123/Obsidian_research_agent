@@ -83,6 +83,92 @@ test("research worker leases and deduplicates source candidates before fetch", a
   );
 });
 
+test("deep-research worker rejects an early handoff until three sources are usable", async () => {
+  const urls = [
+    "https://alpha.example/evidence",
+    "https://beta.example/evidence",
+    "https://gamma.example/evidence",
+  ];
+  const model = sequenceModel([
+    toolResponse("web_search", { query: "deep evidence" }),
+    toolResponse("web_fetch", { url: urls[0] }),
+    finalResponse("One source is enough."),
+    toolResponse("web_fetch", { url: urls[1] }),
+    toolResponse("web_fetch", { url: urls[2] }),
+    finalResponse("Three distinct sources are ready for the Lead."),
+  ]);
+  const executed: string[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () => ["web_search", "web_fetch"].map((name) => ({
+      type: "function" as const,
+      function: { name, parameters: { type: "object" } },
+    })),
+    async execute(call) {
+      executed.push(call.name);
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: urls.map((url, index) => ({
+              title: index === 0 ? "Primary source" : `Source ${index + 1}`,
+              url,
+              snippet: `Navigation result ${index + 1}`,
+            })),
+          },
+        };
+      }
+      const url = String(call.arguments.url);
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: url,
+          url,
+          content:
+            `This independently fetched passage from ${url} provides detailed evidence for the deep research mission and is long enough for durable passage extraction.`,
+          parserStatus: "parsed",
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-deep-ledger",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Gather deep evidence.",
+    originalMission: "Run deep research over the available sources.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 6,
+  });
+
+  assert.deepEqual(executed, [
+    "web_search",
+    "web_fetch",
+    "web_fetch",
+    "web_fetch",
+  ]);
+  assert.equal(
+    result.handoff.status,
+    "ready",
+    JSON.stringify({
+      handoff: result.handoff,
+      proofRequirements: result.sourceLedger.proofRequirements,
+      candidates: result.sourceLedger.candidates,
+    }),
+  );
+  assert.equal(
+    Object.values(result.sourceLedger.candidates).filter(
+      (candidate) => candidate.status === "usable",
+    ).length,
+    3,
+  );
+});
+
 test("read-only worker registry blocks mutation tools without delegation", async () => {
   let delegated = false;
   const registry: ToolRegistry = {

@@ -20,6 +20,22 @@ test("normalizes Ollama base URLs and builds chat URLs", () => {
   );
 });
 
+test("exposes a redacted production descriptor", () => {
+  const client = new OllamaClient({
+    baseUrl: "https://ollama.com/api?credential=never-retained",
+    apiKey: "secret-never-retained",
+    model: "gpt-oss:120b-cloud",
+    transport: async () => ({ status: 200, headers: {}, json: {} }),
+  });
+  assert.deepEqual(client.descriptor, {
+    provider: "ollama",
+    model: "gpt-oss:120b-cloud",
+    endpointCategory: "ollama_cloud",
+    transportKind: "production",
+  });
+  assert.doesNotMatch(JSON.stringify(client.descriptor), /secret|credential=/u);
+});
+
 test("fails fast when Ollama Cloud is missing an API key", async () => {
   let transportCalled = false;
   const client = new OllamaClient({
