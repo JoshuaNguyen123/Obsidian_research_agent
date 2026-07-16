@@ -14,6 +14,13 @@ import { appendToolTranscript } from "./model/toolTranscript";
 import { serializeToolResultForModel } from "./model/toolResultPayload";
 import { isTransientModelError, withModelRetry } from "./model/retry";
 import {
+  createObservableModelClient,
+  extractProviderTokenUsage,
+  type ModelCallEvidenceV1,
+  type ModelExecutionBudgetV1,
+  type ModelUsageAggregateV1,
+} from "./model/modelCallEvidence";
+import {
   approvalDeniedFailureCopy,
   formatAcceptanceFailureCopy,
   formatFailureCopy,
@@ -123,6 +130,8 @@ import {
 } from "./agent/runPlan";
 import {
   deriveAutonomyScope,
+  extractMarkdownPathMentions,
+  hasExplicitCurrentNoteMutationIntent,
   isBroadUnscopedVaultMutation,
   type AutonomyScope,
 } from "./agent/missionScope";
@@ -172,7 +181,7 @@ import {
   claimPassagesFromToolResult,
   upsertClaimPassageRefs,
 } from "./agent/missionEvidence";
-import { retitleNoteMarkdown } from "./tools/noteTitles";
+import { getFirstH1, removeFirstH1 } from "./tools/noteTitles";
 import {
   buildMissionResumeContext,
   extractRequestedRunId,
@@ -196,6 +205,11 @@ import {
   evaluateMissionPlanAcceptance,
 } from "./agent/missionPlanAcceptance";
 import {
+  hasExplicitNoWebIntent,
+  hasExplicitPublicWebSignal,
+  requiresWebEvidenceProof,
+} from "./agent/evidenceIntent";
+import {
   mergeVerificationIntoAcceptance,
   runMissionVerifiers,
   type VerificationCheck,
@@ -206,10 +220,12 @@ import {
   shouldRequireClaimGrounding,
 } from "./agent/claimLedger";
 import {
+  acknowledgeEvidenceConflict,
   detectEvidenceConflicts,
   evidenceConflictsToProofDebtRows,
   listOpenEvidenceConflicts,
   mergeEvidenceConflicts,
+  projectEvidenceConflictAcknowledgements,
   type EvidenceConflict,
 } from "./agent/evidenceConflicts";
 import {
@@ -222,6 +238,7 @@ import {
 import {
   countRemainingMissionPlanTasks,
   createMissionPlan,
+  extractRequiredLiteralAnchors,
   getActiveMissionPlanTask,
   getNextMissionPlanAction,
   isToolAllowedForActiveMissionTask,
@@ -263,6 +280,7 @@ import {
   applyResearchEvidence,
   createResearchPlan,
   formatResearchPlanForPrompt,
+  parseExplicitResearchSourceCount,
   type ResearchPlan,
 } from "./agent/researchPlan";
 import {
@@ -272,7 +290,10 @@ import {
   isTitleOnlyIntent,
   isVisibleTitleRenameIntent,
 } from "./agent/titleIntent";
-import { maybeAutoTitleAfterWrite } from "./agent/autoTitleOnWrite";
+import {
+  isGenericBasename,
+  maybeAutoTitleAfterWrite,
+} from "./agent/autoTitleOnWrite";
 import type { PlaceholderRenameReceipt } from "./agent/placeholderNoteTitle";
 import {
   createAutonomousNoteTarget,
@@ -290,7 +311,7 @@ import {
   hasReviseDesignIntent,
 } from "./agent/codeDesignIntent";
 import {
-  classifyMissionWithModel,
+  classifyMissionWithModelDetailed,
   resolveModelRouterMode,
   type RoutedMissionIntent,
 } from "./agent/missionRouter";
@@ -372,6 +393,7 @@ import type {
   OrchestratorSnapshotV1,
 } from "./orchestrator/types";
 import { isDescriptorApprovedParallelRead } from "../packages/headless-runtime/src/missionScheduler";
+import { MISSION_GRAPH_MAX_DEPTH } from "../packages/headless-runtime/src/missionGraphV3";
 import type {
   MissionGraphPatchV1,
   MissionGraphV3,
@@ -500,6 +522,12 @@ export interface AgentRunMetricEvent {
   totalTokens?: number;
 }
 
+export type {
+  ModelCallEvidenceV1,
+  ModelExecutionBudgetV1,
+  ModelUsageAggregateV1,
+} from "./model/modelCallEvidence";
+
 export interface AgentRunConfigEvent {
   runId: string;
   model: string;
@@ -535,6 +563,8 @@ export interface AgentRunConfigEvent {
   dependencyStatus: MissionDependencyStatus[];
   performanceGates?: PerformanceGateResult[];
   modelProvider?: string;
+  modelDescriptor?: ModelClient["descriptor"];
+  modelExecutionBudget?: ModelExecutionBudgetV1;
   reflexLabel?: string;
   reflexConfidence?: number;
   reflexTopAction?: string;
@@ -636,6 +666,21 @@ export interface AgentRunCompleteEvent {
   autoContinueReason?: AutoContinuationReason;
 }
 
+/**
+ * Redacted durable-evidence projection for runtime attestation. It deliberately
+ * excludes titles, summaries, paths, URLs, passage text, and provider payloads.
+ */
+export interface MissionEvidenceAttestationV1 {
+  schemaVersion: 1;
+  id: string;
+  kind: MissionEvidence["kind"];
+  sourceId?: string;
+  passageIds: string[];
+  usableSource?: boolean;
+  parserStatus?: MissionEvidence["parserStatus"];
+  confidence: MissionEvidence["confidence"];
+}
+
 export interface AgentRunEvents {
   onStatus?: (message: string) => void;
   onPhaseChange?: (phase: AgentRunPhase, message: string) => void;
@@ -658,6 +703,10 @@ export interface AgentRunEvents {
   onThinkingMessageDone?: () => void;
   onStreamLifecycle?: (event: AgentStreamLifecycleEvent) => void;
   onMetric?: (event: AgentRunMetricEvent) => void;
+  /** Redacted provider attestation. Never contains prompts, responses, URLs, or credentials. */
+  onModelCallEvidence?: (event: ModelCallEvidenceV1) => void;
+  /** Redacted durable source attestation. Never contains source text, paths, or URLs. */
+  onMissionEvidence?: (event: MissionEvidenceAttestationV1) => void;
   onRunConfig?: (event: AgentRunConfigEvent) => void;
   onRunComplete?: (event: AgentRunCompleteEvent) => void;
   onApprovalRequest?: (request: ApprovalRequest) => void | Promise<void>;
@@ -886,6 +935,7 @@ const EMPTY_STREAMING_WRITEBACK_MESSAGE =
   "The model returned no writable content. Nothing was written.";
 const OFF_TOPIC_MODEL_OUTPUT_MESSAGE =
   "Stopped model output because it drifted off topic from the current mission.";
+const MAX_STRUCTURED_PLANNING_TIMEOUT_MS = 120_000;
 
 function resolvePromptForIntent(
   prompt: string,
@@ -1057,13 +1107,70 @@ export async function runAgentMission({
       : null;
   const runDeadlineAt =
     configuredMaxRunMs === null ? undefined : Date.now() + configuredMaxRunMs;
+  const externalAbortSignal = abortSignal;
+  const runDeadlineController =
+    configuredMaxRunMs === null ? null : new AbortController();
+  let runDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  const forwardExternalAbort = () => {
+    if (!runDeadlineController?.signal.aborted) {
+      runDeadlineController?.abort(
+        externalAbortSignal?.reason ?? new Error("Mission was stopped."),
+      );
+    }
+  };
+  if (runDeadlineController) {
+    if (externalAbortSignal?.aborted) {
+      forwardExternalAbort();
+    } else {
+      externalAbortSignal?.addEventListener("abort", forwardExternalAbort, {
+        once: true,
+      });
+    }
+    runDeadlineTimer = setTimeout(() => {
+      if (!runDeadlineController.signal.aborted) {
+        runDeadlineController.abort(
+          new Error("Mission wall-clock deadline exhausted."),
+        );
+      }
+    }, configuredMaxRunMs!);
+    (runDeadlineTimer as unknown as { unref?: () => void }).unref?.();
+    abortSignal = runDeadlineController.signal;
+  }
+  const disposeRunDeadline = () => {
+    if (runDeadlineTimer !== null) {
+      clearTimeout(runDeadlineTimer);
+      runDeadlineTimer = null;
+    }
+    externalAbortSignal?.removeEventListener("abort", forwardExternalAbort);
+  };
+  const configuredRequestTimeoutMs =
+    typeof toolContext.settings?.requestTimeoutMs === "number" &&
+    Number.isFinite(toolContext.settings.requestTimeoutMs) &&
+    toolContext.settings.requestTimeoutMs > 0
+      ? Math.trunc(toolContext.settings.requestTimeoutMs)
+      : MAX_STRUCTURED_PLANNING_TIMEOUT_MS;
+  const structuredPlanningTimeoutMs = Math.max(
+    1,
+    Math.min(
+      MAX_STRUCTURED_PLANNING_TIMEOUT_MS,
+      configuredRequestTimeoutMs,
+      configuredMaxRunMs ?? MAX_STRUCTURED_PLANNING_TIMEOUT_MS,
+    ),
+  );
   const runId =
     providedRunId?.trim() ||
     createAgentRunId(toolContext.now?.() ?? new Date());
+  let missionLedger: MissionLedger | null = null;
   const metricEvents: AgentRunMetricEvent[] = [];
   const callerEvents = events;
   events = new Proxy(callerEvents, {
     get: (target, property, receiver) => {
+      if (property === "onRunComplete") {
+        return (event: AgentRunCompleteEvent) => {
+          disposeRunDeadline();
+          callerEvents.onRunComplete?.(event);
+        };
+      }
       if (property === "onMetric") {
         return (event: AgentRunMetricEvent) => {
           metricEvents.push(event);
@@ -1073,6 +1180,42 @@ export async function runAgentMission({
       return Reflect.get(target, property, receiver);
     },
   });
+  const configuredStepBudget = Math.max(
+    1,
+    Math.min(
+      MAX_AGENT_STEPS,
+      providedMaxSteps ?? toolContext.settings?.maxAgentSteps ?? MAX_AGENT_STEPS,
+    ),
+  );
+  const preliminaryModelCallCap = configuredStepBudget * 3 + 8;
+  const configuredContextTokens = Math.max(
+    4_096,
+    toolContext.settings?.numCtx ?? 8_192,
+  );
+  let modelExecutionBudget: ModelExecutionBudgetV1 = {
+    schemaVersion: 1,
+    maxCalls: preliminaryModelCallCap,
+    maxTokens: Math.max(
+      32_768,
+      preliminaryModelCallCap * configuredContextTokens,
+    ),
+    maxWallClockMs: configuredMaxRunMs ?? 60 * 60_000,
+  };
+  const observableModel = createObservableModelClient({
+    client: modelClient,
+    budget: modelExecutionBudget,
+    onEvidence: (evidence) => {
+      events.onModelCallEvidence?.(evidence);
+      if (missionLedger) {
+        missionLedger.providerUsage = observableModel.getUsage();
+      }
+    },
+  });
+  const updateModelExecutionBudget = (next: ModelExecutionBudgetV1) => {
+    modelExecutionBudget = { ...next, schemaVersion: 1 };
+    observableModel.updateBudget(modelExecutionBudget);
+  };
+  modelClient = observableModel.client;
   const approvalBroker = providedApprovalBroker ?? new ApprovalBroker();
   const portableHostApprovalReceipts = new Map<string, HostApprovalReceiptV1[]>();
   const maxToolCalls = normalizeInvocationToolCallLimit(providedMaxToolCalls);
@@ -1090,16 +1233,20 @@ export async function runAgentMission({
   }
   const modelRouterMode = resolveModelRouterMode(toolContext.settings);
   let routedModelIntent: RoutedMissionIntent | null = null;
+  let routedModelFailureReason: string | null = null;
   let routedMissionIntent: RoutedMissionIntent | null = null;
   if (modelRouterMode !== "off") {
     events.onStatus?.("Classifying mission with structured router...");
-    routedModelIntent = await classifyMissionWithModel({
+    const routedClassification = await classifyMissionWithModelDetailed({
       client: modelClient,
       prompt: activeIntentPrompt,
+      timeoutMs: structuredPlanningTimeoutMs,
       recentAssistant: conversationHistory
         .filter((message) => message.role === "assistant")
         .slice(-1)[0]?.content,
     });
+    routedModelIntent = routedClassification.intent;
+    routedModelFailureReason = routedClassification.failureReason;
     const earlyRegexIntent = deriveRoutedIntentFallback({
       missionIntent,
       writeAutonomy: missionIntent.allowAutonomousWrite,
@@ -1124,14 +1271,15 @@ export async function runAgentMission({
         modelRouterMode === "authority"
           ? earlyResolved.source === "model"
             ? `Structured router authority decision: ${earlyResolved.intent.mode} (${earlyResolved.intent.confidence}).`
-            : `Structured router authority fell back to regex (${earlyResolved.fallbackReason ?? "unknown"}).`
+            : `Structured router authority fell back to regex (${routedModelFailureReason ?? earlyResolved.fallbackReason ?? "unknown"}).`
           : routedModelIntent
             ? `Structured router shadow decision: ${routedModelIntent.mode} (${routedModelIntent.confidence}).`
-            : "Structured router shadow decision unavailable; regex fallback remains authoritative.",
+            : `Structured router shadow decision unavailable (${routedModelFailureReason ?? "unknown"}); regex fallback remains authoritative.`,
       outputPreview: {
         mode: modelRouterMode,
         source: earlyResolved.source,
         fallbackReason: earlyResolved.fallbackReason,
+        modelFailureReason: routedModelFailureReason,
         modelIntent: routedModelIntent,
         resolvedIntent: earlyResolved.intent,
         regexIntent: earlyRegexIntent,
@@ -1189,6 +1337,9 @@ export async function runAgentMission({
       passageIds: item.passageIds ? [...item.passageIds] : undefined,
     }),
   );
+  for (const evidence of missionEvidenceRecords) {
+    events.onMissionEvidence?.(toMissionEvidenceAttestation(evidence));
+  }
   let reflexOutput = await reflexController.evaluate({
     prompt: activeIntentPrompt,
     missionIntent,
@@ -1323,6 +1474,11 @@ export async function runAgentMission({
     streamingWritebackKind,
     reflexOutput.intent,
   );
+  tools = constrainOrchestratedHandoffTools(
+    tools,
+    activeIntentPrompt,
+    orchestratorContext,
+  );
   let directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
     prompt: activeIntentPrompt,
     missionIntent,
@@ -1358,11 +1514,14 @@ export async function runAgentMission({
   let wroteToNote = false;
   let unavailableToolCorrectionUsed = false;
   let proofGatedWriteToolCorrectionUsed = false;
+  let literalWriteCorrectionUsed = false;
+  let passageGroundedWriteContractInjected = false;
   let vaultTraversalCorrectionUsed = false;
   let vaultCoverageExpansionUsed = false;
   let webResearchCorrectionUsed = false;
   let toolBeforeWriteCorrectionUsed = false;
   let finalOutputCorrectionUsed = false;
+  const invalidToolCallFailureSignatures = new Set<string>();
   let consecutiveNoProgressSteps = 0;
   let lastProgressSignature = "";
   let lastStep = 0;
@@ -1388,9 +1547,12 @@ export async function runAgentMission({
   // Live receipt array: streamed writer.buildReceipt and tool writes push here
   // before any reflexController.evaluate / acceptance check on the same turn.
   let preparedStreamingSectionEdit: PreparedStreamingSectionEdit | null = null;
-  let missionLedger: MissionLedger | null = null;
   let missionPlan: MissionPlan | null = null;
   let missionGraph: MissionGraphV3 | null = null;
+  // Explicit ordered workflows are authority-complete. Exposing unrelated
+  // capability reads at their live frontier lets a model bypass the graph's
+  // intended partial order and spend the provider budget on irrelevant work.
+  let missionGraphUsesExactPlannedFrontier = false;
   let missionGraphSession: MissionGraphSession | null = null;
   let backgroundDispatchSummary: BackgroundMissionDispatchSummaryV1 | null = null;
   // Once a runtime-snapshot write has an ambiguous outcome, no later ledger or
@@ -1415,10 +1577,20 @@ export async function runAgentMission({
     directCurrentNoteWritebackKind,
     reflex: reflexOutput.intent,
   });
+  const routedModelCallCap = Math.max(4, runPlan.maxStepsForRun * 3 + 8);
+  updateModelExecutionBudget({
+    schemaVersion: 1,
+    maxCalls: routedModelCallCap,
+    maxTokens: Math.max(
+      32_768,
+      routedModelCallCap * configuredContextTokens,
+    ),
+    maxWallClockMs: configuredMaxRunMs ?? 60 * 60_000,
+  });
   activeThink = runPlan.thinking;
   tools = runPlan.allowedTools;
   allowedToolNames = new Set(tools.map((tool) => tool.function.name));
-  reflexOutput = await reflexController.evaluate({
+  const capabilityAwareReflexOutput = await reflexController.evaluate({
     prompt: activeIntentPrompt,
     missionIntent,
     allowedToolNames,
@@ -1428,22 +1600,51 @@ export async function runAgentMission({
     settings: runToolContext.settings,
     embeddingProvider: runToolContext.semanticEmbeddingProvider,
   });
+  reflexOutput = reflexIntentApplication.applied
+    ? {
+        ...capabilityAwareReflexOutput,
+        intent: {
+          ...capabilityAwareReflexOutput.intent,
+          applied: true,
+          reason: reflexIntentApplication.reason,
+        },
+      }
+    : capabilityAwareReflexOutput;
   const stopIfRequested = (step = Math.max(lastStep, 0)) => {
     if (!isRunStopRequested(abortSignal)) {
       return false;
     }
+    const deadlineExpired = Boolean(
+      runDeadlineController?.signal.aborted && !externalAbortSignal?.aborted,
+    );
+    const deadlineMessage =
+      "Wall-clock run budget expired. The ledger was saved and this run can be continued.";
+    const nextAction = deadlineExpired
+      ? `${deadlineMessage} Continue from the saved ledger with a fresh provider budget.`
+      : "User stopped the run.";
 
     if (missionLedger) {
       updateMissionLedgerStatus(
         missionLedger,
-        "stopped",
+        deadlineExpired ? "budget" : "stopped",
         runToolContext.now?.() ?? new Date(),
       );
+      if (deadlineExpired) {
+        setLedgerWallClockExpired(
+          missionLedger,
+          runToolContext.now?.() ?? new Date(),
+        );
+      }
       setLedgerNextAction(
         missionLedger,
-        "User stopped the run.",
+        nextAction,
         runToolContext.now?.() ?? new Date(),
       );
+      // Publish the terminal ledger snapshot before onRunComplete fires. The
+      // durable write below is asynchronous because this predicate is used at
+      // every abort boundary, but Run Details must never retain the prior
+      // `running` snapshot after a wall-clock interruption.
+      emitLedgerRunConfig();
       if (runtimeSnapshotPersistenceBlockedError === null) {
         void writeMissionLedger(runToolContext, missionLedger);
       }
@@ -1451,7 +1652,7 @@ export async function runAgentMission({
         runtimeSnapshot &&
         runtimeSnapshotPersistenceBlockedError === null
       ) {
-        runtimeSnapshot.status = "stopped";
+        runtimeSnapshot.status = deadlineExpired ? "paused" : "stopped";
         runtimeSnapshot.lastSafeStep = missionLedger.lastSafeStep;
         runtimeSnapshot.updatedAt = (
           runToolContext.now?.() ?? new Date()
@@ -1459,9 +1660,23 @@ export async function runAgentMission({
         void writeMissionRuntimeSnapshot(runToolContext, runtimeSnapshot);
       }
     }
+    if (deadlineExpired) {
+      events.onStatus?.(deadlineMessage);
+      events.onTrace?.({
+        id: `wall-clock-budget:${step}`,
+        kind: "status",
+        step,
+        message: deadlineMessage,
+        outputPreview: {
+          elapsedMs: Math.round(nowMs() - runStartedAt),
+          maxRunMs: configuredMaxRunMs,
+          interruptedInFlightCall: true,
+        },
+      });
+    }
     completeRun(
       events,
-      "user_stopped",
+      deadlineExpired ? "budget" : "user_stopped",
       step,
       runStartedAt,
       runPlan.maxStepsForRun,
@@ -1667,6 +1882,11 @@ export async function runAgentMission({
       streamingWritebackKind,
       reflexOutput.intent,
     );
+    tools = constrainOrchestratedHandoffTools(
+      tools,
+      activeIntentPrompt,
+      orchestratorContext,
+    );
     directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
       prompt: activeIntentPrompt,
       missionIntent,
@@ -1729,12 +1949,21 @@ export async function runAgentMission({
     });
   }
 
+  // Structured planners may paraphrase graph.objective and omit the explicit
+  // tool-order words that established an exact workflow. Continuations restore
+  // the original mission into activeIntentPrompt, so reconstruct authority from
+  // that durable source before the graph is resumed.
+  missionGraphUsesExactPlannedFrontier ||=
+    hasExplicitOrderedWorkflowIntent(activeIntentPrompt);
+
   if (canPersistMissionGraphStore(runToolContext)) {
     const emitMissionGraph = (
       graph: MissionGraphV3,
       patch?: MissionGraphPatchV1,
     ) => {
       missionGraph = graph;
+      missionGraphUsesExactPlannedFrontier ||=
+        hasExplicitOrderedWorkflowIntent(graph.objective);
       missionPlan = projectMissionGraphToLegacyPlan(graph);
       events.onMissionGraphUpdate?.(graph, patch);
       const projection = projectMissionGraphToOrchestratorSnapshot(graph);
@@ -1800,6 +2029,18 @@ export async function runAgentMission({
             ? [getStreamingWritebackToolName(streamingWritebackKind)]
             : []),
         ].filter((name) => installedToolNames.has(name));
+        const resumeReceiptToolNames = new Set(
+          (resumeSnapshot?.receipts ?? []).map((receipt) => receipt.toolName),
+        );
+        for (const [toolName, goals] of Object.entries(TOOL_GOALS)) {
+          if (
+            goals?.some(
+              (goal) => resumeSnapshot?.operationGoals[goal] === "done",
+            )
+          ) {
+            resumeReceiptToolNames.add(toolName);
+          }
+        }
         const hostSafeReadToolNames = [...installedToolNames].filter(
           (name) => toolRegistry.getDescriptor?.(name)?.effect === "read",
         );
@@ -1811,20 +2052,66 @@ export async function runAgentMission({
             ...hostSafeReadToolNames,
           ]),
         ];
+        const currentlyRunnableGraphToolNames = new Set([
+          ...allowedToolNames,
+          ...runnerOwnedToolNames,
+          ...postAcceptanceToolNames,
+        ]);
         const bootstrapLoopBudget = planLoopBudget({
           prompt: activeIntentPrompt,
           route: runPlan.route,
           generated: analyzeGeneratedOutputPrompt(activeIntentPrompt),
           configuredMaxSteps: runToolContext.settings?.maxAgentSteps,
         });
+        const bootstrapResearchPlan = createResearchPlan({
+          prompt: activeIntentPrompt,
+          missionIntent,
+          runPlan,
+        });
+        const requiredGraphFetchCount = requiresWebEvidenceProof(
+          activeIntentPrompt,
+          missionIntent,
+        )
+          ? Math.max(
+              1,
+              bootstrapResearchPlan?.sourceRequirements.minFetchedSources ??
+                parseExplicitResearchSourceCount(activeIntentPrompt) ??
+                1,
+            )
+          : 0;
+        const seededResearchHandoffSatisfiesReads = Boolean(
+          orchestratorContext?.trim() &&
+            requiredGraphFetchCount > 0 &&
+            countFetchedWebSources(missionEvidenceRecords) >=
+              requiredGraphFetchCount,
+        );
         const explicitGraphCodeToolNames = getExplicitCodeToolNames(
           activeIntentPrompt,
         ).filter((name) => graphAllowedToolNames.includes(name));
+        const explicitGraphGitHubReadToolNames =
+          getExplicitGitHubCatalogMutationToolNames(activeIntentPrompt).length === 0
+            ? getGitHubCatalogReadToolNames(activeIntentPrompt).filter((name) =>
+                graphAllowedToolNames.includes(name),
+              )
+            : [];
+        const explicitGraphVaultWorkflowToolNames =
+          getExplicitVaultCrudWorkflowToolNames(activeIntentPrompt).filter((name) =>
+            graphAllowedToolNames.includes(name),
+          );
+        const explicitCurrentNoteRenamePrerequisite =
+          explicitGraphVaultWorkflowToolNames.length === 0 &&
+          isVisibleTitleRenameIntent(activeIntentPrompt) &&
+          hasExplicitCurrentNoteMutationIntent(activeIntentPrompt) &&
+          graphAllowedToolNames.includes("rename_current_file")
+            ? ["rename_current_file"]
+            : [];
+        const explicitGraphSemanticToolNames =
+          getExplicitSemanticRetrievalWorkflowToolNames(activeIntentPrompt).filter(
+            (name) => graphAllowedToolNames.includes(name),
+          );
         const explicitGraphDesignToolNames = hasReviseDesignIntent(activeIntentPrompt)
           ? [
-              ...(hasMermaidDesignIntent(activeIntentPrompt)
-                ? ["read_mermaid_block", "upsert_mermaid_block"]
-                : []),
+              ...getExplicitMermaidWorkflowToolNames(activeIntentPrompt),
               ...(hasCanvasDesignIntent(activeIntentPrompt) &&
               !hasSvgDesignIntent(activeIntentPrompt) &&
               !hasMermaidDesignIntent(activeIntentPrompt)
@@ -1835,29 +2122,108 @@ export async function runAgentMission({
                 : []),
             ].filter((name) => graphAllowedToolNames.includes(name))
           : [];
+        const runnerOwnedGraphToolNames = runnerOwnedToolNames.filter(
+          (name) =>
+            explicitGraphDesignToolNames.length === 0 ||
+            ![
+              "append_to_current_file",
+              "append_to_current_section",
+              "edit_current_section",
+              "replace_current_file",
+              "append_file",
+              "replace_file",
+              "create_file",
+            ].includes(name),
+        );
         const explicitGraphWorkflowToolNames =
           explicitGraphCodeToolNames.length > 0
             ? explicitGraphCodeToolNames
-            : explicitGraphDesignToolNames;
+            : explicitGraphDesignToolNames.length > 0
+              ? explicitGraphDesignToolNames
+              : explicitGraphVaultWorkflowToolNames.length > 0
+                ? explicitGraphVaultWorkflowToolNames
+                : explicitGraphGitHubReadToolNames.length > 0
+                  ? explicitGraphGitHubReadToolNames
+                  : explicitGraphSemanticToolNames;
+        missionGraphUsesExactPlannedFrontier =
+          explicitGraphWorkflowToolNames.length > 0 ||
+          seededResearchHandoffSatisfiesReads;
+        const promptOnPageBootstrap = isPromptOnCurrentPageIntent(prompt);
         const plannedToolNames = [
           ...(shouldReadCurrentNote &&
-          explicitGraphDesignToolNames.length === 0 &&
+          explicitGraphWorkflowToolNames.length === 0 &&
           graphAllowedToolNames.includes("read_current_file")
             ? ["read_current_file"]
             : []),
-          ...(explicitGraphWorkflowToolNames.length > 0
-            ? []
-            : bootstrapLoopBudget.expectedTools),
-          ...runnerOwnedToolNames,
-          ...explicitGraphWorkflowToolNames,
-          ...(explicitGraphWorkflowToolNames.length > 0
-            ? []
-            : selectExplicitEffectfulGraphTools({
-                prompt: activeIntentPrompt,
-                allowedToolNames: graphAllowedToolNames,
-                toolRegistry,
-              })),
-        ].filter((name) => graphAllowedToolNames.includes(name));
+          // An explicit current-note rename is an effect prerequisite, not an
+          // exact-workflow replacement for the mission's graph/web reads.
+          // Preserve the user's rename -> research -> write partial order.
+          ...explicitCurrentNoteRenamePrerequisite,
+          // Before the host reads a prompt from the active note, the outer
+          // command is not evidence for the inner mission's retrieval plan.
+          // Keep only the authority-bound current-note read and runner-owned
+          // write here. Any reads selected after reclassification are added as
+          // bounded, journaled graph nodes when they actually execute.
+          ...(promptOnPageBootstrap
+            ? runnerOwnedGraphToolNames
+            : [
+                ...(explicitGraphWorkflowToolNames.length > 0
+                  ? []
+                  : bootstrapLoopBudget.expectedTools.filter(
+                      (name) =>
+                        !explicitCurrentNoteRenamePrerequisite.includes(name) &&
+                        (!seededResearchHandoffSatisfiesReads ||
+                          !["web_search", "web_fetch", "read_source_section"].includes(
+                            name,
+                          )) &&
+                        (name !== "count_words" ||
+                          runnerOwnedGraphToolNames.length === 0),
+                    )),
+                ...getRunPlanMissionGraphReadToolNames(
+                  runPlan,
+                  bootstrapLoopBudget.expectedTools,
+                  reflexOutput.intent,
+                ),
+                ...(explicitGraphWorkflowToolNames.length === 0 &&
+                !seededResearchHandoffSatisfiesReads &&
+                bootstrapLoopBudget.expectedTools.includes("web_fetch")
+                  ? Array.from(
+                      { length: Math.max(0, requiredGraphFetchCount - 1) },
+                      () => "web_fetch",
+                    )
+                  : []),
+                ...explicitGraphWorkflowToolNames,
+                // Explicit workflows already contain their complete ordered
+                // tool lifecycle. Re-adding the same names as runner-owned
+                // write requirements manufactures duplicate graph nodes and
+                // can push a valid workflow past the fixed DAG-depth bound.
+                ...runnerOwnedGraphToolNames.filter(
+                  (name) => !explicitGraphWorkflowToolNames.includes(name),
+                ),
+                // count_words verifies the generated note, not the pre-write
+                // fixture. When a host-owned write is required, preserve the
+                // user's requested write -> metadata-read partial order in the
+                // immutable graph template.
+                ...(explicitGraphWorkflowToolNames.length === 0 &&
+                runnerOwnedGraphToolNames.length > 0
+                  ? bootstrapLoopBudget.expectedTools.filter(
+                      (name) => name === "count_words",
+                    )
+                  : []),
+                ...(resumeLedger?.loopBudget.expectedTools ?? []),
+                ...(explicitGraphWorkflowToolNames.length > 0
+                  ? []
+                  : selectExplicitEffectfulGraphTools({
+                      prompt: activeIntentPrompt,
+                      allowedToolNames: graphAllowedToolNames,
+                      toolRegistry,
+                    })),
+              ]),
+        ].filter(
+          (name) =>
+            currentlyRunnableGraphToolNames.has(name) &&
+            !resumeReceiptToolNames.has(name),
+        );
         const graphMissionId = canonicalResumeGraphId ?? canonicalMissionGraphId(runId);
         let missionBindingOverrides:
           | Awaited<
@@ -1886,16 +2252,32 @@ export async function runAgentMission({
             });
           }
         }
+        const legacyResumePlan =
+          resumeSnapshot?.missionPlan?.version === 1
+            ? resumeSnapshot.missionPlan
+            : resumeLedger?.missionPlan?.version === 1
+              ? resumeLedger.missionPlan
+              : null;
         const hostPlan = await buildHostMissionGraphPlanV1({
           missionId: graphMissionId,
           objective: activeIntentPrompt,
           toolRegistry,
           allowedToolNames: graphAllowedToolNames,
+          modelVisibleToolNames:
+            explicitGraphWorkflowToolNames.length > 0
+              ? new Set([
+                  ...explicitGraphWorkflowToolNames,
+                  ...runnerOwnedGraphToolNames,
+                ])
+              : allowedToolNames,
           plannedToolNames,
           postAcceptanceToolNames,
           currentNotePath: runToolContext.getCurrentMarkdownFile?.()?.path ?? null,
           maxToolCalls,
           maxWallClockMs: configuredMaxRunMs ?? 30 * 60_000,
+          minimumGraphDepth: legacyResumePlan
+            ? Math.min(MISSION_GRAPH_MAX_DEPTH, legacyResumePlan.tasks.length)
+            : undefined,
           now: runToolContext.now?.() ?? new Date(),
           ...(missionBindingOverrides
             ? { bindingOverrides: missionBindingOverrides }
@@ -1909,12 +2291,6 @@ export async function runAgentMission({
               }
             : {}),
         });
-        const legacyResumePlan =
-          resumeSnapshot?.missionPlan?.version === 1
-            ? resumeSnapshot.missionPlan
-            : resumeLedger?.missionPlan?.version === 1
-              ? resumeLedger.missionPlan
-              : null;
         const migratedLegacyGraph =
           exactResumeRunId &&
           !resumeSnapshot?.missionGraphRef &&
@@ -1945,6 +2321,7 @@ export async function runAgentMission({
               capabilityEnvelope: hostPlan.capabilityEnvelope,
               deterministicProposal: hostPlan.deterministicProposal,
               allowedToolDescriptors: hostPlan.allowedToolDescriptors,
+              timeoutMs: structuredPlanningTimeoutMs,
               modelClient:
                 modelRouterMode === "authority" &&
                 routedModelIntent &&
@@ -2006,9 +2383,14 @@ export async function runAgentMission({
 
   const beginMissionGraphTool = async (
     toolName: string,
+    options: { allowExactBootstrapRead?: boolean } = {},
   ): Promise<MissionGraphToolExecution | null> => {
     if (!missionGraphSession) return null;
-    const started = await missionGraphSession.beginToolExecution(toolName);
+    const started = await missionGraphSession.beginToolExecution(toolName, {
+      allowDynamicReadContinuation:
+        !missionGraphUsesExactPlannedFrontier ||
+        options.allowExactBootstrapRead === true,
+    });
     if (!started.ok) {
       throw Object.assign(new Error(started.reason), {
         missionGraphStartCode: started.code,
@@ -2091,7 +2473,12 @@ export async function runAgentMission({
   if (shouldReadCurrentNote) {
     let graphExecution: MissionGraphToolExecution | null = null;
     try {
-      graphExecution = await beginMissionGraphTool("read_current_file");
+      // This single host-owned active-note observation establishes the target
+      // context before the model loop. It is distinct from allowing a model to
+      // invent arbitrary per-file reads after an exact batch-read frontier.
+      graphExecution = await beginMissionGraphTool("read_current_file", {
+        allowExactBootstrapRead: true,
+      });
       currentNoteContext = await readInitialCurrentNote(
         toolRegistry,
         runToolContext,
@@ -2110,6 +2497,9 @@ export async function runAgentMission({
         upsertMissionEvidenceRecord(
           missionEvidenceRecords,
           initialCurrentNoteEvidence,
+        );
+        events.onMissionEvidence?.(
+          toMissionEvidenceAttestation(initialCurrentNoteEvidence),
         );
       }
       await finishMissionGraphTool(
@@ -2204,6 +2594,11 @@ export async function runAgentMission({
       streamingWritebackKind,
       reflexOutput.intent,
     );
+    tools = constrainOrchestratedHandoffTools(
+      tools,
+      activeIntentPrompt,
+      orchestratorContext,
+    );
     if (currentNoteContext !== null) {
       const filteredTools = tools.filter(
         (tool) => tool.function.name !== "read_current_file",
@@ -2236,7 +2631,7 @@ export async function runAgentMission({
     activeThink = runPlan.thinking;
     tools = runPlan.allowedTools;
     allowedToolNames = new Set(tools.map((tool) => tool.function.name));
-    reflexOutput = await reflexController.evaluate({
+    const capabilityAwarePromptPageReflexOutput = await reflexController.evaluate({
       prompt: activeIntentPrompt,
       missionIntent,
       allowedToolNames,
@@ -2246,6 +2641,16 @@ export async function runAgentMission({
       settings: runToolContext.settings,
       embeddingProvider: runToolContext.semanticEmbeddingProvider,
     });
+    reflexOutput = promptPageReflexIntentApplication.applied
+      ? {
+          ...capabilityAwarePromptPageReflexOutput,
+          intent: {
+            ...capabilityAwarePromptPageReflexOutput.intent,
+            applied: true,
+            reason: promptPageReflexIntentApplication.reason,
+          },
+        }
+      : capabilityAwarePromptPageReflexOutput;
     requiredWriteTools = getRequiredWriteToolNames(
       activeIntentPrompt,
       allowedToolNames,
@@ -2313,6 +2718,39 @@ export async function runAgentMission({
     runPlan.route !== "prefetched_vault_writeback"
   ) {
     requireToolBeforeStreamingWriteback = true;
+  }
+
+  const graphRequiredWriteTools = getPendingMissionGraphWriteToolNames(
+    missionGraphSession?.graph ?? missionGraph,
+  );
+  if (graphRequiredWriteTools.length > 0) {
+    requiredWriteTools = [
+      ...new Set([...requiredWriteTools, ...graphRequiredWriteTools]),
+    ];
+    writeRequired = true;
+    tools = addToolDefinitions(tools, toolRegistry, graphRequiredWriteTools);
+    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    runPlan = {
+      ...runPlan,
+      allowedTools: tools,
+      allowedToolNames: [...allowedToolNames],
+      budgetProfile: {
+        ...runPlan.budgetProfile,
+        expectedTools: [
+          ...new Set([
+            ...runPlan.budgetProfile.expectedTools,
+            ...graphRequiredWriteTools,
+          ]),
+        ],
+      },
+    };
+    events.onTrace?.({
+      id: "mission-graph-required-writes",
+      kind: "allowed_tools",
+      message:
+        `Reconciled authoritative MissionGraph writes: ${graphRequiredWriteTools.join(", ")}.`,
+      outputPreview: graphRequiredWriteTools,
+    });
   }
 
   let finalAnswerRelevancePrompt = getFinalAnswerRelevancePrompt(
@@ -2442,7 +2880,86 @@ export async function runAgentMission({
         ],
       },
     };
+  } else if (requiresWebEvidenceProof(activeIntentPrompt, missionIntent)) {
+    // Ordinary sourced output needs one fetched passage by default. Explicit
+    // cardinality (for example "fetch both sources") is authoritative; the
+    // deeper research plan above retains its own larger requirement.
+    loopBudgetPlan = ensureResearchSourceLoopBudget(
+      loopBudgetPlan,
+      parseExplicitResearchSourceCount(activeIntentPrompt) ?? 1,
+    );
   }
+  if (
+    orchestratorContext?.trim() &&
+    countFetchedWebSources(missionEvidenceRecords) >=
+      (researchPlan?.sourceRequirements.minFetchedSources ?? 1)
+  ) {
+    // A read-only worker handoff is already provider-observed evidence. The
+    // Lead must verify and write it, not replay the Researcher's retrieval.
+    executedWebSearchTool = true;
+    executedWebFetchTool = true;
+  }
+  loopBudgetPlan = ensureRequiredWriteLoopBudget(
+    loopBudgetPlan,
+    requiredWriteTools,
+  );
+  const routeDerivedLoopCap = Math.min(
+    loopBudgetPlan.hardCap,
+    Math.max(
+      runPlan.maxStepsForRun,
+      loopBudgetPlan.toolStepBudget + loopBudgetPlan.finalizationReserve,
+    ),
+  );
+  if (routeDerivedLoopCap !== runPlan.maxStepsForRun) {
+    runPlan = {
+      ...runPlan,
+      maxStepsForRun: routeDerivedLoopCap,
+      expectedTimeClass:
+        routeDerivedLoopCap > 12 ? "long" : runPlan.expectedTimeClass,
+      traceReasons: [
+        ...new Set([
+          ...runPlan.traceReasons,
+          "required_tool_budget_reconciled",
+        ]),
+      ],
+      budgetProfile: {
+        ...runPlan.budgetProfile,
+        maxSteps: routeDerivedLoopCap,
+        toolSteps: Math.min(
+          loopBudgetPlan.toolStepBudget,
+          Math.max(
+            0,
+            routeDerivedLoopCap - loopBudgetPlan.finalizationReserve,
+          ),
+        ),
+        finalizationReserve: loopBudgetPlan.finalizationReserve,
+        reason: "required_tool_budget_reconciled",
+        expectedTools: [...loopBudgetPlan.expectedTools],
+      },
+    };
+  }
+  loopBudgetPlan = {
+    ...loopBudgetPlan,
+    hardCap: routeDerivedLoopCap,
+    toolStepBudget: Math.min(
+      loopBudgetPlan.toolStepBudget,
+      Math.max(0, routeDerivedLoopCap - loopBudgetPlan.finalizationReserve),
+    ),
+  };
+  // Structured routing, graph planning, and reflex selection can expand the
+  // route after the preliminary client was created. Refresh the same global
+  // budget here without resetting usage, so pre-loop calls remain charged but
+  // cannot leave the routed loop trapped behind a stale smaller ceiling.
+  const finalizedModelCallCap = Math.max(4, routeDerivedLoopCap * 3 + 8);
+  updateModelExecutionBudget({
+    schemaVersion: 1,
+    maxCalls: finalizedModelCallCap,
+    maxTokens: Math.max(
+      32_768,
+      finalizedModelCallCap * configuredContextTokens,
+    ),
+    maxWallClockMs: configuredMaxRunMs ?? 60 * 60_000,
+  });
   const operationGoals = createMissionOperationGoals({
     prompt: activeIntentPrompt,
     allowedToolNames,
@@ -2507,11 +3024,84 @@ export async function runAgentMission({
   for (const evidence of restoredEvidence) {
     upsertMissionEvidenceRecord(missionEvidenceRecords, { ...evidence });
   }
+  if (researchPlan && missionEvidenceRecords.length > 0) {
+    researchPlan = applyResearchEvidence(researchPlan, missionEvidenceRecords);
+  }
+  const handoffFetchedSourceRequirement =
+    researchPlan?.sourceRequirements.minFetchedSources ?? 1;
+  const restoredResearcherHandoffSatisfiesWeb = Boolean(
+    orchestratorContext?.trim() &&
+      countFetchedWebSources(missionEvidenceRecords) >=
+        handoffFetchedSourceRequirement,
+  );
+  if (restoredResearcherHandoffSatisfiesWeb) {
+    // Continuation restores evidence after the preliminary routing pass. Bind
+    // the same provider-observed Researcher proof back into compatibility
+    // flags and operation goals so a later Lead segment cannot regress to
+    // gather or replay web retrieval that the handoff already completed.
+    executedWebSearchTool = true;
+    executedWebFetchTool = true;
+    missionGraphUsesExactPlannedFrontier = true;
+    markOperationGoalDone(operationGoals, "web_search");
+    markOperationGoalDone(operationGoals, "web_fetch");
+    if (!successfulToolNames.includes("web_search")) {
+      successfulToolNames.push("web_search");
+    }
+    if (!successfulToolNames.includes("web_fetch")) {
+      successfulToolNames.push("web_fetch");
+    }
+  }
   const completedGraphToolNames = new Set(
-    Object.values(missionGraph?.nodes ?? {})
+    Object.values((missionGraphSession?.graph ?? missionGraph)?.nodes ?? {})
       .filter((node) => node.status === "complete")
       .flatMap((node) => node.allowedTools),
   );
+  // A continued artifact-revision workflow may require a read and a write as
+  // one ordered contract. The mutation is restored only from its durable
+  // receipt below, but the prior read has no receipt by design. Preserve that
+  // completed, non-mutating graph node so the resumed segment does not ask for
+  // an already-satisfied read forever. Never infer mutation completion from a
+  // graph status alone.
+  const restoredCompletedGraphToolNames =
+    getRestorableCompletedGraphToolNames(
+      completedGraphToolNames,
+      requiredWriteTools,
+    );
+  operationGoals.completedTools.push(
+    ...restoredCompletedGraphToolNames.filter(
+      (toolName) => !operationGoals.completedTools.includes(toolName),
+    ),
+  );
+  for (const toolName of restoredCompletedGraphToolNames) {
+    if (!successfulToolNames.includes(toolName)) {
+      successfulToolNames.push(toolName);
+    }
+  }
+  if (completedGraphToolNames.size > 0) {
+    events.onTrace?.({
+      id: "completed-graph-tool-restoration",
+      kind: "verification",
+      message:
+        `Restored ${restoredCompletedGraphToolNames.length} completed non-mutating graph tool(s) for continuation.`,
+      outputPreview: {
+        completedGraphTools: [...completedGraphToolNames],
+        requiredTools: [...requiredWriteTools],
+        restoredTools: restoredCompletedGraphToolNames,
+      },
+    });
+  }
+  // Continuation segments reconstruct compatibility state from the durable
+  // graph. Without this, a completed semantic/batch-read frontier is forgotten
+  // locally and the final-answer gate repeatedly asks for vault traversal on
+  // every child segment. The host bootstrap read alone is intentionally not
+  // sufficient evidence of model-directed mission work.
+  if (
+    [...completedGraphToolNames].some(
+      (toolName) => toolName !== "read_current_file",
+    )
+  ) {
+    executedModelTool = true;
+  }
   if (
     resumeSnapshot?.operationGoals.web_search === "done" ||
     completedGraphToolNames.has("web_search")
@@ -2549,6 +3139,10 @@ export async function runAgentMission({
       );
       if (!alreadyRestored) {
         writeReceipts.push(restoredReceipt);
+        // A continuation is a new RunCoordinator segment. Re-emit durable
+        // receipts so Run Details and E2E attestations retain proof produced by
+        // earlier segments instead of showing only the final segment's events.
+        events.onReceipt?.(restoredReceipt);
       }
     }
   }
@@ -2567,9 +3161,10 @@ export async function runAgentMission({
       detected,
     );
   };
-  const buildClaimConflictState = () => {
-    const openConflictCount = listOpenEvidenceConflicts(lastEvidenceConflicts)
-      .length;
+  const buildClaimConflictState = (
+    conflicts: EvidenceConflict[] = lastEvidenceConflicts,
+  ) => {
+    const openConflictCount = listOpenEvidenceConflicts(conflicts).length;
     if (!lastClaimLedger && openConflictCount === 0) {
       // Omit claimConflict so analyze stays vacuously complete until ledger/conflicts exist.
       return null;
@@ -2589,18 +3184,23 @@ export async function runAgentMission({
           : lastClaimLedger.status === "pass" ||
             lastClaimLedger.status === "skipped",
       analyzeComplete:
-        openConflictCount === 0 &&
-        unboundClaimCount === 0 &&
-        (lastClaimLedger == null ||
-          lastClaimLedger.status === "pass" ||
-          lastClaimLedger.status === "skipped"),
+        // Open evidence conflicts are an analyze-phase blocker. Ungrounded
+        // claims are instead verified against the held writeback candidate
+        // (with one correction pass) before any bytes are committed. Treating
+        // a rejected draft claim as an analyze blocker creates a deadlock:
+        // writeback cannot stage until grounded, while grounding cannot run
+        // until a candidate is staged.
+        openConflictCount === 0,
     };
   };
-  const refreshResearchPhase = (verifyComplete = false) => {
+  const refreshResearchPhase = (
+    verifyComplete = false,
+    conflicts: EvidenceConflict[] = lastEvidenceConflicts,
+  ) => {
     researchPhaseDescriptor = deriveResearchPhase({
       researchPlan,
       missionPlan,
-      claimConflict: buildClaimConflictState(),
+      claimConflict: buildClaimConflictState(conflicts),
       writeReceiptPresent: hasConcreteWriteReceipt(writeReceipts),
       externalActionReceiptPresent:
         hasExternalActionReceipt(writeReceipts),
@@ -3140,7 +3740,15 @@ export async function runAgentMission({
         await persistMissionLedger(`mission-ledger-graph-stream-${step}`);
       }
       missionGraphFinished = true;
-      await publishPlaceholderAutoRename(input.kind, step);
+      const streamedLeadingTitle = isRecord(receipt.output)
+        ? getString(receipt.output.leadingTitle)
+        : undefined;
+      await publishPlaceholderAutoRename(
+        input.kind,
+        step,
+        undefined,
+        streamedLeadingTitle,
+      );
       return receipt;
     } catch (error) {
       if (!missionGraphFinished && missionGraphExecution) {
@@ -3248,6 +3856,7 @@ export async function runAgentMission({
     kind: StreamingWritebackKind | "append" | "replace" | "edit",
     step: number,
     writtenMarkdown?: string | null,
+    leadingH1?: string | null,
   ): Promise<AgentRunReceipt | null> => {
     if (kind === "edit") {
       return null;
@@ -3267,6 +3876,7 @@ export async function runAgentMission({
           autoTitleAuthorized: true,
         },
         prompt: activeIntentPrompt,
+        leadingH1,
         writtenMarkdown: noteMarkdown,
         kind,
       });
@@ -3458,6 +4068,12 @@ export async function runAgentMission({
     finalOutput?: string,
   ): MissionAcceptanceResult => {
     refreshEvidenceConflicts();
+    const candidateConflicts = finalOutput
+      ? projectEvidenceConflictAcknowledgements(
+          lastEvidenceConflicts,
+          finalOutput,
+        )
+      : lastEvidenceConflicts;
     const baseAcceptance = evaluateMissionPlanAcceptance({
       prompt: activeIntentPrompt,
       missionIntent,
@@ -3472,7 +4088,7 @@ export async function runAgentMission({
       operationGoals: operationGoals.goals,
       researchPlan,
       plan: missionPlan,
-      conflicts: lastEvidenceConflicts,
+      conflicts: candidateConflicts,
     });
     // Claim → passage grounding is prompt-driven (cite / passage / deep research /
     // verify). Auto deep_web from "current/latest" market language alone must not
@@ -3488,7 +4104,7 @@ export async function runAgentMission({
       prompt: activeIntentPrompt,
       researchMode: researchPlan?.mode,
       passages: claimPassageRefs,
-      conflicts: lastEvidenceConflicts,
+      conflicts: candidateConflicts,
       requireClaimGrounding,
       now: runToolContext.now?.() ?? new Date(),
     });
@@ -3509,9 +4125,30 @@ export async function runAgentMission({
     // Final acceptance only after verify-complete for research-bearing missions.
     const phase = refreshResearchPhase(
       hasRequiredActionReceipt(missionPlan, writeReceipts) &&
-        (buildClaimConflictState()?.analyzeComplete !== false),
+        (buildClaimConflictState(candidateConflicts)?.analyzeComplete !== false),
+      candidateConflicts,
     );
     return gateAcceptanceByResearchPhase(acceptance, phase);
+  };
+  const commitAcceptedEvidenceConflictAcknowledgements = (
+    finalOutput: string,
+  ) => {
+    const projected = projectEvidenceConflictAcknowledgements(
+      lastEvidenceConflicts,
+      finalOutput,
+    );
+    const projectedById = new Map(projected.map((item) => [item.id, item]));
+    lastEvidenceConflicts = lastEvidenceConflicts.map((conflict) => {
+      const candidate = projectedById.get(conflict.id);
+      return candidate?.status === "acknowledged_limitation" &&
+        conflict.status === "open"
+        ? acknowledgeEvidenceConflict(
+            conflict,
+            candidate.resolutionNote ??
+              "Accepted output explicitly records the source disagreement as a limitation.",
+          )
+        : conflict;
+    });
   };
   const hasSatisfiedDurablePreWriteProof = (): boolean => {
     const requiresPreWriteProof = Boolean(
@@ -3542,11 +4179,18 @@ export async function runAgentMission({
         (item) => item.startsWith("pending_goal:") || item.startsWith("failed_goal:"),
       )
     ) {
-      return requiredWriteTools.some((toolName) => allowedToolNames.has(toolName));
+      if (requiredWriteTools.some((toolName) => allowedToolNames.has(toolName))) {
+        return true;
+      }
+      // A required write can legitimately remain queued behind evidence nodes.
+      // Do not let that queued effect mask a different, currently actionable
+      // proof deficit such as web or vault evidence.
     }
 
     if (missing.has("web_evidence")) {
-      return allowedToolNames.has("web_search") || allowedToolNames.has("web_fetch");
+      if (allowedToolNames.has("web_search") || allowedToolNames.has("web_fetch")) {
+        return true;
+      }
     }
 
     if (
@@ -3557,22 +4201,26 @@ export async function runAgentMission({
           item === "research_plan_items",
       )
     ) {
-      return (
+      if (
         allowedToolNames.has("web_search") ||
         allowedToolNames.has("web_fetch") ||
         allowedToolNames.has("semantic_search_notes") ||
         allowedToolNames.has("inspect_vault_context") ||
         allowedToolNames.has("read_markdown_files") ||
         allowedToolNames.has("read_file")
-      );
+      ) {
+        return true;
+      }
     }
 
     if (missing.has("word_count")) {
-      return allowedToolNames.has("count_words");
+      if (allowedToolNames.has("count_words")) {
+        return true;
+      }
     }
 
     if (missing.has("vault_evidence")) {
-      return (
+      if (
         /\b(before answering|must|need to|have to|verify)\b/i.test(activeIntentPrompt) &&
         [
           "inspect_vault_context",
@@ -3581,7 +4229,9 @@ export async function runAgentMission({
           "read_markdown_files",
           "read_file",
         ].some((toolName) => allowedToolNames.has(toolName))
-      );
+      ) {
+        return true;
+      }
     }
 
     return false;
@@ -3824,39 +4474,6 @@ export async function runAgentMission({
           /(?:^|:)final_output$/u.test(item),
       );
     if (
-      stopReason === "final" &&
-      (acceptance.status === "pass" || onlyFinalProjectionProofMissing)
-    ) {
-      await maybeExtractResearchMemory(
-        acceptance.status === "pass"
-          ? acceptance
-          : {
-              ...acceptance,
-              status: "pass",
-              missing: [],
-              reasons: [
-                ...acceptance.reasons,
-                "accepted_before_final_graph_projection",
-              ],
-            },
-        stopReason,
-        step,
-      );
-      if (missionGraphSession) {
-        missionGraph = missionGraphSession.graph;
-        missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
-        acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
-        onlyFinalProjectionProofMissing =
-          acceptance.missing.length > 0 &&
-          acceptance.missing.every(
-            (item) =>
-              item === "final_output" ||
-              /(?:^|:)final_relevance$/u.test(item) ||
-              /(?:^|:)final_output$/u.test(item),
-          );
-      }
-    }
-    if (
       missionGraphSession &&
       (stopReason === "final" || stopReason === "write_completed") &&
       (acceptance.status === "pass" || onlyFinalProjectionProofMissing) &&
@@ -3872,6 +4489,19 @@ export async function runAgentMission({
       missionGraph = missionGraphSession.graph;
       missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
       acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
+      onlyFinalProjectionProofMissing =
+        acceptance.missing.length > 0 &&
+        acceptance.missing.every(
+          (item) =>
+            item === "final_output" ||
+            /(?:^|:)final_relevance$/u.test(item) ||
+            /(?:^|:)final_output$/u.test(item),
+        );
+    }
+    // Research memory may only extract after honest acceptance — never force a
+    // pass before final graph projection / verification.
+    if (stopReason === "final" && acceptance.status === "pass") {
+      await maybeExtractResearchMemory(acceptance, stopReason, step);
     }
     const graphComplete =
       !missionGraph ||
@@ -4081,6 +4711,7 @@ export async function runAgentMission({
     );
     if (evidence) {
       upsertMissionEvidenceRecord(missionEvidenceRecords, evidence);
+      events.onMissionEvidence?.(toMissionEvidenceAttestation(evidence));
       upsertLedgerEvidence(
         missionLedger,
         evidence,
@@ -4133,6 +4764,7 @@ export async function runAgentMission({
       return;
     }
     const evidence = evidenceFromReceipt(receipt);
+    events.onMissionEvidence?.(toMissionEvidenceAttestation(evidence));
     upsertLedgerEvidence(
       missionLedger,
       evidence,
@@ -4214,6 +4846,9 @@ export async function runAgentMission({
     source: "model" | "tool",
     emitVisibleAnswer = true,
   ) => {
+    const providerBudgetExhausted =
+      error instanceof ModelClientError &&
+      error.category === "provider_budget_exhausted";
     const errorMessage =
       source === "model"
         ? formatModelFailureCopy(
@@ -4223,7 +4858,9 @@ export async function runAgentMission({
           )
         : getUnknownErrorMessage(error);
     const message =
-      source === "model"
+      providerBudgetExhausted
+        ? "Provider execution budget exhausted before mission acceptance."
+        : source === "model"
         ? `Model step failed: ${errorMessage}`
         : `Tool execution failed: ${errorMessage}`;
     const continuationCommand = missionLedger?.continuationCommand ?? "continue";
@@ -4236,7 +4873,9 @@ export async function runAgentMission({
       step,
       message,
       error: {
-        code: `${source}_step_failed`,
+        code: providerBudgetExhausted
+          ? "provider_budget_exhausted"
+          : `${source}_step_failed`,
         message: errorMessage,
       },
     });
@@ -4245,7 +4884,13 @@ export async function runAgentMission({
       emitDirectAssistantAnswer(nextAction, events, runPlan.requiresEnglishGuard);
     }
     recordLedgerBlocker(message);
-    await finishRun("error", step, maxSteps, nextAction);
+    await finishRun(
+      providerBudgetExhausted ? "budget" : "error",
+      step,
+      maxSteps,
+      nextAction,
+      providerBudgetExhausted,
+    );
   };
   const runProofGatedCurrentNoteWriteback = async (
     input: Parameters<typeof streamCurrentNoteWriteback>[0],
@@ -4388,6 +5033,9 @@ export async function runAgentMission({
             candidateAcceptance,
             candidate,
             activeIntentPrompt,
+            lastClaimLedger?.knownPassageIds,
+            missionPlan,
+            missionEvidenceRecords,
           ),
         });
         candidate = await stageCandidate(true);
@@ -4438,13 +5086,15 @@ export async function runAgentMission({
 
     lastFinalOutput = candidate;
     try {
-      return await runStreamedWritebackWithJournal(
+      const receipt = await runStreamedWritebackWithJournal(
         {
           ...input,
           stagedContent: candidate,
         },
         step,
       );
+      commitAcceptedEvidenceConflictAcknowledgements(candidate);
+      return receipt;
     } catch (error) {
       const code = isRecord(error) ? getString(error.code) : undefined;
       if (!code?.startsWith("approval_")) {
@@ -4967,13 +5617,45 @@ export async function runAgentMission({
         hostScopeAuthorized && missionGraphSession && missionGraphExecution
           ? missionGraphSession.graph.nodes[missionGraphExecution.nodeId]
           : null;
+      const graphDestinationSelector = hostGraphNode?.destination?.selector ?? null;
+      const exactVaultPathGraphTool =
+        preparedAction.target.system === "vault" &&
+        [
+          "create_file",
+          "append_file",
+          "replace_file",
+          "move_path",
+          "delete_path",
+        ].includes(toolCall.name) &&
+        Boolean(graphDestinationSelector?.toLowerCase().endsWith(".md"));
+      const preparedTargetSelectors = new Set(
+        [
+          preparedAction.target.id,
+          preparedAction.target.identifier,
+          preparedAction.target.path,
+        ].filter((value): value is string => typeof value === "string"),
+      );
+      const graphDestinationMatchesPreparedTarget =
+        !exactVaultPathGraphTool ||
+        (graphDestinationSelector !== null &&
+          preparedTargetSelectors.has(graphDestinationSelector));
       const hostGraphScopeAuthorized = Boolean(
         hostGraphNode &&
           missionGraphExecution?.toolName === toolCall.name &&
           hostGraphNode.allowedTools.includes(toolCall.name) &&
+          graphDestinationMatchesPreparedTarget &&
           (hostGraphNode.status === "running" ||
             hostGraphNode.status === "waiting_approval"),
       );
+      const runnerScopeAuthorized = isPreparedActionWithinRunnerScope({
+        toolName: toolCall.name,
+        descriptor,
+        action: preparedAction,
+        allowedToolNames,
+        policyRouted: policyRouted.intent,
+        missionIntent,
+        writeAutonomy,
+      });
       const actionPolicyContext = {
         toolName: toolCall.name,
         args: toolCall.arguments,
@@ -4987,17 +5669,12 @@ export async function runAgentMission({
         descriptor,
         preparedAction,
         principal: "single_agent" as const,
-        scopeAllowed:
-          hostGraphScopeAuthorized ||
-          isPreparedActionWithinRunnerScope({
-            toolName: toolCall.name,
-            descriptor,
-            action: preparedAction,
-            allowedToolNames,
-            policyRouted: policyRouted.intent,
-            missionIntent,
-            writeAutonomy,
-          }),
+        // A host graph may narrow runner scope but must never widen a prepared
+        // vault mutation to a different path. Exact Markdown path tools require
+        // both the graph destination and the prompt-derived runner scope.
+        scopeAllowed: exactVaultPathGraphTool
+          ? hostGraphScopeAuthorized && runnerScopeAuthorized
+          : hostGraphScopeAuthorized || runnerScopeAuthorized,
         now: runToolContext.now?.() ?? new Date(),
       };
       let preparedPolicyDecision = evaluateToolPolicy(actionPolicyContext);
@@ -5385,6 +6062,81 @@ export async function runAgentMission({
     prestartedMissionGraphExecution?: MissionGraphToolExecution | null;
     missionGraphStartPrepared?: boolean;
   }): Promise<ToolExecutionResult> => {
+    let automaticLeadingTitle: string | null = null;
+    let exactReplacement: string | null = null;
+    if (toolCall.name === "read_mermaid_block") {
+      const explicitReadBinding = extractExplicitMermaidReadBinding(
+        activeIntentPrompt,
+      );
+      if (explicitReadBinding) {
+        toolCall = {
+          ...toolCall,
+          arguments: explicitReadBinding,
+        };
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:read_mermaid_block:explicit-binding`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message:
+            "Bound the read-only Mermaid precondition to the mission's one explicit vault path and exact heading.",
+        });
+      }
+    }
+    if (toolCall.name === "replace_current_file") {
+      exactReplacement = extractExactMarkdownReplacementPayload(
+        activeIntentPrompt,
+      );
+      if (exactReplacement !== null) {
+        toolCall = {
+          ...toolCall,
+          arguments: { text: exactReplacement },
+        };
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:replace_current_file:exact-payload-bound`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message: "Bound the explicit exact-markdown payload before approval fingerprinting.",
+          outputPreview: {
+            characters: exactReplacement.length,
+            payloadFingerprint: hashOperationInput(exactReplacement),
+          },
+        });
+      }
+    }
+    if (
+      exactReplacement === null &&
+      runToolContext.settings?.autoTitleOnWrite !== false &&
+      (toolCall.name === "append_to_current_file" ||
+        toolCall.name === "replace_current_file")
+    ) {
+      const activeFile =
+        runToolContext.getCurrentMarkdownFile?.() ??
+        runToolContext.app?.workspace?.getActiveFile?.();
+      const textKey =
+        typeof toolCall.arguments.text === "string"
+          ? "text"
+          : typeof toolCall.arguments.content === "string"
+            ? "content"
+            : null;
+      if (activeFile && textKey) {
+        const titleResult = consumeLeadingH1Title(
+          toolCall.arguments[textKey] as string,
+          true,
+        );
+        if (titleResult.status === "title") {
+          automaticLeadingTitle = titleResult.title;
+          toolCall = {
+            ...toolCall,
+            arguments: {
+              ...toolCall.arguments,
+              [textKey]: titleResult.body,
+            },
+          };
+        }
+      }
+    }
     if (observedToolCallCount >= maxToolCalls) {
       toolCallBudgetExhausted = true;
       if (!toolCallBudgetNoticeEmitted) {
@@ -6236,10 +6988,18 @@ export async function runAgentMission({
               : typeof toolCall.arguments.content === "string"
                 ? toolCall.arguments.content
                 : null;
+          if (writtenText?.trim()) {
+            // The persisted, receipt-backed note body is the user-visible final
+            // artifact for tool-path writeback. Reuse it for final relevance so
+            // a completed research write does not ask the model for unrelated
+            // post-write tools merely because no separate chat answer exists.
+            lastFinalOutput = writtenText;
+          }
           await publishPlaceholderAutoRename(
             toolCall.name === "replace_current_file" ? "replace" : "append",
             step,
             writtenText,
+            automaticLeadingTitle,
           );
         }
         if (vaultTransaction) {
@@ -6347,6 +7107,7 @@ export async function runAgentMission({
       if (
         toolCall.name === "semantic_search_notes" &&
         !vaultCoverageExpansionUsed &&
+        !missionGraphUsesExactPlannedFrontier &&
         shouldExpandVaultRetrievalCoverage(result.output, researchPlan)
       ) {
         vaultCoverageExpansionUsed = true;
@@ -6419,6 +7180,36 @@ export async function runAgentMission({
         toolCall.name,
         result,
       );
+      if (
+        origin === "model" &&
+        (result.error?.code === "invalid_arguments" ||
+          result.error?.code === "unknown_tool")
+      ) {
+        const failureSignature = `${toolCall.name}:${result.error.code}:${stableStringify(toolCall.arguments)}`;
+        if (invalidToolCallFailureSignatures.has(failureSignature)) {
+          const blocker = `Repeated invalid tool call blocked: ${toolCall.name} (${result.error.code}).`;
+          recordLedgerBlocker(blocker);
+          events.onTrace?.({
+            id: `${toolEventBase.id}:repeated-invalid-tool-call`,
+            kind: "tool_rejected",
+            step,
+            toolName: toolCall.name,
+            message: blocker,
+            error: { code: "repeated_invalid_tool_call", message: blocker },
+          });
+        } else {
+          invalidToolCallFailureSignatures.add(failureSignature);
+          const definition = tools.find(
+            (candidate) => candidate.function.name === toolCall.name,
+          );
+          messages.push({
+            role: "system" as const,
+            content: definition
+              ? `Tool-call schema correction: ${toolCall.name} rejected the supplied arguments. Return one corrected call using exactly this JSON Schema and do not infer omitted mutation values: ${JSON.stringify(definition.function.parameters)}`
+              : `Tool-call schema correction: ${toolCall.name} is not an allowed tool. Choose one exact name from: ${tools.map((candidate) => candidate.function.name).join(", ")}.`,
+          });
+        }
+      }
       if (missionLedger && missionPlan) {
         setLedgerMissionPlan(
           missionLedger,
@@ -6887,6 +7678,11 @@ export async function runAgentMission({
         streamingWritebackKind,
         reflexOutput.intent,
       );
+      tools = constrainOrchestratedHandoffTools(
+        tools,
+        activeIntentPrompt,
+        orchestratorContext,
+      );
       runPlan = {
         ...runPlan,
         route: "grounded_workflow",
@@ -7253,14 +8049,14 @@ export async function runAgentMission({
   );
   const maxRunMs = configuredMaxRunMs;
   const isRepeatedToolBudgetSpent = () => {
-    const lastActionName = recentActions.at(-1)?.name;
-    const previousActionName = recentActions.at(-2)?.name;
+    const lastActionSignature = recentActions.at(-1)?.signature;
+    const previousActionSignature = recentActions.at(-2)?.signature;
     return (
       loopBudgetPlan.toolStepBudget > 0 &&
       currentSegmentSuccessfulToolNames.length >= loopBudgetPlan.toolStepBudget &&
       recoveryAttemptSignatures.length >= 2 &&
-      lastActionName !== undefined &&
-      lastActionName === previousActionName
+      lastActionSignature !== undefined &&
+      lastActionSignature === previousActionSignature
     );
   };
   const stopRepeatedToolBudget = async () => {
@@ -7332,18 +8128,28 @@ export async function runAgentMission({
       const compacted = compactLoopMessages({
         messages,
         ledger: missionLedger,
+        maxPromptChars: runContextBudget.maxPromptChars,
       });
-      messages.splice(0, messages.length, ...compacted.messages);
-      estimatedPromptCharsForRun = compacted.estimatedCharsAfter;
-      events.onStatus?.(
-        `Compacted loop context from ${compacted.estimatedCharsBefore} to ${compacted.estimatedCharsAfter} estimated chars before model call.`,
-      );
+      if (compacted.applied) {
+        messages.splice(0, messages.length, ...compacted.messages);
+        estimatedPromptCharsForRun = compacted.estimatedCharsAfter;
+        events.onStatus?.(
+          `Compacted loop context from ${compacted.estimatedCharsBefore} to ${compacted.estimatedCharsAfter} estimated chars before model call.`,
+        );
+      } else {
+        events.onStatus?.(
+          `Context compaction was not applied because it did not reduce the ${compacted.estimatedCharsBefore}-character estimate.`,
+        );
+      }
       events.onTrace?.({
         id: `context-compaction:${step}`,
-        kind: "status",
+        kind: compacted.applied ? "status" : "error",
         step,
-        message: "Compacted loop context before model call.",
+        message: compacted.applied
+          ? "Compacted loop context before model call."
+          : "Rejected non-reducing loop context compaction.",
         outputPreview: {
+          applied: compacted.applied,
           estimated_prompt_chars_before: compacted.estimatedCharsBefore,
           estimated_prompt_chars_after: compacted.estimatedCharsAfter,
           compacted_tool_messages: compacted.compactedToolMessages,
@@ -7400,11 +8206,76 @@ export async function runAgentMission({
       );
     }
 
+    const stepTools = constrainToolsToMissionGraphFrontier(
+      tools,
+      missionGraphSession?.graph ?? missionGraph,
+      {
+        // Exploratory reads remain available only for non-explicit plans.
+        // MissionGraphSession materializes each such call as a bounded dynamic
+        // node. Explicit ordered workflows expose the exact ready node only.
+        includeCapabilityReads: !missionGraphUsesExactPlannedFrontier,
+      },
+    );
+    const stepAllowedToolNames = new Set(
+      stepTools.map((tool) => tool.function.name),
+    );
+    events.onTrace?.({
+      id: `mission-graph-tool-frontier-${step}`,
+      kind: "allowed_tools",
+      step,
+      message: `MissionGraph frontier tools: ${
+        stepTools.map((tool) => tool.function.name).join(", ") || "none"
+      }`,
+      outputPreview: stepTools.map((tool) => tool.function.name),
+    });
+    const acceptedWritebackPassageIds = getAcceptedMissionPassageIds(
+      missionEvidenceRecords,
+    );
+    if (
+      !passageGroundedWriteContractInjected &&
+      stepAllowedToolNames.has("append_to_current_file") &&
+      requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+      hasSatisfiedDurablePreWriteProof() &&
+      acceptedWritebackPassageIds.length > 0
+    ) {
+      passageGroundedWriteContractInjected = true;
+      messages.push({
+        role: "system" as const,
+        content: buildPassageGroundedWritebackContract(
+          acceptedWritebackPassageIds,
+        ),
+      });
+      events.onTrace?.({
+        id: `passage-writeback-contract-${step}`,
+        kind: "verification",
+        step,
+        message:
+          `Injected the passage-grounded writeback contract with ${acceptedWritebackPassageIds.length} accepted passage identifier(s).`,
+      });
+    }
     let response: ModelChatResponse;
     try {
+      const stepMessages =
+        missionGraph && stepTools.length > 0
+          ? insertMissionGraphFrontierTurnContext(
+              messages,
+              stepTools,
+              buildObservedMissionGraphFrontierBinding(
+                messages,
+                stepTools,
+                writeReceipts,
+              ),
+            )
+          : messages;
       response = await chatForAgentStep(
         modelClient,
-        buildChatRequest(messages, tools, activeThink, modelOptions, abortSignal),
+        buildChatRequest(
+          stepMessages,
+          stepTools,
+          activeThink,
+          modelOptions,
+          abortSignal,
+        ),
         events,
         step,
         disableThinkingForRun,
@@ -7441,6 +8312,16 @@ export async function runAgentMission({
     lastProgressSignature = progressSignature;
     const recoveredTextToolCalls =
       response.toolCalls.length === 0 && responseToolCalls.length > 0;
+    events.onTrace?.({
+      id: `agent-step-response-${step}`,
+      kind: "status",
+      step,
+      message: [
+        `tool_calls=${responseToolCalls.map((call) => call.name).join(",") || "none"}`,
+        `content_chars=${sanitizeAssistantContent(response.message.content ?? "").trim().length}`,
+        `recovered_text_tool_calls=${recoveredTextToolCalls}`,
+      ].join("; "),
+    });
 
     const missingRequiredWebToolsBeforeToolUse = getMissingRequiredWebToolNames({
       prompt: activeIntentPrompt,
@@ -7513,8 +8394,140 @@ export async function runAgentMission({
               ? "edit_current_section"
               : null;
       const pendingToolsBeforeStream = pendingRequiredWritesBeforeToolUse.filter(
-        (name) => name !== plannedStreamTool,
+        (name) =>
+          name !== plannedStreamTool &&
+          !(
+            streamingWritebackKind === "edit" &&
+            preparedStreamingSectionEdit !== null &&
+            name === "prepare_edit_current_section"
+          ),
       );
+      const pendingRequiredWriteTools = getPendingRequiredWriteToolNames(
+        operationGoals,
+        requiredWriteTools,
+      );
+      events.onTrace?.({
+        id: `pending-write-gate-${step}`,
+        kind: "status",
+        step,
+        message: [
+          `required=${requiredWriteTools.join(",") || "none"}`,
+          `pending=${pendingRequiredWriteTools.join(",") || "none"}`,
+          `completed=${operationGoals.completedTools.join(",") || "none"}`,
+          `current_note_content=${operationGoals.goals.current_note_content}`,
+        ].join("; "),
+      });
+      let verifiedFinalAppendCandidate = sanitizeAssistantContent(
+        response.message.content ?? "",
+      ).trim();
+      if (
+        pendingRequiredWriteTools.length === 1 &&
+        pendingRequiredWriteTools[0] === "append_to_current_file" &&
+        hasRenderableAssistantContent(verifiedFinalAppendCandidate) &&
+        hasSatisfiedDurablePreWriteProof()
+      ) {
+        let candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
+          evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
+          requiredWriteTools,
+        );
+        if (
+          candidateAcceptance.status !== "pass" &&
+          candidateAcceptance.missing.length > 0 &&
+          candidateAcceptance.missing.some((item) =>
+            item.startsWith("verifier:citation_coverage:"),
+          ) &&
+          candidateAcceptance.missing.every(
+            (item) =>
+              item.startsWith("verifier:citation_coverage:") ||
+              item.includes("open_evidence_conflicts"),
+          ) &&
+          lastClaimLedger
+        ) {
+          const normalized = attachGroundedPassageCitations(
+            verifiedFinalAppendCandidate,
+            lastClaimLedger,
+          );
+          if (normalized.insertedPassageIds.length > 0) {
+            verifiedFinalAppendCandidate = normalized.content;
+            candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
+              evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
+              requiredWriteTools,
+            );
+            events.onTrace?.({
+              id: `verified-final-append-${step}:citation-normalized`,
+              kind: "verification",
+              step,
+              toolName: "append_to_current_file",
+              message:
+                `Deterministically attached ${normalized.insertedPassageIds.length} accepted passage citation(s); verification=${candidateAcceptance.status}.`,
+              outputPreview: {
+                insertedCitationCount: normalized.insertedPassageIds.length,
+                payloadFingerprint: hashOperationInput(verifiedFinalAppendCandidate),
+                acceptance: candidateAcceptance,
+              },
+            });
+          }
+        }
+        events.onTrace?.({
+          id: `verified-final-append-${step}:candidate-held`,
+          kind: "verification",
+          step,
+          toolName: "append_to_current_file",
+          message:
+            `Held a model final-answer candidate for the pending graph-authorized append: ${candidateAcceptance.status}.`,
+          outputPreview: {
+            characters: verifiedFinalAppendCandidate.length,
+            payloadFingerprint: hashOperationInput(verifiedFinalAppendCandidate),
+            acceptance: candidateAcceptance,
+          },
+        });
+        if (candidateAcceptance.status === "pass") {
+          events.onStatus?.(
+            "Verified final output; committing the pending append through the normal receipt path...",
+          );
+          const appendResult = await runObservedModelToolCall({
+            origin: "runner",
+            toolCall: {
+              name: "append_to_current_file",
+              arguments: { text: verifiedFinalAppendCandidate },
+            },
+            step,
+            toolIndex: "verified-final-append",
+            recordTranscript: false,
+          });
+          if (appendResult.ok) {
+            commitAcceptedEvidenceConflictAcknowledgements(
+              verifiedFinalAppendCandidate,
+            );
+            lastFinalOutput = verifiedFinalAppendCandidate;
+            emitLocalWriteSummary(events, writeReceipts);
+            await finishRun("write_completed", lastStep, stepLimit);
+            return;
+          }
+        } else if (
+          step < stepLimit &&
+          !finalOutputCorrectionUsed &&
+          candidateAcceptance.missing.length > 0 &&
+          candidateAcceptance.missing.every(isRepairableFinalOutputProof)
+        ) {
+          finalOutputCorrectionUsed = true;
+          events.onStatus?.(
+            `Verified append candidate held for correction: ${candidateAcceptance.missing.join(", ")}.`,
+          );
+          messages.push({
+            role: "system" as const,
+            content: buildFinalOutputVerificationCorrectionPrompt(
+              candidateAcceptance,
+              verifiedFinalAppendCandidate,
+              activeIntentPrompt,
+              lastClaimLedger?.knownPassageIds,
+              missionPlan,
+              missionEvidenceRecords,
+            ),
+          });
+          continue;
+        }
+      }
       if (
         streamingWritebackKind &&
         pendingToolsBeforeStream.length > 0 &&
@@ -7683,11 +8696,7 @@ export async function runAgentMission({
         }
       }
 
-      const pendingRequiredWriteTools = getPendingRequiredWriteToolNames(
-        operationGoals,
-        requiredWriteTools,
-      );
-      if (writeRequired && pendingRequiredWriteTools.length > 0) {
+      if (pendingRequiredWriteTools.length > 0) {
         if (step < stepLimit) {
           events.onStatus?.("Write required; asking model to use a write tool...");
           messages.push({
@@ -7844,7 +8853,7 @@ export async function runAgentMission({
             role: "system" as const,
             content: buildReflexCompletionCorrectionPrompt(
               reflexOutput.completion.missing,
-              tools,
+              stepTools,
             ),
           });
           continue;
@@ -7970,7 +8979,7 @@ export async function runAgentMission({
             role: "system" as const,
             content: formatMissionAcceptanceCorrection(
               acceptanceBeforeFinal,
-              tools.map((tool) => tool.function.name),
+              stepTools.map((tool) => tool.function.name),
             ),
           });
           continue;
@@ -8118,6 +9127,9 @@ export async function runAgentMission({
                 candidateAcceptance,
                 rejectedCandidate,
                 activeIntentPrompt,
+                lastClaimLedger?.knownPassageIds,
+                missionPlan,
+                missionEvidenceRecords,
               ),
             });
             continue;
@@ -8139,6 +9151,7 @@ export async function runAgentMission({
           return;
         }
 
+        commitAcceptedEvidenceConflictAcknowledgements(lastFinalOutput);
         emitDirectAssistantAnswer(
           lastFinalOutput,
           events,
@@ -8173,13 +9186,41 @@ export async function runAgentMission({
 
     let shouldReplanAfterUnavailableTool = false;
     let shouldReplanAfterProofGatedWriteTool = false;
+    let shouldReplanAfterLiteralWrite = false;
 
     for (let toolIndex = 0; toolIndex < responseToolCalls.length;) {
       if (stopIfRequested(step)) {
         return;
       }
+      if (toolIndex > 0 && (missionGraphSession?.graph ?? missionGraph)) {
+        // A single provider response may contain an ordered compound action.
+        // Re-evaluate the immutable graph's live frontier after each prior call
+        // commits so a newly-ready dependent call can execute in the same
+        // response. This does not widen authority: the full tool catalog and
+        // capability envelope are unchanged, and only nodes promoted to ready
+        // by durable graph evidence become callable.
+        const refreshedStepTools = constrainToolsToMissionGraphFrontier(
+          tools,
+          missionGraphSession?.graph ?? missionGraph,
+          {
+            includeCapabilityReads: !missionGraphUsesExactPlannedFrontier,
+          },
+        );
+        stepAllowedToolNames.clear();
+        for (const refreshedTool of refreshedStepTools) {
+          stepAllowedToolNames.add(refreshedTool.function.name);
+        }
+      }
       if (toolCallBudgetExhausted || observedToolCallCount >= maxToolCalls) {
         toolCallBudgetExhausted = true;
+        events.onTrace?.({
+          id: `tool-call-budget-precheck-${step}`,
+          kind: "status",
+          step,
+          toolName: responseToolCalls[toolIndex]?.name,
+          message:
+            `Tool-call budget precheck blocked execution: observed=${observedToolCallCount}; max=${maxToolCalls}.`,
+        });
         await finishRun(
           "budget",
           lastStep,
@@ -8196,27 +9237,46 @@ export async function runAgentMission({
         step,
       };
 
-      if (!allowedToolNames.has(toolCall.name)) {
-        events.onStatus?.(`Rejected unavailable tool: ${toolCall.name}`);
+      if (!stepAllowedToolNames.has(toolCall.name)) {
+        const authoritativeGraph = missionGraphSession?.graph ?? missionGraph;
+        const pendingGraphNode = authoritativeGraph
+          ? Object.values(authoritativeGraph.nodes).find(
+              (node) =>
+                node.status !== "complete" &&
+                node.status !== "cancelled" &&
+                node.allowedTools.includes(toolCall.name),
+            )
+          : null;
+        const rejectionCode = pendingGraphNode
+          ? "plan_dependency_violation"
+          : "tool_not_allowed";
+        const rejectionMessage = pendingGraphNode
+          ? `Deferred ${toolCall.name}: authoritative mission node ${pendingGraphNode.id} is not on the ready frontier.`
+          : `Tool is not available for this prompt: ${toolCall.name}`;
+        events.onStatus?.(
+          pendingGraphNode
+            ? rejectionMessage
+            : `Rejected unavailable tool: ${toolCall.name}`,
+        );
         events.onTrace?.({
           id: `${toolEventBase.id}:rejected`,
           kind: "tool_rejected",
           step,
           toolName: toolCall.name,
-          message: `Rejected unavailable tool: ${toolCall.name}`,
+          message: rejectionMessage,
           inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
           error: {
-            code: "tool_not_allowed",
-            message: `Tool is not available for this prompt: ${toolCall.name}`,
+            code: rejectionCode,
+            message: rejectionMessage,
           },
         });
         events.onToolDone?.({
           ...toolEventBase,
           ok: false,
-          message: `Rejected unavailable tool: ${toolCall.name}`,
+          message: rejectionMessage,
           error: {
-            code: "tool_not_allowed",
-            message: `Tool is not available for this prompt: ${toolCall.name}`,
+            code: rejectionCode,
+            message: rejectionMessage,
           },
         });
         messages.push({
@@ -8226,14 +9286,12 @@ export async function runAgentMission({
             ok: false,
             toolName: toolCall.name,
             error: {
-              code: "tool_not_allowed",
-              message: `Tool is not available for this prompt: ${toolCall.name}`,
+              code: rejectionCode,
+              message: rejectionMessage,
             },
           }),
         });
-        if (isWriteToolName(toolCall.name)) {
-          shouldReplanAfterUnavailableTool = true;
-        }
+        shouldReplanAfterUnavailableTool = true;
         toolIndex += 1;
         continue;
       }
@@ -8317,19 +9375,117 @@ export async function runAgentMission({
         continue;
       }
 
+      const proofGatedCurrentNoteTool = [
+        "append_to_current_file",
+        "replace_current_file",
+        "edit_current_section",
+      ].includes(toolCall.name);
+      const proposedWriteText =
+        typeof toolCall.arguments.text === "string"
+          ? toolCall.arguments.text
+          : typeof toolCall.arguments.content === "string"
+            ? toolCall.arguments.content
+            : "";
+      const literalContractError = validateRequiredLiteralWriteArguments(
+        activeIntentPrompt,
+        toolCall,
+      );
+      if (literalContractError) {
+        const rejectedResult: ToolExecutionResult = {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: {
+            code: "invalid_arguments",
+            message: literalContractError,
+          },
+        };
+        const failureSignature = `${toolCall.name}:invalid_arguments:${stableStringify(toolCall.arguments)}`;
+        const repeated = invalidToolCallFailureSignatures.has(failureSignature);
+        events.onStatus?.(literalContractError);
+        events.onTrace?.({
+          id: `${toolEventBase.id}:required-literal-rejected`,
+          kind: "tool_rejected",
+          step,
+          toolName: toolCall.name,
+          message: literalContractError,
+          inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
+          error: rejectedResult.error,
+        });
+        events.onToolDone?.({
+          ...toolEventBase,
+          ok: false,
+          message: literalContractError,
+          error: rejectedResult.error,
+        });
+        appendToolTranscript({
+          messages,
+          toolCall,
+          resultContent: serializeToolResultForModel(rejectedResult),
+          origin: "model",
+          fallbackId: buildToolCallFallbackId(
+            runId,
+            step,
+            toolIndex,
+            toolCall.name,
+          ),
+        });
+        if (repeated) {
+          const execution = await beginMissionGraphTool(toolCall.name);
+          await finishMissionGraphTool(
+            execution,
+            toolCall.name,
+            rejectedResult,
+          );
+          const blocker = `Repeated invalid tool call blocked: ${toolCall.name} (invalid_arguments).`;
+          recordLedgerBlocker(blocker);
+          events.onTrace?.({
+            id: `${toolEventBase.id}:repeated-invalid-required-literal`,
+            kind: "tool_rejected",
+            step,
+            toolName: toolCall.name,
+            message: blocker,
+            error: { code: "repeated_invalid_tool_call", message: blocker },
+          });
+        } else {
+          invalidToolCallFailureSignatures.add(failureSignature);
+          const definition = stepTools.find(
+            (candidate) => candidate.function.name === toolCall.name,
+          );
+          messages.push({
+            role: "system" as const,
+            content: definition
+              ? `Tool-call schema correction: ${toolCall.name} rejected the supplied arguments. Return one corrected call using exactly this JSON Schema and preserve every literal explicitly required by the mission: ${JSON.stringify(definition.function.parameters)}`
+              : `Tool-call schema correction: ${toolCall.name} is not an allowed tool.`,
+          });
+          shouldReplanAfterLiteralWrite = true;
+        }
+        toolIndex += 1;
+        continue;
+      }
+      const durablePreWriteProofSatisfied = hasSatisfiedDurablePreWriteProof();
+      const proposedWriteAcceptance =
+        proofGatedCurrentNoteTool &&
+        requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+        durablePreWriteProofSatisfied &&
+        proposedWriteText.trim()
+          ? getProofGatedWritebackCandidateAcceptance(
+              evaluateCurrentAcceptance(proposedWriteText),
+              requiredWriteTools,
+            )
+          : null;
       if (
-        ((streamingWritebackKind !== null &&
-          toolCall.name === getStreamingWritebackToolName(streamingWritebackKind)) ||
-          (enableStreaming &&
-            [
-              "append_to_current_file",
-              "replace_current_file",
-              "edit_current_section",
-            ].includes(toolCall.name))) &&
-        requiresVerifiedFinalOutput(missionPlan, researchPlan)
+        proofGatedCurrentNoteTool &&
+        requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+        (!durablePreWriteProofSatisfied ||
+          proposedWriteAcceptance?.status !== "pass")
       ) {
         const message =
-          `Held ${toolCall.name} before mutation because this sourced writeback requires final passage verification. Return the complete proposed note content as the final answer without a tool call; the runner will verify and commit it exactly once.`;
+          `Held ${toolCall.name} before mutation because this sourced writeback requires final passage verification${
+            proposedWriteAcceptance?.missing.length
+              ? ` (${proposedWriteAcceptance.missing.join(", ")})`
+              : ""
+          }. Return the complete corrected note content as the final answer without a tool call; the runner will verify and commit it exactly once.`;
         events.onStatus?.(message);
         events.onTrace?.({
           id: `${toolEventBase.id}:proof-gated-writeback-rejected`,
@@ -8338,6 +9494,9 @@ export async function runAgentMission({
           toolName: toolCall.name,
           message,
           inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
+          outputPreview: proposedWriteAcceptance ?? {
+            durablePreWriteProofSatisfied,
+          },
           error: {
             code: "proof_gated_writeback_required",
             message,
@@ -8389,7 +9548,7 @@ export async function runAgentMission({
         ) {
           const candidate = responseToolCalls[batchIndex];
           if (
-            !allowedToolNames.has(candidate.name) ||
+            !stepAllowedToolNames.has(candidate.name) ||
             !isDescriptorApprovedParallelRead(
               toolRegistry.getDescriptor?.(candidate.name),
             )
@@ -8497,6 +9656,95 @@ export async function runAgentMission({
       return;
     }
 
+    const exactFrontierWriteTool = [
+      "append_to_current_file",
+      "replace_current_file",
+      "edit_current_section",
+    ].find((toolName) => stepAllowedToolNames.has(toolName)) ?? null;
+    const exactFrontierWritebackKind: StreamingWritebackKind | null =
+      exactFrontierWriteTool === "append_to_current_file"
+        ? "append"
+        : exactFrontierWriteTool === "replace_current_file"
+          ? "replace"
+          : exactFrontierWriteTool === "edit_current_section"
+            ? "edit"
+            : null;
+    if (
+      shouldReplanAfterUnavailableTool &&
+      missionGraphUsesExactPlannedFrontier &&
+      exactFrontierWriteTool !== null &&
+      exactFrontierWritebackKind !== null &&
+      stepAllowedToolNames.size === 1 &&
+      stepAllowedToolNames.has(exactFrontierWriteTool) &&
+      (hasPendingStreamingWritebackGoal(
+        operationGoals,
+        exactFrontierWritebackKind,
+      ) ||
+        isPendingRequiredWriteReady(
+          exactFrontierWriteTool,
+          getPendingRequiredWriteToolNames(
+            operationGoals,
+            requiredWriteTools,
+          ),
+        ))
+    ) {
+      events.onStatus?.(
+        "Off-frontier read rejected; completing the exact write frontier with host-owned finalization...",
+      );
+      let receipt: AgentRunReceipt;
+      try {
+        const committedReceipt = await runProofGatedCurrentNoteWriteback(
+          {
+            kind: exactFrontierWritebackKind,
+            preparedSectionEdit: preparedStreamingSectionEdit,
+            modelClient,
+            messages: [
+              ...messages,
+              {
+                role: "system" as const,
+                content:
+                  "The exact read workflow is complete. Do not request tools. Return only the final grounded markdown requested for the current note; the host will verify and commit it once.",
+              },
+            ],
+            events,
+            toolContext: runToolContext,
+            knownToolNames,
+            relevancePrompt: finalAnswerRelevancePrompt,
+            think: false,
+            options: modelOptions,
+            abortSignal,
+            onThinkingUnsupported: disableThinkingForRun,
+          },
+          step,
+          stepLimit,
+        );
+        if (!committedReceipt) {
+          return;
+        }
+        receipt = committedReceipt;
+      } catch (error) {
+        if (stopIfRequested(step)) {
+          return;
+        }
+        await finishErroredRunFromException(error, step, stepLimit, "model");
+        throw error;
+      }
+      markStreamingWritebackGoalDone(operationGoals, exactFrontierWritebackKind);
+      writeReceipts.push(receipt);
+      events.onReceipt?.(receipt);
+      await recordLedgerReceipt(receipt);
+      if (!hasPendingOperationGoals(operationGoals)) {
+        await finishRun("write_completed", step, stepLimit);
+        return;
+      }
+      messages.push({
+        role: "system" as const,
+        content:
+          "The exact note write completed with a receipt. Continue only with remaining operation goals.",
+      });
+      continue;
+    }
+
     if (
       shouldReplanAfterProofGatedWriteTool &&
       !proofGatedWriteToolCorrectionUsed &&
@@ -8507,15 +9755,26 @@ export async function runAgentMission({
     }
 
     if (
+      shouldReplanAfterLiteralWrite &&
+      !literalWriteCorrectionUsed &&
+      step < stepLimit
+    ) {
+      literalWriteCorrectionUsed = true;
+      continue;
+    }
+
+    if (
       shouldReplanAfterUnavailableTool &&
       !unavailableToolCorrectionUsed &&
       step < stepLimit
     ) {
       unavailableToolCorrectionUsed = true;
-      events.onStatus?.("Unavailable write tool requested; asking model to choose an allowed path...");
+      events.onStatus?.(
+        "Off-frontier tool requested; asking model to choose an authoritative graph action...",
+      );
       messages.push({
         role: "system" as const,
-        content: buildUnavailableToolCorrectionPrompt(tools),
+        content: buildUnavailableToolCorrectionPrompt(stepTools),
       });
       continue;
     }
@@ -8776,6 +10035,19 @@ export async function runAgentMission({
       decideNextLoopAction(loopLedger, loopBudgetPlan),
       researchPhaseDescriptor,
     );
+    events.onTrace?.({
+      id: `loop-decision-${step}`,
+      kind: "status",
+      step,
+      message: [
+        `action=${loopDecision.action}`,
+        `reason=${loopDecision.reason}`,
+        `successful_tools=${currentSegmentSuccessfulToolNames.length}`,
+        `failed_tools=${failedToolNames.length}`,
+        `repeated_responses=${consecutiveNoProgressSteps}`,
+        `required_tools_satisfied=${requiredLoopToolsSatisfied}`,
+      ].join("; "),
+    });
     if (
       loopDecision.action === "stop_budget" &&
       loopDecision.reason === "required_tools_failed"
@@ -8813,7 +10085,7 @@ export async function runAgentMission({
           role: "system" as const,
           content: formatMissionAcceptanceCorrection(
             acceptanceAfterToolUse,
-            tools.map((tool) => tool.function.name),
+            stepTools.map((tool) => tool.function.name),
           ),
         });
         continue;
@@ -9532,6 +10804,74 @@ function formatCheckpointResumeContext(
   ].join("\n");
 }
 
+export function constrainToolsToMissionGraphFrontier(
+  tools: ModelToolDefinition[],
+  graph: MissionGraphV3 | null | undefined,
+  options: { includeCapabilityReads?: boolean } = {},
+): ModelToolDefinition[] {
+  if (!graph) {
+    return tools;
+  }
+  const frontierNames = new Set(
+    Object.values(graph.nodes)
+      .filter((node) => node.status === "ready")
+      .flatMap((node) => node.allowedTools),
+  );
+  if (options.includeCapabilityReads) {
+    for (const [toolName, grant] of Object.entries(
+      graph.capabilityEnvelope.tools,
+    )) {
+      if (grant.effect === "read") {
+        frontierNames.add(toolName);
+      }
+    }
+  }
+  return tools.filter((tool) => frontierNames.has(tool.function.name));
+}
+
+export function getPendingMissionGraphWriteToolNames(
+  graph: MissionGraphV3 | null | undefined,
+): string[] {
+  if (!graph) return [];
+  return [
+    ...new Set(
+      Object.values(graph.nodes)
+        .filter(
+          (node) =>
+            node.status !== "complete" && node.status !== "cancelled",
+        )
+        .flatMap((node) => node.allowedTools)
+        .filter(
+          (toolName) =>
+            isWriteToolName(toolName) && toolName !== "append_research_memory",
+        ),
+    ),
+  ];
+}
+
+export function toMissionEvidenceAttestation(
+  evidence: MissionEvidence,
+): MissionEvidenceAttestationV1 {
+  const passageIds = [
+    ...(evidence.passageId ? [evidence.passageId] : []),
+    ...(evidence.passageIds ?? []),
+  ];
+  return {
+    schemaVersion: 1,
+    id: evidence.id,
+    kind: evidence.kind,
+    ...(evidence.sourceId ? { sourceId: evidence.sourceId } : {}),
+    passageIds: [...new Set(passageIds)],
+    ...(evidence.usableSource === undefined
+      ? {}
+      : { usableSource: evidence.usableSource }),
+    ...(evidence.parserStatus
+      ? { parserStatus: evidence.parserStatus }
+      : {}),
+    confidence: evidence.confidence,
+  };
+}
+
 function buildChatRequest(
   messages: ModelChatMessage[],
   tools: ModelChatRequest["tools"],
@@ -9624,6 +10964,20 @@ function buildRunConfigEvent({
     model: settings?.model?.trim() || "unknown",
     base: formatBaseUrlCategory(getProviderBaseUrl(settings)),
     modelProvider: settings?.modelProvider ?? "ollama",
+    modelExecutionBudget: {
+      schemaVersion: 1,
+      maxCalls: Math.max(4, runPlan.maxStepsForRun * 3 + 8),
+      maxTokens: Math.max(
+        32_768,
+        Math.max(4, runPlan.maxStepsForRun * 3 + 8) *
+          Math.max(4_096, modelOptions?.num_ctx ?? 8_192),
+      ),
+      maxWallClockMs:
+        typeof settings?.maxRunMinutes === "number" &&
+        settings.maxRunMinutes > 0
+          ? settings.maxRunMinutes * 60_000
+          : 60 * 60_000,
+    },
     streaming: enableStreaming,
     thinkingMode: settings?.thinkingMode ?? "auto",
     resolvedThink: formatResolvedThink(activeThink),
@@ -9908,6 +11262,9 @@ function getFatalDependencyRowsForPreflight({
 
 function classifyBlockerCategory(blocker: string): MissionBlockerCategory {
   const text = blocker.toLowerCase();
+  if (/provider execution budget|provider_budget_exhausted/.test(text)) {
+    return "provider_budget";
+  }
   if (/\b(auth|api key|credential|401|403)\b/.test(text)) {
     return "provider_auth";
   }
@@ -10608,6 +11965,7 @@ async function chatForAgentStep(
   step: number,
   onThinkingUnsupported: () => void,
 ): Promise<ModelChatResponse> {
+  request = { ...request, evidencePhase: request.evidencePhase ?? "agent_step" };
   const startedAt = nowMs();
   const requestChars = measureSerializedChars(request);
   emitModelCallTrace(events, {
@@ -10652,7 +12010,11 @@ async function chatForAgentStep(
   } catch (error) {
     if (request.think !== undefined && isThinkingUnsupportedError(error)) {
       onThinkingUnsupported();
-      const retryRequest = { ...request, think: undefined };
+      const retryRequest = {
+        ...request,
+        think: undefined,
+        evidencePhase: "retry" as const,
+      };
       const retryResponse = await withModelRetry(
         () =>
           withModelWaitStatus(
@@ -10689,7 +12051,11 @@ async function chatForAgentStep(
         "Transient model provider error persisted; retrying without thinking mode...",
       );
       onThinkingUnsupported();
-      const noThinkRequest = { ...request, think: undefined };
+      const noThinkRequest = {
+        ...request,
+        think: undefined,
+        evidencePhase: "retry" as const,
+      };
       const noThinkResponse = await withModelRetry(
         () =>
           withModelWaitStatus(
@@ -10755,6 +12121,7 @@ async function emitNonStreamingFinalModelAnswer({
     messages,
     options,
     abortSignal,
+    evidencePhase: "finalizer",
   };
   const startedAt = nowMs();
   const requestChars = measureSerializedChars(request);
@@ -10836,6 +12203,7 @@ async function emitFinalAnswer({
     messages: buildFinalAnswerMessages(messages, finalInstruction),
     options,
     abortSignal,
+    evidencePhase: "streaming",
   };
   const requestChars = measureSerializedChars(streamRequest);
   const startedAt = nowMs();
@@ -11056,6 +12424,7 @@ interface RelevanceProfile {
   expectedEnglish: boolean;
   acceptsCodeOutput: boolean;
   acceptsNumericOutput: boolean;
+  acceptsScopeClarification: boolean;
 }
 
 function createFinalAnswerRelevanceGate(
@@ -11172,6 +12541,7 @@ function buildRelevanceProfile(prompt: string): RelevanceProfile | null {
     expectedEnglish: isLikelyEnglishPrompt(prompt),
     acceptsCodeOutput: hasCodeAnswerIntent(prompt),
     acceptsNumericOutput: hasWordCountIntent(prompt),
+    acceptsScopeClarification: isBroadUnscopedMutationPrompt(prompt),
   };
 }
 
@@ -11183,6 +12553,14 @@ function isTopicallyRelevant(
     return true;
   }
   if (profile.acceptsNumericOutput && /\b\d[\d,]*(?:\.\d+)?\b/.test(content)) {
+    return true;
+  }
+  if (
+    profile.acceptsScopeClarification &&
+    /\b(?:which|what|specify|choose|name|provide)\b[\s\S]{0,100}\b(?:file|folder|path|note|scope|target)\b|\b(?:file|folder|path|note|scope|target)\b[\s\S]{0,100}\b(?:which|what|specify|choose|name|provide)\b/iu.test(
+      content,
+    )
+  ) {
     return true;
   }
 
@@ -11396,7 +12774,11 @@ async function streamChatWithThinkingFallback({
     }
 
     onThinkingUnsupported();
-    const retryRequest = { ...request, think: undefined };
+    const retryRequest = {
+      ...request,
+      think: undefined,
+      evidencePhase: "retry" as const,
+    };
     return withModelRetry(
       () =>
         withModelWaitStatus(
@@ -11859,6 +13241,17 @@ function getAllowedToolDefinitions(
   streamingWritebackKind: StreamingWritebackKind | null = null,
   reflex: ReflexDecision | null = null,
 ) {
+  // A broad mutation with no file, folder, artifact, or current-note target is
+  // a clarification turn, not a vault-discovery mission. Exposing read tools
+  // here lets the model wander the vault even though no later write can be
+  // authorized, and weakens the explicit-scope blocker into accidental work.
+  if (
+    missionIntent.explicitMutation &&
+    isBroadUnscopedVaultMutation(missionIntent.autonomyScope)
+  ) {
+    return [];
+  }
+
   const noteOutputIntent = missionIntent.noteOutput;
   const allowAppend = hasAppendIntent(prompt);
   const allowSectionAppend = hasSectionAppendIntent(prompt);
@@ -11874,6 +13267,8 @@ function getAllowedToolDefinitions(
   const allowVisibleRename =
     isExplicitVisibleFileRenameIntent(prompt) ||
     (isVisibleTitleRenameIntent(prompt) && isTitleOnlyIntent(prompt));
+  const allowExplicitCurrentNoteRename =
+    allowVisibleRename && hasExplicitCurrentNoteMutationIntent(prompt);
   const allowRetitle = allowMarkdownRetitle || allowVisibleRename;
   const allowResume =
     hasCheckpointResumeIntent(prompt) || hasMissionResumeIntent(prompt);
@@ -11909,6 +13304,7 @@ function getAllowedToolDefinitions(
     isSemanticSearchEnabled(settings) &&
     (allowResume ||
       allowParallelVaultInspection ||
+      hasExplicitSemanticRetrievalIntent(prompt) ||
       hasConceptualVaultSearchIntent(prompt) ||
       hasReflexReadLabel(["semantic_vault_search", "graph_context"]));
   const allowSemanticIndexInspect =
@@ -11967,11 +13363,13 @@ function getAllowedToolDefinitions(
   const allowSpecificFileRead = hasSpecificFileReadIntent(prompt);
   const allowCreateFile = hasCreateFileIntent(prompt);
   const allowCreateFolder = hasCreateFolderIntent(prompt);
-  const allowPathAppend = hasAppendIntent(prompt) && hasPathTargetIntent(prompt);
-  const allowPathReplace = hasReplaceIntent(prompt) && hasPathTargetIntent(prompt);
-  const allowMovePath = hasMovePathIntent(prompt);
   const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
-  const allowCurrentNoteOutput = noteOutputIntent && !preferPathTarget;
+  const hasCurrentMutationTarget = hasExplicitCurrentNoteMutationIntent(prompt);
+  const allowPathAppend = hasAppendIntent(prompt) && preferPathTarget;
+  const allowPathReplace = hasReplaceIntent(prompt) && preferPathTarget;
+  const allowMovePath = hasMovePathIntent(prompt);
+  const allowCurrentNoteOutput =
+    noteOutputIntent && (!preferPathTarget || hasCurrentMutationTarget);
   const allowAutonomousAppend =
     allowCurrentNoteOutput &&
     !allowWholeNoteReplace &&
@@ -12239,7 +13637,7 @@ function getAllowedToolDefinitions(
     if (name === "append_to_current_file") {
       return (
         (allowAppend || allowAutonomousAppend) &&
-        !preferPathTarget &&
+        (!preferPathTarget || hasCurrentMutationTarget) &&
         !hasTitleOnlyIntent(prompt) &&
         !allowSectionAppend &&
         !allowHighlight &&
@@ -12262,7 +13660,7 @@ function getAllowedToolDefinitions(
       return (
         !hasDesignIntent(prompt) &&
         allowVisibleRename &&
-        !preferPathTarget &&
+        (!preferPathTarget || allowExplicitCurrentNoteRename) &&
         !allowEdit &&
         !allowDelete
       );
@@ -12736,23 +14134,35 @@ function hasPendingStreamingWritebackGoal(
   return false;
 }
 
-function getPendingRequiredWriteToolNames(
+export function getPendingRequiredWriteToolNames(
   operationGoals: MissionOperationGoals,
   requiredWriteTools: string[],
 ): string[] {
   const completed = new Set(operationGoals.completedTools);
   return requiredWriteTools.filter((toolName) => {
-    if (completed.has(toolName)) {
-      return false;
-    }
-
     const goals = TOOL_GOALS[toolName] ?? [];
     if (goals.length === 0) {
+      return !completed.has(toolName);
+    }
+    if (
+      goals.some(
+        (goal) =>
+          operationGoals.goals[goal] === "pending" ||
+          operationGoals.goals[goal] === "failed",
+      )
+    ) {
       return true;
     }
-
-    return goals.some((goal) => operationGoals.goals[goal] === "pending");
+    return false;
   });
+}
+
+function isBroadUnscopedMutationPrompt(prompt: string): boolean {
+  const intent = classifyMissionIntent(prompt);
+  return (
+    intent.explicitMutation &&
+    isBroadUnscopedVaultMutation(intent.autonomyScope)
+  );
 }
 
 function getRequiredWriteToolNames(
@@ -12796,8 +14206,11 @@ function getRequiredWriteToolNames(
   const requiredToolNames: string[] = [];
   const wholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
   const noteOutputIntent = missionIntent.noteOutput;
+  const specializedDesignWorkflow =
+    hasDesignIntent(prompt) || hasReviseDesignIntent(prompt);
 
   const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
+  const hasCurrentMutationTarget = hasExplicitCurrentNoteMutationIntent(prompt);
 
   if (streamingWritebackKind === "edit") {
     requiredToolNames.push("prepare_edit_current_section");
@@ -12829,27 +14242,33 @@ function getRequiredWriteToolNames(
 
   if (
     (hasAppendIntent(prompt) || noteOutputIntent) &&
-    !preferPathTarget &&
+    (!preferPathTarget || hasCurrentMutationTarget) &&
     !wholeNoteReplace &&
     !hasSectionAppendIntent(prompt) &&
     !hasHighlightIntent(prompt) &&
     !hasRestoreIntent(prompt) &&
     !hasEditIntent(prompt) &&
     !hasDeleteIntent(prompt) &&
+    !specializedDesignWorkflow &&
     streamingWritebackKind !== "append"
   ) {
     requiredToolNames.push("append_to_current_file");
   }
 
-  if (hasAppendIntent(prompt) && hasPathTargetIntent(prompt)) {
+  if (hasAppendIntent(prompt) && preferPathTarget) {
     requiredToolNames.push("append_file");
   }
 
-  if (hasReplaceIntent(prompt) && !preferPathTarget && streamingWritebackKind !== "replace") {
+  if (
+    hasReplaceIntent(prompt) &&
+    !specializedDesignWorkflow &&
+    (!preferPathTarget || hasCurrentMutationTarget) &&
+    streamingWritebackKind !== "replace"
+  ) {
     requiredToolNames.push("replace_current_file");
   }
 
-  if (hasReplaceIntent(prompt) && hasPathTargetIntent(prompt)) {
+  if (hasReplaceIntent(prompt) && preferPathTarget && !specializedDesignWorkflow) {
     requiredToolNames.push("replace_file");
   }
 
@@ -12904,7 +14323,7 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("retitle_current_file");
   } else if (
     !hasDesignIntent(prompt) &&
-    !preferPathTarget &&
+    (!preferPathTarget || hasExplicitCurrentNoteMutationIntent(prompt)) &&
     (isExplicitVisibleFileRenameIntent(prompt) ||
       (isVisibleTitleRenameIntent(prompt) && isTitleOnlyIntent(prompt)))
   ) {
@@ -12915,7 +14334,11 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("create_folder");
   }
 
-  if (hasCreateFileIntent(prompt) && !hasTemplateIntent(prompt)) {
+  if (
+    hasCreateFileIntent(prompt) &&
+    !hasTemplateIntent(prompt) &&
+    !specializedDesignWorkflow
+  ) {
     requiredToolNames.push("create_file");
   }
 
@@ -13087,7 +14510,7 @@ function buildFallbackWebSearchQuery(prompt: string): string {
 }
 
 function getLatestToolOutput(
-  messages: ModelChatMessage[],
+  messages: readonly ModelChatMessage[],
   toolName: string,
 ): unknown {
   for (const message of [...messages].reverse()) {
@@ -13288,9 +14711,9 @@ function buildUnavailableToolCorrectionPrompt(
   const toolNames = tools?.map((tool) => tool.function.name) ?? [];
 
   return [
-    "You requested a write tool that is not available for this mission.",
-    `Available tools are: ${toolNames.join(", ") || "none"}.`,
-    "Choose an available write tool if one fits. Otherwise provide a concise final answer explaining what user intent is required.",
+    "Your prior tool call is not available at the current authoritative MissionGraph frontier.",
+    `The only available tools for this step are: ${toolNames.join(", ") || "none"}.`,
+    "Return exactly one corrected call using one listed schema. If no tool is listed, provide only the final answer or a concise blocker.",
   ].join(" ");
 }
 
@@ -13733,10 +15156,12 @@ function getMissingRequiredWebToolNames({
   const minFetchedSources = researchPlan?.sourceRequirements.minFetchedSources ?? 0;
   const fetchedSourceCount = countFetchedWebSources(missionEvidence);
   const requiresWeb =
-    hasWebSearchIntent(prompt) ||
-    (researchPlan !== null &&
-      researchPlan !== undefined &&
-      (researchPlan.mode === "deep_web" || researchPlan.mode === "deep_hybrid"));
+    researchPlan?.mode !== "deep_vault" &&
+    (hasWebSearchIntent(prompt) ||
+      (researchPlan !== null &&
+        researchPlan !== undefined &&
+        (researchPlan.mode === "deep_web" ||
+          researchPlan.mode === "deep_hybrid")));
 
   if (!requiresWeb) {
     return [];
@@ -13879,6 +15304,13 @@ function getStreamingWritebackKind(
     return null;
   }
 
+  // Section insertion has its own heading-bound, backup-producing tool. A
+  // generic streamed append would widen authority to the entire current note
+  // and could bypass the requested section boundary.
+  if (hasSectionAppendIntent(prompt)) {
+    return null;
+  }
+
   if (hasExplicitStreamToCurrentNoteIntent(prompt)) {
     return hasReplaceIntent(prompt) || isCurrentNoteReplaceResetPrompt(prompt)
       ? "replace"
@@ -13922,6 +15354,53 @@ function getStreamingWritebackKind(
   return null;
 }
 
+function getReflexMissionGraphReadToolNames(
+  reflex: ReflexDecision | null | undefined,
+): string[] {
+  if (!reflex?.applied) return [];
+  switch (reflex.label) {
+    case "semantic_vault_search":
+      return ["semantic_search_notes", "search_markdown_files"];
+    case "vault_search":
+      return ["search_markdown_files", "read_markdown_files"];
+    case "graph_context":
+      return ["get_note_graph_context", "find_related_notes"];
+    case "word_count":
+      return ["count_words"];
+    default:
+      return [];
+  }
+}
+
+function getRunPlanMissionGraphReadToolNames(
+  runPlan: Pick<RunPlan, "route" | "slowPathReason">,
+  deterministicExpectedTools: readonly string[],
+  reflex: ReflexDecision | null | undefined,
+): string[] {
+  // Explicit lexical routing and deterministic evidence contracts outrank the
+  // advisory reflex. Promoting both into required graph nodes creates proof
+  // debt for unrelated tools and can prevent an otherwise complete run from
+  // reaching its final node.
+  if (deterministicExpectedTools.length > 0) return [];
+  if (
+    runPlan.route === "prefetched_vault_answer" ||
+    runPlan.route === "prefetched_vault_writeback"
+  ) {
+    return [];
+  }
+  if (runPlan.slowPathReason === "needs_graph_context") {
+    return ["get_note_graph_context"];
+  }
+  if (runPlan.slowPathReason === "needs_vault_context") {
+    return getReflexMissionGraphReadToolNames(reflex);
+  }
+  // A reflex is advisory. On direct/write-only/model-planning routes, turning
+  // an unrelated embedding match into a required graph node creates proof
+  // debt for work the route never selected (and can prevent the authorized
+  // write from becoming ready). Only explicit slow paths above may promote it.
+  return [];
+}
+
 function classifyMissionIntent(prompt: string): MissionIntent {
   const generated = analyzeGeneratedOutputPrompt(prompt);
   const explicitGitHubCatalogMutation =
@@ -13959,11 +15438,12 @@ function classifyMissionIntent(prompt: string): MissionIntent {
     explicitDesignWrite ||
     explicitHighlightWrite ||
     explicitRestoreWrite;
+  const explicitPathDelete = hasDeletePathIntent(prompt);
   const explicitDelete =
     !explicitGitHubCatalogMutation &&
-    resetAction.kind !== "replace_current_note" &&
+    (resetAction.kind !== "replace_current_note" || explicitPathDelete) &&
     (!codeWorkflowIntent || codeWorkflowNoteTarget) &&
-    (hasDeleteIntent(prompt) || hasDeletePathIntent(prompt));
+    (hasDeleteIntent(prompt) || explicitPathDelete);
   const explicitMutation =
     explicitGitHubCatalogMutation ||
     codeWorkflowMutation ||
@@ -14446,7 +15926,7 @@ function hasChatOnlyResponseIntent(prompt: string): boolean {
 }
 
 function hasWordCountIntent(prompt: string): boolean {
-  return /\b(word\s*count|count\s+(?:the\s+)?words?|how\s+many\s+words?|length\s+check|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(
+  return /\b(count_words|word\s*count|count\s+(?:the\s+)?words?|how\s+many\s+words?|length\s+check|verify\s+(?:the\s+)?(?:word\s+)?length)\b/i.test(
     prompt,
   );
 }
@@ -14823,13 +16303,18 @@ function hasCreateFileIntent(prompt: string): boolean {
     return false;
   }
 
-  return /\b(create|creating|new|make)\b[\s\S]{0,100}\b(note|file|md|vault)\b|\b(note|file|md|vault)\b[\s\S]{0,100}\b(create|creating|new|make)\b|\.md\b/i.test(
-    prompt,
+  // Require create/new/make to bind to a file/note target. A bare ".md" path
+  // mention plus unrelated "new" wording (e.g. "new findings") must not invent
+  // a create_file mission node ahead of append/stream writeback.
+  return (
+    /\b(create|creating|make)\b[\s\S]{0,100}\b(note|file|md|vault|markdown)\b|\b(note|file|md|vault|markdown)\b[\s\S]{0,100}\b(create|creating|make)\b|\bnew\s+(?:markdown\s+)?(?:note|file)\b|\b(?:create|creating|make|new)\b[\s\S]{0,120}\.md\b/i.test(
+      prompt,
+    )
   );
 }
 
 function hasCreateFolderIntent(prompt: string): boolean {
-  return /\b(create|creating|new|make)\b[\s\S]{0,100}\b(folder|directory)\b|\b(folder|directory)\b[\s\S]{0,100}\b(create|creating|new|make)\b/i.test(
+  return /\b(?:create|creating|make)\s+(?:(?:a|the)\s+)?(?:(?:new)\s+)?(?:folder|directory)\b|\bnew\s+(?:folder|directory)\b/i.test(
     prompt,
   );
 }
@@ -14847,12 +16332,142 @@ function hasResearchPackIntent(prompt: string): boolean {
 }
 
 function hasExplicitNonCurrentPathTarget(prompt: string): boolean {
-  return (
-    !hasCurrentNoteTarget(prompt) &&
-    /(?:^|[\s"'`])[\w .@()-]+\/[\w .@()/-]+|\.md\b|\b(vault file|vault folder|file named|note named|named file|named note|another file|specific file|existing file)\b/i.test(
-      prompt,
-    )
+  const clauses = prompt.split(
+    /(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu,
   );
+  const mutation =
+    /\b(?:append|save|write|update|add|insert|copy|paste|put|replace|rewrite|reset|overwrite|create|make|move|relocate|rename|delete|remove|trash)\b/iu;
+  const nonCurrentTarget =
+    /[A-Za-z0-9.@()[\]_-]+(?:\/[A-Za-z0-9.@()[\]_-]+)+(?:\.md)?\b|\b[A-Za-z0-9][A-Za-z0-9 .@()_-]{0,100}\.md\b|\b(?:vault\s+(?:file|folder)|(?:file|note|folder|directory)\s+(?:named|called)|named\s+(?:file|note|folder|directory)|another\s+(?:file|note)|specific\s+(?:file|note|folder)|existing\s+(?:markdown\s+)?(?:file|note))\b/iu;
+
+  return clauses.some((clause) => {
+    const mutationMatch = mutation.exec(clause);
+    const targetMatch = nonCurrentTarget.exec(clause);
+    return Boolean(
+      mutationMatch &&
+        targetMatch &&
+        (mutationMatch.index ?? 0) < (targetMatch.index ?? 0),
+    );
+  });
+}
+
+function hasMermaidCreateThenReviseIntent(prompt: string): boolean {
+  return (
+    hasMermaidDesignIntent(prompt) &&
+    hasReviseDesignIntent(prompt) &&
+    /\b(create|add|insert|draw|make|build)\b/iu.test(prompt)
+  );
+}
+
+export function getExplicitMermaidWorkflowToolNames(prompt: string): string[] {
+  if (!hasReviseDesignIntent(prompt) || !hasMermaidDesignIntent(prompt)) {
+    return [];
+  }
+  return hasMermaidCreateThenReviseIntent(prompt)
+    ? [
+        "read_mermaid_block",
+        "upsert_mermaid_block",
+        "read_mermaid_block",
+        "upsert_mermaid_block",
+        "read_mermaid_block",
+      ]
+    : ["read_mermaid_block", "upsert_mermaid_block"];
+}
+
+export function extractExplicitMermaidReadBinding(
+  prompt: string,
+): {
+  path: string;
+  selector: { kind: "heading"; heading: string };
+} | null {
+  const pathMatches = [
+    ...prompt.matchAll(
+      /\bexact\s+vault-relative\s+path\s+["']([^"'\r\n]+\.md)["']/giu,
+    ),
+  ];
+  const headingMatches = [
+    ...prompt.matchAll(
+      /\bexact\s+heading\s+["']([^"'\r\n]+)["']/giu,
+    ),
+  ];
+  if (pathMatches.length !== 1 || headingMatches.length !== 1) {
+    return null;
+  }
+  const path = pathMatches[0]?.[1]?.trim() ?? "";
+  const heading = headingMatches[0]?.[1]?.trim() ?? "";
+  if (
+    !path ||
+    !heading ||
+    path.includes("\\") ||
+    path.startsWith("/") ||
+    /(^|\/)\.\.(?:\/|$)/u.test(path)
+  ) {
+    return null;
+  }
+  return {
+    path,
+    selector: { kind: "heading", heading },
+  };
+}
+
+function getExplicitSemanticRetrievalWorkflowToolNames(prompt: string): string[] {
+  if (!hasExplicitSemanticRetrievalIntent(prompt)) {
+    return [];
+  }
+  return ["semantic_search_notes", "read_markdown_files"];
+}
+
+function hasExplicitSemanticRetrievalIntent(prompt: string): boolean {
+  return /\b(?:semantic\s+(?:retrieval|search)|semantic_search_notes)\b/iu.test(
+    prompt,
+  );
+}
+
+function hasExplicitOrderedWorkflowIntent(prompt: string): boolean {
+  return (
+    hasExplicitSemanticRetrievalIntent(prompt) ||
+    getExplicitCodeToolNames(prompt).length > 0 ||
+    getExplicitVaultCrudWorkflowToolNames(prompt).length > 0 ||
+    getExplicitGitHubCatalogMutationToolNames(prompt).length > 0 ||
+    getGitHubCatalogReadToolNames(prompt).length > 0 ||
+    (hasReviseDesignIntent(prompt) &&
+      (hasMermaidDesignIntent(prompt) ||
+        hasCanvasDesignIntent(prompt) ||
+        hasSvgDesignIntent(prompt)))
+  );
+}
+
+function getExplicitVaultCrudWorkflowToolNames(prompt: string): string[] {
+  if (
+    isVisibleTitleRenameIntent(prompt) &&
+    hasExplicitCurrentNoteMutationIntent(prompt) &&
+    // This exact frontier is only for the explicit rename -> move lifecycle.
+    // A rename embedded in research must retain its graph/web read nodes; using
+    // rename alone as the discriminator previously collapsed those missions to
+    // rename + append and made their evidence obligations impossible.
+    hasMovePathIntent(prompt)
+  ) {
+    return [
+      "rename_current_file",
+      ...(hasMovePathIntent(prompt) ? ["move_path"] : []),
+      ...(hasAppendIntent(prompt) ? ["append_to_current_file"] : []),
+    ];
+  }
+  if (
+    !hasCreateFileIntent(prompt) ||
+    !hasMovePathIntent(prompt) ||
+    !hasDeletePathIntent(prompt)
+  ) {
+    return [];
+  }
+  return [
+    ...(hasCreateFolderIntent(prompt) ? ["create_folder"] : []),
+    "create_file",
+    ...(hasAppendIntent(prompt) ? ["append_file"] : []),
+    ...(hasReplaceIntent(prompt) ? ["replace_file"] : []),
+    "move_path",
+    "delete_path",
+  ];
 }
 
 function hasExplicitNonCurrentNoteWriteTarget(prompt: string): boolean {
@@ -14914,24 +16529,42 @@ function hasNoteOutputIntent(prompt: string): boolean {
 }
 
 function hasAppendIntent(prompt: string): boolean {
+  // Scope restrictions constrain *where* an already-requested mutation may
+  // occur; they are not a second append instruction. Without this removal,
+  // "Create X.md ... Only write to that requested file" manufactures an
+  // append_file node ahead of create_file and deadlocks the exact graph.
+  const intentPrompt = prompt.replace(
+    /\b(?:only|just)\s+(?:write|save|put)\s+(?:to|in|into)\s+(?:that|the)\s+(?:requested|specified|named|target(?:ed)?)\s+(?:file|note|path)\b/giu,
+    " ",
+  );
   return /\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,80}\b(note|file|markdown|vault|page|document)\b|\b(note|file|markdown|vault|page|document)\b[\s\S]{0,80}\b(append|save|write|update|add|insert|copy|paste|put)\b|\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,120}\.md\b/i.test(
-    prompt,
+    intentPrompt,
   );
 }
 
 function hasReplaceIntent(prompt: string): boolean {
+  const positivePrompt = prompt
+    .replace(
+      /\b(?:do\s+not|don't|never)\s+(?:rewrite|replace|reset|overwrite)\b[^.;\n]*/giu,
+      " ",
+    )
+    .replace(
+      /\bwithout\s+(?:rewriting|replacing|resetting|overwriting)\b[^.;\n]*/giu,
+      " ",
+    );
   return (
-    isCurrentNoteReplaceResetPrompt(prompt) ||
-    hasWholeNoteRevisionIntent(prompt) ||
+    isCurrentNoteReplaceResetPrompt(positivePrompt) ||
+    hasWholeNoteRevisionIntent(positivePrompt) ||
     /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\breplace\s+(?:the\s+)?existing\s+contents?\b/i.test(
-      prompt,
-    ) || hasClearPageAndWriteIntent(prompt)
+      positivePrompt,
+    ) || hasClearPageAndWriteIntent(positivePrompt)
   );
 }
 
 function hasWholeNoteReplaceIntent(prompt: string): boolean {
   if (
-    isCurrentNoteReplaceResetPrompt(prompt) ||
+    (isCurrentNoteReplaceResetPrompt(prompt) &&
+      hasExplicitCurrentNoteMutationIntent(prompt)) ||
     hasWholeNoteRevisionIntent(prompt)
   ) {
     return true;
@@ -14976,6 +16609,16 @@ function hasWholeNoteRevisionIntent(prompt: string): boolean {
     return false;
   }
 
+  if (
+    hasAppendIntent(prompt) &&
+    !/\b(?:rewrite|replace|reset|overwrite|whole|entire)\b/iu.test(prompt)
+  ) {
+    // Append-first authority: a generic request to "expand" research or
+    // related-note coverage must not become whole-note replacement merely
+    // because the destination is the current note.
+    return false;
+  }
+
   const revisionVerb =
     /\b(edit(?:ing)?|revise|revising|revision|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail)\b/i;
   const wholeTextTarget =
@@ -14997,21 +16640,45 @@ function hasEditIntent(prompt: string): boolean {
 }
 
 function hasDeleteIntent(prompt: string): boolean {
-  if (isCurrentNoteReplaceResetPrompt(prompt)) {
+  if (
+    isCurrentNoteReplaceResetPrompt(prompt) &&
+    hasExplicitCurrentNoteMutationIntent(prompt)
+  ) {
     return false;
   }
 
-  return /\b(delete|remove|trash)\b[\s\S]{0,80}\b(?:current|this|active|whole|entire)\s+(?:note|file)\b|\b(?:current|this|active|whole|entire)\s+(?:note|file)\b[\s\S]{0,80}\b(delete|remove|trash)\b/i.test(
-    prompt,
-  );
+  return prompt
+    .split(/(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu)
+    .some(
+      (clause) =>
+        /\b(?:delete|remove|trash)\b/iu.test(clause) &&
+        /\b(?:current|this|active|whole|entire)\s+(?:note|file)\b|\b(?:note|file)\b[\s\S]{0,40}\b(?:current|this|active|whole|entire)\b/iu.test(
+          clause,
+        ),
+    );
 }
 
 function hasDeletePathIntent(prompt: string): boolean {
-  if (isCurrentNoteReplaceResetPrompt(prompt)) {
+  const explicitMarkdownDelete = extractMarkdownPathMentions(prompt).some(
+    (path) =>
+      new RegExp(
+        String.raw`\b(?:delete|remove|trash)\b[\s\S]{0,160}${path.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`,
+        "iu",
+      ).test(prompt),
+  );
+  if (
+    isCurrentNoteReplaceResetPrompt(prompt) &&
+    !hasExplicitNonCurrentPathTarget(prompt) &&
+    !explicitMarkdownDelete
+  ) {
     return false;
   }
 
-  return /\b(delete|remove|trash)\b/i.test(prompt) && hasPathTargetIntent(prompt);
+  return (
+    /\b(delete|remove|trash)\b/i.test(prompt) &&
+    hasPathTargetIntent(prompt) &&
+    (hasExplicitNonCurrentPathTarget(prompt) || explicitMarkdownDelete)
+  );
 }
 
 function hasMovePathIntent(prompt: string): boolean {
@@ -15059,6 +16726,9 @@ function hasMovePathIntent(prompt: string): boolean {
 }
 
 function hasWebSearchIntent(prompt: string): boolean {
+  if (hasExplicitNoWebIntent(prompt)) {
+    return false;
+  }
   if (hasSimpleDateTimePrompt(prompt)) {
     return false;
   }
@@ -15083,11 +16753,23 @@ function hasWebSearchIntent(prompt: string): boolean {
     return true;
   }
 
+  if (hasExplicitPublicWebSignal(prompt)) {
+    return true;
+  }
+
   if (hasStaticGenerationIntent(prompt) && !hasFetchedWebSourceIntent(prompt)) {
     return false;
   }
 
   if (hasFolderContentQuestionIntent(prompt)) {
+    return false;
+  }
+
+  // A path component such as `crud-source-123.md` must not turn a local
+  // create/read/replace/move/trash workflow into public-web research. Strong
+  // public-network signals were accepted above, so a remaining exact Markdown
+  // path is authoritative local scope.
+  if (hasSpecificFileReadIntent(prompt)) {
     return false;
   }
 
@@ -16109,6 +17791,7 @@ function buildReceipt(
   const bytesDeleted = getNumber(output.bytesDeleted);
   const affectedCount = getNumber(output.affectedCount);
   const matchCount = getNumber(output.matchCount);
+  const readback = parseLegacyReceiptReadback(output.readback);
   const operation = getReceiptOperation(toolName);
   const messageParts = [`${operation} ${path || "current note"}`];
 
@@ -16142,8 +17825,137 @@ function buildReceipt(
     bytesWritten,
     bytesDeleted,
     affectedCount: affectedCount ?? matchCount,
+    readback,
     output,
     message: messageParts.join("; "),
+  };
+}
+
+function buildMissionGraphFrontierTurnContext(
+  stepTools: readonly ModelToolDefinition[],
+  observedBinding: string | null = null,
+): string {
+  const names = stepTools.map((tool) => tool.function.name);
+  return [
+    "AUTHORITATIVE MISSIONGRAPH TOOL FRONTIER FOR THIS TURN:",
+    names.join(", "),
+    "Call one of these exact tool names now.",
+    "Do not call tools mentioned in earlier context unless they appear in this frontier.",
+    "Use the provided JSON schema exactly; do not infer another tool name or partial arguments.",
+    observedBinding ?? "",
+  ].join(" ");
+}
+
+export function getRestorableCompletedGraphToolNames(
+  completedGraphToolNames: Iterable<string>,
+  requiredToolNames: readonly string[],
+): string[] {
+  const required = new Set(requiredToolNames);
+  return [...new Set(completedGraphToolNames)].filter(
+    (toolName) =>
+      required.has(toolName) &&
+      !WRITE_TOOL_NAMES.has(toolName) &&
+      !DELETE_TOOL_NAMES.has(toolName),
+  );
+}
+
+export function constrainOrchestratedHandoffTools(
+  tools: ModelToolDefinition[],
+  prompt: string,
+  orchestratorContext?: string,
+): ModelToolDefinition[] {
+  if (!orchestratorContext?.trim() || hasWordCountIntent(prompt)) {
+    return tools;
+  }
+  // A Researcher handoff already gives the Lead a bounded proof plan. Do not
+  // expose an unrelated metadata verifier that can manufacture a new graph
+  // dependency (and terminal blocker) when the user never asked for length.
+  return removeToolDefinition(tools, "count_words");
+}
+
+/**
+ * Re-presents an exact, successful read result when the ready mutation schema
+ * requires that value. This does not execute or repair the mutation: the model
+ * must still emit every mutation argument explicitly on the ready frontier.
+ */
+export function buildObservedMissionGraphFrontierBinding(
+  messages: readonly ModelChatMessage[],
+  stepTools: readonly ModelToolDefinition[],
+  durableReceipts: readonly AgentRunReceipt[] = [],
+): string | null {
+  const names = stepTools.map((tool) => tool.function.name);
+  if (names.length !== 1 || names[0] !== "upsert_mermaid_block") {
+    return null;
+  }
+  const readback = getLatestToolOutput(messages, "read_mermaid_block");
+  const latestMermaidReceipt = [...durableReceipts]
+    .reverse()
+    .find((receipt) => receipt.toolName === "upsert_mermaid_block");
+  const receiptOutput = isRecord(latestMermaidReceipt?.output)
+    ? latestMermaidReceipt.output
+    : null;
+  const baseHash = isRecord(readback)
+    ? getString(readback.sha256)
+    : latestMermaidReceipt?.readback?.observedRevision;
+  const path = isRecord(readback)
+    ? getString(readback.path)
+    : latestMermaidReceipt?.path ?? latestMermaidReceipt?.resource?.path;
+  if (!baseHash || !/^sha256:[a-f0-9]{64}$/u.test(baseHash) || !path) {
+    return null;
+  }
+  const selectorValue = isRecord(readback)
+    ? readback.selector
+    : receiptOutput?.selector;
+  const selector = isRecord(selectorValue)
+    ? stableStringify(selectorValue)
+    : null;
+  return [
+    "OBSERVED READBACK BINDING FROM THE COMPLETED DEPENDENCY:",
+    `path=${JSON.stringify(path)};`,
+    `baseHash=${JSON.stringify(baseHash)};`,
+    selector ? `selector=${selector}.` : "",
+    "Use these exact observed values in your explicit upsert_mermaid_block call; supply the intended Mermaid text yourself.",
+  ].filter(Boolean).join(" ");
+}
+
+function insertMissionGraphFrontierTurnContext(
+  messages: readonly ModelChatMessage[],
+  stepTools: readonly ModelToolDefinition[],
+  observedBinding: string | null = null,
+): ModelChatMessage[] {
+  const insertAt = Math.max(0, messages.length - 1);
+  return [
+    ...messages.slice(0, insertAt),
+    {
+      role: "system",
+      content: buildMissionGraphFrontierTurnContext(stepTools, observedBinding),
+    },
+    ...messages.slice(insertAt),
+  ];
+}
+
+function parseLegacyReceiptReadback(
+  value: unknown,
+): ActionReceipt["readback"] | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const status = value.status;
+  const checkedAt = getString(value.checkedAt);
+  if (
+    (status !== "verified" && status !== "not_required") ||
+    !checkedAt ||
+    !Number.isFinite(Date.parse(checkedAt))
+  ) {
+    return undefined;
+  }
+  const observedRevision = getString(value.observedRevision);
+  const observedFingerprint = getString(value.observedFingerprint);
+  return {
+    status,
+    checkedAt,
+    ...(observedRevision ? { observedRevision } : {}),
+    ...(observedFingerprint ? { observedFingerprint } : {}),
   };
 }
 
@@ -16704,7 +18516,7 @@ async function streamCurrentNoteWriteback({
       events.onFinalDone?.();
       events.onAssistantMessageDone?.();
       events.onStatus?.("Verified writeback complete.");
-      return writer.buildReceipt(false);
+      return await writer.buildReceipt(false);
     }
 
     let retryUsed = false;
@@ -16827,14 +18639,14 @@ async function streamCurrentNoteWriteback({
       );
     }
     events.onStatus?.("Streaming writeback complete.");
-    return writer.buildReceipt(false);
+    return await writer.buildReceipt(false);
   } catch (error) {
     await writer.finish();
     events.onFinalDone?.();
     events.onAssistantMessageDone?.();
 
     if (writer.hasWritableContent()) {
-      const receipt = writer.buildReceipt(true);
+      const receipt = await writer.buildReceipt(true);
       onPartialReceipt?.(receipt);
       events.onReceipt?.(receipt);
       events.onStatus?.(
@@ -16883,12 +18695,13 @@ function buildStreamingWritebackPrompt(
     ? [
         "PLUGIN BEHAVIOR (do not re-implement):",
         "- The plugin appends/replaces this markdown into the active note.",
-        "- If the active note is a placeholder (Untitled / Untitled N), the plugin renames the file from your leading H1 after writeback.",
+        "- Your leading H1 is title metadata: the plugin removes it from the note body and renames a placeholder file (Untitled / Untitled N) from it after writeback.",
         "- Do not call rename_current_file, retitle_current_file, or any tool during this writeback turn.",
       ].join("\n")
     : [
         "PLUGIN BEHAVIOR (do not re-implement):",
         "- The plugin appends/replaces this markdown into the active note.",
+        "- Your leading H1 is title metadata and is not stored as a second heading in the note body.",
         "- Do not rename the file; the note already has a real title.",
         "- Do not call rename_current_file, retitle_current_file, or any tool during this writeback turn.",
       ].join("\n");
@@ -17308,6 +19121,7 @@ async function requestWordCountCorrection({
     think: undefined,
     options,
     abortSignal,
+    evidencePhase: "retry",
   };
   const requestChars = measureSerializedChars(request);
   const startedAt = nowMs();
@@ -17400,6 +19214,7 @@ async function repairEnglishOnlyOutput({
     think,
     options: repairOptions,
     abortSignal,
+    evidencePhase: "retry",
   };
   const requestChars = measureSerializedChars(request);
   const startedAt = nowMs();
@@ -17464,7 +19279,11 @@ async function chatWithThinkingFallback({
 
     onThinkingUnsupported();
     return withModelWaitStatus(
-      () => modelClient.chat({ ...request, think: undefined }),
+      () => modelClient.chat({
+        ...request,
+        think: undefined,
+        evidencePhase: "retry",
+      }),
       events,
       "word-count correction retry",
     );
@@ -17569,11 +19388,19 @@ async function createStreamingNoteWriter({
     `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}`;
   const getLatestAppendBaseSource = () =>
     (file && toolContext.getCurrentMarkdownContent?.(file)) ?? current;
-  const makeRetitledAppendBase = (title: string) =>
-    makeAppendBase(retitleNoteMarkdown(getLatestAppendBaseSource(), title));
+  const makeTitleMetadataAppendBase = () => {
+    const source = getLatestAppendBaseSource();
+    const heading = getFirstH1(source);
+    return makeAppendBase(
+      heading && isGenericBasename(heading.text)
+        ? removeFirstH1(source)
+        : source,
+    );
+  };
   let baseContent = kind === "append" ? makeAppendBase(current) : "";
   let baseContentChanged = false;
-  let leadingTitleBuffer: string | null = kind === "append" ? "" : null;
+  let leadingTitleBuffer: string | null = kind === "edit" ? null : "";
+  let extractedLeadingTitle: string | null = null;
   const backupPath =
     kind === "replace" && file
       ? await backupActiveFile(toolContext, file, current)
@@ -17609,7 +19436,7 @@ async function createStreamingNoteWriter({
     toolContext.setCurrentMarkdownContent?.(target, content);
     await toolContext.app.vault.modify(target, content);
   };
-  const consumeAppendTitleIfPresent = (
+  const consumeLeadingTitleIfPresent = (
     delta: string,
     force = false,
   ): string => {
@@ -17625,8 +19452,12 @@ async function createStreamingNoteWriter({
 
     leadingTitleBuffer = null;
     if (titleResult.status === "title") {
-      baseContent = makeRetitledAppendBase(titleResult.title);
-      baseContentChanged = true;
+      extractedLeadingTitle = titleResult.title;
+      if (kind === "append") {
+        const nextBaseContent = makeTitleMetadataAppendBase();
+        baseContentChanged ||= nextBaseContent !== baseContent;
+        baseContent = nextBaseContent;
+      }
       return titleResult.body;
     }
 
@@ -17660,7 +19491,7 @@ async function createStreamingNoteWriter({
 
   return {
     push(delta: string) {
-      const writableDelta = consumeAppendTitleIfPresent(delta);
+      const writableDelta = consumeLeadingTitleIfPresent(delta);
       if (!writableDelta) {
         return;
       }
@@ -17681,8 +19512,11 @@ async function createStreamingNoteWriter({
       if (kind === "append") {
         baseContent = makeAppendBase(getLatestAppendBaseSource());
         baseContentChanged = false;
+      }
+      if (kind !== "edit") {
         leadingTitleBuffer = "";
-        streamedContent = consumeAppendTitleIfPresent(content, true);
+        extractedLeadingTitle = null;
+        streamedContent = consumeLeadingTitleIfPresent(content, true);
       } else {
         streamedContent = content;
       }
@@ -17703,10 +19537,11 @@ async function createStreamingNoteWriter({
       }
       streamedContent = "";
       pendingChars = 0;
-      leadingTitleBuffer = kind === "append" ? "" : null;
+      leadingTitleBuffer = kind === "edit" ? null : "";
+      extractedLeadingTitle = null;
     },
     async finish(options: { force?: boolean } = {}) {
-      const trailingTitleContent = consumeAppendTitleIfPresent("", true);
+      const trailingTitleContent = consumeLeadingTitleIfPresent("", true);
       if (trailingTitleContent) {
         streamedContent += trailingTitleContent;
         pendingChars += trailingTitleContent.length;
@@ -17723,21 +19558,43 @@ async function createStreamingNoteWriter({
       }
       await flushChain;
     },
-    buildReceipt(partial: boolean): AgentRunReceipt {
+    async buildReceipt(partial: boolean): Promise<AgentRunReceipt> {
       const resolvedPath = file?.path ?? lazyCreatePath ?? "unknown";
       const operation =
         kind === "append" ? "append" : kind === "replace" ? "replace" : "edit";
       const bytesWritten =
         kind === "append" ? getByteLength(streamedContent) : getByteLength(render());
+      const target = await ensureFile();
+      const expectedContent = render();
+      const observedContent = await toolContext.app.vault.read(target);
+      if (observedContent !== expectedContent) {
+        throw new Error(
+          `Streamed ${operation} readback did not match the committed note content.`,
+        );
+      }
+      const checkedAt = (toolContext.now?.() ?? new Date()).toISOString();
+      const readback: ActionReceipt["readback"] = {
+        status: "verified",
+        checkedAt,
+        observedRevision: hashOperationInput({
+          path: resolvedPath,
+          content: observedContent,
+        }),
+        observedFingerprint: hashOperationInput(observedContent),
+      };
       const output = {
         path: resolvedPath,
         operation,
         backupPath,
         bytesWritten,
+        readback,
         streamed: true,
         partial,
         heading: section?.heading,
         level: section?.level,
+        ...(extractedLeadingTitle
+          ? { leadingTitle: extractedLeadingTitle }
+          : {}),
         ...(createReceiptPath ? { createdPath: createReceiptPath } : {}),
       };
 
@@ -17763,6 +19620,7 @@ async function createStreamingNoteWriter({
         path: resolvedPath,
         backupPath,
         bytesWritten: output.bytesWritten,
+        readback,
         output,
         message: messageParts.join("; "),
       };
@@ -18015,13 +19873,46 @@ export function ensureResearchSourceLoopBudget(
     ...loopBudgetPlan,
     toolStepBudget: Math.min(
       maxToolSteps,
-      Math.max(loopBudgetPlan.toolStepBudget, 2),
+      Math.max(loopBudgetPlan.toolStepBudget, minFetchedSources + 1),
     ),
     expectedTools: [
       ...new Set([
         ...loopBudgetPlan.expectedTools,
         "web_search",
         "web_fetch",
+      ]),
+    ],
+    stopWhenSatisfied: true,
+  };
+}
+
+export function ensureRequiredWriteLoopBudget(
+  loopBudgetPlan: LoopBudgetPlan,
+  requiredWriteTools: readonly string[],
+): LoopBudgetPlan {
+  const missingExpectedWrites = [...new Set(requiredWriteTools)].filter(
+    (toolName) => !loopBudgetPlan.expectedTools.includes(toolName),
+  );
+  if (missingExpectedWrites.length === 0) {
+    return loopBudgetPlan;
+  }
+  const maxToolSteps = Math.max(
+    0,
+    loopBudgetPlan.hardCap - loopBudgetPlan.finalizationReserve,
+  );
+  return {
+    ...loopBudgetPlan,
+    toolStepBudget: Math.min(
+      maxToolSteps,
+      // Reserve one schema-qualified correction turn in addition to the write
+      // itself. Otherwise an early prose answer on the last read step makes a
+      // ready authoritative mutation node unreachable.
+      loopBudgetPlan.toolStepBudget + missingExpectedWrites.length + 1,
+    ),
+    expectedTools: [
+      ...new Set([
+        ...loopBudgetPlan.expectedTools,
+        ...missingExpectedWrites,
       ]),
     ],
     stopWhenSatisfied: true,
@@ -18035,6 +19926,60 @@ function isMissionGraphCapacityError(error: unknown): boolean {
     (error as { missionGraphStartCode?: unknown }).missionGraphStartCode ===
       "budget_exhausted"
   );
+}
+
+export function extractExactMarkdownReplacementPayload(
+  prompt: string,
+): string | null {
+  const match =
+    /\bexactly[ \t]+(?:this|the[ \t]+following)[ \t]+markdown[ \t]*:[ \t]*\r?\n([\s\S]+)$/iu.exec(
+      prompt,
+    );
+  if (!match || match[1].length === 0) {
+    return null;
+  }
+  const fenced = /^```(?:markdown|md)?[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/iu.exec(
+    match[1],
+  );
+  return fenced ? fenced[1] : match[1];
+}
+
+const LITERAL_CONTENT_WRITE_TOOLS = new Set([
+  "append_to_current_file",
+  "replace_current_file",
+  "append_file",
+  "replace_file",
+  "create_file",
+]);
+
+export function validateRequiredLiteralWriteArguments(
+  prompt: string,
+  toolCall: ModelToolCall,
+): string | null {
+  if (!LITERAL_CONTENT_WRITE_TOOLS.has(toolCall.name)) {
+    return null;
+  }
+  const anchors = extractRequiredLiteralAnchors(prompt);
+  if (anchors.length === 0) {
+    return null;
+  }
+  const content =
+    typeof toolCall.arguments.text === "string"
+      ? toolCall.arguments.text
+      : typeof toolCall.arguments.content === "string"
+        ? toolCall.arguments.content
+        : null;
+  if (content === null) {
+    return null;
+  }
+  const normalizedContent = content.toLowerCase();
+  const missing = anchors.filter(
+    (anchor) => !normalizedContent.includes(anchor.toLowerCase()),
+  );
+  if (missing.length === 0) {
+    return null;
+  }
+  return `The ${toolCall.name} content is missing ${missing.length} literal value(s) explicitly required by the mission. Return one corrected call whose content preserves every requested literal exactly.`;
 }
 
 export function sanitizeAssistantContent(content: string): string {
@@ -18339,6 +20284,7 @@ function isRepairableFinalOutputProof(item: string): boolean {
     item === "limitations_section" ||
     item === "confidence_section" ||
     item === "unanswered_questions" ||
+    item.includes("open_evidence_conflicts") ||
     item.startsWith("subquestion_citation_coverage:") ||
     item.startsWith("verifier:citation_coverage:") ||
     item === "verifier:final_output" ||
@@ -18393,8 +20339,38 @@ function buildFinalOutputVerificationCorrectionPrompt(
   acceptance: MissionAcceptanceResult,
   rejectedCandidate: string,
   missionPrompt = "",
+  knownPassageIds: string[] = [],
+  plan: MissionPlan | null = null,
+  evidence: MissionEvidence[] = [],
 ): string {
   const requirePassageIds = shouldRequireClaimGrounding(missionPrompt);
+  const acceptedPassageIds = [
+    ...new Set(
+      knownPassageIds.filter((item) =>
+        /^source:[a-z0-9-]+:passage:\d+-\d+$/u.test(item),
+      ),
+    ),
+  ].slice(0, 16);
+  const missingCitationTaskIds = acceptance.missing.flatMap((item) => {
+    const match = /^verifier:citation_coverage:(.+)$/u.exec(item);
+    return match?.[1] ? [match[1]] : [];
+  });
+  const missingEvidenceIds = new Set(
+    (plan?.tasks ?? [])
+      .filter((task) => missingCitationTaskIds.includes(task.id))
+      .flatMap((task) => task.evidenceIds),
+  );
+  const missingPassageIds = [
+    ...new Set(
+      evidence
+        .filter((item) => missingEvidenceIds.has(item.id))
+        .flatMap((item) => [
+          ...(item.passageId ? [item.passageId] : []),
+          ...(item.passageIds ?? []),
+        ])
+        .filter((item) => acceptedPassageIds.includes(item)),
+    ),
+  ];
   const citationMissing = acceptance.missing.some(
     (item) =>
       item === "citation_url_coverage" ||
@@ -18410,6 +20386,14 @@ function buildFinalOutputVerificationCorrectionPrompt(
         ? "Cite exact source-scoped passage identifiers already present in the evidence context (source:<id>:passage:<start>-<end>). Every material claim must include at least one persisted passage id. Do not invent identifiers or rely on bare URLs alone."
         : "Cite the bound source URL or exact source-scoped passage identifiers already present in the evidence context. Ground each material claim to a persisted passage id."
       : "",
+    acceptedPassageIds.length > 0 &&
+    (requirePassageIds ||
+      acceptance.missing.some((item) => item.startsWith("verifier:citation_coverage:")))
+      ? `The complete accepted passage-id set is: ${acceptedPassageIds.join(", ")}. Use each applicable identifier exactly as written, on the same sentence as the claim it supports; when multiple fetched sources require coverage, cite every listed source at least once.`
+      : "",
+    missingPassageIds.length > 0
+      ? `Your rejected draft specifically omitted coverage for: ${missingPassageIds.join(", ")}. Preserve the supported draft content and add each omitted identifier to the exact material claim sentence supported by that passage.`
+      : "",
     acceptance.missing.some((item) => item.includes("open_evidence_conflicts"))
       ? "Resolve or explicitly acknowledge open evidence conflicts with a Limitations note before finalizing."
       : "",
@@ -18423,7 +20407,7 @@ function buildFinalOutputVerificationCorrectionPrompt(
       item.includes("claim_grounding:missing_quote") ||
       item.includes("claim_grounding:quote_"),
     )
-      ? "For quotation work, include at least one direct quote copied character-for-character from the cited passage. Every other quoted span must also appear verbatim in its cited passage; remove or paraphrase unsupported quotation marks. Paraphrased material claims still need persisted passage ids."
+      ? "For explicitly requested quotation work, include at least one direct quote copied character-for-character from the cited passage. Every other quoted span must also appear verbatim in its cited passage; remove or paraphrase unsupported quotation marks. Paraphrased material claims still need persisted passage ids."
       : "",
     "Return only the corrected final answer. Do not request tools or repeat this instruction.",
     `Rejected draft for revision:\n${truncateForTrace(rejectedCandidate, 6000)}`,
@@ -19027,37 +21011,109 @@ function elapsedMs(startedAt: number): number {
 }
 
 function extractTokenUsageFields(raw: unknown): Partial<AgentRunMetricEvent> {
-  const records = Array.isArray(raw) ? raw : [raw];
-  let promptTokens: number | undefined;
-  let completionTokens: number | undefined;
+  const usage = extractProviderTokenUsage(raw);
+  return usage.reported
+    ? {
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.totalTokens,
+      }
+    : {};
+}
 
-  for (const record of records) {
-    if (!isRecord(record)) {
+function getAcceptedMissionPassageIds(evidence: MissionEvidence[]): string[] {
+  return [
+    ...new Set(
+      evidence
+        .filter(
+          (item) =>
+            item.kind === "web_source" &&
+            item.usableSource === true &&
+            item.parserStatus === "parsed",
+        )
+        .flatMap((item) => [
+          ...(item.passageId ? [item.passageId] : []),
+          ...(item.passageIds ?? []),
+        ])
+        .filter((item) =>
+          /^source:[a-z0-9-]+:passage:\d+-\d+$/u.test(item),
+        ),
+    ),
+  ].slice(0, 16);
+}
+
+export function attachGroundedPassageCitations(
+  draft: string,
+  ledger: ClaimLedger,
+): { content: string; insertedPassageIds: string[] } {
+  const known = new Set(ledger.knownPassageIds);
+  const replacements: Array<{
+    start: number;
+    end: number;
+    text: string;
+    passageIds: string[];
+  }> = [];
+
+  for (const claim of ledger.claims) {
+    if (claim.status !== "grounded" || !claim.text.trim()) continue;
+    const passageIds = [
+      ...new Set(
+        claim.passageIds.filter(
+          (passageId) =>
+            known.has(passageId) && !claim.text.includes(passageId),
+        ),
+      ),
+    ];
+    if (passageIds.length === 0) continue;
+    const start = draft.indexOf(claim.text);
+    if (start < 0 || draft.indexOf(claim.text, start + claim.text.length) >= 0) {
       continue;
     }
 
-    const promptEvalCount = getNumber(record.prompt_eval_count);
-    const evalCount = getNumber(record.eval_count);
-
-    if (promptEvalCount !== undefined) {
-      promptTokens = promptEvalCount;
-    }
-
-    if (evalCount !== undefined) {
-      completionTokens = evalCount;
-    }
+    const citation = passageIds.map((passageId) => `[${passageId}]`).join(" ");
+    const punctuated = /[.!?]$/u.test(claim.text)
+      ? `${claim.text.slice(0, -1)} ${citation}${claim.text.slice(-1)}`
+      : `${claim.text} ${citation}`;
+    replacements.push({
+      start,
+      end: start + claim.text.length,
+      text: punctuated,
+      passageIds,
+    });
   }
 
-  const totalTokens =
-    promptTokens !== undefined || completionTokens !== undefined
-      ? (promptTokens ?? 0) + (completionTokens ?? 0)
-      : undefined;
-
+  const insertedPassageIds = [
+    ...new Set(replacements.flatMap((replacement) => replacement.passageIds)),
+  ];
+  let content = draft;
+  for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+    content =
+      content.slice(0, replacement.start) +
+      replacement.text +
+      content.slice(replacement.end);
+  }
   return {
-    promptTokens,
-    completionTokens,
-    totalTokens,
+    content,
+    insertedPassageIds,
   };
+}
+
+function buildPassageGroundedWritebackContract(passageIds: string[]): string {
+  return [
+    "Passage-grounded writeback contract:",
+    `Accepted passage identifiers: ${passageIds.join(", ")}.`,
+    "Return only the requested note markdown or one current-note write call containing that exact markdown.",
+    "Put at least one accepted passage identifier on the same sentence as every material claim it supports; do not place all identifiers only in a Sources footer.",
+    passageIds.length > 1
+      ? "Cover every accepted fetched source at least once, using each identifier exactly as written."
+      : "Use the accepted identifier exactly as written.",
+    "Required citation shape (replace only the angle-bracket claim text; copy each bracketed identifier literally):",
+    ...passageIds.map(
+      (passageId, index) =>
+        `- <material claim grounded in fetched passage ${index + 1}> [${passageId}]`,
+    ),
+    "Reuse factual terms from the fetched passage so lexical grounding can be checked. Do not invent identifiers, URLs, facts, or quotations.",
+  ].join("\n");
 }
 
 function measureSerializedChars(value: unknown): number {

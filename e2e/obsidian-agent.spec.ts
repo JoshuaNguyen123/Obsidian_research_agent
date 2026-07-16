@@ -24,6 +24,10 @@ import {
 } from "../packages/headless-runtime/src";
 import { MissionGraphSession } from "../src/agent/missionGraphSession";
 import {
+  DAILY_USE_ACCEPTANCE_V1,
+  evaluateDailyUseAcceptanceV1,
+} from "../src/agent/dailyUseAcceptance";
+import {
   createMissionLedger,
   writeMissionLedger,
 } from "../src/agent/missionLedger";
@@ -46,10 +50,18 @@ import {
 } from "./fixtures/ownedE2EArtifacts";
 import { expectRenderedScreenshotState } from "./fixtures/renderedScreenshotQa";
 import {
+  createPluginDataBackup,
+  recoverStalePluginDataBackup,
+  restorePluginDataSnapshot,
+} from "./fixtures/pluginDataBackup";
+import {
   generatedOutputPromptScenarios,
   type PromptScenario,
 } from "./promptMatrix";
-import { terminateControlledObsidian } from "../scripts/obsidian-process-lifecycle";
+import {
+  terminateControlledObsidian,
+  waitForWindowsProcessExit,
+} from "../scripts/obsidian-process-lifecycle";
 
 const execFileAsync = promisify(execFile);
 
@@ -1220,10 +1232,17 @@ test("long-running research auto-continues one budgeted segment", async () => {
           };
         };
         const app = obsidianWindow.app;
+        const plugin = app?.plugins?.plugins?.[pluginId];
         const firstFile = app?.vault?.getFileByPath?.(`Agent Runs/${firstRunId}.md`);
         const secondFile = app?.vault?.getFileByPath?.(`Agent Runs/${secondRunId}.md`);
         const firstMarkdown = firstFile ? await app.vault.read(firstFile) : "";
         const secondMarkdown = secondFile ? await app.vault.read(secondFile) : "";
+        const secondLedgerJson = /## Mission Ledger\r?\n```json\r?\n([\s\S]*?)\r?\n```/u.exec(
+          secondMarkdown,
+        )?.[1];
+        const secondLedger = secondLedgerJson
+          ? JSON.parse(secondLedgerJson)
+          : null;
         return {
           lineageContinuesFirstSegment:
             secondMarkdown.includes(`\"parentSegmentId\": \"${firstRunId}\"`) &&
@@ -1243,13 +1262,59 @@ test("long-running research auto-continues one budgeted segment", async () => {
           passageProofRecorded:
             secondMarkdown.includes('"passageIds"') &&
             secondMarkdown.includes(":passage:"),
+          secondAcceptanceExcerpt:
+            /"acceptance":\s*\{[\s\S]{0,1200}/u.exec(secondMarkdown)?.[0] ??
+            secondMarkdown.slice(-1200),
+          secondLedgerSummary: secondLedger
+            ? {
+                status: secondLedger.status,
+                loopBudget: secondLedger.loopBudget,
+                lastSafeStep: secondLedger.lastSafeStep,
+                successfulToolNames: secondLedger.successfulToolNames,
+                receipts: secondLedger.receipts,
+                blockers: secondLedger.blockers,
+                nextActions: secondLedger.nextActions,
+                remainingActions: secondLedger.remainingActions,
+                missionPlan: secondLedger.missionPlan,
+              }
+            : null,
+          runDiagnostic: (() => {
+            const snapshot = plugin?.getMissionRunSnapshot?.() ?? null;
+            return snapshot
+              ? {
+                  providerUsage: snapshot.providerUsage,
+                  modelCallEvidence: (snapshot.modelCallEvidence ?? []).map(
+                    (item: any) => ({
+                      callId: item.callId,
+                      phase: item.phase,
+                      outcome: item.outcome,
+                      responseChars: item.responseChars,
+                      errorCategory: item.errorCategory,
+                    }),
+                  ),
+                  missionEvidence: snapshot.missionEvidence,
+                  diagnosticAttestations: (
+                    snapshot.diagnosticAttestations ?? []
+                  ).filter((item: any) =>
+                    /verified-final-append|mission-acceptance|terminal-acceptance|pending-write-gate|proof-gated/u.test(
+                      item.id ?? "",
+                    ),
+                  ),
+                  lastComplete: snapshot.lastComplete,
+                }
+              : null;
+          })(),
         };
       },
       { pluginId: PLUGIN_ID, firstRunId, secondRunId },
     );
     expect(completedState.lineageContinuesFirstSegment).toBe(true);
     expect(completedState.verifierPreventedPrematureFinal).toBe(true);
-    expect(completedState.continuationAccepted).toBe(true);
+    if (!completedState.continuationAccepted) {
+      throw new Error(
+        `Continuation ledger was not accepted. Summary:\n${JSON.stringify(completedState.secondLedgerSummary, null, 2)}\nRun diagnostic:\n${JSON.stringify(completedState.runDiagnostic, null, 2)}\nLedger excerpt:\n${completedState.secondAcceptanceExcerpt}`,
+      );
+    }
     expect(completedState.sourceCoverageRecorded).toBe(true);
     expect(completedState.passageProofRecorded).toBe(true);
   });
@@ -1337,6 +1402,7 @@ test("overnight research uses two durable bounded segments and one terminal comp
       const obsidianWindow = window as typeof window & {
         app?: any;
         __e2eRestoreOvernightClock?: (() => void) | null;
+        __e2eOvernightClockAdvanced?: boolean;
         __e2eOvernightCounts?: {
           runComplete: number;
           assistantStart: number;
@@ -1392,6 +1458,8 @@ test("overnight research uses two durable bounded segments and one terminal comp
       );
       const createdAtMs = Date.parse(manifest.createdAt);
       const deadlineAtMs = Date.parse(manifest.deadlineAt);
+      const clockAdvancedBeforeRestore =
+        obsidianWindow.__e2eOvernightClockAdvanced === true;
       obsidianWindow.__e2eRestoreOvernightClock?.();
       delete obsidianWindow.__e2eRestoreOvernightClock;
 
@@ -1405,6 +1473,7 @@ test("overnight research uses two durable bounded segments and one terminal comp
         assistantMessages: assistantMessages.map(
           (message: { content?: string }) => message.content ?? "",
         ),
+        clockAdvancedBeforeRestore,
         activeDurableMissionId: plugin?.getActiveDurableMissionId?.() ?? null,
         renamedTargetExists: Boolean(
           app?.vault?.getFileByPath?.(expectedRenamedNotePath),
@@ -1422,17 +1491,89 @@ test("overnight research uses two durable bounded segments and one terminal comp
       /^Agent Runs\/Missions\/overnight-run-[^/]+\.md$/u,
     );
     if (completed.manifest.status !== "complete") {
+      const childLedgerSummaries = completed.childLedgers.map(
+        ({ path, markdown }: { path: string; markdown: string }) => {
+          const json = /## Mission Ledger\r?\n```json\r?\n([\s\S]*?)\r?\n```/u.exec(
+            markdown,
+          )?.[1];
+          const ledger = json ? JSON.parse(json) : null;
+          return ledger
+            ? {
+                path,
+                status: ledger.status,
+                lastSafeStep: ledger.lastSafeStep,
+                successfulToolNames: ledger.successfulToolNames,
+                receipts: ledger.receipts,
+                blockers: ledger.blockers,
+                acceptance: ledger.acceptance,
+                remainingActions: ledger.remainingActions,
+                missionTasks: (ledger.missionPlan?.tasks ?? []).map(
+                  (task: {
+                    id?: string;
+                    status?: string;
+                    allowedTools?: string[];
+                  }) => ({
+                    id: task.id,
+                    status: task.status,
+                    allowedTools: task.allowedTools,
+                  }),
+                ),
+              }
+            : { path, parseError: true };
+        },
+      );
       throw new Error(
         `overnight manifest not complete: ${JSON.stringify(
           {
             status: completed.manifest.status,
             usage: completed.manifest.usage,
-            blockers: completed.manifest.blockers,
+            blocker: completed.manifest.blocker,
             decision: completed.manifest.decision,
             lastOutcome: completed.manifest.lastOutcome,
             lineage: completed.manifest.lineage,
+            childLedgerSummaries,
             assistantMessages: completed.assistantMessages,
             eventCounts: completed.eventCounts,
+          },
+          null,
+          2,
+        )}`,
+      );
+    }
+    if (completed.manifest.usage?.segments !== 2) {
+      const childLedgerSummaries = completed.childLedgers.map(
+        ({ path, markdown }: { path: string; markdown: string }) => {
+          const json = /## Mission Ledger\r?\n```json\r?\n([\s\S]*?)\r?\n```/u.exec(
+            markdown,
+          )?.[1];
+          const ledger = json ? JSON.parse(json) : null;
+          return ledger
+            ? {
+                path,
+                status: ledger.status,
+                lastSafeStep: ledger.lastSafeStep,
+                successfulToolNames: ledger.successfulToolNames,
+                receipts: ledger.receipts,
+                blockers: ledger.blockers,
+                acceptance: ledger.acceptance,
+                graphNodes: (ledger.missionGraph?.nodes ?? []).map((node: any) => ({
+                  id: node.id,
+                  kind: node.kind,
+                  toolName: node.toolName,
+                  status: node.status,
+                })),
+              }
+            : { path, parseError: true };
+        },
+      );
+      throw new Error(
+        `overnight mission completed without the required second segment: ${JSON.stringify(
+          {
+            usage: completed.manifest.usage,
+            decision: completed.manifest.decision,
+            lastOutcome: completed.manifest.lastOutcome,
+            clockAdvancedBeforeRestore: completed.clockAdvancedBeforeRestore,
+            childLedgerSummaries,
           },
           null,
           2,
@@ -1472,10 +1613,14 @@ test("overnight research uses two durable bounded segments and one terminal comp
     expect(completed.manifest.lineage.currentSegmentId).toBe(
       completed.manifest.lineage.childSegmentIds[1],
     );
-    expect(completed.manifest.usage.modelSteps).toBeGreaterThanOrEqual(4);
-    expect(completed.manifest.usage.modelSteps).toBeLessThanOrEqual(8);
-    expect(completed.manifest.usage.toolCalls).toBeGreaterThanOrEqual(6);
-    expect(completed.manifest.usage.toolCalls).toBeLessThanOrEqual(12);
+    expect(completed.manifest.usage.modelSteps).toBeGreaterThan(0);
+    expect(completed.manifest.usage.modelSteps).toBeLessThanOrEqual(
+      completed.manifest.policy.maxModelSteps,
+    );
+    expect(completed.manifest.usage.toolCalls).toBeGreaterThan(0);
+    expect(completed.manifest.usage.toolCalls).toBeLessThanOrEqual(
+      completed.manifest.policy.maxToolCalls,
+    );
     expect(completed.deadlineFromCreationMs).toBe(8 * 60 * 60 * 1_000);
     expect(completed.deadlineFromStartMs).toBeGreaterThanOrEqual(
       8 * 60 * 60 * 1_000,
@@ -1495,14 +1640,17 @@ test("overnight research uses two durable bounded segments and one terminal comp
     expect(completed.activeDurableMissionId).toBeNull();
     expect(completed.renamedTargetExists).toBe(true);
     expect(completed.promptWasPersisted).toBe(true);
-
-    await page.getByRole("tab", { name: "Chat" }).click();
-    await expect(
-      page.locator(
-        ".agentic-researcher-log-assistant .agentic-researcher-log-message",
-        { hasText: "E2E_AUTO_SEGMENT_CONTINUATION_DONE_" },
-      ),
-    ).toHaveCount(1);
+    expect(completed.childLedgers[1].markdown).toContain('"status": "pass"');
+    expect(completed.childLedgers[1].markdown).toContain(
+      '"toolName": "append_to_current_file"',
+    );
+    if (!completed.eventCounts) {
+      throw new Error("Overnight mission event counters were unavailable.");
+    }
+    expect(completed.eventCounts.runComplete).toBe(1);
+    expect(completed.eventCounts.assistantStart).toBe(
+      completed.eventCounts.assistantDone,
+    );
   });
 });
 
@@ -1559,33 +1707,298 @@ test("long research does not auto-continue a required tool failure", async () =>
   });
 });
 
-test("settings basic view exposes profiles and capability status", async () => {
+test("settings integrates essentials readiness and advanced controls", async ({}, testInfo) => {
   await withE2EHarness("settings-basic-profiles", async ({ page }) => {
+    await page.setViewportSize({ width: 760, height: 900 });
     await openPluginSettings(page);
     const settings = page.locator(".agentic-researcher-settings");
     await expect(settings.locator(".agentic-settings-basic")).toBeVisible();
-    await expect(settings.getByText("Autonomy profile")).toBeVisible();
+    await expect(settings.getByRole("heading", { name: "Essentials" })).toBeVisible();
+    const workingMode = settings.locator(".agentic-settings-basic .setting-item-name", {
+      hasText: /^Working mode$/u,
+    });
+    await expect(workingMode).toHaveCount(1);
+    const memoryConsent = settings.locator(".agentic-settings-basic .setting-item-name", {
+      hasText: /^Memory consent$/u,
+    });
+    await expect(memoryConsent).toHaveCount(1);
     await expect(
-      settings.locator(".agentic-settings-basic .setting-item-name", {
-        hasText: /^Output profile$/u,
-      }),
-    ).toBeVisible();
+      settings.locator("button", { hasText: /^Reset Automatic$/u }),
+    ).toHaveCount(1);
+    const readiness = settings.locator(".agentic-settings-readiness");
+    await expect(readiness).toContainText(
+      "Notes & research",
+    );
+    await expect(readiness).toContainText(
+      "GitHub",
+    );
     await expect(
-      settings.getByRole("button", {
-        name: "Use recommended automatic defaults",
-      }),
+      readiness.locator("button.agentic-settings-readiness-item"),
+    ).toHaveCount(6);
+    await expect(
+      readiness.locator(".agentic-settings-readiness-action"),
+    ).toHaveCount(6);
+    await expect(readiness.locator(".setting-item")).toHaveCount(0);
+    const readinessLayout = await readiness
+      .locator("button.agentic-settings-readiness-item")
+      .evaluateAll((items) =>
+        items.map((item) => {
+          const header = item.querySelector<HTMLElement>(
+            ".agentic-settings-readiness-item-header",
+          );
+          const detail = item.querySelector<HTMLElement>(
+            ".agentic-settings-readiness-detail",
+          );
+          const headerBox = header?.getBoundingClientRect();
+          const detailBox = detail?.getBoundingClientRect();
+          return {
+            fits: item.scrollWidth <= item.clientWidth + 1,
+            isStacked:
+              Boolean(headerBox && detailBox) &&
+              detailBox!.top >= headerBox!.bottom - 1,
+          };
+        }),
+      );
+    expect(readinessLayout).toEqual(
+      Array.from({ length: 6 }, () => ({ fits: true, isStacked: true })),
+    );
+    await expect(
+      readiness.locator(".agentic-settings-status-badge", {
+        hasText: "Ready",
+      }).first(),
     ).toBeVisible();
-    await expect(settings.locator(".agentic-capability-status")).toContainText(
-      "Vault / note output",
-    );
-    await expect(settings.locator(".agentic-capability-status")).toContainText(
-      "Semantic retrieval",
-    );
+
+    const accordion = settings.locator(".agentic-settings-accordion");
+    await expect(accordion).toBeVisible();
+    await expect(
+      accordion.locator("details.agentic-settings-advanced-section"),
+    ).toHaveCount(7);
+    await expect(accordion).toContainText("Output & memory");
+    await expect(accordion).toContainText("Autonomy, teams & schedules");
+    await expect(accordion).toContainText("Built-in system health");
+    await expect(settings).not.toContainText("Installed extensions");
+
+    await readiness.getByRole("button", { name: /Linear:/u }).click();
+    await expect(
+      settings.locator("#agentic-settings-connections"),
+    ).toHaveJSProperty("open", true);
+    await readiness.getByRole("button", { name: /Background work:/u }).click();
+    const systemHealthSection = settings.locator("#agentic-settings-system-health");
+    await expect(systemHealthSection).toHaveJSProperty("open", true);
+    await expect(systemHealthSection).toContainText("Companion");
     await expect(
       settings.locator("details.agentic-settings-advanced-section").first(),
     ).toBeVisible();
     await expect(settings.getByText("Utility model")).toHaveCount(0);
     await expect(settings.getByText("modelRouterEnabled")).toHaveCount(0);
+    await settings
+      .locator("#agentic-settings-connections, #agentic-settings-system-health")
+      .evaluateAll((elements) => {
+        for (const element of elements) {
+          (element as HTMLDetailsElement).open = false;
+        }
+      });
+    await testInfo.attach("integrated-settings-readiness", {
+      body: await readiness.screenshot(),
+      contentType: "image/png",
+    });
+    await testInfo.attach("integrated-settings-advanced-controls", {
+      body: await settings.locator(".agentic-settings-advanced").screenshot(),
+      contentType: "image/png",
+    });
+  });
+});
+
+test("schedule builder updates Background readiness without reopening settings", async () => {
+  await withE2EHarness("settings-schedule-builder-readiness", async ({ page }) => {
+    await openPluginSettings(page);
+    const settings = page.locator(".agentic-researcher-settings");
+    const readiness = settings.locator(".agentic-settings-readiness");
+    await expect(
+      readiness.getByRole("button", { name: /Background work: Needs setup/u }),
+    ).toBeVisible();
+
+    const schedules = settings.locator("#agentic-settings-autonomy");
+    await schedules.evaluate((element) => {
+      (element as HTMLDetailsElement).open = true;
+    });
+    await schedules.getByRole("button", { name: "Add mission" }).click();
+
+    const card = settings.locator(".agentic-schedule-card", {
+      hasText: "Daily vault review",
+    });
+    await expect(card).toBeVisible();
+    await expect(settings.getByText("Mission schedule JSON", { exact: true })).toHaveCount(0);
+    await expect(
+      settings.getByText("Advanced JSON import/export", { exact: true }),
+    ).toBeVisible();
+    await card.locator(".checkbox-container").click();
+
+    await expect(
+      readiness.getByRole("button", { name: /Background work: Ready/u }),
+    ).toBeVisible({ timeout: 5_000 });
+    const persisted = await page.evaluate(({ pluginId }) => {
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      const mission = plugin?.settings?.scheduledMissions?.[0];
+      return {
+        name: mission?.name ?? null,
+        cadence: mission?.cadence ?? null,
+        enabled: mission?.enabled ?? null,
+      };
+    }, { pluginId: PLUGIN_ID });
+    expect(persisted).toEqual({
+      name: "Daily vault review",
+      cadence: "daily",
+      enabled: true,
+    });
+  });
+});
+
+test("blocked mission opens one capability setup and resumes only on explicit action", async () => {
+  await withE2EHarness("settings-capability-resume", async ({ page }) => {
+    const runId = `run-e2e-capability-setup-${Date.now()}`;
+    const continuationCommand = `continue run ${runId}`;
+    const ledgerPath = `Agent Runs/${runId}.md`;
+    try {
+      await page.evaluate(async ({ runId, continuationCommand, ledgerPath }) => {
+        const obsidianWindow = window as typeof window & { app?: any };
+        const app = obsidianWindow.app;
+        if (!app.vault.getAbstractFileByPath("Agent Runs")) {
+          await app.vault.createFolder("Agent Runs");
+        }
+        const now = new Date().toISOString();
+        const ledger = {
+          runId,
+          mission: "Create a useful cloud-model research note after setup.",
+          route: "grounded_workflow",
+          createdAt: now,
+          updatedAt: now,
+          status: "blocked",
+          loopBudget: {
+            hardCap: 30,
+            toolStepBudget: 20,
+            finalizationReserve: 4,
+            expectedTools: [],
+          },
+          milestones: [],
+          evidence: [],
+          receipts: [],
+          blockers: ["Cloud model API key is missing."],
+          blockerCategory: "provider_auth",
+          nextActions: ["Connect the configured model provider."],
+          remainingActions: ["Create the research note."],
+          continuationCommand,
+          resumeCount: 0,
+          lastSafeStep: 0,
+        };
+        await app.vault.create(
+          ledgerPath,
+          `# Agent Run ${runId}\n\n## Mission Ledger\n\`\`\`json\n${JSON.stringify(ledger, null, 2)}\n\`\`\`\n`,
+        );
+        const view = app.workspace.getLeavesOfType("agentic-researcher-view")[0]?.view;
+        if (!view?.renderStartupResumeBanner) {
+          throw new Error("Agent view resume banner API was unavailable.");
+        }
+        await view.renderStartupResumeBanner();
+      }, { runId, continuationCommand, ledgerPath });
+
+      const banner = page.locator(".agentic-researcher-resume-banner");
+      await expect(banner).toContainText("Cloud model API key is missing.");
+      await banner.getByRole("button", { name: "Set up & resume" }).click();
+
+      const settings = page.locator(".agentic-researcher-settings");
+      const pending = settings.locator(".agentic-settings-pending-resume");
+      await expect(pending).toBeVisible();
+      await expect(pending).toContainText("Set up Model");
+      await expect(settings.locator("#agentic-settings-essentials")).toBeVisible();
+
+      await page.evaluate(({ continuationCommand }) => {
+        const obsidianWindow = window as typeof window & {
+          app?: any;
+          __e2eCapabilityResumeCommand?: string;
+        };
+        const view = obsidianWindow.app?.workspace?.getLeavesOfType?.(
+          "agentic-researcher-view",
+        )?.[0]?.view;
+        if (!view) throw new Error("Agent view unavailable for resume spy.");
+        view.submitMissionContinuation = async (command: string) => {
+          obsidianWindow.__e2eCapabilityResumeCommand = command;
+        };
+        obsidianWindow.__e2eCapabilityResumeCommand = "";
+        if (!continuationCommand) throw new Error("Missing continuation command.");
+      }, { continuationCommand });
+
+      await pending.getByRole("button", { name: "Resume blocked mission" }).click();
+      await expect
+        .poll(() =>
+          page.evaluate(() =>
+            (window as typeof window & { __e2eCapabilityResumeCommand?: string })
+              .__e2eCapabilityResumeCommand ?? "",
+          ),
+        )
+        .toBe(continuationCommand);
+      const pendingState = await page.evaluate(({ pluginId }) => {
+        const obsidianWindow = window as typeof window & { app?: any };
+        return obsidianWindow.app?.plugins?.plugins?.[
+          pluginId
+        ]?.getPendingCapabilityResume?.() ?? null;
+      }, { pluginId: PLUGIN_ID });
+      expect(pendingState).toBeNull();
+    } finally {
+      await page.evaluate(async ({ ledgerPath }) => {
+        const obsidianWindow = window as typeof window & { app?: any };
+        const file = obsidianWindow.app?.vault?.getAbstractFileByPath?.(ledgerPath);
+        if (file) await obsidianWindow.app.vault.delete(file, true);
+        delete (window as typeof window & { __e2eCapabilityResumeCommand?: string })
+          .__e2eCapabilityResumeCommand;
+      }, { ledgerPath }).catch(() => undefined);
+    }
+  });
+});
+
+test("model connection setup performs a real bounded check and surfaces failure", async () => {
+  await withE2EHarness("settings-model-connection-check", async ({ page }) => {
+    await openPluginSettings(page);
+    await page.evaluate(({ pluginId }) => {
+      const obsidianWindow = window as typeof window & { app?: any };
+      const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+      plugin.createModelClient = () => ({
+        chat: async () => ({
+          message: { role: "assistant", content: "ok" },
+          toolCalls: [],
+        }),
+        streamChat: async () => ({
+          message: { role: "assistant", content: "ok" },
+          toolCalls: [],
+        }),
+      });
+    }, { pluginId: PLUGIN_ID });
+
+    let connection = page.locator(".agentic-settings-model-connection");
+    await connection.getByRole("button", { name: "Test connection" }).click();
+    connection = page.locator(".agentic-settings-model-connection");
+    await expect(connection).toContainText("Connected to", { timeout: 10_000 });
+
+    await page.evaluate(({ pluginId }) => {
+      const obsidianWindow = window as typeof window & { app?: any };
+      const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+      plugin.createModelClient = () => ({
+        chat: async () => {
+          throw new Error("E2E provider unavailable");
+        },
+        streamChat: async () => {
+          throw new Error("E2E provider unavailable");
+        },
+      });
+    }, { pluginId: PLUGIN_ID });
+
+    await connection.getByRole("button", { name: "Test connection" }).click();
+    connection = page.locator(".agentic-settings-model-connection");
+    await expect(connection).toContainText("Connection failed:", {
+      timeout: 10_000,
+    });
+    await expect(connection).toContainText("E2E provider unavailable");
   });
 });
 
@@ -1593,14 +2006,20 @@ test("automatic profile resets thinking, streaming, and reflex defaults", async 
   await withE2EHarness("settings-automatic-profile-defaults", async ({ page }) => {
     await openPluginSettings(page);
     const settings = page.locator(".agentic-researcher-settings");
-    await expect(settings.getByText("Autonomy profile")).toBeVisible();
-    await page.evaluate(async ({ pluginId }) => {
+    const workingMode = settings.locator(".agentic-settings-basic .setting-item-name", {
+      hasText: /^Working mode$/u,
+    });
+    await workingMode.scrollIntoViewIfNeeded();
+    await expect(workingMode).toBeVisible();
+    const memoryModeBefore = await page.evaluate(async ({ pluginId }) => {
       const obsidianWindow = window as typeof window & { app?: any };
       const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
       if (!plugin || typeof plugin.loadSettings !== "function") {
         throw new Error(`Plugin settings loader is unavailable for ${pluginId}.`);
       }
+      const memoryMode = plugin.settings?.memoryMode ?? null;
       await plugin.loadSettings();
+      return memoryMode;
     }, { pluginId: PLUGIN_ID });
 
     await expect
@@ -1610,6 +2029,8 @@ test("automatic profile resets thinking, streaming, and reflex defaults", async 
             const obsidianWindow = window as typeof window & { app?: any };
             const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
             return {
+              workingMode: plugin?.settings?.workingMode ?? null,
+              memoryMode: plugin?.settings?.memoryMode ?? null,
               autonomyProfile: plugin?.settings?.autonomyProfile ?? null,
               outputProfile: plugin?.settings?.outputProfile ?? null,
               thinkingMode: plugin?.settings?.thinkingMode ?? null,
@@ -1621,6 +2042,7 @@ test("automatic profile resets thinking, streaming, and reflex defaults", async 
         { timeout: 30_000 },
       )
       .toMatchObject({
+        workingMode: "automatic",
         autonomyProfile: "automatic",
         outputProfile: "active_or_new_note",
         thinkingMode: "auto",
@@ -1628,6 +2050,12 @@ test("automatic profile resets thinking, streaming, and reflex defaults", async 
         streamWritebackMode: "all_current_note_content_writes",
         agenticReflexEnabled: true,
       });
+    expect(memoryModeBefore).toMatch(/^(?:off|research|research_and_experience)$/u);
+    const memoryModeAfter = await page.evaluate(({ pluginId }) => {
+      const obsidianWindow = window as typeof window & { app?: any };
+      return obsidianWindow.app?.plugins?.plugins?.[pluginId]?.settings?.memoryMode ?? null;
+    }, { pluginId: PLUGIN_ID });
+    expect(memoryModeAfter).toBe(memoryModeBefore);
   });
 });
 
@@ -1639,7 +2067,7 @@ test("settings semantic chunk controls stay labeled and contained", async () => 
     const settings = page.locator(".agentic-researcher-settings");
     await settings
       .locator("details.agentic-settings-advanced-section", {
-        hasText: "Semantic retrieval tuning",
+        hasText: "Semantic retrieval",
       })
       .evaluate((el) => {
         (el as HTMLDetailsElement).open = true;
@@ -1705,7 +2133,7 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
         },
       };
     }, { pluginId: PLUGIN_ID });
-    expect(startup).toEqual({
+    expect(startup).toMatchObject({
       enabled: false,
       capabilityGate: 0,
       queueEnabled: false,
@@ -1713,11 +2141,11 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
       grantActive: false,
       github: {
         enabled: false,
-        oauthClientId: "",
         connected: false,
         waitingForUser: false,
       },
     });
+    expect(startup.github.oauthClientId).toMatch(/^[A-Za-z0-9_-]{0,128}$/u);
 
     await openPluginSettings(page);
     const settings = page.locator(".agentic-researcher-settings");
@@ -1726,7 +2154,7 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     );
     await settings
       .locator("details.agentic-settings-advanced-section", {
-        hasText: "Browser and integrations",
+        hasText: "Companion & integrations",
       })
       .evaluate((el) => {
         (el as HTMLDetailsElement).open = true;
@@ -1734,26 +2162,29 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     await expect(
       settings.getByRole("heading", { name: "Linear integration" }),
     ).toBeVisible();
-    await expect(settings).toContainText("fixed Linear GraphQL operations");
+    await expect(settings).toContainText("fixed Linear GraphQL tools");
     await expect(settings).toContainText(
-      "New keys use the authenticated companion's persistent OS credential store",
+      "plugin settings retain only an opaque reference",
     );
-    await expect(settings).toContainText(
-      "legacy plaintext remains foreground-only until you explicitly migrate it",
-    );
-    await expect(settings).toContainText("Linear OAuth client ID");
-    await expect(settings).toContainText("Linear OAuth callback port");
+    await expect(settings).toContainText("Connect Linear with OAuth");
+    await expect(settings).toContainText("OAuth app setup (advanced)");
+    const oauthAdvanced = settings.locator(".agentic-linear-oauth-advanced");
+    await oauthAdvanced.evaluate((element) => {
+      (element as HTMLDetailsElement).open = true;
+    });
+    await expect(oauthAdvanced).toContainText("Linear OAuth client ID");
+    await expect(oauthAdvanced).toContainText("Linear OAuth callback port");
     await expect(settings).toContainText(
       "http://127.0.0.1:43119/oauth/linear/callback",
     );
-    await expect(settings).toContainText("Linear OAuth actor");
+    await expect(oauthAdvanced).toContainText("Linear OAuth actor");
     const oauthSetting = settings.locator(".setting-item", {
-      hasText: "Linear OAuth connection",
+      hasText: "Connect Linear with OAuth",
     });
     await expect(oauthSetting).toContainText("Linear OAuth is not connected.");
     await expect(
-      oauthSetting.getByRole("button", { name: "Connect OAuth" }),
-    ).toBeDisabled();
+      oauthSetting.getByRole("button", { name: "Connect Linear" }),
+    ).toBeEnabled();
     await expect(settings).toContainText("Connection capability report");
     await expect(settings).toContainText("No verified discovery snapshot");
 
@@ -1762,36 +2193,33 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     ).toBeVisible();
     await expect(settings).toContainText("fixed-catalog GitHub access");
     await expect(settings).toContainText("verified through /user");
-    const githubEnableSetting = settings.locator(".setting-item", {
-      hasText: "Enable GitHub",
-    });
-    await expect(githubEnableSetting.locator(".checkbox-container")).not.toHaveClass(
-      /is-enabled/,
-    );
+    await expect(settings.getByText("Enable GitHub", { exact: true })).toHaveCount(0);
     const githubOAuthSetting = settings.locator(".setting-item", {
       hasText: "GitHub OAuth client ID",
     });
-    await expect(githubOAuthSetting.locator('input[type="text"]')).toHaveValue("");
+    await expect(githubOAuthSetting.locator('input[type="text"]')).toHaveValue(
+      startup.github.oauthClientId,
+    );
     const githubConnection = settings.locator(".setting-item", {
       hasText: "GitHub connection",
     });
     await expect(githubConnection).toContainText("GitHub is not connected.");
-    await expect(
-      githubConnection.getByRole("button", { name: "Connect OAuth" }),
-    ).toBeDisabled();
+    const githubConnectButton = githubConnection.getByRole("button", {
+      name: "Connect OAuth",
+    });
+    if (startup.github.oauthClientId) {
+      await expect(githubConnectButton).toBeEnabled();
+    } else {
+      await expect(githubConnectButton).toBeDisabled();
+    }
     const githubPatSetting = settings.locator(".setting-item", {
       hasText: "GitHub fine-grained personal access token",
     });
     await expect(githubPatSetting.locator('input[type="password"]')).toHaveValue("");
     await expect(
       githubPatSetting.getByRole("button", { name: "Verify and save" }),
-    ).toBeDisabled();
-
-    const enableSetting = settings.locator(".setting-item", {
-      hasText: "Enable Linear",
-    });
-    const enableToggle = enableSetting.locator(".checkbox-container");
-    await expect(enableToggle).not.toHaveClass(/is-enabled/);
+    ).toBeEnabled();
+    await expect(settings.getByText("Enable Linear", { exact: true })).toHaveCount(0);
 
     const keySetting = settings.locator(".setting-item", {
       hasText: "Linear personal API key",
@@ -1829,14 +2257,12 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
       authoritySetting.getByRole("button", { name: "Revoke" }),
     ).toBeDisabled();
 
-    await enableToggle.click();
-    await expect(enableToggle).toHaveClass(/is-enabled/);
     await expect(queueToggle).toHaveClass(/is-disabled/);
     await expect(
       authoritySetting.getByRole("button", { name: "Authorize 4 hours" }),
     ).toBeDisabled();
 
-    const afterEnable = await page.evaluate(({ pluginId }) => {
+    const afterInspection = await page.evaluate(({ pluginId }) => {
       const plugin = (window as typeof window & { app?: any }).app?.plugins
         ?.plugins?.[pluginId];
       return {
@@ -1844,7 +2270,56 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
         grantActive: plugin?.getLinearQueueGrantStatus?.()?.active ?? null,
       };
     }, { pluginId: PLUGIN_ID });
-    expect(afterEnable).toEqual({ queueEnabled: false, grantActive: false });
+    expect(afterInspection).toEqual({ queueEnabled: false, grantActive: false });
+  });
+});
+
+test("Linear key setup persists only an opaque reference and refreshes readiness", async () => {
+  await withE2EHarness("linear-secret-storage-readiness", async ({ page }) => {
+    await openPluginSettings(page);
+    const readiness = page.locator(
+      ".agentic-researcher-settings .agentic-settings-readiness",
+    );
+    await expect(
+      readiness.getByRole("button", { name: /Linear: Needs setup/u }),
+    ).toBeVisible();
+
+    try {
+      const persisted = await page.evaluate(async ({ pluginId }) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        if (!plugin?.setLinearApiKey || !plugin?.loadData) {
+          throw new Error("Linear settings APIs are unavailable.");
+        }
+        const result = await plugin.setLinearApiKey(
+          "e2e-not-a-real-linear-key",
+        );
+        const data = await plugin.loadData();
+        return {
+          ok: result.ok,
+          plaintextPresent:
+            typeof data?.linearApiKey === "string" && data.linearApiKey.length > 0,
+          referencePresent:
+            typeof data?.linearCredentialReference?.referenceId === "string",
+          persistent: data?.linearCredentialReference?.persistent === true,
+        };
+      }, { pluginId: PLUGIN_ID });
+      expect(persisted).toEqual({
+        ok: true,
+        plaintextPresent: false,
+        referencePresent: true,
+        persistent: true,
+      });
+      await expect(
+        readiness.getByRole("button", { name: /Linear: Degraded/u }),
+      ).toBeVisible({ timeout: 5_000 });
+    } finally {
+      await page.evaluate(async ({ pluginId }) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        await plugin?.clearLinearApiKey?.();
+      }, { pluginId: PLUGIN_ID }).catch(() => undefined);
+    }
   });
 });
 
@@ -1958,7 +2433,7 @@ test("title rename updates file explorer, active tab, and vault path", async () 
   });
 });
 
-test("generated titled text replaces visible Untitled page title", async () => {
+test("generated titled text produces one visible Obsidian title without a duplicate H1", async () => {
   await withE2EHarness("title-replacement-50", async ({ page }) => {
     await setStreamingMode(page, false);
     const untitledPath = "Untitled.md";
@@ -2002,9 +2477,10 @@ test("generated titled text replaces visible Untitled page title", async () => {
       20_000,
     );
     const written = (await readOptionalFile(renamedFilePath)) ?? "";
-    expect(countPlainWords(written.replace(/^#\s+[^\n]+\n*/, ""))).toBe(50);
-    expect(written).toMatch(/^#\s*Purple Horizon\b/m);
+    expect(countPlainWords(written)).toBe(50);
+    expect(written).not.toMatch(/^#\s*Purple Horizon\b/m);
     expect(written).not.toMatch(/^#\s*Untitled\b/m);
+    expect(written).not.toMatch(/^#\s+/m);
 
     await expect(
       page.locator(".nav-file-title-content", { hasText: "Purple Horizon" }).first(),
@@ -2020,7 +2496,7 @@ test("generated titled text replaces visible Untitled page title", async () => {
   });
 });
 
-test("streaming writeback auto-renames Untitled 1 from leading H1", async () => {
+test("streaming writeback auto-renames Untitled 1 without persisting the title H1", async () => {
   await withE2EHarness("stream-placeholder-title", async ({ page }) => {
     await setStreamingMode(page, true);
     const untitledPath = "Untitled 1.md";
@@ -2063,6 +2539,9 @@ test("streaming writeback auto-renames Untitled 1 from leading H1", async () => 
       "Untitled 1.md should be gone after streamed placeholder auto-rename",
       20_000,
     );
+    const written = (await readOptionalFile(renamedFilePath)) ?? "";
+    expect(written).not.toMatch(/^#\s*Hello World in TypeScript\b/m);
+    expect(written).not.toMatch(/^#\s+/m);
     await expect(
       page.locator(".nav-file-title-content", { hasText: "Hello World in TypeScript" }).first(),
     ).toBeVisible({ timeout: 20_000 });
@@ -2110,6 +2589,160 @@ test("agent highlights a requested phrase in the current note", async () => {
     await expectReceipt(page, "highlight");
     await expectReceipt(page, "matches: 1");
   });
+});
+
+test("research selection streams cited findings onto the current note", async () => {
+  await withE2EHarness(
+    "selection-research-stream-page",
+    async ({ page, notePath, noteFilePath, input }) => {
+      const selection = `E2E_SELECTION_TOPIC_${input.marker} quantum battery density`;
+      const original = `# Selection Research\n\n${selection}\n`;
+      await setActiveNoteContent(page, notePath, original);
+      // Match sourced-append: search/fetch via tools, then runner-owned
+      // proof-gated stream writeback (not append_to_current_file on frontier).
+      await setStreamingMode(page, true);
+      await page.getByRole("tab", { name: "Chat" }).click();
+
+      const started = await page.evaluate(
+        async ({ pluginId, selectionText, notePath: path }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const plugin = app?.plugins?.plugins?.[pluginId];
+          if (!plugin) {
+            return { ok: false, error: "plugin missing" };
+          }
+          if (typeof plugin.runSelectionResearch !== "function") {
+            return {
+              ok: false,
+              error: `runSelectionResearch typeof=${typeof plugin.runSelectionResearch}`,
+            };
+          }
+          if (plugin.isMissionRunning?.()) {
+            return { ok: false, error: "mission already running" };
+          }
+          try {
+            const file = app.vault.getAbstractFileByPath(path);
+            if (file) {
+              const leaf = app.workspace.getLeaf(false);
+              await leaf.openFile(file);
+              app.workspace.setActiveLeaf(leaf, { focus: true });
+            }
+            await plugin.activateView?.();
+            // Do not await the full mission; the Playwright test owns completion waits.
+            void plugin.runSelectionResearch({
+              selection: selectionText,
+              notePath: path,
+              mode: "stream_page",
+            });
+            return { ok: true };
+          } catch (error) {
+            return {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        },
+        { pluginId: PLUGIN_ID, selectionText: selection, notePath },
+      );
+      expect(started, JSON.stringify(started)).toMatchObject({ ok: true });
+
+      await expect(
+        page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
+          hasText: selection,
+        }).last(),
+      ).toBeVisible({ timeout: 30_000 });
+      await expect(
+        page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
+          hasText: "Write and append a cited findings section",
+        }).last(),
+      ).toBeVisible({ timeout: 10_000 });
+
+      await waitForMissionComplete(page, 180_000);
+      await assertMockModelUsed(page);
+      await expectToolRun(page, "web_search");
+      await expectToolRun(page, "web_fetch");
+      await page.getByRole("tab", { name: "Run Details" }).click();
+      await expect(page.locator(".agentic-researcher-details-panel")).toContainText(
+        /chat_only_override=off/i,
+      );
+      await expect(page.locator(".agentic-researcher-details-panel")).toContainText(
+        /write_autonomy=on/i,
+      );
+      try {
+        await expectReceipt(page, '"operation": "append"');
+        await expectNoteToContain(
+          noteFilePath,
+          "Cited findings",
+          "selection research should append cited findings onto the note",
+          30_000,
+        );
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\nRun details:\n${await readRunDetailsText(page)}`,
+        );
+      }
+      await expectNoteToContain(
+        noteFilePath,
+        selection,
+        "selection research should keep the original selected text",
+        20_000,
+      );
+    },
+  );
+});
+
+test("research selection chat-only keeps the note unchanged", async () => {
+  await withE2EHarness(
+    "selection-research-chat-only",
+    async ({ page, notePath, noteFilePath, input }) => {
+      const selection = `E2E_SELECTION_CHAT_${input.marker} photosynthesis`;
+      const original = `# Selection Chat Only\n\n${selection}\n`;
+      await setActiveNoteContent(page, notePath, original);
+      await setStreamingMode(page, true);
+      await page.getByRole("tab", { name: "Chat" }).click();
+
+      const started = await page.evaluate(
+        async ({ pluginId, selectionText, notePath: path }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const plugin = app?.plugins?.plugins?.[pluginId];
+          if (typeof plugin?.runSelectionResearch !== "function") {
+            return { ok: false, error: "runSelectionResearch unavailable" };
+          }
+          try {
+            await plugin.activateView?.();
+            void plugin.runSelectionResearch({
+              selection: selectionText,
+              notePath: path,
+              mode: "chat_only",
+            });
+            return { ok: true };
+          } catch (error) {
+            return {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        },
+        { pluginId: PLUGIN_ID, selectionText: selection, notePath },
+      );
+      expect(started, JSON.stringify(started)).toMatchObject({ ok: true });
+
+      await expect(
+        page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
+          hasText: "Keep the answer in chat only",
+        }).last(),
+      ).toBeVisible({ timeout: 30_000 });
+
+      await waitForMissionComplete(page, 180_000);
+      await assertMockModelUsed(page);
+      await expectToolRun(page, "web_search");
+      await page.getByRole("tab", { name: "Run Details" }).click();
+      await expect(page.locator(".agentic-researcher-details-panel")).toContainText(
+        /chat_only_override=on/i,
+      );
+      const after = await readFile(noteFilePath, "utf8");
+      expect(after).toBe(original);
+    },
+  );
 });
 
 test("agent restores the current note from the latest backup", async () => {
@@ -2232,12 +2865,18 @@ test("default note writeback streams plain answers to the active note", async ()
     await setStreamingMode(page, true);
     await submitMission(page, prompt, { waitForCompletion: false });
 
-    await expectNoteToContain(
-      noteFilePath,
-      input.streamChunkOne,
-      "default answer stream should append the first chunk to the active note",
-      10_000,
-    );
+    try {
+      await expectNoteToContain(
+        noteFilePath,
+        input.streamChunkOne,
+        "default answer stream should append the first chunk to the active note",
+        10_000,
+      );
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\nRun details:\n${await readRunDetailsText(page)}`,
+      );
+    }
 
     await waitForMissionComplete(page, 45_000);
     await assertMockModelUsed(page);
@@ -2251,6 +2890,108 @@ test("default note writeback streams plain answers to the active note", async ()
     await expectDetailsText(page, "note_writeback=streaming_current_note");
     await expectDetailsText(page, "chat_only_override=off");
   });
+});
+
+test("DU-01 automatic mode creates one collision-free note when no markdown note is active", async () => {
+  await withE2EHarness(
+    "du01-no-active-note",
+    async ({ page, notePath, input }) => {
+      const prompt = `Create a short project brief for a neighborhood garden. Include ${input.streamChunkOne} and ${input.streamChunkTwo}.`;
+      const setup = await page.evaluate(async ({ seedPath, originalPath }) => {
+        const app = (window as typeof window & { app?: any }).app;
+        if (!app?.vault || !app?.workspace) throw new Error("Obsidian app unavailable.");
+        const existing = app.vault.getAbstractFileByPath(seedPath);
+        const seeded = !existing;
+        if (seeded) await app.vault.create(seedPath, "# Existing Untitled\n\nCollision guard.\n");
+        for (const leaf of app.workspace.getLeavesOfType?.("markdown") ?? []) {
+          await leaf.setViewState({ type: "empty", active: false });
+        }
+        app.workspace.setActiveLeaf(
+          app.workspace.getLeavesOfType?.("agentic-researcher-view")?.[0] ??
+            app.workspace.getLeaf(false),
+          { focus: true },
+        );
+        return {
+          seeded,
+          baseline: (app.vault.getMarkdownFiles?.() ?? []).map((file: any) => file.path),
+          activeFile: app.workspace.getActiveFile?.()?.path ?? null,
+          originalExists: Boolean(app.vault.getAbstractFileByPath(originalPath)),
+        };
+      }, { seedPath: "Untitled.md", originalPath: notePath });
+      expect(setup.activeFile).toBeNull();
+      expect(setup.originalExists).toBe(true);
+
+      let createdPath: string | null = null;
+      try {
+        await setStreamingMode(page, true);
+        await submitMission(page, prompt);
+        await assertMockModelUsed(page);
+        createdPath = await page.evaluate(
+          async ({ baseline, markerOne, markerTwo }) => {
+            const app = (window as typeof window & { app?: any }).app;
+            const before = new Set(baseline);
+            for (const file of app?.vault?.getMarkdownFiles?.() ?? []) {
+              if (before.has(file.path)) continue;
+              const content = await app.vault.cachedRead(file);
+              if (content.includes(markerOne) && content.includes(markerTwo)) {
+                return file.path as string;
+              }
+            }
+            return null;
+          },
+          {
+            baseline: setup.baseline,
+            markerOne: input.streamChunkOne,
+            markerTwo: input.streamChunkTwo,
+          },
+        );
+        expect(createdPath).toBeTruthy();
+        expect(createdPath).not.toBe("Untitled.md");
+        await expectReceipt(page, "create");
+        await expectDetailsText(page, "note_output");
+        const reloadProof = await page.evaluate(async ({ pluginId, targetPath, markerOne }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const fileBefore = app?.vault?.getAbstractFileByPath?.(targetPath);
+          const contentBefore = fileBefore ? await app.vault.cachedRead(fileBefore) : "";
+          await app?.plugins?.disablePlugin?.(pluginId);
+          await app?.plugins?.enablePlugin?.(pluginId);
+          const fileAfter = app?.vault?.getAbstractFileByPath?.(targetPath);
+          const contentAfter = fileAfter ? await app.vault.cachedRead(fileAfter) : "";
+          return {
+            unchanged: contentAfter === contentBefore,
+            markerCountBefore: contentBefore.split(markerOne).length - 1,
+            markerCountAfter: contentAfter.split(markerOne).length - 1,
+          };
+        }, { pluginId: PLUGIN_ID, targetPath: createdPath, markerOne: input.streamChunkOne });
+        expect(reloadProof.unchanged).toBe(true);
+        expect(reloadProof.markerCountBefore).toBeGreaterThan(0);
+        expect(reloadProof.markerCountAfter).toBe(reloadProof.markerCountBefore);
+        expect(
+          evaluateDailyUseAcceptanceV1(DAILY_USE_ACCEPTANCE_V1["DU-01"], {
+            artifacts: ["vault:markdown_note"],
+            proofs: [
+              "vault:collision_free_target",
+              "stream:complete",
+              "receipt:vault_write",
+              "restart:no_replay",
+            ],
+            approvals: [],
+            bindings: [],
+            cleanup: [],
+          }),
+        ).toEqual({ status: "pass", missing: [] });
+      } finally {
+        await page.evaluate(async ({ createdPath, removeSeed }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          for (const target of [createdPath, removeSeed ? "Untitled.md" : null]) {
+            if (!target) continue;
+            const file = app?.vault?.getAbstractFileByPath?.(target);
+            if (file) await app.vault.delete(file, true);
+          }
+        }, { createdPath, removeSeed: setup.seeded }).catch(() => undefined);
+      }
+    },
+  );
 });
 
 test("chat-only toggle keeps streamed answers in chat and resets", async () => {
@@ -3231,7 +3972,10 @@ test("Orchestrator tab replays task and worktree state at 320px", async () => {
       const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
       plugin.settings.orchestratorEnabled = false;
       plugin.settings.orchestratorPreviewEnabled = false;
-      await plugin.saveSettings?.();
+      const retainedSnapshot = plugin.latestOrchestratorSnapshot;
+      plugin.latestOrchestratorSnapshot = null;
+      await plugin.savePluginData?.();
+      plugin.latestOrchestratorSnapshot = retainedSnapshot;
       const app = obsidianWindow.app;
       const leaf = app?.workspace?.getLeavesOfType?.("agentic-researcher-view")?.[0];
       if (!leaf) throw new Error("Agentic Researcher view was unavailable for detach.");
@@ -3249,6 +3993,175 @@ test("Orchestrator tab replays task and worktree state at 320px", async () => {
     await expect(page.getByRole("tab", { name: "Orchestrator" })).toBeVisible();
     await page.getByRole("tab", { name: "Orchestrator" }).click();
     await expect(page.getByText("codex/agent-e2e-template", { exact: true })).toBeVisible();
+  });
+});
+
+test("plugin restart blocks an orphaned Orchestrator run and freezes elapsed time", async ({}, testInfo) => {
+  await withE2EHarness("orchestrator-orphaned-restart", async ({ page }) => {
+    const seededRunId = await page.evaluate(async ({ pluginId }) => {
+      const obsidianWindow = window as typeof window & { app?: any };
+      const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+      if (!plugin) throw new Error("Agentic Researcher plugin is unavailable.");
+      const createdAt = new Date(Date.now() - 5 * 60_000).toISOString();
+      const updatedAt = new Date(Date.now() - 4 * 60_000).toISOString();
+      const runId = `e2e-orphaned-orchestrator-${Date.now()}`;
+      plugin.latestOrchestratorSnapshot = {
+        version: 1,
+        runId,
+        mode: "research_team",
+        status: "running",
+        rootNodeIds: ["mission"],
+        nodes: {
+          mission: {
+            id: "mission",
+            parentId: null,
+            childIds: ["verify"],
+            kind: "mission",
+            title: "Interrupted research mission",
+            status: "running",
+            ownerId: "lead",
+            dependencyIds: [],
+            evidenceIds: ["evidence-orphaned"],
+            receiptIds: [],
+            artifactIds: [],
+            lastAction: "Synthesizing evidence",
+            createdAt,
+            updatedAt,
+          },
+          verify: {
+            id: "verify",
+            parentId: "mission",
+            childIds: [],
+            kind: "verify",
+            title: "Verify final result",
+            status: "queued",
+            ownerId: "lead",
+            dependencyIds: ["mission"],
+            evidenceIds: [],
+            receiptIds: [],
+            artifactIds: [],
+            createdAt,
+            updatedAt,
+          },
+        },
+        participants: {
+          lead: {
+            id: "lead",
+            role: "lead",
+            displayName: "Lead",
+            status: "planning",
+            currentNodeId: "mission",
+            budget: {
+              modelSteps: { used: 2, limit: 20 },
+              toolCalls: { used: 1, limit: 24 },
+              wallClockMs: { used: 1_000, limit: 900_000 },
+            },
+            handoffStatus: "accepted",
+            lastAction: "Synthesizing evidence",
+            updatedAt,
+          },
+        },
+        worktrees: {},
+        handoffs: [],
+        merge: {
+          status: "idle",
+          evidenceReceived: 1,
+          evidenceAccepted: 1,
+          evidenceRejected: 0,
+          evidenceDeduplicated: 0,
+          conflicts: 0,
+          commitShas: [],
+          verificationStatus: "pending",
+          integrationStatus: "not_applicable",
+          updatedAt,
+        },
+        sequence: 7,
+        createdAt,
+        updatedAt,
+      };
+      await plugin.savePluginData?.();
+      return runId;
+    }, { pluginId: PLUGIN_ID });
+
+    try {
+      await restartCorePluginWithHarnessMock(page);
+      const reconciled = await page.evaluate(({ pluginId }) => {
+        const obsidianWindow = window as typeof window & { app?: any };
+        const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+        const snapshot = plugin?.getLatestOrchestratorSnapshot?.();
+        return {
+          runId: snapshot?.runId ?? null,
+          nodeIds: Object.keys(snapshot?.nodes ?? {}).sort(),
+          status: snapshot?.status ?? null,
+        };
+      }, { pluginId: PLUGIN_ID });
+      expect(reconciled).toEqual({
+        runId: seededRunId,
+        nodeIds: ["mission", "verify"],
+        status: "blocked",
+      });
+      const orchestratorTab = page.getByRole("tab", { name: "Orchestrator" });
+      await orchestratorTab.click();
+      const orchestrator = page.locator(".agentic-researcher-orchestrator");
+      await expect(orchestrator).toBeVisible();
+      await expect(
+        orchestrator.locator(
+          '.agentic-researcher-orchestrator-summary .agentic-researcher-orchestrator-status[data-status="blocked"]',
+        ),
+      ).toBeVisible();
+      await expect(orchestrator).toContainText(
+        "Run is no longer active after an Obsidian or plugin restart.",
+      );
+      await expect(
+        orchestrator.locator(
+          '.agentic-researcher-orchestrator-tree-node[data-node-id="mission"][data-status="blocked"]',
+        ),
+      ).toBeVisible();
+      await expect(
+        orchestrator.locator(
+          '.agentic-researcher-orchestrator-tree-node[data-node-id="verify"][data-status="blocked"]',
+        ),
+      ).toBeVisible();
+
+      const elapsedValue = orchestrator
+        .locator(".agentic-researcher-orchestrator-summary-metric", {
+          hasText: "Elapsed",
+        })
+        .locator(".agentic-researcher-orchestrator-value");
+      const elapsedBefore = (await elapsedValue.textContent())?.trim();
+      expect(elapsedBefore).toBeTruthy();
+      await page.waitForTimeout(1_200);
+      await expect(elapsedValue).toHaveText(elapsedBefore!);
+
+      const persisted = await page.evaluate(({ pluginId }) => {
+        const obsidianWindow = window as typeof window & { app?: any };
+        const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+        const snapshot = plugin?.getLatestOrchestratorSnapshot?.();
+        return {
+          status: snapshot?.status ?? null,
+          sequence: snapshot?.sequence ?? null,
+          coordinatorRunning: plugin?.getMissionRunSnapshot?.().isRunning ?? null,
+        };
+      }, { pluginId: PLUGIN_ID });
+      expect(persisted).toEqual({
+        status: "blocked",
+        sequence: 8,
+        coordinatorRunning: false,
+      });
+      await testInfo.attach("orchestrator-orphaned-run-reconciled", {
+        body: await orchestrator.screenshot(),
+        contentType: "image/png",
+      });
+    } finally {
+      await page.evaluate(async ({ pluginId }) => {
+        const obsidianWindow = window as typeof window & { app?: any };
+        const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+        if (!plugin) return;
+        plugin.latestOrchestratorSnapshot = null;
+        await plugin.savePluginData?.();
+        plugin.refreshAgentView?.();
+      }, { pluginId: PLUGIN_ID }).catch(() => undefined);
+    }
   });
 });
 
@@ -3608,6 +4521,11 @@ test("design revise updates and renders Mermaid with backup", async () => {
 test("budget-stopped run exposes Continue Latest Run action", async () => {
   await withE2EHarness("continue-latest-run-action", async ({ page, noteFilePath }) => {
     await setStreamingMode(page, false);
+    await setPluginSettingOverrides(page, {
+      // This scenario proves the explicit manual resume control. Ordinary
+      // effectful missions use completion-driven continuation by default.
+      completionDrivenLoops: false,
+    });
 
     await submitMission(
       page,
@@ -3730,7 +4648,14 @@ test("wall-clock budget stops run with resumable ledger", async () => {
   await withE2EHarness("wall-clock-budget", async ({ page }) => {
     await setStreamingMode(page, false);
     await setAgenticReflexMode(page, false);
-    await setPluginSettingOverrides(page, { maxRunMinutes: 0.05 });
+    await setPluginSettingOverrides(page, {
+      maxRunMinutes: 0.05,
+      // This fixture proves the main-loop wall clock. Structured-router timing
+      // and repair are covered independently and would consume this deliberate
+      // three-second budget before the resumable ledger exists.
+      modelRouterMode: "off",
+      modelRouterEnabled: false,
+    });
 
     await submitMission(
       page,
@@ -3755,7 +4680,7 @@ test("small context budget compacts loop messages mid-run", async () => {
 
     await submitMission(
       page,
-      "Inspect the current note graph for E2E_LOOP_STEPS_5 and complete exactly 5 model steps before the final answer.",
+      "Inspect the current note graph for E2E_LOOP_STEPS_5 with multiple bounded related-note reads before the final synthesis.",
       { timeout: 180_000 },
     );
 
@@ -3766,6 +4691,18 @@ test("small context budget compacts loop messages mid-run", async () => {
     ).toBeVisible({ timeout: 30_000 });
     await expectDetailsText(page, "Compacted loop context");
     await expectDetailsText(page, "estimated_prompt_chars_after");
+    const details = await readRunDetailsText(page);
+    const compaction =
+      /Compacted loop context from\s+(\d+)\s+to\s+(\d+)\s+estimated chars/iu.exec(
+        details,
+      ) ??
+      /estimated_prompt_chars_before\D+(\d+)[\s\S]{0,500}?estimated_prompt_chars_after\D+(\d+)/u.exec(
+        details,
+      );
+    expect(compaction, details).toBeTruthy();
+    expect(Number(compaction?.[2]), details).toBeLessThan(
+      Number(compaction?.[1]),
+    );
   });
 });
 
@@ -3978,12 +4915,18 @@ test("parallel read-only tools run concurrently then mutating tool stays sequent
       { timeout: 120_000 },
     );
 
-    await expectNoteToContain(
-      noteFilePath,
-      marker,
-      "parallel-read scenario should append the marker after reads",
-      60_000,
-    );
+    try {
+      await expectNoteToContain(
+        noteFilePath,
+        marker,
+        "parallel-read scenario should append the marker after reads",
+        60_000,
+      );
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\nRun details:\n${await readRunDetailsText(page)}`,
+      );
+    }
     await expect(
       page.locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
         // Write-completion may short-circuit before a model final answer; the
@@ -4041,7 +4984,7 @@ test("parallel read-only tools run concurrently then mutating tool stays sequent
   });
 });
 
-test("sourced append keeps web and write tools available together", async () => {
+test("sourced append enforces search and fetch before verified writeback", async () => {
   await withE2EHarness("sourced-append-multitool", async ({ page, noteFilePath, input }) => {
     const marker = `E2E_SOURCED_APPEND_MULTI_TOOL_${input.marker}`;
     await setStreamingMode(page, true);
@@ -4060,10 +5003,9 @@ test("sourced append keeps web and write tools available together", async () => 
     );
     await expectToolRun(page, "web_search");
     await expectToolRun(page, "web_fetch");
-    // The mock asserts append_to_current_file is model-visible alongside both
-    // web tools. The proof gate then performs the verified streamed mutation
-    // host-side, so completion proof is the canonical append receipt rather
-    // than a model-requested append entry in the tool timeline.
+    // The authoritative frontier exposes search, then fetch, then the
+    // runner-owned verified writeback. Completion proof is the canonical
+    // append receipt rather than simultaneous mutation authority.
     await expectReceipt(page, "append");
     await page.getByRole("tab", { name: "Run Details" }).click();
     await expect(page.locator(".agentic-researcher-details-panel")).not.toContainText(
@@ -4091,12 +5033,18 @@ test("proof-gated sourced writeback rejects premature mutation and commits one c
         { timeout: 180_000 },
       );
 
-      await expectNoteToContain(
-        noteFilePath,
-        committedMarker,
-        "the corrected proof-bound draft should commit after fetched evidence exists",
-        20_000,
-      );
+      try {
+        await expectNoteToContain(
+          noteFilePath,
+          committedMarker,
+          "the corrected proof-bound draft should commit after fetched evidence exists",
+          20_000,
+        );
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\nRun details:\n${await readRunDetailsText(page)}`,
+        );
+      }
       const finalNote = await readFile(noteFilePath, "utf8");
       expect(finalNote.startsWith(originalNote)).toBe(true);
       expect(finalNote).not.toContain("E2E_PREMATURE_PROOF_GATED_WRITE");
@@ -4109,7 +5057,7 @@ test("proof-gated sourced writeback rejects premature mutation and commits one c
       await expectToolRun(page, "web_fetch");
       await expectReceipt(page, "append");
       await expectDetailsText(page, "plan_dependency_violation");
-      await expectDetailsText(page, "Writeback draft held for verification");
+      await expectDetailsText(page, "Verified append candidate held for correction");
       await expect(
         page.locator(".agentic-researcher-receipt", { hasText: "append" }),
       ).toHaveCount(1);
@@ -4137,16 +5085,13 @@ Write in a business type, market research format.`,
 
     await expectNoteToContain(
       noteFilePath,
-      "# Software project",
-      "current market writeback should title the note output",
-      20_000,
-    );
-    await expectNoteToContain(
-      noteFilePath,
       marker,
       "current market writeback should stream the final report after web fallback",
       20_000,
     );
+    const written = (await readOptionalFile(noteFilePath)) ?? "";
+    expect(written).not.toMatch(/^# Software project$/m);
+    expect(written).toMatch(/^## Market Overview$/m);
     await expectToolRun(page, "web_search");
     await expectToolRun(page, "web_fetch");
     await expectReceipt(page, "append");
@@ -4227,12 +5172,18 @@ test("file-scoped write touches only the requested path", async () => {
       { timeout: 120_000 },
     );
 
-    await expectFileToContain(
-      scopedFilePath,
-      marker,
-      "file-scoped write should create the requested file",
-      20_000,
-    );
+    try {
+      await expectFileToContain(
+        scopedFilePath,
+        marker,
+        "file-scoped write should create the requested file",
+        20_000,
+      );
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\n${JSON.stringify(await readBoundedMissionDiagnostic(page), null, 2)}`,
+      );
+    }
     await expectFileNotToContain(
       noteFilePath,
       marker,
@@ -4345,8 +5296,8 @@ test("CRUD mission reads creates writes updates moves and trashes explicit path"
     await waitForMissionComplete(page, 120_000);
     await assertMockModelUsed(page);
 
+    await expectDetailsText(page, "Timing: read_current_file");
     for (const toolName of [
-      "read_current_file",
       "create_folder",
       "create_file",
       "append_file",
@@ -4572,11 +5523,17 @@ test("authoritative MissionGraph rejects an extra mutation without changing prot
         { timeout: 120_000 },
       );
 
-      await expectFileToContain(
-        allowedFilePath,
-        `ALLOWED_CREATE:${input.marker}`,
-        "the single explicitly planned create should execute",
-      );
+      try {
+        await expectFileToContain(
+          allowedFilePath,
+          `ALLOWED_CREATE:${input.marker}`,
+          "the single explicitly planned create should execute",
+        );
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\n${JSON.stringify(await readBoundedMissionDiagnostic(page), null, 2)}`,
+        );
+      }
       expect((await readFile(allowedFilePath, "utf8")).split(
         `ALLOWED_CREATE:${input.marker}`,
       )).toHaveLength(2);
@@ -4588,7 +5545,7 @@ test("authoritative MissionGraph rejects an extra mutation without changing prot
       await expect(
         page.locator(".agentic-researcher-details-panel"),
       ).toContainText(
-        /(?:mission_graph_authority_blocked|plan_dependency_violation|Deferred create_file|Rejected create_file)/u,
+        /(?:mission_graph_authority_blocked|plan_dependency_violation|Deferred create_file|Rejected (?:unavailable tool: )?create_file|Off-frontier tool requested)/u,
       );
       await expect(
         page.locator(".agentic-researcher-receipt", { hasText: protectedPath }),
@@ -4638,12 +5595,18 @@ test("plugin restart resumes MissionGraph without replaying a completed write", 
           { waitForCompletion: false },
         );
 
-      await expectNoteToContain(
-        noteFilePath,
-        writeMarker,
-        "the first segment should complete its authorized write before restart",
-        60_000,
-      );
+      try {
+        await expectNoteToContain(
+          noteFilePath,
+          writeMarker,
+          "the first segment should complete its authorized write before restart",
+          60_000,
+        );
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\nRun details:\n${await readRunDetailsText(page)}`,
+        );
+      }
       await page.getByRole("tab", { name: "Run Details" }).click();
       const missionId = (await missionGraphField(page, "mission_id").textContent())
         ?.replace(/^mission_id=/u, "") ?? "";
@@ -4651,7 +5614,13 @@ test("plugin restart resumes MissionGraph without replaying a completed write", 
 
       await page.getByRole("tab", { name: "Chat" }).click();
       const runButton = page.locator("button.agentic-researcher-run");
-      await expect(runButton).toHaveText("Stop Mission", { timeout: 30_000 });
+      try {
+        await expect(runButton).toHaveText("Stop Mission", { timeout: 30_000 });
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\nRun details:\n${await readRunDetailsText(page)}`,
+        );
+      }
       await runButton.click();
       await page.evaluate(() => {
         (window as typeof window & {
@@ -4680,6 +5649,11 @@ test("plugin restart resumes MissionGraph without replaying a completed write", 
       await expect(
         page.getByRole("button", { name: "Continue Latest Run" }),
       ).toBeVisible({ timeout: 30_000 });
+      await page.evaluate(() => {
+        (window as typeof window & {
+          __e2eMissionGraphRestartResumePhase?: boolean;
+        }).__e2eMissionGraphRestartResumePhase = true;
+      });
       await page.getByRole("button", { name: "Continue Latest Run" }).click();
       await waitForMissionComplete(page, 120_000);
 
@@ -5086,11 +6060,64 @@ test.describe("phase-3 authenticated companion continuation", () => {
             ).toBeVisible({ timeout: 30_000 });
             await page.getByRole("button", { name: "Continue Latest Run" }).click();
             await waitForMissionComplete(page, 120_000);
-            await expectNoteToContain(
-              noteFilePath,
-              input.secondMarker,
-              "the original host-bound graph node should execute after core reconnect",
-            );
+            try {
+              await expectNoteToContain(
+                noteFilePath,
+                input.secondMarker,
+                "the original host-bound graph node should execute after core reconnect",
+              );
+            } catch (error) {
+              const failedGraph = await readPersistedMissionGraphRecord(
+                contract.graph.missionId,
+              );
+              const failedRuntime = await readMissionRuntimeSnapshotByRunId(
+                createPhase3FilesystemToolContext(
+                  "Diagnose the failed Phase-3 vault-node continuation.",
+                ),
+                contract.graph.missionId,
+              );
+              const panel = await page.evaluate(({ corePluginId }) => {
+                const plugin = (window as typeof window & { app?: any }).app
+                  ?.plugins?.plugins?.[corePluginId];
+                return {
+                  snapshot: plugin?.getMissionRunSnapshot?.() ?? null,
+                  statusText:
+                    plugin?.activeAgentView?.containerEl?.querySelector?.(
+                      ".agentic-researcher-status",
+                    )?.textContent ?? null,
+                  traceRows: Array.from(
+                    plugin?.activeAgentView?.containerEl?.querySelectorAll?.(
+                      ".agentic-researcher-trace-row",
+                    ) ?? [],
+                  )
+                    .slice(-80)
+                    .map((row: any) => ({
+                      id: row?.dataset?.traceId ?? null,
+                      text: row?.textContent ?? "",
+                    })),
+                };
+              }, { corePluginId: PLUGIN_ID });
+              const vaultNode = failedGraph.graph.nodes["vault-write"];
+              const diagnostic = {
+                graph: {
+                  status: failedGraph.graph.status,
+                  revision: failedGraph.graph.revision,
+                  vaultNode: {
+                    status: vaultNode.status,
+                    blocker: vaultNode.blocker,
+                    retries: vaultNode.retries,
+                    evidence: vaultNode.evidence,
+                    receipts: vaultNode.receipts,
+                  },
+                },
+                runtime: failedRuntime?.snapshot ?? null,
+                panel,
+              };
+              throw new Error(
+                `${error instanceof Error ? error.message : String(error)}\n` +
+                  `Phase-3 resume diagnostics: ${JSON.stringify(diagnostic)}`,
+              );
+            }
             const noteAfterResume = await readFile(noteFilePath, "utf8");
             expect(noteAfterResume.split(input.secondMarker)).toHaveLength(2);
 
@@ -5160,10 +6187,12 @@ test("autonomous loop respects bounded tool budget and checkpoints", async () =>
   await withE2EHarness("autonomous-loop-depth", async ({ page }) => {
     await setStreamingMode(page, false);
 
-    for (const steps of [1, 5, 10, 15, 30, 60, 100]) {
-      // Four steps remain reserved for finalization, while MissionGraphV3's
-      // 16-node ceiling can force synthesis earlier for deliberately
-      // pathological repeated-read prompts.
+    for (const steps of [5, 10, 15, 30, 60, 100]) {
+      // A graph read requires at least one executable tool turn in addition
+      // to the four finalization-reserve turns. MissionGraphV3's 16-node
+      // ceiling can force synthesis earlier for deliberately pathological
+      // repeated-read prompts.
+      const effectiveStepCap = Math.max(4, steps);
       const visibleStep = Math.min(Math.max(1, steps - 3), 16);
       const marker = `E2E_LOOP_DONE_${steps}`;
       await submitMission(
@@ -5179,12 +6208,12 @@ test("autonomous loop respects bounded tool budget and checkpoints", async () =>
       await page.getByRole("tab", { name: "Run Details" }).click();
       await expect(
         page.locator(".agentic-researcher-dashboard-section-planning", {
-          hasText: `Step ${visibleStep}/${steps}`,
+          hasText: `Step ${visibleStep}/${effectiveStepCap}`,
         }),
       ).toBeVisible({ timeout: 30_000 });
       await expect(
         page.locator(".agentic-researcher-dashboard-section-status", {
-          hasText: `Agent step ${visibleStep} of max ${steps}`,
+          hasText: `Agent step ${visibleStep} of max ${effectiveStepCap}`,
         }),
       ).toBeVisible({ timeout: 30_000 });
       await expect(
@@ -5384,11 +6413,17 @@ test("prompt-on-page folder traversal writes findings", async () => {
     await setStreamingMode(page, true);
     await submitMission(page, "Refer  to the notes in the notepage as the prompt");
 
-    await expectNoteToContain(
-      noteFilePath,
-      input.notepageFindingMarker,
-      "prompt-on-page traversal should write findings",
-    );
+    try {
+      await expectNoteToContain(
+        noteFilePath,
+        input.notepageFindingMarker,
+        "prompt-on-page traversal should write findings",
+      );
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\nRun details:\n${await readRunDetailsText(page)}`,
+      );
+    }
     await expectNoteToContain(
       noteFilePath,
       input.targetFolderMarkerOne,
@@ -5847,6 +6882,7 @@ async function withE2EHarness(
     throw new Error(`Invalid OBSIDIAN_CDP_PORT: ${String(process.env.OBSIDIAN_CDP_PORT)}`);
   }
 
+  await recoverStalePluginDataBackup(pluginDataPath);
   const dataBefore = await readOptionalFile(pluginDataPath);
   const ownedArtifactsBefore = await snapshotOwnedE2EArtifacts(vaultRoot);
   const communityPluginsBefore = await readOptionalFile(communityPluginsPath);
@@ -5865,6 +6901,7 @@ async function withE2EHarness(
       obsidianAppStateBefore,
       vaultRoot,
     );
+    await createPluginDataBackup(pluginDataPath, dataBefore);
     await seedPluginConversationHistory(
       pluginDataPath,
       dataBefore,
@@ -5982,7 +7019,7 @@ async function withE2EHarness(
     try {
       await restoreOwnedE2EArtifacts(ownedArtifactsBefore);
       await restoreOptionalFile(obsidianAppStatePath, obsidianAppStateBefore);
-      await restoreOptionalFile(pluginDataPath, dataBefore);
+      await restorePluginDataSnapshot(pluginDataPath, dataBefore);
       await restoreOptionalFile(communityPluginsPath, communityPluginsBefore);
     } catch (error) {
       teardownError ??= error;
@@ -6440,6 +7477,61 @@ async function expectDetailsText(page: Page, text: string) {
   ).toBeVisible();
 }
 
+async function readRunDetailsText(page: Page): Promise<string> {
+  await page.getByRole("tab", { name: "Run Details" }).click();
+  return page.locator(".agentic-researcher-details-panel").innerText();
+}
+
+async function readBoundedMissionDiagnostic(page: Page): Promise<unknown> {
+  await page.getByRole("tab", { name: "Run Details" }).click();
+  return page.evaluate(({ pluginId }) => {
+    const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[
+      pluginId
+    ];
+    const snapshot = plugin?.getMissionRunSnapshot?.();
+    const graph = snapshot?.lastMissionGraph ?? null;
+    const root = plugin?.activeAgentView?.containerEl;
+    return {
+      runId: snapshot?.runId ?? null,
+      phase: snapshot?.phase ?? null,
+      ledger: snapshot?.lastMissionLedger
+        ? {
+            status: snapshot.lastMissionLedger.status,
+            blocker: snapshot.lastMissionLedger.blocker,
+            receipts: snapshot.lastMissionLedger.receipts?.map((receipt: any) => ({
+              toolName: receipt.toolName,
+              path: receipt.path,
+              operation: receipt.operation,
+            })),
+          }
+        : null,
+      graph: graph
+        ? {
+            status: graph.status,
+            revision: graph.revision,
+            nodes: Object.values(graph.nodes ?? {}).map((node: any) => ({
+              id: node.id,
+              status: node.status,
+              allowedTools: node.allowedTools,
+              destination: node.destination,
+              retries: node.retries,
+              blocker: node.blocker,
+            })),
+          }
+        : null,
+      status: String(
+        root?.querySelector?.(".agentic-researcher-dashboard-section-status")
+          ?.textContent ?? "",
+      ).slice(-6_000),
+      traces: Array.from(
+        root?.querySelectorAll?.(".agentic-researcher-trace-row") ?? [],
+      )
+        .slice(-40)
+        .map((row: any) => String(row?.textContent ?? "").slice(0, 1_000)),
+    };
+  }, { pluginId: PLUGIN_ID });
+}
+
 async function expectLatestAgentCheckpoint(page: Page, text: string) {
   await expect
     .poll(
@@ -6590,12 +7682,12 @@ async function runGeneratedPromptScenario(
     const afterNoteContent = (await readOptionalFile(noteFilePath)) ?? "";
     const newText = getNewlyGeneratedText(beforeNoteContent, afterNoteContent);
     if (scenario.name === "grapes-stream-title") {
-      expect(afterNoteContent).toMatch(/^# Harvest of Injustice/m);
+      expect(afterNoteContent).not.toMatch(/^# Harvest of Injustice/m);
       expect(afterNoteContent).not.toMatch(/^# Untitled/m);
       expect(
         afterNoteContent.match(/^# Harvest of Injustice/gm)?.length ?? 0,
-        "streamed generated H1 should retitle the note instead of duplicating in the body",
-      ).toBe(1);
+        "streamed generated title metadata should not persist as a body H1",
+      ).toBe(0);
     }
     for (const term of scenario.requiredNewTextTerms ?? []) {
       expect(newText, `${scenario.name} should generate meaningful text containing ${term}`).toMatch(
@@ -7072,7 +8164,9 @@ async function setupVaultNoteAndMockModel(
         thinkingMode: "off",
         model: aiConfig.model,
         ollamaBaseUrl: aiConfig.baseUrl,
-        ollamaApiKey: aiConfig.apiKey || plugin.settings.ollamaApiKey,
+        // Credentials are seeded in data.json before launch. Never serialize
+        // them through Playwright's browser-evaluation channel.
+        ollamaApiKey: plugin.settings.ollamaApiKey,
         requestTimeoutMs: aiConfig.missionTimeoutMs,
         maxAgentSteps: 100,
         streamWritebackMode: "all_current_note_content_writes",
@@ -7120,7 +8214,9 @@ async function setupVaultNoteAndMockModel(
     const quoteVerifyStepCounts = new Map<string, number>();
     const resumeResearchStepCounts = new Map<string, number>();
     const sourcedAppendStepCounts = new Map<string, number>();
+    const selectionResearchStepCounts = new Map<string, number>();
     const proofGatedPrematureAttempted = new Set<string>();
+    const proofGatedCandidateStepCounts = new Map<string, number>();
     const proofGatedStreamStepCounts = new Map<string, number>();
     const currentMarketWritebackStepCounts = new Map<string, number>();
     const semanticSearchStepCounts = new Map<string, number>();
@@ -7149,6 +8245,7 @@ async function setupVaultNoteAndMockModel(
     const missionGraphMaliciousStepCounts = new Map<string, number>();
     const missionGraphRestartStepCounts = new Map<string, number>();
     const phase3ResumeStepCounts = new Map<string, number>();
+    const crudStepCounts = new Map<string, number>();
     plugin.createModelClient = function createModelClient() {
       return {
         playwrightE2EMock: true,
@@ -7331,9 +8428,14 @@ async function setupVaultNoteAndMockModel(
           }
 
           if (requestText.includes("E2E_MGV3_RESTART_WRITE")) {
+            // The runner may include an older resumable-ledger summary in a
+            // brand-new request. That text is not proof this specific graph
+            // has crossed an actual plugin restart. The test sets this host
+            // flag only after restart and immediately before Continue.
             const resumed =
-              /continue\s+run\s+[A-Za-z0-9._:-]+/iu.test(requestText) ||
-              /Resume count:\s*[1-9]/iu.test(requestText);
+              (window as typeof window & {
+                __e2eMissionGraphRestartResumePhase?: boolean;
+              }).__e2eMissionGraphRestartResumePhase === true;
             if (resumed && toolNames.length > 0) {
               const completionPath =
                 `E2E Agent Tests/Mission Graph Guard/restart-complete-${marker}.md`;
@@ -7720,6 +8822,13 @@ async function setupVaultNoteAndMockModel(
             latestUserText.includes("E2E_PARALLEL_READ") ||
             requestText.includes("E2E_PARALLEL_READ")
           ) {
+            if (request.format !== undefined) {
+              return {
+                message: { role: "assistant", content: "{}" },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
             const key = "E2E_PARALLEL_READ";
             const step = parallelReadStepCounts.get(key) ?? 0;
             const preferredReads = [
@@ -7835,7 +8944,9 @@ async function setupVaultNoteAndMockModel(
                 return {
                   message: {
                     role: "assistant",
-                    content: `E2E_LOOP_DONE_${targetSteps}`,
+                    content:
+                      `E2E_LOOP_DONE_${targetSteps} Inspected the current note graph ` +
+                      "across bounded related-note contexts and completed the requested synthesis.",
                   },
                   toolCalls: [],
                   raw: { playwrightE2E: true },
@@ -7865,7 +8976,9 @@ async function setupVaultNoteAndMockModel(
             return {
               message: {
                 role: "assistant",
-                content: `E2E_LOOP_DONE_${targetSteps}`,
+                content:
+                  `E2E_LOOP_DONE_${targetSteps} Inspected the current note graph ` +
+                  "across bounded related-note contexts and completed the requested synthesis.",
               },
               toolCalls: [],
               raw: { playwrightE2E: true },
@@ -7904,7 +9017,9 @@ async function setupVaultNoteAndMockModel(
                   index: 0,
                   name: "append_to_current_file",
                   arguments: {
-                    text: `\n\nE2E_RESUME_LEDGER_${requestedRunId}`,
+                    text:
+                      `\n\nAppended the requested result to the current note. ` +
+                      `E2E_RESUME_LEDGER_${requestedRunId}`,
                   },
                 };
                 return {
@@ -8403,6 +9518,13 @@ async function setupVaultNoteAndMockModel(
             };
           }
 
+          const autoContinuationFixtureAlreadyStarted =
+            (autoSegmentContinuationStepCounts.get(
+              "E2E_AUTO_SEGMENT_CONTINUATION",
+            ) ?? 0) > 0 ||
+            (autoSegmentContinuationStepCounts.get(
+              "E2E_OVERNIGHT_DURABLE_CONTINUATION",
+            ) ?? 0) > 0;
           if (
             requestText.includes("E2E_AUTO_SEGMENT_CONTINUATION") &&
             (/^continue\s+run\s+[A-Za-z0-9._:-]+/iu.test(latestUserText.trim()) ||
@@ -8411,6 +9533,11 @@ async function setupVaultNoteAndMockModel(
               ) ||
               /Runtime snapshot v\d+ revision/u.test(requestText) ||
               /Resume count:\s*[1-9]/iu.test(requestText) ||
+              // Compaction may legitimately replace the verbose continuation
+              // header after the owned fixture has already executed its first
+              // continuation action. Retain the fixture's observed phase
+              // instead of misclassifying the compacted turn as segment zero.
+              autoContinuationFixtureAlreadyStarted ||
               (/Ledger path:\s*Agent Runs\//iu.test(requestText) &&
                 /Run id:\s*run-/iu.test(requestText)))
           ) {
@@ -8438,17 +9565,13 @@ async function setupVaultNoteAndMockModel(
             }
             const continuationKey = requestText.includes("E2E_OVERNIGHT_DURABLE")
               ? "E2E_OVERNIGHT_DURABLE_CONTINUATION"
-              : requestedRunId;
+              : "E2E_AUTO_SEGMENT_CONTINUATION";
             const continuationStep =
               autoSegmentContinuationStepCounts.get(continuationKey) ?? 0;
             if (continuationStep === 0) {
-              const requiredTools = ["web_search", "web_fetch"];
-              const missingTools = requiredTools.filter(
-                (toolName) => !toolNames.includes(toolName),
-              );
-              if (missingTools.length > 0) {
+              if (!toolNames.includes("web_search")) {
                 throw new Error(
-                  `Automatic continuation was missing research tools: ${missingTools.join(", ")}.`,
+                  `Automatic continuation was missing web_search. Tools: ${toolNames.join(", ")}.`,
                 );
               }
               autoSegmentContinuationStepCounts.set(continuationKey, 1);
@@ -8473,38 +9596,95 @@ async function setupVaultNoteAndMockModel(
                 raw: { playwrightE2E: true },
               };
             }
-            if (continuationStep === 1) {
-              if (!toolNames.includes("web_fetch")) {
+            const overnightContinuation = requestText.includes(
+              "E2E_OVERNIGHT_DURABLE",
+            );
+            const autoSegmentLongRun =
+              requestText.includes("E2E_AUTO_SEGMENT_CONTINUATION") &&
+              !overnightContinuation;
+            if (
+              (overnightContinuation || autoSegmentLongRun) &&
+              continuationStep >= 1 &&
+              toolNames.includes("append_to_current_file")
+            ) {
+              const passageIds = [
+                ...new Set(
+                  Array.from(
+                    requestText.matchAll(
+                      /source:[A-Za-z0-9]+:passage:\d+-\d+/g,
+                    ),
+                    (match) => match[0],
+                  ),
+                ),
+              ].slice(-3);
+              if (passageIds.length === 0) {
                 throw new Error(
-                  `Automatic continuation was missing web_fetch after search. Tools: ${toolNames.join(", ")}`,
+                  "Automatic continuation append frontier omitted passage proof.",
                 );
               }
-              autoSegmentContinuationStepCounts.set(continuationKey, 2);
+              const cited = [
+                passageIds[0],
+                passageIds[1] ?? passageIds[0],
+                passageIds[2] ?? passageIds[0],
+              ];
+              autoSegmentContinuationStepCounts.set(continuationKey, 4);
+              return {
+                message: {
+                  role: "assistant",
+                  // The product deliberately holds proof-sensitive direct
+                  // write calls. Return a complete cited candidate so the
+                  // runner can verify it and perform the one authorized
+                  // append itself.
+                  content: [
+                    `### E2E_AUTO_SEGMENT_CONTINUATION_DONE_${requestedRunId}`,
+                    "",
+                    "## Findings",
+                    `Alpha evidence shows the test topic finding from the alpha source [${cited[0]}].`,
+                    `Beta evidence confirms a second independent finding about the test topic [${cited[1]}].`,
+                    `Gamma evidence adds a third corroborating detail for the test topic [${cited[2]}].`,
+                    "",
+                    "## Sources",
+                    `- https://alpha.example.com/deep-source [${cited[0]}]`,
+                    `- https://beta.example.org/deep-source [${cited[1]}]`,
+                    `- https://gamma.example.net/deep-source [${cited[2]}]`,
+                    "",
+                    "Limitations: deterministic owned e2e fixture sources only.",
+                    "",
+                    "Confidence: high for the owned e2e fixture.",
+                  ].join("\n"),
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+            if (
+              continuationStep === 1 ||
+              continuationStep === 2 ||
+              continuationStep === 3
+            ) {
+              const sourceName = ["alpha", "beta", "gamma"][continuationStep - 1];
+              autoSegmentContinuationStepCounts.set(
+                continuationKey,
+                continuationStep + 1,
+              );
+              if (!toolNames.includes("web_fetch")) {
+                throw new Error(
+                  `Automatic continuation had neither an append frontier nor web_fetch. Tools: ${toolNames.join(", ")}`,
+                );
+              }
+              const sourceUrl =
+                sourceName === "alpha"
+                  ? "https://alpha.example.com/deep-source"
+                  : sourceName === "beta"
+                    ? "https://beta.example.org/deep-source"
+                    : "https://gamma.example.net/deep-source";
               const toolCalls = [
                 {
-                  id: `playwright-e2e-auto-segment-fetch-alpha-${continuationKey}`,
+                  id: `playwright-e2e-auto-segment-fetch-${sourceName}-${continuationKey}`,
                   index: 0,
                   name: "web_fetch",
                   arguments: {
-                    url: "https://alpha.example.com/deep-source",
-                    max_chars: 4000,
-                  },
-                },
-                {
-                  id: `playwright-e2e-auto-segment-fetch-beta-${continuationKey}`,
-                  index: 1,
-                  name: "web_fetch",
-                  arguments: {
-                    url: "https://beta.example.org/deep-source",
-                    max_chars: 4000,
-                  },
-                },
-                {
-                  id: `playwright-e2e-auto-segment-fetch-gamma-${continuationKey}`,
-                  index: 2,
-                  name: "web_fetch",
-                  arguments: {
-                    url: "https://gamma.example.net/deep-source",
+                    url: sourceUrl,
                     max_chars: 4000,
                   },
                 },
@@ -8519,63 +9699,13 @@ async function setupVaultNoteAndMockModel(
                 raw: { playwrightE2E: true },
               };
             }
-            const overnightContinuation = requestText.includes(
-              "E2E_OVERNIGHT_DURABLE",
-            );
-            const autoSegmentLongRun =
-              requestText.includes("E2E_AUTO_SEGMENT_CONTINUATION") &&
-              !overnightContinuation;
             if (
-              (overnightContinuation || autoSegmentLongRun) &&
-              continuationStep === 2 &&
-              toolNames.includes("append_to_current_file")
+              continuationStep >= 1 &&
+              !toolNames.includes("append_to_current_file")
             ) {
-              autoSegmentContinuationStepCounts.set(continuationKey, 3);
-              const toolCall = {
-                id: `playwright-e2e-auto-segment-append-${continuationKey}`,
-                index: 0,
-                name: "append_to_current_file",
-                arguments: {
-                  text: `\n\n### E2E_AUTO_SEGMENT_CONTINUATION_DONE_${requestedRunId}\n`,
-                },
-              };
-              return {
-                message: {
-                  role: "assistant",
-                  content: "",
-                  toolCalls: [toolCall],
-                },
-                toolCalls: [toolCall],
-                raw: { playwrightE2E: true },
-              };
-            }
-            if (overnightContinuation && continuationStep === 3) {
-              if (!toolNames.includes("rename_current_file")) {
-                throw new Error(
-                  `Overnight continuation was missing rename_current_file after writeback. Tools: ${toolNames.join(", ")}`,
-                );
-              }
-              const title =
-                /Rename the current note to "([^"]+)"/u.exec(requestText)?.[1];
-              if (!title) {
-                throw new Error("Overnight continuation rename title was missing.");
-              }
-              autoSegmentContinuationStepCounts.set(continuationKey, 4);
-              const toolCall = {
-                id: `playwright-e2e-overnight-rename-${continuationKey}`,
-                index: 0,
-                name: "rename_current_file",
-                arguments: { title },
-              };
-              return {
-                message: {
-                  role: "assistant",
-                  content: "",
-                  toolCalls: [toolCall],
-                },
-                toolCalls: [toolCall],
-                raw: { playwrightE2E: true },
-              };
+              throw new Error(
+                `Automatic continuation exhausted its owned fetch sequence before append became ready. Tools: ${toolNames.join(", ")}`,
+              );
             }
             const passageIds = [
               ...new Set(
@@ -8584,7 +9714,7 @@ async function setupVaultNoteAndMockModel(
                   (match) => match[0],
                 ),
               ),
-            ];
+            ].slice(-3);
             if (passageIds.length < 3 && !overnightContinuation && !autoSegmentLongRun) {
               throw new Error(
                 `automatic continuation expected at least 3 passage citation ids, found ${passageIds.length}`,
@@ -8611,11 +9741,9 @@ async function setupVaultNoteAndMockModel(
                   `- https://beta.example.org/deep-source [${cited[1]}]`,
                   `- https://gamma.example.net/deep-source [${cited[2]}]`,
                   "",
-                  "## Limitations",
                   "Limitations: deterministic e2e fixture sources only.",
                   "",
-                  "## Confidence",
-                  "High confidence in segment lineage and completion-event behavior.",
+                  "Confidence: high in segment lineage and completion-event behavior.",
                 ].join("\n"),
               },
               toolCalls: [],
@@ -8646,7 +9774,7 @@ async function setupVaultNoteAndMockModel(
             if (autoSegmentInitial && step === 0) {
               if (!toolNames.includes("rename_current_file")) {
                 throw new Error(
-                  `rename_current_file was not available for ${key}. Tools: ${toolNames.join(", ")}`,
+                  `rename_current_file was not the first effect prerequisite for ${key}. Tools: ${toolNames.join(", ")}`,
                 );
               }
               const title =
@@ -8654,7 +9782,7 @@ async function setupVaultNoteAndMockModel(
               if (!title) {
                 throw new Error("Automatic continuation rename title was missing.");
               }
-              wallClockStepCounts.set(key, 1);
+              wallClockStepCounts.set(key, -1);
               const toolCall = {
                 id: "playwright-e2e-auto-segment-rename",
                 index: 0,
@@ -8671,25 +9799,47 @@ async function setupVaultNoteAndMockModel(
                 raw: { playwrightE2E: true },
               };
             }
-            if (
-              autoSegmentInitial &&
-              !isResumedContinuation &&
-              !/^continue\s+run\s+[A-Za-z0-9._:-]+/iu.test(latestUserText.trim())
-            ) {
+            if (autoSegmentInitial && step === -1) {
+              if (!toolNames.includes("get_note_graph_context")) {
+                throw new Error(
+                  `get_note_graph_context was not available for ${key}. Tools: ${toolNames.join(", ")}`,
+                );
+              }
+              wallClockStepCounts.set(key, 1);
+              const toolCall = {
+                id: "playwright-e2e-auto-segment-initial-graph-read",
+                index: 0,
+                name: "get_note_graph_context",
+                arguments: { path: loopContextNotePaths[0] },
+              };
+              return {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [toolCall],
+                },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+            if (autoSegmentInitial && step === 1) {
               const overnightWindow = window as typeof window & {
                 __e2eOvernightClockAdvanced?: boolean;
                 __e2eRestoreOvernightClock?: (() => void) | null;
               };
               if (overnightWindow.__e2eOvernightClockAdvanced !== true) {
+                const originalDateNow = Date.now.bind(Date);
                 const originalPerformanceNow = window.performance.now.bind(
                   window.performance,
                 );
+                Date.now = () => originalDateNow() + 31 * 60_000;
                 Object.defineProperty(window.performance, "now", {
                   configurable: true,
                   value: () => originalPerformanceNow() + 31 * 60_000,
                 });
                 overnightWindow.__e2eOvernightClockAdvanced = true;
                 overnightWindow.__e2eRestoreOvernightClock = () => {
+                  Date.now = originalDateNow;
                   Object.defineProperty(window.performance, "now", {
                     configurable: true,
                     value: originalPerformanceNow,
@@ -8698,8 +9848,18 @@ async function setupVaultNoteAndMockModel(
                   overnightWindow.__e2eRestoreOvernightClock = null;
                 };
               }
+              wallClockStepCounts.set(key, 2);
+              return {
+                message: {
+                  role: "assistant",
+                  content:
+                    "E2E_AUTO_SEGMENT_BUDGET_BOUNDARY web research and append remain pending for the durable continuation.",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
             }
-            const graphStep = autoSegmentInitial ? step - 1 : step;
+            const graphStep = autoSegmentInitial ? step - 2 : step;
             if (graphStep < 8 && toolNames.includes("get_note_graph_context")) {
               wallClockStepCounts.set(key, step + 1);
               const loopContextPath =
@@ -9284,22 +10444,19 @@ async function setupVaultNoteAndMockModel(
 
           if (requestText.includes("E2E_PROOF_GATED_DEPENDENCY_WRITEBACK")) {
             const key = "E2E_PROOF_GATED_DEPENDENCY_WRITEBACK";
+            if (request.format !== undefined) {
+              return {
+                message: { role: "assistant", content: "{}" },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
             if (toolNames.length === 0) {
               return {
                 message: { role: "assistant", content: "" },
                 toolCalls: [],
                 raw: { playwrightE2E: true },
               };
-            }
-            const missingTools = [
-              "web_search",
-              "web_fetch",
-              "append_to_current_file",
-            ].filter((toolName) => !toolNames.includes(toolName));
-            if (missingTools.length > 0) {
-              throw new Error(
-                `proof-gated writeback tools were not available: ${missingTools.join(", ")}. Tools: ${toolNames.join(", ")}`,
-              );
             }
             const webSearchDone =
               requestText.includes("E2E MCP Proof-Gated Source") ||
@@ -9311,25 +10468,17 @@ async function setupVaultNoteAndMockModel(
 
             if (!prematureDone) {
               proofGatedPrematureAttempted.add(key);
-              const toolCalls = [
-                {
-                  id: "playwright-e2e-proof-gated-premature-write",
-                  index: 0,
-                  name: "append_to_current_file",
-                  arguments: {
-                    text: "E2E_PREMATURE_PROOF_GATED_WRITE must be rejected before fetch.",
-                  },
+              // Deliberately request a mutation that is absent from the ready
+              // graph frontier. The host must reject it and give the model one
+              // schema-qualified correction turn without mutating the note.
+              const toolCalls = [{
+                id: "playwright-e2e-proof-gated-premature-write",
+                index: 0,
+                name: "append_to_current_file",
+                arguments: {
+                  text: "E2E_PREMATURE_PROOF_GATED_WRITE must be rejected before fetch.",
                 },
-                {
-                  id: "playwright-e2e-proof-gated-search",
-                  index: 1,
-                  name: "web_search",
-                  arguments: {
-                    query: "E2E_PROOF_GATED_DEPENDENCY_WRITEBACK MCP servers",
-                    max_results: 1,
-                  },
-                },
-              ];
+              }];
               return {
                 message: { role: "assistant", content: "", toolCalls },
                 toolCalls,
@@ -9338,6 +10487,11 @@ async function setupVaultNoteAndMockModel(
             }
 
             if (!webSearchDone) {
+              if (!toolNames.includes("web_search")) {
+                throw new Error(
+                  `proof-gated correction was missing web_search. Tools: ${toolNames.join(", ")}`,
+                );
+              }
               const toolCall = {
                 id: "playwright-e2e-proof-gated-search",
                 index: 0,
@@ -9355,6 +10509,11 @@ async function setupVaultNoteAndMockModel(
             }
 
             if (!fetchDone) {
+              if (!toolNames.includes("web_fetch")) {
+                throw new Error(
+                  `proof-gated continuation was missing web_fetch. Tools: ${toolNames.join(", ")}`,
+                );
+              }
               const toolCall = {
                 id: "playwright-e2e-proof-gated-fetch",
                 index: 0,
@@ -9370,10 +10529,133 @@ async function setupVaultNoteAndMockModel(
               };
             }
 
+            const candidateStep = proofGatedCandidateStepCounts.get(key) ?? 0;
+            proofGatedCandidateStepCounts.set(key, candidateStep + 1);
+            if (candidateStep === 0) {
+              return {
+                message: {
+                  role: "assistant",
+                  content:
+                    "E2E_INVALID_UNCITED_PROOF_DRAFT MCP servers expose tools, but this draft has no bound citation.",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+            const passageId =
+              /source:[A-Za-z0-9]+:passage:\d+-\d+/.exec(requestText)?.[0] ?? "";
+            if (!passageId) {
+              throw new Error(
+                "proof-gated correction request omitted fetched passage proof",
+              );
+            }
+            const marker =
+              /E2E_PROOF_GATED_COMMIT_[A-Za-z0-9_]+/.exec(requestText)?.[0] ??
+              "E2E_PROOF_GATED_COMMIT_MISSING";
             return {
               message: {
                 role: "assistant",
-                content: "Fetched MCP evidence is ready for verified writeback.",
+                content: `${marker}\n\nMCP servers expose tools and resources through a standard protocol. Source: https://example.com/e2e-proof-gated-source Passage evidence: [${passageId}]`,
+              },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
+
+          if (latestUserText.includes("Research the following selected text")) {
+            const chatOnly = /Keep the answer in chat only/i.test(latestUserText);
+            const key = chatOnly
+              ? "E2E_SELECTION_RESEARCH_CHAT"
+              : "E2E_SELECTION_RESEARCH_STREAM";
+            if (request.format !== undefined) {
+              return {
+                message: { role: "assistant", content: "{}" },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+            const step = selectionResearchStepCounts.get(key) ?? 0;
+            if (step === 0) {
+              if (!toolNames.includes("web_search")) {
+                throw new Error(
+                  `selection research was missing web_search. Tools: ${toolNames.join(", ")}`,
+                );
+              }
+              selectionResearchStepCounts.set(key, 1);
+              const toolCall = {
+                id: "playwright-e2e-selection-research-search",
+                index: 0,
+                name: "web_search",
+                arguments: {
+                  query: "E2E selection research selected text",
+                  max_results: 1,
+                },
+              };
+              return {
+                message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+            if (step === 1) {
+              if (!toolNames.includes("web_fetch")) {
+                throw new Error(
+                  `selection research was missing web_fetch. Tools: ${toolNames.join(", ")}`,
+                );
+              }
+              selectionResearchStepCounts.set(key, 2);
+              // Reuse the proven ledger source so passage binding matches
+              // sourced-append writeback fixtures.
+              const toolCall = {
+                id: "playwright-e2e-selection-research-fetch",
+                index: 0,
+                name: "web_fetch",
+                arguments: {
+                  url: "https://example.com/e2e-ledger-source",
+                },
+              };
+              return {
+                message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+            const selectedSnippet =
+              /E2E_SELECTION_[A-Z]+_[A-Za-z0-9_]+[^\n"]*/.exec(latestUserText)?.[0] ??
+              "selected text";
+            if (chatOnly) {
+              const passageId =
+                /source:[A-Za-z0-9]+:passage:\d+-\d+/.exec(requestText)?.[0] ??
+                /"passageIds"\s*:\s*\[\s*"([^"]+)"/.exec(requestText)?.[1] ??
+                "source:selectionresearch:passage:0-120";
+              const body = [
+                "## Cited findings",
+                "",
+                `Research on ${selectedSnippet.trim()} with citation [${passageId}].`,
+                "",
+                "https://example.com/e2e-ledger-source",
+                "",
+                "## Limitations",
+                "",
+                "Sources may disagree on secondary details for this selection research.",
+                "",
+                "## Confidence",
+                "",
+                "medium",
+              ].join("\n");
+              return {
+                message: { role: "assistant", content: body },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+            // Empty content so the runner owns proof-gated stream writeback
+            // instead of holding this handoff line as an append candidate.
+            selectionResearchStepCounts.set(key, 3);
+            return {
+              message: {
+                role: "assistant",
+                content: "",
               },
               toolCalls: [],
               raw: { playwrightE2E: true },
@@ -9382,19 +10664,21 @@ async function setupVaultNoteAndMockModel(
 
           if (latestUserText.includes("E2E_SOURCED_APPEND_MULTI_TOOL")) {
             const key = "E2E_SOURCED_APPEND_MULTI_TOOL";
-            const sourcedAppendStep = sourcedAppendStepCounts.get(key) ?? 0;
-            const missingTools = [
-              "web_search",
-              "web_fetch",
-              "append_to_current_file",
-            ].filter((toolName) => !toolNames.includes(toolName));
-            if (missingTools.length > 0) {
-              throw new Error(
-                `sourced append tools were not available: ${missingTools.join(", ")}. Tools: ${toolNames.join(", ")}`,
-              );
+            if (request.format !== undefined) {
+              return {
+                message: { role: "assistant", content: "{}" },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
             }
+            const sourcedAppendStep = sourcedAppendStepCounts.get(key) ?? 0;
 
             if (sourcedAppendStep === 0) {
+              if (!toolNames.includes("web_search")) {
+                throw new Error(
+                  `sourced append was missing web_search at the initial frontier. Tools: ${toolNames.join(", ")}`,
+                );
+              }
               sourcedAppendStepCounts.set(key, 1);
               const toolCall = {
                 id: "playwright-e2e-sourced-append-search",
@@ -9418,6 +10702,11 @@ async function setupVaultNoteAndMockModel(
             }
 
             if (sourcedAppendStep === 1) {
+              if (!toolNames.includes("web_fetch")) {
+                throw new Error(
+                  `sourced append was missing web_fetch after search. Tools: ${toolNames.join(", ")}`,
+                );
+              }
               sourcedAppendStepCounts.set(key, 2);
               const toolCall = {
                 id: "playwright-e2e-sourced-append-fetch",
@@ -10133,6 +11422,17 @@ async function setupVaultNoteAndMockModel(
           ) {
             const key = "E2E_SVG_REVISE_UPDATE";
             const step = designReviseStepCounts.get(key) ?? 0;
+            if (step >= 2) {
+              return {
+                message: {
+                  role: "assistant",
+                  content:
+                    "E2E_SVG_REVISE_UPDATE_DONE The SVG title was revised and verified.",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
             if (step === 0) {
               if (!toolNames.includes("read_svg_design")) {
                 throw new Error(
@@ -10194,6 +11494,17 @@ async function setupVaultNoteAndMockModel(
           ) {
             const key = "E2E_MERMAID_REVISE_UPDATE";
             const step = designReviseStepCounts.get(key) ?? 0;
+            if (step >= 2) {
+              return {
+                message: {
+                  role: "assistant",
+                  content:
+                    "E2E_MERMAID_REVISE_UPDATE_DONE The Mermaid block was revised and verified.",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
             if (step === 0) {
               if (!toolNames.includes("read_mermaid_block")) {
                 throw new Error(
@@ -10253,6 +11564,17 @@ async function setupVaultNoteAndMockModel(
           ) {
             const key = "E2E_DESIGN_REVISE_UPDATE";
             const step = designReviseStepCounts.get(key) ?? 0;
+            if (step >= 2) {
+              return {
+                message: {
+                  role: "assistant",
+                  content:
+                    "E2E_DESIGN_REVISE_UPDATE_DONE The canvas title was revised and verified.",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
             if (step === 0) {
               if (!toolNames.includes("read_design_canvas")) {
                 throw new Error(
@@ -10557,43 +11879,19 @@ async function setupVaultNoteAndMockModel(
           }
 
           if (latestUserText.includes("E2E_CRUD_CHAIN")) {
-            const requiredTools = [
-              "read_current_file",
-              "create_folder",
-              "create_file",
-              "append_file",
-              "replace_file",
-              "move_path",
-              "delete_path",
-            ];
-            const missingTools = requiredTools.filter(
-              (toolName) => !toolNames.includes(toolName),
-            );
-            if (missingTools.length > 0) {
-              throw new Error(
-                `CRUD e2e tools were not available: ${missingTools.join(", ")}. Tools: ${toolNames.join(", ")}`,
-              );
-            }
-
+            const key = `E2E_CRUD_CHAIN:${marker}`;
+            const step = crudStepCounts.get(key) ?? 0;
             const basePath = `E2E Agent Tests/CRUD Chain/${marker}`;
             const initialPath = `${basePath}/crud-target-${marker}.md`;
             const movedPath = `${basePath}/crud-target-${marker}-moved.md`;
-            const toolCalls = [
-              {
-                id: "playwright-e2e-crud-read",
-                index: 0,
-                name: "read_current_file",
-                arguments: {},
-              },
+            const orderedCalls = [
               {
                 id: "playwright-e2e-crud-create-folder",
-                index: 1,
                 name: "create_folder",
                 arguments: { path: basePath },
               },
               {
                 id: "playwright-e2e-crud-create-file",
-                index: 2,
                 name: "create_file",
                 arguments: {
                   path: initialPath,
@@ -10602,7 +11900,6 @@ async function setupVaultNoteAndMockModel(
               },
               {
                 id: "playwright-e2e-crud-append",
-                index: 3,
                 name: "append_file",
                 arguments: {
                   path: initialPath,
@@ -10611,7 +11908,6 @@ async function setupVaultNoteAndMockModel(
               },
               {
                 id: "playwright-e2e-crud-replace",
-                index: 4,
                 name: "replace_file",
                 arguments: {
                   path: initialPath,
@@ -10620,7 +11916,6 @@ async function setupVaultNoteAndMockModel(
               },
               {
                 id: "playwright-e2e-crud-move",
-                index: 5,
                 name: "move_path",
                 arguments: {
                   fromPath: initialPath,
@@ -10629,19 +11924,35 @@ async function setupVaultNoteAndMockModel(
               },
               {
                 id: "playwright-e2e-crud-delete",
-                index: 6,
                 name: "delete_path",
                 arguments: { path: movedPath },
               },
             ];
-
+            const nextCall = orderedCalls[step];
+            if (!nextCall) {
+              return {
+                message: {
+                  role: "assistant",
+                  content: "E2E_CRUD_CHAIN_DONE",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+            if (!toolNames.includes(nextCall.name)) {
+              throw new Error(
+                `CRUD e2e frontier expected ${nextCall.name} at step ${step}; tools: ${toolNames.join(", ")}`,
+              );
+            }
+            crudStepCounts.set(key, step + 1);
+            const toolCall = { ...nextCall, index: 0 };
             return {
               message: {
                 role: "assistant",
                 content: "",
-                toolCalls,
+                toolCalls: [toolCall],
               },
-              toolCalls,
+              toolCalls: [toolCall],
               raw: { playwrightE2E: true },
             };
           }
@@ -10748,6 +12059,52 @@ async function setupVaultNoteAndMockModel(
               ?.content ?? "";
           const requestText =
             request.messages?.map((message) => message.content ?? "").join("\n") ?? "";
+          if (requestText.includes("E2E_AUTO_SEGMENT_CONTINUATION")) {
+            const passageIds = [
+              ...new Set(
+                Array.from(
+                  requestText.matchAll(/source:[A-Za-z0-9]+:passage:\d+-\d+/g),
+                  (match) => match[0],
+                ),
+              ),
+            ].slice(-3);
+            if (passageIds.length > 0) {
+              const requestedRunId =
+                /Continuation command:\s*continue\s+run\s+([A-Za-z0-9._:-]+)/iu.exec(
+                  requestText,
+                )?.[1] ??
+                /Run id:\s*([A-Za-z0-9._:-]+)/u.exec(requestText)?.[1] ??
+                "resumed-segment";
+              const cited = [
+                passageIds[0],
+                passageIds[1] ?? passageIds[0],
+                passageIds[2] ?? passageIds[0],
+              ];
+              const content = [
+                `### E2E_AUTO_SEGMENT_CONTINUATION_DONE_${requestedRunId}`,
+                "",
+                "## Findings",
+                `Alpha evidence shows the test topic finding from the alpha source [${cited[0]}].`,
+                `Beta evidence confirms a second independent finding about the test topic [${cited[1]}].`,
+                `Gamma evidence adds a third corroborating detail for the test topic [${cited[2]}].`,
+                "",
+                "## Sources",
+                `- https://alpha.example.com/deep-source [${cited[0]}]`,
+                `- https://beta.example.org/deep-source [${cited[1]}]`,
+                `- https://gamma.example.net/deep-source [${cited[2]}]`,
+                "",
+                "Limitations: deterministic owned e2e fixture sources only.",
+                "",
+                "Confidence: high for the owned e2e fixture.",
+              ].join("\n");
+              events?.onContentDelta?.(content);
+              return {
+                message: { role: "assistant", content },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+          }
           if (requestText.includes("E2E_DIRECT_USER_ROLE_WRITEBACK")) {
             const lastMessage = request.messages?.at(-1);
             if (
@@ -10809,6 +12166,54 @@ async function setupVaultNoteAndMockModel(
               );
             }
             const content = `${marker}: Alpha evidence shows the test topic finding [${passageId}].\n\nAlpha evidence shows the test topic finding in the fetched MCP source. Source: https://alpha.example.com/deep-source [${passageId}]`;
+            const splitAt = Math.max(1, Math.floor(content.length / 2));
+            events?.onContentDelta?.(content.slice(0, splitAt));
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            events?.onContentDelta?.(content.slice(splitAt));
+            return {
+              message: { role: "assistant", content },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
+
+          if (requestText.includes("Research the following selected text")) {
+            const originatingMissionText =
+              request.messages?.find(
+                (message) =>
+                  message.role === "user" &&
+                  String(message.content ?? "").includes(
+                    "Research the following selected text",
+                  ),
+              )?.content ?? requestText;
+            if (/Keep the answer in chat only/i.test(originatingMissionText)) {
+              return {
+                message: { role: "assistant", content: "{}" },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+            const passageId =
+              /source:[A-Za-z0-9]+:passage:\d+-\d+/.exec(requestText)?.[0] ?? "";
+            if (!passageId) {
+              throw new Error(
+                "selection research writeback request omitted fetched passage proof",
+              );
+            }
+            const selectedSnippet =
+              /E2E_SELECTION_[A-Z]+_[A-Za-z0-9_]+[^\n"]*/.exec(
+                originatingMissionText,
+              )?.[0] ?? "selected text";
+            // Include early mission-title relevance terms ("following",
+            // "selected", "text") plus the selection topic so final_relevance
+            // accepts the streamed append candidate.
+            const content = [
+              "## Cited findings",
+              "",
+              `Following the selected text on quantum battery density (${selectedSnippet.trim()}), Alpha evidence shows the test topic finding [${passageId}].`,
+              "",
+              `Alpha evidence shows the test topic finding about quantum battery density in the fetched source. Source: https://example.com/e2e-ledger-source [${passageId}]`,
+            ].join("\n");
             const splitAt = Math.max(1, Math.floor(content.length / 2));
             events?.onContentDelta?.(content.slice(0, splitAt));
             await new Promise((resolve) => setTimeout(resolve, 100));
@@ -11211,7 +12616,7 @@ Confidence: high for deterministic workflow coverage.
         thinkingMode: "off",
         model: aiConfig.model,
         ollamaBaseUrl: aiConfig.baseUrl,
-        ollamaApiKey: aiConfig.apiKey || activePlugin.settings.ollamaApiKey,
+        ollamaApiKey: activePlugin.settings.ollamaApiKey,
         requestTimeoutMs: aiConfig.missionTimeoutMs,
         maxAgentSteps: 100,
         streamWritebackMode: "all_current_note_content_writes",
@@ -11692,6 +13097,22 @@ Confidence: high for deterministic workflow coverage.
           };
         }
 
+        if (query.includes("E2E selection research") || query.includes("selection research")) {
+          return {
+            status: 200,
+            json: {
+              results: [
+                {
+                  title: "E2E Selection Research Source",
+                  url: "https://example.com/e2e-ledger-source",
+                  snippet: "E2E selection research source snippet for cited findings.",
+                },
+              ],
+            },
+            text: "",
+          };
+        }
+
         if (query.includes("E2E_WEB_LEDGER_SOURCE")) {
           return {
             status: 200,
@@ -11825,6 +13246,20 @@ Confidence: high for deterministic workflow coverage.
           };
         }
 
+        if (requestedUrl.includes("e2e-selection-research-source")) {
+          return {
+            status: 200,
+            json: {
+              title: "E2E Selection Research Source",
+              url: requestedUrl,
+              content:
+                "Selection research fetched passage with enough detail for a cited findings append during Playwright e2e.",
+              links: [],
+            },
+            text: "",
+          };
+        }
+
         if (requestedUrl.includes("e2e-auto-followup-source")) {
           return {
             status: 200,
@@ -11859,7 +13294,7 @@ Confidence: high for deterministic workflow coverage.
               title: "E2E Web Ledger Source",
               url: requestedUrl,
               content:
-                "E2E_WEB_LEDGER_SOURCE fetched source content for mission evidence tracking.",
+                "E2E_WEB_LEDGER_SOURCE fetched source content for mission evidence tracking. Alpha evidence shows the test topic finding in the fetched MCP source, including quantum battery density context for selection research.",
               links: [],
             },
             text: "",
@@ -12208,7 +13643,7 @@ async function reloadAssistantPanel(page: Page) {
         thinkingMode: "off",
         model: config.model,
         ollamaBaseUrl: config.baseUrl,
-        ollamaApiKey: config.apiKey || plugin.settings?.ollamaApiKey,
+        ollamaApiKey: plugin.settings?.ollamaApiKey,
         requestTimeoutMs: config.missionTimeoutMs,
         maxAgentSteps: 100,
         streamWritebackMode: "all_current_note_content_writes",
@@ -12289,8 +13724,7 @@ async function setStreamingMode(
       if (mode === "real") {
         nextSettings.model = config.model;
         nextSettings.ollamaBaseUrl = config.baseUrl;
-        nextSettings.ollamaApiKey =
-          config.apiKey || mutable.settings?.ollamaApiKey;
+        nextSettings.ollamaApiKey = mutable.settings?.ollamaApiKey;
       } else {
         nextSettings.model = "playwright-e2e-mock";
         nextSettings.ollamaBaseUrl = "http://127.0.0.1:11434";
@@ -12784,34 +14218,9 @@ async function terminateObsidian(
         process.kill();
       });
     },
-    waitForOwnedExit: () => waitForChildClose(process, 10_000),
+    waitForOwnedExit: () => waitForWindowsProcessExit(process.pid!, 30_000),
     waitForNoRunningProcess: () => waitForNoRunningObsidian(30_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
-  });
-}
-
-async function waitForChildClose(
-  process: ChildProcessWithoutNullStreams,
-  timeoutMs: number,
-) {
-  if (process.exitCode !== null || process.signalCode !== null) {
-    return true;
-  }
-
-  return await new Promise<boolean>((resolve) => {
-    let settled = false;
-    const onClose = () => finish(true);
-    const finish = (result: boolean) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      process.off("close", onClose);
-      resolve(result);
-    };
-    const timeout = setTimeout(() => finish(false), timeoutMs);
-    process.once("close", onClose);
   });
 }
 

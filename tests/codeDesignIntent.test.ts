@@ -32,6 +32,10 @@ test("codeDesignIntent classifies code and design prompts", () => {
     false,
   );
   assert.equal(hasReviseDesignIntent("revise the canvas layout"), true);
+  assert.equal(
+    hasReviseDesignIntent("read the Mermaid block, then revise the same block"),
+    true,
+  );
   assert.equal(hasHtmlPreviewIntent("preview the html page"), true);
 });
 

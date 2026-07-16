@@ -9,6 +9,7 @@ import {
 import {
   acknowledgeEvidenceConflict,
   detectEvidenceConflicts,
+  projectEvidenceConflictAcknowledgements,
 } from "../src/agent/evidenceConflicts";
 import {
   createMissionPlan,
@@ -331,6 +332,25 @@ test("similar vault note indices do not create numeric evidence conflicts", () =
   assert.equal(conflicts.length, 0);
 });
 
+test("operational negation caveats do not create substantive evidence conflicts", () => {
+  const conflicts = detectEvidenceConflicts([
+    {
+      id: "owned:alpha",
+      text: "Alpha evidence supports the bounded synthesis and preserves existing tool authority.",
+    },
+    {
+      id: "owned:beta",
+      text: "Beta evidence independently supports the bounded synthesis and does not widen tool authority.",
+    },
+    {
+      id: "owned:gamma",
+      text: "Gamma evidence independently corroborates the bounded synthesis under existing tool authority.",
+    },
+  ]);
+
+  assert.equal(conflicts.length, 0);
+});
+
 test("two opposing passages detect an open evidence conflict", () => {
   const conflicts = detectEvidenceConflicts([
     {
@@ -456,6 +476,28 @@ test("acknowledged_limitation allows research acceptance with explicit limitatio
     verifier.checks.find((check) => check.kind === "evidence_conflicts")?.status,
     "pass",
   );
+});
+
+test("candidate conflict acknowledgement requires an explicit disagreement section", () => {
+  const open = detectEvidenceConflicts([
+    { id: "p1", text: "Study data show treatment X improves recovery rates." },
+    { id: "p2", text: "Study data show treatment X does not improve recovery rates." },
+  ]);
+  assert.equal(open.length, 1);
+
+  const genericCaveat = projectEvidenceConflictAcknowledgements(
+    open,
+    "## Limitations\n\nMore research may be useful.",
+  );
+  assert.equal(genericCaveat[0]?.status, "open");
+
+  const explicitConflict = projectEvidenceConflictAcknowledgements(
+    open,
+    "Limitations: The two sources conflict on treatment X recovery rates.",
+  );
+  assert.equal(explicitConflict[0]?.status, "acknowledged_limitation");
+  assert.match(explicitConflict[0]?.resolutionNote ?? "", /source disagreement/iu);
+  assert.equal(open[0]?.status, "open", "projection must not mutate durable state");
 });
 
 function hybridResearchPlan(): ResearchPlan {

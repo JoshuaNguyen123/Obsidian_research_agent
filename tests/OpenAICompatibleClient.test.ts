@@ -10,6 +10,22 @@ import {
 import type { HttpRequest } from "../src/model/types";
 import { ModelClientError } from "../src/model/types";
 
+test("OpenAI-compatible descriptor is production and endpoint-redacted", () => {
+  const client = new OpenAICompatibleClient({
+    baseUrl: "https://models.example.test/v1?key=never-retained",
+    apiKey: "secret-never-retained",
+    model: "example-model",
+    transport: async () => ({ status: 200, headers: {}, json: {} }),
+  });
+  assert.deepEqual(client.descriptor, {
+    provider: "openai_compatible",
+    model: "example-model",
+    endpointCategory: "custom",
+    transportKind: "production",
+  });
+  assert.doesNotMatch(JSON.stringify(client.descriptor), /secret|never-retained/u);
+});
+
 test("maps internal messages to OpenAI-compatible tool transcripts", () => {
   const messages = toOpenAIMessages([
     { role: "system", content: "System" },

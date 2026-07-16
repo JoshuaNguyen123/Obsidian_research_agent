@@ -47,6 +47,14 @@ export function planReadOnlyFollowups(input: AutoFollowupInput): AutoFollowupReq
 }
 
 function planNextSourceSection(input: AutoFollowupInput): AutoFollowupRequest | null {
+  const stillNeedsSourceCoverage = input.acceptanceNeeds.some((need) =>
+    /web_evidence|fetched_sources|distinct_domains|source|citation|passage/i.test(
+      need,
+    ),
+  );
+  if (!stillNeedsSourceCoverage) {
+    return null;
+  }
   const output = getOutput(input.lastToolResult);
   if (!isRecord(output)) {
     return null;
@@ -54,7 +62,8 @@ function planNextSourceSection(input: AutoFollowupInput): AutoFollowupRequest | 
   const path = typeof output.cachedPath === "string" ? output.cachedPath : "";
   const section = typeof output.section === "number" ? output.section : 1;
   const sectionCount = typeof output.sectionCount === "number" ? output.sectionCount : 1;
-  if (!path || section >= sectionCount) {
+  // Cap section thrash: at most one auto section advance per fetch.
+  if (!path || section >= sectionCount || section >= 2) {
     return null;
   }
   return {

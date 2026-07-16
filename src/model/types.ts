@@ -3,6 +3,26 @@ import { formatModelFailureCopy } from "../agent/failureCopy";
 export type ModelRole = "system" | "user" | "assistant" | "tool";
 export type ModelThink = boolean | "low" | "medium" | "high" | "max";
 export type ModelProvider = "ollama" | "openai_compatible";
+export type ModelEndpointCategory = "local" | "ollama_cloud" | "custom";
+export type ModelTransportKind = "production" | "test_mock";
+
+/** Redacted, stable identity for the configured transport. */
+export interface ModelClientDescriptor {
+  provider: ModelProvider;
+  model: string;
+  endpointCategory: ModelEndpointCategory;
+  transportKind: ModelTransportKind;
+}
+
+export type ModelCallPhase =
+  | "router"
+  | "graph_planner"
+  | "agent_step"
+  | "finalizer"
+  | "streaming"
+  | "retry"
+  | "worker"
+  | "unknown";
 
 export type ModelClientErrorCategory =
   | "missing_api_key"
@@ -10,7 +30,8 @@ export type ModelClientErrorCategory =
   | "rate_limit"
   | "api"
   | "network"
-  | "invalid_response";
+  | "invalid_response"
+  | "provider_budget_exhausted";
 
 export interface JsonSchemaObject {
   type?: string | string[];
@@ -57,6 +78,8 @@ export interface ModelChatRequest {
   think?: ModelThink;
   options?: ModelRequestOptions;
   abortSignal?: AbortSignal;
+  /** Host-only observability label. It is never serialized to the provider. */
+  evidencePhase?: ModelCallPhase;
 }
 
 export interface ModelRequestOptions {
@@ -80,6 +103,8 @@ export interface ModelChatStreamEvents {
 }
 
 export interface ModelClient {
+  /** Required on production clients; optional for legacy unit-test doubles. */
+  readonly descriptor?: ModelClientDescriptor;
   chat(request: ModelChatRequest): Promise<ModelChatResponse>;
   streamChat(
     request: ModelChatRequest,

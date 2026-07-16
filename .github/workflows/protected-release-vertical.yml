@@ -1,0 +1,117 @@
+name: Protected live release vertical
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact commit SHA to attest
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-proof:
+    environment: protected-live-release
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+      - obsidian-e2e
+      - agentic-sandbox-wsl2
+    timeout-minutes: 240
+    env:
+      E2E_RELEASE_COMMIT_SHA: ${{ inputs.commit_sha }}
+      E2E_OLLAMA_API_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
+      E2E_AI_MODEL: ${{ vars.E2E_AI_MODEL || 'gpt-oss:120b-cloud' }}
+      E2E_OLLAMA_BASE_URL: ${{ vars.E2E_OLLAMA_BASE_URL || 'https://ollama.com/api' }}
+      E2E_LINEAR_API_KEY: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
+      E2E_GITHUB_TOKEN: ${{ secrets.GITHUB_LIVE_TEST_TOKEN }}
+      E2E_RELEASE_LINEAR_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
+      E2E_RELEASE_GITHUB_REPOSITORY: ${{ vars.DISPOSABLE_GITHUB_REPOSITORY }}
+      E2E_REAL_SANDBOX_PROVIDER: wsl2
+      LINEAR_LIVE_TEST_TOKEN: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
+      LINEAR_LIVE_TEST_TEAM_ID: ${{ vars.LINEAR_LIVE_TEST_TEAM_ID }}
+      LINEAR_LIVE_TEST_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
+      GITHUB_LIVE_TEST_TOKEN: ${{ secrets.GITHUB_LIVE_TEST_TOKEN }}
+      E2E_LIVE_GITHUB_REPOSITORY: ${{ vars.DISPOSABLE_GITHUB_REPOSITORY }}
+      E2E_LIVE_LINEAR_PROJECT: ${{ vars.DISPOSABLE_LINEAR_PROJECT_LABEL }}
+      LIVE_EXTERNAL_TARGET_LABEL: ${{ vars.LIVE_EXTERNAL_TARGET_LABEL }}
+      LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: DISPOSABLE_ONLY
+      AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true"
+      AGENTIC_SANDBOX_CI_LIVE: "1"
+      AGENTIC_SANDBOX_CI_PROVIDER: wsl2
+      AGENTIC_SANDBOX_CI_EXECUTABLE: wsl.exe
+      AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE: ${{ vars.AGENTIC_SANDBOX_CI_WSL2_RUNTIME_REFERENCE }}
+      AGENTIC_SANDBOX_CI_RUNTIME_DIGEST: ${{ vars.AGENTIC_SANDBOX_CI_WSL2_RUNTIME_DIGEST }}
+      AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION: ${{ vars.AGENTIC_SANDBOX_CI_WSL2_DISTRIBUTION }}
+      AGENTIC_SANDBOX_CI_RUNTIME_ROOT: ${{ vars.AGENTIC_SANDBOX_CI_WSL2_RUNTIME_ROOT }}
+      E2E_TRUST_DISPOSABLE_VAULT: "1"
+      OBSIDIAN_VAULT: ${{ runner.temp }}\agentic-researcher-disposable-release-vault
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+      - name: Verify exact SHA
+        shell: powershell
+        run: |
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:E2E_RELEASE_COMMIT_SHA) { throw "Checked out $actual instead of requested SHA." }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm ci
+      - name: Install semantic embedding runtime
+        run: python -m pip install --disable-pip-version-check fastembed==0.8.0
+      - name: Install Obsidian desktop
+        shell: powershell
+        run: winget install --id Obsidian.Obsidian --exact --silent --accept-package-agreements --accept-source-agreements
+      - name: Create isolated vault
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:OBSIDIAN_VAULT | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:OBSIDIAN_VAULT ".obsidian") | Out-Null
+          Set-Content -LiteralPath (Join-Path $env:OBSIDIAN_VAULT ".obsidian\community-plugins.json") -Value '[]' -Encoding utf8
+      - name: Deterministic matrix
+        run: npm run test:e2e:deterministic-matrix
+      - name: Live contract
+        run: npm run test:e2e
+      - name: Live autonomy soak
+        run: npm run test:e2e:real:soak
+      - name: Attest real fixed sandbox provider
+        run: node --import tsx scripts/ci-sandbox-boundary.ts
+      - name: Release vertical artifact and provider gates
+        run: npm run test:e2e:release-vertical
+      - name: Disposable Linear publish, readback, and cleanup
+        shell: powershell
+        run: |
+          node scripts/live-external-preflight.mjs --provider linear
+          $env:E2E_LIVE_PROVIDER = "linear"
+          $env:E2E_LIVE_ALLOW_MERGE = "0"
+          Remove-Item Env:LIVE_EXTERNAL_MERGE_CONFIRMATION -ErrorAction SilentlyContinue
+          npm run test:e2e:live
+      - name: Disposable GitHub publish, merge, reconciliation, and cleanup
+        shell: powershell
+        run: |
+          $env:E2E_LIVE_PROVIDER = "github_merge"
+          $env:E2E_LIVE_ALLOW_MERGE = "1"
+          $env:LIVE_EXTERNAL_MERGE_CONFIRMATION = "MERGE_DISPOSABLE_PR"
+          node scripts/live-external-preflight.mjs --provider github_merge
+          npm run test:e2e:live
+      - name: Upload protected proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protected-release-proof-${{ inputs.commit_sha }}
+          path: |
+            playwright-report
+            test-results
+          retention-days: 30
+          if-no-files-found: ignore

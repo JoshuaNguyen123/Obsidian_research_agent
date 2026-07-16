@@ -70,7 +70,7 @@ const PRESERVE_TITLE_PATTERN =
   /\b(keep|preserve|do\s+not\s+(?:change|rename|retitle)|don'?t\s+(?:change|rename|retitle))\b[\s\S]{0,40}\b(title|name|filename)\b/i;
 
 const CONTENT_PRODUCING_PATTERN =
-  /\b(write|draft|compose|generate|summar(?:y|ize)|explain|essay|report|article|plan|analysis|how\s+to|guide|brief|markdown|append|put\s+(?:this|it)\s+(?:in|on|into)\s+(?:the\s+)?(?:note|page))\b/i;
+  /\b(write|draft|compose|generate|research|investigate|summar(?:y|ize)|explain|essay|report|article|plan|analysis|how\s+to|guide|brief|markdown|append|put\s+(?:this|it)\s+(?:in|on|into)\s+(?:the\s+)?(?:note|page)|cited\s+findings|stream\s+writeback)\b/i;
 
 const TRIVIAL_CHAT_PATTERN =
   /^(?:\s*(?:hi|hello|hey|thanks|thank\s+you|ok|okay|yes|no|sure|what(?:'s|\s+is)\s+up)\s*[.!?…]*)+$/i;

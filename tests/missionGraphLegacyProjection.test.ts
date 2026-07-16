@@ -33,7 +33,7 @@ test("MissionGraphV3 projects status, progress, next action, evidence, and recei
 
   assert.equal(legacy.status, "complete");
   assert.equal(legacy.activeTaskId, null);
-  assert.deepEqual(legacy.tasks[0].evidenceIds, ["evidence-web"]);
+  assert.deepEqual(legacy.tasks[0].evidenceIds, ["web:evidence-web"]);
   assert.deepEqual(legacy.tasks[1].receiptIds, [
     "receipt-write",
     "receipt-proof:write_receipt",
@@ -100,6 +100,104 @@ test("host-added read retry nodes do not become semantic citation obligations", 
       ?.completionContract.citationMode,
     undefined,
   );
+});
+
+test("legacy citation projection preserves passage-level verification requested by the mission", async () => {
+  const envelope = await createEnvelope();
+  const migrated = await migrateLegacyMissionPlanToMissionGraphV3(
+    completePlan(),
+    {
+      ...migrationOptions(envelope),
+      toolNameMap: {
+        ...migrationOptions(envelope).toolNameMap,
+        "legacy-web": "web_fetch",
+      },
+      objective:
+        "Fetch both sources and verify each finding against the fetched passages.",
+    },
+  );
+  const projected = projectMissionGraphToLegacyPlan(migrated);
+
+  assert.equal(
+    projected.tasks.find((task) => task.id === "research")
+      ?.completionContract.citationMode,
+    "passage",
+  );
+});
+
+test("legacy citation projection keeps ordinary cited research at source level", async () => {
+  const envelope = await createEnvelope();
+  const migrated = await migrateLegacyMissionPlanToMissionGraphV3(
+    completePlan(),
+    {
+      ...migrationOptions(envelope),
+      toolNameMap: {
+        ...migrationOptions(envelope).toolNameMap,
+        "legacy-web": "web_fetch",
+      },
+      objective: "Research the topic and include a citation.",
+    },
+  );
+  const projected = projectMissionGraphToLegacyPlan(migrated);
+
+  assert.equal(
+    projected.tasks.find((task) => task.id === "research")
+      ?.completionContract.citationMode,
+    "source",
+  );
+});
+
+test("legacy projection does not invent a citation contract for an external prerequisite", async () => {
+  const envelope = await createEnvelope();
+  const migrated = await migrateLegacyMissionPlanToMissionGraphV3(
+    completePlan(),
+    {
+      ...migrationOptions(envelope),
+      toolNameMap: {
+        ...migrationOptions(envelope).toolNameMap,
+        "legacy-web": "web_fetch",
+      },
+      objective:
+        "Complete the external prerequisite, then append the exact authorized marker.",
+    },
+  );
+  const externalGraph = await parseMissionGraphV3({
+    ...migrated,
+    nodes: {
+      ...migrated.nodes,
+      research: {
+        ...migrated.nodes.research,
+        outputs: {},
+        evidence: [{
+          id: "external-evidence-proof",
+          kind: "public_web_source",
+          fingerprint: `sha256:${"a".repeat(64)}`,
+          observedAt: UPDATED_AT,
+        }],
+        verification: {
+          verifierId: "companion-external-result-v1",
+          status: "passed",
+          fingerprint: `sha256:${"b".repeat(64)}`,
+          verifiedAt: UPDATED_AT,
+        },
+        completionContract: {
+          ...migrated.nodes.research.completionContract,
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["public_web_source"],
+          verifierId: "companion-external-result-v1",
+        },
+      },
+    },
+  });
+  const projected = projectMissionGraphToLegacyPlan(externalGraph);
+  const research = projected.tasks.find((task) => task.id === "research");
+
+  assert.equal(
+    research?.completionContract.citationMode,
+    undefined,
+  );
+  assert.deepEqual(research?.evidenceIds, ["web:external-evidence-proof"]);
+  assert.deepEqual(research?.completionContract.requiredProof, ["web_evidence"]);
 });
 
 test("count_words graph nodes project metadata proof instead of vault-content proof", async () => {
@@ -323,7 +421,7 @@ async function createEnvelope(): Promise<MissionCapabilityEnvelopeV1> {
         allowedEffects: ["read", "mutation"],
       },
     },
-    verifiers: [],
+    verifiers: ["companion-external-result-v1"],
     tools: {
       "web-search": {
         name: "web-search",

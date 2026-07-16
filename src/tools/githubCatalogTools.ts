@@ -343,6 +343,13 @@ export function getGitHubCatalogReadToolNames(prompt: string): GitHubCatalogTool
 
 export function getExplicitGitHubCatalogMutationToolNames(prompt: string): GitHubCatalogToolName[] {
   if (!hasExplicitGitHubCatalogIntent(prompt)) return [];
+  if (
+    /\bwithout\s+(?:making\s+)?(?:any\s+)?(?:changes?|updates?|edits?|mutations?)\b|\bwithout\s+(?:changing|updating|editing|mutating)\b|\b(?:do\s+not|don't|no)\s+(?:change|update|edit|mutate)\b/iu.test(
+      prompt,
+    )
+  ) {
+    return [];
+  }
   const names = new Set<GitHubCatalogToolName>();
   const issue = /\bissue\b/iu.test(prompt);
   const pullRequest = /\b(pull request|pr)\b/iu.test(prompt);

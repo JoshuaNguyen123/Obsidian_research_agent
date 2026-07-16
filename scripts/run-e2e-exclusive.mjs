@@ -16,11 +16,15 @@ const DEFAULT_POLL_MS = 250;
 const DEFAULT_PLAYWRIGHT_PROJECT = "deterministic-core-mock";
 const PLAYWRIGHT_PROJECTS = new Set([
   DEFAULT_PLAYWRIGHT_PROJECT,
+  "daily-use-mock",
   "integration-mock",
   "integration-mock-legacy",
   "sandbox",
   "companion-restart",
-  "real-ai",
+  "real-ai-contract",
+  "real-ai-soak",
+  "provider-canary",
+  "release-vertical",
   "disposable-live-external",
 ]);
 const SIGNAL_EXIT_CODES = {
@@ -471,8 +475,14 @@ export function normalizeExclusiveArgs(rawArgs) {
       );
     }
   }
-  if (aiMode === "real" && projects.some((project) => project !== "real-ai")) {
-    throw new Error("--real-ai is restricted to the opt-in real-ai Playwright project.");
+  const realAiProjects = new Set([
+    "real-ai-contract",
+    "real-ai-soak",
+    "provider-canary",
+    "release-vertical",
+  ]);
+  if (aiMode === "real" && projects.some((project) => !realAiProjects.has(project))) {
+    throw new Error("--real-ai is restricted to attested live-provider Playwright projects.");
   }
   if (
     liveExternal &&

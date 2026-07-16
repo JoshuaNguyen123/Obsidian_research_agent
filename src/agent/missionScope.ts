@@ -88,13 +88,10 @@ export function deriveAutonomyScope(
   scope.read.folders = mentionedFolders;
 
   scope.write.currentNote =
-    (input.noteOutput === true && !broadVaultWriteTarget) ||
-    /\b(append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect|undo|restore|revert|rollback|roll\s+back)\b[\s\S]{0,160}\b(note|page|document|file|section|heading|backup)\b/i.test(
-      prompt,
-    ) ||
-    /\b(note|page|document|file|section|heading|backup)\b[\s\S]{0,160}\b(append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect|undo|restore|revert|rollback|roll\s+back)\b/i.test(
-      prompt,
-    );
+    (input.noteOutput === true &&
+      mentionedFiles.length === 0 &&
+      !broadVaultWriteTarget) ||
+    hasExplicitCurrentNoteMutationIntent(prompt);
   scope.write.researchMemory =
     /\b(remember|save|persist|store)\b[\s\S]{0,120}\b(research memory|memory)\b/i.test(
       prompt,
@@ -174,9 +171,86 @@ function dedupeScope(scope: AutonomyScope): AutonomyScope {
   };
 }
 
-function extractMarkdownPathMentions(prompt: string): string[] {
-  const matches = prompt.match(/[A-Za-z0-9 .@()[\]_-]+(?:\/[A-Za-z0-9 .@()[\]_-]+)+\.md\b/g) ?? [];
-  return matches.map((match) => normalizeMentionedPath(match)).filter(Boolean);
+export function extractMarkdownPathMentions(prompt: string): string[] {
+  const path = String.raw`[A-Za-z0-9 .@()[\]_-]+?(?:\/[A-Za-z0-9 .@()[\]_-]+?)+\.md`;
+  const quoted = [...prompt.matchAll(new RegExp(String.raw`["'\x60](${path})["'\x60]`, "giu"))]
+    .map((match) => match[1] ?? "");
+  const movePairs = [
+    ...prompt.matchAll(
+      new RegExp(
+        String.raw`\b(?:move|rename)\s+(${path})\s+to\s+(${path})(?=\s*[,.;]|\s+then\b|\s*$)`,
+        "giu",
+      ),
+    ),
+  ].flatMap((match) => [match[1] ?? "", match[2] ?? ""]);
+  const labeled = [
+    ...prompt.matchAll(
+      new RegExp(
+        String.raw`\b(?:markdown\s+file|file|note|path)\s+(?:named\s+|called\s+)?(${path})\b`,
+        "giu",
+      ),
+    ),
+  ].map((match) => match[1] ?? "");
+  const mutationTargets = [
+    ...prompt.matchAll(
+      new RegExp(
+        String.raw`\b(?:create|make|delete|trash|remove|read|inspect|open)\s+(?:(?:a|the)\s+)?(?:(?:exact|new|markdown)\s+)*(?:(?:file|note|path)\s+)?(?:at\s+|named\s+|called\s+)?(${path})(?=\s+(?:with|containing|and|then|only)\b|\s*[,.;:]|\s*$)`,
+        "giu",
+      ),
+    ),
+  ].map((match) => match[1] ?? "");
+  const relocationTargets = [
+    ...prompt.matchAll(
+      new RegExp(
+        String.raw`\b(?:move|relocate|rename)\b[\s\S]{0,160}?\bto\s+(?:(?:the|a)\s+)?(?:(?:file|note|path)\s+)?(${path})(?=\s+(?:with|containing|and|then|only)\b|\s*[,.;:]|\s*$)`,
+        "giu",
+      ),
+    ),
+  ].map((match) => match[1] ?? "");
+  // Unquoted paths containing spaces are ambiguous with surrounding prose.
+  // Accept them only after a resource label above. Compact slash paths remain
+  // safe to recognize without a label.
+  const compact =
+    prompt.match(/[A-Za-z0-9.@()[\]_-]+(?:\/[A-Za-z0-9.@()[\]_-]+)+\.md\b/gu) ?? [];
+  const explicit = [
+    ...quoted,
+    ...movePairs,
+    ...labeled,
+    ...mutationTargets,
+    ...relocationTargets,
+  ]
+    .map((match) => normalizeMentionedPath(match))
+    .filter(Boolean);
+  return dedupeStrings([
+    ...explicit,
+    ...compact.filter(
+      (candidate) =>
+        !explicit.some(
+          (explicitPath) =>
+            explicitPath === candidate || explicitPath.endsWith(candidate),
+        ),
+    ),
+  ]
+    .map((match) => normalizeMentionedPath(match))
+    .filter(Boolean));
+}
+
+/**
+ * Returns true only when an explicit current-note target and its mutation verb
+ * occur in the same natural-language clause. Merely reading the current note
+ * must not authorize a later mutation whose clause targets another vault path.
+ */
+export function hasExplicitCurrentNoteMutationIntent(prompt: string): boolean {
+  const clauses = prompt.split(
+    /(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu,
+  );
+  const mutation =
+    /\b(?:append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect|undo|restore|revert|rollback|roll\s+back|replace|rewrite|reset|overwrite|clear|delete|remove|trash|empty)\b/iu;
+  const currentTarget =
+    /\b(?:current|this|active)\s+(?:note|file|markdown|document|page|section|heading)\b|\b(?:note|file|markdown|document|page|section|heading)\b[\s\S]{0,40}\b(?:current|this|active)\b/iu;
+  return clauses.some(
+    (clause) => mutation.test(clause) && currentTarget.test(clause),
+  );
 }
 
 function extractFolderMentions(prompt: string, files: string[]): string[] {
@@ -189,7 +263,17 @@ function extractFolderMentions(prompt: string, files: string[]): string[] {
   const quotedFolders = [
     ...prompt.matchAll(/\b(?:folder|folders|directory|directories)\s+(?:named|called)?\s*["'`]([^"'`]+)["'`]/gi),
   ].map((match) => normalizeMentionedPath(match[1]));
-  const pathFolders = prompt.match(/[A-Za-z0-9 .@()[\]_-]+(?:\/[A-Za-z0-9 .@()[\]_-]+)+(?!\.md\b)/g) ?? [];
+  // Space-bearing folders are derived from an exact Markdown path or an
+  // explicitly quoted folder. Treat only compact slash paths as standalone
+  // folder mentions so ordinary sentences cannot become write authority.
+  const promptWithoutFiles = files.reduce(
+    (current, file) => current.split(file).join(" "),
+    prompt,
+  );
+  const pathFolders =
+    promptWithoutFiles.match(
+      /[A-Za-z0-9.@()[\]_-]+(?:\/[A-Za-z0-9.@()[\]_-]+)+(?![A-Za-z0-9.@()[\]_-])/gu,
+    ) ?? [];
   return [
     ...folders,
     ...quotedFolders,

@@ -222,6 +222,7 @@ test("mission ledger serializes milestones while parsing older ledgers", () => {
 
   const old = JSON.parse(JSON.stringify(ledger));
   delete old.milestones;
+  delete old.providerUsage;
   const oldParsed = parseMissionLedgerFromMarkdown([
     "## Mission Ledger",
     "```json",
@@ -229,6 +230,16 @@ test("mission ledger serializes milestones while parsing older ledgers", () => {
     "```",
   ].join("\n"));
   assert.deepEqual(oldParsed?.milestones, []);
+  assert.deepEqual(oldParsed?.providerUsage, {
+    schemaVersion: 1,
+    modelCallCount: 0,
+    successfulCallCount: 0,
+    failedCallCount: 0,
+    reportedTokens: 0,
+    estimatedTokens: 0,
+    retries: 0,
+    wallClockMs: 0,
+  });
 });
 
 test("design package writer creates unique canvas and markdown brief safely", async () => {

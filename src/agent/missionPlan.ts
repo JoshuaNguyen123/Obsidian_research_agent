@@ -1,6 +1,10 @@
 import type { MissionEvidence } from "./missionLedger";
 import { isBroadUnscopedVaultMutation } from "./missionScope";
 import type { MissionIntent } from "../tools/types";
+import {
+  requiresVaultEvidenceProof,
+  requiresWebEvidenceProof,
+} from "./evidenceIntent";
 import type { RunPlanDecision } from "./runPlan";
 
 export type MissionPlanStatus =
@@ -930,6 +934,16 @@ export function isFinalOutputRelevant(
     task.completionContract.requiredProof.includes("final_relevance"),
   );
   const tasks = verificationTasks.length > 0 ? verificationTasks : plan.tasks;
+  const requiredLiteralAnchors = dedupeStrings(
+    tasks.flatMap((task) => extractRequiredLiteralAnchors(task.title)),
+  );
+  if (
+    requiredLiteralAnchors.some(
+      (anchor) => !output.includes(anchor.toLowerCase()),
+    )
+  ) {
+    return false;
+  }
   const terms = dedupeStrings(
     tasks.flatMap((task) =>
       task.completionContract.relevanceTerms?.length
@@ -1062,10 +1076,7 @@ function inferProofContract(
       requiredProof: [...requiredProof],
     };
   }
-  if (
-    /\b(web|online|sources?|citations?|cited|latest|current\s+(?:events?|information|data|news)|verify|fact[-\s]?check)\b/i.test(prompt) ||
-    /^\s*(?:please\s+)?(?:research|investigate)\b/i.test(prompt)
-  ) {
+  if (requiresWebEvidenceProof(prompt, intent)) {
     requiredProof.add("web_evidence");
   }
   if (requiresVaultEvidenceProof(prompt, intent)) {
@@ -1114,22 +1125,20 @@ function inferProofContract(
   };
 }
 
+export function extractRequiredLiteralAnchors(text: string): string[] {
+  const anchors: string[] = [];
+  const pattern = /\b(?:include(?:\s+the)?(?:\s+marker)?|containing)\s+[`"']?([a-z0-9][a-z0-9_.:-]{7,})[`"']?/giu;
+  for (const match of text.matchAll(pattern)) {
+    const anchor = match[1]?.replace(/[.,;!?]+$/gu, "") ?? "";
+    if (anchor) anchors.push(anchor);
+  }
+  return anchors;
+}
+
 function requiresPassageCitationProof(prompt: string): boolean {
   return /\b(?:cite|cited|citation|citations|passage|passages|quote|quoted|quotations|text[-\s]?level\s+quotation|verify|fact[-\s]?check|deep\s+research|long[-\s]?running\s+(?:research|co-?research)|long\s+research|exhaustive\s+(?:research|investigation))\b/i.test(
     prompt,
   );
-}
-
-function requiresVaultEvidenceProof(prompt: string, intent: MissionIntent): boolean {
-  const asksForVaultContext =
-    /\b(read|check|inspect|look\s+through|browse|search|find|summari[sz]e|analy[sz]e|what|where|which|related|backlinks?|graph|semantic(?:ally)?|across\s+(?:my\s+)?notes|other\s+folders?|what\s+do\s+my\s+notes\s+say|search\s+my\s+notes)\b/i.test(
-      prompt,
-    );
-  if ((intent.explicitMutation || intent.requireWriteCompletion) && !asksForVaultContext) {
-    return false;
-  }
-
-  return /\b(vault|my notes|across notes|other folders|related notes|semantic search|search my notes)\b/i.test(prompt);
 }
 
 function getMissingTaskProof(task: MissionPlanTask): MissionPlanProofKind[] {
@@ -1488,12 +1497,27 @@ function extractRelevanceTerms(value: string): string[] {
     "web",
     "write",
   ]);
-  return dedupeStrings(
+  const selectedBlock =
+    /Selected text:\s*"""([\s\S]*?)"""/i.exec(value)?.[1] ??
+    /Selected text:\s*"([\s\S]*?)"/i.exec(value)?.[1] ??
+    "";
+  const preferred = selectedBlock.trim()
+    ? extractRelevanceTermsFromBlob(selectedBlock, stopWords)
+    : [];
+  const general = extractRelevanceTermsFromBlob(value, stopWords);
+  return dedupeStrings([...preferred, ...general]).slice(0, 8);
+}
+
+function extractRelevanceTermsFromBlob(
+  value: string,
+  stopWords: Set<string>,
+): string[] {
+  return (
     value
       .toLowerCase()
       .match(/[a-z0-9][a-z0-9_-]{3,}/g)
-      ?.filter((term) => !stopWords.has(term)) ?? [],
-  ).slice(0, 8);
+      ?.filter((term) => !stopWords.has(term)) ?? []
+  );
 }
 
 function getStatus(value: unknown): MissionPlanStatus | null {

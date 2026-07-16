@@ -69,6 +69,133 @@ test("host graph plan turns filtered descriptors into exact read-before-mutation
   );
 });
 
+test("dormant safe-read grants cannot become structured graph debt unless the route exposes them", async () => {
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-visible-read-boundary",
+    objective: "Read the current note and append a bounded result.",
+    toolRegistry: registryFor([
+      "read_current_file",
+      "inspect_semantic_index",
+      "append_to_current_file",
+    ]),
+    // The immutable envelope retains this safe read so a later host-owned
+    // reclassification can materialize it, but the current model route does
+    // not expose it.
+    allowedToolNames: [
+      "read_current_file",
+      "inspect_semantic_index",
+      "append_to_current_file",
+    ],
+    modelVisibleToolNames: ["read_current_file", "append_to_current_file"],
+    plannedToolNames: ["read_current_file", "append_to_current_file"],
+    currentNotePath: "Research/Brief.md",
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  assert.ok(host.capabilityEnvelope.tools.inspect_semantic_index);
+  assert.equal(
+    Object.values(host.deterministicProposal.optionalReadNodes ?? {}).some(
+      (node) => node.allowedTools.includes("inspect_semantic_index"),
+    ),
+    false,
+  );
+});
+
+test("host graph preserves repeated source fetches as distinct budgeted nodes", async () => {
+  const registry = registryFor([
+    "web_search",
+    "web_fetch",
+    "append_to_current_file",
+  ]);
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-two-source-graph",
+    objective: "Fetch two owned sources before appending verified findings.",
+    toolRegistry: registry,
+    allowedToolNames: [
+      "web_search",
+      "web_fetch",
+      "append_to_current_file",
+    ],
+    plannedToolNames: [
+      "web_search",
+      "web_fetch",
+      "web_fetch",
+      "append_to_current_file",
+      "append_to_current_file",
+    ],
+    currentNotePath: "Research/Brief.md",
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes);
+  const fetchNodes = nodes.filter((node) =>
+    node.allowedTools.includes("web_fetch"),
+  );
+  const searchNode = nodes.find((node) =>
+    node.allowedTools.includes("web_search"),
+  );
+  const appendNode = nodes.find((node) =>
+    node.allowedTools.includes("append_to_current_file"),
+  );
+  assert.equal(fetchNodes.length, 2);
+  assert.ok(searchNode);
+  assert.ok(fetchNodes.every((node) => node.dependencyIds.includes(searchNode.id)));
+  assert.ok(appendNode);
+  assert.equal(
+    nodes.filter((node) =>
+      node.allowedTools.includes("append_to_current_file"),
+    ).length,
+    1,
+  );
+  assert.ok(fetchNodes.every((node) => appendNode.dependencyIds.includes(node.id)));
+});
+
+test("host graph orders semantic discovery before batch note reads and writeback", async () => {
+  const registry = registryFor([
+    "semantic_search_notes",
+    "read_markdown_files",
+    "append_to_current_file",
+  ]);
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-semantic-read-graph",
+    objective: "Expand semantic retrieval, read the selected notes, and append findings.",
+    toolRegistry: registry,
+    allowedToolNames: [
+      "semantic_search_notes",
+      "read_markdown_files",
+      "append_to_current_file",
+    ],
+    plannedToolNames: [
+      "semantic_search_notes",
+      "read_markdown_files",
+      "append_to_current_file",
+    ],
+    currentNotePath: "Research/Brief.md",
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes);
+  const semantic = nodes.find((node) =>
+    node.allowedTools.includes("semantic_search_notes"),
+  );
+  const batchRead = nodes.find((node) =>
+    node.allowedTools.includes("read_markdown_files"),
+  );
+  const append = nodes.find((node) =>
+    node.allowedTools.includes("append_to_current_file"),
+  );
+  assert.ok(semantic && batchRead && append);
+  assert.deepEqual(batchRead.dependencyIds, [semantic.id]);
+  assert.ok(append.dependencyIds.includes(batchRead.id));
+  assert.ok(append.dependencyIds.includes(semantic.id));
+});
+
 test("host graph planning fails closed when a tool has no explicit descriptor", async () => {
   const registry: ToolRegistry = {
     getDefinitions: () => [
@@ -122,7 +249,140 @@ test("planned reads after a prerequisite mutation wait for that mutation", async
   assert.ok(createFolder && listFolder && createFile);
   assert.deepEqual(createFolder.dependencyIds, []);
   assert.deepEqual(listFolder.dependencyIds, [createFolder.id]);
-  assert.deepEqual(createFile.dependencyIds, [listFolder.id]);
+  assert.deepEqual(createFile.dependencyIds, [createFolder.id, listFolder.id]);
+});
+
+test("Mermaid creation and verified revision retain two separately budgeted upserts", async () => {
+  const names = [
+    "read_mermaid_block",
+    "upsert_mermaid_block",
+    "read_mermaid_block",
+    "upsert_mermaid_block",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-mermaid-create-revise",
+    objective: "Create a Mermaid block, read it back, then revise it in place.",
+    toolRegistry: registryFor(["upsert_mermaid_block", "read_mermaid_block"]),
+    allowedToolNames: ["upsert_mermaid_block", "read_mermaid_block"],
+    modelVisibleToolNames: ["upsert_mermaid_block", "read_mermaid_block"],
+    plannedToolNames: names,
+    currentNotePath: "Research/Diagram.md",
+    maxToolCalls: 6,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes);
+  const upserts = nodes.filter((node) =>
+    node.allowedTools.includes("upsert_mermaid_block"),
+  );
+  const readback = nodes.find((node) =>
+    node.allowedTools.includes("read_mermaid_block") &&
+    node.dependencyIds.includes(upserts[0].id),
+  );
+  assert.equal(upserts.length, 2);
+  assert.ok(readback);
+  const initialRead = nodes.find((node) =>
+    node.allowedTools.includes("read_mermaid_block") &&
+    node.dependencyIds.length === 0,
+  );
+  assert.ok(initialRead);
+  assert.ok(upserts[0].dependencyIds.includes(initialRead.id));
+  assert.deepEqual(readback.dependencyIds, [upserts[0].id]);
+  assert.ok(upserts[1].dependencyIds.includes(readback.id));
+});
+
+test("vault CRUD graph binds prompt paths and serializes destructive effects", async () => {
+  const sourcePath = "E2E Agent Tests/crud-source-marker.md";
+  const movedPath = "E2E Agent Tests/crud-moved-marker.md";
+  const names = [
+    "create_file",
+    "read_file",
+    "replace_file",
+    "move_path",
+    "delete_path",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-vault-crud-bindings",
+    objective:
+      `Create the exact markdown file ${sourcePath}. Read ${sourcePath}. ` +
+      `Replace ${sourcePath}. Move ${sourcePath} to ${movedPath}, then trash ${movedPath}.`,
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: "E2E Agent Tests/current-fixture.md",
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes);
+  const byTool = (name: string) => {
+    const node = nodes.find((candidate) => candidate.allowedTools.includes(name));
+    assert.ok(node);
+    return node;
+  };
+  const create = byTool("create_file");
+  const read = byTool("read_file");
+  const replace = byTool("replace_file");
+  const move = byTool("move_path");
+  const trash = byTool("delete_path");
+  assert.equal(create.destination?.selector, sourcePath);
+  assert.equal(replace.destination?.selector, sourcePath);
+  assert.equal(move.destination?.selector, sourcePath);
+  assert.equal(trash.destination?.selector, movedPath);
+  assert.deepEqual(read.dependencyIds, [create.id]);
+  assert.ok(replace.dependencyIds.includes(read.id));
+  assert.ok(move.dependencyIds.includes(replace.id));
+  assert.ok(trash.dependencyIds.includes(move.id));
+  assert.equal(host.capabilityEnvelope.budgets.maxDepth, names.length + 1);
+});
+
+test("host graph keeps an explicit workspace CRUD lifecycle within the bounded DAG depth", async () => {
+  const names = [
+    "code_workspace_create",
+    "code_workspace_mkdir",
+    "code_workspace_create_file",
+    "code_workspace_read",
+    "code_workspace_write_expected",
+    "code_workspace_move",
+    "code_workspace_trash",
+    "code_workspace_restore",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-workspace-crud-depth",
+    objective:
+      "Create a scratch workspace, read and update one file, then move, trash, and restore it.",
+    toolRegistry: registryForDescriptors(
+      names.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: 16,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const result = await planMissionGraphV3({
+    mission: {
+      missionId: "run-workspace-crud-depth",
+      objective:
+        "Create a scratch workspace, read and update one file, then move, trash, and restore it.",
+    },
+    routerMode: "off",
+    capabilityEnvelope: host.capabilityEnvelope,
+    deterministicProposal: host.deterministicProposal,
+    allowedToolDescriptors: host.allowedToolDescriptors,
+    now: () => NOW.toISOString(),
+  });
+
+  assert.equal(Object.keys(result.graph.nodes).length, names.length + 1);
+  assert.equal(
+    result.graph.capabilityEnvelope.budgets.maxDepth,
+    names.length + 1,
+  );
 });
 
 test("explicit background planning routes an installed fixed read executor", async () => {
@@ -522,6 +782,39 @@ function registryForDescriptors(descriptors: ToolDescriptor[]): ToolRegistry {
       })),
     getDescriptor: (name) => byName.get(name) ?? null,
     execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+}
+
+function workspaceLifecycleDescriptor(name: string): ToolDescriptor {
+  const readOnly = name === "code_workspace_read";
+  return {
+    version: 1,
+    name,
+    capability: {
+      system: "workspace",
+      resourceType: "managed_workspace",
+      action: readOnly ? "read" : "update",
+    },
+    effect: readOnly ? "read" : "reversible_mutation",
+    risk: readOnly ? "low" : "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: false,
+      fallback: readOnly ? "none" : "exact",
+    },
+    execution: {
+      preparation: readOnly ? "none" : "required",
+      cacheable: readOnly,
+      parallelSafe: readOnly,
+    },
+    durability: {
+      journal: !readOnly,
+      receipt: !readOnly,
+      readback: readOnly ? "none" : "required",
+      reconciliation: readOnly ? "none" : "required",
+    },
+    allowedPrincipals: ["single_agent", "lead", "code_worker"],
+    ...(readOnly ? {} : { receiptKind: "code_change" as const }),
   };
 }
 

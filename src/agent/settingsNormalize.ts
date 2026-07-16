@@ -10,15 +10,21 @@ import { deriveOutputProfileFromLegacy } from "./noteOutputPolicy";
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 
-export const SETTINGS_SCHEMA_VERSION = 3;
+export const SETTINGS_SCHEMA_VERSION = 4;
 
-export type SupportedSettingsSchemaVersion = 1 | 2 | 3;
+export type SupportedSettingsSchemaVersion = 1 | 2 | 3 | 4;
 
 /** Missing version is the original schema-1 representation. */
 export function parseSupportedSettingsSchemaVersion(
   value: unknown,
 ): SupportedSettingsSchemaVersion {
-  if (value === undefined || value === 1 || value === 2 || value === 3) {
+  if (
+    value === undefined ||
+    value === 1 ||
+    value === 2 ||
+    value === 3 ||
+    value === 4
+  ) {
     return (value ?? 1) as SupportedSettingsSchemaVersion;
   }
   if (
@@ -27,7 +33,7 @@ export function parseSupportedSettingsSchemaVersion(
     value < 1
   ) {
     throw new Error(
-      "settingsSchemaVersion must be one of the supported integer schemas: 1, 2, or 3.",
+      "settingsSchemaVersion must be one of the supported integer schemas: 1, 2, 3, or 4.",
     );
   }
   throw new Error(
@@ -37,12 +43,19 @@ export function parseSupportedSettingsSchemaVersion(
 
 export type AutonomyProfileSetting = AutonomyProfile;
 export type OutputProfileSetting = OutputProfile;
+export type WorkingModeSetting = "automatic" | "chat_only" | "custom";
+export type MemoryModeSetting =
+  | "off"
+  | "research"
+  | "research_and_experience";
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
 
 /** Minimal settings shape used by normalize — compatible with AgentSettings. */
 export interface NormalizableAgentSettings {
   settingsSchemaVersion?: number;
+  workingMode?: WorkingModeSetting;
+  memoryMode?: MemoryModeSetting;
   autonomyProfile?: AutonomyProfileSetting;
   outputProfile?: OutputProfileSetting;
   modelProvider: ModelProvider;
@@ -123,6 +136,8 @@ export interface NormalizableAgentSettings {
 
 const BASE_DEFAULTS: NormalizableAgentSettings = {
   settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
+  workingMode: "automatic",
+  memoryMode: "research",
   autonomyProfile: "automatic",
   outputProfile: "active_or_new_note",
   modelProvider: "ollama",
@@ -201,6 +216,8 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
 
 export interface NormalizedAgentSettings extends NormalizableAgentSettings {
   settingsSchemaVersion: number;
+  workingMode: WorkingModeSetting;
+  memoryMode: MemoryModeSetting;
   autonomyProfile: AutonomyProfileSetting;
   outputProfile: OutputProfileSetting;
 }
@@ -260,25 +277,52 @@ export function normalizeAgentSettings(
   const schemaVersion = parseSupportedSettingsSchemaVersion(
     data.settingsSchemaVersion,
   );
+  const explicitWorkingMode = coerceWorkingMode(data.workingMode);
+  const explicitMemoryMode = coerceMemoryMode(data.memoryMode);
   const explicitProfile = coerceAutonomyProfile(data.autonomyProfile);
   const explicitOutput = coerceOutputProfile(data.outputProfile);
 
   let autonomyProfile: AutonomyProfileSetting;
   let outputProfile: OutputProfileSetting;
+  let workingMode: WorkingModeSetting;
 
-  if (installKind === "new_install" && schemaVersion < 2) {
+  if (explicitWorkingMode === "automatic") {
+    workingMode = "automatic";
+    autonomyProfile = "automatic";
+    outputProfile = "active_or_new_note";
+    applyAutomaticProfileDefaults(merged);
+  } else if (explicitWorkingMode === "chat_only") {
+    workingMode = "chat_only";
+    autonomyProfile = "conservative";
+    outputProfile = "chat_first";
+    applyConservativeOutputDefaults(merged);
+  } else if (explicitWorkingMode === "custom") {
+    workingMode = "custom";
+    autonomyProfile = "custom";
+    outputProfile =
+      explicitOutput ??
+      deriveOutputProfileFromLegacy({
+        enableStreaming: merged.enableStreaming,
+        streamWritebackMode: merged.streamWritebackMode,
+        autoTitleOnWrite: merged.autoTitleOnWrite !== false,
+      });
+  } else if (installKind === "new_install" && schemaVersion < 2) {
+    workingMode = "automatic";
     autonomyProfile = "automatic";
     outputProfile = "active_or_new_note";
     applyAutomaticProfileDefaults(merged);
   } else if (explicitProfile === "automatic") {
+    workingMode = "automatic";
     autonomyProfile = "automatic";
     outputProfile = "active_or_new_note";
     applyAutomaticProfileDefaults(merged);
   } else if (explicitProfile === "conservative") {
+    workingMode = "chat_only";
     autonomyProfile = "conservative";
     outputProfile = "chat_first";
     applyConservativeOutputDefaults(merged);
   } else if (explicitProfile === "custom" || hasConflictingLegacyOutput(merged)) {
+    workingMode = "custom";
     autonomyProfile = "custom";
     outputProfile =
       explicitOutput ??
@@ -288,6 +332,7 @@ export function normalizeAgentSettings(
         autoTitleOnWrite: merged.autoTitleOnWrite !== false,
       });
   } else if (installKind === "new_install") {
+    workingMode = "automatic";
     autonomyProfile = "automatic";
     outputProfile = "active_or_new_note";
     applyAutomaticProfileDefaults(merged);
@@ -306,6 +351,8 @@ export function normalizeAgentSettings(
       merged.autoTitleOnWrite !== false
         ? "automatic"
         : "custom";
+    workingMode =
+      autonomyProfile === "automatic" ? "automatic" : "custom";
   }
 
   if (autonomyProfile === "automatic" && outputProfile === "active_or_new_note") {
@@ -317,11 +364,21 @@ export function normalizeAgentSettings(
     applyConservativeOutputDefaults(merged);
   }
 
+  const memoryMode =
+    explicitMemoryMode ??
+    deriveMemoryMode({
+      researchMemoryEnabled: merged.researchMemoryEnabled,
+      experienceMemoryEnabled: merged.experienceMemoryEnabled,
+    });
+  applyMemoryModeDefaults(merged, memoryMode);
+
   return {
     ...merged,
     settingsSchemaVersion: Math.max(schemaVersion, SETTINGS_SCHEMA_VERSION),
     autonomyProfile,
     outputProfile,
+    workingMode,
+    memoryMode,
   };
 }
 
@@ -331,6 +388,7 @@ export function applyRecommendedAutomaticDefaults(
 ): NormalizedAgentSettings {
   const next = {
     ...settings,
+    workingMode: "automatic" as const,
     autonomyProfile: "automatic" as const,
     outputProfile: "active_or_new_note" as const,
     settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
@@ -355,6 +413,39 @@ export function applyAutomaticProfileDefaults(
   settings.agenticReflexEnabled = true;
   settings.modelRouterMode = "authority";
   settings.modelRouterEnabled = true;
+}
+
+export function applyWorkingModeDefaults(
+  settings: NormalizableAgentSettings,
+  mode: WorkingModeSetting,
+): void {
+  settings.workingMode = mode;
+  if (mode === "automatic") {
+    settings.autonomyProfile = "automatic";
+    settings.outputProfile = "active_or_new_note";
+    settings.orchestratorEnabled = true;
+    settings.orchestratorPreviewEnabled = true;
+    settings.autoContinueLongRuns = true;
+    settings.completionDrivenLoops = true;
+    applyAutomaticProfileDefaults(settings);
+    return;
+  }
+  if (mode === "chat_only") {
+    settings.autonomyProfile = "conservative";
+    settings.outputProfile = "chat_first";
+    applyConservativeOutputDefaults(settings);
+    return;
+  }
+  settings.autonomyProfile = "custom";
+}
+
+export function applyMemoryModeDefaults(
+  settings: NormalizableAgentSettings,
+  mode: MemoryModeSetting,
+): void {
+  settings.memoryMode = mode;
+  settings.researchMemoryEnabled = mode !== "off";
+  settings.experienceMemoryEnabled = mode === "research_and_experience";
 }
 
 /** Normalize the public OAuth application identifier without accepting secrets. */
@@ -472,4 +563,27 @@ function coerceOutputProfile(value: unknown): OutputProfileSetting | null {
     return value;
   }
   return null;
+}
+
+function coerceWorkingMode(value: unknown): WorkingModeSetting | null {
+  return value === "automatic" || value === "chat_only" || value === "custom"
+    ? value
+    : null;
+}
+
+function coerceMemoryMode(value: unknown): MemoryModeSetting | null {
+  return value === "off" ||
+    value === "research" ||
+    value === "research_and_experience"
+    ? value
+    : null;
+}
+
+function deriveMemoryMode(input: {
+  researchMemoryEnabled: boolean;
+  experienceMemoryEnabled: boolean;
+}): MemoryModeSetting {
+  if (input.experienceMemoryEnabled) return "research_and_experience";
+  if (input.researchMemoryEnabled) return "research";
+  return "off";
 }

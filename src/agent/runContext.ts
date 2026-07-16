@@ -12,6 +12,7 @@ export interface RunContextBudget {
 }
 
 export interface LoopCompactionResult {
+  applied: boolean;
   messages: ModelChatMessage[];
   missionStateMessage: string | null;
   compactedToolMessages: number;
@@ -56,33 +57,71 @@ export function compactLoopMessages({
   messages,
   ledger,
   keepRecentSteps = KEEP_RECENT_LOOP_STEPS,
+  maxPromptChars,
 }: {
   messages: ModelChatMessage[];
   ledger: MissionLedger;
   keepRecentSteps?: number;
+  maxPromptChars?: number;
 }): LoopCompactionResult {
   const estimatedCharsBefore = estimatePromptChars(messages);
-  const recentStart = findRecentLoopStart(messages, keepRecentSteps);
-  const prefix = keepPrefixMessages(messages, recentStart);
-  const recent = messages.slice(recentStart);
-  const compactedToolMessages = messages
-    .slice(prefix.length, recentStart)
-    .filter((message) => message.role === "tool").length;
-  const missionStateMessage = buildMissionStateMessage(ledger, compactedToolMessages);
-  const compactedMessages = [
-    ...prefix,
-    ...(missionStateMessage
-      ? [{ role: "system" as const, content: missionStateMessage }]
-      : []),
-    ...recent,
-  ];
+  const attempts = [...new Set([keepRecentSteps, 3, 1, 0])]
+    .filter((steps) => steps >= 0 && steps <= keepRecentSteps);
+  let best: Omit<LoopCompactionResult, "applied" | "estimatedCharsBefore"> | null = null;
+
+  for (const retainedSteps of attempts) {
+    const recentStart = findRecentLoopStart(messages, retainedSteps);
+    const prefix = keepPrefixMessages(messages, recentStart);
+    const recent = messages.slice(recentStart);
+    const compactedToolMessages = messages
+      .slice(0, recentStart)
+      .filter((message) => message.role === "tool").length;
+    const missionStateMessage = buildMissionStateMessage(
+      ledger,
+      compactedToolMessages,
+    );
+    const compactedMessages = [
+      ...prefix,
+      { role: "system" as const, content: missionStateMessage },
+      ...recent,
+    ];
+    const estimatedCharsAfter = estimatePromptChars(compactedMessages);
+    const candidate = {
+      messages: compactedMessages,
+      missionStateMessage,
+      compactedToolMessages,
+      estimatedCharsAfter,
+    };
+    if (!best || estimatedCharsAfter < best.estimatedCharsAfter) {
+      best = candidate;
+    }
+    if (
+      estimatedCharsAfter < estimatedCharsBefore &&
+      (maxPromptChars === undefined || estimatedCharsAfter <= maxPromptChars)
+    ) {
+      return {
+        applied: true,
+        ...candidate,
+        estimatedCharsBefore,
+      };
+    }
+  }
+
+  if (best && best.estimatedCharsAfter < estimatedCharsBefore) {
+    return {
+      applied: true,
+      ...best,
+      estimatedCharsBefore,
+    };
+  }
 
   return {
-    messages: compactedMessages,
-    missionStateMessage,
-    compactedToolMessages,
+    applied: false,
+    messages: [...messages],
+    missionStateMessage: null,
+    compactedToolMessages: 0,
     estimatedCharsBefore,
-    estimatedCharsAfter: estimatePromptChars(compactedMessages),
+    estimatedCharsAfter: estimatedCharsBefore,
   };
 }
 
@@ -99,23 +138,20 @@ function keepPrefixMessages(
     }
   };
 
-  messages.forEach((message, index) => {
-    if (index >= recentStart) {
-      return;
-    }
-    if (index === 0 && message.role === "system") {
-      add(index);
-      return;
-    }
+  if (messages[0]?.role === "system") add(0);
+
+  for (let index = recentStart - 1; index > 0; index -= 1) {
+    const message = messages[index];
     if (
       message.role === "system" &&
-      /mission plan|research plan|runtime context|mission intent|structured intent|allowed tools|tool authority|language/i.test(
+      /runtime context|mission intent|structured intent|allowed tools|tool authority/i.test(
         message.content,
       )
     ) {
       add(index);
+      break;
     }
-  });
+  }
 
   const latestUserBeforeRecent = findLastIndex(
     messages.slice(0, recentStart),
@@ -129,6 +165,9 @@ function findRecentLoopStart(
   messages: ModelChatMessage[],
   keepRecentSteps: number,
 ): number {
+  if (keepRecentSteps <= 0) {
+    return messages.length;
+  }
   let loopBoundaries = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
@@ -152,7 +191,10 @@ function buildMissionStateMessage(
     const evidenceText = item.evidenceIds?.length
       ? ` evidence=${item.evidenceIds.join(",")}`
       : "";
-    return `- step ${item.step} ${item.stage}: ${item.summary}${toolText}${evidenceText}`;
+    return truncateContextLine(
+      `- step ${item.step} ${item.stage}: ${item.summary}${toolText}${evidenceText}`,
+      360,
+    );
   });
   const receipts = ledger.receipts.slice(-12);
   const plan = ledger.missionPlan;
@@ -194,7 +236,16 @@ function formatEvidence(item: MissionEvidence): string {
     : item.sourceId
       ? `; source_id=${item.sourceId}`
       : "";
-  return `- ${item.id}: ${item.title} (${item.kind}; ${item.confidence}; ${locator}${citations}) ${item.summary}`;
+  return truncateContextLine(
+    `- ${item.id}: ${item.title} (${item.kind}; ${item.confidence}; ${locator}${citations}) ${item.summary}`,
+    520,
+  );
+}
+
+function truncateContextLine(value: string, maxChars: number): string {
+  return value.length <= maxChars
+    ? value
+    : `${value.slice(0, Math.max(0, maxChars - 13)).trimEnd()}…[truncated]`;
 }
 
 function findLastIndex<T>(values: T[], predicate: (value: T) => boolean): number {

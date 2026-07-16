@@ -22,6 +22,21 @@ import {
   receiptsSatisfyWriteProof,
 } from "./editOrganizeIntent";
 import { receiptSatisfiesProof } from "./missionPlan";
+import {
+  requiresVaultEvidenceProof,
+  requiresWebEvidenceProof,
+} from "./evidenceIntent";
+
+export {
+  DAILY_USE_ACCEPTANCE_V1,
+  evaluateDailyUseAcceptanceV1,
+} from "./dailyUseAcceptance";
+export type {
+  DailyUseAcceptanceResultV1,
+  DailyUseAcceptanceV1,
+  DailyUseObservedAcceptanceV1,
+  DailyUseScenarioId,
+} from "./dailyUseAcceptance";
 
 export type MissionAcceptanceStatus = "pass" | "fail" | "needs_more_work";
 
@@ -119,11 +134,17 @@ export function evaluateMissionAcceptance(
     }
   }
 
-  if (requiresWebEvidence(input.prompt) && !hasWebEvidence(input.evidence)) {
+  if (
+    requiresWebEvidenceProof(input.prompt, input.missionIntent) &&
+    !hasWebEvidence(input.evidence)
+  ) {
     missing.add("web_evidence");
   }
 
-  if (requiresVaultEvidence(input.prompt, input.missionIntent) && !hasVaultEvidence(input.evidence)) {
+  if (
+    requiresVaultEvidenceProof(input.prompt, input.missionIntent) &&
+    !hasVaultEvidence(input.evidence)
+  ) {
     missing.add("vault_evidence");
   }
 
@@ -325,25 +346,6 @@ function hasVaultEvidence(evidence: MissionEvidence[]): boolean {
       item.kind === "vault_note" ||
       (item.kind === "tool_result" && Boolean(item.path)),
   );
-}
-
-function requiresWebEvidence(prompt: string): boolean {
-  return (
-    /\b(web|online|sources?|citations?|cited|latest|current\s+(?:events?|information|data|news)|verify|fact[-\s]?check)\b/i.test(prompt) ||
-    /^\s*(?:please\s+)?(?:research|investigate)\b/i.test(prompt)
-  );
-}
-
-function requiresVaultEvidence(prompt: string, intent: MissionIntent): boolean {
-  const asksForVaultContext =
-    /\b(read|check|inspect|look\s+through|browse|search|find|summari[sz]e|analy[sz]e|what|where|which|related|backlinks?|graph|semantic(?:ally)?|across\s+(?:my\s+)?notes|other\s+folders?|what\s+do\s+my\s+notes\s+say|search\s+my\s+notes)\b/i.test(
-      prompt,
-    );
-  if ((intent.explicitMutation || intent.requireWriteCompletion) && !asksForVaultContext) {
-    return false;
-  }
-
-  return /\b(vault|my notes|across notes|other folders|related notes|semantic search|what do my notes say|search my notes)\b/i.test(prompt);
 }
 
 function requiresWordCountEvidence(prompt: string): boolean {

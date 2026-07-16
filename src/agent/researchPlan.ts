@@ -10,6 +10,7 @@ import {
   isFetchedWebEvidence,
   isVaultReadEvidence,
 } from "./missionPlan";
+import { hasExplicitNoWebIntent } from "./evidenceIntent";
 
 export type ResearchMode = "none" | "deep_web" | "deep_vault" | "deep_hybrid";
 export type ResearchEvidenceType = "web_source" | "vault_note" | "either";
@@ -89,9 +90,13 @@ export function createResearchPlan({
     return null;
   }
 
+  const explicitSourceCount = parseExplicitResearchSourceCount(prompt);
+  const minFetchedSources =
+    mode === "deep_vault" ? 0 : (explicitSourceCount ?? 3);
   const sourceRequirements: ResearchSourceRequirements = {
-    minFetchedSources: mode === "deep_vault" ? 0 : 3,
-    minDistinctDomains: mode === "deep_vault" ? 0 : 2,
+    minFetchedSources,
+    minDistinctDomains:
+      mode === "deep_vault" ? 0 : Math.min(2, minFetchedSources),
   };
   const coverageRequirements: ResearchCoverageRequirements = {
     minVaultCoverageConfidence: mode === "deep_web" ? "medium" : "medium",
@@ -112,6 +117,32 @@ export function createResearchPlan({
   };
   plan.nextAction = getNextResearchAction(plan);
   return plan;
+}
+
+export function parseExplicitResearchSourceCount(prompt: string): number | null {
+  const normalized = prompt.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return null;
+  if (/\bboth\s+(?:returned\s+|fetched\s+|owned\s+)*(?:sources?|passages?)\b/u.test(normalized)) {
+    return 2;
+  }
+  const match = /\b(?:exactly\s+|use\s+|fetch\s+|from\s+)?(one|two|three|four|five|six|seven|eight|\d{1,2})\s+(?:returned\s+|fetched\s+|owned\s+|web\s+)*(?:sources?|passages?)\b/u.exec(
+    normalized,
+  );
+  if (!match?.[1]) return null;
+  const words: Record<string, number> = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+  };
+  const parsed = words[match[1]] ?? Number(match[1]);
+  return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 8
+    ? parsed
+    : null;
 }
 
 export function getNextResearchAction(
@@ -469,11 +500,13 @@ function classifyResearchMode(
     return "none";
   }
 
-  const web = hasDeepWebResearchIntent(prompt);
+  const web = !hasExplicitNoWebIntent(prompt) && hasDeepWebResearchIntent(prompt);
   const vault = hasDeepVaultResearchIntent(prompt);
   const deep = hasDeepResearchIntent(prompt) || hasInvestigativeIntent(prompt);
+  const explicitWeb =
+    !hasExplicitNoWebIntent(prompt) && hasExplicitWebSignal(prompt);
 
-  if ((web || (deep && hasExplicitWebSignal(prompt))) && vault) {
+  if ((web || (deep && explicitWeb)) && vault) {
     return "deep_hybrid";
   }
   if (vault && (deep || hasBroadVaultSynthesisIntent(prompt))) {
@@ -958,19 +991,19 @@ function hasDeepResearchIntent(prompt: string): boolean {
 }
 
 function hasInvestigativeIntent(prompt: string): boolean {
-  return /\b(investigate|verify|fact[-\s]?check|strategy|strategic|compare|tradeoffs?|current\s+(?:state|status|research|information|events?|news)|latest|recent)\b/i.test(prompt);
+  return /\b(investigate|strategy|strategic|compare|tradeoffs?|current\s+(?:state|status|research|information|events?|news)|latest|recent)\b/i.test(prompt);
 }
 
 function hasDeepWebResearchIntent(prompt: string): boolean {
   return (
     hasDeepResearchIntent(prompt) ||
-    /\b(multi[-\s]?source|compare\s+sources?|investigate|verify|fact[-\s]?check|strategy|strategic)\b/i.test(prompt) ||
-    /\b(latest|recent|current|up[-\s]?to[-\s]?date)\b[\s\S]{0,80}\b(events?|news|information|data|research|reports?|studies?|sources?|facts?|market|law|policy|version|status)\b/i.test(prompt)
+    /\b(multi[-\s]?source|compare\s+sources?|investigate|strategy|strategic)\b/i.test(prompt) ||
+    /\b(latest|recent|current(?!\s+(?:note|file|page)\b)|up[-\s]?to[-\s]?date)\b[\s\S]{0,80}\b(events?|news|information|data|research|reports?|studies?|sources?|facts?|market|law|policy|version|status)\b/i.test(prompt)
   ) && !hasDeepVaultResearchIntent(prompt);
 }
 
 function hasExplicitWebSignal(prompt: string): boolean {
-  return /\b(web|online|internet|sources?|citations?|cited|cite|reference\s+list|bibliography|latest|recent|current|news|up[-\s]?to[-\s]?date|verify|fact[-\s]?check)\b/i.test(prompt);
+  return /\b(web|online|internet|sources?|citations?|cited|cite|reference\s+list|bibliography|latest|recent|current(?!\s+(?:note|file|page)\b)|news|up[-\s]?to[-\s]?date|verify|fact[-\s]?check)\b/i.test(prompt);
 }
 
 function hasDeepVaultResearchIntent(prompt: string): boolean {

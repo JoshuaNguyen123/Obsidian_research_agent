@@ -151,6 +151,7 @@ export function runMissionVerifiers({
   if (conflicts && conflicts.length > 0) {
     checks.push(verifyEvidenceConflicts(conflicts, finalOutput, verifierNow));
   }
+  // Base acceptance gaps are merged by the caller via mergeVerificationIntoAcceptance.
   void baseAcceptance;
   const missing = [...new Set(checks.flatMap((check) => check.missing))];
   const blocked = checks.some((check) => check.status === "blocked" || check.status === "fail");
@@ -272,7 +273,16 @@ function verifyWriteSafety(receipts: AgentRunReceipt[], now: Date): Verification
       ["replace", "delete", "trash", "restore"].includes(receipt.operation),
   );
   const missing = risky
-    .filter((receipt) => receipt.operation !== "trash" && !receipt.backupPath && !receipt.restoredFromBackupPath)
+    .filter(
+      (receipt) =>
+        receipt.operation !== "trash" &&
+        !(
+          receipt.toolName === "delete_path" &&
+          receipt.readback?.status === "verified"
+        ) &&
+        !receipt.backupPath &&
+        !receipt.restoredFromBackupPath,
+    )
     .map((receipt) => `verifier:write_safety:${receipt.path ?? receipt.operation}`);
   return {
     id: "verifier:write_safety",

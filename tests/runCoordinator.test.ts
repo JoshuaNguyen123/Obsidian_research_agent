@@ -48,6 +48,96 @@ test("run coordinator replays buffered events to a replacement view", async () =
   assert.deepEqual(seen, ["working", "final"]);
 });
 
+test("run coordinator aggregates redacted provider evidence", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onModelCallEvidence?.({
+      schemaVersion: 1,
+      callId: "model-call-1",
+      phase: "router",
+      provider: "ollama",
+      model: "gpt-oss:120b-cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+      attempt: 1,
+      durationMs: 42,
+      outcome: "success",
+      responseChars: 80,
+      promptTokens: 9,
+      completionTokens: 4,
+      totalTokens: 13,
+      tokenUsageReported: true,
+    });
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.modelCallEvidence.length, 1);
+  assert.equal(snapshot.providerUsage.modelCallCount, 1);
+  assert.equal(snapshot.providerUsage.reportedTokens, 13);
+  assert.equal(snapshot.providerUsage.wallClockMs, 42);
+});
+
+test("run coordinator retains only redacted durable source evidence", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onMissionEvidence?.({
+      schemaVersion: 1,
+      id: "web:owned-alpha",
+      kind: "web_source",
+      sourceId: "source:owned-alpha",
+      passageIds: ["source:owned-alpha:passage:0-42"],
+      usableSource: true,
+      parserStatus: "parsed",
+      confidence: "high",
+    });
+    events.onTrace?.({
+      id: "verified-final-append-3:candidate-held",
+      kind: "verification",
+      step: 3,
+      toolName: "append_to_current_file",
+      message: "Held candidate: fail.",
+      outputPreview: {
+        acceptance: { missing: ["claim_grounding:missing"] },
+        content: "must-not-escape",
+      },
+    });
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.deepEqual(snapshot.missionEvidence, [
+    {
+      schemaVersion: 1,
+      id: "web:owned-alpha",
+      kind: "web_source",
+      sourceId: "source:owned-alpha",
+      passageIds: ["source:owned-alpha:passage:0-42"],
+      usableSource: true,
+      parserStatus: "parsed",
+      confidence: "high",
+    },
+  ]);
+  assert.equal(
+    /summary|content|title|path|url/iu.test(JSON.stringify(snapshot.missionEvidence)),
+    false,
+  );
+  assert.deepEqual(snapshot.diagnosticAttestations, [
+    {
+      schemaVersion: 1,
+      id: "verified-final-append-3:candidate-held",
+      kind: "verification",
+      step: 3,
+      toolName: "append_to_current_file",
+      message: "Held candidate: fail.",
+      missing: ["claim_grounding:missing"],
+    },
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(snapshot.diagnosticAttestations),
+    /must-not-escape/u,
+  );
+});
+
 test("run coordinator retains and replays the latest canonical mission graph", async () => {
   const coordinator = new RunCoordinator();
   const graph = {

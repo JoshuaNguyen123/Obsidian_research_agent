@@ -2,10 +2,10 @@ export interface E2EAiConfig {
   mode: "mock" | "real";
   model: string;
   baseUrl: string;
-  apiKey: string;
   missionTimeoutMs: number;
   firstChunkTimeoutMs: number;
   completionTimeoutMs: number;
+  /** Legacy monolith compatibility only; live contract specs never use this. */
   interCallPauseMs: number;
   reasoningEffort?: string;
 }
@@ -18,19 +18,18 @@ export interface E2ESemanticEmbeddingConfig {
 }
 
 export function getE2EAiConfig(): E2EAiConfig {
-  // The default `test:e2e` lane is deterministic and passes --mock-ai.
-  // Opt-in `test:e2e:real*` lanes pass --real-ai (gpt-oss:120b-cloud).
+  // Default `npm run test:e2e` is the live real-ai-contract pack (credentials).
+  // Deterministic matrix uses `npm run test:e2e:mock` / `--mock-ai`.
   const mode = process.env.E2E_AI_MODE === "real" ? "real" : "mock";
 
   return {
     mode,
     model: process.env.E2E_AI_MODEL?.trim() || "gpt-oss:120b-cloud",
     baseUrl: process.env.E2E_OLLAMA_BASE_URL?.trim() || "https://ollama.com/api",
-    apiKey: process.env.E2E_OLLAMA_API_KEY?.trim() || "",
     missionTimeoutMs: readTimeout("E2E_MISSION_TIMEOUT_MS", 600_000),
     firstChunkTimeoutMs: readTimeout("E2E_FIRST_CHUNK_TIMEOUT_MS", 180_000),
     completionTimeoutMs: readTimeout("E2E_COMPLETION_TIMEOUT_MS", 600_000),
-    interCallPauseMs: readTimeout("E2E_AI_CALL_PAUSE_MS", 30_000),
+    interCallPauseMs: readTimeout("E2E_AI_CALL_PAUSE_MS", 0),
     reasoningEffort: process.env.E2E_REASONING_EFFORT?.trim() || undefined,
   };
 }
@@ -55,6 +54,18 @@ export function shouldRunRealAiE2E(): boolean {
   return (
     process.env.E2E_REAL_AI === "1" &&
     process.env.E2E_AI_MODE === "real"
+  );
+}
+
+/** Node-only credential source. Never pass this value to page.evaluate. */
+export function getE2EAiCredential(
+  provider: "ollama" | "openai_compatible" = "ollama",
+): string {
+  return (
+    (provider === "openai_compatible"
+      ? process.env.E2E_OPENAI_COMPATIBLE_API_KEY?.trim()
+      : process.env.E2E_OLLAMA_API_KEY?.trim()) ||
+    ""
   );
 }
 

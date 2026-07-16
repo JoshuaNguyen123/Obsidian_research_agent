@@ -229,6 +229,7 @@ export class MissionGraphSession {
 
   async beginToolExecution(
     toolName: string,
+    options: { allowDynamicReadContinuation?: boolean } = {},
   ): Promise<MissionGraphToolStartResult> {
     return this.enqueueMutation(async () => {
       let node = Object.values(this.record.graph.nodes).find(
@@ -368,6 +369,12 @@ export class MissionGraphSession {
           }
           node = this.record.graph.nodes[dynamicId];
         } else {
+        if (options.allowDynamicReadContinuation === false) {
+          return {
+            ok: false as const,
+            reason: `Tool ${toolName} is not ready in the exact authoritative mission graph.`,
+          };
+        }
         const dynamicId = `retry-${this.record.graph.revision + 1}-${sanitizeMissionId(
           toolName,
         )}`;
@@ -856,6 +863,20 @@ export class MissionGraphSession {
           status: "verifying",
           blocker: null,
         },
+        ...(node.completionContract.verifierId
+          ? [
+              {
+                op: "record_verification" as const,
+                nodeId: node.id,
+                verification: {
+                  verifierId: node.completionContract.verifierId,
+                  status: "passed" as const,
+                  fingerprint: input.outputFingerprint,
+                  verifiedAt: input.observedAt,
+                },
+              },
+            ]
+          : []),
         {
           op: "set_status",
           nodeId: node.id,

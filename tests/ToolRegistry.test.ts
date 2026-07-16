@@ -1324,6 +1324,20 @@ test("path CRUD tools create, append, replace with backup, move, and trash markd
   );
   assert.equal(appended.ok, true);
   assert.equal(mock.content.get("Projects/New/Brief.md"), "# Brief\nNext");
+  const appendReadback = (
+    appended.output as {
+      readback?: {
+        status: string;
+        checkedAt: string;
+        observedRevision: string;
+        observedFingerprint: string;
+      };
+    }
+  ).readback;
+  assert.equal(appendReadback?.status, "verified");
+  assert.equal(appendReadback?.checkedAt, new Date(123).toISOString());
+  assert.match(appendReadback?.observedRevision ?? "", /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(appendReadback?.observedFingerprint, appendReadback?.observedRevision);
 
   const replaced = await executeAuthorizedPrepared(
     registry,
@@ -1834,6 +1848,10 @@ test("reads, appends, and replaces the active markdown file with backup", async 
   );
   assert.equal(append.ok, true);
   assert.equal(mock.content.get("Current.md"), "Initial note\nAppended");
+  assert.equal(
+    (append.output as { readback?: { status?: string } }).readback?.status,
+    "verified",
+  );
 
   const replace = await executeAuthorizedPrepared(
     registry,

@@ -12,6 +12,7 @@ import {
 } from "../src/agent/missionLedger";
 import {
   createResearchPlan,
+  parseExplicitResearchSourceCount,
   decomposePromptIntoResearchQuestions,
 } from "../src/agent/researchPlan";
 import {
@@ -623,6 +624,78 @@ test("plain deep research topic still produces bounded useful defaults", () => {
     "deep research topic solid-state batteries",
   );
   assert.equal(decomposed.length, 0);
+});
+
+test("deep research explicitly scoped across the vault stays vault-only", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "Take 16 model steps at most to do deep research across my vault. Use semantic retrieval, batch-read only returned paths, and append a grounded synthesis to the current note. Do not use web or memory tools.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_vault_context",
+    },
+  });
+
+  assert.ok(plan);
+  assert.equal(plan.mode, "deep_vault");
+  assert.equal(plan.sourceRequirements.minFetchedSources, 0);
+  assert.equal(plan.sourceRequirements.minDistinctDomains, 0);
+});
+
+test("explicit source cardinality overrides the deep-research default without reading claim counts", () => {
+  assert.equal(
+    parseExplicitResearchSourceCount(
+      "Fetch both returned sources and verify exactly two finding sentences.",
+    ),
+    2,
+  );
+  assert.equal(
+    parseExplicitResearchSourceCount(
+      "Verify exactly two finding sentences against the available evidence.",
+    ),
+    null,
+  );
+  const plan = createResearchPlan({
+    prompt:
+      "Do deep research using exactly two owned sources and cite their passages.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+  assert.ok(plan);
+  assert.equal(plan.sourceRequirements.minFetchedSources, 2);
+  assert.equal(plan.sourceRequirements.minDistinctDomains, 2);
+});
+
+test("bounded two-claim verification does not inherit the deep-research three-source floor", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "Search the web, fetch the returned owned sources, and verify two claims against their passages.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+
+  assert.equal(plan, null);
+});
+
+test("current-note sourced writeback is not misclassified as current-events deep research", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "Search the web, fetch both returned sources, verify exactly two finding sentences against their fetched passages, then append a short cited synthesis to the current note. End each sentence with the exact source passage identifier.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+
+  assert.equal(plan, null);
 });
 
 function researchIntent() {

@@ -7,8 +7,10 @@ import {
 import { SharedBudget } from "../src/orchestrator/sharedBudget";
 import {
   normalizeOrchestratorSnapshot,
+  ORPHANED_ORCHESTRATOR_BLOCKER,
   OrchestratorStore,
   parseOrchestratorSnapshot,
+  reconcileOrphanedOrchestratorSnapshot,
   serializeOrchestratorSnapshot,
   type OrchestratorSnapshotRepository,
 } from "../src/orchestrator/orchestratorStore";
@@ -155,6 +157,54 @@ test("snapshot normalization migrates legacy tasks to a safe single-lead tree", 
   assert.equal(parseOrchestratorSnapshot("not-json"), null);
 });
 
+test("orphaned running projection becomes blocked and freezes active state", () => {
+  const running = replayOrchestratorEvents([
+    event(1, {
+      kind: "orchestrator_started",
+      mode: "research_team",
+      participants: [participant("lead", "lead")],
+      rootNodes: [node("mission", null, "Interrupted mission")],
+    }),
+    event(2, {
+      kind: "node_progressed",
+      nodeId: "mission",
+      status: "running",
+      lastAction: "Synthesizing evidence",
+    }),
+    event(3, {
+      kind: "participant_updated",
+      participantId: "lead",
+      patch: {
+        status: "planning",
+        currentNodeId: "mission",
+        lastAction: "Synthesizing evidence",
+      },
+    }),
+  ]);
+  assert.ok(running);
+
+  const reconciled = reconcileOrphanedOrchestratorSnapshot(running, {
+    now: new Date("2026-07-10T12:05:00.000Z"),
+  });
+  assert.equal(reconciled?.status, "blocked");
+  assert.equal(reconciled?.sequence, 4);
+  assert.equal(reconciled?.updatedAt, "2026-07-10T12:05:00.000Z");
+  assert.equal(reconciled?.nodes.mission.status, "blocked");
+  assert.equal(reconciled?.nodes.mission.blocker, ORPHANED_ORCHESTRATOR_BLOCKER);
+  assert.equal(reconciled?.participants.lead.status, "blocked");
+  assert.equal(
+    reconciled?.participants.lead.lastAction,
+    ORPHANED_ORCHESTRATOR_BLOCKER,
+  );
+
+  assert.deepEqual(
+    reconcileOrphanedOrchestratorSnapshot(reconciled, {
+      now: new Date("2026-07-10T13:00:00.000Z"),
+    }),
+    reconciled,
+  );
+});
+
 test("shared budget commits batches atomically and protects the lead reserve", () => {
   const budget = new SharedBudget({
     modelSteps: 10,
@@ -287,4 +337,3 @@ function node(
     artifactIds: [],
   };
 }
-

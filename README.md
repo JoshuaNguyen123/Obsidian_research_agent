@@ -40,6 +40,8 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Simple target-only current-note writes skip redundant read/planner loops and stream directly into the active note.
 - Current-note prompt extraction lets prompts such as `Read the prompt on the page` read the visible note, execute the prompt written there, and stream generated writing back into that same note when the page prompt asks for prose or markdown output.
 - Prompt-on-page source, citation, verification, vault, and graph requests route through the normal tool loop before writeback, so the run shows tool progress instead of waiting inside one long direct stream.
+- Highlight any text in a markdown note and run **Research selection (web)** from the command palette or editor context menu: the side panel opens and cited findings stream/append onto the current page by default. Use **Research selection (chat only)** when you want an answer without mutating the note.
+- Chat is the mission console; **Chat only** is an explicit opt-out from note writeback. Research-shaped missions default to proof-gated streamed append under the Automatic autonomy profile.
 
 ## Requirements
 
@@ -99,16 +101,19 @@ npm run sync:test-vault
 Run the Obsidian desktop e2e tests (Obsidian must be closed first):
 
 ```bash
-npm run test:e2e                       # default deterministic core-mock lane
+npm run test:e2e                       # configured-primary live contract pack
+npm run test:e2e:mock                  # deterministic core host/runtime lane
 npm run test:e2e:deterministic-matrix  # core, integration, sandbox, and companion-restart lanes
 npm run test:e2e:integration           # deterministic Linear/GitHub integration mocks
 npm run test:e2e:sandbox               # deterministic sandbox boundary lane
 npm run test:e2e:companion             # deterministic companion restart lane
-npm run test:e2e:real                  # opt-in real-AI lane
+npm run test:e2e:real:soak             # 45-60 minute real-model autonomy soak
+npm run test:e2e:provider-canary       # optional E2E_CANARY_MODEL compatibility run
+npm run test:e2e:release-vertical      # protected live-provider release gate
 npm run test:e2e:live                  # opt-in disposable external-provider mutation lane
 ```
 
-`npm run test:e2e` is deterministic by default and does not call a live model. The deterministic matrix runs the core mock, integration mock, sandbox, and companion-restart Playwright projects. `npm run test:e2e:real` is the explicit real-model lane. `npm run test:e2e:live` is a guarded, credentialed disposable-provider lane: Linear creates, reads, duplicate-searches, comments on, and trashes one test issue; GitHub pushes a local-worktree commit with ephemeral askpass, verifies a draft PR, and cleans up its PR/branch. Live merge requires a separate exact confirmation and performs a compensating cleanup merge.
+`npm run test:e2e` now fails closed unless the configured primary production provider is available and runs the four-scenario live contract pack with Playwright retries disabled. The deterministic matrix remains secret-free and runs the core mock, integration mock, sandbox, and companion-restart projects. `npm run test:e2e:live` is the separately guarded, credentialed disposable-provider lane: Linear creates, reads, duplicate-searches, comments on, and trashes one test issue; GitHub pushes a local-worktree commit with ephemeral askpass, verifies a draft PR, and cleans up its PR/branch. Live merge requires a separate exact confirmation and performs a compensating cleanup merge.
 
 The e2e harness builds the one plugin artifact set, syncs it without overwriting core `data.json`, safely retires split-plugin folders with their data intact, launches a controlled Obsidian process, and verifies missions against seeded notes. By default it resolves the vault as `%USERPROFILE%\OneDrive\Desktop\test_vault_obsidian_ai`; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
 

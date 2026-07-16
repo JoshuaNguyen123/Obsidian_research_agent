@@ -18,6 +18,7 @@ import type {
   ToolRegistry,
 } from "../tools/types";
 import type { WorkerHandoff } from "./types";
+import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
 import {
   addSourceCandidate,
   claimSourceCandidate,
@@ -100,6 +101,12 @@ export async function runResearchWorker(input: {
   const registry = createReadOnlyWorkerRegistry(input.toolRegistry);
   const evidence: MissionEvidence[] = [];
   const claimPassages: ClaimPassageRef[] = [];
+  const minimumUsableSources = clamp(
+    parseExplicitResearchSourceCount(input.originalMission) ??
+      (/\bdeep\s+research\b/iu.test(input.originalMission) ? 3 : 1),
+    1,
+    5,
+  );
   let sourceLedger = createSourceCandidateLedger({
     runId: input.runId,
     query: input.assignment,
@@ -108,8 +115,11 @@ export async function runResearchWorker(input: {
       {
         claimId: "mission",
         description: input.assignment,
-        minUsableSources: 1,
-        preferredSourceTypes: ["primary", "official"],
+        minUsableSources: minimumUsableSources,
+        // At least one primary source is a hard quality floor. Requiring both
+        // primary and official types made a complete three-source handoff
+        // impossible for bounded owned fixtures and many legitimate topics.
+        preferredSourceTypes: ["primary"],
       },
     ],
   });
@@ -123,6 +133,7 @@ export async function runResearchWorker(input: {
         "Never request a write, delete, code, dependency, approval, browser-action, or memory-mutation tool.",
         "Return a concise evidence handoff: findings, source URLs or vault paths, conflicts, limitations, and unresolved questions.",
         "Do not claim that a search snippet is fetched proof; fetch or read the underlying content.",
+        `Gather at least ${minimumUsableSources} distinct usable source${minimumUsableSources === 1 ? "" : "s"} before declaring the handoff ready.`,
         "If provider fetch returns unusable content, try a cached section, safe browser extraction, a document-native result, or an alternate search result before reporting failure.",
         `Start with distinct source candidates and avoid duplicate work. Suggested query variants: ${sourceLedger.queryVariants.join(" | ")}.`,
       ].join(" "),
@@ -145,11 +156,22 @@ export async function runResearchWorker(input: {
       tools: registry.getDefinitions(),
       think: false,
       abortSignal: input.abortSignal,
+      evidencePhase: "worker",
     });
     messages.push(response.message);
     if (response.toolCalls.length === 0) {
       finalSummary = response.message.content.trim();
-      if (finalSummary) break;
+      const remainingProofDebt = computeSourceProofDebt(sourceLedger);
+      if (finalSummary && remainingProofDebt.length === 0) break;
+      if (finalSummary && step < maxSteps) {
+        finalSummary = "";
+        messages.push({
+          role: "user",
+          content:
+            `The handoff still lacks ${remainingProofDebt.map((item) => item.missing).reduce((sum, value) => sum + value, 0)} required usable source(s). Fetch distinct candidates before returning the final handoff.`,
+        });
+        continue;
+      }
       messages.push({
         role: "user",
         content: "Provide the structured evidence handoff now. Do not request unavailable tools.",
@@ -270,7 +292,8 @@ export async function runResearchWorker(input: {
       fromParticipantId: input.participantId,
       toParticipantId: input.leadParticipantId,
       taskId: input.taskId,
-      status: evidence.length > 0 ? "ready" : "rejected",
+      status:
+        evidence.length > 0 && proofDebt.length === 0 ? "ready" : "rejected",
       summary: finalSummary,
       sourceIds,
       evidenceIds: evidence.map((item) => item.id),
@@ -286,7 +309,10 @@ export async function runResearchWorker(input: {
         : evidence.length > 0
           ? "medium"
           : "low",
-      stopReason: evidence.length > 0 ? "handoff_ready" : "no_usable_evidence",
+      stopReason:
+        evidence.length > 0 && proofDebt.length === 0
+          ? "handoff_ready"
+          : "no_usable_evidence",
       createdAt: now,
       updatedAt: now,
     },

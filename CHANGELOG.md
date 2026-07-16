@@ -2,9 +2,33 @@
 
 All notable changes to Agentic Researcher are documented here.
 
-## [0.2.0] — pre-release (worktree)
+## [0.4.0] — unified desktop plugin
 
-Treat this worktree as **pre-release** until the B1 Playwright mock gate is green, then bump/tag for release packaging (B8).
+Desktop-only unified Agentic Researcher (`package.json` / `manifest.json` 0.4.0). Treat as pre-release until the deterministic mock e2e matrix and live contract gates you care about are green.
+
+### Added
+- Editor **Research selection (web)** command and context-menu action: highlight text → side-panel web research → proof-gated streamed/append writeback onto the current note. Optional **Research selection (chat only)** keeps the answer in chat.
+- Host final-node verifier (`host-acceptance-v1`) records verification before MissionGraph final completion.
+- Continue Latest Run surfaces the ledger/acceptance next action when a run is resumable.
+
+### Changed
+- Research-shaped note output treats `research` / `investigate` / cited findings language as content-producing (stream append by default when Chat only is off).
+- Evidence conflict detection requires three shared claim terms (fewer false-positive stalls).
+- Auto section follow-ups stop once source proof debt is cleared and cap at one section advance per fetch.
+- Legacy MissionGraph evidence projection no longer invents vault proof from bare `web_search` / unknown tool-result kinds.
+- Bare “latest/current …” language no longer forces web proof debt without an explicit research/web/source cue.
+
+### Known limits
+- The automatic Linear queue runs only while Obsidian is open and requires gate 5, a current read-only connection test, complete lifecycle mappings, and an unexpired user-issued grant.
+- Automatic Linear `research` ticket execution remains web-read-only and chat-only; automatic vault writes from the queue stay blocked until a trusted vault executor/binding exists.
+- GitHub publication (push / draft PR / merge) is available through the Integrations catalog and prepared-action path when configured; treat live provider proof as environment-gated.
+- Overnight / long multi-segment runs are not background daemons (Obsidian must stay open for vault work).
+- Real-AI soak outcome must be recorded before claiming Product 10 B3.
+- Generated-code sandbox execution stays disabled until a Docker/Podman/WSL2/bubblewrap provider passes the boundary probe.
+
+## [0.2.0] — pre-release (historical worktree notes)
+
+Historical notes from the pre-unified worktree.
 
 ### Added
 - Versioned external-action contracts: `ToolDescriptor`, `PreparedAction`, `AuthorityGrantV1`, and `ActionReceipt`, including fingerprint-bound approval previews, fail-closed registration, readback, reconciliation, and durable action-journal state.
@@ -24,16 +48,7 @@ Treat this worktree as **pre-release** until the B1 Playwright mock gate is gree
 
 ### Changed
 - Every default tool now receives an explicit descriptor. Existing vault/code mutations retain their compatibility execution path until they gain side-effect-free preparation; Linear mutations require the new prepare/authorize/execute/readback lifecycle.
-- Linear tools are disabled by default and filtered from model definitions unless both the integration is enabled and the prompt contains explicit Linear intent. Settings now disclose unencrypted `data.json` key storage and provide a read-only connection test, queue project/lifecycle mappings, and explicit grant controls.
-- Run Details approval cards show the prepared destination, target, field-level changes or outbound payload, duplicate candidates, warning text, fingerprint, outbound bytes, and required confirmation step. Canonical external receipts are projected into the receipt surface without allowing them to satisfy vault-write proof.
+- Linear tools are disabled by default and filtered from model definitions unless both the integration is enabled and the prompt contains explicit Linear intent.
 - E2E defaults: `npm run test:e2e` → live `gpt-oss:120b-cloud`; `npm run test:e2e:mock` → deterministic mock
 - Settings honesty: overnight requires Obsidian open; keep-awake and model router opt-in / experimental
 - Router authority mode remains opt-in (never default-on)
-
-### Known limits
-- The automatic Linear queue runs only while Obsidian is open and requires gate 5, a current read-only connection test, complete lifecycle mappings, and an unexpired user-issued grant.
-- Automatic `research` execution is currently web-read-only and chat-only. Automatic vault writes are blocked until a trusted vault executor/binding exists; automatic code execution/promotion is blocked until the trusted repository-profile path passes compatibility e2e proof.
-- The GitHub client is scaffolding only. No GitHub token setting, agent tool registration, branch push, publication receipt, PR linkage, review response, or merge operation is enabled.
-- Overnight / long multi-segment runs are not background daemons
-- Real-AI soak outcome must be recorded before claiming Product 10 B3
-- Architecture 10 requires claim/conflict/phase/proof-debt paths proven green end-to-end

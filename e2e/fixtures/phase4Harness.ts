@@ -5,7 +5,10 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { terminateControlledObsidian } from "../../scripts/obsidian-process-lifecycle";
+import {
+  terminateControlledObsidian,
+  waitForWindowsProcessExit,
+} from "../../scripts/obsidian-process-lifecycle";
 import {
   restoreOwnedE2EArtifacts,
   snapshotOwnedE2EArtifacts,
@@ -14,6 +17,11 @@ import {
   removeNewPhase4OwnedWorkspaces,
   snapshotPhase4OwnedWorkspaces,
 } from "./phase4OwnedWorkspaces";
+import {
+  createPluginDataBackup,
+  recoverStalePluginDataBackup,
+  restorePluginDataSnapshot,
+} from "./pluginDataBackup";
 
 const execFileAsync = promisify(execFile);
 
@@ -117,6 +125,9 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
   const pluginDataPaths = [PHASE4_CORE_PLUGIN_ID].map(
     (pluginId) => path.join(vaultRoot, ".obsidian", "plugins", pluginId, "data.json"),
   );
+  for (const pluginDataPath of pluginDataPaths) {
+    await recoverStalePluginDataBackup(pluginDataPath);
+  }
   const [obsidianStateBefore, communityPluginsBefore, ...pluginDataBefore] =
     await Promise.all([
       readOptionalFile(obsidianStatePath),
@@ -136,6 +147,9 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
   await assertPortFree(cdpPort);
   try {
     await forceOnlyVaultOpen(obsidianStatePath, obsidianStateBefore, vaultRoot);
+    for (const [index, pluginDataPath] of pluginDataPaths.entries()) {
+      await createPluginDataBackup(pluginDataPath, pluginDataBefore[index] ?? null);
+    }
     // The test owns this launch and restores the exact prior bytes on close.
     // Keep the verified capability-migration readback while clearing only the
     // host-specific sandbox binding. Core deliberately rejects an already-
@@ -232,7 +246,13 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
       restartUnifiedPlugin: () =>
         restartUnifiedPlugin(activePage, PHASE4_CORE_PLUGIN_ID, PHASE4_CODE_PLUGIN_ID),
       setUnifiedPluginEnabled: (enabled) =>
-        setPluginEnabled(activePage, PHASE4_CORE_PLUGIN_ID, enabled),
+        enabled
+          ? restartUnifiedPlugin(
+              activePage,
+              PHASE4_CORE_PLUGIN_ID,
+              PHASE4_CODE_PLUGIN_ID,
+            )
+          : setPluginEnabled(activePage, PHASE4_CORE_PLUGIN_ID, false),
       stopActiveMission: (timeoutMs = PHASE4_MISSION_STOP_TIMEOUT_MS) =>
         stopActiveMissionForTeardown(
           activePage,
@@ -268,7 +288,10 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
           await restoreOptionalFile(obsidianStatePath, obsidianStateBefore);
           await restoreOptionalFile(communityPluginsPath, communityPluginsBefore);
           for (let index = 0; index < pluginDataPaths.length; index += 1) {
-            await restoreOptionalFile(pluginDataPaths[index], pluginDataBefore[index]);
+            await restorePluginDataSnapshot(
+              pluginDataPaths[index],
+              pluginDataBefore[index] ?? null,
+            );
           }
         } catch (error) {
           teardownError ??= error;
@@ -289,9 +312,10 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
       () => undefined,
     );
     for (let index = 0; index < pluginDataPaths.length; index += 1) {
-      await restoreOptionalFile(pluginDataPaths[index], pluginDataBefore[index]).catch(
-        () => undefined,
-      );
+      await restorePluginDataSnapshot(
+        pluginDataPaths[index],
+        pluginDataBefore[index] ?? null,
+      ).catch(() => undefined);
     }
     throw error;
   }
@@ -568,7 +592,7 @@ async function installPhase4PageHarness(
             }
             default:
               return final(
-                `Created scratch code workspace ${workspaceId}, created ${originalPath}, updated it with its expected hash, moved it to ${movedPath}, trashed and restored it, and captured the mutation receipts. PHASE4_CRUD_STAGE_1_DONE ${marker}`,
+                `Created scratch code workspace ${workspaceId}, created ${originalPath} containing before:${marker}, updated it to after:${marker} with its expected hash, moved it to ${movedPath}, trashed and restored it, and captured the mutation receipts. PHASE4_CRUD_STAGE_1_DONE ${marker}`,
               );
           }
         }
@@ -851,10 +875,25 @@ async function submitMissionWithApprovals(
   const runIdLine = page
     .locator(".agentic-researcher-config-line")
     .filter({ hasText: "run_id=" })
-    .first();
+    // Run Details retains prior config rows across missions. The first row is
+    // therefore stale after another Phase 4 scenario; the newest rendered row
+    // is the public UI attestation for the mission just submitted.
+    .last();
   const readRunId = async () => {
+    const snapshotRunId = await page.evaluate(({ corePluginId }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const snapshot = app?.plugins?.plugins?.[corePluginId]
+        ?.getMissionRunSnapshot?.();
+      const runId = snapshot?.lastConfig?.runId ?? snapshot?.runId;
+      return typeof runId === "string" ? runId.trim() : "";
+    }, { corePluginId: PHASE4_CORE_PLUGIN_ID });
+    if (snapshotRunId) return snapshotRunId;
     if ((await runIdLine.count()) === 0) return "";
-    return (await runIdLine.textContent({ timeout: 1_000 }).catch(() => null))?.trim() ?? "";
+    return (
+      (await runIdLine.textContent({ timeout: 1_000 }).catch(() => null))
+        ?.trim()
+        .replace(/^run_id=/u, "") ?? ""
+    );
   };
   const previousRunId = await readRunId();
   await input.fill(prompt);
@@ -912,8 +951,51 @@ async function submitMissionWithApprovals(
         .locator(".agentic-researcher-continuation-action")
         .filter({ hasText: currentRunId });
       if (await currentRunContinuation.isVisible().catch(() => false)) {
+        const diagnostic = await page.evaluate(({ corePluginId }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const snapshot = app?.plugins?.plugins?.[corePluginId]
+            ?.getMissionRunSnapshot?.();
+          return snapshot
+            ? {
+                lastComplete: snapshot.lastComplete,
+                providerUsage: snapshot.providerUsage,
+                missionLedger: snapshot.lastMissionLedger,
+                missionGraph: snapshot.lastMissionGraph
+                  ? {
+                      revision: snapshot.lastMissionGraph.revision,
+                      routing: snapshot.lastMissionGraph.routing,
+                      nodes: Object.values(
+                        snapshot.lastMissionGraph.nodes ?? {},
+                      ).map((node: any) => ({
+                        id: node.id,
+                        status: node.status,
+                        attempts: node.retries?.attempts,
+                        allowedTools: node.allowedTools,
+                        evidenceCount: node.evidence?.length ?? 0,
+                        receiptCount: node.receipts?.length ?? 0,
+                      })),
+                    }
+                  : null,
+                modelCallEvidence: (snapshot.modelCallEvidence ?? []).map(
+                  (item: any) => ({
+                    phase: item.phase,
+                    outcome: item.outcome,
+                    responseChars: item.responseChars,
+                    errorCategory: item.errorCategory,
+                  }),
+                ),
+                diagnosticAttestations: (
+                  snapshot.diagnosticAttestations ?? []
+                ).filter((item: any) =>
+                  /mission-acceptance|terminal-acceptance|proof-gated/u.test(
+                    item.id ?? "",
+                  ),
+                ),
+              }
+            : null;
+        }, { corePluginId: PHASE4_CORE_PLUGIN_ID });
         throw new Error(
-          `Phase 4 mission ${currentRunId} became idle but remained resumable.`,
+          `Phase 4 mission ${currentRunId} became idle but remained resumable. Diagnostic: ${JSON.stringify(diagnostic)}`,
         );
       }
       return approvals;
@@ -1046,23 +1128,10 @@ async function terminateObsidian(
         processHandle.kill();
       });
     },
-    waitForOwnedExit: () => waitForChildClose(processHandle, 10_000),
+    waitForOwnedExit: () =>
+      waitForWindowsProcessExit(processHandle.pid!, 30_000),
     waitForNoRunningProcess: () => waitForNoObsidian(30_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
-  });
-}
-
-async function waitForChildClose(
-  processHandle: ChildProcessWithoutNullStreams,
-  timeoutMs: number,
-): Promise<boolean> {
-  if (processHandle.exitCode !== null || processHandle.signalCode !== null) return true;
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => resolve(false), timeoutMs);
-    processHandle.once("close", () => {
-      clearTimeout(timeout);
-      resolve(true);
-    });
   });
 }
 

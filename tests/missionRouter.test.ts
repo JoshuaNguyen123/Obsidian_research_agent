@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MISSION_ROUTER_SCHEMA,
+  MISSION_ROUTER_SYSTEM_PROMPT,
   ROUTER_AUTHORITY_CONFIDENCE_THRESHOLD,
   classifyMissionWithModel,
+  classifyMissionWithModelDetailed,
   intersectAuthoritativeIntent,
   normalizeModelRouterMode,
   normalizeRoutedMissionIntent,
@@ -22,6 +24,7 @@ import type {
   ModelChatResponse,
   ModelClient,
 } from "../src/model/types";
+import { ModelClientError } from "../src/model/types";
 
 function routedJson(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -91,6 +94,18 @@ test("normalizeRoutedMissionIntent rejects invalid modes, scopes, and confidence
   );
   assert.equal(normalizeRoutedMissionIntent(null), null);
   assert.equal(normalizeRoutedMissionIntent(42), null);
+  assert.equal(
+    normalizeRoutedMissionIntent(`Here is the route:\n\n\`\`\`json\n${routedJson()}\n\`\`\``),
+    null,
+  );
+});
+
+test("normalizeRoutedMissionIntent accepts one complete fenced JSON object", () => {
+  const intent = normalizeRoutedMissionIntent(
+    `\`\`\`json\n${routedJson()}\n\`\`\``,
+  );
+  assert.ok(intent);
+  assert.equal(intent.mode, "web_research");
 });
 
 test("normalizeRoutedMissionIntent clamps confidence and truncates rationale", () => {
@@ -132,7 +147,9 @@ test("classifyMissionWithModel sends schema-constrained request and parses reply
   assert.equal(intent.mode, "web_research");
   assert.equal(requests.length, 1);
   assert.equal(requests[0].format, MISSION_ROUTER_SCHEMA);
+  assert.equal(requests[0].think, false);
   assert.equal(requests[0].options?.temperature, 0);
+  assert.equal(requests[0].messages[0].content, MISSION_ROUTER_SYSTEM_PROMPT);
   assert.ok(
     requests[0].messages.some((message) =>
       /Recent assistant context/.test(message.content),
@@ -185,6 +202,40 @@ test("classifyMissionWithModel returns null for unparseable router output", asyn
     prompt: "anything",
   });
   assert.equal(intent, null);
+});
+
+test("classifyMissionWithModel performs one bounded schema repair", async () => {
+  const requests: ModelChatRequest[] = [];
+  const client = clientFromResponse(async (request) => {
+    requests.push(request);
+    return {
+      message: {
+        role: "assistant",
+        content: requests.length === 1 ? "not json" : routedJson(),
+      },
+      toolCalls: [],
+    };
+  });
+  const intent = await classifyMissionWithModel({ client, prompt: "research this" });
+  assert.equal(intent?.mode, "web_research");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].evidencePhase, "router");
+  assert.equal(requests[1].evidencePhase, "retry");
+  assert.match(requests[1].messages.at(-1)?.content ?? "", /Schema repair/);
+});
+
+test("router exposes auth failure and never schema-retries it", async () => {
+  let calls = 0;
+  const result = await classifyMissionWithModelDetailed({
+    client: clientFromResponse(async () => {
+      calls += 1;
+      throw new ModelClientError("auth", "unauthorized");
+    }),
+    prompt: "research this",
+  });
+  assert.equal(result.intent, null);
+  assert.equal(result.failureReason, "router_auth");
+  assert.equal(calls, 1);
 });
 
 test("resolveModelRouterMode maps legacy boolean and normalizes modes", () => {

@@ -2006,12 +2006,29 @@ export const appendFileTool: AgentTool = {
     const prefix = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
     const appendedText = `${prefix}${text}`;
 
-    await context.app.vault.modify(file, `${current}${appendedText}`);
+    const nextContent = `${current}${appendedText}`;
+    await context.app.vault.modify(file, nextContent);
+    const observed = await context.app.vault.read(file);
+    if (observed !== nextContent) {
+      throw new ToolExecutionError(
+        "vault_readback_failed",
+        `Vault append acknowledged, but exact readback did not match: ${file.path}.`,
+        { mutationState: "may_have_applied" },
+      );
+    }
+    const checkedAt = (context.now?.() ?? new Date()).toISOString();
+    const observedFingerprint = await sha256Fingerprint(observed);
 
     return {
       path: file.path,
       operation: "append",
       bytesWritten: getByteLength(appendedText),
+      readback: {
+        status: "verified",
+        checkedAt,
+        observedRevision: observedFingerprint,
+        observedFingerprint,
+      },
     };
   },
 };
@@ -2140,11 +2157,28 @@ export const appendToCurrentFileTool: AgentTool = {
     const prefix = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
     const appendedText = `${prefix}${text}`;
 
-    await context.app.vault.modify(file, `${current}${appendedText}`);
+    const nextContent = `${current}${appendedText}`;
+    await context.app.vault.modify(file, nextContent);
+    const observed = await context.app.vault.read(file);
+    if (observed !== nextContent) {
+      throw new ToolExecutionError(
+        "vault_readback_failed",
+        `Current-note append acknowledged, but exact readback did not match: ${file.path}.`,
+        { mutationState: "may_have_applied" },
+      );
+    }
+    const checkedAt = (context.now?.() ?? new Date()).toISOString();
+    const observedFingerprint = await sha256Fingerprint(observed);
 
     return {
       path: file.path,
       bytesWritten: getByteLength(appendedText),
+      readback: {
+        status: "verified",
+        checkedAt,
+        observedRevision: observedFingerprint,
+        observedFingerprint,
+      },
     };
   },
 };

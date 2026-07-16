@@ -12,10 +12,19 @@ import { normalizeModelRouterMode } from "./agent/missionRouter";
 import { runDependencyPreflight } from "./agent/dependencyPreflight";
 import type { MissionDependencyStatus } from "./agent/missionLedger";
 import {
-  applyAutomaticProfileDefaults,
+  applyMemoryModeDefaults,
   applyRecommendedAutomaticDefaults,
+  applyWorkingModeDefaults,
 } from "./agent/settingsNormalize";
-import type { NormalizableAgentSettings } from "./agent/settingsNormalize";
+import type {
+  MemoryModeSetting,
+  NormalizableAgentSettings,
+  WorkingModeSetting,
+} from "./agent/settingsNormalize";
+import {
+  capabilitySetupLabel,
+  type CapabilitySetupTarget,
+} from "./agent/capabilitySetup";
 
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
@@ -30,6 +39,10 @@ export type { ModelRouterMode };
 export interface AgentSettings {
   /** Settings schema version for profile migration. */
   settingsSchemaVersion?: number;
+  /** Canonical normal-user behavior profile. Legacy autonomy/output fields are derived. */
+  workingMode?: WorkingModeSetting;
+  /** Canonical memory consent profile. Legacy memory booleans are derived. */
+  memoryMode?: MemoryModeSetting;
   /** High-level autonomy profile; Custom preserves legacy per-feature flags. */
   autonomyProfile?: AutonomyProfile;
   /** Default note vs chat output behavior for content-producing missions. */
@@ -130,7 +143,9 @@ export interface AgentSettings {
 }
 
 export const DEFAULT_SETTINGS: AgentSettings = {
-  settingsSchemaVersion: 3,
+  settingsSchemaVersion: 4,
+  workingMode: "automatic",
+  memoryMode: "research",
   autonomyProfile: "automatic",
   outputProfile: "active_or_new_note",
   modelProvider: "ollama",
@@ -214,6 +229,9 @@ export const DEFAULT_SETTINGS: AgentSettings = {
 export class AgentSettingTab extends PluginSettingTab {
   private readonly plugin: AgenticResearcherPlugin;
   private extensionContributionsEl: HTMLDetailsElement | null = null;
+  private pendingFocusTarget: CapabilitySetupTarget | null = null;
+  private readinessRefreshTimer: number | null = null;
+  private readinessSignature = "";
 
   constructor(app: App, plugin: AgenticResearcherPlugin) {
     super(app, plugin);
@@ -221,6 +239,7 @@ export class AgentSettingTab extends PluginSettingTab {
   }
 
   display() {
+    this.stopReadinessRefresh();
     const { containerEl } = this;
     containerEl.empty();
     this.extensionContributionsEl = null;
@@ -229,17 +248,79 @@ export class AgentSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Agentic Researcher" });
     containerEl.createEl("p", {
       text: "Native right-side co-researcher for Obsidian. Basic settings stay compact; tuning lives under Advanced. Vault work requires Obsidian; an installed, healthy Companion may continue only already-authorized non-vault operations.",
-      cls: "setting-item-description",
+      cls: "setting-item-description agentic-settings-intro",
     });
+
+    this.renderPendingMissionSetup(containerEl);
 
     this.renderBasicSection(containerEl);
     this.renderCapabilityStatus(containerEl);
     this.renderAdvancedSections(containerEl);
+    this.applyPendingFocus();
+    this.startReadinessRefresh();
+  }
+
+  hide(): void {
+    this.stopReadinessRefresh();
+  }
+
+  focusCapability(target: CapabilitySetupTarget): void {
+    this.pendingFocusTarget = target;
+    this.display();
+  }
+
+  private renderPendingMissionSetup(containerEl: HTMLElement): void {
+    const pending = this.plugin.getPendingCapabilityResume();
+    if (!pending) return;
+
+    const panel = containerEl.createDiv({
+      cls: "agentic-settings-pending-resume agentic-settings-panel",
+    });
+    panel.createEl("h3", { text: `Set up ${capabilitySetupLabel(pending.target)}` });
+    panel.createEl("p", {
+      text: `${pending.reason} Your unfinished mission is preserved and will resume only when you choose it.`,
+      cls: "setting-item-description",
+    });
+    const controls = panel.createDiv({ cls: "agentic-settings-pending-resume-controls" });
+    const resume = controls.createEl("button", {
+      text: "Resume blocked mission",
+      cls: "mod-cta",
+      attr: { type: "button" },
+    });
+    resume.addEventListener("click", () => {
+      void this.plugin.resumePendingCapabilityMission();
+    });
+    const cancel = controls.createEl("button", {
+      text: "Cancel",
+      attr: { type: "button" },
+    });
+    cancel.addEventListener("click", () => {
+      this.plugin.clearPendingCapabilityResume();
+      this.display();
+    });
+  }
+
+  private applyPendingFocus(): void {
+    const target = this.pendingFocusTarget;
+    this.pendingFocusTarget = null;
+    if (!target) return;
+    const targetId = capabilitySetupTargetId(target);
+    const element = this.containerEl.querySelector<HTMLElement>(`#${targetId}`);
+    if (!element) return;
+    if (element instanceof HTMLDetailsElement) element.open = true;
+    element.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   private renderBasicSection(containerEl: HTMLElement): void {
-    const basicEl = containerEl.createDiv({ cls: "agentic-settings-basic" });
-    basicEl.createEl("h3", { text: "Basic" });
+    const basicEl = containerEl.createDiv({
+      cls: "agentic-settings-basic agentic-settings-panel",
+      attr: { id: "agentic-settings-essentials" },
+    });
+    basicEl.createEl("h3", { text: "Essentials" });
+    basicEl.createEl("p", {
+      text: "Choose the model and the default way Agentic Researcher works. Everything else can stay collapsed.",
+      cls: "setting-item-description agentic-settings-section-intro",
+    });
 
     const provider = this.plugin.settings.modelProvider;
 
@@ -257,6 +338,7 @@ export class AgentSettingTab extends PluginSettingTab {
             this.plugin.settings.modelProvider = isModelProvider(value)
               ? value
               : DEFAULT_SETTINGS.modelProvider;
+            this.plugin.invalidateModelConnectionStatus();
             await this.plugin.saveSettings();
             this.display();
           }),
@@ -274,6 +356,7 @@ export class AgentSettingTab extends PluginSettingTab {
             .setValue(this.plugin.settings.openAiCompatibleApiKey)
             .onChange(async (value) => {
               this.plugin.settings.openAiCompatibleApiKey = value.trim();
+              this.plugin.invalidateModelConnectionStatus();
               await this.plugin.saveSettings();
             });
           text.inputEl.type = "password";
@@ -290,6 +373,7 @@ export class AgentSettingTab extends PluginSettingTab {
             .setValue(this.plugin.settings.ollamaApiKey)
             .onChange(async (value) => {
               this.plugin.settings.ollamaApiKey = value.trim();
+              this.plugin.invalidateModelConnectionStatus();
               await this.plugin.saveSettings();
             });
           text.inputEl.type = "password";
@@ -305,6 +389,7 @@ export class AgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.model)
           .onChange(async (value) => {
             this.plugin.settings.model = value.trim() || DEFAULT_SETTINGS.model;
+            this.plugin.invalidateModelConnectionStatus();
             await this.plugin.saveSettings();
           }),
       );
@@ -325,6 +410,7 @@ export class AgentSettingTab extends PluginSettingTab {
               this.plugin.settings.openAiCompatibleBaseUrl =
                 normalizeProviderBaseUrl(value) ??
                 DEFAULT_SETTINGS.openAiCompatibleBaseUrl;
+              this.plugin.invalidateModelConnectionStatus();
               await this.plugin.saveSettings();
             }),
         );
@@ -339,6 +425,7 @@ export class AgentSettingTab extends PluginSettingTab {
             .onChange(async (value) => {
               this.plugin.settings.ollamaBaseUrl =
                 value.trim() || DEFAULT_SETTINGS.ollamaBaseUrl;
+              this.plugin.invalidateModelConnectionStatus();
               await this.plugin.saveSettings();
             }),
         );
@@ -346,84 +433,53 @@ export class AgentSettingTab extends PluginSettingTab {
 
     this.renderConnectionStatusRow(basicEl);
 
-    new Setting(basicEl)
-      .setName("Autonomy profile")
+    const workingModeSetting = new Setting(basicEl)
+      .setName("Working mode")
       .setDesc(
-        "Automatic uses safe note-first defaults for thinking, streaming, and reflex. Conservative prefers chat. Custom keeps per-feature Advanced overrides.",
+        "Automatic is note-first and agentic; Chat only keeps ordinary answers in chat; Custom exposes expert overrides under Advanced.",
       )
       .addDropdown((dropdown) =>
         dropdown
           .addOption("automatic", "Automatic (recommended)")
-          .addOption("conservative", "Conservative")
+          .addOption("chat_only", "Chat only")
           .addOption("custom", "Custom")
-          .setValue(this.plugin.settings.autonomyProfile ?? "automatic")
+          .setValue(this.plugin.settings.workingMode ?? "automatic")
           .onChange(async (value) => {
-            await this.applyAutonomyProfileChange(value);
+            await this.applyWorkingModeChange(value);
           }),
       );
+    workingModeSetting.addButton((button) =>
+      button
+        .setButtonText("Reset Automatic")
+        .setTooltip("Restore safe Automatic defaults without clearing credentials or memory consent.")
+        .onClick(async () => {
+          Object.assign(
+            this.plugin.settings,
+            applyRecommendedAutomaticDefaults(
+              this.plugin.settings as NormalizableAgentSettings,
+            ),
+          );
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+    );
 
     new Setting(basicEl)
-      .setName("Output profile")
+      .setName("Memory consent")
       .setDesc(
-        "Where content-producing missions write by default. Explicit chat-only and specialized routes still win.",
+        "Choose durable local memory. Research memory is stored as Markdown; Clear chat never removes it.",
       )
       .addDropdown((dropdown) =>
         dropdown
-          .addOption("active_or_new_note", "Smart note - stream and title")
-          .addOption("active_note_only", "Active note only")
-          .addOption("chat_first", "Chat first")
-          .setValue(this.plugin.settings.outputProfile ?? "active_or_new_note")
+          .addOption("off", "Off")
+          .addOption("research", "Research memory only")
+          .addOption(
+            "research_and_experience",
+            "Research + experience memory",
+          )
+          .setValue(this.plugin.settings.memoryMode ?? "research")
           .onChange(async (value) => {
-            await this.applyOutputProfileChange(value);
-          }),
-      );
-
-    new Setting(basicEl)
-      .setName("Research memory")
-      .setDesc(
-        "Consent to store durable topic memory as markdown notes. Clear chat does not remove this memory.",
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.researchMemoryEnabled)
-          .onChange(async (value) => {
-            this.plugin.settings.researchMemoryEnabled = value;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(basicEl)
-      .setName("Experience memory")
-      .setDesc(
-        "Consent for explicit local companion memories (observations, sources, procedures).",
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.experienceMemoryEnabled)
-          .onChange(async (value) => {
-            this.plugin.settings.experienceMemoryEnabled = value;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(basicEl)
-      .setName("Recommended defaults")
-      .setDesc(
-        "Reset Automatic / Smart note plus thinking, streaming, and reflex defaults without clearing credentials.",
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Use recommended automatic defaults")
-          .setCta()
-          .onClick(async () => {
-            Object.assign(
-              this.plugin.settings,
-              applyRecommendedAutomaticDefaults(
-                this.plugin.settings as NormalizableAgentSettings,
-              ),
-            );
-            await this.plugin.saveSettings();
-            this.display();
+            await this.applyMemoryModeChange(value);
           }),
       );
   }
@@ -431,6 +487,7 @@ export class AgentSettingTab extends PluginSettingTab {
   private renderConnectionStatusRow(containerEl: HTMLElement): void {
     const rows = buildSettingsDependencyRows(this.plugin.settings);
     const preflight = runDependencyPreflight(rows);
+    const live = this.plugin.getModelConnectionStatus();
     const summary = rows
       .map((row) => `${formatDependencyRowName(row)} — ${row.summary}`)
       .join(" ");
@@ -438,66 +495,187 @@ export class AgentSettingTab extends PluginSettingTab {
     const setting = new Setting(containerEl)
       .setName("Connection status")
       .setDesc(
-        `Advisory only (status: ${preflight.status}). ${summary}`,
+        `${live.message} Configuration preflight: ${preflight.status}. ${summary}`,
       );
+    setting.settingEl.addClass("agentic-settings-model-connection");
     setting.addButton((button) =>
-      button.setButtonText("Test").onClick(() => {
-        this.display();
-      }),
+      button
+        .setButtonText(live.status === "testing" ? "Testing..." : "Test connection")
+        .setDisabled(live.status === "testing")
+        .onClick(async () => {
+          const pending = this.plugin.testModelConnection();
+          this.display();
+          await pending;
+          this.display();
+        }),
     );
   }
 
   private renderCapabilityStatus(containerEl: HTMLElement): void {
     const statusEl = containerEl.createDiv({
-      cls: "agentic-capability-status",
+      cls: "agentic-settings-readiness agentic-settings-panel",
     });
-    statusEl.createEl("h3", { text: "Capability status" });
-    statusEl.createEl("p", {
-      text: "Read-only readiness from current settings. Open Advanced to configure.",
-      cls: "setting-item-description",
+    this.renderCapabilityStatusContents(statusEl);
+  }
+
+  private renderCapabilityStatusContents(statusEl: HTMLElement): void {
+    const rows = buildCapabilityStatusRows(this.plugin);
+    this.readinessSignature = JSON.stringify(rows);
+    statusEl.empty();
+    const readyCount = rows.filter((row) => row.status === "Ready").length;
+    const header = statusEl.createDiv({
+      cls: "agentic-settings-readiness-header",
+    });
+    const headerCopy = header.createDiv();
+    headerCopy.createEl("h3", { text: "System readiness" });
+    headerCopy.createEl("p", {
+      text: "Open a status to jump directly to its controls.",
+      cls: "setting-item-description agentic-settings-section-intro",
+    });
+    header.createEl("span", {
+      text: `${readyCount}/${rows.length} ready`,
+      cls: "agentic-settings-readiness-count",
     });
 
-    for (const row of buildCapabilityStatusRows(this.plugin)) {
-      new Setting(statusEl)
-        .setName(row.name)
-        .setDesc(`${row.status} — ${row.detail}`);
+    const grid = statusEl.createDiv({ cls: "agentic-settings-readiness-grid" });
+    for (const row of rows) {
+      const targetId = capabilitySettingsTargetId(row.name);
+      const item = grid.createEl("button", {
+        cls: "agentic-settings-readiness-item",
+        attr: {
+          type: "button",
+          "data-status": capabilityStatusSlug(row.status),
+          "aria-label": `${row.name}: ${row.status}. Open settings.`,
+        },
+      });
+      const itemHeader = item.createDiv({
+        cls: "agentic-settings-readiness-item-header",
+      });
+      itemHeader.createEl("span", {
+        text: row.name,
+        cls: "agentic-settings-readiness-name",
+      });
+      itemHeader.createEl("span", {
+        text: row.status,
+        cls: `agentic-settings-status-badge is-${capabilityStatusSlug(row.status)}`,
+      });
+      item.createEl("span", {
+        text: row.detail,
+        cls: "agentic-settings-readiness-detail",
+      });
+      item.createEl("span", {
+        text: capabilityPrimaryAction(row.name, row.status),
+        cls: "agentic-settings-readiness-action",
+      });
+      item.addEventListener("click", () => {
+        const target = this.containerEl.querySelector<HTMLDetailsElement>(
+          `#${targetId}`,
+        );
+        if (!target) return;
+        target.open = true;
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
     }
+  }
+
+  private startReadinessRefresh(): void {
+    this.readinessRefreshTimer = window.setInterval(() => {
+      const rows = buildCapabilityStatusRows(this.plugin);
+      const signature = JSON.stringify(rows);
+      if (signature === this.readinessSignature) return;
+      const statusEl = this.containerEl.querySelector<HTMLElement>(
+        ".agentic-settings-readiness",
+      );
+      if (statusEl) this.renderCapabilityStatusContents(statusEl);
+    }, 1_000);
+  }
+
+  private stopReadinessRefresh(): void {
+    if (this.readinessRefreshTimer === null) return;
+    window.clearInterval(this.readinessRefreshTimer);
+    this.readinessRefreshTimer = null;
+  }
+
+  private redisplayWithAdvancedSectionOpen(sectionId: string): void {
+    this.display();
+    const section = this.containerEl.querySelector<HTMLDetailsElement>(
+      `#${sectionId}`,
+    );
+    if (section) section.open = true;
   }
 
   private renderAdvancedSections(containerEl: HTMLElement): void {
     const advancedRoot = containerEl.createDiv({
-      cls: "agentic-settings-advanced",
+      cls: "agentic-settings-advanced agentic-settings-panel",
     });
-    advancedRoot.createEl("h3", { text: "Advanced" });
+    advancedRoot.createEl("h3", { text: "Advanced controls" });
     advancedRoot.createEl("p", {
-      text: "Collapsed tuning for power users. Legacy router/orchestrator boolean switches stay out of the UI; use router mode and Orchestrator team runtime instead.",
-      cls: "setting-item-description",
+      text: "Power-user controls are grouped by job. Readiness stays visible while the details remain out of the way.",
+      cls: "setting-item-description agentic-settings-section-intro",
     });
 
-    this.renderAdvancedModelRouting(advancedRoot);
-    this.renderAdvancedOutputOverrides(advancedRoot);
-    this.renderAdvancedAutonomyBudgets(advancedRoot);
-    this.renderAdvancedSemantic(advancedRoot);
-    this.renderAdvancedBrowserIntegrations(advancedRoot);
-    this.renderAdvancedExtensionContributions(advancedRoot);
-    this.renderAdvancedDiagnostics(advancedRoot);
+    const accordion = advancedRoot.createDiv({
+      cls: "agentic-settings-accordion",
+    });
+    this.renderAdvancedModelRouting(accordion);
+    this.renderAdvancedOutputOverrides(accordion);
+    this.renderAdvancedAutonomyBudgets(accordion);
+    this.renderAdvancedSemantic(accordion);
+    this.renderAdvancedBrowserIntegrations(accordion);
+    this.renderAdvancedExtensionContributions(accordion);
+    this.renderAdvancedDiagnostics(accordion);
   }
 
   private createAdvancedDetails(
     parent: HTMLElement,
+    id: string,
     title: string,
+    description: string,
+    capabilityNames: string[] = [],
   ): HTMLDetailsElement {
     const details = parent.createEl("details", {
       cls: "agentic-settings-advanced-section",
+      attr: { id },
     });
-    details.createEl("summary", { text: title });
+    const summary = details.createEl("summary");
+    const summaryContent = summary.createSpan({
+      cls: "agentic-settings-advanced-summary",
+    });
+    const copy = summaryContent.createSpan({
+      cls: "agentic-settings-advanced-summary-copy",
+    });
+    copy.createSpan({
+      text: title,
+      cls: "agentic-settings-advanced-title",
+    });
+    copy.createSpan({
+      text: description,
+      cls: "agentic-settings-advanced-description",
+    });
+    const statuses = buildCapabilityStatusRows(this.plugin).filter((row) =>
+      capabilityNames.includes(row.name),
+    );
+    if (statuses.length > 0) {
+      const statusGroup = summaryContent.createSpan({
+        cls: "agentic-settings-advanced-statuses",
+      });
+      for (const status of statuses) {
+        statusGroup.createSpan({
+          text: `${capabilityStatusShortName(status.name)} · ${status.status}`,
+          title: `${status.name}: ${status.detail}`,
+          cls: `agentic-settings-status-badge is-${capabilityStatusSlug(status.status)}`,
+        });
+      }
+    }
     return details;
   }
 
   private renderAdvancedModelRouting(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
-      "Model routing and sampling",
+      "agentic-settings-model-routing",
+      "Model & routing",
+      "Provider behavior, request limits and generation controls.",
     );
 
     new Setting(section)
@@ -627,7 +805,13 @@ export class AgentSettingTab extends PluginSettingTab {
   }
 
   private renderAdvancedOutputOverrides(parent: HTMLElement): void {
-    const section = this.createAdvancedDetails(parent, "Output overrides");
+    const section = this.createAdvancedDetails(
+      parent,
+      "agentic-settings-output-memory",
+      "Output & memory",
+      "Note targeting, streaming, titles and durable research memory.",
+      ["Notes & research"],
+    );
 
     new Setting(section)
       .setName("Stream final answers")
@@ -730,7 +914,13 @@ export class AgentSettingTab extends PluginSettingTab {
   }
 
   private renderAdvancedAutonomyBudgets(parent: HTMLElement): void {
-    const section = this.createAdvancedDetails(parent, "Autonomy and budgets");
+    const section = this.createAdvancedDetails(
+      parent,
+      "agentic-settings-autonomy",
+      "Autonomy, teams & schedules",
+      "Budgets, long runs, Lead + Worker routing and recurring missions.",
+      ["Background work"],
+    );
 
     new Setting(section)
       .setName("Maximum agent steps")
@@ -1042,12 +1232,17 @@ export class AgentSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    this.renderScheduledMissionControls(section);
   }
 
   private renderAdvancedSemantic(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
-      "Semantic retrieval tuning",
+      "agentic-settings-semantic",
+      "Semantic retrieval",
+      "Local embeddings, chunking and index persistence.",
+      ["Notes & research"],
     );
 
     new Setting(section)
@@ -1270,7 +1465,10 @@ export class AgentSettingTab extends PluginSettingTab {
   private renderAdvancedBrowserIntegrations(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
-      "Browser and integrations",
+      "agentic-settings-connections",
+      "Companion & integrations",
+      "Browser tools plus Linear and GitHub connections.",
+      ["Browser & web", "Linear", "GitHub"],
     );
 
     new Setting(section)
@@ -1332,46 +1530,42 @@ export class AgentSettingTab extends PluginSettingTab {
 
     section.createEl("h4", { text: "Linear integration" });
     section.createEl("p", {
-      text: "Optional private-workspace integration using fixed Linear GraphQL operations. New keys use the authenticated companion's persistent OS credential store when available; legacy plaintext remains foreground-only until you explicitly migrate it.",
+      text: "Connect once, then use fixed Linear GraphQL tools without per-tool setup. Credentials live in secure storage; plugin settings retain only an opaque reference.",
       cls: "setting-item-description",
     });
 
-    new Setting(section)
-      .setName("Enable Linear")
-      .setDesc(
-        "Expose validated Linear tools only for prompts with explicit Linear intent.",
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.linearEnabled === true)
-          .onChange(async (value) => {
-            this.plugin.settings.linearEnabled = value;
-            if (!value) {
-              this.plugin.settings.linearQueueEnabled = false;
-            }
-            await this.plugin.saveSettings();
-          }),
-      );
+    const oauthConnectionHost = section.createDiv({
+      cls: "agentic-linear-oauth-primary",
+    });
+    const oauthAdvanced = section.createEl("details", {
+      cls: "agentic-settings-disclosure agentic-linear-oauth-advanced",
+    });
+    oauthAdvanced.createEl("summary", { text: "OAuth app setup (advanced)" });
+    oauthAdvanced.createEl("p", {
+      text: "Most people only need to enter a client ID once. The safe loopback port and user actor defaults can stay unchanged.",
+      cls: "setting-item-description",
+    });
 
-    new Setting(section)
+    new Setting(oauthAdvanced)
       .setName("Linear OAuth client ID")
       .setDesc(
-        "Non-secret client ID from a Linear OAuth application configured with the exact loopback redirect shown below.",
+        "Non-secret client ID from your Linear OAuth application.",
       )
-      .addText((text) =>
-        text
+      .addText((text) => {
+        text.inputEl.addClass("agentic-linear-oauth-client-id");
+        return text
           .setPlaceholder("Linear OAuth client ID")
           .setValue(this.plugin.settings.linearOAuthClientId ?? "")
           .onChange(async (value) => {
             this.plugin.settings.linearOAuthClientId = value.trim();
             await this.plugin.saveSettings();
-          }),
-      );
+          });
+      });
 
     const oauthCallbackPort = this.plugin.settings.linearOAuthCallbackPort ?? 43119;
     const oauthRedirectUri =
       `http://127.0.0.1:${oauthCallbackPort}/oauth/linear/callback`;
-    new Setting(section)
+    new Setting(oauthAdvanced)
       .setName("Linear OAuth callback port")
       .setDesc(
         `Register this exact redirect URI in the Linear OAuth application before connecting: ${oauthRedirectUri}`,
@@ -1393,7 +1587,7 @@ export class AgentSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(section)
+    new Setting(oauthAdvanced)
       .setName("Linear OAuth actor")
       .setDesc(
         "User acts as the consenting member. App uses the OAuth app actor and fails closed unless the companion proves persistent OS credential storage.",
@@ -1411,14 +1605,26 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     const oauthStatus = this.plugin.getLinearOAuthStatus();
-    const oauthSetting = new Setting(section)
-      .setName("Linear OAuth connection")
+    const oauthSetting = new Setting(oauthConnectionHost)
+      .setName("Connect Linear with OAuth")
       .setDesc(oauthStatus.message);
     oauthSetting.addButton((button) =>
       button
-        .setButtonText(oauthStatus.connected ? "Reconnect OAuth" : "Connect OAuth")
-        .setDisabled(!(this.plugin.settings.linearOAuthClientId ?? "").trim())
+        .setButtonText(oauthStatus.connected ? "Reconnect" : "Connect Linear")
+        .setCta()
         .onClick(async () => {
+          if (!(this.plugin.settings.linearOAuthClientId ?? "").trim()) {
+            oauthAdvanced.open = true;
+            oauthSetting.setDesc(
+              "Enter the one-time OAuth client ID below, then choose Connect Linear again.",
+            );
+            window.setTimeout(() => {
+              oauthAdvanced
+                .querySelector<HTMLInputElement>(".agentic-linear-oauth-client-id")
+                ?.focus();
+            }, 0);
+            return;
+          }
           button.setDisabled(true).setButtonText("Starting...");
           const result = await this.plugin.startLinearOAuthAuthorization();
           oauthSetting.setDesc(result.message);
@@ -1433,7 +1639,7 @@ export class AgentSettingTab extends PluginSettingTab {
               );
             }
           }
-          window.setTimeout(() => this.display(), 500);
+          window.setTimeout(() => this.display(), 250);
         }),
     );
     if (oauthStatus.authorizationUrl) {
@@ -1485,9 +1691,19 @@ export class AgentSettingTab extends PluginSettingTab {
       button.setButtonText("Save key").onClick(async () => {
         button.setDisabled(true).setButtonText("Saving...");
         const result = await this.plugin.setLinearApiKey(pendingLinearKey);
-        linearKeySetting.setDesc(result.message);
-        button.setButtonText(result.ok ? "Saved" : "Not saved");
-        window.setTimeout(() => this.display(), 1_500);
+        if (!result.ok) {
+          linearKeySetting.setDesc(result.message);
+          button.setButtonText("Not saved");
+          window.setTimeout(() => this.display(), 1_500);
+          return;
+        }
+        button.setButtonText("Verifying...");
+        const verified = await this.plugin.testLinearConnection();
+        linearKeySetting.setDesc(
+          verified.ok ? `${result.message} ${verified.message}` : verified.message,
+        );
+        button.setButtonText(verified.ok ? "Connected" : "Saved; verify failed");
+        window.setTimeout(() => this.display(), 500);
       }),
     );
     if (credentialStatus.configured && !credentialStatus.secure) {
@@ -1703,22 +1919,6 @@ export class AgentSettingTab extends PluginSettingTab {
     });
 
     new Setting(section)
-      .setName("Enable GitHub")
-      .setDesc(
-        "Expose bounded GitHub capabilities only after the built-in integrations capability is configured and verified.",
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.githubEnabled === true)
-          .onChange(async (value) => {
-            this.plugin.settings.githubEnabled = value;
-            if (!value) this.plugin.cancelGitHubDeviceAuthorization();
-            await this.plugin.saveSettings();
-            this.display();
-          }),
-      );
-
-    new Setting(section)
       .setName("GitHub OAuth client ID")
       .setDesc(
         "Non-secret client ID from a GitHub OAuth app with device flow enabled.",
@@ -1741,8 +1941,7 @@ export class AgentSettingTab extends PluginSettingTab {
       button
         .setButtonText(githubStatus.connected ? "Reconnect OAuth" : "Connect OAuth")
         .setDisabled(
-          this.plugin.settings.githubEnabled !== true ||
-            !(this.plugin.settings.githubOAuthClientId ?? "").trim() ||
+          !(this.plugin.settings.githubOAuthClientId ?? "").trim() ||
             githubStatus.waitingForUser,
         )
         .onClick(async () => {
@@ -1805,7 +2004,6 @@ export class AgentSettingTab extends PluginSettingTab {
     githubPatSetting.addButton((button) =>
       button
         .setButtonText("Verify and save")
-        .setDisabled(this.plugin.settings.githubEnabled !== true)
         .onClick(async () => {
           button.setDisabled(true).setButtonText("Verifying...");
           const result = await this.plugin.setGitHubFineGrainedPat(
@@ -1818,34 +2016,228 @@ export class AgentSettingTab extends PluginSettingTab {
         }),
     );
 
+  }
+
+  private renderScheduledMissionControls(section: HTMLElement): void {
+    section.createEl("h4", { text: "Recurring missions" });
+    section.createEl("p", {
+      text: "Create a recurring mission with ordinary fields. Schedules share the same autonomy budgets and safety boundaries as foreground missions.",
+      cls: "setting-item-description agentic-settings-subsection-intro",
+    });
+
+    const schedules = this.plugin.settings.scheduledMissions ?? [];
+    const list = section.createDiv({ cls: "agentic-schedule-list" });
+    if (schedules.length === 0) {
+      list.createEl("p", {
+        text: "No recurring missions yet. Add one to start with a safe, disabled daily template.",
+        cls: "setting-item-description agentic-schedule-empty",
+      });
+    }
+
+    schedules.forEach((mission, index) => {
+      const card = list.createDiv({
+        cls: "agentic-schedule-card",
+        attr: { "data-schedule-id": mission.id },
+      });
+      const header = card.createDiv({ cls: "agentic-schedule-card-header" });
+      header.createEl("h5", {
+        text: mission.name?.trim() || `Recurring mission ${index + 1}`,
+      });
+      header.createEl("span", {
+        text: mission.enabled ? "Enabled" : "Paused",
+        cls: `agentic-settings-status-badge ${mission.enabled ? "is-ready" : "is-needs-setup"}`,
+      });
+
+      new Setting(card)
+        .setName("Enabled")
+        .setDesc("Run this mission when its schedule becomes due.")
+        .addToggle((toggle) =>
+          toggle.setValue(mission.enabled).onChange(async (value) => {
+            mission.enabled = value;
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+          }),
+        );
+
+      new Setting(card)
+        .setName("Name")
+        .setDesc("A short label shown only in settings and run details.")
+        .addText((text) =>
+          text
+            .setPlaceholder(`Recurring mission ${index + 1}`)
+            .setValue(mission.name ?? "")
+            .onChange(async (value) => {
+              mission.name = value.trim() || undefined;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(card)
+        .setName("Mission prompt")
+        .setDesc("Tell the agent the outcome to produce; it will plan the intermediate steps.")
+        .addTextArea((text) => {
+          text.inputEl.rows = 4;
+          text.inputEl.addClass("agentic-schedule-prompt");
+          return text
+            .setPlaceholder("Research this topic, verify sources, and append the result to my note.")
+            .setValue(mission.prompt)
+            .onChange(async (value) => {
+              mission.prompt = value;
+              await this.plugin.saveSettings();
+            });
+        });
+
+      new Setting(card)
+        .setName("Repeat")
+        .setDesc("Hourly runs start when due. Daily and weekly runs use your local time.")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("hourly", "Every hour")
+            .addOption("daily", "Every day")
+            .addOption("weekly", "Every week")
+            .setValue(mission.cadence)
+            .onChange(async (value) => {
+              mission.cadence =
+                value === "hourly" || value === "weekly" ? value : "daily";
+              await this.plugin.saveSettings();
+              this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+            }),
+        );
+
+      if (mission.cadence !== "hourly") {
+        if (mission.cadence === "weekly") {
+          new Setting(card)
+            .setName("Day")
+            .setDesc("Local weekday for the weekly run.")
+            .addDropdown((dropdown) => {
+              ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+                .forEach((label, weekday) => dropdown.addOption(String(weekday), label));
+              return dropdown
+                .setValue(String(mission.weekday ?? 1))
+                .onChange(async (value) => {
+                  mission.weekday = Number(value);
+                  await this.plugin.saveSettings();
+                });
+            });
+        }
+        new Setting(card)
+          .setName("Start hour")
+          .setDesc("Local hour from 0 through 23.")
+          .addText((text) => {
+            text.inputEl.type = "number";
+            text.inputEl.min = "0";
+            text.inputEl.max = "23";
+            text.inputEl.step = "1";
+            return text
+              .setValue(String(mission.hourLocal ?? 8))
+              .onChange(async (value) => {
+                const parsed = Number(value);
+                if (!Number.isInteger(parsed) || parsed < 0 || parsed > 23) return;
+                mission.hourLocal = parsed;
+                await this.plugin.saveSettings();
+              });
+          });
+      }
+
+      new Setting(card)
+        .setName("Output note (optional)")
+        .setDesc("Vault-relative Markdown path. Leave blank to let the mission choose its normal output.")
+        .addText((text) =>
+          text
+            .setPlaceholder("Research/Daily review.md")
+            .setValue(mission.targetNotePath ?? "")
+            .onChange(async (value) => {
+              mission.targetNotePath = value.trim() || undefined;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(card)
+        .setName("Remove schedule")
+        .setDesc("Removes this schedule only; it does not delete notes or prior run receipts.")
+        .addButton((button) =>
+          button.setButtonText("Remove").setWarning().onClick(async () => {
+            this.plugin.settings.scheduledMissions = schedules.filter(
+              (_, candidateIndex) => candidateIndex !== index,
+            );
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+          }),
+        );
+    });
+
     new Setting(section)
-      .setName("Scheduled missions")
-      .setDesc(
-        "JSON array of recurring missions. Standard fields: id, prompt, cadence hourly/daily/weekly, hourLocal, weekday, targetNotePath, enabled. Continuous research also supports mode=continuous_research, pinnedTargetIds, and quietHours {startMinute,endMinute}.",
-      )
+      .setName("Add recurring mission")
+      .setDesc("Adds a paused daily template. Review its prompt, then enable it.")
+      .addButton((button) =>
+        button.setButtonText("Add mission").setCta().onClick(async () => {
+          const now = Date.now();
+          this.plugin.settings.scheduledMissions = [
+            ...schedules,
+            {
+              id: `schedule-${now.toString(36)}`,
+              name: "Daily vault review",
+              prompt:
+                "Review today's active project notes, summarize meaningful progress, and append a concise next-actions section.",
+              cadence: "daily",
+              hourLocal: 8,
+              weekday: 1,
+              enabled: false,
+              lastRunAt: null,
+              lastRunId: null,
+              mode: "standard",
+            },
+          ];
+          await this.plugin.saveSettings();
+          this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+        }),
+      );
+
+    const advanced = section.createEl("details", {
+      cls: "agentic-settings-disclosure agentic-schedule-json",
+    });
+    advanced.createEl("summary", { text: "Advanced JSON import/export" });
+    advanced.createEl("p", {
+      text: "Optional power-user view for moving schedules between vaults. Invalid JSON is never applied.",
+      cls: "setting-item-description",
+    });
+    let pendingJson = JSON.stringify(schedules, null, 2);
+    const jsonStatus = advanced.createEl("p", {
+      text: "Edit the JSON, then choose Apply JSON.",
+      cls: "setting-item-description agentic-schedule-json-status",
+    });
+    new Setting(advanced)
+      .setName("Schedule JSON")
+      .setDesc("The form above remains the recommended editor.")
       .addTextArea((text) => {
         text.inputEl.rows = 8;
         text.inputEl.addClass("agentic-researcher-scheduled-missions-input");
-        text
-          .setPlaceholder(
-            '[{"id":"daily-review","prompt":"Summarize today","cadence":"daily","hourLocal":8,"enabled":true}]',
-          )
-          .setValue(
-            JSON.stringify(this.plugin.settings.scheduledMissions ?? [], null, 2),
-          )
-          .onChange(async (value) => {
-            const parsed = parseScheduledMissionsJson(value);
-            if (parsed === null) {
-              return;
-            }
-            this.plugin.settings.scheduledMissions = parsed;
-            await this.plugin.saveSettings();
-          });
-      });
+        return text.setValue(pendingJson).onChange((value) => {
+          pendingJson = value;
+          jsonStatus.setText("JSON has unapplied changes.");
+        });
+      })
+      .addButton((button) =>
+        button.setButtonText("Apply JSON").onClick(async () => {
+          const parsed = parseScheduledMissionsJson(pendingJson);
+          if (parsed === null) {
+            jsonStatus.setText("Invalid JSON. Nothing was changed.");
+            return;
+          }
+          this.plugin.settings.scheduledMissions = parsed;
+          await this.plugin.saveSettings();
+          this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+        }),
+      );
   }
 
   private renderAdvancedDiagnostics(parent: HTMLElement): void {
-    const section = this.createAdvancedDetails(parent, "Diagnostics");
+    const section = this.createAdvancedDetails(
+      parent,
+      "agentic-settings-diagnostics",
+      "Diagnostics",
+      "Effective runtime settings, dependency checks and reflex visibility.",
+    );
     const s = this.plugin.settings;
     const provider = s.modelProvider ?? "ollama";
     const base =
@@ -1854,7 +2246,7 @@ export class AgentSettingTab extends PluginSettingTab {
         : s.ollamaBaseUrl;
 
     section.createEl("p", {
-      text: `Effective profile: autonomy=${s.autonomyProfile ?? "automatic"}, output=${s.outputProfile ?? "active_or_new_note"}, schema=${s.settingsSchemaVersion ?? 1}. Provider=${provider}, model=${s.model}, thinking=${s.thinkingMode}, base=${base}. Streaming=${s.enableStreaming ? "on" : "off"}, note_stream=${s.streamWritebackMode}, auto_title=${s.autoTitleOnWrite !== false ? "on" : "off"}, orchestrator=${s.orchestratorEnabled !== false ? "on" : "off"}, router=${normalizeModelRouterMode(s.modelRouterMode, s.modelRouterEnabled)}, reflex=${s.agenticReflexEnabled ? "on" : "off"}.`,
+      text: `Effective profile: working=${s.workingMode ?? "automatic"}, memory=${s.memoryMode ?? "research"}, autonomy=${s.autonomyProfile ?? "automatic"}, output=${s.outputProfile ?? "active_or_new_note"}, schema=${s.settingsSchemaVersion ?? 1}. Provider=${provider}, model=${s.model}, thinking=${s.thinkingMode}, base=${base}. Streaming=${s.enableStreaming ? "on" : "off"}, note_stream=${s.streamWritebackMode}, auto_title=${s.autoTitleOnWrite !== false ? "on" : "off"}, orchestrator=${s.orchestratorEnabled !== false ? "on" : "off"}, router=${normalizeModelRouterMode(s.modelRouterMode, s.modelRouterEnabled)}, reflex=${s.agenticReflexEnabled ? "on" : "off"}.`,
       cls: "setting-item-description agentic-settings-diagnostics-summary",
     });
 
@@ -1871,6 +2263,7 @@ export class AgentSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.agenticReflexEnabled = value;
             this.plugin.settings.autonomyProfile = "custom";
+            this.plugin.settings.workingMode = "custom";
             await this.plugin.saveSettings();
           }),
       );
@@ -1893,11 +2286,14 @@ export class AgentSettingTab extends PluginSettingTab {
   private renderAdvancedExtensionContributions(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
-      "Built-in capabilities (read only)",
+      "agentic-settings-system-health",
+      "Built-in system health",
+      "Internal Code, Companion and Integrations contracts.",
+      ["Code", "Background work"],
     );
     this.extensionContributionsEl = section;
     section.createEl("p", {
-      text: "Code, background service, and integrations ship inside this one plugin. Their internal contracts remain isolated and are shown here for health and migration diagnostics.",
+      text: "Code, Companion, and Integrations ship inside Agentic Researcher. Their internal boundaries stay isolated and appear here only for health and migration diagnostics.",
       cls: "setting-item-description",
     });
 
@@ -1946,65 +2342,26 @@ export class AgentSettingTab extends PluginSettingTab {
     }
   }
 
-  private async applyAutonomyProfileChange(value: string): Promise<void> {
-    if (value === "automatic") {
-      applyAutomaticProfileDefaults(
-        this.plugin.settings as NormalizableAgentSettings,
-      );
-      this.plugin.settings.autonomyProfile = "automatic";
-      this.plugin.settings.outputProfile = "active_or_new_note";
-      this.plugin.settings.enableStreaming = true;
-      this.plugin.settings.streamWritebackMode =
-        "all_current_note_content_writes";
-      this.plugin.settings.autoTitleOnWrite = true;
-      this.plugin.settings.thinkingMode = "auto";
-      this.plugin.settings.agenticReflexEnabled = true;
-      this.plugin.settings.modelRouterMode = "authority";
-      this.plugin.settings.modelRouterEnabled = true;
-    } else if (value === "conservative") {
-      this.plugin.settings.autonomyProfile = "conservative";
-      this.plugin.settings.outputProfile = "chat_first";
-      this.plugin.settings.enableStreaming = true;
-      this.plugin.settings.streamWritebackMode = "off";
-      this.plugin.settings.autoTitleOnWrite = false;
-      this.plugin.settings.modelRouterMode = "off";
-      this.plugin.settings.modelRouterEnabled = false;
-    } else {
-      this.plugin.settings.autonomyProfile = "custom";
-    }
+  private async applyWorkingModeChange(value: string): Promise<void> {
+    const mode: WorkingModeSetting =
+      value === "chat_only" || value === "custom" ? value : "automatic";
+    applyWorkingModeDefaults(
+      this.plugin.settings as NormalizableAgentSettings,
+      mode,
+    );
     await this.plugin.saveSettings();
     this.display();
   }
 
-  private async applyOutputProfileChange(value: string): Promise<void> {
-    const profile: OutputProfile = isOutputProfile(value)
-      ? value
-      : "active_or_new_note";
-    this.plugin.settings.outputProfile = profile;
-
-    if (profile === "active_or_new_note") {
-      this.plugin.settings.enableStreaming = true;
-      this.plugin.settings.streamWritebackMode =
-        "all_current_note_content_writes";
-      this.plugin.settings.autoTitleOnWrite = true;
-    } else if (profile === "chat_first") {
-      this.plugin.settings.enableStreaming = true;
-      this.plugin.settings.streamWritebackMode = "off";
-      this.plugin.settings.autoTitleOnWrite = false;
-    } else {
-      this.plugin.settings.enableStreaming = true;
-      this.plugin.settings.streamWritebackMode =
-        "all_current_note_content_writes";
-    }
-
-    const autonomy = this.plugin.settings.autonomyProfile ?? "automatic";
-    if (
-      (autonomy === "automatic" && profile !== "active_or_new_note") ||
-      (autonomy === "conservative" && profile !== "chat_first")
-    ) {
-      this.plugin.settings.autonomyProfile = "custom";
-    }
-
+  private async applyMemoryModeChange(value: string): Promise<void> {
+    const mode: MemoryModeSetting =
+      value === "off" || value === "research_and_experience"
+        ? value
+        : "research";
+    applyMemoryModeDefaults(
+      this.plugin.settings as NormalizableAgentSettings,
+      mode,
+    );
     await this.plugin.saveSettings();
     this.display();
   }
@@ -2080,66 +2437,90 @@ type CapabilityUiStatus =
   | "Needs setup"
   | "Approval required";
 
+function capabilityStatusSlug(status: CapabilityUiStatus): string {
+  return status.toLowerCase().replace(/\s+/g, "-");
+}
+
+function capabilitySettingsTargetId(name: string): string {
+  if (name === "Notes & research") return "agentic-settings-output-memory";
+  if (name === "Browser & web" || name === "Linear" || name === "GitHub") {
+    return "agentic-settings-connections";
+  }
+  return "agentic-settings-system-health";
+}
+
+function capabilitySetupTargetId(target: CapabilitySetupTarget): string {
+  if (target === "model") return "agentic-settings-essentials";
+  if (target === "notes_research") return "agentic-settings-output-memory";
+  if (
+    target === "browser_web" ||
+    target === "linear" ||
+    target === "github"
+  ) {
+    return "agentic-settings-connections";
+  }
+  return "agentic-settings-system-health";
+}
+
+function capabilityStatusShortName(name: string): string {
+  if (name === "Notes & research") return "Notes";
+  if (name === "Browser & web") return "Web";
+  if (name === "Background work") return "Background";
+  return name;
+}
+
+function capabilityPrimaryAction(
+  name: string,
+  status: CapabilityUiStatus,
+): string {
+  if (status === "Ready") return "Review";
+  if (status === "Approval required") return "Review approval";
+  if (name === "Linear") return "Connect Linear";
+  if (name === "GitHub") return "Connect GitHub";
+  if (name === "Code") return "Set up execution";
+  if (name === "Browser & web") return "Test web tools";
+  if (name === "Background work") return "Set up background work";
+  return "Review note setup";
+}
+
 function buildCapabilityStatusRows(
   plugin: AgenticResearcherPlugin,
 ): Array<{ name: string; status: CapabilityUiStatus; detail: string }> {
   const settings = plugin.settings;
   const output = settings.outputProfile ?? "active_or_new_note";
-  const vaultStatus: CapabilityUiStatus =
+  const notesStatus: CapabilityUiStatus =
     output === "chat_first"
       ? "Ready"
       : settings.enableStreaming === false ||
           settings.streamWritebackMode === "off"
         ? "Degraded"
         : "Ready";
-  const vaultDetail =
+  const notesDetail =
     output === "active_or_new_note"
-      ? "Smart note output (active or new) with stream/title policy."
+      ? `Active-or-new-note output is ready; semantic retrieval is ${settings.semanticSearchEnabled ? "on" : "optional/off"}.`
       : output === "active_note_only"
         ? "Active note only; falls back to chat when no Markdown note is open."
         : "Chat-first default; explicit note writes still work.";
 
-  let semanticStatus: CapabilityUiStatus = "Needs setup";
-  let semanticDetail = "Semantic search is disabled.";
-  if (settings.semanticSearchEnabled) {
-    if (!settings.semanticEmbeddingModel?.trim()) {
-      semanticStatus = "Degraded";
-      semanticDetail = "Enabled but no embedding model is set.";
-    } else {
-      semanticStatus = "Ready";
-      semanticDetail = `Model ${settings.semanticEmbeddingModel}; index ${settings.semanticIndexEnabled ? "on" : "off"}.`;
-    }
-  }
-
-  let browserStatus: CapabilityUiStatus = "Needs setup";
-  let browserDetail = "Browser tools are off.";
+  let browserStatus: CapabilityUiStatus = "Ready";
+  let browserDetail = "Web search/fetch are available; supervised browser actions are off.";
   if (settings.browserToolsEnabled) {
     browserStatus = "Approval required";
     browserDetail =
-      "Companion tools enabled; click/type/submit remain SafetyPolicy gated.";
+      "Web plus supervised browser tools are available; click/type/submit remain SafetyPolicy gated.";
   }
 
-  const overnightOn = settings.overnightRunsEnabled !== false;
-  const longRunStatus: CapabilityUiStatus = overnightOn ? "Ready" : "Needs setup";
-  const longRunDetail = overnightOn
-    ? `Overnight on (${settings.overnightRunHours ?? 10}h); auto-resume ${settings.autoResumeOvernightRuns !== false ? "on" : "off"}.`
-    : "Overnight research is disabled.";
-
-  const orchestratorOn = settings.orchestratorEnabled !== false;
-  const orchestratorStatus: CapabilityUiStatus = orchestratorOn
-    ? "Ready"
-    : "Needs setup";
-  const orchestratorDetail = orchestratorOn
-    ? "Lead + Worker routing available for eligible missions."
-    : "Orchestrator is off; missions stay single-agent.";
+  const registered = new Set(plugin.getRegisteredCapabilityIds());
+  const codeReady = registered.has("agentic-researcher-code");
+  const codeStatus: CapabilityUiStatus = codeReady ? "Ready" : "Degraded";
+  const codeDetail = codeReady
+    ? "Durable workspace editing is ready; execution still verifies the configured sandbox per mission."
+    : "Built-in Code did not register; reload and inspect system health.";
 
   let linearStatus: CapabilityUiStatus = "Needs setup";
-  let linearDetail = "Linear is disabled or missing a key.";
-  if (settings.linearEnabled === true) {
-    if (!plugin.hasLinearApiKey()) {
-      linearStatus = "Needs setup";
-      linearDetail = "Enabled but no API key is configured.";
-    } else if (settings.linearQueueEnabled === true) {
+  let linearDetail = "Connect Linear to expose fixed-catalog tools for explicit Linear requests.";
+  if (plugin.hasLinearApiKey()) {
+    if (settings.linearQueueEnabled === true) {
       const grant = plugin.getLinearQueueGrantStatus();
       if (!grant.active) {
         linearStatus = "Approval required";
@@ -2151,58 +2532,74 @@ function buildCapabilityStatusRows(
       }
     } else if (!plugin.getLinearCapabilitySnapshot()) {
       linearStatus = "Degraded";
-      linearDetail = "Credential present; test the connection to discover capabilities.";
+      linearDetail = "Connected credential present; test once to discover workspace capabilities.";
     } else {
-      const configuration = plugin.getLinearQueueConfigurationStatus();
-      linearStatus = configuration.ready ? "Ready" : "Degraded";
-      linearDetail = configuration.ready
-        ? "Connected with verified queue bindings; automatic queue is off."
-        : configuration.reason;
+      linearStatus = "Ready";
+      linearDetail = "Connected with verified workspace discovery; automatic queue remains optional.";
     }
   }
 
-  const schedules = settings.scheduledMissions ?? [];
-  const enabledSchedules = schedules.filter((mission) => mission.enabled);
-  const scheduleStatus: CapabilityUiStatus =
-    enabledSchedules.length > 0 ? "Ready" : "Needs setup";
-  const scheduleDetail =
-    enabledSchedules.length > 0
-      ? `${enabledSchedules.length} enabled schedule(s).`
-      : schedules.length > 0
-        ? `${schedules.length} schedule(s) configured but none enabled.`
-        : "No scheduled missions configured.";
+  const github = plugin.getGitHubCredentialStatus();
+  const githubStatus: CapabilityUiStatus = github.connected
+    ? github.enabled
+      ? "Ready"
+      : "Degraded"
+    : github.waitingForUser
+      ? "Approval required"
+      : "Needs setup";
+  const githubDetail = github.connected
+    ? github.enabled
+      ? `Connected as ${github.account?.login ?? "verified account"}; repository access remains profile-bound.`
+      : "Credential is connected but a legacy disabled flag still blocks tools; reconnect or reset the connection."
+    : github.waitingForUser
+      ? "Finish the active GitHub device authorization."
+      : "Connect GitHub to enable fixed-catalog repository activity.";
+
+  const companionReady = registered.has("agentic-researcher-companion");
+  const enabledSchedules = (settings.scheduledMissions ?? []).filter(
+    (mission) => mission.enabled,
+  );
+  const backgroundStatus: CapabilityUiStatus = companionReady
+    ? enabledSchedules.length > 0
+      ? "Ready"
+      : "Needs setup"
+    : "Degraded";
+  const backgroundDetail = !companionReady
+    ? "Built-in Companion did not register; background work is unavailable."
+    : enabledSchedules.length > 0
+      ? `${enabledSchedules.length} schedule(s) enabled; service and grant health remain visible in Run Details.`
+      : "Companion is available; install/attest the service or add a schedule for unattended work.";
 
   return [
     {
-      name: "Vault / note output",
-      status: vaultStatus,
-      detail: vaultDetail,
+      name: "Notes & research",
+      status: notesStatus,
+      detail: notesDetail,
     },
     {
-      name: "Semantic retrieval",
-      status: semanticStatus,
-      detail: semanticDetail,
+      name: "Code",
+      status: codeStatus,
+      detail: codeDetail,
     },
     {
-      name: "Browser companion",
+      name: "Linear",
+      status: linearStatus,
+      detail: linearDetail,
+    },
+    {
+      name: "GitHub",
+      status: githubStatus,
+      detail: githubDetail,
+    },
+    {
+      name: "Browser & web",
       status: browserStatus,
       detail: browserDetail,
     },
     {
-      name: "Long-run / overnight",
-      status: longRunStatus,
-      detail: longRunDetail,
-    },
-    {
-      name: "Orchestrator",
-      status: orchestratorStatus,
-      detail: orchestratorDetail,
-    },
-    { name: "Linear", status: linearStatus, detail: linearDetail },
-    {
-      name: "Scheduled missions",
-      status: scheduleStatus,
-      detail: scheduleDetail,
+      name: "Background work",
+      status: backgroundStatus,
+      detail: backgroundDetail,
     },
   ];
 }
@@ -2236,14 +2633,6 @@ function isThinkingMode(value: string): value is ThinkingMode {
     value === "medium" ||
     value === "high" ||
     value === "max"
-  );
-}
-
-function isOutputProfile(value: string): value is OutputProfile {
-  return (
-    value === "active_or_new_note" ||
-    value === "active_note_only" ||
-    value === "chat_first"
   );
 }
 

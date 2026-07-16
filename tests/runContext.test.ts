@@ -61,6 +61,7 @@ test("run context estimates prompt chars and compacts through ledger state", () 
   ];
   const compacted = compactLoopMessages({ messages, ledger, keepRecentSteps: 3 });
 
+  assert.equal(compacted.applied, true);
   assert.ok(compacted.estimatedCharsAfter < compacted.estimatedCharsBefore);
   assert.match(compacted.missionStateMessage ?? "", /Compacted mission state/);
   assert.match(
@@ -70,4 +71,30 @@ test("run context estimates prompt chars and compacts through ledger state", () 
   assert.equal(compacted.messages[0].content, "system prompt");
   assert.ok(compacted.messages.some((message) => /mission plan/i.test(message.content)));
   assert.ok(compacted.messages.some((message) => message.content === "latest user mission"));
+});
+
+test("run context rejects a compaction candidate that would increase the estimate", () => {
+  const messages: ModelChatMessage[] = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "short mission" },
+  ];
+  const ledger = createMissionLedger({
+    runId: "run-nonreducing-compaction",
+    mission: "x".repeat(4000),
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 10,
+      toolStepBudget: 6,
+      finalizationReserve: 4,
+      expectedTools: [],
+      stopWhenSatisfied: true,
+    },
+  });
+
+  const compacted = compactLoopMessages({ messages, ledger, keepRecentSteps: 0 });
+
+  assert.equal(compacted.applied, false);
+  assert.equal(compacted.estimatedCharsAfter, compacted.estimatedCharsBefore);
+  assert.deepEqual(compacted.messages, messages);
+  assert.equal(compacted.missionStateMessage, null);
 });

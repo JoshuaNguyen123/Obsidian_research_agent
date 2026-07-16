@@ -1448,7 +1448,16 @@ async function ensureFolderPath(app: App, folder: string) {
   for (const part of parts) {
     current = current ? `${current}/${part}` : part;
     if (!app.vault.getFolderByPath(current)) {
-      await app.vault.createFolder(current);
+      try {
+        await app.vault.createFolder(current);
+      } catch (error) {
+        // File watchers and an explicit updatePaths() call may race while
+        // creating a fresh per-run index folder. Treat only the confirmed
+        // postcondition as success; all other create failures remain fatal.
+        if (!app.vault.getFolderByPath(current)) {
+          throw error;
+        }
+      }
     }
   }
 }

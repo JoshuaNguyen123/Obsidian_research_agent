@@ -46,13 +46,42 @@ export async function withModelRetry<T>(
 
       const delayMs = Math.min(
         policy.maxDelayMs,
-        policy.baseDelayMs * 2 ** (attempt - 1),
+        Math.max(
+          policy.baseDelayMs * 2 ** (attempt - 1),
+          getRetryAfterMs(error) ?? 0,
+        ),
       );
       options.onRetry?.(attempt + 1, error, delayMs);
       await abortableDelay(delayMs, options.abortSignal);
       attempt += 1;
     }
   }
+}
+
+export function parseRetryAfterMs(
+  headers: Record<string, string> | undefined,
+  now = Date.now(),
+): number | undefined {
+  const raw = Object.entries(headers ?? {}).find(
+    ([name]) => name.toLowerCase() === "retry-after",
+  )?.[1]?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1_000);
+  }
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+}
+
+function getRetryAfterMs(error: unknown): number | undefined {
+  if (!(error instanceof ModelClientError) || !isRecord(error.details)) {
+    return undefined;
+  }
+  const value = error.details.retryAfterMs;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
 }
 
 function normalizeRetryPolicy(policy: Partial<RetryPolicy> | undefined): RetryPolicy {

@@ -107,15 +107,21 @@ function getGeneratedOutputTarget(
     return "chat_only";
   }
 
-  if (/\b(replace|overwrite|rewrite|clear|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b[\s\S]{0,180}\b(write|generate|draft|compose|create)\b|\b(write|generate|draft|compose|create)\b[\s\S]{0,180}\b(replace|overwrite|rewrite|clear|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i.test(prompt)) {
+  if (
+    /\b(replace|overwrite|rewrite|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b[\s\S]{0,180}\b(write|generate|draft|compose|create)\b|\b(write|generate|draft|compose|create)\b[\s\S]{0,180}\b(replace|overwrite|rewrite|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b|\bclear\s+(?:(?:the|this|active|current|whole|entire)\s+)?(?:note|page|document|file|contents?|body|text|writing)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i.test(
+      prompt,
+    )
+  ) {
     return "current_note_replace";
   }
 
   if (
-    /\b(generate|write|draft|compose|create|tell\s+me|walk\s+me\s+through|explain)\b/i.test(
+    /\b(generate|write|draft|compose|create|append|tell\s+me|walk\s+me\s+through|explain)\b/i.test(
       prompt,
     ) ||
-    /\b\d{1,5}\s*words?\b/i.test(prompt)
+    /\b\d{1,5}\s*words?\b/i.test(prompt) ||
+    /\bstream(?:ing)?\s+writeback\b/i.test(prompt) ||
+    /\bcited\s+findings\b/i.test(prompt)
   ) {
     return "current_note_append";
   }

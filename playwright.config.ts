@@ -1,5 +1,19 @@
 import { defineConfig } from "@playwright/test";
 
+const activeLanes = new Set(
+  (process.env.E2E_PLAYWRIGHT_LANE ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
+const liveGlobalTimeout = activeLanes.has("real-ai-contract")
+  ? 15 * 60_000
+  : activeLanes.has("real-ai-soak")
+    ? 60 * 60_000
+    : activeLanes.has("release-vertical")
+      ? 120 * 60_000
+      : undefined;
+
 // These native UI/approval cases still share the monolithic harness.
 // New Phase 6/7 integration coverage is routed by dedicated spec file below.
 const legacyIntegrationMockTitles =
@@ -29,12 +43,14 @@ export default defineConfig({
   testDir: "./e2e",
   forbidOnly: !!process.env.CI,
   fullyParallel: false,
+  globalTimeout: liveGlobalTimeout,
   retries: process.env.CI ? 2 : 0,
   timeout: 120_000,
   workers: 1,
   reporter: [
     ["list"],
     ["html", { open: "never" }],
+    ["./e2e/reporters/dailyUseReporter.ts"],
   ],
   use: {
     screenshot: "only-on-failure",
@@ -77,15 +93,43 @@ export default defineConfig({
       expect: { timeout: 30_000 },
     },
     {
-      name: "real-ai",
-      testMatch: /obsidian-agent\.spec\.ts/u,
-      grep: realAiTitles,
-      timeout: 1_800_000,
+      name: "real-ai-contract",
+      testMatch: /real-ai-contract\.spec\.ts/u,
+      retries: 0,
+      timeout: 900_000,
+      expect: { timeout: 180_000 },
+    },
+    {
+      name: "daily-use-mock",
+      testMatch: /daily-use-.*\.spec\.ts/u,
+      timeout: 240_000,
+      expect: { timeout: 20_000 },
+    },
+    {
+      name: "real-ai-soak",
+      testMatch: /real-ai-soak\.spec\.ts/u,
+      retries: 0,
+      timeout: 3_600_000,
+      expect: { timeout: 180_000 },
+    },
+    {
+      name: "provider-canary",
+      testMatch: /provider-canary\.spec\.ts/u,
+      retries: 0,
+      timeout: 900_000,
+      expect: { timeout: 180_000 },
+    },
+    {
+      name: "release-vertical",
+      testMatch: /release-vertical\.spec\.ts/u,
+      retries: 0,
+      timeout: 3_600_000,
       expect: { timeout: 180_000 },
     },
     {
       name: "disposable-live-external",
       testMatch: /disposable-live-external\.spec\.ts/u,
+      retries: 0,
       timeout: 600_000,
       expect: { timeout: 30_000 },
     },

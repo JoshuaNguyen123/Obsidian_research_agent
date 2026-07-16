@@ -62,6 +62,47 @@ test("mission acceptance asks for more work when source evidence is missing", ()
   assert.ok(result.missing.includes("web_evidence"));
 });
 
+test("named vault Markdown sources do not require unrelated web evidence", () => {
+  const result = evaluateMissionAcceptance({
+    prompt:
+      "Read the named vault notes Sources/Alpha.md and Sources/Beta.md, synthesize two findings, and append them to the current note.",
+    missionIntent: {
+      ...baseIntent,
+      vaultContext: true,
+      noteOutput: true,
+      explicitPersistence: true,
+      explicitMutation: true,
+      requireWriteCompletion: true,
+    },
+    requiredTools: ["read_file", "append_to_current_file"],
+    successfulTools: ["read_file", "append_to_current_file"],
+    failedTools: [],
+    evidence: [
+      {
+        id: "vault:alpha",
+        kind: "vault_note",
+        title: "Sources/Alpha.md",
+        path: "Sources/Alpha.md",
+        summary: "Owned vault evidence.",
+        confidence: "high",
+      },
+    ],
+    receipts: [
+      {
+        toolName: "append_to_current_file",
+        operation: "append",
+        path: "Current.md",
+        bytesWritten: 42,
+      },
+    ],
+    operationGoals: { current_note_content: "completed" },
+    finalOutput: "Appended the two findings.",
+  });
+
+  assert.equal(result.missing.includes("web_evidence"), false);
+  assert.equal(result.status, "pass");
+});
+
 test("mission acceptance passes when evidence and receipts satisfy the mission", () => {
   const receipt: MissionAcceptanceReceiptLike = {
     toolName: "append_to_current_file",

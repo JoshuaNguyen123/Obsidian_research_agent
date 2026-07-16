@@ -22,6 +22,7 @@ import type { ToolExecutionContext } from "../tools/types";
 import { normalizeVaultPath } from "../tools/validation";
 import { withSerializedRunWrite } from "./runStore";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
+import type { ModelUsageAggregateV1 } from "../model/modelCallEvidence";
 import { normalizeOrchestratorSnapshot } from "../orchestrator/orchestratorStore";
 
 const MAX_CLAIM_PASSAGES = 64;
@@ -75,6 +76,7 @@ export type MissionBlockerCategory =
   | "obsidian_vault"
   | "safety_policy"
   | "tool_unavailable"
+  | "provider_budget"
   | "unknown";
 
 export interface MissionDependencyStatus {
@@ -157,6 +159,8 @@ export interface MissionLedger {
     finalizationReserve: number;
     expectedTools: string[];
   };
+  /** Aggregate-only provider accounting. Missing legacy values normalize to zero. */
+  providerUsage?: ModelUsageAggregateV1;
   tasks: MissionTask[];
   milestones: MissionMilestone[];
   evidence: MissionEvidence[];
@@ -279,6 +283,16 @@ export function createMissionLedger({
       toolStepBudget: loopBudget.toolStepBudget,
       finalizationReserve: loopBudget.finalizationReserve,
       expectedTools: [...loopBudget.expectedTools],
+    },
+    providerUsage: {
+      schemaVersion: 1,
+      modelCallCount: 0,
+      successfulCallCount: 0,
+      failedCallCount: 0,
+      reportedTokens: 0,
+      estimatedTokens: 0,
+      retries: 0,
+      wallClockMs: 0,
     },
     tasks,
     milestones: [
@@ -959,6 +973,7 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
       finalizationReserve: getNumber(loopBudget.finalizationReserve) ?? 0,
       expectedTools: getStringArray(loopBudget.expectedTools),
     },
+    providerUsage: normalizeProviderUsage(value.providerUsage),
     tasks: Array.isArray(value.tasks)
       ? value.tasks.map(normalizeMissionTask).filter(isMissionTask)
       : [],
@@ -1263,9 +1278,24 @@ function getBlockerCategory(value: unknown): MissionBlockerCategory | undefined 
     value === "obsidian_vault" ||
     value === "safety_policy" ||
     value === "tool_unavailable" ||
+    value === "provider_budget" ||
     value === "unknown"
     ? value
     : undefined;
+}
+
+function normalizeProviderUsage(value: unknown): ModelUsageAggregateV1 {
+  const record = isRecord(value) ? value : {};
+  return {
+    schemaVersion: 1,
+    modelCallCount: Math.max(0, Math.floor(getNumber(record.modelCallCount) ?? 0)),
+    successfulCallCount: Math.max(0, Math.floor(getNumber(record.successfulCallCount) ?? 0)),
+    failedCallCount: Math.max(0, Math.floor(getNumber(record.failedCallCount) ?? 0)),
+    reportedTokens: Math.max(0, Math.floor(getNumber(record.reportedTokens) ?? 0)),
+    estimatedTokens: Math.max(0, Math.floor(getNumber(record.estimatedTokens) ?? 0)),
+    retries: Math.max(0, Math.floor(getNumber(record.retries) ?? 0)),
+    wallClockMs: Math.max(0, Math.floor(getNumber(record.wallClockMs) ?? 0)),
+  };
 }
 
 function getDependencyHealthStatus(

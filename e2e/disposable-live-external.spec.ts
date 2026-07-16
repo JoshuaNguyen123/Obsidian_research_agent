@@ -268,7 +268,7 @@ async function runGitHubSmoke(input: { merge: boolean }): Promise<void> {
   let markerCleaned = false;
 
   try {
-    const lease = await store.lease(credential.referenceId, { ttlSeconds: 900 });
+    const lease = await store.lease(credential.referenceId, { ttlSeconds: 300 });
     try {
       await lease.withSecret(async (secret) => {
         const client = new GitHubRestClient({

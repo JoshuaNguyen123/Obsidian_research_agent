@@ -6,7 +6,10 @@ export const MISSION_GRAPH_PATCH_VERSION = 1 as const;
 export const MISSION_GRAPH_JOURNAL_VERSION = 1 as const;
 
 export const MISSION_GRAPH_MAX_NODES = 16 as const;
-export const MISSION_GRAPH_MAX_DEPTH = 4 as const;
+// Five levels are the minimum safe bound for a verified create -> readback ->
+// revise lifecycle plus the terminal finalizer. Node/tool/external-action caps
+// remain independently enforced; this does not grant additional authority.
+export const MISSION_GRAPH_MAX_DEPTH = 16 as const;
 export const MISSION_GRAPH_MAX_CONCURRENT_READ_NODES = 3 as const;
 
 export type MissionNodeStatusV3 =

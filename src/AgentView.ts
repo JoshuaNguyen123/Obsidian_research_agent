@@ -39,6 +39,7 @@ import {
 import { readMissionRuntimeSnapshotByRunId } from "./agent/runStore";
 import type { RunOutcome } from "./agent/runCoordinator";
 import type { OrchestratorSnapshotV1 } from "./orchestrator/types";
+import { inferCapabilitySetupTarget } from "./agent/capabilitySetup";
 import {
   OrchestratorTab,
   type OrchestratorDetailsTarget,
@@ -280,11 +281,17 @@ export class AgentView extends ItemView {
     }
   }
 
-  async submitMissionPrompt(prompt: string): Promise<RunOutcome | null> {
+  async submitMissionPrompt(
+    prompt: string,
+    options?: { forceChatOnly?: boolean },
+  ): Promise<RunOutcome | null> {
     if (this.isRunning || this.plugin.isMissionRunning() || !this.promptEl) {
       return null;
     }
     this.promptEl.value = prompt;
+    if (this.chatOnlyToggleEl) {
+      this.chatOnlyToggleEl.checked = options?.forceChatOnly === true;
+    }
     this.focusPrompt({ moveCaretToEnd: true });
     return this.capturePrompt();
   }
@@ -642,15 +649,33 @@ export class AgentView extends ItemView {
         cls: "agentic-researcher-resume-banner-controls",
       });
       if (!debt.resumeBlocked) {
+        const setupTarget = debt.blocked
+          ? inferCapabilitySetupTarget({
+              mission: loaded.ledger.mission,
+              summary: debt.nextAction.summary,
+              reason: debt.nextAction.reason,
+              blockerCategory: loaded.ledger.blockerCategory,
+              missing: debt.missing,
+              toolName: debt.nextAction.toolName,
+            })
+          : null;
         const continueButton = controlsEl.createEl("button", {
-          text: "Continue",
+          text: setupTarget ? "Set up & resume" : "Continue",
           cls: "agentic-researcher-secondary-action",
           attr: { type: "button" },
         });
         continueButton.addEventListener("click", (event) => {
           event.preventDefault();
+          if (setupTarget) {
+            void this.plugin.openCapabilitySetup(setupTarget, {
+              runId: loaded.ledger.runId,
+              continuationCommand: plan.continuationCommand,
+              reason: debt.nextAction.summary,
+            });
+            return;
+          }
           this.hideStartupResumeBanner();
-          void this.submitContinuationPrompt(plan.continuationCommand);
+          void this.submitMissionContinuation(plan.continuationCommand);
         });
       }
       const dismissButton = controlsEl.createEl("button", {
@@ -2234,6 +2259,16 @@ export class AgentView extends ItemView {
       text: `Latest incomplete ledger: ${ledger.runId}`,
       cls: "agentic-researcher-config-line",
     });
+    const nextAction =
+      ledger.acceptance?.nextAction?.trim() ||
+      ledger.nextAction?.trim() ||
+      "";
+    if (nextAction) {
+      actionEl.createDiv({
+        text: `Next: ${nextAction}`,
+        cls: "agentic-researcher-config-line agentic-researcher-proof-debt-next",
+      });
+    }
     const buttonEl = actionEl.createEl("button", {
       text: "Continue Latest Run",
       cls: "agentic-researcher-secondary-action",
@@ -2246,11 +2281,11 @@ export class AgentView extends ItemView {
     buttonEl.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      void this.submitContinuationPrompt(ledger.continuationCommand);
+      void this.submitMissionContinuation(ledger.continuationCommand);
     });
   }
 
-  private async submitContinuationPrompt(command: string) {
+  async submitMissionContinuation(command: string) {
     if (this.isRunning || !this.promptEl) {
       return;
     }

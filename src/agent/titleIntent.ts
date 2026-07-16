@@ -27,6 +27,18 @@ export function isExplicitVisibleFileRenameIntent(prompt: string): boolean {
     return false;
   }
 
+  const explicitlyTargetsVisibleNoteTitle =
+    /\b(?:page|file|tab|visible|note)\s+title\b|\bcall\s+(?:this|the)\s+note\b/i.test(
+      prompt,
+    );
+  const targetsArtifactTitle =
+    /\b(?:canvas|diagram|svg|mermaid|wireframe|mockup|design|graph|chart)\b[\s\S]{0,80}\btitle\b|\btitle\b[\s\S]{0,80}\b(?:canvas|diagram|svg|mermaid|wireframe|mockup|design|graph|chart)\b/i.test(
+      prompt,
+    );
+  if (targetsArtifactTitle && !explicitlyTargetsVisibleNoteTitle) {
+    return false;
+  }
+
   return /\b(retitle|rename)\b|\b(change|update|set|replace)\b[\s\S]{0,48}\b(?:the\s+)?(?:page\s+title|file\s+title|tab\s+title|visible\s+title|note\s+title|title)\b|\b(?:page\s+title|file\s+title|tab\s+title|visible\s+title)\b|\bcall\s+(?:this|the)\s+note\b|\btarget\s+\S+[\s\S]{0,100}\b(?:title|change|replace|move)\b|\b(?:move|put|place)\b[\s\S]{0,120}\btitle\b[\s\S]{0,80}\b(?:spot|place|top|page|file|tab)\b/i.test(
     prompt,
   );
@@ -39,6 +51,18 @@ export function isVisibleTitleRenameIntent(prompt: string): boolean {
 
   if (isExplicitVisibleFileRenameIntent(prompt)) {
     return true;
+  }
+
+  const explicitlyTargetsVisibleNoteTitle =
+    /\b(?:page|file|tab|visible|note)\s+title\b|\bcall\s+(?:this|the)\s+note\b/i.test(
+      prompt,
+    );
+  const targetsArtifactTitle =
+    /\b(?:canvas|diagram|svg|mermaid|wireframe|mockup|design|graph|chart)\b[\s\S]{0,80}\btitle\b|\btitle\b[\s\S]{0,80}\b(?:canvas|diagram|svg|mermaid|wireframe|mockup|design|graph|chart)\b/i.test(
+      prompt,
+    );
+  if (targetsArtifactTitle && !explicitlyTargetsVisibleNoteTitle) {
+    return false;
   }
 
   return /\b(title|untitled)\b/i.test(prompt);
