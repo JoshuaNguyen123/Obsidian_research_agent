@@ -2022,6 +2022,12 @@ test("automatic profile resets thinking, streaming, and reflex defaults", async 
       return memoryMode;
     }, { pluginId: PLUGIN_ID });
 
+    await settings
+      .getByRole("button", {
+        name: "Restore safe Automatic defaults without clearing credentials or memory consent.",
+      })
+      .click();
+
     await expect
       .poll(
         async () =>
