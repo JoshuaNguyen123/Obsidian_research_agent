@@ -5,6 +5,8 @@ export type MissionCadence = "hourly" | "daily" | "weekly";
 
 export interface ScheduledMission {
   id: string;
+  /** Human-readable label used by the settings schedule builder. */
+  name?: string;
   prompt: string;
   cadence: MissionCadence;
   hourLocal?: number;
@@ -155,6 +157,7 @@ function normalizeScheduledMission(value: unknown): ScheduledMission | null {
   }
   return {
     id,
+    name: getString(value.name)?.trim() || undefined,
     prompt,
     cadence,
     hourLocal: clampHour(getNumber(value.hourLocal)),

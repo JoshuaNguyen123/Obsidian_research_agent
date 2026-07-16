@@ -230,6 +230,8 @@ export class AgentSettingTab extends PluginSettingTab {
   private readonly plugin: AgenticResearcherPlugin;
   private extensionContributionsEl: HTMLDetailsElement | null = null;
   private pendingFocusTarget: CapabilitySetupTarget | null = null;
+  private readinessRefreshTimer: number | null = null;
+  private readinessSignature = "";
 
   constructor(app: App, plugin: AgenticResearcherPlugin) {
     super(app, plugin);
@@ -237,6 +239,7 @@ export class AgentSettingTab extends PluginSettingTab {
   }
 
   display() {
+    this.stopReadinessRefresh();
     const { containerEl } = this;
     containerEl.empty();
     this.extensionContributionsEl = null;
@@ -254,6 +257,11 @@ export class AgentSettingTab extends PluginSettingTab {
     this.renderCapabilityStatus(containerEl);
     this.renderAdvancedSections(containerEl);
     this.applyPendingFocus();
+    this.startReadinessRefresh();
+  }
+
+  hide(): void {
+    this.stopReadinessRefresh();
   }
 
   focusCapability(target: CapabilitySetupTarget): void {
@@ -504,10 +512,16 @@ export class AgentSettingTab extends PluginSettingTab {
   }
 
   private renderCapabilityStatus(containerEl: HTMLElement): void {
-    const rows = buildCapabilityStatusRows(this.plugin);
     const statusEl = containerEl.createDiv({
       cls: "agentic-settings-readiness agentic-settings-panel",
     });
+    this.renderCapabilityStatusContents(statusEl);
+  }
+
+  private renderCapabilityStatusContents(statusEl: HTMLElement): void {
+    const rows = buildCapabilityStatusRows(this.plugin);
+    this.readinessSignature = JSON.stringify(rows);
+    statusEl.empty();
     const readyCount = rows.filter((row) => row.status === "Ready").length;
     const header = statusEl.createDiv({
       cls: "agentic-settings-readiness-header",
@@ -554,12 +568,40 @@ export class AgentSettingTab extends PluginSettingTab {
         cls: "agentic-settings-readiness-action",
       });
       item.addEventListener("click", () => {
-        const target = containerEl.querySelector<HTMLDetailsElement>(`#${targetId}`);
+        const target = this.containerEl.querySelector<HTMLDetailsElement>(
+          `#${targetId}`,
+        );
         if (!target) return;
         target.open = true;
         target.scrollIntoView({ behavior: "smooth", block: "start" });
       });
     }
+  }
+
+  private startReadinessRefresh(): void {
+    this.readinessRefreshTimer = window.setInterval(() => {
+      const rows = buildCapabilityStatusRows(this.plugin);
+      const signature = JSON.stringify(rows);
+      if (signature === this.readinessSignature) return;
+      const statusEl = this.containerEl.querySelector<HTMLElement>(
+        ".agentic-settings-readiness",
+      );
+      if (statusEl) this.renderCapabilityStatusContents(statusEl);
+    }, 1_000);
+  }
+
+  private stopReadinessRefresh(): void {
+    if (this.readinessRefreshTimer === null) return;
+    window.clearInterval(this.readinessRefreshTimer);
+    this.readinessRefreshTimer = null;
+  }
+
+  private redisplayWithAdvancedSectionOpen(sectionId: string): void {
+    this.display();
+    const section = this.containerEl.querySelector<HTMLDetailsElement>(
+      `#${sectionId}`,
+    );
+    if (section) section.open = true;
   }
 
   private renderAdvancedSections(containerEl: HTMLElement): void {
@@ -1488,29 +1530,42 @@ export class AgentSettingTab extends PluginSettingTab {
 
     section.createEl("h4", { text: "Linear integration" });
     section.createEl("p", {
-      text: "Optional private-workspace integration using fixed Linear GraphQL operations. New keys use the authenticated companion's persistent OS credential store when available; legacy plaintext remains foreground-only until you explicitly migrate it.",
+      text: "Connect once, then use fixed Linear GraphQL tools without per-tool setup. Credentials live in secure storage; plugin settings retain only an opaque reference.",
       cls: "setting-item-description",
     });
 
-    new Setting(section)
+    const oauthConnectionHost = section.createDiv({
+      cls: "agentic-linear-oauth-primary",
+    });
+    const oauthAdvanced = section.createEl("details", {
+      cls: "agentic-settings-disclosure agentic-linear-oauth-advanced",
+    });
+    oauthAdvanced.createEl("summary", { text: "OAuth app setup (advanced)" });
+    oauthAdvanced.createEl("p", {
+      text: "Most people only need to enter a client ID once. The safe loopback port and user actor defaults can stay unchanged.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(oauthAdvanced)
       .setName("Linear OAuth client ID")
       .setDesc(
-        "Non-secret client ID from a Linear OAuth application configured with the exact loopback redirect shown below.",
+        "Non-secret client ID from your Linear OAuth application.",
       )
-      .addText((text) =>
-        text
+      .addText((text) => {
+        text.inputEl.addClass("agentic-linear-oauth-client-id");
+        return text
           .setPlaceholder("Linear OAuth client ID")
           .setValue(this.plugin.settings.linearOAuthClientId ?? "")
           .onChange(async (value) => {
             this.plugin.settings.linearOAuthClientId = value.trim();
             await this.plugin.saveSettings();
-          }),
-      );
+          });
+      });
 
     const oauthCallbackPort = this.plugin.settings.linearOAuthCallbackPort ?? 43119;
     const oauthRedirectUri =
       `http://127.0.0.1:${oauthCallbackPort}/oauth/linear/callback`;
-    new Setting(section)
+    new Setting(oauthAdvanced)
       .setName("Linear OAuth callback port")
       .setDesc(
         `Register this exact redirect URI in the Linear OAuth application before connecting: ${oauthRedirectUri}`,
@@ -1532,7 +1587,7 @@ export class AgentSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(section)
+    new Setting(oauthAdvanced)
       .setName("Linear OAuth actor")
       .setDesc(
         "User acts as the consenting member. App uses the OAuth app actor and fails closed unless the companion proves persistent OS credential storage.",
@@ -1550,14 +1605,26 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     const oauthStatus = this.plugin.getLinearOAuthStatus();
-    const oauthSetting = new Setting(section)
-      .setName("Linear OAuth connection")
+    const oauthSetting = new Setting(oauthConnectionHost)
+      .setName("Connect Linear with OAuth")
       .setDesc(oauthStatus.message);
     oauthSetting.addButton((button) =>
       button
-        .setButtonText(oauthStatus.connected ? "Reconnect OAuth" : "Connect OAuth")
-        .setDisabled(!(this.plugin.settings.linearOAuthClientId ?? "").trim())
+        .setButtonText(oauthStatus.connected ? "Reconnect" : "Connect Linear")
+        .setCta()
         .onClick(async () => {
+          if (!(this.plugin.settings.linearOAuthClientId ?? "").trim()) {
+            oauthAdvanced.open = true;
+            oauthSetting.setDesc(
+              "Enter the one-time OAuth client ID below, then choose Connect Linear again.",
+            );
+            window.setTimeout(() => {
+              oauthAdvanced
+                .querySelector<HTMLInputElement>(".agentic-linear-oauth-client-id")
+                ?.focus();
+            }, 0);
+            return;
+          }
           button.setDisabled(true).setButtonText("Starting...");
           const result = await this.plugin.startLinearOAuthAuthorization();
           oauthSetting.setDesc(result.message);
@@ -1572,7 +1639,7 @@ export class AgentSettingTab extends PluginSettingTab {
               );
             }
           }
-          window.setTimeout(() => this.display(), 500);
+          window.setTimeout(() => this.display(), 250);
         }),
     );
     if (oauthStatus.authorizationUrl) {
@@ -1624,9 +1691,19 @@ export class AgentSettingTab extends PluginSettingTab {
       button.setButtonText("Save key").onClick(async () => {
         button.setDisabled(true).setButtonText("Saving...");
         const result = await this.plugin.setLinearApiKey(pendingLinearKey);
-        linearKeySetting.setDesc(result.message);
-        button.setButtonText(result.ok ? "Saved" : "Not saved");
-        window.setTimeout(() => this.display(), 1_500);
+        if (!result.ok) {
+          linearKeySetting.setDesc(result.message);
+          button.setButtonText("Not saved");
+          window.setTimeout(() => this.display(), 1_500);
+          return;
+        }
+        button.setButtonText("Verifying...");
+        const verified = await this.plugin.testLinearConnection();
+        linearKeySetting.setDesc(
+          verified.ok ? `${result.message} ${verified.message}` : verified.message,
+        );
+        button.setButtonText(verified.ok ? "Connected" : "Saved; verify failed");
+        window.setTimeout(() => this.display(), 500);
       }),
     );
     if (credentialStatus.configured && !credentialStatus.secure) {
@@ -1944,32 +2021,214 @@ export class AgentSettingTab extends PluginSettingTab {
   private renderScheduledMissionControls(section: HTMLElement): void {
     section.createEl("h4", { text: "Recurring missions" });
     section.createEl("p", {
-      text: "Schedules share the same autonomy budgets and safety boundaries as foreground missions.",
+      text: "Create a recurring mission with ordinary fields. Schedules share the same autonomy budgets and safety boundaries as foreground missions.",
       cls: "setting-item-description agentic-settings-subsection-intro",
     });
 
+    const schedules = this.plugin.settings.scheduledMissions ?? [];
+    const list = section.createDiv({ cls: "agentic-schedule-list" });
+    if (schedules.length === 0) {
+      list.createEl("p", {
+        text: "No recurring missions yet. Add one to start with a safe, disabled daily template.",
+        cls: "setting-item-description agentic-schedule-empty",
+      });
+    }
+
+    schedules.forEach((mission, index) => {
+      const card = list.createDiv({
+        cls: "agentic-schedule-card",
+        attr: { "data-schedule-id": mission.id },
+      });
+      const header = card.createDiv({ cls: "agentic-schedule-card-header" });
+      header.createEl("h5", {
+        text: mission.name?.trim() || `Recurring mission ${index + 1}`,
+      });
+      header.createEl("span", {
+        text: mission.enabled ? "Enabled" : "Paused",
+        cls: `agentic-settings-status-badge ${mission.enabled ? "is-ready" : "is-needs-setup"}`,
+      });
+
+      new Setting(card)
+        .setName("Enabled")
+        .setDesc("Run this mission when its schedule becomes due.")
+        .addToggle((toggle) =>
+          toggle.setValue(mission.enabled).onChange(async (value) => {
+            mission.enabled = value;
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+          }),
+        );
+
+      new Setting(card)
+        .setName("Name")
+        .setDesc("A short label shown only in settings and run details.")
+        .addText((text) =>
+          text
+            .setPlaceholder(`Recurring mission ${index + 1}`)
+            .setValue(mission.name ?? "")
+            .onChange(async (value) => {
+              mission.name = value.trim() || undefined;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(card)
+        .setName("Mission prompt")
+        .setDesc("Tell the agent the outcome to produce; it will plan the intermediate steps.")
+        .addTextArea((text) => {
+          text.inputEl.rows = 4;
+          text.inputEl.addClass("agentic-schedule-prompt");
+          return text
+            .setPlaceholder("Research this topic, verify sources, and append the result to my note.")
+            .setValue(mission.prompt)
+            .onChange(async (value) => {
+              mission.prompt = value;
+              await this.plugin.saveSettings();
+            });
+        });
+
+      new Setting(card)
+        .setName("Repeat")
+        .setDesc("Hourly runs start when due. Daily and weekly runs use your local time.")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("hourly", "Every hour")
+            .addOption("daily", "Every day")
+            .addOption("weekly", "Every week")
+            .setValue(mission.cadence)
+            .onChange(async (value) => {
+              mission.cadence =
+                value === "hourly" || value === "weekly" ? value : "daily";
+              await this.plugin.saveSettings();
+              this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+            }),
+        );
+
+      if (mission.cadence !== "hourly") {
+        if (mission.cadence === "weekly") {
+          new Setting(card)
+            .setName("Day")
+            .setDesc("Local weekday for the weekly run.")
+            .addDropdown((dropdown) => {
+              ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+                .forEach((label, weekday) => dropdown.addOption(String(weekday), label));
+              return dropdown
+                .setValue(String(mission.weekday ?? 1))
+                .onChange(async (value) => {
+                  mission.weekday = Number(value);
+                  await this.plugin.saveSettings();
+                });
+            });
+        }
+        new Setting(card)
+          .setName("Start hour")
+          .setDesc("Local hour from 0 through 23.")
+          .addText((text) => {
+            text.inputEl.type = "number";
+            text.inputEl.min = "0";
+            text.inputEl.max = "23";
+            text.inputEl.step = "1";
+            return text
+              .setValue(String(mission.hourLocal ?? 8))
+              .onChange(async (value) => {
+                const parsed = Number(value);
+                if (!Number.isInteger(parsed) || parsed < 0 || parsed > 23) return;
+                mission.hourLocal = parsed;
+                await this.plugin.saveSettings();
+              });
+          });
+      }
+
+      new Setting(card)
+        .setName("Output note (optional)")
+        .setDesc("Vault-relative Markdown path. Leave blank to let the mission choose its normal output.")
+        .addText((text) =>
+          text
+            .setPlaceholder("Research/Daily review.md")
+            .setValue(mission.targetNotePath ?? "")
+            .onChange(async (value) => {
+              mission.targetNotePath = value.trim() || undefined;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(card)
+        .setName("Remove schedule")
+        .setDesc("Removes this schedule only; it does not delete notes or prior run receipts.")
+        .addButton((button) =>
+          button.setButtonText("Remove").setWarning().onClick(async () => {
+            this.plugin.settings.scheduledMissions = schedules.filter(
+              (_, candidateIndex) => candidateIndex !== index,
+            );
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+          }),
+        );
+    });
+
     new Setting(section)
-      .setName("Mission schedule JSON")
-      .setDesc(
-        "JSON array of recurring missions. Standard fields: id, prompt, cadence hourly/daily/weekly, hourLocal, weekday, targetNotePath, enabled. Continuous research also supports mode=continuous_research, pinnedTargetIds, and quietHours {startMinute,endMinute}.",
-      )
+      .setName("Add recurring mission")
+      .setDesc("Adds a paused daily template. Review its prompt, then enable it.")
+      .addButton((button) =>
+        button.setButtonText("Add mission").setCta().onClick(async () => {
+          const now = Date.now();
+          this.plugin.settings.scheduledMissions = [
+            ...schedules,
+            {
+              id: `schedule-${now.toString(36)}`,
+              name: "Daily vault review",
+              prompt:
+                "Review today's active project notes, summarize meaningful progress, and append a concise next-actions section.",
+              cadence: "daily",
+              hourLocal: 8,
+              weekday: 1,
+              enabled: false,
+              lastRunAt: null,
+              lastRunId: null,
+              mode: "standard",
+            },
+          ];
+          await this.plugin.saveSettings();
+          this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+        }),
+      );
+
+    const advanced = section.createEl("details", {
+      cls: "agentic-settings-disclosure agentic-schedule-json",
+    });
+    advanced.createEl("summary", { text: "Advanced JSON import/export" });
+    advanced.createEl("p", {
+      text: "Optional power-user view for moving schedules between vaults. Invalid JSON is never applied.",
+      cls: "setting-item-description",
+    });
+    let pendingJson = JSON.stringify(schedules, null, 2);
+    const jsonStatus = advanced.createEl("p", {
+      text: "Edit the JSON, then choose Apply JSON.",
+      cls: "setting-item-description agentic-schedule-json-status",
+    });
+    new Setting(advanced)
+      .setName("Schedule JSON")
+      .setDesc("The form above remains the recommended editor.")
       .addTextArea((text) => {
         text.inputEl.rows = 8;
         text.inputEl.addClass("agentic-researcher-scheduled-missions-input");
-        text
-          .setPlaceholder(
-            '[{"id":"daily-review","prompt":"Summarize today","cadence":"daily","hourLocal":8,"enabled":true}]',
-          )
-          .setValue(
-            JSON.stringify(this.plugin.settings.scheduledMissions ?? [], null, 2),
-          )
-          .onChange(async (value) => {
-            const parsed = parseScheduledMissionsJson(value);
-            if (parsed === null) return;
-            this.plugin.settings.scheduledMissions = parsed;
-            await this.plugin.saveSettings();
-          });
-      });
+        return text.setValue(pendingJson).onChange((value) => {
+          pendingJson = value;
+          jsonStatus.setText("JSON has unapplied changes.");
+        });
+      })
+      .addButton((button) =>
+        button.setButtonText("Apply JSON").onClick(async () => {
+          const parsed = parseScheduledMissionsJson(pendingJson);
+          if (parsed === null) {
+            jsonStatus.setText("Invalid JSON. Nothing was changed.");
+            return;
+          }
+          this.plugin.settings.scheduledMissions = parsed;
+          await this.plugin.saveSettings();
+          this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+        }),
+      );
   }
 
   private renderAdvancedDiagnostics(parent: HTMLElement): void {

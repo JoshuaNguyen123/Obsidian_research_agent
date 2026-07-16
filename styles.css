@@ -350,6 +350,68 @@
   width: min(100%, 620px);
 }
 
+.agentic-researcher-settings .agentic-schedule-list {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.agentic-researcher-settings .agentic-schedule-empty {
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 8px;
+  margin: 0;
+  padding: 14px;
+}
+
+.agentic-researcher-settings .agentic-schedule-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.agentic-researcher-settings .agentic-schedule-card-header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.agentic-researcher-settings .agentic-schedule-card-header h5 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.agentic-researcher-settings .agentic-schedule-card .setting-item {
+  align-items: flex-start;
+}
+
+.agentic-researcher-settings .agentic-schedule-card .setting-item-control,
+.agentic-researcher-settings .agentic-schedule-card input,
+.agentic-researcher-settings .agentic-schedule-card textarea,
+.agentic-researcher-settings .agentic-schedule-card select {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.agentic-researcher-settings .agentic-schedule-prompt {
+  min-height: 88px;
+  resize: vertical;
+  width: min(100%, 520px);
+}
+
+.agentic-researcher-settings .agentic-schedule-json-status {
+  min-height: 1.4em;
+}
+
+.agentic-researcher-settings .agentic-linear-oauth-primary .setting-item {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  margin-top: 8px;
+  padding: 12px;
+}
+
 @media (max-width: 760px) {
   .agentic-researcher-settings .agentic-researcher-semantic-chunk-grid {
     grid-template-columns: repeat(2, minmax(96px, 1fr));
@@ -388,6 +450,16 @@
   .agentic-researcher-settings .agentic-settings-readiness-item {
     padding-left: 12px;
     padding-right: 12px;
+  }
+
+  .agentic-researcher-settings .agentic-schedule-card .setting-item {
+    display: block;
+  }
+
+  .agentic-researcher-settings .agentic-schedule-card .setting-item-control {
+    justify-content: flex-start;
+    margin-top: 8px;
+    width: 100%;
   }
 
 }

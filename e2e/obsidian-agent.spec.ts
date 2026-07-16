@@ -1809,6 +1809,52 @@ test("settings integrates essentials readiness and advanced controls", async ({}
   });
 });
 
+test("schedule builder updates Background readiness without reopening settings", async () => {
+  await withE2EHarness("settings-schedule-builder-readiness", async ({ page }) => {
+    await openPluginSettings(page);
+    const settings = page.locator(".agentic-researcher-settings");
+    const readiness = settings.locator(".agentic-settings-readiness");
+    await expect(
+      readiness.getByRole("button", { name: /Background work: Needs setup/u }),
+    ).toBeVisible();
+
+    const schedules = settings.locator("#agentic-settings-autonomy");
+    await schedules.evaluate((element) => {
+      (element as HTMLDetailsElement).open = true;
+    });
+    await schedules.getByRole("button", { name: "Add mission" }).click();
+
+    const card = settings.locator(".agentic-schedule-card", {
+      hasText: "Daily vault review",
+    });
+    await expect(card).toBeVisible();
+    await expect(settings.getByText("Mission schedule JSON", { exact: true })).toHaveCount(0);
+    await expect(
+      settings.getByText("Advanced JSON import/export", { exact: true }),
+    ).toBeVisible();
+    await card.locator(".checkbox-container").click();
+
+    await expect(
+      readiness.getByRole("button", { name: /Background work: Ready/u }),
+    ).toBeVisible({ timeout: 5_000 });
+    const persisted = await page.evaluate(({ pluginId }) => {
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      const mission = plugin?.settings?.scheduledMissions?.[0];
+      return {
+        name: mission?.name ?? null,
+        cadence: mission?.cadence ?? null,
+        enabled: mission?.enabled ?? null,
+      };
+    }, { pluginId: PLUGIN_ID });
+    expect(persisted).toEqual({
+      name: "Daily vault review",
+      cadence: "daily",
+      enabled: true,
+    });
+  });
+});
+
 test("blocked mission opens one capability setup and resumes only on explicit action", async () => {
   await withE2EHarness("settings-capability-resume", async ({ page }) => {
     const runId = `run-e2e-capability-setup-${Date.now()}`;
@@ -2087,7 +2133,7 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
         },
       };
     }, { pluginId: PLUGIN_ID });
-    expect(startup).toEqual({
+    expect(startup).toMatchObject({
       enabled: false,
       capabilityGate: 0,
       queueEnabled: false,
@@ -2095,11 +2141,11 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
       grantActive: false,
       github: {
         enabled: false,
-        oauthClientId: "",
         connected: false,
         waitingForUser: false,
       },
     });
+    expect(startup.github.oauthClientId).toMatch(/^[A-Za-z0-9_-]{0,128}$/u);
 
     await openPluginSettings(page);
     const settings = page.locator(".agentic-researcher-settings");
@@ -2116,26 +2162,29 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     await expect(
       settings.getByRole("heading", { name: "Linear integration" }),
     ).toBeVisible();
-    await expect(settings).toContainText("fixed Linear GraphQL operations");
+    await expect(settings).toContainText("fixed Linear GraphQL tools");
     await expect(settings).toContainText(
-      "New keys use the authenticated companion's persistent OS credential store",
+      "plugin settings retain only an opaque reference",
     );
-    await expect(settings).toContainText(
-      "legacy plaintext remains foreground-only until you explicitly migrate it",
-    );
-    await expect(settings).toContainText("Linear OAuth client ID");
-    await expect(settings).toContainText("Linear OAuth callback port");
+    await expect(settings).toContainText("Connect Linear with OAuth");
+    await expect(settings).toContainText("OAuth app setup (advanced)");
+    const oauthAdvanced = settings.locator(".agentic-linear-oauth-advanced");
+    await oauthAdvanced.evaluate((element) => {
+      (element as HTMLDetailsElement).open = true;
+    });
+    await expect(oauthAdvanced).toContainText("Linear OAuth client ID");
+    await expect(oauthAdvanced).toContainText("Linear OAuth callback port");
     await expect(settings).toContainText(
       "http://127.0.0.1:43119/oauth/linear/callback",
     );
-    await expect(settings).toContainText("Linear OAuth actor");
+    await expect(oauthAdvanced).toContainText("Linear OAuth actor");
     const oauthSetting = settings.locator(".setting-item", {
-      hasText: "Linear OAuth connection",
+      hasText: "Connect Linear with OAuth",
     });
     await expect(oauthSetting).toContainText("Linear OAuth is not connected.");
     await expect(
-      oauthSetting.getByRole("button", { name: "Connect OAuth" }),
-    ).toBeDisabled();
+      oauthSetting.getByRole("button", { name: "Connect Linear" }),
+    ).toBeEnabled();
     await expect(settings).toContainText("Connection capability report");
     await expect(settings).toContainText("No verified discovery snapshot");
 
@@ -2148,14 +2197,21 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     const githubOAuthSetting = settings.locator(".setting-item", {
       hasText: "GitHub OAuth client ID",
     });
-    await expect(githubOAuthSetting.locator('input[type="text"]')).toHaveValue("");
+    await expect(githubOAuthSetting.locator('input[type="text"]')).toHaveValue(
+      startup.github.oauthClientId,
+    );
     const githubConnection = settings.locator(".setting-item", {
       hasText: "GitHub connection",
     });
     await expect(githubConnection).toContainText("GitHub is not connected.");
-    await expect(
-      githubConnection.getByRole("button", { name: "Connect OAuth" }),
-    ).toBeDisabled();
+    const githubConnectButton = githubConnection.getByRole("button", {
+      name: "Connect OAuth",
+    });
+    if (startup.github.oauthClientId) {
+      await expect(githubConnectButton).toBeEnabled();
+    } else {
+      await expect(githubConnectButton).toBeDisabled();
+    }
     const githubPatSetting = settings.locator(".setting-item", {
       hasText: "GitHub fine-grained personal access token",
     });
@@ -2215,6 +2271,55 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
       };
     }, { pluginId: PLUGIN_ID });
     expect(afterInspection).toEqual({ queueEnabled: false, grantActive: false });
+  });
+});
+
+test("Linear key setup persists only an opaque reference and refreshes readiness", async () => {
+  await withE2EHarness("linear-secret-storage-readiness", async ({ page }) => {
+    await openPluginSettings(page);
+    const readiness = page.locator(
+      ".agentic-researcher-settings .agentic-settings-readiness",
+    );
+    await expect(
+      readiness.getByRole("button", { name: /Linear: Needs setup/u }),
+    ).toBeVisible();
+
+    try {
+      const persisted = await page.evaluate(async ({ pluginId }) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        if (!plugin?.setLinearApiKey || !plugin?.loadData) {
+          throw new Error("Linear settings APIs are unavailable.");
+        }
+        const result = await plugin.setLinearApiKey(
+          "e2e-not-a-real-linear-key",
+        );
+        const data = await plugin.loadData();
+        return {
+          ok: result.ok,
+          plaintextPresent:
+            typeof data?.linearApiKey === "string" && data.linearApiKey.length > 0,
+          referencePresent:
+            typeof data?.linearCredentialReference?.referenceId === "string",
+          persistent: data?.linearCredentialReference?.persistent === true,
+        };
+      }, { pluginId: PLUGIN_ID });
+      expect(persisted).toEqual({
+        ok: true,
+        plaintextPresent: false,
+        referencePresent: true,
+        persistent: true,
+      });
+      await expect(
+        readiness.getByRole("button", { name: /Linear: Degraded/u }),
+      ).toBeVisible({ timeout: 5_000 });
+    } finally {
+      await page.evaluate(async ({ pluginId }) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        await plugin?.clearLinearApiKey?.();
+      }, { pluginId: PLUGIN_ID }).catch(() => undefined);
+    }
   });
 });
 

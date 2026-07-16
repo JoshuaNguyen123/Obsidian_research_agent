@@ -474,6 +474,10 @@ const LEGACY_EXTENSION_RETENTION_RELEASES = ["0.3.0", "0.4.0"] as const;
 const COMPANION_RECONCILE_FAST_ATTEMPTS = 60;
 const COMPANION_RECONCILE_MAX_DELAY_MS = 5_000;
 const COMPANION_RECONCILE_IDLE_DELAY_MS = 30_000;
+const OBSIDIAN_SECRET_STORAGE_BACKEND = "obsidian-secret-storage";
+const OBSIDIAN_LINEAR_SECRET_ID = "agentic-researcher-linear-api-key";
+const OBSIDIAN_LINEAR_CREDENTIAL_REFERENCE_ID =
+  "credential_obsidian-linear-api-key";
 
 function resolveLinearQueueVaultTargetPath(
   workItem: ParsedCompatibleWorkItemSpec,
@@ -597,9 +601,8 @@ export default class AgenticResearcherPlugin extends Plugin {
   private companionLinearQueueProjection: CompanionLinearQueueRunDetailsProjectionV1 | null = null;
   private unloading = false;
   private latestOrchestratorSnapshot: OrchestratorSnapshotV1 | null = null;
-  /** Stored in data.json but intentionally kept out of ToolExecutionContext.settings. */
+  /** Session-only fallback; plaintext is never written to data.json or tool settings. */
   private linearApiKey = "";
-  private persistLegacyLinearApiKey = false;
   private linearCredentialReference: SecretDescriptionV1 | null = null;
   private linearOAuthRuntimeState: LinearOAuthRuntimeStateV1 | null = null;
   private activeLinearOAuthLoopback: LinearOAuthLoopbackResultV1 | null = null;
@@ -1320,6 +1323,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       pluginDataV3Migration: _rawPluginDataV3Migration,
       ...settingsData
     } = record;
+    const hadLegacyLinearPlaintext =
+      typeof rawLinearApiKey === "string" && rawLinearApiKey.trim().length > 0;
     void _rawExtensionStateMigration;
     void _rawPluginDataV3Migration;
     // Preserve the exact persisted compatibility inputs before any extension
@@ -1580,15 +1585,24 @@ export default class AgenticResearcherPlugin extends Plugin {
     settings.experienceMemoryEnabled = normalizedProfiles.experienceMemoryEnabled;
 
     this.settings = settings;
-    this.linearApiKey =
-      typeof rawLinearApiKey === "string" ? rawLinearApiKey.trim() : "";
-    this.persistLegacyLinearApiKey = this.linearApiKey.length > 0;
     const credentialReference = normalizeLinearCredentialReference(
       rawLinearCredentialReference,
     );
     this.linearCredentialReference = credentialReference?.persistent
       ? credentialReference
       : null;
+    this.linearApiKey = hadLegacyLinearPlaintext
+      ? String(rawLinearApiKey).trim()
+      : "";
+    if (this.linearApiKey && !this.linearCredentialReference) {
+      const migrated = this.tryPersistLinearCredentialInObsidianSecretStorage(
+        this.linearApiKey,
+      );
+      if (migrated.ok) this.linearApiKey = "";
+    } else if (this.linearCredentialReference) {
+      // A verified opaque reference wins over redundant legacy plaintext.
+      this.linearApiKey = "";
+    }
     this.linearOAuthRuntimeState = normalizeLinearOAuthRuntimeStateV1(
       rawLinearOAuthRuntimeState,
     );
@@ -1708,7 +1722,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (
       loadedMigration.needsPersistence ||
       loadedPluginDataMigration.needsPersistence ||
-      bundledImport.imported.length > 0
+      bundledImport.imported.length > 0 ||
+      hadLegacyLinearPlaintext
     ) {
       await this.savePluginData();
     }
@@ -2179,12 +2194,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (this.linearCredentialReference) {
       return {
         configured: true,
-        secure:
-          this.linearCredentialReference.persistent &&
-          !this.persistLegacyLinearApiKey,
-        message: this.persistLegacyLinearApiKey
-          ? "A secure credential reference exists, but legacy plaintext is still retained. Use Migrate legacy key to complete verified cleanup."
-          : `Stored as an opaque ${this.linearCredentialReference.backend} reference. Plaintext is not persisted by core.`,
+        secure: this.linearCredentialReference.persistent,
+        message: `Stored as an opaque ${this.linearCredentialReference.backend} reference. Plaintext is not persisted in plugin settings.`,
       };
     }
     if (this.linearApiKey) {
@@ -2192,7 +2203,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         configured: true,
         secure: false,
         message:
-          "Foreground compatibility mode: this legacy key remains in core data.json until you explicitly migrate it to the secure companion store.",
+          "Available for this Obsidian session only. Plaintext was removed from plugin settings; save again after secure storage becomes available.",
       };
     }
     return { configured: false, secure: false, message: "No Linear credential is configured." };
@@ -2218,7 +2229,6 @@ export default class AgenticResearcherPlugin extends Plugin {
     const secure = await this.tryPersistLinearCredential(apiKey);
     if (secure.ok) {
       this.linearApiKey = "";
-      this.persistLegacyLinearApiKey = false;
     } else if (this.linearCredentialReference) {
       return {
         ok: false,
@@ -2226,7 +2236,6 @@ export default class AgenticResearcherPlugin extends Plugin {
       };
     } else {
       this.linearApiKey = apiKey;
-      this.persistLegacyLinearApiKey = true;
     }
     this.settings.linearEnabled = true;
     this.linearApiKeyRevision += 1;
@@ -2239,7 +2248,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       ? secure
       : {
           ok: true,
-          message: `${secure.message} Saved in explicit foreground compatibility mode; migrate when the secure companion is connected.`,
+          message: `${secure.message} Available only for this Obsidian session; plaintext was not persisted.`,
         };
   }
 
@@ -2247,29 +2256,32 @@ export default class AgenticResearcherPlugin extends Plugin {
     ok: boolean;
     message: string;
   }> {
-    if (!this.linearApiKey || !this.persistLegacyLinearApiKey) {
-      return { ok: false, message: "No legacy Linear key is available to migrate." };
+    if (!this.linearApiKey) {
+      return { ok: false, message: "No session-only Linear key is available to save." };
     }
     const result = await this.tryPersistLinearCredential(this.linearApiKey);
     if (!result.ok) return result;
     // Clearing is explicit and occurs only after secure-store put + describe readback.
     this.linearApiKey = "";
-    this.persistLegacyLinearApiKey = false;
     this.linearApiKeyRevision += 1;
     await this.savePluginData();
     this.scheduleCompanionMissionReconciliation(250);
     return {
       ok: true,
-      message: "Secure-store readback succeeded; legacy plaintext was removed from core data.",
+      message: "Secure-store readback succeeded; plugin settings retain only an opaque reference.",
     };
   }
 
   async clearLinearApiKey(): Promise<{ ok: boolean; message: string }> {
     if (this.linearCredentialReference) {
       try {
-        const removed = await this.createCompanionSecretStore().remove(
-          this.linearCredentialReference.referenceId,
-        );
+        const removed =
+          this.linearCredentialReference.backend ===
+          OBSIDIAN_SECRET_STORAGE_BACKEND
+            ? this.clearLinearCredentialFromObsidianSecretStorage()
+            : await this.createCompanionSecretStore().remove(
+                this.linearCredentialReference.referenceId,
+              );
         if (!removed) {
           return {
             ok: false,
@@ -2285,7 +2297,6 @@ export default class AgenticResearcherPlugin extends Plugin {
       }
     }
     this.linearApiKey = "";
-    this.persistLegacyLinearApiKey = false;
     this.linearCredentialReference = null;
     if (!this.linearOAuthRuntimeState) {
       this.settings.linearEnabled = false;
@@ -3966,7 +3977,11 @@ export default class AgenticResearcherPlugin extends Plugin {
         await previousClient.revoke(previousState.credential, "both").catch(() => undefined);
       }
       this.linearOAuthStatusMessage =
-        `Connected with ${input.actor}-actor OAuth. Test the connection to refresh workspace capabilities.`;
+        `Connected with ${input.actor}-actor OAuth. Discovering workspace capabilities...`;
+      const discovery = await this.testLinearConnection();
+      this.linearOAuthStatusMessage = discovery.ok
+        ? `Connected with ${input.actor}-actor OAuth and verified workspace discovery.`
+        : `OAuth connected. ${discovery.message}`;
       void this.restartLinearQueueRuntime(false).catch(() => undefined);
       this.scheduleCompanionMissionReconciliation(250);
     } catch (error) {
@@ -4138,11 +4153,75 @@ export default class AgenticResearcherPlugin extends Plugin {
         message: `Linear credential stored in the verified ${readback.backend} backend.`,
       };
     } catch {
+      return this.tryPersistLinearCredentialInObsidianSecretStorage(apiKey);
+    }
+  }
+
+  private tryPersistLinearCredentialInObsidianSecretStorage(
+    apiKey: string,
+  ): { ok: boolean; message: string } {
+    const secretStorage = this.app.secretStorage;
+    if (
+      !secretStorage ||
+      typeof secretStorage.setSecret !== "function" ||
+      typeof secretStorage.getSecret !== "function"
+    ) {
       return {
         ok: false,
         message:
-          "A secure persistent companion credential backend is not authenticated for this session.",
+          "Secure storage is unavailable in this Obsidian version and the authenticated Companion is not ready.",
       };
+    }
+    try {
+      secretStorage.setSecret(OBSIDIAN_LINEAR_SECRET_ID, apiKey);
+      if (secretStorage.getSecret(OBSIDIAN_LINEAR_SECRET_ID) !== apiKey) {
+        return {
+          ok: false,
+          message: "Obsidian SecretStorage readback failed; no persistent credential was accepted.",
+        };
+      }
+      const now = new Date().toISOString();
+      const createdAt =
+        this.linearCredentialReference?.backend ===
+          OBSIDIAN_SECRET_STORAGE_BACKEND &&
+        this.linearCredentialReference.referenceId ===
+          OBSIDIAN_LINEAR_CREDENTIAL_REFERENCE_ID
+          ? this.linearCredentialReference.createdAt
+          : now;
+      this.linearCredentialReference = {
+        version: 1,
+        referenceId: OBSIDIAN_LINEAR_CREDENTIAL_REFERENCE_ID,
+        label: "Linear personal API credential",
+        metadata: {
+          provider: "linear",
+          credentialKind: "personal_api_key",
+          scope: "agentic-researcher-integrations",
+        },
+        backend: OBSIDIAN_SECRET_STORAGE_BACKEND,
+        persistent: true,
+        createdAt,
+        updatedAt: now,
+      };
+      return {
+        ok: true,
+        message:
+          "Linear credential saved in Obsidian SecretStorage; plugin settings contain only an opaque reference.",
+      };
+    } catch {
+      return {
+        ok: false,
+        message:
+          "Obsidian SecretStorage and the authenticated Companion credential backend are unavailable.",
+      };
+    }
+  }
+
+  private clearLinearCredentialFromObsidianSecretStorage(): boolean {
+    try {
+      this.app.secretStorage.setSecret(OBSIDIAN_LINEAR_SECRET_ID, "");
+      return this.app.secretStorage.getSecret(OBSIDIAN_LINEAR_SECRET_ID) === "";
+    } catch {
+      return false;
     }
   }
 
@@ -4183,6 +4262,22 @@ export default class AgenticResearcherPlugin extends Plugin {
       }
     }
     if (this.linearCredentialReference) {
+      if (
+        this.linearCredentialReference.backend ===
+        OBSIDIAN_SECRET_STORAGE_BACKEND
+      ) {
+        const apiKey = this.app.secretStorage.getSecret(
+          OBSIDIAN_LINEAR_SECRET_ID,
+        );
+        if (!apiKey) {
+          throw new LinearClientError(
+            "linear_missing_api_key",
+            "The Linear SecretStorage entry is unavailable; reconnect Linear.",
+            { retryable: false },
+          );
+        }
+        return use(apiKey);
+      }
       const lease = await this.createCompanionSecretStore().lease(
         this.linearCredentialReference.referenceId,
         { ttlSeconds: 60 },
@@ -4193,7 +4288,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         lease.dispose();
       }
     }
-    if (this.linearApiKey && this.persistLegacyLinearApiKey) {
+    if (this.linearApiKey) {
       return use(this.linearApiKey);
     }
     throw new LinearClientError(
@@ -4227,7 +4322,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     const workspaceId = this.linearQueueState?.workspaceId ?? null;
     const credentialReferenceId =
       this.linearOAuthRuntimeState?.credential.accessTokenReferenceId ??
-      this.linearCredentialReference?.referenceId ??
+      (this.linearCredentialReference?.backend !==
+      OBSIDIAN_SECRET_STORAGE_BACKEND
+        ? this.linearCredentialReference?.referenceId
+        : null) ??
       null;
     if (
       !this.getOptionalExtensionCapabilities().integrations ||
@@ -4291,7 +4389,10 @@ export default class AgenticResearcherPlugin extends Plugin {
         );
       const currentCredentialReferenceId =
         this.linearOAuthRuntimeState?.credential.accessTokenReferenceId ??
-        this.linearCredentialReference?.referenceId ??
+        (this.linearCredentialReference?.backend !==
+        OBSIDIAN_SECRET_STORAGE_BACKEND
+          ? this.linearCredentialReference?.referenceId
+          : null) ??
         null;
       if (
         !stillCurrent ||
@@ -5399,7 +5500,10 @@ export default class AgenticResearcherPlugin extends Plugin {
         if (provider !== "linear") return null;
         return (
           this.linearOAuthRuntimeState?.credential.accessTokenReferenceId ??
-          this.linearCredentialReference?.referenceId ??
+          (this.linearCredentialReference?.backend !==
+          OBSIDIAN_SECRET_STORAGE_BACKEND
+            ? this.linearCredentialReference?.referenceId
+            : null) ??
           null
         );
       },
@@ -5817,9 +5921,6 @@ export default class AgenticResearcherPlugin extends Plugin {
       .then(async () => {
         await this.saveData({
           ...this.settings,
-          ...(this.persistLegacyLinearApiKey && this.linearApiKey
-            ? { linearApiKey: this.linearApiKey }
-            : {}),
           linearCredentialReference: this.linearCredentialReference,
           linearOAuthRuntimeState: this.linearOAuthRuntimeState,
           githubCredential: this.githubCredential,

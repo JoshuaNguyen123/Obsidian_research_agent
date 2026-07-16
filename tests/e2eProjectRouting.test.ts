@@ -69,6 +69,15 @@ test("Windows installed matrix explicitly trusts only its created disposable vau
     workflow,
     /- name: Deterministic Obsidian Playwright matrix\s+env:\s+(?:#[^\r\n]*\s+)*E2E_TRUST_DISPOSABLE_VAULT: "1"\s+run: npm run test:e2e:deterministic-matrix/u,
   );
+  assert.match(workflow, /runs-on: windows-2022/u);
+  assert.match(workflow, /Obsidian-\$version\.exe/u);
+  assert.match(
+    workflow,
+    /f35d2a35061098400a3fafc1bfd38d8bd33f1ad76df8b78b62ccdf20b0a30d26/u,
+  );
+  assert.match(workflow, /\$machine -ne 0x8664/u);
+  assert.match(workflow, /Get-AuthenticodeSignature/u);
+  assert.doesNotMatch(workflow, /choco install obsidian/u);
 });
 
 test("real AI and live external flags cannot widen into other projects", () => {

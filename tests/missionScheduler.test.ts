@@ -7,6 +7,10 @@ import {
   type SchedulableMissionEffect,
   type SchedulableMissionNode,
 } from "../packages/headless-runtime/src/missionScheduler";
+import {
+  getDueMissions,
+  normalizeScheduledMissions,
+} from "../src/agent/missionScheduler";
 
 test("scheduler overlaps at most three descriptor-approved reads", () => {
   const batch = selectMissionNodeBatch({
@@ -66,6 +70,43 @@ test("an active resource lock keeps the node out of the ready batch", () => {
     lockedResourceKeys: new Set(["vault:note:locked.md"]),
   });
   assert.deepEqual(batch.nodeIds, ["free"]);
+});
+
+test("form-authored schedules preserve a friendly normalized name", () => {
+  const schedules = normalizeScheduledMissions([
+    {
+      id: "daily-vault-review",
+      name: "  Daily vault review  ",
+      prompt: "Summarize today's project notes.",
+      cadence: "daily",
+      hourLocal: 8,
+      enabled: true,
+    },
+  ]);
+
+  assert.equal(schedules.length, 1);
+  assert.equal(schedules[0]?.name, "Daily vault review");
+  assert.equal(schedules[0]?.lastRunAt, null);
+  assert.equal(schedules[0]?.lastRunId, null);
+});
+
+test("disabled or incomplete recurring schedules never run", () => {
+  const normalized = normalizeScheduledMissions([
+    {
+      id: "paused-review",
+      name: "Paused review",
+      prompt: "Review notes.",
+      cadence: "daily",
+      hourLocal: 8,
+      enabled: false,
+    },
+  ]);
+
+  assert.deepEqual(
+    getDueMissions(normalized, new Date("2026-07-16T12:00:00")),
+    [],
+  );
+  assert.deepEqual(normalizeScheduledMissions([{ id: "draft", prompt: "" }]), []);
 });
 
 function node(
