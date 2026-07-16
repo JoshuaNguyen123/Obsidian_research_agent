@@ -76,6 +76,8 @@ test("Windows installed matrix explicitly trusts only its created disposable vau
     /f35d2a35061098400a3fafc1bfd38d8bd33f1ad76df8b78b62ccdf20b0a30d26/u,
   );
   assert.match(workflow, /\$machine -ne 0x8664/u);
+  assert.match(workflow, /if \(\$null -ne \$reader\)/u);
+  assert.doesNotMatch(workflow, /\$reader\?\.Dispose\(\)/u);
   assert.match(workflow, /Get-AuthenticodeSignature/u);
   assert.doesNotMatch(workflow, /choco install obsidian/u);
 });

@@ -140,7 +140,9 @@ jobs:
             $stream.Position = $peOffset + 4
             $machine = $reader.ReadUInt16()
           } finally {
-            $reader?.Dispose()
+            if ($null -ne $reader) {
+              $reader.Dispose()
+            }
             $stream.Dispose()
           }
           if ($machine -ne 0x8664) {
