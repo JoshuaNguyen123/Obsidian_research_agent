@@ -40,6 +40,7 @@
     "test:e2e:provider-canary": "node scripts/run-e2e-exclusive.mjs --real-ai --project=provider-canary",
     "test:e2e:release-vertical": "node scripts/run-e2e-exclusive.mjs --real-ai --project=release-vertical",
     "test:e2e:live": "node scripts/run-e2e-exclusive.mjs --live-external --project=disposable-live-external",
+    "test:e2e:configured-linear": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=configured-linear-live",
     "test:e2e:headed": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=deterministic-core-mock --headed",
     "test:e2e:real:headed": "node scripts/run-e2e-exclusive.mjs --real-ai --project=real-ai-contract --headed"
   },

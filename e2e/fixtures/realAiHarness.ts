@@ -288,7 +288,7 @@ async function installRealAiPageHarness(context: {
   marker: string;
   notePath: string;
 }): Promise<void> {
-  await context.page.evaluate(async ({ pluginId, notePath }) => {
+  await context.page.evaluate(async ({ pluginId, notePath, marker }) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.plugins || !app?.vault || !app?.workspace) {
       throw new Error("Obsidian app APIs are unavailable.");
@@ -324,7 +324,7 @@ async function installRealAiPageHarness(context: {
     if (existing) await app.vault.delete(existing, true);
     const note = await app.vault.create(
       notePath,
-      "# Live Provider Contract\n\nOwned live-provider fixture.\n",
+      `# Live Provider Contract\n\nOwned live-provider fixture ${marker}.\n`,
     );
     const leaf =
       app.workspace.getLeavesOfType?.("markdown")?.[0] ??
@@ -333,7 +333,11 @@ async function installRealAiPageHarness(context: {
     await leaf.openFile(note);
     app.workspace.setActiveLeaf(leaf, { focus: true });
     await plugin.activateView?.();
-  }, { pluginId: NATIVE_CORE_PLUGIN_ID, notePath: context.notePath });
+  }, {
+    pluginId: NATIVE_CORE_PLUGIN_ID,
+    notePath: context.notePath,
+    marker: context.marker,
+  });
 }
 
 async function assertProductionClientReady(

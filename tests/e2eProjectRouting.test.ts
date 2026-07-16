@@ -112,6 +112,35 @@ test("live external routing is single-project and explicitly exported", () => {
   });
 });
 
+test("configured Linear live routing is explicit and keeps secrets inside Obsidian", () => {
+  const normalized = normalizeExclusiveArgs([
+    "--mock-ai",
+    "--project=configured-linear-live",
+  ]);
+  assert.equal(normalized.liveExternal, false);
+  assert.deepEqual(normalized.projects, ["configured-linear-live"]);
+  const env: NodeJS.ProcessEnv = {};
+  applyE2eLane(normalized, env);
+  assert.deepEqual(env, {
+    E2E_PLAYWRIGHT_LANE: "configured-linear-live",
+    E2E_LIVE_EXTERNAL: "0",
+  });
+
+  const source = readFileSync(
+    new URL("../e2e/configured-linear-live.spec.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /preserveConfiguredLinearCredential: true/u);
+  assert.match(source, /getLinearCredentialStatus/u);
+  assert.doesNotMatch(source, /LINEAR_LIVE_TEST_TOKEN/u);
+  assert.doesNotMatch(source, /linearApiKey/u);
+  const preflight = readFileSync(
+    new URL("../scripts/e2e-preflight.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(preflight, /"configured-linear-live": \[\]/u);
+});
+
 test("runner mode exports explicit child-process environment without secrets", () => {
   const env: NodeJS.ProcessEnv = {};
   applyE2eAiMode("real", env);
@@ -141,6 +170,10 @@ test("standard E2E command is the live contract and live projects disable reruns
   assert.match(packageJson.scripts["test:e2e:daily-use:linear"], /DU-04/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:github"], /DU-05/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:compound"], /DU-06/u);
+  assert.match(
+    packageJson.scripts["test:e2e:configured-linear"],
+    /--project=configured-linear-live/u,
+  );
   const config = readFileSync(new URL("../playwright.config.ts", import.meta.url), "utf8");
   for (const project of ["real-ai-contract", "real-ai-soak", "provider-canary", "release-vertical"]) {
     assert.match(

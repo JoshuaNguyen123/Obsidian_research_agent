@@ -43,15 +43,13 @@ ${p.text.slice(0,2e4)}`).join(`
         nodes { ${zs[r]} }
         ${Gp}
       }
-    }`,variables:{allowed:n?["first","after","includeArchived","filter"]:["first","after","includeArchived"],paginated:!0}})}function km(){let t="issues.search",e=ji(t);Ut.push({key:t,gate:1,access:"read",operationName:e,rootField:"issueSearch",resourceType:"issue",resultKind:"connection",document:`query ${e}(
-      $query: String!
+    }`,variables:{allowed:n?["first","after","includeArchived","filter"]:["first","after","includeArchived"],paginated:!0}})}function km(){let t="issues.search",e=ji(t);Ut.push({key:t,gate:1,access:"read",operationName:e,rootField:"issues",resourceType:"issue",resultKind:"connection",document:`query ${e}(
       $filter: IssueFilter
       $first: Int!
       $after: String
       $includeArchived: Boolean!
     ) {
-      issueSearch(
-        query: $query
+      issues(
         filter: $filter
         first: $first
         after: $after

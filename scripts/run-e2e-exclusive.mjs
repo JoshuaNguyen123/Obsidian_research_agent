@@ -26,6 +26,7 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "provider-canary",
   "release-vertical",
   "disposable-live-external",
+  "configured-linear-live",
 ]);
 const SIGNAL_EXIT_CODES = {
   SIGHUP: 129,

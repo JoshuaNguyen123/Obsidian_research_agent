@@ -45,6 +45,12 @@ export interface StartNativeObsidianHarnessOptions {
   pluginIds?: readonly string[];
   /** Node-side settings seed; useful for credentials that must never enter traces. */
   corePluginDataOverrides?: Readonly<Record<string, unknown>>;
+  /**
+   * Preserve only the existing opaque Linear SecretStorage reference while
+   * sanitizing every plaintext/provider runtime field as usual. Reserved for
+   * the explicitly routed configured-Linear live proof.
+   */
+  preserveConfiguredLinearCredential?: boolean;
   setup(context: NativeObsidianSetupContext): Promise<void>;
   beforeClose?(context: NativeObsidianSetupContext): Promise<void>;
 }
@@ -134,6 +140,7 @@ export async function startNativeObsidianHarness(
       pluginDataPaths[0],
       pluginDataBefore[0],
       options.corePluginDataOverrides,
+      options.preserveConfiguredLinearCredential === true,
     );
     for (const pluginId of pluginIds) {
       await ensureCommunityPluginEnabled(communityPluginsPath, pluginId);
@@ -284,8 +291,14 @@ async function seedCorePluginData(
   filePath: string,
   existingContent: string | null,
   overrides: Readonly<Record<string, unknown>> = {},
+  preserveConfiguredLinearCredential = false,
 ): Promise<void> {
   const parsed = parseObject(existingContent) ?? {};
+  const preservedLinearCredentialReference =
+    preserveConfiguredLinearCredential &&
+    isRecord(parsed.linearCredentialReference)
+      ? parsed.linearCredentialReference
+      : null;
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(
     filePath,
@@ -299,11 +312,11 @@ async function seedCorePluginData(
         streamWritebackMode: "off",
         scheduledMissions: [],
         autoResumeOvernightRuns: false,
-        linearEnabled: false,
+        linearEnabled: preserveConfiguredLinearCredential,
         linearCapabilityGate: 0,
         linearQueueEnabled: false,
         linearApiKey: "",
-        linearCredentialReference: null,
+        linearCredentialReference: preservedLinearCredentialReference,
         linearOAuthRuntimeState: null,
         linearCapabilitySnapshot: null,
         authorityGrants: [],

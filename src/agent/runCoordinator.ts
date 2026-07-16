@@ -421,7 +421,12 @@ export class RunCoordinator {
       this.runId = snapshot?.runId ?? this.runId;
     } else if (key === "onReceipt") {
       const receipt = args[0] as AgentRunReceipt | undefined;
-      if (receipt) {
+      if (
+        receipt &&
+        !this.lastReceipts.some((existing) =>
+          sameRetainedReceiptIdentity(existing, receipt),
+        )
+      ) {
         this.lastReceipts.push({ ...receipt });
         if (this.lastReceipts.length > MAX_RETAINED_RUN_RECEIPTS) {
           this.lastReceipts.splice(
@@ -504,6 +509,24 @@ function extractDiagnosticMissing(outputPreview: unknown): string[] {
     );
   }
   return [];
+}
+
+function sameRetainedReceiptIdentity(
+  left: AgentRunReceipt,
+  right: AgentRunReceipt,
+): boolean {
+  if (left.id && right.id) {
+    return left.id === right.id;
+  }
+  return (
+    left.toolName === right.toolName &&
+    left.operation === right.operation &&
+    left.path === right.path &&
+    left.toPath === right.toPath &&
+    left.resource?.system === right.resource?.system &&
+    left.resource?.id === right.resource?.id &&
+    left.message === right.message
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

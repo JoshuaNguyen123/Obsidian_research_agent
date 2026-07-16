@@ -16,7 +16,7 @@ test.describe("live provider contract pack", () => {
       await harness.seedNote(sourceB, "# Source B\n\nFinding Beta: errors fell after validation moved before writes.\n");
       const before = await readFile(harness.noteFilePath, "utf8");
       await harness.submitMission(
-        `Read the two named vault notes ${sourceA} and ${sourceB}. Synthesize exactly two findings and append them to the current note. Do not replace existing text. Include the marker ${harness.marker}.`,
+        `Read the two named vault notes ${sourceA} and ${sourceB}. Synthesize exactly two findings and append them to the current note. Do not replace existing text.`,
       );
       const after = await readFile(harness.noteFilePath, "utf8");
       const snapshot = await harness.attestProductionRun({ requireStructuredRouting: true });
@@ -39,8 +39,8 @@ test.describe("live provider contract pack", () => {
       expect(appendReceipts, JSON.stringify(safeState)).toHaveLength(1);
       expect(after.startsWith(before)).toBe(true);
       expect(after).toContain(harness.marker);
-      expect(after).toMatch(/Alpha/iu);
-      expect(after).toMatch(/Beta/iu);
+      expect(after).toMatch(/retention\s+improved/iu);
+      expect(after).toMatch(/error(?:s|\s+rates?)?\s+fell/iu);
       expect(appendReceipts[0]?.readback).toBeTruthy();
       expect(
         Object.values(snapshot.lastMissionGraph.nodes).every(

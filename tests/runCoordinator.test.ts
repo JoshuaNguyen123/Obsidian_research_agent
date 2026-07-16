@@ -374,6 +374,47 @@ test("run coordinator bounds replay payloads and retained receipts", async () =>
   assert.equal(snapshot.lastReceipts.at(-1)?.path, "Note-899.md");
 });
 
+test("run coordinator retains one receipt when a continuation re-emits durable proof", async () => {
+  const coordinator = new RunCoordinator();
+  const resource = {
+    system: "vault",
+    resourceType: "markdown",
+    id: "Notes/Result.md",
+    path: "Notes/Result.md",
+  } as const;
+  const readback = {
+    status: "verified",
+    checkedAt: "2026-07-16T22:00:00.000Z",
+    observedFingerprint: `sha256:${"a".repeat(64)}`,
+    observedRevision: `sha256:${"a".repeat(64)}`,
+  } as const;
+
+  await coordinator.start(async (_signal, events) => {
+    events.onReceipt?.({
+      toolName: "append_to_current_file",
+      operation: "append",
+      path: resource.path,
+      resource,
+      message: `append ${resource.path}`,
+      readback,
+      bytesWritten: 183,
+    });
+    events.onReceipt?.({
+      id: "receipt-1",
+      toolName: "append_to_current_file",
+      operation: "append",
+      path: resource.path,
+      resource,
+      message: `append ${resource.path}`,
+      readback,
+      bytesWritten: 183,
+    });
+    events.onRunComplete?.({ step: 1, maxSteps: 2, stopReason: "write_completed" });
+  });
+
+  assert.equal(coordinator.getSnapshot().lastReceipts.length, 1);
+});
+
 test("a rejected concurrent start cannot tap or persist the active run's events", async () => {
   const coordinator = new RunCoordinator();
   let release: (() => void) | undefined;

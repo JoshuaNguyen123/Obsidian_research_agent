@@ -133,5 +133,12 @@ export default defineConfig({
       timeout: 600_000,
       expect: { timeout: 30_000 },
     },
+    {
+      name: "configured-linear-live",
+      testMatch: /configured-linear-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 600_000,
+      expect: { timeout: 30_000 },
+    },
   ],
 });

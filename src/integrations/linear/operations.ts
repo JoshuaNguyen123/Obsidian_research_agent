@@ -632,18 +632,16 @@ function addIssueSearch() {
     gate: 1,
     access: "read",
     operationName,
-    rootField: "issueSearch",
+    rootField: "issues",
     resourceType: "issue",
     resultKind: "connection",
     document: `query ${operationName}(
-      $query: String!
       $filter: IssueFilter
       $first: Int!
       $after: String
       $includeArchived: Boolean!
     ) {
-      issueSearch(
-        query: $query
+      issues(
         filter: $filter
         first: $first
         after: $after

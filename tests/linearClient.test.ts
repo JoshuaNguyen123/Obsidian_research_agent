@@ -170,6 +170,55 @@ test("a null resource root with NOT_FOUND is absence, not partial success", asyn
   );
 });
 
+test("Linear's INPUT_ERROR entity-not-found shape is classified as absence", async () => {
+  const client = createLinearGraphqlClient({
+    apiKey: "key",
+    transport: async () => ({
+      status: 200,
+      headers: {},
+      json: {
+        errors: [
+          {
+            message: "Entity not found: Issue",
+            path: ["issue"],
+            extensions: { code: "INPUT_ERROR" },
+          },
+        ],
+      },
+    }),
+  });
+
+  await assert.rejects(
+    client.execute("issues.get", { id: "missing-client-uuid" }),
+    (error: unknown) =>
+      error instanceof LinearClientError && error.code === "linear_not_found",
+  );
+});
+
+test("unrelated Linear INPUT_ERROR responses are not treated as absence", async () => {
+  const client = createLinearGraphqlClient({
+    apiKey: "key",
+    transport: async () => ({
+      status: 200,
+      headers: {},
+      json: {
+        errors: [
+          {
+            message: "The supplied filter is invalid.",
+            extensions: { code: "INPUT_ERROR" },
+          },
+        ],
+      },
+    }),
+  });
+
+  await assert.rejects(
+    client.execute("issues.get", { id: "not-an-issue-id" }),
+    (error: unknown) =>
+      error instanceof LinearClientError && error.code === "linear_graphql",
+  );
+});
+
 test("rate-limit errors preserve reset metadata and read retryability", async () => {
   const client = createLinearGraphqlClient({
     apiKey: "key",
@@ -259,6 +308,106 @@ test("pagination is bounded and connection nodes are normalized", async () => {
     hasNextPage: true,
     endCursor: "cursor-2",
   });
+});
+
+test("nullable Linear cursors are normalized to an omitted first-page cursor", async () => {
+  let captured: HttpRequest | undefined;
+  const client = createLinearGraphqlClient({
+    apiKey: "key",
+    transport: async (request) => {
+      captured = request;
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          data: {
+            issues: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      };
+    },
+  });
+
+  await client.execute("issues.search", {
+    query: "disposable-marker",
+    first: 10,
+    after: null,
+    includeArchived: false,
+  });
+
+  const variables = JSON.parse(String(captured?.body)).variables;
+  assert.equal("after" in variables, false);
+  assert.equal("query" in variables, false);
+  assert.equal(variables.first, 10);
+  assert.equal(variables.includeArchived, false);
+  assert.deepEqual(variables.filter, {
+    or: [
+      { title: { containsIgnoreCase: "disposable-marker" } },
+      { description: { containsIgnoreCase: "disposable-marker" } },
+    ],
+  });
+});
+
+test("issue search combines a destination filter with its supported text filter", async () => {
+  let captured: HttpRequest | undefined;
+  const client = createLinearGraphqlClient({
+    apiKey: "key",
+    transport: async (request) => {
+      captured = request;
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          data: {
+            issues: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      };
+    },
+  });
+
+  await client.execute("issues.search", {
+    query: "signed-fingerprint",
+    filter: { project: { id: { eq: "project-1" } } },
+    first: 5,
+    includeArchived: false,
+  });
+
+  const body = JSON.parse(String(captured?.body));
+  assert.match(body.query, /\bissues\s*\(/u);
+  assert.doesNotMatch(body.query, /\bissueSearch\s*\(/u);
+  assert.deepEqual(body.variables.filter, {
+    project: { id: { eq: "project-1" } },
+    or: [
+      { title: { containsIgnoreCase: "signed-fingerprint" } },
+      { description: { containsIgnoreCase: "signed-fingerprint" } },
+    ],
+  });
+});
+
+test("issue search rejects an ambiguous caller-supplied top-level or filter", async () => {
+  const client = createLinearGraphqlClient({
+    apiKey: "key",
+    transport: async () => {
+      throw new Error("transport must not run");
+    },
+  });
+
+  await assert.rejects(
+    client.execute("issues.search", {
+      query: "marker",
+      filter: { or: [{ priority: { eq: 1 } }] },
+    }),
+    (error: unknown) =>
+      error instanceof LinearClientError &&
+      error.code === "linear_invalid_arguments",
+  );
 });
 
 test("fixed operations reject unknown variables and unsafe nested JSON", async () => {

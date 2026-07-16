@@ -82,10 +82,14 @@ export class LinearGraphqlClient {
     }
 
     const normalizedVariables = normalizeVariables(definition, variables);
+    const transportVariables = normalizeTransportVariables(
+      definition,
+      normalizedVariables,
+    );
     const body = JSON.stringify({
       operationName: definition.operationName,
       query: definition.document,
-      variables: normalizedVariables,
+      variables: transportVariables,
     });
     if (body.length > MAX_REQUEST_BODY_CHARS) {
       throw new LinearClientError(
@@ -223,7 +227,7 @@ export async function parseLinearResponse(
   }
   if (
     !hasPartialData &&
-    hasGraphqlErrorCode(errors, "NOT_FOUND", "ENTITY_NOT_FOUND")
+    hasGraphqlNotFoundError(errors)
   ) {
     throw new LinearClientError(
       "linear_not_found",
@@ -527,8 +531,10 @@ function normalizeVariables(
       false,
       definition.key,
     );
-    if (variables.after !== undefined) {
+    if (variables.after !== undefined && variables.after !== null) {
       output.after = normalizeCursor(variables.after, definition.key);
+    } else if (variables.after === null) {
+      delete output.after;
     }
   }
   if (variables.query !== undefined) {
@@ -554,6 +560,40 @@ function normalizeVariables(
     }
   }
   return output;
+}
+
+function normalizeTransportVariables(
+  definition: LinearOperationDefinition,
+  variables: Record<string, unknown>,
+): Record<string, unknown> {
+  if (definition.key !== "issues.search") return variables;
+  const query = requireBoundedString(
+    variables.query,
+    "query",
+    LINEAR_MAX_QUERY_CHARS,
+    definition.key,
+  );
+  const existingFilter = isRecord(variables.filter) ? variables.filter : {};
+  if (Object.prototype.hasOwnProperty.call(existingFilter, "or")) {
+    throw invalidArguments(
+      definition.key,
+      "Issue search cannot combine its text match with a caller-supplied top-level or filter.",
+    );
+  }
+  const { query: _query, filter: _filter, ...transportVariables } = variables;
+  return {
+    ...transportVariables,
+    filter: {
+      ...existingFilter,
+      // The former issueSearch field is now a non-functioning deprecated
+      // stub. Linear's supported issues filter provides equivalent bounded
+      // duplicate lookup over the fields used by our signed work items.
+      or: [
+        { title: { containsIgnoreCase: query } },
+        { description: { containsIgnoreCase: query } },
+      ],
+    },
+  };
 }
 
 function parseEnvelope(
@@ -596,6 +636,23 @@ function hasGraphqlErrorCode(
   return errors.some(
     (error) =>
       typeof error.code === "string" && expected.has(error.code.toUpperCase()),
+  );
+}
+
+function hasGraphqlNotFoundError(
+  errors: SanitizedLinearGraphqlError[],
+): boolean {
+  if (hasGraphqlErrorCode(errors, "NOT_FOUND", "ENTITY_NOT_FOUND")) {
+    return true;
+  }
+  // Linear's current production API can report an absent entity as the
+  // generic INPUT_ERROR code while retaining an unambiguous provider message.
+  // Keep this match deliberately narrow so unrelated input failures are not
+  // mistaken for the safe absence required by prepared creates.
+  return errors.some(
+    (error) =>
+      error.code?.toUpperCase() === "INPUT_ERROR" &&
+      /^Entity not found(?:\s*:|\s*$)/iu.test(error.message.trim()),
   );
 }
 

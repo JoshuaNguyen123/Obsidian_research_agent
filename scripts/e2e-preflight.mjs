@@ -73,6 +73,7 @@ async function resolveExpectedPluginIds() {
     "provider-canary": [],
     "release-vertical": [],
     "disposable-live-external": [],
+    "configured-linear-live": [],
   };
   for (const lane of playwrightLanes) {
     const lanePlugins = requiredByLane[lane];
