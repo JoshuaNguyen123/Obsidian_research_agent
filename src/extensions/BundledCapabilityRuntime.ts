@@ -270,6 +270,14 @@ export class BundledCodeCapability {
     return this.runtime.readState();
   }
 
+  getSandboxCapabilityStatus(): SandboxCapabilityStatusV2 {
+    return this.runtime.getSandboxCapabilityStatus();
+  }
+
+  readCapabilityState() {
+    return this.runtime.readState();
+  }
+
   async loadData(): Promise<unknown> {
     return this.options.dataPlugin.loadData();
   }

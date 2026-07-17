@@ -25,10 +25,27 @@ export interface RealAiHarness extends NativeObsidianHarness {
   }): Promise<void>;
   attestProductionRun(options?: { requireStructuredRouting?: boolean }): Promise<any>;
   restartCorePlugin(): Promise<void>;
-  approveUntilMissionComplete(timeoutMs?: number): Promise<number>;
+  approveUntilMissionComplete(
+    timeoutMs?: number,
+    options?: CompoundMissionApprovalOptions,
+  ): Promise<number>;
   activePreparedApproval(toolName: string): Locator;
   approve(approval: Locator): Promise<void>;
   deny(approval: Locator): Promise<void>;
+}
+
+export type ProjectLifecycleStageName =
+  | "accepted_research"
+  | "linear_hierarchy"
+  | "code_execution"
+  | "private_github_publication"
+  | "reconciliation_cleanup";
+
+export interface CompoundMissionApprovalOptions {
+  maxContinuations?: number;
+  /** Restart the production plugin immediately after selected durable stage commits. */
+  restartAfterProjectStages?: readonly ProjectLifecycleStageName[];
+  onStageRestarted?: (stage: ProjectLifecycleStageName) => Promise<void>;
 }
 
 export async function startRealAiHarness(
@@ -110,8 +127,17 @@ export async function startRealAiHarness(
       attestProductionRun(native.page, config, options),
     restartCorePlugin: () =>
       restartCorePlugin(native.page, config, provider),
-    approveUntilMissionComplete: (timeoutMs = config.completionTimeoutMs) =>
-      approveUntilMissionComplete(native.page, timeoutMs),
+    approveUntilMissionComplete: (
+      timeoutMs = config.completionTimeoutMs,
+      options = {},
+    ) =>
+      approveUntilMissionComplete(native.page, timeoutMs, {
+        ...options,
+        restartCorePlugin: (stage) =>
+          restartCorePlugin(native.page, config, provider).then(async () => {
+            await options.onStageRestarted?.(stage);
+          }),
+      }),
     activePreparedApproval: (toolName) => activePreparedApproval(native.page, toolName),
     approve: (approval) => resolveApproval(approval, "approve"),
     deny: (approval) => resolveApproval(approval, "deny"),
@@ -150,11 +176,20 @@ async function restartCorePlugin(
 async function approveUntilMissionComplete(
   page: Page,
   timeoutMs: number,
+  options: CompoundMissionApprovalOptions & {
+    restartCorePlugin?: (stage: ProjectLifecycleStageName) => Promise<void>;
+  } = {},
 ): Promise<number> {
   const deadline = Date.now() + timeoutMs;
   let approvals = 0;
   let continuations = 0;
   let missingContinuationPolls = 0;
+  const maximumContinuations = Math.max(
+    1,
+    Math.min(12, Math.floor(options.maxContinuations ?? 3)),
+  );
+  const restartStages = new Set(options.restartAfterProjectStages ?? []);
+  const restartedStages = new Set<ProjectLifecycleStageName>();
   await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
   while (Date.now() < deadline) {
     const ui = await page.evaluate(({ pluginId }) => {
@@ -195,8 +230,30 @@ async function approveUntilMissionComplete(
         hasGraphBlocker: Object.values(snapshot?.lastMissionGraph?.nodes ?? {}).some(
           (node: any) => node?.status === "blocked" || Boolean(node?.blocker),
         ),
+        projectStages: Array.from(new Set(
+          (app?.plugins?.plugins?.[pluginId]?.getProjectLineages?.() ?? [])
+            .flatMap((lineage: any) =>
+              Array.isArray(lineage?.commits)
+                ? lineage.commits.map((commit: any) => commit?.stage)
+                : [],
+            )
+            .filter((stage: unknown) => typeof stage === "string"),
+        )),
       };
     }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    const committedRestartStage = ui.projectStages.find(
+      (stage): stage is ProjectLifecycleStageName =>
+        restartStages.has(stage as ProjectLifecycleStageName) &&
+        !restartedStages.has(stage as ProjectLifecycleStageName),
+    );
+    if (committedRestartStage && options.restartCorePlugin) {
+      restartedStages.add(committedRestartStage);
+      await options.restartCorePlugin(committedRestartStage);
+      await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
+      const continued = await continueLatestRunAfterStageRestart(page);
+      if (continued) continuations += 1;
+      continue;
+    }
     if (ui.hasEnabledApproval) {
       const clicked = await page.evaluate(() => {
         const button = Array.from(document.querySelectorAll<HTMLButtonElement>(
@@ -241,9 +298,9 @@ async function approveUntilMissionComplete(
         }
         missingContinuationPolls = 0;
         continuations += 1;
-        if (continuations > 3) {
+        if (continuations > maximumContinuations) {
           throw new Error(
-            `Mission exceeded 3 explicit budget continuations; approved=${approvals}; state=${JSON.stringify(ui)}.`,
+            `Mission exceeded ${maximumContinuations} explicit continuations; approved=${approvals}; state=${JSON.stringify(ui)}.`,
           );
         }
         await continuation.click();
@@ -280,6 +337,40 @@ async function approveUntilMissionComplete(
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
   throw new Error(
     `Timed out after ${timeoutMs} ms while resolving prepared approvals; approved=${approvals}; state=${JSON.stringify(safeState)}.`,
+  );
+}
+
+async function continueLatestRunAfterStageRestart(page: Page): Promise<boolean> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const state = await page.evaluate(({ pluginId }) => {
+      const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
+      const snapshot = plugin?.getMissionRunSnapshot?.();
+      return {
+        running: plugin?.isMissionRunning?.() === true,
+        complete:
+          snapshot?.lastMissionLedger?.acceptance?.status === "pass" ||
+          snapshot?.lastMissionLedger?.status === "complete",
+        canResume: snapshot?.lastMissionLedger?.canResume === true,
+        continuationCommand: snapshot?.lastMissionLedger?.continuationCommand ?? "",
+      };
+    }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    if (state.running || state.complete) return false;
+    if (state.canResume && state.continuationCommand) {
+      const continuation = page.getByRole("button", { name: /Continue Latest Run/iu });
+      if (
+        await continuation.isVisible().catch(() => false) &&
+        await continuation.isEnabled().catch(() => false)
+      ) {
+        await continuation.click();
+        await page.waitForTimeout(250);
+        return true;
+      }
+    }
+    await page.waitForTimeout(250);
+  }
+  throw new Error(
+    "Restarted lifecycle stage did not expose a safe continuation or a completed ledger.",
   );
 }
 

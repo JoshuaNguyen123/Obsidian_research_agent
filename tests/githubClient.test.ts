@@ -49,6 +49,68 @@ test("GitHubRestClient reads a repository through fixed headers", async () => {
   assert.equal(request?.method, "GET");
 });
 
+test("GitHubRestClient creates only an exact private repository payload", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    return response(201, repositoryPayload());
+  });
+
+  const created = await client.createPrivateRepository({
+    ownerKind: "organization",
+    owner: "acme",
+    repository: "research-agent",
+    description: "Private daily-use fixture",
+  });
+
+  assert.equal(created.private, true);
+  assert.equal(requests[0]?.method, "POST");
+  assert.equal(requests[0]?.url, "https://api.github.com/orgs/acme/repos");
+  assert.deepEqual(JSON.parse(String(requests[0]?.body)), {
+    name: "research-agent",
+    private: true,
+    visibility: "private",
+    auto_init: false,
+    has_issues: true,
+    has_projects: false,
+    has_wiki: false,
+    description: "Private daily-use fixture",
+  });
+});
+
+test("GitHubRestClient deletes only the exact fixed repository endpoint", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    return response(204, undefined);
+  });
+
+  await client.deleteRepository("acme", "disposable-private-proof");
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.method, "DELETE");
+  assert.equal(
+    requests[0]?.url,
+    "https://api.github.com/repos/acme/disposable-private-proof",
+  );
+  assert.equal(requests[0]?.body, undefined);
+});
+
+test("GitHubRestClient rejects a create response that is public or identity-drifted", async () => {
+  const client = clientWith(async () => response(201, {
+    ...repositoryPayload(),
+    private: false,
+  }));
+  await assert.rejects(
+    client.createPrivateRepository({
+      ownerKind: "user",
+      owner: "acme",
+      repository: "research-agent",
+    }),
+    /exact active private repository/iu,
+  );
+});
+
 test("GitHubRestClient exposes bounded Git database reads with exact paths", async () => {
   const paths: string[] = [];
   const client = clientWith(async (request) => {

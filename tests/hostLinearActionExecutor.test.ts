@@ -27,6 +27,43 @@ const SUBJECT: LinearAuthoritySubject = {
   id: "linear-queue-project-1",
 };
 
+test("host-owned hierarchy executor exposes its fixed gate-4 link child only at gate 4", async () => {
+  const client: LinearToolClient = {
+    async execute(operationKey) {
+      if (operationKey === "initiative_project_links.get") {
+        throw notFound(operationKey);
+      }
+      throw new Error(`Unexpected Linear operation ${operationKey}`);
+    },
+  };
+  const createExecutor = (gate: 3 | 4) =>
+    new HostLinearActionExecutor({
+      client,
+      gate,
+      activeGrants: [],
+      authorizeAndConsume: async () => {
+        throw new Error("Preparation cannot consume authority.");
+      },
+    });
+  const request = {
+    toolName: "linear_create_initiative_project_link",
+    arguments: {
+      input: { initiativeId: "initiative-1", projectId: "project-1" },
+    },
+    runId: "run-hierarchy-link",
+    toolCallId: "call-hierarchy-link",
+    context: contextFixture("run-hierarchy-link", "call-hierarchy-link"),
+  };
+
+  const gateThree = await createExecutor(3).prepare(request);
+  assert.equal(gateThree.ok, false);
+  const gateFour = await createExecutor(4).prepare(request);
+  assert.equal(gateFour.ok, true);
+  if (!gateFour.ok) return;
+  assert.equal(gateFour.action.toolName, request.toolName);
+  assert.equal(gateFour.descriptor.capability.resourceType, "initiative_project_link");
+});
+
 test("host Linear executor persists authority consumption before dispatch and returns a canonical receipt", async () => {
   const events: string[] = [];
   const grant = await queueGrant(SUBJECT, "grant-success");

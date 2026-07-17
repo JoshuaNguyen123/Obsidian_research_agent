@@ -39,6 +39,7 @@ export * from "./AcceptedResearchArtifactV1";
 export * from "./AcceptedResearchNoteWriter";
 export * from "./ResearchPublicationWorkflow";
 export * from "./ResearchPublicationCheckpointStore";
+export * from "./ResearchProjectHierarchyWorkflowV1";
 export * from "./ExternalWorkItemBindingV1";
 export * from "./LinearContractSupport";
 export * from "./WorkItemLineageV1";

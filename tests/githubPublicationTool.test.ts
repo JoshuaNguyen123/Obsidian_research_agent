@@ -300,6 +300,7 @@ function bindingResolution() {
   return {
     workflowBinding: binding(),
     publicationBinding: {} as never,
+    privateRepositoryBinding: {} as never,
     profile: {} as never,
   };
 }

@@ -17,6 +17,15 @@ const DEFAULT_PLAYWRIGHT_PROJECT = "deterministic-core-mock";
 const PLAYWRIGHT_PROJECTS = new Set([
   DEFAULT_PLAYWRIGHT_PROJECT,
   "daily-use-mock",
+  "daily-use-connections",
+  "daily-use-note",
+  "daily-use-memory-reflex",
+  "daily-use-research",
+  "daily-use-code",
+  "daily-use-code-live",
+  "daily-use-linear",
+  "daily-use-github",
+  "daily-use-compound",
   "integration-mock",
   "integration-mock-legacy",
   "sandbox",
@@ -481,6 +490,9 @@ export function normalizeExclusiveArgs(rawArgs) {
     "real-ai-soak",
     "provider-canary",
     "release-vertical",
+    "daily-use-research",
+    "daily-use-code-live",
+    "daily-use-compound",
   ]);
   if (aiMode === "real" && projects.some((project) => !realAiProjects.has(project))) {
     throw new Error("--real-ai is restricted to attested live-provider Playwright projects.");

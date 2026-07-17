@@ -42,6 +42,9 @@ if (playwrightLanes.some((lane) => [
   "real-ai-soak",
   "provider-canary",
   "release-vertical",
+  "daily-use-research",
+  "daily-use-code-live",
+  "daily-use-compound",
 ].includes(lane))) {
   await assertLiveObsidianExecutable();
   await assertLiveProviderConfiguration();
@@ -64,6 +67,15 @@ async function resolveExpectedPluginIds() {
   const requiredByLane = {
     "deterministic-core-mock": [],
     "daily-use-mock": [],
+    "daily-use-connections": [],
+    "daily-use-note": [],
+    "daily-use-memory-reflex": [],
+    "daily-use-research": [],
+    "daily-use-code": [],
+    "daily-use-code-live": [],
+    "daily-use-linear": [],
+    "daily-use-github": [],
+    "daily-use-compound": [],
     "integration-mock": [],
     "integration-mock-legacy": [],
     sandbox: [],

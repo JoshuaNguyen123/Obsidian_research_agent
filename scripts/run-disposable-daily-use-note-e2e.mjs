@@ -22,9 +22,7 @@ try {
   exitCode = await run(process.execPath, [
     path.join(repoRoot, "scripts", "run-e2e-exclusive.mjs"),
     "--mock-ai",
-    "--project=deterministic-core-mock",
-    "--grep",
-    "DU-01",
+    "--project=daily-use-note",
   ], {
     ...process.env,
     OBSIDIAN_VAULT: vaultRoot,

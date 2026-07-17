@@ -9,8 +9,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   release-proof:
@@ -31,6 +30,7 @@ jobs:
       E2E_GITHUB_TOKEN: ${{ secrets.GITHUB_LIVE_TEST_TOKEN }}
       E2E_RELEASE_LINEAR_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
       E2E_RELEASE_GITHUB_REPOSITORY: ${{ vars.DISPOSABLE_GITHUB_REPOSITORY }}
+      E2E_RELEASE_GITHUB_REPOSITORY_PREFIX: ${{ vars.DISPOSABLE_GITHUB_REPOSITORY_PREFIX || 'agentic-du06-e2e' }}
       E2E_REAL_SANDBOX_PROVIDER: wsl2
       LINEAR_LIVE_TEST_TOKEN: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
       LINEAR_LIVE_TEST_TEAM_ID: ${{ vars.LINEAR_LIVE_TEST_TEAM_ID }}
@@ -83,17 +83,24 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:OBSIDIAN_VAULT | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $env:OBSIDIAN_VAULT ".obsidian") | Out-Null
           Set-Content -LiteralPath (Join-Path $env:OBSIDIAN_VAULT ".obsidian\community-plugins.json") -Value '[]' -Encoding utf8
-      - name: Deterministic matrix
-        run: npm run test:e2e:deterministic-matrix
-      - name: Live contract
-        run: npm run test:e2e
-      - name: Live autonomy soak
-        run: npm run test:e2e:real:soak
+      - name: Build exact release artifacts
+        run: npm run build
       - name: Attest real fixed sandbox provider
         run: node --import tsx scripts/ci-sandbox-boundary.ts
-      - name: Release vertical artifact and provider gates
-        run: npm run test:e2e:release-vertical
-      - name: Disposable Linear publish, readback, and cleanup
+      - name: Daily-use connection and first-run lanes
+        shell: powershell
+        run: |
+          npm run test:e2e:daily-use:connections
+          npm run test:e2e:daily-use-note
+      - name: Daily-use memory, compaction, and reflex lane
+        run: npm run test:e2e:daily-use:memory-reflex
+      - name: Affected DU-02 research scenarios
+        run: npm run test:e2e:daily-use:live-model
+      - name: Protected DU-03 real-model sandbox and commit journey
+        run: npm run test:e2e:daily-use:code:live
+      - name: DU-04 hierarchy, dedupe, restart, and backlink lane
+        run: npm run test:e2e:daily-use:linear
+      - name: Disposable Linear provider readback and cleanup
         shell: powershell
         run: |
           node scripts/live-external-preflight.mjs --provider linear
@@ -101,14 +108,18 @@ jobs:
           $env:E2E_LIVE_ALLOW_MERGE = "0"
           Remove-Item Env:LIVE_EXTERNAL_MERGE_CONFIRMATION -ErrorAction SilentlyContinue
           npm run test:e2e:live
-      - name: Disposable GitHub publish, merge, reconciliation, and cleanup
+      - name: DU-05 private publication, restart, and branch cleanup lane
+        run: npm run test:e2e:daily-use:github
+      - name: Disposable GitHub draft publication and cleanup
         shell: powershell
         run: |
-          $env:E2E_LIVE_PROVIDER = "github_merge"
-          $env:E2E_LIVE_ALLOW_MERGE = "1"
-          $env:LIVE_EXTERNAL_MERGE_CONFIRMATION = "MERGE_DISPOSABLE_PR"
-          node scripts/live-external-preflight.mjs --provider github_merge
+          $env:E2E_LIVE_PROVIDER = "github_draft"
+          $env:E2E_LIVE_ALLOW_MERGE = "0"
+          Remove-Item Env:LIVE_EXTERNAL_MERGE_CONFIRMATION -ErrorAction SilentlyContinue
+          node scripts/live-external-preflight.mjs --provider github_draft
           npm run test:e2e:live
+      - name: DU-06 exact-SHA compound lifecycle and cleanup
+        run: npm run test:e2e:daily-use:compound
       - name: Upload protected proof
         if: always()
         uses: actions/upload-artifact@v4

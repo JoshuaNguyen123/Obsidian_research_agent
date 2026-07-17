@@ -7,9 +7,9 @@ import { applyE2eAiMode, applyE2eLane, normalizeExclusiveArgs } from "../scripts
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
 
-test("Phase 6 Linear scenarios are owned by the dedicated file-routed spec", () => {
+test("DU-04 Linear scenarios are owned by the dedicated file-routed spec", () => {
   const phase6 = readFileSync(
-    new URL("../e2e/phase6-linear.spec.ts", import.meta.url),
+    new URL("../e2e/daily-use-linear.spec.ts", import.meta.url),
     "utf8",
   );
   const monolith = readFileSync(
@@ -18,7 +18,7 @@ test("Phase 6 Linear scenarios are owned by the dedicated file-routed spec", () 
   );
   for (const title of [
     "ordinary Linear-looking text does not expose or execute Linear tools",
-    "accepted research is note-backed before exact Linear approval and persists verified lineage",
+    "DU-04 accepted research creates a verified Linear hierarchy, backlink, and restart-safe dedupe",
     "rereads claims executes vault work and reconciles completion without replay",
   ]) {
     assert.equal(phase6.includes(title), true, `missing Phase 6 title: ${title}`);
@@ -185,13 +185,15 @@ test("runner mode exports explicit child-process environment without secrets", (
   });
 });
 
-test("standard E2E command is the live contract and live projects disable reruns", () => {
+test("daily-use commands route to focused specs and live projects disable reruns", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   );
-  assert.match(packageJson.scripts["test:e2e"], /--real-ai --project=real-ai-contract/u);
+  assert.match(packageJson.scripts["test:e2e"], /--real-ai --project=daily-use-research/u);
   assert.match(packageJson.scripts["test:e2e:mock"], /deterministic-core-mock/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use-mock/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use:connections/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use:memory-reflex/u);
+  assert.doesNotMatch(packageJson.scripts["test:e2e:daily-use"], /daily-use-mock/u);
   assert.equal(
     packageJson.scripts["test:e2e:daily-use:mock"],
     "npm run test:e2e:daily-use",
@@ -206,12 +208,57 @@ test("standard E2E command is the live contract and live projects disable reruns
     /--project=configured-linear-live/u,
   );
   const config = readFileSync(new URL("../playwright.config.ts", import.meta.url), "utf8");
-  for (const project of ["real-ai-contract", "real-ai-soak", "provider-canary", "release-vertical"]) {
+  for (const project of [
+    "daily-use-research",
+    "daily-use-code-live",
+    "daily-use-compound",
+    "real-ai-soak",
+    "provider-canary",
+  ]) {
     assert.match(
       config,
       new RegExp(`name: "${project}"[\\s\\S]{0,160}retries: 0`, "u"),
     );
   }
+});
+
+test("protected release workflow is exact-SHA and cannot dispatch broad or merge lanes", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/protected-release-vertical.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /workflow_dispatch:/u);
+  assert.match(workflow, /ref: \$\{\{ inputs\.commit_sha \}\}/u);
+  assert.match(workflow, /if \(\$actual -ne \$env:E2E_RELEASE_COMMIT_SHA\)/u);
+  for (const targetedCommand of [
+    "test:e2e:daily-use:connections",
+    "test:e2e:daily-use-note",
+    "test:e2e:daily-use:memory-reflex",
+    "test:e2e:daily-use:live-model",
+    "test:e2e:daily-use:code:live",
+    "test:e2e:daily-use:linear",
+    "test:e2e:daily-use:github",
+    "test:e2e:daily-use:compound",
+  ]) {
+    assert.match(workflow, new RegExp(`npm run ${targetedCommand}`, "u"));
+  }
+  assert.doesNotMatch(workflow, /^\s*(?:run:\s*)?npm run test:e2e\s*$/mu);
+  assert.doesNotMatch(workflow, /npm run test:e2e:deterministic-matrix/u);
+  assert.doesNotMatch(workflow, /npm run test:e2e:real:soak/u);
+  assert.doesNotMatch(workflow, /E2E_LIVE_ALLOW_MERGE:\s*["']?1/u);
+  assert.doesNotMatch(workflow, /LIVE_EXTERNAL_MERGE_CONFIRMATION:\s*MERGE/u);
+  assert.doesNotMatch(workflow, /git\s+push[^\r\n]*(?:--force|-f\b)/u);
+  assert.match(workflow, /protected-release-proof-\$\{\{ inputs\.commit_sha \}\}/u);
+
+  const compound = readFileSync(
+    new URL("../e2e/daily-use-compound.spec.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(compound, /restartAfterProjectStages: MAIN_STAGES/u);
+  assert.match(compound, /restartAfterProjectStages: \["reconciliation_cleanup"\]/u);
+  assert.match(compound, /expectGitHubRepositoryAbsent/u);
+  assert.match(compound, /independentlyVerifyLinearCleanup/u);
+  assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);
 });
 
 test("live external preflight validates authority without returning credentials", () => {

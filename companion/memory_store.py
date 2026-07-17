@@ -6,7 +6,18 @@ import sqlite3
 import uuid
 from pathlib import Path
 
-from schemas import MemorySearchRequest, MemorySearchResult, MemoryWriteRequest
+from persisted_data import canonical_fingerprint
+from schemas import (
+    MemoryClearRequest,
+    MemoryDeleteRequest,
+    MemoryMutationReceiptV1,
+    MemorySearchRequest,
+    MemorySearchResult,
+    MemoryWriteRequest,
+)
+
+
+LEGACY_UNSCOPED = "legacy_unscoped"
 
 
 class MemoryStore:
@@ -30,6 +41,7 @@ class MemoryStore:
                 ALTER TABLE memories RENAME TO memories_legacy_vault_paths;
                 CREATE TABLE memories (
                   id TEXT PRIMARY KEY,
+                  vault_scope_id TEXT NOT NULL,
                   kind TEXT NOT NULL,
                   content TEXT NOT NULL,
                   confidence REAL NOT NULL,
@@ -43,10 +55,10 @@ class MemoryStore:
                   updated_at TEXT NOT NULL
                 );
                 INSERT INTO memories (
-                  id, kind, content, confidence, tags_json, source_url, source_title,
+                  id, vault_scope_id, kind, content, confidence, tags_json, source_url, source_title,
                   note_receipt_fingerprint, evidence_json, task_id, created_at, updated_at
                 )
-                SELECT id, kind, content, confidence, tags_json, source_url, source_title,
+                SELECT id, 'legacy_unscoped', kind, content, confidence, tags_json, source_url, source_title,
                        NULL, evidence_json, task_id, created_at, updated_at
                 FROM memories_legacy_vault_paths;
                 DROP TABLE memories_legacy_vault_paths;
@@ -57,6 +69,7 @@ class MemoryStore:
             """
             CREATE TABLE IF NOT EXISTS memories (
               id TEXT PRIMARY KEY,
+              vault_scope_id TEXT NOT NULL,
               kind TEXT NOT NULL,
               content TEXT NOT NULL,
               confidence REAL NOT NULL,
@@ -78,6 +91,14 @@ class MemoryStore:
             );
             """
         )
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "vault_scope_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE memories ADD COLUMN vault_scope_id TEXT NOT NULL DEFAULT 'legacy_unscoped'"
+            )
         self.conn.commit()
         self.ready = True
 
@@ -98,13 +119,14 @@ class MemoryStore:
         conn.execute(
             """
             INSERT INTO memories (
-              id, kind, content, confidence, tags_json, source_url, source_title,
+              id, vault_scope_id, kind, content, confidence, tags_json, source_url, source_title,
               note_receipt_fingerprint, evidence_json, task_id, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
+                request.vaultScopeId,
                 request.kind,
                 request.content,
                 request.confidence,
@@ -131,8 +153,8 @@ class MemoryStore:
     def search(self, request: MemorySearchRequest) -> list[MemorySearchResult]:
         conn = self._conn()
         query = sanitize_fts_query(request.query)
-        params: list[object] = [query]
-        where = ["memory_fts MATCH ?"]
+        params: list[object] = [query, request.vaultScopeId]
+        where = ["memory_fts MATCH ?", "m.vault_scope_id = ?"]
 
         if request.kinds:
             placeholders = ",".join("?" for _ in request.kinds)
@@ -165,6 +187,7 @@ class MemoryStore:
             results.append(
                 MemorySearchResult(
                     id=row["id"],
+                    vaultScopeId=row["vault_scope_id"],
                     kind=row["kind"],
                     content=row["content"],
                     score=score,
@@ -177,6 +200,69 @@ class MemoryStore:
                 )
             )
         return results
+
+    def delete(self, request: MemoryDeleteRequest) -> MemoryMutationReceiptV1:
+        return self._delete_scoped(
+            operation="delete",
+            vault_scope_id=request.vaultScopeId,
+            memory_id=request.memoryId,
+            kinds=None,
+        )
+
+    def clear(self, request: MemoryClearRequest) -> MemoryMutationReceiptV1:
+        return self._delete_scoped(
+            operation="clear",
+            vault_scope_id=request.vaultScopeId,
+            memory_id=None,
+            kinds=request.kinds,
+        )
+
+    def _delete_scoped(
+        self,
+        *,
+        operation: str,
+        vault_scope_id: str,
+        memory_id: str | None,
+        kinds: list[str] | None,
+    ) -> MemoryMutationReceiptV1:
+        conn = self._conn()
+        where = ["vault_scope_id = ?"]
+        params: list[object] = [vault_scope_id]
+        if memory_id is not None:
+            where.append("id = ?")
+            params.append(memory_id)
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            where.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        rows = conn.execute(
+            f"SELECT id FROM memories WHERE {' AND '.join(where)} ORDER BY id",
+            params,
+        ).fetchall()
+        deleted_ids = [str(row["id"]) for row in rows]
+        if deleted_ids:
+            placeholders = ",".join("?" for _ in deleted_ids)
+            conn.execute(f"DELETE FROM memory_fts WHERE id IN ({placeholders})", deleted_ids)
+            conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", deleted_ids)
+            conn.commit()
+        observed_at = dt.datetime.now(dt.UTC).isoformat()
+        fingerprint = canonical_fingerprint(
+            {
+                "version": 1,
+                "operation": operation,
+                "vaultScopeId": vault_scope_id,
+                "deletedCount": len(deleted_ids),
+                "deletedIds": deleted_ids,
+            }
+        )
+        return MemoryMutationReceiptV1(
+            operation=operation,
+            vaultScopeId=vault_scope_id,
+            deletedCount=len(deleted_ids),
+            deletedIds=deleted_ids,
+            observedAt=observed_at,
+            fingerprint=fingerprint,
+        )
 
     def _conn(self) -> sqlite3.Connection:
         if not self.conn:

@@ -8,6 +8,10 @@ import {
   estimatePromptChars,
   shouldCompactLoopMessages,
 } from "../src/agent/runContext";
+import {
+  buildContinuationHandoffV1,
+  validateContinuationHandoffV1,
+} from "../src/agent/continuationMemory";
 
 test("run context estimates prompt chars and compacts through ledger state", () => {
   const messages: ModelChatMessage[] = [
@@ -71,6 +75,54 @@ test("run context estimates prompt chars and compacts through ledger state", () 
   assert.equal(compacted.messages[0].content, "system prompt");
   assert.ok(compacted.messages.some((message) => /mission plan/i.test(message.content)));
   assert.ok(compacted.messages.some((message) => message.content === "latest user mission"));
+});
+
+test("fingerprinted continuation handoff survives compaction and rejects tampering", () => {
+  const ledger = createMissionLedger({
+    runId: "run-handoff",
+    mission: "Preserve durable proof",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["read_file"],
+      stopWhenSatisfied: true,
+    },
+  });
+  ledger.receipts = ["receipt-1"];
+  ledger.approvals = [{
+    id: "approval-1",
+    toolName: "append_to_current_file",
+    action: "append",
+    decision: "approved",
+    decidedAt: "2026-07-16T00:00:00.000Z",
+  }];
+  const handoff = buildContinuationHandoffV1({
+    ledger,
+    lineageFingerprints: [`sha256:${"b".repeat(64)}`],
+    now: new Date("2026-07-16T00:00:00.000Z"),
+  });
+  assert.equal(validateContinuationHandoffV1(handoff).ok, true);
+
+  const messages: ModelChatMessage[] = [
+    { role: "system", content: "system" },
+    { role: "user", content: "mission" },
+  ];
+  for (let index = 0; index < 8; index += 1) {
+    messages.push({ role: "assistant", content: "", toolCalls: [{ name: "read_file", arguments: { path: `${index}.md` } }] });
+    messages.push({ role: "tool", toolName: "read_file", content: "x".repeat(200) });
+  }
+  const compacted = compactLoopMessages({ messages, ledger, keepRecentSteps: 1, handoff });
+  assert.equal(compacted.applied, true);
+  assert.match(compacted.missionStateMessage ?? "", /Canonical continuation handoff/);
+  assert.match(compacted.missionStateMessage ?? "", new RegExp(handoff.fingerprint));
+
+  const tampered = { ...handoff, proofDebt: { ...handoff.proofDebt, blocked: !handoff.proofDebt.blocked } };
+  assert.equal(validateContinuationHandoffV1(tampered).ok, false);
+  const rejected = compactLoopMessages({ messages, ledger, handoff: tampered });
+  assert.equal(rejected.applied, false);
+  assert.equal(rejected.rejectionReason, "invalid_handoff");
 });
 
 test("run context rejects a compaction candidate that would increase the estimate", () => {

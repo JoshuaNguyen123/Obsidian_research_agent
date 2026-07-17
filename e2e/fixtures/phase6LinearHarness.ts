@@ -52,8 +52,26 @@ export interface Phase6LinearHarness extends NativeObsidianHarness {
     issueGetCalls: number;
     issue: any | null;
     checkpoint: any | null;
+    hierarchyCreateCalls: number;
+    hierarchyRecords: any[];
+    hierarchyCheckpoint: any | null;
+    missionSnapshot: any | null;
+    toolFailures: Array<{
+      name: string;
+      code: string;
+      message: string;
+    }>;
+    runErrors: Array<{
+      id: string;
+      code: string;
+      message: string;
+    }>;
   }>;
   cleanupResearchPublication(notePath: string): Promise<void>;
+  cleanupResearchProjectHierarchy(): Promise<{
+    removed: number;
+    remaining: number;
+  }>;
   installQueueClient(fixture: FixedLinearQueueFixture): Promise<void>;
   authorizeAndRunQueue(): Promise<{ ok: boolean; message: string }>;
   waitForReconciliation(issueId: string): Promise<FixedLinearQueueSnapshot>;
@@ -114,6 +132,8 @@ export async function startPhase6LinearHarness(): Promise<Phase6LinearHarness> {
       readFixedLinearPublicationState(native.page, notePath),
     cleanupResearchPublication: (notePath) =>
       cleanupResearchPublication(native.page, notePath),
+    cleanupResearchProjectHierarchy: () =>
+      cleanupResearchProjectHierarchy(native.page),
     installQueueClient: (fixture) =>
       installFixedLinearQueueClient(native.page, fixture),
     authorizeAndRunQueue: () => authorizeAndRunFixedLinearQueue(native.page),
@@ -213,6 +233,103 @@ async function installPhase6LinearPageHarness(context: {
           const tools = (request.tools ?? [])
             .map((tool) => tool.function?.name)
             .filter((name): name is string => typeof name === "string");
+
+          if (requestText.includes("E2E_LINEAR_PROJECT_HIERARCHY")) {
+            if (request.format !== undefined) {
+              return {
+                message: { role: "assistant", content: "{}" },
+                toolCalls: [],
+                raw: { playwrightPhase6Linear: true },
+              };
+            }
+            const activeRunId =
+              plugin.getMissionRunSnapshot?.()?.lastConfig?.runId ?? "unknown-run";
+            const hierarchyKey =
+              `E2E_LINEAR_PROJECT_HIERARCHY:${marker}:${activeRunId}`;
+            const hierarchyStep = stepCounts.get(hierarchyKey) ?? 0;
+            if (hierarchyStep === 0) {
+              if (!tools.includes("publish_research_project_to_linear")) {
+                throw new Error(
+                  `Explicit project hierarchy intent did not expose its composite tool. Tools: ${tools.join(", ")}`,
+                );
+              }
+              const notePath = `E2E Agent Tests/Accepted Research ${marker}.md`;
+              const checkpoints =
+                await plugin.researchPublicationCheckpointStore?.list?.();
+              const accepted = Array.isArray(checkpoints)
+                ? checkpoints.find(
+                    (candidate: any) => candidate?.artifact?.notePath === notePath,
+                  )
+                : null;
+              const artifactFingerprint =
+                accepted?.artifact?.artifactFingerprint;
+              if (typeof artifactFingerprint !== "string") {
+                throw new Error(
+                  "The hierarchy mission could not resolve its accepted research binding.",
+                );
+              }
+              stepCounts.set(hierarchyKey, 1);
+              const toolCall = {
+                id: "playwright-e2e-linear-project-hierarchy",
+                index: 0,
+                name: "publish_research_project_to_linear",
+                arguments: {
+                  plan: {
+                    planId: `e2e-project-plan-${marker.toLowerCase()}`,
+                    acceptedResearchArtifactFingerprint: artifactFingerprint,
+                    sourceNotePath: notePath,
+                    initiative: {
+                      key: "initiative-e2e",
+                      title: `E2E Research Initiative ${marker}`,
+                      description:
+                        "Own the accepted research through verified delivery.",
+                    },
+                    project: {
+                      key: "project-e2e",
+                      title: `E2E Research Project ${marker}`,
+                      description:
+                        "Deliver the dependency-aware accepted research plan.",
+                    },
+                    issues: [
+                      {
+                        key: "issue-foundation",
+                        title: `Implement foundation ${marker}`,
+                        description: "Implement the first verified work slice.",
+                        dependencyKeys: [],
+                        acceptanceCriteria: [
+                          "Targeted and fresh-full validation both pass.",
+                        ],
+                        workItemFingerprint: `sha256:${"b".repeat(64)}`,
+                      },
+                      {
+                        key: "issue-reconcile",
+                        title: `Reconcile delivery ${marker}`,
+                        description: "Backlink and reconcile the verified result.",
+                        dependencyKeys: ["issue-foundation"],
+                        acceptanceCriteria: [
+                          "Provider readbacks and backlinks are independently verified.",
+                        ],
+                        workItemFingerprint: `sha256:${"c".repeat(64)}`,
+                      },
+                    ],
+                  },
+                },
+              };
+              return {
+                message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                toolCalls: [toolCall],
+                raw: { playwrightPhase6Linear: true },
+              };
+            }
+            return {
+              message: {
+                role: "assistant",
+                content: `E2E_LINEAR_PROJECT_HIERARCHY_DONE ${marker}`,
+              },
+              toolCalls: [],
+              raw: { playwrightPhase6Linear: true },
+            };
+          }
 
           if (requestText.includes("E2E_LINEAR_RESEARCH_PUBLICATION")) {
             if (request.format !== undefined) {
@@ -688,7 +805,8 @@ async function installFixedLinearPublicationClient(page: Page): Promise<void> {
         variables: Record<string, unknown>;
       }>;
       issue: any | null;
-    } = { calls: [], issue: null };
+      records: Map<string, any>;
+    } = { calls: [], issue: null, records: new Map() };
     const fetchedAt = () => new Date().toISOString();
     const pageResult = (items: any[]) => ({
       items,
@@ -731,6 +849,9 @@ async function installFixedLinearPublicationClient(page: Page): Promise<void> {
                 attributes: { teams: ["e2e-team"] },
                 snapshotHash: `sha256:${"2".repeat(64)}`,
               },
+              ...[...state.records.values()].filter(
+                (record) => record.resourceType === "project",
+              ),
             ]);
           case "workflow_states.list":
             return pageResult([
@@ -753,18 +874,71 @@ async function installFixedLinearPublicationClient(page: Page): Promise<void> {
             ]);
           case "issues.search":
             return pageResult([]);
+          case "initiatives.list":
+            return pageResult(
+              [...state.records.values()].filter(
+                (record) => record.resourceType === "initiative",
+              ),
+            );
+          case "issues.list":
+            return pageResult([
+              ...(state.issue ? [state.issue] : []),
+              ...[...state.records.values()].filter(
+                (record) => record.resourceType === "issue",
+              ),
+            ]);
+          case "initiative_project_links.list":
+            return pageResult(
+              [...state.records.values()].filter(
+                (record) => record.resourceType === "initiative_project_link",
+              ),
+            );
+          case "issue_relations.list":
+            return pageResult(
+              [...state.records.values()].filter(
+                (record) => record.resourceType === "issue_relation",
+              ),
+            );
           case "issues.get": {
             const requestedId = String(variables.id ?? "");
-            if (!state.issue || state.issue.id !== requestedId) {
+            const issue =
+              state.issue?.id === requestedId
+                ? state.issue
+                : state.records.get(requestedId);
+            if (!issue) {
               throw new LinearClientErrorConstructor(
                 "linear_not_found",
                 `E2E issue ${requestedId || "unknown"} was not found.`,
                 { operationKey },
               );
             }
-            return JSON.parse(JSON.stringify(state.issue));
+            return JSON.parse(JSON.stringify(issue));
+          }
+          case "initiatives.get":
+          case "projects.get":
+          case "initiative_project_links.get":
+          case "issue_relations.get": {
+            const requestedId = String(variables.id ?? "");
+            const record = state.records.get(requestedId);
+            if (!record) {
+              throw new LinearClientErrorConstructor(
+                "linear_not_found",
+                `E2E hierarchy resource ${requestedId || "unknown"} was not found.`,
+                { operationKey },
+              );
+            }
+            return JSON.parse(JSON.stringify(record));
           }
           case "issues.create": {
+            if (
+              String(
+                (variables.input as Record<string, unknown> | undefined)?.description ??
+                  variables.description ??
+                  "",
+              ).includes("agentic-idempotency:")
+            ) {
+              return createHierarchyRecord("issue", variables, operationKey);
+            }
             if (state.issue) {
               throw new Error(
                 "The E2E fixed client observed a duplicate issue create.",
@@ -813,8 +987,95 @@ async function installFixedLinearPublicationClient(page: Page): Promise<void> {
               acknowledgedAt: timestamp,
             };
           }
+          case "initiatives.create":
+            return createHierarchyRecord("initiative", variables, operationKey);
+          case "projects.create":
+            return createHierarchyRecord("project", variables, operationKey);
+          case "initiative_project_links.create":
+            return createHierarchyRecord(
+              "initiative_project_link",
+              variables,
+              operationKey,
+            );
+          case "issue_relations.create":
+            return createHierarchyRecord("issue_relation", variables, operationKey);
           default:
             throw new Error(`Unexpected fixed Linear operation: ${operationKey}`);
+        }
+
+        function createHierarchyRecord(
+          resourceType: string,
+          rawVariables: Record<string, unknown>,
+          operation: string,
+        ) {
+          const input =
+            rawVariables.input && typeof rawVariables.input === "object"
+              ? rawVariables.input as Record<string, unknown>
+              : rawVariables;
+          const id = String(input.id ?? rawVariables.id ?? "");
+          if (!id) {
+            throw new Error(`${operation} omitted its host-prepared resource id.`);
+          }
+          if (state.records.has(id)) {
+            throw new Error(`Duplicate hierarchy mutation for ${id}.`);
+          }
+          const timestamp = fetchedAt();
+          const snapshotHash = `sha256:${(state.records.size + 6)
+            .toString(16)
+            .padStart(64, "0")}`;
+          const record = resourceType === "issue"
+            ? {
+                resourceType,
+                id,
+                identifier: `E2E-H${state.records.size + 1}`,
+                title: String(input.title ?? ""),
+                description: String(input.description ?? ""),
+                url: `https://linear.app/e2e/issue/${id}`,
+                priority: 0,
+                trashed: false,
+                labels: [],
+                team: {
+                  id: String(input.teamId ?? ""),
+                  name: "E2E Team",
+                  key: "E2E",
+                },
+                state: {
+                  id: String(input.stateId ?? "e2e-started"),
+                  name: "In Progress",
+                  type: "started",
+                },
+                ...(typeof input.projectId === "string"
+                  ? {
+                      project: {
+                        id: input.projectId,
+                        name: "E2E Agentic Research",
+                      },
+                    }
+                  : {}),
+                createdAt: timestamp,
+                updatedAt: timestamp,
+                snapshotHash,
+              }
+            : {
+                resourceType,
+                id,
+                name: String(input.name ?? input.title ?? resourceType),
+                title: String(input.title ?? input.name ?? resourceType),
+                description: String(input.description ?? ""),
+                url: `https://linear.app/e2e/${resourceType}/${id}`,
+                createdAt: timestamp,
+                updatedAt: timestamp,
+                attributes: JSON.parse(JSON.stringify(input)),
+                snapshotHash,
+              };
+          state.records.set(id, record);
+          return {
+            success: true,
+            operationKey: operation,
+            operationName: operation,
+            resourceType,
+            acknowledgedAt: timestamp,
+          };
         }
       },
     };
@@ -838,7 +1099,11 @@ async function installFixedLinearPublicationClient(page: Page): Promise<void> {
         "Connection discovery did not bind the fixed Linear destination.",
       );
     }
-    obsidianWindow.__e2eFixedLinearPublication = { state, original };
+    obsidianWindow.__e2eFixedLinearPublication = {
+      state,
+      original,
+      fakeClient,
+    };
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
 }
 
@@ -850,6 +1115,20 @@ async function readFixedLinearPublicationState(
   issueGetCalls: number;
   issue: any | null;
   checkpoint: any | null;
+  hierarchyCreateCalls: number;
+  hierarchyRecords: any[];
+  hierarchyCheckpoint: any | null;
+  missionSnapshot: any | null;
+  toolFailures: Array<{
+    name: string;
+    code: string;
+    message: string;
+  }>;
+  runErrors: Array<{
+    id: string;
+    code: string;
+    message: string;
+  }>;
 }> {
   return page.evaluate(
     async ({ pluginId, notePath }) => {
@@ -872,7 +1151,79 @@ async function readFixedLinearPublicationState(
       const checkpoint =
         checkpoints.find(
           (candidate: any) => candidate?.artifact?.notePath === notePath,
+          ) ?? null;
+      const hierarchyNamespace =
+        plugin.researchProjectHierarchyCheckpointNamespace;
+      const hierarchyCheckpoints =
+        hierarchyNamespace?.checkpoints &&
+        typeof hierarchyNamespace.checkpoints === "object"
+          ? Object.values(hierarchyNamespace.checkpoints)
+          : [];
+      const hierarchyCheckpoint =
+        hierarchyCheckpoints.find(
+          (candidate: any) =>
+            candidate?.items?.some?.(
+              (item: any) => item.kind === "project",
+          ),
         ) ?? null;
+      const bufferedEvents = (
+        Array.isArray(plugin.runCoordinator?.bufferedEvents)
+          ? plugin.runCoordinator.bufferedEvents
+          : []
+      );
+      const toolFailures = bufferedEvents
+        .filter((event: any) => event?.key === "onToolDone")
+        .map((event: any) => event?.args?.[0])
+        .filter((event: any) => event?.ok === false)
+        .map((event: any) => ({
+          name: String(event?.name ?? "unknown"),
+          code: String(event?.error?.code ?? "unknown"),
+          message: String(event?.error?.message ?? event?.message ?? ""),
+        }));
+      const runErrors = bufferedEvents
+        .filter((event: any) => event?.key === "onTrace")
+        .map((event: any) => event?.args?.[0])
+        .filter((event: any) => event?.kind === "error" || event?.error)
+        .map((event: any) => ({
+          id: String(event?.id ?? "unknown"),
+          code: String(event?.error?.code ?? "unknown"),
+          message: String(event?.error?.message ?? event?.message ?? ""),
+        }));
+      const runSnapshot =
+        typeof plugin.getMissionRunSnapshot === "function"
+          ? plugin.getMissionRunSnapshot()
+          : null;
+      const redactedMissionSnapshot = runSnapshot
+        ? {
+            lastComplete: runSnapshot.lastComplete
+              ? JSON.parse(JSON.stringify(runSnapshot.lastComplete))
+              : null,
+            diagnosticAttestations: Array.isArray(
+              runSnapshot.diagnosticAttestations,
+            )
+              ? JSON.parse(JSON.stringify(runSnapshot.diagnosticAttestations))
+              : [],
+            lastMissionGraph: runSnapshot.lastMissionGraph
+              ? {
+                  nodes: Object.fromEntries(
+                    Object.entries(runSnapshot.lastMissionGraph.nodes ?? {}).map(
+                      ([id, node]: [string, any]) => [
+                        id,
+                        {
+                          id,
+                          status: node?.status,
+                          allowedTools: Array.isArray(node?.allowedTools)
+                            ? [...node.allowedTools]
+                            : [],
+                          effect: node?.effect,
+                        },
+                      ],
+                    ),
+                  ),
+                }
+              : null,
+          }
+        : null;
       return {
         createCalls: fixed.state.calls.filter(
           (call: any) => call.operationKey === "issues.create",
@@ -886,6 +1237,16 @@ async function readFixedLinearPublicationState(
         checkpoint: checkpoint
           ? JSON.parse(JSON.stringify(checkpoint))
           : null,
+        hierarchyCreateCalls: fixed.state.records.size,
+        hierarchyRecords: [...fixed.state.records.values()].map((record: any) =>
+          JSON.parse(JSON.stringify(record)),
+        ),
+        hierarchyCheckpoint: hierarchyCheckpoint
+          ? JSON.parse(JSON.stringify(hierarchyCheckpoint))
+          : null,
+        missionSnapshot: redactedMissionSnapshot,
+        toolFailures,
+        runErrors,
       };
     },
     { pluginId: NATIVE_CORE_PLUGIN_ID, notePath: acceptedNotePath },
@@ -982,6 +1343,41 @@ async function cleanupResearchPublication(
     });
   }
   if (cleanupError) throw cleanupError;
+}
+
+async function cleanupResearchProjectHierarchy(
+  page: Page,
+): Promise<{ removed: number; remaining: number }> {
+  return page.evaluate((pluginId) => {
+    const obsidianWindow = window as typeof window & {
+      app?: any;
+      __e2eFixedLinearPublication?: any;
+    };
+    const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+    const fixed = obsidianWindow.__e2eFixedLinearPublication;
+    const checkpoints = Object.values(
+      plugin?.researchProjectHierarchyCheckpointNamespace?.checkpoints ?? {},
+    ) as any[];
+    const complete = checkpoints.find(
+      (candidate) => candidate?.status === "complete",
+    );
+    if (!complete || !(fixed?.state?.records instanceof Map)) {
+      throw new Error("The marker-owned hierarchy cleanup state is unavailable.");
+    }
+    let removed = 0;
+    for (const item of complete.items ?? []) {
+      if (fixed.state.records.delete(String(item.resourceId ?? ""))) {
+        removed += 1;
+      }
+    }
+    const remaining = fixed.state.records.size;
+    if (remaining !== 0) {
+      throw new Error(
+        `Marker-owned hierarchy cleanup left ${remaining} resource(s).`,
+      );
+    }
+    return { removed, remaining };
+  }, NATIVE_CORE_PLUGIN_ID);
 }
 
 async function installFixedLinearQueueClient(

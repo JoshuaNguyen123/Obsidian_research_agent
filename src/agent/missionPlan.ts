@@ -1426,7 +1426,11 @@ function isGenericWriteTool(tool: string): boolean {
 
 function isExternalActionTool(tool: string): boolean {
   return (
-    (tool === "publish_research_to_linear" || /^(?:linear|github)_/u.test(tool)) &&
+    (
+      tool === "publish_research_to_linear" ||
+      tool === "publish_research_project_to_linear" ||
+      /^(?:linear|github)_/u.test(tool)
+    ) &&
     !/_(?:read|get|list|search|find|inspect|resolve)(?:_|$)/u.test(tool)
   );
 }

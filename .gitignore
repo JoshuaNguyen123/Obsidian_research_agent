@@ -18,6 +18,20 @@ yarn-error.log*
 pnpm-debug.log*
 *.log
 
+# Local database state and crash-recovery sidecars
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Local environment and editor state
 .env
 .env.*

@@ -3,10 +3,12 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 
 import {
   createPhase4GitFixture,
+  createPhase4TypeScriptProjectFixture,
   type Phase4GitFixture,
 } from "./fixtures/phase4GitRepo";
 import {
@@ -18,24 +20,208 @@ import {
   type Phase4ToolCatalogEntry,
   startPhase4Harness,
 } from "./fixtures/phase4Harness";
+import { startRealAiHarness } from "./fixtures/realAiHarness";
+import { liveProviderConfiguration } from "../scripts/ci-sandbox-boundary";
 
 const SUITE_TIMEOUT_MS = 420_000;
 const MISSION_TIMEOUT_MS = 240_000;
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+const LIVE_CODE_LANE = (process.env.E2E_PLAYWRIGHT_LANE ?? "")
+  .split(",")
+  .includes("daily-use-code-live");
 
-test.describe("Phase 4 built-in Code capability production boundaries", () => {
+test.describe("Daily-use Code capability production boundaries", () => {
   test.describe.configure({ timeout: SUITE_TIMEOUT_MS });
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
 
   let harness: Phase4Harness | null = null;
 
   test.beforeAll(async () => {
+    if (LIVE_CODE_LANE) return;
     harness = await startPhase4Harness("phase4-code");
   });
 
   test.afterAll(async () => {
     await harness?.close();
+  });
+
+  test("DU-03 protected real-model TypeScript project creation, validation, README, commit, and readback", async ({}, testInfo) => {
+    test.skip(
+      !LIVE_CODE_LANE,
+      "The real-model code proof runs only in the targeted protected daily-use-code-live lane.",
+    );
+    test.setTimeout(45 * 60_000);
+    const startedAt = Date.now();
+    const marker = `DU03_LIVE_${startedAt}`;
+    const fixture = await createPhase4TypeScriptProjectFixture(marker);
+    const workspaceId = `du03-live-${startedAt}`;
+    let liveHarness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
+    let verifiedWorktree: { root: string; branch: string } | null = null;
+    try {
+      liveHarness = await startRealAiHarness(
+        "du03-protected-real-model-code",
+        {
+          missionTimeoutMs: 40 * 60_000,
+          completionTimeoutMs: 40 * 60_000,
+        },
+        {
+          maxAgentSteps: 80,
+          maxRunMinutes: 40,
+          orchestratorEnabled: false,
+          completionDrivenLoops: true,
+        },
+      );
+      const sandboxConfig = liveProviderConfiguration("wsl2");
+      const sandboxProbe = await liveHarness.page.evaluate(
+        async ({ codePluginId, config }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const code = app?.plugins?.plugins?.["agentic-researcher"]
+            ?.getBundledCapability?.(codePluginId);
+          if (!code?.configureSandboxProvider || !code?.probeConfiguredSandboxProviders) {
+            throw new Error("The built-in Code sandbox configuration API is unavailable.");
+          }
+          await code.configureSandboxProvider(config);
+          const status = await code.probeConfiguredSandboxProviders();
+          const persisted = code.readState?.()?.sandbox?.lastProbe ?? null;
+          return { status, persisted };
+        },
+        { codePluginId: PHASE4_CODE_PLUGIN_ID, config: sandboxConfig },
+      );
+      expect(sandboxProbe.status).toMatchObject({
+        executionAvailable: true,
+        selectedProvider: "wsl2",
+      });
+      expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? ""))).toBeGreaterThanOrEqual(
+        startedAt,
+      );
+
+      const requestId = `du03-request-${startedAt}`;
+      const mission = [
+        `Implement a complete TypeScript math package in the exact trusted local repository ${fixture.root}.`,
+        `Create repository workspace ${workspaceId} and use one repair request id ${requestId} for every validation and commit call.`,
+        "Create exactly src/math.ts, src/index.ts, test/math.test.mjs, and README.md; do not change package.json, scripts/verify-project.mjs, workflows, hooks, or any other path.",
+        `src/math.ts must export a working add(left, right) function and an exported marker equal to ${marker}. src/index.ts must re-export the public API.`,
+        `The Node test must execute the add behavior and verify marker ${marker}. README.md must document npm test and include ${marker}.`,
+        "Detect the repository profile, read back every created file, run targeted validation, then run a distinct fresh full validation, create one local commit with message feat: add protected TypeScript math package, and independently read the exact commit SHA back.",
+        "Use the visible exact approval surface whenever required. Stop only after a verified_code_publication_handoff proves the four changed paths, targeted and fresh-full validation, clean worktree, and commit readback.",
+      ].join(" ");
+      await liveHarness.submitMission(mission, {
+        waitForCompletion: false,
+        timeoutMs: 40 * 60_000,
+      });
+      const approvals = await liveHarness.approveUntilMissionComplete(
+        40 * 60_000,
+      );
+      const snapshot = await liveHarness.attestProductionRun({
+        requireStructuredRouting: true,
+      });
+      const statusResult = await executeReadOnlyCodeTool(
+        liveHarness.page,
+        "code_workspace_status",
+        { workspaceId },
+        `Read back exact workspace ${workspaceId} after the protected mission.`,
+      );
+      const workspaceStatus = requireRecord(
+        toolOutput(statusResult),
+        "protected TypeScript workspace status",
+      );
+      const manifest = requireRecord(
+        workspaceStatus.manifest,
+        "protected TypeScript workspace manifest",
+      );
+      const repositoryBinding = requireRecord(
+        manifest.repositoryBinding,
+        "protected TypeScript repository binding",
+      );
+      const profileKey = requireString(
+        repositoryBinding.profileKey,
+        "protected TypeScript profile key",
+      );
+      const handoff = await liveHarness.page.evaluate(
+        async ({ codePluginId, profileKey }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const code = app?.plugins?.plugins?.["agentic-researcher"]
+            ?.getBundledCapability?.(codePluginId);
+          return code?.resolveVerifiedCodePublicationHandoff?.(profileKey) ?? null;
+        },
+        { codePluginId: PHASE4_CODE_PLUGIN_ID, profileKey },
+      );
+      expect(handoff?.status, JSON.stringify({
+        complete: snapshot.lastComplete,
+        acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
+        graph: snapshot.lastMissionGraph?.routing ?? null,
+      })).toBe("verified");
+      if (!handoff) throw new Error("Protected DU-03 did not produce a verified code handoff.");
+      expect(handoff.workspaceId).toBe(workspaceId);
+      expect(handoff.baseSha).toBe(fixture.baseSha);
+      expect(handoff.parentSha).toBe(fixture.baseSha);
+      expect(handoff.commitSha).toMatch(/^[a-f0-9]{40}$/u);
+      expect(handoff.targetedValidationReceiptId).not.toBe(
+        handoff.fullValidationReceiptId,
+      );
+      expect(handoff.targetedValidationFingerprint).toMatch(FINGERPRINT_PATTERN);
+      expect(handoff.fullValidationFingerprint).toMatch(FINGERPRINT_PATTERN);
+      expect([...handoff.changedPaths].sort()).toEqual([
+        "README.md",
+        "src/index.ts",
+        "src/math.ts",
+        "test/math.test.mjs",
+      ]);
+      verifiedWorktree = {
+        root: handoff.canonicalWorktreeRoot,
+        branch: handoff.branch,
+      };
+      const worktree = await fixture.inspectWorktree(handoff.canonicalWorktreeRoot);
+      expect(worktree.head).toBe(handoff.commitSha);
+      expect(worktree.status).toBe("");
+      expect(worktree.changedPaths).toEqual([...handoff.changedPaths].sort());
+      expect(worktree.files["src/math.ts"]).toMatch(/export\s+function\s+add/iu);
+      expect(worktree.files["src/math.ts"]).toContain(marker);
+      expect(worktree.files["src/index.ts"]).toMatch(/export/iu);
+      expect(worktree.files["test/math.test.mjs"]).toMatch(/add/iu);
+      expect(worktree.files["README.md"]).toContain(marker);
+      expect(await fixture.head()).toBe(fixture.baseSha);
+      expect(await fixture.status()).toBe("");
+
+      await recordDailyUseAcceptance(
+        testInfo,
+        "DU-03",
+        {
+          artifacts: [
+            "code:source_files",
+            "code:tests",
+            "code:readme",
+            "git:local_commit",
+          ],
+          proofs: [
+            "code:trusted_repository",
+            "code:durable_workspace",
+            "sandbox:boundary_attested",
+            "validation:targeted",
+            "validation:fresh_full",
+            "git:commit_readback",
+          ],
+          approvals: ["approval:sandbox_execution"],
+          bindings: ["git:commit_artifacts"],
+          cleanup: [],
+        },
+        {
+          modelCalls: snapshot.modelCallEvidence.length,
+          toolCalls: snapshot.missionEvidence.length,
+          approvals,
+        },
+        { requireComplete: true },
+      );
+    } finally {
+      if (verifiedWorktree) {
+        await fixture
+          .removeOwnedWorktree(verifiedWorktree.root, verifiedWorktree.branch)
+          .catch(() => undefined);
+      }
+      await liveHarness?.close().catch(() => undefined);
+      await fixture.cleanup();
+    }
   });
 
   test("managed metadata boundary supports durable CRUD and restart with hashes and trash/restore receipts", async () => {
@@ -230,7 +416,7 @@ test.describe("Phase 4 built-in Code capability production boundaries", () => {
     }
   });
 
-  test("DU-03 fixture Git repair commits only after targeted and fresh-full validation, or exposes a durable production blocker", async () => {
+  test("DU-03 fixture Git repair commits only after targeted and fresh-full validation, or exposes a durable production blocker", async ({}, testInfo) => {
     test.setTimeout(SUITE_TIMEOUT_MS);
     const active = requireHarness(harness);
     const fixture = await createPhase4GitFixture(active.marker);
@@ -403,6 +589,23 @@ test.describe("Phase 4 built-in Code capability production boundaries", () => {
       expect(worktree.source).toContain("return left + right");
       expect(await fixture.head()).toBe(fixture.baseSha);
       expect(await fixture.status()).toBe("");
+      await recordDailyUseAcceptance(testInfo, "DU-03", {
+        artifacts: ["code:source_files", "git:local_commit"],
+        proofs: [
+          "code:trusted_repository",
+          "code:durable_workspace",
+          "sandbox:boundary_attested",
+          "validation:targeted",
+          "validation:fresh_full",
+          "git:commit_readback",
+        ],
+        approvals: ["approval:sandbox_execution"],
+        bindings: ["git:commit_artifacts"],
+        cleanup: [],
+      }, {
+        toolCalls: repairRun.approvals.length + 4,
+        approvals: repairRun.approvals.length,
+      });
     } finally {
       await cleanupOwnedRepositoryWorkspace(active, fixture, workspaceId, workspaceStatus);
       await fixture.cleanup();
@@ -441,6 +644,32 @@ test.describe("Phase 4 built-in Code capability production boundaries", () => {
 function requireHarness(harness: Phase4Harness | null): Phase4Harness {
   if (!harness) throw new Error("Phase 4 harness did not start.");
   return harness;
+}
+
+async function executeReadOnlyCodeTool(
+  page: Page,
+  name: string,
+  args: Record<string, unknown>,
+  prompt: string,
+): Promise<any> {
+  return page.evaluate(
+    async ({ toolName, toolArgs, originalPrompt }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const core = app?.plugins?.plugins?.["agentic-researcher"];
+      if (!core?.createToolRegistry || !core?.createToolExecutionContext) {
+        throw new Error("Core tool execution API is unavailable.");
+      }
+      return core.createToolRegistry().execute(
+        {
+          id: `du03-readback-${toolName}-${Date.now()}`,
+          name: toolName,
+          arguments: toolArgs,
+        },
+        core.createToolExecutionContext(originalPrompt),
+      );
+    },
+    { toolName: name, toolArgs: args, originalPrompt: prompt },
+  );
 }
 
 function missingTools(

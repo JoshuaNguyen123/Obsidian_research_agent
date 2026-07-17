@@ -55,6 +55,7 @@ const WORKSPACE_READS = new Set([
   "read_workspace_file",
 ]);
 const MEMORY_READS = new Set(["memory_search"]);
+const MEMORY_DELETES = new Set(["memory_forget", "memory_clear_experience"]);
 const CREATE_TOOLS = new Set([
   "create_design_canvas",
   "create_design_package",
@@ -137,6 +138,16 @@ export function descriptorFor(toolName: string): ToolDescriptor {
   }
   if (MEMORY_READS.has(toolName)) {
     return readDescriptor(toolName, "workspace", "memory");
+  }
+  if (MEMORY_DELETES.has(toolName)) {
+    return legacyActionDescriptor(toolName, "workspace", "memory", "delete", {
+      effect: "destructive_mutation",
+      risk: "high",
+      journal: false,
+      receipt: true,
+      approvalFallback: "exact",
+      preparation: "optional",
+    });
   }
   if (CREATE_TOOLS.has(toolName)) {
     return legacyMutationDescriptor(toolName, "create");

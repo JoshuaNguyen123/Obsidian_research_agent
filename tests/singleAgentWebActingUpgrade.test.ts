@@ -149,13 +149,17 @@ test("companion client parses health, browser observation, and memory responses"
   );
   assert.deepEqual(
     await client.writeMemory({
+      vaultScopeId: "vault_test_scope",
       kind: "episodic",
       content: "Observed a page.",
       confidence: 0.9,
     }),
     { id: "mem-1" },
   );
-  assert.deepEqual(await client.searchMemory({ query: "page" }), { results: [] });
+  assert.deepEqual(
+    await client.searchMemory({ vaultScopeId: "vault_test_scope", query: "page" }),
+    { results: [] },
+  );
 });
 
 test("companion client formats HTTP errors and aborts timed out requests", async () => {

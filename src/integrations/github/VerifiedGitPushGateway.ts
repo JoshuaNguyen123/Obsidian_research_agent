@@ -191,6 +191,19 @@ export class VerifiedGitPushGatewayV1 {
           environment,
           input.signal,
         );
+        const beforeBaseSha = await this.readRemoteRefSha(
+          prepared.handoff,
+          prepared.remoteUrl,
+          prepared.handoff.baseBranch,
+          environment,
+          input.signal,
+        );
+        if (beforeBaseSha && beforeBaseSha !== prepared.handoff.baseSha) {
+          throw new VerifiedGitPushErrorV1(
+            "remote_non_fast_forward",
+            "Remote base branch does not match the exact verified local base SHA; publication cannot rewrite or force-update it.",
+          );
+        }
         if (beforeRemoteSha && beforeRemoteSha !== prepared.handoff.commitSha) {
           await this.assertFastForward(
             prepared.handoff,
@@ -212,7 +225,10 @@ export class VerifiedGitPushGatewayV1 {
           beforeRemoteSha,
           expectedCommitSha: prepared.handoff.commitSha,
           status: "dispatching",
-          dispatchCount: beforeRemoteSha === prepared.handoff.commitSha ? 0 : 1,
+          dispatchCount:
+            beforeRemoteSha === prepared.handoff.commitSha && beforeBaseSha
+              ? 0
+              : 1,
           reconciliationKey: `github-ref:${prepared.binding.owner}/${prepared.binding.repository}:refs/heads/${prepared.handoff.branch}`,
           startedAt,
           updatedAt: startedAt,
@@ -224,7 +240,10 @@ export class VerifiedGitPushGatewayV1 {
           if (concurrent) return resultFromPrior(concurrent);
           throw new VerifiedGitPushErrorV1("attempt_store_conflict", "Git push attempt could not be claimed durably.");
         }
-        if (beforeRemoteSha === prepared.handoff.commitSha) {
+        if (
+          beforeRemoteSha === prepared.handoff.commitSha &&
+          beforeBaseSha === prepared.handoff.baseSha
+        ) {
           return this.completeVerified(
             attempt,
             prepared,
@@ -234,14 +253,27 @@ export class VerifiedGitPushGatewayV1 {
         }
         let pushResult: VerifiedGitCommandResultV1;
         try {
+          const refspecs = [
+            ...(beforeBaseSha
+              ? []
+              : [
+                  `${prepared.handoff.baseSha}:refs/heads/${prepared.handoff.baseBranch}`,
+                ]),
+            ...(beforeRemoteSha === prepared.handoff.commitSha
+              ? []
+              : [
+                  `${prepared.handoff.commitSha}:refs/heads/${prepared.handoff.branch}`,
+                ]),
+          ];
           pushResult = await this.runGit(
             prepared.handoff.canonicalWorktreeRoot,
             [
               "push",
+              "--atomic",
               "--porcelain",
               "--no-verify",
               prepared.remoteUrl,
-              `${prepared.handoff.commitSha}:refs/heads/${prepared.handoff.branch}`,
+              ...refspecs,
             ],
             environment,
             input.signal,
@@ -267,6 +299,19 @@ export class VerifiedGitPushGatewayV1 {
           return this.markReconcileRequired(
             attempt,
             "Remote branch readback did not match the expected verified commit.",
+          );
+        }
+        const observedBase = await this.readRemoteRefSha(
+          prepared.handoff,
+          prepared.remoteUrl,
+          prepared.handoff.baseBranch,
+          environment,
+          input.signal,
+        );
+        if (observedBase !== prepared.handoff.baseSha) {
+          return this.markReconcileRequired(
+            attempt,
+            "Remote base branch readback did not match the exact verified local base SHA.",
           );
         }
         return this.completeVerified(
@@ -308,6 +353,19 @@ export class VerifiedGitPushGatewayV1 {
           return this.markReconcileRequired(attempt, safeDiagnostic(error));
         }
         if (observed === prepared.handoff.commitSha) {
+          const observedBase = await this.readRemoteRefSha(
+            prepared.handoff,
+            prepared.remoteUrl,
+            prepared.handoff.baseBranch,
+            askpassEnvironment(handle),
+            input.signal,
+          );
+          if (observedBase !== prepared.handoff.baseSha) {
+            return this.markReconcileRequired(
+              attempt,
+              "Remote feature branch is present, but the exact verified base branch readback is missing or drifted.",
+            );
+          }
           return this.completeVerified(
             attempt,
             prepared,
@@ -428,7 +486,23 @@ export class VerifiedGitPushGatewayV1 {
     environment: Readonly<Record<string, string>>,
     signal?: AbortSignal,
   ): Promise<string | null> {
-    const ref = `refs/heads/${handoff.branch}`;
+    return this.readRemoteRefSha(
+      handoff,
+      remoteUrl,
+      handoff.branch,
+      environment,
+      signal,
+    );
+  }
+
+  private async readRemoteRefSha(
+    handoff: VerifiedCodePublicationHandoffV1,
+    remoteUrl: string,
+    branch: string,
+    environment: Readonly<Record<string, string>>,
+    signal?: AbortSignal,
+  ): Promise<string | null> {
+    const ref = `refs/heads/${branch}`;
     const result = await this.runGit(
       handoff.canonicalWorktreeRoot,
       ["ls-remote", "--heads", remoteUrl, ref],

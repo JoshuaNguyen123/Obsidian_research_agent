@@ -125,6 +125,31 @@ test("run planner keeps thinking mode resolution with planner boundary", () => {
   );
 });
 
+test("provider backlink preservation does not trigger vault graph retrieval", () => {
+  const prompt = [
+    "Turn this accepted research into a Linear initiative, project, and dependency-aware issues.",
+    "Use one exact grouped approval, independently read every object back, and preserve the note backlink.",
+  ].join(" ");
+  const plan = createRunPlan({
+    prompt,
+    missionIntent: missionIntent({
+      mode: "explicit_file_mutation",
+      explicitMutation: true,
+      requireWriteCompletion: true,
+    }),
+    tools: [
+      "get_note_graph_context",
+      "publish_research_project_to_linear",
+    ].map((name) => tool(name)),
+    settings: settings(),
+    streamingWritebackKind: null,
+    directCurrentNoteWritebackKind: null,
+  });
+
+  assert.equal(plan.traceReasons.includes("graph_connection_intent"), false);
+  assert.notEqual(plan.slowPathReason, "needs_graph_context");
+});
+
 test("compound title and current-note content reserves rename, writeback, and correction steps", () => {
   const plan = createRunPlan({
     prompt:

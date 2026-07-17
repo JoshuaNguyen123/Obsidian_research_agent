@@ -1,6 +1,7 @@
 export * from "./GitHubRestClient";
 export * from "./GitHubAuth";
 export * from "./TrustedGitHubRepositoryBindingV1";
+export * from "./TrustedGitHubRepositoryBindingV2";
 export * from "./VerifiedGitPushGateway";
 export * from "./SecureGitPushRuntime";
 export * from "./GitHubReviewRepairCoordinatorV1";

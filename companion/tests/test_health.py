@@ -53,6 +53,8 @@ def test_health_and_status_require_authentication(companion_client):
         ("POST", "/browser/extract_markdown"),
         ("POST", "/memory/write"),
         ("POST", "/memory/search"),
+        ("POST", "/memory/delete"),
+        ("POST", "/memory/clear"),
         ("POST", "/jobs"),
         ("POST", "/worker/heartbeat"),
         ("GET", "/jobs"),

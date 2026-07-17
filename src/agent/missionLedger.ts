@@ -24,6 +24,11 @@ import { withSerializedRunWrite } from "./runStore";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
 import type { ModelUsageAggregateV1 } from "../model/modelCallEvidence";
 import { normalizeOrchestratorSnapshot } from "../orchestrator/orchestratorStore";
+import {
+  parseContinuationHandoffV1,
+  type ContinuationHandoffV1,
+} from "./continuationMemory";
+import type { ReflexCheckpointReceiptV1 } from "./reflex/types";
 
 const MAX_CLAIM_PASSAGES = 64;
 
@@ -191,6 +196,12 @@ export interface MissionLedger {
   lastSafeStep: number;
   continuationCommand: string;
   continuationPrompt?: string;
+  /** Fingerprinted state required before compacting or resuming a run. */
+  continuationHandoff?: ContinuationHandoffV1;
+  /** Transient fail-closed marker when persisted handoff parsing failed. */
+  continuationHandoffInvalid?: true;
+  /** Redacted reflex metadata only; prompts and model text are never persisted. */
+  reflexCheckpoints?: ReflexCheckpointReceiptV1[];
 }
 
 export interface MissionLedgerWriteResult {
@@ -326,6 +337,7 @@ export function createMissionLedger({
     resumeCount: 0,
     lastSafeStep: 0,
     continuationCommand: getContinuationCommand(runId),
+    reflexCheckpoints: [],
   };
 }
 
@@ -1033,7 +1045,56 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
     continuationCommand:
       getString(value.continuationCommand) ?? getContinuationCommand(runId),
     continuationPrompt: getString(value.continuationPrompt),
+    ...(() => {
+      try {
+        return value.continuationHandoff
+          ? { continuationHandoff: parseContinuationHandoffV1(value.continuationHandoff) }
+          : {};
+      } catch {
+        return { continuationHandoffInvalid: true as const };
+      }
+    })(),
+    reflexCheckpoints: Array.isArray(value.reflexCheckpoints)
+      ? value.reflexCheckpoints
+          .map(normalizeReflexCheckpointReceipt)
+          .filter((item): item is ReflexCheckpointReceiptV1 => item !== null)
+          .slice(-64)
+      : [],
   };
+}
+
+function normalizeReflexCheckpointReceipt(
+  value: unknown,
+): ReflexCheckpointReceiptV1 | null {
+  if (!isRecord(value)) return null;
+  const checkpoint = value.checkpoint;
+  const label = value.label;
+  const confidenceBand = value.confidenceBand;
+  const reasonCode = value.reasonCode;
+  if (
+    value.version !== 1 ||
+    typeof value.runId !== "string" ||
+    ![
+      "initial_routing",
+      "material_context_change",
+      "terminal_attempt",
+      "retryable_recovery",
+    ].includes(String(checkpoint)) ||
+    typeof label !== "string" ||
+    !["low", "medium", "high"].includes(String(confidenceBand)) ||
+    typeof reasonCode !== "string" ||
+    typeof value.applied !== "boolean" ||
+    typeof value.actionCount !== "number" ||
+    typeof value.evidenceCount !== "number" ||
+    typeof value.receiptCount !== "number" ||
+    (value.frontierFingerprint !== null && typeof value.frontierFingerprint !== "string") ||
+    typeof value.observedAt !== "string" ||
+    typeof value.fingerprint !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/.test(value.fingerprint)
+  ) {
+    return null;
+  }
+  return value as unknown as ReflexCheckpointReceiptV1;
 }
 
 function normalizeApprovalRecord(value: unknown): MissionApprovalRecord | null {

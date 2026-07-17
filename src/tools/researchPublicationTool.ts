@@ -10,6 +10,7 @@ import type { JsonSchemaObject } from "../model/types";
 import type { AuthorityGrantV1 } from "../agent/authority";
 import {
   ResearchPublicationWorkflow,
+  type AcceptedResearchArtifactV1,
   type AcceptedResearchNotePackageV1,
   type ResearchPublicationDestinationV1,
   type ResearchPublicationExactApprovalRequestV1,
@@ -42,6 +43,10 @@ export interface CreateResearchPublicationToolOptionsV1 {
   validateTrustedBindings(package_: AcceptedResearchNotePackageV1): void;
   mintOneActionGrant(input: ResearchPublicationGrantInputV1): Promise<AuthorityGrantV1>;
   persistExternalReceipt(receipt: ActionReceipt): Promise<void>;
+  persistAcceptedProjectLineage?(input: {
+    artifact: AcceptedResearchArtifactV1;
+    package: AcceptedResearchNotePackageV1;
+  }): Promise<void>;
   isAvailable?: () => boolean;
   now?: () => Date;
 }
@@ -156,6 +161,12 @@ export function createResearchPublicationTool(
         note,
         destination: options.destination,
       });
+      if ("artifact" in result) {
+        await options.persistAcceptedProjectLineage?.({
+          artifact: result.artifact,
+          package: note.package,
+        });
+      }
       if (!result.ok && result.status !== "waiting_obsidian") {
         throw new ToolExecutionError(
           result.status === "denied" ? "approval_denied" : result.error.code,

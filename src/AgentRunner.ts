@@ -83,9 +83,22 @@ import {
   PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
 } from "./tools/researchPublicationTool";
 import {
+  hasExplicitResearchProjectHierarchyIntent,
+  PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+} from "./tools/researchProjectHierarchyTool";
+import {
   hasExplicitGitHubPublicationIntent,
   PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
 } from "./tools/githubPublicationTool";
+import {
+  CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  hasExplicitPrivateGitHubRepositoryCreationIntent,
+} from "./tools/githubPrivateRepositoryTool";
+import {
+  DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  hasExplicitPrivateGitHubRepositoryCleanupIntent,
+} from "./tools/githubPrivateRepositoryCleanupTool";
+import { detectProjectLifecycleStagesV1 } from "./agent/projectLifecycle";
 import {
   GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES,
   GITHUB_CATALOG_MUTATION_TOOL_NAMES,
@@ -268,10 +281,13 @@ import {
   type VaultMutationTransaction,
 } from "./agent/vaultTransactions";
 import {
+  buildContinuationHandoffV1,
   buildContinuationMemoryBundle,
   formatContinuationBundleForPrompt,
   recordContinuationLoad,
+  validateContinuationHandoffV1,
 } from "./agent/continuationMemory";
+import { buildReflexCheckpointReceiptV1 } from "./agent/reflex/checkpointReceipt";
 import {
   formatMissionPlanForPrompt,
   formatMissionPlanNextActionPrompt,
@@ -780,6 +796,7 @@ interface CheckpointResumeState {
   missionResume?: MissionResumeContext;
   runtimeSnapshot?: MissionRuntimeSnapshotV2;
   missingRequestedRunId?: string;
+  invalidHandoffRunId?: string;
 }
 
 const SYSTEM_PROMPT = `You are an agentic research assistant running inside Obsidian.
@@ -1741,6 +1758,16 @@ export async function runAgentMission({
     completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
     return;
   }
+  if (checkpointResumeContext?.invalidHandoffRunId) {
+    const invalidRunId = checkpointResumeContext.invalidHandoffRunId;
+    const message =
+      `Run ${invalidRunId} has an invalid fingerprinted continuation handoff. ` +
+      "Refusing to resume because graph, evidence, approval, or binding state could be lost.";
+    events.onStatus?.(message);
+    emitDirectAssistantAnswer(message, events, true);
+    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
   const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
   const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
   if (resumeLedger && checkpointResumeContext?.missionResume?.plan.canResume === false) {
@@ -2016,8 +2043,15 @@ export async function runAgentMission({
         const installedToolNames = new Set(
           toolRegistry.getDefinitions().map((definition) => definition.function.name),
         );
+        const proofBoundProviderLifecycle =
+          isProofBoundProviderLifecycleWithoutPublicWeb({
+            prompt: activeIntentPrompt,
+            missionIntent,
+            requiredToolNames: requiredWriteTools,
+          });
         const postAcceptanceToolNames =
           runToolContext.settings?.researchMemoryEnabled === true &&
+          !proofBoundProviderLifecycle &&
           hasWebSearchIntent(activeIntentPrompt) &&
           !missionIntent.requireWriteCompletion &&
           installedToolNames.has("append_research_memory")
@@ -2063,11 +2097,13 @@ export async function runAgentMission({
           generated: analyzeGeneratedOutputPrompt(activeIntentPrompt),
           configuredMaxSteps: runToolContext.settings?.maxAgentSteps,
         });
-        const bootstrapResearchPlan = createResearchPlan({
-          prompt: activeIntentPrompt,
-          missionIntent,
-          runPlan,
-        });
+        const bootstrapResearchPlan = proofBoundProviderLifecycle
+          ? null
+          : createResearchPlan({
+              prompt: activeIntentPrompt,
+              missionIntent,
+              runPlan,
+            });
         const requiredGraphFetchCount = requiresWebEvidenceProof(
           activeIntentPrompt,
           missionIntent,
@@ -2135,8 +2171,13 @@ export async function runAgentMission({
               "create_file",
             ].includes(name),
         );
+        const explicitGraphLifecycleToolNames = proofBoundProviderLifecycle
+          ? runnerOwnedGraphToolNames
+          : [];
         const explicitGraphWorkflowToolNames =
-          explicitGraphCodeToolNames.length > 0
+          explicitGraphLifecycleToolNames.length > 0
+            ? explicitGraphLifecycleToolNames
+            : explicitGraphCodeToolNames.length > 0
             ? explicitGraphCodeToolNames
             : explicitGraphDesignToolNames.length > 0
               ? explicitGraphDesignToolNames
@@ -2772,6 +2813,23 @@ export async function runAgentMission({
     configuredMaxSteps: getConfiguredMaxAgentSteps(runToolContext.settings),
     requestedSteps: parseExplicitModelStepTarget(activeIntentPrompt),
   });
+  const proofBoundProviderLifecycle =
+    isProofBoundProviderLifecycleWithoutPublicWeb({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      requiredToolNames: requiredWriteTools,
+    });
+  if (proofBoundProviderLifecycle) {
+    loopBudgetPlan = {
+      ...loopBudgetPlan,
+      toolStepBudget: Math.max(
+        loopBudgetPlan.toolStepBudget,
+        requiredWriteTools.length,
+      ),
+      expectedTools: [...new Set(requiredWriteTools)],
+      stopWhenSatisfied: true,
+    };
+  }
   const explicitLoopCodeToolNames = getExplicitCodeToolNames(
     activeIntentPrompt,
   ).filter((name) => allowedToolNames.has(name));
@@ -2831,11 +2889,13 @@ export async function runAgentMission({
       },
     };
   }
-  researchPlan = createResearchPlan({
-    prompt: activeIntentPrompt,
-    missionIntent,
-    runPlan,
-  });
+  researchPlan = proofBoundProviderLifecycle
+    ? null
+    : createResearchPlan({
+        prompt: activeIntentPrompt,
+        missionIntent,
+        runPlan,
+      });
   const restoredResearchPlan =
     resumeSnapshot?.researchPlan ?? resumeLedger?.researchPlan;
   if (restoredResearchPlan) {
@@ -2966,6 +3026,7 @@ export async function runAgentMission({
     requiredWriteTools,
     researchPlan,
     streamingWritebackKind,
+    proofBoundProviderLifecycle,
   });
   if (currentNoteContext !== null) {
     markOperationGoalDone(operationGoals, "read_current_note");
@@ -3944,6 +4005,37 @@ export async function runAgentMission({
     }
     await persistRuntimeSnapshot(traceId);
   };
+  const recordReflexCheckpoint = (
+    checkpoint:
+      | "initial_routing"
+      | "material_context_change"
+      | "terminal_attempt"
+      | "retryable_recovery",
+  ) => {
+    if (!missionLedger) return;
+    const receipt = buildReflexCheckpointReceiptV1({
+      runId,
+      checkpoint,
+      decision: reflexOutput.intent,
+      actionCount: recentActions.length,
+      evidenceCount: missionEvidenceRecords.length,
+      receiptCount: writeReceipts.length,
+      frontierFingerprint:
+        (missionGraphSession?.graph ?? missionGraph)?.capabilityEnvelope
+          .fingerprint ?? null,
+      observedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+    });
+    missionLedger.reflexCheckpoints = [
+      ...(missionLedger.reflexCheckpoints ?? []),
+      receipt,
+    ].slice(-64);
+    events.onTrace?.({
+      id: `reflex-checkpoint:${checkpoint}:${missionLedger.reflexCheckpoints.length}`,
+      kind: "status",
+      message: `Recorded ${checkpoint.replace(/_/g, " ")} reflex checkpoint.`,
+      outputPreview: receipt,
+    });
+  };
   const preflight = runDependencyPreflight(
     getFatalDependencyRowsForPreflight({
       rows: dependencyStatus,
@@ -4453,6 +4545,7 @@ export async function runAgentMission({
     nextAction?: string,
     suppressAutoContinuation = false,
   ) => {
+    recordReflexCheckpoint("terminal_attempt");
     if (missionPlan && lastFinalOutput.trim()) {
       applyMissionPlanAdvance(
         advanceMissionPlanFromFinalOutput({
@@ -6914,6 +7007,15 @@ export async function runAgentMission({
       name: recordedToolCall.name,
       ok: result.ok,
       signature: `${recordedToolCall.name}:${stableStringify(recordedToolCall.arguments)}`,
+      stateFingerprint: await sha256MissionFingerprint({
+        frontier:
+          (missionGraphSession?.graph ?? missionGraph)?.capabilityEnvelope
+            .fingerprint ?? null,
+        evidence: missionEvidenceRecords.map((item) => item.id).sort(),
+        receipts: writeReceipts
+          .map((item) => item.id ?? item.message)
+          .sort(),
+      }),
     });
 
     if (backgroundSubmitted) {
@@ -7241,7 +7343,13 @@ export async function runAgentMission({
       receipts: writeReceipts,
       settings: runToolContext.settings,
       embeddingProvider: runToolContext.semanticEmbeddingProvider,
+      checkpoint: "material_context_change",
+      frontierFingerprint:
+        (missionGraphSession?.graph ?? missionGraph)?.capabilityEnvelope
+          .fingerprint ?? null,
     });
+    recordReflexCheckpoint("material_context_change");
+    await persistMissionLedger(`mission-ledger-reflex-material-${step}`);
 
     return result;
   };
@@ -7321,6 +7429,7 @@ export async function runAgentMission({
       missionEvidence: missionEvidenceRecords,
     }).length === 0;
   };
+  recordReflexCheckpoint("initial_routing");
   await persistMissionLedger("mission-ledger-start");
 
   const compactedConversation =
@@ -8125,11 +8234,33 @@ export async function runAgentMission({
       missionLedger &&
       shouldCompactLoopMessages(messages, runContextBudget)
     ) {
-      const compacted = compactLoopMessages({
-        messages,
+      const handoff = buildContinuationHandoffV1({
         ledger: missionLedger,
-        maxPromptChars: runContextBudget.maxPromptChars,
+        graph: missionGraphSession?.graph ?? missionGraph,
+        now: runToolContext.now?.() ?? new Date(),
       });
+      const handoffValidation = validateContinuationHandoffV1(handoff);
+      if (handoffValidation.ok) {
+        missionLedger.continuationHandoff = handoff;
+        missionLedger.continuationHandoffInvalid = undefined;
+        await persistMissionLedger(`mission-ledger-compaction-handoff-${step}`);
+      }
+      const compacted = handoffValidation.ok
+        ? compactLoopMessages({
+            messages,
+            ledger: missionLedger,
+            maxPromptChars: runContextBudget.maxPromptChars,
+            handoff,
+          })
+        : {
+            applied: false,
+            messages: [...messages],
+            missionStateMessage: null,
+            compactedToolMessages: 0,
+            estimatedCharsBefore: estimatedPromptCharsForRun,
+            estimatedCharsAfter: estimatedPromptCharsForRun,
+            rejectionReason: "invalid_handoff" as const,
+          };
       if (compacted.applied) {
         messages.splice(0, messages.length, ...compacted.messages);
         estimatedPromptCharsForRun = compacted.estimatedCharsAfter;
@@ -8138,7 +8269,9 @@ export async function runAgentMission({
         );
       } else {
         events.onStatus?.(
-          `Context compaction was not applied because it did not reduce the ${compacted.estimatedCharsBefore}-character estimate.`,
+          compacted.rejectionReason === "invalid_handoff"
+            ? "Context compaction was rejected because its continuation handoff failed validation."
+            : `Context compaction was not applied because it did not reduce the ${compacted.estimatedCharsBefore}-character estimate.`,
         );
       }
       events.onTrace?.({
@@ -8147,13 +8280,18 @@ export async function runAgentMission({
         step,
         message: compacted.applied
           ? "Compacted loop context before model call."
-          : "Rejected non-reducing loop context compaction.",
+          : compacted.rejectionReason === "invalid_handoff"
+            ? "Rejected loop context compaction with an invalid continuation handoff."
+            : "Rejected non-reducing loop context compaction.",
         outputPreview: {
           applied: compacted.applied,
           estimated_prompt_chars_before: compacted.estimatedCharsBefore,
           estimated_prompt_chars_after: compacted.estimatedCharsAfter,
           compacted_tool_messages: compacted.compactedToolMessages,
           num_ctx: modelOptions?.num_ctx ?? null,
+          rejection_reason: compacted.rejectionReason ?? null,
+          continuation_handoff_fingerprint:
+            handoffValidation.ok ? handoff.fingerprint : null,
         },
       });
       events.onRunConfig?.(
@@ -10100,6 +10238,7 @@ export async function runAgentMission({
       continue;
     }
     if (loopDecision.action === "reflect_and_replan" && missionPlan && step < stepLimit) {
+      recordReflexCheckpoint("retryable_recovery");
       const failedAction = recentActions.at(-1)?.name;
       const boundedRecovery = decideRecoveryAction({
         plan: missionPlan,
@@ -10669,6 +10808,31 @@ async function buildCheckpointResumeContext({
       toolContext,
     });
     if (missionResume) {
+      const storedHandoff = missionResume.ledger.continuationHandoff;
+      const handoffValidation = storedHandoff
+        ? validateContinuationHandoffV1(storedHandoff)
+        : null;
+      if (
+        missionResume.ledger.continuationHandoffInvalid === true ||
+        (handoffValidation && !handoffValidation.ok)
+      ) {
+        events.onTrace?.({
+          id: "mission-ledger-resume:invalid-handoff",
+          kind: "error",
+          message: `Run ${missionResume.ledger.runId} has an invalid continuation handoff.`,
+          outputPreview: {
+            runId: missionResume.ledger.runId,
+            errors:
+              handoffValidation && !handoffValidation.ok
+                ? handoffValidation.errors
+                : ["persisted_handoff_parse_failed"],
+          },
+        });
+        return {
+          promptContext: "",
+          invalidHandoffRunId: missionResume.ledger.runId,
+        };
+      }
       const storedRuntime = await readMissionRuntimeSnapshotByRunId(
         toolContext,
         missionResume.ledger.runId,
@@ -12884,6 +13048,8 @@ const WRITE_TOOL_NAMES = new Set([
     ),
   ),
   PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+  PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+  CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
   PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
   "open_web_source",
   "create_design_canvas",
@@ -12923,9 +13089,12 @@ const WRITE_TOOL_NAMES = new Set([
 
 const DELETE_TOOL_NAMES = new Set([
   ...GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES,
+  DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
   "delete_path",
   "delete_current_file",
   "delete_research_memory_entry",
+  "memory_forget",
+  "memory_clear_experience",
 ]);
 
 const ALL_OPERATION_GOALS: OperationGoal[] = [
@@ -13050,6 +13219,8 @@ const MEMORY_TOOL_NAMES = new Set([
   "memory_write_task_summary",
   "memory_write_procedural",
   "memory_write_source",
+  "memory_forget",
+  "memory_clear_experience",
 ]);
 
 type ToolAuthority = "read" | "write" | "edit" | "delete" | "web" | "code";
@@ -13167,6 +13338,8 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   memory_write_task_summary: "write",
   memory_write_procedural: "write",
   memory_write_source: "write",
+  memory_forget: "delete",
+  memory_clear_experience: "delete",
   rebuild_semantic_index: "write",
 };
 
@@ -13388,10 +13561,38 @@ function getAllowedToolDefinitions(
       );
     }
 
+    if (name === PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) {
+      return (
+        settings?.linearEnabled === true &&
+        linearIntent.explicit &&
+        hasExplicitResearchProjectHierarchyIntent(prompt)
+      );
+    }
+
     if (name === PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME) {
+      const lifecycleStages = detectProjectLifecycleStagesV1(prompt);
+      const compoundPrivatePublication =
+        lifecycleStages.length > 1 &&
+        lifecycleStages.includes("private_github_publication");
       return (
         hasExplicitGitHubPublicationIntent(prompt) &&
+        (compoundPrivatePublication ||
+          !hasExplicitPrivateGitHubRepositoryCreationIntent(prompt)) &&
         preparedBackgroundGitHubNames.size === 0
+      );
+    }
+
+    if (name === CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME) {
+      return (
+        settings?.githubEnabled === true &&
+        hasExplicitPrivateGitHubRepositoryCreationIntent(prompt)
+      );
+    }
+
+    if (name === DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME) {
+      return (
+        settings?.githubEnabled === true &&
+        hasExplicitPrivateGitHubRepositoryCleanupIntent(prompt)
       );
     }
 
@@ -13905,7 +14106,10 @@ function isToolWithinAutonomyScope(
   }
 
   if (MEMORY_TOOL_NAMES.has(name)) {
-    return name === "memory_search" ? true : scope.write.researchMemory;
+    return name === "memory_search"
+      ? true
+      : scope.write.researchMemory &&
+          (!DELETE_TOOL_NAMES.has(name) || intent.explicitDelete);
   }
 
   if (name === "replace_current_file") {
@@ -13947,12 +14151,14 @@ function createMissionOperationGoals({
   requiredWriteTools,
   researchPlan,
   streamingWritebackKind,
+  proofBoundProviderLifecycle = false,
 }: {
   prompt: string;
   allowedToolNames: Set<string>;
   requiredWriteTools: string[];
   researchPlan?: ResearchPlan | null;
   streamingWritebackKind: StreamingWritebackKind | null;
+  proofBoundProviderLifecycle?: boolean;
 }): MissionOperationGoals {
   const goals = Object.fromEntries(
     ALL_OPERATION_GOALS.map((goal) => [goal, "not_requested" as const]),
@@ -13963,19 +14169,21 @@ function createMissionOperationGoals({
     }
   };
 
-  for (const toolName of getMissingRequiredWebToolNames({
-    prompt,
-    allowedToolNames,
-    executedWebSearchTool: false,
-    executedWebFetchTool: false,
-    researchPlan,
-    missionEvidence: [],
-  })) {
-    if (toolName === "web_search") {
-      requestGoal("web_search");
-    }
-    if (toolName === "web_fetch") {
-      requestGoal("web_fetch");
+  if (!proofBoundProviderLifecycle) {
+    for (const toolName of getMissingRequiredWebToolNames({
+      prompt,
+      allowedToolNames,
+      executedWebSearchTool: false,
+      executedWebFetchTool: false,
+      researchPlan,
+      missionEvidence: [],
+    })) {
+      if (toolName === "web_search") {
+        requestGoal("web_search");
+      }
+      if (toolName === "web_fetch") {
+        requestGoal("web_fetch");
+      }
     }
   }
 
@@ -14165,26 +14373,114 @@ function isBroadUnscopedMutationPrompt(prompt: string): boolean {
   );
 }
 
+const PROOF_BOUND_PROVIDER_LIFECYCLE_TOOL_NAMES = new Set<string>([
+  PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+  PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+  CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+  DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+]);
+
+function isProofBoundProviderLifecycleWithoutPublicWeb(input: {
+  prompt: string;
+  missionIntent: MissionIntent;
+  requiredToolNames: readonly string[];
+}): boolean {
+  return (
+    input.requiredToolNames.some((name) =>
+      PROOF_BOUND_PROVIDER_LIFECYCLE_TOOL_NAMES.has(name),
+    ) && !requiresWebEvidenceProof(input.prompt, input.missionIntent)
+  );
+}
+
 function getRequiredWriteToolNames(
   prompt: string,
   allowedToolNames: Set<string>,
   missionIntent: MissionIntent,
   streamingWritebackKind: StreamingWritebackKind | null = null,
 ): string[] {
+  const lifecycleStages = detectProjectLifecycleStagesV1(prompt);
+  const compoundLifecycle = lifecycleStages.length > 1;
+  const lifecycleRequiredToolNames: string[] = [];
+  if (compoundLifecycle) {
+    if (
+      lifecycleStages.includes("accepted_research") &&
+      lifecycleStages.includes("linear_hierarchy") &&
+      allowedToolNames.has(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME)
+    ) {
+      lifecycleRequiredToolNames.push(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME);
+    }
+    if (
+      lifecycleStages.includes("linear_hierarchy") &&
+      allowedToolNames.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME)
+    ) {
+      lifecycleRequiredToolNames.push(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME);
+    }
+    if (lifecycleStages.includes("code_execution")) {
+      lifecycleRequiredToolNames.push(...getRequiredCodeWorkflowToolNames(prompt));
+    }
+    if (lifecycleStages.includes("private_github_publication")) {
+      if (allowedToolNames.has(CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME)) {
+        lifecycleRequiredToolNames.push(CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME);
+      }
+      if (allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME)) {
+        lifecycleRequiredToolNames.push(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME);
+      }
+    }
+    // A compound project lifecycle is already represented by its ordered,
+    // composite stage tools. Do not infer unrelated vault write tools from
+    // words such as "note", "file", or a requested .md destination inside
+    // the accepted-research package. Those extra mutations are neither part
+    // of the lifecycle contract nor needed to create its host-owned note and
+    // would consume the fixed mission-graph frontier before publication.
+    return [...new Set(lifecycleRequiredToolNames)].filter((name) =>
+      allowedToolNames.has(name),
+    );
+  }
   if (
+    !compoundLifecycle &&
+    allowedToolNames.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) &&
+    hasExplicitResearchProjectHierarchyIntent(prompt)
+  ) {
+    return [PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME];
+  }
+  if (
+    !compoundLifecycle &&
     allowedToolNames.has(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) &&
     hasExplicitResearchPublicationIntent(prompt)
   ) {
     return [PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME];
   }
+  const explicitlyNamedLinearMutations = getExplicitLinearMutationToolNames(
+    prompt,
+    allowedToolNames,
+  );
+  if (!compoundLifecycle && explicitlyNamedLinearMutations.length > 0) {
+    return explicitlyNamedLinearMutations;
+  }
   const preparedBackgroundGitHubTools =
     getRequestedPreparedBackgroundGitHubTools(prompt).filter((name) =>
       allowedToolNames.has(name),
     );
-  if (preparedBackgroundGitHubTools.length > 0) {
+  if (!compoundLifecycle && preparedBackgroundGitHubTools.length > 0) {
     return preparedBackgroundGitHubTools;
   }
   if (
+    !compoundLifecycle &&
+    allowedToolNames.has(CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME) &&
+    hasExplicitPrivateGitHubRepositoryCreationIntent(prompt)
+  ) {
+    return [CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME];
+  }
+  if (
+    !compoundLifecycle &&
+    allowedToolNames.has(DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME) &&
+    hasExplicitPrivateGitHubRepositoryCleanupIntent(prompt)
+  ) {
+    return [DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME];
+  }
+  if (
+    !compoundLifecycle &&
     allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME) &&
     hasExplicitGitHubPublicationIntent(prompt)
   ) {
@@ -14194,16 +14490,16 @@ function getRequiredWriteToolNames(
     getExplicitGitHubCatalogMutationToolNames(prompt).filter((name) =>
       allowedToolNames.has(name),
     );
-  if (explicitGitHubMutationToolNames.length > 0) {
+  if (!compoundLifecycle && explicitGitHubMutationToolNames.length > 0) {
     return explicitGitHubMutationToolNames;
   }
   const explicitCodeToolNames = getExplicitCodeToolNames(prompt).filter((name) =>
     allowedToolNames.has(name),
   );
-  if (explicitCodeToolNames.length > 0) {
+  if (!compoundLifecycle && explicitCodeToolNames.length > 0) {
     return explicitCodeToolNames;
   }
-  const requiredToolNames: string[] = [];
+  const requiredToolNames: string[] = [...lifecycleRequiredToolNames];
   const wholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
   const noteOutputIntent = missionIntent.noteOutput;
   const specializedDesignWorkflow =
@@ -14364,7 +14660,27 @@ function getRequiredWriteToolNames(
 
   requiredToolNames.push(...getRequiredCodeWorkflowToolNames(prompt));
 
-  return requiredToolNames.filter((name) => allowedToolNames.has(name));
+  return [...new Set(requiredToolNames)].filter((name) =>
+    allowedToolNames.has(name),
+  );
+}
+
+function getExplicitLinearMutationToolNames(
+  prompt: string,
+  allowedToolNames: ReadonlySet<string>,
+): string[] {
+  if (!detectLinearIntent(prompt).explicit) return [];
+  const normalized = prompt.toLowerCase();
+  return [...allowedToolNames]
+    .filter(
+      (name) =>
+        name.startsWith("linear_") &&
+        !/^linear_(?:get|list|search)_/u.test(name) &&
+        normalized.includes(name.toLowerCase()),
+    )
+    .map((name) => ({ name, index: normalized.indexOf(name.toLowerCase()) }))
+    .sort((left, right) => left.index - right.index)
+    .map(({ name }) => name);
 }
 
 function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
@@ -15932,9 +16248,13 @@ function hasWordCountIntent(prompt: string): boolean {
 }
 
 function hasGraphConnectionIntent(prompt: string): boolean {
+  const intentText = prompt.replace(
+    /\bpreserve\b[^.\n]{0,100}\b(?:note\s+)?backlinks?\b/giu,
+    " ",
+  );
   return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
-    prompt,
-  ) && /\b(note|notes|file|files|vault|current|this|active|markdown)\b/i.test(prompt);
+    intentText,
+  ) && /\b(note|notes|file|files|vault|current|this|active|markdown)\b/i.test(intentText);
 }
 
 function hasGraphLinkWriteIntent(prompt: string): boolean {
@@ -16087,7 +16407,7 @@ function hasBrowserAutomationIntent(prompt: string): boolean {
 }
 
 function hasExperienceMemoryIntent(prompt: string): boolean {
-  return /\b(experience\s+memory|episodic\s+memory|semantic\s+memory|procedural\s+memory|source\s+memory|memory\s+search|memory\s+write|store\s+(?:an?\s+)?memory|remember\s+this|learned\s+strategy)\b/i.test(
+  return /\b(experience\s+memory|episodic\s+memory|semantic\s+memory|procedural\s+memory|source\s+memory|memory\s+search|memory\s+write|memory\s+(?:delete|clear|forget)|(?:delete|clear|forget|remove)\s+(?:the\s+|my\s+|this\s+)?(?:experience\s+)?memor(?:y|ies)|store\s+(?:an?\s+)?memory|remember\s+this|learned\s+strategy)\b/i.test(
     prompt,
   );
 }
@@ -17227,7 +17547,9 @@ function getToolPreparationStatus(toolName: string): string | null {
   }
 
   if (MEMORY_TOOL_NAMES.has(toolName)) {
-    return "Writing explicit experience memory...";
+    return DELETE_TOOL_NAMES.has(toolName)
+      ? "Deleting scoped experience memory..."
+      : "Writing explicit experience memory...";
   }
 
   return null;

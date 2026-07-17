@@ -177,6 +177,15 @@
   overflow-wrap: anywhere;
 }
 
+.agentic-researcher-settings .agentic-settings-readiness-evidence {
+  color: var(--text-faint);
+  display: block;
+  font-family: var(--font-monospace);
+  font-size: 0.72em;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
 .agentic-researcher-settings .agentic-settings-readiness-action {
   color: var(--interactive-accent);
   font-size: var(--font-ui-smaller);
@@ -199,13 +208,21 @@
   color: var(--color-green, var(--interactive-accent));
 }
 
-.agentic-researcher-settings .agentic-settings-status-badge.is-needs-setup {
+.agentic-researcher-settings .agentic-settings-status-badge.is-setup-needed {
   color: var(--color-yellow, var(--text-warning));
 }
 
 .agentic-researcher-settings .agentic-settings-status-badge.is-degraded,
-.agentic-researcher-settings .agentic-settings-status-badge.is-approval-required {
+.agentic-researcher-settings .agentic-settings-status-badge.is-approval-needed {
   color: var(--color-orange, var(--text-warning));
+}
+
+.agentic-researcher-settings .agentic-settings-status-badge.is-available {
+  color: var(--text-muted);
+}
+
+.agentic-researcher-settings .agentic-settings-status-badge.is-blocked {
+  color: var(--text-error);
 }
 
 .agentic-researcher-settings .agentic-settings-advanced {
@@ -567,6 +584,45 @@
 
 .agentic-researcher-chat-panel {
   gap: 10px;
+}
+
+.agentic-researcher-first-run {
+  background: linear-gradient(135deg, rgba(92, 255, 141, 0.08), rgba(1, 2, 1, 0.94));
+  border: 1px solid var(--agent-terminal-border);
+  border-radius: 4px;
+  color: var(--agent-terminal-green);
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.agentic-researcher-first-run.is-hidden {
+  display: none;
+}
+
+.agentic-researcher-first-run h3,
+.agentic-researcher-first-run p {
+  margin: 0;
+}
+
+.agentic-researcher-first-run p {
+  color: var(--agent-terminal-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.45;
+}
+
+.agentic-researcher-first-run-kicker {
+  color: #a8ffbf;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  letter-spacing: 0.12em;
+}
+
+.agentic-researcher-first-run-action {
+  background: transparent;
+  border: 1px solid var(--agent-terminal-green);
+  color: var(--agent-terminal-green);
+  justify-self: start;
 }
 
 .agentic-researcher-log {

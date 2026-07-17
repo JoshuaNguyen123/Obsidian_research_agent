@@ -20,6 +20,229 @@ import {
   buildHypothesisSystemHint,
   type ResearchHypothesis,
 } from "./researchHypotheses";
+import type { MissionGraphV3 } from "../../packages/headless-runtime/src/missionGraphV3";
+import { canonicalJson } from "../../packages/headless-runtime/src/canonicalize";
+import { portableSha256Text } from "../../packages/core-api/src/portableSha256";
+
+export interface ContinuationHandoffV1 {
+  version: 1;
+  runId: string;
+  graphFrontier: {
+    missionId: string;
+    revision: number;
+    graphFingerprint: string;
+    activeNodeIds: string[];
+    readyNodeIds: string[];
+  } | null;
+  evidence: Array<{ id: string; fingerprint: string }>;
+  readbackFingerprints: string[];
+  receiptFingerprints: string[];
+  approvals: Array<{ id: string; decision: string; fingerprint: string }>;
+  bindingFingerprints: string[];
+  lineageFingerprints: string[];
+  recovery: {
+    stalledCount: number;
+    lastMeaningfulAction: string | null;
+    remainingActions: string[];
+  };
+  proofDebt: {
+    missing: string[];
+    blocked: boolean;
+    resumeBlocked: boolean;
+  };
+  createdAt: string;
+  fingerprint: string;
+}
+
+export function buildContinuationHandoffV1(input: {
+  ledger: MissionLedger;
+  graph?: MissionGraphV3 | null;
+  lineageFingerprints?: string[];
+  now?: Date;
+}): ContinuationHandoffV1 {
+  const graph = input.graph ?? null;
+  const debt = computeProofDebt(proofDebtSnapshotFromLedger(input.ledger));
+  const graphNodes = graph ? Object.values(graph.nodes) : [];
+  const graphFrontier = graph
+    ? {
+        missionId: graph.missionId,
+        revision: graph.revision,
+        graphFingerprint: fingerprint({
+          missionId: graph.missionId,
+          revision: graph.revision,
+          journalHeadFingerprint: graph.journalHeadFingerprint,
+          nodeStatus: graphNodes
+            .map((node) => ({ id: node.id, status: node.status }))
+            .sort((left, right) => left.id.localeCompare(right.id)),
+        }),
+        activeNodeIds: graphNodes
+          .filter((node) => node.status === "running" || node.status === "waiting_approval")
+          .map((node) => node.id)
+          .sort(),
+        readyNodeIds: graphNodes
+          .filter((node) => node.status === "ready")
+          .map((node) => node.id)
+          .sort(),
+      }
+    : null;
+  const core = {
+    version: 1 as const,
+    runId: input.ledger.runId,
+    graphFrontier,
+    evidence: dedupeBy(
+      [
+        ...input.ledger.evidence.map((item) => ({
+          id: item.id,
+          fingerprint: fingerprint({
+            id: item.id,
+            kind: item.kind,
+            path: item.path ?? null,
+            url: item.url ?? null,
+            sourceId: item.sourceId ?? null,
+            passageIds: item.passageIds ?? (item.passageId ? [item.passageId] : []),
+            confidence: item.confidence,
+          }),
+        })),
+        ...graphNodes.flatMap((node) => node.evidence.map((item) => ({
+          id: item.id,
+          fingerprint: item.fingerprint,
+        }))),
+      ],
+      (item) => `${item.id}:${item.fingerprint}`,
+    ).slice(-64),
+    readbackFingerprints: uniqueSorted(
+      graphNodes
+        .map((node) => node.verification?.fingerprint)
+        .filter((value): value is string => Boolean(value)),
+    ),
+    receiptFingerprints: uniqueSorted([
+      ...input.ledger.receipts.map((id) => fingerprint({ receiptId: id })),
+      ...graphNodes.flatMap((node) => node.receipts.map((item) => item.fingerprint)),
+    ]),
+    approvals: input.ledger.approvals.slice(-32).map((approval) => ({
+      id: approval.id,
+      decision: approval.decision,
+      fingerprint: fingerprint({
+        id: approval.id,
+        toolName: approval.toolName,
+        action: approval.action,
+        decision: approval.decision,
+      }),
+    })),
+    bindingFingerprints: uniqueSorted(
+      graph
+        ? Object.values(graph.capabilityEnvelope.bindings).map(
+            (binding) => binding.destinationFingerprint,
+          )
+        : [],
+    ),
+    lineageFingerprints: uniqueSorted(input.lineageFingerprints ?? []),
+    recovery: {
+      stalledCount: Math.max(0, input.ledger.stalledCount),
+      lastMeaningfulAction: input.ledger.lastMeaningfulAction ?? null,
+      remainingActions: uniqueSorted([
+        ...input.ledger.remainingActions,
+        ...input.ledger.nextActions,
+      ]).slice(0, 32),
+    },
+    proofDebt: {
+      missing: uniqueSorted(debt.missing).slice(0, 64),
+      blocked: debt.blocked,
+      resumeBlocked: debt.resumeBlocked,
+    },
+  };
+  return {
+    ...core,
+    createdAt: (input.now ?? new Date()).toISOString(),
+    fingerprint: fingerprint(core),
+  };
+}
+
+export function validateContinuationHandoffV1(
+  value: unknown,
+): { ok: true; value: ContinuationHandoffV1 } | { ok: false; errors: string[] } {
+  const errors: string[] = [];
+  if (!isRecord(value)) return { ok: false, errors: ["handoff_not_an_object"] };
+  if (value.version !== 1) errors.push("unsupported_version");
+  if (typeof value.runId !== "string" || !value.runId) errors.push("missing_run_id");
+  if (typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))) {
+    errors.push("invalid_created_at");
+  }
+  if (!isFingerprint(value.fingerprint)) errors.push("invalid_fingerprint");
+  for (const key of [
+    "evidence",
+    "readbackFingerprints",
+    "receiptFingerprints",
+    "approvals",
+    "bindingFingerprints",
+    "lineageFingerprints",
+  ] as const) {
+    if (!Array.isArray(value[key])) errors.push(`invalid_${key}`);
+  }
+  if (!isRecord(value.recovery)) errors.push("invalid_recovery");
+  if (!isRecord(value.proofDebt)) errors.push("invalid_proof_debt");
+  if (value.graphFrontier !== null && !isRecord(value.graphFrontier)) {
+    errors.push("invalid_graph_frontier");
+  }
+  if (errors.length > 0) return { ok: false, errors };
+  const { createdAt: _createdAt, fingerprint: stored, ...core } = value;
+  if (fingerprint(core) !== stored) {
+    return { ok: false, errors: ["fingerprint_mismatch"] };
+  }
+  return { ok: true, value: value as unknown as ContinuationHandoffV1 };
+}
+
+export function parseContinuationHandoffV1(value: unknown): ContinuationHandoffV1 {
+  const parsed = validateContinuationHandoffV1(value);
+  if (!parsed.ok) {
+    throw new TypeError(`Invalid ContinuationHandoffV1: ${parsed.errors.join(", ")}`);
+  }
+  return parsed.value;
+}
+
+export function formatContinuationHandoffForPrompt(
+  handoff: ContinuationHandoffV1,
+): string {
+  return [
+    "Canonical continuation handoff (fingerprint validated).",
+    `Fingerprint: ${handoff.fingerprint}`,
+    `Graph frontier: ${handoff.graphFrontier ? `${handoff.graphFrontier.missionId}@${handoff.graphFrontier.revision}; active=${handoff.graphFrontier.activeNodeIds.join(",") || "none"}; ready=${handoff.graphFrontier.readyNodeIds.join(",") || "none"}` : "none"}`,
+    `Evidence: ${handoff.evidence.map((item) => `${item.id}:${item.fingerprint}`).join("; ") || "none"}`,
+    `Readbacks: ${handoff.readbackFingerprints.join(", ") || "none"}`,
+    `Receipts: ${handoff.receiptFingerprints.join(", ") || "none"}`,
+    `Approvals: ${handoff.approvals.map((item) => `${item.id}:${item.decision}:${item.fingerprint}`).join("; ") || "none"}`,
+    `Bindings: ${handoff.bindingFingerprints.join(", ") || "none"}`,
+    `Lineage: ${handoff.lineageFingerprints.join(", ") || "none"}`,
+    `Recovery: stalled=${handoff.recovery.stalledCount}; last=${handoff.recovery.lastMeaningfulAction ?? "none"}; remaining=${handoff.recovery.remainingActions.join("; ") || "none"}`,
+    `Proof debt: blocked=${handoff.proofDebt.blocked}; resumeBlocked=${handoff.proofDebt.resumeBlocked}; missing=${handoff.proofDebt.missing.join(", ") || "none"}`,
+  ].join("\n");
+}
+
+function fingerprint(value: unknown): string {
+  return `sha256:${portableSha256Text(canonicalJson(value))}`;
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values.filter((value) => typeof value === "string" && value))].sort();
+}
+
+function dedupeBy<T>(values: T[], key: (value: T) => string): T[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const identity = key(value);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFingerprint(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
+}
 
 export interface ContinuationMemoryBundle {
   runId: string;

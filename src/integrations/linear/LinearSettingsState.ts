@@ -30,9 +30,13 @@ export function deriveLinearCapabilityGate(
   snapshot: LinearCapabilitySnapshotV1 | null,
 ): LinearCapabilityGate {
   if (!hasCapability(snapshot, "authenticated_connection")) return 0;
-  // Queue and ticket publication need the issue/comment catalog (gate 1).
-  // Project readback is allowed only when project discovery also succeeded.
-  return hasCapability(snapshot, "project_selection") ? 2 : 1;
+  // Ticket publication needs only the authenticated issue/comment catalog.
+  // Project operations additionally need a connection-derived team binding,
+  // while the initiative/project hierarchy is exposed only after the same
+  // fresh probe returned a compatible project binding. Mutations at every gate
+  // remain independently subject to prepared approval and provider readback.
+  if (!hasCapability(snapshot, "team_selection")) return 1;
+  return hasCapability(snapshot, "project_selection") ? 3 : 2;
 }
 
 export function evaluateLinearQueueConfiguration(

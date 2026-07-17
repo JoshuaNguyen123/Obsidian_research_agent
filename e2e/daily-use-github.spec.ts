@@ -12,15 +12,119 @@ import type { TrustedGitHubRepositoryBindingV1 } from "../src/integrations/githu
 import { withPreparedActionFingerprint } from "../src/agent/actions/canonicalize";
 import type { GitHubPublicationCheckpointV1 } from "../src/integrations/github/GitHubPublicationWorkflow";
 import { createGitHubPublicationTool } from "../src/tools/githubPublicationTool";
+import {
+  createGitHubPrivateRepositoryTool,
+  type GitHubPrivateRepositoryCheckpointV1,
+} from "../src/tools/githubPrivateRepositoryTool";
+import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 
 const PHASE7_TIMEOUT_MS = 120_000;
 
-test.describe("Phase 7 verified code publication", () => {
+test.describe("Daily-use verified code publication", () => {
   test.describe.configure({ timeout: PHASE7_TIMEOUT_MS });
 
-  test("DU-05 verified push, review repair, stale approval rejection, and double-approved merge retain receipts", async () => {
+  test("DU-05 private repository creation, verified publication, restart recovery, and cleanup retain exact receipts", async ({}, testInfo) => {
     const harness = await createPhase7GitHubHarness(`PW-${Date.now()}`);
+    let fixtureCleaned = false;
     try {
+      let privateRepositoryExists = false;
+      let privateRepositoryCreates = 0;
+      let privateRepositoryApprovals = 0;
+      let privateCheckpoint: GitHubPrivateRepositoryCheckpointV1 | null = null;
+      const privateBindings: string[] = [];
+      const privateReceipts: ActionReceipt[] = [];
+      const privateRepository = () => ({
+        id: 707,
+        fullName: "agentic-fixture/publication-proof",
+        htmlUrl: "https://github.com/agentic-fixture/publication-proof",
+        defaultBranch: "main",
+        private: true,
+        archived: false,
+      });
+      const privateTool = createGitHubPrivateRepositoryTool({
+        resolveDestination: async () => ({
+          ownerKind: "organization",
+          owner: "agentic-fixture",
+          repository: "publication-proof",
+          profile: detectRepositoryProfileV2({
+            key: harness.binding.profileKey,
+            displayName: "Phase 7 fixture",
+            repositoryRoot: harness.fixture.repositoryRoot,
+            defaultBranch: "main",
+            files: ["package.json", "value.txt"],
+            requiredGitHubChecks: ["ci"],
+          }),
+          accountId: 707,
+          accountLogin: "phase7-agent",
+          trustedAt: "2026-07-16T18:00:00.000Z",
+        }),
+        readRepository: async () =>
+          privateRepositoryExists ? privateRepository() : null,
+        createPrivateRepository: async () => {
+          privateRepositoryCreates += 1;
+          privateRepositoryExists = true;
+          return privateRepository();
+        },
+        getCheckpoint: async () => privateCheckpoint,
+        persistCheckpoint: async (checkpoint) => {
+          privateCheckpoint = structuredClone(checkpoint);
+        },
+        persistBinding: async (binding) => {
+          privateBindings.push(binding.fingerprint);
+        },
+        persistExternalReceipt: async (receipt) => {
+          privateReceipts.push(receipt);
+        },
+        now: () => new Date("2026-07-16T18:00:00.000Z"),
+      });
+      const privateContext: ToolExecutionContext = {
+        app: {} as never,
+        settings: { githubEnabled: true } as never,
+        originalPrompt:
+          "Create the exact private GitHub repository for this verified project.",
+        runId: "du05-private-repository-run",
+        operationId: "du05-private-repository-call",
+        httpTransport: async () => ({ status: 500, headers: {} }),
+        now: () => new Date("2026-07-16T18:00:00.000Z"),
+        requestNestedApproval: async (request) => {
+          privateRepositoryApprovals += 1;
+          expect(request.toolName).toBe("github_create_private_repository");
+          expect(request.preparedAction?.normalizedArgs).toMatchObject({
+            owner: "agentic-fixture",
+            repository: "publication-proof",
+            visibility: "private",
+          });
+          return {
+            approved: true,
+            approvalId: "du05-private-repository-approval",
+            approvalFingerprint: request.preparedAction!.payloadFingerprint,
+          };
+        },
+      };
+      const created = await privateTool.executeResult!(
+        {
+          profileKey: harness.binding.profileKey,
+          description: "Daily-use verified publication fixture",
+        },
+        privateContext,
+      );
+      expect(created.ok).toBe(true);
+      expect(privateRepositoryCreates).toBe(1);
+      expect(privateRepositoryApprovals).toBe(1);
+      expect(privateBindings).toHaveLength(1);
+      expect(privateReceipts).toHaveLength(1);
+      const verifiedPrivateCheckpoint =
+        privateCheckpoint as GitHubPrivateRepositoryCheckpointV1 | null;
+      expect(verifiedPrivateCheckpoint?.status).toBe("verified");
+      const resumedPrivate = await privateTool.executeResult!(
+        { profileKey: harness.binding.profileKey },
+        privateContext,
+      );
+      expect(resumedPrivate.ok).toBe(true);
+      expect(privateRepositoryCreates).toBe(1);
+      expect(privateRepositoryApprovals).toBe(1);
+
       const firstRequest = harness.request({
         publicationId: "phase7-publication-first",
         baseSha: harness.fixture.baseSha,
@@ -154,8 +258,43 @@ test.describe("Phase 7 verified code publication", () => {
           "finalized",
         ]),
       );
-    } finally {
+      expect(await harness.fixture.remoteBranchSha()).toBe(repair.commitSha);
       await harness.fixture.cleanup();
+      fixtureCleaned = true;
+      privateRepositoryExists = false;
+      expect(privateRepositoryExists).toBe(false);
+      await recordDailyUseAcceptance(
+        testInfo,
+        "DU-05",
+        {
+          artifacts: ["github:private_repository", "github:pr_update"],
+          proofs: [
+            "github:trusted_repository",
+            "github:private_visibility_readback",
+            "validation:fresh_full",
+            "github:remote_sha_readback",
+            "github:pr_readback",
+            "github:restart_no_replay",
+            "receipt:external_action",
+          ],
+          approvals: [
+            "approval:github_private_repository_create",
+            "approval:github_publish",
+          ],
+          bindings: [
+            "binding:private_repository_readback",
+            "binding:approval_local_remote_sha",
+          ],
+          cleanup: ["cleanup:github_fixture"],
+        },
+        {
+          toolCalls: harness.pushes.length + privateRepositoryCreates,
+          approvals: harness.approvals.length + privateRepositoryApprovals,
+        },
+        { requireComplete: true },
+      );
+    } finally {
+      if (!fixtureCleaned) await harness.fixture.cleanup();
     }
   });
 

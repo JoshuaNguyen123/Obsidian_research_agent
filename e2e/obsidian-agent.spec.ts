@@ -27,6 +27,7 @@ import {
   DAILY_USE_ACCEPTANCE_V1,
   evaluateDailyUseAcceptanceV1,
 } from "../src/agent/dailyUseAcceptance";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
   createMissionLedger,
   writeMissionLedger,
@@ -3060,7 +3061,7 @@ test("default note writeback streams plain answers to the active note", async ()
   });
 });
 
-test("DU-01 automatic mode creates one collision-free note when no markdown note is active", async () => {
+test("DU-01 automatic mode creates one collision-free note when no markdown note is active", async ({}, testInfo) => {
   await withE2EHarness(
     "du01-no-active-note",
     async ({ page, notePath, input }) => {
@@ -3134,20 +3135,25 @@ test("DU-01 automatic mode creates one collision-free note when no markdown note
         expect(reloadProof.unchanged).toBe(true);
         expect(reloadProof.markerCountBefore).toBeGreaterThan(0);
         expect(reloadProof.markerCountAfter).toBe(reloadProof.markerCountBefore);
+        const observed = {
+          artifacts: ["vault:markdown_note"],
+          proofs: [
+            "vault:collision_free_target",
+            "stream:complete",
+            "receipt:vault_write",
+            "restart:no_replay",
+          ],
+          approvals: [],
+          bindings: [],
+          cleanup: [],
+        };
         expect(
-          evaluateDailyUseAcceptanceV1(DAILY_USE_ACCEPTANCE_V1["DU-01"], {
-            artifacts: ["vault:markdown_note"],
-            proofs: [
-              "vault:collision_free_target",
-              "stream:complete",
-              "receipt:vault_write",
-              "restart:no_replay",
-            ],
-            approvals: [],
-            bindings: [],
-            cleanup: [],
-          }),
+          evaluateDailyUseAcceptanceV1(DAILY_USE_ACCEPTANCE_V1["DU-01"], observed),
         ).toEqual({ status: "pass", missing: [] });
+        await recordDailyUseAcceptance(testInfo, "DU-01", observed, {
+          modelCalls: 1,
+          toolCalls: 1,
+        }, { requireComplete: true });
       } finally {
         await page.evaluate(async ({ createdPath, removeSeed }) => {
           const app = (window as typeof window & { app?: any }).app;

@@ -18,12 +18,50 @@ export type ReflexLabel =
   | "memory_update"
   | "unknown";
 
-export interface ReflexDecision {
+export interface ReflexDecisionV2 {
+  version: 2;
   label: ReflexLabel;
   confidence: number;
+  confidenceBand: "low" | "medium" | "high";
+  winningMargin: number;
   applied: boolean;
   reason: string;
+  reasonCode:
+    | "semantic_match"
+    | "disabled"
+    | "embedding_provider_unavailable"
+    | "low_confidence"
+    | "ambiguous_margin"
+    | "deterministic_authority"
+    | "negated_intent"
+    | "untrusted_content";
+  suggestedAction: string | null;
+  allowedAction: string | null;
   safetyNotes: string[];
+}
+
+export type ReflexDecision = ReflexDecisionV2;
+
+export type ReflexCheckpointKind =
+  | "initial_routing"
+  | "material_context_change"
+  | "terminal_attempt"
+  | "retryable_recovery";
+
+export interface ReflexCheckpointReceiptV1 {
+  version: 1;
+  runId: string;
+  checkpoint: ReflexCheckpointKind;
+  label: ReflexLabel;
+  confidenceBand: ReflexDecisionV2["confidenceBand"];
+  reasonCode: ReflexDecisionV2["reasonCode"];
+  applied: boolean;
+  actionCount: number;
+  evidenceCount: number;
+  receiptCount: number;
+  frontierFingerprint: string | null;
+  observedAt: string;
+  fingerprint: string;
 }
 
 export interface AgentTrajectoryEvent {
@@ -31,6 +69,8 @@ export interface AgentTrajectoryEvent {
   name?: string;
   ok?: boolean;
   signature?: string;
+  /** Same action plus unchanged frontier/evidence state counts as one loop. */
+  stateFingerprint?: string;
 }
 
 export interface ReflexReceiptLike {
@@ -70,6 +110,7 @@ export interface ProgressSignal {
   shouldReflect: boolean;
   shouldStop: boolean;
   reason: string;
+  correction: "none" | "reflect_once" | "block";
 }
 
 export interface CompletionSignal {
@@ -97,6 +138,8 @@ export interface AgenticReflexInput {
   receipts: ReflexReceiptLike[];
   settings?: AgentSettings;
   embeddingProvider?: SemanticEmbeddingProvider;
+  checkpoint?: ReflexCheckpointKind;
+  frontierFingerprint?: string | null;
 }
 
 export interface AgenticReflexOutput {

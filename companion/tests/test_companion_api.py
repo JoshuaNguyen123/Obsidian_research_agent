@@ -296,7 +296,40 @@ def test_memory_api_rejects_legacy_vault_path_instead_of_ignoring_it(companion_c
             "kind": "episodic",
             "content": "safe observation",
             "confidence": 0.9,
+            "vaultScopeId": "vault_" + "a" * 64,
             "vaultPath": "Private/Secrets.md",
         },
     )
     assert response.status_code == 422
+
+
+def test_memory_api_requires_scope_and_deletes_only_within_scope(companion_client):
+    client, headers, _config = companion_client
+    scope = "vault_" + "a" * 64
+    missing_scope = client.post(
+        "/memory/write",
+        headers=headers,
+        json={"kind": "episodic", "content": "safe observation", "confidence": 0.9},
+    )
+    assert missing_scope.status_code == 422
+
+    written = client.post(
+        "/memory/write",
+        headers=headers,
+        json={
+            "vaultScopeId": scope,
+            "kind": "episodic",
+            "content": "safe scoped observation",
+            "confidence": 0.9,
+        },
+    )
+    assert written.status_code == 200
+    memory_id = written.json()["id"]
+    deleted = client.post(
+        "/memory/delete",
+        headers=headers,
+        json={"vaultScopeId": scope, "memoryId": memory_id},
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["deletedIds"] == [memory_id]
+    assert deleted.json()["fingerprint"].startswith("sha256:")

@@ -13,6 +13,7 @@ import {
 import type {
   SandboxProviderConfigV2,
   SandboxProviderKindV2,
+  SandboxCapabilityStatusV2,
 } from "./sandbox";
 import type { CodeRepairRequestV1 } from "./repair";
 import type { VerifiedCodePublicationHandoffV1 } from "@agentic-researcher/core-api";
@@ -143,6 +144,18 @@ export default class AgenticResearcherCodeExtension extends Plugin {
     const runtime = this.runtime;
     if (!runtime) throw new Error("The Agentic Researcher Code runtime is not ready.");
     return runtime.getRepositoryProfile(profileKey);
+  }
+
+  getSandboxCapabilityStatus(): SandboxCapabilityStatusV2 {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("The Agentic Researcher Code runtime is not ready.");
+    return runtime.getSandboxCapabilityStatus();
+  }
+
+  readCapabilityState() {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("The Agentic Researcher Code runtime is not ready.");
+    return runtime.readState();
   }
 
   async createTrustedQueueCodeMissionPrompt(input: {

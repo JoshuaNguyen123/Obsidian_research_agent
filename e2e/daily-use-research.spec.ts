@@ -2,8 +2,9 @@ import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 
-test.describe("live provider contract pack", () => {
+test.describe("Daily-use live research contract", () => {
   test.describe.configure({ mode: "default", timeout: 900_000, retries: 0 });
 
   test("structured plan reads owned notes before one verified append", async () => {
@@ -53,7 +54,7 @@ test.describe("live provider contract pack", () => {
     }
   });
 
-  test("DU-02 proof-gated sourced writeback binds owned fetched passages", async () => {
+  test("DU-02 proof-gated sourced writeback binds owned fetched passages", async ({}, testInfo) => {
     let harness: RealAiHarness | null = null;
     try {
       harness = await startRealAiHarness("live-owned-source-writeback");
@@ -103,6 +104,30 @@ test.describe("live provider contract pack", () => {
         ),
         JSON.stringify(safeState),
       ).toBe(true);
+      await recordDailyUseAcceptance(
+        testInfo,
+        "DU-02",
+        {
+          artifacts: ["vault:cited_findings_section"],
+          proofs: [
+            "evidence:vault",
+            "evidence:web_fetch",
+            "evidence:persisted_passages",
+            "receipt:single_append",
+            "research:conflicts_visible",
+          ],
+          approvals: [],
+          bindings: ["citation:fetched_source"],
+          cleanup: [],
+        },
+        {
+          modelCalls: snapshot.modelCallEvidence.length,
+          toolCalls: snapshot.missionEvidence.filter(
+            (item: any) => item.kind === "tool_result",
+          ).length,
+        },
+        { requireComplete: true },
+      );
     } finally {
       await harness?.close();
     }

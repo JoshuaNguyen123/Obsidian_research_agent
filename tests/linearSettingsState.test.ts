@@ -51,8 +51,30 @@ const snapshot = {
   snapshotHash: `sha256:${"a".repeat(64)}`,
 } as LinearCapabilitySnapshotV1;
 
-test("Linear queue readiness is derived from discovered bindings, not a magic gate", () => {
-  assert.equal(deriveLinearCapabilityGate(snapshot), 2);
+test("Linear queue and hierarchy readiness are derived from discovered bindings, not a magic gate", () => {
+  assert.equal(deriveLinearCapabilityGate(snapshot), 3);
+  assert.equal(
+    deriveLinearCapabilityGate({
+      ...snapshot,
+      capabilities: snapshot.capabilities.map((capability) =>
+        capability.id === "project_selection"
+          ? { ...capability, enabled: false }
+          : capability,
+      ),
+    }),
+    2,
+  );
+  assert.equal(
+    deriveLinearCapabilityGate({
+      ...snapshot,
+      capabilities: snapshot.capabilities.map((capability) =>
+        capability.id === "team_selection" || capability.id === "project_selection"
+          ? { ...capability, enabled: false }
+          : capability,
+      ),
+    }),
+    1,
+  );
   assert.deepEqual(
     evaluateLinearQueueConfiguration(snapshot, {
       teamId: "team-1",

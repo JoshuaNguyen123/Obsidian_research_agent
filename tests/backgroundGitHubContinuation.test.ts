@@ -854,8 +854,8 @@ test("production push writes provider WAL before one verified fast-forward and n
   const push = git.runner.calls.find((call) => gitOperation(call.args) === "push");
   assert.ok(push);
   assert.equal(push!.args.some((argument) => /force/iu.test(argument)), false);
-  assert.deepEqual(push!.args.slice(-5), [
-    "push", "--porcelain", "--no-verify",
+  assert.deepEqual(push!.args.slice(-6), [
+    "push", "--atomic", "--porcelain", "--no-verify",
     "https://github.com/acme/research-agent.git",
     `${COMMIT}:refs/heads/codex/repair-1`,
   ]);
@@ -1712,6 +1712,8 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
     }
     if (operation === "branch") return ok("codex/repair-1");
     if (operation === "ls-remote") {
+      const ref = input.args.at(-1);
+      if (ref === "refs/heads/main") return ok(`${BASE}\t${ref}`);
       return ok(this.remoteSha ? `${this.remoteSha}\trefs/heads/codex/repair-1` : "");
     }
     if (operation === "fetch") { this.fetches += 1; return ok(""); }

@@ -443,8 +443,17 @@ async function createPhase7GitFixture(marker: string): Promise<Phase7GitFixture>
   await git(repositoryRoot, hooksRoot, ["init", "--initial-branch=main"]);
   await git(repositoryRoot, hooksRoot, ["config", "user.name", "Phase 7 E2E"]);
   await git(repositoryRoot, hooksRoot, ["config", "user.email", "phase7-e2e@example.invalid"]);
+  await writeFile(
+    path.join(repositoryRoot, "package.json"),
+    `${JSON.stringify({
+      name: "agentic-phase7-fixture",
+      private: true,
+      scripts: { test: "node --test" },
+    }, null, 2)}\n`,
+    "utf8",
+  );
   await writeFile(path.join(repositoryRoot, "value.txt"), `base:${marker}\n`, "utf8");
-  await git(repositoryRoot, hooksRoot, ["add", "--", "value.txt"]);
+  await git(repositoryRoot, hooksRoot, ["add", "--", "package.json", "value.txt"]);
   await git(repositoryRoot, hooksRoot, ["commit", "-m", "phase7 fixture base"]);
   const baseSha = await git(repositoryRoot, hooksRoot, ["rev-parse", "HEAD"]);
   await git(root, hooksRoot, ["init", "--bare", bareRemoteRoot]);

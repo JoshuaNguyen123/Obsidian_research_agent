@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   SandboxManagerV2,
@@ -393,9 +391,9 @@ function inSequence(values: readonly string[], expected: readonly string[]): boo
   );
 }
 
-const directScript = process.argv[1]
-  ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-  : false;
+const directScript = /(?:^|[\\/])ci-sandbox-boundary\.(?:ts|js|mjs|cjs)$/u.test(
+  process.argv[1] ?? "",
+);
 if (directScript) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));

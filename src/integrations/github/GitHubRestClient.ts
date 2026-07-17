@@ -47,6 +47,13 @@ export interface GitHubRepositoryRecord {
   archived: boolean;
 }
 
+export interface CreatePrivateGitHubRepositoryInput {
+  ownerKind: "user" | "organization";
+  owner: string;
+  repository: string;
+  description?: string;
+}
+
 export interface GitHubReferenceRecord {
   ref: string;
   sha: string;
@@ -211,6 +218,62 @@ export class GitHubRestClient {
   ): Promise<GitHubRepositoryRecord> {
     return normalizeRepository(
       await this.request("GET", repoPath(owner, repository), undefined, signal),
+    );
+  }
+
+  /**
+   * The creation payload is intentionally fixed. In particular, callers
+   * cannot request public visibility, initialize content, or widen unrelated
+   * repository features through model-supplied fields.
+   */
+  async createPrivateRepository(
+    input: CreatePrivateGitHubRepositoryInput,
+    signal?: AbortSignal,
+  ): Promise<GitHubRepositoryRecord> {
+    const owner = validateLogin(input.owner);
+    const repository = validateOwnerRepoSegment(input.repository, "repository");
+    const description = optionalBoundedText(input.description, "description", 1_024);
+    const path = input.ownerKind === "user"
+      ? "/user/repos"
+      : `/orgs/${encodeURIComponent(owner)}/repos`;
+    const created = normalizeRepository(await this.request("POST", path, {
+      name: repository,
+      private: true,
+      visibility: "private",
+      auto_init: false,
+      has_issues: true,
+      has_projects: false,
+      has_wiki: false,
+      ...(description ? { description } : {}),
+    }, signal));
+    if (
+      created.private !== true ||
+      created.archived === true ||
+      created.fullName.toLowerCase() !== `${owner}/${repository}`.toLowerCase()
+    ) {
+      throw invalidResponse(
+        "GitHub did not create the exact active private repository requested.",
+      );
+    }
+    return created;
+  }
+
+  /**
+   * Permanently remove one exact repository. The caller must enforce
+   * disposable ownership and obtain a separate destructive approval before
+   * invoking this fixed endpoint.
+   */
+  async deleteRepository(
+    owner: string,
+    repository: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.request(
+      "DELETE",
+      repoPath(owner, repository),
+      undefined,
+      signal,
+      true,
     );
   }
 
@@ -1409,6 +1472,21 @@ function segment(value: string): string {
   return encodeURIComponent(value);
 }
 
+function validateOwnerRepoSegment(value: string, field: string): string {
+  const normalized = value.trim();
+  if (
+    !OWNER_REPO_PATTERN.test(normalized) ||
+    normalized === "." ||
+    normalized === ".."
+  ) {
+    throw new GitHubApiError(
+      "github_invalid_response",
+      `GitHub ${field} identifier is invalid.`,
+    );
+  }
+  return normalized;
+}
+
 function validateLogin(value: string): string {
   const normalized = value.trim();
   const base = normalized.endsWith("[bot]") ? normalized.slice(0, -5) : normalized;
@@ -1475,6 +1553,15 @@ function boundedText(
     );
   }
   return normalized;
+}
+
+function optionalBoundedText(
+  value: string | undefined,
+  field: string,
+  maximum: number,
+): string | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  return boundedText(value, field, 1, maximum);
 }
 
 function definedBody(body: Record<string, unknown>): Record<string, unknown> {

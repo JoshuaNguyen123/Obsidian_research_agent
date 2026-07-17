@@ -38,6 +38,14 @@ export interface MissionIntent {
 }
 
 export interface ResearchMemoryIndexEntry {
+  /** V2 metadata is additive so existing vault-local indexes remain readable. */
+  version?: 2;
+  id?: string;
+  vaultScopeId?: string;
+  origin?: "vault_local";
+  sourceLabels?: ResearchMemorySourceLabelV2[];
+  createdAt?: string;
+  fingerprint?: string;
   topic: string;
   path: string;
   keywords: string[];
@@ -54,6 +62,23 @@ export interface ResearchMemoryIndexEntry {
   supersededAt?: string;
   supersededById?: string;
   sourceHashes?: Record<string, string>;
+}
+
+export interface ResearchMemorySourceLabelV2 {
+  kind: "note" | "public_url" | "receipt";
+  reference: string;
+  label?: string;
+}
+
+export interface ResearchMemoryRecordV2 extends ResearchMemoryIndexEntry {
+  version: 2;
+  id: string;
+  vaultScopeId: string;
+  origin: "vault_local";
+  sourceLabels: ResearchMemorySourceLabelV2[];
+  createdAt: string;
+  fingerprint: string;
+  verificationState: "unverified" | "verified" | "stale" | "superseded";
 }
 
 export interface ToolExecutionContext {

@@ -624,6 +624,9 @@ function hasGraphConnectionIntent(prompt: string): boolean {
   const intentText = prompt.replace(
     /[A-Za-z0-9 .@()[\]_-]+(?:\/[A-Za-z0-9 .@()[\]_-]+)+\.md\b/giu,
     " [markdown-path] ",
+  ).replace(
+    /\bpreserve\b[^.\n]{0,100}\b(?:note\s+)?backlinks?\b/giu,
+    " ",
   );
   return /\b(graph|backlinks?|outgoing\s+links?|incoming\s+links?|related\s+notes?|semantic(?:ally)?\s+(?:related|connected)|connections?|connected|link(?:ed)?\s+notes?|note\s+relationships?|references?)\b/i.test(
     intentText,

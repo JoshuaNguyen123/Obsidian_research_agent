@@ -37,6 +37,8 @@ export function createCompanionTools(): AgentTool[] {
     memoryWriteTaskSummaryTool,
     memoryWriteProceduralTool,
     memoryWriteSourceTool,
+    memoryForgetTool,
+    memoryClearExperienceTool,
   ];
 }
 
@@ -415,6 +417,7 @@ const memorySearchTool: AgentTool = {
     }
 
     return client(context).searchMemory({
+      vaultScopeId: requireVaultScopeId(context),
       query: getRequiredString(args, "query"),
       kinds: getOptionalMemoryKinds(args.kinds),
       tags: getOptionalStringList(args.tags),
@@ -480,6 +483,7 @@ function createMemoryWriteTool(
       }
 
       const input: MemoryWriteInput = {
+        vaultScopeId: requireVaultScopeId(context),
         kind: getOptionalMemoryKind(args.kind) ?? defaultKind,
         content: getRequiredString(args, "content"),
         confidence: getConfidence(args.confidence),
@@ -493,6 +497,47 @@ function createMemoryWriteTool(
     },
   };
 }
+
+const memoryForgetTool: AgentTool = {
+  name: "memory_forget",
+  description:
+    "Delete one explicit Companion experience-memory record from the current vault scope and return a deletion receipt.",
+  parameters: {
+    type: "object",
+    required: ["memoryId"],
+    properties: { memoryId: { type: "string" } },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const block = await getMemoryBlockReason(context);
+    if (block) return block;
+    return client(context).deleteMemory({
+      vaultScopeId: requireVaultScopeId(context),
+      memoryId: getRequiredString(args, "memoryId"),
+    });
+  },
+};
+
+const memoryClearExperienceTool: AgentTool = {
+  name: "memory_clear_experience",
+  description:
+    "Clear Companion experience-memory records only from the current vault scope, optionally by kind, and return a deletion receipt. Clear chat does not invoke this tool.",
+  parameters: {
+    type: "object",
+    properties: {
+      kinds: { type: "array", items: { type: "string" } },
+    },
+    additionalProperties: false,
+  },
+  async execute(args, context) {
+    const block = await getMemoryBlockReason(context);
+    if (block) return block;
+    return client(context).clearMemory({
+      vaultScopeId: requireVaultScopeId(context),
+      kinds: getOptionalMemoryKinds(args.kinds),
+    });
+  },
+};
 
 async function getMemoryBlockReason(
   context: ToolExecutionContext,
@@ -515,6 +560,17 @@ async function getMemoryBlockReason(
 
 function client(context: ToolExecutionContext): CompanionClient {
   return new CompanionClient(context.settings.companionBaseUrl);
+}
+
+function requireVaultScopeId(context: ToolExecutionContext): string {
+  const scope = context.settings.vaultScopeId;
+  if (typeof scope !== "string" || !/^vault_[a-f0-9]{64}$/.test(scope)) {
+    throw new ToolExecutionError(
+      "invalid_state",
+      "Experience memory requires an initialized vault scope.",
+    );
+  }
+  return scope;
 }
 
 async function getHealth(context: ToolExecutionContext): Promise<CompanionHealth | null> {

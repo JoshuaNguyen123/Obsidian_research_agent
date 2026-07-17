@@ -63,6 +63,9 @@ from schemas import (
     LinearQueueScanFailureRequest,
     LinearQueueRescanRequestV1,
     LinearQueueStatusV1,
+    MemoryClearRequest,
+    MemoryDeleteRequest,
+    MemoryMutationReceiptV1,
     MemorySearchRequest,
     MemorySearchResponse,
     MemoryWriteRequest,
@@ -445,6 +448,14 @@ def create_app(
     @application.post("/memory/search", response_model=MemorySearchResponse)
     async def memory_search(request: MemorySearchRequest) -> MemorySearchResponse:
         return MemorySearchResponse(results=application.state.memory.search(request))
+
+    @application.post("/memory/delete", response_model=MemoryMutationReceiptV1)
+    async def memory_delete(request: MemoryDeleteRequest) -> MemoryMutationReceiptV1:
+        return application.state.memory.delete(request)
+
+    @application.post("/memory/clear", response_model=MemoryMutationReceiptV1)
+    async def memory_clear(request: MemoryClearRequest) -> MemoryMutationReceiptV1:
+        return application.state.memory.clear(request)
 
     @application.post("/jobs", response_model=JobRecord)
     async def create_job(request: JobCreateRequest) -> JobRecord:

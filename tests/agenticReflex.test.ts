@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { AgenticReflexController } from "../src/agent/reflex/AgenticReflexController";
 import { evaluateCompletion } from "../src/agent/reflex/completionEvaluator";
 import { evaluateProgress } from "../src/agent/reflex/progressMonitor";
+import { buildReflexCheckpointReceiptV1 } from "../src/agent/reflex/checkpointReceipt";
 import type { AgenticReflexInput } from "../src/agent/reflex/types";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
 import type { SemanticEmbeddingProvider } from "../src/embeddings/types";
@@ -107,6 +108,8 @@ test("reflex controller classifies semantic vault intent and scores semantic act
   const output = await new AgenticReflexController().evaluate(input());
   assert.equal(output.intent.label, "semantic_vault_search");
   assert.equal(output.intent.reason, "embedding_prototype_match");
+  assert.equal(output.intent.version, 2);
+  assert.ok(output.intent.winningMargin >= 0.08);
   assert.equal(output.actionScores[0].action.toolName, "semantic_search_notes");
 });
 
@@ -133,6 +136,71 @@ test("progress monitor flags repeated no-evidence tool calls", () => {
   );
   assert.equal(progress.shouldStop, true);
   assert.equal(progress.reason, "repeated_tool_calls_without_new_evidence");
+  assert.equal(progress.correction, "block");
+});
+
+test("progress monitor corrects once then blocks an unchanged frontier even with old evidence", () => {
+  const priorEvidence = [{
+    id: "old",
+    kind: "tool_result" as const,
+    title: "Old evidence",
+    summary: "Predates this loop.",
+    confidence: "high" as const,
+  }];
+  const two = evaluateProgress(input({
+    evidence: priorEvidence,
+    recentActions: [
+      { kind: "tool", signature: "same", stateFingerprint: "frontier-a" },
+      { kind: "tool", signature: "same", stateFingerprint: "frontier-a" },
+    ],
+  }));
+  assert.equal(two.shouldReflect, true);
+  assert.equal(two.shouldStop, false);
+  assert.equal(two.correction, "reflect_once");
+  const three = evaluateProgress(input({
+    evidence: priorEvidence,
+    recentActions: [
+      { kind: "tool", signature: "same", stateFingerprint: "frontier-a" },
+      { kind: "tool", signature: "same", stateFingerprint: "frontier-a" },
+      { kind: "tool", signature: "same", stateFingerprint: "frontier-a" },
+    ],
+  }));
+  assert.equal(three.shouldStop, true);
+});
+
+test("explicit negation and deterministic mutation authority override semantic routing", async () => {
+  const negated = await new AgenticReflexController().evaluate(input({
+    prompt: "Do not search my vault; answer only from this prompt.",
+  }));
+  assert.equal(negated.intent.label, "unknown");
+  assert.equal(negated.intent.reasonCode, "negated_intent");
+
+  const mutation = await new AgenticReflexController().evaluate(input({
+    missionIntent: {
+      ...missionIntent,
+      mode: "explicit_file_mutation",
+      explicitMutation: true,
+    },
+  }));
+  assert.equal(mutation.intent.reasonCode, "deterministic_authority");
+});
+
+test("reflex checkpoint receipts contain only redacted metadata and stable counters", async () => {
+  const output = await new AgenticReflexController().evaluate(input());
+  const receipt = buildReflexCheckpointReceiptV1({
+    runId: "run-reflex",
+    checkpoint: "initial_routing",
+    decision: output.intent,
+    actionCount: 2,
+    evidenceCount: 1,
+    receiptCount: 0,
+    frontierFingerprint: `sha256:${"a".repeat(64)}`,
+    observedAt: "2026-07-16T00:00:00.000Z",
+  });
+  const serialized = JSON.stringify(receipt);
+  assert.match(receipt.fingerprint, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(serialized.includes("What do my notes say"), false);
+  assert.equal(receipt.actionCount, 2);
 });
 
 test("completion evaluator requires vault evidence and write receipts", () => {

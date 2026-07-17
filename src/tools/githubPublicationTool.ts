@@ -9,6 +9,7 @@ import {
   type TrustedGitHubPublicationBindingV1,
 } from "../integrations/github/GitHubPublicationWorkflow";
 import type { TrustedGitHubRepositoryBindingV1 } from "../integrations/github/TrustedGitHubRepositoryBindingV1";
+import type { TrustedGitHubRepositoryBindingV2 } from "../integrations/github/TrustedGitHubRepositoryBindingV2";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 
@@ -37,6 +38,7 @@ export interface CreateGitHubPublicationToolOptionsV1 {
 export interface GitHubPublicationBindingResolutionV1 {
   workflowBinding: TrustedGitHubPublicationBindingV1;
   publicationBinding: TrustedGitHubRepositoryBindingV1;
+  privateRepositoryBinding: TrustedGitHubRepositoryBindingV2;
   profile: RepositoryProfileV2;
   completionProof?: "draft_pr" | "merged_pr";
 }

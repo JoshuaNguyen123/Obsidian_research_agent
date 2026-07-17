@@ -9,6 +9,9 @@ import {
   BrowserTypeInput,
   MemorySearchInput,
   MemorySearchResult,
+  MemoryClearInput,
+  MemoryDeleteInput,
+  MemoryMutationReceiptV1,
   MemoryWriteInput,
   SafetyDecision,
 } from "./ToolContracts";
@@ -196,6 +199,14 @@ export class CompanionClient {
       "/memory/search",
       input,
     );
+  }
+
+  async deleteMemory(input: MemoryDeleteInput): Promise<MemoryMutationReceiptV1> {
+    return this.post<MemoryDeleteInput, MemoryMutationReceiptV1>("/memory/delete", input);
+  }
+
+  async clearMemory(input: MemoryClearInput): Promise<MemoryMutationReceiptV1> {
+    return this.post<MemoryClearInput, MemoryMutationReceiptV1>("/memory/clear", input);
   }
 
   private async postBrowser<TResponse>(

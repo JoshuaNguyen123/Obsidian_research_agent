@@ -210,6 +210,7 @@ class MemoryEvidenceRefV1(ClosedModel):
 
 
 class MemoryWriteRequest(ClosedModel):
+    vaultScopeId: str = Field(pattern=r"^vault_[a-f0-9]{64}$")
     kind: Literal["episodic", "semantic", "procedural", "source"]
     content: str = Field(min_length=1, max_length=250_000)
     confidence: float = Field(ge=0, le=1)
@@ -250,6 +251,7 @@ class MemoryWriteResponse(BaseModel):
 
 
 class MemorySearchRequest(ClosedModel):
+    vaultScopeId: str = Field(pattern=r"^vault_[a-f0-9]{64}$")
     query: str = Field(min_length=1, max_length=4_096)
     kinds: list[Literal["episodic", "semantic", "procedural", "source"]] | None = Field(
         default=None, max_length=4
@@ -261,6 +263,7 @@ class MemorySearchRequest(ClosedModel):
 
 class MemorySearchResult(BaseModel):
     id: str
+    vaultScopeId: str
     kind: str
     content: str
     score: float
@@ -274,6 +277,28 @@ class MemorySearchResult(BaseModel):
 
 class MemorySearchResponse(BaseModel):
     results: list[MemorySearchResult]
+
+
+class MemoryDeleteRequest(ClosedModel):
+    vaultScopeId: str = Field(pattern=r"^vault_[a-f0-9]{64}$")
+    memoryId: str = Field(pattern=STABLE_ID_PATTERN.pattern)
+
+
+class MemoryClearRequest(ClosedModel):
+    vaultScopeId: str = Field(pattern=r"^vault_[a-f0-9]{64}$")
+    kinds: list[Literal["episodic", "semantic", "procedural", "source"]] | None = Field(
+        default=None, max_length=4
+    )
+
+
+class MemoryMutationReceiptV1(ClosedModel):
+    version: Literal[1] = 1
+    operation: Literal["delete", "clear"]
+    vaultScopeId: str = Field(pattern=r"^vault_[a-f0-9]{64}$")
+    deletedCount: int = Field(ge=0)
+    deletedIds: list[str] = Field(default_factory=list, max_length=500)
+    observedAt: str
+    fingerprint: str = Field(pattern=FINGERPRINT_PATTERN.pattern)
 
 
 class BackgroundAuthorizationV1(ClosedModel):

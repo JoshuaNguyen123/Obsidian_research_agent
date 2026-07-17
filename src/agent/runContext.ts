@@ -1,5 +1,10 @@
 import type { ModelChatMessage } from "../model/types";
 import type { MissionLedger, MissionEvidence } from "./missionLedger";
+import {
+  formatContinuationHandoffForPrompt,
+  validateContinuationHandoffV1,
+  type ContinuationHandoffV1,
+} from "./continuationMemory";
 
 export const CHARS_PER_TOKEN_ESTIMATE = 4;
 export const DEFAULT_ASSUMED_NUM_CTX = 8192;
@@ -18,6 +23,7 @@ export interface LoopCompactionResult {
   compactedToolMessages: number;
   estimatedCharsBefore: number;
   estimatedCharsAfter: number;
+  rejectionReason?: "invalid_handoff" | "non_reducing";
 }
 
 export function createRunContextBudget(numCtx: number | null): RunContextBudget {
@@ -58,13 +64,26 @@ export function compactLoopMessages({
   ledger,
   keepRecentSteps = KEEP_RECENT_LOOP_STEPS,
   maxPromptChars,
+  handoff,
 }: {
   messages: ModelChatMessage[];
   ledger: MissionLedger;
   keepRecentSteps?: number;
   maxPromptChars?: number;
+  handoff?: ContinuationHandoffV1;
 }): LoopCompactionResult {
   const estimatedCharsBefore = estimatePromptChars(messages);
+  if (handoff && !validateContinuationHandoffV1(handoff).ok) {
+    return {
+      applied: false,
+      messages: [...messages],
+      missionStateMessage: null,
+      compactedToolMessages: 0,
+      estimatedCharsBefore,
+      estimatedCharsAfter: estimatedCharsBefore,
+      rejectionReason: "invalid_handoff",
+    };
+  }
   const attempts = [...new Set([keepRecentSteps, 3, 1, 0])]
     .filter((steps) => steps >= 0 && steps <= keepRecentSteps);
   let best: Omit<LoopCompactionResult, "applied" | "estimatedCharsBefore"> | null = null;
@@ -79,6 +98,7 @@ export function compactLoopMessages({
     const missionStateMessage = buildMissionStateMessage(
       ledger,
       compactedToolMessages,
+      handoff,
     );
     const compactedMessages = [
       ...prefix,
@@ -122,6 +142,7 @@ export function compactLoopMessages({
     compactedToolMessages: 0,
     estimatedCharsBefore,
     estimatedCharsAfter: estimatedCharsBefore,
+    rejectionReason: "non_reducing",
   };
 }
 
@@ -184,6 +205,7 @@ function findRecentLoopStart(
 function buildMissionStateMessage(
   ledger: MissionLedger,
   compactedToolMessages: number,
+  handoff?: ContinuationHandoffV1,
 ): string {
   const evidence = ledger.evidence.slice(-12).map(formatEvidence);
   const milestones = ledger.milestones.slice(-10).map((item) => {
@@ -204,6 +226,7 @@ function buildMissionStateMessage(
     `Mission: ${ledger.mission}`,
     `Status: ${ledger.status}`,
     `Compacted earlier tool messages: ${compactedToolMessages}`,
+    handoff ? formatContinuationHandoffForPrompt(handoff) : null,
     `Route: ${ledger.route}`,
     `Expected tools: ${ledger.loopBudget.expectedTools.join(", ") || "none"}`,
     `Acceptance: ${ledger.acceptance?.status ?? "unchecked"}`,
@@ -220,7 +243,7 @@ function buildMissionStateMessage(
     receipts.length ? receipts.map((id) => `- ${id}`).join("\n") : "none",
     "Recent milestones:",
     milestones.length ? milestones.join("\n") : "none",
-  ].join("\n");
+  ].filter((line): line is string => line !== null).join("\n");
 }
 
 function formatEvidence(item: MissionEvidence): string {

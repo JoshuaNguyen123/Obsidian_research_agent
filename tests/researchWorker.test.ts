@@ -169,6 +169,97 @@ test("deep-research worker rejects an early handoff until three sources are usab
   );
 });
 
+test("research worker performs one bounded alternative read and preserves prior accepted evidence", async () => {
+  const accepted = "https://primary.example/accepted";
+  const unusable = "https://blocked.example/unusable";
+  const alternative = "https://official.example/alternative";
+  const model = sequenceModel([
+    toolResponse("web_search", { query: "bounded alternative evidence" }),
+    toolResponse("web_fetch", { url: accepted }),
+    toolResponse("web_fetch", { url: unusable }),
+    finalResponse("The accepted and alternative sources are ready for the Lead."),
+  ]);
+  const fetched: string[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () => ["web_search", "web_fetch"].map((name) => ({
+      type: "function" as const,
+      function: { name, parameters: { type: "object" } },
+    })),
+    async execute(call) {
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: [accepted, unusable, alternative].map((url, index) => ({
+              title: index === 0 ? "Primary source" : `Source ${index + 1}`,
+              url,
+              snippet: "Candidate",
+            })),
+          },
+        };
+      }
+      const url = String(call.arguments.url);
+      fetched.push(url);
+      if (url === unusable) {
+        return {
+          ok: false,
+          toolName: call.name,
+          error: {
+            code: "source_unusable",
+            message: "No passage-backed content was extractable.",
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: url,
+          url,
+          content:
+            `This fetched passage from ${url} contains detailed, independently verifiable evidence and enough concrete context for a durable research handoff.`,
+          parserStatus: "parsed",
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-alternative",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Gather bounded alternative evidence.",
+    originalMission: "Research this claim using two sources.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 5,
+  });
+
+  assert.deepEqual(fetched, [accepted, unusable, alternative]);
+  assert.equal(result.alternativeSourceReads, 1);
+  assert.equal(result.handoff.status, "ready");
+  assert.equal(
+    result.evidence.filter(
+      (item) =>
+        item.kind === "web_source" &&
+        (item.url === accepted || item.url === alternative),
+    ).length,
+    2,
+  );
+  assert.ok(result.evidence.some((item) => item.url === accepted));
+  assert.ok(result.evidence.some((item) => item.url === alternative));
+  assert.ok(!result.evidence.some((item) => item.url === unusable));
+  assert.equal(
+    Object.values(result.sourceLedger.candidates).filter(
+      (candidate) => candidate.status === "unusable",
+    ).length,
+    1,
+  );
+});
+
 test("read-only worker registry blocks mutation tools without delegation", async () => {
   let delegated = false;
   const registry: ToolRegistry = {

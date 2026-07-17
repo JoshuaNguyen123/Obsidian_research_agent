@@ -11,10 +11,11 @@ import {
   startPhase6LinearHarness,
   type Phase6LinearHarness,
 } from "./fixtures/phase6LinearHarness";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 
 const PHASE6_TIMEOUT_MS = 300_000;
 
-test.describe("Phase 6 Linear integration", () => {
+test.describe("Daily-use Linear integration", () => {
   test.describe.configure({ timeout: PHASE6_TIMEOUT_MS });
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
 
@@ -106,7 +107,7 @@ test.describe("Phase 6 Linear integration", () => {
     }
   });
 
-  test("DU-04 accepted research is note-backed before exact Linear approval and persists verified lineage", async () => {
+  test("DU-04 accepted research creates a verified Linear hierarchy, backlink, and restart-safe dedupe", async ({}, testInfo) => {
     let harness: Phase6LinearHarness | null = null;
     let acceptedNotePath = "";
     try {
@@ -225,6 +226,180 @@ test.describe("Phase 6 Linear integration", () => {
           })
           .first(),
       ).toBeVisible();
+
+      const hierarchyPrompt = [
+        `E2E_LINEAR_PROJECT_HIERARCHY ${harness.marker}:`,
+        "Turn this accepted research into a Linear initiative, project, and dependency-aware issues.",
+        "Use one exact grouped approval, independently read every object back, and preserve the note backlink.",
+      ].join(" ");
+      await harness.submitMission(hierarchyPrompt, { waitForCompletion: false });
+      await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      const hierarchyApproval = harness.activePreparedApproval(
+        "publish_research_project_to_linear",
+      );
+      await expect(hierarchyApproval).toBeVisible({ timeout: 60_000 });
+      await expect(hierarchyApproval).toContainText("exact_grouped_approval");
+      await expect(hierarchyApproval).toContainText("e2e-team");
+      await expect(
+        harness.page
+          .locator(".agentic-researcher-approval-card", {
+            hasText: "publish_research_project_to_linear",
+          })
+          .filter({
+            has: harness.page.locator(
+              "button.agentic-researcher-approval-approve:enabled",
+            ),
+          }),
+      ).toHaveCount(1);
+      await harness.approvePreparedApproval(hierarchyApproval);
+      await harness.waitForMissionComplete(180_000);
+
+      const firstHierarchy =
+        await harness.readResearchPublicationState(acceptedNotePath);
+      expect(
+        firstHierarchy.missionSnapshot?.lastComplete?.stopReason,
+        JSON.stringify(
+          {
+            lastComplete: firstHierarchy.missionSnapshot?.lastComplete,
+            diagnostics:
+              firstHierarchy.missionSnapshot?.diagnosticAttestations,
+            toolFailures: firstHierarchy.toolFailures,
+            runErrors: firstHierarchy.runErrors,
+            graphNodes: Object.values(
+              firstHierarchy.missionSnapshot?.lastMissionGraph?.nodes ?? {},
+            ).map((node: any) => ({
+              id: node.id,
+              status: node.status,
+              tools: node.allowedTools,
+              effect: node.effect,
+            })),
+          },
+          null,
+          2,
+        ),
+      ).toBe("final");
+      expect(
+        firstHierarchy.hierarchyCheckpoint?.status,
+        JSON.stringify(
+          {
+            checkpoint: firstHierarchy.hierarchyCheckpoint,
+            mission: firstHierarchy.missionSnapshot,
+          },
+          null,
+          2,
+        ),
+      ).toBe("complete");
+      expect(firstHierarchy).toMatchObject({
+        hierarchyCreateCalls: 6,
+        hierarchyCheckpoint: { status: "complete" },
+        hierarchyRecords: expect.arrayContaining([
+          expect.objectContaining({ resourceType: "initiative" }),
+          expect.objectContaining({ resourceType: "project" }),
+          expect.objectContaining({ resourceType: "initiative_project_link" }),
+          expect.objectContaining({ resourceType: "issue_relation" }),
+        ]),
+      });
+      expect(firstHierarchy.hierarchyRecords).toHaveLength(6);
+      expect(firstHierarchy.hierarchyCheckpoint).toMatchObject({
+        status: "complete",
+        items: expect.arrayContaining([
+          expect.objectContaining({ kind: "initiative", status: "committed" }),
+          expect.objectContaining({ kind: "project", status: "committed" }),
+          expect.objectContaining({ kind: "issue", status: "committed" }),
+          expect.objectContaining({
+            kind: "issue_relation",
+            status: "committed",
+          }),
+        ]),
+      });
+      expect(
+        firstHierarchy.hierarchyCheckpoint.items.every(
+          (item: any) => typeof item.readbackFingerprint === "string",
+        ),
+      ).toBe(true);
+      await expect
+        .poll(
+          async () => (await readOptionalText(acceptedNoteFilePath)) ?? "",
+          { timeout: 30_000 },
+        )
+        .toContain("## Linear project hierarchy");
+      const noteAfterFirstHierarchy =
+        (await readOptionalText(acceptedNoteFilePath)) ?? "";
+      const backlinkMarkerCount =
+        noteAfterFirstHierarchy.split("<!-- agentic-research-project:").length - 1;
+      expect(backlinkMarkerCount).toBe(1);
+
+      await harness.page.evaluate(async (pluginId) => {
+        const obsidianWindow = window as typeof window & {
+          app?: any;
+          __e2eFixedLinearPublication?: any;
+        };
+        const app = obsidianWindow.app;
+        const fixed = obsidianWindow.__e2eFixedLinearPublication;
+        await app.plugins.disablePlugin(pluginId);
+        await app.plugins.enablePlugin(pluginId);
+        const plugin = app.plugins.plugins?.[pluginId];
+        if (!plugin || !fixed?.fakeClient) {
+          throw new Error("Fixed Linear provider did not survive restart.");
+        }
+        plugin.linearApiKey = "e2e-session-credential-placeholder";
+        plugin.persistLegacyLinearApiKey = true;
+        plugin.createSecretBackedLinearClient = () => fixed.fakeClient;
+        plugin.settings.linearEnabled = true;
+        await plugin.testLinearConnection();
+        await plugin.activateView?.();
+      }, "agentic-researcher");
+      await expect(harness.page.locator(".agentic-researcher-view")).toHaveCount(
+        1,
+        { timeout: 30_000 },
+      );
+      await harness.submitMission(hierarchyPrompt, { timeoutMs: 180_000 });
+      const resumedHierarchy =
+        await harness.readResearchPublicationState(acceptedNotePath);
+      expect(resumedHierarchy.hierarchyCreateCalls).toBe(6);
+      expect(resumedHierarchy.hierarchyCheckpoint?.status).toBe("complete");
+      const noteAfterResume = (await readOptionalText(acceptedNoteFilePath)) ?? "";
+      expect(
+        noteAfterResume.split("<!-- agentic-research-project:").length - 1,
+      ).toBe(1);
+      const cleanup = await harness.cleanupResearchProjectHierarchy();
+      expect(cleanup).toEqual({ removed: 6, remaining: 0 });
+
+      await recordDailyUseAcceptance(
+        testInfo,
+        "DU-04",
+        {
+          artifacts: [
+            "linear:initiative",
+            "linear:project",
+            "linear:issue",
+            "vault:linear_lineage",
+          ],
+          proofs: [
+            "vault:accepted_note",
+            "linear:hierarchy_readback",
+            "linear:provider_readback",
+            "linear:idempotency",
+            "linear:restart_no_replay",
+            "receipt:external_action",
+          ],
+          approvals: [
+            "approval:linear_issue_create",
+            "approval:linear_hierarchy_group",
+          ],
+          bindings: [
+            "binding:note_linear_issue",
+            "binding:note_linear_hierarchy",
+          ],
+          cleanup: ["cleanup:linear_fixture"],
+        },
+        {
+          modelCalls: 4,
+          toolCalls: 2,
+          approvals: 2,
+        },
+        { requireComplete: true },
+      );
     } finally {
       if (harness) {
         if (acceptedNotePath) {

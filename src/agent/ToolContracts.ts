@@ -131,6 +131,7 @@ export interface BrowserObservation {
 export type MemoryKind = "episodic" | "semantic" | "procedural" | "source";
 
 export interface MemoryWriteInput {
+  vaultScopeId: string;
   kind: MemoryKind;
   content: string;
   confidence: number;
@@ -143,6 +144,7 @@ export interface MemoryWriteInput {
 }
 
 export interface MemorySearchInput {
+  vaultScopeId: string;
   query: string;
   kinds?: MemoryKind[];
   tags?: string[];
@@ -152,6 +154,7 @@ export interface MemorySearchInput {
 
 export interface MemorySearchResult {
   id: string;
+  vaultScopeId: string;
   kind: MemoryKind;
   content: string;
   score: number;
@@ -161,4 +164,24 @@ export interface MemorySearchResult {
   sourceTitle?: string;
   noteReceiptFingerprint?: string;
   createdAt: string;
+}
+
+export interface MemoryDeleteInput {
+  vaultScopeId: string;
+  memoryId: string;
+}
+
+export interface MemoryClearInput {
+  vaultScopeId: string;
+  kinds?: MemoryKind[];
+}
+
+export interface MemoryMutationReceiptV1 {
+  version: 1;
+  operation: "delete" | "clear";
+  vaultScopeId: string;
+  deletedCount: number;
+  deletedIds: string[];
+  observedAt: string;
+  fingerprint: string;
 }

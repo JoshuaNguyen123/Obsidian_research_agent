@@ -23,6 +23,123 @@ export interface Phase4GitFixture {
   cleanup(): Promise<void>;
 }
 
+export interface Phase4TypeScriptProjectFixture {
+  root: string;
+  baseSha: string;
+  head(): Promise<string>;
+  status(): Promise<string>;
+  inspectWorktree(worktreeRoot: string): Promise<{
+    head: string;
+    status: string;
+    changedPaths: string[];
+    files: Record<string, string>;
+  }>;
+  removeOwnedWorktree(worktreeRoot: string, branch: string): Promise<void>;
+  cleanup(): Promise<void>;
+}
+
+/**
+ * Empty-but-valid Node repository used by the protected real-model DU-03 lane.
+ * The model must create two TypeScript modules, a runnable test, and README;
+ * pre-existing build controls validate those exact artifacts without allowing
+ * the mission to rewrite its own validation contract.
+ */
+export async function createPhase4TypeScriptProjectFixture(
+  marker: string,
+): Promise<Phase4TypeScriptProjectFixture> {
+  const root = await realpath(
+    await mkdtemp(path.join(tmpdir(), "agentic-phase4-typescript-")),
+  );
+  const packageJson = {
+    name: `phase4-typescript-${marker
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gu, "-")}`,
+    private: true,
+    type: "module",
+    scripts: {
+      test: "node --test test/math.test.mjs",
+      build: "node scripts/verify-project.mjs",
+    },
+  };
+  await mkdir(path.join(root, "scripts"), { recursive: true });
+  await writeFile(
+    path.join(root, "package.json"),
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(root, "scripts", "verify-project.mjs"),
+    [
+      "import assert from 'node:assert/strict';",
+      "import { readFile } from 'node:fs/promises';",
+      "const [math, index, readme] = await Promise.all([",
+      "  readFile('src/math.ts', 'utf8'),",
+      "  readFile('src/index.ts', 'utf8'),",
+      "  readFile('README.md', 'utf8'),",
+      "]);",
+      "assert.match(math, /export\\s+function\\s+add/);",
+      "assert.match(index, /math\\.js|math\\.ts/);",
+      "assert.match(readme, /npm\\s+test/i);",
+      `assert.match(readme, /${marker.replace(/[^A-Za-z0-9_]/gu, "_")}/);`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await git(root, ["init", "--initial-branch=main"]);
+  await git(root, ["config", "user.name", "Phase 4 E2E"]);
+  await git(root, ["config", "user.email", "phase4-e2e@example.invalid"]);
+  await git(root, ["add", "--", "package.json", "scripts/verify-project.mjs"]);
+  await git(root, ["commit", "-m", "phase4 TypeScript fixture baseline"]);
+  const baseSha = await git(root, ["rev-parse", "HEAD"]);
+  if (!/^[a-f0-9]{40}$/u.test(baseSha)) {
+    await cleanupTypeScriptGitFixture(root);
+    throw new Error("Phase 4 TypeScript fixture did not produce a full Git SHA.");
+  }
+  return {
+    root,
+    baseSha,
+    head: () => git(root, ["rev-parse", "HEAD"]),
+    status: () => git(root, ["status", "--short"]),
+    async inspectWorktree(worktreeRoot) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      const changed = await git(verified, [
+        "diff",
+        "--name-only",
+        baseSha,
+        "HEAD",
+        "--",
+      ]);
+      const expected = [
+        "README.md",
+        "src/index.ts",
+        "src/math.ts",
+        "test/math.test.mjs",
+      ];
+      return {
+        head: await git(verified, ["rev-parse", "HEAD"]),
+        status: await git(verified, ["status", "--short"]),
+        changedPaths: changed.split(/\r?\n/gu).filter(Boolean).sort(),
+        files: Object.fromEntries(
+          await Promise.all(
+            expected.map(async (relativePath) => [
+              relativePath,
+              await readFile(path.join(verified, ...relativePath.split("/")), "utf8"),
+            ]),
+          ),
+        ),
+      };
+    },
+    async removeOwnedWorktree(worktreeRoot, branch) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      await git(root, ["worktree", "remove", "--force", verified]);
+      if (branch.startsWith("codex/workspace-")) {
+        await git(root, ["branch", "-D", branch]).catch(() => "");
+      }
+    },
+    cleanup: () => cleanupTypeScriptGitFixture(root),
+  };
+}
+
 /**
  * A bounded local repository with one deliberately broken implementation.
  * The initial commit is valid Git state; Phase 4 repair should change only
@@ -172,6 +289,21 @@ async function cleanupGitFixture(root: string): Promise<void> {
     !path.basename(verifiedRoot).startsWith("agentic-phase4-git-")
   ) {
     throw new Error(`Refusing to remove unowned Phase 4 Git fixture: ${verifiedRoot}`);
+  }
+  await rm(verifiedRoot, { recursive: true, force: true });
+}
+
+async function cleanupTypeScriptGitFixture(root: string): Promise<void> {
+  const verifiedRoot = await realpath(root).catch(() => null);
+  if (!verifiedRoot) return;
+  const verifiedTemp = await realpath(tmpdir());
+  if (
+    path.dirname(verifiedRoot) !== verifiedTemp ||
+    !path.basename(verifiedRoot).startsWith("agentic-phase4-typescript-")
+  ) {
+    throw new Error(
+      `Refusing to remove unowned Phase 4 TypeScript fixture: ${verifiedRoot}`,
+    );
   }
   await rm(verifiedRoot, { recursive: true, force: true });
 }

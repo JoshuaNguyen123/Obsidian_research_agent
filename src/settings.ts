@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
 import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
 import type { ModelProvider } from "./model/types";
@@ -25,6 +25,10 @@ import {
   capabilitySetupLabel,
   type CapabilitySetupTarget,
 } from "./agent/capabilitySetup";
+import type {
+  CapabilityReadinessStatusV2,
+  CapabilityReadinessV2,
+} from "./agent/capabilityReadiness";
 
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
@@ -39,6 +43,13 @@ export type { ModelRouterMode };
 export interface AgentSettings {
   /** Settings schema version for profile migration. */
   settingsSchemaVersion?: number;
+  /** Opaque vault-local scope used to isolate durable research and experience memory. */
+  vaultScopeId?: string;
+  /** Persisted evidence from a successful connection test; never contains a credential. */
+  modelConnectionVerifiedAt?: string;
+  modelConnectionVerifiedProvider?: ModelProvider;
+  modelConnectionVerifiedModel?: string;
+  modelConnectionVerifiedBaseUrl?: string;
   /** Canonical normal-user behavior profile. Legacy autonomy/output fields are derived. */
   workingMode?: WorkingModeSetting;
   /** Canonical memory consent profile. Legacy memory booleans are derived. */
@@ -539,7 +550,7 @@ export class AgentSettingTab extends PluginSettingTab {
 
     const grid = statusEl.createDiv({ cls: "agentic-settings-readiness-grid" });
     for (const row of rows) {
-      const targetId = capabilitySettingsTargetId(row.name);
+      const targetId = capabilitySetupTargetId(row.setupTarget);
       const item = grid.createEl("button", {
         cls: "agentic-settings-readiness-item",
         attr: {
@@ -560,11 +571,15 @@ export class AgentSettingTab extends PluginSettingTab {
         cls: `agentic-settings-status-badge is-${capabilityStatusSlug(row.status)}`,
       });
       item.createEl("span", {
-        text: row.detail,
+        text: row.reason,
         cls: "agentic-settings-readiness-detail",
       });
       item.createEl("span", {
-        text: capabilityPrimaryAction(row.name, row.status),
+        text: `Evidence: ${row.evidenceAt ?? "not yet observed"}`,
+        cls: "agentic-settings-readiness-evidence",
+      });
+      item.createEl("span", {
+        text: row.nextAction,
         cls: "agentic-settings-readiness-action",
       });
       item.addEventListener("click", () => {
@@ -666,7 +681,7 @@ export class AgentSettingTab extends PluginSettingTab {
       for (const status of statuses) {
         statusGroup.createSpan({
           text: `${capabilityStatusShortName(status.name)} · ${status.status}`,
-          title: `${status.name}: ${status.detail}`,
+          title: `${status.name}: ${status.reason}`,
           cls: `agentic-settings-status-badge is-${capabilityStatusSlug(status.status)}`,
         });
       }
@@ -2497,22 +2512,10 @@ export class AgentSettingTab extends PluginSettingTab {
   }
 }
 
-type CapabilityUiStatus =
-  | "Ready"
-  | "Degraded"
-  | "Needs setup"
-  | "Approval required";
-
-function capabilityStatusSlug(status: CapabilityUiStatus): string {
+function capabilityStatusSlug(
+  status: CapabilityReadinessStatusV2,
+): string {
   return status.toLowerCase().replace(/\s+/g, "-");
-}
-
-function capabilitySettingsTargetId(name: string): string {
-  if (name === "Notes & research") return "agentic-settings-output-memory";
-  if (name === "Browser & web" || name === "Linear" || name === "GitHub") {
-    return "agentic-settings-connections";
-  }
-  return "agentic-settings-system-health";
 }
 
 function capabilitySetupTargetId(target: CapabilitySetupTarget): string {
@@ -2535,140 +2538,10 @@ function capabilityStatusShortName(name: string): string {
   return name;
 }
 
-function capabilityPrimaryAction(
-  name: string,
-  status: CapabilityUiStatus,
-): string {
-  if (status === "Ready") return "Review";
-  if (status === "Approval required") return "Review approval";
-  if (name === "Linear") return "Connect Linear";
-  if (name === "GitHub") return "Connect GitHub";
-  if (name === "Code") return "Set up execution";
-  if (name === "Browser & web") return "Test web tools";
-  if (name === "Background work") return "Set up background work";
-  return "Review note setup";
-}
-
 function buildCapabilityStatusRows(
   plugin: AgenticResearcherPlugin,
-): Array<{ name: string; status: CapabilityUiStatus; detail: string }> {
-  const settings = plugin.settings;
-  const output = settings.outputProfile ?? "active_or_new_note";
-  const notesStatus: CapabilityUiStatus =
-    output === "chat_first"
-      ? "Ready"
-      : settings.enableStreaming === false ||
-          settings.streamWritebackMode === "off"
-        ? "Degraded"
-        : "Ready";
-  const notesDetail =
-    output === "active_or_new_note"
-      ? `Active-or-new-note output is ready; semantic retrieval is ${settings.semanticSearchEnabled ? "on" : "optional/off"}.`
-      : output === "active_note_only"
-        ? "Active note only; falls back to chat when no Markdown note is open."
-        : "Chat-first default; explicit note writes still work.";
-
-  let browserStatus: CapabilityUiStatus = "Ready";
-  let browserDetail = "Web search/fetch are available; supervised browser actions are off.";
-  if (settings.browserToolsEnabled) {
-    browserStatus = "Approval required";
-    browserDetail =
-      "Web plus supervised browser tools are available; click/type/submit remain SafetyPolicy gated.";
-  }
-
-  const registered = new Set(plugin.getRegisteredCapabilityIds());
-  const codeReady = registered.has("agentic-researcher-code");
-  const codeStatus: CapabilityUiStatus = codeReady ? "Ready" : "Degraded";
-  const codeDetail = codeReady
-    ? "Durable workspace editing is ready; execution still verifies the configured sandbox per mission."
-    : "Built-in Code did not register; reload and inspect system health.";
-
-  let linearStatus: CapabilityUiStatus = "Needs setup";
-  let linearDetail = "Connect Linear to expose fixed-catalog tools for explicit Linear requests.";
-  if (plugin.hasLinearApiKey()) {
-    if (settings.linearQueueEnabled === true) {
-      const grant = plugin.getLinearQueueGrantStatus();
-      if (!grant.active) {
-        linearStatus = "Approval required";
-        linearDetail =
-          "Queue enabled; authorize a bounded four-hour grant to execute.";
-      } else {
-        linearStatus = "Ready";
-        linearDetail = `Queue authority active until ${grant.expiresAt}.`;
-      }
-    } else if (!plugin.getLinearCapabilitySnapshot()) {
-      linearStatus = "Degraded";
-      linearDetail = "Connected credential present; test once to discover workspace capabilities.";
-    } else {
-      linearStatus = "Ready";
-      linearDetail = "Connected with verified workspace discovery; automatic queue remains optional.";
-    }
-  }
-
-  const github = plugin.getGitHubCredentialStatus();
-  const githubStatus: CapabilityUiStatus = github.connected
-    ? github.enabled
-      ? "Ready"
-      : "Degraded"
-    : github.waitingForUser
-      ? "Approval required"
-      : "Needs setup";
-  const githubDetail = github.connected
-    ? github.enabled
-      ? `Connected as ${github.account?.login ?? "verified account"}; repository access remains profile-bound.`
-      : "Credential is connected but a legacy disabled flag still blocks tools; reconnect or reset the connection."
-    : github.waitingForUser
-      ? "Finish the active GitHub device authorization."
-      : "Connect GitHub to enable fixed-catalog repository activity.";
-
-  const companionReady = registered.has("agentic-researcher-companion");
-  const schedules = settings.scheduledMissions ?? [];
-  const enabledSchedules = (settings.scheduledMissions ?? []).filter(
-    (mission) => mission.enabled,
-  );
-  const backgroundStatus: CapabilityUiStatus = companionReady
-    ? "Ready"
-    : "Degraded";
-  const backgroundDetail = !companionReady
-    ? "Built-in Companion did not register; background work is unavailable."
-    : enabledSchedules.length > 0
-      ? `${enabledSchedules.length} schedule(s) enabled; service and grant health remain visible in Run Details.`
-      : schedules.length > 0
-        ? `${schedules.length} recurring schedule(s) paused; background runtime is ready when you choose to enable one.`
-        : "Background runtime is ready and idle; add a recurring mission only when you want unattended work.";
-
-  return [
-    {
-      name: "Notes & research",
-      status: notesStatus,
-      detail: notesDetail,
-    },
-    {
-      name: "Code",
-      status: codeStatus,
-      detail: codeDetail,
-    },
-    {
-      name: "Linear",
-      status: linearStatus,
-      detail: linearDetail,
-    },
-    {
-      name: "GitHub",
-      status: githubStatus,
-      detail: githubDetail,
-    },
-    {
-      name: "Browser & web",
-      status: browserStatus,
-      detail: browserDetail,
-    },
-    {
-      name: "Background work",
-      status: backgroundStatus,
-      detail: backgroundDetail,
-    },
-  ];
+): CapabilityReadinessV2[] {
+  return plugin.getCapabilityReadiness();
 }
 
 function formatExtensionSettingMetadata(

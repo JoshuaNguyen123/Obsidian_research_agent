@@ -21,6 +21,7 @@ import type { WorkerHandoff } from "./types";
 import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
 import {
   addSourceCandidate,
+  claimNextSourceCandidate,
   claimSourceCandidate,
   computeSourceProofDebt,
   createSourceCandidateLedger,
@@ -62,6 +63,7 @@ export interface ResearchWorkerResult {
   finalSummary: string;
   modelSteps: number;
   toolCalls: number;
+  alternativeSourceReads?: number;
   sourceLedger: SourceCandidateLedgerV1;
 }
 
@@ -145,6 +147,7 @@ export async function runResearchWorker(input: {
   ];
   let modelSteps = 0;
   let toolCalls = 0;
+  let alternativeSourceReads = 0;
   let finalSummary = "";
 
   for (let step = 1; step <= maxSteps; step += 1) {
@@ -272,6 +275,100 @@ export async function runResearchWorker(input: {
         origin: "model",
         fallbackId: call.id ?? eventId,
       });
+      if (
+        call.name === "web_fetch" &&
+        claimedCandidateId !== null &&
+        nextEvidence === null &&
+        alternativeSourceReads < 1 &&
+        toolCalls < maxToolCalls
+      ) {
+        const alternativeClaim = claimNextSourceCandidate(
+          sourceLedger,
+          input.participantId,
+          {
+            now: input.now?.() ?? new Date(),
+            claimId: "mission",
+          },
+        );
+        const candidate = alternativeClaim.candidate;
+        if (
+          alternativeClaim.accepted &&
+          candidate &&
+          typeof candidate.url === "string" &&
+          candidate.url.trim()
+        ) {
+          sourceLedger = alternativeClaim.ledger;
+          alternativeSourceReads += 1;
+          toolCalls += 1;
+          const alternativeCall: ModelToolCall = {
+            id: `${input.runId}-worker-alternative-${alternativeSourceReads}`,
+            name: "web_fetch",
+            arguments: { url: candidate.url },
+          };
+          const alternativeEventId =
+            `${input.participantId}-tool-${toolCalls}`;
+          await input.events?.onStatus?.(
+            "The first public source was unusable; reading one bounded alternative source.",
+          );
+          await input.events?.onToolStart?.({
+            id: alternativeEventId,
+            name: alternativeCall.name,
+            step,
+          });
+          const alternativeResult = await registry.execute(alternativeCall, {
+            ...input.toolContext,
+            runId: `${input.runId}-${input.participantId}`,
+            originalPrompt: input.assignment,
+            abortSignal: input.abortSignal,
+            writeAutonomy: false,
+            userApprovalGranted: false,
+          });
+          await input.events?.onToolDone?.({
+            id: alternativeEventId,
+            name: alternativeCall.name,
+            step,
+            result: alternativeResult,
+          });
+          const alternativeEvidence = evidenceFromToolResult(
+            alternativeCall.name,
+            alternativeResult,
+          );
+          if (
+            alternativeEvidence &&
+            !evidence.some((item) => item.id === alternativeEvidence.id)
+          ) {
+            evidence.push(alternativeEvidence);
+          }
+          for (const passage of claimPassagesFromToolResult(
+            alternativeCall.name,
+            alternativeResult,
+          )) {
+            if (!claimPassages.some((item) => item.id === passage.id)) {
+              claimPassages.push(passage);
+            }
+          }
+          sourceLedger = recordSourceCandidateOutcome(
+            sourceLedger,
+            candidate.id,
+            alternativeEvidence
+              ? { status: "usable", evidenceIds: [alternativeEvidence.id] }
+              : {
+                  status: "unusable",
+                  failure:
+                    alternativeResult.error?.message ??
+                    "The bounded alternative source did not yield passage-backed evidence.",
+                },
+            input.now?.() ?? new Date(),
+          );
+          appendToolTranscript({
+            messages,
+            toolCall: alternativeCall,
+            resultContent: serializeToolResultForModel(alternativeResult),
+            origin: "runner",
+            fallbackId: alternativeEventId,
+          });
+        }
+      }
     }
     if (finalSummary) break;
   }
@@ -321,6 +418,7 @@ export async function runResearchWorker(input: {
     finalSummary,
     modelSteps,
     toolCalls,
+    alternativeSourceReads,
     sourceLedger,
   };
 }

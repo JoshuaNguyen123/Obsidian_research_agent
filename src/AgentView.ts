@@ -89,6 +89,7 @@ export class AgentView extends ItemView {
   private orchestratorSnapshot: OrchestratorSnapshotV1 | null = null;
   private orchestratorReferenceRunId: string | null = null;
   private resumeBannerEl: HTMLElement | null = null;
+  private firstRunEl: HTMLElement | null = null;
   private phaseValueEl: HTMLElement | null = null;
   private stepValueEl: HTMLElement | null = null;
   private activeToolValueEl: HTMLElement | null = null;
@@ -228,6 +229,10 @@ export class AgentView extends ItemView {
     this.renderConversationLog();
   }
 
+  refreshFirstRunState(): void {
+    this.renderFirstRunEmptyState();
+  }
+
   /** Refreshes the restart-safe Run Details projection from coordinator state. */
   refreshDurableMissionProjection(): void {
     const snapshot = this.plugin.getMissionRunSnapshot();
@@ -355,6 +360,7 @@ export class AgentView extends ItemView {
     this.liveAssistantMessageEl = null;
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
+    this.firstRunEl = null;
     this.orchestratorTab?.destroy();
     this.orchestratorTab = null;
     this.orchestratorReferenceRunId = null;
@@ -410,8 +416,45 @@ export class AgentView extends ItemView {
     );
   }
 
+  private renderFirstRunEmptyState(): void {
+    const emptyState = this.firstRunEl;
+    if (!emptyState) return;
+    emptyState.empty();
+    if (this.plugin.hasVerifiedModelConnection()) {
+      emptyState.hide();
+      emptyState.addClass("is-hidden");
+      return;
+    }
+    emptyState.show();
+    emptyState.removeClass("is-hidden");
+    emptyState.createSpan({
+      text: "FIRST RUN",
+      cls: "agentic-researcher-first-run-kicker",
+    });
+    emptyState.createEl("h3", { text: "Connect a model to start" });
+    emptyState.createEl("p", {
+      text: "Choose your provider and model, then pass the connection test. Successful setup returns here with your prompt and conversation intact.",
+    });
+    const button = emptyState.createEl("button", {
+      text: "Connect model",
+      cls: "agentic-researcher-first-run-action",
+      attr: { type: "button" },
+    });
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.plugin.openFirstRunModelSetup();
+    });
+  }
+
   private renderChat(container: HTMLElement) {
     container.addClass("agentic-researcher-chat-panel");
+
+    this.firstRunEl = container.createDiv({
+      cls: "agentic-researcher-first-run is-hidden",
+      attr: { "data-testid": "first-run-model-setup" },
+    });
+    this.renderFirstRunEmptyState();
 
     this.logEl = container.createDiv({
       cls: "agentic-researcher-log",

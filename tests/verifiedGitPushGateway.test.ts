@@ -48,11 +48,13 @@ test("VerifiedGitPushGateway pushes a new agent branch and verifies remote readb
   const push = fixture.runner.calls.find((call) => operation(call.args) === "push");
   assert.ok(push);
   assert.equal(push?.inheritEnvironment, false);
-  assert.deepEqual(push?.args.slice(-5), [
+  assert.deepEqual(push?.args.slice(-7), [
     "push",
+    "--atomic",
     "--porcelain",
     "--no-verify",
     "https://github.com/acme/research-agent.git",
+    `${BASE}:refs/heads/main`,
     `${COMMIT}:refs/heads/codex/repair-1`,
   ]);
   assert.equal(push?.environment.GIT_TERMINAL_PROMPT, "0");
@@ -122,10 +124,20 @@ test("local commit identity drift blocks before remote access", async () => {
 });
 
 test("an already-present exact remote commit is verified without push", async () => {
-  const fixture = createFixture({ remoteSha: COMMIT });
+  const fixture = createFixture({ remoteSha: COMMIT, remoteBaseSha: BASE });
   const result = await fixture.gateway.push(fixture.input);
   assert.equal(result.status, "pushed_verified");
   if (result.status === "pushed_verified") assert.equal(result.receipt.commitKind, "already_present");
+  assert.equal(fixture.runner.pushes, 0);
+});
+
+test("an existing remote base that differs from the verified local base blocks atomically", async () => {
+  const fixture = createFixture({ remoteBaseSha: REMOTE_OLD });
+  await assert.rejects(
+    fixture.gateway.push(fixture.input),
+    (error: unknown) =>
+      error instanceof VerifiedGitPushErrorV1 && error.code === "remote_non_fast_forward",
+  );
   assert.equal(fixture.runner.pushes, 0);
 });
 
@@ -144,6 +156,7 @@ test("trusted GitHub binding is closed, profile-bound, and builds the remote hos
 
 function createFixture(options: {
   remoteSha?: string | null;
+  remoteBaseSha?: string | null;
   fastForward?: boolean;
   pushMode?: "success" | "applied_throw" | "readback_mismatch";
   localTreeSha?: string;
@@ -177,6 +190,7 @@ function createFixture(options: {
   });
   const runner = new FakeGitRunner({
     remoteSha: options.remoteSha ?? null,
+    remoteBaseSha: options.remoteBaseSha ?? null,
     fastForward: options.fastForward ?? true,
     pushMode: options.pushMode ?? "success",
     localTreeSha: options.localTreeSha ?? TREE,
@@ -249,14 +263,17 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
   mergeBaseChecks = 0;
   remoteReads = 0;
   private remoteSha: string | null;
+  private remoteBaseSha: string | null;
 
   constructor(private readonly options: {
     remoteSha: string | null;
+    remoteBaseSha: string | null;
     fastForward: boolean;
     pushMode: "success" | "applied_throw" | "readback_mismatch";
     localTreeSha: string;
   }) {
     this.remoteSha = options.remoteSha;
+    this.remoteBaseSha = options.remoteBaseSha;
   }
 
   async run(input: Parameters<VerifiedGitCommandRunnerV1["run"]>[0]) {
@@ -272,8 +289,14 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
     if (op === "branch") return ok("codex/repair-1");
     if (op === "ls-remote") {
       this.remoteReads += 1;
-      const ref = "refs/heads/codex/repair-1";
-      return ok(this.remoteSha ? `${this.remoteSha}\t${ref}` : "");
+      const ref = input.args.at(-1);
+      if (ref === "refs/heads/main") {
+        return ok(this.remoteBaseSha ? `${this.remoteBaseSha}\t${ref}` : "");
+      }
+      if (ref === "refs/heads/codex/repair-1") {
+        return ok(this.remoteSha ? `${this.remoteSha}\t${ref}` : "");
+      }
+      return { exitCode: 2, stdout: "", stderr: `Unexpected remote ref ${String(ref)}` };
     }
     if (op === "fetch") {
       this.fetches += 1;
@@ -286,13 +309,16 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
     if (op === "push") {
       this.pushes += 1;
       if (this.options.pushMode === "applied_throw") {
+        this.remoteBaseSha = BASE;
         this.remoteSha = COMMIT;
         throw new Error("transport closed after dispatch");
       }
       if (this.options.pushMode === "readback_mismatch") {
+        this.remoteBaseSha = BASE;
         this.remoteSha = "e".repeat(40);
         return ok("push dispatched");
       }
+      this.remoteBaseSha = BASE;
       this.remoteSha = COMMIT;
       return ok("push dispatched");
     }
