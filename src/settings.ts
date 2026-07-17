@@ -2599,19 +2599,20 @@ function buildCapabilityStatusRows(
       : "Connect GitHub to enable fixed-catalog repository activity.";
 
   const companionReady = registered.has("agentic-researcher-companion");
+  const schedules = settings.scheduledMissions ?? [];
   const enabledSchedules = (settings.scheduledMissions ?? []).filter(
     (mission) => mission.enabled,
   );
   const backgroundStatus: CapabilityUiStatus = companionReady
-    ? enabledSchedules.length > 0
-      ? "Ready"
-      : "Needs setup"
+    ? "Ready"
     : "Degraded";
   const backgroundDetail = !companionReady
     ? "Built-in Companion did not register; background work is unavailable."
     : enabledSchedules.length > 0
       ? `${enabledSchedules.length} schedule(s) enabled; service and grant health remain visible in Run Details.`
-      : "Companion is available; install/attest the service or add a schedule for unattended work.";
+      : schedules.length > 0
+        ? `${schedules.length} recurring schedule(s) paused; background runtime is ready when you choose to enable one.`
+        : "Background runtime is ready and idle; add a recurring mission only when you want unattended work.";
 
   return [
     {

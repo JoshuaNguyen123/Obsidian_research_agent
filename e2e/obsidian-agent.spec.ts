@@ -1809,14 +1809,18 @@ test("settings integrates essentials readiness and advanced controls", async ({}
   });
 });
 
-test("schedule builder updates Background readiness without reopening settings", async () => {
+test("Background is ready by default and schedule details refresh without reopening settings", async () => {
   await withE2EHarness("settings-schedule-builder-readiness", async ({ page }) => {
     await openPluginSettings(page);
     const settings = page.locator(".agentic-researcher-settings");
     const readiness = settings.locator(".agentic-settings-readiness");
-    await expect(
-      readiness.getByRole("button", { name: /Background work: Needs setup/u }),
-    ).toBeVisible();
+    const backgroundReadiness = readiness.getByRole("button", {
+      name: /Background work: Ready/u,
+    });
+    await expect(backgroundReadiness).toBeVisible();
+    await expect(backgroundReadiness).toContainText(
+      "Background runtime is ready and idle",
+    );
 
     const schedules = settings.locator("#agentic-settings-autonomy");
     await schedules.evaluate((element) => {
@@ -1832,11 +1836,15 @@ test("schedule builder updates Background readiness without reopening settings",
     await expect(
       settings.getByText("Advanced JSON import/export", { exact: true }),
     ).toBeVisible();
+    await expect(backgroundReadiness).toContainText(
+      "1 recurring schedule(s) paused",
+      { timeout: 5_000 },
+    );
     await card.locator(".checkbox-container").click();
 
-    await expect(
-      readiness.getByRole("button", { name: /Background work: Ready/u }),
-    ).toBeVisible({ timeout: 5_000 });
+    await expect(backgroundReadiness).toContainText("1 schedule(s) enabled", {
+      timeout: 5_000,
+    });
     const persisted = await page.evaluate(({ pluginId }) => {
       const plugin = (window as typeof window & { app?: any }).app?.plugins
         ?.plugins?.[pluginId];
