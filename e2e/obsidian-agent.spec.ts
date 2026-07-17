@@ -2267,7 +2267,7 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
       "Ready tickets cannot execute until you explicitly authorize a four-hour bounded grant.",
     );
     await expect(
-      authoritySetting.getByRole("button", { name: "Authorize 4 hours" }),
+        authoritySetting.getByRole("button", { name: "Activate & authorize" }),
     ).toBeDisabled();
     await expect(
       authoritySetting.getByRole("button", { name: "Revoke" }),
@@ -2275,7 +2275,7 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
 
     await expect(queueToggle).toHaveClass(/is-disabled/);
     await expect(
-      authoritySetting.getByRole("button", { name: "Authorize 4 hours" }),
+        authoritySetting.getByRole("button", { name: "Activate & authorize" }),
     ).toBeDisabled();
 
     const afterInspection = await page.evaluate(({ pluginId }) => {

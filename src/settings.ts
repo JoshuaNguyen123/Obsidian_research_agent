@@ -1895,7 +1895,7 @@ export class AgentSettingTab extends PluginSettingTab {
       .setName("Automatic Linear queue")
       .setDesc(
         queueConfiguration.ready
-          ? "Scan at most ten updated issues every 15 minutes while Obsidian is open. A live scoped grant is still required."
+          ? "Scan at most ten updated issues every 15 minutes while Obsidian is open. Authorize once to activate this queue and grant its four-hour execution window."
           : `Unavailable: ${queueConfiguration.reason}`,
       )
       .addToggle((toggle) => {
@@ -1916,13 +1916,19 @@ export class AgentSettingTab extends PluginSettingTab {
       .setDesc(
         queueGrant.active
           ? `Explicit bounded authority is active until ${queueGrant.expiresAt}. It never covers permanent deletion or GitHub publication.`
-          : "No live queue authority. Ready tickets cannot execute until you explicitly authorize a four-hour bounded grant.",
+          : "No live queue authority. Authorizing activates the queue and grants a four-hour execution window; it never covers permanent deletion or GitHub publication.",
       );
     queueGrantSetting.addButton((button) =>
       button
-        .setButtonText(queueGrant.active ? "Renew 4 hours" : "Authorize 4 hours")
+        .setButtonText(
+          queueGrant.active
+            ? "Renew 4 hours"
+            : this.plugin.settings.linearQueueEnabled === true
+              ? "Authorize 4 hours"
+              : "Activate & authorize",
+        )
         .setCta()
-        .setDisabled(this.plugin.settings.linearQueueEnabled !== true)
+        .setDisabled(!queueConfiguration.ready)
         .onClick(async () => {
           button.setDisabled(true).setButtonText("Authorizing...");
           const result = await this.plugin.authorizeLinearQueueForFourHours();

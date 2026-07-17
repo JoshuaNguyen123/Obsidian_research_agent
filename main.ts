@@ -2406,7 +2406,6 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (
       !this.authorityGrantStore ||
       this.settings.linearEnabled !== true ||
-      !this.settings.linearQueueEnabled ||
       !this.getLinearQueueConfigurationStatus().ready ||
       !projectId ||
       !this.settings.linearDefaultTeamId ||
@@ -2421,6 +2420,11 @@ export default class AgenticResearcherPlugin extends Plugin {
           "Verify the Linear connection and choose a discovered team, queue project, and lifecycle states before authorizing the queue.",
       };
     }
+    // The same explicit action that grants bounded mutation authority also
+    // activates the otherwise read-only queue. This removes a redundant
+    // enable-toggle step without allowing unattended mutation by default.
+    this.settings.linearQueueEnabled = true;
+    await this.savePluginData();
     const subjectId = linearQueueGrantSubjectId(projectId);
     for (const existing of this.authorityGrantStore.snapshot().grants) {
       if (
@@ -2463,7 +2467,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.scheduleCompanionMissionReconciliation(250);
     return {
       ok: true,
-      message: `Queue authority expires at ${grant.expiresAt}. Companion polling is ${companionPollingConfigured ? "configured" : "pending an authenticated persistent companion"}. Permanent deletion and GitHub publication remain blocked.`,
+      message: `Automatic queue activated; authority expires at ${grant.expiresAt}. Companion polling is ${companionPollingConfigured ? "configured" : "pending an authenticated persistent companion"}. Permanent deletion and GitHub publication remain blocked.`,
     };
   }
 

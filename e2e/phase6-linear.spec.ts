@@ -329,7 +329,8 @@ test.describe("Phase 6 Linear integration", () => {
 
       const authorization = await harness.authorizeAndRunQueue();
       expect(authorization.ok).toBe(true);
-      expect(authorization.message).toContain("Queue authority expires");
+      expect(authorization.message).toContain("Automatic queue activated");
+      expect(authorization.message).toContain("authority expires");
 
       const ambiguous = await harness.waitForReconciliation(issueId);
       expect(ambiguous.candidate).toMatchObject({
