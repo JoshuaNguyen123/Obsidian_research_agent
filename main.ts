@@ -341,6 +341,7 @@ import {
 } from "./src/integrations/ObsidianSecretStoreV1";
 import type { ParsedCompatibleWorkItemSpec } from "./src/integrations/linear/WorkItemSpecV2";
 import {
+  GitHubAuthErrorV1,
   GitHubAuthV1,
   parseGitHubCredentialV1,
   type GitHubCredentialV1,
@@ -2060,16 +2061,26 @@ export default class AgenticResearcherPlugin extends Plugin {
         message: this.githubAuthStatusMessage,
       };
     }
-    const store = this.createForegroundSecretStore();
     try {
-      await this.requirePersistentForegroundSecretStore(store);
-      const auth = this.createGitHubAuthClient(
-        store,
-        normalizeGitHubOAuthClientIdSetting(this.settings.githubOAuthClientId) ||
-          "pat-import",
-      );
-      const credential = await auth.importFineGrainedPat(token.trim());
-      await this.acceptGitHubCredential(auth, store, credential);
+      const primaryStore = this.createForegroundSecretStore();
+      try {
+        await this.importGitHubFineGrainedPat(token.trim(), primaryStore);
+      } catch (error) {
+        // Native SecretStorage can be present but temporarily locked or
+        // unavailable. Retry the same verified import through the persistent
+        // Companion store; never fall back to plaintext plugin settings.
+        if (
+          !(error instanceof GitHubAuthErrorV1) ||
+          error.code !== "github_auth_secret_store_failed" ||
+          primaryStore instanceof CompanionSecretStoreClientV1
+        ) {
+          throw error;
+        }
+        await this.importGitHubFineGrainedPat(
+          token.trim(),
+          this.createCompanionSecretStore(),
+        );
+      }
       return { ok: true, message: this.githubAuthStatusMessage };
     } catch (error) {
       this.githubAuthStatusMessage =
@@ -4321,6 +4332,20 @@ export default class AgenticResearcherPlugin extends Plugin {
           `Obsidian SecretStorage and the authenticated Companion credential backend are unavailable: ${sanitizeExtensionRuntimeError(error)}`,
       };
     }
+  }
+
+  private async importGitHubFineGrainedPat(
+    token: string,
+    store: SecretStoreV1,
+  ): Promise<void> {
+    await this.requirePersistentForegroundSecretStore(store);
+    const auth = this.createGitHubAuthClient(
+      store,
+      normalizeGitHubOAuthClientIdSetting(this.settings.githubOAuthClientId) ||
+        "pat-import",
+    );
+    const credential = await auth.importFineGrainedPat(token);
+    await this.acceptGitHubCredential(auth, store, credential);
   }
 
   private async removeLinearCredentialReference(
