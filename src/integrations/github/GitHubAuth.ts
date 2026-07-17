@@ -25,7 +25,7 @@ const MAX_SCOPE_BYTES = 128;
 const CLIENT_ID_PATTERN = /^[A-Za-z0-9._-]{3,256}$/;
 const SESSION_ID_PATTERN = /^github_device_session_[A-Za-z0-9_-]{20,128}$/;
 const CREDENTIAL_ID_PATTERN = /^github_credential_[A-Za-z0-9_-]{20,128}$/;
-const SECRET_REFERENCE_PATTERN = /^(?:secret|credential)_[A-Za-z0-9-]{8,128}$/;
+const SECRET_REFERENCE_PATTERN = /^(?:(?:secret|credential)_[A-Za-z0-9-]{8,128}|secret-obsidian-[a-z0-9-]{16,48})$/;
 const SCOPE_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
 const FINE_GRAINED_PAT_PATTERN = /^github_pat_[A-Za-z0-9_-]{20,500}$/;
 

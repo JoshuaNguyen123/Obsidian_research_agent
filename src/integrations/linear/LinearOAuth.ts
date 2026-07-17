@@ -23,7 +23,9 @@ const MAX_TOKEN_BYTES = 65_536;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 120_000;
 const CALLBACK_PATH = "/oauth/linear/callback";
-const SECRET_REFERENCE_PATTERN = /^(?:secret|credential)_[A-Za-z0-9-]{8,128}$/;
+// Foreground Obsidian SecretStorage uses `secret-obsidian-<id>` while the
+// Companion store uses the older `secret_<id>` / `credential_<id>` forms.
+const SECRET_REFERENCE_PATTERN = /^(?:(?:secret|credential)_[A-Za-z0-9-]{8,128}|secret-obsidian-[a-z0-9-]{16,48})$/;
 const SAFE_CLIENT_ID_PATTERN = /^[A-Za-z0-9._-]{3,256}$/;
 const SESSION_ID_PATTERN = /^linear_oauth_session_[A-Za-z0-9_-]{20,128}$/;
 const PENDING_ID_PATTERN = /^linear_oauth_refresh_[A-Za-z0-9_-]{20,128}$/;

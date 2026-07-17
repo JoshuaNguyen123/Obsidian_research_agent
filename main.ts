@@ -1833,7 +1833,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
     const actor: LinearOAuthActorV1 =
       this.settings.linearOAuthActor === "app" ? "app" : "user";
-    const store = this.createGitHubForegroundSecretStore();
+    const store = this.createForegroundSecretStore();
     try {
       await this.requirePersistentForegroundSecretStore(store);
     } catch {
