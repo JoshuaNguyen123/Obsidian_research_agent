@@ -341,7 +341,6 @@ import {
 } from "./src/integrations/ObsidianSecretStoreV1";
 import type { ParsedCompatibleWorkItemSpec } from "./src/integrations/linear/WorkItemSpecV2";
 import {
-  GitHubAuthErrorV1,
   GitHubAuthV1,
   parseGitHubCredentialV1,
   type GitHubCredentialV1,
@@ -1834,7 +1833,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
     const actor: LinearOAuthActorV1 =
       this.settings.linearOAuthActor === "app" ? "app" : "user";
-    const store = this.createForegroundSecretStore();
+    const store = this.createGitHubForegroundSecretStore();
     try {
       await this.requirePersistentForegroundSecretStore(store);
     } catch {
@@ -2062,25 +2061,10 @@ export default class AgenticResearcherPlugin extends Plugin {
       };
     }
     try {
-      const primaryStore = this.createForegroundSecretStore();
-      try {
-        await this.importGitHubFineGrainedPat(token.trim(), primaryStore);
-      } catch (error) {
-        // Native SecretStorage can be present but temporarily locked or
-        // unavailable. Retry the same verified import through the persistent
-        // Companion store; never fall back to plaintext plugin settings.
-        if (
-          !(error instanceof GitHubAuthErrorV1) ||
-          error.code !== "github_auth_secret_store_failed" ||
-          primaryStore instanceof CompanionSecretStoreClientV1
-        ) {
-          throw error;
-        }
-        await this.importGitHubFineGrainedPat(
-          token.trim(),
-          this.createCompanionSecretStore(),
-        );
-      }
+      await this.importGitHubFineGrainedPat(
+        token.trim(),
+        this.createGitHubForegroundSecretStore(),
+      );
       return { ok: true, message: this.githubAuthStatusMessage };
     } catch (error) {
       this.githubAuthStatusMessage =
@@ -3866,6 +3850,59 @@ export default class AgenticResearcherPlugin extends Plugin {
       return this.createObsidianSecretStore();
     }
     return this.createCompanionSecretStore();
+  }
+
+  /**
+   * GitHub device flow owns its token until the provider response is committed,
+   * so the fallback must live beneath GitHubAuthV1 rather than after polling.
+   * Native SecretStorage remains preferred; a classified write failure retries
+   * through the authenticated persistent Companion store without plaintext.
+   */
+  private createGitHubForegroundSecretStore(): SecretStoreV1 {
+    const native =
+      this.app.secretStorage &&
+      typeof this.app.secretStorage.getSecret === "function" &&
+      typeof this.app.secretStorage.setSecret === "function"
+        ? this.createObsidianSecretStore()
+        : null;
+    const companion = this.createCompanionSecretStore();
+    let active: SecretStoreV1 | null = native;
+    const resolve = (referenceId: string): SecretStoreV1 =>
+      native && isObsidianSecretReferenceV1(referenceId) ? native : companion;
+    return {
+      version: 1,
+      health: async () => {
+        if (active) {
+          const health = await active.health();
+          if (health.available && health.persistent) return health;
+        }
+        const health = await companion.health();
+        if (health.available && health.persistent) {
+          active = companion;
+        }
+        return health;
+      },
+      put: async (input) => {
+        if (native) {
+          const health = await native.health();
+          if (health.available && health.persistent) {
+            try {
+              const description = await native.put(input);
+              active = native;
+              return description;
+            } catch {
+              // Fall through only to another persistent credential backend.
+            }
+          }
+        }
+        const description = await companion.put(input);
+        active = companion;
+        return description;
+      },
+      describe: (referenceId) => resolve(referenceId).describe(referenceId),
+      lease: (referenceId, input) => resolve(referenceId).lease(referenceId, input),
+      remove: (referenceId) => resolve(referenceId).remove(referenceId),
+    };
   }
 
   private async requirePersistentForegroundSecretStore(
