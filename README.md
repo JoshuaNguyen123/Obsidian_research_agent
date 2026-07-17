@@ -111,6 +111,7 @@ npm run test:e2e:daily-use:github       # deterministic DU-05
 npm run test:e2e:daily-use:live-model   # affected DU-02 live-model cases only
 npm run test:e2e:daily-use:code:live    # protected local WSL2 DU-03
 npm run test:e2e:daily-use:compound     # protected local WSL2/provider DU-06
+npm run test:e2e:daily-use:checkers     # single Ollama Cloud BYOK checkers-to-private-GitHub DU-06
 npm run test:e2e:live                   # opt-in disposable provider mutation and cleanup
 ```
 

@@ -272,6 +272,8 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.match(compound, /verifiedPrivate: true/u);
   assert.match(compound, /git", \["status", "--porcelain"\]/u);
   assert.match(compound, /preserveConfiguredLinearCredential: !linearToken/u);
+  assert.match(compound, /https:\/\/ollama\.com\/api/u);
+  assert.match(compound, /getE2EAiConfig/u);
   assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);
 });
 

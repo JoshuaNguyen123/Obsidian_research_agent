@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 
 import { expect, test, type Page } from "@playwright/test";
 
+import { getE2EAiConfig } from "./aiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
   createPhase4PythonCheckersProjectFixture,
@@ -77,6 +78,10 @@ interface ProtectedCredentialOwnership {
 
 test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independently cleans providers", async ({}, testInfo) => {
   test.setTimeout(120 * 60_000);
+  const protectedModel = getE2EAiConfig();
+  expect(process.env.E2E_MODEL_PROVIDER?.trim() || "ollama").toBe("ollama");
+  expect(normalizeEndpoint(protectedModel.baseUrl)).toBe("https://ollama.com/api");
+  expect(protectedModel.model.trim()).not.toBe("");
   const releaseSha = requiredEnvironment("E2E_RELEASE_COMMIT_SHA");
   const linearToken = optionalEnvironment("E2E_LINEAR_API_KEY");
   const githubToken = requiredEnvironment("E2E_GITHUB_TOKEN");
@@ -1212,6 +1217,10 @@ function requiredEnvironment(name: string): string {
 
 function optionalEnvironment(name: string): string | null {
   return process.env[name]?.trim() || null;
+}
+
+function normalizeEndpoint(value: string): string {
+  return value.trim().replace(/\/+$/u, "");
 }
 
 function safeDisposableRepositoryName(value: string): string {
