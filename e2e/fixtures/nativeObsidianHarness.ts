@@ -159,6 +159,7 @@ export async function startNativeObsidianHarness(
     await waitForCdp(cdpPort, processHandle, 45_000);
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     page = await findOnlyVaultPage(browser, vaultRoot);
+    await trustDisposableVaultIfPrompted(page);
     await ensurePluginRuntimesLoaded(page, pluginIds);
     setupContext.page = page;
     await options.setup(setupContext);
@@ -367,29 +368,105 @@ async function ensurePluginRuntimesLoaded(
   page: Page,
   pluginIds: readonly string[],
 ): Promise<void> {
-  await page.evaluate(async (requiredPluginIds) => {
+  await page.evaluate(async ({ requiredPluginIds, corePluginId }) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.workspace || !app?.plugins) {
       throw new Error("Obsidian app services are unavailable.");
     }
+    const delayInPage = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms));
     if (typeof app.workspace.onLayoutReady === "function") {
       await new Promise<void>((resolve) => app.workspace.onLayoutReady(resolve));
     }
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const rootReady =
+        app.workspace.rootSplit?.containerEl?.isConnected ||
+        Boolean(document.querySelector(".workspace-split.mod-root"));
+      if (rootReady) break;
+      if (attempt === 79) {
+        throw new Error("Obsidian workspace layout was not ready.");
+      }
+      await delayInPage(250);
+    }
+
     for (const pluginId of requiredPluginIds) {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (app.plugins.manifests?.[pluginId]) break;
+        if (typeof app.plugins.loadManifests === "function") {
+          await app.plugins.loadManifests();
+        }
+        if (app.plugins.manifests?.[pluginId]) break;
+        await delayInPage(250);
+      }
+      if (!app.plugins.manifests?.[pluginId]) {
+        throw new Error(`Plugin manifest is not installed: ${pluginId}`);
+      }
       if (!app.plugins.plugins?.[pluginId]) {
         await app.plugins.enablePlugin(pluginId);
       }
+      if (
+        !app.plugins.plugins?.[pluginId] &&
+        typeof app.plugins.loadPlugin === "function"
+      ) {
+        await app.plugins.loadPlugin(pluginId);
+      }
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (app.plugins.plugins?.[pluginId]) break;
+        await delayInPage(250);
+      }
+      const plugin = app.plugins.plugins?.[pluginId];
+      if (!plugin) {
+        throw new Error(
+          `Plugin did not load after enabling: ${pluginId}; ${JSON.stringify({
+            manifestPresent: Boolean(app.plugins.manifests?.[pluginId]),
+            enabled:
+              app.plugins.enabledPlugins?.has?.(pluginId) ??
+              app.plugins.enabledPlugins?.includes?.(pluginId) ??
+              null,
+            safeMode: app.plugins.safeMode ?? null,
+            restrictedMode: app.plugins.restrictedMode ?? null,
+          })}`,
+        );
+      }
+      if (pluginId === corePluginId) {
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+          const candidate = app.plugins.plugins?.[pluginId] ?? plugin;
+          if (candidate?.agenticResearcherApi?.state === "ready") break;
+          if (candidate?.agenticResearcherApi?.state === "unloading") {
+            throw new Error(
+              "Agentic Researcher core began unloading during startup.",
+            );
+          }
+          if (attempt === 119) {
+            throw new Error(
+              `Agentic Researcher core did not become ready: ${JSON.stringify({
+                apiState: candidate?.agenticResearcherApi?.state ?? "missing",
+                startupPhase: candidate?.startupPhase ?? "missing",
+                startupFailure: candidate?.startupFailure ?? "missing",
+                settingsSchemaVersion:
+                  candidate?.settings?.settingsSchemaVersion ?? "missing",
+              })}`,
+            );
+          }
+          await delayInPage(100);
+        }
+      }
     }
-  }, [...pluginIds]);
-  await page.waitForFunction(
-    (requiredPluginIds) => {
-      const plugins = (window as typeof window & { app?: any }).app?.plugins
-        ?.plugins;
-      return requiredPluginIds.every((pluginId) => Boolean(plugins?.[pluginId]));
-    },
-    [...pluginIds],
-    { timeout: 30_000 },
-  );
+  }, { requiredPluginIds: [...pluginIds], corePluginId: NATIVE_CORE_PLUGIN_ID });
+}
+
+async function trustDisposableVaultIfPrompted(page: Page): Promise<void> {
+  const trustVaultButton = page.getByRole("button", {
+    name: "Trust author and enable plugins",
+  });
+  if (!(await trustVaultButton.isVisible().catch(() => false))) return;
+  if (process.env.E2E_TRUST_DISPOSABLE_VAULT !== "1") {
+    throw new Error(
+      "Obsidian opened this vault in Restricted Mode. Set E2E_TRUST_DISPOSABLE_VAULT=1 only for a controlled disposable vault containing trusted local plugin artifacts.",
+    );
+  }
+  await trustVaultButton.click();
+  await trustVaultButton.waitFor({ state: "hidden", timeout: 30_000 });
 }
 
 async function forceOnlyVaultOpen(
