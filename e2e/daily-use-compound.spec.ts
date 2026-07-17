@@ -72,6 +72,7 @@ interface LinearReadbackClient {
 interface ProtectedCredentialOwnership {
   linear: boolean;
   github: boolean;
+  verifyPreservedLinear: boolean;
 }
 
 test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independently cleans providers", async ({}, testInfo) => {
@@ -172,7 +173,9 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
   let credentialOwnership: ProtectedCredentialOwnership = {
     linear: false,
     github: false,
+    verifyPreservedLinear: false,
   };
+  let missionError: unknown = null;
   let cleanupVerified = false;
   const cleanupErrors: string[] = [];
   const restartedStages: ProjectLifecycleStageName[] = [];
@@ -629,6 +632,8 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       },
       { requireComplete: true },
     );
+  } catch (error) {
+    missionError = error;
   } finally {
     if (harness && !cleanupVerified) {
       try {
@@ -680,9 +685,13 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       cleanupErrors.push(`fixture cleanup: ${safeError(error)}`);
     });
     if (cleanupErrors.length > 0) {
-      throw new Error(`DU-06 cleanup failures: ${cleanupErrors.join("; ")}`);
+      const primary = missionError
+        ? `DU-06 failed: ${safeError(missionError)}; `
+        : "";
+      throw new Error(`${primary}cleanup failures: ${cleanupErrors.join("; ")}`);
     }
   }
+  if (missionError) throw missionError;
 });
 
 async function configureProtectedConnections(
@@ -756,6 +765,7 @@ async function configureProtectedConnections(
         credentialOwnership: {
           linear: linearOwned,
           github: githubOwned,
+          verifyPreservedLinear: !linearOwned,
         },
       };
     } catch (error) {
@@ -779,7 +789,11 @@ async function clearProtectedConnections(
     if (!plugin) return { linear: true, github: true };
     const linear = ownership.linear
       ? await plugin.clearLinearApiKey()
-      : { ok: plugin.getLinearCredentialStatus?.()?.secure === true };
+      : {
+          ok:
+            !ownership.verifyPreservedLinear ||
+            plugin.getLinearCredentialStatus?.()?.secure === true,
+        };
     const github = ownership.github
       ? await plugin.disconnectGitHub()
       : { ok: true };
