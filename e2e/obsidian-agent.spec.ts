@@ -2213,11 +2213,7 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     const githubConnectButton = githubConnection.getByRole("button", {
       name: "Connect OAuth",
     });
-    if (startup.github.oauthClientId) {
-      await expect(githubConnectButton).toBeEnabled();
-    } else {
-      await expect(githubConnectButton).toBeDisabled();
-    }
+    await expect(githubConnectButton).toBeEnabled();
     const githubPatSetting = settings.locator(".setting-item", {
       hasText: "GitHub fine-grained personal access token",
     });
@@ -2303,19 +2299,22 @@ test("Linear key setup persists only an opaque reference and refreshes readiness
         const data = await plugin.loadData();
         return {
           ok: result.ok,
+          message: result.message,
           plaintextPresent:
             typeof data?.linearApiKey === "string" && data.linearApiKey.length > 0,
           referencePresent:
             typeof data?.linearCredentialReference?.referenceId === "string",
+          referenceId: data?.linearCredentialReference?.referenceId ?? null,
           persistent: data?.linearCredentialReference?.persistent === true,
         };
       }, { pluginId: PLUGIN_ID });
-      expect(persisted).toEqual({
+      expect(persisted, persisted.message).toMatchObject({
         ok: true,
         plaintextPresent: false,
         referencePresent: true,
         persistent: true,
       });
+      expect(persisted.referenceId).toMatch(/^secret-obsidian-/u);
       await expect(
         readiness.getByRole("button", { name: /Linear: Degraded/u }),
       ).toBeVisible({ timeout: 5_000 });
@@ -2323,6 +2322,147 @@ test("Linear key setup persists only an opaque reference and refreshes readiness
       await page.evaluate(async ({ pluginId }) => {
         const plugin = (window as typeof window & { app?: any }).app?.plugins
           ?.plugins?.[pluginId];
+        await plugin?.clearLinearApiKey?.();
+      }, { pluginId: PLUGIN_ID }).catch(() => undefined);
+    }
+  });
+});
+
+test("Linear and GitHub connection actions refresh in place and preserve retry state", async () => {
+  test.setTimeout(120_000);
+  await withE2EHarness("integration-connection-refresh", async ({ page }) => {
+    await openPluginSettings(page);
+    const settings = page.locator(".agentic-researcher-settings");
+    const connections = settings.locator("#agentic-settings-connections");
+    await connections.evaluate((element) => {
+      (element as HTMLDetailsElement).open = true;
+    });
+
+    await page.evaluate(({ pluginId }) => {
+      const obsidianWindow = window as typeof window & {
+        app?: any;
+        __e2eRestoreConnectionRefresh?: (() => void) | null;
+      };
+      const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+      if (!plugin?.testLinearConnection || !plugin?.startGitHubDeviceAuthorization) {
+        throw new Error("Integration settings APIs are unavailable.");
+      }
+      const originalLinearTest = plugin.testLinearConnection.bind(plugin);
+      const originalGitHubStart = plugin.startGitHubDeviceAuthorization.bind(plugin);
+      const originalWindowOpen = window.open;
+      window.open = () => null;
+      plugin.testLinearConnection = async () => ({
+        ok: false,
+        message: "Deterministic E2E verification failure after secure save.",
+      });
+      plugin.startGitHubDeviceAuthorization = async function startGitHubE2E() {
+        const now = new Date();
+        this.githubDeviceFlowState = {
+          version: 1,
+          sessionId: "e2e-github-device-session",
+          status: "waiting_for_user",
+          userCode: "E2E-CODE",
+          verificationUri: "https://github.com/login/device",
+          scopes: ["repo"],
+          intervalSeconds: 5,
+          attempts: 0,
+          createdAt: now.toISOString(),
+          expiresAt: new Date(now.getTime() + 15 * 60_000).toISOString(),
+          nextPollAt: new Date(now.getTime() + 5_000).toISOString(),
+        };
+        this.githubAuthStatusMessage =
+          "Enter E2E-CODE at GitHub; waiting for authorization.";
+        return {
+          ok: true,
+          message: this.githubAuthStatusMessage,
+          userCode: "E2E-CODE",
+        };
+      };
+      obsidianWindow.__e2eRestoreConnectionRefresh = () => {
+        plugin.testLinearConnection = originalLinearTest;
+        plugin.startGitHubDeviceAuthorization = originalGitHubStart;
+        window.open = originalWindowOpen;
+        obsidianWindow.__e2eRestoreConnectionRefresh = null;
+      };
+    }, { pluginId: PLUGIN_ID });
+
+    try {
+      let linearKey = settings.locator(".setting-item", {
+        hasText: "Linear personal API key",
+      });
+      await linearKey.locator('input[type="password"]').fill("e2e-linear-key-not-real");
+      await linearKey.getByRole("button", { name: "Save key" }).click();
+      await expect(connections).toHaveAttribute("open", "");
+      await expect(
+        settings
+          .locator(".agentic-settings-readiness")
+          .getByRole("button", { name: /Linear: Degraded/u }),
+      ).toBeVisible({ timeout: 10_000 });
+      linearKey = settings.locator(".setting-item", {
+        hasText: "Linear personal API key",
+      });
+      await expect(linearKey).toContainText("opaque");
+      await expect(
+        linearKey.getByRole("button", { name: "Test connection" }),
+      ).toBeEnabled();
+
+      const oauthAdvanced = settings.locator(".agentic-linear-oauth-advanced");
+      await oauthAdvanced.evaluate((element) => {
+        (element as HTMLDetailsElement).open = true;
+      });
+      await oauthAdvanced
+        .locator("input.agentic-linear-oauth-client-id")
+        .fill("e2e-linear-oauth-client");
+      const linearOauth = settings.locator(".setting-item", {
+        hasText: "Connect Linear with OAuth",
+      });
+      await linearOauth.getByRole("button", { name: "Connect Linear" }).click();
+      await expect(connections).toHaveAttribute("open", "");
+      await expect(
+        settings.locator(".setting-item", { hasText: "Connect Linear with OAuth" }),
+      ).toContainText("Waiting for the one-time Linear callback", { timeout: 10_000 });
+      await settings
+        .locator(".setting-item", { hasText: "Connect Linear with OAuth" })
+        .getByRole("button", { name: "Cancel" })
+        .click();
+      await expect(connections).toHaveAttribute("open", "");
+
+      const githubClient = settings.locator(".setting-item", {
+        hasText: "GitHub OAuth client ID",
+      });
+      await githubClient
+        .locator("input.agentic-github-oauth-client-id")
+        .fill("e2e-github-oauth-client");
+      let githubConnection = settings.locator(".setting-item", {
+        hasText: "GitHub connection",
+      });
+      await expect(
+        githubConnection.getByRole("button", { name: "Connect OAuth" }),
+      ).toBeEnabled();
+      await githubConnection.getByRole("button", { name: "Connect OAuth" }).click();
+      await expect(connections).toHaveAttribute("open", "");
+      githubConnection = settings.locator(".setting-item", {
+        hasText: "GitHub connection",
+      });
+      await expect(githubConnection).toContainText("E2E-CODE");
+      await expect(
+        githubConnection.getByRole("button", { name: "Copy user code" }),
+      ).toBeVisible();
+      await githubConnection.getByRole("button", { name: "Cancel" }).click();
+      await expect(connections).toHaveAttribute("open", "");
+      await expect(
+        settings.locator(".setting-item", { hasText: "GitHub connection" }),
+      ).toContainText("GitHub authorization was cancelled");
+    } finally {
+      await page.evaluate(async ({ pluginId }) => {
+        const obsidianWindow = window as typeof window & {
+          app?: any;
+          __e2eRestoreConnectionRefresh?: (() => void) | null;
+        };
+        obsidianWindow.__e2eRestoreConnectionRefresh?.();
+        const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+        plugin?.cancelGitHubDeviceAuthorization?.();
+        await plugin?.disconnectLinearOAuth?.();
         await plugin?.clearLinearApiKey?.();
       }, { pluginId: PLUGIN_ID }).catch(() => undefined);
     }

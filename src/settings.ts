@@ -604,6 +604,10 @@ export class AgentSettingTab extends PluginSettingTab {
     if (section) section.open = true;
   }
 
+  refreshConnectionStatus(): void {
+    this.redisplayWithAdvancedSectionOpen("agentic-settings-connections");
+  }
+
   private renderAdvancedSections(containerEl: HTMLElement): void {
     const advancedRoot = containerEl.createDiv({
       cls: "agentic-settings-advanced agentic-settings-panel",
@@ -1590,7 +1594,7 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(oauthAdvanced)
       .setName("Linear OAuth actor")
       .setDesc(
-        "User acts as the consenting member. App uses the OAuth app actor and fails closed unless the companion proves persistent OS credential storage.",
+        "User acts as the consenting member. App uses the OAuth app actor. Foreground credentials use Obsidian SecretStorage; optional background continuation requires the Companion credential store.",
       )
       .addDropdown((dropdown) =>
         dropdown
@@ -1610,7 +1614,14 @@ export class AgentSettingTab extends PluginSettingTab {
       .setDesc(oauthStatus.message);
     oauthSetting.addButton((button) =>
       button
-        .setButtonText(oauthStatus.connected ? "Reconnect" : "Connect Linear")
+        .setButtonText(
+          oauthStatus.waitingForCallback
+            ? "Waiting for approval"
+            : oauthStatus.connected
+              ? "Reconnect"
+              : "Connect Linear",
+        )
+        .setDisabled(oauthStatus.waitingForCallback)
         .setCta()
         .onClick(async () => {
           if (!(this.plugin.settings.linearOAuthClientId ?? "").trim()) {
@@ -1628,6 +1639,12 @@ export class AgentSettingTab extends PluginSettingTab {
           button.setDisabled(true).setButtonText("Starting...");
           const result = await this.plugin.startLinearOAuthAuthorization();
           oauthSetting.setDesc(result.message);
+          if (!result.ok) {
+            button
+              .setDisabled(false)
+              .setButtonText(oauthStatus.connected ? "Reconnect" : "Connect Linear");
+            return;
+          }
           if (result.ok && result.authorizationUrl) {
             const opened = openLinearAuthorizationUrl(result.authorizationUrl);
             if (!opened) {
@@ -1639,7 +1656,7 @@ export class AgentSettingTab extends PluginSettingTab {
               );
             }
           }
-          window.setTimeout(() => this.display(), 250);
+          this.refreshConnectionStatus();
         }),
     );
     if (oauthStatus.authorizationUrl) {
@@ -1664,7 +1681,13 @@ export class AgentSettingTab extends PluginSettingTab {
             button.setDisabled(true).setButtonText("Disconnecting...");
             const result = await this.plugin.disconnectLinearOAuth();
             oauthSetting.setDesc(result.message);
-            if (result.ok) this.display();
+            if (result.ok) {
+              this.refreshConnectionStatus();
+            } else {
+              button
+                .setDisabled(false)
+                .setButtonText(oauthStatus.connected ? "Revoke OAuth" : "Cancel");
+            }
           }),
       );
     }
@@ -1693,8 +1716,7 @@ export class AgentSettingTab extends PluginSettingTab {
         const result = await this.plugin.setLinearApiKey(pendingLinearKey);
         if (!result.ok) {
           linearKeySetting.setDesc(result.message);
-          button.setButtonText("Not saved");
-          window.setTimeout(() => this.display(), 1_500);
+          button.setDisabled(false).setButtonText("Save key");
           return;
         }
         button.setButtonText("Verifying...");
@@ -1703,7 +1725,7 @@ export class AgentSettingTab extends PluginSettingTab {
           verified.ok ? `${result.message} ${verified.message}` : verified.message,
         );
         button.setButtonText(verified.ok ? "Connected" : "Saved; verify failed");
-        window.setTimeout(() => this.display(), 500);
+        this.refreshConnectionStatus();
       }),
     );
     if (credentialStatus.configured && !credentialStatus.secure) {
@@ -1712,8 +1734,11 @@ export class AgentSettingTab extends PluginSettingTab {
           button.setDisabled(true).setButtonText("Migrating...");
           const result = await this.plugin.migrateLegacyLinearApiKeyToSecureStore();
           linearKeySetting.setDesc(result.message);
-          button.setButtonText(result.ok ? "Migrated" : "Migration blocked");
-          window.setTimeout(() => this.display(), 2_000);
+          if (result.ok) {
+            this.refreshConnectionStatus();
+          } else {
+            button.setDisabled(false).setButtonText("Migrate legacy key");
+          }
         }),
       );
     }
@@ -1724,7 +1749,7 @@ export class AgentSettingTab extends PluginSettingTab {
         .onClick(async () => {
           const result = await this.plugin.clearLinearApiKey();
           linearKeySetting.setDesc(result.message);
-          if (result.ok) this.display();
+          if (result.ok) this.refreshConnectionStatus();
         }),
     );
     linearKeySetting.addButton((button) =>
@@ -1737,9 +1762,7 @@ export class AgentSettingTab extends PluginSettingTab {
           const result = await this.plugin.testLinearConnection();
           button.setButtonText(result.ok ? "Connected" : "Test failed");
           linearKeySetting.setDesc(result.message);
-          window.setTimeout(() => {
-            this.display();
-          }, 2_000);
+          this.refreshConnectionStatus();
         }),
     );
 
@@ -1914,7 +1937,7 @@ export class AgentSettingTab extends PluginSettingTab {
 
     section.createEl("h4", { text: "GitHub integration" });
     section.createEl("p", {
-      text: "Optional fixed-catalog GitHub access. OAuth device flow and fine-grained tokens are verified through /user, stored only in the companion's persistent OS credential backend, and pinned to the returned account identity.",
+      text: "Optional fixed-catalog GitHub access. OAuth device flow and fine-grained tokens are verified through /user, stored in Obsidian SecretStorage for foreground use, and pinned to the returned account identity. Background continuation remains Companion-gated.",
       cls: "setting-item-description",
     });
 
@@ -1923,15 +1946,16 @@ export class AgentSettingTab extends PluginSettingTab {
       .setDesc(
         "Non-secret client ID from a GitHub OAuth app with device flow enabled.",
       )
-      .addText((text) =>
-        text
+      .addText((text) => {
+        text.inputEl.addClass("agentic-github-oauth-client-id");
+        return text
           .setPlaceholder("GitHub OAuth client ID")
           .setValue(this.plugin.settings.githubOAuthClientId ?? "")
           .onChange(async (value) => {
             this.plugin.settings.githubOAuthClientId = value.trim();
             await this.plugin.saveSettings();
-          }),
-      );
+          });
+      });
 
     const githubStatus = this.plugin.getGitHubCredentialStatus();
     const githubConnection = new Setting(section)
@@ -1940,20 +1964,32 @@ export class AgentSettingTab extends PluginSettingTab {
     githubConnection.addButton((button) =>
       button
         .setButtonText(githubStatus.connected ? "Reconnect OAuth" : "Connect OAuth")
-        .setDisabled(
-          !(this.plugin.settings.githubOAuthClientId ?? "").trim() ||
-            githubStatus.waitingForUser,
-        )
+        .setDisabled(githubStatus.waitingForUser)
         .onClick(async () => {
+          if (!(this.plugin.settings.githubOAuthClientId ?? "").trim()) {
+            githubConnection.setDesc(
+              "Enter the GitHub OAuth client ID above, then choose Connect OAuth again.",
+            );
+            section
+              .querySelector<HTMLInputElement>(".agentic-github-oauth-client-id")
+              ?.focus();
+            return;
+          }
           button.setDisabled(true).setButtonText("Starting...");
           const result = await this.plugin.startGitHubDeviceAuthorization();
           githubConnection.setDesc(result.message);
+          if (!result.ok) {
+            button
+              .setDisabled(false)
+              .setButtonText(githubStatus.connected ? "Reconnect OAuth" : "Connect OAuth");
+            return;
+          }
           if (result.ok && result.verificationUri) {
             if (!openGitHubDeviceAuthorizationUrl(result.verificationUri)) {
               await copyTextToClipboard(result.verificationUri);
             }
           }
-          this.display();
+          this.refreshConnectionStatus();
         }),
     );
     if (githubStatus.waitingForUser) {
@@ -1971,7 +2007,7 @@ export class AgentSettingTab extends PluginSettingTab {
         button.setButtonText("Cancel").onClick(() => {
           const result = this.plugin.cancelGitHubDeviceAuthorization();
           githubConnection.setDesc(result.message);
-          this.display();
+          this.refreshConnectionStatus();
         }),
       );
     }
@@ -1981,7 +2017,11 @@ export class AgentSettingTab extends PluginSettingTab {
           button.setDisabled(true).setButtonText("Disconnecting...");
           const result = await this.plugin.disconnectGitHub();
           githubConnection.setDesc(result.message);
-          if (result.ok) this.display();
+          if (result.ok) {
+            this.refreshConnectionStatus();
+          } else {
+            button.setDisabled(false).setButtonText("Disconnect");
+          }
         }),
       );
     }
@@ -2011,8 +2051,11 @@ export class AgentSettingTab extends PluginSettingTab {
           );
           pendingGitHubPat = "";
           githubPatSetting.setDesc(result.message);
-          button.setButtonText(result.ok ? "Saved" : "Not saved");
-          window.setTimeout(() => this.display(), 1_500);
+          if (result.ok) {
+            this.refreshConnectionStatus();
+          } else {
+            button.setDisabled(false).setButtonText("Verify and save");
+          }
         }),
     );
 

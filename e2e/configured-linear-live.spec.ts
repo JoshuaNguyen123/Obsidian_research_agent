@@ -61,7 +61,11 @@ test.describe.serial("configured native Linear live proof", () => {
 
         const connection = await plugin.testLinearConnection();
         if (!connection?.ok) {
-          throw new Error("The configured Linear credential failed live discovery.");
+          throw new Error(
+            `The configured Linear credential failed live discovery: ${String(
+              connection?.message ?? "no provider message",
+            ).slice(0, 500)}`,
+          );
         }
         const snapshot = plugin.getLinearCapabilitySnapshot?.();
         const teamId = plugin.settings?.linearDefaultTeamId || snapshot?.teams?.[0]?.id;

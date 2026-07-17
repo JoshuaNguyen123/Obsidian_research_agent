@@ -8,6 +8,92 @@ import {
   SecretStoreBoundaryErrorV1,
   requireBackgroundSecretStoreV1,
 } from "../packages/headless-runtime/src/secretStoreV1";
+import { ObsidianSecretStoreV1 } from "../src/integrations/ObsidianSecretStoreV1";
+
+test("Obsidian SecretStorage adapter persists opaque foreground credentials", async () => {
+  const values = new Map<string, string>();
+  let now = new Date("2026-07-16T12:00:00.000Z");
+  const plaintext = "oauth-access-token-must-stay-out-of-plugin-data";
+  const store = new ObsidianSecretStoreV1(
+    {
+      getSecret: (id) => values.get(id) ?? null,
+      setSecret: (id, value) => {
+        values.set(id, value);
+      },
+    },
+    {
+      now: () => now,
+      randomId: () => "12345678-abcd-1234-abcd-123456789abc",
+    },
+  );
+
+  const health = await store.health();
+  assert.deepEqual(health, {
+    version: 1,
+    available: true,
+    persistent: true,
+    backend: "obsidian-secret-storage",
+    backgroundEligible: false,
+    blocker: "secure_persistent_credential_backend_required",
+  });
+
+  const description = await store.put({
+    value: plaintext,
+    label: "GitHub OAuth credential",
+    metadata: { provider: "github", credentialKind: "oauth_device" },
+  });
+  assert.match(description.referenceId, /^secret-obsidian-/u);
+  assert.equal(description.backend, "obsidian-secret-storage");
+  assert.equal(description.persistent, true);
+  assert.equal(JSON.stringify(description).includes(plaintext), false);
+  assert.deepEqual(await store.describe(description.referenceId), description);
+
+  const lease = await store.lease(description.referenceId, { ttlSeconds: 30 });
+  assert.equal(await lease.withSecret(async (secret) => secret), plaintext);
+  assert.equal(JSON.stringify(lease).includes(plaintext), false);
+  now = new Date("2026-07-16T12:00:30.001Z");
+  await assert.rejects(
+    () => lease.withSecret(async () => undefined),
+    /Secret lease expired/u,
+  );
+  assert.equal(lease.disposed, true);
+
+  assert.equal(await store.remove(description.referenceId), true);
+  assert.equal(await store.remove(description.referenceId), false);
+  await assert.rejects(
+    () => store.describe(description.referenceId),
+    /Secret reference was not found/u,
+  );
+});
+
+test("Obsidian SecretStorage adapter rejects unsafe metadata and malformed entries", async () => {
+  const values = new Map<string, string>();
+  const store = new ObsidianSecretStoreV1(
+    {
+      getSecret: (id) => values.get(id) ?? null,
+      setSecret: (id, value) => {
+        values.set(id, value);
+      },
+    },
+    { randomId: () => "abcdef12-abcd-1234-abcd-123456789abc" },
+  );
+
+  await assert.rejects(
+    () =>
+      store.put({
+        value: "safe-value",
+        label: "Unsafe metadata",
+        metadata: { token: "must-not-persist" } as never,
+      }),
+    /Secret metadata is malformed/u,
+  );
+  const referenceId = "secret-obsidian-abcdef12-abcd-1234-abcd-123456789abc";
+  values.set(referenceId, "not-json");
+  await assert.rejects(
+    () => store.describe(referenceId),
+    /Obsidian SecretStorage entry is malformed/u,
+  );
+});
 
 test("foreground SecretStoreV1 persists only opaque metadata and redacts leases", async () => {
   const plaintext = "github_pat_plaintext_must_never_serialize";

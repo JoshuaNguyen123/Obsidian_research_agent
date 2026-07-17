@@ -331,7 +331,14 @@ import {
   CompanionSecretStoreClientV1,
   requireBackgroundSecretStoreV1,
 } from "./packages/headless-runtime/src/secretStoreV1";
-import type { SecretDescriptionV1 } from "./packages/core-api/src/secretStoreV1";
+import type {
+  SecretDescriptionV1,
+  SecretStoreV1,
+} from "./packages/core-api/src/secretStoreV1";
+import {
+  isObsidianSecretReferenceV1,
+  ObsidianSecretStoreV1,
+} from "./src/integrations/ObsidianSecretStoreV1";
 import type { ParsedCompatibleWorkItemSpec } from "./src/integrations/linear/WorkItemSpecV2";
 import {
   GitHubAuthV1,
@@ -476,8 +483,6 @@ const COMPANION_RECONCILE_MAX_DELAY_MS = 5_000;
 const COMPANION_RECONCILE_IDLE_DELAY_MS = 30_000;
 const OBSIDIAN_SECRET_STORAGE_BACKEND = "obsidian-secret-storage";
 const OBSIDIAN_LINEAR_SECRET_ID = "agentic-researcher-linear-api-key";
-const OBSIDIAN_LINEAR_CREDENTIAL_REFERENCE_ID =
-  "credential_obsidian-linear-api-key";
 
 function resolveLinearQueueVaultTargetPath(
   workItem: ParsedCompatibleWorkItemSpec,
@@ -1595,7 +1600,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       ? String(rawLinearApiKey).trim()
       : "";
     if (this.linearApiKey && !this.linearCredentialReference) {
-      const migrated = this.tryPersistLinearCredentialInObsidianSecretStorage(
+      const migrated = await this.tryPersistLinearCredentialInObsidianSecretStorage(
         this.linearApiKey,
       );
       if (migrated.ok) this.linearApiKey = "";
@@ -1756,10 +1761,29 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   hasLinearApiKey(): boolean {
+    const reference = this.linearCredentialReference;
+    let referencedCredentialAvailable = false;
+    if (reference) {
+      if (reference.backend !== OBSIDIAN_SECRET_STORAGE_BACKEND) {
+        referencedCredentialAvailable = true;
+      } else {
+        try {
+          referencedCredentialAvailable = Boolean(
+            this.app.secretStorage.getSecret(
+              isObsidianSecretReferenceV1(reference.referenceId)
+                ? reference.referenceId
+                : OBSIDIAN_LINEAR_SECRET_ID,
+            ),
+          );
+        } catch {
+          referencedCredentialAvailable = false;
+        }
+      }
+    }
     return (
       this.linearOAuthRuntimeState !== null ||
       this.linearApiKey.length > 0 ||
-      this.linearCredentialReference !== null
+      referencedCredentialAvailable
     );
   }
 
@@ -1789,32 +1813,35 @@ export default class AgenticResearcherPlugin extends Plugin {
     authorizationUrl?: string;
   }> {
     if (!this.getOptionalExtensionCapabilities().integrations) {
+      this.linearOAuthStatusMessage =
+        "The built-in Integrations capability is not ready. Reload Agentic Researcher, then connect Linear again.";
       return {
         ok: false,
-        message: "The built-in Integrations capability is not ready. Check Run Details before connecting Linear OAuth.",
+        message: this.linearOAuthStatusMessage,
       };
     }
     const clientId = normalizeLinearOAuthClientIdV1(
       this.settings.linearOAuthClientId,
     );
     if (!clientId) {
+      this.linearOAuthStatusMessage =
+        "Enter the client ID from a configured Linear OAuth application.";
       return {
         ok: false,
-        message: "Enter the client ID from a configured Linear OAuth application.",
+        message: this.linearOAuthStatusMessage,
       };
     }
     const actor: LinearOAuthActorV1 =
       this.settings.linearOAuthActor === "app" ? "app" : "user";
-    const store = this.createCompanionSecretStore();
+    const store = this.createForegroundSecretStore();
     try {
-      await requireBackgroundSecretStoreV1(store);
+      await this.requirePersistentForegroundSecretStore(store);
     } catch {
+      this.linearOAuthStatusMessage =
+        "Linear OAuth needs Obsidian SecretStorage or an authenticated persistent Companion credential store.";
       return {
         ok: false,
-        message:
-          actor === "app"
-            ? "App-actor OAuth is blocked until the authenticated companion proves a persistent OS credential store."
-            : "OAuth token storage requires the authenticated companion's persistent OS credential store.",
+        message: this.linearOAuthStatusMessage,
       };
     }
 
@@ -1855,6 +1882,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         clientId,
         actor,
         sessionId: authorization.sessionId,
+        store,
       });
       return {
         ok: true,
@@ -1883,8 +1911,10 @@ export default class AgenticResearcherPlugin extends Plugin {
       return { ok: true, message: this.linearOAuthStatusMessage };
     }
     try {
-      const store = this.createCompanionSecretStore();
-      if (state.actor === "app") await requireBackgroundSecretStoreV1(store);
+      const store = this.createForegroundSecretStore(
+        state.credential.accessTokenReferenceId,
+      );
+      await this.requirePersistentForegroundSecretStore(store);
       const client = this.createLinearOAuthClient(store, state.clientId);
       await client.revoke(state.credential, "both");
       this.linearOAuthRuntimeState = null;
@@ -1950,28 +1980,33 @@ export default class AgenticResearcherPlugin extends Plugin {
     verificationUri?: string;
   }> {
     if (!this.getOptionalExtensionCapabilities().integrations) {
+      this.githubAuthStatusMessage =
+        "The built-in Integrations capability is not ready. Reload Agentic Researcher, then connect GitHub again.";
       return {
         ok: false,
-        message: "The built-in Integrations capability is not ready. Check Run Details before connecting GitHub.",
+        message: this.githubAuthStatusMessage,
       };
     }
     const clientId = normalizeGitHubOAuthClientIdSetting(
       this.settings.githubOAuthClientId,
     );
     if (!clientId) {
+      this.githubAuthStatusMessage =
+        "Enter the client ID from a GitHub OAuth app with device flow enabled.";
       return {
         ok: false,
-        message: "Enter the client ID from a GitHub OAuth app with device flow enabled.",
+        message: this.githubAuthStatusMessage,
       };
     }
-    const store = this.createCompanionSecretStore();
+    const store = this.createForegroundSecretStore();
     try {
-      await requireBackgroundSecretStoreV1(store);
+      await this.requirePersistentForegroundSecretStore(store);
     } catch {
+      this.githubAuthStatusMessage =
+        "GitHub OAuth needs Obsidian SecretStorage or an authenticated persistent Companion credential store.";
       return {
         ok: false,
-        message:
-          "GitHub authentication requires the authenticated companion's persistent OS credential store.",
+        message: this.githubAuthStatusMessage,
       };
     }
 
@@ -1988,7 +2023,12 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.githubDeviceFlowState = device;
       this.githubAuthStatusMessage =
         `Enter ${device.userCode} at ${device.verificationUri}; waiting for GitHub authorization.`;
-      void this.finishGitHubDeviceAuthorization(auth, device.sessionId, generation);
+      void this.finishGitHubDeviceAuthorization(
+        auth,
+        store,
+        device.sessionId,
+        generation,
+      );
       return {
         ok: true,
         message: this.githubAuthStatusMessage,
@@ -2013,14 +2053,16 @@ export default class AgenticResearcherPlugin extends Plugin {
     token: string,
   ): Promise<{ ok: boolean; message: string }> {
     if (!this.getOptionalExtensionCapabilities().integrations) {
+      this.githubAuthStatusMessage =
+        "The built-in Integrations capability is not ready. Reload Agentic Researcher, then connect GitHub again.";
       return {
         ok: false,
-        message: "The built-in Integrations capability is not ready. Check Run Details before connecting GitHub.",
+        message: this.githubAuthStatusMessage,
       };
     }
-    const store = this.createCompanionSecretStore();
+    const store = this.createForegroundSecretStore();
     try {
-      await requireBackgroundSecretStoreV1(store);
+      await this.requirePersistentForegroundSecretStore(store);
       const auth = this.createGitHubAuthClient(
         store,
         normalizeGitHubOAuthClientIdSetting(this.settings.githubOAuthClientId) ||
@@ -2045,12 +2087,12 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.githubAuthStatusMessage = "GitHub is not connected.";
       return { ok: true, message: this.githubAuthStatusMessage };
     }
-    const store = this.createCompanionSecretStore();
+    const store = this.createForegroundSecretStore(credential.tokenReferenceId);
     try {
-      await requireBackgroundSecretStoreV1(store);
+      await this.requirePersistentForegroundSecretStore(store);
     } catch {
       this.githubAuthStatusMessage =
-        "GitHub disconnect is blocked until the authenticated companion can remove the persistent credential.";
+        "GitHub disconnect is blocked until the credential's persistent secure store can remove it.";
       return { ok: false, message: this.githubAuthStatusMessage };
     }
     this.githubCredential = null;
@@ -2090,8 +2132,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
     const credential = this.githubCredential;
     if (!credential) throw new Error("GitHub is not connected.");
-    const store = this.createCompanionSecretStore();
-    await requireBackgroundSecretStoreV1(store);
+    const store = this.createForegroundSecretStore(credential.tokenReferenceId);
+    await this.requirePersistentForegroundSecretStore(store);
     const auth = this.createGitHubAuthClient(
       store,
       normalizeGitHubOAuthClientIdSetting(this.settings.githubOAuthClientId) ||
@@ -2192,6 +2234,18 @@ export default class AgenticResearcherPlugin extends Plugin {
     message: string;
   } {
     if (this.linearCredentialReference) {
+      if (
+        this.linearCredentialReference.backend ===
+          OBSIDIAN_SECRET_STORAGE_BACKEND &&
+        !this.hasLinearApiKey()
+      ) {
+        return {
+          configured: false,
+          secure: false,
+          message:
+            "The saved opaque Linear reference has no matching SecretStorage entry. Paste the key again or reconnect OAuth.",
+        };
+      }
       return {
         configured: true,
         secure: this.linearCredentialReference.persistent,
@@ -2275,13 +2329,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   async clearLinearApiKey(): Promise<{ ok: boolean; message: string }> {
     if (this.linearCredentialReference) {
       try {
-        const removed =
-          this.linearCredentialReference.backend ===
-          OBSIDIAN_SECRET_STORAGE_BACKEND
-            ? this.clearLinearCredentialFromObsidianSecretStorage()
-            : await this.createCompanionSecretStore().remove(
-                this.linearCredentialReference.referenceId,
-              );
+        const removed = await this.removeLinearCredentialReference(
+          this.linearCredentialReference,
+        );
         if (!removed) {
           return {
             ok: false,
@@ -2292,7 +2342,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         return {
           ok: false,
           message:
-            "The authenticated secure companion is unavailable. Credential removal failed closed and the reference was retained.",
+            "The credential's secure store is unavailable. Removal failed closed and the opaque reference was retained.",
         };
       }
     }
@@ -3771,8 +3821,37 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
   }
 
+  private createObsidianSecretStore(): ObsidianSecretStoreV1 {
+    return new ObsidianSecretStoreV1(this.app.secretStorage);
+  }
+
+  private createForegroundSecretStore(referenceId?: string): SecretStoreV1 {
+    if (referenceId && !isObsidianSecretReferenceV1(referenceId)) {
+      return this.createCompanionSecretStore();
+    }
+    if (
+      this.app.secretStorage &&
+      typeof this.app.secretStorage.getSecret === "function" &&
+      typeof this.app.secretStorage.setSecret === "function"
+    ) {
+      return this.createObsidianSecretStore();
+    }
+    return this.createCompanionSecretStore();
+  }
+
+  private async requirePersistentForegroundSecretStore(
+    store: SecretStoreV1,
+  ): Promise<void> {
+    const health = await store.health();
+    if (!health.available || !health.persistent) {
+      throw new Error(
+        "A persistent Obsidian or Companion credential store is required.",
+      );
+    }
+  }
+
   private createGitHubAuthClient(
-    store: CompanionSecretStoreClientV1,
+    store: SecretStoreV1,
     clientId: string,
   ): GitHubAuthV1 {
     return new GitHubAuthV1({
@@ -3805,6 +3884,7 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   private async finishGitHubDeviceAuthorization(
     auth: GitHubAuthV1,
+    store: SecretStoreV1,
     sessionId: string,
     generation: number,
   ): Promise<void> {
@@ -3826,12 +3906,12 @@ export default class AgenticResearcherPlugin extends Plugin {
           this.githubDeviceFlowState = result.state;
           this.githubAuthStatusMessage =
             `Enter ${result.state.userCode} at ${result.state.verificationUri}; GitHub authorization is still pending.`;
-          this.agentSettingTab?.display();
+          this.agentSettingTab?.refreshConnectionStatus();
           continue;
         }
         await this.acceptGitHubCredential(
           auth,
-          this.createCompanionSecretStore(),
+          store,
           result.credential,
         );
         this.githubAuthClient = null;
@@ -3851,21 +3931,23 @@ export default class AgenticResearcherPlugin extends Plugin {
             : "GitHub device authorization failed.";
       }
     } finally {
-      this.agentSettingTab?.display();
+      this.agentSettingTab?.refreshConnectionStatus();
     }
   }
 
   private async acceptGitHubCredential(
     auth: GitHubAuthV1,
-    store: CompanionSecretStoreClientV1,
+    store: SecretStoreV1,
     credential: GitHubCredentialV1,
   ): Promise<void> {
     try {
       const [health, description] = await Promise.all([
-        requireBackgroundSecretStoreV1(store),
+        store.health(),
         store.describe(credential.tokenReferenceId),
       ]);
       if (
+        !health.available ||
+        !health.persistent ||
         !description.persistent ||
         description.backend !== health.backend ||
         description.referenceId !== credential.tokenReferenceId
@@ -3892,14 +3974,16 @@ export default class AgenticResearcherPlugin extends Plugin {
       previous &&
       previous.tokenReferenceId !== credential.tokenReferenceId
     ) {
-      await store.remove(previous.tokenReferenceId).catch(() => false);
+      await this.createForegroundSecretStore(previous.tokenReferenceId)
+        .remove(previous.tokenReferenceId)
+        .catch(() => false);
     }
     this.githubAuthStatusMessage =
       `Connected as ${credential.account.login} with a verified ${credential.credentialKind === "oauth_device" ? "OAuth device credential" : "fine-grained token"}.`;
   }
 
   private createLinearOAuthClient(
-    store: CompanionSecretStoreClientV1,
+    store: SecretStoreV1,
     clientId: string,
   ): LinearOAuthClientV1 {
     return new LinearOAuthClientV1({
@@ -3916,6 +4000,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     clientId: string;
     actor: LinearOAuthActorV1;
     sessionId: string;
+    store: SecretStoreV1;
   }): Promise<void> {
     try {
       const callbackUrl = await input.loopback.callbackUrl;
@@ -3925,13 +4010,15 @@ export default class AgenticResearcherPlugin extends Plugin {
         callbackUrl,
       });
       const credential = await input.client.exchangeCode(grant);
-      const store = this.createCompanionSecretStore();
+      const store = input.store;
       const [health, access, refresh] = await Promise.all([
-        requireBackgroundSecretStoreV1(store),
+        store.health(),
         store.describe(credential.accessTokenReferenceId),
         store.describe(credential.refreshTokenReferenceId),
       ]);
       if (
+        !health.available ||
+        !health.persistent ||
         !access.persistent ||
         !refresh.persistent ||
         access.backend !== health.backend ||
@@ -3970,8 +4057,11 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.linearOAuthPersistenceRequired = false;
       this.linearOAuthDeferredCleanupReferenceIds = [];
       if (previousState) {
+        const previousStore = this.createForegroundSecretStore(
+          previousState.credential.accessTokenReferenceId,
+        );
         const previousClient = this.createLinearOAuthClient(
-          store,
+          previousStore,
           previousState.clientId,
         );
         await previousClient.revoke(previousState.credential, "both").catch(() => undefined);
@@ -3997,7 +4087,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         this.linearOAuthAuthorizationUrl = null;
       }
       await input.loopback.close().catch(() => undefined);
-      this.agentSettingTab?.display();
+      this.agentSettingTab?.refreshConnectionStatus();
     }
   }
 
@@ -4018,7 +4108,9 @@ export default class AgenticResearcherPlugin extends Plugin {
             { retryable: false },
           );
         }
-        const store = this.createCompanionSecretStore();
+        const store = this.createForegroundSecretStore(
+          current.credential.accessTokenReferenceId,
+        );
         if (this.linearOAuthPersistenceRequired) {
           try {
             await this.savePluginData();
@@ -4036,9 +4128,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             cleanup.map((referenceId) => store.remove(referenceId)),
           );
         }
-        if (current.actor === "app") {
-          await requireBackgroundSecretStoreV1(store);
-        }
+        await this.requirePersistentForegroundSecretStore(store);
         const client = this.createLinearOAuthClient(store, current.clientId);
         const needsRefresh =
           current.pendingRefresh !== null ||
@@ -4146,7 +4236,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       const previous = this.linearCredentialReference;
       this.linearCredentialReference = readback;
       if (previous && previous.referenceId !== readback.referenceId) {
-        await store.remove(previous.referenceId).catch(() => false);
+        await this.removeLinearCredentialReference(previous).catch(() => false);
       }
       return {
         ok: true,
@@ -4157,9 +4247,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
   }
 
-  private tryPersistLinearCredentialInObsidianSecretStorage(
+  private async tryPersistLinearCredentialInObsidianSecretStorage(
     apiKey: string,
-  ): { ok: boolean; message: string } {
+  ): Promise<{ ok: boolean; message: string }> {
     const secretStorage = this.app.secretStorage;
     if (
       !secretStorage ||
@@ -4173,47 +4263,60 @@ export default class AgenticResearcherPlugin extends Plugin {
       };
     }
     try {
-      secretStorage.setSecret(OBSIDIAN_LINEAR_SECRET_ID, apiKey);
-      if (secretStorage.getSecret(OBSIDIAN_LINEAR_SECRET_ID) !== apiKey) {
-        return {
-          ok: false,
-          message: "Obsidian SecretStorage readback failed; no persistent credential was accepted.",
-        };
-      }
-      const now = new Date().toISOString();
-      const createdAt =
-        this.linearCredentialReference?.backend ===
-          OBSIDIAN_SECRET_STORAGE_BACKEND &&
-        this.linearCredentialReference.referenceId ===
-          OBSIDIAN_LINEAR_CREDENTIAL_REFERENCE_ID
-          ? this.linearCredentialReference.createdAt
-          : now;
-      this.linearCredentialReference = {
-        version: 1,
-        referenceId: OBSIDIAN_LINEAR_CREDENTIAL_REFERENCE_ID,
+      const store = this.createObsidianSecretStore();
+      await this.requirePersistentForegroundSecretStore(store);
+      const created = await store.put({
+        value: apiKey,
         label: "Linear personal API credential",
         metadata: {
           provider: "linear",
           credentialKind: "personal_api_key",
           scope: "agentic-researcher-integrations",
         },
-        backend: OBSIDIAN_SECRET_STORAGE_BACKEND,
-        persistent: true,
-        createdAt,
-        updatedAt: now,
-      };
+      });
+      const readback = await store.describe(created.referenceId);
+      if (
+        readback.referenceId !== created.referenceId ||
+        !readback.persistent ||
+        readback.backend !== OBSIDIAN_SECRET_STORAGE_BACKEND
+      ) {
+        await store.remove(created.referenceId).catch(() => false);
+        return {
+          ok: false,
+          message: "Obsidian SecretStorage readback failed; no persistent credential was accepted.",
+        };
+      }
+      const previous = this.linearCredentialReference;
+      this.linearCredentialReference = readback;
+      if (previous && previous.referenceId !== readback.referenceId) {
+        await this.removeLinearCredentialReference(previous).catch(() => false);
+      }
       return {
         ok: true,
         message:
           "Linear credential saved in Obsidian SecretStorage; plugin settings contain only an opaque reference.",
       };
-    } catch {
+    } catch (error) {
       return {
         ok: false,
         message:
-          "Obsidian SecretStorage and the authenticated Companion credential backend are unavailable.",
+          `Obsidian SecretStorage and the authenticated Companion credential backend are unavailable: ${sanitizeExtensionRuntimeError(error)}`,
       };
     }
+  }
+
+  private async removeLinearCredentialReference(
+    reference: SecretDescriptionV1,
+  ): Promise<boolean> {
+    if (
+      reference.backend === OBSIDIAN_SECRET_STORAGE_BACKEND &&
+      !isObsidianSecretReferenceV1(reference.referenceId)
+    ) {
+      return this.clearLinearCredentialFromObsidianSecretStorage();
+    }
+    return this.createForegroundSecretStore(reference.referenceId).remove(
+      reference.referenceId,
+    );
   }
 
   private clearLinearCredentialFromObsidianSecretStorage(): boolean {
@@ -4244,7 +4347,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (this.linearOAuthRuntimeState) {
       try {
         const state = await this.ensureLinearOAuthCredential();
-        const store = this.createCompanionSecretStore();
+        const store = this.createForegroundSecretStore(
+          state.credential.accessTokenReferenceId,
+        );
         const client = this.createLinearOAuthClient(store, state.clientId);
         const lease = await client.leaseAccessToken(state.credential, 60);
         try {
@@ -4264,7 +4369,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (this.linearCredentialReference) {
       if (
         this.linearCredentialReference.backend ===
-        OBSIDIAN_SECRET_STORAGE_BACKEND
+          OBSIDIAN_SECRET_STORAGE_BACKEND &&
+        !isObsidianSecretReferenceV1(
+          this.linearCredentialReference.referenceId,
+        )
       ) {
         const apiKey = this.app.secretStorage.getSecret(
           OBSIDIAN_LINEAR_SECRET_ID,
@@ -4278,7 +4386,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         }
         return use(apiKey);
       }
-      const lease = await this.createCompanionSecretStore().lease(
+      const lease = await this.createForegroundSecretStore(
+        this.linearCredentialReference.referenceId,
+      ).lease(
         this.linearCredentialReference.referenceId,
         { ttlSeconds: 60 },
       );
@@ -9656,8 +9766,10 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   private async createVerifiedGitPushGateway(): Promise<VerifiedGitPushGatewayV1> {
-    const store = this.createCompanionSecretStore();
-    await requireBackgroundSecretStoreV1(store);
+    const referenceId = this.githubCredential?.tokenReferenceId;
+    if (!referenceId) throw new Error("GitHub is not connected.");
+    const store = this.createForegroundSecretStore(referenceId);
+    await this.requirePersistentForegroundSecretStore(store);
     const runtime = await prepareGitHubPublicationRuntimePaths();
     return new VerifiedGitPushGatewayV1({
       runner: new SpawnVerifiedGitCommandRunnerV1({
