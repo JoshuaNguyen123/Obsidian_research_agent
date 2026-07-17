@@ -2235,7 +2235,13 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
       hasText: "Linear personal API key",
     });
     const keyInput = keySetting.locator('input[type="password"]');
+    await expect(keySetting).toContainText("No key saved");
+    await expect(keySetting).toContainText("No Linear personal API key is saved.");
     await expect(keyInput).toHaveValue("");
+    await expect(keyInput).toHaveAttribute(
+      "placeholder",
+      "Paste a personal API key",
+    );
     await expect(
       keySetting.getByRole("button", { name: "Save key" }),
     ).toBeEnabled();
@@ -2409,7 +2415,15 @@ test("Linear and GitHub connection actions refresh in place and preserve retry s
       linearKey = settings.locator(".setting-item", {
         hasText: "Linear personal API key",
       });
+      await expect(linearKey).toContainText("Key saved (hidden)");
+      await expect(linearKey).toContainText("Key is present but hidden.");
       await expect(linearKey).toContainText("opaque");
+      await expect(linearKey.locator('input[type="password"]')).toHaveValue("");
+      await expect(linearKey.locator('input[type="password"]')).toHaveAttribute(
+        "placeholder",
+        "******** (saved securely)",
+      );
+      await expect(linearKey).not.toContainText("e2e-linear-key-not-real");
       await expect(
         linearKey.getByRole("button", { name: "Test connection" }),
       ).toBeEnabled();

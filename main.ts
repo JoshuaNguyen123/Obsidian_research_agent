@@ -2231,6 +2231,8 @@ export default class AgenticResearcherPlugin extends Plugin {
   getLinearCredentialStatus(): {
     configured: boolean;
     secure: boolean;
+    state: "not_configured" | "saved_securely" | "session_only" | "stale_reference";
+    presenceLabel: string;
     message: string;
   } {
     if (this.linearCredentialReference) {
@@ -2242,25 +2244,37 @@ export default class AgenticResearcherPlugin extends Plugin {
         return {
           configured: false,
           secure: false,
+          state: "stale_reference",
+          presenceLabel: "Saved key unavailable",
           message:
-            "The saved opaque Linear reference has no matching SecretStorage entry. Paste the key again or reconnect OAuth.",
+            "A saved key reference was found, but the hidden key is unavailable. Paste the key again or reconnect OAuth.",
         };
       }
       return {
         configured: true,
         secure: this.linearCredentialReference.persistent,
-        message: `Stored as an opaque ${this.linearCredentialReference.backend} reference. Plaintext is not persisted in plugin settings.`,
+        state: "saved_securely",
+        presenceLabel: "Key saved (hidden)",
+        message: `Key is present but hidden. It is stored securely as an opaque ${this.linearCredentialReference.backend} reference; plaintext is not persisted in plugin settings.`,
       };
     }
     if (this.linearApiKey) {
       return {
         configured: true,
         secure: false,
+        state: "session_only",
+        presenceLabel: "Key present (session only)",
         message:
-          "Available for this Obsidian session only. Plaintext was removed from plugin settings; save again after secure storage becomes available.",
+          "Key is present but hidden for this Obsidian session only. Plaintext was removed from plugin settings; save again after secure storage becomes available.",
       };
     }
-    return { configured: false, secure: false, message: "No Linear credential is configured." };
+    return {
+      configured: false,
+      secure: false,
+      state: "not_configured",
+      presenceLabel: "No key saved",
+      message: "No Linear personal API key is saved.",
+    };
   }
 
   getLinearCapabilitySnapshot(): LinearCapabilitySnapshotV1 | null {

@@ -1695,14 +1695,20 @@ export class AgentSettingTab extends PluginSettingTab {
     const credentialStatus = this.plugin.getLinearCredentialStatus();
     let pendingLinearKey = "";
     const linearKeySetting = new Setting(section)
-      .setName("Linear personal API key")
+      .setName(`Linear personal API key - ${credentialStatus.presenceLabel}`)
       .setDesc(credentialStatus.message);
     linearKeySetting.addText((text) => {
       text.inputEl.type = "password";
+      text.inputEl.setAttribute(
+        "aria-label",
+        "Linear personal API key (saved value stays hidden)",
+      );
       text
         .setPlaceholder(
           credentialStatus.configured
-            ? "Key configured"
+            ? credentialStatus.secure
+              ? "******** (saved securely)"
+              : "******** (session only)"
             : "Paste a personal API key",
         )
         .setValue("")
