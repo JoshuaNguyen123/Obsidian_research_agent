@@ -1797,6 +1797,17 @@ export class AgentSettingTab extends PluginSettingTab {
 
     if (linearSnapshot) {
       new Setting(section)
+        .setName("Agentic queue setup")
+        .setDesc("Choose the best available team, project, and workflow states for an autonomous queue. You can revise the recommendations below before granting authority.")
+        .addButton((button) =>
+          button.setButtonText("Recommend queue").setCta().onClick(async () => {
+            button.setDisabled(true).setButtonText("Choosing...");
+            const result = await this.plugin.configureRecommendedLinearQueue();
+            new Notice(result.message);
+            this.display();
+          }),
+        );
+      new Setting(section)
         .setName("Default Linear team")
         .setDesc(
           "Connection-derived team used when a prepared action omits a team.",

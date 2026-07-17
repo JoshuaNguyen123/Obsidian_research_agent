@@ -3834,6 +3834,32 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
   }
 
+  async configureRecommendedLinearQueue(): Promise<{ ok: boolean; message: string }> {
+    const snapshot = this.linearCapabilitySnapshot;
+    if (!snapshot) return { ok: false, message: "Test the Linear connection before queue setup." };
+    const team = snapshot.teams.find((item) => item.id === this.settings.linearDefaultTeamId)
+      ?? [...snapshot.teams].sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id))[0];
+    if (!team) return { ok: false, message: "Linear did not return a team for queue setup." };
+    const project = snapshot.projects
+      .filter((item) => item.teamIds.length === 0 || item.teamIds.includes(team.id))
+      .sort((a, b) => projectSetupRank(a.name ?? a.id) - projectSetupRank(b.name ?? b.id) || (a.name ?? a.id).localeCompare(b.name ?? b.id))[0];
+    const states = snapshot.workflowStates.filter((item) => item.teamId === null || item.teamId === team.id);
+    const started = states.find((item) => item.type === "started");
+    const completed = states.find((item) => item.type === "completed");
+    const blocked = states.find((item) => item.type === "canceled");
+    if (!project || !started || !completed) {
+      return { ok: false, message: "Linear did not return a usable project plus started and completed workflow states. Create or connect a project, then test the connection again." };
+    }
+    this.settings.linearDefaultTeamId = team.id;
+    this.settings.linearQueueProjectId = project.id;
+    this.settings.linearStartedStateId = started.id;
+    this.settings.linearCompletedStateId = completed.id;
+    this.settings.linearBlockedStateId = blocked?.id ?? "";
+    await this.savePluginData();
+    await this.restartLinearQueueRuntime(false);
+    return { ok: true, message: `Queue setup selected ${project.name ?? project.id} for ${team.name ?? team.id}. Review the recommendations below, then activate authority.` };
+  }
+
   private createObsidianSecretStore(): ObsidianSecretStoreV1 {
     return new ObsidianSecretStoreV1(this.app.secretStorage);
   }
@@ -11242,6 +11268,13 @@ function normalizeLinearIntegrationStateOrDefault(
   } catch {
     return createLinearIntegrationState({ at: new Date().toISOString() });
   }
+}
+
+function projectSetupRank(name: string): number {
+  const normalized = name.trim().toLowerCase();
+  if (/\bagent\b.*\bqueue\b|\bqueue\b.*\bagent\b/u.test(normalized)) return 0;
+  if (/\bautomation\b|\bbacklog\b|\binbox\b/u.test(normalized)) return 1;
+  return 2;
 }
 
 function normalizeLinearQueueStateOrNull(
