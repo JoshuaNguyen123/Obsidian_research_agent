@@ -6,8 +6,8 @@ import { expect, test, type Page } from "@playwright/test";
 
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
-  createPhase4TypeScriptProjectFixture,
-  type Phase4TypeScriptProjectFixture,
+  createPhase4PythonCheckersProjectFixture,
+  type Phase4PythonCheckersProjectFixture,
 } from "./fixtures/phase4GitRepo";
 import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import {
@@ -33,8 +33,8 @@ import { liveProviderConfiguration } from "../scripts/ci-sandbox-boundary";
 const execFileAsync = promisify(execFile);
 const FULL_SHA = /^[a-f0-9]{40}$/u;
 const SHA256 = /^sha256:[a-f0-9]{64}$/u;
-const PROFILE_KEY = "du06-project";
-const VALIDATION_PROFILE_KEY = "du06-node-validation";
+const PROFILE_KEY = "du06-checkers-project";
+const VALIDATION_PROFILE_KEY = "du06-python-checkers-validation";
 const MAIN_STAGES: readonly ProjectLifecycleStageName[] = [
   "accepted_research",
   "linear_hierarchy",
@@ -65,13 +65,24 @@ interface SafeLifecycleState {
   codeHandoff: any | null;
 }
 
-test("DU-06 exact-SHA compound lifecycle restarts at every stage and independently cleans providers", async ({}, testInfo) => {
+interface LinearReadbackClient {
+  execute(operation: any, variables: Record<string, unknown>): Promise<unknown>;
+}
+
+interface ProtectedCredentialOwnership {
+  linear: boolean;
+  github: boolean;
+}
+
+test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independently cleans providers", async ({}, testInfo) => {
   test.setTimeout(120 * 60_000);
   const releaseSha = requiredEnvironment("E2E_RELEASE_COMMIT_SHA");
-  const linearToken = requiredEnvironment("E2E_LINEAR_API_KEY");
+  const linearToken = optionalEnvironment("E2E_LINEAR_API_KEY");
   const githubToken = requiredEnvironment("E2E_GITHUB_TOKEN");
-  const linearTeamId = requiredEnvironment("LINEAR_LIVE_TEST_TEAM_ID");
-  const linearProjectId = requiredEnvironment("E2E_RELEASE_LINEAR_PROJECT_ID");
+  const requestedLinearTeamId = optionalEnvironment("LINEAR_LIVE_TEST_TEAM_ID");
+  const requestedLinearProjectId = optionalEnvironment(
+    "E2E_RELEASE_LINEAR_PROJECT_ID",
+  );
   const repositoryPrefix = requiredEnvironment(
     "E2E_RELEASE_GITHUB_REPOSITORY_PREFIX",
   );
@@ -86,6 +97,13 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     })
   ).stdout.trim().toLowerCase();
   expect(checkoutSha).toBe(releaseSha);
+  const checkoutStatus = (
+    await execFileAsync("git", ["status", "--porcelain"], {
+      cwd: process.cwd(),
+      windowsHide: true,
+    })
+  ).stdout.trim();
+  expect(checkoutStatus, "DU-06 exact-SHA proof requires a clean checkout").toBe("");
   if (process.env.GITHUB_SHA?.trim()) {
     expect(process.env.GITHUB_SHA.trim().toLowerCase()).toBe(releaseSha);
   }
@@ -95,11 +113,13 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     token: githubToken,
     timeoutMs: 60_000,
   });
-  const linearClient = new LinearGraphqlClient({
-    transport: fetchTransport,
-    apiKey: linearToken,
-    timeoutMs: 60_000,
-  });
+  let linearClient: LinearReadbackClient | null = linearToken
+    ? new LinearGraphqlClient({
+        transport: fetchTransport,
+        apiKey: linearToken,
+        timeoutMs: 60_000,
+      })
+    : null;
   const githubAccount = await githubClient.getAuthenticatedUser();
   const suffix = randomUUID().replace(/-/gu, "").slice(0, 16);
   const repository = safeDisposableRepositoryName(
@@ -110,21 +130,29 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
   const workspaceId = `du06-${suffix}`;
   const requestId = `du06-request-${suffix}`;
   const issueFingerprint = contractFingerprint(`${marker}:implementation`);
-  const fixture = await createPhase4TypeScriptProjectFixture(marker);
+  const fixture = await createPhase4PythonCheckersProjectFixture(marker);
   const profile = createRepositoryProfile({
     key: PROFILE_KEY,
-    displayName: "Protected DU-06 disposable project",
+    displayName: "Protected DU-06 Python checkers project",
     repositoryRoot: fixture.root,
     defaultBranch: "main",
-    allowedPathPrefixes: ["README.md", "src", "test"],
+    allowedPathPrefixes: ["README.md", "checkers", "tests"],
     validationProfile: {
       id: VALIDATION_PROFILE_KEY,
       bootstrapCommands: [],
       validationCommands: [
-        { command: "npm", args: ["test"], label: "npm test" },
-        { command: "npm", args: ["run", "build"], label: "npm run build" },
+        {
+          command: "python3",
+          args: ["-m", "unittest", "discover", "-s", "tests", "-p", "test_checkers.py"],
+          label: "Python targeted checkers tests",
+        },
+        {
+          command: "python3",
+          args: ["scripts/verify_project.py"],
+          label: "Python protected checkers contract",
+        },
       ],
-      protectedPaths: ["package.json", "scripts"],
+      protectedPaths: ["scripts"],
       allowedGeneratedPaths: [],
     },
     promotionPolicy: {
@@ -141,6 +169,10 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
   let pullRequestNumber: number | null = null;
   let publishedBranch: string | null = null;
   let publishedSha: string | null = null;
+  let credentialOwnership: ProtectedCredentialOwnership = {
+    linear: false,
+    github: false,
+  };
   let cleanupVerified = false;
   const cleanupErrors: string[] = [];
   const restartedStages: ProjectLifecycleStageName[] = [];
@@ -161,25 +193,41 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
         completionDrivenLoops: true,
         orchestratorEnabled: false,
         linearEnabled: true,
-        linearDefaultTeamId: linearTeamId,
-        linearQueueProjectId: linearProjectId,
+        ...(requestedLinearTeamId
+          ? { linearDefaultTeamId: requestedLinearTeamId }
+          : {}),
+        ...(requestedLinearProjectId
+          ? { linearQueueProjectId: requestedLinearProjectId }
+          : {}),
         githubEnabled: true,
         repositoryProfileRegistry: createRepositoryProfileRegistry([profile]),
+      },
+      {
+        preserveConfiguredLinearCredential: !linearToken,
       },
     );
     const connection = await configureProtectedConnections(
       harness.page,
-      linearTeamId,
-      linearProjectId,
+      requestedLinearTeamId,
+      requestedLinearProjectId,
     );
+    credentialOwnership = connection.credentialOwnership;
     expect(connection).toMatchObject({
       linearConnected: true,
       linearCredentialSecure: true,
-      linearTeamId,
-      linearProjectId,
       githubConnected: true,
       githubLogin: githubAccount.login,
     });
+    expect(connection.linearTeamId).toBeTruthy();
+    expect(connection.linearProjectId).toBeTruthy();
+    if (requestedLinearTeamId) {
+      expect(connection.linearTeamId).toBe(requestedLinearTeamId);
+    }
+    if (requestedLinearProjectId) {
+      expect(connection.linearProjectId).toBe(requestedLinearProjectId);
+    }
+    linearClient ??= createPageBackedLinearReadbackClient(harness.page);
+    const activeLinearClient = linearClient;
 
     const startedAt = Date.now();
     const sandboxProbe = await harness.page.evaluate(
@@ -205,14 +253,17 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     });
     expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? "")))
       .toBeGreaterThanOrEqual(startedAt);
-    await harness.installOwnedWebBackend({ sourceCount: 2 });
+    await harness.installOwnedWebBackend({ sourceCount: 2, topic: "checkers" });
 
     const mission = [
-      `Use the exact vault destination ${notePath} for the accepted research package.`,
-      `Research the product problem marked ${marker} using exactly two public web sources and fetch both sources before accepting findings.`,
-      `Publish the accepted research note to Linear in the configured destination. The package is code work for repository key ${PROFILE_KEY} and validation requirement ${VALIDATION_PROFILE_KEY}.`,
-      `Turn that accepted research into one Linear initiative, one project, and exactly one implementation issue. Use logical keys du06-initiative-${suffix}, du06-project-${suffix}, and du06-issue-${suffix}; the issue has no dependencies, has explicit acceptance criteria, and uses work-item fingerprint ${issueFingerprint}. Reuse the returned accepted artifact fingerprint and exact source note path.`,
-      `Implement the accepted work in the exact trusted repository ${fixture.root}, using durable workspace ${workspaceId} and repair request ${requestId}. Add only src/math.ts, src/index.ts, test/math.test.mjs, and README.md. Export a working add function and marker ${marker}; re-export the API; test both values; document npm test and the marker. Leave package.json and scripts unchanged.`,
+      `Build a simple American checkers game in Python and use the exact vault destination ${notePath} for its accepted research notebook.`,
+      `Research American checkers rules marked ${marker} using exactly two public web sources and fetch both sources before accepting findings. The notebook must cite both fetched source URLs and passages and use the exact headings ## Board and setup, ## Movement and kings, ## Mandatory captures and multi-jumps, ## End conditions, and ## Implementation implications.`,
+      `Publish the accepted checkers research note to Linear in the configured destination. The package is code work for repository key ${PROFILE_KEY} and validation requirement ${VALIDATION_PROFILE_KEY}.`,
+      `Turn that accepted research into one Linear initiative, one project, and exactly one implementation issue titled Build a simple Python checkers game. Use logical keys du06-initiative-${suffix}, du06-project-${suffix}, and du06-issue-${suffix}; the issue has no dependencies, uses work-item fingerprint ${issueFingerprint}, and binds the accepted artifact fingerprint and exact source note path.`,
+      "The implementation issue acceptance criteria must require an 8 by 8 board with twelve men per side; constants RED, BLACK, RED_KING, and BLACK_KING; CheckersGame(board, turn), CheckersGame.initial(), legal_moves(), apply_move(start, end), and winner(); red moving upward; mandatory captures; same-piece multi-jumps before the turn changes; capture removal; back-rank promotion; kings moving both directions; no-piece or no-legal-move wins; and a runnable CLI.",
+      `After creating the hierarchy, explicitly call linear_get_issue for the returned implementation issue. Read back its title, description, acceptance criteria, and ${notePath} binding before opening the code workspace.`,
+      `Reflect against both that Linear issue readback and the notebook while implementing the exact trusted repository ${fixture.root}, using durable workspace ${workspaceId} and repair request ${requestId}. Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py. Leave the protected scripts directory unchanged.`,
+      `The README must include marker ${marker}, commands python -m checkers.cli and python -m unittest, the exact heading ## Research and Linear traceability, the exact Obsidian path ${notePath}, and the exact Linear issue identifier or URL returned by linear_get_issue.`,
       "Run targeted validation and then a distinct fresh full validation, create one local commit, and independently read back its exact SHA.",
       `Create the exact host-bound private GitHub repository ${githubAccount.login}/${repository}, publish that verified commit to its agent-owned branch, and open one draft pull request with the final Linear and Obsidian backlinks.`,
       "Do not merge. Do not clean up or delete any provider resource until a separate cleanup request.",
@@ -238,7 +289,7 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
             state,
             fixture,
             githubClient,
-            linearClient,
+            linearClient: activeLinearClient,
             expectedOwner: githubAccount.login,
             expectedRepository: repository,
           });
@@ -258,6 +309,15 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
         (node: any) => node?.status === "blocked" || Boolean(node?.blocker),
       ),
     ).toBe(false);
+    expect(
+      Object.values(mainSnapshot.lastMissionGraph?.nodes ?? {}).some(
+        (node: any) =>
+          node?.status === "complete" &&
+          Array.isArray(node?.allowedTools) &&
+          node.allowedTools.includes("linear_get_issue"),
+      ),
+      "the production graph must complete an explicit Linear issue read stage",
+    ).toBe(true);
 
     const state = await readSafeLifecycleState(harness.page, PROFILE_KEY);
     const lineage = requireOne(state.lineages, "completed project lineage");
@@ -279,6 +339,23 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     expect(hierarchy.items.filter((item: any) => item.kind === "initiative")).toHaveLength(1);
     expect(hierarchy.items.filter((item: any) => item.kind === "project")).toHaveLength(1);
     expect(hierarchy.items.filter((item: any) => item.kind === "issue")).toHaveLength(1);
+    const implementationIssueId = String(
+      (requireOne(
+        hierarchy.items.filter((item: any) => item.kind === "issue"),
+        "checkers implementation issue",
+      ) as any).resourceId,
+    );
+    const implementationIssue = await activeLinearClient.execute(
+      "issues.get",
+      { id: implementationIssueId },
+    ) as any;
+    expect(String(implementationIssue?.title ?? "")).toMatch(/python checkers/iu);
+    const implementationIssueText = JSON.stringify(implementationIssue);
+    expect(implementationIssueText).toContain(notePath);
+    expect(implementationIssueText).toMatch(/mandatory capture/iu);
+    expect(implementationIssueText).toMatch(/multi-jump/iu);
+    expect(implementationIssueText).toMatch(/king/iu);
+    expect(implementationIssueText).toMatch(/(?:command.line|\bcli\b)/iu);
     const codeHandoff = state.codeHandoff;
     expect(codeHandoff?.status).toBe("verified");
     expect(codeHandoff?.commitSha).toMatch(FULL_SHA);
@@ -288,9 +365,10 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     );
     expect([...codeHandoff.changedPaths].sort()).toEqual([
       "README.md",
-      "src/index.ts",
-      "src/math.ts",
-      "test/math.test.mjs",
+      "checkers/__init__.py",
+      "checkers/cli.py",
+      "checkers/game.py",
+      "tests/test_checkers.py",
     ]);
     verifiedWorktree = {
       root: codeHandoff.canonicalWorktreeRoot,
@@ -299,8 +377,15 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     const verifiedCode = await fixture.inspectWorktree(verifiedWorktree.root);
     expect(verifiedCode.head).toBe(codeHandoff.commitSha);
     expect(verifiedCode.status).toBe("");
-    expect(verifiedCode.files["src/math.ts"]).toContain(marker);
+    expect(verifiedCode.files["checkers/game.py"]).toMatch(/class CheckersGame/iu);
+    expect(verifiedCode.files["checkers/cli.py"]).toMatch(/def main/iu);
     expect(verifiedCode.files["README.md"]).toContain(marker);
+    expect(verifiedCode.files["README.md"]).toContain(notePath);
+    const implementationIssueReference = String(
+      implementationIssue?.identifier ?? implementationIssue?.url ?? "",
+    ).trim();
+    expect(implementationIssueReference).not.toBe("");
+    expect(verifiedCode.files["README.md"]).toContain(implementationIssueReference);
     expect(await fixture.head()).toBe(fixture.baseSha);
     expect(await fixture.status()).toBe("");
 
@@ -373,11 +458,20 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     ).toBe(exactPublishedSha);
     const note = await readVaultNote(harness.page, notePath);
     expect(note).toContain(marker);
+    expect(note).toMatch(/## Board and setup/iu);
+    expect(note).toMatch(/## Movement and kings/iu);
+    expect(note).toMatch(/## Mandatory captures and multi-jumps/iu);
+    expect(note).toMatch(/## End conditions/iu);
+    expect(note).toMatch(/## Implementation implications/iu);
+    expect(note).toMatch(/8\s*(?:x|×|by)\s*8/iu);
+    expect(note).toMatch(/mandatory capture/iu);
+    expect(note).toMatch(/multi-jump/iu);
+    expect(note).toMatch(/king/iu);
     expect(note).toMatch(/linear\.app/iu);
     expect(note).toMatch(/github\.com/iu);
 
     linearResources = resourcesFromState(state);
-    await independentlyReadLinearResources(linearClient, linearResources);
+    await independentlyReadLinearResources(activeLinearClient, linearResources);
 
     await harness.submitMission(
       [
@@ -421,7 +515,7 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
     approvalCount += await harness.approveUntilMissionComplete(25 * 60_000, {
       maxContinuations: 5,
     });
-    await independentlyVerifyLinearCleanup(linearClient, linearResources);
+    await independentlyVerifyLinearCleanup(activeLinearClient, linearResources);
 
     await harness.submitMission(
       `Reconcile and clean up this completed project by permanently deleting the exact private GitHub repository bound to trusted profile ${PROFILE_KEY}. Obtain the separate destructive approval and require independent absence readback.`,
@@ -478,9 +572,13 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
       {
         artifacts: [
           "vault:research_note",
+          "vault:checkers_rules_notebook",
           "linear:initiative",
           "linear:project",
           "linear:issue",
+          "linear:checkers_implementation_issue",
+          "linear:issue_readback",
+          "code:python_checkers",
           "git:local_commit",
           "github:private_repository",
           "github:draft_pr",
@@ -490,6 +588,8 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
           "research:accepted",
           "linear:hierarchy_readback",
           "linear:provider_readback",
+          "linear:issue_read_before_code",
+          "code:checkers_rules_contract",
           "code:workspace_validated",
           "validation:fresh_full",
           "git:exact_commit_sha",
@@ -510,6 +610,7 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
         ],
         bindings: [
           "binding:note_linear_issue",
+          "binding:notebook_linear_code",
           "binding:note_commit_pr",
           "binding:linear_commit_pr",
           "binding:project_lineage",
@@ -546,7 +647,7 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
       } catch (error) {
         cleanupErrors.push(`state recovery: ${safeError(error)}`);
       }
-      if (linearResources) {
+      if (linearResources && linearClient) {
         cleanupErrors.push(
           ...(await bestEffortLinearCleanup(linearClient, linearResources)),
         );
@@ -563,7 +664,7 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
       );
     }
     if (harness) {
-      await clearProtectedConnections(harness.page).catch((error) => {
+      await clearProtectedConnections(harness.page, credentialOwnership).catch((error) => {
         cleanupErrors.push(`credential cleanup: ${safeError(error)}`);
       });
     }
@@ -586,62 +687,143 @@ test("DU-06 exact-SHA compound lifecycle restarts at every stage and independent
 
 async function configureProtectedConnections(
   page: Page,
-  linearTeamId: string,
-  linearProjectId: string,
+  requestedLinearTeamId: string | null,
+  requestedLinearProjectId: string | null,
 ) {
-  return page.evaluate(async ({ pluginId, linearTeamId, linearProjectId }) => {
+  return page.evaluate(async ({
+    pluginId,
+    requestedLinearTeamId,
+    requestedLinearProjectId,
+  }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
     const environment = (globalThis as any).process?.env ?? {};
     const linearToken = String(environment.E2E_LINEAR_API_KEY ?? "").trim();
     const githubToken = String(environment.E2E_GITHUB_TOKEN ?? "").trim();
-    if (!plugin || !linearToken || !githubToken) {
-      throw new Error("Protected provider credentials are unavailable in the native runner.");
+    if (!plugin || !githubToken) {
+      throw new Error("Protected GitHub credentials are unavailable in the native runner.");
     }
-    const linearSaved = await plugin.setLinearApiKey(linearToken);
-    if (!linearSaved?.ok) throw new Error("Linear secure credential setup failed.");
-    plugin.settings.linearDefaultTeamId = linearTeamId;
-    plugin.settings.linearQueueProjectId = linearProjectId;
-    await plugin.saveSettings();
-    const linearConnection = await plugin.testLinearConnection();
-    if (!linearConnection?.ok) throw new Error("Linear capability discovery failed.");
-    const linearCredential = plugin.getLinearCredentialStatus?.();
-    if (linearCredential?.configured !== true || linearCredential?.secure !== true) {
-      throw new Error("Linear credential did not land in native secure storage.");
+    let linearOwned = false;
+    let githubOwned = false;
+    try {
+      if (linearToken) {
+        const linearSaved = await plugin.setLinearApiKey(linearToken);
+        if (!linearSaved?.ok) throw new Error("Linear secure credential setup failed.");
+        linearOwned = true;
+      } else {
+        const existing = plugin.getLinearCredentialStatus?.();
+        if (existing?.configured !== true || existing?.secure !== true) {
+          throw new Error(
+            "Protected DU-06 requires E2E_LINEAR_API_KEY or an existing opaque native Linear credential.",
+          );
+        }
+      }
+      const linearConnection = await plugin.testLinearConnection();
+      if (!linearConnection?.ok) throw new Error("Linear capability discovery failed.");
+      const linearCredential = plugin.getLinearCredentialStatus?.();
+      if (linearCredential?.configured !== true || linearCredential?.secure !== true) {
+        throw new Error("Linear credential did not land in native secure storage.");
+      }
+      const snapshot = plugin.getLinearCapabilitySnapshot?.();
+      const linearTeamId =
+        requestedLinearTeamId ||
+        String(plugin.settings?.linearDefaultTeamId ?? "").trim() ||
+        String(snapshot?.teams?.[0]?.id ?? "").trim();
+      const linearProjectId =
+        requestedLinearProjectId ||
+        String(plugin.settings?.linearQueueProjectId ?? "").trim() ||
+        String(snapshot?.projects?.[0]?.id ?? "").trim();
+      if (!linearTeamId || !linearProjectId) {
+        throw new Error("Linear discovery did not provide a usable team and project destination.");
+      }
+      plugin.settings.linearDefaultTeamId = linearTeamId;
+      plugin.settings.linearQueueProjectId = linearProjectId;
+      await plugin.saveSettings();
+
+      const githubSaved = await plugin.setGitHubFineGrainedPat(githubToken);
+      if (!githubSaved?.ok) throw new Error("GitHub secure credential setup failed.");
+      githubOwned = true;
+      const github = plugin.getGitHubCredentialStatus?.();
+      if (!github?.connected || !github?.account?.login) {
+        throw new Error("GitHub verified identity is unavailable.");
+      }
+      return {
+        linearConnected: true,
+        linearCredentialSecure: true,
+        linearTeamId,
+        linearProjectId,
+        githubConnected: true,
+        githubLogin: github.account.login,
+        credentialOwnership: {
+          linear: linearOwned,
+          github: githubOwned,
+        },
+      };
+    } catch (error) {
+      if (githubOwned) await plugin.disconnectGitHub().catch(() => undefined);
+      if (linearOwned) await plugin.clearLinearApiKey().catch(() => undefined);
+      throw error;
     }
-    if (
-      plugin.settings.linearDefaultTeamId !== linearTeamId ||
-      plugin.settings.linearQueueProjectId !== linearProjectId
-    ) {
-      throw new Error("Linear discovery drifted from the exact disposable destination.");
-    }
-    const githubSaved = await plugin.setGitHubFineGrainedPat(githubToken);
-    if (!githubSaved?.ok) throw new Error("GitHub secure credential setup failed.");
-    const github = plugin.getGitHubCredentialStatus?.();
-    if (!github?.connected || !github?.account?.login) {
-      throw new Error("GitHub verified identity is unavailable.");
-    }
-    return {
-      linearConnected: true,
-      linearCredentialSecure: true,
-      linearTeamId: plugin.settings.linearDefaultTeamId,
-      linearProjectId: plugin.settings.linearQueueProjectId,
-      githubConnected: true,
-      githubLogin: github.account.login,
-    };
-  }, { pluginId: NATIVE_CORE_PLUGIN_ID, linearTeamId, linearProjectId });
+  }, {
+    pluginId: NATIVE_CORE_PLUGIN_ID,
+    requestedLinearTeamId,
+    requestedLinearProjectId,
+  });
 }
 
-async function clearProtectedConnections(page: Page): Promise<void> {
-  const result = await page.evaluate(async ({ pluginId }) => {
+async function clearProtectedConnections(
+  page: Page,
+  ownership: ProtectedCredentialOwnership,
+): Promise<void> {
+  const result = await page.evaluate(async ({ pluginId, ownership }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
     if (!plugin) return { linear: true, github: true };
-    const linear = await plugin.clearLinearApiKey();
-    const github = await plugin.disconnectGitHub();
+    const linear = ownership.linear
+      ? await plugin.clearLinearApiKey()
+      : { ok: plugin.getLinearCredentialStatus?.()?.secure === true };
+    const github = ownership.github
+      ? await plugin.disconnectGitHub()
+      : { ok: true };
     return { linear: linear?.ok === true, github: github?.ok === true };
-  }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+  }, { pluginId: NATIVE_CORE_PLUGIN_ID, ownership });
   if (!result.linear || !result.github) {
     throw new Error("Native secure-store credential cleanup was not verified.");
   }
+}
+
+function createPageBackedLinearReadbackClient(page: Page): LinearReadbackClient {
+  return {
+    async execute(operation, variables) {
+      const result = await page.evaluate(async ({ pluginId, operation, variables }) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
+        if (!plugin?.createSecretBackedLinearClient) {
+          throw new Error("The native secret-backed Linear client is unavailable.");
+        }
+        try {
+          return {
+            ok: true as const,
+            value: await plugin.createSecretBackedLinearClient().execute(
+              operation,
+              variables,
+            ),
+          };
+        } catch (error) {
+          return {
+            ok: false as const,
+            error: {
+              message: String((error as any)?.message ?? error).slice(0, 500),
+              code: String((error as any)?.code ?? "linear_error").slice(0, 100),
+            },
+          };
+        }
+      }, { pluginId: NATIVE_CORE_PLUGIN_ID, operation, variables });
+      if (!result.ok) {
+        throw Object.assign(new Error(result.error.message), {
+          code: result.error.code,
+        });
+      }
+      return result.value;
+    },
+  };
 }
 
 async function readSafeLifecycleState(
@@ -746,9 +928,9 @@ async function readSafeLifecycleState(
 async function attestIndependentStageEntry(input: {
   stage: ProjectLifecycleStageName;
   state: SafeLifecycleState;
-  fixture: Phase4TypeScriptProjectFixture;
+  fixture: Phase4PythonCheckersProjectFixture;
   githubClient: GitHubRestClient;
-  linearClient: LinearGraphqlClient;
+  linearClient: LinearReadbackClient;
   expectedOwner: string;
   expectedRepository: string;
 }): Promise<void> {
@@ -830,7 +1012,7 @@ function resourcesFromStateOrNull(
 }
 
 async function independentlyReadLinearResources(
-  client: LinearGraphqlClient,
+  client: LinearReadbackClient,
   resources: LinearCleanupResources,
 ): Promise<void> {
   await expectLinearResource(client, "initiatives.get", resources.initiativeId);
@@ -844,7 +1026,7 @@ async function independentlyReadLinearResources(
 }
 
 async function independentlyVerifyLinearCleanup(
-  client: LinearGraphqlClient,
+  client: LinearReadbackClient,
   resources: LinearCleanupResources,
 ): Promise<void> {
   for (const id of resources.initiativeProjectLinkIds) {
@@ -858,7 +1040,7 @@ async function independentlyVerifyLinearCleanup(
 }
 
 async function expectLinearResource(
-  client: LinearGraphqlClient,
+  client: LinearReadbackClient,
   operation: string,
   id: string,
 ): Promise<void> {
@@ -867,7 +1049,7 @@ async function expectLinearResource(
 }
 
 async function expectLinearRemoved(
-  client: LinearGraphqlClient,
+  client: LinearReadbackClient,
   operation: string,
   id: string,
 ): Promise<void> {
@@ -883,7 +1065,7 @@ async function expectLinearRemoved(
 }
 
 async function bestEffortLinearCleanup(
-  client: LinearGraphqlClient,
+  client: LinearReadbackClient,
   resources: LinearCleanupResources,
 ): Promise<string[]> {
   const errors: string[] = [];
@@ -1012,6 +1194,10 @@ function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`Protected DU-06 is missing required environment ${name}.`);
   return value;
+}
+
+function optionalEnvironment(name: string): string | null {
+  return process.env[name]?.trim() || null;
 }
 
 function safeDisposableRepositoryName(value: string): string {

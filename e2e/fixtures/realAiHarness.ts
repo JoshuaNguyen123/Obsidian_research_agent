@@ -22,6 +22,7 @@ export interface RealAiHarness extends NativeObsidianHarness {
   installOwnedWebBackend(options?: {
     failFirstFetch?: boolean;
     sourceCount?: 2 | 3;
+    topic?: "generic" | "checkers";
   }): Promise<void>;
   attestProductionRun(options?: { requireStructuredRouting?: boolean }): Promise<any>;
   restartCorePlugin(): Promise<void>;
@@ -48,10 +49,16 @@ export interface CompoundMissionApprovalOptions {
   onStageRestarted?: (stage: ProjectLifecycleStageName) => Promise<void>;
 }
 
+export interface RealAiHarnessNativeOptions {
+  /** Reuse only the vault's opaque native Linear reference; never copy a token. */
+  preserveConfiguredLinearCredential?: boolean;
+}
+
 export async function startRealAiHarness(
   label: string,
   overrides: Partial<E2EAiConfig> = {},
   pluginDataOverrides: Readonly<Record<string, unknown>> = {},
+  nativeOptions: RealAiHarnessNativeOptions = {},
 ): Promise<RealAiHarness> {
   const config = { ...getE2EAiConfig(), ...overrides, mode: "real" as const };
   const ownedIndexLabel = label.replace(/[^A-Za-z0-9_-]+/gu, "-").slice(0, 80);
@@ -95,6 +102,8 @@ export async function startRealAiHarness(
   const native = await startNativeObsidianHarness({
     label,
     corePluginDataOverrides,
+    preserveConfiguredLinearCredential:
+      nativeOptions.preserveConfiguredLinearCredential === true,
     setup: installRealAiPageHarness,
     beforeClose: async ({ page }) => restoreOwnedWebBackend(page),
   });
@@ -525,9 +534,13 @@ async function indexSemanticNotes(page: Page, paths: string[]): Promise<void> {
 async function installOwnedWebBackend(
   page: Page,
   marker: string,
-  options: { failFirstFetch?: boolean; sourceCount?: 2 | 3 },
+  options: {
+    failFirstFetch?: boolean;
+    sourceCount?: 2 | 3;
+    topic?: "generic" | "checkers";
+  },
 ): Promise<void> {
-  await page.evaluate(({ pluginId, failFirstFetch, sourceCount, marker }) => {
+  await page.evaluate(({ pluginId, failFirstFetch, sourceCount, marker, topic }) => {
     const w = window as typeof window & { app?: any; __realAiWebRestore?: () => void };
     const plugin = w.app?.plugins?.plugins?.[pluginId];
     if (!plugin) throw new Error("Core plugin unavailable.");
@@ -540,10 +553,25 @@ async function installOwnedWebBackend(
       context.httpTransport = async (request: any) => {
         if (String(request.url).endsWith("/web_search")) {
           const markerPath = encodeURIComponent(marker);
-          const results = [
-            { title: "Owned primary", url: `https://primary.owned.example/evidence/${markerPath}`, snippet: "Owned passage: alpha evidence establishes the first finding." },
-            { title: "Owned alternate", url: `https://alternate-owned.example/evidence/${markerPath}`, snippet: "Owned passage: beta evidence establishes the second finding." },
-          ];
+          const results = topic === "checkers"
+            ? [
+                {
+                  title: "Owned American checkers rules",
+                  url: `https://primary.owned.example/checkers/${markerPath}`,
+                  snippet:
+                    "American checkers uses an 8x8 board, twelve men per side, diagonal movement, mandatory captures, multi-jumps, and kings.",
+                },
+                {
+                  title: "Owned checkers end conditions and implementation notes",
+                  url: `https://alternate-owned.example/checkers/${markerPath}`,
+                  snippet:
+                    "A player wins when the opponent has no pieces or legal moves; implementations must preserve forced-capture and turn-continuation state.",
+                },
+              ]
+            : [
+                { title: "Owned primary", url: `https://primary.owned.example/evidence/${markerPath}`, snippet: "Owned passage: alpha evidence establishes the first finding." },
+                { title: "Owned alternate", url: `https://alternate-owned.example/evidence/${markerPath}`, snippet: "Owned passage: beta evidence establishes the second finding." },
+              ];
           if (sourceCount === 3) {
             results.push({
               title: "Owned corroborating",
@@ -567,11 +595,15 @@ async function installOwnedWebBackend(
               : alternate
                 ? "Owned alternate"
                 : "Owned primary",
-            content: corroborating
-              ? "Gamma evidence is a third independently fetched passage. It positively corroborates the bounded synthesis and preserves the existing tool authority."
-              : alternate
-              ? "Beta evidence is the independently fetched second passage. It supports bounded recovery and source verification."
-              : "Alpha evidence is the fetched primary passage. It supports the first verified claim with owned deterministic content.",
+            content: topic === "checkers"
+              ? alternate
+                ? "American checkers ends when a player has no pieces or no legal move. A legal-move engine must return captures instead of quiet moves whenever any capture exists. After a jump, the same piece must continue while another jump is available, so the turn changes only after the capture sequence ends. A man reaching the opponent's back rank is crowned as a king; kings may move and capture diagonally forward or backward. Draw conventions vary and should be documented rather than invented for a bounded implementation."
+                : "American checkers, also called English draughts, is played only on the dark squares of an 8 by 8 board. Each side begins with twelve men on the first three rows nearest that player. Men move one dark square diagonally forward. Captures jump an adjacent opposing piece into the empty square beyond and are mandatory when available. Multiple jumps continue with the same piece. Reaching the farthest row crowns a man as a king, which can move and capture in both diagonal directions."
+              : corroborating
+                ? "Gamma evidence is a third independently fetched passage. It positively corroborates the bounded synthesis and preserves the existing tool authority."
+                : alternate
+                  ? "Beta evidence is the independently fetched second passage. It supports bounded recovery and source verification."
+                  : "Alpha evidence is the fetched primary passage. It supports the first verified claim with owned deterministic content.",
             links: [],
           } };
         }
@@ -588,6 +620,7 @@ async function installOwnedWebBackend(
     failFirstFetch: options.failFirstFetch === true,
     sourceCount: options.sourceCount ?? 2,
     marker,
+    topic: options.topic ?? "generic",
   });
 }
 

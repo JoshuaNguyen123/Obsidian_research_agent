@@ -10,6 +10,7 @@ import {
   parseRepositoryProfileRegistry,
   upsertRepositoryProfile,
 } from "../src/agent/repositories";
+import { migrateRepositoryProfileV1 } from "../extensions/code/repositories/RepositoryProfileV2";
 
 function createProfile() {
   return createRepositoryProfile({
@@ -99,4 +100,33 @@ test("repository profiles pin remote proof without granting publication", () => 
   assert.equal(profile.promotionPolicy.completionProof, "merged_pr");
   assert.equal(profile.promotionPolicy.localBasePromotion, "disabled");
   assert.deepEqual(profile.promotionPolicy.requiredChecks, ["test", "build"]);
+});
+
+test("Python repository profiles accept the Linux python3 executable", () => {
+  const profile = createRepositoryProfile({
+    key: "python-checkers",
+    displayName: "Python checkers",
+    repositoryRoot: "C:\\work\\python-checkers",
+    defaultBranch: "main",
+    allowedPathPrefixes: ["README.md", "checkers", "tests"],
+    validationProfile: {
+      id: "python-checkers-validation",
+      bootstrapCommands: [],
+      validationCommands: [
+        {
+          command: "python3",
+          args: ["-m", "unittest", "discover", "-s", "tests"],
+          label: "Python checkers tests",
+        },
+      ],
+      protectedPaths: ["scripts"],
+      allowedGeneratedPaths: [],
+    },
+  });
+  assert.equal(profile.validationProfile.validationCommands[0]?.command, "python3");
+  const migrated = migrateRepositoryProfileV1(profile);
+  assert.deepEqual(migrated.ecosystems, ["python"]);
+  assert.deepEqual(migrated.projects[0]?.ecosystems, ["python"]);
+  assert.equal(migrated.validationCatalog[0]?.executable, "python3");
+  assert.equal(migrated.pinnedRuntimes[0]?.executable, "python3");
 });

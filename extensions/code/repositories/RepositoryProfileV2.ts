@@ -157,7 +157,7 @@ const ECOSYSTEMS: readonly RepositoryEcosystemV2[] = [
 
 const COMMANDS_BY_ECOSYSTEM: Readonly<Record<RepositoryEcosystemV2, readonly string[]>> = {
   node: ["npm", "pnpm", "yarn", "node"],
-  python: ["python", "py", "uv", "poetry", "pipenv"],
+  python: ["python", "python3", "py", "uv", "poetry", "pipenv"],
   rust: ["cargo"],
   go: ["go"],
   java_maven: ["mvn", "./mvnw"],
@@ -399,6 +399,21 @@ export function detectRepositoryProfileV2(input: RepositoryDetectionInputV2): Re
 /** Preserve V1 policy while moving it into the richer closed V2 contract. */
 export function migrateRepositoryProfileV1(profile: RepositoryProfileV1): RepositoryProfileV2 {
   const projectId = "root";
+  const migratedExecutables = [
+    ...profile.validationProfile.bootstrapCommands,
+    ...profile.validationProfile.validationCommands,
+  ].map((command) => command.command);
+  const migratedEcosystems: RepositoryEcosystemV2[] = [
+    ...(migratedExecutables.some((command) => ["npm", "node"].includes(command))
+      ? ["node" as const]
+      : []),
+    ...(migratedExecutables.some((command) => ["py", "python", "python3"].includes(command))
+      ? ["python" as const]
+      : []),
+  ];
+  const pythonExecutable = migratedExecutables.find((command) =>
+    ["py", "python", "python3"].includes(command),
+  );
   const validationCatalog: RepositoryValidationCommandV2[] = [
     ...profile.validationProfile.bootstrapCommands.map((command, index) => ({
       id: `root-bootstrap-${index + 1}`,
@@ -431,11 +446,17 @@ export function migrateRepositoryProfileV1(profile: RepositoryProfileV1): Reposi
     displayName: profile.displayName,
     repositoryRoot: profile.repositoryRoot,
     defaultBranch: profile.defaultBranch,
-    projects: [{ id: projectId, root: ".", ecosystems: ["node"], allowedPaths: profile.allowedPathPrefixes }],
-    ecosystems: ["node"],
+    projects: [{ id: projectId, root: ".", ecosystems: migratedEcosystems, allowedPaths: profile.allowedPathPrefixes }],
+    ecosystems: migratedEcosystems,
     allowedPaths: profile.allowedPathPrefixes,
     protectedControls: profile.validationProfile.protectedPaths.map(protectedControlForPath),
-    pinnedRuntimes: [unresolvedRuntime(projectId, "node", "node", undefined)],
+    pinnedRuntimes: migratedEcosystems.map((ecosystem) =>
+      unresolvedRuntime(
+        projectId,
+        ecosystem,
+        ecosystem === "python" ? (pythonExecutable ?? "python") : "node",
+        undefined,
+      )),
     validationCatalog,
     generatedOutputs: profile.validationProfile.allowedGeneratedPaths,
     requiredGitHubChecks: profile.promotionPolicy.requiredChecks,

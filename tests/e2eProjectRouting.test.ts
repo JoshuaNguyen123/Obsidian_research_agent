@@ -209,6 +209,10 @@ test("daily-use commands route to focused specs and live projects disable reruns
   assert.match(packageJson.scripts["test:e2e:daily-use:github"], /DU-05/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:compound"], /DU-06/u);
   assert.match(
+    packageJson.scripts["test:e2e:daily-use:checkers"],
+    /--project=daily-use-compound --grep="DU-06 checkers"/u,
+  );
+  assert.match(
     packageJson.scripts["test:e2e:configured-linear"],
     /--project=configured-linear-live/u,
   );
@@ -260,6 +264,14 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.match(compound, /restartAfterProjectStages: \["reconciliation_cleanup"\]/u);
   assert.match(compound, /expectGitHubRepositoryAbsent/u);
   assert.match(compound, /independentlyVerifyLinearCleanup/u);
+  assert.match(compound, /createPhase4PythonCheckersProjectFixture/u);
+  assert.match(compound, /topic: "checkers"/u);
+  assert.match(compound, /linear_get_issue/u);
+  assert.match(compound, /checkers\/game\.py/u);
+  assert.match(compound, /tests\/test_checkers\.py/u);
+  assert.match(compound, /verifiedPrivate: true/u);
+  assert.match(compound, /git", \["status", "--porcelain"\]/u);
+  assert.match(compound, /preserveConfiguredLinearCredential: !linearToken/u);
   assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);
 });
 

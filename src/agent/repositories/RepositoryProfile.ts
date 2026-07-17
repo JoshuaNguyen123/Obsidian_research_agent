@@ -278,7 +278,7 @@ function parseCommands(value: unknown, label: string): ValidationCommand[] {
       throw new RepositoryProfileError(`${label} ${index + 1} args must be an array.`);
     }
     const command = expectString(record.command, `${label} command`, 1, 80);
-    if (!["npm", "node", "py", "python"].includes(command)) {
+    if (!["npm", "node", "py", "python", "python3"].includes(command)) {
       throw new RepositoryProfileError(`${label} uses an unsupported executable.`);
     }
     return {

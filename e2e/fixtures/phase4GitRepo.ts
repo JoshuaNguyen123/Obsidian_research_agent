@@ -38,6 +38,21 @@ export interface Phase4TypeScriptProjectFixture {
   cleanup(): Promise<void>;
 }
 
+export interface Phase4PythonCheckersProjectFixture {
+  root: string;
+  baseSha: string;
+  head(): Promise<string>;
+  status(): Promise<string>;
+  inspectWorktree(worktreeRoot: string): Promise<{
+    head: string;
+    status: string;
+    changedPaths: string[];
+    files: Record<string, string>;
+  }>;
+  removeOwnedWorktree(worktreeRoot: string, branch: string): Promise<void>;
+  cleanup(): Promise<void>;
+}
+
 /**
  * Empty-but-valid Node repository used by the protected real-model DU-03 lane.
  * The model must create two TypeScript modules, a runnable test, and README;
@@ -137,6 +152,149 @@ export async function createPhase4TypeScriptProjectFixture(
       }
     },
     cleanup: () => cleanupTypeScriptGitFixture(root),
+  };
+}
+
+/**
+ * Empty Python repository with a protected executable rules contract for the
+ * compound checkers journey. The agent must create the package, CLI, tests,
+ * and README; it cannot weaken the validation script that verifies setup,
+ * mandatory captures, multi-jumps, promotion, king movement, and victory.
+ */
+export async function createPhase4PythonCheckersProjectFixture(
+  marker: string,
+): Promise<Phase4PythonCheckersProjectFixture> {
+  const root = await realpath(
+    await mkdtemp(path.join(tmpdir(), "agentic-phase4-python-checkers-")),
+  );
+  const safeMarker = marker.replace(/[^A-Za-z0-9_]/gu, "_");
+  await mkdir(path.join(root, "scripts"), { recursive: true });
+  await writeFile(
+    path.join(root, "scripts", "verify_project.py"),
+    [
+      "from pathlib import Path",
+      "",
+      "from checkers.game import (",
+      "    BLACK,",
+      "    BLACK_KING,",
+      "    RED,",
+      "    RED_KING,",
+      "    CheckersGame,",
+      ")",
+      "from checkers.cli import main",
+      "",
+      "",
+      "def empty_board():",
+      "    return [[None for _column in range(8)] for _row in range(8)]",
+      "",
+      "",
+      "initial = CheckersGame.initial()",
+      "assert len(initial.board) == 8",
+      "assert all(len(row) == 8 for row in initial.board)",
+      "assert sum(piece in (RED, RED_KING) for row in initial.board for piece in row) == 12",
+      "assert sum(piece in (BLACK, BLACK_KING) for row in initial.board for piece in row) == 12",
+      "assert all(",
+      "    piece is None or (row_index + column_index) % 2 == 1",
+      "    for row_index, row in enumerate(initial.board)",
+      "    for column_index, piece in enumerate(row)",
+      ")",
+      "",
+      "board = empty_board()",
+      "board[5][0] = RED",
+      "board[5][4] = RED",
+      "board[4][1] = BLACK",
+      "board[2][3] = BLACK",
+      "capture = CheckersGame(board=board, turn=RED)",
+      "assert set(capture.legal_moves()) == {((5, 0), (3, 2))}",
+      "capture.apply_move((5, 0), (3, 2))",
+      "assert capture.board[4][1] is None",
+      "assert capture.turn == RED",
+      "assert set(capture.legal_moves()) == {((3, 2), (1, 4))}",
+      "capture.apply_move((3, 2), (1, 4))",
+      "assert capture.board[2][3] is None",
+      "assert capture.turn == BLACK",
+      "",
+      "board = empty_board()",
+      "board[1][2] = RED",
+      "board[7][0] = BLACK",
+      "promotion = CheckersGame(board=board, turn=RED)",
+      "promotion.apply_move((1, 2), (0, 3))",
+      "assert promotion.board[0][3] == RED_KING",
+      "",
+      "board = empty_board()",
+      "board[3][2] = RED_KING",
+      "board[7][0] = BLACK",
+      "king = CheckersGame(board=board, turn=RED)",
+      "assert ((3, 2), (4, 3)) in king.legal_moves()",
+      "",
+      "board = empty_board()",
+      "board[3][2] = RED",
+      "finished = CheckersGame(board=board, turn=BLACK)",
+      "assert finished.winner() == RED",
+      "assert callable(main)",
+      "",
+      "readme = Path('README.md').read_text(encoding='utf-8')",
+      "assert 'python -m checkers.cli' in readme",
+      "assert 'python -m unittest' in readme",
+      "assert 'Research and Linear traceability' in readme",
+      `assert ${JSON.stringify(safeMarker)} in readme`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await git(root, ["init", "--initial-branch=main"]);
+  await git(root, ["config", "user.name", "Phase 4 E2E"]);
+  await git(root, ["config", "user.email", "phase4-e2e@example.invalid"]);
+  await git(root, ["add", "--", "scripts/verify_project.py"]);
+  await git(root, ["commit", "-m", "phase4 Python checkers fixture baseline"]);
+  const baseSha = await git(root, ["rev-parse", "HEAD"]);
+  if (!/^[a-f0-9]{40}$/u.test(baseSha)) {
+    await cleanupPythonCheckersGitFixture(root);
+    throw new Error("Phase 4 Python checkers fixture did not produce a full Git SHA.");
+  }
+  const expected = [
+    "README.md",
+    "checkers/__init__.py",
+    "checkers/cli.py",
+    "checkers/game.py",
+    "tests/test_checkers.py",
+  ];
+  return {
+    root,
+    baseSha,
+    head: () => git(root, ["rev-parse", "HEAD"]),
+    status: () => git(root, ["status", "--short"]),
+    async inspectWorktree(worktreeRoot) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      const changed = await git(verified, [
+        "diff",
+        "--name-only",
+        baseSha,
+        "HEAD",
+        "--",
+      ]);
+      return {
+        head: await git(verified, ["rev-parse", "HEAD"]),
+        status: await git(verified, ["status", "--short"]),
+        changedPaths: changed.split(/\r?\n/gu).filter(Boolean).sort(),
+        files: Object.fromEntries(
+          await Promise.all(
+            expected.map(async (relativePath) => [
+              relativePath,
+              await readFile(path.join(verified, ...relativePath.split("/")), "utf8"),
+            ]),
+          ),
+        ),
+      };
+    },
+    async removeOwnedWorktree(worktreeRoot, branch) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      await git(root, ["worktree", "remove", "--force", verified]);
+      if (branch.startsWith("codex/workspace-")) {
+        await git(root, ["branch", "-D", branch]).catch(() => "");
+      }
+    },
+    cleanup: () => cleanupPythonCheckersGitFixture(root),
   };
 }
 
@@ -303,6 +461,21 @@ async function cleanupTypeScriptGitFixture(root: string): Promise<void> {
   ) {
     throw new Error(
       `Refusing to remove unowned Phase 4 TypeScript fixture: ${verifiedRoot}`,
+    );
+  }
+  await rm(verifiedRoot, { recursive: true, force: true });
+}
+
+async function cleanupPythonCheckersGitFixture(root: string): Promise<void> {
+  const verifiedRoot = await realpath(root).catch(() => null);
+  if (!verifiedRoot) return;
+  const verifiedTemp = await realpath(tmpdir());
+  if (
+    path.dirname(verifiedRoot) !== verifiedTemp ||
+    !path.basename(verifiedRoot).startsWith("agentic-phase4-python-checkers-")
+  ) {
+    throw new Error(
+      `Refusing to remove unowned Phase 4 Python checkers fixture: ${verifiedRoot}`,
     );
   }
   await rm(verifiedRoot, { recursive: true, force: true });
