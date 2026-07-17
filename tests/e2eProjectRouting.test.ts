@@ -286,6 +286,21 @@ test("public workflows use only ephemeral hosted runners and SHA-pinned actions"
       );
     }
   }
+
+  const pagesWorkflow = readFileSync(
+    new URL("../.github/workflows/pages.yml", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    pagesWorkflow,
+    /actions\/upload-pages-artifact@/u,
+    "Pages must not use a composite action whose internal upload action is tag-pinned",
+  );
+  assert.match(
+    pagesWorkflow,
+    /actions\/upload-artifact@[0-9a-f]{40}/u,
+    "Pages must upload its explicit artifact through a full-SHA-pinned action",
+  );
 });
 
 test("live external preflight validates authority without returning credentials", () => {
