@@ -159,6 +159,7 @@ export async function startNativeObsidianHarness(
     await waitForCdp(cdpPort, processHandle, 45_000);
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     page = await findOnlyVaultPage(browser, vaultRoot);
+    await ensurePluginRuntimesLoaded(page, pluginIds);
     setupContext.page = page;
     await options.setup(setupContext);
 
@@ -360,6 +361,35 @@ async function ensureCommunityPluginEnabled(
   if (!pluginIds.includes(pluginId)) pluginIds.push(pluginId);
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, `${JSON.stringify(pluginIds, null, 2)}\n`, "utf8");
+}
+
+async function ensurePluginRuntimesLoaded(
+  page: Page,
+  pluginIds: readonly string[],
+): Promise<void> {
+  await page.evaluate(async (requiredPluginIds) => {
+    const app = (window as typeof window & { app?: any }).app;
+    if (!app?.workspace || !app?.plugins) {
+      throw new Error("Obsidian app services are unavailable.");
+    }
+    if (typeof app.workspace.onLayoutReady === "function") {
+      await new Promise<void>((resolve) => app.workspace.onLayoutReady(resolve));
+    }
+    for (const pluginId of requiredPluginIds) {
+      if (!app.plugins.plugins?.[pluginId]) {
+        await app.plugins.enablePlugin(pluginId);
+      }
+    }
+  }, [...pluginIds]);
+  await page.waitForFunction(
+    (requiredPluginIds) => {
+      const plugins = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins;
+      return requiredPluginIds.every((pluginId) => Boolean(plugins?.[pluginId]));
+    },
+    [...pluginIds],
+    { timeout: 30_000 },
+  );
 }
 
 async function forceOnlyVaultOpen(
