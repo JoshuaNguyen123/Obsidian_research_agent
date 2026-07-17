@@ -175,6 +175,8 @@ class ClickableCandidate(BaseModel):
     selector: str | None = None
     href: str | None = None
     formAction: str | None = None
+    formMethod: str | None = None
+    submitsForm: bool = False
     inputType: str | None = None
     text: str | None = None
     candidateFingerprint: str = Field(pattern=FINGERPRINT_PATTERN.pattern)

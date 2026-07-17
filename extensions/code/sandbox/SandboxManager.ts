@@ -205,8 +205,10 @@ export interface SandboxExecutionReceiptV2 {
 
 export interface SandboxValidationDiagnosticsV1 {
   version: 1;
-  stdout: string;
-  stderr: string;
+  stdoutSha256: string;
+  stderrSha256: string;
+  stdoutBytes: number;
+  stderrBytes: number;
   truncated: boolean;
   redactedLines: number;
 }
@@ -219,7 +221,7 @@ export type SandboxExecutionResultV2 =
   | {
       status: "verified" | "failed";
       receipt: SandboxExecutionReceiptV2;
-      /** Transient and untrusted; never included in the durable receipt. */
+      /** Redacted metadata only. Raw child-process output never crosses into tool/model output. */
       diagnostics: SandboxValidationDiagnosticsV1;
     }
   | { status: "blocked"; blocker: SandboxDurableBlockerV2 };
@@ -772,39 +774,23 @@ function transientDiagnostics(
   stderrInput: string,
 ): SandboxValidationDiagnosticsV1 {
   let redactedLines = 0;
-  const redact = (value: string) => value
-    .replace(/[^\u0009\u000a\u000d\u0020-\uffff]/gu, "")
-    .split(/\r?\n/u)
-    .map((line) => {
-      if (!CREDENTIAL_SHAPED_LINE.test(line)) return line;
-      redactedLines += 1;
-      return "[REDACTED credential-shaped line]";
-    })
-    .join("\n");
-  const stdoutRedacted = redact(stdoutInput);
-  const stderrRedacted = redact(stderrInput);
-  const stdout = boundedUtf8Tail(stdoutRedacted, TRANSIENT_DIAGNOSTIC_BYTES);
-  const stderr = boundedUtf8Tail(stderrRedacted, TRANSIENT_DIAGNOSTIC_BYTES);
+  for (const value of [stdoutInput, stderrInput]) {
+    for (const line of value.split(/\r?\n/u)) {
+      if (CREDENTIAL_SHAPED_LINE.test(line)) redactedLines += 1;
+    }
+  }
+  const stdoutBytes = Buffer.byteLength(stdoutInput, "utf8");
+  const stderrBytes = Buffer.byteLength(stderrInput, "utf8");
   return {
     version: 1,
-    stdout: stdout.value,
-    stderr: stderr.value,
-    truncated: stdout.truncated || stderr.truncated,
+    stdoutSha256: sha256Text(stdoutInput),
+    stderrSha256: sha256Text(stderrInput),
+    stdoutBytes,
+    stderrBytes,
+    truncated:
+      stdoutBytes > TRANSIENT_DIAGNOSTIC_BYTES ||
+      stderrBytes > TRANSIENT_DIAGNOSTIC_BYTES,
     redactedLines,
-  };
-}
-
-function boundedUtf8Tail(
-  value: string,
-  maxBytes: number,
-): { value: string; truncated: boolean } {
-  const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength <= maxBytes) return { value, truncated: false };
-  let start = bytes.byteLength - maxBytes;
-  while (start < bytes.byteLength && (bytes[start] & 0xc0) === 0x80) start += 1;
-  return {
-    value: `[truncated ${start} bytes]\n${bytes.subarray(start).toString("utf8")}`,
-    truncated: true,
   };
 }
 

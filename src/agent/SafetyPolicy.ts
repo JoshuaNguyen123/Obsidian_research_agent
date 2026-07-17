@@ -17,6 +17,9 @@ export interface SafetyContext {
   candidateLabel?: string;
   candidateRole?: string;
   candidateHref?: string;
+  candidateFormAction?: string;
+  candidateFormMethod?: string;
+  candidateSubmitsForm?: boolean;
   explicitUserApproval?: boolean;
 }
 
@@ -104,8 +107,30 @@ export class SafetyPolicy {
       ctx.candidateLabel,
       ctx.candidateRole,
       ctx.candidateHref,
+      ctx.candidateFormAction,
+      ctx.candidateFormMethod,
       input.selector,
     ].filter(Boolean).join("\n");
+
+    if (ctx.candidateSubmitsForm) {
+      if (this.matchesNeverApprove(text)) {
+        return this.block("Blocked high-risk browser form submission.", [
+          "browser_form_submit",
+          "high_risk_click",
+        ]);
+      }
+      if (ctx.explicitUserApproval) {
+        return this.allow(
+          "Browser form submission allowed after explicit one-shot user approval.",
+          "high",
+          ["browser_form_submit", "explicit_user_approval"],
+        );
+      }
+      return this.requireApproval(
+        "This control submits a form and requires explicit approval.",
+        ["browser_form_submit"],
+      );
+    }
 
     if (this.matchesHighRisk(text)) {
       if (this.matchesNeverApprove(text)) {
@@ -174,7 +199,13 @@ export class SafetyPolicy {
     const base = this.browserBaseCheck(ctx);
     if (base.status !== "allow") return base;
     if (/^(?:Enter|Space| )$/i.test(input.key)) {
-      const text = [ctx.visibleText, ctx.candidateLabel, ctx.candidateRole].filter(Boolean).join("\n");
+      const text = [
+        ctx.visibleText,
+        ctx.candidateLabel,
+        ctx.candidateRole,
+        ctx.candidateFormAction,
+        ctx.candidateFormMethod,
+      ].filter(Boolean).join("\n");
       if (this.matchesNeverApprove(text)) {
         return this.block("Blocked high-risk browser keypress.", ["high_risk_keypress"]);
       }

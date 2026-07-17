@@ -78,6 +78,7 @@ export class DurableValidationReceiptRegistryV1
       const scope = parseScope(input.scope);
       const action = parsePreparedSandboxActionV2(input.action);
       const receipt = await parseSandboxReceipt(input.receipt);
+      const diagnostics = parseDiagnostics(input.diagnostics);
       const kind = validationKind(action.purpose);
       if (action.workspaceId !== scope.workspaceId) {
         throw new DurableValidationReceiptErrorV1(
@@ -95,6 +96,17 @@ export class DurableValidationReceiptRegistryV1
         throw new DurableValidationReceiptErrorV1(
           "validation_action_mismatch",
           "Sandbox receipt does not belong to the prepared sandbox action.",
+        );
+      }
+      if (
+        diagnostics.stdoutSha256 !== receipt.stdoutSha256 ||
+        diagnostics.stderrSha256 !== receipt.stderrSha256 ||
+        diagnostics.stdoutBytes !== receipt.stdoutBytes ||
+        diagnostics.stderrBytes !== receipt.stderrBytes
+      ) {
+        throw new DurableValidationReceiptErrorV1(
+          "validation_diagnostics_mismatch",
+          "Redacted validation diagnostics do not match the sandbox receipt.",
         );
       }
       if (
@@ -123,7 +135,7 @@ export class DurableValidationReceiptRegistryV1
         scope,
         validatedWorkspaceManifestFingerprint,
         workspaceChangedPaths,
-        parseDiagnostics(input.diagnostics),
+        diagnostics,
       );
       const record: DurableValidationReceiptRecordV1 = {
         version: 1,
@@ -408,35 +420,30 @@ function parseDiagnostics(input: SandboxValidationDiagnosticsV1): SandboxValidat
     typeof input !== "object" ||
     Array.isArray(input) ||
     input.version !== 1 ||
-    typeof input.stdout !== "string" ||
-    typeof input.stderr !== "string" ||
+    !SHA256.test(input.stdoutSha256) ||
+    !SHA256.test(input.stderrSha256) ||
+    !Number.isSafeInteger(input.stdoutBytes) ||
+    input.stdoutBytes < 0 ||
+    !Number.isSafeInteger(input.stderrBytes) ||
+    input.stderrBytes < 0 ||
     typeof input.truncated !== "boolean" ||
     !Number.isSafeInteger(input.redactedLines) ||
-    input.redactedLines < 0 ||
-    Buffer.byteLength(input.stdout, "utf8") > 16_384 ||
-    Buffer.byteLength(input.stderr, "utf8") > 16_384
+    input.redactedLines < 0
   ) throw new Error("Transient validation diagnostics are invalid.");
   return { ...input };
 }
 
 /**
- * Collapse volatile execution detail while retaining the command failure's
- * stable diagnostic meaning. Raw diagnostics remain transient and are never
- * copied into the durable registry.
+ * Preserve only redacted, receipt-bound metadata for unchanged-failure loop
+ * detection. Child-process output never crosses this boundary.
  */
 function semanticFailureSignal(input: SandboxValidationDiagnosticsV1): string {
-  const normalize = (value: string) => value
-    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
-    .replace(/\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z\b/giu, "<TIME>")
-    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/giu, "<ID>")
-    .replace(/\b0x[0-9a-f]+\b/giu, "<ADDRESS>")
-    .replace(/(?:[A-Za-z]:[\\/]|\/(?!\/))[^\s'"<>|]+/gu, "<PATH>")
-    .replace(/\b\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?)\b/giu, "<DURATION>")
-    .replace(/\s+/gu, " ")
-    .trim();
-  const stdout = normalize(input.stdout);
-  const stderr = normalize(input.stderr);
-  return `stdout=${stdout.slice(-8_192)}\nstderr=${stderr.slice(-8_192)}`;
+  return [
+    `stdout=${input.stdoutSha256};bytes=${input.stdoutBytes}`,
+    `stderr=${input.stderrSha256};bytes=${input.stderrBytes}`,
+    `truncated=${input.truncated}`,
+    `redactedLines=${input.redactedLines}`,
+  ].join("\n");
 }
 
 async function parseNamespace(

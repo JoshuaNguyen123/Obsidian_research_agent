@@ -56,7 +56,7 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
     requestId: string;
     action: PreparedSandboxActionV2;
     receipt: SandboxExecutionReceiptV2;
-    /** Redacted, bounded, transient failure signal. Implementations must not persist raw text. */
+    /** Hash/size metadata only; raw child-process output never crosses this boundary. */
     diagnostics: SandboxValidationDiagnosticsV1;
     context: ScopedExtensionContextV1;
   }): Promise<JsonValueV1>;

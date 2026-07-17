@@ -4,6 +4,7 @@ import test from "node:test";
 
 import { createVerifiedCodePublicationHandoffV1 } from "../packages/core-api/src";
 import type { VerifiedLocalCommitReceiptV1 } from "../extensions/code/repair";
+import type { ActionReceipt } from "../src/agent/actions";
 import { verifyPreparedActionFingerprint } from "../src/agent/actions/canonicalize";
 import type {
   GitHubPublicationCheckpointV1,
@@ -80,6 +81,7 @@ test("GitHub merge requests two distinct exact approval gestures", async () => {
   const durable = checkpoint("review_or_merge_ready");
   const confirmationOrdinals: number[] = [];
   const approvalIds: string[] = [];
+  const persistedReceipts: ActionReceipt[] = [];
   const tool = createGitHubPublicationTool({
     async resolveHandoff() {
       return handoff;
@@ -122,7 +124,9 @@ test("GitHub merge requests two distinct exact approval gestures", async () => {
         },
       } as never;
     },
-    async persistExternalReceipt() {},
+    async persistExternalReceipt(receipt) {
+      persistedReceipts.push(receipt);
+    },
   });
   const mergeContext: ToolExecutionContext = {
     ...context(),
@@ -150,6 +154,9 @@ test("GitHub merge requests two distinct exact approval gestures", async () => {
 
   assert.equal(result.ok, true);
   assert.deepEqual(confirmationOrdinals, [1, 2]);
+  assert.equal(result.receipt?.resource.revision, GIT_C);
+  assert.equal(result.receipt?.readback.observedRevision, GIT_C);
+  assert.equal(persistedReceipts[0]?.resource.revision, GIT_C);
 });
 
 test("GitHub publication tool rejects model-supplied paths or SHAs before resolution", async () => {

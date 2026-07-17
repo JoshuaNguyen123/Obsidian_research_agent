@@ -102,6 +102,8 @@ export interface ClickableCandidate {
   candidateFingerprint: string;
   href?: string;
   formAction?: string;
+  formMethod?: string;
+  submitsForm?: boolean;
   inputType?: string;
   text?: string;
   focused?: boolean;

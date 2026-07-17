@@ -407,6 +407,7 @@ export class Phase7FakeGitHubProvider {
       state: "closed",
       draft: false,
       merged: true,
+      mergeSha,
       updatedAt: this.nextTimestamp(),
     };
     return {

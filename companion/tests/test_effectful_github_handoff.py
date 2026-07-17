@@ -248,12 +248,14 @@ def test_github_action_and_package_roundtrip_are_closed_and_remote_safe():
 
 def test_github_transport_survives_store_restart_without_widening_payload(tmp_path):
     body = effectful_github_job_body()
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     created = store.create_job(JobCreateRequest(**body))
     store.close()
 
-    restarted = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    restarted = CoordinatorStore(
+        tmp_path / "coordinator.sqlite3", integrity_key="i" * 43
+    )
     restarted.initialize()
     try:
         restored = restarted.get_job(created.id)
@@ -271,7 +273,7 @@ def test_github_transport_survives_store_restart_without_widening_payload(tmp_pa
 def test_expired_github_authority_reclaims_only_from_exact_ambiguous_marker(
     tmp_path, monkeypatch
 ):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(JobCreateRequest(**effectful_github_job_body()))
@@ -315,6 +317,7 @@ def test_expired_github_authority_reclaims_only_from_exact_ambiguous_marker(
         store.conn.execute(
             "UPDATE jobs SET lease_expires_at = 0 WHERE id = ?", (job.id,)
         )
+        store._refresh_job_integrity_locked(store.conn, job.id)
         expired = dt.datetime.fromisoformat(action["expiresAt"].replace("Z", "+00:00"))
         expired += dt.timedelta(seconds=1)
         monkeypatch.setattr(
@@ -329,7 +332,7 @@ def test_expired_github_authority_reclaims_only_from_exact_ambiguous_marker(
 def test_expired_github_authority_without_marker_cannot_start_dispatch(
     tmp_path, monkeypatch
 ):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(JobCreateRequest(**effectful_github_job_body()))
@@ -337,6 +340,7 @@ def test_expired_github_authority_without_marker_cannot_start_dispatch(
         store.conn.execute(
             "UPDATE jobs SET lease_expires_at = 0 WHERE id = ?", (job.id,)
         )
+        store._refresh_job_integrity_locked(store.conn, job.id)
         action = job.payload["preparedBackgroundGitHubAction"]
         expired = dt.datetime.fromisoformat(action["expiresAt"].replace("Z", "+00:00"))
         expired += dt.timedelta(seconds=1)

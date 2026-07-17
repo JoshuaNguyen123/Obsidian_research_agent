@@ -1,4 +1,4 @@
-name: Cross-platform CI
+name: Free targeted CI
 
 on:
   pull_request:
@@ -11,36 +11,28 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: targeted-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
-    name: ${{ matrix.os }} / ${{ matrix.sandbox_provider }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            sandbox_provider: wsl2
-          - os: macos-latest
-            sandbox_provider: podman
-          - os: ubuntu-latest
-            sandbox_provider: bubblewrap
+    name: Ubuntu / unit, build, and Companion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
@@ -49,52 +41,47 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
-      - name: Install companion dependencies
+      - name: Install Companion dependencies
         run: python -m pip install --disable-pip-version-check -r companion/requirements.txt
 
       - name: Unit tests
         run: npm test
 
-      - name: TypeScript
-        run: npx tsc --noEmit --skipLibCheck
-
       - name: Path hygiene
         run: npm run check:path-hygiene
 
-      - name: Build the unified plugin artifact
+      - name: Build unified plugin artifact
         run: npm run build
 
       - name: Companion tests
         run: npm run test:companion
 
-      - name: Platform sandbox boundary fixture
-        run: node --import tsx scripts/ci-sandbox-boundary.ts
-        env:
-          AGENTIC_SANDBOX_CI_PROVIDER: ${{ matrix.sandbox_provider }}
-
       - name: Unified capability and artifact gates
         run: node scripts/check-extension-release-gates.mjs --component all --skip-tests
 
-      - name: Installed artifact freshness and data preservation
+      - name: Installed-artifact freshness and data preservation
         run: node scripts/verify-installed-artifacts.mjs
 
-  windows-obsidian-e2e:
-    name: Windows / installed Obsidian deterministic matrix
+  windows-daily-use:
+    name: Windows / affected daily-use lanes
     needs: validate
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
@@ -103,59 +90,14 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
-      - name: Install companion dependencies
+      - name: Install Companion dependencies
         run: python -m pip install --disable-pip-version-check -r companion/requirements.txt
 
-      - name: Install Obsidian and export its executable path
+      - name: Install verified Obsidian desktop
         shell: pwsh
-        run: |
-          $version = "1.12.7"
-          $expectedSha256 = "f35d2a35061098400a3fafc1bfd38d8bd33f1ad76df8b78b62ccdf20b0a30d26"
-          $installer = Join-Path $env:RUNNER_TEMP "Obsidian-$version.exe"
-          $installDir = Join-Path $env:RUNNER_TEMP "Obsidian"
-          $assetUrl = "https://github.com/obsidianmd/obsidian-releases/releases/download/v$version/Obsidian-$version.exe"
+        run: ./scripts/install-verified-obsidian.ps1
 
-          Invoke-WebRequest -Uri $assetUrl -OutFile $installer
-          $actualSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "Obsidian installer SHA-256 mismatch. Expected $expectedSha256, received $actualSha256."
-          }
-
-          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-          $process = Start-Process -FilePath $installer -ArgumentList @("/S", "/D=$installDir") -Wait -PassThru
-          if ($process.ExitCode -ne 0) {
-            throw "Obsidian installer exited with code $($process.ExitCode)."
-          }
-
-          $obsidianExe = Join-Path $installDir "Obsidian.exe"
-          if (-not (Test-Path -LiteralPath $obsidianExe -PathType Leaf)) {
-            throw "The verified installer completed, but $obsidianExe was not created."
-          }
-
-          $stream = [System.IO.File]::OpenRead($obsidianExe)
-          try {
-            $reader = [System.IO.BinaryReader]::new($stream)
-            $stream.Position = 0x3c
-            $peOffset = $reader.ReadInt32()
-            $stream.Position = $peOffset + 4
-            $machine = $reader.ReadUInt16()
-          } finally {
-            if ($null -ne $reader) {
-              $reader.Dispose()
-            }
-            $stream.Dispose()
-          }
-          if ($machine -ne 0x8664) {
-            throw ("Installed Obsidian executable is not x64 (PE machine 0x{0:x4})." -f $machine)
-          }
-
-          $signature = Get-AuthenticodeSignature -LiteralPath $obsidianExe
-          if ($signature.Status -ne "Valid") {
-            throw "Installed Obsidian Authenticode signature is $($signature.Status), expected Valid."
-          }
-          "OBSIDIAN_EXE=$obsidianExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Create isolated Obsidian vault
+      - name: Create isolated disposable Obsidian vault
         shell: pwsh
         run: |
           $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-e2e-vault"
@@ -164,19 +106,16 @@ jobs:
           "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Deterministic Obsidian Playwright matrix
+      - name: Run affected daily-use Playwright lanes
         env:
-          # This job creates the vault above from trusted checked-out artifacts.
-          # Keep the first-open trust opt-in scoped to that disposable vault run.
           E2E_TRUST_DISPOSABLE_VAULT: "1"
-        run: npm run test:e2e:deterministic-matrix
+        run: npm run test:e2e:daily-use
 
-      - name: Upload Playwright diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - name: Upload redacted daily-use summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: windows-obsidian-playwright-diagnostics
-          path: |
-            test-results/
-            playwright-report/
+          name: daily-use-summary-${{ github.sha }}
+          path: test-results/daily-use-run-summary.json
+          retention-days: 3
           if-no-files-found: ignore

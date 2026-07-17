@@ -1007,6 +1007,7 @@ function redactSecretText(value: string): string {
     .replace(/\bghp_[A-Za-z0-9]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]")
+    .replace(/\blin_api_[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_LINEAR_TOKEN]")
     .replace(/(token|secret|password|passwd|api[_-]?key)\s*[=:]\s*[^\s,;}]+/gi, "$1=[REDACTED]");
 }
 

@@ -121,7 +121,7 @@ def test_queue_scan_schedules_only_fingerprint_bound_readback_and_dedupes_restar
     configuration = queue_configuration(now)
     observation = candidate(now)
 
-    first = CoordinatorStore(database)
+    first = CoordinatorStore(database, integrity_key="i" * 43)
     first.initialize()
     try:
         configured = first.configure_linear_queue(configuration)
@@ -159,7 +159,7 @@ def test_queue_scan_schedules_only_fingerprint_bound_readback_and_dedupes_restar
     finally:
         first.close()
 
-    second = CoordinatorStore(database)
+    second = CoordinatorStore(database, integrity_key="i" * 43)
     second.initialize()
     try:
         # Simulate the next 15-minute due edge without changing the persisted
@@ -203,7 +203,7 @@ def test_queue_scan_schedules_only_fingerprint_bound_readback_and_dedupes_restar
 def test_wrong_project_and_raw_issue_fields_fail_before_persistence(tmp_path):
     now = dt.datetime.now(dt.UTC)
     configuration = queue_configuration(now)
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         store.configure_linear_queue(configuration)
@@ -228,7 +228,7 @@ def test_expired_queue_authority_cannot_claim_scan_or_readback_job(
     now = dt.datetime.now(dt.UTC)
     configuration = queue_configuration(now)
     observation = candidate(now)
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         store.configure_linear_queue(configuration)

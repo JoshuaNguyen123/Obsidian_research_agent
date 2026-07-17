@@ -680,6 +680,50 @@ test("ordinary workspace mutations roll filesystem state back when manifest pers
   }
 });
 
+test("workspace copy rejects a destination inside its source without leaving partial output", async () => {
+  const fixture = await fixtureManager("copy-descendant");
+  try {
+    await fixture.manager.createScratchWorkspace({
+      workspaceId: "copy-descendant-space",
+      ownerRunId: "run-copy-descendant",
+    });
+    const lease = (await fixture.manager.acquireLease(
+      "copy-descendant-space",
+      "worker-copy-descendant",
+    )).lease!.id;
+    await fixture.manager.mkdir("copy-descendant-space", lease, "source");
+    await fixture.manager.createFile(
+      "copy-descendant-space",
+      lease,
+      "source/value.txt",
+      "safe\n",
+    );
+    const source = await fixture.manager.stat("copy-descendant-space", "source");
+    await assert.rejects(
+      fixture.manager.copy(
+        "copy-descendant-space",
+        lease,
+        "source",
+        "source/nested-copy",
+        source.sha256,
+      ),
+      (error: unknown) =>
+        error instanceof WorkspaceManagerErrorV2 &&
+        error.code === "copy_destination_inside_source",
+    );
+    await assert.rejects(
+      fixture.manager.stat("copy-descendant-space", "source/nested-copy"),
+      /does not exist/u,
+    );
+    assert.equal(
+      (await fixture.manager.read("copy-descendant-space", "source/value.txt")).content,
+      "safe\n",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 async function fixtureManager(name: string) {
   const root = await mkdtemp(path.join(tmpdir(), `workspace-v2-${name}-`));
   let milliseconds = Date.parse("2026-07-12T20:00:00.000Z");

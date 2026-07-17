@@ -8,7 +8,11 @@ from pydantic import ValidationError
 
 import coordinator_store as coordinator_store_module
 from conftest import fp
-from coordinator_store import CoordinatorStore, build_receipt_fingerprint
+from coordinator_store import (
+    CoordinatorStore,
+    JobIntegrityInvalid,
+    build_receipt_fingerprint,
+)
 from persisted_data import PersistedDataRejected, canonical_fingerprint, sanitize_receipt_payload
 from schemas import JobCreateRequest, ReceiptAppendRequest
 
@@ -176,7 +180,7 @@ def test_effectful_linear_dispatch_receipt_survives_restart_for_readback_reconci
     tmp_path,
 ):
     database = tmp_path / "coordinator.sqlite3"
-    first = CoordinatorStore(database)
+    first = CoordinatorStore(database, integrity_key="i" * 43)
     first.initialize()
     job = first.create_job(JobCreateRequest(**effectful_linear_job_body()))
     _leased, token = first.claim_job(job.id, "worker-a", 60)
@@ -206,7 +210,7 @@ def test_effectful_linear_dispatch_receipt_survives_restart_for_readback_reconci
     )
     first.close()
 
-    second = CoordinatorStore(database)
+    second = CoordinatorStore(database, integrity_key="i" * 43)
     second.initialize()
     try:
         restored = second.get_job(job.id)
@@ -215,6 +219,7 @@ def test_effectful_linear_dispatch_receipt_survives_restart_for_readback_reconci
         second.conn.execute(
             "UPDATE jobs SET lease_expires_at = 0 WHERE id = ?", (job.id,)
         )
+        second._refresh_job_integrity_locked(second.conn, job.id)
         _reclaimed, retry_token = second.claim_job(job.id, "worker-b", 60)
         verified_payload = {
             **dispatched_payload,
@@ -243,11 +248,36 @@ def test_effectful_linear_dispatch_receipt_survives_restart_for_readback_reconci
         second.close()
 
 
+def test_effectful_job_tampering_is_quarantined_before_claim(tmp_path):
+    store = CoordinatorStore(
+        tmp_path / "coordinator.sqlite3", integrity_key="i" * 43
+    )
+    store.initialize()
+    try:
+        job = store.create_job(JobCreateRequest(**effectful_linear_job_body()))
+        store.conn.execute(
+            "UPDATE jobs SET payload_json = '{}' WHERE id = ?", (job.id,)
+        )
+
+        with pytest.raises(JobIntegrityInvalid, match="integrity authenticator"):
+            store.claim_job(job.id, "worker-a", 60)
+
+        assert store.conn.execute(
+            "SELECT 1 FROM jobs WHERE id = ?", (job.id,)
+        ).fetchone() is None
+        quarantined = store.conn.execute(
+            "SELECT reason_code FROM quarantined_jobs WHERE job_id = ?", (job.id,)
+        ).fetchone()
+        assert quarantined["reason_code"] == "integrity_authenticator_mismatch"
+    finally:
+        store.close()
+
+
 def test_expired_effectful_authority_can_reclaim_only_after_exact_dispatch_marker(
     tmp_path, monkeypatch
 ):
     database = tmp_path / "coordinator.sqlite3"
-    store = CoordinatorStore(database)
+    store = CoordinatorStore(database, integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(JobCreateRequest(**effectful_linear_job_body()))
@@ -280,6 +310,7 @@ def test_expired_effectful_authority_can_reclaim_only_after_exact_dispatch_marke
         store.conn.execute(
             "UPDATE jobs SET lease_expires_at = 0 WHERE id = ?", (job.id,)
         )
+        store._refresh_job_integrity_locked(store.conn, job.id)
         after_expiry = (
             dt.datetime.fromisoformat(handoff["expiresAt"]) + dt.timedelta(seconds=1)
         ).timestamp()

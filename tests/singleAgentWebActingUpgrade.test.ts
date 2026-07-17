@@ -92,6 +92,33 @@ test("safety policy requires approval for reversible high-risk actions and block
     policy.evaluateBrowserType({ text: "my password", selector: "#search" }, base).status,
     "block",
   );
+  assert.equal(
+    policy.evaluateBrowserClick(
+      {},
+      {
+        ...base,
+        candidateLabel: "Continue",
+        candidateSubmitsForm: true,
+        candidateFormMethod: "post",
+        candidateFormAction: "https://example.com/preferences",
+      },
+    ).status,
+    "require_approval",
+  );
+  assert.equal(
+    policy.evaluateBrowserClick(
+      {},
+      {
+        ...base,
+        candidateLabel: "Continue",
+        candidateSubmitsForm: true,
+        candidateFormMethod: "post",
+        candidateFormAction: "https://example.com/preferences",
+        explicitUserApproval: true,
+      },
+    ).status,
+    "allow",
+  );
 });
 
 test("companion client parses health, browser observation, and memory responses", async () => {

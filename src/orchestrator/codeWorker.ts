@@ -437,7 +437,8 @@ function assertWorkerMutationPath(root: string, target: string, runtime: Runtime
   const blockedDirectory = lowerParts.slice(0, -1).some((part) =>
     BLOCKED_MUTATION_DIRECTORIES.has(part)
   );
-  const workflowFile = lowerParts[0] === ".github" && lowerParts[1] === "workflows";
+  const githubExecutionControl = lowerParts[0] === ".github" &&
+    (lowerParts[1] === "workflows" || lowerParts[1] === "actions");
   const requirementsFile = /^requirements(?:[-_.][a-z0-9_-]+)?\.txt$/i.test(fileName);
   const executableConfigFile = /(?:^|\.)(?:config|workspace)\.(?:[cm]?js|tsx?)$/i.test(
     fileName,
@@ -445,7 +446,7 @@ function assertWorkerMutationPath(root: string, target: string, runtime: Runtime
   const typedConfigFile = /^(?:js|ts)config(?:\.[a-z0-9_-]+)?\.json$/i.test(fileName);
   if (
     blockedDirectory ||
-    workflowFile ||
+    githubExecutionControl ||
     BLOCKED_MUTATION_FILES.has(fileName) ||
     BLOCKED_MUTATION_EXTENSIONS.has(extension) ||
     requirementsFile ||

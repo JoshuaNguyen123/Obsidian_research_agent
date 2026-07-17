@@ -153,7 +153,11 @@ test("publisher deduplicates only an exact signed contract in the pinned queue p
   const publisher = publisherFixture(readClient, executor);
   duplicateDescription = publisher.build(SECTIONS, DRAFT).description;
 
-  const result = await publisher.publish(requestFixture());
+  const result = await publisher.publish(requestFixture({
+    status: "deduplicated",
+    duplicateId: "duplicate",
+    duplicateSnapshotHash: HASH,
+  }));
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -169,6 +173,35 @@ test("publisher deduplicates only an exact signed contract in the pinned queue p
     assert.equal(variables.includeArchived, false);
     assert.ok(Number(variables.first) <= 10);
   }
+});
+
+test("publisher rejects create-to-deduplicate drift after exact approval", async () => {
+  let executeCalls = 0;
+  let duplicateDescription = "";
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") {
+        return page([issue("late-duplicate", duplicateDescription, QUEUE_PROJECT_ID)]);
+      }
+      if (operationKey === "issues.get") {
+        assert.deepEqual(variables, { id: "late-duplicate" });
+        return issue("late-duplicate", duplicateDescription, QUEUE_PROJECT_ID);
+      }
+      throw new Error(`Unexpected operation ${operationKey}`);
+    },
+  };
+  const publisher = publisherFixture(readClient, fakeExecutor({
+    onExecute: () => { executeCalls += 1; },
+  }));
+  duplicateDescription = publisher.build(SECTIONS, DRAFT).description;
+
+  const result = await publisher.publish(requestFixture());
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.status, "rejected");
+  assert.equal(result.error.code, "research_ticket_approved_preview_changed");
+  assert.equal(executeCalls, 0);
 });
 
 test("publisher prepares one deterministic pinned create and verifies independent readback", async () => {
@@ -324,7 +357,12 @@ function publisherFixture(
   });
 }
 
-function requestFixture() {
+function requestFixture(overrides: Partial<{
+  status: "create" | "deduplicated";
+  duplicateId: string | null;
+  duplicateSnapshotHash: string | null;
+}> = {}) {
+  const ticket = publisherFixture(emptyReadClient(), unusedExecutor()).build(SECTIONS, DRAFT);
   return {
     runId: "research-run-42",
     toolCallId: "publish-ticket-1",
@@ -332,6 +370,12 @@ function requestFixture() {
     context: contextFixture(),
     sections: SECTIONS,
     draft: DRAFT,
+    approvedPreview: {
+      status: overrides.status ?? "create",
+      workItemFingerprint: ticket.spec.fingerprint,
+      duplicateId: overrides.duplicateId ?? null,
+      duplicateSnapshotHash: overrides.duplicateSnapshotHash ?? null,
+    },
     preferredGrantId: "grant-queue",
   };
 }

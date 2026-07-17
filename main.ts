@@ -354,6 +354,10 @@ import {
   isObsidianSecretReferenceV1,
   ObsidianSecretStoreV1,
 } from "./src/integrations/ObsidianSecretStoreV1";
+import {
+  emptyModelCredentialReferencesV1,
+  ModelCredentialStoreV1,
+} from "./src/integrations/ModelCredentialStoreV1";
 import type { ParsedCompatibleWorkItemSpec } from "./src/integrations/linear/WorkItemSpecV2";
 import {
   GitHubAuthV1,
@@ -653,6 +657,8 @@ export default class AgenticResearcherPlugin extends Plugin {
   private companionLinearQueueProjection: CompanionLinearQueueRunDetailsProjectionV1 | null = null;
   private unloading = false;
   private latestOrchestratorSnapshot: OrchestratorSnapshotV1 | null = null;
+  /** Model keys live only in memory; plugin data contains opaque SecretStorage references. */
+  private modelCredentialStore: ModelCredentialStoreV1 | null = null;
   /** Session-only fallback; plaintext is never written to data.json or tool settings. */
   private linearApiKey = "";
   private linearCredentialReference: SecretDescriptionV1 | null = null;
@@ -1442,6 +1448,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       conversationHistory: rawHistory,
       researchMemoryIndex: rawResearchMemoryIndex,
       latestOrchestratorSnapshot: rawOrchestratorSnapshot,
+      ollamaApiKey: rawOllamaApiKey,
+      openAiCompatibleApiKey: rawOpenAiCompatibleApiKey,
+      modelCredentialReferences: rawModelCredentialReferences,
       linearApiKey: rawLinearApiKey,
       linearCredentialReference: rawLinearCredentialReference,
       linearOAuthRuntimeState: rawLinearOAuthRuntimeState,
@@ -1472,11 +1481,23 @@ export default class AgenticResearcherPlugin extends Plugin {
     } = record;
     const hadLegacyLinearPlaintext =
       typeof rawLinearApiKey === "string" && rawLinearApiKey.trim().length > 0;
+    const hadLegacyModelPlaintext =
+      (typeof rawOllamaApiKey === "string" && rawOllamaApiKey.trim().length > 0) ||
+      (typeof rawOpenAiCompatibleApiKey === "string" &&
+        rawOpenAiCompatibleApiKey.trim().length > 0);
     void _rawExtensionStateMigration;
     void _rawPluginDataV3Migration;
     // Preserve the exact persisted compatibility inputs before any extension
     // migration preparation or runtime-default sanitation occurs.
-    const persistedSettingsData = { ...settingsData };
+    const persistedSettingsData = {
+      ...settingsData,
+      ...(typeof rawOllamaApiKey === "string"
+        ? { ollamaApiKey: rawOllamaApiKey }
+        : {}),
+      ...(typeof rawOpenAiCompatibleApiKey === "string"
+        ? { openAiCompatibleApiKey: rawOpenAiCompatibleApiKey }
+        : {}),
+    };
 
     const bundledDataLoadedAt = new Date().toISOString();
     this.bundledCapabilityData = parseBundledCapabilityData(
@@ -1713,6 +1734,24 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     settings.vaultScopeId = ensureVaultScopeId(settings.vaultScopeId);
 
+    this.modelCredentialStore = new ModelCredentialStoreV1(
+      this.createObsidianSecretStore(),
+    );
+    const loadedModelCredentials = await this.modelCredentialStore.load(
+      rawModelCredentialReferences,
+      {
+        ollama:
+          typeof rawOllamaApiKey === "string" ? rawOllamaApiKey : "",
+        openAiCompatible:
+          typeof rawOpenAiCompatibleApiKey === "string"
+            ? rawOpenAiCompatibleApiKey
+            : "",
+      },
+    );
+    settings.ollamaApiKey = loadedModelCredentials.values.ollama;
+    settings.openAiCompatibleApiKey =
+      loadedModelCredentials.values.openAiCompatible;
+
     const normalizedProfiles = normalizeAgentSettings(
       persistedSettingsData,
       detectInstallKind(persistedSettingsData),
@@ -1932,7 +1971,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       loadedMigration.needsPersistence ||
       loadedPluginDataMigration.needsPersistence ||
       bundledImport.imported.length > 0 ||
-      hadLegacyLinearPlaintext
+      hadLegacyLinearPlaintext ||
+      hadLegacyModelPlaintext ||
+      loadedModelCredentials.migrated
     ) {
       await this.savePluginData();
     }
@@ -1957,7 +1998,16 @@ export default class AgenticResearcherPlugin extends Plugin {
     ) {
       this.settings.linearQueueEnabled = false;
     }
+    const retiredModelCredentialReferences = this.modelCredentialStore
+      ? await this.modelCredentialStore.synchronize({
+          ollama: this.settings.ollamaApiKey,
+          openAiCompatible: this.settings.openAiCompatibleApiKey,
+        })
+      : [];
     await this.savePluginData();
+    await this.modelCredentialStore?.removeRetired(
+      retiredModelCredentialReferences,
+    );
     void this.restartLinearQueueRuntime(false).catch((error) =>
       console.warn("Unable to refresh the Linear queue runtime.", error),
     );
@@ -6487,8 +6537,18 @@ export default class AgenticResearcherPlugin extends Plugin {
     const write = this.pluginDataSaveTail
       .catch(() => undefined)
       .then(async () => {
+        const {
+          ollamaApiKey: _ollamaApiKey,
+          openAiCompatibleApiKey: _openAiCompatibleApiKey,
+          ...persistableSettings
+        } = this.settings;
+        void _ollamaApiKey;
+        void _openAiCompatibleApiKey;
         await this.saveData({
-          ...this.settings,
+          ...persistableSettings,
+          modelCredentialReferences:
+            this.modelCredentialStore?.snapshot() ??
+            emptyModelCredentialReferencesV1(),
           linearCredentialReference: this.linearCredentialReference,
           linearOAuthRuntimeState: this.linearOAuthRuntimeState,
           githubCredential: this.githubCredential,
@@ -7992,6 +8052,26 @@ export default class AgenticResearcherPlugin extends Plugin {
     events: AgentRunEvents;
     canonicalDispatch?: MissionGraphSession;
   }): Promise<OrchestratorSnapshotV1 | null> {
+    if (!this.isLegacyNativeCodeExecutionEnabled()) {
+      const blocker =
+        "The legacy native code-team executor is retired. Use the Code capability, which requires a fresh attested sandbox probe before repository execution.";
+      if (input.canonicalDispatch) {
+        await input.canonicalDispatch.transitionNode("dispatch", "blocked", {
+          code: "legacy_native_code_execution_retired",
+          message: blocker,
+          requiredAction: "Run this mission through the built-in Code capability.",
+        });
+      }
+      emitOrchestratorAssistantResult(input.events, blocker, "error");
+      input.events.onRunComplete?.({
+        step: 0,
+        maxSteps: this.settings.orchestratorWorkerMaxSteps ?? 20,
+        stopReason: "final",
+      });
+      return null;
+    }
+
+    /* istanbul ignore next -- retained only for additive snapshot compatibility. */
     const rootDeadline = createLinkedDeadlineSignal(
       input.abortSignal,
       30 * 60_000,
@@ -8629,6 +8709,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     } finally {
       rootDeadline.dispose();
     }
+  }
+
+  private isLegacyNativeCodeExecutionEnabled(): boolean {
+    return false;
   }
 
   private async persistLatestOrchestratorToRunArtifacts(

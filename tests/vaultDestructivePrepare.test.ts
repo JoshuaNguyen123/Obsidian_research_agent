@@ -226,6 +226,45 @@ test("delete_path prepare to executePrepared uses fingerprint-bound trash", asyn
   assert.equal(executed.receipt?.payloadFingerprint, prepared.action.payloadFingerprint);
 });
 
+test("recursive delete rejects descendant content drift after approval", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createVaultMockContext({
+    prompt: "Delete Projects recursively from the vault.",
+  });
+  mock.content.set("Projects/second.md", "Second project note");
+
+  const prepared = await registry.prepare!(
+    {
+      name: "delete_path",
+      arguments: { path: "Projects", recursive: true },
+    },
+    {
+      ...mock.context,
+      runId: "run-vault-recursive",
+      operationId: "call-delete-projects",
+    },
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  mock.content.set("Projects/second.md", "Changed after approval");
+  const executed = await registry.executePrepared!(
+    prepared.action,
+    mock.context,
+    {
+      preparedActionId: prepared.action.id,
+      payloadFingerprint: prepared.action.payloadFingerprint,
+      grantId: "grant-delete-projects",
+    },
+  );
+
+  assert.equal(executed.ok, false);
+  assert.equal(executed.error?.code, "vault_precondition_changed");
+  assert.equal(mock.content.has("Projects/example.md"), true);
+  assert.equal(mock.content.has("Projects/second.md"), true);
+  assert.equal(mock.operations.some((entry) => entry.startsWith("trash:Projects:")), false);
+});
+
 function createVaultMockContext(options: {
   prompt?: string;
   now?: Date;
@@ -274,6 +313,10 @@ function createVaultMockContext(options: {
         getFileByPath: getFile,
         getFolderByPath: getFolder,
         getAbstractFileByPath: (path: string) => getFile(path) ?? getFolder(path),
+        getAllLoadedFiles: () => [
+          ...[...folders].map((path) => ({ path })),
+          ...[...content.keys()].map((path) => getFile(path)!),
+        ],
         trash: async (target: { path: string }, system: boolean) => {
           operations.push(`trash:${target.path}:${system}`);
           content.delete(target.path);

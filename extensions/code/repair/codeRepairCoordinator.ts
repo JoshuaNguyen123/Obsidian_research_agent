@@ -775,8 +775,15 @@ export class CodeRepairCoordinatorV1 {
     checkpoint: CodeRepairCheckpointV1,
     diff: CodeDiffReceiptV1,
   ): Promise<CodeRepairCheckpointV1> {
+    // A rename is a mutation of both names. Classifying only the destination
+    // would let a protected control be renamed away under an ordinary-file
+    // approval.
+    const approvalChangedPaths = [...new Set([
+      ...diff.changedPaths,
+      ...diff.files.flatMap((file) => file.previousPath ? [file.previousPath] : []),
+    ])].sort();
     const classification = classifyProtectedControlChanges(
-      diff.changedPaths,
+      approvalChangedPaths,
       checkpoint.request.protectedControlPaths,
     );
     if (classification.level === "none") return checkpoint;
@@ -816,7 +823,7 @@ export class CodeRepairCoordinatorV1 {
         payloadFingerprint: diff.fingerprint,
         diffFingerprint: diff.fingerprint,
         diffPatch: diff.patch,
-        changedPaths: [...diff.changedPaths],
+        changedPaths: approvalChangedPaths,
         protectedPaths: [...classification.protectedPaths],
       };
       const decision = normalizeApprovalDecision(

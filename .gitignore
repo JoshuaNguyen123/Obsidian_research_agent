@@ -50,6 +50,8 @@ Thumbs.db
 .agent-backups/
 
 # Local-only planning, agent, and skill context
+/AGENTS.md
+/agents.md
 AGENTS.local.md
 agents.local.md
 skills/

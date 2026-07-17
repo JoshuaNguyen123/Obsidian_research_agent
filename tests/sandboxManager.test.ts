@@ -514,7 +514,7 @@ test("validation contribution withholds success when durable receipt persistence
   assert.equal(executions, 1, "sandbox ran once, but no green tool result was returned");
 });
 
-test("failed validation exposes bounded redacted diagnostics but durable observer sees hashes only", async () => {
+test("failed validation exposes diagnostic metadata only and durable observer sees hashes only", async () => {
   const durableSources: unknown[] = [];
   const manager = new SandboxManagerV2({
     providers: [dockerProvider()],
@@ -578,12 +578,20 @@ test("failed validation exposes bounded redacted diagnostics but durable observe
     },
   }));
   const output = executed.output as {
-    validationDiagnostics: { stdout: string; stderr: string; redactedLines: number };
+    validationDiagnostics: {
+      stdoutSha256: string;
+      stderrSha256: string;
+      stdoutBytes: number;
+      stderrBytes: number;
+      redactedLines: number;
+    };
   };
-  assert.match(output.validationDiagnostics.stdout, /TS2322 expected string/iu);
-  assert.match(output.validationDiagnostics.stderr, /AssertionError: expected 2/iu);
-  assert.doesNotMatch(output.validationDiagnostics.stderr, /do-not-persist/iu);
+  assert.match(output.validationDiagnostics.stdoutSha256, /^sha256:[a-f0-9]{64}$/u);
+  assert.match(output.validationDiagnostics.stderrSha256, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(output.validationDiagnostics.stdoutBytes, Buffer.byteLength("src/index.ts(4,3): TS2322 expected string but received number", "utf8"));
+  assert.equal(output.validationDiagnostics.stderrBytes, Buffer.byteLength("API_TOKEN=do-not-persist\nAssertionError: expected 2, received 3", "utf8"));
   assert.equal(output.validationDiagnostics.redactedLines, 1);
+  assert.doesNotMatch(JSON.stringify(output), /TS2322|AssertionError|do-not-persist/iu);
   assert.doesNotMatch(JSON.stringify(durableSources), /TS2322|AssertionError|do-not-persist/iu);
 });
 

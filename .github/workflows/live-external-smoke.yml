@@ -30,25 +30,36 @@ concurrency:
 jobs:
   smoke:
     name: ${{ inputs.provider }} / mutate, verify, and clean up
-    runs-on:
-      - self-hosted
-      - Windows
-      - X64
-      - obsidian-e2e
+    runs-on: windows-2022
     timeout-minutes: 45
     environment: disposable-live-external
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Install verified Obsidian desktop
+        shell: pwsh
+        run: ./scripts/install-verified-obsidian.ps1
+
+      - name: Create isolated disposable Obsidian vault
+        shell: pwsh
+        run: |
+          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-live-external-vault"
+          New-Item -ItemType Directory -Force -Path (Join-Path $vault ".obsidian\plugins") | Out-Null
+          Set-Content -LiteralPath (Join-Path $vault ".obsidian\community-plugins.json") -Value "[]" -Encoding utf8
+          "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Fail-closed disposable-target preflight
         run: node scripts/live-external-preflight.mjs --provider ${{ inputs.provider }}
@@ -57,7 +68,6 @@ jobs:
           LIVE_EXTERNAL_MERGE_CONFIRMATION: ${{ inputs.merge_confirmation }}
           LIVE_EXTERNAL_TARGET_LABEL: ${{ vars.LIVE_EXTERNAL_TARGET_LABEL }}
           AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true"
-          OBSIDIAN_VAULT: ${{ vars.DISPOSABLE_OBSIDIAN_VAULT }}
           LINEAR_LIVE_TEST_TOKEN: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
           LINEAR_LIVE_TEST_TEAM_ID: ${{ vars.LINEAR_LIVE_TEST_TEAM_ID }}
           LINEAR_LIVE_TEST_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
@@ -80,4 +90,4 @@ jobs:
           E2E_LIVE_ALLOW_MERGE: ${{ inputs.provider == 'github_merge' && '1' || '0' }}
           LIVE_EXTERNAL_MERGE_CONFIRMATION: ${{ inputs.merge_confirmation }}
           AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true"
-          OBSIDIAN_VAULT: ${{ vars.DISPOSABLE_OBSIDIAN_VAULT }}
+          E2E_TRUST_DISPOSABLE_VAULT: "1"

@@ -44,6 +44,14 @@ def test_output_and_blocker_allowlist_rejects_credentials_paths_and_commands():
         )
 
 
+def test_linear_api_token_shape_is_rejected_before_persistence():
+    token = "lin_api_" + "a" * 32
+    with pytest.raises(PersistedDataRejected, match="credential"):
+        sanitize_completion_output(
+            "linear", {"blocker": {"code": "failed", "message": token}}
+        )
+
+
 def test_closed_domain_job_rejects_ambiguous_target_and_accepts_logical_binding():
     with pytest.raises(ValidationError, match="not allowed"):
         JobCreateRequest(**valid_job_body(inputs={"target": "src/index.ts"}))
@@ -66,7 +74,7 @@ def test_closed_domain_job_rejects_ambiguous_target_and_accepts_logical_binding(
 
 
 def test_completion_store_rejects_secret_before_sqlite_write(tmp_path):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(JobCreateRequest(**valid_job_body()))

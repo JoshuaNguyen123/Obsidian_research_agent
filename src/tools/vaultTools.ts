@@ -2649,6 +2649,9 @@ export const deleteCurrentFileTool: AgentTool = {
 
 type VaultPathType = "file" | "folder";
 
+const MAX_DELETE_MANIFEST_ENTRIES = 1_000;
+const MAX_DELETE_MANIFEST_BYTES = 50 * 1024 * 1024;
+
 interface VaultEntryLike {
   path: string;
   name?: string;
@@ -3726,6 +3729,85 @@ function getDescendantEntries(
     const relativePath = getRelativeChildPath(entry.path, folderPath);
     return relativePath !== null && relativePath.length > 0;
   });
+}
+
+async function buildVaultDeletionManifest(
+  context: ToolExecutionContext,
+  targetPath: string,
+  targetType: VaultPathType,
+  recursive: boolean,
+): Promise<{ fingerprint: string; bytes: number }> {
+  const entries = targetType === "folder"
+    ? getDescendantEntries(context, targetPath)
+    : [getAbstractPath(context, targetPath)].filter(
+        (entry): entry is VaultEntryLike => entry !== null,
+      );
+  if (entries.length > MAX_DELETE_MANIFEST_ENTRIES) {
+    throw new ToolExecutionError(
+      "vault_delete_manifest_too_large",
+      `Delete preparation supports at most ${MAX_DELETE_MANIFEST_ENTRIES} entries.`,
+      { mutationState: "not_applied" },
+    );
+  }
+  const manifest: Array<Record<string, JsonValue>> = [];
+  let bytes = 0;
+  for (const entry of [...entries].sort((left, right) => left.path.localeCompare(right.path))) {
+    const type = getPathType(entry);
+    if (type === "folder") {
+      manifest.push({ path: entry.path, type });
+      continue;
+    }
+    const file = context.app.vault.getFileByPath(entry.path);
+    if (!file) {
+      throw new ToolExecutionError(
+        "vault_precondition_changed",
+        `Vault file disappeared while preparing deletion: ${entry.path}`,
+        { mutationState: "not_applied" },
+      );
+    }
+    const vault = context.app.vault as unknown as {
+      read(file: TFile): Promise<string>;
+      readBinary?: (file: TFile) => Promise<ArrayBuffer>;
+    };
+    const contentBytes = typeof vault.readBinary === "function"
+      ? new Uint8Array(await vault.readBinary(file))
+      : new TextEncoder().encode(await vault.read(file));
+    bytes += contentBytes.byteLength;
+    if (bytes > MAX_DELETE_MANIFEST_BYTES) {
+      throw new ToolExecutionError(
+        "vault_delete_manifest_too_large",
+        `Delete preparation supports at most ${MAX_DELETE_MANIFEST_BYTES} bytes.`,
+        { mutationState: "not_applied" },
+      );
+    }
+    manifest.push({
+      path: entry.path,
+      type,
+      bytes: contentBytes.byteLength,
+      sha256: await sha256VaultBytes(contentBytes),
+    });
+  }
+  return {
+    fingerprint: await sha256Fingerprint({
+      version: 1,
+      path: targetPath,
+      type: targetType,
+      recursive,
+      entries: manifest,
+    }),
+    bytes,
+  };
+}
+
+async function sha256VaultBytes(bytes: Uint8Array): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error("SHA-256 is unavailable in this runtime.");
+  const digestInput = new Uint8Array(bytes.byteLength);
+  digestInput.set(bytes);
+  const digest = await subtle.digest("SHA-256", digestInput.buffer);
+  return `sha256:${[...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
 }
 
 async function ensureParentFolder(
@@ -5035,21 +5117,14 @@ async function prepareDeletePath(
     if (type === "folder" && affectedCount > 0 && !recursive) {
       throw new Error("delete_path requires recursive=true for non-empty folders.");
     }
-    const current =
-      type === "file" && getEntryExtension(target) === "md"
-        ? await context.app.vault.read(target as TFile)
-        : null;
-    const contentRevision = current
-      ? await sha256Fingerprint(current)
-      : await sha256Fingerprint({
-          path,
-          type,
-          recursive,
-          descendants: type === "folder"
-            ? getDescendantEntries(context, path).map((entry) => entry.path).sort()
-            : [],
-        });
-    const bytesDeleted = current ? getByteLength(current) : undefined;
+    const deletionManifest = await buildVaultDeletionManifest(
+      context,
+      path,
+      type,
+      recursive,
+    );
+    const contentRevision = deletionManifest.fingerprint;
+    const bytesDeleted = deletionManifest.bytes;
     const action = await buildPreparedVaultAction({
       context,
       toolName: "delete_path",
@@ -5059,7 +5134,7 @@ async function prepareDeletePath(
         recursive,
         pathType: type,
         contentRevision,
-        ...(bytesDeleted === undefined ? {} : { bytesDeleted }),
+        bytesDeleted,
         affectedCount,
       },
       preview: {
@@ -5069,7 +5144,7 @@ async function prepareDeletePath(
           path,
           type,
           affectedCount,
-          ...(bytesDeleted === undefined ? {} : { bytes: bytesDeleted }),
+          bytes: bytesDeleted,
         },
         after: { path, present: false },
         outboundPayload: { path, recursive },
@@ -5113,20 +5188,14 @@ async function executePreparedDeletePath(
       { mutationState: "not_applied" },
     );
   }
-  const current =
-    pathType === "file" && getEntryExtension(target) === "md"
-      ? await context.app.vault.read(target as TFile)
-      : null;
-  const currentRevision = current
-    ? await sha256Fingerprint(current)
-    : await sha256Fingerprint({
-        path,
-        type: pathType,
-        recursive,
-        descendants: pathType === "folder"
-          ? getDescendantEntries(context, path).map((entry) => entry.path).sort()
-          : [],
-      });
+  const currentRevision = (
+    await buildVaultDeletionManifest(
+      context,
+      path,
+      pathType as VaultPathType,
+      recursive,
+    )
+  ).fingerprint;
   if (
     currentRevision !== contentRevision ||
     action.expectedTargetRevision !== contentRevision

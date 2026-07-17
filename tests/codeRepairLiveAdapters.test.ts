@@ -54,8 +54,10 @@ test("durable validation registry captures only exact request-scoped sandbox evi
     receipt,
     diagnostics: {
       version: 1 as const,
-      stdout: "FAIL C:/volatile/one/src/index.ts at 2026-07-12T20:00:00.000Z",
-      stderr: "expected true, received false after 812ms",
+      stdoutSha256: receipt.stdoutSha256,
+      stderrSha256: receipt.stderrSha256,
+      stdoutBytes: receipt.stdoutBytes,
+      stderrBytes: receipt.stderrBytes,
       truncated: false,
       redactedLines: 0,
     },
@@ -105,8 +107,10 @@ test("durable validation registry captures only exact request-scoped sandbox evi
     receipt: semanticallySame,
     diagnostics: {
       version: 1,
-      stdout: "FAIL D:/different/root/src/index.ts at 2027-01-01T01:02:03.000Z",
-      stderr: "expected true, received false after 2.1 seconds",
+      stdoutSha256: semanticallySame.stdoutSha256,
+      stderrSha256: semanticallySame.stderrSha256,
+      stdoutBytes: semanticallySame.stdoutBytes,
+      stderrBytes: semanticallySame.stderrBytes,
       truncated: false,
       redactedLines: 0,
     },
@@ -114,7 +118,15 @@ test("durable validation registry captures only exact request-scoped sandbox evi
   assert.equal(
     semanticCapture.failureFingerprint,
     captured.failureFingerprint,
-    "failure fingerprint must ignore volatile paths, timestamps, and durations",
+    "failure fingerprint must remain stable for identical redacted output metadata",
+  );
+
+  await assert.rejects(
+    registry.capture({
+      ...captureInput,
+      diagnostics: { ...captureInput.diagnostics, stdoutSha256: SHA("f") },
+    }),
+    /diagnostics do not match/i,
   );
 
   await assert.rejects(

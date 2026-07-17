@@ -805,6 +805,7 @@ function unresolvedRuntime(
 function detectProtectedControls(files: readonly string[]): RepositoryProtectedControlV2[] {
   const controls = new Map<string, RepositoryProtectedControlV2>();
   addControl(controls, ".github/workflows", "workflow", "double_exact");
+  addControl(controls, ".github/actions", "workflow", "double_exact");
   addControl(controls, ".githooks", "hook", "double_exact");
   addControl(controls, ".husky", "hook", "double_exact");
   addControl(controls, ".git/hooks", "hook", "double_exact");
@@ -813,6 +814,7 @@ function detectProtectedControls(files: readonly string[]): RepositoryProtectedC
   for (const path of files) {
     const base = basename(path);
     if (path.startsWith(".github/workflows/")) addControl(controls, ".github/workflows", "workflow", "double_exact");
+    if (path.startsWith(".github/actions/")) addControl(controls, ".github/actions", "workflow", "double_exact");
     if (path.startsWith(".githooks/") || path.startsWith(".husky/") || path.startsWith(".git/hooks/")) {
       const root = path.startsWith(".husky/") ? ".husky" : path.startsWith(".githooks/") ? ".githooks" : ".git/hooks";
       addControl(controls, root, "hook", "double_exact");
@@ -838,7 +840,7 @@ function detectProtectedControls(files: readonly string[]): RepositoryProtectedC
 
 function protectedControlForPath(path: string): RepositoryProtectedControlV2 {
   const normalized = safeRelativePath(path, "protected path", false);
-  if (normalized.startsWith(".github/workflows")) return { path: normalized, kind: "workflow", approval: "double_exact" };
+  if (normalized.startsWith(".github/workflows") || normalized.startsWith(".github/actions")) return { path: normalized, kind: "workflow", approval: "double_exact" };
   if (normalized.startsWith(".githooks") || normalized.startsWith(".husky") || normalized.startsWith(".git/hooks")) {
     return { path: normalized, kind: "hook", approval: "double_exact" };
   }

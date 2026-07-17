@@ -162,6 +162,9 @@ const browserClickTool: AgentTool = {
         candidateLabel: trusted.candidate.label,
         candidateRole: trusted.candidate.role,
         candidateHref: trusted.candidate.href,
+        candidateFormAction: trusted.candidate.formAction,
+        candidateFormMethod: trusted.candidate.formMethod,
+        candidateSubmitsForm: trusted.candidate.submitsForm,
       }),
     );
     if (safety.status !== "allow") {
@@ -288,6 +291,9 @@ const browserKeypressTool: AgentTool = {
         candidateLabel: focused.label,
         candidateRole: focused.role,
         candidateHref: focused.href,
+        candidateFormAction: focused.formAction,
+        candidateFormMethod: focused.formMethod,
+        candidateSubmitsForm: focused.submitsForm,
       }),
     );
     if (safety.status !== "allow") {
@@ -596,6 +602,12 @@ function buildSafetyContext(
     candidateLabel: getOptionalString(args, "candidateLabel"),
     candidateRole: getOptionalString(args, "candidateRole"),
     candidateHref: getOptionalString(args, "candidateHref"),
+    candidateFormAction: getOptionalString(args, "candidateFormAction"),
+    candidateFormMethod: getOptionalString(args, "candidateFormMethod"),
+    candidateSubmitsForm:
+      typeof args.candidateSubmitsForm === "boolean"
+        ? args.candidateSubmitsForm
+        : undefined,
     explicitUserApproval: context.userApprovalGranted === true,
   };
 }

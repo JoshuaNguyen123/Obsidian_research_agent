@@ -108,6 +108,7 @@ export default defineConfig({
       retries: 0,
       timeout: 900_000,
       expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
       name: "daily-use-mock",
@@ -141,6 +142,7 @@ export default defineConfig({
       retries: 0,
       timeout: 900_000,
       expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
       name: "daily-use-code",
@@ -184,6 +186,7 @@ export default defineConfig({
       retries: 0,
       timeout: 3_600_000,
       expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
       name: "provider-canary",
@@ -191,6 +194,7 @@ export default defineConfig({
       retries: 0,
       timeout: 900_000,
       expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
       name: "release-vertical",
@@ -198,6 +202,7 @@ export default defineConfig({
       retries: 0,
       timeout: 3_600_000,
       expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
       name: "disposable-live-external",
@@ -205,6 +210,7 @@ export default defineConfig({
       retries: 0,
       timeout: 600_000,
       expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
       name: "configured-linear-live",
@@ -212,6 +218,7 @@ export default defineConfig({
       retries: 0,
       timeout: 600_000,
       expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
   ],
 });

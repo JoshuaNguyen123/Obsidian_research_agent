@@ -93,8 +93,17 @@ export interface ResearchTicketPublishRequest {
   context: ToolExecutionContext;
   sections: SynthesizedResearchTicketSectionsV1;
   draft: ResearchTicketWorkItemDraft;
+  /** Exact duplicate/create decision approved before this fresh provider read. */
+  approvedPreview: ResearchTicketApprovedPreviewV1;
   activeGrants?: readonly AuthorityGrantV1[];
   preferredGrantId?: string;
+}
+
+export interface ResearchTicketApprovedPreviewV1 {
+  status: "create" | "deduplicated";
+  workItemFingerprint: string;
+  duplicateId: string | null;
+  duplicateSnapshotHash: string | null;
 }
 
 export interface ResearchTicketPreviewRequest {
@@ -294,6 +303,22 @@ export class ResearchTicketPublisher {
 
     const preview = await this.preview(request);
     if (!preview.ok) return preview;
+    const approvedPreviewMismatch = compareApprovedPreview(
+      request.approvedPreview,
+      preview,
+    );
+    if (approvedPreviewMismatch) {
+      return {
+        ok: false,
+        status: "rejected",
+        error: {
+          code: "research_ticket_approved_preview_changed",
+          message: approvedPreviewMismatch,
+        },
+        ticket: preview.ticket,
+        candidatesExamined: preview.candidatesExamined,
+      };
+    }
     const { ticket } = preview;
     if (preview.duplicate) {
       return {
@@ -455,6 +480,23 @@ export class ResearchTicketPublisher {
     }
     return result;
   }
+}
+
+function compareApprovedPreview(
+  approved: ResearchTicketApprovedPreviewV1,
+  current: Extract<ResearchTicketPreviewResult, { ok: true }>,
+): string | null {
+  const duplicateId = current.duplicate?.id ?? null;
+  const duplicateSnapshotHash = current.duplicate?.snapshotHash ?? null;
+  if (
+    approved.status !== current.status ||
+    approved.workItemFingerprint !== current.ticket.spec.fingerprint ||
+    approved.duplicateId !== duplicateId ||
+    approved.duplicateSnapshotHash !== duplicateSnapshotHash
+  ) {
+    return "The Linear create/deduplicate decision changed after exact approval; prepare and approve a fresh preview.";
+  }
+  return null;
 }
 
 export class ResearchTicketPublisherError extends Error {

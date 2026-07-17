@@ -117,7 +117,8 @@ def create_app(
         )
         instance.state.memory = MemoryStore(data_dir / "memory.sqlite3")
         instance.state.coordinator = CoordinatorStore(
-            data_dir / "coordinator.sqlite3"
+            data_dir / "coordinator.sqlite3",
+            integrity_key=selected.security.bootstrap_token,
         )
         instance.state.secrets = SecretStore(
             data_dir / "secrets.sqlite3",

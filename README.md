@@ -98,22 +98,27 @@ Sync the built plugin artifacts into the live test vault:
 npm run sync:test-vault
 ```
 
-Run the Obsidian desktop e2e tests (Obsidian must be closed first):
+Run only the Obsidian desktop journey you changed (Obsidian must be closed first):
 
 ```bash
-npm run test:e2e                       # configured-primary live contract pack
-npm run test:e2e:mock                  # deterministic core host/runtime lane
-npm run test:e2e:deterministic-matrix  # core, integration, sandbox, and companion-restart lanes
-npm run test:e2e:integration           # deterministic Linear/GitHub integration mocks
-npm run test:e2e:sandbox               # deterministic sandbox boundary lane
-npm run test:e2e:companion             # deterministic companion restart lane
-npm run test:e2e:real:soak             # 45-60 minute real-model autonomy soak
-npm run test:e2e:provider-canary       # optional E2E_CANARY_MODEL compatibility run
-npm run test:e2e:release-vertical      # protected live-provider release gate
-npm run test:e2e:live                  # opt-in disposable external-provider mutation lane
+npm run test:e2e:daily-use              # two-launch deterministic DU-01/03/04/05 plus connection and memory/reflex pack
+npm run test:e2e:daily-use:connections  # first-run and capability readiness
+npm run test:e2e:daily-use-note         # DU-01 in an owned disposable vault
+npm run test:e2e:daily-use:memory-reflex
+npm run test:e2e:daily-use:code         # deterministic DU-03
+npm run test:e2e:daily-use:linear       # deterministic DU-04
+npm run test:e2e:daily-use:github       # deterministic DU-05
+npm run test:e2e:daily-use:live-model   # affected DU-02 live-model cases only
+npm run test:e2e:daily-use:code:live    # protected local WSL2 DU-03
+npm run test:e2e:daily-use:compound     # protected local WSL2/provider DU-06
+npm run test:e2e:live                   # opt-in disposable provider mutation and cleanup
 ```
 
-`npm run test:e2e` now fails closed unless the configured primary production provider is available and runs the four-scenario live contract pack with Playwright retries disabled. The deterministic matrix remains secret-free and runs the core mock, integration mock, sandbox, and companion-restart projects. `npm run test:e2e:live` is the separately guarded, credentialed disposable-provider lane: Linear creates, reads, duplicate-searches, comments on, and trashes one test issue; GitHub pushes a local-worktree commit with ephemeral askpass, verifies a draft PR, and cleans up its PR/branch. Live merge requires a separate exact confirmation and performs a compensating cleanup merge.
+The daily-use pack builds once for the disposable-note lane and once for all other focused deterministic projects, instead of rebuilding for every project. Public workflows never invoke the full Playwright suite, deterministic matrix, or real-model soak. `npm run test:e2e:live` remains separately guarded: Linear uses one disposable issue and GitHub one disposable draft branch/PR, independently verifies the result, and cleans up. Live merge is not part of the hosted release workflow.
+
+GitHub Actions uses standard ephemeral GitHub-hosted runners only. The Ubuntu job handles cached unit/build/Companion checks; the Windows job handles affected installed-Obsidian lanes. The live workflows are manual, pin every Action by commit SHA, expose each credential only to its exact provider step, and upload only redacted daily-use summaries for three days. This is free for a public repository and avoids placing public-fork code on a persistent personal runner.
+
+The standard hosted Windows image does not provide the dedicated attested WSL2 runtime required by the product's sandbox contract. Run DU-03 live and DU-06 locally on the protected Windows machine at the exact pushed SHA; hosted checks are intentionally described as partial until those two local receipts exist.
 
 The e2e harness builds the one plugin artifact set, syncs it without overwriting core `data.json`, safely retires split-plugin folders with their data intact, launches a controlled Obsidian process, and verifies missions against seeded notes. By default it resolves the vault as `%USERPROFILE%\OneDrive\Desktop\test_vault_obsidian_ai`; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
 
@@ -165,4 +170,4 @@ Architecture, implementation choices, runtime flow, tool contracts, and validati
 
 ## GitHub Notes
 
-This repository keeps `AGENTS.md` and product/README instructions in source control. Project documentation under `docs/` is local-only and must not be committed. Other local-only agent, skill, and planning context should use ignored paths such as `AGENTS.local.md`, `agents.local.md`, `skills/`, `.agents/`, and `.codex/`.
+Product and contributor instructions in this README are public. `AGENTS.md`, `agents.md`, project documentation under `docs/`, and other agent/skill/planning context are local-only and ignored; do not force-add them. Runtime databases, SQLite sidecars, vault state, Playwright reports/authentication, and environment files are also ignored and must never be committed or uploaded as public diagnostics.

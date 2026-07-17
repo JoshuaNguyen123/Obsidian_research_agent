@@ -359,7 +359,7 @@ export class AgentSettingTab extends PluginSettingTab {
       new Setting(basicEl)
         .setName("GPT/OpenAI-compatible API key")
         .setDesc(
-          "Bearer token for OpenAI Chat Completions or an OpenAI-compatible gateway.",
+          "Bearer token for OpenAI Chat Completions or a compatible gateway. Saved in Obsidian SecretStorage; plugin data keeps only an opaque reference.",
         )
         .addText((text) => {
           text
@@ -376,7 +376,7 @@ export class AgentSettingTab extends PluginSettingTab {
       new Setting(basicEl)
         .setName("Ollama API key")
         .setDesc(
-          "Used for Ollama Cloud or any Ollama-compatible endpoint that requires a bearer token.",
+          "Used for Ollama Cloud or a compatible endpoint. Saved in Obsidian SecretStorage; plugin data keeps only an opaque reference.",
         )
         .addText((text) => {
           text

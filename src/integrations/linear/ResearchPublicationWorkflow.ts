@@ -389,7 +389,15 @@ export class ResearchPublicationWorkflow {
       context: request.context,
       sections,
       draft,
-      ...(decision.activeGrants ? { activeGrants: decision.activeGrants } : {}),
+      approvedPreview: {
+        status: preview.status,
+        workItemFingerprint: preview.ticket.spec.fingerprint,
+        duplicateId: preview.duplicate?.id ?? null,
+        duplicateSnapshotHash: preview.duplicate?.snapshotHash ?? null,
+      },
+      // Never fall back to executor-global grants. Exact publication approval
+      // authorizes only the grants returned by this approval decision.
+      activeGrants: decision.activeGrants ?? [],
       ...(decision.preferredGrantId ? { preferredGrantId: decision.preferredGrantId } : {}),
     } as ResearchTicketPublishRequest);
     if (!published.ok) {

@@ -936,31 +936,47 @@ export class WorkspaceManagerV2 {
       const source = await this.resolveSafePath(manifest, sourcePath, { mustExist: true, mutation: false });
       const destination = await this.resolveSafePath(manifest, destinationPath, { mustExist: false, mutation: true });
       if (destination.exists) throw new WorkspaceManagerErrorV2("path_exists", "Copy destination already exists.");
+      if (isSameOrDescendantPath(source.absolutePath, destination.absolutePath)) {
+        throw new WorkspaceManagerErrorV2(
+          "copy_destination_inside_source",
+          "Copy destination cannot be the source or one of its descendants.",
+        );
+      }
       const tree = await this.scanTree(manifest, source.relativePath, true);
       const sourceFingerprint = mutationFingerprint(tree, source.relativePath);
       if (sourceFingerprint !== expectedSha256) throw new WorkspaceManagerErrorV2("precondition_failed", "Copy source fingerprint changed.");
       const changed = tree.files.map((file) => remapPath(file.path, source.relativePath, destination.relativePath));
       this.assertBudget(manifest, changed, tree.bytes);
+      await this.revalidateGuard(source.parentGuard!);
       await this.revalidateGuard(destination.parentGuard!);
-      await copyTreeSafe(source.absolutePath, destination.absolutePath);
-      const verify = await this.scanTree(manifest, destination.relativePath, true);
-      const expectedDestinationTree = remapTree(
-        tree,
-        source.relativePath,
-        destination.relativePath,
-      );
-      if (verify.fingerprint !== expectedDestinationTree.fingerprint) {
-        await fs.rm(destination.absolutePath, { recursive: true, force: true });
-        throw new WorkspaceManagerErrorV2("copy_readback_failed", "Copied workspace tree failed hash readback.");
-      }
-      const updates = verify.files.map((file) => ({ path: file.path, hash: { sha256: file.sha256, bytes: file.bytes } }));
-      try {
-        manifest = await this.recordChanges(manifest, updates, tree.bytes, [], changed);
-      } catch (error) {
-        await fs.rm(destination.absolutePath, { recursive: true, force: true });
-        await this.restoreManifestAfterFailedMutation(manifest);
-        throw error;
-      }
+      let destinationCreated = false;
+      const verify = await (async () => {
+        try {
+          await copyTreeSafe(
+            source.absolutePath,
+            destination.absolutePath,
+            () => { destinationCreated = true; },
+          );
+          const readback = await this.scanTree(manifest, destination.relativePath, true);
+          const expectedDestinationTree = remapTree(
+            tree,
+            source.relativePath,
+            destination.relativePath,
+          );
+          if (readback.fingerprint !== expectedDestinationTree.fingerprint) {
+            throw new WorkspaceManagerErrorV2("copy_readback_failed", "Copied workspace tree failed hash readback.");
+          }
+          const updates = readback.files.map((file) => ({ path: file.path, hash: { sha256: file.sha256, bytes: file.bytes } }));
+          manifest = await this.recordChanges(manifest, updates, tree.bytes, [], changed);
+          return readback;
+        } catch (error) {
+          if (destinationCreated) {
+            await fs.rm(destination.absolutePath, { recursive: true, force: true });
+          }
+          await this.restoreManifestAfterFailedMutation(manifest);
+          throw error;
+        }
+      })();
       return this.receipt(manifest, { operation: "copy", path: source.relativePath, relatedPath: destination.relativePath, beforeSha256: sourceFingerprint, afterSha256: mutationFingerprint(verify, destination.relativePath), bytesWritten: tree.bytes, affectedCount: tree.files.length });
     });
   }
@@ -1378,19 +1394,40 @@ async function scanAbsoluteTree(absoluteRoot: string, relativeRoot: string): Pro
   return { files, bytes, fingerprint: sha256Json(files.map((file) => ({ path: file.path, sha256: file.sha256, bytes: file.bytes }))) };
 }
 
-async function copyTreeSafe(source: string, destination: string): Promise<void> {
+async function copyTreeSafe(
+  source: string,
+  destination: string,
+  onRootCreated?: () => void,
+  depth = 0,
+): Promise<void> {
   const stat = await fs.lstat(source);
   if (stat.isSymbolicLink()) throw new WorkspaceManagerErrorV2("reparse_path", "Copy source contains a reparse point.");
   if (stat.isFile()) {
     assertSafeRegularFile(stat, source, true);
     await fs.copyFile(source, destination, fsConstants.COPYFILE_EXCL);
+    if (depth === 0) onRootCreated?.();
     return;
   }
   await fs.mkdir(destination);
+  if (depth === 0) onRootCreated?.();
   for (const entry of await fs.readdir(source, { withFileTypes: true })) {
     if (entry.name.toLowerCase() === ".git" || entry.isSymbolicLink()) throw new WorkspaceManagerErrorV2("reparse_path", "Copy source contains a blocked entry.");
-    await copyTreeSafe(path.join(source, entry.name), path.join(destination, entry.name));
+    await copyTreeSafe(
+      path.join(source, entry.name),
+      path.join(destination, entry.name),
+      onRootCreated,
+      depth + 1,
+    );
   }
+}
+
+function isSameOrDescendantPath(parent: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative === "" || (
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
 }
 
 async function moveAcrossDevices(source: string, destination: string): Promise<void> {

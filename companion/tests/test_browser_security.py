@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import socket
@@ -10,6 +11,7 @@ import pytest
 from browser_security import (
     BrowserBoundaryError,
     BrowserSafetyVerifier,
+    open_pinned_public_connection,
     sign_safety_decision,
     validate_public_http_url,
 )
@@ -111,3 +113,52 @@ async def test_dns_resolution_rejects_any_private_answer_and_accepts_public_only
     assert await validate_public_http_url("https://example.com/path", public) == (
         "https://example.com/path"
     )
+
+
+@pytest.mark.asyncio
+async def test_connection_time_resolution_blocks_dns_rebinding_before_dial():
+    calls = 0
+    dialed: list[tuple[str, int]] = []
+
+    def rebinding(_host, _port, **_kwargs):
+        nonlocal calls
+        calls += 1
+        address = "93.184.216.34" if calls == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))]
+
+    async def connector(host: str, port: int):
+        dialed.append((host, port))
+        raise AssertionError("A rebound private address must never be dialed")
+
+    await validate_public_http_url("https://example.com", rebinding)
+    with pytest.raises(BrowserBoundaryError, match="Private"):
+        await open_pinned_public_connection(
+            "example.com",
+            443,
+            resolver=rebinding,
+            connector=connector,
+        )
+    assert dialed == []
+
+
+@pytest.mark.asyncio
+async def test_connection_time_proxy_dials_the_validated_ip_literal():
+    dialed: list[tuple[str, int]] = []
+
+    def public(_host, _port, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+
+    class DummyWriter:
+        pass
+
+    async def connector(host: str, port: int):
+        dialed.append((host, port))
+        return asyncio.StreamReader(), DummyWriter()
+
+    await open_pinned_public_connection(
+        "example.com",
+        443,
+        resolver=public,
+        connector=connector,
+    )
+    assert dialed == [("93.184.216.34", 443)]

@@ -116,6 +116,19 @@ test("PR drift after merge approval invalidates approval before provider merge",
   assert.equal(harness.merges, 0);
 });
 
+test("merge response and independent readback must prove the same merge SHA", async () => {
+  const harness = createHarness({ mergeResponseSha: SHA_A });
+  const workflow = new GitHubPublicationWorkflowV1(harness.options);
+  const published = await workflow.publishDraft(request());
+
+  const result = await workflow.merge(published, request().binding);
+
+  assert.equal(result.status, "reconcile_required");
+  assert.equal(result.pendingAction?.operation, "pull_request_merge");
+  assert.equal(result.mergeSha, null);
+  assert.match(result.blocker?.message ?? "", /exact merge SHA/i);
+});
+
 test("non-explicit publication and non-agent branch fail before push", async () => {
   const harness = createHarness();
   const workflow = new GitHubPublicationWorkflowV1(harness.options);
@@ -321,6 +334,7 @@ function createHarness(options: {
   ambiguousPush?: boolean;
   ambiguousReady?: boolean;
   ambiguousMerge?: boolean;
+  mergeResponseSha?: string;
   failLinearCompletionOnce?: boolean;
   failLinearLinkOnce?: boolean;
   failCheckpointStatusOnce?: GitHubPublicationCheckpointV1["status"];
@@ -429,7 +443,7 @@ function createHarness(options: {
       }
       return {
         merged: true,
-        sha: SHA_C,
+        sha: options.mergeResponseSha ?? SHA_C,
         receipt: receipt("receipt-merge", "merge"),
       };
     },

@@ -172,7 +172,7 @@ def test_code_action_and_package_roundtrip_are_closed_and_remote_safe():
 
 
 def test_expired_code_authority_reclaims_only_from_exact_ambiguous_marker(tmp_path, monkeypatch):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(JobCreateRequest(**effectful_code_job_body()))
@@ -211,6 +211,7 @@ def test_expired_code_authority_reclaims_only_from_exact_ambiguous_marker(tmp_pa
             ),
         )
         store.conn.execute("UPDATE jobs SET lease_expires_at = 0 WHERE id = ?", (job.id,))
+        store._refresh_job_integrity_locked(store.conn, job.id)
         expired = dt.datetime.fromisoformat(handoff["expiresAt"]) + dt.timedelta(seconds=1)
         monkeypatch.setattr(coordinator_store_module, "_now_epoch", lambda: expired.timestamp())
         reclaimed, _token = store.claim_job(job.id, "worker-code-b", 60)
@@ -220,7 +221,7 @@ def test_expired_code_authority_reclaims_only_from_exact_ambiguous_marker(tmp_pa
 
 
 def test_dispatched_code_marker_does_not_extend_expired_commit_authority(tmp_path, monkeypatch):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(JobCreateRequest(**effectful_code_job_body()))
@@ -251,6 +252,7 @@ def test_dispatched_code_marker_does_not_extend_expired_commit_authority(tmp_pat
             fingerprint=fingerprint, payload=payload,
         ))
         store.conn.execute("UPDATE jobs SET lease_expires_at = 0 WHERE id = ?", (job.id,))
+        store._refresh_job_integrity_locked(store.conn, job.id)
         expired = dt.datetime.fromisoformat(handoff["expiresAt"]) + dt.timedelta(seconds=1)
         monkeypatch.setattr(coordinator_store_module, "_now_epoch", lambda: expired.timestamp())
         with pytest.raises(Exception, match="expired"):

@@ -147,6 +147,8 @@ function isDoubleExactControl(path: string): boolean {
   return (
     lower === ".github/workflows" ||
     lower.startsWith(".github/workflows/") ||
+    lower === ".github/actions" ||
+    lower.startsWith(".github/actions/") ||
     lower === ".circleci" ||
     lower.startsWith(".circleci/") ||
     lower === ".githooks" ||

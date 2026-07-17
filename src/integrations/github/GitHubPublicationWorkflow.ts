@@ -967,17 +967,24 @@ export class GitHubPublicationWorkflowV1 {
       pullRequest.number,
       signal,
     );
-    if (!mergedReadback.merged || mergedReadback.head.sha !== pullRequest.head.sha) {
-      throw new DurableLinearContractError(
-        "Merged pull request readback did not prove the approved head.",
+    if (
+      !mergedReadback.merged ||
+      mergedReadback.head.sha !== pullRequest.head.sha ||
+      !mergedReadback.mergeSha ||
+      mergedReadback.mergeSha !== merged.sha
+    ) {
+      return this.markPendingMutationUncertain(
+        current,
+        "github_merge_reconcile_required",
+        "Merge response and independent pull-request readback did not prove one exact merge SHA; readback reconciliation is required before completion.",
       );
     }
     current = {
       ...fresh,
       status: "merged_verified",
       updatedAt: this.isoNow(),
-      pullRequest: { ...mergedReadback, mergeSha: merged.sha },
-      mergeSha: merged.sha,
+      pullRequest: mergedReadback,
+      mergeSha: mergedReadback.mergeSha,
       mergeApprovalFingerprint,
       receiptIds: [...current.receiptIds, merged.receipt.id],
       pendingAction: null,

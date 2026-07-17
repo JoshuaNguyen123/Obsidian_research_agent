@@ -664,7 +664,7 @@ def _reject_command_like(value: str, path: str) -> None:
 
 def _reject_secret_text(value: str, path: str) -> None:
     if re.search(
-        r"(?:Bearer\s+[A-Za-z0-9._~+/-]{8,}|(?:github[_-]?token|api[_-]?key|password|client[_-]?secret)\s*[=:]\s*\S+|\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]{12,})",
+        r"(?:Bearer\s+[A-Za-z0-9._~+/-]{8,}|(?:github[_-]?token|api[_-]?key|password|client[_-]?secret)\s*[=:]\s*\S+|\b(?:ghp_|github_pat_|sk-|lin_api_)[A-Za-z0-9_-]{12,})",
         value,
         flags=re.I,
     ):

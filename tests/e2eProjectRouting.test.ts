@@ -56,7 +56,7 @@ test("exclusive E2E runner permits the bounded deterministic matrix", () => {
   assert.equal(normalized.aiMode, "mock");
 });
 
-test("Windows installed matrix explicitly trusts only its created disposable vault", () => {
+test("Windows daily-use job explicitly trusts only its created disposable vault", () => {
   const workflow = readFileSync(
     new URL("../.github/workflows/ci.yml", import.meta.url),
     "utf8",
@@ -67,18 +67,21 @@ test("Windows installed matrix explicitly trusts only its created disposable vau
   );
   assert.match(
     workflow,
-    /- name: Deterministic Obsidian Playwright matrix\s+env:\s+(?:#[^\r\n]*\s+)*E2E_TRUST_DISPOSABLE_VAULT: "1"\s+run: npm run test:e2e:deterministic-matrix/u,
+    /- name: Run affected daily-use Playwright lanes\s+env:\s+E2E_TRUST_DISPOSABLE_VAULT: "1"\s+run: npm run test:e2e:daily-use/u,
   );
   assert.match(workflow, /runs-on: windows-2022/u);
-  assert.match(workflow, /Obsidian-\$version\.exe/u);
-  assert.match(
-    workflow,
-    /f35d2a35061098400a3fafc1bfd38d8bd33f1ad76df8b78b62ccdf20b0a30d26/u,
+  assert.match(workflow, /\.\/scripts\/install-verified-obsidian\.ps1/u);
+  assert.doesNotMatch(workflow, /npm run test:e2e:deterministic-matrix/u);
+  const installer = readFileSync(
+    new URL("../scripts/install-verified-obsidian.ps1", import.meta.url),
+    "utf8",
   );
-  assert.match(workflow, /\$machine -ne 0x8664/u);
-  assert.match(workflow, /if \(\$null -ne \$reader\)/u);
-  assert.doesNotMatch(workflow, /\$reader\?\.Dispose\(\)/u);
-  assert.match(workflow, /Get-AuthenticodeSignature/u);
+  assert.match(installer, /Obsidian-\$version\.exe/u);
+  assert.match(installer, /f35d2a35061098400a3fafc1bfd38d8bd33f1ad76df8b78b62ccdf20b0a30d26/u);
+  assert.match(installer, /\$machine -ne 0x8664/u);
+  assert.match(installer, /if \(\$null -ne \$reader\)/u);
+  assert.doesNotMatch(installer, /\$reader\?\.Dispose\(\)/u);
+  assert.match(installer, /Get-AuthenticodeSignature/u);
   assert.doesNotMatch(workflow, /choco install obsidian/u);
 });
 
@@ -191,8 +194,10 @@ test("daily-use commands route to focused specs and live projects disable reruns
   );
   assert.match(packageJson.scripts["test:e2e"], /--real-ai --project=daily-use-research/u);
   assert.match(packageJson.scripts["test:e2e:mock"], /deterministic-core-mock/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use:connections/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use:memory-reflex/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use-note/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use:focused/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:focused"], /daily-use-connections/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:focused"], /daily-use-memory-reflex/u);
   assert.doesNotMatch(packageJson.scripts["test:e2e:daily-use"], /daily-use-mock/u);
   assert.equal(
     packageJson.scripts["test:e2e:daily-use:mock"],
@@ -231,14 +236,9 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.match(workflow, /ref: \$\{\{ inputs\.commit_sha \}\}/u);
   assert.match(workflow, /if \(\$actual -ne \$env:E2E_RELEASE_COMMIT_SHA\)/u);
   for (const targetedCommand of [
-    "test:e2e:daily-use:connections",
-    "test:e2e:daily-use-note",
-    "test:e2e:daily-use:memory-reflex",
+    "test:e2e:daily-use",
     "test:e2e:daily-use:live-model",
-    "test:e2e:daily-use:code:live",
-    "test:e2e:daily-use:linear",
-    "test:e2e:daily-use:github",
-    "test:e2e:daily-use:compound",
+    "test:e2e:live",
   ]) {
     assert.match(workflow, new RegExp(`npm run ${targetedCommand}`, "u"));
   }
@@ -248,7 +248,9 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.doesNotMatch(workflow, /E2E_LIVE_ALLOW_MERGE:\s*["']?1/u);
   assert.doesNotMatch(workflow, /LIVE_EXTERNAL_MERGE_CONFIRMATION:\s*MERGE/u);
   assert.doesNotMatch(workflow, /git\s+push[^\r\n]*(?:--force|-f\b)/u);
-  assert.match(workflow, /protected-release-proof-\$\{\{ inputs\.commit_sha \}\}/u);
+  assert.match(workflow, /protected-hosted-summaries-\$\{\{ inputs\.commit_sha \}\}/u);
+  assert.match(workflow, /standard GitHub-hosted Windows image cannot attest/u);
+  assert.doesNotMatch(workflow, /self-hosted/u);
 
   const compound = readFileSync(
     new URL("../e2e/daily-use-compound.spec.ts", import.meta.url),
@@ -259,6 +261,31 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.match(compound, /expectGitHubRepositoryAbsent/u);
   assert.match(compound, /independentlyVerifyLinearCleanup/u);
   assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);
+});
+
+test("public workflows use only ephemeral hosted runners and SHA-pinned actions", () => {
+  for (const file of [
+    "ci.yml",
+    "live-external-smoke.yml",
+    "live-model.yml",
+    "live-sandbox-boundary.yml",
+    "pages.yml",
+    "protected-release-vertical.yml",
+    "unified-plugin-release-gate.yml",
+  ]) {
+    const workflow = readFileSync(
+      new URL(`../.github/workflows/${file}`, import.meta.url),
+      "utf8",
+    );
+    assert.doesNotMatch(workflow, /self-hosted/u, `${file} must not run public code on a persistent runner`);
+    for (const match of workflow.matchAll(/^\s*uses:\s*([^\s#]+).*$/gmu)) {
+      assert.match(
+        match[1] ?? "",
+        /^actions\/[A-Za-z0-9_.-]+@[0-9a-f]{40}$/u,
+        `${file} contains an unpinned or non-GitHub-owned action`,
+      );
+    }
+  }
 });
 
 test("live external preflight validates authority without returning credentials", () => {

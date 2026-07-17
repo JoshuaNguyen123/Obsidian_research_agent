@@ -1,60 +1,69 @@
-name: Live model contract
+name: Targeted live model contract
 
 on:
-  workflow_call:
   workflow_dispatch:
-  schedule:
-    - cron: "17 8 * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: targeted-live-model-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  live-contract:
-    runs-on: windows-latest
-    timeout-minutes: 90
-    env:
-      E2E_OLLAMA_API_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
-      E2E_AI_MODEL: ${{ vars.E2E_AI_MODEL || 'gpt-oss:120b-cloud' }}
-      E2E_OLLAMA_BASE_URL: ${{ vars.E2E_OLLAMA_BASE_URL || 'https://ollama.com/api' }}
-      E2E_TRUST_DISPOSABLE_VAULT: "1"
+  live-research:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    environment: protected-live-release
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure isolated vault path
-        shell: powershell
-        run: |
-          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-live-vault"
-          "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - uses: actions/setup-node@v4
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          node-version: 20
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
           cache: npm
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
-      - run: npm ci
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Install semantic embedding runtime
         run: python -m pip install --disable-pip-version-check fastembed==0.8.0
-      - name: Install Obsidian desktop
-        shell: powershell
-        run: winget install --id Obsidian.Obsidian --exact --silent --accept-package-agreements --accept-source-agreements
-      - name: Create isolated vault
-        shell: powershell
+
+      - name: Install verified Obsidian desktop
+        shell: pwsh
+        run: ./scripts/install-verified-obsidian.ps1
+
+      - name: Create isolated disposable Obsidian vault
+        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path $env:OBSIDIAN_VAULT | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $env:OBSIDIAN_VAULT ".obsidian") | Out-Null
-          Set-Content -LiteralPath (Join-Path $env:OBSIDIAN_VAULT ".obsidian\community-plugins.json") -Value '[]' -Encoding utf8
-      - name: Live provider contract pack
-        run: npm run test:e2e
-      - name: Live provider autonomy soak
-        run: npm run test:e2e:real:soak
-      - name: Upload failure evidence
-        if: failure()
-        uses: actions/upload-artifact@v4
+          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-live-vault"
+          New-Item -ItemType Directory -Force -Path (Join-Path $vault ".obsidian\plugins") | Out-Null
+          Set-Content -LiteralPath (Join-Path $vault ".obsidian\community-plugins.json") -Value "[]" -Encoding utf8
+          "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run affected DU-02 live-model scenarios
+        run: npm run test:e2e:daily-use:live-model
+        env:
+          E2E_OLLAMA_API_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
+          E2E_AI_MODEL: ${{ vars.E2E_AI_MODEL || 'gpt-oss:120b-cloud' }}
+          E2E_OLLAMA_BASE_URL: ${{ vars.E2E_OLLAMA_BASE_URL || 'https://ollama.com/api' }}
+          E2E_TRUST_DISPOSABLE_VAULT: "1"
+
+      - name: Upload redacted live summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: live-model-failure-${{ github.sha }}
-          path: |
-            playwright-report
-            test-results
-          retention-days: 14
+          name: live-model-summary-${{ github.sha }}
+          path: test-results/daily-use-run-summary.json
+          retention-days: 3
           if-no-files-found: ignore

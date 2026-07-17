@@ -49,6 +49,14 @@ async def test_browser_service_observes_clicks_and_extracts_markdown(tmp_path):
         assert observation.title == "Deterministic Agent Page"
         assert "Initial state" in (observation.visibleText or "")
         assert observation.candidates
+        submit_candidate = next(
+            candidate
+            for candidate in observation.candidates
+            if candidate.selector == "#continue"
+        )
+        assert submit_candidate.submitsForm is True
+        assert submit_candidate.formMethod == "post"
+        assert submit_candidate.formAction == "/preferences"
 
         click_candidate = next(
             candidate

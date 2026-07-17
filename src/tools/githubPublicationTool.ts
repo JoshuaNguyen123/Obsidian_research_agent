@@ -320,6 +320,13 @@ function createWorkflowReceipt(
   const payloadFingerprint = merged
     ? checkpoint.mergeApprovalFingerprint
     : checkpoint.publishApprovalFingerprint;
+  const verifiedRevision = merged ? checkpoint.mergeSha : checkpoint.headSha;
+  if (!verifiedRevision) {
+    throw notApplied(
+      "github_publication_revision_missing",
+      "GitHub publication completed without an independently verified revision.",
+    );
+  }
   if (!payloadFingerprint) {
     throw notApplied(
       "github_publication_proof_missing",
@@ -338,7 +345,7 @@ function createWorkflowReceipt(
       resourceType: pullRequest ? "pull_request" : "repository_branch",
       id: pullRequest ? String(pullRequest.number) : checkpoint.branch,
       ...(pullRequest?.htmlUrl ? { url: pullRequest.htmlUrl } : {}),
-      revision: checkpoint.headSha,
+      revision: verifiedRevision,
     },
     message: merged
       ? `Verified GitHub merge for pull request #${pullRequest?.number ?? "unknown"}.`
@@ -352,7 +359,7 @@ function createWorkflowReceipt(
     readback: {
       status: "verified",
       checkedAt: committedAt,
-      observedRevision: checkpoint.headSha,
+      observedRevision: verifiedRevision,
       observedFingerprint:
         checkpoint.proofSnapshot?.snapshotFingerprint ?? checkpoint.handoffFingerprint,
     },

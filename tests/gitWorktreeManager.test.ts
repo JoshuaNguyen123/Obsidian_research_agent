@@ -40,7 +40,7 @@ test("Git operations disable hooks and integration returns the cherry-pick SHA",
   assert.ok(calls[0].includes("cherry-pick"));
 });
 
-test("Node validation profile bootstraps without lifecycle scripts", async () => {
+test("legacy native validation is retired without running lifecycle scripts", async () => {
   const root = await mkdtemp(join(tmpdir(), "orchestrator-validation-"));
   try {
     await writeFile(
@@ -80,14 +80,14 @@ test("Node validation profile bootstraps without lifecycle scripts", async () =>
     const validationCommands = [
       { command: "node", args: ["-e", "process.exit(0)"], label: "direct node check" },
     ];
-    const results = await manager.runValidationCommands({
-      worktree: worktree(root),
-      validationCommands,
-      profile: createNodeValidationProfile(validationCommands),
-    });
-
-    assert.equal(results.length, 1);
-    assert.equal(results[0].exitCode, 0);
+    await assert.rejects(
+      manager.runValidationCommands({
+        worktree: worktree(root),
+        validationCommands,
+        profile: createNodeValidationProfile(validationCommands),
+      }),
+      /Native repository validation is disabled/u,
+    );
     await assert.rejects(readFile(join(root, "lifecycle-ran.txt"), "utf8"));
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -110,7 +110,27 @@ test("validation profile rejects worker changes to protected controls", async ()
       validationCommands,
       profile: createNodeValidationProfile(validationCommands),
     }),
-    /protected validation controls/i,
+    /Native repository validation is disabled/i,
+  );
+});
+
+test("validation profile rejects worker changes to local GitHub Actions", async () => {
+  const executor: GitCommandExecutor = async ({ args }) => ({
+    exitCode: 0,
+    stdout: args.includes("status") ? " M .github/actions/setup/action.yml\n" : "",
+    stderr: "",
+  });
+  const manager = new GitWorktreeManager(executor);
+  const validationCommands = [
+    { command: "node", args: ["-e", "process.exit(0)"], label: "direct node check" },
+  ];
+  await assert.rejects(
+    manager.runValidationCommands({
+      worktree: worktree("C:\\safe\\worker"),
+      validationCommands,
+      profile: createNodeValidationProfile(validationCommands),
+    }),
+    /Native repository validation is disabled/i,
   );
 });
 
@@ -142,7 +162,7 @@ test("commit refuses files introduced by validation", async () => {
           { command: "node", args: ["-e", "process.exit(0)"], label: "direct check" },
         ],
       }),
-      /bootstrap changed the worktree.*build\/generated\.js/i,
+      /Native repository validation is disabled/i,
     );
     assert.equal(addCalled, false);
   } finally {
@@ -150,7 +170,7 @@ test("commit refuses files introduced by validation", async () => {
   }
 });
 
-test("commit accepts only explicitly declared generated artifacts", async () => {
+test("legacy commit path cannot bypass retired native validation", async () => {
   const root = await mkdtemp(join(tmpdir(), "orchestrator-validation-generated-"));
   let fullStatusCalls = 0;
   try {
@@ -177,20 +197,21 @@ test("commit accepts only explicitly declared generated artifacts", async () => 
     const validationCommands = [
       { command: "node", args: ["-e", "process.exit(0)"], label: "direct check" },
     ];
-    const committed = await manager.commitGreenWorktree({
-      worktree: worktree(root),
-      message: "scoped change",
-      validationCommands,
-      profile: {
-        id: "generated-main-js",
-        bootstrapCommands: [],
+    await assert.rejects(
+      manager.commitGreenWorktree({
+        worktree: worktree(root),
+        message: "scoped change",
         validationCommands,
-        protectedPaths: ["package.json"],
-        allowedGeneratedPaths: ["main.js"],
-      },
-    });
-    assert.equal(committed.commitSha, INTEGRATION_SHA);
-    assert.deepEqual(committed.changedFilePaths, ["src/example.ts", "main.js"]);
+        profile: {
+          id: "generated-main-js",
+          bootstrapCommands: [],
+          validationCommands,
+          protectedPaths: ["package.json"],
+          allowedGeneratedPaths: ["main.js"],
+        },
+      }),
+      /Native repository validation is disabled/i,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

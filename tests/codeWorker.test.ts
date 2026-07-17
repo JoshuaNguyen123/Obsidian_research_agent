@@ -46,6 +46,7 @@ test("code worker blocks edits to execution-control files and scripts", async ()
   try {
     await writeFile(join(root, "package.json"), '{"name":"safe"}\n', "utf8");
     await mkdir(join(root, "scripts"));
+    await mkdir(join(root, ".github", "actions"), { recursive: true });
     const packageResult = await executeCodeWorkerTool({
       root,
       call: {
@@ -67,9 +68,17 @@ test("code worker blocks edits to execution-control files and scripts", async ()
         arguments: { path: "esbuild.config.mjs", content: "process.exit(0);" },
       },
     });
+    const localActionResult = await executeCodeWorkerTool({
+      root,
+      call: {
+        name: "code_write_file",
+        arguments: { path: ".github/actions/runner/action.yml", content: "runs: {}" },
+      },
+    });
     assert.equal(packageResult.ok, false);
     assert.equal(scriptResult.ok, false);
     assert.equal(configResult.ok, false);
+    assert.equal(localActionResult.ok, false);
     assert.match(await readFile(join(root, "package.json"), "utf8"), /safe/);
   } finally {
     await rm(root, { recursive: true, force: true });

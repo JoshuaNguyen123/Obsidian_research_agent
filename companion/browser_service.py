@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import socket
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from browser_security import BrowserBoundaryError, validate_public_http_url
+from browser_security import BrowserBoundaryError, PinnedPublicProxy, validate_public_http_url
 from persisted_data import canonical_fingerprint
 
 from schemas import (
@@ -60,6 +61,7 @@ class BrowserService:
         self.last_candidates: dict[str, dict[str, Any]] = {}
         self.last_candidate_handles: dict[str, ElementHandle] = {}
         self.pending_boundary_error: BrowserBoundaryError | None = None
+        self.pinned_proxy: PinnedPublicProxy | None = None
 
     async def start(self) -> None:
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -70,7 +72,15 @@ class BrowserService:
 
         try:
             self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(headless=self.headless)
+            self.pinned_proxy = PinnedPublicProxy(
+                resolver=self.resolver or socket.getaddrinfo,
+                on_boundary_error=self._record_proxy_boundary_error,
+            )
+            await self.pinned_proxy.start()
+            self.browser = await self.playwright.chromium.launch(
+                headless=self.headless,
+                proxy={"server": self.pinned_proxy.server_url, "bypass": "<-loopback>"},
+            )
             self.context = await self.browser.new_context(
                 service_workers="block",
                 accept_downloads=False,
@@ -92,14 +102,32 @@ class BrowserService:
         except Exception as exc:  # pragma: no cover - environment dependent.
             self.startup_error = str(exc)
             self.ready = False
+            if self.browser:
+                await self.browser.close()
+                self.browser = None
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
+            if self.pinned_proxy:
+                await self.pinned_proxy.stop()
+                self.pinned_proxy = None
 
     async def stop(self) -> None:
         self.ready = False
         await self._dispose_candidate_handles()
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+        try:
+            if self.browser:
+                await self.browser.close()
+        finally:
+            self.browser = None
+            try:
+                if self.playwright:
+                    await self.playwright.stop()
+            finally:
+                self.playwright = None
+                if self.pinned_proxy:
+                    await self.pinned_proxy.stop()
+                    self.pinned_proxy = None
 
     async def open(self, request: BrowserOpenRequest) -> BrowserObservation:
         await self._validate_target(request.url)
@@ -111,6 +139,10 @@ class BrowserService:
             if self.pending_boundary_error:
                 raise self.pending_boundary_error
             raise
+        if self.pending_boundary_error:
+            error = self.pending_boundary_error
+            await page.goto("about:blank")
+            raise error
         try:
             await self._validate_target(page.url)
         except BrowserBoundaryError:
@@ -220,15 +252,28 @@ class BrowserService:
                 const label = text || el.getAttribute('href') || el.tagName.toLowerCase();
                 const inputType = el.getAttribute('type');
                 const role = el.getAttribute('role') || inputType || el.tagName.toLowerCase();
-                const formAction = el.getAttribute('formaction') ||
-                  (el.form ? el.form.getAttribute('action') : null);
+                const form = el.form || el.closest('form');
+                const formAction = form
+                  ? (el.getAttribute('formaction') || form.getAttribute('action') || location.href)
+                  : null;
+                const formMethod = form
+                  ? (el.getAttribute('formmethod') || form.getAttribute('method') || 'get').toLowerCase()
+                  : null;
+                const tagName = el.tagName.toLowerCase();
+                const effectiveType = (inputType || (tagName === 'button' ? 'submit' : '')).toLowerCase();
+                const submitsForm = !!form && (
+                  (tagName === 'button' && effectiveType === 'submit') ||
+                  (tagName === 'input' && /^(?:submit|image)$/.test(effectiveType))
+                );
                 return {
                   label,
                   role,
-                  tagName: el.tagName.toLowerCase(),
+                  tagName,
                   selector: cssPath(el),
                   href: el.getAttribute('href'),
                   formAction,
+                  formMethod,
+                  submitsForm,
                   inputType,
                   text,
                   enabled: !el.disabled,
@@ -324,8 +369,19 @@ class BrowserService:
               const rect = el.getBoundingClientRect();
               const inputType = el.getAttribute('type');
               const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
-              const formAction = el.getAttribute('formaction') ||
-                (el.form ? el.form.getAttribute('action') : null);
+              const form = el.form || el.closest('form');
+              const formAction = form
+                ? (el.getAttribute('formaction') || form.getAttribute('action') || location.href)
+                : null;
+              const formMethod = form
+                ? (el.getAttribute('formmethod') || form.getAttribute('method') || 'get').toLowerCase()
+                : null;
+              const tagName = el.tagName.toLowerCase();
+              const effectiveType = (inputType || (tagName === 'button' ? 'submit' : '')).toLowerCase();
+              const submitsForm = !!form && (
+                (tagName === 'button' && effectiveType === 'submit') ||
+                (tagName === 'input' && /^(?:submit|image)$/.test(effectiveType))
+              );
               return {
                 connected: el.isConnected,
                 focused: document.activeElement === el,
@@ -333,6 +389,8 @@ class BrowserService:
                 selector: cssPath(el),
                 href: el.getAttribute('href'),
                 formAction,
+                formMethod,
+                submitsForm,
                 inputType,
                 text,
                 enabled: !el.disabled,
@@ -407,6 +465,9 @@ class BrowserService:
             return
         await route.continue_()
 
+    def _record_proxy_boundary_error(self, error: BrowserBoundaryError) -> None:
+        self.pending_boundary_error = error
+
 
 async def safe_body_text(page: Page) -> str:
     try:
@@ -425,6 +486,8 @@ def candidate_fingerprint(candidate_id: str, value: dict[str, Any]) -> str:
             "text": value.get("text"),
             "href": value.get("href"),
             "formAction": value.get("formAction"),
+            "formMethod": value.get("formMethod"),
+            "submitsForm": value.get("submitsForm"),
             "inputType": value.get("inputType"),
         }
     )

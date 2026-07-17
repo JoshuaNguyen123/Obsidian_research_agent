@@ -52,7 +52,7 @@ def job_binding(job):
 
 
 def test_job_lease_is_single_owner_and_events_and_receipts_are_replayable(tmp_path):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         created = store.create_job(job_request())
@@ -122,13 +122,13 @@ def test_job_lease_is_single_owner_and_events_and_receipts_are_replayable(tmp_pa
 
 def test_job_and_active_lease_survive_restart_without_duplicate_owner(tmp_path):
     database = tmp_path / "coordinator.sqlite3"
-    first = CoordinatorStore(database)
+    first = CoordinatorStore(database, integrity_key="i" * 43)
     first.initialize()
     created = first.create_job(job_request())
     first.claim_job(created.id, "worker-a", 60)
     first.close()
 
-    second = CoordinatorStore(database)
+    second = CoordinatorStore(database, integrity_key="i" * 43)
     second.initialize()
     try:
         restored = second.get_job(created.id)
@@ -148,7 +148,7 @@ def test_job_and_active_lease_survive_restart_without_duplicate_owner(tmp_path):
 
 def test_expired_lease_can_be_reclaimed_by_exactly_one_new_owner(tmp_path):
     database = tmp_path / "coordinator.sqlite3"
-    store = CoordinatorStore(database)
+    store = CoordinatorStore(database, integrity_key="i" * 43)
     store.initialize()
     try:
         created = store.create_job(job_request())
@@ -156,6 +156,7 @@ def test_expired_lease_can_be_reclaimed_by_exactly_one_new_owner(tmp_path):
         store.conn.execute(
             "UPDATE jobs SET lease_expires_at = 0 WHERE id = ?", (created.id,)
         )
+        store._refresh_job_integrity_locked(store.conn, created.id)
         reclaimed, _token = store.claim_job(created.id, "worker-b", 60)
         assert reclaimed.ownerCoordinatorId == "worker-b"
         assert reclaimed.attempts == 2
@@ -181,7 +182,7 @@ def test_companion_job_schema_rejects_vault_paths_and_content():
 
 
 def test_arbitrary_receipt_fingerprint_and_duplicate_event_fail_closed(tmp_path):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(job_request())
@@ -223,7 +224,7 @@ def test_arbitrary_receipt_fingerprint_and_duplicate_event_fail_closed(tmp_path)
 
 def test_sqlite_job_ledger_contains_no_lease_token_plaintext(tmp_path):
     database = tmp_path / "coordinator.sqlite3"
-    store = CoordinatorStore(database)
+    store = CoordinatorStore(database, integrity_key="i" * 43)
     store.initialize()
     try:
         created = store.create_job(job_request())
@@ -239,7 +240,7 @@ def test_sqlite_job_ledger_contains_no_lease_token_plaintext(tmp_path):
 
 
 def test_worker_readiness_requires_fresh_matching_single_coordinator_heartbeat(tmp_path):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     expected = "sha256:" + "c" * 64
     try:
@@ -273,7 +274,7 @@ def test_worker_readiness_requires_fresh_matching_single_coordinator_heartbeat(t
 
 
 def test_public_research_worker_receipt_event_and_completion_contract_round_trip(tmp_path):
-    store = CoordinatorStore(tmp_path / "coordinator.sqlite3")
+    store = CoordinatorStore(tmp_path / "coordinator.sqlite3", integrity_key="i" * 43)
     store.initialize()
     try:
         job = store.create_job(job_request())

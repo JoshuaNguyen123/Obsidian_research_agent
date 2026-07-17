@@ -56,6 +56,10 @@ class IdempotencyConflict(CoordinatorStoreError):
     code = "idempotency_conflict"
 
 
+class JobIntegrityInvalid(CoordinatorStoreError):
+    code = "job_integrity_invalid"
+
+
 class CoordinatorStore:
     """Restart-safe job, lease, replay, and external-receipt ledger."""
 
@@ -63,11 +67,18 @@ class CoordinatorStore:
     LINEAR_QUEUE_SCAN_INTERVAL_SECONDS = 15 * 60
     LINEAR_QUEUE_SCAN_LEASE_SECONDS = 120
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, integrity_key: str):
+        if len(integrity_key.encode("utf-8")) < 32:
+            raise ValueError("Coordinator integrity_key must contain at least 256 bits of material.")
         self.db_path = db_path
         self.conn: sqlite3.Connection | None = None
         self.ready = False
         self._lock = threading.RLock()
+        self._integrity_key = hmac.new(
+            integrity_key.encode("utf-8"),
+            b"agentic-researcher/coordinator-job-integrity/v1",
+            hashlib.sha256,
+        ).digest()
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +110,8 @@ class CoordinatorStore:
               lease_expires_at REAL,
               attempts INTEGER NOT NULL DEFAULT 0,
               created_at REAL NOT NULL,
-              updated_at REAL NOT NULL
+              updated_at REAL NOT NULL,
+              integrity_authenticator TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS job_events (
@@ -188,6 +200,13 @@ class CoordinatorStore:
             );
             """
         )
+        job_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "integrity_authenticator" not in job_columns:
+            self.conn.execute(
+                "ALTER TABLE jobs ADD COLUMN integrity_authenticator TEXT NOT NULL DEFAULT ''"
+            )
         self._quarantine_invalid_jobs()
         self.ready = True
 
@@ -217,6 +236,7 @@ class CoordinatorStore:
             (request.idempotencyKey,),
         ).fetchone()
         if existing:
+            self._require_job_integrity_locked(conn, existing)
             if not hmac.compare_digest(existing["request_fingerprint"], fingerprint):
                 raise IdempotencyConflict(
                     "The idempotency key is already bound to different job content."
@@ -250,27 +270,34 @@ class CoordinatorStore:
             {"executionHost": request.executionHost},
             now,
         )
+        self._refresh_job_integrity_locked(conn, request.id)
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (request.id,)).fetchone()
         return row, True
 
     def get_job(self, job_id: str) -> JobRecord:
-        row = self._conn().execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        if not row:
-            raise JobNotFound(f"Unknown job: {job_id}")
+        conn = self._conn()
+        with self._transaction(conn):
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                raise JobNotFound(f"Unknown job: {job_id}")
+            self._require_job_integrity_locked(conn, row)
         return _job_from_row(row)
 
     def list_jobs(self, states: list[str] | None = None, limit: int = 100) -> list[JobRecord]:
         conn = self._conn()
-        if states:
-            placeholders = ",".join("?" for _ in states)
-            rows = conn.execute(
-                f"SELECT * FROM jobs WHERE state IN ({placeholders}) ORDER BY created_at LIMIT ?",
-                [*states, limit],
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM jobs ORDER BY created_at LIMIT ?", (limit,)
-            ).fetchall()
+        with self._transaction(conn):
+            if states:
+                placeholders = ",".join("?" for _ in states)
+                rows = conn.execute(
+                    f"SELECT * FROM jobs WHERE state IN ({placeholders}) ORDER BY created_at LIMIT ?",
+                    [*states, limit],
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM jobs ORDER BY created_at LIMIT ?", (limit,)
+                ).fetchall()
+            for row in rows:
+                self._require_job_integrity_locked(conn, row)
         return [_job_from_row(row) for row in rows]
 
     def claim_job(
@@ -289,6 +316,7 @@ class CoordinatorStore:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if not row:
                 raise JobNotFound(f"Unknown job: {job_id}")
+            self._require_job_integrity_locked(conn, row)
             if row["state"] in self.TERMINAL_STATES:
                 raise JobLeaseConflict("Terminal jobs cannot be claimed.")
             stored_payload = json.loads(row["payload_json"])
@@ -324,6 +352,7 @@ class CoordinatorStore:
                     """,
                     (now, job_id),
                 )
+                self._refresh_job_integrity_locked(conn, job_id)
                 self._append_event_locked(
                     conn,
                     job_id,
@@ -355,6 +384,7 @@ class CoordinatorStore:
                     """,
                     (coordinator_id, token_hash, expires, now, job_id),
                 )
+                self._refresh_job_integrity_locked(conn, job_id)
                 self._append_event_locked(
                     conn,
                     job_id,
@@ -549,6 +579,7 @@ class CoordinatorStore:
                 "UPDATE jobs SET lease_expires_at = ?, updated_at = ? WHERE id = ?",
                 (expires, now, job_id),
             )
+            self._refresh_job_integrity_locked(conn, job_id)
             self._append_event_locked(
                 conn,
                 job_id,
@@ -603,6 +634,7 @@ class CoordinatorStore:
                 """,
                 (state, _canonical_json(sanitized_output), now, job_id),
             )
+            self._refresh_job_integrity_locked(conn, job_id)
             self._append_event_locked(
                 conn,
                 job_id,
@@ -1434,6 +1466,7 @@ class CoordinatorStore:
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if not row:
             raise JobNotFound(f"Unknown job: {job_id}")
+        self._require_job_integrity_locked(conn, row)
         stored_hash = row["lease_token_hash"]
         if (
             row["state"] != "running"
@@ -1468,6 +1501,81 @@ class CoordinatorStore:
             raise RuntimeError("Coordinator store is not initialized.")
         return self.conn
 
+    def _refresh_job_integrity_locked(
+        self, conn: sqlite3.Connection, job_id: str
+    ) -> None:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise JobNotFound(f"Unknown job: {job_id}")
+        authenticator = self._job_integrity_authenticator(row)
+        conn.execute(
+            "UPDATE jobs SET integrity_authenticator = ? WHERE id = ?",
+            (authenticator, job_id),
+        )
+
+    def _require_job_integrity_locked(
+        self, conn: sqlite3.Connection, row: sqlite3.Row
+    ) -> None:
+        supplied = row["integrity_authenticator"]
+        expected = self._job_integrity_authenticator(row)
+        if isinstance(supplied, str) and hmac.compare_digest(supplied, expected):
+            return
+        self._quarantine_job_locked(
+            conn,
+            row,
+            "integrity_authenticator_mismatch",
+        )
+        raise JobIntegrityInvalid(
+            "The durable job integrity authenticator is missing or invalid."
+        )
+
+    def _job_integrity_authenticator(self, row: sqlite3.Row) -> str:
+        protected = {
+            "version": 1,
+            "id": row["id"],
+            "missionId": row["mission_id"],
+            "nodeId": row["node_id"],
+            "executionHost": row["execution_host"],
+            "payloadJson": row["payload_json"],
+            "capabilityEnvelopeJson": row["capability_envelope_json"],
+            "idempotencyKey": row["idempotency_key"],
+            "requestFingerprint": row["request_fingerprint"],
+            "state": row["state"],
+            "outputJson": row["output_json"],
+            "ownerCoordinatorId": row["owner_coordinator_id"],
+            "leaseTokenHash": row["lease_token_hash"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "attempts": int(row["attempts"]),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+        return hmac.new(
+            self._integrity_key,
+            _canonical_json(protected).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def _quarantine_job_locked(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        reason_code: str,
+    ) -> None:
+        stored_fingerprint = str(row["request_fingerprint"])
+        if not stored_fingerprint.startswith("sha256:") or len(stored_fingerprint) != 71:
+            stored_fingerprint = canonical_fingerprint(
+                {"version": 1, "storedRequestFingerprint": stored_fingerprint}
+            )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO quarantined_jobs (
+              job_id, request_fingerprint, reason_code, quarantined_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (row["id"], stored_fingerprint, reason_code, _now_epoch()),
+        )
+        conn.execute("DELETE FROM jobs WHERE id = ?", (row["id"],))
+
     def _quarantine_invalid_jobs(self) -> None:
         from pydantic import ValidationError
         from schemas import JobCreateRequest
@@ -1476,7 +1584,7 @@ class CoordinatorStore:
         rows = conn.execute("SELECT * FROM jobs").fetchall()
         for row in rows:
             try:
-                JobCreateRequest.model_validate(
+                request = JobCreateRequest.model_validate(
                     {
                         "id": row["id"],
                         "missionId": row["mission_id"],
@@ -1488,16 +1596,28 @@ class CoordinatorStore:
                     },
                     context={"allow_expired": True},
                 )
+                expected_request_fingerprint = _fingerprint_request(request)
+                if not hmac.compare_digest(
+                    str(row["request_fingerprint"]), expected_request_fingerprint
+                ):
+                    raise ValueError("Persisted request fingerprint drifted.")
+                supplied = row["integrity_authenticator"]
+                if supplied:
+                    if not hmac.compare_digest(
+                        str(supplied), self._job_integrity_authenticator(row)
+                    ):
+                        self._quarantine_job_locked(
+                            conn, row, "integrity_authenticator_mismatch"
+                        )
+                    continue
+                if row["execution_host"] != "research":
+                    self._quarantine_job_locked(
+                        conn, row, "legacy_effectful_job_missing_integrity"
+                    )
+                    continue
+                self._refresh_job_integrity_locked(conn, row["id"])
             except (ValidationError, ValueError, json.JSONDecodeError):
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO quarantined_jobs (
-                      job_id, request_fingerprint, reason_code, quarantined_at
-                    ) VALUES (?, ?, 'invalid_persisted_contract', ?)
-                    """,
-                    (row["id"], row["request_fingerprint"], _now_epoch()),
-                )
-                conn.execute("DELETE FROM jobs WHERE id = ?", (row["id"],))
+                self._quarantine_job_locked(conn, row, "invalid_persisted_contract")
 
     class _Transaction:
         def __init__(self, store: "CoordinatorStore", conn: sqlite3.Connection):
@@ -1511,7 +1631,10 @@ class CoordinatorStore:
 
         def __exit__(self, exc_type, exc, traceback) -> None:
             try:
-                self.conn.execute("ROLLBACK" if exc_type else "COMMIT")
+                commit_quarantine = exc_type is not None and issubclass(
+                    exc_type, JobIntegrityInvalid
+                )
+                self.conn.execute("COMMIT" if exc_type is None or commit_quarantine else "ROLLBACK")
             finally:
                 self.store._lock.release()
 

@@ -53,8 +53,8 @@ export interface ValidationProfile {
   allowedGeneratedPaths: string[];
 }
 
-const ALLOWED_VALIDATION_COMMANDS = new Set(["npm", "node", "py", "python"]);
 const NODE_VALIDATION_PROTECTED_PATHS = [
+  ".github/actions",
   ".github/workflows",
   ".githooks",
   ".husky",
@@ -219,37 +219,10 @@ export class GitWorktreeManager {
     signal?: AbortSignal;
     onValidationOutput?: (line: string) => void;
   }): Promise<GitCommandResult[]> {
-    const validationCommands = input.profile?.validationCommands ?? input.validationCommands;
-    if (validationCommands.length === 0) {
-      throw new Error("At least one integration validation command is required.");
-    }
-    if (input.profile) {
-      await this.prepareValidationDependencies({
-        worktree: input.worktree,
-        profile: input.profile,
-        signal: input.signal,
-        onValidationOutput: input.onValidationOutput,
-      });
-      await this.assertProtectedValidationPathsUnchanged(
-        input.worktree,
-        input.profile.protectedPaths,
-        input.signal,
-      );
-    }
-    const validation: GitCommandResult[] = [];
-    for (const command of validationCommands) {
-      const result = await runValidationCommand(
-        input.worktree.path,
-        command,
-        input.signal,
-      );
-      validation.push(result);
-      input.onValidationOutput?.(`${command.label}: exit ${result.exitCode}`);
-      if (result.exitCode !== 0) {
-        throw new Error(`${command.label} failed with exit code ${result.exitCode}.`);
-      }
-    }
-    return validation;
+    void input;
+    throw new Error(
+      "Native repository validation is disabled. Use the verified Code sandbox capability.",
+    );
   }
 
   async prepareValidationDependencies(input: {
@@ -258,33 +231,10 @@ export class GitWorktreeManager {
     signal?: AbortSignal;
     onValidationOutput?: (line: string) => void;
   }): Promise<GitCommandResult[]> {
-    if (this.preparedValidationPaths.has(input.worktree.path)) return [];
-    await this.assertProtectedValidationPathsUnchanged(
-      input.worktree,
-      input.profile.protectedPaths,
-      input.signal,
+    void input;
+    throw new Error(
+      "Native dependency bootstrap is disabled. Use the verified Code sandbox capability.",
     );
-    const results: GitCommandResult[] = [];
-    for (const command of input.profile.bootstrapCommands) {
-      const result = await runValidationCommand(
-        input.worktree.path,
-        command,
-        input.signal,
-        { forceIgnoreLifecycleScripts: true },
-      );
-      results.push(result);
-      input.onValidationOutput?.(`${command.label}: exit ${result.exitCode}`);
-      if (result.exitCode !== 0) {
-        throw new Error(`${command.label} failed with exit code ${result.exitCode}.`);
-      }
-    }
-    await this.assertProtectedValidationPathsUnchanged(
-      input.worktree,
-      input.profile.protectedPaths,
-      input.signal,
-    );
-    this.preparedValidationPaths.add(input.worktree.path);
-    return results;
   }
 
   async commitGreenWorktree(input: {
@@ -482,83 +432,6 @@ function createGitCommandExecutor(): GitCommandExecutor {
       child.on("close", (exitCode) => resolve({ exitCode: exitCode ?? 1, stdout, stderr }));
     });
   };
-}
-
-async function runValidationCommand(
-  cwd: string,
-  command: ValidationCommand,
-  signal?: AbortSignal,
-  options: { forceIgnoreLifecycleScripts?: boolean } = {},
-): Promise<GitCommandResult> {
-  if (!ALLOWED_VALIDATION_COMMANDS.has(command.command)) {
-    throw new Error(`Validation command is not allowlisted: ${command.command}`);
-  }
-  const { spawn } = requireNodeModule<typeof import("child_process")>(
-    "child_process",
-    "git_worktree_validation",
-  );
-  return new Promise((resolve, reject) => {
-    const invocation = resolveValidationInvocation(command);
-    const child = spawn(invocation.executable, invocation.args, {
-      cwd,
-      shell: false,
-      windowsHide: true,
-      signal,
-      env: {
-        ...process.env,
-        CI: "1",
-        NPM_CONFIG_AUDIT: "false",
-        NPM_CONFIG_FUND: "false",
-        NPM_CONFIG_UPDATE_NOTIFIER: "false",
-        ...(options.forceIgnoreLifecycleScripts
-          ? { NPM_CONFIG_IGNORE_SCRIPTS: "true" }
-          : {}),
-      },
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
-    child.on("error", reject);
-    child.on("close", (exitCode) => resolve({ exitCode: exitCode ?? 1, stdout, stderr }));
-  });
-}
-
-function resolveValidationInvocation(command: ValidationCommand): {
-  executable: string;
-  args: string[];
-} {
-  if (
-    command.command !== "npm" ||
-    typeof process === "undefined" ||
-    process.platform !== "win32"
-  ) {
-    return { executable: command.command, args: [...command.args] };
-  }
-  const npmCli = findWindowsNpmCli();
-  if (!npmCli) {
-    throw new Error(
-      "Unable to locate npm-cli.js for shell-free validation on Windows.",
-    );
-  }
-  return { executable: "node", args: [npmCli, ...command.args] };
-}
-
-function findWindowsNpmCli(): string | null {
-  const fs = requireNodeModule<typeof import("fs")>("fs", "git_worktree_validation");
-  const path = requireNodeModule<typeof import("path")>("path", "git_worktree_validation");
-  const candidates = new Set<string>();
-  const npmExecPath = process.env.npm_execpath;
-  if (npmExecPath) candidates.add(npmExecPath);
-  for (const entry of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
-    candidates.add(path.join(entry, "node_modules", "npm", "bin", "npm-cli.js"));
-    candidates.add(path.join(entry, "..", "node_modules", "npm", "bin", "npm-cli.js"));
-  }
-  for (const candidate of candidates) {
-    const resolved = path.resolve(candidate);
-    if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) return resolved;
-  }
-  return null;
 }
 
 async function createDisabledHooksDirectory(): Promise<string> {
