@@ -102,4 +102,17 @@ describe("CapabilityReadinessV2", () => {
     assert.equal(rows.find((row) => row.id === "browser")?.status, "Approval needed");
     assert.equal(rows.find((row) => row.id === "linear")?.status, "Approval needed");
   });
+
+  it("keeps public web reads available when supervised browser automation is unhealthy", () => {
+    const partial = inputs();
+    partial.browser.enabled = true;
+    partial.browser.companionHealthy = false;
+    const browser = buildCapabilityReadinessV2(partial, NOW).find(
+      (row) => row.id === "browser",
+    );
+    assert.equal(browser?.status, "Degraded");
+    assert.match(browser?.reason ?? "", /Web search and fetch are available/u);
+    assert.match(browser?.reason ?? "", /Companion passes a healthy runtime probe/u);
+    assert.equal(browser?.nextAction, "Connect and test Companion");
+  });
 });

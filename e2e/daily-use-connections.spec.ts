@@ -244,6 +244,48 @@ test.describe("daily-use connections and setup", () => {
     }
   });
 
+  test("public web tools remain available when supervised browser automation has no healthy Companion", async () => {
+    let harness: NativeObsidianHarness | null = null;
+    try {
+      harness = await startNativeObsidianHarness({
+        label: "daily-use-public-web-readiness",
+        setup: setupDailyUsePage,
+      });
+      const browser = await harness.page.evaluate((pluginId) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        if (!plugin) throw new Error("Agentic Researcher plugin is unavailable.");
+        const originalBrowserToolsEnabled = plugin.settings.browserToolsEnabled;
+        const originalGetCompanionRuntimePlugin = plugin.getCompanionRuntimePlugin;
+        try {
+          plugin.settings.browserToolsEnabled = true;
+          plugin.getCompanionRuntimePlugin = () => null;
+          return plugin
+            .getCapabilityReadiness()
+            .find((row: { id: string }) => row.id === "browser");
+        } finally {
+          plugin.settings.browserToolsEnabled = originalBrowserToolsEnabled;
+          plugin.getCompanionRuntimePlugin = originalGetCompanionRuntimePlugin;
+        }
+      }, NATIVE_CORE_PLUGIN_ID);
+
+      expect(browser).toEqual(
+        expect.objectContaining({
+          version: 2,
+          id: "browser",
+          status: "Degraded",
+          reason: expect.stringContaining("Web search and fetch are available"),
+          nextAction: "Connect and test Companion",
+        }),
+      );
+      expect(browser?.reason).toContain(
+        "Supervised browser actions are enabled but unavailable",
+      );
+    } finally {
+      await harness?.close();
+    }
+  });
+
   test("setup and resume preserves the exact continuation command across the settings hop", async () => {
     let harness: NativeObsidianHarness | null = null;
     let ledgerPath = "";

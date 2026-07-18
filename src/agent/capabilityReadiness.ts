@@ -105,13 +105,13 @@ export function buildCapabilityReadinessV2(
     status: !input.browser.enabled
       ? "Available"
       : !input.browser.companionHealthy
-        ? "Blocked"
+        ? "Degraded"
         : "Approval needed",
     reason: !input.browser.enabled
       ? "Web search and fetch are available; supervised browser actions are off."
       : !input.browser.companionHealthy
-        ? "Supervised browser actions are enabled, but the authenticated companion has no healthy runtime probe."
-        : "Supervised browser reads are available; click, type, and submit remain SafetyPolicy and approval gated.",
+        ? "Web search and fetch are available. Supervised browser actions are enabled but unavailable until the authenticated Companion passes a healthy runtime probe."
+        : "Web search and fetch are available. Supervised browser reads are also available; click, type, and submit remain SafetyPolicy and approval gated.",
     evidenceAt: input.browser.checkedAt ?? input.observedAt,
     nextAction: !input.browser.enabled
       ? "Enable browser tools if needed"
