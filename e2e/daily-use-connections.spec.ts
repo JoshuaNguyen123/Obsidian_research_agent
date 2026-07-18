@@ -129,6 +129,9 @@ test.describe("daily-use connections and setup", () => {
         settings.locator(".agentic-settings-basic select").nth(2),
       ).toHaveValue("off");
     } finally {
+      if (harness) {
+        await closeObsidianSettings(harness.page).catch(() => undefined);
+      }
       await harness?.close();
     }
   });
@@ -154,6 +157,7 @@ test.describe("daily-use connections and setup", () => {
       const preservedPrompt = `Preserve this setup prompt ${harness.marker}`;
       await prompt.fill(preservedPrompt);
 
+      await closeObsidianSettings(page);
       await emptyState.getByRole("button", { name: "Connect model" }).click();
       const settings = page.locator(".agentic-researcher-settings");
       await expect(settings.locator("#agentic-settings-essentials")).toBeVisible();
@@ -233,6 +237,9 @@ test.describe("daily-use connections and setup", () => {
         delete (window as typeof window & { __e2eConnectionShouldFail?: boolean })
           .__e2eConnectionShouldFail;
       }).catch(() => undefined);
+      if (harness) {
+        await closeObsidianSettings(harness.page).catch(() => undefined);
+      }
       await harness?.close();
     }
   });
@@ -292,6 +299,7 @@ test.describe("daily-use connections and setup", () => {
 
       const banner = harness.page.locator(".agentic-researcher-resume-banner");
       await expect(banner).toContainText("Cloud model API key is missing.");
+      await closeObsidianSettings(harness.page);
       await banner.getByRole("button", { name: "Set up & resume" }).click();
       const pending = harness.page.locator(".agentic-settings-pending-resume");
       await expect(pending).toContainText("Set up Model");
@@ -329,13 +337,16 @@ test.describe("daily-use connections and setup", () => {
             .__e2eResumeCommand;
         }, ledgerPath).catch(() => undefined);
       }
+      if (harness) {
+        await closeObsidianSettings(harness.page).catch(() => undefined);
+      }
       await harness?.close();
     }
   });
 });
 
 async function setupDailyUsePage(context: { page: NativeObsidianHarness["page"] }) {
-  await context.page.evaluate((pluginId) => {
+  await context.page.evaluate(async (pluginId) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.plugins?.plugins?.[pluginId]) {
       throw new Error("Agentic Researcher plugin is unavailable.");
@@ -344,32 +355,37 @@ async function setupDailyUsePage(context: { page: NativeObsidianHarness["page"] 
     if (!plugin?.activateView) {
       throw new Error("Agentic Researcher view activation is unavailable.");
     }
-    const e2eWindow = window as typeof window & {
-      __e2eDailyUseActivationError?: string;
-    };
-    delete e2eWindow.__e2eDailyUseActivationError;
-    // A fresh hosted Obsidian vault can render the view while revealLeaf's
-    // promise remains pending. The UI is the readiness contract for these
-    // scenarios, so observe the rendered panel instead of awaiting that
-    // host-internal promise indefinitely.
-    void Promise.resolve(plugin.activateView()).catch((error: unknown) => {
-      e2eWindow.__e2eDailyUseActivationError =
-        error instanceof Error ? error.message : String(error);
-    });
+    await plugin.activateView();
   }, NATIVE_CORE_PLUGIN_ID);
+  // Obsidian can restore a settings modal from the preceding desktop run.
+  // Close it after activating the daily-use panel and wait for its animated
+  // teardown so it cannot intercept first-run connection controls.
+  await closeObsidianSettings(context.page);
   await context.page.waitForFunction(
     () => {
-      const e2eWindow = window as typeof window & {
-        __e2eDailyUseActivationError?: string;
-      };
-      if (e2eWindow.__e2eDailyUseActivationError) {
-        throw new Error(
-          `Agentic Researcher view activation failed: ${e2eWindow.__e2eDailyUseActivationError}`,
-        );
-      }
       return Boolean(document.querySelector(".agentic-researcher-view"));
     },
     undefined,
     { timeout: 30_000 },
+  );
+}
+
+async function closeObsidianSettings(page: NativeObsidianHarness["page"]) {
+  await page.evaluate(() => {
+    (window as typeof window & { app?: any }).app?.setting?.close?.();
+  });
+  await page.waitForFunction(
+    () =>
+      Array.from(document.querySelectorAll<HTMLElement>(".modal.mod-settings"))
+        .every((modal) => {
+          const style = getComputedStyle(modal);
+          return (
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            modal.getClientRects().length === 0
+          );
+        }),
+    undefined,
+    { timeout: 5_000 },
   );
 }
