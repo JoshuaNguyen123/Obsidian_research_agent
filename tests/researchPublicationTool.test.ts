@@ -356,7 +356,7 @@ test("trusted web readback replaces an empty model evidence list", async () => {
   );
 });
 
-test("durable run evidence replaces an empty model evidence list after runtime cache loss", async () => {
+test("durable run evidence replaces an empty model evidence list when the runtime cache is unavailable", async () => {
   let loads = 0;
   const fixture = createFixture("created", {
     loadDurableWebEvidence: async (runId) => {
@@ -377,7 +377,7 @@ test("durable run evidence replaces an empty model evidence list after runtime c
   const context = contextFixture(
     "Publish this research to Linear in Published.md",
   );
-  context.runtimeCache = { toolResults: new Map() };
+  context.runtimeCache = undefined;
   context.requestNestedApproval = async (request) => ({
     approved: true,
     approvalId: "approval-durable-web-evidence",
@@ -399,6 +399,61 @@ test("durable run evidence replaces an empty model evidence list after runtime c
     label: "Durably verified source",
     summary: "Verified source content restored from the mission ledger.",
   }]);
+});
+
+test("durable run evidence merges with a partial live proof cache before publication", async () => {
+  const secondHash = `sha256:${"b".repeat(64)}`;
+  const fixture = createFixture("created", {
+    loadDurableWebEvidence: async () => [{
+      url: "https://second.example.test/evidence",
+      contentHash: secondHash,
+      usableSource: true,
+      title: "Second durable source",
+      summary: "Second verified source content restored from the mission ledger.",
+      parserStatus: "parsed",
+    }],
+  });
+  const args = argsFixture();
+  (args.package as Record<string, unknown>).evidence = [];
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.runtimeCache = {
+    toolResults: new Map(),
+    trustedWebFetchResults: new Map([["first", {
+      ok: true,
+      toolName: "web_fetch",
+      output: {
+        url: "https://first.example.test/evidence",
+        normalizedUrl: "https://first.example.test/evidence",
+        contentHash: HASH,
+        title: "First live source",
+        content: "First verified source content.",
+      },
+    }]]),
+  };
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-merged-web-evidence",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    fixture.noteWrites[0]?.package.evidence.map((item) => ({
+      reference: item.reference,
+      contentSha256: item.contentSha256,
+    })),
+    [
+      { reference: "https://first.example.test/evidence", contentSha256: HASH },
+      { reference: "https://second.example.test/evidence", contentSha256: secondHash },
+    ],
+  );
 });
 
 test("same-run web readback rejects a conflicting model-supplied evidence hash", async () => {

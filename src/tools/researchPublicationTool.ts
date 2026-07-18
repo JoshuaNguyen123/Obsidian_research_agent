@@ -87,12 +87,10 @@ export function createResearchPublicationTool(
       }
       const runId = requireIdentity(context.runId, "run id");
       const toolCallId = requireIdentity(context.operationId, "tool call id");
-      if (
-        options.loadDurableWebEvidence &&
-        !hasTrustedWebEvidence(context.runtimeCache)
-      ) {
+      const proofCache = context.runtimeCache ?? { toolResults: new Map() };
+      if (options.loadDurableWebEvidence) {
         seedDurableWebEvidence(
-          context.runtimeCache,
+          proofCache,
           await options.loadDurableWebEvidence(runId),
         );
       }
@@ -102,14 +100,14 @@ export function createResearchPublicationTool(
         toolCallId,
         originalPrompt: context.originalPrompt,
         vaultBindingKey: options.vaultBindingKey,
-        runtimeCache: context.runtimeCache,
+        runtimeCache: proofCache,
         resolveNotePath: options.resolveNotePath,
         validateTrustedBindings: options.validateTrustedBindings,
         nowProvider: options.now ?? context.now,
       });
       const note = stabilizeAcceptedResearchRequest(
         parsedNote,
-        context.runtimeCache,
+        proofCache,
         runId,
       );
       if (!context.requestNestedApproval) {
@@ -859,23 +857,6 @@ function hydrateTrustedWebEvidence(
       summary: entry.summary,
     })),
   ];
-}
-
-function hasTrustedWebEvidence(
-  runtimeCache: ToolExecutionContext["runtimeCache"],
-): boolean {
-  return [...(runtimeCache?.trustedWebFetchResults?.values() ?? [])].some(
-    (result) => {
-      if (!result.ok) return false;
-      const output = asRecord(result.output);
-      return Boolean(
-        output &&
-        normalizeTrustedWebReference(output.normalizedUrl ?? output.url) &&
-        typeof output.contentHash === "string" &&
-        /^sha256:[a-f0-9]{64}$/u.test(output.contentHash.trim().toLowerCase()),
-      );
-    },
-  );
 }
 
 function seedDurableWebEvidence(
