@@ -16354,11 +16354,17 @@ function isCodeToolAllowedForPrompt(toolName: string, prompt: string): boolean {
   return CODE_READ_ONLY_TOOL_NAMES.has(toolName);
 }
 
-function getExplicitCodeToolNames(prompt: string): string[] {
+export function getExplicitCodeToolNames(prompt: string): string[] {
   const normalized = prompt.toLowerCase();
-  return [...CODE_TOOL_NAMES]
-    .map((name) => ({ name, index: normalized.indexOf(name) }))
-    .filter((entry) => entry.index >= 0)
+  const matches: Array<{ name: string; index: number }> = [];
+  const seen = new Set<string>();
+  for (const match of normalized.matchAll(/[a-z][a-z0-9_]*/gu)) {
+    const name = match[0];
+    if (!CODE_TOOL_NAMES.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    matches.push({ name, index: match.index });
+  }
+  return matches
     .sort((left, right) => left.index - right.index)
     .map((entry) => entry.name);
 }

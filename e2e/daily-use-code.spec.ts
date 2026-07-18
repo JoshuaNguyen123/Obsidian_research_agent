@@ -224,6 +224,60 @@ test.describe("Daily-use Code capability production boundaries", () => {
     }
   });
 
+  test("LANG-01 creates and reads back eleven supported source languages", async () => {
+    test.skip(
+      LIVE_CODE_LANE,
+      "The deterministic language-creation contract runs in the targeted daily-use-code lane.",
+    );
+    const active = requireHarness(harness);
+    const files = [
+      { language: "python", path: "app.py", content: `MARKER = "${active.marker}"\n` },
+      { language: "typescript", path: "app.ts", content: `export const marker: string = "${active.marker}";\n` },
+      { language: "javascript", path: "app.js", content: `export const marker = "${active.marker}";\n` },
+      { language: "c", path: "app.c", content: `const char *marker = "${active.marker}";\n` },
+      { language: "cpp", path: "app.cpp", content: `const char* marker = "${active.marker}";\n` },
+      { language: "html", path: "index.html", content: `<!doctype html><title>${active.marker}</title>\n` },
+      { language: "css", path: "styles.css", content: `/* ${active.marker} */\nbody { color: green; }\n` },
+      { language: "rust", path: "app.rs", content: `const MARKER: &str = "${active.marker}";\n` },
+      { language: "go", path: "app.go", content: `package main\nconst marker = "${active.marker}"\n` },
+      { language: "java", path: "App.java", content: `final class App { static final String MARKER = "${active.marker}"; }\n` },
+      { language: "csharp", path: "Program.cs", content: `internal static class Program { internal const string Marker = "${active.marker}"; }\n` },
+    ];
+    const workspaceIds = new Map<string, string>();
+    let completedMissions = 0;
+    for (const file of files) {
+      const workspaceId = `phase4-${file.language}-${active.marker.toLowerCase()}`;
+      workspaceIds.set(file.language, workspaceId);
+      await active.configureScenario("language-create", { workspaceId, files: [file] });
+      await active.submitMissionWithApprovals(
+        [
+          `LANG-01 create isolated scratch workspace ${workspaceId}, then create ${file.path}.`,
+          "Use exactly code_workspace_create and code_workspace_create_file through the normal prepared approval path.",
+          "Do not overwrite any path and stop only after both exact creation receipts are committed.",
+        ].join(" "),
+        { timeoutMs: MISSION_TIMEOUT_MS },
+      );
+      completedMissions += 1;
+    }
+    expect(completedMissions).toBe(files.length);
+    expect(workspaceIds.size).toBe(files.length);
+    for (const file of files) {
+      const workspaceId = workspaceIds.get(file.language);
+      if (!workspaceId) throw new Error(`Missing LANG-01 workspace for ${file.language}.`);
+      const result = await active.executeTool(
+        "code_workspace_read",
+        { workspaceId, path: file.path },
+        `Read back LANG-01 source file ${file.path}.`,
+      );
+      expect(
+        requireString(
+          requireRecord(toolOutput(result), `${file.path} readback`).content,
+          `${file.path} content`,
+        ),
+      ).toBe(file.content);
+    }
+  });
+
   test("managed metadata boundary supports durable CRUD and restart with hashes and trash/restore receipts", async () => {
     test.setTimeout(SUITE_TIMEOUT_MS);
     const active = requireHarness(harness);

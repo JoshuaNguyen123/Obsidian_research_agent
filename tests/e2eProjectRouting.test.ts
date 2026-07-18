@@ -205,6 +205,10 @@ test("daily-use commands route to focused specs and live projects disable reruns
   );
   assert.match(packageJson.scripts["test:e2e:daily-use:live-model"], /DU-02/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:code"], /DU-03/u);
+  assert.match(
+    packageJson.scripts["test:e2e:daily-use:languages"],
+    /--project=daily-use-code --grep=LANG-01/u,
+  );
   assert.match(packageJson.scripts["test:e2e:daily-use:linear"], /DU-04/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:github"], /DU-05/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:compound"], /DU-06/u);

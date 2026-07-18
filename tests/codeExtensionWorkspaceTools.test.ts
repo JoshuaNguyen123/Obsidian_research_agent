@@ -20,6 +20,7 @@ import {
 } from "../extensions/code/workspaceTools";
 import { WorkspaceManagerV2 } from "../extensions/code/workspaces";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories";
+import { CODE_CREATION_LANGUAGE_CATALOG_V1 } from "../extensions/code/CodeCreationLanguagesV1";
 
 test("workspace contribution factory replaces every new and legacy tool name", async () => {
   const fixture = await createFixture("names");
@@ -93,6 +94,59 @@ test("workspace contribution factory replaces every new and legacy tool name", a
       context,
     ) as { content: string };
     assert.match(read.content, /legacy = true/u);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("prepared workspace creation supports eleven explicit source languages", async () => {
+  const fixture = await createFixture("languages");
+  try {
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const context = fixture.context("Create a multi-language source workspace.");
+    await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "language-space", kind: "scratch" },
+      context,
+    );
+    const files = [
+      { language: "python", path: "app.py", content: "print('ok')\n" },
+      { language: "typescript", path: "app.ts", content: "export const ok: boolean = true;\n" },
+      { language: "javascript", path: "app.js", content: "export const ok = true;\n" },
+      { language: "c", path: "app.c", content: "int main(void) { return 0; }\n" },
+      { language: "cpp", path: "app.cpp", content: "int main() { return 0; }\n" },
+      { language: "html", path: "index.html", content: "<!doctype html><title>OK</title>\n" },
+      { language: "css", path: "styles.css", content: "body { color: green; }\n" },
+      { language: "rust", path: "app.rs", content: "fn main() {}\n" },
+      { language: "go", path: "app.go", content: "package main\nfunc main() {}\n" },
+      { language: "java", path: "App.java", content: "final class App {}\n" },
+      { language: "csharp", path: "Program.cs", content: "internal static class Program {}\n" },
+    ] as const;
+    assert.deepEqual(
+      CODE_CREATION_LANGUAGE_CATALOG_V1.map((language) => language.id),
+      files.map((file) => file.language),
+    );
+    const createTool = tools.get("code_workspace_create_file")!;
+    assert.match(createTool.description, /Python, TypeScript, JavaScript, C, C\+\+/u);
+    assert.match(createTool.description, /HTML, CSS, Rust, Go, Java, and C#/u);
+    for (const file of files) {
+      const prepared = await requirePrepared(
+        createTool,
+        { workspaceId: "language-space", path: file.path, content: file.content },
+        context,
+      );
+      assert.equal(prepared.normalizedArgs.creationLanguage, file.language);
+      await createTool.executePrepared!(prepared, authorize(context, prepared));
+      const readback = await tools.get("code_workspace_read")!.execute(
+        { workspaceId: "language-space", path: file.path },
+        context,
+      ) as { content: string };
+      assert.equal(readback.content, file.content);
+    }
   } finally {
     await fixture.cleanup();
   }

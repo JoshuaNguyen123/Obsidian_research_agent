@@ -71,7 +71,12 @@ export interface Phase4Harness {
   noteFilePath: string;
   vaultRoot: string;
   configureScenario(
-    name: "core-health" | "crud-stage-1" | "crud-stage-2" | "repository-create",
+    name:
+      | "core-health"
+      | "crud-stage-1"
+      | "crud-stage-2"
+      | "repository-create"
+      | "language-create",
     data?: Record<string, unknown>,
   ): Promise<void>;
   readToolCatalog(): Promise<Phase4ToolCatalogEntry[]>;
@@ -521,6 +526,15 @@ async function installPhase4PageHarness(
         const movedPath = String(
           scenarioState.data.movedPath ?? "src/phase4-value-restored.txt",
         );
+        const languageFiles = Array.isArray(scenarioState.data.files)
+          ? scenarioState.data.files.filter(
+              (entry): entry is { path: string; content: string } =>
+                Boolean(entry) &&
+                typeof entry === "object" &&
+                typeof (entry as any).path === "string" &&
+                typeof (entry as any).content === "string",
+            )
+          : [];
         if (scenarioState.name === "core-health") {
           return final(`PHASE4_CORE_HEALTH_OK ${marker}`);
         }
@@ -534,6 +548,25 @@ async function installPhase4PageHarness(
           }
           return final(
             `Created repository workspace ${workspaceId} from the trusted fixture root with a verified worktree receipt. PHASE4_REPOSITORY_WORKSPACE_READY ${marker}`,
+          );
+        }
+        if (scenarioState.name === "language-create") {
+          if (scenarioState.step === 0) {
+            return toolCall(required("code_workspace_create"), {
+              workspaceId,
+              kind: "scratch",
+            });
+          }
+          const file = languageFiles[0];
+          if (scenarioState.step === 1 && file) {
+            return toolCall(required("code_workspace_create_file"), {
+              workspaceId,
+              path: file.path,
+              content: file.content,
+            });
+          }
+          return final(
+            `Created ${file?.path ?? "the requested source file"} in ${workspaceId} with a prepared receipt. PHASE4_LANGUAGE_FILE_DONE ${marker}`,
           );
         }
         if (scenarioState.name === "crud-stage-1") {

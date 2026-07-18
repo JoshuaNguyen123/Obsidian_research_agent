@@ -11,6 +11,7 @@ import {
   ensureRequiredWriteLoopBudget,
   extractExactMarkdownReplacementPayload,
   getExplicitMermaidWorkflowToolNames,
+  getExplicitCodeToolNames,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
   getRestorableCompletedGraphToolNames,
@@ -103,6 +104,21 @@ test("prepared background Code intent requires an affirmative scoped continuatio
       "Do not run the exact prepared Code validation commit in the background; only describe it.",
     ),
     false,
+  );
+});
+
+test("explicit Code tool selection does not widen a tool name to its prefix", () => {
+  assert.deepEqual(
+    getExplicitCodeToolNames(
+      "Use code_workspace_create_file through the prepared action path.",
+    ),
+    ["code_workspace_create_file"],
+  );
+  assert.deepEqual(
+    getExplicitCodeToolNames(
+      "Use code_workspace_create, then code_workspace_create_file exactly once.",
+    ),
+    ["code_workspace_create", "code_workspace_create_file"],
   );
 });
 

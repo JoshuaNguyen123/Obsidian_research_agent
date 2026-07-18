@@ -51,6 +51,7 @@ Thumbs.db
 
 # Local-only planning, agent, and skill context
 /AGENTS.md
+/Agents.md
 /agents.md
 AGENTS.local.md
 agents.local.md

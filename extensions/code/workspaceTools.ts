@@ -28,6 +28,10 @@ import {
   type RepositoryProfileV2,
 } from "./repositories";
 import { canonicalJson } from "../../packages/headless-runtime/src/canonicalize";
+import {
+  CODE_CREATION_LANGUAGE_SUMMARY_V1,
+  detectCodeCreationLanguageV1,
+} from "./CodeCreationLanguagesV1";
 
 export const CODE_WORKSPACE_TOOL_NAMES_V2 = [
   "code_workspace_create",
@@ -238,14 +242,16 @@ class WorkspaceToolRuntimeV2 {
         } else if (name === "code_workspace_create_file") {
           await assertMissing(this.manager, workspaceId, targetPath);
           const content = requiredString(args.content, "content", true);
+          const sourceLanguage = detectCodeCreationLanguageV1(targetPath);
           outboundBytes = byteLength(content);
           expected = absentFingerprint(workspaceId, targetPath);
           normalizedArgs.expectedTargetState = "absent";
           normalizedArgs.expectedSha256 = null;
           normalizedArgs.content = content;
+          if (sourceLanguage) normalizedArgs.creationLanguage = sourceLanguage.id;
           normalizedArgs.expectedAfterSha256 = sha256Text(content);
           normalizedArgs.payloadBytes = outboundBytes;
-          summary = `Create ${targetPath} without overwrite while the target remains absent.`;
+          summary = `Create ${sourceLanguage ? `${sourceLanguage.displayName} source file ` : ""}${targetPath} without overwrite while the target remains absent.`;
           action = "create";
         } else if (name === "code_workspace_append") {
           const stat = await this.manager.stat(workspaceId, targetPath);
@@ -265,7 +271,9 @@ class WorkspaceToolRuntimeV2 {
           action = "append";
         } else if (name === "code_workspace_write_expected" || name === "write_workspace_file") {
           const content = requiredString(args.content, "content", true);
+          const sourceLanguage = detectCodeCreationLanguageV1(targetPath);
           normalizedArgs.content = content;
+          if (sourceLanguage) normalizedArgs.creationLanguage = sourceLanguage.id;
           normalizedArgs.expectedAfterSha256 = sha256Text(content);
           outboundBytes = byteLength(content);
           normalizedArgs.payloadBytes = outboundBytes;
@@ -1409,7 +1417,16 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
 
 function objectSchema(properties: Record<string, JsonSchemaObjectV1>, required: string[] = []): JsonSchemaObjectV1 { return { type: "object", properties, required, additionalProperties: false }; }
 function stringSchema(): JsonSchemaObjectV1 { return { type: "string" }; }
-function description(name: string): string { return `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace.`; }
+function description(name: string): string {
+  const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace.`;
+  return [
+    "code_workspace_create_file",
+    "code_workspace_write_expected",
+    "write_workspace_file",
+  ].includes(name)
+    ? `${base} Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`
+    : base;
+}
 function workspaceIdFrom(args: Record<string, unknown>, context: ScopedExtensionContextV1): string { return (optionalString(args.workspaceId) ?? context.missionId ?? context.operationId ?? "adhoc").toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 128) || "adhoc"; }
 function runId(context: ScopedExtensionContextV1): string { return context.missionId ?? context.operationId ?? "adhoc"; }
 function requiredPath(args: Record<string, unknown>, ...names: string[]): string { for (const name of names) { const value = optionalString(args[name]); if (value) return assertWorkspaceRelativePathV2(value); } throw new WorkspaceManagerErrorV2("invalid_arguments", `${names[0]} is required.`); }
