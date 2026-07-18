@@ -2262,14 +2262,6 @@ function selectForegroundValidationCommand(
         ? "full"
         : "bootstrap";
   const exact = catalog.filter((command) => command.phase === exactPhase);
-  if (exact.length === 1) return exact[0];
-  if (exact.length > 1) {
-    throw new CodeSandboxContributionErrorV2(
-      "sandbox_validation_command_ambiguous",
-      `The trusted repository profile has multiple ${exactPhase} commands for project ${projectId}.`,
-    );
-  }
-
   const legacyFull = catalog.filter((command) => command.phase === "full");
   const isLegacyV1Catalog = legacyFull.length > 0 && legacyFull.every((command) =>
     /^root-full-\d+$/u.test(command.id),
@@ -2281,6 +2273,13 @@ function selectForegroundValidationCommand(
     return purpose === "validation_full"
       ? legacyFull.at(-1)!
       : legacyFull[0];
+  }
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new CodeSandboxContributionErrorV2(
+      "sandbox_validation_command_ambiguous",
+      `The trusted repository profile has multiple ${exactPhase} commands for project ${projectId}.`,
+    );
   }
   if (
     legacyFull.length === 1 &&

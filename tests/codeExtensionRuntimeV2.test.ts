@@ -526,6 +526,24 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
       sha256: readback.sha256,
       bytes: readback.bytes,
     }]);
+    const targetedPreparation = await runtime.resolveSandboxPreparationInput(
+      "validation_targeted",
+      manifest.workspaceId,
+    );
+    assert.equal(
+      targetedPreparation.commandId,
+      "root-full-1",
+      "migrated V1 profiles keep their first command as the targeted validation lane",
+    );
+    const fullPreparation = await runtime.resolveSandboxPreparationInput(
+      "validation_full",
+      manifest.workspaceId,
+    );
+    assert.equal(
+      fullPreparation.commandId,
+      "root-full-2",
+      "migrated V1 profiles keep their last command as a distinct fresh full validation lane",
+    );
     const repairBinding = await runtime.resolveRepairWorkspaceBinding({
       workspaceId: manifest.workspaceId,
       profileKey: profile.key,
