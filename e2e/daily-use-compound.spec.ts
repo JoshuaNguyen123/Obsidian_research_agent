@@ -225,6 +225,10 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
         preserveConfiguredGitHubCredential: true,
       },
     );
+    // A newly prepared extension migration is intentionally activated only on
+    // the next plugin load. Exercise that production reload boundary before
+    // asking Integrations for live provider discovery.
+    await harness.restartCorePlugin();
     const connection = await configureProtectedConnections(
       harness.page,
       requestedLinearTeamId,
