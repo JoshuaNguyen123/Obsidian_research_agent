@@ -7,6 +7,8 @@ test("core persistence preserves only exact extension-owned plugin namespaces", 
   const selected = selectExtensionOwnedPluginData({
     schemaVersion: 1,
     codeRuntimeState: { profile: "retained" },
+    codeRepairCheckpointsV1: { revision: 3, checkpoints: { repair: "retained" } },
+    codeValidationReceiptsV1: { revision: 4, receipts: { validation: "retained" } },
     companionRuntimeState: { service: "retained" },
     backgroundGitHubHostStateV1: { binding: "retained" },
     ollamaApiKey: "must-not-survive",
@@ -18,6 +20,8 @@ test("core persistence preserves only exact extension-owned plugin namespaces", 
   assert.deepEqual(selected, {
     schemaVersion: 1,
     codeRuntimeState: { profile: "retained" },
+    codeRepairCheckpointsV1: { revision: 3, checkpoints: { repair: "retained" } },
+    codeValidationReceiptsV1: { revision: 4, receipts: { validation: "retained" } },
     companionRuntimeState: { service: "retained" },
     backgroundGitHubHostStateV1: { binding: "retained" },
   });

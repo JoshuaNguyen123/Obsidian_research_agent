@@ -1,6 +1,8 @@
 export const EXTENSION_OWNED_PLUGIN_DATA_KEYS = Object.freeze([
   "schemaVersion",
   "codeRuntimeState",
+  "codeRepairCheckpointsV1",
+  "codeValidationReceiptsV1",
   "companionRuntimeState",
   "backgroundGitHubHostStateV1",
 ] as const);
