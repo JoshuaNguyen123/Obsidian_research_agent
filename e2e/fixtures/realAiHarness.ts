@@ -321,7 +321,15 @@ async function approveUntilMissionComplete(
           : [],
       };
     }, { pluginId: NATIVE_CORE_PLUGIN_ID });
-    if (ui.ledger || ui.graph.length > 0) {
+    const preAuthorityReconciliationBlock = ui.diagnostics.some(
+      (diagnostic: { id: string; errorCode: string }) =>
+        diagnostic.id === "resume-mutation-reconciliation-required" ||
+        diagnostic.errorCode === "mutation_reconciliation_required",
+    );
+    if (
+      (ui.ledger || ui.graph.length > 0) &&
+      !preAuthorityReconciliationBlock
+    ) {
       lastDurableState = JSON.parse(JSON.stringify(ui)) as Record<string, unknown>;
     }
     const committedRestartStage = ui.projectStages.find(
