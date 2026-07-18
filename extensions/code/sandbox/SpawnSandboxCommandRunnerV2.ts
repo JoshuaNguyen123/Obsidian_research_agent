@@ -212,8 +212,9 @@ function validateFixedProviderSpec(
     invalidSpec("Sandbox provider processes cannot inherit action environment values.");
   }
   if (
-    value.args.some((argument) =>
-      /(?:docker\.sock|podman\.sock|\/var\/run|^\/$)/i.test(argument),
+    value.args.some((argument, index) =>
+      /(?:docker\.sock|podman\.sock|\/var\/run)/i.test(argument) ||
+      (argument === "/" && value.args[index - 1] !== "--remount-ro"),
     ) ||
     value.args.some((argument) =>
       ["--privileged", "--mount", "--volume", "-v", "--host", "-H"].includes(
@@ -248,6 +249,7 @@ function validateFixedProviderSpec(
     requireSequence(value.args, ["--ro-bind"]);
     requireArgument(value.args, "--die-with-parent");
     requireArgument(value.args, "--new-session");
+    requireSequence(value.args, ["--remount-ro", "/"]);
     if (value.purpose === "execute") {
       requireArgument(value.args, "--cpu-count");
       requireArgument(value.args, "--memory-mb");

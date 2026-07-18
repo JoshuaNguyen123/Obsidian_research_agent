@@ -377,7 +377,7 @@ test("web_fetch exposes freshness controls and auto-refreshes latest missions", 
     context,
   ) as { fromCache: boolean; contentHash: string };
   assert.equal(cached.fromCache, true);
-  assert.match(cached.contentHash, /^fnv1a32x2:/);
+  assert.match(cached.contentHash, /^sha256:[a-f0-9]{64}$/u);
   assert.equal(transportCalls, 1);
 
   now = new Date(now.getTime() + 61_000);

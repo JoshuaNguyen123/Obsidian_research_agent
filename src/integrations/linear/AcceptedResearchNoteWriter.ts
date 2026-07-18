@@ -57,12 +57,12 @@ export interface AcceptedResearchNoteWriteRequestV1 {
 
 export interface AcceptedResearchNoteWriteResultV1 {
   path: string;
-  operation: "create" | "append";
+  operation: "create" | "append" | "no_op";
   beforeSha256: string | null;
   afterSha256: string;
   noteReceiptId: string;
   artifact: AcceptedResearchArtifactV1;
-  transaction: DiagramArtifactCreateTransactionReceipt | DiagramArtifactUpdateReceipt;
+  transaction: DiagramArtifactCreateTransactionReceipt | DiagramArtifactUpdateReceipt | null;
 }
 
 export interface ResearchNoteBacklinkResultV1 {
@@ -125,21 +125,49 @@ export class AcceptedResearchNoteWriter {
     const rendered = renderAcceptedResearchNotePackageV1(normalized);
     let beforeSha256: string | null = null;
     let afterSha256: string;
-    let operation: "create" | "append";
-    let transaction: DiagramArtifactCreateTransactionReceipt | DiagramArtifactUpdateReceipt;
+    let operation: "create" | "append" | "no_op";
+    let transaction: DiagramArtifactCreateTransactionReceipt | DiagramArtifactUpdateReceipt | null;
 
     if (request.mode === "create") {
-      const created = await this.store.createMany([{
-        path: request.path,
-        content: rendered,
-        validator: ({ content }) => validateRenderedResearchNote(content, normalized.title),
-      }]);
-      if (created.status !== "committed" || !created.artifacts[0]?.afterSha256) {
-        throw new Error(created.error?.message ?? "Accepted research note create rolled back.");
+      let existing = null;
+      try {
+        existing = await this.store.read(request.path);
+      } catch (error) {
+        if (!(error instanceof DiagramArtifactStoreError && error.code === "artifact_not_found")) {
+          throw error;
+        }
       }
-      operation = "create";
-      afterSha256 = created.artifacts[0].afterSha256;
-      transaction = created;
+      if (existing) {
+        if (existing.content !== rendered) {
+          throw new DiagramArtifactStoreError(
+            "path_exists",
+            `Accepted research note cannot overwrite changed content: ${existing.path}.`,
+          );
+        }
+        const validation = validateRenderedResearchNote(existing.content, normalized.title);
+        if (!validation.ok) {
+          throw new DiagramArtifactStoreError(
+            "validation_failed",
+            validation.errors.join(" ") || "Accepted research note readback is invalid.",
+          );
+        }
+        operation = "no_op";
+        beforeSha256 = existing.sha256;
+        afterSha256 = existing.sha256;
+        transaction = null;
+      } else {
+        const created = await this.store.createMany([{
+          path: request.path,
+          content: rendered,
+          validator: ({ content }) => validateRenderedResearchNote(content, normalized.title),
+        }]);
+        if (created.status !== "committed" || !created.artifacts[0]?.afterSha256) {
+          throw new Error(created.error?.message ?? "Accepted research note create rolled back.");
+        }
+        operation = "create";
+        afterSha256 = created.artifacts[0].afterSha256;
+        transaction = created;
+      }
     } else {
       const current = await this.store.read(request.path);
       beforeSha256 = current.sha256;

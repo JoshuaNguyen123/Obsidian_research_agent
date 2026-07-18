@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -11,6 +12,7 @@ import { createResearchProjectPlanV1 } from "../src/agent/projectLifecycle";
 import {
   LINEAR_RESEARCH_PROJECT_HIERARCHY_RECEIPT_TOOL_NAME,
   ResearchProjectHierarchyWorkflowV1,
+  providerSummary,
   type ResearchProjectHierarchyCheckpointV1,
   type ResearchProjectHierarchyCheckpointPortV1,
 } from "../src/integrations/linear/ResearchProjectHierarchyWorkflowV1";
@@ -20,7 +22,17 @@ import type {
 } from "../src/integrations/linear/HostLinearActionExecutor";
 import type { LinearToolClient } from "../src/integrations/linear/LinearTools";
 import type { LinearBaseRecord, LinearOperationResult } from "../src/integrations/linear/types";
-import { hasExplicitResearchProjectHierarchyIntent } from "../src/tools/researchProjectHierarchyTool";
+import {
+  canonicalizeHierarchyAcceptanceCriteria,
+  canonicalizeHierarchyDependencyKeys,
+  canonicalizeHierarchyItemTitle,
+  deriveResearchProjectWorkItemFingerprint,
+  deriveResearchProjectPlanIdForAcceptedArtifact,
+  hasExplicitResearchProjectHierarchyIntent,
+  resolveCanonicalAcceptedResearchFingerprint,
+  resolveCanonicalAcceptedResearchNotePath,
+  selectAcceptedResearchBindingForCurrentMission,
+} from "../src/tools/researchProjectHierarchyTool";
 import type { ToolExecutionContext } from "../src/tools/types";
 
 const NOW = "2026-07-16T15:00:00.000Z";
@@ -39,6 +51,176 @@ test("hierarchy intent does not capture single accepted-research issue publicati
     ),
     true,
   );
+});
+
+test("hierarchy plan identity is host-derived from the accepted artifact", () => {
+  assert.equal(
+    deriveResearchProjectPlanIdForAcceptedArtifact(HASH("a")),
+    `research-plan-${"a".repeat(32)}`,
+  );
+});
+
+test("hierarchy work-item identity is host-derived from accepted research and canonical issue content", () => {
+  const input = {
+    acceptedResearchArtifactFingerprint: HASH("a"),
+    key: "checkers-game",
+    title: "Build checkers",
+    description: "Implement the accepted rules as a Python game.",
+    dependencyKeys: [],
+    acceptanceCriteria: ["The targeted tests pass."],
+  };
+  const first = deriveResearchProjectWorkItemFingerprint(input);
+  assert.match(first, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(deriveResearchProjectWorkItemFingerprint(input), first);
+  assert.notEqual(
+    deriveResearchProjectWorkItemFingerprint({
+      ...input,
+      acceptanceCriteria: ["The targeted tests and CLI smoke test pass."],
+    }),
+    first,
+  );
+});
+
+test("hierarchy uses the durable accepted artifact and rejects a conflicting valid fingerprint", () => {
+  assert.equal(
+    resolveCanonicalAcceptedResearchFingerprint(null, HASH("a")),
+    HASH("a"),
+  );
+  assert.throws(
+    () => resolveCanonicalAcceptedResearchFingerprint(HASH("b"), HASH("a")),
+    /conflicts with the durable note binding/u,
+  );
+});
+
+test("hierarchy uses the durable note path and rejects a conflicting supplied path", () => {
+  assert.equal(
+    resolveCanonicalAcceptedResearchNotePath(null, "Projects/Checkers/Research.md"),
+    "Projects/Checkers/Research.md",
+  );
+  assert.throws(
+    () => resolveCanonicalAcceptedResearchNotePath(
+      "Projects/Other.md",
+      "Projects/Checkers/Research.md",
+    ),
+    /conflicts with the durable accepted-research binding/u,
+  );
+});
+
+test("hierarchy resolves host lineage before checking a model path assertion", () => {
+  const source = readFileSync(
+    new URL("../src/tools/researchProjectHierarchyTool.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /resolveAcceptedResearchBinding\(\{[\s\S]*?runId,[\s\S]*?notePath: null,[\s\S]*?\}\)/u,
+  );
+  assert.match(
+    source,
+    /resolveCanonicalAcceptedResearchNotePath\([\s\S]*?planInput\.suppliedSourceNotePath/u,
+  );
+});
+
+test("hierarchy selects root-run lineage or one note named by the canonical graph objective", () => {
+  const candidates = [
+    {
+      runId: "run-root",
+      artifactFingerprint: HASH("a"),
+      notePath: "Projects/Checkers/Research.md",
+    },
+    {
+      runId: "run-other",
+      artifactFingerprint: HASH("b"),
+      notePath: "Projects/Chess/Research.md",
+    },
+  ];
+  assert.deepEqual(
+    selectAcceptedResearchBindingForCurrentMission(candidates, {
+      acceptedRunIds: new Set(["run-root"]),
+      missionObjective: "Continue a child segment.",
+    }),
+    {
+      artifactFingerprint: HASH("a"),
+      notePath: "Projects/Checkers/Research.md",
+    },
+  );
+  assert.deepEqual(
+    selectAcceptedResearchBindingForCurrentMission(candidates, {
+      acceptedRunIds: new Set(["run-child"]),
+      missionObjective:
+        "Write accepted research to Projects/Checkers/Research.md, then publish it.",
+    }),
+    {
+      artifactFingerprint: HASH("a"),
+      notePath: "Projects/Checkers/Research.md",
+    },
+  );
+  assert.equal(
+    selectAcceptedResearchBindingForCurrentMission(candidates, {
+      acceptedRunIds: new Set(["run-child"]),
+      missionObjective: "Publish accepted research without naming its note.",
+    }),
+    null,
+  );
+});
+
+test("hierarchy canonicalizes only bounded equivalent issue-list shorthand", () => {
+  assert.deepEqual(canonicalizeHierarchyDependencyKeys(null), []);
+  assert.deepEqual(canonicalizeHierarchyDependencyKeys("issue-a"), ["issue-a"]);
+  assert.deepEqual(
+    canonicalizeHierarchyAcceptanceCriteria("The CLI tests pass."),
+    ["The CLI tests pass."],
+  );
+  assert.deepEqual(
+    canonicalizeHierarchyAcceptanceCriteria({ id: "AC-1", text: "The board renders." }),
+    ["The board renders."],
+  );
+  assert.throws(
+    () => canonicalizeHierarchyAcceptanceCriteria({ text: "Valid", command: "hidden" }),
+    /may contain only id and text/u,
+  );
+  assert.throws(
+    () => canonicalizeHierarchyDependencyKeys({ key: "issue-a" }),
+    /must be an array or one logical issue key/u,
+  );
+});
+
+test("hierarchy canonicalizes only a non-conflicting Linear name alias to title", () => {
+  assert.equal(
+    canonicalizeHierarchyItemTitle(
+      { name: "Checkers implementation" },
+      "project",
+    ),
+    "Checkers implementation",
+  );
+  assert.equal(
+    canonicalizeHierarchyItemTitle(
+      { title: "Checkers implementation", name: "Checkers implementation" },
+      "project",
+    ),
+    "Checkers implementation",
+  );
+  assert.throws(
+    () =>
+      canonicalizeHierarchyItemTitle(
+        { title: "Checkers", name: "Chess" },
+        "project",
+      ),
+    /conflicts with its compatible name alias/u,
+  );
+  assert.throws(
+    () => canonicalizeHierarchyItemTitle({ name: "" }, "project"),
+    /project title must contain/u,
+  );
+});
+
+test("hierarchy keeps provider summaries bounded and preserves full markdown in content", () => {
+  const source = `Long initiative context ${"detail ".repeat(60)}`.trim();
+  const summary = providerSummary(source);
+  assert.equal(summary.length, 240);
+  assert.match(summary, /\.\.\.$/u);
+  assert.equal(summary.includes("\n"), false);
+  assert.equal(providerSummary("  Short\ncontext  "), "Short context");
 });
 
 test("hierarchy rejects a mismatched outer tool identity before preparation", async () => {
@@ -66,6 +248,16 @@ test("Linear hierarchy checkpoints every prepared action before one grouped appr
   assert.equal(result.checkpoint.items.every((item) => item.readbackFingerprint), true);
   assert.equal(fixture.mutations.length, 6);
   assert.equal(new Set(fixture.mutations).size, 6);
+  const initiativeInput = fixture.preparedArguments.find(
+    (item) => item.toolName === "linear_create_initiative",
+  )?.arguments.input as Record<string, unknown>;
+  const projectInput = fixture.preparedArguments.find(
+    (item) => item.toolName === "linear_create_project",
+  )?.arguments.input as Record<string, unknown>;
+  assert.equal(initiativeInput.description, fixture.plan.initiative.description);
+  assert.match(String(initiativeInput.content), /agentic-idempotency:/u);
+  assert.equal(projectInput.description, fixture.plan.project.description);
+  assert.match(String(projectInput.content), /agentic-idempotency:/u);
   assert.equal(
     result.receipt.toolName,
     LINEAR_RESEARCH_PROJECT_HIERARCHY_RECEIPT_TOOL_NAME,
@@ -94,7 +286,7 @@ test("hierarchy deduplicates an exact idempotency marker before preparing mutati
     id: "initiative-existing",
     resourceType: "initiative",
     name: plan.initiative.title,
-    description: `${plan.initiative.description}\n\n<!-- agentic-idempotency:${plan.initiative.idempotencyKey} -->`,
+    content: `${plan.initiative.description}\n\n<!-- agentic-idempotency:${plan.initiative.idempotencyKey} -->`,
     snapshotHash: HASH("e"),
   };
   const fixture = await hierarchyFixture({ plan, seed: [existing] });
@@ -116,6 +308,10 @@ async function hierarchyFixture(options: {
   const records = new Map((options.seed ?? []).map((record) => [record.id, record]));
   const checkpointStore = new MemoryCheckpointStore();
   const mutations: string[] = [];
+  const preparedArguments: Array<{
+    toolName: string;
+    arguments: Record<string, unknown>;
+  }> = [];
   let approvals = 0;
   let firstMutationSawPreparedCheckpoint = false;
   let failOnceAtMutation = options.failOnceAtMutation ?? -1;
@@ -154,6 +350,10 @@ async function hierarchyFixture(options: {
     }): Promise<HostLinearActionPreparation> {
       assert.equal(input.context.runId, input.runId);
       assert.equal(input.context.operationId, input.toolCallId);
+      preparedArguments.push({
+        toolName: input.toolName,
+        arguments: JSON.parse(JSON.stringify(input.arguments)),
+      });
       const resourceType = resourceTypeForTool(input.toolName);
       const id = `resource-${input.toolCallId}`.slice(0, 150);
       const action = await withPreparedActionFingerprint({
@@ -256,6 +456,7 @@ async function hierarchyFixture(options: {
     workflow,
     plan,
     mutations,
+    preparedArguments,
     checkpointStore,
     get approvals() { return approvals; },
     get firstMutationSawPreparedCheckpoint() { return firstMutationSawPreparedCheckpoint; },

@@ -103,6 +103,7 @@ test("repository profiles pin remote proof without granting publication", () => 
 });
 
 test("Python repository profiles accept the Linux python3 executable", () => {
+  const runtimeDigest = `sha256:${"c".repeat(64)}`;
   const profile = createRepositoryProfile({
     key: "python-checkers",
     displayName: "Python checkers",
@@ -122,6 +123,7 @@ test("Python repository profiles accept the Linux python3 executable", () => {
       protectedPaths: ["scripts"],
       allowedGeneratedPaths: [],
     },
+    runtimeDigests: { python: runtimeDigest },
   });
   assert.equal(profile.validationProfile.validationCommands[0]?.command, "python3");
   const migrated = migrateRepositoryProfileV1(profile);
@@ -129,4 +131,6 @@ test("Python repository profiles accept the Linux python3 executable", () => {
   assert.deepEqual(migrated.projects[0]?.ecosystems, ["python"]);
   assert.equal(migrated.validationCatalog[0]?.executable, "python3");
   assert.equal(migrated.pinnedRuntimes[0]?.executable, "python3");
+  assert.equal(migrated.pinnedRuntimes[0]?.digest, runtimeDigest);
+  assert.deepEqual(migrated.pinnedRuntimes[0]?.approval, "one_time_exact_digest");
 });

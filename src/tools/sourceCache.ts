@@ -1,4 +1,5 @@
 import type { ToolExecutionContext } from "./types";
+import { sha256Fingerprint } from "../agent/actions";
 import { normalizeVaultPath, truncateText } from "./validation";
 import { isSourceCachePath } from "./vaultExclusions";
 
@@ -69,7 +70,7 @@ export async function writeSourceCacheNote(
   const parserStatus = source.parserStatus ?? (
     source.content.trim() ? "parsed" : "empty"
   );
-  const contentHash = `fnv1a32x2:${hashSourceText(source.content)}`;
+  const contentHash = await sha256Fingerprint(content);
   const readableBody = [`# ${title}`, "", content].join("\n");
   const sectionCount = Math.max(
     1,
@@ -147,6 +148,9 @@ export async function findFreshCachedSource(
     }
     const parsed = parseCachedSourceNote(file.path, await ctx.app.vault.read(file));
     if (!parsed || parsed.normalizedUrl !== normalizedUrl) {
+      continue;
+    }
+    if (!isStrongContentHash(parsed.contentHash)) {
       continue;
     }
     const age = now - Date.parse(parsed.fetchedAt);
@@ -283,6 +287,9 @@ async function findFreshManifestEntry(
   if (!entry) {
     return null;
   }
+  if (!isStrongContentHash(entry.contentHash)) {
+    return null;
+  }
   const age = (ctx.now?.().getTime() ?? Date.now()) - Date.parse(entry.fetchedAt);
   if (!Number.isFinite(age) || age < 0 || age > maxAgeMs) {
     return null;
@@ -388,6 +395,10 @@ function normalizeCachedSourceRecord(value: unknown): CachedSource | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStrongContentHash(value: string): boolean {
+  return /^sha256:[a-f0-9]{64}$/u.test(value);
 }
 
 function stripFrontmatter(markdown: string): string {

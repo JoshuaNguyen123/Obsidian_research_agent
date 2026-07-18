@@ -53,9 +53,13 @@ test.describe.serial("configured native Linear live proof", () => {
         if (!plugin) throw new Error("Agentic Researcher is unavailable.");
 
         const credential = plugin.getLinearCredentialStatus?.();
-        if (credential?.configured !== true || credential?.secure !== true) {
+        const oauth = plugin.getLinearOAuthStatus?.();
+        if (
+          oauth?.connected !== true &&
+          (credential?.configured !== true || credential?.secure !== true)
+        ) {
           throw new Error(
-            "A persistent opaque Linear credential is required; plaintext fallback is not accepted.",
+            "A persistent opaque Linear OAuth or personal-key credential is required; plaintext fallback is not accepted.",
           );
         }
 
@@ -336,8 +340,10 @@ test.describe.serial("configured native Linear live proof", () => {
         }
 
         return {
-          credentialConfigured: credential.configured,
-          credentialSecure: credential.secure,
+          credentialConfigured:
+            oauth?.connected === true || credential?.configured === true,
+          credentialSecure:
+            oauth?.connected === true || credential?.secure === true,
           teamCount: snapshot.teams.length,
           projectCount: snapshot.projects.length,
           workflowStateCount: snapshot.workflowStates.length,

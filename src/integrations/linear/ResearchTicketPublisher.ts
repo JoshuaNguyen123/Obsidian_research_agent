@@ -136,7 +136,8 @@ export interface ResearchTicketPublisherOptions {
     "prepare" | "executePrepared"
   >;
   queueTeamId: string;
-  queueProjectId: string;
+  /** Omit to publish a team-scoped issue that is not assigned to a project. */
+  queueProjectId?: string | null;
   duplicateCandidateLimit?: number;
 }
 
@@ -183,15 +184,15 @@ interface DuplicateSearchResult {
  */
 export class ResearchTicketPublisher {
   private readonly queueTeamId: string;
-  private readonly queueProjectId: string;
+  private readonly queueProjectId: string | null;
   private readonly duplicateCandidateLimit: number;
 
   constructor(private readonly options: ResearchTicketPublisherOptions) {
     this.queueTeamId = requireIdentifier(options.queueTeamId, "queue team ID");
-    this.queueProjectId = requireIdentifier(
-      options.queueProjectId,
-      "queue project ID",
-    );
+    this.queueProjectId = typeof options.queueProjectId === "string" &&
+      options.queueProjectId.trim()
+      ? requireIdentifier(options.queueProjectId, "queue project ID")
+      : null;
     this.duplicateCandidateLimit = normalizeDuplicateCandidateLimit(
       options.duplicateCandidateLimit,
     );
@@ -335,7 +336,7 @@ export class ResearchTicketPublisher {
       arguments: {
         id: ticket.deterministicIssueId,
         teamId: this.queueTeamId,
-        projectId: this.queueProjectId,
+        ...(this.queueProjectId ? { projectId: this.queueProjectId } : {}),
         title: ticket.title,
         description: ticket.description,
       },
@@ -386,6 +387,7 @@ export class ResearchTicketPublisher {
     const mismatch = ticketReadbackMismatch(
       readback,
       ticket.spec,
+      this.queueTeamId,
       this.queueProjectId,
     );
     if (mismatch) {
@@ -430,7 +432,9 @@ export class ResearchTicketPublisher {
         "issues.search",
         {
           query,
-          filter: { project: { id: { eq: this.queueProjectId } } },
+          filter: this.queueProjectId
+            ? { project: { id: { eq: this.queueProjectId } } }
+            : { team: { id: { eq: this.queueTeamId } } },
           first: remaining,
           includeArchived: false,
         },
@@ -440,7 +444,10 @@ export class ResearchTicketPublisher {
       for (const issue of page.items) {
         if (candidates.size >= this.duplicateCandidateLimit) break;
         // Never follow or read a candidate returned outside the pinned queue.
-        if (issue.project?.id !== this.queueProjectId) continue;
+        if (
+          issue.team.id !== this.queueTeamId ||
+          (issue.project?.id ?? null) !== this.queueProjectId
+        ) continue;
         candidates.set(issue.id, issue);
       }
     }
@@ -456,7 +463,12 @@ export class ResearchTicketPublisher {
         }
         throw error;
       }
-      if (!ticketReadbackMismatch(readback, spec, this.queueProjectId)) {
+      if (!ticketReadbackMismatch(
+        readback,
+        spec,
+        this.queueTeamId,
+        this.queueProjectId,
+      )) {
         return { issue: readback, candidatesExamined: candidates.size };
       }
     }
@@ -758,7 +770,7 @@ function deterministicIssueUuid(fingerprint: string): string {
   return [
     hex.slice(0, 8),
     hex.slice(8, 12),
-    `5${hex.slice(13, 16)}`,
+    `4${hex.slice(13, 16)}`,
     `${variant}${hex.slice(17, 20)}`,
     hex.slice(20, 32),
   ].join("-");
@@ -767,9 +779,13 @@ function deterministicIssueUuid(fingerprint: string): string {
 function ticketReadbackMismatch(
   issue: LinearIssueRecord,
   expected: ParsedCompatibleWorkItemSpec,
-  queueProjectId: string,
+  queueTeamId: string,
+  queueProjectId: string | null,
 ): string | null {
-  if (issue.project?.id !== queueProjectId) {
+  if (issue.team.id !== queueTeamId) {
+    return "Linear issue readback is outside the pinned queue team.";
+  }
+  if ((issue.project?.id ?? null) !== queueProjectId) {
     return "Linear issue readback is outside the pinned queue project.";
   }
   if (typeof issue.description !== "string") {
@@ -873,9 +889,12 @@ function publisherError(
     return { code: error.code, message: error.message };
   }
   if (error instanceof LinearClientError) {
+    const operationSuffix = error.operationKey
+      ? ` (operation ${error.operationKey})`
+      : "";
     return {
       code: error.code,
-      message: error.message,
+      message: `${error.message}${operationSuffix}`,
       ...(error.details ? { details: { graphqlErrors: error.details } } : {}),
     };
   }

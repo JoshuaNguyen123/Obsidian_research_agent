@@ -859,10 +859,13 @@ function buildProviderCommand(
       "--die-with-parent",
       "--new-session",
       "--ro-bind", provider.runtimeRoot!, "/runtime",
+      "--ro-bind", `${provider.runtimeRoot!}/lib`, "/lib",
+      "--ro-bind", `${provider.runtimeRoot!}/lib64`, "/lib64",
       "--tmpfs", "/workspace",
       "--tmpfs", "/tmp",
       "--proc", "/proc",
       "--dev", "/dev",
+      "--remount-ro", "/",
       "--chdir", "/workspace",
       "--setenv", "HOME", "/tmp/home",
       "--setenv", "PATH", "/runtime/bin",
@@ -874,7 +877,10 @@ function buildProviderCommand(
       ? ["--distribution", provider.wslDistribution!, "--user", "agentic", "--exec", ...bwrap]
       : bwrap.slice(1);
   }
-  if (args.some((argument) => /(?:docker\.sock|podman\.sock|\/var\/run|^\/$)/i.test(argument))) {
+  if (args.some((argument, index) =>
+    /(?:docker\.sock|podman\.sock|\/var\/run)/i.test(argument) ||
+    (argument === "/" && args[index - 1] !== "--remount-ro"),
+  )) {
     throw new SandboxManagerV2Error("Sandbox command attempted a root or container-socket mount.");
   }
   return {

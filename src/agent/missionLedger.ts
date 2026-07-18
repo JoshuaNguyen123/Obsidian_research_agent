@@ -116,6 +116,8 @@ export interface MissionEvidence {
   title: string;
   path?: string;
   url?: string;
+  /** Strong source-content proof retained for exact downstream research binding. */
+  contentHash?: string;
   sourceId?: string;
   passageId?: string;
   passageIds?: string[];
@@ -1251,12 +1253,16 @@ function normalizeMissionEvidence(value: unknown): MissionEvidence | null {
     value.parserStatus === "legacy_unknown"
       ? value.parserStatus
       : undefined;
+  const contentHash = getString(value.contentHash);
   return {
     id,
     kind,
     title,
     ...(getString(value.path) ? { path: getString(value.path) } : {}),
     ...(getString(value.url) ? { url: getString(value.url) } : {}),
+    ...(contentHash && /^sha256:[a-f0-9]{64}$/u.test(contentHash)
+      ? { contentHash }
+      : {}),
     ...(sourceId ? { sourceId } : {}),
     ...(passageId ? { passageId } : {}),
     ...(passageIds.length > 0 ? { passageIds } : {}),

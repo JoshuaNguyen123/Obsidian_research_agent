@@ -3543,7 +3543,11 @@ function joinVaultPath(folder: string, child: string): string {
 function getMarkdownFileByPath(context: ToolExecutionContext, path: string): TFile {
   const file = context.app.vault.getFileByPath(path);
   if (!file || file.extension !== "md") {
-    throw new Error(`Markdown file not found: ${path}`);
+    throw new ToolExecutionError(
+      "vault_markdown_not_found",
+      `Markdown file not found: ${path}`,
+      { mutationState: "not_applied" },
+    );
   }
 
   return file;

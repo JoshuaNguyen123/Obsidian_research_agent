@@ -128,6 +128,35 @@ test("ambiguous Linear publication persists reconcile_required and never backlin
   assert.equal(fixture.trace.includes("backlink_started"), false);
 });
 
+test("a retry adopts the exact pending issue through fresh duplicate readback without rewriting the accepted note", async () => {
+  const fixture = workflowFixture("reconcile_required");
+  const first = await fixture.workflow.execute(requestFixture());
+  assert.equal(first.status, "reconcile_required");
+  fixture.publisher.mode = "deduplicated";
+
+  const second = await fixture.workflow.execute(requestFixture());
+
+  assert.equal(second.ok, true);
+  if (!second.ok) return;
+  assert.equal(second.publication, "deduplicated");
+  assert.equal(fixture.publisher.mutationCount, 1);
+  assert.equal(
+    fixture.checkpoints.filter((entry) => entry.status === "note_verified").length,
+    1,
+  );
+  assert.deepEqual(fixture.checkpoints.map((entry) => entry.status), [
+    "note_verified",
+    "reconcile_required",
+    "linear_verified",
+    "complete",
+  ]);
+  assert.equal(fixture.approvalRequests.at(-1)?.proposedAction, "reuse_duplicate");
+  assert.match(
+    fixture.vault.files.get("Research/Agent platform.md") ?? "",
+    /https:\/\/linear\.app\/acme\/issue\/ENG-42/u,
+  );
+});
+
 test("backlink failure persists waiting_obsidian after verified Linear lineage without recreating the issue", async () => {
   const fixture = workflowFixture("created");
   fixture.vault.failLinearBacklinkWrites = true;
@@ -195,6 +224,12 @@ function workflowFixture(
       },
     },
     lineage: {
+      get: async (publicationId) =>
+        structuredClone(
+          [...checkpoints]
+            .reverse()
+            .find((checkpoint) => checkpoint.publicationId === publicationId) ?? null,
+        ),
       persist: async (checkpoint) => {
         checkpoints.push(structuredClone(checkpoint));
       },
@@ -212,7 +247,7 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
   private ticket: ReturnType<typeof ticketFromRequest> | null = null;
 
   constructor(
-    private readonly mode: "created" | "deduplicated" | "reconcile_required",
+    public mode: "created" | "deduplicated" | "reconcile_required",
   ) {}
 
   async preview(request: ResearchTicketPreviewRequest) {

@@ -139,6 +139,22 @@ test("progress monitor flags repeated no-evidence tool calls", () => {
   assert.equal(progress.correction, "block");
 });
 
+test("reflex controller fails closed when the embedding provider throws", async () => {
+  const output = await new AgenticReflexController().evaluate(
+    input({
+      embeddingProvider: {
+        async embed() {
+          throw new Error("helper unavailable at C:\\private\\semantic with lin_api_secret");
+        },
+      },
+    }),
+  );
+  assert.equal(output.intent.label, "unknown");
+  assert.equal(output.intent.reason, "embedding_provider_failed");
+  assert.equal(output.intent.reasonCode, "embedding_provider_unavailable");
+  assert.equal(JSON.stringify(output).includes("private"), false);
+});
+
 test("progress monitor corrects once then blocks an unchanged frontier even with old evidence", () => {
   const priorEvidence = [{
     id: "old",

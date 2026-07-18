@@ -366,15 +366,38 @@ export function getExplicitGitHubCatalogMutationToolNames(prompt: string): GitHu
   if (/\b(comment on|add (?:a )?comment|post (?:a )?comment|create (?:a )?comment)\b/iu.test(prompt)) names.add("github_create_issue_comment");
   if (reviewComment && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_review_comment");
   if (!reviewComment && /\bcomment\b/iu.test(prompt) && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_issue_comment");
-  if (/\bdelete\b/iu.test(prompt) && /\bcomment\b/iu.test(prompt)) names.add("github_delete_owned_comment");
+  if (hasAffirmativeActionClause(prompt, /\bdelete\b/iu, /\bcomment\b/iu)) {
+    names.add("github_delete_owned_comment");
+  }
   if (/\b(reply|respond)\b/iu.test(prompt) && reviewComment) names.add("github_reply_to_review_comment");
   if (/\b(submit|create|leave|approve|request changes?)\b/iu.test(prompt) && /\breview\b/iu.test(prompt) && !reviewComment) names.add("github_create_pull_request_review");
   if (pullRequest && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_pull_request");
   if (pullRequest && /\bclose\b/iu.test(prompt) && !/\bmerge\b/iu.test(prompt)) names.add("github_close_pull_request");
   if (pullRequest && /\breopen\b/iu.test(prompt)) names.add("github_reopen_pull_request");
   if (/\brerun\b/iu.test(prompt) && /\b(failed|workflow|job|check|action)\b/iu.test(prompt)) names.add("github_rerun_failed_workflow_jobs");
-  if (/\bdelete\b/iu.test(prompt) && /\bbranch\b/iu.test(prompt)) names.add("github_delete_owned_branch");
+  if (hasAffirmativeActionClause(prompt, /\bdelete\b/iu, /\bbranch\b/iu)) {
+    names.add("github_delete_owned_branch");
+  }
   return [...names].filter((name) => MUTATION_NAMES.has(name));
+}
+
+function hasAffirmativeActionClause(
+  prompt: string,
+  action: RegExp,
+  target: RegExp,
+): boolean {
+  return prompt
+    .split(/(?:[.!?;\r\n]+|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some((clause) => {
+      const match = action.exec(clause);
+      if (!match || !target.test(clause)) return false;
+      const prefix = clause.slice(0, match.index);
+      return !/(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(
+        prefix,
+      );
+    });
 }
 
 export function createGitHubCatalogTools(

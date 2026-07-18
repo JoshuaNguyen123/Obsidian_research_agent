@@ -303,7 +303,8 @@ function buildBlockedNextAction(
     return {
       kind: "blocked",
       reason: `WAL reconcile required for ${first.operationId ?? first.toolName ?? "operation"}.`,
-      summary: "Resolve vault transaction reconciliation before continuing.",
+      summary:
+        `Resolve vault transaction reconciliation for ${first.toolName ?? "the pending operation"} before continuing.`,
     };
   }
   if (snapshot.pendingApprovals) {

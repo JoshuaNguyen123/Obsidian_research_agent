@@ -101,6 +101,12 @@ test("run coordinator retains only redacted durable source evidence", async () =
         content: "must-not-escape",
       },
     });
+    events.onTrace?.({
+      id: "mission-graph-initialization-failed",
+      kind: "error",
+      message: "Mission graph initialization failed before tool execution: invalid bounded graph.",
+      error: { code: "mission_graph_initialization_failed", message: "bounded" },
+    });
     events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
   });
 
@@ -130,6 +136,14 @@ test("run coordinator retains only redacted durable source evidence", async () =
       toolName: "append_to_current_file",
       message: "Held candidate: fail.",
       missing: ["claim_grounding:missing"],
+    },
+    {
+      schemaVersion: 1,
+      id: "mission-graph-initialization-failed",
+      kind: "error",
+      message: "Mission graph initialization failed before tool execution: invalid bounded graph.",
+      errorCode: "mission_graph_initialization_failed",
+      missing: [],
     },
   ]);
   assert.doesNotMatch(
@@ -372,6 +386,95 @@ test("run coordinator bounds replay payloads and retained receipts", async () =>
   assert.ok(snapshot.droppedEventCount > 0);
   assert.equal(snapshot.lastReceipts.length, 256);
   assert.equal(snapshot.lastReceipts.at(-1)?.path, "Note-899.md");
+});
+
+test("run coordinator retains a bounded redacted terminal rejection", async () => {
+  const coordinator = new RunCoordinator();
+  const secret = `lin_api_${"s".repeat(64)}`;
+  await assert.rejects(
+    coordinator.start(async () => {
+      const error = new Error(
+        `Resume failed for ${secret} at C:\\Users\\person\\vault\\Agent Runs\\run.md`,
+      ) as Error & { code: string };
+      error.code = "resume_contract_failed";
+      throw error;
+    }),
+    /Resume failed/u,
+  );
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.lastComplete?.stopReason, "error");
+  assert.deepEqual(snapshot.diagnosticAttestations, [
+    {
+      schemaVersion: 1,
+      id: "run-coordinator-terminal-error",
+      kind: "error",
+      message: "Error: Resume failed for [REDACTED] at [LOCAL_PATH]",
+      errorCode: "resume_contract_failed",
+      missing: [],
+    },
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(snapshot.diagnosticAttestations),
+    /lin_api_|person|run\.md/u,
+  );
+});
+
+test("run coordinator retains a redacted failed tool-result code", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onTrace?.({
+      id: "tool-call-2:result",
+      kind: "tool_result",
+      toolName: "publish_research_project_to_linear",
+      message: `Tool returned error at C:\\private\\vault using lin_api_${"x".repeat(64)}`,
+      error: {
+        code: "linear_hierarchy_invalid_arguments",
+        message: "not retained",
+      },
+    });
+    events.onRunComplete?.({ step: 2, maxSteps: 24, stopReason: "budget" });
+  });
+
+  assert.deepEqual(coordinator.getSnapshot().diagnosticAttestations, [
+    {
+      schemaVersion: 1,
+      id: "tool-call-2:result",
+      kind: "tool_result",
+      toolName: "publish_research_project_to_linear",
+      message: "Tool returned error at [LOCAL_PATH]",
+      errorCode: "linear_hierarchy_invalid_arguments",
+      missing: [],
+    },
+  ]);
+});
+
+test("run event observer failures are redacted and cannot abort the mission", async () => {
+  const coordinator = new RunCoordinator();
+  coordinator.subscribe({
+    onRunConfig: () => {
+      throw new Error(
+        `view detached at C:\\private\\vault with github_pat_${"z".repeat(64)}`,
+      );
+    },
+  });
+
+  const outcome = await coordinator.start(async (_signal, events) => {
+    events.onRunConfig?.({ runId: "run-observer", maxStepsForRun: 3 } as never);
+    events.onRunComplete?.({ step: 1, maxSteps: 3, stopReason: "final" });
+  });
+
+  assert.equal(outcome.stopReason, "final");
+  assert.deepEqual(coordinator.getSnapshot().diagnosticAttestations, [
+    {
+      schemaVersion: 1,
+      id: "run-event-listener-error:onRunConfig",
+      kind: "error",
+      message: "Error: view detached at [LOCAL_PATH]",
+      errorCode: "run_event_listener_failed",
+      missing: [],
+    },
+  ]);
 });
 
 test("run coordinator retains one receipt when a continuation re-emits durable proof", async () => {

@@ -1339,6 +1339,18 @@ test("path CRUD tools create, append, replace with backup, move, and trash markd
   assert.match(appendReadback?.observedRevision ?? "", /^sha256:[a-f0-9]{64}$/u);
   assert.equal(appendReadback?.observedFingerprint, appendReadback?.observedRevision);
 
+  const missingAppend = await registry.execute(
+    {
+      name: "append_file",
+      arguments: { path: "Projects/New/Missing.md", text: "Never written" },
+    },
+    mock.context,
+  );
+  assert.equal(missingAppend.ok, false);
+  assert.equal(missingAppend.error?.code, "vault_markdown_not_found");
+  assert.equal(missingAppend.mutationState, "not_applied");
+  assert.equal(mock.content.has("Projects/New/Missing.md"), false);
+
   const replaced = await executeAuthorizedPrepared(
     registry,
     {
@@ -2733,7 +2745,7 @@ test("web_fetch normalizes request and response", async () => {
     /^Agent Sources\/docs\.ollama\.com\/Ollama-Docs-[a-f0-9]{16}\.md$/u,
   );
   assert.match(String(output.urlHash), /^[a-f0-9]{16}$/u);
-  assert.match(String(output.contentHash), /^fnv1a32x2:[a-f0-9]{16}$/u);
+  assert.match(String(output.contentHash), /^sha256:[a-f0-9]{64}$/u);
 });
 
 test("web tools reject work when the run is already cancelled", async () => {

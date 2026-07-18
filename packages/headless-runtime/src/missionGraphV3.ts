@@ -5,11 +5,10 @@ export const MISSION_CAPABILITY_ENVELOPE_VERSION = 1 as const;
 export const MISSION_GRAPH_PATCH_VERSION = 1 as const;
 export const MISSION_GRAPH_JOURNAL_VERSION = 1 as const;
 
-export const MISSION_GRAPH_MAX_NODES = 16 as const;
-// Five levels are the minimum safe bound for a verified create -> readback ->
-// revise lifecycle plus the terminal finalizer. Node/tool/external-action caps
-// remain independently enforced; this does not grant additional authority.
-export const MISSION_GRAPH_MAX_DEPTH = 16 as const;
+// Compound daily-use lifecycles remain bounded while retaining their composite
+// research, provider, Code, and finalizer nodes in one authoritative graph.
+export const MISSION_GRAPH_MAX_NODES = 24 as const;
+export const MISSION_GRAPH_MAX_DEPTH = 24 as const;
 export const MISSION_GRAPH_MAX_CONCURRENT_READ_NODES = 3 as const;
 
 export type MissionNodeStatusV3 =
@@ -1226,7 +1225,12 @@ function normalizeNode(
   );
   const node: MissionNodeV3 = {
     id: stableId(source.id, `${path}.id`),
-    dependencyIds: stableIdArray(source.dependencyIds, `${path}.dependencyIds`, 0, 15),
+    dependencyIds: stableIdArray(
+      source.dependencyIds,
+      `${path}.dependencyIds`,
+      0,
+      MISSION_GRAPH_MAX_NODES - 1,
+    ),
     objective: text(source.objective, `${path}.objective`, 1, 4_000),
     executorId: stableId(source.executorId, `${path}.executorId`),
     executionHost: executionHost(source.executionHost, `${path}.executionHost`),
@@ -1533,7 +1537,12 @@ function normalizeNodeChanges(value: unknown, path: string): MissionNodeChangesV
   }
   const changes: MissionNodeChangesV1 = {};
   if ("dependencyIds" in source) {
-    changes.dependencyIds = stableIdArray(source.dependencyIds, `${path}.dependencyIds`, 0, 15);
+    changes.dependencyIds = stableIdArray(
+      source.dependencyIds,
+      `${path}.dependencyIds`,
+      0,
+      MISSION_GRAPH_MAX_NODES - 1,
+    );
   }
   if ("objective" in source) {
     changes.objective = text(source.objective, `${path}.objective`, 1, 4_000);

@@ -101,22 +101,22 @@ export function buildCapabilityReadinessV2(
 
   const browser = readiness({
     id: "browser",
-    name: "Browser & web",
+    name: "Web research",
     status: !input.browser.enabled
       ? "Available"
       : !input.browser.companionHealthy
-        ? "Degraded"
+        ? "Available"
         : "Approval needed",
     reason: !input.browser.enabled
-      ? "Web search and fetch are available; supervised browser actions are off."
+      ? "Public web search and fetch are available; optional supervised browser automation is off."
       : !input.browser.companionHealthy
-        ? "Web search and fetch are available. Supervised browser actions are enabled but unavailable until the authenticated Companion passes a healthy runtime probe."
-        : "Web search and fetch are available. Supervised browser reads are also available; click, type, and submit remain SafetyPolicy and approval gated.",
+        ? "Public web search and fetch are available. Optional supervised browser automation is unavailable until the authenticated Companion passes a healthy runtime probe."
+        : "Public web search and fetch are available. Supervised browser reads are also available; click, type, and submit remain SafetyPolicy and approval gated.",
     evidenceAt: input.browser.checkedAt ?? input.observedAt,
     nextAction: !input.browser.enabled
       ? "Enable browser tools if needed"
       : !input.browser.companionHealthy
-        ? "Connect and test Companion"
+        ? "Use web research"
         : "Review browser approvals",
     setupTarget: "browser_web",
   });

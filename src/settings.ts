@@ -1708,10 +1708,16 @@ export class AgentSettingTab extends PluginSettingTab {
     }
 
     const credentialStatus = this.plugin.getLinearCredentialStatus();
+    const personalKeyDescription = oauthStatus.connected
+      ? "Linear OAuth is saved securely and remains active across restarts. This optional personal API key fallback stays blank because saved secrets are never redisplayed."
+      : credentialStatus.message;
+    const personalKeyPresence = oauthStatus.connected
+      ? "OAuth active; optional fallback"
+      : credentialStatus.presenceLabel;
     let pendingLinearKey = "";
     const linearKeySetting = new Setting(section)
-      .setName(`Linear personal API key - ${credentialStatus.presenceLabel}`)
-      .setDesc(credentialStatus.message);
+      .setName(`Linear personal API key fallback - ${personalKeyPresence}`)
+      .setDesc(personalKeyDescription);
     linearKeySetting.addText((text) => {
       text.inputEl.type = "password";
       text.inputEl.setAttribute(

@@ -36,6 +36,7 @@ const FULL_SHA = /^[a-f0-9]{40}$/u;
 const SHA256 = /^sha256:[a-f0-9]{64}$/u;
 const PROFILE_KEY = "du06-checkers-project";
 const VALIDATION_PROFILE_KEY = "du06-python-checkers-validation";
+const LINEAR_EVIDENCE_DESTINATION_NAME = "Application Testing Dumping Grounds";
 const MAIN_STAGES: readonly ProjectLifecycleStageName[] = [
   "accepted_research",
   "linear_hierarchy",
@@ -136,6 +137,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
   const workspaceId = `du06-${suffix}`;
   const requestId = `du06-request-${suffix}`;
   const issueFingerprint = contractFingerprint(`${marker}:implementation`);
+  const sandboxConfiguration = liveProviderConfiguration("wsl2");
   const fixture = await createPhase4PythonCheckersProjectFixture(marker);
   const profile = createRepositoryProfile({
     key: PROFILE_KEY,
@@ -161,6 +163,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       protectedPaths: ["scripts"],
       allowedGeneratedPaths: [],
     },
+    runtimeDigests: { python: sandboxConfiguration.runtimeDigest },
     promotionPolicy: {
       localBasePromotion: "disabled",
       completionProof: "draft_pr",
@@ -212,6 +215,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       },
       {
         preserveConfiguredLinearCredential: !linearToken,
+        preserveConfiguredGitHubCredential: true,
       },
     );
     const connection = await configureProtectedConnections(
@@ -223,11 +227,17 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
     expect(connection).toMatchObject({
       linearConnected: true,
       linearCredentialSecure: true,
+      linearHierarchyAvailable: true,
       githubConnected: true,
       githubLogin: githubAccount.login,
     });
+    expect(normalizeLinearDestinationName(connection.linearWorkspaceName)).toBe(
+      normalizeLinearDestinationName(LINEAR_EVIDENCE_DESTINATION_NAME),
+    );
+    expect(normalizeLinearDestinationName(connection.linearTeamName)).toBe(
+      normalizeLinearDestinationName(LINEAR_EVIDENCE_DESTINATION_NAME),
+    );
     expect(connection.linearTeamId).toBeTruthy();
-    expect(connection.linearProjectId).toBeTruthy();
     if (requestedLinearTeamId) {
       expect(connection.linearTeamId).toBe(requestedLinearTeamId);
     }
@@ -252,7 +262,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       },
       {
         codePluginId: PHASE4_CODE_PLUGIN_ID,
-        config: liveProviderConfiguration("wsl2"),
+        config: sandboxConfiguration,
       },
     );
     expect(sandboxProbe.status).toMatchObject({
@@ -706,6 +716,7 @@ async function configureProtectedConnections(
 ) {
   return page.evaluate(async ({
     pluginId,
+    linearEvidenceDestinationName,
     requestedLinearTeamId,
     requestedLinearProjectId,
   }) => {
@@ -725,38 +736,118 @@ async function configureProtectedConnections(
         linearOwned = true;
       } else {
         const existing = plugin.getLinearCredentialStatus?.();
-        if (existing?.configured !== true || existing?.secure !== true) {
+        const oauth = plugin.getLinearOAuthStatus?.();
+        if (
+          oauth?.connected !== true &&
+          (existing?.configured !== true || existing?.secure !== true)
+        ) {
           throw new Error(
-            "Protected DU-06 requires E2E_LINEAR_API_KEY or an existing opaque native Linear credential.",
+            "Protected DU-06 requires E2E_LINEAR_API_KEY or an existing opaque native Linear OAuth or personal-key credential.",
           );
         }
       }
       const linearConnection = await plugin.testLinearConnection();
       if (!linearConnection?.ok) throw new Error("Linear capability discovery failed.");
       const linearCredential = plugin.getLinearCredentialStatus?.();
-      if (linearCredential?.configured !== true || linearCredential?.secure !== true) {
+      const linearOAuth = plugin.getLinearOAuthStatus?.();
+      if (
+        linearOAuth?.connected !== true &&
+        (linearCredential?.configured !== true || linearCredential?.secure !== true)
+      ) {
         throw new Error("Linear credential did not land in native secure storage.");
       }
       const snapshot = plugin.getLinearCapabilitySnapshot?.();
-      const linearTeamId =
-        requestedLinearTeamId ||
-        String(plugin.settings?.linearDefaultTeamId ?? "").trim() ||
-        String(snapshot?.teams?.[0]?.id ?? "").trim();
-      const linearProjectId =
-        requestedLinearProjectId ||
-        String(plugin.settings?.linearQueueProjectId ?? "").trim() ||
-        String(snapshot?.projects?.[0]?.id ?? "").trim();
-      if (!linearTeamId || !linearProjectId) {
-        throw new Error("Linear discovery did not provide a usable team and project destination.");
+      const normalizeDestinationName = (value: unknown) =>
+        String(value ?? "")
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/gu, "");
+      const expectedDestinationName = normalizeDestinationName(
+        linearEvidenceDestinationName,
+      );
+      const workspaceName = String(snapshot?.workspace?.name ?? "").trim();
+      const evidenceTeam = (snapshot?.teams ?? []).find(
+        (team: any) =>
+          normalizeDestinationName(team?.name) === expectedDestinationName,
+      );
+      if (
+        normalizeDestinationName(workspaceName) !== expectedDestinationName ||
+        !evidenceTeam
+      ) {
+        throw new Error(
+          `Linear discovery did not verify the required ${linearEvidenceDestinationName} workspace and team.`,
+        );
+      }
+      const requestedTeam = requestedLinearTeamId
+        ? (snapshot?.teams ?? []).find(
+            (team: any) => String(team?.id ?? "").trim() === requestedLinearTeamId,
+          )
+        : null;
+      if (requestedLinearTeamId && !requestedTeam) {
+        throw new Error(
+          `E2E_RELEASE_LINEAR_TEAM_ID did not resolve to ${linearEvidenceDestinationName}.`,
+        );
+      }
+      if (requestedTeam && requestedTeam?.id !== evidenceTeam?.id) {
+        throw new Error(
+          `E2E_RELEASE_LINEAR_TEAM_ID must identify ${linearEvidenceDestinationName}.`,
+        );
+      }
+      const linearTeamId = String(evidenceTeam?.id ?? "").trim();
+      const requestedProject = requestedLinearProjectId
+        ? (snapshot?.projects ?? []).find(
+            (project: any) =>
+              String(project?.id ?? "").trim() === requestedLinearProjectId,
+          )
+        : null;
+      if (requestedLinearProjectId && !requestedProject) {
+        throw new Error(
+          "E2E_RELEASE_LINEAR_PROJECT_ID did not resolve in the verified Linear workspace.",
+        );
+      }
+      if (
+        requestedProject &&
+        Array.isArray(requestedProject?.teamIds) &&
+        requestedProject.teamIds.length > 0 &&
+        !requestedProject.teamIds.includes(linearTeamId)
+      ) {
+        throw new Error(
+          `E2E_RELEASE_LINEAR_PROJECT_ID must belong to ${linearEvidenceDestinationName}.`,
+        );
+      }
+      const linearProjectId = String(requestedProject?.id ?? "").trim();
+      if (!linearTeamId) {
+        throw new Error("Linear discovery did not provide a usable team destination.");
       }
       plugin.settings.linearDefaultTeamId = linearTeamId;
       plugin.settings.linearQueueProjectId = linearProjectId;
       await plugin.saveSettings();
+      const registeredToolNames = new Set(
+        plugin.createToolRegistry?.().getDefinitions?.().map(
+          (definition: any) => String(definition?.function?.name ?? ""),
+        ) ?? [],
+      );
 
-      const githubSaved = await plugin.setGitHubFineGrainedPat(githubToken);
-      if (!githubSaved?.ok) throw new Error("GitHub secure credential setup failed.");
-      githubOwned = true;
-      const github = plugin.getGitHubCredentialStatus?.();
+      let github = plugin.getGitHubCredentialStatus?.();
+      if (github?.connected === true) {
+        const leased = await plugin.withGitHubCredentialToken(
+          (_token: string, account: { id: number; login: string }) => ({
+            account: { ...account },
+          }),
+        );
+        github = { ...github, account: leased.account };
+      } else {
+        const githubSaved = await plugin.setGitHubFineGrainedPat(githubToken);
+        if (!githubSaved?.ok) {
+          throw new Error(
+            `GitHub secure credential setup failed: ${String(
+              githubSaved?.message ?? "no provider message",
+            ).slice(0, 500)}`,
+          );
+        }
+        githubOwned = true;
+        github = plugin.getGitHubCredentialStatus?.();
+      }
       if (!github?.connected || !github?.account?.login) {
         throw new Error("GitHub verified identity is unavailable.");
       }
@@ -765,6 +856,14 @@ async function configureProtectedConnections(
         linearCredentialSecure: true,
         linearTeamId,
         linearProjectId,
+        linearWorkspaceName: workspaceName,
+        linearTeamName: String(evidenceTeam?.name ?? "").trim(),
+        linearProjectName: String(
+          requestedProject?.name ?? "",
+        ).trim(),
+        linearHierarchyAvailable: registeredToolNames.has(
+          "publish_research_project_to_linear",
+        ),
         githubConnected: true,
         githubLogin: github.account.login,
         credentialOwnership: {
@@ -780,9 +879,17 @@ async function configureProtectedConnections(
     }
   }, {
     pluginId: NATIVE_CORE_PLUGIN_ID,
+    linearEvidenceDestinationName: LINEAR_EVIDENCE_DESTINATION_NAME,
     requestedLinearTeamId,
     requestedLinearProjectId,
   });
+}
+
+function normalizeLinearDestinationName(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "");
 }
 
 async function clearProtectedConnections(
@@ -797,6 +904,7 @@ async function clearProtectedConnections(
       : {
           ok:
             !ownership.verifyPreservedLinear ||
+            plugin.getLinearOAuthStatus?.()?.connected === true ||
             plugin.getLinearCredentialStatus?.()?.secure === true,
         };
     const github = ownership.github

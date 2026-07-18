@@ -22,6 +22,7 @@ const NOTE_HASH = `sha256:${"b".repeat(64)}`;
 const WORK_ITEM_HASH = `sha256:${"c".repeat(64)}`;
 const APPROVAL_HASH = `sha256:${"d".repeat(64)}`;
 const ISSUE_HASH = `sha256:${"e".repeat(64)}`;
+const REFRESHED_APPROVAL_HASH = `sha256:${"f".repeat(64)}`;
 
 test("checkpoint store serializes concurrent upserts and returns detached deterministic snapshots", async () => {
   const persistence = new MemoryPersistence(8);
@@ -59,6 +60,30 @@ test("reconcile_required and waiting_obsidian checkpoints survive plugin-data ro
   assert.deepEqual(await restarted.get(waiting.publicationId), waiting);
   assert.equal((await restarted.get(reconcile.publicationId))?.pendingAction?.actionId, "action-42");
   assert.equal((await restarted.get(waiting.publicationId))?.binding?.issueIdentifier, "ENG-42");
+});
+
+test("reconciliation may adopt the same pending issue after a fresh exact approval and verified binding", async () => {
+  const persistence = new MemoryPersistence();
+  const store = new ResearchPublicationCheckpointStoreV1(persistence);
+  const publicationId = "publication-adopt-reconciliation";
+  const reconcile = reconcileCheckpoint(publicationId);
+  await store.persist(reconcile);
+  const { binding, lineage, issue } = linearState();
+
+  await store.persist({
+    ...noteVerifiedCheckpoint(publicationId),
+    status: "linear_verified",
+    updatedAt: LATER_AT,
+    lineage,
+    approvalFingerprint: REFRESHED_APPROVAL_HASH,
+    binding,
+    issue,
+  });
+
+  const adopted = await store.get(publicationId);
+  assert.equal(adopted?.status, "linear_verified");
+  assert.equal(adopted?.issue?.id, reconcile.pendingAction?.issueId);
+  assert.equal(adopted?.approvalFingerprint, REFRESHED_APPROVAL_HASH);
 });
 
 test("checkpoint validation rejects credentials and corrupt cross-contract identity without writing", async () => {

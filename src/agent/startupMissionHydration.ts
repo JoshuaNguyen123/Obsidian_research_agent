@@ -18,6 +18,14 @@ import {
   type MissionRuntimeSnapshotV2,
 } from "./runStore";
 
+const LIFECYCLE_RESTART_TOOLS = new Set([
+  "publish_research_to_linear",
+  "publish_research_project_to_linear",
+  "code_commit_verified",
+  "publish_verified_code_to_github",
+  "github_delete_private_repository",
+]);
+
 export class StartupMissionHydrationIntegrityError extends Error {
   readonly code = "startup_mission_hydration_integrity_error";
 
@@ -25,6 +33,23 @@ export class StartupMissionHydrationIntegrityError extends Error {
     super(message);
     this.name = "StartupMissionHydrationIntegrityError";
   }
+}
+
+export function getDurablyCompletedLifecycleToolNames(
+  projection: PersistedMissionRunProjection,
+): string[] {
+  if (!projection.missionLedger.canResume) {
+    return [];
+  }
+  return [...new Set(
+    Object.values(projection.missionGraph.nodes).flatMap((node) =>
+      node.status === "complete"
+        ? node.allowedTools.filter((toolName) =>
+            LIFECYCLE_RESTART_TOOLS.has(toolName),
+          )
+        : [],
+    ),
+  )].sort((left, right) => left.localeCompare(right));
 }
 
 /**

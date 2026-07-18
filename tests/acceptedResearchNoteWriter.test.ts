@@ -79,6 +79,50 @@ test("accepted research is formatted, persisted, hashed, accepted, and backlinke
   );
 });
 
+test("accepted research create retry reuses exact persisted bytes without a second mutation", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const request = {
+    path: "Research/Retry-safe package.md",
+    mode: "create" as const,
+    artifactId: "accepted-research-run-retry",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  };
+  const first = await writer.writeAcceptedPackage(request);
+  const persisted = vault.files.get(request.path);
+  const second = await writer.writeAcceptedPackage(request);
+
+  assert.equal(first.operation, "create");
+  assert.equal(second.operation, "no_op");
+  assert.equal(second.beforeSha256, first.afterSha256);
+  assert.equal(second.afterSha256, first.afterSha256);
+  assert.equal(second.noteReceiptId, first.noteReceiptId);
+  assert.equal(second.transaction, null);
+  assert.equal(vault.files.get(request.path), persisted);
+});
+
+test("accepted research create retry rejects changed content at the same path", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const request = {
+    path: "Research/Retry collision.md",
+    mode: "create" as const,
+    artifactId: "accepted-research-run-collision",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  };
+  await writer.writeAcceptedPackage(request);
+  vault.files.set(request.path, `${vault.files.get(request.path)}\nUser-authored change.\n`);
+  const before = vault.files.get(request.path);
+
+  await assert.rejects(
+    writer.writeAcceptedPackage(request),
+    /cannot overwrite changed content/u,
+  );
+  assert.equal(vault.files.get(request.path), before);
+});
+
 test("accepted research append and backlink reject stale hashes before changing bytes", async () => {
   const vault = new ResearchVault({ "Research/Existing.md": "# Existing\n" });
   const writer = new AcceptedResearchNoteWriter(vault);

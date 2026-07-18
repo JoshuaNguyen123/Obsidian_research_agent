@@ -47,7 +47,8 @@ export type ResearchPublicationCheckpointStatusV1 =
 export interface ResearchPublicationDestinationV1 {
   workspaceId: string;
   teamId: string;
-  projectId: string;
+  /** Optional because Linear issues can be created directly in a team. */
+  projectId?: string;
 }
 
 export interface ResearchPublicationRequestV1 {
@@ -144,6 +145,7 @@ export interface ResearchPublicationCheckpointV1 {
 }
 
 export interface ResearchPublicationLineagePortV1 {
+  get?(publicationId: string): Promise<ResearchPublicationCheckpointV1 | null>;
   persist(checkpoint: ResearchPublicationCheckpointV1): Promise<void>;
 }
 
@@ -249,11 +251,19 @@ export class ResearchPublicationWorkflow {
   async execute(request: ResearchPublicationRequestV1): Promise<ResearchPublicationResultV1> {
     validateHostIntent(request);
     const publicationId = `publication-${request.note.artifactId}`;
+    const priorCheckpoint = await this.options.lineage.get?.(publicationId) ?? null;
+    const resumesReconciliation = priorCheckpoint?.status === "reconcile_required";
     this.trace("explicit_intent_verified", publicationId);
 
     this.trace("note_write_started", publicationId);
     const note = await this.options.noteWriter.writeAcceptedPackage(request.note);
     const artifact = note.artifact;
+    if (
+      priorCheckpoint &&
+      priorCheckpoint.artifact.artifactFingerprint !== artifact.artifactFingerprint
+    ) {
+      throw new Error("The accepted research artifact changed during publication resume.");
+    }
     this.trace("note_verified", publicationId, {
       noteSha256: note.afterSha256,
       noteReceiptId: note.noteReceiptId,
@@ -295,20 +305,30 @@ export class ResearchPublicationWorkflow {
       workItemFingerprint: preview.ticket.spec.fingerprint,
     });
 
-    let lineage = createNoteVerifiedLineage(request, artifact, preview.ticket);
-    await this.persist({
-      publicationId,
-      status: "note_verified",
-      artifact,
-      lineage,
-      workItemFingerprint: preview.ticket.spec.fingerprint,
-      approvalFingerprint: null,
-      binding: null,
-      issue: null,
-      pendingAction: null,
-      backlink: null,
-      error: null,
-    });
+    if (
+      priorCheckpoint?.workItemFingerprint &&
+      priorCheckpoint.workItemFingerprint !== preview.ticket.spec.fingerprint
+    ) {
+      throw new Error("The accepted research work item changed during publication resume.");
+    }
+
+    let lineage = priorCheckpoint?.lineage ??
+      createNoteVerifiedLineage(request, artifact, preview.ticket);
+    if (!resumesReconciliation) {
+      await this.persist({
+        publicationId,
+        status: "note_verified",
+        artifact,
+        lineage,
+        workItemFingerprint: preview.ticket.spec.fingerprint,
+        approvalFingerprint: null,
+        binding: null,
+        issue: null,
+        pendingAction: null,
+        backlink: null,
+        error: null,
+      });
+    }
     this.trace("note_lineage_persisted", publicationId);
 
     const approvalRequest = await buildExactApprovalRequest(request, artifact, preview);
@@ -321,19 +341,21 @@ export class ResearchPublicationWorkflow {
         code: "research_publication_approval_denied",
         message: decision.reason?.trim() || "Research publication approval was denied.",
       };
-      await this.persist({
-        publicationId,
-        status: "approval_denied",
-        artifact,
-        lineage,
-        workItemFingerprint: preview.ticket.spec.fingerprint,
-        approvalFingerprint: approvalRequest.approvalFingerprint,
-        binding: null,
-        issue: null,
-        pendingAction: null,
-        backlink: null,
-        error,
-      });
+      if (!resumesReconciliation) {
+        await this.persist({
+          publicationId,
+          status: "approval_denied",
+          artifact,
+          lineage,
+          workItemFingerprint: preview.ticket.spec.fingerprint,
+          approvalFingerprint: approvalRequest.approvalFingerprint,
+          binding: null,
+          issue: null,
+          pendingAction: null,
+          backlink: null,
+          error,
+        });
+      }
       this.trace("approval_denied", publicationId);
       return {
         ok: false,
@@ -453,12 +475,20 @@ export class ResearchPublicationWorkflow {
 
     const drift = publicationDrift(preview.ticket, published.ticket);
     const destinationMismatch = issueDestinationMismatch(published.issue, request.destination);
-    if (drift || destinationMismatch) {
+    const reconciliationIssueMismatch =
+      priorCheckpoint?.pendingAction?.issueId &&
+      priorCheckpoint.pendingAction.issueId !== published.issue.id
+        ? "The reconciled Linear issue differs from the pending action target."
+        : null;
+    if (drift || destinationMismatch || reconciliationIssueMismatch) {
       const error = {
         code: drift
           ? "research_publication_preview_drift"
-          : "research_publication_destination_mismatch",
-        message: drift ?? destinationMismatch ?? "Research publication readback changed.",
+          : destinationMismatch
+            ? "research_publication_destination_mismatch"
+            : "research_publication_reconciliation_target_mismatch",
+        message: drift ?? destinationMismatch ?? reconciliationIssueMismatch ??
+          "Research publication readback changed.",
       };
       const pendingAction = pendingFromSuccess(
         published,
@@ -842,7 +872,7 @@ function issueDestinationMismatch(
   if (issue.team.id !== destination.teamId) {
     return "Linear issue readback is outside the approved team.";
   }
-  if (issue.project?.id !== destination.projectId) {
+  if ((issue.project?.id ?? null) !== (destination.projectId ?? null)) {
     return "Linear issue readback is outside the approved project.";
   }
   return null;

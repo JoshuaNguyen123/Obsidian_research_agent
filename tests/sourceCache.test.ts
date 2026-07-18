@@ -91,7 +91,7 @@ test("writeSourceCacheNote writes a sectioned frontmatter note under Agent Sourc
   assert.equal(cached.totalChars, body.length);
   assert.equal(cached.truncated, false);
   assert.equal(cached.parserStatus, "parsed");
-  assert.match(cached.contentHash, /^fnv1a32x2:[a-f0-9]{16}$/);
+  assert.match(cached.contentHash, /^sha256:[a-f0-9]{64}$/);
   assert.equal(cached.fetchedAt, now.toISOString());
   assert.ok(folders.has(SOURCE_CACHE_FOLDER));
   assert.ok(folders.has(`${SOURCE_CACHE_FOLDER}/example.com`));
@@ -102,7 +102,7 @@ test("writeSourceCacheNote writes a sectioned frontmatter note under Agent Sourc
   assert.match(note, /url: "https:\/\/example\.com\/articles\/local-agents\?ref=42"/);
   assert.match(note, /title: "Local Agents: A Field Guide"/);
   assert.match(note, /fetchedAt: "2026-07-07T12:00:00\.000Z"/);
-  assert.match(note, /contentHash: "fnv1a32x2:[a-f0-9]{16}"/);
+  assert.match(note, /contentHash: "sha256:[a-f0-9]{64}"/);
   assert.match(note, /truncated: false/);
   assert.match(note, /parserStatus: "parsed"/);
   assert.match(note, /sectionCount: 3/);
@@ -299,7 +299,7 @@ test("readSourceSection returns 1-based clamped sections without frontmatter", a
   assert.equal(first.section, 1);
   assert.equal(first.sectionCount, 2);
   assert.equal(first.parserStatus, "parsed");
-  assert.match(first.contentHash, /^fnv1a32x2:/);
+  assert.match(first.contentHash, /^sha256:[a-f0-9]{64}$/);
   assert.ok(!first.content.includes("fetchedAt:"));
   assert.equal(first.sourceStartChar, 0);
   assert.equal(first.content, sectionOne);
@@ -325,6 +325,37 @@ test("readSourceSection returns 1-based clamped sections without frontmatter", a
   await assert.rejects(
     () => readSourceSection(context, { url: "https://missing.example.com" }, 1),
     /Cached source was not found/,
+  );
+});
+
+test("fresh lookup invalidates legacy weak content hashes for refetch", async () => {
+  const now = new Date("2026-07-07T12:00:00.000Z");
+  const { context, content } = createCacheContext(now);
+  const cached = await writeSourceCacheNote(context, {
+    url: "https://example.com/legacy-weak-hash",
+    title: "Legacy weak hash",
+    content: "Legacy content that must be fetched again.",
+  });
+  const weakHash = "fnv1a32x2:0123456789abcdef";
+  content.set(
+    cached.vaultPath,
+    String(content.get(cached.vaultPath)).replace(cached.contentHash, weakHash),
+  );
+  content.set(
+    SOURCE_CACHE_MANIFEST_PATH,
+    String(content.get(SOURCE_CACHE_MANIFEST_PATH)).replace(
+      cached.contentHash,
+      weakHash,
+    ),
+  );
+
+  assert.equal(
+    await findFreshCachedSource(
+      context,
+      "https://example.com/legacy-weak-hash",
+      { maxAgeMs: SOURCE_CACHE_FRESH_MS },
+    ),
+    null,
   );
 });
 

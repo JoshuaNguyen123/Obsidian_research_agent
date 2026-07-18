@@ -275,6 +275,15 @@ def _resource_limits_enforced() -> bool:
     return all(soft != resource.RLIM_INFINITY for soft, _hard in limits)
 
 
+def _apply_boundary_probe_limits() -> None:
+    """Bound the probe itself so its receipt proves real process limits."""
+    if resource is None:
+        raise ProtocolError("sandbox runtime requires Linux resource limits")
+    resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+    resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+    resource.setrlimit(resource.RLIMIT_CPU, (60, 61))
+
+
 def boundary_proof(expected_runtime_digest: str) -> dict[str, Any]:
     _load_runtime_identity(expected_runtime_digest)
     runtime_path = "/runtime" if Path("/runtime").exists() else "/opt/agentic"
@@ -410,6 +419,7 @@ def main(argv: list[str]) -> int:
         if argv == ["--boundary-probe-json", "--expected-runtime-digest"]:
             raise ProtocolError("boundary probe digest is missing")
         if len(argv) == 3 and argv[:2] == ["--boundary-probe-json", "--expected-runtime-digest"]:
+            _apply_boundary_probe_limits()
             proof = boundary_proof(argv[2])
             sys.stdout.buffer.write(_canonical_json(proof))
             return 0

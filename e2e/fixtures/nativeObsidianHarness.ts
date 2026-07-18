@@ -46,11 +46,13 @@ export interface StartNativeObsidianHarnessOptions {
   /** Node-side settings seed; useful for credentials that must never enter traces. */
   corePluginDataOverrides?: Readonly<Record<string, unknown>>;
   /**
-   * Preserve only the existing opaque Linear SecretStorage reference while
-   * sanitizing every plaintext/provider runtime field as usual. Reserved for
-   * the explicitly routed configured-Linear live proof.
+   * Preserve an existing opaque Linear personal-key reference or secret-free
+   * OAuth runtime state while sanitizing plaintext and provider result state.
+   * Reserved for explicitly routed configured-Linear live proof.
    */
   preserveConfiguredLinearCredential?: boolean;
+  /** Preserve only the existing opaque GitHub credential metadata. */
+  preserveConfiguredGitHubCredential?: boolean;
   setup(context: NativeObsidianSetupContext): Promise<void>;
   beforeClose?(context: NativeObsidianSetupContext): Promise<void>;
 }
@@ -141,6 +143,7 @@ export async function startNativeObsidianHarness(
       pluginDataBefore[0],
       options.corePluginDataOverrides,
       options.preserveConfiguredLinearCredential === true,
+      options.preserveConfiguredGitHubCredential === true,
     );
     for (const pluginId of pluginIds) {
       await ensureCommunityPluginEnabled(communityPluginsPath, pluginId);
@@ -298,12 +301,25 @@ async function seedCorePluginData(
   existingContent: string | null,
   overrides: Readonly<Record<string, unknown>> = {},
   preserveConfiguredLinearCredential = false,
+  preserveConfiguredGitHubCredential = false,
 ): Promise<void> {
   const parsed = parseObject(existingContent) ?? {};
   const preservedLinearCredentialReference =
     preserveConfiguredLinearCredential &&
     isRecord(parsed.linearCredentialReference)
       ? parsed.linearCredentialReference
+      : null;
+  const preservedLinearOAuthRuntimeState =
+    preserveConfiguredLinearCredential &&
+    isRecord(parsed.linearOAuthRuntimeState)
+      ? parsed.linearOAuthRuntimeState
+      : null;
+  const hasPreservedLinearCredential = Boolean(
+    preservedLinearCredentialReference || preservedLinearOAuthRuntimeState,
+  );
+  const preservedGitHubCredential =
+    preserveConfiguredGitHubCredential && isRecord(parsed.githubCredential)
+      ? parsed.githubCredential
       : null;
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(
@@ -318,12 +334,12 @@ async function seedCorePluginData(
         streamWritebackMode: "off",
         scheduledMissions: [],
         autoResumeOvernightRuns: false,
-        linearEnabled: preserveConfiguredLinearCredential,
+        linearEnabled: hasPreservedLinearCredential,
         linearCapabilityGate: 0,
         linearQueueEnabled: false,
         linearApiKey: "",
         linearCredentialReference: preservedLinearCredentialReference,
-        linearOAuthRuntimeState: null,
+        linearOAuthRuntimeState: preservedLinearOAuthRuntimeState,
         linearCapabilitySnapshot: null,
         authorityGrants: [],
         authorityGrantUsage: {},
@@ -334,7 +350,7 @@ async function seedCorePluginData(
         queueResourceLockState: null,
         queueDailyStartBudgetState: null,
         githubApiToken: "",
-        githubCredential: null,
+        githubCredential: preservedGitHubCredential,
         conversationHistory: [],
         ...overrides,
       },

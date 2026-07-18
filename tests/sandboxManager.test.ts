@@ -266,13 +266,22 @@ test("all provider command specs are shell-free, bounded, and omit host/root/soc
     for (const spec of [probe, execute]) {
       assert.equal(spec.shell, false);
       assert.equal(spec.cwd, null);
-      assert.equal(spec.args.some((arg) => /docker\.sock|podman\.sock|^\/$/i.test(arg)), false);
+      assert.equal(spec.args.some((arg) => /docker\.sock|podman\.sock/i.test(arg)), false);
+      assert.deepEqual(
+        spec.args.flatMap((arg, index) => arg === "/" ? [spec.args[index - 1]] : []),
+        provider.kind === "wsl2" || provider.kind === "bubblewrap"
+          ? ["--remount-ro"]
+          : [],
+      );
       assert.equal(spec.args.includes("--privileged"), false);
     }
     if (provider.kind === "wsl2" || provider.kind === "bubblewrap") {
       assert.ok(execute.args.includes("--unshare-all"));
       assert.ok(execute.args.includes("--unshare-net"));
       assert.ok(inSequence(execute.args, ["--ro-bind", "/opt/agentic/runtime", "/runtime"]));
+      assert.ok(inSequence(execute.args, ["--ro-bind", "/opt/agentic/runtime/lib", "/lib"]));
+      assert.ok(inSequence(execute.args, ["--ro-bind", "/opt/agentic/runtime/lib64", "/lib64"]));
+      assert.ok(inSequence(execute.args, ["--remount-ro", "/"]));
       assert.ok(inSequence(execute.args, ["--setenv", "CI", "true"]));
     } else {
       assert.ok(inSequence(execute.args, ["--env", "CI=true"]));

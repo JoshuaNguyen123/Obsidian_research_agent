@@ -365,8 +365,9 @@ function assertBoundarySpec(
   assert.equal(spec.cwd, null);
   assert.deepEqual(spec.env, {});
   assert.equal(
-    spec.args.some((argument) =>
-      /(?:docker\.sock|podman\.sock|\/var\/run|^\/$|--privileged)/iu.test(argument),
+    spec.args.some((argument, index) =>
+      /(?:docker\.sock|podman\.sock|\/var\/run|--privileged)/iu.test(argument) ||
+      (argument === "/" && spec.args[index - 1] !== "--remount-ro"),
     ),
     false,
   );

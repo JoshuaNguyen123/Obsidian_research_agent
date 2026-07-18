@@ -385,6 +385,45 @@ test("host graph keeps an explicit workspace CRUD lifecycle within the bounded D
   );
 });
 
+test("host graph retains every node in a compound daily-use lifecycle", async () => {
+  const descriptors = Array.from({ length: 16 }, (_unused, index) =>
+    workspaceLifecycleDescriptor(`compound_stage_${String(index + 1).padStart(2, "0")}`),
+  );
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-compound-daily-use-depth",
+    objective: "Complete the accepted research, Linear, Code, and GitHub lifecycle.",
+    toolRegistry: registryForDescriptors(descriptors),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: names.length,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  assert.deepEqual(
+    Object.values(host.deterministicProposal.nodes)
+      .filter((node) => node.id !== "final")
+      .map((node) => node.allowedTools[0]),
+    names,
+  );
+  assert.equal(host.capabilityEnvelope.budgets.maxDepth, names.length + 1);
+  const planned = await planMissionGraphV3({
+    mission: {
+      missionId: "run-compound-daily-use-depth",
+      objective: "Complete the accepted research, Linear, Code, and GitHub lifecycle.",
+    },
+    routerMode: "off",
+    capabilityEnvelope: host.capabilityEnvelope,
+    deterministicProposal: host.deterministicProposal,
+    allowedToolDescriptors: host.allowedToolDescriptors,
+    now: () => NOW.toISOString(),
+  });
+  assert.equal(Object.keys(planned.graph.nodes).length, names.length + 1);
+  assert.equal(planned.graph.nodes.final.dependencyIds.length, names.length);
+});
+
 test("explicit background planning routes an installed fixed read executor", async () => {
   const names = ["web_fetch"];
   const host = await buildHostMissionGraphPlanV1({

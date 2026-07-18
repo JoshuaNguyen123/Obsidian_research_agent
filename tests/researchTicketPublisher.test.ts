@@ -62,7 +62,7 @@ test("publisher rebuilds, fingerprints, renders, and bounds synthesized ticket i
   );
   assert.match(
     built.deterministicIssueId,
-    /^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
+    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
   );
   assert.equal(
     publisher.build(SECTIONS, { ...DRAFT, fingerprint: "caller-controlled" })
@@ -253,6 +253,54 @@ test("publisher prepares one deterministic pinned create and verifies independen
   );
   assert.equal(result.receipt.grantId, "grant-queue");
   assert.equal(searches.length, 2);
+});
+
+test("publisher supports an exact team-scoped destination when Linear has no project", async () => {
+  const searches: Array<Record<string, unknown>> = [];
+  let preparedArguments: Record<string, unknown> | undefined;
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") {
+        searches.push(variables);
+        return page([]);
+      }
+      if (operationKey === "issues.get" && preparedArguments) {
+        return issue(
+          String(preparedArguments.id),
+          String(preparedArguments.description),
+          null,
+        );
+      }
+      throw new Error(`Unexpected operation ${operationKey}`);
+    },
+  };
+  const publisher = new ResearchTicketPublisher({
+    readClient,
+    actionExecutor: fakeExecutor({
+      onPrepare: (arguments_) => {
+        preparedArguments = arguments_;
+      },
+    }),
+    queueTeamId: QUEUE_TEAM_ID,
+  });
+
+  const result = await publisher.publish(requestFixture());
+
+  assert.equal(result.ok, true);
+  if (!result.ok || result.status !== "created") return;
+  assert.equal(preparedArguments?.teamId, QUEUE_TEAM_ID);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(preparedArguments ?? {}, "projectId"),
+    false,
+  );
+  assert.equal(result.issue.team.id, QUEUE_TEAM_ID);
+  assert.equal(result.issue.project, undefined);
+  assert.equal(searches.length, 2);
+  for (const variables of searches) {
+    assert.deepEqual(variables.filter, {
+      team: { id: { eq: QUEUE_TEAM_ID } },
+    });
+  }
 });
 
 test("publisher fails closed when created issue readback changes project or contract", async (t) => {
@@ -528,7 +576,7 @@ function createDescriptor() {
 function issue(
   id: string,
   description: string,
-  projectId: string,
+  projectId: string | null,
 ): LinearIssueRecord {
   return {
     resourceType: "issue",
@@ -541,7 +589,7 @@ function issue(
     trashed: false,
     team: { id: QUEUE_TEAM_ID, name: "Research" },
     state: { id: "state-ready", name: "Ready", type: "unstarted" },
-    project: { id: projectId, name: "Agent queue" },
+    ...(projectId ? { project: { id: projectId, name: "Agent queue" } } : {}),
     labels: [],
     snapshotHash: HASH,
   };

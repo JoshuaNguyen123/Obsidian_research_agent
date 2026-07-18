@@ -97,11 +97,22 @@ export async function classifyIntent(
     );
   }
 
-  const scored = await scorePromptAgainstPrototypes({
-    prompt: input.prompt,
-    settings: input.settings,
-    embeddingProvider: input.embeddingProvider,
-  });
+  let scored: ScoredIntent[];
+  try {
+    scored = await scorePromptAgainstPrototypes({
+      prompt: input.prompt,
+      settings: input.settings,
+      embeddingProvider: input.embeddingProvider,
+    });
+  } catch {
+    return fallbackDecision(
+      "embedding_provider_failed",
+      "embedding_provider_unavailable",
+      0,
+      0,
+      ["Semantic routing failed closed; deterministic routing remains authoritative."],
+    );
+  }
   const best = scored[0];
   if (!best || best.score < INTENT_CONFIDENCE_THRESHOLD) {
     return fallbackDecision("low_confidence", "low_confidence", best?.score ?? 0);

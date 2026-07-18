@@ -52,7 +52,19 @@ export interface CompoundMissionApprovalOptions {
 export interface RealAiHarnessNativeOptions {
   /** Reuse only the vault's opaque native Linear reference; never copy a token. */
   preserveConfiguredLinearCredential?: boolean;
+  /** Reuse only the vault's opaque native GitHub reference; never copy a token. */
+  preserveConfiguredGitHubCredential?: boolean;
 }
+
+const PROJECT_STAGE_COMPLETION_TOOL: Readonly<
+  Record<ProjectLifecycleStageName, string>
+> = Object.freeze({
+  accepted_research: "publish_research_to_linear",
+  linear_hierarchy: "publish_research_project_to_linear",
+  code_execution: "code_commit_verified",
+  private_github_publication: "publish_verified_code_to_github",
+  reconciliation_cleanup: "github_delete_private_repository",
+});
 
 export async function startRealAiHarness(
   label: string,
@@ -104,6 +116,8 @@ export async function startRealAiHarness(
     corePluginDataOverrides,
     preserveConfiguredLinearCredential:
       nativeOptions.preserveConfiguredLinearCredential === true,
+    preserveConfiguredGitHubCredential:
+      nativeOptions.preserveConfiguredGitHubCredential === true,
     setup: installRealAiPageHarness,
     beforeClose: async ({ page }) => restoreOwnedWebBackend(page),
   });
@@ -143,7 +157,7 @@ export async function startRealAiHarness(
       approveUntilMissionComplete(native.page, timeoutMs, {
         ...options,
         restartCorePlugin: (stage) =>
-          restartCorePlugin(native.page, config, provider).then(async () => {
+          restartCorePlugin(native.page, config, provider, stage).then(async () => {
             await options.onStageRestarted?.(stage);
           }),
       }),
@@ -157,11 +171,24 @@ async function restartCorePlugin(
   page: Page,
   config: E2EAiConfig,
   provider: "ollama" | "openai_compatible",
+  stage?: ProjectLifecycleStageName,
 ): Promise<void> {
-  await page.evaluate(async ({ pluginId }) => {
+  await page.evaluate(async ({ pluginId, requiredLifecycleTool }) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.plugins?.disablePlugin || !app?.plugins?.enablePlugin) {
       throw new Error("Obsidian plugin lifecycle APIs are unavailable.");
+    }
+    const activePlugin = app.plugins.plugins?.[pluginId];
+    if (requiredLifecycleTool) {
+      const prepared =
+        await activePlugin?.prepareForDurableMissionRestart?.(
+          requiredLifecycleTool,
+        );
+      if (prepared !== true) {
+        throw new Error(
+          "The active lifecycle stage did not reach a quiescent durable restart boundary.",
+        );
+      }
     }
     await app.plugins.disablePlugin(pluginId);
     await app.plugins.enablePlugin(pluginId);
@@ -175,7 +202,12 @@ async function restartCorePlugin(
       throw new Error("Agentic Researcher did not become ready after restart.");
     }
     await plugin.activateView?.();
-  }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+  }, {
+    pluginId: NATIVE_CORE_PLUGIN_ID,
+    requiredLifecycleTool: stage
+      ? PROJECT_STAGE_COMPLETION_TOOL[stage]
+      : null,
+  });
   await expect(page.locator(".agentic-researcher-view")).toHaveCount(1, {
     timeout: 30_000,
   });
@@ -193,6 +225,7 @@ async function approveUntilMissionComplete(
   let approvals = 0;
   let continuations = 0;
   let missingContinuationPolls = 0;
+  let lastDurableState: Record<string, unknown> | null = null;
   const maximumContinuations = Math.max(
     1,
     Math.min(12, Math.floor(options.maxContinuations ?? 3)),
@@ -201,9 +234,15 @@ async function approveUntilMissionComplete(
   const restartedStages = new Set<ProjectLifecycleStageName>();
   await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
   while (Date.now() < deadline) {
-    const ui = await page.evaluate(({ pluginId }) => {
+    const ui = await page.evaluate(async ({ pluginId }) => {
       const app = (window as typeof window & { app?: any }).app;
-      const snapshot = app?.plugins?.plugins?.[pluginId]?.getMissionRunSnapshot?.();
+      const plugin = app?.plugins?.plugins?.[pluginId];
+      const snapshot = plugin?.getMissionRunSnapshot?.();
+      const durableRestart =
+        await plugin?.getDurableMissionRestartReadiness?.() ?? null;
+      const lastError = Array.from(document.querySelectorAll<HTMLElement>(
+        ".agentic-researcher-log-error .agentic-researcher-log-message",
+      )).at(-1)?.textContent ?? "";
       return {
         runText: document.querySelector("button.agentic-researcher-run")?.textContent?.trim() ?? "",
         statusText: document.querySelector(".agentic-researcher-run-status-text")?.textContent?.trim() ?? "",
@@ -233,9 +272,34 @@ async function approveUntilMissionComplete(
               allowedTools: node.allowedTools,
               attempts: node.retries?.attempts ?? 0,
               blockerCode: node.blocker?.code ?? null,
+              blockerMessage:
+                typeof node.blocker?.message === "string"
+                  ? node.blocker.message.slice(0, 500)
+                  : null,
             }))
           : [],
         providerUsage: snapshot?.providerUsage ?? null,
+        lastComplete: snapshot?.lastComplete ?? null,
+        modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
+          ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
+              phase: item?.phase ?? null,
+              outcome: item?.outcome ?? null,
+            }))
+          : [],
+        lastError: lastError
+          .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
+          .slice(0, 500),
+        diagnostics: Array.isArray(snapshot?.diagnosticAttestations)
+          ? snapshot.diagnosticAttestations.slice(-12).map((item: any) => ({
+              id: item.id ?? null,
+              errorCode: item.errorCode ?? null,
+              message: typeof item.message === "string"
+                ? item.message
+                    .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
+                    .slice(0, 500)
+                : "",
+            }))
+          : [],
         hasGraphBlocker: Object.values(snapshot?.lastMissionGraph?.nodes ?? {}).some(
           (node: any) => node?.status === "blocked" || Boolean(node?.blocker),
         ),
@@ -248,12 +312,32 @@ async function approveUntilMissionComplete(
             )
             .filter((stage: unknown) => typeof stage === "string"),
         )),
+        durablyCompletedLifecycleTools: Array.isArray(
+          durableRestart?.completedLifecycleTools,
+        )
+          ? durableRestart.completedLifecycleTools.filter(
+              (toolName: unknown) => typeof toolName === "string",
+            )
+          : [],
       };
     }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    if (ui.ledger || ui.graph.length > 0) {
+      lastDurableState = JSON.parse(JSON.stringify(ui)) as Record<string, unknown>;
+    }
     const committedRestartStage = ui.projectStages.find(
       (stage): stage is ProjectLifecycleStageName =>
         restartStages.has(stage as ProjectLifecycleStageName) &&
-        !restartedStages.has(stage as ProjectLifecycleStageName),
+        !restartedStages.has(stage as ProjectLifecycleStageName) &&
+        ui.graph.some(
+          (node) =>
+            node.status === "complete" &&
+            node.allowedTools.includes(
+              PROJECT_STAGE_COMPLETION_TOOL[stage as ProjectLifecycleStageName],
+            ),
+        ) &&
+        ui.durablyCompletedLifecycleTools.includes(
+          PROJECT_STAGE_COMPLETION_TOOL[stage as ProjectLifecycleStageName],
+        ),
     );
     if (committedRestartStage && options.restartCorePlugin) {
       restartedStages.add(committedRestartStage);
@@ -282,13 +366,23 @@ async function approveUntilMissionComplete(
       if (ui.acceptanceStatus === "pass" || ui.ledgerStatus === "complete") {
         return approvals;
       }
-      if (ui.stopReason === "budget" && !ui.hasGraphBlocker) {
+      if (
+        !ui.hasGraphBlocker &&
+        (
+          ui.stopReason === "budget" ||
+          (
+            ui.stopReason === null &&
+            ui.canResume &&
+            Boolean(ui.continuationCommand)
+          )
+        )
+      ) {
         const continuation = page.getByRole("button", {
           name: /Continue Latest Run/iu,
         });
         if (!ui.canResume || !ui.continuationCommand) {
           throw new Error(
-            `Mission stopped for budget without a durable continuation: ${JSON.stringify(ui)}.`,
+            `Idle mission did not expose its required durable continuation: ${JSON.stringify(ui)}.`,
           );
         }
         const visible = await continuation.isVisible().catch(() => false);
@@ -316,7 +410,9 @@ async function approveUntilMissionComplete(
         await page.waitForTimeout(250);
         continue;
       }
-      return approvals;
+      throw new Error(
+        `Mission stopped before acceptance; approved=${approvals}; state=${JSON.stringify(ui)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
+      );
     }
     missingContinuationPolls = 0;
     await page.waitForTimeout(250);
@@ -337,33 +433,63 @@ async function approveUntilMissionComplete(
               allowedTools: node.allowedTools,
               attempts: node.retries?.attempts ?? 0,
               blockerCode: node.blocker?.code ?? null,
+              blockerMessage:
+                typeof node.blocker?.message === "string"
+                  ? node.blocker.message.slice(0, 500)
+                  : null,
             })),
           }
         : null,
       acceptance: snapshot?.lastMissionLedger?.acceptance ?? null,
       providerUsage: snapshot?.providerUsage ?? null,
+      diagnostics: Array.isArray(snapshot?.diagnosticAttestations)
+        ? snapshot.diagnosticAttestations.slice(-12).map((item: any) => ({
+            id: item.id ?? null,
+            errorCode: item.errorCode ?? null,
+            message: typeof item.message === "string"
+              ? item.message
+                  .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
+                  .slice(0, 500)
+              : "",
+          }))
+        : [],
     };
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
   throw new Error(
-    `Timed out after ${timeoutMs} ms while resolving prepared approvals; approved=${approvals}; state=${JSON.stringify(safeState)}.`,
+    `Timed out after ${timeoutMs} ms while resolving prepared approvals; approved=${approvals}; state=${JSON.stringify(safeState)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
   );
 }
 
 async function continueLatestRunAfterStageRestart(page: Page): Promise<boolean> {
   const deadline = Date.now() + 15_000;
+  let lastState: Record<string, unknown> | null = null;
   while (Date.now() < deadline) {
     const state = await page.evaluate(({ pluginId }) => {
       const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
       const snapshot = plugin?.getMissionRunSnapshot?.();
       return {
         running: plugin?.isMissionRunning?.() === true,
+        phase: snapshot?.phase ?? null,
         complete:
           snapshot?.lastMissionLedger?.acceptance?.status === "pass" ||
           snapshot?.lastMissionLedger?.status === "complete",
+        ledgerStatus: snapshot?.lastMissionLedger?.status ?? null,
+        acceptanceStatus: snapshot?.lastMissionLedger?.acceptance?.status ?? null,
         canResume: snapshot?.lastMissionLedger?.canResume === true,
         continuationCommand: snapshot?.lastMissionLedger?.continuationCommand ?? "",
+        nextAction: snapshot?.lastMissionLedger?.nextAction ?? null,
+        blockerCategory: snapshot?.lastMissionLedger?.blockerCategory ?? null,
+        graph: snapshot?.lastMissionGraph
+          ? Object.values(snapshot.lastMissionGraph.nodes ?? {}).map((node: any) => ({
+              id: node.id,
+              status: node.status,
+              allowedTools: node.allowedTools,
+              blockerCode: node.blocker?.code ?? null,
+            }))
+          : [],
       };
     }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    lastState = state;
     if (state.running || state.complete) return false;
     if (state.canResume && state.continuationCommand) {
       const continuation = page.getByRole("button", { name: /Continue Latest Run/iu });
@@ -379,7 +505,7 @@ async function continueLatestRunAfterStageRestart(page: Page): Promise<boolean> 
     await page.waitForTimeout(250);
   }
   throw new Error(
-    "Restarted lifecycle stage did not expose a safe continuation or a completed ledger.",
+    `Restarted lifecycle stage did not expose a safe continuation or a completed ledger; state=${JSON.stringify(lastState)}.`,
   );
 }
 

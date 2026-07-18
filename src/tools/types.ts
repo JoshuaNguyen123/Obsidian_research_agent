@@ -170,6 +170,10 @@ export type NestedToolApprovalDecision =
 
 export interface AgentRuntimeCache {
   toolResults: Map<string, ToolExecutionResult>;
+  /** Successful strong-hash web reads retained for proof-bound downstream tools. */
+  trustedWebFetchResults?: Map<string, ToolExecutionResult>;
+  /** First validated accepted-research request for a run/path; retries cannot rewrite it. */
+  acceptedResearchPublicationRequests?: Map<string, unknown>;
   semanticProfiles?: Map<string, unknown>;
   graphProfiles?: Map<string, unknown>;
 }

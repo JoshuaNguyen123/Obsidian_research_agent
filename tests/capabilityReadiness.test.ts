@@ -110,9 +110,10 @@ describe("CapabilityReadinessV2", () => {
     const browser = buildCapabilityReadinessV2(partial, NOW).find(
       (row) => row.id === "browser",
     );
-    assert.equal(browser?.status, "Degraded");
-    assert.match(browser?.reason ?? "", /Web search and fetch are available/u);
+    assert.equal(browser?.name, "Web research");
+    assert.equal(browser?.status, "Available");
+    assert.match(browser?.reason ?? "", /Public web search and fetch are available/u);
     assert.match(browser?.reason ?? "", /Companion passes a healthy runtime probe/u);
-    assert.equal(browser?.nextAction, "Connect and test Companion");
+    assert.equal(browser?.nextAction, "Use web research");
   });
 });

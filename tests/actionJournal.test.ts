@@ -10,8 +10,92 @@ import {
   createOperationJournalRecord,
   buildOperationReconciliationInputs,
   normalizeMissionRuntimeSnapshot,
+  reconcilePriorExactLifecycleJournalRecords,
   transitionOperationJournalRecord,
 } from "../src/agent/runStore";
+
+test("verified exact lifecycle retry closes an older ambiguous WAL row for the same graph node", () => {
+  const make = (operationId: string) =>
+    createOperationJournalRecord({
+      operationId,
+      rootRunId: "run-lifecycle",
+      segmentId: "run-lifecycle",
+      nodeId: "tool-04-publish-research",
+      toolName: "publish_research_to_linear",
+      operation: "publish",
+      now: new Date("2026-07-18T10:00:00.000Z"),
+    });
+  const prior = transitionOperationJournalRecord(
+    transitionOperationJournalRecord(make("prior"), "applying", {
+      message: "Provider dispatch started.",
+      mutationMayHaveApplied: true,
+      now: new Date("2026-07-18T10:00:01.000Z"),
+    }),
+    "reconcile_required",
+    {
+      message: "Provider result was ambiguous.",
+      mutationMayHaveApplied: true,
+      now: new Date("2026-07-18T10:00:02.000Z"),
+    },
+  );
+  const receipt: ActionReceipt = {
+    version: 1,
+    id: "receipt-reconciled",
+    runId: "run-lifecycle",
+    actionId: "publication-action",
+    toolName: "linear_create_issue",
+    operation: "publish",
+    resource: {
+      system: "linear",
+      resourceType: "issue",
+      id: "issue-1",
+      identifier: "APP-1",
+    },
+    message: "Verified APP-1",
+    payloadFingerprint: `sha256:${"a".repeat(64)}`,
+    grantId: "grant-publication",
+    idempotencyKey: "research-publication:stable-work-item",
+    startedAt: "2026-07-18T10:00:03.000Z",
+    committedAt: "2026-07-18T10:00:04.000Z",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-18T10:00:04.000Z",
+    },
+  };
+  let current = transitionOperationJournalRecord(make("current"), "applying", {
+    message: "Retry started.",
+    now: new Date("2026-07-18T10:00:03.000Z"),
+  });
+  current = transitionOperationJournalRecord(current, "applied", {
+    message: "Retry returned.",
+    mutationMayHaveApplied: true,
+    now: new Date("2026-07-18T10:00:04.000Z"),
+  });
+  current = transitionOperationJournalRecord(current, "verified", {
+    message: "Retry readback verified.",
+    receipt,
+    now: new Date("2026-07-18T10:00:04.000Z"),
+  });
+  current = transitionOperationJournalRecord(current, "committed", {
+    message: "Retry committed.",
+    receipt,
+    now: new Date("2026-07-18T10:00:05.000Z"),
+  });
+
+  const reconciled = reconcilePriorExactLifecycleJournalRecords(
+    [prior, current],
+    current,
+    receipt,
+    new Date("2026-07-18T10:00:06.000Z"),
+  );
+
+  assert.deepEqual(reconciled.map((record) => record.state), [
+    "committed",
+    "committed",
+  ]);
+  assert.equal(reconciled[0].receipt?.id, receipt.id);
+});
 
 test("action journal v2 round-trips prepared authority and canonical receipt", async () => {
   const descriptor = descriptorFixture();

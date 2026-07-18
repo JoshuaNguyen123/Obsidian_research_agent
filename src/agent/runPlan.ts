@@ -815,14 +815,27 @@ function hasEditIntent(prompt: string): boolean {
   return isNamedSectionEditIntent(prompt);
 }
 
+function hasNegatedDeleteClause(clause: string): boolean {
+  return /\b(?:do\s+not|don't|never|without|avoid)\b[\s\S]{0,80}\b(?:delete|remove|trash)\b/iu.test(
+    clause,
+  );
+}
+
 function hasDeleteIntent(prompt: string): boolean {
   if (isCurrentNoteReplaceResetPrompt(prompt)) {
     return false;
   }
 
-  return /\b(delete|remove|trash)\b[\s\S]{0,80}\b(?:current|this|active|whole|entire)\s+(?:note|file)\b|\b(?:current|this|active|whole|entire)\s+(?:note|file)\b[\s\S]{0,80}\b(delete|remove|trash)\b/i.test(
-    prompt,
-  );
+  return prompt
+    .split(/(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu)
+    .some(
+      (clause) =>
+        /\b(?:delete|remove|trash)\b/iu.test(clause) &&
+        !hasNegatedDeleteClause(clause) &&
+        /\b(?:current|this|active|whole|entire)\s+(?:note|file)\b|\b(?:note|file)\b[\s\S]{0,40}\b(?:current|this|active|whole|entire)\b/iu.test(
+          clause,
+        ),
+    );
 }
 
 function hasDeletePathIntent(prompt: string): boolean {
@@ -830,7 +843,14 @@ function hasDeletePathIntent(prompt: string): boolean {
     return false;
   }
 
-  return /\b(delete|remove|trash)\b/i.test(prompt) && hasPathTargetIntent(prompt);
+  return prompt
+    .split(/(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu)
+    .some(
+      (clause) =>
+        /\b(?:delete|remove|trash)\b/iu.test(clause) &&
+        !hasNegatedDeleteClause(clause) &&
+        hasPathTargetIntent(clause),
+    );
 }
 
 function hasWebSearchIntent(prompt: string): boolean {

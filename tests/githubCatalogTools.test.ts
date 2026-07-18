@@ -190,6 +190,18 @@ test("GitHub intent routing selects bounded reads or the exact requested mutatio
     getExplicitGitHubCatalogMutationToolNames("Open GitHub issue 12 and summarize it."),
     [],
   );
+  assert.deepEqual(
+    getExplicitGitHubCatalogMutationToolNames(
+      "Publish the commit to its agent-owned branch. Do not clean up or delete any provider resource.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getExplicitGitHubCatalogMutationToolNames(
+      "Delete the agent-owned GitHub branch at its expected SHA.",
+    ),
+    ["github_delete_owned_branch"],
+  );
 });
 
 test("workflow rerun receipt requires run_attempt advancement and otherwise remains reconcile-required", async () => {

@@ -455,7 +455,9 @@ export function migrateRepositoryProfileV1(profile: RepositoryProfileV1): Reposi
         projectId,
         ecosystem,
         ecosystem === "python" ? (pythonExecutable ?? "python") : "node",
-        undefined,
+        ecosystem === "node" || ecosystem === "python"
+          ? profile.runtimeDigests?.[ecosystem]
+          : undefined,
       )),
     validationCatalog,
     generatedOutputs: profile.validationProfile.allowedGeneratedPaths,

@@ -125,6 +125,17 @@ test.describe("Daily-use Linear integration", () => {
       );
 
       await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      await expect(
+        harness.page.locator(".agentic-researcher-status-line", {
+          hasText:
+            "Pipeline: 1/1 Linear prepare, approval, create, and readback",
+        }),
+      ).toBeVisible({ timeout: 30_000 });
+      await expect(
+        harness.page.locator(".agentic-researcher-config-line", {
+          hasText: "pipeline_active_estimate=2-6_minutes",
+        }),
+      ).toBeVisible({ timeout: 30_000 });
       const approval = harness.activePreparedApproval(
         "publish_research_to_linear",
       );

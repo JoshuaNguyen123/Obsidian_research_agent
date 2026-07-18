@@ -9,6 +9,7 @@ import {
   createResearchProjectPlanV1,
   createResearcherHandoffV1,
   detectProjectLifecycleStagesV1,
+  estimateProjectLifecycleV1,
   parseProjectLineageV1,
   parseProjectLineageNamespaceV1,
   parseResearchProjectPlanV1,
@@ -84,6 +85,37 @@ test("explicit lifecycle classification is ordered, negation-authoritative, and 
       "reconciliation_cleanup",
     ],
   );
+  const partialPrompt = [
+    "Research American checkers rules using credible public web sources.",
+    "Write Projects/Checkers/Research.md, then prepare exactly one Linear issue.",
+    "Stop after its readback. Do not delete or clean up the issue.",
+  ].join(" ");
+  assert.deepEqual(detectProjectLifecycleStagesV1(partialPrompt), [
+    "accepted_research",
+    "linear_hierarchy",
+  ]);
+  assert.deepEqual(estimateProjectLifecycleV1(partialPrompt), {
+    version: 1,
+    stages: [
+      {
+        stage: "accepted_research",
+        label: "Research and Obsidian note",
+        activeMinutesMin: 4,
+        activeMinutesMax: 12,
+        approvalMayPause: false,
+      },
+      {
+        stage: "linear_hierarchy",
+        label: "Linear prepare, approval, create, and readback",
+        activeMinutesMin: 2,
+        activeMinutesMax: 6,
+        approvalMayPause: true,
+      },
+    ],
+    activeMinutesMin: 6,
+    activeMinutesMax: 18,
+    excludesProviderAndApprovalWaits: true,
+  });
   assert.deepEqual(
     detectProjectLifecycleStagesV1(
       "Research the product. Do not publish to GitHub even if a source mentions GitHub publication.",

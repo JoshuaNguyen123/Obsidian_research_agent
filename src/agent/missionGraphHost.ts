@@ -100,7 +100,7 @@ export async function buildHostMissionGraphPlanV1(
     plannedNames.push(name);
   }
   const plannedSet = new Set(plannedNames);
-  const maxToolNodes = 15;
+  const maxToolNodes = MISSION_GRAPH_MAX_DEPTH - 1;
   const selectedPlanned = plannedNames.slice(0, maxToolNodes);
   const postAcceptanceNames = unique([
     ...(input.postAcceptanceToolNames ?? []),

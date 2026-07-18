@@ -158,7 +158,10 @@ test("issue creation prepares a canonical action without dispatching a mutation"
   const variables = prepared.action.normalizedArgs.variables as {
     input: Record<string, unknown>;
   };
-  assert.match(String(variables.input.id), /^[0-9a-f-]{36}$/);
+  assert.match(
+    String(variables.input.id),
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
   assert.equal(prepared.action.target.id, variables.input.id);
   assert.equal(prepared.action.target.teamId, "team-1");
   assert.equal(prepared.action.preview.outboundPayload?.input instanceof Object, true);
@@ -441,6 +444,55 @@ test("uncertain creation reconciles only after matching independent readback", a
   assert.equal(reconciled.receipt?.readback.observedRevision, HASH_B);
 });
 
+test("issue create readback failure reports only stable mismatched field names", async () => {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          description: "Provider changed the approved description.",
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description: "Exact approved description.",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-readback-diagnostic",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "linear_readback_failed");
+  assert.match(result.error?.message ?? "", /Mismatched readback fields: description\./u);
+  assert.deepEqual(result.error?.details?.mismatchFields, ["description"]);
+  assert.doesNotMatch(result.error?.message ?? "", /Provider changed|Exact approved/u);
+});
+
 test("comment deletion succeeds only after absence readback", async () => {
   let deleted = false;
   const client: LinearToolClient = {
@@ -667,6 +719,7 @@ function issueRecord(
   overrides: {
     id?: string;
     title?: string;
+    description?: string;
     teamId?: string;
     priority?: number;
     projectId?: string;
@@ -679,6 +732,9 @@ function issueRecord(
     identifier: "PLAT-42",
     url: "https://linear.app/acme/issue/PLAT-42",
     title: overrides.title ?? "Before",
+    ...(overrides.description !== undefined
+      ? { description: overrides.description }
+      : {}),
     priority: overrides.priority ?? 0,
     trashed: false,
     team: { id: overrides.teamId ?? "team-1", name: "Platform", key: "PLAT" },

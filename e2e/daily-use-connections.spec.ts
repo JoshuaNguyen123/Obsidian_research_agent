@@ -273,15 +273,160 @@ test.describe("daily-use connections and setup", () => {
         expect.objectContaining({
           version: 2,
           id: "browser",
-          status: "Degraded",
-          reason: expect.stringContaining("Web search and fetch are available"),
-          nextAction: "Connect and test Companion",
+          name: "Web research",
+          status: "Available",
+          reason: expect.stringContaining("Public web search and fetch are available"),
+          nextAction: "Use web research",
         }),
       );
       expect(browser?.reason).toContain(
-        "Supervised browser actions are enabled but unavailable",
+        "Optional supervised browser automation is unavailable",
       );
     } finally {
+      await harness?.close();
+    }
+  });
+
+  test("Linear OAuth remains securely available after a plugin restart", async () => {
+    let harness: NativeObsidianHarness | null = null;
+    const suffix = Date.now().toString(36).padStart(16, "0");
+    const accessReferenceId = `secret-obsidian-linear-access-${suffix}`;
+    const refreshReferenceId = `secret-obsidian-linear-refresh-${suffix}`;
+    try {
+      harness = await startNativeObsidianHarness({
+        label: "daily-use-linear-oauth-restart",
+        setup: setupDailyUsePage,
+      });
+      const beforeRestart = await harness.page.evaluate(async ({
+        pluginId,
+        accessReferenceId,
+        refreshReferenceId,
+      }) => {
+        const app = (window as typeof window & { app?: any }).app;
+        const plugin = app?.plugins?.plugins?.[pluginId];
+        if (!plugin) throw new Error("Agentic Researcher plugin is unavailable.");
+        const issuedAt = new Date().toISOString();
+        const accessExpiresAt = new Date(
+          Date.parse(issuedAt) + 24 * 60 * 60 * 1_000,
+        ).toISOString();
+        const envelope = (referenceId: string, value: string, label: string) =>
+          JSON.stringify({
+            version: 1,
+            value,
+            description: {
+              version: 1,
+              referenceId,
+              label,
+              metadata: {
+                provider: "linear",
+                actor: "user",
+                credentialKind: "oauth",
+                scope: "read write",
+              },
+              backend: "obsidian-secret-storage",
+              persistent: true,
+              createdAt: issuedAt,
+              updatedAt: issuedAt,
+            },
+          });
+        app.secretStorage.setSecret(
+          accessReferenceId,
+          envelope(accessReferenceId, "e2e-linear-access-token", "Linear OAuth access"),
+        );
+        app.secretStorage.setSecret(
+          refreshReferenceId,
+          envelope(refreshReferenceId, "e2e-linear-refresh-token", "Linear OAuth refresh"),
+        );
+        plugin.linearOAuthRuntimeState = {
+          version: 1,
+          clientId: "e2e-linear-client",
+          actor: "user",
+          credential: {
+            version: 1,
+            credentialId: `linear_oauth_credential_${"e2e".repeat(8)}`,
+            actor: "user",
+            scopes: ["read", "write"],
+            accessTokenReferenceId: accessReferenceId,
+            refreshTokenReferenceId: refreshReferenceId,
+            tokenType: "Bearer",
+            issuedAt,
+            accessExpiresAt,
+            refreshGeneration: 0,
+          },
+          pendingRefresh: null,
+          updatedAt: issuedAt,
+        };
+        plugin.settings.linearEnabled = true;
+        plugin.settings.linearOAuthClientId = "e2e-linear-client";
+        await plugin.saveSettings();
+        return {
+          status: plugin.getLinearOAuthStatus(),
+          available: plugin.hasLinearApiKey(),
+        };
+      }, { pluginId: NATIVE_CORE_PLUGIN_ID, accessReferenceId, refreshReferenceId });
+
+      expect(beforeRestart.status.connected).toBe(true);
+      expect(beforeRestart.available).toBe(true);
+
+      await harness.page.evaluate(async (pluginId) => {
+        const app = (window as typeof window & { app?: any }).app;
+        await app.plugins.disablePlugin(pluginId);
+        await app.plugins.enablePlugin(pluginId);
+      }, NATIVE_CORE_PLUGIN_ID);
+      await harness.page.waitForFunction(
+        (pluginId) =>
+          (window as typeof window & { app?: any }).app?.plugins?.plugins?.[
+            pluginId
+          ]?.agenticResearcherApi?.state === "ready",
+        NATIVE_CORE_PLUGIN_ID,
+        { timeout: 30_000 },
+      );
+
+      const afterRestart = await harness.page.evaluate(async (pluginId) => {
+        const app = (window as typeof window & { app?: any }).app;
+        const plugin = app?.plugins?.plugins?.[pluginId];
+        const persisted = await plugin.loadData();
+        await app.setting.open();
+        await app.setting.openTabById(pluginId);
+        return {
+          status: plugin.getLinearOAuthStatus(),
+          available: plugin.hasLinearApiKey(),
+          persisted: persisted?.linearOAuthRuntimeState ?? null,
+        };
+      }, NATIVE_CORE_PLUGIN_ID);
+
+      expect(afterRestart.status).toEqual(
+        expect.objectContaining({
+          connected: true,
+          message: expect.stringContaining("remain available after restart"),
+        }),
+      );
+      expect(afterRestart.available).toBe(true);
+      expect(afterRestart.persisted).toEqual(
+        expect.objectContaining({
+          clientId: "e2e-linear-client",
+          credential: expect.objectContaining({
+            accessTokenReferenceId: accessReferenceId,
+            refreshTokenReferenceId: refreshReferenceId,
+          }),
+        }),
+      );
+      const settings = harness.page.locator(".agentic-researcher-settings");
+      await expect(settings).toContainText(
+        "Linear OAuth is saved securely and remains active across restarts",
+      );
+      await expect(settings).toContainText(
+        "optional personal API key fallback stays blank",
+      );
+    } finally {
+      if (harness) {
+        await harness.page.evaluate(({ accessReferenceId, refreshReferenceId }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          app?.secretStorage?.setSecret?.(accessReferenceId, "");
+          app?.secretStorage?.setSecret?.(refreshReferenceId, "");
+        }, { accessReferenceId, refreshReferenceId }).catch(() => undefined);
+        await closeObsidianSettings(harness.page).catch(() => undefined);
+      }
       await harness?.close();
     }
   });

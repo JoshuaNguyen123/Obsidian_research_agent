@@ -591,7 +591,11 @@ export class ResearchProjectHierarchyWorkflowV1 {
       arguments: {
         input: {
           name: plan.initiative.title,
-          description: taggedDescription(plan.initiative.description, plan.initiative.idempotencyKey),
+          description: providerSummary(plan.initiative.description),
+          content: taggedDescription(
+            plan.initiative.description,
+            plan.initiative.idempotencyKey,
+          ),
         },
       },
       duplicate: duplicates.get(plan.initiative.idempotencyKey),
@@ -608,7 +612,11 @@ export class ResearchProjectHierarchyWorkflowV1 {
       arguments: {
         input: {
           name: plan.project.title,
-          description: taggedDescription(plan.project.description, plan.project.idempotencyKey),
+          description: providerSummary(plan.project.description),
+          content: taggedDescription(
+            plan.project.description,
+            plan.project.idempotencyKey,
+          ),
           teamIds: [plan.destination.teamId],
         },
       },
@@ -828,6 +836,18 @@ function stableToolCallId(planFingerprint: string, key: string): string {
 
 function taggedDescription(description: string, idempotencyKey: string): string {
   return `${description}\n\n${idempotencyMarker(idempotencyKey)}`;
+}
+
+/**
+ * Linear's project and initiative `description` is the bounded list synopsis;
+ * their full markdown belongs in `content`. Keep the synopsis comfortably
+ * below the provider boundary while preserving the complete source text and
+ * idempotency marker in content.
+ */
+export function providerSummary(description: string): string {
+  const compact = description.replace(/\s+/gu, " ").trim();
+  if (compact.length <= 240) return compact;
+  return `${compact.slice(0, 237).trimEnd()}...`;
 }
 
 function idempotencyMarker(key: string): string {

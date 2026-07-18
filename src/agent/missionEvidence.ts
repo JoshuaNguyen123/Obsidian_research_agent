@@ -69,11 +69,15 @@ export function evidenceFromToolResult(
       return null;
     }
     const passageIds = sourceUsability.passageIds;
+    const contentHash = getString(result.output.contentHash);
     return {
       id: `web:${hashEvidenceKey(sourceLocator)}`,
       kind: "web_source",
       title,
       ...(url ? { url } : {}),
+      ...(contentHash && /^sha256:[a-f0-9]{64}$/u.test(contentHash)
+        ? { contentHash }
+        : {}),
       sourceId: createEvidenceSourceId(sourceLocator),
       ...(passageIds[0] ? { passageId: passageIds[0] } : {}),
       ...(passageIds.length > 0 ? { passageIds } : {}),

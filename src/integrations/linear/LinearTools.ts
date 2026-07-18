@@ -734,12 +734,17 @@ async function executePreparedMutation(
   );
   const verification = verifyPostcondition(config, payload.variables, observation);
   if (!verification.ok) {
+    const mismatchFields = describePostconditionMismatch(
+      config,
+      payload.variables,
+      observation,
+    );
     throw new ToolExecutionError(
       "linear_readback_failed",
-      `Linear acknowledged ${config.operationKey}, but independent readback did not verify the approved result.`,
+      `Linear acknowledged ${config.operationKey}, but independent readback did not verify the approved result. Mismatched readback fields: ${mismatchFields.join(", ")}.`,
       {
         mutationState: "may_have_applied",
-        details: { reconciliationKey: journal.operationId },
+        details: { reconciliationKey: journal.operationId, mismatchFields },
       },
     );
   }
@@ -1195,6 +1200,14 @@ function matchesIssueInput(
   issue: LinearIssueRecord,
   input: Record<string, JsonValue>,
 ): boolean {
+  return issueInputMismatchFields(issue, input).length === 0;
+}
+
+function issueInputMismatchFields(
+  issue: LinearIssueRecord,
+  input: Record<string, JsonValue>,
+): string[] {
+  const mismatchedFields: string[] = [];
   const comparisons: Record<string, unknown> = {
     title: issue.title,
     description: issue.description,
@@ -1216,15 +1229,37 @@ function matchesIssueInput(
       const expectedIds = Array.isArray(expected)
         ? expected.map(String).sort()
         : [];
-      if (canonicalJson(actualIds) !== canonicalJson(expectedIds)) return false;
+      if (canonicalJson(actualIds) !== canonicalJson(expectedIds)) {
+        mismatchedFields.push(key);
+      }
       continue;
     }
     const actual = comparisons[key];
     if (expected === null ? actual !== undefined : actual !== expected) {
-      return false;
+      mismatchedFields.push(key);
     }
   }
-  return true;
+  return mismatchedFields.sort();
+}
+
+function describePostconditionMismatch(
+  config: MutationToolConfig,
+  variables: Record<string, JsonValue>,
+  observation: LinearReadback,
+): string[] {
+  if (!observation.found) return ["resource_absent"];
+  if (observation.record.resourceType !== config.resourceType) {
+    return ["resource_type"];
+  }
+  const input = recordValue(variables.input);
+  if (config.resourceType === "issue") {
+    const fields = issueInputMismatchFields(
+      observation.record as LinearIssueRecord,
+      input,
+    );
+    return fields.length > 0 ? fields : ["issue_postcondition"];
+  }
+  return ["postcondition"];
 }
 
 function matchesCommentInput(
@@ -2064,7 +2099,10 @@ function randomToken(): string {
 async function deterministicUuid(value: string): Promise<string> {
   const hash = (await sha256Fingerprint(value)).slice("sha256:".length);
   const chars = hash.slice(0, 32).split("");
-  chars[12] = "5";
+  // Linear accepts client-supplied idempotency IDs in the UUIDv4 shape used
+  // by its native clients. The bits stay fingerprint-derived so a replay of
+  // the same prepared operation targets the same provider identity.
+  chars[12] = "4";
   chars[16] = ((parseInt(chars[16], 16) & 0x3) | 0x8).toString(16);
   const compact = chars.join("");
   return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
@@ -2077,5 +2115,8 @@ function invalidArguments(message: string): ToolExecutionError {
 }
 
 function safeErrorMessage(error: unknown): string {
+  if (error instanceof LinearClientError && error.operationKey) {
+    return `${error.message} (operation ${error.operationKey})`;
+  }
   return error instanceof Error ? error.message : String(error);
 }

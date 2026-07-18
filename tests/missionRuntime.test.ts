@@ -232,6 +232,7 @@ test("mission evidence converts web, vault, artifact, and receipt outputs and de
     url: "https://example.com/mcp",
     title: "MCP",
     content: "A long source body about MCP servers.",
+    contentHash: `sha256:${"a".repeat(64)}`,
   }));
   const vaultEvidence = evidenceFromToolResult("read_file", okResult({
     path: "Research/MCP.md",
@@ -252,6 +253,7 @@ test("mission evidence converts web, vault, artifact, and receipt outputs and de
   });
 
   assert.equal(webEvidence?.kind, "web_source");
+  assert.equal(webEvidence?.contentHash, `sha256:${"a".repeat(64)}`);
   assert.equal(vaultEvidence?.kind, "vault_note");
   assert.equal(artifactEvidence?.kind, "artifact");
   assert.equal(receiptEvidence.kind, "receipt");
@@ -268,6 +270,8 @@ test("mission evidence converts web, vault, artifact, and receipt outputs and de
     }
   }
   assert.equal(ledger.evidence.length, 4);
+  const restored = parseMissionLedgerFromMarkdown(formatMissionLedgerBlock(ledger));
+  assert.equal(restored?.evidence[0]?.contentHash, `sha256:${"a".repeat(64)}`);
 });
 
 test("same-source section evidence merges passage ids in memory and ledger round trips", () => {

@@ -4,6 +4,7 @@ import {
   MAX_AGENT_STEPS,
   attachGroundedPassageCitations,
   buildObservedMissionGraphFrontierBinding,
+  buildMissionGraphFrontierTurnContext,
   canonicalMissionGraphId,
   constrainToolsToMissionGraphFrontier,
   constrainOrchestratedHandoffTools,
@@ -12,13 +13,16 @@ import {
   extractExactMarkdownReplacementPayload,
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
+  getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
   getRestorableCompletedGraphToolNames,
   hasPreparedBackgroundCodeValidationCommitIntent,
   resolveThinkingMode,
+  restoreTrustedWebFetchResultsFromEvidence,
   runAgentMission,
   sanitizeAssistantContent,
+  shouldDeferAdditionalProjectLifecycleMutation,
   buildStreamingWritebackPromptForTests,
   type AgentRunCompleteEvent,
   type AgentRunConfigEvent,
@@ -35,6 +39,7 @@ import type {
   ModelToolCall,
 } from "../src/model/types";
 import type {
+  AgentRuntimeCache,
   ToolExecutionContext,
   ToolExecutionResult,
   ToolRegistry,
@@ -3882,6 +3887,171 @@ test("delete path prompts expose delete_path and emit a trash receipt", async ()
   assert.ok(!toolNames.includes("replace_file"));
   assert.deepEqual(executedCalls.map((call) => call.name), ["delete_path"]);
   assert.deepEqual(receipts, ["trash Projects/Old.md; affected: 1"]);
+});
+
+test("compound public-web lifecycle reserves exact research reads before effects", () => {
+  const prompt = [
+    "Research American checkers using exactly two public web sources and fetch both sources.",
+    "Write the accepted research notebook, create the Linear hierarchy, implement Python in the repository,",
+    "run targeted validation, commit it, and publish it to a private GitHub repository.",
+  ].join(" ");
+  assert.deepEqual(
+    getCompoundLifecycleResearchGraphToolNames(prompt),
+    ["web_search", "web_fetch", "web_fetch"],
+  );
+});
+
+test("durable strong-hash web evidence restores the publication proof registry", () => {
+  const runtimeCache: AgentRuntimeCache = { toolResults: new Map() };
+  const contentHash = `sha256:${"a".repeat(64)}`;
+  restoreTrustedWebFetchResultsFromEvidence(runtimeCache, [
+    {
+      id: "web:source",
+      kind: "web_source",
+      title: "Verified rules",
+      url: "https://example.test/rules",
+      contentHash,
+      usableSource: true,
+      parserStatus: "parsed",
+      summary: "Verified American checkers rules.",
+      confidence: "high",
+    },
+  ]);
+  const restored = runtimeCache.trustedWebFetchResults?.get(
+    `https://example.test/rules:${contentHash}`,
+  );
+  assert.equal(restored?.ok, true);
+  assert.deepEqual(restored?.output, {
+    url: "https://example.test/rules",
+    normalizedUrl: "https://example.test/rules",
+    title: "Verified rules",
+    content: "Verified American checkers rules.",
+    contentHash,
+    parserStatus: "parsed",
+  });
+});
+
+test("one provider response cannot cross two durable project lifecycle mutation boundaries", () => {
+  assert.equal(
+    shouldDeferAdditionalProjectLifecycleMutation(
+      "publish_research_project_to_linear",
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    shouldDeferAdditionalProjectLifecycleMutation(
+      "code_commit_verified",
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    shouldDeferAdditionalProjectLifecycleMutation("web_fetch", true),
+    false,
+  );
+  assert.equal(
+    shouldDeferAdditionalProjectLifecycleMutation(
+      "publish_research_project_to_linear",
+      false,
+    ),
+    false,
+  );
+});
+
+test("accepted-research frontier separates publication from hierarchy arguments", () => {
+  const context = buildMissionGraphFrontierTurnContext([
+    {
+      type: "function",
+      function: {
+        name: "publish_research_to_linear",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ]);
+  assert.match(context, /fields directly: schemaVersion, title, problemImpact/u);
+  assert.match(context, /proposedWork, scope, acceptanceCriteria/u);
+  assert.match(context, /must each contain at least one item/u);
+  assert.match(context, /exact JSON string "create"/u);
+  assert.match(context, /omit baseHash entirely/u);
+  assert.match(context, /Never send an empty baseHash placeholder/u);
+  assert.match(context, /never use write, overwrite, upsert, create_or_append/iu);
+  assert.match(context, /Do not add research, initiativeKey, projectKey/u);
+  assert.match(context, /separate later frontier/u);
+  assert.match(context, /exact riskClass values low, medium, or high/u);
+  assert.match(context, /exact executionClass values research, vault, code, or human/u);
+  assert.match(context, /executionClass=code/u);
+});
+
+test("research-hierarchy frontier states exact issue list and fingerprint contracts", () => {
+  const context = buildMissionGraphFrontierTurnContext([
+    {
+      type: "function",
+      function: {
+        name: "publish_research_project_to_linear",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ]);
+  assert.match(context, /dependencyKeys must be a JSON array/u);
+  assert.match(context, /use \[\] when it has no dependency/u);
+  assert.match(context, /acceptanceCriteria must be a nonempty JSON array/u);
+  assert.match(context, /initiative and project must each contain nonempty key, title, and description/u);
+  assert.match(context, /Use title, not name/u);
+  assert.match(context, /Omit workItemFingerprint/u);
+});
+
+test("negated cleanup after a research path does not become a delete mission", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const statuses: string[] = [];
+  const prompt = [
+    "Research American checkers rules using at least two credible public web sources.",
+    "Write the accepted research into Projects/Checkers/Research.md.",
+    "Then prepare exactly one Linear issue, create it after approval, and read it back independently.",
+    "Stop after the Linear readback. Do not delete or clean up the issue.",
+  ].join(" ");
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("Research is still in progress.")],
+    }),
+    toolRegistry: createRegistry([]),
+    toolContext: {} as ToolExecutionContext,
+    enableStreaming: false,
+    maxSteps: 1,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(configs[0]?.missionMode, "explicit_file_mutation");
+  assert.equal(configs[0]?.allowedToolNames.includes("delete_path"), false);
+  assert.equal(configs[0]?.allowedToolNames.includes("delete_current_file"), false);
+  assert.equal(configs[0]?.allowedToolNames.includes("web_search"), true);
+  assert.equal(configs[0]?.allowedToolNames.includes("web_fetch"), true);
+  assert.deepEqual(
+    configs[0]?.projectLifecycleEstimate?.stages.map((stage) => stage.stage),
+    ["accepted_research", "linear_hierarchy"],
+  );
+  assert.equal(configs[0]?.projectLifecycleEstimate?.activeMinutesMin, 6);
+  assert.equal(configs[0]?.projectLifecycleEstimate?.activeMinutesMax, 18);
+  assert.equal(
+    statuses.some(
+      (message) =>
+        message.includes("Pipeline: 1/2 Research and Obsidian note") &&
+        message.includes("2/2 Linear prepare, approval, create, and readback") &&
+        message.includes("6-18 minutes"),
+    ),
+    true,
+  );
+  assert.equal(
+    chatRequests[0]?.tools?.some((tool) => tool.function.name === "delete_path"),
+    false,
+  );
 });
 
 test("runner emits structured trace events for intent, tools, receipts, metrics, and final state", async () => {
@@ -10999,6 +11169,79 @@ test("missing required literal rejects a write before mutation and accepts one c
   );
 });
 
+test("namespaced invalid-argument errors receive one schema-qualified correction", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () => [{
+      type: "function",
+      function: {
+        name: "append_to_current_file",
+        parameters: {
+          type: "object",
+          properties: { text: { type: "string" } },
+          required: ["text"],
+          additionalProperties: false,
+        },
+      },
+    }],
+    execute: async (call) => {
+      executedCalls.push(call);
+      if (executedCalls.length === 1) {
+        return {
+          ok: false,
+          toolName: call.name,
+          mutationState: "not_applied",
+          error: {
+            code: "vault_append_invalid_arguments",
+            message: "The append payload must use the current schema.",
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          path: "Current.md",
+          operation: "append",
+          bytesWritten: 20,
+          readback: {
+            status: "verified",
+            checkedAt: "2026-07-18T00:00:00.000Z",
+            observedFingerprint: `sha256:${"a".repeat(64)}`,
+          },
+        },
+      };
+    },
+  };
+
+  await runAgentMission({
+    prompt: "Append the bounded result to the current note.",
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithToolCall("append_to_current_file", { text: "first" }),
+        () => responseWithToolCall("append_to_current_file", { text: "corrected" }),
+        () => responseWithContent("The bounded append is complete."),
+      ],
+    }),
+    toolRegistry: registry,
+    toolContext: createRunnerVaultContext({
+      prompt: "Append the bounded result to the current note.",
+    }).context,
+    enableStreaming: false,
+  });
+
+  assert.equal(executedCalls.length, 2);
+  assert.ok(
+    chatRequests.some((request) =>
+      /Tool-call schema correction: append_to_current_file rejected the supplied arguments/iu.test(
+        request.messages.at(-1)?.content ?? "",
+      ),
+    ),
+  );
+});
+
 test("repository implementation exposes only read-only status tools at the initial graph frontier", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const prompt = "Fix the bug in repository: C:/trusted/project, validate it, and commit the verified change.";
@@ -11085,6 +11328,38 @@ test("explicit scratch workspace workflow stays out of note-output routing", asy
   ]) {
     assert.ok(configs[0]?.allowedToolNames.includes(required), `missing ${required}`);
   }
+});
+
+test("generic repository implementation does not expose unrequested path relocation or cleanup", async () => {
+  const configs: AgentRunConfigEvent[] = [];
+  const prompt = [
+    "Implement the Python checkers files in the trusted repository and validate the code.",
+    "Do not move, copy, trash, restore, or delete any file or provider resource.",
+  ].join(" ");
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-17T16:00:00.000Z"),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [() => responseWithContent("Repository execution is pending.")],
+    }),
+    toolRegistry: createCodeV2RoutingRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 1,
+    events: { onRunConfig: (event) => configs.push(event) },
+  });
+
+  const allowed = new Set(configs[0]?.allowedToolNames ?? []);
+  assert.equal(allowed.has("code_workspace_patch"), true);
+  assert.equal(allowed.has("code_workspace_move"), false);
+  assert.equal(allowed.has("code_workspace_copy"), false);
+  assert.equal(allowed.has("code_workspace_trash"), false);
+  assert.equal(allowed.has("code_workspace_restore"), false);
 });
 
 test("explicit workspace CRUD lifecycle is planned once and reaches the model", async () => {
@@ -12068,6 +12343,44 @@ test("ordinary GitHub read prompts do not expose the verified-code publication t
       "github_get_combined_status",
     ],
     JSON.stringify(chatRequests.map((request) => request.tools?.map((tool) => tool.function.name) ?? [])),
+  );
+});
+
+test("compound project lifecycle does not expose pre-binding GitHub catalog reads", async () => {
+  const prompt = [
+    "Research checkers from public web sources and accept the research note.",
+    "Turn the accepted research into one Linear initiative, one project, and one issue.",
+    "Implement the issue in the trusted code repository and commit the validated code.",
+    "Create a private GitHub repository and publish the verified commit as a draft pull request.",
+  ].join(" ");
+  const chatRequests: ModelChatRequest[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.githubEnabled = true;
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("The lifecycle is pending.")],
+    }),
+    toolRegistry: createDefaultToolRegistry({
+      githubCatalogTools: [githubRunnerFixtureTool("github_get_repository")],
+      optionalCapabilities: { code: false, integrations: true, companion: false },
+      isOptionalCapabilityAvailable: (capability) => capability === "integrations",
+      legacyCompatibility: { code: false, companion: false },
+    }),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 1,
+  });
+
+  assert.equal(
+    chatRequests.some((request) =>
+      request.tools?.some(
+        (tool) => tool.function.name === "github_get_repository",
+      ),
+    ),
+    false,
   );
 });
 

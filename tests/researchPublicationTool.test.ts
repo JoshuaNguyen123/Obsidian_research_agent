@@ -90,6 +90,380 @@ test("exact duplicate publishes with no mutation grant and emits verified readba
   assert.equal(fixture.persistedReceipts.length, 1);
 });
 
+test("equivalent V1 schema labels are canonicalized before accepted publication", async (t) => {
+  for (const schemaVersion of ["1", "v1", "Version 1", "1.0"]) {
+    await t.test(schemaVersion, async () => {
+      const fixture = createFixture("created");
+      const context = contextFixture(
+        "Publish this research to Linear in Published.md",
+        "run:42",
+        "tool:call:string-schema",
+      );
+      context.requestNestedApproval = async (request) => ({
+        approved: true,
+        approvalId: "approval-string-schema",
+        approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+      });
+      const args = argsFixture();
+      (args.package as Record<string, unknown>).schemaVersion = schemaVersion;
+
+      const result = await new DefaultToolRegistry([fixture.tool]).execute(
+        { name: "publish_research_to_linear", arguments: args },
+        context,
+      );
+
+      assert.equal(result.ok, true);
+      assert.equal(fixture.noteWrites[0]?.package.schemaVersion, 1);
+    });
+  }
+});
+
+test("research publication mode schema documents exact non-overwriting labels", () => {
+  const parameters = createFixture("created").tool.parameters;
+  const mode = parameters.properties?.mode;
+  const baseHash = parameters.properties?.baseHash;
+  const packageSchema = parameters.properties?.package;
+  assert.deepEqual(mode?.enum, ["create", "append"]);
+  assert.match(String(mode?.description ?? ""), /create never overwrites/u);
+  assert.match(String(mode?.description ?? ""), /Never use write, overwrite, upsert/u);
+  assert.match(String(baseHash?.description ?? ""), /Omit entirely for create/u);
+  assert.match(String(baseHash?.description ?? ""), /never send an empty placeholder/u);
+  assert.equal(packageSchema?.properties?.proposedWork?.minItems, 1);
+  assert.equal(packageSchema?.properties?.scope?.minItems, 1);
+  assert.equal(packageSchema?.properties?.acceptanceCriteria?.minItems, 1);
+  assert.equal(packageSchema?.properties?.validationRequirementKeys?.minItems, 1);
+  assert.equal(packageSchema?.properties?.nonGoals?.minItems, undefined);
+  assert.equal(packageSchema?.properties?.dependencies?.minItems, undefined);
+});
+
+test("create canonicalizes an empty optional base hash while append rejects it", async () => {
+  const createFixture_ = createFixture("created");
+  const createArgs = argsFixture();
+  createArgs.baseHash = "";
+  const createContext = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  createContext.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-empty-create-base-hash",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+  const createResult = await new DefaultToolRegistry([createFixture_.tool]).execute(
+    { name: "publish_research_to_linear", arguments: createArgs },
+    createContext,
+  );
+  assert.equal(createResult.ok, true);
+  assert.equal(createFixture_.noteWrites[0]?.baseHash, undefined);
+
+  const appendFixture = createFixture("created");
+  const appendArgs = argsFixture();
+  appendArgs.mode = "append";
+  appendArgs.baseHash = "";
+  const appendResult = await new DefaultToolRegistry([appendFixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: appendArgs },
+    contextFixture(
+      "Publish this research to Linear by appending it in Published.md",
+    ),
+  );
+  assert.equal(appendResult.ok, false);
+  assert.equal(appendResult.error?.code, "research_publication_base_hash_required");
+});
+
+test("host derives missing package identifiers from canonical evidence and order", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  const package_ = args.package as Record<string, unknown>;
+  const evidence = package_.evidence as Array<Record<string, unknown>>;
+  evidence[0].id = "invalid evidence id with spaces";
+  const criteria = package_.acceptanceCriteria as Array<Record<string, unknown>>;
+  criteria[0].id = "criterion one";
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-host-derived-identifiers",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    fixture.noteWrites[0]?.package.evidence[0]?.id,
+    `evidence-${"a".repeat(64)}`,
+  );
+  assert.equal(fixture.noteWrites[0]?.package.acceptanceCriteria[0]?.id, "AC-1");
+});
+
+test("same-run publication retry reuses the first validated package and stable artifact identity", async () => {
+  const fixture = createFixture("created");
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.runtimeCache = { toolResults: new Map() };
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-stable-publication-retry",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+  const firstArgs = argsFixture();
+  const secondArgs = argsFixture();
+  (secondArgs.package as Record<string, unknown>).title =
+    "A later model response tried to rewrite accepted research";
+
+  await fixture.tool.execute(firstArgs, context);
+  context.operationId = "call-2";
+  await fixture.tool.execute(secondArgs, context);
+
+  assert.equal(fixture.noteWrites.length, 2);
+  assert.equal(fixture.noteWrites[1]?.package.title, "Accepted research");
+  assert.equal(
+    fixture.noteWrites[1]?.artifactId,
+    fixture.noteWrites[0]?.artifactId,
+  );
+  assert.notEqual(
+    fixture.noteWrites[1]?.artifactId,
+    `accepted-${context.runId}-${context.operationId}`,
+  );
+});
+
+test("host canonicalizes bounded string acceptance criteria from compatible models", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  const package_ = args.package as Record<string, unknown>;
+  package_.acceptanceCriteria = [
+    "A legal multi-jump continues until no further capture is available.",
+    "The focused Python tests pass.",
+  ];
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-string-criteria",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(fixture.noteWrites[0]?.package.acceptanceCriteria, [
+    {
+      id: "AC-1",
+      text: "A legal multi-jump continues until no further capture is available.",
+    },
+    { id: "AC-2", text: "The focused Python tests pass." },
+  ]);
+});
+
+test("same-run web readback hydrates and binds an omitted evidence hash", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  const package_ = args.package as Record<string, unknown>;
+  const evidence = package_.evidence as Array<Record<string, unknown>>;
+  evidence[0].id = "";
+  evidence[0].kind = "public_web";
+  evidence[0].contentSha256 = "";
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.runtimeCache = {
+    toolResults: new Map(),
+    trustedWebFetchResults: new Map([
+      [
+        `https://example.test/evidence:${HASH}`,
+        {
+          ok: true,
+          toolName: "web_fetch",
+          output: {
+            url: "https://example.test/evidence",
+            normalizedUrl: "https://example.test/evidence",
+            contentHash: HASH,
+            content: "Verified source content.",
+          },
+        },
+      ],
+    ]),
+  };
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-hydrated-web-evidence",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites[0]?.package.evidence[0]?.kind, "web");
+  assert.equal(fixture.noteWrites[0]?.package.evidence[0]?.contentSha256, HASH);
+  assert.equal(
+    fixture.noteWrites[0]?.package.evidence[0]?.id,
+    `evidence-${"a".repeat(64)}`,
+  );
+});
+
+test("trusted web readback replaces an empty model evidence list", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  (args.package as Record<string, unknown>).evidence = [];
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.runtimeCache = {
+    toolResults: new Map(),
+    trustedWebFetchResults: new Map([
+      [
+        `https://example.test/evidence:${HASH}`,
+        {
+          ok: true,
+          toolName: "web_fetch",
+          output: {
+            url: "https://example.test/evidence",
+            normalizedUrl: "https://example.test/evidence",
+            contentHash: HASH,
+            content: "Verified source content.",
+          },
+        },
+      ],
+    ]),
+  };
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-empty-model-evidence",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites[0]?.package.evidence.length, 1);
+  assert.equal(
+    fixture.noteWrites[0]?.package.evidence[0]?.contentSha256,
+    HASH,
+  );
+});
+
+test("same-run web readback rejects a conflicting model-supplied evidence hash", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  const package_ = args.package as Record<string, unknown>;
+  const evidence = package_.evidence as Array<Record<string, unknown>>;
+  evidence[0].contentSha256 = `sha256:${"b".repeat(64)}`;
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.runtimeCache = {
+    toolResults: new Map([
+      [
+        'web_fetch:{"url":"https://example.test/evidence"}',
+        {
+          ok: true,
+          toolName: "web_fetch",
+          output: {
+            url: "https://example.test/evidence",
+            normalizedUrl: "https://example.test/evidence",
+            contentHash: HASH,
+          },
+        },
+      ],
+    ]),
+  };
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "research_publication_evidence_changed");
+  assert.equal(fixture.noteWrites.length, 0);
+});
+
+test("same-run web readbacks replace unfetched model web claims with canonical sources", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  const package_ = args.package as Record<string, unknown>;
+  const evidence = package_.evidence as Array<Record<string, unknown>>;
+  evidence[0] = {
+    id: "untrusted-model-source",
+    kind: "web",
+    reference: "https://unfetched.example.test/claim",
+    contentSha256: `sha256:${"b".repeat(64)}`,
+    label: "Unfetched claim",
+    summary: "This claim did not receive a host fetch readback.",
+  };
+  evidence.push({
+    id: "model evidence with invalid spacing",
+    kind: "user",
+    reference: "model-only-user-claim",
+    contentSha256: "",
+    label: "Unverified user claim",
+    summary: "This model-authored entry has no host readback or strong hash.",
+  });
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.runtimeCache = {
+    toolResults: new Map([
+      [
+        'web_fetch:{"url":"https://example.test/evidence"}',
+        {
+          ok: true,
+          toolName: "web_fetch",
+          output: {
+            title: "Verified rules source",
+            url: "https://example.test/evidence",
+            normalizedUrl: "https://example.test/evidence",
+            urlHash: "1234567890abcdef",
+            contentHash: HASH,
+            content: "Verified source content for accepted research.",
+          },
+        },
+      ],
+    ]),
+  };
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-canonical-web-projection",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites[0]?.package.evidence.length, 1);
+  assert.equal(
+    fixture.noteWrites[0]?.package.evidence[0]?.reference,
+    "https://example.test/evidence",
+  );
+  assert.equal(fixture.noteWrites[0]?.package.evidence[0]?.contentSha256, HASH);
+  assert.equal(
+    fixture.noteWrites[0]?.package.evidence[0]?.id,
+    `evidence-${"a".repeat(48)}-1234567890abcdef`,
+  );
+  assert.equal(fixture.noteWrites[0]?.package.evidence[0]?.label, "Verified rules source");
+  assert.doesNotMatch(
+    fixture.noteWrites[0]?.package.evidence[0]?.reference ?? "",
+    /unfetched/u,
+  );
+});
+
 test("external bindings, origin ids, and unscoped paths fail before note mutation", async (t) => {
   await t.test("model origin id", async () => {
     const fixture = createFixture("created");
@@ -108,6 +482,57 @@ test("external bindings, origin ids, and unscoped paths fail before note mutatio
       /untrusted repository/i,
     );
     assert.equal(fixture.noteWrites.length, 0);
+  });
+  await t.test("combined hierarchy envelope reports redacted argument shape", async () => {
+    const fixture = createFixture("created");
+    const args = argsFixture();
+    args.package = {
+      acceptanceCriteria: [],
+      research: { summary: "not serialized in diagnostics" },
+      initiativeKey: "initiative-e2e",
+    };
+    await assert.rejects(
+      fixture.tool.execute(
+        args,
+        contextFixture("Publish this code research to Linear in Published.md"),
+      ),
+      /unknown_shapes: initiativeKey:string, research:object\(summary\)/i,
+    );
+    assert.equal(fixture.noteWrites.length, 0);
+  });
+  await t.test("repository-bound non-code package", async () => {
+    const fixture = createFixture("created");
+    const args = argsFixture();
+    (args.package as Record<string, unknown>).executionClass = "research";
+    await assert.rejects(
+      fixture.tool.execute(
+        args,
+        contextFixture("Publish this code research to Linear in Published.md"),
+      ),
+      /repositoryKey must use executionClass code/i,
+    );
+    assert.equal(fixture.noteWrites.length, 0);
+  });
+  await t.test("bounded human-readable enum labels are canonicalized", async () => {
+    const fixture = createFixture("created");
+    const args = argsFixture();
+    (args.package as Record<string, unknown>).riskClass = "medium-risk";
+    (args.package as Record<string, unknown>).executionClass = "code execution";
+    const context = contextFixture(
+      "Publish this code research to Linear in Published.md",
+    );
+    context.requestNestedApproval = async (request) => ({
+      approved: true,
+      approvalId: "approval-canonical-enums",
+      approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+    });
+    await fixture.tool.execute(
+      args,
+      context,
+    );
+    assert.equal(fixture.noteWrites.length, 1);
+    assert.equal(fixture.noteWrites[0]?.package.riskClass, "medium");
+    assert.equal(fixture.noteWrites[0]?.package.executionClass, "code");
   });
   await t.test("path absent from mission", async () => {
     const fixture = createFixture("created");

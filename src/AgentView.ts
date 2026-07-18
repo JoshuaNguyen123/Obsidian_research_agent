@@ -2083,6 +2083,15 @@ export class AgentView extends ItemView {
       `chat_only_override=${this.runConfig.chatOnlyOverride ? "on" : "off"}`,
       `route=${this.runConfig.route}`,
       `expected=${this.runConfig.expectedTimeClass}`,
+      ...(this.runConfig.projectLifecycleEstimate
+        ? [
+            `pipeline_active_estimate=${this.runConfig.projectLifecycleEstimate.activeMinutesMin}-${this.runConfig.projectLifecycleEstimate.activeMinutesMax}_minutes_excluding_provider_and_approval_waits`,
+            ...this.runConfig.projectLifecycleEstimate.stages.map(
+              (stage, index, stages) =>
+                `pipeline_stage=${index + 1}/${stages.length}:${stage.stage}:${stage.label}:${stage.activeMinutesMin}-${stage.activeMinutesMax}_active_minutes:${stage.approvalMayPause ? "approval_may_pause" : "no_approval_expected"}`,
+            ),
+          ]
+        : []),
       `step_cap=${this.runConfig.maxStepsForRun}`,
       ...(this.runConfig.budgetProfile
         ? [

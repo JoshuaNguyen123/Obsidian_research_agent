@@ -23,6 +23,8 @@ export interface RepositoryProfileV1 {
   /** Repository-relative prefixes an autonomous coding run may mutate. */
   allowedPathPrefixes: string[];
   validationProfile: ValidationProfile;
+  /** Optional immutable runtime pins used when migrating this trusted V1 profile. */
+  runtimeDigests?: Partial<Record<"node" | "python", string>>;
   promotionPolicy: RepositoryPromotionPolicyV1;
 }
 
@@ -59,6 +61,7 @@ export function parseRepositoryProfile(value: unknown): RepositoryProfileV1 {
   const source = expectRecord(value, "repository profile");
   const record: Record<string, unknown> = {
     promotionPolicy: defaultRepositoryPromotionPolicy(),
+    runtimeDigests: undefined,
     ...source,
   };
   assertExactKeys(
@@ -71,6 +74,7 @@ export function parseRepositoryProfile(value: unknown): RepositoryProfileV1 {
       "defaultBranch",
       "allowedPathPrefixes",
       "validationProfile",
+      "runtimeDigests",
       "promotionPolicy",
     ],
     "repository profile",
@@ -92,6 +96,7 @@ export function parseRepositoryProfile(value: unknown): RepositoryProfileV1 {
     );
   }
 
+  const runtimeDigests = parseRuntimeDigests(record.runtimeDigests);
   return {
     schemaVersion: REPOSITORY_PROFILE_SCHEMA_VERSION,
     key,
@@ -100,8 +105,32 @@ export function parseRepositoryProfile(value: unknown): RepositoryProfileV1 {
     defaultBranch,
     allowedPathPrefixes,
     validationProfile: parseValidationProfile(record.validationProfile),
+    ...(runtimeDigests ? { runtimeDigests } : {}),
     promotionPolicy: parsePromotionPolicy(record.promotionPolicy),
   };
+}
+
+function parseRuntimeDigests(
+  value: unknown,
+): Partial<Record<"node" | "python", string>> | undefined {
+  if (value === undefined) return undefined;
+  const record = expectRecord(value, "repository runtime digests");
+  const keys = Object.keys(record);
+  if (keys.some((key) => key !== "node" && key !== "python")) {
+    throw new RepositoryProfileError("Repository runtime digests contain an unknown ecosystem.");
+  }
+  const output: Partial<Record<"node" | "python", string>> = {};
+  for (const key of keys as Array<"node" | "python">) {
+    const digest = record[key];
+    if (
+      typeof digest !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(digest)
+    ) {
+      throw new RepositoryProfileError(`${key} runtime digest must be an exact SHA-256 fingerprint.`);
+    }
+    output[key] = digest;
+  }
+  return Object.keys(output).length > 0 ? output : undefined;
 }
 
 export function defaultRepositoryPromotionPolicy(): RepositoryPromotionPolicyV1 {

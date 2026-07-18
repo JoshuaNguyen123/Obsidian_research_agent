@@ -71,6 +71,14 @@ function getExpectedTools(
       : ["create_design_canvas"];
   }
 
+  // A compound research-to-code mission still requires its explicit public
+  // web evidence before repository execution. Generic later wording such as
+  // "run targeted validation" must not replace that evidence frontier with
+  // the legacy single-block code tool.
+  if (hasExplicitWebGroundingIntent(prompt)) {
+    return ["web_search", "web_fetch"];
+  }
+
   if (hasRunCodeIntent(prompt)) {
     return ["run_code_block"];
   }
@@ -109,7 +117,7 @@ function getExpectedTools(
       : ["inspect_semantic_index", "semantic_search_notes"];
   }
 
-  if (generated.requiresGrounding || /\b(web|online|sources?|citations?)\b/i.test(prompt)) {
+  if (generated.requiresGrounding || /\b(sources?)\b/i.test(prompt)) {
     return ["web_search", "web_fetch"];
   }
 

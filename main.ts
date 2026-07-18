@@ -121,6 +121,7 @@ import {
   type RunOutcome,
 } from "./src/agent/runCoordinator";
 import {
+  getDurablyCompletedLifecycleToolNames,
   loadLatestPersistedMissionRunProjection,
   loadPersistedMissionRunProjectionByRunId,
 } from "./src/agent/startupMissionHydration";
@@ -472,6 +473,7 @@ import {
 import {
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
   createResearchProjectHierarchyTool,
+  selectAcceptedResearchBindingForCurrentMission,
 } from "./src/tools/researchProjectHierarchyTool";
 import {
   createGitHubPublicationTool,
@@ -1823,7 +1825,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       rawLinearOAuthRuntimeState,
     );
     this.linearOAuthStatusMessage = this.linearOAuthRuntimeState
-      ? `Connected with ${this.linearOAuthRuntimeState.actor}-actor OAuth; tokens are stored as opaque secure references.`
+      ? `Connected with ${this.linearOAuthRuntimeState.actor}-actor OAuth; tokens are saved as opaque secure references and remain available after restart.`
       : "Linear OAuth is not connected.";
     try {
       this.githubCredential = rawGitHubCredential
@@ -1849,10 +1851,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       );
     // A verified credential is the connection switch. The legacy booleans stay
     // as internal runtime gates, but no longer require a second user setting.
-    this.settings.linearEnabled =
-      this.linearOAuthRuntimeState !== null ||
-      this.linearApiKey.length > 0 ||
-      this.linearCredentialReference !== null;
+    this.settings.linearEnabled = this.hasLinearApiKey();
     this.settings.githubEnabled = this.githubCredential !== null;
     this.githubPublicationCheckpointNamespace =
       parseGitHubPublicationCheckpointNamespaceV1(
@@ -2014,7 +2013,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.scheduleCompanionMissionReconciliation(250);
   }
 
-  hasLinearApiKey(): boolean {
+  private hasLinearReferencedApiKey(): boolean {
     const reference = this.linearCredentialReference;
     let referencedCredentialAvailable = false;
     if (reference) {
@@ -2034,10 +2033,40 @@ export default class AgenticResearcherPlugin extends Plugin {
         }
       }
     }
+    return referencedCredentialAvailable;
+  }
+
+  private hasLinearOAuthCredential(): boolean {
+    const state = this.linearOAuthRuntimeState;
+    if (!state) return false;
+    const references = [
+      state.credential.accessTokenReferenceId,
+      state.credential.refreshTokenReferenceId,
+    ];
+    const nativeReferences = references.filter((referenceId) =>
+      isObsidianSecretReferenceV1(referenceId),
+    );
+    if (nativeReferences.length === 0) {
+      // Companion-backed references are availability-probed by the async
+      // secret store when used. Retain them across restart without pretending
+      // that they belong to Obsidian's native SecretStorage.
+      return true;
+    }
+    if (nativeReferences.length !== references.length) return false;
+    try {
+      return nativeReferences.every((referenceId) =>
+        Boolean(this.app.secretStorage.getSecret(referenceId)),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  hasLinearApiKey(): boolean {
     return (
-      this.linearOAuthRuntimeState !== null ||
+      this.hasLinearOAuthCredential() ||
       this.linearApiKey.length > 0 ||
-      referencedCredentialAvailable
+      this.hasLinearReferencedApiKey()
     );
   }
 
@@ -2048,14 +2077,19 @@ export default class AgenticResearcherPlugin extends Plugin {
     message: string;
     authorizationUrl: string | null;
   } {
+    const oauthCredentialAvailable = this.hasLinearOAuthCredential();
+    const unavailableSavedReference =
+      this.linearOAuthRuntimeState !== null && !oauthCredentialAvailable;
     return {
-      connected: this.linearOAuthRuntimeState !== null,
+      connected: oauthCredentialAvailable,
       waitingForCallback: this.activeLinearOAuthLoopback !== null,
       actor:
         this.linearOAuthRuntimeState?.actor ??
         (this.settings.linearOAuthActor === "app" ? "app" : "user"),
       message: this.linearOAuthRuntimeState?.pendingRefresh
         ? "Linear OAuth refresh is awaiting replay reconciliation; external work is paused."
+        : unavailableSavedReference
+          ? "A saved Linear OAuth reference exists, but its secure token is unavailable. Reconnect Linear; the saved reference was retained for recovery."
         : this.linearOAuthStatusMessage,
       authorizationUrl: this.linearOAuthAuthorizationUrl,
     };
@@ -2507,7 +2541,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       if (
         this.linearCredentialReference.backend ===
           OBSIDIAN_SECRET_STORAGE_BACKEND &&
-        !this.hasLinearApiKey()
+        !this.hasLinearReferencedApiKey()
       ) {
         return {
           configured: false,
@@ -6872,6 +6906,87 @@ export default class AgenticResearcherPlugin extends Plugin {
       .map((lineage) => JSON.parse(JSON.stringify(lineage)) as ProjectLineageV1);
   }
 
+  async getDurableMissionRestartReadiness(): Promise<{
+    ready: boolean;
+    runId: string | null;
+    completedLifecycleTools: string[];
+    ledgerStatus: string | null;
+  }> {
+    const runId = this.runCoordinator.getSnapshot().runId;
+    if (!runId) {
+      return {
+        ready: false,
+        runId: null,
+        completedLifecycleTools: [],
+        ledgerStatus: null,
+      };
+    }
+    try {
+      const context = this.createToolExecutionContext(
+        `attest durable lifecycle restart boundary ${runId}`,
+      );
+      const projection = await loadPersistedMissionRunProjectionByRunId(
+        context,
+        runId,
+      );
+      if (!projection) {
+        return {
+          ready: false,
+          runId,
+          completedLifecycleTools: [],
+          ledgerStatus: null,
+        };
+      }
+      const completedLifecycleTools =
+        getDurablyCompletedLifecycleToolNames(projection);
+      return {
+        ready: completedLifecycleTools.length > 0,
+        runId,
+        completedLifecycleTools,
+        ledgerStatus: projection.missionLedger.status,
+      };
+    } catch {
+      return {
+        ready: false,
+        runId,
+        completedLifecycleTools: [],
+        ledgerStatus: null,
+      };
+    }
+  }
+
+  async prepareForDurableMissionRestart(
+    requiredLifecycleTool: string,
+  ): Promise<boolean> {
+    const before = await this.getDurableMissionRestartReadiness();
+    if (!before.completedLifecycleTools.includes(requiredLifecycleTool)) {
+      return false;
+    }
+    if (this.runCoordinator.isRunning()) {
+      this.runCoordinator.requestStop();
+    }
+    const idleDeadline = Date.now() + 15_000;
+    while (this.runCoordinator.isRunning() && Date.now() < idleDeadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    if (this.runCoordinator.isRunning()) {
+      return false;
+    }
+    const persistedDeadline = Date.now() + 10_000;
+    while (Date.now() < persistedDeadline) {
+      const after = await this.getDurableMissionRestartReadiness();
+      if (
+        after.runId === before.runId &&
+        after.ledgerStatus !== "running" &&
+        after.completedLifecycleTools.includes(requiredLifecycleTool)
+      ) {
+        return true;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
   private async hydrateLatestMissionRunProjection(
     preferredRunId?: string,
   ): Promise<void> {
@@ -9403,22 +9518,27 @@ export default class AgenticResearcherPlugin extends Plugin {
     if (
       !snapshot ||
       !teamId ||
-      !projectId ||
       getLinearCapabilitySnapshotFreshness(snapshot) !== "fresh" ||
       deriveLinearCapabilityGate(snapshot) < 1
     ) {
       return null;
     }
     const team = snapshot.teams.find((item) => item.id === teamId);
-    const project = snapshot.projects.find((item) => item.id === projectId);
+    const project = projectId
+      ? snapshot.projects.find((item) => item.id === projectId)
+      : undefined;
     if (
       !team ||
-      !project ||
-      (project.teamIds.length > 0 && !project.teamIds.includes(team.id))
+      (projectId && !project) ||
+      (project && project.teamIds.length > 0 && !project.teamIds.includes(team.id))
     ) {
       return null;
     }
-    return { workspaceId: snapshot.workspace.id, teamId, projectId };
+    return {
+      workspaceId: snapshot.workspace.id,
+      teamId,
+      ...(projectId ? { projectId } : {}),
+    };
   }
 
   private getResearchProjectHierarchyDestination(): {
@@ -9431,7 +9551,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       !snapshot ||
       !teamId ||
       getLinearCapabilitySnapshotFreshness(snapshot) !== "fresh" ||
-      deriveLinearCapabilityGate(snapshot) < 3
+      deriveLinearCapabilityGate(snapshot) < 2
     ) {
       return null;
     }
@@ -9510,7 +9630,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             actions: ["create"],
             selector: {
               teamIds: [target.teamId],
-              projectIds: [target.projectId],
+              ...(target.projectId ? { projectIds: [target.projectId] } : {}),
             },
           }],
           limits: {
@@ -9865,17 +9985,34 @@ export default class AgenticResearcherPlugin extends Plugin {
       actionExecutor: executor,
       checkpoints: this.researchProjectHierarchyCheckpointStore,
       destination,
-      validateAcceptedResearchBinding: async ({
-        artifactFingerprint,
-        notePath,
-      }) => {
-        const checkpoints = await this.researchPublicationCheckpointStore.list();
-        return checkpoints.some(
-          (checkpoint) =>
-            checkpoint.artifact.artifactFingerprint === artifactFingerprint &&
-            checkpoint.artifact.notePath === notePath &&
-            !["failed", "approval_denied"].includes(checkpoint.status),
+      resolveAcceptedResearchBinding: async ({ runId }) => {
+        const runSnapshot = this.runCoordinator.getSnapshot();
+        const acceptedRunIds = new Set(
+          [
+            runId,
+            runSnapshot.lastMissionLedger?.runId,
+            runSnapshot.lastMissionGraph?.missionId,
+          ].filter((value): value is string => Boolean(value)),
         );
+        const candidates: Array<{
+          runId: string;
+          artifactFingerprint: string;
+          notePath: string;
+        }> = [];
+        for (const lineage of await this.projectLineageStore.list()) {
+          const proof = lineage.commits[0]?.proof;
+          if (proof?.stage === "accepted_research") {
+            candidates.push({
+              runId: lineage.runId,
+              artifactFingerprint: proof.artifactFingerprint,
+              notePath: proof.notePath,
+            });
+          }
+        }
+        return selectAcceptedResearchBindingForCurrentMission(candidates, {
+          acceptedRunIds,
+          missionObjective: runSnapshot.lastMissionGraph?.objective ?? "",
+        });
       },
       mintHierarchyGrant: async ({
         runId,

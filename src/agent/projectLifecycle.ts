@@ -36,6 +36,22 @@ export const PROJECT_LIFECYCLE_STAGES = Object.freeze([
 
 export type ProjectLifecycleStageV1 = (typeof PROJECT_LIFECYCLE_STAGES)[number];
 
+export interface ProjectLifecycleStageEstimateV1 {
+  stage: ProjectLifecycleStageV1;
+  label: string;
+  activeMinutesMin: number;
+  activeMinutesMax: number;
+  approvalMayPause: boolean;
+}
+
+export interface ProjectLifecycleEstimateV1 {
+  version: 1;
+  stages: ProjectLifecycleStageEstimateV1[];
+  activeMinutesMin: number;
+  activeMinutesMax: number;
+  excludesProviderAndApprovalWaits: true;
+}
+
 export interface ResearcherHandoffV1 {
   schemaVersion: typeof RESEARCHER_HANDOFF_SCHEMA_VERSION;
   kind: "researcher_to_lead";
@@ -417,7 +433,7 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   if (positive(/\b(?:research|investigate|study|analy[sz]e)\b[^.\n]{0,120}\b(?:topic|product|problem|idea|market|vault|web|sources?)\b/u, "research|investigat(?:e|ion)")) {
     stages.push("accepted_research");
   }
-  if (positive(/\b(?:shape|turn|send|publish|create|build)\b[^.\n]{0,140}\blinear\b[^.\n]{0,100}\b(?:initiative|project|issues?|hierarchy|plan)\b/u, "linear|initiative|hierarchy")) {
+  if (positive(/\b(?:prepare|format|shape|turn|send|publish|create|build)\b[^.\n]{0,140}\blinear\b[^.\n]{0,100}\b(?:initiative|project|issues?|hierarchy|plan)\b/u, "linear|initiative|hierarchy")) {
     stages.push("linear_hierarchy");
   }
   if (positive(/\b(?:implement|code|execute|work|build|fix)\b[^.\n]{0,140}\b(?:code|repository|repo|workspace|linear\s+issues?)\b/u, "code|implement(?:ation)?|repository|repo|workspace")) {
@@ -430,6 +446,79 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
     stages.push("reconciliation_cleanup");
   }
   return PROJECT_LIFECYCLE_STAGES.filter((stage) => stages.includes(stage));
+}
+
+/**
+ * User-facing active-work estimate for a detected project lifecycle. These are
+ * intentionally broad deterministic ranges, not promises: provider latency
+ * and time spent waiting for an approval are reported separately.
+ */
+export function estimateProjectLifecycleV1(
+  command: string,
+): ProjectLifecycleEstimateV1 | null {
+  const stages = detectProjectLifecycleStagesV1(command);
+  if (stages.length === 0) return null;
+  const estimates = stages.map(projectLifecycleStageEstimate);
+  return {
+    version: 1,
+    stages: estimates,
+    activeMinutesMin: estimates.reduce(
+      (total, estimate) => total + estimate.activeMinutesMin,
+      0,
+    ),
+    activeMinutesMax: estimates.reduce(
+      (total, estimate) => total + estimate.activeMinutesMax,
+      0,
+    ),
+    excludesProviderAndApprovalWaits: true,
+  };
+}
+
+function projectLifecycleStageEstimate(
+  stage: ProjectLifecycleStageV1,
+): ProjectLifecycleStageEstimateV1 {
+  switch (stage) {
+    case "accepted_research":
+      return {
+        stage,
+        label: "Research and Obsidian note",
+        activeMinutesMin: 4,
+        activeMinutesMax: 12,
+        approvalMayPause: false,
+      };
+    case "linear_hierarchy":
+      return {
+        stage,
+        label: "Linear prepare, approval, create, and readback",
+        activeMinutesMin: 2,
+        activeMinutesMax: 6,
+        approvalMayPause: true,
+      };
+    case "code_execution":
+      return {
+        stage,
+        label: "Code implementation, validation, and commit",
+        activeMinutesMin: 5,
+        activeMinutesMax: 20,
+        approvalMayPause: true,
+      };
+    case "private_github_publication":
+      return {
+        stage,
+        label: "Private GitHub publication and readback",
+        activeMinutesMin: 2,
+        activeMinutesMax: 7,
+        approvalMayPause: true,
+      };
+    case "reconciliation_cleanup":
+      return {
+        stage,
+        label: "Backlinks, status reconciliation, and cleanup proof",
+        activeMinutesMin: 2,
+        activeMinutesMax: 6,
+        approvalMayPause: true,
+      };
+  }
 }
 
 export function buildProjectLifecycleStageNodesV1(

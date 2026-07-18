@@ -140,10 +140,31 @@ async function assertLiveProviderConfiguration() {
     ? process.env.E2E_OPENAI_COMPATIBLE_API_KEY?.trim()
     : process.env.E2E_OLLAMA_API_KEY?.trim()) ||
     (provider === "openai_compatible" ? settings.openAiCompatibleApiKey : settings.ollamaApiKey);
+  const secureReferenceKey = provider === "openai_compatible"
+    ? "openAiCompatible"
+    : "ollama";
+  const secureReference = settings.modelCredentialReferences?.[secureReferenceKey];
+  const hasPersistentSecureReference = Boolean(
+    secureReference &&
+    typeof secureReference === "object" &&
+    secureReference.version === 1 &&
+    typeof secureReference.referenceId === "string" &&
+    /^secret-obsidian-[a-z0-9-]{16,48}$/u.test(secureReference.referenceId) &&
+    secureReference.backend === "obsidian-secret-storage" &&
+    secureReference.persistent === true &&
+    secureReference.metadata?.provider === provider &&
+    secureReference.metadata?.credentialKind === "model_api_key",
+  );
   if (!String(model).trim()) throw new Error("Live-provider model is not configured.");
   if (!String(baseUrl).trim()) throw new Error("Live-provider endpoint is not configured.");
-  if (!String(credential).trim() && !/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])/iu.test(String(baseUrl))) {
-    throw new Error("Live-provider credential is missing for a non-local endpoint.");
+  if (
+    !String(credential).trim() &&
+    !hasPersistentSecureReference &&
+    !/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])/iu.test(String(baseUrl))
+  ) {
+    throw new Error(
+      "Live-provider credential is missing for a non-local endpoint; configure an environment credential or a persistent opaque model credential reference.",
+    );
   }
   if (playwrightLanes.includes("provider-canary") && !process.env.E2E_CANARY_MODEL?.trim()) {
     throw new Error("E2E_CANARY_MODEL is required for the provider-canary lane.");

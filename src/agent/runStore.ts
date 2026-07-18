@@ -1169,6 +1169,95 @@ export function transitionOperationJournalRecord(
   };
 }
 
+const EXACT_LIFECYCLE_RECONCILIATION_TOOLS = new Set([
+  "publish_research_to_linear",
+  "publish_research_project_to_linear",
+  "code_commit_verified",
+  "github_create_private_repository",
+  "publish_verified_code_to_github",
+  "github_delete_private_repository",
+]);
+
+/**
+ * A resumable composite may first return an ambiguous provider outcome and
+ * later finish by independently adopting that exact operation. Its verified,
+ * idempotency-bound receipt resolves older outer-runner WAL rows for the same
+ * graph node; otherwise startup would keep blocking on ambiguity that the
+ * nested workflow has already reconciled. This is deliberately unavailable to
+ * ordinary mutations and to receipts without exact readback proof.
+ */
+export function reconcilePriorExactLifecycleJournalRecords(
+  records: readonly OperationJournalRecord[],
+  current: OperationJournalRecord,
+  receipt: ActionReceipt,
+  now = new Date(),
+): OperationJournalRecord[] {
+  const eligible =
+    current.state === "committed" &&
+    typeof current.nodeId === "string" &&
+    current.nodeId.length > 0 &&
+    EXACT_LIFECYCLE_RECONCILIATION_TOOLS.has(current.toolName) &&
+    exactLifecycleReceiptMatches(current.toolName, receipt) &&
+    receipt.commitKind === "committed" &&
+    receipt.readback.status === "verified" &&
+    typeof receipt.idempotencyKey === "string" &&
+    receipt.idempotencyKey.length > 0;
+  if (!eligible) return records.map((record) => ({ ...record }));
+
+  return records.map((record) => {
+    if (
+      record.operationId === current.operationId ||
+      record.state !== "reconcile_required" ||
+      record.rootRunId !== current.rootRunId ||
+      record.nodeId !== current.nodeId ||
+      record.toolName !== current.toolName
+    ) {
+      return { ...record };
+    }
+    return transitionOperationJournalRecord(record, "committed", {
+      message:
+        "A later exact lifecycle retry independently reconciled this operation and committed its verified receipt.",
+      receipt,
+      mutationMayHaveApplied: true,
+      now,
+    });
+  });
+}
+
+function exactLifecycleReceiptMatches(
+  compositeToolName: string,
+  receipt: ActionReceipt,
+): boolean {
+  const expected: Record<string, { system: ResourceRef["system"]; prefix: string }> = {
+    publish_research_to_linear: {
+      system: "linear",
+      prefix: "research-publication:",
+    },
+    publish_research_project_to_linear: {
+      system: "linear",
+      prefix: "linear-research-project:",
+    },
+    github_create_private_repository: {
+      system: "github",
+      prefix: "github-private-repository:",
+    },
+    publish_verified_code_to_github: {
+      system: "github",
+      prefix: "github-publication:",
+    },
+    github_delete_private_repository: {
+      system: "github",
+      prefix: "github-private-repository-cleanup:",
+    },
+  };
+  const binding = expected[compositeToolName];
+  return Boolean(
+    binding &&
+    receipt.resource.system === binding.system &&
+    receipt.idempotencyKey?.startsWith(binding.prefix),
+  );
+}
+
 /**
  * Binds a validated prepared external action to the existing write-ahead
  * record. Callers must persist the returned record before any remote dispatch.
@@ -2736,15 +2825,30 @@ function normalizeEvidence(value: unknown): MissionEvidence | null {
   const sourceId = getNonEmptyString(value.sourceId);
   const passageId = getNonEmptyString(value.passageId);
   const passageIds = dedupeStrings(getStringArray(value.passageIds)).slice(0, 6);
+  const contentHash = getNonEmptyString(value.contentHash);
+  const parserStatus =
+    value.parserStatus === "parsed" ||
+    value.parserStatus === "empty" ||
+    value.parserStatus === "missing_content" ||
+    value.parserStatus === "legacy_unknown"
+      ? value.parserStatus
+      : undefined;
   return {
     id,
     kind,
     title,
     path: getNonEmptyString(value.path),
     url: getNonEmptyString(value.url),
+    ...(contentHash && /^sha256:[a-f0-9]{64}$/u.test(contentHash)
+      ? { contentHash }
+      : {}),
     ...(sourceId ? { sourceId } : {}),
     ...(passageId ? { passageId } : {}),
     ...(passageIds.length > 0 ? { passageIds } : {}),
+    ...(typeof value.usableSource === "boolean"
+      ? { usableSource: value.usableSource }
+      : {}),
+    ...(parserStatus ? { parserStatus } : {}),
     summary,
     confidence,
   };

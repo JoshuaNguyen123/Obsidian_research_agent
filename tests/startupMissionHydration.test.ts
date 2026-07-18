@@ -20,6 +20,7 @@ import {
   writeMissionRuntimeSnapshot,
 } from "../src/agent/runStore";
 import {
+  getDurablyCompletedLifecycleToolNames,
   loadLatestPersistedMissionRunProjection,
   loadPersistedMissionRunProjectionByRunId,
   StartupMissionHydrationIntegrityError,
@@ -53,6 +54,29 @@ test("startup hydration reads the exact durable graph and resumable ledger", asy
     "run-startup-valid",
   );
   assert.deepEqual(direct, projection);
+});
+
+test("lifecycle restart readiness requires a resumable durable completed node", () => {
+  const projection = {
+    missionLedger: { canResume: true },
+    missionGraph: {
+      nodes: {
+        accepted: {
+          status: "complete",
+          allowedTools: ["publish_research_to_linear"],
+        },
+        hierarchy: {
+          status: "running",
+          allowedTools: ["publish_research_project_to_linear"],
+        },
+      },
+    },
+  } as unknown as Parameters<typeof getDurablyCompletedLifecycleToolNames>[0];
+  assert.deepEqual(getDurablyCompletedLifecycleToolNames(projection), [
+    "publish_research_to_linear",
+  ]);
+  projection.missionLedger.canResume = false;
+  assert.deepEqual(getDurablyCompletedLifecycleToolNames(projection), []);
 });
 
 test("startup hydration skips a newer accepted ledger and selects the older incomplete run", async () => {

@@ -274,6 +274,7 @@ test("runtime snapshot v2 round-trips complete resumable mission state", () => {
         kind: "web_source",
         title: "Durable execution",
         url: "https://example.com/durable",
+        contentHash: `sha256:${"a".repeat(64)}`,
         sourceId: "source:durable",
         passageId: "source:durable:passage:0-128",
         passageIds: [
@@ -282,6 +283,8 @@ test("runtime snapshot v2 round-trips complete resumable mission state", () => {
         ],
         summary: "A source about durable execution.",
         confidence: "high",
+        usableSource: true,
+        parserStatus: "parsed",
       },
     ],
     receipts: [
@@ -324,6 +327,9 @@ test("runtime snapshot v2 round-trips complete resumable mission state", () => {
   assert.equal(restored?.researchPlan?.mode, "deep_hybrid");
   assert.equal(restored?.evidence[0].id, "web:1");
   assert.equal(restored?.evidence[0].sourceId, "source:durable");
+  assert.equal(restored?.evidence[0].contentHash, `sha256:${"a".repeat(64)}`);
+  assert.equal(restored?.evidence[0].usableSource, true);
+  assert.equal(restored?.evidence[0].parserStatus, "parsed");
   assert.deepEqual(restored?.evidence[0].passageIds, [
     "source:durable:passage:0-128",
     "source:durable:passage:256-384",

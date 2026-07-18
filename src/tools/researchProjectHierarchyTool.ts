@@ -18,6 +18,10 @@ import {
   type ResearchProjectHierarchyCheckpointPortV1,
 } from "../integrations/linear/ResearchProjectHierarchyWorkflowV1";
 import type { HostLinearActionExecutor } from "../integrations/linear/HostLinearActionExecutor";
+import {
+  DurableLinearContractError,
+  fingerprintContract,
+} from "../integrations/linear/LinearContractSupport";
 import type { LinearToolClient } from "../integrations/linear/LinearTools";
 import type { JsonSchemaObject } from "../model/types";
 import type { AgentTool } from "./types";
@@ -42,10 +46,10 @@ export interface CreateResearchProjectHierarchyToolOptionsV1 {
   >;
   checkpoints: ResearchProjectHierarchyCheckpointPortV1;
   destination: ResearchProjectDestinationV1;
-  validateAcceptedResearchBinding(input: {
-    artifactFingerprint: string;
-    notePath: string;
-  }): Promise<boolean>;
+  resolveAcceptedResearchBinding(input: {
+    runId: string;
+    notePath: string | null;
+  }): Promise<{ artifactFingerprint: string; notePath: string } | null>;
   mintHierarchyGrant(
     input: ResearchProjectHierarchyGrantInputV1,
   ): Promise<AuthorityGrantV1>;
@@ -82,7 +86,7 @@ export function createResearchProjectHierarchyTool(
       if (options.isAvailable?.() === false) {
         throw notApplied(
           "linear_hierarchy_unavailable",
-          "Linear hierarchy publication requires a verified gate-3 Linear connection and destination.",
+          "Linear hierarchy publication requires a verified Linear connection and team destination.",
         );
       }
       if (!hasExplicitResearchProjectHierarchyIntent(context.originalPrompt)) {
@@ -100,20 +104,68 @@ export function createResearchProjectHierarchyTool(
       const runId = requireIdentity(context.runId, "run id");
       const toolCallId = requireIdentity(context.operationId, "tool call id");
       const planInput = parsePlanArguments(args);
-      const plan = createResearchProjectPlanV1({
-        ...planInput,
-        runId,
-        destination: options.destination,
-        createdAt: (options.now ?? context.now ?? (() => new Date()))().toISOString(),
-      });
-      if (!(await options.validateAcceptedResearchBinding({
-        artifactFingerprint: plan.acceptedResearchArtifactFingerprint,
-        notePath: plan.sourceNotePath,
-      }))) {
+      const acceptedResearchBinding =
+        await options.resolveAcceptedResearchBinding({
+          runId,
+          // Resolve the one host-owned current-run lineage first. A model
+          // supplied path is checked below only as a narrowing assertion; it
+          // must never choose which accepted artifact the host loads.
+          notePath: null,
+        });
+      if (!acceptedResearchBinding) {
         throw notApplied(
           "linear_hierarchy_accepted_research_required",
-          "The project plan is not bound to a host-accepted research artifact at the supplied note path.",
+          "The project plan is not bound to one host-accepted research artifact at the supplied note path.",
         );
+      }
+      const suppliedArtifactFingerprint = planInput.suppliedArtifactFingerprint;
+      const acceptedResearchArtifactFingerprint =
+        resolveCanonicalAcceptedResearchFingerprint(
+          suppliedArtifactFingerprint,
+          acceptedResearchBinding.artifactFingerprint,
+        );
+      const sourceNotePath = resolveCanonicalAcceptedResearchNotePath(
+        planInput.suppliedSourceNotePath,
+        acceptedResearchBinding.notePath,
+      );
+      const {
+        suppliedArtifactFingerprint: _suppliedArtifactFingerprint,
+        suppliedSourceNotePath: _suppliedSourceNotePath,
+        ...canonicalPlanInput
+      } = planInput;
+      let plan: ReturnType<typeof createResearchProjectPlanV1>;
+      try {
+        plan = createResearchProjectPlanV1({
+          ...canonicalPlanInput,
+          issues: canonicalPlanInput.issues.map((issue) => ({
+            ...issue,
+            workItemFingerprint: deriveResearchProjectWorkItemFingerprint({
+              acceptedResearchArtifactFingerprint,
+              key: issue.key,
+              title: issue.title,
+              description: issue.description,
+              dependencyKeys: issue.dependencyKeys,
+              acceptanceCriteria: issue.acceptanceCriteria,
+            }),
+          })),
+          planId: deriveResearchProjectPlanIdForAcceptedArtifact(
+            acceptedResearchArtifactFingerprint,
+          ),
+          acceptedResearchArtifactFingerprint:
+            acceptedResearchArtifactFingerprint,
+          sourceNotePath,
+          runId,
+          destination: options.destination,
+          createdAt: (options.now ?? context.now ?? (() => new Date()))().toISOString(),
+        });
+      } catch (error) {
+        if (error instanceof DurableLinearContractError) {
+          throw notApplied(
+            "linear_hierarchy_invalid_arguments",
+            error.message,
+          );
+        }
+        throw error;
       }
       const workflow = new ResearchProjectHierarchyWorkflowV1({
         readClient: options.readClient,
@@ -313,16 +365,91 @@ async function buildGroupedApprovalAction(
 
 function parsePlanArguments(args: Record<string, unknown>) {
   const plan = expectRecord(args.plan, "research project plan");
+  const suppliedArtifactFingerprint =
+    typeof plan.acceptedResearchArtifactFingerprint === "string" &&
+    /^sha256:[a-f0-9]{64}$/u.test(plan.acceptedResearchArtifactFingerprint)
+      ? plan.acceptedResearchArtifactFingerprint
+      : null;
+  const suppliedSourceNotePath =
+    typeof plan.sourceNotePath === "string" && plan.sourceNotePath.trim()
+      ? plan.sourceNotePath.trim()
+      : null;
   return {
-    planId: requireLogicalKey(plan.planId, "plan id"),
-    acceptedResearchArtifactFingerprint: requireFingerprint(
-      plan.acceptedResearchArtifactFingerprint,
-      "accepted research artifact fingerprint",
-    ),
-    sourceNotePath: requireText(plan.sourceNotePath, "source note path", 500),
+    suppliedArtifactFingerprint,
+    suppliedSourceNotePath,
     initiative: parseHierarchyItem(plan.initiative, "initiative"),
     project: parseHierarchyItem(plan.project, "project"),
     issues: parseIssues(plan.issues),
+  };
+}
+
+export function deriveResearchProjectPlanIdForAcceptedArtifact(
+  artifactFingerprint: string,
+): string {
+  const fingerprint = requireFingerprint(
+    artifactFingerprint,
+    "accepted research artifact fingerprint",
+  );
+  return `research-plan-${fingerprint.slice("sha256:".length, "sha256:".length + 32)}`;
+}
+
+export function resolveCanonicalAcceptedResearchFingerprint(
+  suppliedFingerprint: string | null,
+  durableFingerprint: string,
+): string {
+  const durable = requireFingerprint(
+    durableFingerprint,
+    "durable accepted research artifact fingerprint",
+  );
+  if (suppliedFingerprint && suppliedFingerprint !== durable) {
+    throw notApplied(
+      "linear_hierarchy_accepted_research_mismatch",
+      "The supplied accepted-research fingerprint conflicts with the durable note binding.",
+    );
+  }
+  return durable;
+}
+
+export function resolveCanonicalAcceptedResearchNotePath(
+  suppliedNotePath: string | null,
+  durableNotePath: string,
+): string {
+  const durable = requireText(durableNotePath, "durable accepted research note path", 500);
+  if (suppliedNotePath && suppliedNotePath !== durable) {
+    throw notApplied(
+      "linear_hierarchy_accepted_research_mismatch",
+      "The supplied source note path conflicts with the durable accepted-research binding.",
+    );
+  }
+  return durable;
+}
+
+export function selectAcceptedResearchBindingForCurrentMission(
+  candidates: Array<{
+    runId: string;
+    artifactFingerprint: string;
+    notePath: string;
+  }>,
+  input: {
+    acceptedRunIds: ReadonlySet<string>;
+    missionObjective: string;
+  },
+): { artifactFingerprint: string; notePath: string } | null {
+  const exactRunMatches = candidates.filter((candidate) =>
+    input.acceptedRunIds.has(candidate.runId),
+  );
+  const selected =
+    exactRunMatches.length > 0
+      ? exactRunMatches
+      : candidates.filter(
+          (candidate) =>
+            candidate.notePath.length > 0 &&
+            input.missionObjective.includes(candidate.notePath),
+        );
+  if (selected.length !== 1) return null;
+  return {
+    artifactFingerprint: selected[0].artifactFingerprint,
+    notePath: selected[0].notePath,
   };
 }
 
@@ -330,9 +457,24 @@ function parseHierarchyItem(value: unknown, label: string) {
   const item = expectRecord(value, label);
   return {
     key: requireLogicalKey(item.key, `${label} key`),
-    title: requireText(item.title, `${label} title`, 240),
+    title: canonicalizeHierarchyItemTitle(item, label),
     description: requireText(item.description, `${label} description`, 8_000),
   };
+}
+
+export function canonicalizeHierarchyItemTitle(
+  item: Record<string, unknown>,
+  label: string,
+): string {
+  const title = typeof item.title === "string" ? item.title.trim() : "";
+  const name = typeof item.name === "string" ? item.name.trim() : "";
+  if (title && name && title !== name) {
+    throw notApplied(
+      "linear_hierarchy_invalid_arguments",
+      `${label} title conflicts with its compatible name alias.`,
+    );
+  }
+  return requireText(title || name, `${label} title`, 240);
 }
 
 function parseIssues(value: unknown) {
@@ -344,27 +486,101 @@ function parseIssues(value: unknown) {
   }
   return value.map((raw, index) => {
     const item = expectRecord(raw, `issue ${index + 1}`);
-    if (!Array.isArray(item.dependencyKeys) || !Array.isArray(item.acceptanceCriteria)) {
-      throw notApplied(
-        "linear_hierarchy_invalid_arguments",
-        `Issue ${index + 1} dependencyKeys and acceptanceCriteria must be arrays.`,
-      );
-    }
+    const dependencyKeys = canonicalizeHierarchyDependencyKeys(
+      item.dependencyKeys,
+      index,
+    );
+    const acceptanceCriteria = canonicalizeHierarchyAcceptanceCriteria(
+      item.acceptanceCriteria,
+      index,
+    );
     return {
       key: requireLogicalKey(item.key, `issue ${index + 1} key`),
       title: requireText(item.title, `issue ${index + 1} title`, 240),
       description: requireText(item.description, `issue ${index + 1} description`, 8_000),
-      dependencyKeys: item.dependencyKeys.map((key) =>
+      dependencyKeys: dependencyKeys.map((key) =>
         requireLogicalKey(key, `issue ${index + 1} dependency key`),
       ),
-      acceptanceCriteria: item.acceptanceCriteria.map((criterion) =>
+      acceptanceCriteria: acceptanceCriteria.map((criterion) =>
         requireText(criterion, `issue ${index + 1} acceptance criterion`, 500),
       ),
-      workItemFingerprint: requireFingerprint(
-        item.workItemFingerprint,
-        `issue ${index + 1} work item fingerprint`,
-      ),
     };
+  });
+}
+
+export function deriveResearchProjectWorkItemFingerprint(input: {
+  acceptedResearchArtifactFingerprint: string;
+  key: string;
+  title: string;
+  description: string;
+  dependencyKeys: unknown[];
+  acceptanceCriteria: unknown[];
+}): string {
+  return fingerprintContract({
+    version: 1,
+    acceptedResearchArtifactFingerprint: requireFingerprint(
+      input.acceptedResearchArtifactFingerprint,
+      "accepted research artifact fingerprint",
+    ),
+    key: requireLogicalKey(input.key, "work item key"),
+    title: requireText(input.title, "work item title", 240),
+    description: requireText(input.description, "work item description", 8_000),
+    dependencyKeys: input.dependencyKeys.map((value, index) =>
+      requireLogicalKey(value, `work item dependency ${index + 1}`),
+    ),
+    acceptanceCriteria: input.acceptanceCriteria.map((value, index) =>
+      requireText(value, `work item acceptance criterion ${index + 1}`, 500),
+    ),
+  });
+}
+
+export function canonicalizeHierarchyDependencyKeys(
+  value: unknown,
+  issueIndex = 0,
+): unknown[] {
+  if (
+    value === undefined ||
+    value === null ||
+    (typeof value === "string" && value.trim() === "")
+  ) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return [value];
+  }
+  throw notApplied(
+    "linear_hierarchy_invalid_arguments",
+    `Issue ${issueIndex + 1} dependencyKeys must be an array or one logical issue key.`,
+  );
+}
+
+export function canonicalizeHierarchyAcceptanceCriteria(
+  value: unknown,
+  issueIndex = 0,
+): unknown[] {
+  const values = Array.isArray(value) ? value : [value];
+  return values.map((criterion) => {
+    if (typeof criterion === "string") {
+      return criterion;
+    }
+    const record = expectRecord(
+      criterion,
+      `issue ${issueIndex + 1} acceptance criterion`,
+    );
+    const keys = Object.keys(record).sort();
+    if (
+      !keys.every((key) => key === "id" || key === "text") ||
+      !keys.includes("text")
+    ) {
+      throw notApplied(
+        "linear_hierarchy_invalid_arguments",
+        `Issue ${issueIndex + 1} acceptance criterion object may contain only id and text.`,
+      );
+    }
+    return record.text;
   });
 }
 
@@ -453,7 +669,16 @@ const STRING: JsonSchemaObject = { type: "string" };
 const HIERARCHY_ITEM: JsonSchemaObject = {
   type: "object",
   additionalProperties: false,
-  properties: { key: STRING, title: STRING, description: STRING },
+  properties: {
+    key: STRING,
+    title: STRING,
+    name: {
+      type: "string",
+      description:
+        "Optional provider-compatibility alias for title; omit it when title is present.",
+    },
+    description: STRING,
+  },
   required: ["key", "title", "description"],
 };
 const RESEARCH_PROJECT_HIERARCHY_PARAMETERS: JsonSchemaObject = {
@@ -464,9 +689,21 @@ const RESEARCH_PROJECT_HIERARCHY_PARAMETERS: JsonSchemaObject = {
       type: "object",
       additionalProperties: false,
       properties: {
-        planId: STRING,
-        acceptedResearchArtifactFingerprint: STRING,
-        sourceNotePath: STRING,
+        planId: {
+          type: "string",
+          description:
+            "Optional compatibility field. The host derives the canonical plan identity from the accepted research artifact fingerprint.",
+        },
+        acceptedResearchArtifactFingerprint: {
+          type: "string",
+          description:
+            "Optional compatibility field. The host resolves the accepted artifact fingerprint from the durable source-note binding and rejects a conflicting valid fingerprint.",
+        },
+        sourceNotePath: {
+          type: "string",
+          description:
+            "Optional compatibility field. The host resolves the canonical note path from the current run's durable accepted-research lineage and rejects a conflicting nonempty path.",
+        },
         initiative: HIERARCHY_ITEM,
         project: HIERARCHY_ITEM,
         issues: {
@@ -482,17 +719,20 @@ const RESEARCH_PROJECT_HIERARCHY_PARAMETERS: JsonSchemaObject = {
               description: STRING,
               dependencyKeys: { type: "array", items: STRING, maxItems: 19 },
               acceptanceCriteria: { type: "array", items: STRING, minItems: 1, maxItems: 20 },
-              workItemFingerprint: STRING,
+              workItemFingerprint: {
+                type: "string",
+                description:
+                  "Deprecated compatibility field. The host derives the stable work-item fingerprint from the accepted research binding and canonical issue content.",
+              },
             },
             required: [
               "key", "title", "description", "dependencyKeys",
-              "acceptanceCriteria", "workItemFingerprint",
+              "acceptanceCriteria",
             ],
           },
         },
       },
       required: [
-        "planId", "acceptedResearchArtifactFingerprint", "sourceNotePath",
         "initiative", "project", "issues",
       ],
     },

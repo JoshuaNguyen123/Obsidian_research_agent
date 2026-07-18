@@ -450,7 +450,11 @@ function validateCheckpointTransition(
   if (
     previous.artifact.artifactFingerprint !== next.artifact.artifactFingerprint ||
     (previous.workItemFingerprint && previous.workItemFingerprint !== next.workItemFingerprint) ||
-    (previous.approvalFingerprint && previous.approvalFingerprint !== next.approvalFingerprint)
+    (
+      previous.approvalFingerprint &&
+      previous.approvalFingerprint !== next.approvalFingerprint &&
+      !isVerifiedReconciliationAdoption(previous, next)
+    )
   ) {
     throw new ResearchPublicationCheckpointStoreError(
       "research_publication_checkpoint_identity_changed",
@@ -464,6 +468,26 @@ function validateCheckpointTransition(
       `Research publication cannot transition from ${previous.status} to ${next.status}.`,
     );
   }
+}
+
+function isVerifiedReconciliationAdoption(
+  previous: ResearchPublicationCheckpointV1,
+  next: ResearchPublicationCheckpointV1,
+): boolean {
+  return (
+    previous.status === "reconcile_required" &&
+    previous.pendingAction !== null &&
+    next.status === "linear_verified" &&
+    next.approvalFingerprint !== null &&
+    next.binding !== null &&
+    next.issue !== null &&
+    next.pendingAction === null &&
+    next.error === null &&
+    (
+      previous.pendingAction.issueId === null ||
+      previous.pendingAction.issueId === next.issue.id
+    )
+  );
 }
 
 const STATUS_TRANSITIONS: Readonly<Record<

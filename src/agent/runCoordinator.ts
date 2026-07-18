@@ -257,6 +257,7 @@ export class RunCoordinator {
           maxSteps: complete.maxSteps,
         });
       } catch (error) {
+        this.emit("onTrace", [buildTerminalErrorDiagnostic(error)]);
         if (!this.lastComplete) {
           this.emit("onRunComplete", [
             {
@@ -401,15 +402,27 @@ export class RunCoordinator {
             outputPreview?: unknown;
           }
         | undefined;
-      if (trace?.id && isAttestedDiagnosticTraceId(trace.id)) {
+      const failedToolResult = Boolean(
+        trace?.id &&
+          trace.kind === "tool_result" &&
+          trace.error?.code,
+      );
+      if (
+        trace?.id &&
+        (isAttestedDiagnosticTraceId(trace.id) || failedToolResult)
+      ) {
         this.diagnosticAttestations.push({
           schemaVersion: 1,
           id: trace.id,
           kind: trace.kind ?? "status",
           ...(trace.step === undefined ? {} : { step: trace.step }),
           ...(trace.toolName ? { toolName: trace.toolName } : {}),
-          message: trace.message ?? "",
-          ...(trace.error?.code ? { errorCode: trace.error.code } : {}),
+          message: failedToolResult
+            ? sanitizeTerminalDiagnostic(trace.message ?? "", 500)
+            : trace.message ?? "",
+          ...(trace.error?.code
+            ? { errorCode: sanitizeTerminalDiagnostic(trace.error.code, 80) }
+            : {}),
           missing: extractDiagnosticMissing(trace.outputPreview),
         });
         if (this.diagnosticAttestations.length > 128) {
@@ -463,10 +476,54 @@ export class RunCoordinator {
     }
     const activeEventTap = this.activeEventTap;
     if (activeEventTap) {
-      dispatchRunEvent(activeEventTap, event);
+      this.dispatchObserverSafely(activeEventTap, event);
     }
     for (const listener of this.listeners) {
-      dispatchRunEvent(listener, event);
+      this.dispatchObserverSafely(listener, event);
+    }
+  }
+
+  private dispatchObserverSafely(
+    observer: AgentRunEvents,
+    event: BufferedRunEvent,
+  ): void {
+    try {
+      dispatchRunEvent(observer, event);
+    } catch (error) {
+      const id = `run-event-listener-error:${String(event.key)}`;
+      const record = isRecord(error) ? error : null;
+      const rawCode =
+        typeof record?.code === "string"
+          ? record.code
+          : "run_event_listener_failed";
+      const rawMessage =
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : typeof error === "string"
+            ? error
+            : "Run event observer rejected.";
+      const attestation: RunDiagnosticAttestationV1 = {
+        schemaVersion: 1,
+        id,
+        kind: "error",
+        message: sanitizeTerminalDiagnostic(rawMessage, 500),
+        errorCode:
+          sanitizeTerminalDiagnostic(rawCode, 80) ||
+          "run_event_listener_failed",
+        missing: [],
+      };
+      if (
+        !this.diagnosticAttestations.some(
+          (item) =>
+            item.id === attestation.id &&
+            item.message === attestation.message,
+        )
+      ) {
+        this.diagnosticAttestations.push(attestation);
+        if (this.diagnosticAttestations.length > 128) {
+          this.diagnosticAttestations.shift();
+        }
+      }
     }
   }
 }
@@ -486,7 +543,7 @@ function emptyProviderUsage(): ModelUsageAggregateV1 {
 
 function isAttestedDiagnosticTraceId(id: string): boolean {
   return (
-    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|operation-goals:)/u.test(
+    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|operation-goals:)/u.test(
       id,
     ) ||
     id.endsWith(":proof-gated-writeback-rejected") ||
@@ -509,6 +566,46 @@ function extractDiagnosticMissing(outputPreview: unknown): string[] {
     );
   }
   return [];
+}
+
+function buildTerminalErrorDiagnostic(error: unknown): {
+  id: string;
+  kind: string;
+  message: string;
+  error: { code: string };
+  outputPreview: { missing: string[] };
+} {
+  const record = isRecord(error) ? error : null;
+  const rawCode = typeof record?.code === "string" ? record.code : "run_failed";
+  const rawName =
+    error instanceof Error && error.name.trim() ? error.name.trim() : "Error";
+  const rawMessage =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "The mission runtime rejected before publishing a run configuration.";
+  return {
+    id: "run-coordinator-terminal-error",
+    kind: "error",
+    message: `${sanitizeTerminalDiagnostic(rawName, 80)}: ${sanitizeTerminalDiagnostic(rawMessage, 500)}`,
+    error: { code: sanitizeTerminalDiagnostic(rawCode, 80) || "run_failed" },
+    outputPreview: { missing: [] },
+  };
+}
+
+function sanitizeTerminalDiagnostic(value: string, maxChars: number): string {
+  return value
+    .replace(
+      /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
+      "[REDACTED]",
+    )
+    .replace(/\b[A-Za-z]:[\\/][^\r\n\t"']+/gu, "[LOCAL_PATH]")
+    .replace(/\\\\[^\s"']+/gu, "[NETWORK_PATH]")
+    .replace(/([?&](?:token|key|secret|code|state)=)[^&\s]+/giu, "$1[REDACTED]")
+    .replace(/[\r\n\t]+/gu, " ")
+    .trim()
+    .slice(0, maxChars);
 }
 
 function sameRetainedReceiptIdentity(

@@ -166,13 +166,23 @@ test("configured Linear live routing is explicit and keeps secrets inside Obsidi
   );
   assert.match(source, /preserveConfiguredLinearCredential: true/u);
   assert.match(source, /getLinearCredentialStatus/u);
+  assert.match(source, /getLinearOAuthStatus/u);
   assert.doesNotMatch(source, /LINEAR_LIVE_TEST_TOKEN/u);
   assert.doesNotMatch(source, /linearApiKey/u);
+  const harness = readFileSync(
+    new URL("../e2e/fixtures/nativeObsidianHarness.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(harness, /preservedLinearOAuthRuntimeState/u);
+  assert.match(harness, /linearOAuthRuntimeState: preservedLinearOAuthRuntimeState/u);
   const preflight = readFileSync(
     new URL("../scripts/e2e-preflight.mjs", import.meta.url),
     "utf8",
   );
   assert.match(preflight, /"configured-linear-live": \[\]/u);
+  assert.match(preflight, /modelCredentialReferences/u);
+  assert.match(preflight, /hasPersistentSecureReference/u);
+  assert.match(preflight, /persistent opaque model credential reference/u);
 });
 
 test("runner mode exports explicit child-process environment without secrets", () => {
@@ -264,18 +274,49 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
     new URL("../e2e/daily-use-compound.spec.ts", import.meta.url),
     "utf8",
   );
+  const realHarness = readFileSync(
+    new URL("../e2e/fixtures/realAiHarness.ts", import.meta.url),
+    "utf8",
+  );
+  const mainSource = readFileSync(
+    new URL("../main.ts", import.meta.url),
+    "utf8",
+  );
   assert.match(compound, /restartAfterProjectStages: MAIN_STAGES/u);
   assert.match(compound, /restartAfterProjectStages: \["reconciliation_cleanup"\]/u);
+  assert.match(
+    realHarness,
+    /PROJECT_STAGE_COMPLETION_TOOL\[stage as ProjectLifecycleStageName\]/u,
+  );
+  assert.match(realHarness, /node\.status === "complete"/u);
+  assert.match(
+    realHarness,
+    /ui\.stopReason === null &&\s*ui\.canResume &&\s*Boolean\(ui\.continuationCommand\)/u,
+  );
+  assert.match(realHarness, /durablyCompletedLifecycleTools\.includes/u);
+  assert.match(mainSource, /after\.ledgerStatus !== "running"/u);
+  assert.match(realHarness, /prepareForDurableMissionRestart/u);
+  assert.match(realHarness, /quiescent durable restart boundary/u);
   assert.match(compound, /expectGitHubRepositoryAbsent/u);
   assert.match(compound, /independentlyVerifyLinearCleanup/u);
   assert.match(compound, /createPhase4PythonCheckersProjectFixture/u);
   assert.match(compound, /topic: "checkers"/u);
+  assert.match(compound, /Application Testing Dumping Grounds/u);
+  assert.match(
+    compound,
+    /linearEvidenceDestinationName:\s*LINEAR_EVIDENCE_DESTINATION_NAME/u,
+  );
+  assert.match(compound, /linearWorkspaceName:\s*workspaceName/u);
+  assert.match(compound, /linearTeamName:/u);
   assert.match(compound, /linear_get_issue/u);
   assert.match(compound, /checkers\/game\.py/u);
   assert.match(compound, /tests\/test_checkers\.py/u);
   assert.match(compound, /verifiedPrivate: true/u);
   assert.match(compound, /git", \["status", "--porcelain"\]/u);
   assert.match(compound, /preserveConfiguredLinearCredential: !linearToken/u);
+  assert.match(compound, /preserveConfiguredGitHubCredential: true/u);
+  assert.match(compound, /withGitHubCredentialToken/u);
+  assert.match(compound, /getLinearOAuthStatus/u);
   assert.match(compound, /https:\/\/ollama\.com\/api/u);
   assert.match(compound, /getE2EAiConfig/u);
   assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);

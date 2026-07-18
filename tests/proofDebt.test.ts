@@ -121,6 +121,7 @@ test("computeProofDebt blocks on WAL reconcile_required and auto-continue refuse
   assert.equal(debt.empty, false);
   assert.equal(debt.nextAction.kind, "blocked");
   assert.match(debt.nextAction.reason, /WAL reconcile/);
+  assert.match(debt.nextAction.summary, /append_to_current_file/);
   assert.deepEqual(
     decideAutoContinuation({
       stopReason: "budget",

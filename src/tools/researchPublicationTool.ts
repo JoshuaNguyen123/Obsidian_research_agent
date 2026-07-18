@@ -1,4 +1,5 @@
 import {
+  sha256Fingerprint,
   withPreparedActionFingerprint,
   type ActionReceipt,
   type JsonValue,
@@ -12,6 +13,7 @@ import {
   ResearchPublicationWorkflow,
   type AcceptedResearchArtifactV1,
   type AcceptedResearchNotePackageV1,
+  type AcceptedResearchNoteWriteRequestV1,
   type ResearchPublicationDestinationV1,
   type ResearchPublicationExactApprovalRequestV1,
   type ResearchPublicationLineagePortV1,
@@ -77,16 +79,22 @@ export function createResearchPublicationTool(
       }
       const runId = requireIdentity(context.runId, "run id");
       const toolCallId = requireIdentity(context.operationId, "tool call id");
-      const note = parseToolArguments({
+      const parsedNote = await parseToolArguments({
         value: args,
         runId,
         toolCallId,
         originalPrompt: context.originalPrompt,
         vaultBindingKey: options.vaultBindingKey,
+        runtimeCache: context.runtimeCache,
         resolveNotePath: options.resolveNotePath,
         validateTrustedBindings: options.validateTrustedBindings,
         nowProvider: options.now ?? context.now,
       });
+      const note = stabilizeAcceptedResearchRequest(
+        parsedNote,
+        context.runtimeCache,
+        runId,
+      );
       if (!context.requestNestedApproval) {
         throw new ToolExecutionError(
           "research_publication_approval_unavailable",
@@ -109,7 +117,7 @@ export function createResearchPublicationTool(
               toolName: PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
               action:
                 request.proposedAction === "create"
-                  ? `Create Linear issue in ${request.destination.teamId}/${request.destination.projectId}: ${request.title}`
+                  ? `Create Linear issue in ${formatLinearDestination(request.destination)}: ${request.title}`
                   : `Reuse verified duplicate Linear issue: ${request.duplicate?.identifier ?? request.title}`,
               reason:
                 "Approve the exact research note hash, Linear destination, title, description, machine contract, and duplicate decision shown below.",
@@ -209,12 +217,13 @@ export function hasExplicitResearchPublicationIntent(prompt: string): boolean {
   );
 }
 
-function parseToolArguments(input: {
+async function parseToolArguments(input: {
   value: Record<string, unknown>;
   runId: string;
   toolCallId: string;
   originalPrompt: string;
   vaultBindingKey: string;
+  runtimeCache: ToolExecutionContext["runtimeCache"];
   resolveNotePath: CreateResearchPublicationToolOptionsV1["resolveNotePath"];
   validateTrustedBindings: CreateResearchPublicationToolOptionsV1["validateTrustedBindings"];
   nowProvider?: () => Date;
@@ -242,13 +251,47 @@ function parseToolArguments(input: {
     ],
     ["repositoryKey"],
   );
+  if (
+    typeof packageRecord.schemaVersion === "string" &&
+    /^(?:v(?:ersion)?[-_ ]*)?1(?:\.0)?$/iu.test(
+      packageRecord.schemaVersion.trim(),
+    )
+  ) {
+    packageRecord.schemaVersion = 1;
+  }
+  packageRecord.riskClass = canonicalizeRiskClass(packageRecord.riskClass);
+  packageRecord.executionClass = canonicalizeExecutionClass(
+    packageRecord.executionClass,
+  );
   if (packageRecord.schemaVersion !== 1) {
     throw new ToolExecutionError(
-      "research_publication_run_binding_mismatch",
-      "The accepted research package must use schema version 1.",
+      "research_publication_invalid_arguments",
+      `The accepted research package must use schema version 1 (received ${describeRedactedValueShape(packageRecord.schemaVersion)}).`,
       { mutationState: "not_applied" },
     );
   }
+  if (
+    packageRecord.repositoryKey !== undefined &&
+    packageRecord.executionClass !== "code"
+  ) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      "A package with repositoryKey must use executionClass code.",
+      { mutationState: "not_applied" },
+    );
+  }
+  if (
+    packageRecord.executionClass === "code" &&
+    packageRecord.repositoryKey === undefined
+  ) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      "A package with executionClass code must include the trusted repositoryKey named by the mission.",
+      { mutationState: "not_applied" },
+    );
+  }
+  hydrateTrustedWebEvidence(packageRecord, input.runtimeCache);
+  canonicalizePackageIdentifiers(packageRecord);
   if (value.mode !== "create" && value.mode !== "append") {
     throw new ToolExecutionError(
       "research_publication_invalid_arguments",
@@ -257,7 +300,12 @@ function parseToolArguments(input: {
     );
   }
   const mode: "create" | "append" = value.mode;
-  if (mode === "append" && typeof value.baseHash !== "string") {
+  const baseHash =
+    typeof value.baseHash === "string" &&
+    value.baseHash.trim() === ""
+      ? undefined
+      : value.baseHash;
+  if (mode === "append" && typeof baseHash !== "string") {
     throw new ToolExecutionError(
       "research_publication_base_hash_required",
       "Appending an accepted research package requires the current note SHA-256 hash.",
@@ -281,23 +329,75 @@ function parseToolArguments(input: {
     originRunId: runId,
   } as unknown as AcceptedResearchNotePackageV1;
   input.validateTrustedBindings(package_);
+  const path = input.resolveNotePath({
+    ...(requestedPath ? { requestedPath } : {}),
+    originalPrompt: input.originalPrompt,
+    runId,
+  });
+  const artifactIdentity = await sha256Fingerprint({
+    schemaVersion: 1,
+    kind: "accepted_research_publication",
+    runId,
+    path,
+  });
   return {
-    path: input.resolveNotePath({
-      ...(requestedPath ? { requestedPath } : {}),
-      originalPrompt: input.originalPrompt,
-      runId,
-    }),
+    path,
     mode,
-    ...(typeof value.baseHash === "string"
-      ? { baseHash: requireSha256(value.baseHash, "base hash") }
+    ...(typeof baseHash === "string"
+      ? { baseHash: requireSha256(baseHash, "base hash") }
       : {}),
-    artifactId: requireLogicalKey(
-      `accepted-${runId}-${input.toolCallId}`.replace(/[^A-Za-z0-9._-]+/gu, "-"),
-      "artifact id",
-    ),
+    artifactId: `accepted-${artifactIdentity.slice("sha256:".length, 39)}`,
     acceptedAt,
     package: package_,
   };
+}
+
+function canonicalizeRiskClass(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const match = /^(?:risk[-_ ]*)?(low|medium|high)(?:[-_ ]*risk)?$/iu.exec(
+    value.trim(),
+  );
+  return match?.[1]?.toLowerCase() ?? value;
+}
+
+function canonicalizeExecutionClass(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const match = /^(research|vault|code|human)(?:[-_ ]*(?:work|execution))?$/iu.exec(
+    value.trim(),
+  );
+  return match?.[1]?.toLowerCase() ?? value;
+}
+
+function stabilizeAcceptedResearchRequest(
+  candidate: AcceptedResearchNoteWriteRequestV1,
+  runtimeCache: ToolExecutionContext["runtimeCache"],
+  runId: string,
+): AcceptedResearchNoteWriteRequestV1 {
+  if (!runtimeCache) return cloneAcceptedResearchRequest(candidate);
+  runtimeCache.acceptedResearchPublicationRequests ??= new Map<string, unknown>();
+  const key = `${runId}:${candidate.path}`;
+  const stored = runtimeCache.acceptedResearchPublicationRequests.get(key);
+  if (stored) {
+    return cloneAcceptedResearchRequest(
+      stored as AcceptedResearchNoteWriteRequestV1,
+    );
+  }
+  const canonical = cloneAcceptedResearchRequest(candidate);
+  runtimeCache.acceptedResearchPublicationRequests.set(
+    key,
+    cloneAcceptedResearchRequest(canonical),
+  );
+  return canonical;
+}
+
+function cloneAcceptedResearchRequest(
+  value: AcceptedResearchNoteWriteRequestV1,
+): AcceptedResearchNoteWriteRequestV1 {
+  return structuredClone(value);
 }
 
 async function buildApprovalPreparedAction(
@@ -314,7 +414,9 @@ async function buildApprovalPreparedAction(
         url: request.duplicate.url,
         workspaceId: request.destination.workspaceId,
         teamId: request.destination.teamId,
-        projectId: request.destination.projectId,
+        ...(request.destination.projectId
+          ? { projectId: request.destination.projectId }
+          : {}),
       }]
     : [];
   const outboundPayload: Record<string, JsonValue> = {
@@ -344,7 +446,9 @@ async function buildApprovalPreparedAction(
       ...(request.duplicate?.url ? { url: request.duplicate.url } : {}),
       workspaceId: request.destination.workspaceId,
       teamId: request.destination.teamId,
-      projectId: request.destination.projectId,
+      ...(request.destination.projectId
+        ? { projectId: request.destination.projectId }
+        : {}),
     },
     relatedResources: [],
     normalizedArgs: {
@@ -361,7 +465,7 @@ async function buildApprovalPreparedAction(
           : `Reuse Linear issue: ${request.duplicate?.identifier ?? request.title}`,
       destination:
         `Linear workspace=${request.destination.workspaceId} ` +
-        `team=${request.destination.teamId} project=${request.destination.projectId}`,
+        `team=${request.destination.teamId} project=${request.destination.projectId ?? "none"}`,
       outboundPayload,
       duplicateCandidates,
       warnings: request.proposedAction === "reuse_duplicate"
@@ -376,6 +480,14 @@ async function buildApprovalPreparedAction(
     requiredConfirmations: 1,
   };
   return withPreparedActionFingerprint(action);
+}
+
+function formatLinearDestination(
+  destination: ResearchPublicationDestinationV1,
+): string {
+  return destination.projectId
+    ? `${destination.teamId}/${destination.projectId}`
+    : destination.teamId;
 }
 
 function createDeduplicatedReadbackReceipt(output: {
@@ -458,15 +570,30 @@ const RESEARCH_PUBLICATION_DESCRIPTOR: ToolDescriptor = {
 
 const STRING: JsonSchemaObject = { type: "string" };
 const STRING_ARRAY: JsonSchemaObject = { type: "array", items: STRING, maxItems: 50 };
+const NON_EMPTY_STRING_ARRAY: JsonSchemaObject = {
+  ...STRING_ARRAY,
+  minItems: 1,
+};
 const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
   type: "object",
   additionalProperties: false,
   properties: {
     notePath: { type: "string", description: "Vault-relative Markdown note path." },
-    mode: { type: "string", enum: ["create", "append"] },
-    baseHash: { type: "string", description: "Required SHA-256 when appending." },
+    mode: {
+      type: "string",
+      enum: ["create", "append"],
+      description:
+        "Use the exact string create for a new note (create never overwrites). Use append only with notePath and the current baseHash. Never use write, overwrite, upsert, or a combined label.",
+    },
+    baseHash: {
+      type: "string",
+      description:
+        "Omit entirely for create. Required exact SHA-256 when appending; never send an empty placeholder.",
+    },
     package: {
       type: "object",
+      description:
+        "Accepted-research fields are direct children of this object. Do not nest a research object or include initiative/project/issue plan fields.",
       additionalProperties: false,
       properties: {
         schemaVersion: { type: "integer", enum: [1] },
@@ -480,20 +607,28 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
             type: "object",
             additionalProperties: false,
             properties: {
-              id: STRING,
+              id: {
+                type: "string",
+                description:
+                  "Optional stable evidence id. Omit when unavailable; the host derives it from contentSha256.",
+              },
               kind: { type: "string", enum: ["web", "vault", "user"] },
               reference: STRING,
-              contentSha256: STRING,
+              contentSha256: {
+                type: "string",
+                description:
+                  "Optional exact source hash. Omit when unavailable; the host fills it only from a successful same-run web_fetch readback for this reference.",
+              },
               label: STRING,
               summary: STRING,
             },
-            required: ["id", "kind", "reference", "contentSha256", "label", "summary"],
+            required: ["kind", "reference", "label", "summary"],
           },
         },
         confidenceLimitations: STRING,
-        proposedWork: STRING_ARRAY,
+        proposedWork: NON_EMPTY_STRING_ARRAY,
         nonGoals: STRING_ARRAY,
-        scope: STRING_ARRAY,
+        scope: NON_EMPTY_STRING_ARRAY,
         dependencies: STRING_ARRAY,
         acceptanceCriteria: {
           type: "array",
@@ -502,15 +637,31 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
           items: {
             type: "object",
             additionalProperties: false,
-            properties: { id: STRING, text: STRING },
-            required: ["id", "text"],
+            properties: {
+              id: {
+                type: "string",
+                description:
+                  "Optional stable criterion id. Omit when unavailable; the host derives AC-1, AC-2, and so on from canonical order.",
+              },
+              text: STRING,
+            },
+            required: ["text"],
           },
         },
-        validationRequirementKeys: STRING_ARRAY,
+        validationRequirementKeys: NON_EMPTY_STRING_ARRAY,
         riskClass: { type: "string", enum: ["low", "medium", "high"] },
-        executionClass: { type: "string", enum: ["research", "vault", "code", "human"] },
+        executionClass: {
+          type: "string",
+          enum: ["research", "vault", "code", "human"],
+          description:
+            "Use code when repositoryKey is present; repository-bound implementation research is code work.",
+        },
         objective: STRING,
-        repositoryKey: STRING,
+        repositoryKey: {
+          type: "string",
+          description:
+            "Optional trusted repository profile key. If present, executionClass must be code.",
+        },
       },
       required: [
         "schemaVersion", "title", "problemImpact", "evidence",
@@ -529,15 +680,242 @@ function assertExactKeys(
   optional: readonly string[] = [],
 ): void {
   const allowed = new Set([...required, ...optional]);
-  const unknown = Object.keys(record).filter((key) => !allowed.has(key));
+  const unknown = Object.keys(record)
+    .filter((key) => !allowed.has(key))
+    .sort((left, right) => left.localeCompare(right));
   const missing = required.filter((key) => !Object.prototype.hasOwnProperty.call(record, key));
   if (unknown.length || missing.length) {
+    const unknownShapes = unknown.map(
+      (key) => `${key}:${describeRedactedValueShape(record[key])}`,
+    );
     throw new ToolExecutionError(
       "research_publication_invalid_arguments",
-      `Research publication fields are invalid (unknown: ${unknown.join(", ") || "none"}; missing: ${missing.join(", ") || "none"}).`,
+      `Research publication fields are invalid (unknown: ${unknown.join(", ") || "none"}; unknown_shapes: ${unknownShapes.join(", ") || "none"}; missing: ${missing.join(", ") || "none"}).`,
       { mutationState: "not_applied" },
     );
   }
+}
+
+function canonicalizePackageIdentifiers(
+  packageRecord: Record<string, unknown>,
+): void {
+  if (Array.isArray(packageRecord.evidence)) {
+    for (const candidate of packageRecord.evidence) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        continue;
+      }
+      const evidence = candidate as Record<string, unknown>;
+      const contentSha256 =
+        typeof evidence.contentSha256 === "string"
+          ? evidence.contentSha256.trim().toLowerCase()
+          : "";
+      if (
+        !isValidEvidenceIdentifier(evidence.id) &&
+        /^sha256:[a-f0-9]{64}$/u.test(contentSha256)
+      ) {
+        evidence.id = `evidence-${contentSha256.slice("sha256:".length)}`;
+      }
+    }
+  }
+  if (Array.isArray(packageRecord.acceptanceCriteria)) {
+    const criteria = packageRecord.acceptanceCriteria.map((candidate, index) =>
+      typeof candidate === "string"
+        ? { id: `AC-${index + 1}`, text: candidate.trim() }
+        : candidate,
+    );
+    packageRecord.acceptanceCriteria = criteria;
+    criteria.forEach((candidate, index) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        return;
+      }
+      const criterion = candidate as Record<string, unknown>;
+      if (!isValidCriterionIdentifier(criterion.id)) {
+        criterion.id = `AC-${index + 1}`;
+      }
+    });
+  }
+}
+
+function hydrateTrustedWebEvidence(
+  packageRecord: Record<string, unknown>,
+  runtimeCache: ToolExecutionContext["runtimeCache"],
+): void {
+  if (!Array.isArray(packageRecord.evidence) || !runtimeCache) return;
+  const candidateResults = [
+    ...[...(runtimeCache.trustedWebFetchResults?.values() ?? [])].map(
+      (result) => ({ trustedRegistry: true, cacheKey: "", result }),
+    ),
+    ...[...runtimeCache.toolResults.entries()].map(([cacheKey, result]) => ({
+      trustedRegistry: false,
+      cacheKey,
+      result,
+    })),
+  ];
+  const trustedCandidates = candidateResults.flatMap(
+    ({ trustedRegistry, cacheKey, result }) => {
+      if ((!trustedRegistry && !cacheKey.startsWith("web_fetch:")) || !result.ok) {
+        return [];
+      }
+      const output = asRecord(result.output);
+      if (!output) return [];
+      const contentHash =
+        typeof output.contentHash === "string"
+          ? output.contentHash.trim().toLowerCase()
+          : "";
+      if (!/^sha256:[a-f0-9]{64}$/u.test(contentHash)) return [];
+      const references = [output.normalizedUrl, output.url]
+        .filter((value): value is string => typeof value === "string")
+        .map(normalizeTrustedWebReference)
+        .filter((value): value is string => value !== null);
+      if (references.length === 0) return [];
+      const reference = references[0];
+      const contentHex = contentHash.slice("sha256:".length);
+      const urlHash =
+        typeof output.urlHash === "string" && /^[a-f0-9]{16}$/u.test(output.urlHash)
+          ? output.urlHash
+          : "";
+      return [{
+        references: new Set(references),
+        reference,
+        contentHash,
+        id: urlHash
+          ? `evidence-${contentHex.slice(0, 48)}-${urlHash}`
+          : `evidence-${contentHex}`,
+        label: trustedEvidenceText(output.title, reference, 240),
+        summary: trustedEvidenceText(
+          output.content,
+          `Verified fetched source: ${reference}`,
+          1_000,
+        ),
+      }];
+    },
+  );
+  const trustedByReference = new Map<
+    string,
+    (typeof trustedCandidates)[number]
+  >();
+  for (const candidate of trustedCandidates) {
+    trustedByReference.set(candidate.reference, candidate);
+  }
+  const trusted = [...trustedByReference.values()].sort((left, right) =>
+    left.reference.localeCompare(right.reference),
+  );
+  if (trusted.length === 0) return;
+
+  const modelEvidence = packageRecord.evidence;
+  for (const candidate of modelEvidence) {
+    const evidence = asRecord(candidate);
+    if (!evidence) continue;
+    const reference = normalizeTrustedWebReference(evidence.reference);
+    if (!reference) continue;
+    const readback = trusted.find((entry) => entry.references.has(reference));
+    if (!readback) continue;
+    const suppliedHash =
+      typeof evidence.contentSha256 === "string"
+        ? evidence.contentSha256.trim().toLowerCase()
+        : "";
+    if (suppliedHash && suppliedHash !== readback.contentHash) {
+      throw new ToolExecutionError(
+        "research_publication_evidence_changed",
+        "Accepted research evidence hash does not match the successful same-run web readback.",
+        { mutationState: "not_applied" },
+      );
+    }
+  }
+  const preservedNonWebEvidence = modelEvidence.filter((candidate) => {
+    const evidence = asRecord(candidate);
+    if (!evidence) return false;
+    return (
+      normalizeTrustedWebReference(evidence.reference) === null &&
+      (evidence.kind === "vault" || evidence.kind === "user") &&
+      isPreservableNonWebEvidence(evidence)
+    );
+  });
+  packageRecord.evidence = [
+    ...preservedNonWebEvidence,
+    ...trusted.map((entry) => ({
+      id: entry.id,
+      kind: "web",
+      reference: entry.reference,
+      contentSha256: entry.contentHash,
+      label: entry.label,
+      summary: entry.summary,
+    })),
+  ];
+}
+
+function trustedEvidenceText(
+  value: unknown,
+  fallback: string,
+  maximum: number,
+): string {
+  const normalized = (typeof value === "string" ? value : "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return (normalized || fallback).slice(0, maximum);
+}
+
+function normalizeTrustedWebReference(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = new URL(value.trim());
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    parsed.hash = "";
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function isValidEvidenceIdentifier(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value.length <= 80 &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value) &&
+    !["__proto__", "prototype", "constructor"].includes(value)
+  );
+}
+
+function isPreservableNonWebEvidence(
+  evidence: Record<string, unknown>,
+): boolean {
+  const contentSha256 = typeof evidence.contentSha256 === "string"
+    ? evidence.contentSha256.trim().toLowerCase()
+    : "";
+  return (
+    /^sha256:[a-f0-9]{64}$/u.test(contentSha256) &&
+    isSafeBoundedEvidenceText(evidence.reference, 2_000) &&
+    isSafeBoundedEvidenceText(evidence.label, 240) &&
+    isSafeBoundedEvidenceText(evidence.summary, 1_000)
+  );
+}
+
+function isSafeBoundedEvidenceText(value: unknown, maximum: number): boolean {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return (
+    normalized.length > 0 &&
+    normalized.length <= maximum &&
+    !/[\0\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(normalized)
+  );
+}
+
+function isValidCriterionIdentifier(value: unknown): boolean {
+  return typeof value === "string" && /^AC-[1-9][0-9]?$/u.test(value);
+}
+
+function describeRedactedValueShape(value: unknown): string {
+  if (Array.isArray(value)) return `array(${Math.min(value.length, 999)})`;
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>).sort().slice(0, 20);
+    return `object(${keys.join("|") || "empty"})`;
+  }
+  return value === null ? "null" : typeof value;
 }
 
 function expectRecord(value: unknown, label: string): Record<string, unknown> {

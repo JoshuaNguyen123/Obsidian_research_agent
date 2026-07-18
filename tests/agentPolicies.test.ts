@@ -152,6 +152,23 @@ test("loop planner keeps vault-only evidence research off the web", () => {
   ]);
 });
 
+test("explicit web research stays ahead of later repository validation", () => {
+  const prompt = [
+    "Research American checkers using exactly two public web sources and fetch both sources.",
+    "Write the accepted research to the Obsidian notebook and create the Linear hierarchy.",
+    "Implement the Python game in the trusted repository, run targeted validation, and commit it.",
+    "Publish the verified commit to a private GitHub repository.",
+  ].join(" ");
+  const budget = planLoopBudget({
+    prompt,
+    route: "grounded_workflow",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 100,
+  });
+
+  assert.deepEqual(budget.expectedTools, ["web_search", "web_fetch"]);
+});
+
 test("loop planner uses exact file reads for explicitly named markdown sources", () => {
   const prompt =
     "Read Sources/Alpha.md and Sources/Beta.md, then append two findings to the current note without replacing it.";
