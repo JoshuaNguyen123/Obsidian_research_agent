@@ -45,11 +45,13 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
   getProfile(profileKey: string): Promise<RepositoryProfileV2 | null>;
   /** Resolve mutable workspace proof on the host; model arguments never carry hashes. */
   resolvePreparationInput?(input: {
-    profile: RepositoryProfileV2;
-    projectId: string;
+    purpose: SandboxPrepareInputV2["purpose"];
     workspaceId: string;
     context: ScopedExtensionContextV1;
   }): Promise<{
+    profile: RepositoryProfileV2;
+    projectId: string;
+    commandId: string;
     workspaceManifestFingerprint: string;
     stagingManifest: SandboxPrepareInputV2["stagingManifest"];
   }>;
@@ -76,9 +78,16 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
 interface ParsedSandboxToolArgsV2
   extends Omit<
     SandboxPrepareInputV2,
-    "profile" | "purpose" | "workspaceManifestFingerprint" | "stagingManifest"
+    | "profile"
+    | "purpose"
+    | "projectId"
+    | "commandId"
+    | "workspaceManifestFingerprint"
+    | "stagingManifest"
   > {
-  profileKey: string;
+  profileKey: string | null;
+  projectId: string | null;
+  commandId: string | null;
   workspaceManifestFingerprint: string | null;
   stagingManifest: SandboxPrepareInputV2["stagingManifest"] | null;
 }
@@ -205,31 +214,28 @@ function preparedSandboxContribution(
           args,
           Boolean(options.resolvePreparationInput),
         );
-        const profile = await options.getProfile(normalized.profileKey);
+        const hostProof = options.resolvePreparationInput
+          ? await options.resolvePreparationInput({
+              purpose,
+              workspaceId: normalized.workspaceId,
+              context,
+            })
+          : null;
+        const profile = hostProof?.profile ?? await options.getProfile(normalized.profileKey!);
         if (!profile) {
           return failure("repository_profile_missing", "The trusted RepositoryProfileV2 is unavailable.");
         }
         parseRepositoryProfileV2(profile);
-        const hostProof = options.resolvePreparationInput
-          ? await options.resolvePreparationInput({
-              profile,
-              projectId: normalized.projectId,
-              workspaceId: normalized.workspaceId,
-              context,
-            })
-          : {
-              workspaceManifestFingerprint: normalized.workspaceManifestFingerprint!,
-              stagingManifest: normalized.stagingManifest!,
-            };
         const prepared = await options.sandboxManager.prepareExecution({
           profile,
           purpose,
-          projectId: normalized.projectId,
-          commandId: normalized.commandId,
+          projectId: hostProof?.projectId ?? normalized.projectId!,
+          commandId: hostProof?.commandId ?? normalized.commandId!,
           workspaceId: normalized.workspaceId,
           repairRequestId: normalized.repairRequestId,
-          workspaceManifestFingerprint: hostProof.workspaceManifestFingerprint,
-          stagingManifest: hostProof.stagingManifest,
+          workspaceManifestFingerprint:
+            hostProof?.workspaceManifestFingerprint ?? normalized.workspaceManifestFingerprint!,
+          stagingManifest: hostProof?.stagingManifest ?? normalized.stagingManifest!,
           expectedArtifacts: normalized.expectedArtifacts,
           environment: normalized.environment,
         });
@@ -490,6 +496,9 @@ function sandboxParameters(
 ): ExtensionToolContributionV1["tool"]["parameters"] {
   const workspaceProofProperties: Record<string, JsonSchemaObjectV1> = {};
   if (!hostResolvesWorkspaceProof) {
+    workspaceProofProperties.profileKey = { type: "string" };
+    workspaceProofProperties.projectId = { type: "string" };
+    workspaceProofProperties.commandId = { type: "string" };
     workspaceProofProperties.workspaceManifestFingerprint = { type: "string" };
     workspaceProofProperties.stagingManifest = {
       type: "array",
@@ -509,12 +518,9 @@ function sandboxParameters(
     type: "object",
     additionalProperties: false,
     properties: {
-      profileKey: { type: "string" },
-      projectId: { type: "string" },
-      commandId: { type: "string" },
+      ...workspaceProofProperties,
       workspaceId: { type: "string" },
       repairRequestId: { type: ["string", "null"] },
-      ...workspaceProofProperties,
       expectedArtifacts: {
         type: "array",
         items: {
@@ -532,14 +538,17 @@ function sandboxParameters(
       environment: { type: "object", additionalProperties: { type: "string" } },
     },
     required: [
-      "profileKey",
-      "projectId",
-      "commandId",
       "workspaceId",
       "repairRequestId",
       ...(hostResolvesWorkspaceProof
         ? []
-        : ["workspaceManifestFingerprint", "stagingManifest"]),
+        : [
+            "profileKey",
+            "projectId",
+            "commandId",
+            "workspaceManifestFingerprint",
+            "stagingManifest",
+          ]),
     ],
   };
 }
@@ -549,16 +558,18 @@ function parseSandboxToolArgs(
   hostResolvesWorkspaceProof: boolean,
 ): ParsedSandboxToolArgsV2 {
   assertAllowedArgs(args, [
-    "profileKey", "projectId", "commandId", "workspaceId",
-    "repairRequestId", "expectedArtifacts", "environment",
+    "workspaceId", "repairRequestId", "expectedArtifacts", "environment",
     ...(hostResolvesWorkspaceProof
       ? []
-      : ["workspaceManifestFingerprint", "stagingManifest"]),
+      : [
+          "profileKey", "projectId", "commandId",
+          "workspaceManifestFingerprint", "stagingManifest",
+        ]),
   ]);
   return {
-    profileKey: requiredId(args.profileKey, "profileKey"),
-    projectId: requiredId(args.projectId, "projectId"),
-    commandId: requiredId(args.commandId, "commandId"),
+    profileKey: hostResolvesWorkspaceProof ? null : requiredId(args.profileKey, "profileKey"),
+    projectId: hostResolvesWorkspaceProof ? null : requiredId(args.projectId, "projectId"),
+    commandId: hostResolvesWorkspaceProof ? null : requiredId(args.commandId, "commandId"),
     workspaceId: requiredId(args.workspaceId, "workspaceId"),
     repairRequestId: args.repairRequestId === null
       ? null

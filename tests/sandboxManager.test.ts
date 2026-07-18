@@ -373,10 +373,12 @@ test("code contribution factory replaces compatibility execution tools with prep
       return key === fixture.profile.key ? fixture.profile : null;
     },
     async resolvePreparationInput(input) {
-      assert.equal(input.profile.key, fixture.profile.key);
-      assert.equal(input.projectId, fixture.projectId);
+      assert.equal(input.purpose, "validation_fast");
       assert.equal(input.workspaceId, fixture.workspaceId);
       return {
+        profile: fixture.profile,
+        projectId: fixture.projectId,
+        commandId: fixture.commandId,
         workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
         stagingManifest: fixture.stagingManifest,
       };
@@ -451,11 +453,17 @@ test("code contribution factory replaces compatibility execution tools with prep
     ),
     false,
   );
+  for (const modelOwnedSelector of ["profileKey", "projectId", "commandId"]) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(
+        validation.parameters.properties ?? {},
+        modelOwnedSelector,
+      ),
+      false,
+    );
+  }
   const prepared = await validation.prepare!(
     {
-      profileKey: fixture.profile.key,
-      projectId: fixture.projectId,
-      commandId: fixture.commandId,
       workspaceId: fixture.workspaceId,
       repairRequestId: "request-1",
       environment: fixture.environment,

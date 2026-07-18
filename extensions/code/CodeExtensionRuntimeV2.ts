@@ -47,6 +47,7 @@ import {
   migrateRepositoryProfileV1,
   parseRepositoryProfileV2,
   type RepositoryProfileV2,
+  type RepositoryValidationCommandV2,
 } from "./repositories";
 import {
   CODE_WORKSPACE_TOOL_NAMES_V2,
@@ -310,8 +311,8 @@ export class CodeExtensionRuntimeV2 {
     const execution = createCodeExecutionContributionsV2({
       sandboxManager,
       getProfile: (profileKey) => this.getRepositoryProfile(profileKey),
-      resolvePreparationInput: ({ profile, projectId, workspaceId }) =>
-        this.resolveSandboxPreparationInput(profile, projectId, workspaceId),
+      resolvePreparationInput: ({ purpose, workspaceId }) =>
+        this.resolveSandboxPreparationInput(purpose, workspaceId),
       resolveExecutionInput: (_action, sandboxAction, context) =>
         this.resolveSandboxExecutionInput(sandboxAction, context),
       observeValidationReceipt: this.validationReceiptRegistry
@@ -694,33 +695,43 @@ export class CodeExtensionRuntimeV2 {
   }
 
   async resolveSandboxPreparationInput(
-    profileInput: RepositoryProfileV2,
-    projectId: string,
+    purpose: PreparedSandboxActionV2["purpose"],
     workspaceId: string,
   ): Promise<{
+    profile: RepositoryProfileV2;
+    projectId: string;
+    commandId: string;
     workspaceManifestFingerprint: string;
     stagingManifest: Array<{ path: string; sha256: string; bytes: number }>;
   }> {
     this.assertInitialized();
-    const profile = parseRepositoryProfileV2(profileInput);
-    const project = profile.projects.find((candidate) => candidate.id === projectId);
-    if (!project) {
-      throw new CodeSandboxContributionErrorV2(
-        "sandbox_project_binding_mismatch",
-        "Sandbox preparation references an unknown trusted repository project.",
-      );
-    }
     const manifest = await this.workspaceManager.loadManifest(workspaceId);
+    const profileKey = manifest.repositoryBinding?.profileKey;
+    const profile = profileKey ? await this.getRepositoryProfile(profileKey) : null;
     if (
+      !profile ||
       manifest.kind !== "repository" ||
-      manifest.repositoryBinding?.profileKey !== profile.key ||
-      !samePath(manifest.repositoryBinding.repositoryRoot, profile.repositoryRoot)
+      !samePath(manifest.repositoryBinding!.repositoryRoot, profile.repositoryRoot)
     ) {
       throw new CodeSandboxContributionErrorV2(
         "sandbox_workspace_binding_mismatch",
-        "Sandbox preparation requires the exact trusted repository-worktree binding.",
+        "Sandbox preparation requires the exact trusted repository-worktree profile binding.",
       );
     }
+    const changedPaths = manifest.budget.changedPaths;
+    const projects = profile.projects.filter((candidate) =>
+      changedPaths.length === 0 || changedPaths.every((relativePath) =>
+        candidate.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath)),
+      ),
+    );
+    if (projects.length !== 1) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_project_binding_mismatch",
+        "Sandbox preparation requires exactly one project covering the trusted workspace changes.",
+      );
+    }
+    const project = projects[0];
+    const command = selectForegroundValidationCommand(profile, project.id, purpose);
     const stagingManifest = Object.entries(manifest.hashes.files)
       .filter(([relativePath]) =>
         project.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath)) ||
@@ -739,6 +750,9 @@ export class CodeExtensionRuntimeV2 {
       );
     }
     return {
+      profile,
+      projectId: project.id,
+      commandId: command.id,
       workspaceManifestFingerprint: manifest.hashes.indexFingerprint,
       stagingManifest,
     };
@@ -2220,6 +2234,55 @@ async function canonicalSafeDirectory(value: string): Promise<string> {
 
 function pathAtOrBelow(root: string, candidate: string): boolean {
   return root === "." || candidate === root || candidate.startsWith(`${root}/`);
+}
+
+function selectForegroundValidationCommand(
+  profile: RepositoryProfileV2,
+  projectId: string,
+  purpose: PreparedSandboxActionV2["purpose"],
+): RepositoryValidationCommandV2 {
+  const catalog = profile.validationCatalog
+    .filter((command) => command.projectId === projectId)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const exactPhase = purpose === "validation_fast"
+    ? "fast"
+    : purpose === "validation_targeted" || purpose === "code_block"
+      ? "targeted"
+      : purpose === "validation_full"
+        ? "full"
+        : "bootstrap";
+  const exact = catalog.filter((command) => command.phase === exactPhase);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new CodeSandboxContributionErrorV2(
+      "sandbox_validation_command_ambiguous",
+      `The trusted repository profile has multiple ${exactPhase} commands for project ${projectId}.`,
+    );
+  }
+
+  const legacyFull = catalog.filter((command) => command.phase === "full");
+  const isLegacyV1Catalog = legacyFull.length > 0 && legacyFull.every((command) =>
+    /^root-full-\d+$/u.test(command.id),
+  );
+  if (
+    isLegacyV1Catalog &&
+    (purpose === "validation_fast" || purpose === "validation_targeted" || purpose === "validation_full")
+  ) {
+    return purpose === "validation_full"
+      ? legacyFull.at(-1)!
+      : legacyFull[0];
+  }
+  if (
+    legacyFull.length === 1 &&
+    (purpose === "validation_fast" || purpose === "validation_targeted" || purpose === "validation_full")
+  ) {
+    return legacyFull[0];
+  }
+
+  throw new CodeSandboxContributionErrorV2(
+    "sandbox_validation_command_unavailable",
+    `The trusted repository profile has no unambiguous ${exactPhase} command for project ${projectId}.`,
+  );
 }
 
 function contextRunId(context: ScopedExtensionContextV1): string {

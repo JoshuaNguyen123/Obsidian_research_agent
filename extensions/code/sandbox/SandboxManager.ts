@@ -939,9 +939,10 @@ function assertPurposeMatchesCommand(
     code_block: "targeted",
     lockfile_restore: "bootstrap",
   } as const;
-  const targetedFastFallback =
-    purpose === "validation_targeted" && command.phase === "fast";
-  if (command.phase !== expected[purpose] && !targetedFastFallback) {
+  const strongerValidationFallback =
+    (purpose === "validation_fast" && command.phase === "full") ||
+    (purpose === "validation_targeted" && ["fast", "full"].includes(command.phase));
+  if (command.phase !== expected[purpose] && !strongerValidationFallback) {
     throw new SandboxManagerV2Error(`Sandbox purpose ${purpose} requires a ${expected[purpose]} catalog command.`);
   }
   if (purpose === "lockfile_restore" && (!command.lockfile || command.network !== "exact_approval_required")) {
