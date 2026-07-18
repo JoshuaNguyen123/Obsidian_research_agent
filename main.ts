@@ -226,6 +226,8 @@ import {
   BundledIntegrationsCapability,
   type BundledCapabilitiesV1,
 } from "./src/extensions/BundledCapabilityRuntime";
+import { selectExtensionOwnedPluginData } from "./src/extensions/pluginDataOwnership";
+import { withPluginDataLock } from "./extensions/shared/softDependency";
 import {
   AGENTIC_RESEARCHER_CORE_READY_EVENT,
   AGENTIC_RESEARCHER_CORE_UNLOADING_EVENT,
@@ -6579,45 +6581,51 @@ export default class AgenticResearcherPlugin extends Plugin {
         } = this.settings;
         void _ollamaApiKey;
         void _openAiCompatibleApiKey;
-        await this.saveData({
-          ...persistableSettings,
-          modelCredentialReferences:
-            this.modelCredentialStore?.snapshot() ??
-            emptyModelCredentialReferencesV1(),
-          linearCredentialReference: this.linearCredentialReference,
-          linearOAuthRuntimeState: this.linearOAuthRuntimeState,
-          githubCredential: this.githubCredential,
-          trustedGitHubRepositoryBindingsV2:
-            this.trustedGitHubRepositoryBindingsV2,
-          githubPrivateRepositoryCheckpoints:
-            this.githubPrivateRepositoryCheckpoints,
-          githubPrivateRepositoryCleanupCheckpoints:
-            this.githubPrivateRepositoryCleanupCheckpoints,
-          githubPublicationCheckpoints:
-            this.githubPublicationCheckpointNamespace,
-          githubReviewRepairCheckpoints:
-            this.githubReviewRepairCheckpointNamespace,
-          githubGitPushAttempts: this.gitPushAttemptNamespace,
-          linearCapabilitySnapshot: this.linearCapabilitySnapshot,
-          conversationHistory: this.conversationHistory,
-          researchMemoryIndex: this.researchMemoryIndex,
-          latestOrchestratorSnapshot: this.latestOrchestratorSnapshot,
-          linearIntegrationState: this.linearIntegrationState,
-          pendingLinearReconciliationState: this.pendingLinearReconciliationState,
-          externalActionReceiptLedger: this.externalActionReceiptLedger,
-          researchPublicationCheckpoints:
-            this.researchPublicationCheckpointNamespace,
-          researchProjectHierarchyCheckpoints:
-            this.researchProjectHierarchyCheckpointNamespace,
-          projectLineages: this.projectLineageNamespace,
-          linearQueueState: this.linearQueueState,
-          queueResourceLockState: this.queueResourceLockState,
-          queueDailyStartBudgetState: this.queueDailyStartBudgetState,
-          repositoryProfileRegistry: this.repositoryProfileRegistry,
-          authorityGrantStoreState: this.authorityGrantStoreState,
-          bundledCapabilityData: this.bundledCapabilityData,
-          extensionStateMigration: this.extensionStateMigration,
-          pluginDataV3Migration: this.pluginDataV3Migration,
+        await withPluginDataLock(this, async () => {
+          const extensionOwnedData = selectExtensionOwnedPluginData(
+            await this.loadData(),
+          );
+          await this.saveData({
+            ...extensionOwnedData,
+            ...persistableSettings,
+            modelCredentialReferences:
+              this.modelCredentialStore?.snapshot() ??
+              emptyModelCredentialReferencesV1(),
+            linearCredentialReference: this.linearCredentialReference,
+            linearOAuthRuntimeState: this.linearOAuthRuntimeState,
+            githubCredential: this.githubCredential,
+            trustedGitHubRepositoryBindingsV2:
+              this.trustedGitHubRepositoryBindingsV2,
+            githubPrivateRepositoryCheckpoints:
+              this.githubPrivateRepositoryCheckpoints,
+            githubPrivateRepositoryCleanupCheckpoints:
+              this.githubPrivateRepositoryCleanupCheckpoints,
+            githubPublicationCheckpoints:
+              this.githubPublicationCheckpointNamespace,
+            githubReviewRepairCheckpoints:
+              this.githubReviewRepairCheckpointNamespace,
+            githubGitPushAttempts: this.gitPushAttemptNamespace,
+            linearCapabilitySnapshot: this.linearCapabilitySnapshot,
+            conversationHistory: this.conversationHistory,
+            researchMemoryIndex: this.researchMemoryIndex,
+            latestOrchestratorSnapshot: this.latestOrchestratorSnapshot,
+            linearIntegrationState: this.linearIntegrationState,
+            pendingLinearReconciliationState: this.pendingLinearReconciliationState,
+            externalActionReceiptLedger: this.externalActionReceiptLedger,
+            researchPublicationCheckpoints:
+              this.researchPublicationCheckpointNamespace,
+            researchProjectHierarchyCheckpoints:
+              this.researchProjectHierarchyCheckpointNamespace,
+            projectLineages: this.projectLineageNamespace,
+            linearQueueState: this.linearQueueState,
+            queueResourceLockState: this.queueResourceLockState,
+            queueDailyStartBudgetState: this.queueDailyStartBudgetState,
+            repositoryProfileRegistry: this.repositoryProfileRegistry,
+            authorityGrantStoreState: this.authorityGrantStoreState,
+            bundledCapabilityData: this.bundledCapabilityData,
+            extensionStateMigration: this.extensionStateMigration,
+            pluginDataV3Migration: this.pluginDataV3Migration,
+          });
         });
       });
     this.pluginDataSaveTail = write.then(
