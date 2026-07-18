@@ -4054,7 +4054,7 @@ test("workspace correction preserves the verified read binding after transcript 
   });
 });
 
-test("workspace correction refreshes only a completed exact read in its durably created workspace", () => {
+test("workspace correction refreshes completed exact reads in its durably created workspace", () => {
   const path = "checkers/game.py";
   const writeTool = [{
     type: "function" as const,
@@ -4077,11 +4077,23 @@ test("workspace correction refreshes only a completed exact read in its durably 
           },
         },
       },
+      protectedRead: {
+        id: "protectedRead",
+        status: "complete",
+        allowedTools: ["code_workspace_read"],
+        inputs: {
+          resource: {
+            kind: "binding",
+            bindingId: "workspace-binding",
+            selector: path,
+          },
+        },
+      },
       write: {
         id: "write",
         status: "ready",
         allowedTools: ["code_workspace_write_expected"],
-        dependencyIds: ["read"],
+        dependencyIds: ["read", "protectedRead"],
         inputs: {},
         destination: {
           bindingId: "workspace-binding",
@@ -4124,6 +4136,10 @@ test("workspace correction refreshes only a completed exact read in its durably 
         nodes: {
           ...graph.nodes,
           read: { ...graph.nodes.read, status: "queued" },
+          protectedRead: {
+            ...graph.nodes.protectedRead,
+            status: "queued",
+          },
         },
       },
       writeTool,

@@ -11734,7 +11734,12 @@ export function getVerifiedWorkspaceReadRefreshBinding(
             getMissionGraphNodeSelector(node) === graphDestinationSelector,
         ),
     );
-  if (completedExactReads.length !== 1) return null;
+  // A protected contract path can also be one of the files in the bounded
+  // correction pass (for example README.md). In that case the graph contains
+  // multiple completed reads for the same exact selector. They do not make the
+  // destination ambiguous: the host still performs one fresh read below and
+  // binds the write to the newly observed hash and content.
+  if (completedExactReads.length === 0) return null;
   const workspaceIds = new Set(
     durableReceipts
       .filter(
