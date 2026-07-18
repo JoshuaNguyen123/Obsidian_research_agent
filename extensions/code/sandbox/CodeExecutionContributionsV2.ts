@@ -4,6 +4,7 @@ import type {
   ActionReceiptV1,
   ExtensionContributionV1,
   ExtensionToolContributionV1,
+  JsonSchemaObjectV1,
   JsonValueV1,
   PreparedActionResultV1,
   PreparedActionV1,
@@ -42,6 +43,16 @@ export const CODE_EXECUTION_TOOL_NAMES_V2 = [
 export interface CodeExecutionContributionFactoryOptionsV2 {
   sandboxManager: SandboxManagerV2;
   getProfile(profileKey: string): Promise<RepositoryProfileV2 | null>;
+  /** Resolve mutable workspace proof on the host; model arguments never carry hashes. */
+  resolvePreparationInput?(input: {
+    profile: RepositoryProfileV2;
+    projectId: string;
+    workspaceId: string;
+    context: ScopedExtensionContextV1;
+  }): Promise<{
+    workspaceManifestFingerprint: string;
+    stagingManifest: SandboxPrepareInputV2["stagingManifest"];
+  }>;
   resolveExecutionInput?(
     action: PreparedActionV1,
     sandboxAction: PreparedSandboxActionV2,
@@ -63,8 +74,13 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
 }
 
 interface ParsedSandboxToolArgsV2
-  extends Omit<SandboxPrepareInputV2, "profile" | "purpose"> {
+  extends Omit<
+    SandboxPrepareInputV2,
+    "profile" | "purpose" | "workspaceManifestFingerprint" | "stagingManifest"
+  > {
   profileKey: string;
+  workspaceManifestFingerprint: string | null;
+  stagingManifest: SandboxPrepareInputV2["stagingManifest"] | null;
 }
 
 /**
@@ -164,7 +180,7 @@ function preparedSandboxContribution(
     description: install
       ? "Restore only profile-declared lockfiles in a verified sandbox after exact prepared approval; arbitrary package installation is not supported."
       : "Run the selected immutable RepositoryProfileV2 command only inside a verified sandbox.",
-    parameters: sandboxParameters(),
+    parameters: sandboxParameters(Boolean(options.resolvePreparationInput)),
     descriptor: descriptor(
       name,
       resourceType,
@@ -185,12 +201,26 @@ function preparedSandboxContribution(
     },
     async prepare(args, context): Promise<PreparedActionResultV1> {
       try {
-        const normalized = parseSandboxToolArgs(args);
+        const normalized = parseSandboxToolArgs(
+          args,
+          Boolean(options.resolvePreparationInput),
+        );
         const profile = await options.getProfile(normalized.profileKey);
         if (!profile) {
           return failure("repository_profile_missing", "The trusted RepositoryProfileV2 is unavailable.");
         }
         parseRepositoryProfileV2(profile);
+        const hostProof = options.resolvePreparationInput
+          ? await options.resolvePreparationInput({
+              profile,
+              projectId: normalized.projectId,
+              workspaceId: normalized.workspaceId,
+              context,
+            })
+          : {
+              workspaceManifestFingerprint: normalized.workspaceManifestFingerprint!,
+              stagingManifest: normalized.stagingManifest!,
+            };
         const prepared = await options.sandboxManager.prepareExecution({
           profile,
           purpose,
@@ -198,8 +228,8 @@ function preparedSandboxContribution(
           commandId: normalized.commandId,
           workspaceId: normalized.workspaceId,
           repairRequestId: normalized.repairRequestId,
-          workspaceManifestFingerprint: normalized.workspaceManifestFingerprint,
-          stagingManifest: normalized.stagingManifest,
+          workspaceManifestFingerprint: hostProof.workspaceManifestFingerprint,
+          stagingManifest: hostProof.stagingManifest,
           expectedArtifacts: normalized.expectedArtifacts,
           environment: normalized.environment,
         });
@@ -455,7 +485,26 @@ function descriptor(
   };
 }
 
-function sandboxParameters(): ExtensionToolContributionV1["tool"]["parameters"] {
+function sandboxParameters(
+  hostResolvesWorkspaceProof = false,
+): ExtensionToolContributionV1["tool"]["parameters"] {
+  const workspaceProofProperties: Record<string, JsonSchemaObjectV1> = {};
+  if (!hostResolvesWorkspaceProof) {
+    workspaceProofProperties.workspaceManifestFingerprint = { type: "string" };
+    workspaceProofProperties.stagingManifest = {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          path: { type: "string" },
+          sha256: { type: "string" },
+          bytes: { type: "integer" },
+        },
+        required: ["path", "sha256", "bytes"],
+      },
+    };
+  }
   return {
     type: "object",
     additionalProperties: false,
@@ -465,20 +514,7 @@ function sandboxParameters(): ExtensionToolContributionV1["tool"]["parameters"] 
       commandId: { type: "string" },
       workspaceId: { type: "string" },
       repairRequestId: { type: ["string", "null"] },
-      workspaceManifestFingerprint: { type: "string" },
-      stagingManifest: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            path: { type: "string" },
-            sha256: { type: "string" },
-            bytes: { type: "integer" },
-          },
-          required: ["path", "sha256", "bytes"],
-        },
-      },
+      ...workspaceProofProperties,
       expectedArtifacts: {
         type: "array",
         items: {
@@ -501,16 +537,23 @@ function sandboxParameters(): ExtensionToolContributionV1["tool"]["parameters"] 
       "commandId",
       "workspaceId",
       "repairRequestId",
-      "workspaceManifestFingerprint",
-      "stagingManifest",
+      ...(hostResolvesWorkspaceProof
+        ? []
+        : ["workspaceManifestFingerprint", "stagingManifest"]),
     ],
   };
 }
 
-function parseSandboxToolArgs(args: Record<string, unknown>): ParsedSandboxToolArgsV2 {
+function parseSandboxToolArgs(
+  args: Record<string, unknown>,
+  hostResolvesWorkspaceProof: boolean,
+): ParsedSandboxToolArgsV2 {
   assertAllowedArgs(args, [
     "profileKey", "projectId", "commandId", "workspaceId",
-    "repairRequestId", "workspaceManifestFingerprint", "stagingManifest", "expectedArtifacts", "environment",
+    "repairRequestId", "expectedArtifacts", "environment",
+    ...(hostResolvesWorkspaceProof
+      ? []
+      : ["workspaceManifestFingerprint", "stagingManifest"]),
   ]);
   return {
     profileKey: requiredId(args.profileKey, "profileKey"),
@@ -520,11 +563,18 @@ function parseSandboxToolArgs(args: Record<string, unknown>): ParsedSandboxToolA
     repairRequestId: args.repairRequestId === null
       ? null
       : requiredId(args.repairRequestId, "repairRequestId"),
-    workspaceManifestFingerprint: requiredFingerprint(
-      args.workspaceManifestFingerprint,
-      "workspaceManifestFingerprint",
-    ),
-    stagingManifest: requiredArray(args.stagingManifest, "stagingManifest") as SandboxPrepareInputV2["stagingManifest"],
+    workspaceManifestFingerprint: hostResolvesWorkspaceProof
+      ? null
+      : requiredFingerprint(
+          args.workspaceManifestFingerprint,
+          "workspaceManifestFingerprint",
+        ),
+    stagingManifest: hostResolvesWorkspaceProof
+      ? null
+      : requiredArray(
+          args.stagingManifest,
+          "stagingManifest",
+        ) as SandboxPrepareInputV2["stagingManifest"],
     expectedArtifacts: args.expectedArtifacts === undefined
       ? []
       : requiredArray(args.expectedArtifacts, "expectedArtifacts") as SandboxPrepareInputV2["expectedArtifacts"],

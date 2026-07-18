@@ -372,6 +372,15 @@ test("code contribution factory replaces compatibility execution tools with prep
     async getProfile(key) {
       return key === fixture.profile.key ? fixture.profile : null;
     },
+    async resolvePreparationInput(input) {
+      assert.equal(input.profile.key, fixture.profile.key);
+      assert.equal(input.projectId, fixture.projectId);
+      assert.equal(input.workspaceId, fixture.workspaceId);
+      return {
+        workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
+        stagingManifest: fixture.stagingManifest,
+      };
+    },
     async resolveExecutionInput() {
       return { stagedFiles: [{ path: "src/index.ts", bytes: source }] };
     },
@@ -428,6 +437,20 @@ test("code contribution factory replaces compatibility execution tools with prep
 
   await manager.probeProviders();
   const validation = tools.find((contribution) => contribution.tool.name === "code_validate_fast")!.tool;
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      validation.parameters.properties ?? {},
+      "workspaceManifestFingerprint",
+    ),
+    false,
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      validation.parameters.properties ?? {},
+      "stagingManifest",
+    ),
+    false,
+  );
   const prepared = await validation.prepare!(
     {
       profileKey: fixture.profile.key,
@@ -435,8 +458,6 @@ test("code contribution factory replaces compatibility execution tools with prep
       commandId: fixture.commandId,
       workspaceId: fixture.workspaceId,
       repairRequestId: "request-1",
-      workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
-      stagingManifest: fixture.stagingManifest,
       environment: fixture.environment,
     },
     context(),

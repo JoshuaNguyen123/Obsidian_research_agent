@@ -502,6 +502,20 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
     );
     const manifest = await manager.loadManifest("fixture-workspace");
     const readback = await manager.read("fixture-workspace", "src/value.ts");
+    const hostPreparation = await runtime.resolveSandboxPreparationInput(
+      (await runtime.getRepositoryProfile(profile.key))!,
+      "root",
+      manifest.workspaceId,
+    );
+    assert.equal(
+      hostPreparation.workspaceManifestFingerprint,
+      manifest.hashes.indexFingerprint,
+    );
+    assert.deepEqual(hostPreparation.stagingManifest, [{
+      path: readback.path,
+      sha256: readback.sha256,
+      bytes: readback.bytes,
+    }]);
     const repairBinding = await runtime.resolveRepairWorkspaceBinding({
       workspaceId: manifest.workspaceId,
       profileKey: profile.key,

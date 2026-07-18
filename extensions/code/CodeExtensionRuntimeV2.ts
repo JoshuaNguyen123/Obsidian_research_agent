@@ -310,6 +310,8 @@ export class CodeExtensionRuntimeV2 {
     const execution = createCodeExecutionContributionsV2({
       sandboxManager,
       getProfile: (profileKey) => this.getRepositoryProfile(profileKey),
+      resolvePreparationInput: ({ profile, projectId, workspaceId }) =>
+        this.resolveSandboxPreparationInput(profile, projectId, workspaceId),
       resolveExecutionInput: (_action, sandboxAction, context) =>
         this.resolveSandboxExecutionInput(sandboxAction, context),
       observeValidationReceipt: this.validationReceiptRegistry
@@ -525,7 +527,10 @@ export class CodeExtensionRuntimeV2 {
     const stagedFiles: SandboxStagedFileBytesV2[] = [];
     for (const entry of sandboxAction.stagingManifest) {
       const relativePath = assertWorkspaceRelativePathV2(entry.path);
-      if (!project.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath))) {
+      if (
+        !project.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath)) &&
+        !profile.protectedControls.some((control) => pathAtOrBelow(control.path, relativePath))
+      ) {
         throw new CodeSandboxContributionErrorV2(
           "sandbox_staging_scope_rejected",
           `Sandbox staging path is outside the trusted project scope: ${relativePath}.`,
@@ -686,6 +691,57 @@ export class CodeExtensionRuntimeV2 {
       },
     };
     return { stagedFiles, artifactImporter };
+  }
+
+  async resolveSandboxPreparationInput(
+    profileInput: RepositoryProfileV2,
+    projectId: string,
+    workspaceId: string,
+  ): Promise<{
+    workspaceManifestFingerprint: string;
+    stagingManifest: Array<{ path: string; sha256: string; bytes: number }>;
+  }> {
+    this.assertInitialized();
+    const profile = parseRepositoryProfileV2(profileInput);
+    const project = profile.projects.find((candidate) => candidate.id === projectId);
+    if (!project) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_project_binding_mismatch",
+        "Sandbox preparation references an unknown trusted repository project.",
+      );
+    }
+    const manifest = await this.workspaceManager.loadManifest(workspaceId);
+    if (
+      manifest.kind !== "repository" ||
+      manifest.repositoryBinding?.profileKey !== profile.key ||
+      !samePath(manifest.repositoryBinding.repositoryRoot, profile.repositoryRoot)
+    ) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_workspace_binding_mismatch",
+        "Sandbox preparation requires the exact trusted repository-worktree binding.",
+      );
+    }
+    const stagingManifest = Object.entries(manifest.hashes.files)
+      .filter(([relativePath]) =>
+        project.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath)) ||
+        profile.protectedControls.some((control) => pathAtOrBelow(control.path, relativePath)),
+      )
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([relativePath, evidence]) => ({
+        path: relativePath,
+        sha256: evidence.sha256,
+        bytes: evidence.bytes,
+      }));
+    if (stagingManifest.length === 0) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_empty",
+        "The trusted workspace has no hash-bound files in the selected project scope.",
+      );
+    }
+    return {
+      workspaceManifestFingerprint: manifest.hashes.indexFingerprint,
+      stagingManifest,
+    };
   }
 
   /** User/settings command only. It never receives a model-supplied command. */
