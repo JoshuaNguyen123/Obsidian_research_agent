@@ -14,7 +14,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 - Native Obsidian view with a minimal green-on-black mission console.
 - A durable `MissionGraphV3` is the authoritative plan; the conditional `Orchestrator` tab is a projection of that graph, while Chat and Run Details remain the primary surfaces.
-- Ollama-compatible model client for local model chat and streaming.
+- Ollama Cloud BYOK is the default agentic model connection. The API key stays in Obsidian SecretStorage; local Ollama and other compatible endpoints remain supported as optional alternatives.
 - Agent loop with bounded steps, tool validation, and run receipts.
 - Vault tools for reading markdown files, inspecting folders, editing sections, appending to notes, replacing notes with backups, moving paths, and Obsidian-safe trash flows.
 - Graph-aware vault tools for explicit links, backlinks, unresolved links, related-note discovery, link suggestions, and controlled inline wiki-link insertion with backups.
@@ -22,7 +22,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 - Web search and fetch tools for sourced research when enabled by the mission.
 - Truthful source gating rejects empty/unparsed pages as proof and supports cache, provider, and safety-gated browser extraction fallbacks.
 - Metadata-aware template ranking, dry rendering, safe built-ins, collision handling, and read-back verification.
-- Built-in Code capability with durable scratch folders and trusted Git worktrees, bounded file CRUD, repository profiles, sandbox-only validation, repair checkpoints, and verified local commits.
+- Built-in Code capability with durable scratch folders and trusted Git worktrees, bounded file CRUD, repository profiles, sandbox-only validation, repair checkpoints, and verified local commits. Creation covers Python, TypeScript, JavaScript, C, C++, HTML, CSS, Rust, Go, Java, and C#.
 - Native Canvas, SVG, and Mermaid read/patch tools with optimistic concurrency, transactional design packages, structural QA, bounded layout repair, readback, and receipts.
 - A descriptor-based external-action kernel with prepared-action fingerprints, scoped authority grants, exact approval previews, canonical receipts, readback, and reconciliation.
 - Fixed Linear GraphQL tools through capability gates 0-5; the model cannot submit arbitrary GraphQL, credentials remain host-owned, and Linear tools appear only for explicit Linear intent.
@@ -47,7 +47,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 - Obsidian Desktop 1.5.0 or newer. Version 0.4.0 is desktop-only because the unified Code and Companion modules require guarded Node/Electron capabilities.
 - Node.js and npm.
-- A local or compatible Ollama API endpoint if you want model-backed runs.
+- An Ollama Cloud API key for the default BYOK experience. Local Ollama and compatible Ollama endpoints are optional alternatives.
 
 ## Install For Development
 
