@@ -405,20 +405,44 @@ async function ensurePluginRuntimesLoaded(
       if (!app.plugins.manifests?.[pluginId]) {
         throw new Error(`Plugin manifest is not installed: ${pluginId}`);
       }
-      if (!app.plugins.plugins?.[pluginId]) {
-        await app.plugins.enablePlugin(pluginId);
+      let plugin = app.plugins.plugins?.[pluginId];
+      let loadAttempts = 0;
+      let lastLoadErrorKind: string | null = null;
+      // On a cold disposable vault Obsidian can persist the enabled id before
+      // its community-plugin manager has installed the runtime instance. A
+      // completed enable/load call is therefore not sufficient readback.
+      // Retry only the same fixed plugin id and require the runtime registry.
+      for (let attempt = 0; attempt < 3 && !plugin; attempt += 1) {
+        loadAttempts += 1;
+        try {
+          const enabled =
+            app.plugins.enabledPlugins?.has?.(pluginId) ??
+            app.plugins.enabledPlugins?.includes?.(pluginId) ??
+            false;
+          if (!enabled) {
+            await app.plugins.enablePlugin(pluginId);
+          }
+          if (
+            !app.plugins.plugins?.[pluginId] &&
+            typeof app.plugins.loadPlugin === "function"
+          ) {
+            await app.plugins.loadPlugin(pluginId);
+          }
+          lastLoadErrorKind = null;
+        } catch (error) {
+          lastLoadErrorKind =
+            error instanceof Error ? error.name : typeof error;
+        }
+        for (
+          let readbackAttempt = 0;
+          readbackAttempt < 20;
+          readbackAttempt += 1
+        ) {
+          plugin = app.plugins.plugins?.[pluginId];
+          if (plugin) break;
+          await delayInPage(250);
+        }
       }
-      if (
-        !app.plugins.plugins?.[pluginId] &&
-        typeof app.plugins.loadPlugin === "function"
-      ) {
-        await app.plugins.loadPlugin(pluginId);
-      }
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        if (app.plugins.plugins?.[pluginId]) break;
-        await delayInPage(250);
-      }
-      const plugin = app.plugins.plugins?.[pluginId];
       if (!plugin) {
         throw new Error(
           `Plugin did not load after enabling: ${pluginId}; ${JSON.stringify({
@@ -429,6 +453,8 @@ async function ensurePluginRuntimesLoaded(
               null,
             safeMode: app.plugins.safeMode ?? null,
             restrictedMode: app.plugins.restrictedMode ?? null,
+            loadAttempts,
+            lastLoadErrorKind,
           })}`,
         );
       }

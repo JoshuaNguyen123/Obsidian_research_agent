@@ -345,7 +345,9 @@ test.describe("daily-use connections and setup", () => {
   });
 });
 
-async function setupDailyUsePage(context: { page: NativeObsidianHarness["page"] }) {
+async function setupDailyUsePage(context: {
+  page: NativeObsidianHarness["page"];
+}) {
   await context.page.evaluate(async (pluginId) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.plugins?.plugins?.[pluginId]) {
@@ -371,21 +373,26 @@ async function setupDailyUsePage(context: { page: NativeObsidianHarness["page"] 
 }
 
 async function closeObsidianSettings(page: NativeObsidianHarness["page"]) {
-  await page.evaluate(() => {
-    (window as typeof window & { app?: any }).app?.setting?.close?.();
-  });
   await page.waitForFunction(
-    () =>
-      Array.from(document.querySelectorAll<HTMLElement>(".modal.mod-settings"))
-        .every((modal) => {
-          const style = getComputedStyle(modal);
-          return (
-            style.display === "none" ||
-            style.visibility === "hidden" ||
-            modal.getClientRects().length === 0
-          );
-        }),
+    () => {
+      const visibleSettings = Array.from(
+        document.querySelectorAll<HTMLElement>(".modal.mod-settings"),
+      ).filter((modal) => {
+        const style = getComputedStyle(modal);
+        return !(
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          modal.getClientRects().length === 0
+        );
+      });
+      if (visibleSettings.length === 0) return true;
+      // A close request made during Obsidian's opening animation may be
+      // ignored. Repeat the same host-owned close until DOM readback proves
+      // the settings modal no longer intercepts the agent panel.
+      (window as typeof window & { app?: any }).app?.setting?.close?.();
+      return false;
+    },
     undefined,
-    { timeout: 5_000 },
+    { polling: 100, timeout: 15_000 },
   );
 }
