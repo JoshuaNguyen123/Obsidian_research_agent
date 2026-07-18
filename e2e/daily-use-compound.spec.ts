@@ -212,6 +212,12 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
           : {}),
         githubEnabled: true,
         repositoryProfileRegistry: createRepositoryProfileRegistry([profile]),
+        // This scenario owns a fresh disposable repository profile. Remove the
+        // restored vault's immutable migration snapshots so production startup
+        // migrates the exact scenario registry instead of an older baseline.
+        extensionStateMigration: undefined,
+        pluginDataV3Migration: undefined,
+        codeRuntimeState: undefined,
       },
       {
         preserveConfiguredLinearCredential: !linearToken,
