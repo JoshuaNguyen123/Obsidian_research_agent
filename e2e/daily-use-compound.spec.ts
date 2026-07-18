@@ -212,23 +212,12 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
           : {}),
         githubEnabled: true,
         repositoryProfileRegistry: createRepositoryProfileRegistry([profile]),
-        // This scenario owns a fresh disposable repository profile. Remove the
-        // restored vault's immutable migration snapshots so production startup
-        // migrates the exact scenario registry instead of an older baseline.
-        settingsSchemaVersion: 3,
-        extensionStateMigration: undefined,
-        pluginDataV3Migration: undefined,
-        codeRuntimeState: undefined,
       },
       {
         preserveConfiguredLinearCredential: !linearToken,
         preserveConfiguredGitHubCredential: true,
       },
     );
-    // A newly prepared extension migration is intentionally activated only on
-    // the next plugin load. Exercise that production reload boundary before
-    // asking Integrations for live provider discovery.
-    await harness.restartCorePlugin();
     const connection = await configureProtectedConnections(
       harness.page,
       requestedLinearTeamId,

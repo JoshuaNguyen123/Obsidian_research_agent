@@ -18,6 +18,12 @@ import {
   recoverStalePluginDataBackup,
   restorePluginDataSnapshot,
 } from "./pluginDataBackup";
+import { fingerprintCanonicalJson } from "../../src/agent/queue/fingerprint";
+import { parseRepositoryProfileRegistry } from "../../src/agent/repositories/RepositoryProfile";
+import {
+  parseCodeRuntimeStateV2,
+} from "../../extensions/code/CodeExtensionRuntimeV2";
+import { migrateRepositoryProfileV1 } from "../../extensions/code/repositories";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CDP_PORT = 11223;
@@ -321,12 +327,19 @@ async function seedCorePluginData(
     preserveConfiguredGitHubCredential && isRecord(parsed.githubCredential)
       ? parsed.githubCredential
       : null;
+  const codeRuntimeState = overrides.repositoryProfileRegistry === undefined
+    ? parsed.codeRuntimeState
+    : seedCodeRuntimeRepositoryProfiles(
+        parsed.codeRuntimeState,
+        overrides.repositoryProfileRegistry,
+      );
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(
     filePath,
     `${JSON.stringify(
       {
         ...parsed,
+        ...(codeRuntimeState === undefined ? {} : { codeRuntimeState }),
         enableStreaming: false,
         thinkingMode: "off",
         model: "playwright-phase6-linear-mock",
@@ -359,6 +372,30 @@ async function seedCorePluginData(
     )}\n`,
     "utf8",
   );
+}
+
+function seedCodeRuntimeRepositoryProfiles(
+  runtimeValue: unknown,
+  registryValue: unknown,
+): unknown {
+  const runtime = parseCodeRuntimeStateV2(runtimeValue);
+  const registry = parseRepositoryProfileRegistry(registryValue);
+  const repositoryProfiles = { ...runtime.repositoryProfiles };
+  const now = new Date().toISOString();
+  for (const [key, source] of Object.entries(registry.profiles)) {
+    repositoryProfiles[key] = {
+      version: 2,
+      source: "migrated_repository_profile_v1",
+      sourceFingerprint: fingerprintCanonicalJson(source),
+      trustedAt: repositoryProfiles[key]?.trustedAt ?? now,
+      profile: migrateRepositoryProfileV1(source),
+    };
+  }
+  return parseCodeRuntimeStateV2({
+    ...runtime,
+    repositoryProfiles,
+    updatedAt: now,
+  });
 }
 
 async function ensureCommunityPluginEnabled(
