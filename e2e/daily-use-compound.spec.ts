@@ -754,7 +754,15 @@ async function configureProtectedConnections(
         }
       }
       const linearConnection = await plugin.testLinearConnection();
-      if (!linearConnection?.ok) throw new Error("Linear capability discovery failed.");
+      if (!linearConnection?.ok) {
+        const reason = String(
+          linearConnection?.error ?? linearConnection?.message ?? "unknown",
+        )
+          .replace(/(?:lin_api_|Bearer\s+)[^\s,;]+/giu, "[REDACTED]")
+          .replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]")
+          .slice(0, 400);
+        throw new Error(`Linear capability discovery failed: ${reason}`);
+      }
       const linearCredential = plugin.getLinearCredentialStatus?.();
       const linearOAuth = plugin.getLinearOAuthStatus?.();
       if (
