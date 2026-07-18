@@ -294,6 +294,18 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
     /ui\.stopReason === null &&\s*ui\.canResume &&\s*Boolean\(ui\.continuationCommand\)/u,
   );
   assert.match(realHarness, /durablyCompletedLifecycleTools\.includes/u);
+  const approvalPoll = realHarness.indexOf(
+    "if (await approveFirstVisiblePreparedAction(page))",
+  );
+  const durableRestartRead = realHarness.indexOf(
+    "await plugin?.getDurableMissionRestartReadiness?.()",
+  );
+  assert.ok(approvalPoll >= 0);
+  assert.ok(durableRestartRead >= 0);
+  assert.ok(
+    approvalPoll < durableRestartRead,
+    "protected approval polling must run before durable restart projection",
+  );
   assert.match(mainSource, /after\.ledgerStatus !== "running"/u);
   assert.match(realHarness, /prepareForDurableMissionRestart/u);
   assert.match(realHarness, /quiescent durable restart boundary/u);

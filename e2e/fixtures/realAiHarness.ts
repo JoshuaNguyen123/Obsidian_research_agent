@@ -234,6 +234,15 @@ async function approveUntilMissionComplete(
   const restartedStages = new Set<ProjectLifecycleStageName>();
   await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
   while (Date.now() < deadline) {
+    // Approval is the time-sensitive foreground action. Never await durable
+    // vault/ledger projection work before looking for the already-rendered
+    // exact approval card, because an active lifecycle write may hold the same
+    // persistence boundary until the approval resolves.
+    if (await approveFirstVisiblePreparedAction(page)) {
+      approvals += 1;
+      await page.waitForTimeout(100);
+      continue;
+    }
     const ui = await page.evaluate(async ({ pluginId }) => {
       const app = (window as typeof window & { app?: any }).app;
       const plugin = app?.plugins?.plugins?.[pluginId];
@@ -362,14 +371,7 @@ async function approveUntilMissionComplete(
       continue;
     }
     if (ui.hasEnabledApproval) {
-      const clicked = await page.evaluate(() => {
-        const button = Array.from(document.querySelectorAll<HTMLButtonElement>(
-          "button.agentic-researcher-approval-approve:not(:disabled)",
-        )).find((candidate) => candidate.getClientRects().length > 0);
-        if (!button) return false;
-        button.click();
-        return true;
-      });
+      const clicked = await approveFirstVisiblePreparedAction(page);
       if (clicked) {
         approvals += 1;
       }
@@ -486,6 +488,17 @@ async function approveUntilMissionComplete(
   throw new Error(
     `Timed out after ${timeoutMs} ms while resolving prepared approvals; approved=${approvals}; state=${JSON.stringify(safeState)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
   );
+}
+
+async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const button = Array.from(document.querySelectorAll<HTMLButtonElement>(
+      "button.agentic-researcher-approval-approve:not(:disabled)",
+    )).find((candidate) => candidate.getClientRects().length > 0);
+    if (!button) return false;
+    button.click();
+    return true;
+  });
 }
 
 async function continueLatestRunAfterStageRestart(page: Page): Promise<boolean> {
