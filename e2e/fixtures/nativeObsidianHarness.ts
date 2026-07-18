@@ -25,6 +25,11 @@ import {
   parseCodeRuntimeStateV2,
 } from "../../extensions/code/CodeExtensionRuntimeV2";
 import { migrateRepositoryProfileV1 } from "../../extensions/code/repositories";
+import {
+  parseBundledCapabilityData,
+  readBundledCapabilityState,
+  writeBundledCapabilityState,
+} from "../../src/extensions/bundledCapabilityData";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CDP_PORT = 11223;
@@ -334,6 +339,12 @@ async function seedCorePluginData(
         parsed.codeRuntimeState,
         overrides.repositoryProfileRegistry,
       );
+  const bundledCapabilityData = overrides.repositoryProfileRegistry === undefined
+    ? parsed.bundledCapabilityData
+    : seedBundledCodeRuntimeRepositoryProfiles(
+        parsed.bundledCapabilityData,
+        overrides.repositoryProfileRegistry,
+      );
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(
     filePath,
@@ -341,6 +352,7 @@ async function seedCorePluginData(
       {
         ...parsed,
         ...(codeRuntimeState === undefined ? {} : { codeRuntimeState }),
+        ...(bundledCapabilityData === undefined ? {} : { bundledCapabilityData }),
         enableStreaming: false,
         thinkingMode: "off",
         model: "playwright-phase6-linear-mock",
@@ -397,6 +409,29 @@ function seedCodeRuntimeRepositoryProfiles(
   return parseCodeRuntimeStateV2({
     ...runtime,
     repositoryProfiles,
+    updatedAt: now,
+  });
+}
+
+function seedBundledCodeRuntimeRepositoryProfiles(
+  bundledValue: unknown,
+  registryValue: unknown,
+): unknown {
+  const now = new Date().toISOString();
+  const bundled = parseBundledCapabilityData(bundledValue, now);
+  const codeState = readBundledCapabilityState(bundled, "code");
+  const codeRuntimeState = seedCodeRuntimeRepositoryProfiles(
+    codeState.codeRuntimeState,
+    registryValue,
+  );
+  return writeBundledCapabilityState({
+    current: bundled,
+    namespace: "code",
+    state: {
+      ...codeState,
+      schemaVersion: 1,
+      codeRuntimeState,
+    },
     updatedAt: now,
   });
 }

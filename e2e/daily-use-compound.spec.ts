@@ -271,6 +271,11 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
     });
     expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? "")))
       .toBeGreaterThanOrEqual(startedAt);
+    await expectTrustedRepositoryProfile(
+      harness.page,
+      PROFILE_KEY,
+      fixture.root,
+    );
     await harness.installOwnedWebBackend({ sourceCount: 2, topic: "checkers" });
 
     const mission = [
@@ -297,6 +302,11 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
         restartAfterProjectStages: MAIN_STAGES,
         onStageRestarted: async (stage) => {
           restartedStages.push(stage);
+          await expectTrustedRepositoryProfile(
+            harness!.page,
+            PROFILE_KEY,
+            fixture.root,
+          );
           const state = await readSafeLifecycleState(harness!.page, PROFILE_KEY);
           const lineage = requireOne(state.lineages, "project lineage after restart");
           const stageIndex = MAIN_STAGES.indexOf(stage);
@@ -1058,6 +1068,34 @@ async function readSafeLifecycleState(
     codePluginId: PHASE4_CODE_PLUGIN_ID,
     profileKey,
   });
+}
+
+async function expectTrustedRepositoryProfile(
+  page: Page,
+  profileKey: string,
+  repositoryRoot: string,
+): Promise<void> {
+  const observed = await page.evaluate(
+    async ({ corePluginId, codePluginId, expectedKey }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const code = app?.plugins?.plugins?.[corePluginId]
+        ?.getBundledCapability?.(codePluginId);
+      const profile = await code?.resolveTrustedRepositoryProfile?.(expectedKey);
+      return profile
+        ? {
+            key: profile.key,
+            repositoryRoot: profile.repositoryRoot,
+          }
+        : null;
+    },
+    {
+      corePluginId: NATIVE_CORE_PLUGIN_ID,
+      codePluginId: PHASE4_CODE_PLUGIN_ID,
+      expectedKey: profileKey,
+    },
+  );
+  expect(observed, "the built-in Code runtime must retain the disposable trusted profile")
+    .toEqual({ key: profileKey, repositoryRoot });
 }
 
 async function attestIndependentStageEntry(input: {
