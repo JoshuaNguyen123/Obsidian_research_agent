@@ -78,7 +78,9 @@ export interface CodeRepairToolHandlersV1 {
  */
 export function createCodeRepairToolContributionsV1(
   handlers: CodeRepairToolHandlersV1,
+  options: { hostResolvesDurableProof?: boolean } = {},
 ): ExtensionToolContributionV1[] {
+  const hostResolvesDurableProof = options.hostResolvesDurableProof === true;
   return [
     {
       descriptor: contributionDescriptor(CODE_REPAIR_STATUS_TOOL, "Code repair status"),
@@ -130,19 +132,23 @@ export function createCodeRepairToolContributionsV1(
           ...scopeSchema(),
           properties: {
             ...scopeSchema().properties,
-            cycle: { type: "integer", minimum: 1, maximum: 3 },
-            checkpointSequence: { type: "integer", minimum: 0 },
-            validationReceiptId: { type: "string", minLength: 1, maxLength: 256 },
-            cycleFingerprint: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+            ...(hostResolvesDurableProof ? {} : {
+              cycle: { type: "integer", minimum: 1, maximum: 3 },
+              checkpointSequence: { type: "integer", minimum: 0 },
+              validationReceiptId: { type: "string", minLength: 1, maxLength: 256 },
+              cycleFingerprint: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+            }),
           },
           required: [
             "runId",
             "workspaceId",
             "requestId",
-            "cycle",
-            "checkpointSequence",
-            "validationReceiptId",
-            "cycleFingerprint",
+            ...(hostResolvesDurableProof ? [] : [
+              "cycle",
+              "checkpointSequence",
+              "validationReceiptId",
+              "cycleFingerprint",
+            ]),
           ],
         },
         descriptor: {
@@ -200,18 +206,22 @@ export function createCodeRepairToolContributionsV1(
           ...scopeSchema(),
           properties: {
             ...scopeSchema().properties,
-            checkpointSequence: { type: "integer", minimum: 0 },
-            diffFingerprint: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
-            targetedValidationReceiptId: { type: "string", minLength: 1, maxLength: 256 },
-            fullValidationReceiptId: { type: "string", minLength: 1, maxLength: 256 },
+            ...(hostResolvesDurableProof ? {} : {
+              checkpointSequence: { type: "integer", minimum: 0 },
+              diffFingerprint: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+              targetedValidationReceiptId: { type: "string", minLength: 1, maxLength: 256 },
+              fullValidationReceiptId: { type: "string", minLength: 1, maxLength: 256 },
+            }),
           },
           required: [
             "runId",
             "workspaceId",
             "requestId",
-            "checkpointSequence",
-            "targetedValidationReceiptId",
-            "fullValidationReceiptId",
+            ...(hostResolvesDurableProof ? [] : [
+              "checkpointSequence",
+              "targetedValidationReceiptId",
+              "fullValidationReceiptId",
+            ]),
           ],
         },
         descriptor: {

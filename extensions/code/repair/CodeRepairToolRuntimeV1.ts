@@ -90,6 +90,12 @@ export interface ValidationReceiptRegistryV1 {
     workspaceId: string;
     requestId: string;
   }): Promise<CodeValidationReceiptV1 | null>;
+  readLatestValidation?(input: {
+    runId: string;
+    workspaceId: string;
+    requestId: string;
+    kind: CodeValidationReceiptV1["kind"];
+  }): Promise<CodeValidationReceiptV1 | null>;
 }
 
 export interface CodeRepairToolRuntimeDependenciesV1 {
@@ -200,7 +206,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       checkpoint = await this.loadOrCreateCheckpoint(
         scope,
         resolved.request,
-        parsed.checkpointSequence,
+        parsed.checkpointSequence ?? 0,
       );
       if (checkpoint.terminal) {
         return preparationFailure(
@@ -208,17 +214,18 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           "The code repair checkpoint is terminal and immutable.",
         );
       }
-      if (parsed.checkpointSequence !== checkpoint.sequence) {
+      if (
+        parsed.checkpointSequence !== null &&
+        parsed.checkpointSequence !== checkpoint.sequence
+      ) {
         return preparationFailure(
           "repair_checkpoint_stale",
           `Checkpoint sequence is ${checkpoint.sequence}, not ${parsed.checkpointSequence}.`,
         );
       }
-      const validation = await this.requiredValidation(
-        scope,
-        parsed.validationReceiptId,
-        "fast",
-      );
+      const validation = parsed.validationReceiptId === null
+        ? await this.latestValidation(scope, "fast")
+        : await this.requiredValidation(scope, parsed.validationReceiptId, "fast");
       assertValidationBoundToWorkspace(
         validation,
         resolved.manifest,
@@ -226,7 +233,10 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
         scope,
       );
       const hostCycleFingerprint = validation.failureFingerprint ?? validation.fingerprint;
-      if (parsed.cycleFingerprint !== hostCycleFingerprint) {
+      if (
+        parsed.cycleFingerprint !== null &&
+        parsed.cycleFingerprint !== hostCycleFingerprint
+      ) {
         await this.persistBlocker(
           checkpoint,
           "diff_readback_invalid",
@@ -239,8 +249,10 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           "Cycle fingerprint does not match the referenced validation proof.",
         );
       }
+      const nextCycle = checkpoint.attempts.length + 1;
+      const cycle = parsed.cycle ?? nextCycle;
       const existingAttempt = checkpoint.attempts.find(
-        (attempt) => attempt.cycle === parsed.cycle,
+        (attempt) => attempt.cycle === cycle,
       );
       if (
         existingAttempt?.fastValidation &&
@@ -251,8 +263,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           "This cycle is already bound to a different validation receipt.",
         );
       }
-      const nextCycle = checkpoint.attempts.length + 1;
-      if (!existingAttempt && parsed.cycle !== nextCycle) {
+      if (!existingAttempt && cycle !== nextCycle) {
         return preparationFailure(
           "cycle_sequence_invalid",
           `The next repair cycle must be ${nextCycle}.`,
@@ -263,11 +274,11 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
         validation.failureFingerprint &&
         checkpoint.failureHistory.some(
           (entry) =>
-            entry.cycle < parsed.cycle &&
+            entry.cycle < cycle &&
             entry.fingerprint === validation.failureFingerprint,
         )
       ) {
-        await this.recordUnchangedFailure(checkpoint, parsed.cycle, validation);
+        await this.recordUnchangedFailure(checkpoint, cycle, validation);
         return preparationFailure(
           "unchanged_failure",
           "The same fast-validation failure fingerprint survived a repair; further repair is stopped.",
@@ -275,14 +286,14 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       }
       const outcome = validation.status === "passed"
         ? "passed"
-        : parsed.cycle >= 3
+        : cycle >= 3
           ? "blocked"
           : "repaired";
       const payload: CycleActionPayloadV1 = {
         kind: "code_repair_cycle_v1",
         scope,
         checkpointSequence: checkpoint.sequence,
-        cycle: parsed.cycle,
+        cycle,
         validationReceiptId: validation.id,
         validationFingerprint: validation.fingerprint,
         cycleFingerprint: hostCycleFingerprint,
@@ -296,7 +307,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           context,
           normalizedArgs: payload as unknown as Record<string, JsonValueV1>,
           expectedTargetRevision: String(checkpoint.sequence),
-          summary: `Record repair cycle ${parsed.cycle} from verified fast sandbox receipt ${validation.id}.`,
+          summary: `Record repair cycle ${cycle} from verified fast sandbox receipt ${validation.id}.`,
           warnings: outcome === "blocked"
             ? ["This third failed cycle will durably block the repair request."]
             : [],
@@ -541,7 +552,10 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           "The code repair checkpoint is terminal and immutable.",
         );
       }
-      if (checkpoint.sequence !== parsed.checkpointSequence) {
+      if (
+        parsed.checkpointSequence !== null &&
+        checkpoint.sequence !== parsed.checkpointSequence
+      ) {
         return preparationFailure(
           "repair_checkpoint_stale",
           `Checkpoint sequence is ${checkpoint.sequence}, not ${parsed.checkpointSequence}.`,
@@ -561,16 +575,20 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
         );
       }
       const [targeted, full] = await Promise.all([
-        this.requiredValidation(
-          parsed.scope,
-          parsed.targetedValidationReceiptId,
-          "targeted",
-        ),
-        this.requiredValidation(
-          parsed.scope,
-          parsed.fullValidationReceiptId,
-          "full",
-        ),
+        parsed.targetedValidationReceiptId === null
+          ? this.latestValidation(parsed.scope, "targeted")
+          : this.requiredValidation(
+              parsed.scope,
+              parsed.targetedValidationReceiptId,
+              "targeted",
+            ),
+        parsed.fullValidationReceiptId === null
+          ? this.latestValidation(parsed.scope, "full")
+          : this.requiredValidation(
+              parsed.scope,
+              parsed.fullValidationReceiptId,
+              "full",
+            ),
       ]);
       assertCommitValidationPair(targeted, full);
       const proof = await this.readCommitProof(resolved, parsed.scope, context);
@@ -1266,6 +1284,23 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     return validateValidationReceipt(receipt, receiptId, kind);
   }
 
+  private async latestValidation(
+    scope: CodeRepairScopeArgsV1,
+    kind: CodeValidationReceiptV1["kind"],
+  ): Promise<CodeValidationReceiptV1> {
+    const receipt = await this.dependencies.validations.readLatestValidation?.({
+      ...scope,
+      kind,
+    });
+    if (!receipt) {
+      throw new CodeRepairToolRuntimeErrorV1(
+        "validation_receipt_missing",
+        `No durable ${kind} validation receipt is available for this exact scope.`,
+      );
+    }
+    return validateValidationReceipt(receipt, receipt.id, kind);
+  }
+
   private async readCommitProof(
     resolved: ResolvedRepairScopeV1,
     _scope: CodeRepairScopeArgsV1,
@@ -1453,69 +1488,56 @@ export class CodeRepairToolRuntimeErrorV1 extends Error {
 
 function parseCycleArgs(args: Record<string, unknown>): {
   scope: CodeRepairScopeArgsV1;
-  cycle: number;
-  checkpointSequence: number;
-  validationReceiptId: string;
-  cycleFingerprint: string;
+  cycle: number | null;
+  checkpointSequence: number | null;
+  validationReceiptId: string | null;
+  cycleFingerprint: string | null;
 } {
-  assertExactKeys(args, [
-    "runId",
-    "workspaceId",
-    "requestId",
-    "cycle",
-    "checkpointSequence",
-    "validationReceiptId",
-    "cycleFingerprint",
-  ]);
+  const optionalKeys = [
+    "cycle", "checkpointSequence", "validationReceiptId", "cycleFingerprint",
+  ].filter((key) => args[key] !== undefined);
+  assertExactKeys(args, ["runId", "workspaceId", "requestId", ...optionalKeys]);
   return {
     scope: parseScope(args),
-    cycle: safeInteger(args.cycle, "cycle", 1, 3),
-    checkpointSequence: safeInteger(
-      args.checkpointSequence,
-      "checkpointSequence",
-      0,
-      Number.MAX_SAFE_INTEGER,
-    ),
-    validationReceiptId: identifier(args.validationReceiptId, "validationReceiptId"),
-    cycleFingerprint: sha256(args.cycleFingerprint, "cycleFingerprint"),
+    cycle: args.cycle === undefined ? null : safeInteger(args.cycle, "cycle", 1, 3),
+    checkpointSequence: args.checkpointSequence === undefined
+      ? null
+      : safeInteger(args.checkpointSequence, "checkpointSequence", 0, Number.MAX_SAFE_INTEGER),
+    validationReceiptId: args.validationReceiptId === undefined
+      ? null
+      : identifier(args.validationReceiptId, "validationReceiptId"),
+    cycleFingerprint: args.cycleFingerprint === undefined
+      ? null
+      : sha256(args.cycleFingerprint, "cycleFingerprint"),
   };
 }
 
 function parseCommitArgs(args: Record<string, unknown>): {
   scope: CodeRepairScopeArgsV1;
-  checkpointSequence: number;
+  checkpointSequence: number | null;
   diffFingerprint: string | null;
-  targetedValidationReceiptId: string;
-  fullValidationReceiptId: string;
+  targetedValidationReceiptId: string | null;
+  fullValidationReceiptId: string | null;
 } {
-  assertExactKeys(args, [
-    "runId",
-    "workspaceId",
-    "requestId",
-    "checkpointSequence",
-    "targetedValidationReceiptId",
-    "fullValidationReceiptId",
-    ...(args.diffFingerprint === undefined ? [] : ["diffFingerprint"]),
-  ]);
+  const optionalKeys = [
+    "checkpointSequence", "diffFingerprint",
+    "targetedValidationReceiptId", "fullValidationReceiptId",
+  ].filter((key) => args[key] !== undefined);
+  assertExactKeys(args, ["runId", "workspaceId", "requestId", ...optionalKeys]);
   return {
     scope: parseScope(args),
-    checkpointSequence: safeInteger(
-      args.checkpointSequence,
-      "checkpointSequence",
-      0,
-      Number.MAX_SAFE_INTEGER,
-    ),
+    checkpointSequence: args.checkpointSequence === undefined
+      ? null
+      : safeInteger(args.checkpointSequence, "checkpointSequence", 0, Number.MAX_SAFE_INTEGER),
     diffFingerprint: args.diffFingerprint === undefined
       ? null
       : sha256(args.diffFingerprint, "diffFingerprint"),
-    targetedValidationReceiptId: identifier(
-      args.targetedValidationReceiptId,
-      "targetedValidationReceiptId",
-    ),
-    fullValidationReceiptId: identifier(
-      args.fullValidationReceiptId,
-      "fullValidationReceiptId",
-    ),
+    targetedValidationReceiptId: args.targetedValidationReceiptId === undefined
+      ? null
+      : identifier(args.targetedValidationReceiptId, "targetedValidationReceiptId"),
+    fullValidationReceiptId: args.fullValidationReceiptId === undefined
+      ? null
+      : identifier(args.fullValidationReceiptId, "fullValidationReceiptId"),
   };
 }
 

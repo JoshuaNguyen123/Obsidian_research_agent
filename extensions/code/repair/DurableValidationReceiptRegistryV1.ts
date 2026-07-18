@@ -224,6 +224,28 @@ export class DurableValidationReceiptRegistryV1
     });
   }
 
+  readLatestValidation(input: {
+    runId: string;
+    workspaceId: string;
+    requestId: string;
+    kind: ValidationKindV1;
+  }): Promise<CodeValidationReceiptV1 | null> {
+    return this.serialized(async () => {
+      const requestedScope = parseScope(input);
+      const namespace = await parseNamespace(await this.persistence.readNamespace());
+      const matches = Object.values(namespace.receipts)
+        .filter((record) =>
+          sameScope(record.scope, requestedScope) &&
+          record.validation.kind === input.kind,
+        )
+        .sort((left, right) =>
+          Date.parse(right.capturedAt) - Date.parse(left.capturedAt) ||
+          right.validation.id.localeCompare(left.validation.id),
+        );
+      return matches[0] ? cloneJson(matches[0].validation) : null;
+    });
+  }
+
   private serialized<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.queue.then(operation, operation);
     this.queue = result.then(() => undefined, () => undefined);

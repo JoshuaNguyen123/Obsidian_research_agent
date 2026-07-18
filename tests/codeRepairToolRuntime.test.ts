@@ -309,6 +309,61 @@ test("unchanged fast failure stops at cycle two and persists the blocker", async
   assert.equal(harness.gateway.commitCalls, 0);
 });
 
+test("production repair preparation derives checkpoint sequence and latest scoped validation proof", async (t) => {
+  const harness = await createHarness(t, "src/index.ts");
+  const fast = await validation(
+    "fast", "fast-host", true, "fast-host-proof", 0, true, null,
+    harness.validationBinding,
+  );
+  harness.validations.set(fast.id, fast);
+  const cyclePrepared = await harness.handlers.prepareCycleRecord(SCOPE, context());
+  assert.equal(cyclePrepared.ok, true);
+  if (!cyclePrepared.ok) return;
+  assert.deepEqual(
+    cyclePrepared.action.normalizedArgs,
+    {
+      kind: "code_repair_cycle_v1",
+      scope: SCOPE,
+      checkpointSequence: 0,
+      cycle: 1,
+      validationReceiptId: fast.id,
+      validationFingerprint: fast.fingerprint,
+      cycleFingerprint: fast.fingerprint,
+      outcome: "passed",
+    },
+  );
+  await harness.handlers.executePreparedCycleRecord(
+    cyclePrepared.action,
+    authorizedContext(cyclePrepared.action),
+  );
+
+  const targeted = await validation(
+    "targeted", "targeted-host", true, "targeted-host-proof", 60_000, true, null,
+    harness.validationBinding,
+  );
+  const full = await validation(
+    "full", "full-host", true, "full-host-proof", 120_000, true, null,
+    harness.validationBinding,
+  );
+  harness.validations.set(targeted.id, targeted);
+  harness.validations.set(full.id, full);
+  const commitPrepared = await harness.handlers.prepareVerifiedCommit(SCOPE, context());
+  assert.equal(commitPrepared.ok, true);
+  if (!commitPrepared.ok) return;
+  assert.equal(
+    (commitPrepared.action.normalizedArgs as Record<string, unknown>).checkpointSequence,
+    1,
+  );
+  assert.equal(
+    (commitPrepared.action.normalizedArgs as Record<string, unknown>).targetedValidationReceiptId,
+    targeted.id,
+  );
+  assert.equal(
+    (commitPrepared.action.normalizedArgs as Record<string, unknown>).fullValidationReceiptId,
+    full.id,
+  );
+});
+
 test("denial means execute is not called, and missing authorization cannot reach Git", async (t) => {
   const harness = await createHarness(t, "src/index.ts");
   await recordPassingFast(harness);
@@ -446,6 +501,14 @@ async function createHarness(
     validations: {
       async readValidation({ receiptId }) {
         return validations.get(receiptId) ?? null;
+      },
+      async readLatestValidation({ kind }) {
+        return [...validations.values()]
+          .filter((receipt) => receipt.kind === kind)
+          .sort((left, right) =>
+            Date.parse(right.completedAt) - Date.parse(left.completedAt) ||
+            right.id.localeCompare(left.id),
+          )[0] ?? null;
       },
     },
     checkpointPersistence: persistence,

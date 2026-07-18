@@ -914,6 +914,21 @@ test("CodeExtensionRuntimeV2 publishes real tool contributions and probes only i
       assert.ok(names.includes(required), `missing production contribution ${required}`);
     }
     assert.equal(runtime.readState().repair.mode, "production_wired");
+    for (const toolName of [CODE_REPAIR_RECORD_CYCLE_TOOL, CODE_COMMIT_VERIFIED_TOOL]) {
+      const contribution = contributions.find(
+        (candidate) =>
+          candidate.descriptor.kind === "tool" &&
+          (candidate as { tool: { name: string } }).tool.name === toolName,
+      );
+      const parameters = (contribution as {
+        tool: { parameters: { properties?: Record<string, unknown> } };
+      }).tool.parameters;
+      assert.deepEqual(
+        Object.keys(parameters.properties ?? {}).sort(),
+        ["requestId", "runId", "workspaceId"],
+        `${toolName} must resolve checkpoint and validation proof on the host`,
+      );
+    }
     for (const required of [
       "code_repair_status",
       "code_repair_record_cycle",

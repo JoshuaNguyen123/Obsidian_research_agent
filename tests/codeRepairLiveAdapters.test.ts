@@ -73,6 +73,10 @@ test("durable validation registry captures only exact request-scoped sandbox evi
     await registry.readValidation({ receiptId: receipt.id, ...scope }),
     captured,
   );
+  assert.deepEqual(
+    await registry.readLatestValidation({ ...scope, kind: "fast" }),
+    captured,
+  );
   await assert.rejects(
     registry.readValidation({
       receiptId: receipt.id,

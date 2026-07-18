@@ -1302,7 +1302,9 @@ export class CodeExtensionRuntimeV2 {
         now: this.now,
       });
       this.validationReceiptRegistry = validationReceiptRegistry;
-      this.repairContributions = createCodeRepairToolContributionsV1(handlers);
+      this.repairContributions = createCodeRepairToolContributionsV1(handlers, {
+        hostResolvesDurableProof: true,
+      });
       if (this.requireState().repair.mode !== "production_wired") {
         this.state = await this.persistState(parseCodeRuntimeStateV2({
           ...this.requireState(),
