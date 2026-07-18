@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   MAX_AGENT_STEPS,
   attachGroundedPassageCitations,
+  bindVerifiedWorkspaceWriteExpected,
   buildObservedMissionGraphFrontierBinding,
   buildMissionGraphFrontierTurnContext,
   canonicalMissionGraphId,
@@ -14,6 +15,7 @@ import {
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
   getExplicitLinearReadToolNames,
+  getVerifiedWorkspaceReadObservation,
   getVerifiedLinearHierarchyIssueId,
   getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
@@ -24,6 +26,7 @@ import {
   insertExplicitLinearReadbacksIntoLifecycleToolNames,
   resolveLinearIssueReadbackBinding,
   resolveThinkingMode,
+  rememberVerifiedWorkspaceReadResult,
   restoreTrustedWebFetchResultsFromEvidence,
   runAgentMission,
   sanitizeAssistantContent,
@@ -3981,6 +3984,73 @@ test("workspace correction frontiers bind exact reads, hashes, content, and Line
   assert.match(binding ?? "", /currentContent="# Checkers\\n"/u);
   assert.match(binding ?? "", /APP-42/u);
   assert.match(binding ?? "", /linear\.app\/example\/issue\/APP-42/u);
+});
+
+test("workspace correction preserves the verified read binding after transcript compaction", () => {
+  const sha256 = `sha256:${"b".repeat(64)}`;
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  rememberVerifiedWorkspaceReadResult(
+    runtimeCache,
+    {
+      name: "code_workspace_read",
+      arguments: { workspaceId: "Checkers Workspace", path: "checkers/game.py" },
+    },
+    { rootMissionId: "ignored-root" },
+    {
+      ok: true,
+      toolName: "code_workspace_read",
+      output: {
+        path: "checkers/game.py",
+        sha256,
+        content: "def legal_moves():\n    return []\n",
+      },
+    },
+  );
+  const observation = getVerifiedWorkspaceReadObservation(
+    runtimeCache,
+    "checkers/game.py",
+  );
+  assert.ok(observation);
+  assert.equal(observation.workspaceId, "checkers-workspace");
+
+  const frontier = buildObservedMissionGraphFrontierBinding(
+    [],
+    [{
+      type: "function",
+      function: {
+        name: "code_workspace_write_expected",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    [],
+    "checkers/game.py",
+    null,
+    observation,
+  );
+  assert.match(frontier ?? "", new RegExp(sha256));
+  assert.match(frontier ?? "", /currentContent="def legal_moves\(\):\\n    return \[\]\\n"/u);
+
+  const bound = bindVerifiedWorkspaceWriteExpected(
+    {
+      name: "code_workspace_write_expected",
+      arguments: {
+        path: "model/alias.py",
+        content: "def legal_moves():\n    return [\"forced\"]\n",
+        expectedSha256: `sha256:${"c".repeat(64)}`,
+      },
+    },
+    "checkers/game.py",
+    observation,
+  );
+  assert.deepEqual(bound?.arguments, {
+    workspaceId: "checkers-workspace",
+    path: "checkers/game.py",
+    content: "def legal_moves():\n    return [\"forced\"]\n",
+    expectedSha256: sha256,
+  });
 });
 
 test("Linear issue readback binds the one durable hierarchy issue instead of a model alias", () => {

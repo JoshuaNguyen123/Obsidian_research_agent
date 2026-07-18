@@ -177,10 +177,23 @@ export interface AgentRuntimeCache {
   toolResults: Map<string, ToolExecutionResult>;
   /** Successful strong-hash web reads retained for proof-bound downstream tools. */
   trustedWebFetchResults?: Map<string, ToolExecutionResult>;
+  /**
+   * Bounded, run-local workspace reads used to bind a later exact-path write to
+   * the host-observed SHA even when model-visible tool messages are compacted.
+   * These observations are never used to skip a fresh tool execution.
+   */
+  verifiedWorkspaceReads?: Map<string, VerifiedWorkspaceReadObservation>;
   /** First validated accepted-research request for a run/path; retries cannot rewrite it. */
   acceptedResearchPublicationRequests?: Map<string, unknown>;
   semanticProfiles?: Map<string, unknown>;
   graphProfiles?: Map<string, unknown>;
+}
+
+export interface VerifiedWorkspaceReadObservation {
+  workspaceId: string;
+  path: string;
+  sha256: string;
+  content: string;
 }
 
 export interface AgentTool {

@@ -41,6 +41,7 @@ import type {
   ToolExecutionContext,
   ToolExecutionResult,
   ToolRegistry,
+  VerifiedWorkspaceReadObservation,
 } from "./tools/types";
 import { resolveNestedApprovalBindingV1 } from "./agent/nestedApprovalPolicy";
 import {
@@ -6534,6 +6535,87 @@ export async function runAgentMission({
         });
       }
     }
+    if (
+      toolCall.name === "code_workspace_write_expected" &&
+      missionGraphExecution &&
+      missionGraphSession
+    ) {
+      const executionNode =
+        missionGraphSession.graph.nodes[missionGraphExecution.nodeId];
+      const executionResource = executionNode?.inputs.resource;
+      const exactPath =
+        executionNode?.destination?.selector ??
+        (executionResource?.kind === "binding"
+          ? executionResource.selector
+          : null);
+      const observation =
+        typeof exactPath === "string" &&
+        !exactPath.startsWith("prompt-scoped-")
+          ? getVerifiedWorkspaceReadObservation(runtimeCache, exactPath)
+          : null;
+      const boundToolCall =
+        typeof exactPath === "string" && observation
+          ? bindVerifiedWorkspaceWriteExpected(
+              toolCall,
+              exactPath,
+              observation,
+            )
+          : null;
+      if (!boundToolCall) {
+        const blockedResult: ToolExecutionResult = {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: {
+            code: "workspace_read_binding_unavailable",
+            message:
+              "The exact host-verified workspace read SHA and bounded content from the completed graph dependency are unavailable or ambiguous.",
+          },
+        };
+        await finishMissionGraphTool(
+          missionGraphExecution,
+          toolCall.name,
+          blockedResult,
+        );
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:code_workspace_write_expected:binding-missing`,
+          kind: "tool_rejected",
+          step,
+          toolName: toolCall.name,
+          message: blockedResult.error!.message,
+          error: blockedResult.error,
+        });
+        if (recordTranscript) {
+          appendToolTranscript({
+            messages,
+            toolCall,
+            resultContent: serializeToolResultForModel(blockedResult),
+            origin,
+            fallbackId: buildToolCallFallbackId(
+              runId,
+              step,
+              toolIndex,
+              toolCall.name,
+            ),
+          });
+        }
+        return blockedResult;
+      }
+      toolCall = boundToolCall;
+      events.onTrace?.({
+        id: `${step}:${String(toolIndex)}:code_workspace_write_expected:verified-binding`,
+        kind: "status",
+        step,
+        toolName: toolCall.name,
+        message:
+          "Bound the corrective workspace write to the exact path, workspace, and SHA from its host-verified read dependency.",
+        outputPreview: {
+          source: "verified_workspace_read",
+          path: exactPath,
+          hasExpectedSha256: true,
+        },
+      });
+    }
     observedToolCallCount += 1;
     const toolEventBase: AgentToolRunEvent = {
       id: `${step}:${toolIndex}:${toolCall.name}`,
@@ -8629,6 +8711,12 @@ export async function runAgentMission({
           `Injected the passage-grounded writeback contract with ${acceptedWritebackPassageIds.length} accepted passage identifier(s).`,
       });
     }
+    const stepGraphDestinationSelector = missionGraph
+      ? getMissionGraphFrontierDestinationSelector(
+          missionGraphSession?.graph ?? missionGraph,
+          stepTools,
+        )
+      : null;
     let response: ModelChatResponse;
     try {
       const stepMessages =
@@ -8640,11 +8728,14 @@ export async function runAgentMission({
                 messages,
                 stepTools,
                 writeReceipts,
-                getMissionGraphFrontierDestinationSelector(
-                  missionGraphSession?.graph ?? missionGraph,
-                  stepTools,
-                ),
+                stepGraphDestinationSelector,
                 getVerifiedLinearHierarchyIssueId(runToolContext),
+                stepGraphDestinationSelector
+                  ? getVerifiedWorkspaceReadObservation(
+                      runtimeCache,
+                      stepGraphDestinationSelector,
+                    )
+                  : null,
               ),
             )
           : messages;
@@ -15722,6 +15813,7 @@ function createRuntimeCache(): AgentRuntimeCache {
   return {
     toolResults: new Map(),
     trustedWebFetchResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
   };
 }
 
@@ -18933,6 +19025,7 @@ export function buildObservedMissionGraphFrontierBinding(
   durableReceipts: readonly AgentRunReceipt[] = [],
   graphDestinationSelector: string | null = null,
   verifiedLinearHierarchyIssueId: string | null = null,
+  verifiedWorkspaceReadObservation: VerifiedWorkspaceReadObservation | null = null,
 ): string | null {
   const names = stepTools.map((tool) => tool.function.name);
   if (names.length === 1 && names[0] === "linear_get_issue") {
@@ -18991,11 +19084,14 @@ export function buildObservedMissionGraphFrontierBinding(
     graphDestinationSelector &&
     !graphDestinationSelector.startsWith("prompt-scoped-")
   ) {
-    const readback = getLatestToolOutputForPath(
-      messages,
-      "code_workspace_read",
-      graphDestinationSelector,
-    );
+    const readback =
+      verifiedWorkspaceReadObservation?.path === graphDestinationSelector
+        ? verifiedWorkspaceReadObservation
+        : getLatestToolOutputForPath(
+            messages,
+            "code_workspace_read",
+            graphDestinationSelector,
+          );
     const sha256 = isRecord(readback) ? getString(readback.sha256) : undefined;
     const content = isRecord(readback) ? getString(readback.content) : undefined;
     const linearReference = getLatestLinearIssueReference(messages);
@@ -21702,6 +21798,14 @@ async function executePreparedToolWithMetrics({
       toolContext,
       authorization,
     );
+    if (result.ok && preparedAction.toolName === "code_workspace_write_expected") {
+      forgetVerifiedWorkspaceReadObservation(
+        toolContext.runtimeCache,
+        getString(preparedAction.normalizedArgs.workspaceId),
+        getString(preparedAction.target.path) ??
+          getString(preparedAction.normalizedArgs.path),
+      );
+    }
     emitMetricEvent(events, {
       kind: "tool",
       name: preparedAction.toolName,
@@ -21815,6 +21919,12 @@ async function executeToolWithMetrics({
       toolCall.name,
       result,
     );
+    rememberVerifiedWorkspaceReadResult(
+      toolContext.runtimeCache,
+      toolCall,
+      toolContext,
+      result,
+    );
     if (cacheKey && result.ok) {
       toolCache?.set(cacheKey, result);
     }
@@ -21875,6 +21985,147 @@ async function executeToolWithMetrics({
       inputChars,
     });
     throw error;
+  }
+}
+
+const MAX_VERIFIED_WORKSPACE_READ_OBSERVATIONS = 64;
+const MAX_VERIFIED_WORKSPACE_READ_CONTENT_CHARS = 100_000;
+
+function normalizeWorkspaceObservationId(value: string): string {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/gu, "-")
+      .replace(/^-+|-+$/gu, "")
+      .slice(0, 128) || "adhoc"
+  );
+}
+
+function verifiedWorkspaceReadKey(workspaceId: string, path: string): string {
+  return JSON.stringify([workspaceId, path]);
+}
+
+export function rememberVerifiedWorkspaceReadResult(
+  runtimeCache: AgentRuntimeCache | undefined,
+  toolCall: Pick<ModelToolCall, "name" | "arguments">,
+  context: Pick<
+    ToolExecutionContext,
+    "rootMissionId" | "runId" | "operationId"
+  >,
+  result: ToolExecutionResult,
+): void {
+  if (
+    toolCall.name !== "code_workspace_read" ||
+    !runtimeCache ||
+    !result.ok ||
+    !isRecord(result.output)
+  ) {
+    return;
+  }
+  const path = getString(result.output.path);
+  const sha256 = getString(result.output.sha256);
+  const content = getString(result.output.content);
+  if (
+    !path ||
+    !sha256 ||
+    !/^sha256:[a-f0-9]{64}$/u.test(sha256) ||
+    content === undefined ||
+    content.length > MAX_VERIFIED_WORKSPACE_READ_CONTENT_CHARS
+  ) {
+    return;
+  }
+  const workspaceId = normalizeWorkspaceObservationId(
+    getString(toolCall.arguments.workspaceId) ??
+      context.rootMissionId ??
+      context.runId ??
+      context.operationId ??
+      "adhoc",
+  );
+  runtimeCache.verifiedWorkspaceReads ??= new Map();
+  const key = verifiedWorkspaceReadKey(workspaceId, path);
+  if (
+    !runtimeCache.verifiedWorkspaceReads.has(key) &&
+    runtimeCache.verifiedWorkspaceReads.size >=
+      MAX_VERIFIED_WORKSPACE_READ_OBSERVATIONS
+  ) {
+    const oldestKey = runtimeCache.verifiedWorkspaceReads.keys().next().value;
+    if (typeof oldestKey === "string") {
+      runtimeCache.verifiedWorkspaceReads.delete(oldestKey);
+    }
+  }
+  runtimeCache.verifiedWorkspaceReads.set(key, {
+    workspaceId,
+    path,
+    sha256,
+    content,
+  });
+}
+
+export function getVerifiedWorkspaceReadObservation(
+  runtimeCache: AgentRuntimeCache | undefined,
+  path: string,
+  workspaceId?: string,
+): VerifiedWorkspaceReadObservation | null {
+  const observations = runtimeCache?.verifiedWorkspaceReads;
+  if (!observations) return null;
+  if (workspaceId) {
+    return (
+      observations.get(
+        verifiedWorkspaceReadKey(
+          normalizeWorkspaceObservationId(workspaceId),
+          path,
+        ),
+      ) ?? null
+    );
+  }
+  const matches = [...observations.values()].filter(
+    (observation) => observation.path === path,
+  );
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+export function bindVerifiedWorkspaceWriteExpected(
+  toolCall: ModelToolCall,
+  exactPath: string,
+  observation: VerifiedWorkspaceReadObservation,
+): ModelToolCall | null {
+  if (
+    toolCall.name !== "code_workspace_write_expected" ||
+    observation.path !== exactPath ||
+    !/^sha256:[a-f0-9]{64}$/u.test(observation.sha256)
+  ) {
+    return null;
+  }
+  return {
+    ...toolCall,
+    arguments: {
+      workspaceId: observation.workspaceId,
+      path: exactPath,
+      content: toolCall.arguments.content,
+      expectedSha256: observation.sha256,
+    },
+  };
+}
+
+function forgetVerifiedWorkspaceReadObservation(
+  runtimeCache: AgentRuntimeCache | undefined,
+  workspaceId: string | undefined,
+  path: string | undefined,
+): void {
+  if (!runtimeCache?.verifiedWorkspaceReads || !path) return;
+  if (workspaceId) {
+    runtimeCache.verifiedWorkspaceReads.delete(
+      verifiedWorkspaceReadKey(
+        normalizeWorkspaceObservationId(workspaceId),
+        path,
+      ),
+    );
+    return;
+  }
+  for (const [key, observation] of runtimeCache.verifiedWorkspaceReads) {
+    if (observation.path === path) {
+      runtimeCache.verifiedWorkspaceReads.delete(key);
+    }
   }
 }
 
