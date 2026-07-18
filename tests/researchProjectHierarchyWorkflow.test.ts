@@ -31,6 +31,7 @@ import {
   hasExplicitResearchProjectHierarchyIntent,
   resolveCanonicalAcceptedResearchFingerprint,
   resolveCanonicalAcceptedResearchNotePath,
+  sanitizeHierarchyNarrative,
   selectAcceptedResearchBindingForCurrentMission,
 } from "../src/tools/researchProjectHierarchyTool";
 import type { ToolExecutionContext } from "../src/tools/types";
@@ -221,6 +222,21 @@ test("hierarchy keeps provider summaries bounded and preserves full markdown in 
   assert.match(summary, /\.\.\.$/u);
   assert.equal(summary.includes("\n"), false);
   assert.equal(providerSummary("  Short\ncontext  "), "Short context");
+});
+
+test("hierarchy prose redacts raw host paths but retains inert implementation references", () => {
+  assert.equal(
+    sanitizeHierarchyNarrative(
+      "Use C:\\Users\\person\\private repo, then document python -m unittest in Projects/Checkers/Research.md.",
+    ),
+    "Use [host-bound local path], then document python -m unittest in Projects/Checkers/Research.md.",
+  );
+  assert.equal(
+    sanitizeHierarchyNarrative(
+      "Implement checkers/game.py and validate with python -m unittest.",
+    ),
+    "Implement checkers/game.py and validate with python -m unittest.",
+  );
 });
 
 test("hierarchy rejects a mismatched outer tool identity before preparation", async () => {

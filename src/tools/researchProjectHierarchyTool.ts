@@ -458,7 +458,9 @@ function parseHierarchyItem(value: unknown, label: string) {
   return {
     key: requireLogicalKey(item.key, `${label} key`),
     title: canonicalizeHierarchyItemTitle(item, label),
-    description: requireText(item.description, `${label} description`, 8_000),
+    description: sanitizeHierarchyNarrative(
+      requireText(item.description, `${label} description`, 8_000),
+    ),
   };
 }
 
@@ -497,15 +499,40 @@ function parseIssues(value: unknown) {
     return {
       key: requireLogicalKey(item.key, `issue ${index + 1} key`),
       title: requireText(item.title, `issue ${index + 1} title`, 240),
-      description: requireText(item.description, `issue ${index + 1} description`, 8_000),
+      description: sanitizeHierarchyNarrative(
+        requireText(item.description, `issue ${index + 1} description`, 8_000),
+      ),
       dependencyKeys: dependencyKeys.map((key) =>
         requireLogicalKey(key, `issue ${index + 1} dependency key`),
       ),
       acceptanceCriteria: acceptanceCriteria.map((criterion) =>
-        requireText(criterion, `issue ${index + 1} acceptance criterion`, 500),
+        sanitizeHierarchyNarrative(
+          requireText(
+            criterion,
+            `issue ${index + 1} acceptance criterion`,
+            500,
+          ),
+        ),
       ),
     };
   });
+}
+
+/**
+ * Model-authored Linear prose must never disclose a raw local host path. The
+ * replacement is intentionally content-only; it grants no repository binding
+ * or command authority. Vault-relative and repository-relative paths remain
+ * intact because the issue needs durable Obsidian/code traceability.
+ */
+export function sanitizeHierarchyNarrative(value: string): string {
+  return value
+    .replace(/[A-Za-z]:[\\/][^,\r\n]+/gu, "[host-bound local path]")
+    .replace(/\\\\[^,\r\n]+/gu, "[host-bound local path]")
+    .replace(
+      /(^|[\s(])\/(?:etc|home|Users|var|tmp|opt|root|mnt|srv)\/[^,\r\n]+/gimu,
+      "$1[host-bound local path]",
+    )
+    .trim();
 }
 
 export function deriveResearchProjectWorkItemFingerprint(input: {

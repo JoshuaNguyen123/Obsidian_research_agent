@@ -874,7 +874,11 @@ function parseHierarchyItem(
   return {
     key: expectLogicalKey(record.key, `${label} key`, 100),
     title: expectString(record.title, `${label} title`, 1, 240, { secretFree: true }),
-    description: cleanNarrative(record.description, `${label} description`, 8_000),
+    description: cleanProjectNarrative(
+      record.description,
+      `${label} description`,
+      8_000,
+    ),
     ...(record.idempotencyKey === undefined
       ? {}
       : { idempotencyKey: expectString(record.idempotencyKey, `${label} idempotency key`, 1, 500, { secretFree: true }) }),
@@ -893,9 +897,19 @@ function parseIssue(value: unknown, index: number): ResearchProjectPlanUnsignedV
   return {
     key: expectLogicalKey(record.key, `${label} key`, 100),
     title: expectString(record.title, `${label} title`, 1, 240, { secretFree: true }),
-    description: cleanNarrative(record.description, `${label} description`, 8_000),
+    description: cleanProjectNarrative(
+      record.description,
+      `${label} description`,
+      8_000,
+    ),
     dependencyKeys: parseUniqueStrings(record.dependencyKeys, `${label} dependency key`, 0, 19, 100, expectLogicalKey),
-    acceptanceCriteria: parseNarrativeList(record.acceptanceCriteria, `${label} acceptance criterion`, 1, 20, 500),
+    acceptanceCriteria: parseProjectNarrativeList(
+      record.acceptanceCriteria,
+      `${label} acceptance criterion`,
+      1,
+      20,
+      500,
+    ),
     workItemFingerprint: expectSha256(record.workItemFingerprint, `${label} work item fingerprint`),
     ...(record.idempotencyKey === undefined
       ? {}
@@ -1156,6 +1170,38 @@ function cleanNarrative(value: unknown, label: string, maximumLength: number): s
   return text;
 }
 
+/**
+ * Linear hierarchy text is inert provider content, not execution authority.
+ * Relative Obsidian/repository paths and command names are valid acceptance
+ * requirements, but raw host paths, traversal, command blocks, and shell
+ * composition remain forbidden.
+ */
+function cleanProjectNarrative(
+  value: unknown,
+  label: string,
+  maximumLength: number,
+): string {
+  const text = expectString(value, label, 1, maximumLength, {
+    allowNewlines: true,
+    secretFree: true,
+  });
+  const unsafeControlPatterns = [
+    /[A-Za-z]:[\\/]/u,
+    /(?:^|[\s"'`])\.\.[\\/]/u,
+    /\\\\[^\s]+/u,
+    /(?:^|\s)\/(?:etc|home|Users|var|tmp|opt|root|mnt|srv)\//iu,
+    /```/u,
+    /(?:^|\n)\s*[$>]\s*\S+/mu,
+    /(?:&&|\|\|)/u,
+  ];
+  if (unsafeControlPatterns.some((pattern) => pattern.test(text))) {
+    throw new DurableLinearContractError(
+      `${label} must not contain raw host paths, traversal, command blocks, or shell control operators.`,
+    );
+  }
+  return text;
+}
+
 function parseNarrativeList(
   value: unknown,
   label: string,
@@ -1169,6 +1215,29 @@ function parseNarrativeList(
   const parsed = value.map((entry, index) => cleanNarrative(entry, `${label} ${index + 1}`, maximumLength));
   if (new Set(parsed).size !== parsed.length) {
     throw new DurableLinearContractError(`${label} list must not contain duplicates.`);
+  }
+  return parsed;
+}
+
+function parseProjectNarrativeList(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+  maximumLength: number,
+): string[] {
+  if (!Array.isArray(value) || value.length < minimum || value.length > maximum) {
+    throw new DurableLinearContractError(
+      `${label} list requires ${minimum}-${maximum} entries.`,
+    );
+  }
+  const parsed = value.map((entry, index) =>
+    cleanProjectNarrative(entry, `${label} ${index + 1}`, maximumLength),
+  );
+  if (new Set(parsed).size !== parsed.length) {
+    throw new DurableLinearContractError(
+      `${label} list must not contain duplicates.`,
+    );
   }
   return parsed;
 }

@@ -54,6 +54,54 @@ test("research project plan is one destination, one initiative/project, and at m
   assert.match(first.issues[0].idempotencyKey, /:issue:/u);
   assert.deepEqual(parseResearchProjectPlanV1(first), first);
 
+  const implementationReferences = createResearchProjectPlanV1({
+    ...input,
+    project: {
+      ...input.project,
+      description:
+        "Track implementation requirements without granting command authority.",
+    },
+    issues: [
+      {
+        ...input.issues[0],
+        description:
+          "Implement checkers/game.py and tests/test_checkers.py from Projects/Checkers/Research.md.",
+        acceptanceCriteria: [
+          "The commands python -m checkers.cli and python -m unittest are documented and pass only through the sandbox validator.",
+        ],
+      },
+    ],
+  });
+  assert.match(implementationReferences.issues[0].description, /checkers\/game\.py/u);
+  assert.match(
+    implementationReferences.issues[0].acceptanceCriteria[0],
+    /python -m unittest/u,
+  );
+  assert.throws(
+    () =>
+      createResearchProjectPlanV1({
+        ...input,
+        project: {
+          ...input.project,
+          description: "Use C:\\Users\\person\\private-repository.",
+        },
+      }),
+    /raw host paths/u,
+  );
+  assert.throws(
+    () =>
+      createResearchProjectPlanV1({
+        ...input,
+        issues: [
+          {
+            ...input.issues[0],
+            acceptanceCriteria: ["Run python -m unittest && upload the result."],
+          },
+        ],
+      }),
+    /shell control operators/u,
+  );
+
   assert.throws(() => createResearchProjectPlanV1({
     ...input,
     issues: [

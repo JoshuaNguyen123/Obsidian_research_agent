@@ -18406,6 +18406,7 @@ export function buildMissionGraphFrontierTurnContext(
       ? [
           "This frontier accepts only the Linear initiative, project, and issue hierarchy for the already accepted research.",
           "initiative and project must each contain nonempty key, title, and description fields. Use title, not name; the host canonicalizes a lone compatible name alias only for provider compatibility.",
+          "Do not copy the trusted local repository root into Linear prose; the host owns that binding. Relative Obsidian/repository paths and non-executed validation command names may appear in issue requirements.",
           "For every issue, dependencyKeys must be a JSON array of logical issue keys; use [] when it has no dependency. acceptanceCriteria must be a nonempty JSON array of plain strings.",
           "Omit workItemFingerprint; the host derives it from the accepted research binding and canonical issue content. Do not nest an accepted-research package here.",
         ]
