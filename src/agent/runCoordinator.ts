@@ -124,6 +124,8 @@ export class RunCoordinator {
   private eventSequence = 0;
   private startedAtMs: number | null = null;
   private lastActivityAtMs: number | null = null;
+  private activeRunPublishedAuthority = false;
+  private activeRunStartedFromPersistedProjection = false;
 
   isRunning(): boolean {
     return this.activePromise !== null;
@@ -208,9 +210,12 @@ export class RunCoordinator {
     this.missionEvidence.splice(0, this.missionEvidence.length);
     this.diagnosticAttestations.splice(0, this.diagnosticAttestations.length);
     this.providerUsage = emptyProviderUsage();
-    this.lastMissionGraph = null;
-    this.lastMissionLedger = null;
-    this.persistedProjection = null;
+    // Keep an integrity-checked restart projection visible until the accepted
+    // executor publishes its own config or graph. A continuation can be
+    // cancelled while its structured router is in flight; eagerly clearing
+    // here would turn that recoverable stop into a blank, non-resumable view.
+    this.activeRunPublishedAuthority = false;
+    this.activeRunStartedFromPersistedProjection = this.persistedProjection !== null;
     this.lastReceipts.splice(0, this.lastReceipts.length);
     this.lastComplete = null;
     this.activeController = new AbortController();
@@ -235,6 +240,14 @@ export class RunCoordinator {
     void (async () => {
       try {
         await executor(controller.signal, events);
+        if (
+          !this.activeRunPublishedAuthority &&
+          (controller.signal.aborted || this.activeRunStartedFromPersistedProjection)
+        ) {
+          this.emit("onTrace", [
+            buildPreAuthorityCompletionDiagnostic(controller.signal),
+          ]);
+        }
         const fallbackComplete = {
           step: 0,
           maxSteps: this.lastConfig?.maxStepsForRun ?? 0,
@@ -310,18 +323,18 @@ export class RunCoordinator {
     return true;
   }
 
-  requestStop(): boolean {
+  requestStop(reason = "user_requested"): boolean {
     if (!this.activeController || this.activeController.signal.aborted) {
       return false;
     }
     this.state = "stopping";
     this.lastActivityAtMs = Date.now();
-    this.activeController.abort();
+    this.activeController.abort(reason);
     return true;
   }
 
   async shutdown(): Promise<void> {
-    this.requestStop();
+    this.requestStop("coordinator_shutdown");
     if (!this.activePromise) {
       return;
     }
@@ -349,14 +362,16 @@ export class RunCoordinator {
     this.lastActivityAtMs = Date.now();
     if (key === "onRunConfig") {
       const config = args[0] as AgentRunConfigEvent | undefined;
+      this.acceptActiveRunAuthority();
       this.runId = config?.runId ?? this.runId;
       this.lastConfig = config ? { ...config } : this.lastConfig;
       this.lastMissionLedger = config?.missionLedger
         ? structuredCloneValue(config.missionLedger)
-        : this.lastMissionLedger;
+        : null;
     } else if (key === "onMissionGraphUpdate") {
       const graph = args[0] as MissionGraphV3 | undefined;
       if (graph) {
+        this.acceptActiveRunAuthority();
         this.runId = graph.missionId || this.runId;
         this.lastMissionGraph = structuredCloneValue(graph);
       }
@@ -526,6 +541,14 @@ export class RunCoordinator {
       }
     }
   }
+
+  private acceptActiveRunAuthority(): void {
+    if (this.activeRunPublishedAuthority) return;
+    this.activeRunPublishedAuthority = true;
+    this.lastMissionGraph = null;
+    this.lastMissionLedger = null;
+    this.persistedProjection = null;
+  }
 }
 
 function emptyProviderUsage(): ModelUsageAggregateV1 {
@@ -543,7 +566,7 @@ function emptyProviderUsage(): ModelUsageAggregateV1 {
 
 function isAttestedDiagnosticTraceId(id: string): boolean {
   return (
-    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|operation-goals:)/u.test(
+    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|operation-goals:)/u.test(
       id,
     ) ||
     id.endsWith(":proof-gated-writeback-rejected") ||
@@ -566,6 +589,38 @@ function extractDiagnosticMissing(outputPreview: unknown): string[] {
     );
   }
   return [];
+}
+
+function buildPreAuthorityCompletionDiagnostic(signal: AbortSignal): {
+  id: string;
+  kind: string;
+  message: string;
+  error: { code: string };
+  outputPreview: { missing: string[] };
+} {
+  const reason = signal.aborted
+    ? sanitizeTerminalDiagnostic(
+        typeof signal.reason === "string"
+          ? signal.reason
+          : signal.reason instanceof Error
+            ? signal.reason.message
+            : "aborted",
+        120,
+      )
+    : "executor_returned";
+  return {
+    id: "run-coordinator-pre-authority-completion",
+    kind: "error",
+    message: signal.aborted
+      ? `Mission stopped before publishing run authority; reason=${reason || "aborted"}. The verified restart projection was retained.`
+      : "Mission executor returned before publishing run authority. The verified restart projection was retained.",
+    error: {
+      code: signal.aborted
+        ? "run_stopped_before_authority"
+        : "run_returned_before_authority",
+    },
+    outputPreview: { missing: [] },
+  };
 }
 
 function buildTerminalErrorDiagnostic(error: unknown): {

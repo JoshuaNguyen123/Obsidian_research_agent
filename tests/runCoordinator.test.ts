@@ -388,6 +388,71 @@ test("run coordinator bounds replay payloads and retained receipts", async () =>
   assert.equal(snapshot.lastReceipts.at(-1)?.path, "Note-899.md");
 });
 
+test("a continuation stopped before publishing authority retains its verified restart projection", async () => {
+  const coordinator = new RunCoordinator();
+  const graph = {
+    schemaVersion: 3,
+    missionId: "mission-resumable",
+    objective: "Resume accepted research",
+    revision: 4,
+    nodes: {},
+  } as never;
+  coordinator.hydratePersistedMission({
+    runId: "run-resumable",
+    runtimeSnapshotPath: "Agent Runs/run-resumable.md",
+    missionLedgerPath: "Agent Runs/run-resumable.md",
+    graphStorePath: "Agent Runs/Mission Graphs/run-resumable.md",
+    graphReference: {
+      version: 1,
+      missionId: "mission-resumable",
+      path: "Agent Runs/Mission Graphs/run-resumable.md",
+      storeRevision: 5,
+      graphRevision: 4,
+      recordFingerprint: `sha256:${"a".repeat(64)}`,
+      journalHeadFingerprint: `sha256:${"b".repeat(64)}`,
+    },
+    missionLedger: {
+      runId: "run-resumable",
+      status: "stopped",
+      evidenceCount: 2,
+      receiptCount: 1,
+      expectedTools: ["publish_research_project_to_linear"],
+      nextAction: "Create the Linear hierarchy.",
+      remainingActions: ["Create the Linear hierarchy."],
+      continuationCommand: "continue run run-resumable",
+      canResume: true,
+      dependencyStatus: [],
+      iterationCount: 3,
+      progressScore: 0.4,
+      stalledCount: 0,
+    },
+    missionGraph: graph,
+  });
+
+  const active = coordinator.start(async (signal) => {
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  });
+  assert.equal(coordinator.requestStop("durable_restart_boundary"), true);
+  assert.equal((await active).stopReason, "user_stopped");
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.lastMissionLedger?.runId, "run-resumable");
+  assert.equal(snapshot.lastMissionLedger?.canResume, true);
+  assert.deepEqual(snapshot.lastMissionGraph, graph);
+  assert.equal(snapshot.persistedProjection?.graphReference.storeRevision, 5);
+  assert.deepEqual(snapshot.diagnosticAttestations.at(-1), {
+    schemaVersion: 1,
+    id: "run-coordinator-pre-authority-completion",
+    kind: "error",
+    message:
+      "Mission stopped before publishing run authority; reason=durable_restart_boundary. The verified restart projection was retained.",
+    errorCode: "run_stopped_before_authority",
+    missing: [],
+  });
+});
+
 test("run coordinator retains a bounded redacted terminal rejection", async () => {
   const coordinator = new RunCoordinator();
   const secret = `lin_api_${"s".repeat(64)}`;

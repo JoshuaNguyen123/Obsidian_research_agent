@@ -6963,7 +6963,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       return false;
     }
     if (this.runCoordinator.isRunning()) {
-      this.runCoordinator.requestStop();
+      this.runCoordinator.requestStop("durable_restart_boundary");
     }
     const idleDeadline = Date.now() + 15_000;
     while (this.runCoordinator.isRunning() && Date.now() < idleDeadline) {
@@ -7026,7 +7026,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   requestMissionStop(): boolean {
-    const requested = this.runCoordinator.requestStop();
+    const requested = this.runCoordinator.requestStop("user_requested");
     if (requested && this.activeDurableMissionId && this.durableMissionRuntime) {
       // Coordinator abort listeners mark reload-style interruption first; the
       // explicit durable cancel then wins and prevents startup auto-resume.
