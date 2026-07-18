@@ -662,14 +662,30 @@ class WorkspaceToolRuntimeV2 {
     await assertWorkspaceAbsent(this.manager, workspaceId);
     const profileKeyInput = optionalString(args.repositoryProfileKey);
     const rawRoot = optionalString(args.repositoryRoot);
-    if ((profileKeyInput ? 1 : 0) + (rawRoot ? 1 : 0) !== 1) {
-      throw new WorkspaceManagerErrorV2("repository_binding_required", "Repository workspace creation requires exactly one profile key or raw repository root.");
+    if (!profileKeyInput && !rawRoot) {
+      throw new WorkspaceManagerErrorV2("repository_binding_required", "Repository workspace creation requires a profile key or raw repository root.");
     }
     let profileKey = profileKeyInput ?? `raw-${workspaceId}`;
     let repositoryRoot: string;
     if (profileKeyInput) {
       repositoryRoot = await this.repositories.resolveProfile?.(profileKeyInput, context) ?? "";
       if (!repositoryRoot) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", `Repository profile ${profileKeyInput} is unavailable.`);
+      if (rawRoot) {
+        if (!path.isAbsolute(rawRoot)) {
+          throw new WorkspaceManagerErrorV2("repository_path_invalid", "Raw repository root must be absolute.");
+        }
+        const [profileCanonicalRoot, assertedCanonicalRoot] = await Promise.all([
+          fs.realpath(repositoryRoot),
+          fs.realpath(rawRoot),
+        ]);
+        if (profileCanonicalRoot !== assertedCanonicalRoot) {
+          throw new WorkspaceManagerErrorV2(
+            "repository_binding_conflict",
+            "Repository profile key and raw repository root identify different repositories.",
+          );
+        }
+        repositoryRoot = profileCanonicalRoot;
+      }
     } else {
       if (!path.isAbsolute(rawRoot!)) throw new WorkspaceManagerErrorV2("repository_path_invalid", "Raw repository root must be absolute.");
       const canonical = await fs.realpath(rawRoot!);
@@ -1419,6 +1435,9 @@ function objectSchema(properties: Record<string, JsonSchemaObjectV1>, required: 
 function stringSchema(): JsonSchemaObjectV1 { return { type: "string" }; }
 function description(name: string): string {
   const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace.`;
+  if (name === "code_workspace_create") {
+    return `${base} Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
+  }
   return [
     "code_workspace_create_file",
     "code_workspace_write_expected",

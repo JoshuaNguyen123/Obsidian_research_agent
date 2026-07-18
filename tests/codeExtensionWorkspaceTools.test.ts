@@ -473,6 +473,31 @@ test("raw repository roots require exact foreground prompt binding while logical
       profileContext,
     );
     assert.equal(profilePrepared.normalizedArgs.profileKey, "fixture-profile");
+
+    const equivalentPrepared = await requirePrepared(
+      create,
+      {
+        workspaceId: "profile-and-root-equivalent",
+        kind: "repository",
+        repositoryProfileKey: "fixture-profile",
+        repositoryRoot: canonicalRepo,
+      },
+      fixture.context(`Use trusted profile fixture-profile for ${canonicalRepo}.`),
+    );
+    assert.equal(equivalentPrepared.normalizedArgs.profileKey, "fixture-profile");
+    assert.equal(equivalentPrepared.normalizedArgs.repositoryRoot, canonicalRepo);
+
+    const conflicting = await create.prepare!(
+      {
+        workspaceId: "profile-and-root-conflict",
+        kind: "repository",
+        repositoryProfileKey: "fixture-profile",
+        repositoryRoot: await realpath(fixture.root),
+      },
+      fixture.context(`Use trusted profile fixture-profile for ${fixture.root}.`),
+    );
+    assert.equal(conflicting.ok, false);
+    if (!conflicting.ok) assert.equal(conflicting.error.code, "repository_binding_conflict");
   } finally {
     await fixture.cleanup();
   }
