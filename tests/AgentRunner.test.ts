@@ -3890,6 +3890,26 @@ test("delete path prompts expose delete_path and emit a trash receipt", async ()
   assert.deepEqual(receipts, ["trash Projects/Old.md; affected: 1"]);
 });
 
+test("workspace creation frontier exposes its exact graph-bound path", () => {
+  const binding = buildObservedMissionGraphFrontierBinding(
+    [],
+    [
+      {
+        type: "function",
+        function: {
+          name: "code_workspace_create_file",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+    [],
+    "checkers/game.py",
+  );
+  assert.match(binding ?? "", /EXACT GRAPH-BOUND NEW WORKSPACE FILE/u);
+  assert.match(binding ?? "", /path="checkers\/game\.py"/u);
+  assert.match(binding ?? "", /complete content for only this file/u);
+});
+
 test("compound public-web lifecycle reserves exact research reads before effects", () => {
   const prompt = [
     "Research American checkers using exactly two public web sources and fetch both sources.",
@@ -11412,7 +11432,15 @@ test("generic repository implementation does not expose unrequested path relocat
 
 test("explicit add-only filename lists route to no-overwrite workspace creation", async () => {
   const configs: AgentRunConfigEvent[] = [];
-  const graphs: Array<{ nodes: Record<string, { allowedTools: string[] }> }> = [];
+  const graphs: Array<{
+    nodes: Record<
+      string,
+      {
+        allowedTools: string[];
+        destination?: { selector?: string | null } | null;
+      }
+    >;
+  }> = [];
   const prompt = [
     "Implement the Python checkers game in the trusted repository.",
     "Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py.",
@@ -11441,10 +11469,26 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
 
   const allowed = new Set(configs[0]?.allowedToolNames ?? []);
   assert.equal(allowed.has("code_workspace_create_file"), true);
-  const graphTools = Object.values(graphs.at(-1)?.nodes ?? {}).flatMap(
+  const graphNodes = Object.values(graphs.at(-1)?.nodes ?? {});
+  const graphTools = graphNodes.flatMap(
     (node) => node.allowedTools,
   );
-  assert.equal(graphTools.includes("code_workspace_create_file"), true);
+  assert.equal(
+    graphTools.filter((name) => name === "code_workspace_create_file").length,
+    5,
+  );
+  assert.deepEqual(
+    graphNodes
+      .filter((node) => node.allowedTools[0] === "code_workspace_create_file")
+      .map((node) => node.destination?.selector),
+    [
+      "README.md",
+      "checkers/__init__.py",
+      "checkers/cli.py",
+      "checkers/game.py",
+      "tests/test_checkers.py",
+    ],
+  );
   assert.equal(graphTools.includes("code_workspace_patch"), false);
 });
 

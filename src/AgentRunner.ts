@@ -147,6 +147,7 @@ import {
 } from "./agent/runPlan";
 import {
   deriveAutonomyScope,
+  extractExplicitNewWorkspaceFilePaths,
   extractMarkdownPathMentions,
   hasExplicitCurrentNoteMutationIntent,
   isBroadUnscopedVaultMutation,
@@ -5768,6 +5769,11 @@ export async function runAgentMission({
           "delete_path",
         ].includes(toolCall.name) &&
         Boolean(graphDestinationSelector?.toLowerCase().endsWith(".md"));
+      const exactWorkspacePathGraphTool =
+        preparedAction.target.system === "workspace" &&
+        toolCall.name === "code_workspace_create_file" &&
+        typeof graphDestinationSelector === "string" &&
+        !graphDestinationSelector.startsWith("prompt-scoped-");
       const preparedTargetSelectors = new Set(
         [
           preparedAction.target.id,
@@ -5776,7 +5782,7 @@ export async function runAgentMission({
         ].filter((value): value is string => typeof value === "string"),
       );
       const graphDestinationMatchesPreparedTarget =
-        !exactVaultPathGraphTool ||
+        (!exactVaultPathGraphTool && !exactWorkspacePathGraphTool) ||
         (graphDestinationSelector !== null &&
           preparedTargetSelectors.has(graphDestinationSelector));
       const hostGraphScopeAuthorized = Boolean(
@@ -5812,7 +5818,7 @@ export async function runAgentMission({
         // A host graph may narrow runner scope but must never widen a prepared
         // vault mutation to a different path. Exact Markdown path tools require
         // both the graph destination and the prompt-derived runner scope.
-        scopeAllowed: exactVaultPathGraphTool
+        scopeAllowed: exactVaultPathGraphTool || exactWorkspacePathGraphTool
           ? hostGraphScopeAuthorized && runnerScopeAuthorized
           : hostGraphScopeAuthorized || runnerScopeAuthorized,
         now: runToolContext.now?.() ?? new Date(),
@@ -8467,6 +8473,10 @@ export async function runAgentMission({
                 messages,
                 stepTools,
                 writeReceipts,
+                getMissionGraphFrontierDestinationSelector(
+                  missionGraphSession?.graph ?? missionGraph,
+                  stepTools,
+                ),
               ),
             )
           : messages;
@@ -11330,6 +11340,26 @@ function buildRunConfigEvent({
         }
       : {}),
   };
+}
+
+export function getMissionGraphFrontierDestinationSelector(
+  graph: MissionGraphV3 | null | undefined,
+  stepTools: readonly ModelToolDefinition[],
+): string | null {
+  if (!graph || stepTools.length !== 1) return null;
+  const toolName = stepTools[0]?.function.name;
+  const selectors = new Set(
+    Object.values(graph.nodes)
+      .filter(
+        (node) =>
+          node.status === "ready" &&
+          toolName !== undefined &&
+          node.allowedTools.includes(toolName),
+      )
+      .map((node) => node.destination?.selector ?? null)
+      .filter((value): value is string => typeof value === "string"),
+  );
+  return selectors.size === 1 ? [...selectors][0]! : null;
 }
 
 function safeProjectLifecycleEstimate(
@@ -16544,6 +16574,7 @@ function isCodeToolAllowedForPrompt(toolName: string, prompt: string): boolean {
 }
 
 function hasExplicitNewWorkspaceFileIntent(prompt: string): boolean {
+  if (extractExplicitNewWorkspaceFilePaths(prompt).length > 0) return true;
   const relativeFilePath = /(?:^|[\s,`])(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}(?=$|[\s,;:`])/iu;
   return prompt
     .split(/(?:[!?;\r\n]+|\bbut\b)/iu)
@@ -18539,8 +18570,21 @@ export function buildObservedMissionGraphFrontierBinding(
   messages: readonly ModelChatMessage[],
   stepTools: readonly ModelToolDefinition[],
   durableReceipts: readonly AgentRunReceipt[] = [],
+  graphDestinationSelector: string | null = null,
 ): string | null {
   const names = stepTools.map((tool) => tool.function.name);
+  if (
+    names.length === 1 &&
+    names[0] === "code_workspace_create_file" &&
+    graphDestinationSelector &&
+    !graphDestinationSelector.startsWith("prompt-scoped-")
+  ) {
+    return [
+      "EXACT GRAPH-BOUND NEW WORKSPACE FILE:",
+      `path=${JSON.stringify(graphDestinationSelector)}.`,
+      "Call code_workspace_create_file with this exact path and the complete content for only this file; the host will reject a different destination or overwrite.",
+    ].join(" ");
+  }
   if (names.length !== 1 || names[0] !== "upsert_mermaid_block") {
     return null;
   }

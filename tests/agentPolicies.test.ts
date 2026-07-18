@@ -14,9 +14,31 @@ import {
 } from "../src/agent/projectMemory";
 import {
   deriveAutonomyScope,
+  extractExplicitNewWorkspaceFilePaths,
   extractMarkdownPathMentions,
   hasExplicitCurrentNoteMutationIntent,
 } from "../src/agent/missionScope";
+
+test("explicit repository file sets are extracted without adjacent mission paths", () => {
+  const prompt = [
+    "Write accepted research to Projects/Checkers/Research.md.",
+    "Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py.",
+    "Leave scripts/verify_project.py unchanged and then validate.",
+  ].join(" ");
+  assert.deepEqual(extractExplicitNewWorkspaceFilePaths(prompt), [
+    "README.md",
+    "checkers/__init__.py",
+    "checkers/cli.py",
+    "checkers/game.py",
+    "tests/test_checkers.py",
+  ]);
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Do not create exactly safe.py, ../escape.py, or C:/private.py.",
+    ),
+    [],
+  );
+});
 import {
   hasExplicitNoWebIntent,
   hasExplicitPublicWebSignal,

@@ -19,7 +19,10 @@ import {
   INSTALLED_HEADLESS_TOOL_BY_DOMAIN_V1,
   type BackgroundExecutionDomainV1,
 } from "../../packages/headless-runtime/src";
-import { extractMarkdownPathMentions } from "./missionScope";
+import {
+  extractExplicitNewWorkspaceFilePaths,
+  extractMarkdownPathMentions,
+} from "./missionScope";
 
 export interface BuildHostMissionGraphPlanInput {
   missionId: string;
@@ -75,6 +78,8 @@ export async function buildHostMissionGraphPlanV1(
           descriptorByName.has(name),
         ),
   );
+  const explicitNewWorkspaceFilePaths =
+    extractExplicitNewWorkspaceFilePaths(input.objective);
   // Preserve deliberate read multiplicity: two bounded source fetches are two
   // separately budgeted graph nodes even though they use the same descriptor.
   // Effectful tools remain deduplicated except for the explicit Mermaid
@@ -93,6 +98,17 @@ export async function buildHostMissionGraphPlanV1(
     const isVerifiedMermaidRevision =
       name === "upsert_mermaid_block" &&
       plannedNames.at(-1) === "read_mermaid_block";
+    if (
+      name === "code_workspace_create_file" &&
+      explicitNewWorkspaceFilePaths.length > 0 &&
+      !seenEffectfulPlannedNames.has(name)
+    ) {
+      seenEffectfulPlannedNames.add(name);
+      plannedNames.push(
+        ...explicitNewWorkspaceFilePaths.map(() => name),
+      );
+      continue;
+    }
     if (seenEffectfulPlannedNames.has(name) && !isVerifiedMermaidRevision) {
       continue;
     }
@@ -101,6 +117,14 @@ export async function buildHostMissionGraphPlanV1(
   }
   const plannedSet = new Set(plannedNames);
   const maxToolNodes = MISSION_GRAPH_MAX_DEPTH - 1;
+  if (
+    explicitNewWorkspaceFilePaths.length > 1 &&
+    plannedNames.length > maxToolNodes
+  ) {
+    throw new Error(
+      `The explicit ${explicitNewWorkspaceFilePaths.length}-file creation set exceeds the bounded mission graph capacity. Split it into smaller approved stages.`,
+    );
+  }
   const selectedPlanned = plannedNames.slice(0, maxToolNodes);
   const postAcceptanceNames = unique([
     ...(input.postAcceptanceToolNames ?? []),
@@ -287,6 +311,7 @@ export async function buildHostMissionGraphPlanV1(
     headlessToolNames,
     preferBackground: input.background?.preferBackground === true,
     bindingIdByTool,
+    explicitNewWorkspaceFilePaths,
   });
   const optionalReadNodes = buildOptionalReadNodeProposals({
     names: optionalReadNames,
@@ -376,16 +401,22 @@ function buildToolNodeProposals(input: {
   headlessToolNames: ReadonlySet<string>;
   preferBackground: boolean;
   bindingIdByTool: ReadonlyMap<string, string | null>;
+  explicitNewWorkspaceFilePaths: readonly string[];
 }): Record<string, MissionGraphNodeProposalV1> {
   const result: Record<string, MissionGraphNodeProposalV1> = {};
   const readNodeIds: string[] = [];
   const plannedReadNodes: Array<{ id: string; name: string }> = [];
   const effectfulNodeIds: string[] = [];
   const githubEffectfulNodeIds: string[] = [];
+  let newWorkspaceFileIndex = 0;
   input.names.forEach((name, index) => {
     const descriptor = input.descriptorByName.get(name)!;
     const effect = graphEffect(descriptor);
     const nodeId = toolNodeId(index, name);
+    const explicitNewWorkspaceFilePath =
+      name === "code_workspace_create_file"
+        ? input.explicitNewWorkspaceFilePaths[newWorkspaceFileIndex++] ?? null
+        : null;
     const dependencies =
       effect === "read"
         ? effectfulNodeIds.length > 0
@@ -411,11 +442,16 @@ function buildToolNodeProposals(input: {
       headlessToolNames: input.headlessToolNames,
       preferBackground: input.preferBackground,
       bindingId: input.bindingIdByTool.get(name) ?? null,
-      selector: explicitVaultSelector({
-        toolName: name,
-        objective: input.objective,
-        currentNotePath: input.currentNotePath,
-      }),
+      selector:
+        explicitNewWorkspaceFilePath ??
+        explicitVaultSelector({
+          toolName: name,
+          objective: input.objective,
+          currentNotePath: input.currentNotePath,
+        }),
+      objective: explicitNewWorkspaceFilePath
+        ? `Create the exact new workspace file ${explicitNewWorkspaceFilePath} without overwrite.`
+        : undefined,
     });
     if (effect === "read") {
       readNodeIds.push(nodeId);
@@ -489,6 +525,7 @@ function proposalForTool(input: {
   preferBackground: boolean;
   bindingId: string | null;
   selector?: string | null;
+  objective?: string;
 }): MissionGraphNodeProposalV1 {
   const effect = graphEffect(input.descriptor);
   const bindingId = input.bindingId;
@@ -516,7 +553,7 @@ function proposalForTool(input: {
   return {
     id: input.nodeId,
     dependencyIds: input.dependencies,
-    objective: objectiveForDescriptor(input.descriptor),
+    objective: input.objective ?? objectiveForDescriptor(input.descriptor),
     executorId: runHeadless
       ? INSTALLED_HEADLESS_EXECUTOR_IDS_V1[backgroundDomain!]
       : "single-agent",

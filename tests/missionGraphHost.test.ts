@@ -385,6 +385,47 @@ test("host graph keeps an explicit workspace CRUD lifecycle within the bounded D
   );
 });
 
+test("host graph binds every explicit new repository file to its own ordered node", async () => {
+  const name = "code_workspace_create_file";
+  const paths = [
+    "README.md",
+    "checkers/__init__.py",
+    "checkers/cli.py",
+    "checkers/game.py",
+    "tests/test_checkers.py",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-explicit-multifile",
+    objective:
+      `Implement the repository. Add only ${paths.slice(0, -1).join(", ")}, and ${paths.at(-1)}. ` +
+      "Then validate the result.",
+    toolRegistry: registryForDescriptors([workspaceLifecycleDescriptor(name)]),
+    allowedToolNames: [name],
+    modelVisibleToolNames: [name],
+    plannedToolNames: [name],
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.allowedTools[0] === name,
+  );
+  assert.equal(nodes.length, paths.length);
+  assert.deepEqual(
+    nodes.map((node) => node.destination?.selector),
+    paths,
+  );
+  assert.deepEqual(
+    nodes.map((node) => node.objective),
+    paths.map((path) => `Create the exact new workspace file ${path} without overwrite.`),
+  );
+  for (let index = 1; index < nodes.length; index += 1) {
+    assert.ok(nodes[index]!.dependencyIds.includes(nodes[index - 1]!.id));
+  }
+  assert.equal(host.capabilityEnvelope.budgets.maxDepth, paths.length + 1);
+});
+
 test("host graph retains every node in a compound daily-use lifecycle", async () => {
   const descriptors = Array.from({ length: 16 }, (_unused, index) =>
     workspaceLifecycleDescriptor(`compound_stage_${String(index + 1).padStart(2, "0")}`),

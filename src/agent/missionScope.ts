@@ -245,6 +245,57 @@ export function extractMarkdownPathMentions(prompt: string): string[] {
 }
 
 /**
+ * Extracts a bounded, explicit new-file set from phrases such as
+ * "Add only README.md, src/app.ts, and tests/app.test.ts." The strict
+ * only/exactly wording is intentional: ordinary prose and unrelated note or
+ * provider paths must never manufacture extra repository mutations.
+ */
+export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
+  if (prompt.length > 100_000 || prompt.includes("\0")) return [];
+  const introductions = [
+    ...prompt.matchAll(
+      /\b(?:add|create|make)\s+(?:(?:only|exactly)\s+|(?:the\s+)?exact\s+(?:new\s+)?files?\s*:?[ \t]*)/giu,
+    ),
+  ];
+  const paths: string[] = [];
+  for (const introduction of introductions) {
+    const introductionIndex = introduction.index ?? 0;
+    const prefix = prompt.slice(Math.max(0, introductionIndex - 100), introductionIndex);
+    if (/(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(prefix)) {
+      continue;
+    }
+    const start = introductionIndex + introduction[0].length;
+    const remainder = prompt.slice(start, Math.min(prompt.length, start + 4_000));
+    const boundary = /[!?;\r\n]|\.\s+(?=[A-Z])|\b(?:and\s+then|then|after\s+that)\b/iu.exec(
+      remainder,
+    );
+    const clause = remainder.slice(0, boundary?.index ?? remainder.length);
+    for (const match of clause.matchAll(
+      /(?:^|[\s,("'\x60])((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?=$|[\s,):."'\x60])/gu,
+    )) {
+      const candidate = match[1] ?? "";
+      if (!isSafeExplicitWorkspaceFilePath(candidate)) continue;
+      paths.push(candidate);
+    }
+  }
+  return dedupeStrings(paths);
+}
+
+function isSafeExplicitWorkspaceFilePath(value: string): boolean {
+  if (!value || value.length > 240 || value.includes("\\") || value.includes(":")) {
+    return false;
+  }
+  const segments = value.split("/");
+  return segments.every(
+    (segment) =>
+      segment.length > 0 &&
+      segment !== "." &&
+      segment !== ".." &&
+      /^[A-Za-z0-9_.-]+$/u.test(segment),
+  );
+}
+
+/**
  * Returns true only when an explicit current-note target and its mutation verb
  * occur in the same natural-language clause. Merely reading the current note
  * must not authorize a later mutation whose clause targets another vault path.

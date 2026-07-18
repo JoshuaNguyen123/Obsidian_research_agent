@@ -651,21 +651,65 @@ export class WorkspaceManagerV2 {
     return this.serializeWrite(async () => {
       let manifest = await this.requireLease(await this.loadManifest(workspaceId), leaseId);
       const bytes = textBytes(content);
-      const target = await this.resolveSafePath(manifest, relativePath, { mustExist: false, mutation: true });
-      if (target.exists) throw new WorkspaceManagerErrorV2("path_exists", `${target.relativePath} already exists.`);
-      this.assertBudget(manifest, [target.relativePath], bytes.byteLength);
-      await this.revalidateGuard(target.parentGuard!);
-      const handle = await fs.open(target.absolutePath, "wx", 0o600);
-      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
-      const after = await hashFile(target.absolutePath);
+      const normalized = assertWorkspaceRelativePathV2(relativePath);
+      const createdDirectories: string[] = [];
+      let createdFilePath: string | null = null;
+      let target: Awaited<ReturnType<WorkspaceManagerV2["resolveSafePath"]>>;
       try {
+        const parentSegments = normalized.split("/").slice(0, -1);
+        let parentPath = "";
+        for (const segment of parentSegments) {
+          parentPath = parentPath ? `${parentPath}/${segment}` : segment;
+          const parent = await this.resolveSafePath(manifest, parentPath, {
+            mustExist: false,
+            mutation: true,
+          });
+          if (parent.exists) {
+            const stat = await fs.lstat(parent.absolutePath);
+            if (!stat.isDirectory()) {
+              throw new WorkspaceManagerErrorV2(
+                "path_conflict",
+                `${parent.relativePath} is not a directory.`,
+              );
+            }
+            continue;
+          }
+          await this.revalidateGuard(parent.parentGuard!);
+          await fs.mkdir(parent.absolutePath);
+          createdDirectories.push(parent.absolutePath);
+        }
+        target = await this.resolveSafePath(manifest, normalized, {
+          mustExist: false,
+          mutation: true,
+        });
+        if (target.exists) throw new WorkspaceManagerErrorV2("path_exists", `${target.relativePath} already exists.`);
+        this.assertBudget(manifest, [target.relativePath], bytes.byteLength);
+        await this.revalidateGuard(target.parentGuard!);
+        const handle = await fs.open(target.absolutePath, "wx", 0o600);
+        createdFilePath = target.absolutePath;
+        try {
+          await handle.writeFile(bytes);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        const after = await hashFile(target.absolutePath);
         manifest = await this.recordChanges(manifest, [{ path: target.relativePath, hash: after }], bytes.byteLength);
+        return this.receipt(manifest, {
+          operation: "create",
+          path: target.relativePath,
+          afterSha256: after.sha256,
+          bytesWritten: after.bytes,
+          affectedCount: createdDirectories.length + 1,
+        });
       } catch (error) {
-        await fs.rm(target.absolutePath, { force: true });
-        await this.restoreManifestAfterFailedMutation(manifest);
+        if (createdFilePath) await fs.rm(createdFilePath, { force: true }).catch(() => undefined);
+        for (const directory of createdDirectories.reverse()) {
+          await fs.rmdir(directory).catch(() => undefined);
+        }
+        if (createdFilePath) await this.restoreManifestAfterFailedMutation(manifest);
         throw error;
       }
-      return this.receipt(manifest, { operation: "create", path: target.relativePath, afterSha256: after.sha256, bytesWritten: after.bytes, affectedCount: 1 });
     });
   }
 

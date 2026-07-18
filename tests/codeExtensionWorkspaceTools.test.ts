@@ -152,6 +152,43 @@ test("prepared workspace creation supports eleven explicit source languages", as
   }
 });
 
+test("prepared new-file creation safely materializes missing parent folders", async () => {
+  const fixture = await createFixture("nested-create");
+  try {
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const context = fixture.context("Create exactly src/checkers/game.py.");
+    await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "nested-space", kind: "scratch" },
+      context,
+    );
+    const committed = await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      {
+        workspaceId: "nested-space",
+        path: "src/checkers/game.py",
+        content: "class CheckersGame:\n    pass\n",
+      },
+      context,
+    );
+    const output = committed.output as {
+      receipt?: { affectedCount?: number; path?: string };
+    };
+    assert.equal(output.receipt?.affectedCount, 3);
+    assert.equal(output.receipt?.path, "src/checkers/game.py");
+    assert.equal(
+      (await fixture.manager.read("nested-space", "src/checkers/game.py")).content,
+      "class CheckersGame:\n    pass\n",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("continuation segments reuse one durable root-owned workspace with segment-bound approvals", async () => {
   const fixture = await createFixture("continuation-root");
   try {
