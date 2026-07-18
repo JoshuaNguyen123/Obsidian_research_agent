@@ -112,6 +112,12 @@ test.describe.serial("configured native Linear live proof", () => {
           "linear_create_issue",
           "linear_get_issue",
           "linear_search_issues",
+          "linear_create_initiative",
+          "linear_get_initiative",
+          "linear_trash_initiative",
+          "linear_create_project",
+          "linear_get_project",
+          "linear_trash_project",
           "linear_create_comment",
           "linear_delete_comment",
           "linear_trash_issue",
@@ -133,6 +139,9 @@ test.describe.serial("configured native Linear live proof", () => {
         let operationSequence = 0;
         let issueId: string | null = null;
         let commentId: string | null = null;
+        let initiativeId: string | null = null;
+        let projectId: string | null = null;
+        let initiativeProjectLinkId: string | null = null;
         const cleanupErrors: string[] = [];
         let primaryError: unknown = null;
 
@@ -175,6 +184,34 @@ test.describe.serial("configured native Linear live proof", () => {
           }
           return result.output;
         };
+        const executeFixedLinear = async (
+          operation: string,
+          variables: Record<string, unknown>,
+        ) => {
+          try {
+            return await plugin.createSecretBackedLinearClient().execute(
+              operation,
+              variables,
+            );
+          } catch (error) {
+            const details = Array.isArray((error as any)?.details)
+              ? (error as any).details.slice(0, 3).map((detail: any) => ({
+                  code: String(detail?.code ?? "").slice(0, 80),
+                  path: Array.isArray(detail?.path)
+                    ? detail.path.slice(0, 12).map((item: unknown) =>
+                        String(item).replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]"))
+                    : [],
+                  message: String(detail?.message ?? "")
+                    .replace(/(?:lin_api_|Bearer\s+)[^\s,;]+/giu, "[REDACTED]")
+                    .replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]")
+                    .slice(0, 300),
+                }))
+              : [];
+            throw new Error(
+              `${operation} failed: ${String((error as any)?.code ?? "unknown")}; provider=${JSON.stringify(details)}`,
+            );
+          }
+        };
         const executeMutation = async (
           name: string,
           args: Record<string, unknown>,
@@ -213,12 +250,81 @@ test.describe.serial("configured native Linear live proof", () => {
               return { ok: true, receipt: reconciled.receipt, output: { reconciled: true } };
             }
           }
+          const details = Array.isArray(executed?.error?.details)
+            ? executed.error.details.slice(0, 3).map((detail: any) => ({
+                code: String(detail?.code ?? "").slice(0, 80),
+                path: Array.isArray(detail?.path)
+                  ? detail.path.slice(0, 12).map((item: unknown) =>
+                      String(item).replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]"))
+                  : [],
+                message: String(detail?.message ?? "")
+                  .replace(/(?:lin_api_|Bearer\s+)[^\s,;]+/giu, "[REDACTED]")
+                  .replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]")
+                  .slice(0, 300),
+              }))
+            : [];
           throw new Error(
-            `${name} failed: ${String(executed?.error?.code ?? "unknown")}`,
+            `${name} failed: ${String(executed?.error?.code ?? "unknown")}; provider=${JSON.stringify(details)}`,
           );
         };
 
         try {
+          const requestedInitiativeId = crypto.randomUUID();
+          initiativeId = requestedInitiativeId;
+          const createdInitiative = await executeMutation(
+            "linear_create_initiative",
+            {
+              input: {
+                id: requestedInitiativeId,
+                name: `Agentic configured initiative ${suffix}`,
+                description: "Disposable configured-credential initiative proof.",
+                content: `Disposable initiative marker ${suffix}`,
+              },
+            },
+            `configured-linear-create-initiative-${suffix}`,
+          );
+          initiativeId = createdInitiative.receipt.resource.id;
+
+          const requestedProjectId = crypto.randomUUID();
+          projectId = requestedProjectId;
+          const createdProject = await executeMutation(
+            "linear_create_project",
+            {
+              input: {
+                id: requestedProjectId,
+                name: `Agentic configured project ${suffix}`,
+                description: "Disposable configured-credential project proof.",
+                content: `Disposable project marker ${suffix}`,
+                teamIds: [teamId],
+              },
+            },
+            `configured-linear-create-project-${suffix}`,
+          );
+          projectId = createdProject.receipt.resource.id;
+
+          const requestedLinkId = crypto.randomUUID();
+          initiativeProjectLinkId = requestedLinkId;
+          await executeFixedLinear(
+            "initiative_project_links.create",
+            { input: { id: requestedLinkId, initiativeId, projectId } },
+          );
+          const [initiative, project, link] = await Promise.all([
+            executeRead("linear_get_initiative", { id: initiativeId }),
+            executeRead("linear_get_project", { id: projectId }),
+            executeFixedLinear("initiative_project_links.get", {
+              id: initiativeProjectLinkId,
+            }),
+          ]) as any[];
+          if (
+            initiative?.id !== initiativeId ||
+            project?.id !== projectId ||
+            link?.id !== initiativeProjectLinkId ||
+            link?.attributes?.initiative !== initiativeId ||
+            link?.attributes?.project !== projectId
+          ) {
+            throw new Error("Independent Linear hierarchy readback did not match creation.");
+          }
+
           const requestedIssueId = crypto.randomUUID();
           issueId = requestedIssueId;
           const created = await executeMutation(
@@ -226,6 +332,7 @@ test.describe.serial("configured native Linear live proof", () => {
             {
               id: requestedIssueId,
               teamId,
+              projectId,
               title,
               description: [
                 "Disposable production-path proof created by Agentic Researcher.",
@@ -325,13 +432,56 @@ test.describe.serial("configured native Linear live proof", () => {
               cleanupErrors.push(`issue: ${String(error)}`);
             }
           }
+          if (initiativeProjectLinkId) {
+            try {
+              await executeFixedLinear(
+                "initiative_project_links.delete",
+                { id: initiativeProjectLinkId },
+              );
+              initiativeProjectLinkId = null;
+            } catch (error) {
+              cleanupErrors.push(`initiative-project link: ${String(error)}`);
+            }
+          }
+          if (projectId) {
+            try {
+              await executeMutation(
+                "linear_trash_project",
+                { id: projectId },
+                `configured-linear-clean-project-${suffix}`,
+              );
+              projectId = null;
+            } catch (error) {
+              cleanupErrors.push(`project: ${String(error)}`);
+            }
+          }
+          if (initiativeId) {
+            try {
+              await executeMutation(
+                "linear_trash_initiative",
+                { id: initiativeId },
+                `configured-linear-clean-initiative-${suffix}`,
+              );
+              initiativeId = null;
+            } catch (error) {
+              cleanupErrors.push(`initiative: ${String(error)}`);
+            }
+          }
         }
 
-        if (primaryError || issueId || commentId || cleanupErrors.length > 0) {
+        if (
+          primaryError ||
+          issueId ||
+          commentId ||
+          initiativeId ||
+          projectId ||
+          initiativeProjectLinkId ||
+          cleanupErrors.length > 0
+        ) {
           const primary = primaryError ? String(primaryError) : "none";
           const cleanup = cleanupErrors.length
             ? cleanupErrors.join("; ")
-            : issueId || commentId
+            : issueId || commentId || initiativeId || projectId || initiativeProjectLinkId
               ? "resource identifiers remain"
               : "complete";
           throw new Error(
@@ -347,7 +497,12 @@ test.describe.serial("configured native Linear live proof", () => {
           teamCount: snapshot.teams.length,
           projectCount: snapshot.projects.length,
           workflowStateCount: snapshot.workflowStates.length,
-          cleaned: issueId === null && commentId === null,
+          cleaned:
+            issueId === null &&
+            commentId === null &&
+            initiativeId === null &&
+            projectId === null &&
+            initiativeProjectLinkId === null,
         };
       }, NATIVE_CORE_PLUGIN_ID);
 
@@ -361,7 +516,7 @@ test.describe.serial("configured native Linear live proof", () => {
       test.info().annotations.push({
         type: "live-provider-proof",
         description:
-          "Used the Obsidian-persisted opaque Linear credential to discover capabilities, create/read/search/comment, and clean the disposable issue through the production tool registry.",
+          "Used the Obsidian-persisted opaque Linear credential to create/read/clean a disposable initiative-project hierarchy and issue/comment through the production prepared-action registry plus its fixed gate-4 link client.",
       });
     } finally {
       await harness?.close();

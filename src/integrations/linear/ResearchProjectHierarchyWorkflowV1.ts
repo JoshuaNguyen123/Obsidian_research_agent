@@ -346,7 +346,9 @@ export class ResearchProjectHierarchyWorkflowV1 {
     if (checkpoint?.status === "complete") {
       try {
         checkpoint = await this.reverifyCommittedCheckpoint(plan, checkpoint, request.context);
+        await this.options.checkpoints.persist(checkpoint);
         const receipt = createHierarchyReceipt(plan, checkpoint, request.runId);
+        await this.persistCheckpointReceipts(checkpoint, receipt);
         return completeResult(plan, checkpoint, receipt);
       } catch (error) {
         return rejected(plan, checkpoint, "linear_hierarchy_resume_readback_failed", safeMessage(error));
@@ -414,6 +416,11 @@ export class ResearchProjectHierarchyWorkflowV1 {
       // Required crash boundary: no mutation occurs before this resolves.
       await this.options.checkpoints.persist(checkpoint);
     }
+
+    // A prior attempt may have committed a provider mutation and its readback
+    // before the external receipt ledger became durable. Rehydrate that
+    // idempotent ledger from the authoritative checkpoint before proceeding.
+    await this.persistCheckpointReceipts(checkpoint);
 
     let grant: AuthorityGrantV1 | null = null;
     if (checkpoint.grantId && this.options.approval.resolvePersistedGrant) {
@@ -544,7 +551,6 @@ export class ResearchProjectHierarchyWorkflowV1 {
         await this.options.checkpoints.persist(checkpoint);
         return rejected(plan, checkpoint, "linear_hierarchy_independent_readback_failed", `Independent Linear readback failed for ${item.key}.`, "reconcile_required");
       }
-      await this.options.persistExternalReceipt?.(resolved.receipt);
       const nextItems: ResearchProjectHierarchyCheckpointItemV1[] = checkpoint.items.map(
         (candidate, candidateIndex): ResearchProjectHierarchyCheckpointItemV1 =>
           candidateIndex === index
@@ -562,7 +568,11 @@ export class ResearchProjectHierarchyWorkflowV1 {
         items: nextItems,
         updatedAt: this.now().toISOString(),
       };
+      // Provider truth and its receipt must become durable in the checkpoint
+      // before the separately persisted receipt ledger is allowed to fail.
+      // Otherwise resume would replay an already-applied provider mutation.
       await this.options.checkpoints.persist(checkpoint);
+      await this.options.persistExternalReceipt?.(resolved.receipt);
     }
 
     checkpoint = await this.reverifyCommittedCheckpoint(
@@ -572,8 +582,19 @@ export class ResearchProjectHierarchyWorkflowV1 {
     );
     await this.options.checkpoints.persist(checkpoint);
     const receipt = createHierarchyReceipt(plan, checkpoint, request.runId);
-    await this.options.persistExternalReceipt?.(receipt);
+    await this.persistCheckpointReceipts(checkpoint, receipt);
     return completeResult(plan, checkpoint, receipt);
+  }
+
+  private async persistCheckpointReceipts(
+    checkpoint: ResearchProjectHierarchyCheckpointV1,
+    hierarchyReceipt?: ActionReceipt,
+  ): Promise<void> {
+    if (!this.options.persistExternalReceipt) return;
+    for (const item of checkpoint.items) {
+      if (item.receipt) await this.options.persistExternalReceipt(item.receipt);
+    }
+    if (hierarchyReceipt) await this.options.persistExternalReceipt(hierarchyReceipt);
   }
 
   private async buildOperations(

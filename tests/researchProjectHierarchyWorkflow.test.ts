@@ -296,6 +296,29 @@ test("partial hierarchy resume reuses verified items and never redispatches them
   assert.equal(new Set(fixture.mutations).size, 6, "committed actions must not replay");
 });
 
+test("receipt-ledger failure resumes from the committed provider checkpoint without replay", async () => {
+  const fixture = await hierarchyFixture({ failOnceAtExternalReceipt: 1 });
+
+  await assert.rejects(
+    fixture.workflow.execute(fixture.request()),
+    /fixture receipt ledger unavailable/u,
+  );
+  assert.equal(fixture.mutations.length, 1);
+  assert.equal(fixture.checkpointStore.current?.items[0]?.status, "committed");
+  assert.ok(fixture.checkpointStore.current?.items[0]?.receipt);
+
+  const resumed = await fixture.workflow.execute(fixture.request());
+  assert.equal(resumed.ok, true);
+  assert.equal(fixture.mutations.length, 6);
+  assert.equal(new Set(fixture.mutations).size, 6, "checkpointed provider actions must not replay");
+  assert.equal(
+    fixture.externalReceipts.has(fixture.checkpointStore.current!.items[0]!.receipt!.id),
+    true,
+    "resume must restore the child receipt that failed to reach the external ledger",
+  );
+  assert.equal(fixture.externalReceipts.has(resumed.ok ? resumed.receipt.id : ""), true);
+});
+
 test("hierarchy deduplicates an exact idempotency marker before preparing mutations", async () => {
   const plan = planFixture();
   const existing: LinearBaseRecord = {
@@ -317,6 +340,7 @@ test("hierarchy deduplicates an exact idempotency marker before preparing mutati
 
 async function hierarchyFixture(options: {
   failOnceAtMutation?: number;
+  failOnceAtExternalReceipt?: number;
   plan?: ReturnType<typeof planFixture>;
   seed?: LinearBaseRecord[];
 } = {}) {
@@ -331,6 +355,9 @@ async function hierarchyFixture(options: {
   let approvals = 0;
   let firstMutationSawPreparedCheckpoint = false;
   let failOnceAtMutation = options.failOnceAtMutation ?? -1;
+  let failOnceAtExternalReceipt = options.failOnceAtExternalReceipt ?? -1;
+  let externalReceiptAttempts = 0;
+  const externalReceipts = new Map<string, ActionReceipt>();
   const grant = await hierarchyGrant();
 
   const client: LinearToolClient = {
@@ -453,6 +480,19 @@ async function hierarchyFixture(options: {
     actionExecutor: executor,
     checkpoints: checkpointStore,
     now: () => new Date(NOW),
+    async persistExternalReceipt(receipt) {
+      externalReceiptAttempts += 1;
+      if (externalReceiptAttempts === failOnceAtExternalReceipt) {
+        failOnceAtExternalReceipt = -1;
+        throw new Error("fixture receipt ledger unavailable");
+      }
+      const existing = externalReceipts.get(receipt.id);
+      if (existing) {
+        assert.deepEqual(existing, receipt);
+        return;
+      }
+      externalReceipts.set(receipt.id, JSON.parse(JSON.stringify(receipt)));
+    },
     approval: {
       async requestExactGroupedApproval(request) {
         approvals += 1;
@@ -474,6 +514,7 @@ async function hierarchyFixture(options: {
     mutations,
     preparedArguments,
     checkpointStore,
+    externalReceipts,
     get approvals() { return approvals; },
     get firstMutationSawPreparedCheckpoint() { return firstMutationSawPreparedCheckpoint; },
     request: () => ({

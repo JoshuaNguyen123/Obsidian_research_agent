@@ -1126,6 +1126,9 @@ function verifyPostcondition(
   observation: LinearReadback,
 ): { ok: boolean; changedFields: string[] } {
   const changedFields = mutationChangedFields(config, variables);
+  if (config.kind === "generic_trash" && !observation.found) {
+    return { ok: true, changedFields };
+  }
   if (expectsAbsence(config.kind)) {
     return { ok: !observation.found, changedFields };
   }

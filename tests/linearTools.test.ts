@@ -570,6 +570,43 @@ test("gate-two project creation uses generic prepared input and exact readback",
   assert.equal(result.receipt?.resource.resourceType, "project");
 });
 
+test("generic trash accepts verified provider absence as a terminal readback", async () => {
+  let trashed = false;
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      if (key === "initiatives.get" && trashed) throw notFound(key);
+      if (key === "initiatives.get") {
+        return genericRecord("initiative", "initiative-1", {
+          name: "Disposable initiative",
+        });
+      }
+      if (key === "initiatives.trash") {
+        trashed = true;
+        return mutationAck(key, "initiative");
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 3 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    { name: "linear_trash_initiative", arguments: { id: "initiative-1" } },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-initiative-trash",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.receipt?.readback.status, "verified");
+  assert.deepEqual(result.receipt?.effects?.changedFields, ["trashed"]);
+});
+
 test("gate-four label binding verifies the project label set", async () => {
   let linked = false;
   const client: LinearToolClient = {
