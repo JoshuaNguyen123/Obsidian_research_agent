@@ -424,8 +424,22 @@ async function approveUntilMissionComplete(
         await page.waitForTimeout(250);
         continue;
       }
+      const failureSummary = {
+        blockedGraph: ui.graph
+          .filter((node) => node.status === "blocked" || node.blockerCode)
+          .map((node) => ({
+            id: node.id,
+            allowedTools: node.allowedTools,
+            attempts: node.attempts,
+            blockerCode: node.blockerCode,
+            blockerMessage: node.blockerMessage,
+          })),
+        projectStages: ui.projectStages,
+        durablyCompletedLifecycleTools: ui.durablyCompletedLifecycleTools,
+        recentDiagnostics: ui.diagnostics.slice(-6),
+      };
       throw new Error(
-        `Mission stopped before acceptance; approved=${approvals}; state=${JSON.stringify(ui)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
+        `Mission stopped before acceptance; approved=${approvals}; summary=${JSON.stringify(failureSummary)}; state=${JSON.stringify(ui)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
       );
     }
     missingContinuationPolls = 0;

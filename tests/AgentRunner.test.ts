@@ -16,6 +16,7 @@ import {
   getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
+  getDurablyProvenCompletedGraphToolNames,
   getRestorableCompletedGraphToolNames,
   hasPreparedBackgroundCodeValidationCommitIntent,
   resolveThinkingMode,
@@ -3898,6 +3899,53 @@ test("compound public-web lifecycle reserves exact research reads before effects
   assert.deepEqual(
     getCompoundLifecycleResearchGraphToolNames(prompt),
     ["web_search", "web_fetch", "web_fetch"],
+  );
+});
+
+test("continuation restores a mutation only from receipt-bound graph proof", () => {
+  const proven = {
+    id: "tool-1",
+    status: "complete",
+    effect: "external_action",
+    allowedTools: ["publish_research_to_linear"],
+    evidence: [{ id: "evidence-1", kind: "tool-result" }],
+    receipts: [{ id: "receipt-1", kind: "external_action" }],
+    verification: null,
+    completionContract: {
+      minimumEvidence: 1,
+      requiredEvidenceKinds: ["tool-result"],
+      minimumReceipts: 1,
+      requiredReceiptKinds: ["external_action"],
+      verifierId: null,
+    },
+  } as any;
+  assert.deepEqual(
+    getDurablyProvenCompletedGraphToolNames(
+      [proven],
+      ["publish_research_to_linear"],
+    ),
+    ["publish_research_to_linear"],
+  );
+  assert.deepEqual(
+    getDurablyProvenCompletedGraphToolNames(
+      [{ ...proven, receipts: [] }],
+      ["publish_research_to_linear"],
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getDurablyProvenCompletedGraphToolNames(
+      [{
+        ...proven,
+        verification: { verifierId: "provider-v1", status: "failed" },
+        completionContract: {
+          ...proven.completionContract,
+          verifierId: "provider-v1",
+        },
+      }],
+      ["publish_research_to_linear"],
+    ),
+    [],
   );
 });
 

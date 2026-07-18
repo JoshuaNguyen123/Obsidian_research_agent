@@ -3142,10 +3142,11 @@ export async function runAgentMission({
       successfulToolNames.push("web_fetch");
     }
   }
+  const completedGraphNodes = Object.values(
+    (missionGraphSession?.graph ?? missionGraph)?.nodes ?? {},
+  ).filter((node) => node.status === "complete");
   const completedGraphToolNames = new Set(
-    Object.values((missionGraphSession?.graph ?? missionGraph)?.nodes ?? {})
-      .filter((node) => node.status === "complete")
-      .flatMap((node) => node.allowedTools),
+    completedGraphNodes.flatMap((node) => node.allowedTools),
   );
   // A continued artifact-revision workflow may require a read and a write as
   // one ordered contract. The mutation is restored only from its durable
@@ -3153,11 +3154,18 @@ export async function runAgentMission({
   // completed, non-mutating graph node so the resumed segment does not ask for
   // an already-satisfied read forever. Never infer mutation completion from a
   // graph status alone.
-  const restoredCompletedGraphToolNames =
-    getRestorableCompletedGraphToolNames(
-      completedGraphToolNames,
-      requiredWriteTools,
-    );
+  const restoredCompletedGraphToolNames = [
+    ...new Set([
+      ...getRestorableCompletedGraphToolNames(
+        completedGraphToolNames,
+        requiredWriteTools,
+      ),
+      ...getDurablyProvenCompletedGraphToolNames(
+        completedGraphNodes,
+        requiredWriteTools,
+      ),
+    ]),
+  ];
   operationGoals.completedTools.push(
     ...restoredCompletedGraphToolNames.filter(
       (toolName) => !operationGoals.completedTools.includes(toolName),
@@ -18463,6 +18471,44 @@ export function getRestorableCompletedGraphToolNames(
       !WRITE_TOOL_NAMES.has(toolName) &&
       !DELETE_TOOL_NAMES.has(toolName),
   );
+}
+
+/**
+ * Restore a completed effect only from the canonical graph's receipt-bound
+ * completion proof. Parsed MissionGraphV3 state already rejects a complete
+ * node whose evidence, receipt kinds, or verifier result does not satisfy its
+ * immutable completion contract; this helper repeats the local predicates so
+ * compatibility acceptance never treats graph status alone as mutation proof.
+ */
+export function getDurablyProvenCompletedGraphToolNames(
+  completedNodes: Iterable<MissionGraphV3["nodes"][string]>,
+  requiredToolNames: readonly string[],
+): string[] {
+  const required = new Set(requiredToolNames);
+  const restored = new Set<string>();
+  for (const node of completedNodes) {
+    if (node.status !== "complete" || node.allowedTools.length !== 1) continue;
+    const toolName = node.allowedTools[0];
+    if (!required.has(toolName)) continue;
+    const contract = node.completionContract;
+    const evidenceKinds = new Set(node.evidence.map((item) => item.kind));
+    const receiptKinds = new Set(node.receipts.map((item) => item.kind));
+    if (
+      node.evidence.length < contract.minimumEvidence ||
+      node.receipts.length < contract.minimumReceipts ||
+      contract.requiredEvidenceKinds.some((kind) => !evidenceKinds.has(kind)) ||
+      contract.requiredReceiptKinds.some((kind) => !receiptKinds.has(kind)) ||
+      (node.effect !== "read" &&
+        (contract.minimumReceipts < 1 || node.receipts.length < 1)) ||
+      (contract.verifierId !== null &&
+        (node.verification?.verifierId !== contract.verifierId ||
+          node.verification.status !== "passed"))
+    ) {
+      continue;
+    }
+    restored.add(toolName);
+  }
+  return [...restored];
 }
 
 export function constrainOrchestratedHandoffTools(

@@ -1405,7 +1405,12 @@ function requireOne<T>(items: readonly T[], label: string): T {
 }
 
 function safeError(error: unknown): string {
-  return String(error instanceof Error ? error.message : error).slice(0, 500);
+  return String(error instanceof Error ? error.message : error)
+    .replace(
+      /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
+      "[REDACTED]",
+    )
+    .slice(0, 8_000);
 }
 
 const fetchTransport: HttpTransport = async (request) => {

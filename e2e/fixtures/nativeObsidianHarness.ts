@@ -700,7 +700,7 @@ async function terminateObsidian(
     },
     waitForOwnedExit: () =>
       waitForWindowsProcessExit(processHandle.pid!, 30_000),
-    waitForNoRunningProcess: () => waitForNoObsidian(30_000),
+    waitForNoRunningProcess: () => waitForNoObsidian(45_000),
     waitForCdpClose: () => waitForCdpClose(cdpPort, 10_000),
   });
 }
