@@ -162,7 +162,11 @@ export async function startNativeObsidianHarness(
     await trustDisposableVaultIfPrompted(page);
     await ensurePluginRuntimesLoaded(page, pluginIds);
     setupContext.page = page;
-    await options.setup(setupContext);
+    await withTimeout(
+      options.setup(setupContext),
+      60_000,
+      `Native Obsidian scenario setup (${options.label})`,
+    );
 
     const activePage = page;
     return {

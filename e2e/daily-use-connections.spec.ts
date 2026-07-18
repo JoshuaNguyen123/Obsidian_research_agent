@@ -335,18 +335,41 @@ test.describe("daily-use connections and setup", () => {
 });
 
 async function setupDailyUsePage(context: { page: NativeObsidianHarness["page"] }) {
-  await context.page.evaluate(async (pluginId) => {
+  await context.page.evaluate((pluginId) => {
     const app = (window as typeof window & { app?: any }).app;
-    if (typeof app?.workspace?.onLayoutReady === "function") {
-      await new Promise<void>((resolve) => app.workspace.onLayoutReady(resolve));
-    }
     if (!app?.plugins?.plugins?.[pluginId]) {
-      await app?.plugins?.enablePlugin?.(pluginId);
+      throw new Error("Agentic Researcher plugin is unavailable.");
     }
     const plugin = app?.plugins?.plugins?.[pluginId];
     if (!plugin?.activateView) {
       throw new Error("Agentic Researcher view activation is unavailable.");
     }
-    await plugin.activateView();
+    const e2eWindow = window as typeof window & {
+      __e2eDailyUseActivationError?: string;
+    };
+    delete e2eWindow.__e2eDailyUseActivationError;
+    // A fresh hosted Obsidian vault can render the view while revealLeaf's
+    // promise remains pending. The UI is the readiness contract for these
+    // scenarios, so observe the rendered panel instead of awaiting that
+    // host-internal promise indefinitely.
+    void Promise.resolve(plugin.activateView()).catch((error: unknown) => {
+      e2eWindow.__e2eDailyUseActivationError =
+        error instanceof Error ? error.message : String(error);
+    });
   }, NATIVE_CORE_PLUGIN_ID);
+  await context.page.waitForFunction(
+    () => {
+      const e2eWindow = window as typeof window & {
+        __e2eDailyUseActivationError?: string;
+      };
+      if (e2eWindow.__e2eDailyUseActivationError) {
+        throw new Error(
+          `Agentic Researcher view activation failed: ${e2eWindow.__e2eDailyUseActivationError}`,
+        );
+      }
+      return Boolean(document.querySelector(".agentic-researcher-view"));
+    },
+    undefined,
+    { timeout: 30_000 },
+  );
 }
