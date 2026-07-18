@@ -115,7 +115,14 @@ export function createCodeRepairToolContributionsV1(
           operationGoals: ["read durable repair progress", "surface blockers and proof"],
         },
         async execute(args, context) {
-          return handlers.readStatus(normalizeScopeArgs(args), context);
+          return handlers.readStatus(
+            normalizeScopeArgs(
+              hostResolvesDurableProof
+                ? bindRunIdToMissionContext(args, context)
+                : args,
+            ),
+            context,
+          );
         },
       },
     },
@@ -184,7 +191,12 @@ export function createCodeRepairToolContributionsV1(
         async execute() {
           throw new Error(`${CODE_REPAIR_RECORD_CYCLE_TOOL} requires a prepared action.`);
         },
-        prepare: (args, context) => handlers.prepareCycleRecord(args, context),
+        prepare: (args, context) => handlers.prepareCycleRecord(
+          hostResolvesDurableProof
+            ? bindRunIdToMissionContext(args, context)
+            : args,
+          context,
+        ),
         async executePrepared(action, context) {
           const result = await handlers.executePreparedCycleRecord(action, context);
           return {
@@ -254,7 +266,12 @@ export function createCodeRepairToolContributionsV1(
         async execute() {
           throw new Error(`${CODE_COMMIT_VERIFIED_TOOL} requires a prepared exact action.`);
         },
-        prepare: (args, context) => handlers.prepareVerifiedCommit(args, context),
+        prepare: (args, context) => handlers.prepareVerifiedCommit(
+          hostResolvesDurableProof
+            ? bindRunIdToMissionContext(args, context)
+            : args,
+          context,
+        ),
         async executePrepared(action, context) {
           const result = await handlers.executePreparedVerifiedCommit(action, context);
           return {
@@ -267,6 +284,17 @@ export function createCodeRepairToolContributionsV1(
       },
     },
   ];
+}
+
+function bindRunIdToMissionContext(
+  args: Record<string, unknown>,
+  context: ScopedExtensionContextV1,
+): Record<string, unknown> {
+  const runId = context.missionId?.trim();
+  if (!runId) {
+    throw new Error("Production code repair tools require a host mission identity.");
+  }
+  return { ...args, runId };
 }
 
 function contributionDescriptor(id: string, displayName: string) {

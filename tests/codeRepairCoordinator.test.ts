@@ -58,6 +58,70 @@ test("exports the fixed AgentRunner tool catalog with fail-closed commit prepara
   assert.equal(contributions[2].tool.descriptor.durability.readback, "required");
 });
 
+test("production repair contributions bind model run aliases to the host mission identity", async () => {
+  const observed: Array<{ operation: string; runId: string }> = [];
+  const unavailable = async () => {
+    throw new Error("not used");
+  };
+  const handlers = {
+    async readStatus(args: { runId: string }) {
+      observed.push({ operation: "status", runId: args.runId });
+      return {
+        ...args,
+        workspaceId: "workspace-1",
+        requestId: "request-1",
+        kind: "code_repair_status" as const,
+        checkpointId: "checkpoint-1",
+        sequence: 0,
+        stage: "pending",
+        attempts: [],
+        targetedValidationReceiptId: null,
+        fullValidationReceiptId: null,
+        terminalStatus: null,
+        publicationEligible: false,
+        blockerCode: null,
+      };
+    },
+    async prepareCycleRecord(args: Record<string, unknown>) {
+      observed.push({ operation: "cycle", runId: String(args.runId) });
+      return { ok: false as const, code: "expected", message: "captured" };
+    },
+    executePreparedCycleRecord: unavailable,
+    reconcileCycleRecord: unavailable,
+    async prepareVerifiedCommit(args: Record<string, unknown>) {
+      observed.push({ operation: "commit", runId: String(args.runId) });
+      return { ok: false as const, code: "expected", message: "captured" };
+    },
+    executePreparedVerifiedCommit: unavailable,
+    reconcileVerifiedCommit: unavailable,
+  } as unknown as CodeRepairToolHandlersV1;
+  const contributions = createCodeRepairToolContributionsV1(handlers, {
+    hostResolvesDurableProof: true,
+  });
+  const context = {
+    version: 1 as const,
+    extensionId: "agentic-researcher-code",
+    missionId: "run-2026-07-18t16-48-26.022z-host",
+    operationId: "repair-host-scope-test",
+    abortSignal: new AbortController().signal,
+    now: () => new Date(NOW),
+    reportProgress() {},
+  };
+  const args = {
+    runId: "run-2026-07-18T16-48-26.022Z-display",
+    workspaceId: "workspace-1",
+    requestId: "request-1",
+  };
+  await contributions[0].tool.execute(args, context);
+  await contributions[1].tool.prepare!(args, context);
+  await contributions[2].tool.prepare!(args, context);
+  assert.deepEqual(observed, [
+    { operation: "status", runId: context.missionId },
+    { operation: "cycle", runId: context.missionId },
+    { operation: "commit", runId: context.missionId },
+  ]);
+});
+
 test("repairs a later cycle, validates fresh, and emits only a readback-verified commit", async () => {
   const harness = createHarness({ fastOutcomes: ["TS2322", null] });
   const request = createRequest("repair-success");
