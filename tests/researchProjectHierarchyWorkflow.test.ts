@@ -338,6 +338,99 @@ test("hierarchy deduplicates an exact idempotency marker before preparing mutati
   assert.equal(fixture.mutations.length, 5);
 });
 
+test("hierarchy deduplicates an existing initiative-project relation after parent recovery", async () => {
+  const plan = planFixture();
+  const initiative: LinearBaseRecord = {
+    id: "initiative-existing",
+    resourceType: "initiative",
+    name: plan.initiative.title,
+    content: `${plan.initiative.description}\n\n<!-- agentic-idempotency:${plan.initiative.idempotencyKey} -->`,
+    snapshotHash: HASH("e"),
+  };
+  const project: LinearBaseRecord = {
+    id: "project-existing",
+    resourceType: "project",
+    name: plan.project.title,
+    content: `${plan.project.description}\n\n<!-- agentic-idempotency:${plan.project.idempotencyKey} -->`,
+    snapshotHash: HASH("f"),
+  };
+  const link: LinearBaseRecord = {
+    id: "initiative-project-link-existing",
+    resourceType: "initiative_project_link",
+    attributes: { initiative: initiative.id, project: project.id },
+    snapshotHash: HASH("d"),
+  };
+  const fixture = await hierarchyFixture({ plan, seed: [initiative, project, link] });
+
+  const result = await fixture.workflow.execute(fixture.request());
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const relation = result.checkpoint.items.find(
+    (item) => item.kind === "initiative_project_link",
+  );
+  assert.equal(relation?.status, "deduplicated");
+  assert.equal(relation?.resourceId, link.id);
+  assert.equal(
+    fixture.mutations.length,
+    3,
+    "only the two issue creates and their dependency relation remain",
+  );
+});
+
+test("hierarchy deduplicates an existing dependency relation after issue recovery", async () => {
+  const plan = planFixture();
+  const foundation = plan.issues[0]!;
+  const integration = plan.issues[1]!;
+  const records: LinearBaseRecord[] = [
+    {
+      id: "initiative-existing",
+      resourceType: "initiative",
+      content: `<!-- agentic-idempotency:${plan.initiative.idempotencyKey} -->`,
+      snapshotHash: HASH("1"),
+    },
+    {
+      id: "project-existing",
+      resourceType: "project",
+      content: `<!-- agentic-idempotency:${plan.project.idempotencyKey} -->`,
+      snapshotHash: HASH("2"),
+    },
+    {
+      id: "foundation-existing",
+      resourceType: "issue",
+      description: `<!-- agentic-idempotency:${foundation.idempotencyKey} -->`,
+      snapshotHash: HASH("3"),
+    },
+    {
+      id: "integration-existing",
+      resourceType: "issue",
+      description: `<!-- agentic-idempotency:${integration.idempotencyKey} -->`,
+      snapshotHash: HASH("4"),
+    },
+    {
+      id: "link-existing",
+      resourceType: "initiative_project_link",
+      attributes: { initiative: "initiative-existing", project: "project-existing" },
+      snapshotHash: HASH("5"),
+    },
+    {
+      id: "relation-existing",
+      resourceType: "issue_relation",
+      type: "blocks",
+      attributes: { issue: "foundation-existing", relatedIssue: "integration-existing" },
+      snapshotHash: HASH("6"),
+    },
+  ];
+  const fixture = await hierarchyFixture({ plan, seed: records });
+
+  const result = await fixture.workflow.execute(fixture.request());
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.checkpoint.items.every((item) => item.status === "deduplicated"), true);
+  assert.equal(fixture.mutations.length, 0);
+});
+
 async function hierarchyFixture(options: {
   failOnceAtMutation?: number;
   failOnceAtExternalReceipt?: number;

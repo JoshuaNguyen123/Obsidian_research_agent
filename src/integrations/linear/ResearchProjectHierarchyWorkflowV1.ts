@@ -646,6 +646,14 @@ export class ResearchProjectHierarchyWorkflowV1 {
     operations.push(project);
     const projectId = project.duplicate?.id ?? await this.previewTargetId(project, request);
 
+    const existingInitiativeProjectLink = await this.findUniqueRelation(
+      "initiative_project_links.list",
+      (record) =>
+        record.attributes?.initiative === initiativeId &&
+        record.attributes?.project === projectId,
+      `initiative ${initiativeId} and project ${projectId}`,
+      request.context,
+    );
     operations.push(operation({
       key: "initiative-project-link",
       kind: "initiative_project_link",
@@ -653,6 +661,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
       runId: request.runId,
       plan,
       arguments: { input: { initiativeId, projectId } },
+      duplicate: existingInitiativeProjectLink,
     }));
 
     const issueIds = new Map<string, string>();
@@ -680,8 +689,24 @@ export class ResearchProjectHierarchyWorkflowV1 {
         issueOperation.duplicate?.id ?? await this.previewTargetId(issueOperation, request),
       );
     }
+    const hasDependencies = plan.issues.some((issue) => issue.dependencyKeys.length > 0);
+    const existingIssueRelations = hasDependencies
+      ? await this.list("issue_relations.list", request.context)
+      : [];
     for (const issue of plan.issues) {
       for (const dependencyKey of issue.dependencyKeys) {
+        const issueId = issueIds.get(dependencyKey);
+        const relatedIssueId = issueIds.get(issue.key);
+        const matches = existingIssueRelations.filter((record) =>
+          record.attributes?.issue === issueId &&
+          record.attributes?.relatedIssue === relatedIssueId &&
+          record.type === "blocks"
+        );
+        if (matches.length > 1) {
+          throw new Error(
+            `Linear issue relation ${dependencyKey} blocks ${issue.key} matches multiple resources.`,
+          );
+        }
         operations.push(operation({
           key: `relation:${dependencyKey}:blocks:${issue.key}`,
           kind: "issue_relation",
@@ -690,11 +715,12 @@ export class ResearchProjectHierarchyWorkflowV1 {
           plan,
           arguments: {
             input: {
-              issueId: issueIds.get(dependencyKey),
-              relatedIssueId: issueIds.get(issue.key),
+              issueId,
+              relatedIssueId,
               type: "blocks",
             },
           },
+          duplicate: matches[0],
         }));
       }
     }
@@ -756,6 +782,19 @@ export class ResearchProjectHierarchyWorkflowV1 {
   private async list(operationKey: string, context: ToolExecutionContext): Promise<LinearBaseRecord[]> {
     const output = await this.options.readClient.execute(operationKey, { first: 50 }, requestOptions(context));
     return isLinearPage(output) ? output.items : [];
+  }
+
+  private async findUniqueRelation(
+    operationKey: string,
+    matches: (record: LinearBaseRecord) => boolean,
+    label: string,
+    context: ToolExecutionContext,
+  ): Promise<LinearBaseRecord | undefined> {
+    const candidates = (await this.list(operationKey, context)).filter(matches);
+    if (candidates.length > 1) {
+      throw new Error(`Linear relation ${label} matches multiple resources.`);
+    }
+    return candidates[0];
   }
 
   private async readItem(
