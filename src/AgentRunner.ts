@@ -14886,7 +14886,7 @@ function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
             ? "code_workspace_move"
             : /\b(remove|delete|trash)\b[\s\S]{0,80}\b(file|folder|directory|path)\b/i.test(prompt)
               ? "code_workspace_trash"
-              : /\b(create|add|new)\b[\s\S]{0,80}\b(file|module|component|class|test)\b/i.test(prompt)
+              : hasExplicitNewWorkspaceFileIntent(prompt)
                 ? "code_workspace_create_file"
                 : /\bappend\b/i.test(prompt)
                   ? "code_workspace_append"
@@ -16528,6 +16528,27 @@ function isCodeToolAllowedForPrompt(toolName: string, prompt: string): boolean {
     return explicit.includes(toolName);
   }
   return CODE_READ_ONLY_TOOL_NAMES.has(toolName);
+}
+
+function hasExplicitNewWorkspaceFileIntent(prompt: string): boolean {
+  const relativeFilePath = /(?:^|[\s,`])(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}(?=$|[\s,;:`])/iu;
+  return prompt
+    .split(/(?:[!?;\r\n]+|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some((clause) => {
+      const action = /\b(?:create|new|add\s+only)\b/iu.exec(clause);
+      if (!action) {
+        return /\b(?:create|add|new)\b[\s\S]{0,80}\b(?:file|module|component|class|test)\b/iu.test(
+          clause,
+        );
+      }
+      const prefix = clause.slice(0, action.index);
+      if (/(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(prefix)) {
+        return false;
+      }
+      return relativeFilePath.test(clause.slice(action.index + action[0].length));
+    });
 }
 
 export function getCompoundLifecycleResearchGraphToolNames(

@@ -302,7 +302,13 @@ class WorkspaceToolRuntimeV2 {
             action = "create";
           }
         } else if (name === "code_workspace_patch") {
-          const stat = await this.manager.stat(workspaceId, targetPath);
+          const stat = await statOrMissing(this.manager, workspaceId, targetPath);
+          if (!stat) {
+            throw new WorkspaceManagerErrorV2(
+              "path_not_found",
+              `${targetPath} does not exist. Use code_workspace_create_file with the complete new-file content; patches only update an existing hash-bound file.`,
+            );
+          }
           if (stat.kind !== "file") throw new WorkspaceManagerErrorV2("path_conflict", `${targetPath} is not a regular file.`);
           expected = stat.sha256;
           assertRequestedFingerprint(args.expectedSha256, expected);
@@ -1438,8 +1444,13 @@ function description(name: string): string {
   if (name === "code_workspace_create") {
     return `${base} Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
   }
+  if (name === "code_workspace_create_file") {
+    return `${base} Use this only for an absent path and provide the complete new-file content; it never overwrites an existing path. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+  }
+  if (name === "code_workspace_patch") {
+    return `${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
+  }
   return [
-    "code_workspace_create_file",
     "code_workspace_write_expected",
     "write_workspace_file",
   ].includes(name)

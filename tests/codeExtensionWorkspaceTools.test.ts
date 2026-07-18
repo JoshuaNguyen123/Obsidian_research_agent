@@ -198,6 +198,8 @@ test("workspace tools prepare every mutation and return exact readback receipts"
     assert.equal((await fixture.manager.stat("tool-space", "public/assets")).kind, "directory");
 
     const createFileTool = tools.get("code_workspace_create_file")!;
+    assert.match(createFileTool.description, /absent path/u);
+    assert.match(tools.get("code_workspace_patch")!.description, /existing file/u);
     await assert.rejects(
       createFileTool.execute(
         { workspaceId: "tool-space", path: "index.html", content: "<h1>Before</h1>\n" },
@@ -236,6 +238,19 @@ test("workspace tools prepare every mutation and return exact readback receipts"
       /already exists/u,
     );
     assert.equal((await fixture.manager.read("tool-space", "stale.txt")).content, "winner\n");
+
+    const missingPatch = await tools.get("code_workspace_patch")!.prepare!(
+      {
+        workspaceId: "tool-space",
+        path: "missing.md",
+        replacements: [{ oldText: "before", newText: "after" }],
+      },
+      context,
+    );
+    assert.equal(missingPatch.ok, false);
+    if (missingPatch.ok) throw new Error("Missing-file patch unexpectedly prepared.");
+    assert.match(missingPatch.error.message, /code_workspace_create_file/u);
+    await assert.rejects(fixture.manager.read("tool-space", "missing.md"), /does not exist/u);
 
     const writeTool = tools.get("code_workspace_write_expected")!;
     await assert.rejects(

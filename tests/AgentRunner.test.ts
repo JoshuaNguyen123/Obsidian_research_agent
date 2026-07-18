@@ -11362,6 +11362,44 @@ test("generic repository implementation does not expose unrequested path relocat
   assert.equal(allowed.has("code_workspace_restore"), false);
 });
 
+test("explicit add-only filename lists route to no-overwrite workspace creation", async () => {
+  const configs: AgentRunConfigEvent[] = [];
+  const graphs: Array<{ nodes: Record<string, { allowedTools: string[] }> }> = [];
+  const prompt = [
+    "Implement the Python checkers game in the trusted repository.",
+    "Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py.",
+    "Leave the protected scripts directory unchanged, then validate and commit the code.",
+  ].join(" ");
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-18T16:00:00.000Z"),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [() => responseWithContent("Repository execution is pending.")],
+    }),
+    toolRegistry: createCodeV2RoutingRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 1,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+      onMissionGraphUpdate: (graph) => graphs.push(graph),
+    },
+  });
+
+  const allowed = new Set(configs[0]?.allowedToolNames ?? []);
+  assert.equal(allowed.has("code_workspace_create_file"), true);
+  const graphTools = Object.values(graphs.at(-1)?.nodes ?? {}).flatMap(
+    (node) => node.allowedTools,
+  );
+  assert.equal(graphTools.includes("code_workspace_create_file"), true);
+  assert.equal(graphTools.includes("code_workspace_patch"), false);
+});
+
 test("explicit workspace CRUD lifecycle is planned once and reaches the model", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const traceMessages: string[] = [];
