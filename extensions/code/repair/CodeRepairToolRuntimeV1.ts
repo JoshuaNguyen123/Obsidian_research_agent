@@ -106,6 +106,8 @@ export interface CodeRepairToolRuntimeDependenciesV1 {
   proofReader: CodeProofReaderV1;
   /** Commit-only fixed-argv gateway with Git object readback. */
   commitGateway: VerifiedCommitGatewayV1;
+  /** Production may recover the request id from one exact durable root/workspace checkpoint. */
+  hostResolvesDurableScope?: boolean;
   now?: () => Date;
 }
 
@@ -542,8 +544,12 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
   ): Promise<PreparedActionResultV1> {
     let checkpoint: CodeRepairCheckpointV1 | null = null;
     try {
-      const parsed = parseCommitArgs(args);
-      assertContextScope(parsed.scope, context);
+      const parsedInput = parseCommitArgs(args);
+      assertContextScope(parsedInput.scope, context);
+      const parsed = {
+        ...parsedInput,
+        scope: await this.resolveCommitScope(parsedInput.scope),
+      };
       const resolved = await this.resolveScope(parsed.scope, context);
       checkpoint = await this.requiredCheckpoint(parsed.scope);
       if (checkpoint.terminal) {
@@ -1262,6 +1268,29 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     }
     assertCheckpointScope(checkpoint, scope);
     return checkpoint;
+  }
+
+  private async resolveCommitScope(
+    scope: CodeRepairScopeArgsV1,
+  ): Promise<CodeRepairScopeArgsV1> {
+    const exact = await this.checkpoints.load(checkpointId(scope));
+    if (exact || this.dependencies.hostResolvesDurableScope !== true) {
+      return scope;
+    }
+    const candidates = await this.checkpoints.findByMissionWorkspace({
+      runId: scope.runId,
+      workspaceId: scope.workspaceId,
+    });
+    if (candidates.length > 1) {
+      throw new CodeRepairToolRuntimeErrorV1(
+        "repair_checkpoint_ambiguous",
+        "Multiple durable repair checkpoints match this mission workspace; the host cannot select one safely.",
+      );
+    }
+    const recovered = candidates[0];
+    return recovered
+      ? { ...scope, requestId: recovered.request.id }
+      : scope;
   }
 
   private async requiredValidation(

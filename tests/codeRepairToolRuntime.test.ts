@@ -309,6 +309,80 @@ test("unchanged fast failure stops at cycle two and persists the blocker", async
   assert.equal(harness.gateway.commitCalls, 0);
 });
 
+test("production commit scope recovers one durable request id from the trusted mission workspace", async (t) => {
+  const harness = await createHarness(t, "src/index.ts", false, true);
+  await recordPassingFast(harness);
+  const targeted = await validation(
+    "targeted", "targeted-sandbox", true, "targeted-host-scope",
+    0, true, null, harness.validationBinding,
+  );
+  const full = await validation(
+    "full", "full-sandbox", true, "full-host-scope",
+    60_000, true, null, harness.validationBinding,
+  );
+  harness.validations.set(targeted.id, targeted);
+  harness.validations.set(full.id, full);
+  const modelArgs = commitArgs(
+    1,
+    harness.diffFingerprint,
+    targeted.id,
+    full.id,
+  );
+  modelArgs.requestId = "model-transcribed-request-alias";
+
+  const prepared = await harness.handlers.prepareVerifiedCommit(
+    modelArgs,
+    context(),
+  );
+
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const scope = prepared.action.normalizedArgs.scope as Record<string, unknown>;
+  assert.equal(scope.runId, SCOPE.runId);
+  assert.equal(scope.workspaceId, SCOPE.workspaceId);
+  assert.equal(scope.requestId, SCOPE.requestId);
+});
+
+test("production commit scope fails closed when a mission workspace has multiple repair checkpoints", async (t) => {
+  const harness = await createHarness(t, "src/index.ts", false, true);
+  await recordPassingFast(harness);
+  const secondScope = { ...SCOPE, requestId: "request-2" };
+  const secondBinding = {
+    ...harness.validationBinding,
+    requestId: secondScope.requestId,
+  };
+  const secondFast = await validation(
+    "fast", "fast-sandbox-2", true, "fast-pass-2",
+    2_000, true, null, secondBinding,
+  );
+  harness.validations.set(secondFast.id, secondFast);
+  const secondPrepared = await harness.handlers.prepareCycleRecord(
+    {
+      ...cycleArgs(secondFast, 1, 0),
+      ...secondScope,
+    },
+    context(),
+  );
+  assert.equal(secondPrepared.ok, true);
+  if (!secondPrepared.ok) return;
+  await harness.handlers.executePreparedCycleRecord(
+    secondPrepared.action,
+    authorizedContext(secondPrepared.action),
+  );
+
+  const prepared = await harness.handlers.prepareVerifiedCommit(
+    {
+      ...commitArgs(1, harness.diffFingerprint, "targeted", "full"),
+      requestId: "unknown-request",
+    },
+    context(),
+  );
+
+  assert.equal(prepared.ok, false);
+  if (!prepared.ok) assert.equal(prepared.error.code, "repair_checkpoint_ambiguous");
+  assert.equal(harness.gateway.commitCalls, 0);
+});
+
 test("production repair preparation derives checkpoint sequence and latest scoped validation proof", async (t) => {
   const harness = await createHarness(t, "src/index.ts");
   const fast = await validation(
@@ -395,6 +469,7 @@ async function createHarness(
   t: test.TestContext,
   changedPath: string,
   includeWorkflow = false,
+  hostResolvesDurableScope = false,
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-repair-runtime-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -532,6 +607,7 @@ async function createHarness(
       },
     },
     commitGateway: gateway,
+    hostResolvesDurableScope,
     now: () => NOW,
   });
   return state;

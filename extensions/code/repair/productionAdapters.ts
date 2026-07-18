@@ -64,6 +64,31 @@ export class CallbackCodeRepairCheckpointStoreV1
     });
   }
 
+  findByMissionWorkspace(input: {
+    runId: string;
+    workspaceId: string;
+  }): Promise<CodeRepairCheckpointV1[]> {
+    const runId = boundedIdentifier(input.runId, "repair mission id", 128);
+    const workspaceId = boundedIdentifier(
+      input.workspaceId,
+      "repair workspace id",
+      128,
+    );
+    return this.serialized(async () => {
+      const namespace = await normalizeCheckpointNamespace(
+        await this.persistence.readNamespace(),
+      );
+      return Object.values(namespace.checkpoints)
+        .filter(
+          (checkpoint) =>
+            checkpoint.request.runId === runId &&
+            checkpoint.request.worktree.id === workspaceId,
+        )
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((checkpoint) => cloneJson(checkpoint));
+    });
+  }
+
   save(
     checkpointInput: CodeRepairCheckpointV1,
     expectedSequence: number | null,

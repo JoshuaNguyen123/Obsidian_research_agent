@@ -1299,6 +1299,7 @@ export class CodeExtensionRuntimeV2 {
         checkpointPersistence: this.checkpointPersistence(),
         proofReader: proof,
         commitGateway,
+        hostResolvesDurableScope: true,
         now: this.now,
       });
       this.validationReceiptRegistry = validationReceiptRegistry;
