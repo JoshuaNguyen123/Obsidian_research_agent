@@ -749,6 +749,14 @@ export class CodeExtensionRuntimeV2 {
         "The trusted workspace has no hash-bound files in the selected project scope.",
       );
     }
+    const sandboxStatus = await this.probeConfiguredSandboxProviders();
+    if (!sandboxStatus.executionAvailable) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_provider_unavailable",
+        sandboxStatus.blocker?.message ??
+          "No sandbox provider passed the fresh preparation boundary probe.",
+      );
+    }
     return {
       profile,
       projectId: project.id,
@@ -758,7 +766,7 @@ export class CodeExtensionRuntimeV2 {
     };
   }
 
-  /** User/settings command only. It never receives a model-supplied command. */
+  /** Host-controlled boundary probe. It never receives a model-supplied command. */
   async probeConfiguredSandboxProviders(signal?: AbortSignal): Promise<SandboxCapabilityStatusV2> {
     this.assertInitialized();
     const status = await this.requireSandboxManager().probeProviders(signal);

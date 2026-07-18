@@ -442,9 +442,11 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
       now: () => new Date(NOW),
       randomId: incrementingId(),
     });
+    let sandboxProbeCount = 0;
     const queueSandboxRunner: SandboxCommandRunnerV2 = {
       async run(spec) {
         assert.equal(spec.purpose, "boundary_probe");
+        sandboxProbeCount += 1;
         return {
           exitCode: 0,
           stdout: JSON.stringify({
@@ -481,6 +483,7 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
       runtimeRoot: null,
     });
     await runtime.probeConfiguredSandboxProviders();
+    assert.equal(sandboxProbeCount, 1);
     await manager.registerTrustedRepositoryWorkspace({
       workspaceId: "fixture-workspace",
       ownerRunId: "fixture-run",
@@ -505,6 +508,11 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
     const hostPreparation = await runtime.resolveSandboxPreparationInput(
       "validation_fast",
       manifest.workspaceId,
+    );
+    assert.equal(
+      sandboxProbeCount,
+      2,
+      "trusted preparation must re-attest the configured sandbox after a restart or stale status",
     );
     assert.equal(hostPreparation.profile.key, profile.key);
     assert.equal(hostPreparation.projectId, "root");
