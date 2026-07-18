@@ -21,6 +21,7 @@ import {
 import { fingerprintCanonicalJson } from "../../src/agent/queue/fingerprint";
 import { parseRepositoryProfileRegistry } from "../../src/agent/repositories/RepositoryProfile";
 import {
+  createInitialCodeRuntimeStateV2,
   parseCodeRuntimeStateV2,
 } from "../../extensions/code/CodeExtensionRuntimeV2";
 import { migrateRepositoryProfileV1 } from "../../extensions/code/repositories";
@@ -378,10 +379,12 @@ function seedCodeRuntimeRepositoryProfiles(
   runtimeValue: unknown,
   registryValue: unknown,
 ): unknown {
-  const runtime = parseCodeRuntimeStateV2(runtimeValue);
+  const now = new Date().toISOString();
+  const runtime = runtimeValue === undefined || runtimeValue === null
+    ? createInitialCodeRuntimeStateV2(now)
+    : parseCodeRuntimeStateV2(runtimeValue);
   const registry = parseRepositoryProfileRegistry(registryValue);
   const repositoryProfiles = { ...runtime.repositoryProfiles };
-  const now = new Date().toISOString();
   for (const [key, source] of Object.entries(registry.profiles)) {
     repositoryProfiles[key] = {
       version: 2,
