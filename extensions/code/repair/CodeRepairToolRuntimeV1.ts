@@ -205,6 +205,15 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       scope = parsed.scope;
       assertContextScope(scope, context);
       const resolved = await this.resolveScope(scope, context);
+      const validation = parsed.validationReceiptId === null
+        ? await this.latestValidation(scope, "fast")
+        : await this.requiredValidation(scope, parsed.validationReceiptId, "fast");
+      assertValidationBoundToWorkspace(
+        validation,
+        resolved.manifest,
+        resolved.profile.key,
+        scope,
+      );
       checkpoint = await this.loadOrCreateCheckpoint(
         scope,
         resolved.request,
@@ -225,15 +234,6 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
           `Checkpoint sequence is ${checkpoint.sequence}, not ${parsed.checkpointSequence}.`,
         );
       }
-      const validation = parsed.validationReceiptId === null
-        ? await this.latestValidation(scope, "fast")
-        : await this.requiredValidation(scope, parsed.validationReceiptId, "fast");
-      assertValidationBoundToWorkspace(
-        validation,
-        resolved.manifest,
-        resolved.profile.key,
-        scope,
-      );
       const hostCycleFingerprint = validation.failureFingerprint ?? validation.fingerprint;
       if (
         parsed.cycleFingerprint !== null &&
@@ -1274,20 +1274,30 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     scope: CodeRepairScopeArgsV1,
   ): Promise<CodeRepairScopeArgsV1> {
     const exact = await this.checkpoints.load(checkpointId(scope));
-    if (exact || this.dependencies.hostResolvesDurableScope !== true) {
+    if (this.dependencies.hostResolvesDurableScope !== true) {
       return scope;
     }
+    if (exact && hasVerifiedPassingRepairCycle(exact)) return scope;
     const candidates = await this.checkpoints.findByMissionWorkspace({
       runId: scope.runId,
       workspaceId: scope.workspaceId,
     });
-    if (candidates.length > 1) {
+    const provenCandidates = candidates.filter(hasVerifiedPassingRepairCycle);
+    if (provenCandidates.length > 1) {
       throw new CodeRepairToolRuntimeErrorV1(
         "repair_checkpoint_ambiguous",
-        "Multiple durable repair checkpoints match this mission workspace; the host cannot select one safely.",
+        "Multiple verified passing repair checkpoints match this mission workspace; the host cannot select one safely.",
       );
     }
-    const recovered = candidates[0];
+    const recovered = provenCandidates[0] ?? (exact ? exact : candidates.length === 1
+      ? candidates[0]
+      : null);
+    if (!recovered && candidates.length > 1) {
+      throw new CodeRepairToolRuntimeErrorV1(
+        "repair_checkpoint_ambiguous",
+        "Multiple unproven repair checkpoints match this mission workspace; the host cannot select one safely.",
+      );
+    }
     return recovered
       ? { ...scope, requestId: recovered.request.id }
       : scope;
@@ -1513,6 +1523,25 @@ export class CodeRepairToolRuntimeErrorV1 extends Error {
     super(message);
     this.name = "CodeRepairToolRuntimeErrorV1";
   }
+}
+
+function hasVerifiedPassingRepairCycle(
+  checkpoint: CodeRepairCheckpointV1,
+): boolean {
+  if (checkpoint.terminal?.status === "blocked") return false;
+  return checkpoint.attempts.some((attempt) => {
+    const validation = attempt.fastValidation;
+    const receipt = attempt.cycleReceipt;
+    return Boolean(
+      validation?.status === "passed" &&
+      receipt?.outcome === "passed" &&
+      receipt.requestId === checkpoint.request.id &&
+      receipt.runId === checkpoint.request.runId &&
+      receipt.workspaceId === checkpoint.request.worktree.id &&
+      receipt.validationReceiptId === validation.id &&
+      receipt.validationFingerprint === validation.fingerprint,
+    );
+  });
 }
 
 function parseCycleArgs(args: Record<string, unknown>): {

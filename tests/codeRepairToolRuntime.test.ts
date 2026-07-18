@@ -10,6 +10,8 @@ import type {
 } from "@agentic-researcher/core-api";
 import { sha256Fingerprint } from "../packages/headless-runtime/src/canonicalize";
 import {
+  CallbackCodeRepairCheckpointStoreV1,
+  codeRepairCheckpointIdV1,
   createCodeRepairToolRuntimeV1,
   type ArtifactHashReadbackV1,
   type CallbackCheckpointPersistenceV1,
@@ -17,6 +19,7 @@ import {
   type CodeCommitResultV1,
   type CodeDiffFileV1,
   type CodeDiffReceiptV1,
+  type CodeRepairCheckpointV1,
   type CodeRepairCheckpointNamespaceV1,
   type CodeValidationReceiptV1,
   type NormalizedCodeRepairRequestV1,
@@ -343,6 +346,70 @@ test("production commit scope recovers one durable request id from the trusted m
   assert.equal(scope.requestId, SCOPE.requestId);
 });
 
+test("rejected cycle preparation does not create an unproven repair checkpoint", async (t) => {
+  const harness = await createHarness(t, "src/index.ts", false, true);
+  const prepared = await harness.handlers.prepareCycleRecord(
+    { ...SCOPE, requestId: "unproven-model-alias" },
+    context(),
+  );
+
+  assert.equal(prepared.ok, false);
+  if (!prepared.ok) assert.equal(prepared.error.code, "validation_receipt_missing");
+  const namespace = await harness.checkpointPersistence.readNamespace();
+  assert.equal(Object.keys(namespace?.checkpoints ?? {}).length, 0);
+});
+
+test("production commit ignores an initialized alias beside one verified passing checkpoint", async (t) => {
+  const harness = await createHarness(t, "src/index.ts", false, true);
+  await recordPassingFast(harness);
+  const namespace = await harness.checkpointPersistence.readNamespace();
+  const source = Object.values(namespace?.checkpoints ?? {})[0];
+  assert.ok(source);
+  const request = {
+    ...source.request,
+    id: "unproven-model-alias",
+  };
+  const initializedAlias: CodeRepairCheckpointV1 = {
+    ...source,
+    id: codeRepairCheckpointIdV1(request),
+    request,
+    requestFingerprint: await sha256Fingerprint(request),
+    sequence: 0,
+    stage: "initialized",
+    attempts: [],
+    failureHistory: [],
+    validationHistory: [],
+    approvalHistory: [],
+  };
+  const store = new CallbackCodeRepairCheckpointStoreV1(
+    harness.checkpointPersistence,
+  );
+  await store.save(initializedAlias, null);
+
+  const targeted = await validation(
+    "targeted", "targeted-sandbox", true, "targeted-canonical-scope",
+    0, true, null, harness.validationBinding,
+  );
+  const full = await validation(
+    "full", "full-sandbox", true, "full-canonical-scope",
+    60_000, true, null, harness.validationBinding,
+  );
+  harness.validations.set(targeted.id, targeted);
+  harness.validations.set(full.id, full);
+  const prepared = await harness.handlers.prepareVerifiedCommit(
+    {
+      ...commitArgs(1, harness.diffFingerprint, targeted.id, full.id),
+      requestId: "another-model-alias",
+    },
+    context(),
+  );
+
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const scope = prepared.action.normalizedArgs.scope as Record<string, unknown>;
+  assert.equal(scope.requestId, SCOPE.requestId);
+});
+
 test("production commit scope fails closed when a mission workspace has multiple repair checkpoints", async (t) => {
   const harness = await createHarness(t, "src/index.ts", false, true);
   await recordPassingFast(harness);
@@ -560,6 +627,7 @@ async function createHarness(
     validationBinding,
     gateway,
     manager,
+    checkpointPersistence: persistence,
     handlers: null as unknown as ReturnType<typeof createCodeRepairToolRuntimeV1>,
   };
   state.handlers = createCodeRepairToolRuntimeV1({
