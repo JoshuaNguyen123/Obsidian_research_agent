@@ -256,6 +256,10 @@ const MAX_STAGED_FILE_BYTES = 2_000_000;
 const MAX_STAGED_TOTAL_BYTES = 10_000_000;
 const MAX_ARTIFACT_BYTES = 10_000_000;
 const PROBE_TIMEOUT_MS = 30_000;
+// A dedicated WSL distribution may need to cold-start before bwrap can run the
+// fixed boundary command. Keep the ordinary provider budget tight, but allow
+// WSL2 enough time to produce fresh attestation under normal workstation load.
+const WSL2_PROBE_TIMEOUT_MS = 60_000;
 
 /**
  * Sandbox-only execution boundary. A runner must be injected explicitly; this
@@ -291,11 +295,14 @@ export class SandboxManagerV2 {
   /** Read cached health without starting a process or mutating provider state. */
   readStatus(): SandboxCapabilityStatusV2 {
     const selected = this.selectedProvider();
+    const providerDiagnostic = summarizeUnavailableProviders(this.statuses);
     const statusBlocker = selected
       ? null
       : blocker(
           "sandbox_provider_unavailable",
-          "No sandbox provider has passed its boundary probe.",
+          providerDiagnostic
+            ? `No sandbox provider has passed its boundary probe. ${providerDiagnostic}`
+            : "No sandbox provider has passed its boundary probe.",
           "Install or repair Docker, Podman, the dedicated WSL2 sandbox, or bubblewrap, then run the explicit boundary probe.",
           true,
         );
@@ -894,7 +901,11 @@ function buildProviderCommand(
     // Action environment is passed only to the guest through fixed provider
     // arguments above; it is never inherited by the host provider process.
     env: {},
-    timeoutMs: purpose === "boundary_probe" ? PROBE_TIMEOUT_MS : action!.resources.timeoutMs,
+    timeoutMs: purpose === "boundary_probe"
+      ? provider.kind === "wsl2"
+        ? WSL2_PROBE_TIMEOUT_MS
+        : PROBE_TIMEOUT_MS
+      : action!.resources.timeoutMs,
     stdinMode: purpose === "boundary_probe" ? "none" : "verified_staging_bundle",
     stdoutMode: purpose === "boundary_probe" ? "boundary_probe_json" : "artifact_bundle",
   };
@@ -1155,6 +1166,18 @@ function safeDiagnostic(error: unknown): string {
   return message
     .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
     .replace(/(?:token|secret|password|authorization|cookie|credential|api[_-]?key)\s*[=:]\s*\S+/gi, "credential=[REDACTED]")
+    .slice(0, 1_000);
+}
+
+function summarizeUnavailableProviders(
+  statuses: readonly SandboxProviderStatusV2[],
+): string {
+  return statuses
+    .filter((status) => status.state !== "verified" && status.state !== "unprobed")
+    .map((status) =>
+      `${status.provider} ${status.state}: ${safeDiagnostic(status.diagnostic).slice(0, 240)}`,
+    )
+    .join("; ")
     .slice(0, 1_000);
 }
 

@@ -62,6 +62,11 @@ test("SandboxManager stays editing-only until a provider passes its explicit bou
   const probed = await manager.probeProviders();
   assert.equal(probed.mode, "editing_only");
   assert.equal(calls, 1);
+  assert.match(
+    probed.blocker?.message ?? "",
+    /docker unavailable: Probe exited 1\./u,
+  );
+  assert.ok(probed.providers[0]?.checkedAt, "failed probes retain an evidence timestamp");
   const prepared = await manager.prepareExecution(prepareInput());
   assert.equal(prepared.status, "blocked");
   if (prepared.status === "blocked") {
@@ -261,6 +266,11 @@ test("all provider command specs are shell-free, bounded, and omit host/root/soc
     if (prepared.status !== "prepared") continue;
     const probe = buildSandboxProbeCommandV2(provider);
     const execute = buildSandboxExecutionCommandV2(provider, prepared.action);
+    assert.equal(
+      probe.timeoutMs,
+      provider.kind === "wsl2" ? 60_000 : 30_000,
+      "WSL2 cold-start attestation has a bounded provider-specific budget",
+    );
     assert.deepEqual(execute.env, {}, "action environment must not be inherited by the host provider process");
     assert.ok(inSequence(execute.args, ["--command-cwd", "."]));
     for (const spec of [probe, execute]) {
