@@ -52,6 +52,8 @@ export interface CodeExecutionContributionFactoryOptionsV2 {
     profile: RepositoryProfileV2;
     projectId: string;
     commandId: string;
+    workspaceId?: string;
+    repairRequestId?: string | null;
     workspaceManifestFingerprint: string;
     stagingManifest: SandboxPrepareInputV2["stagingManifest"];
   }>;
@@ -231,8 +233,11 @@ function preparedSandboxContribution(
           purpose,
           projectId: hostProof?.projectId ?? normalized.projectId!,
           commandId: hostProof?.commandId ?? normalized.commandId!,
-          workspaceId: normalized.workspaceId,
-          repairRequestId: normalized.repairRequestId,
+          workspaceId: hostProof?.workspaceId ?? normalized.workspaceId,
+          repairRequestId:
+            hostProof?.repairRequestId !== undefined
+              ? hostProof.repairRequestId
+              : normalized.repairRequestId,
           workspaceManifestFingerprint:
             hostProof?.workspaceManifestFingerprint ?? normalized.workspaceManifestFingerprint!,
           stagingManifest: hostProof?.stagingManifest ?? normalized.stagingManifest!,

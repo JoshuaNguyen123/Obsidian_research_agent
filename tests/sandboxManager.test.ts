@@ -384,11 +384,13 @@ test("code contribution factory replaces compatibility execution tools with prep
     },
     async resolvePreparationInput(input) {
       assert.equal(input.purpose, "validation_fast");
-      assert.equal(input.workspaceId, fixture.workspaceId);
+      assert.equal(input.workspaceId, "model-workspace-alias");
       return {
         profile: fixture.profile,
         projectId: fixture.projectId,
         commandId: fixture.commandId,
+        workspaceId: fixture.workspaceId,
+        repairRequestId: "request-1",
         workspaceManifestFingerprint: fixture.workspaceManifestFingerprint,
         stagingManifest: fixture.stagingManifest,
       };
@@ -474,8 +476,8 @@ test("code contribution factory replaces compatibility execution tools with prep
   }
   const prepared = await validation.prepare!(
     {
-      workspaceId: fixture.workspaceId,
-      repairRequestId: "request-1",
+      workspaceId: "model-workspace-alias",
+      repairRequestId: "model-request-alias",
       environment: fixture.environment,
     },
     context(),

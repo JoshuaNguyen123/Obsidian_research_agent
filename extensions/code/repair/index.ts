@@ -21,6 +21,11 @@ export {
   type CodeRepairToolHandlersV1,
 } from "./contributions";
 export {
+  bindForegroundRepairScopeV1,
+  resolveForegroundRepairScopeV1,
+  type ForegroundRepairScopeV1,
+} from "./ForegroundRepairScopeV1";
+export {
   CallbackCodeRepairCheckpointStoreV1,
   CommitOnlyVerifiedCommitGatewayV1,
   ProductionAdapterErrorV1,

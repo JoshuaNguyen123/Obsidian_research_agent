@@ -71,6 +71,7 @@ import {
   SpawnFixedArgvGitRunnerV1,
   createCodeRepairToolContributionsV1,
   createCodeRepairToolRuntimeV1,
+  resolveForegroundRepairScopeV1,
   createFixedArgvVerifiedCommitGatewayV1,
   normalizeCodeRepairRequestV1,
   parseCodeRepairCheckpointV1,
@@ -311,8 +312,8 @@ export class CodeExtensionRuntimeV2 {
     const execution = createCodeExecutionContributionsV2({
       sandboxManager,
       getProfile: (profileKey) => this.getRepositoryProfile(profileKey),
-      resolvePreparationInput: ({ purpose, workspaceId }) =>
-        this.resolveSandboxPreparationInput(purpose, workspaceId),
+      resolvePreparationInput: ({ purpose, workspaceId, context }) =>
+        this.resolveSandboxPreparationInput(purpose, workspaceId, context),
       resolveExecutionInput: (_action, sandboxAction, context) =>
         this.resolveSandboxExecutionInput(sandboxAction, context),
       observeValidationReceipt: this.validationReceiptRegistry
@@ -697,15 +698,22 @@ export class CodeExtensionRuntimeV2 {
   async resolveSandboxPreparationInput(
     purpose: PreparedSandboxActionV2["purpose"],
     workspaceId: string,
+    context?: ScopedExtensionContextV1,
   ): Promise<{
     profile: RepositoryProfileV2;
     projectId: string;
     commandId: string;
+    workspaceId: string;
+    repairRequestId?: string | null;
     workspaceManifestFingerprint: string;
     stagingManifest: Array<{ path: string; sha256: string; bytes: number }>;
   }> {
     this.assertInitialized();
-    const manifest = await this.workspaceManager.loadManifest(workspaceId);
+    const foregroundScope = purpose.startsWith("validation_")
+      ? resolveForegroundRepairScopeV1(context?.originalPrompt, workspaceId)
+      : null;
+    const resolvedWorkspaceId = foregroundScope?.workspaceId ?? workspaceId;
+    const manifest = await this.workspaceManager.loadManifest(resolvedWorkspaceId);
     const profileKey = manifest.repositoryBinding?.profileKey;
     const profile = profileKey ? await this.getRepositoryProfile(profileKey) : null;
     if (
@@ -761,6 +769,8 @@ export class CodeExtensionRuntimeV2 {
       profile,
       projectId: project.id,
       commandId: command.id,
+      workspaceId: resolvedWorkspaceId,
+      ...(foregroundScope === null ? {} : { repairRequestId: foregroundScope.requestId }),
       workspaceManifestFingerprint: manifest.hashes.indexFingerprint,
       stagingManifest,
     };

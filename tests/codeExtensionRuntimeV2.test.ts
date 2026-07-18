@@ -517,6 +517,8 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
     assert.equal(hostPreparation.profile.key, profile.key);
     assert.equal(hostPreparation.projectId, "root");
     assert.equal(hostPreparation.commandId, "root-full-1");
+    assert.equal(hostPreparation.workspaceId, manifest.workspaceId);
+    assert.equal(hostPreparation.repairRequestId, undefined);
     assert.equal(
       hostPreparation.workspaceManifestFingerprint,
       manifest.hashes.indexFingerprint,
@@ -526,6 +528,17 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
       sha256: readback.sha256,
       bytes: readback.bytes,
     }]);
+    const foregroundPreparation = await runtime.resolveSandboxPreparationInput(
+      "validation_fast",
+      "model-workspace-alias",
+      {
+        ...extensionContext(),
+        originalPrompt:
+          `Reflect against the issue using durable workspace ${manifest.workspaceId} and repair request fixture-request. Validate it.`,
+      },
+    );
+    assert.equal(foregroundPreparation.workspaceId, manifest.workspaceId);
+    assert.equal(foregroundPreparation.repairRequestId, "fixture-request");
     const targetedPreparation = await runtime.resolveSandboxPreparationInput(
       "validation_targeted",
       manifest.workspaceId,

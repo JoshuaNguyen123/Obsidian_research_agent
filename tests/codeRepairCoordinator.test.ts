@@ -10,6 +10,7 @@ import {
   classifyProtectedControlChanges,
   codeRepairCheckpointIdV1,
   createCodeRepairToolContributionsV1,
+  resolveForegroundRepairScopeV1,
   type ArtifactHashReadbackV1,
   type CodeDiffReceiptV1,
   type CodeRepairCheckpointStoreV1,
@@ -58,14 +59,19 @@ test("exports the fixed AgentRunner tool catalog with fail-closed commit prepara
   assert.equal(contributions[2].tool.descriptor.durability.readback, "required");
 });
 
-test("production repair contributions bind model run aliases to the host mission identity", async () => {
-  const observed: Array<{ operation: string; runId: string }> = [];
+test("production repair contributions bind model scope aliases to the exact foreground mission identity", async () => {
+  const observed: Array<{
+    operation: string;
+    runId: string;
+    workspaceId: string;
+    requestId: string;
+  }> = [];
   const unavailable = async () => {
     throw new Error("not used");
   };
   const handlers = {
-    async readStatus(args: { runId: string }) {
-      observed.push({ operation: "status", runId: args.runId });
+    async readStatus(args: { runId: string; workspaceId: string; requestId: string }) {
+      observed.push({ operation: "status", ...args });
       return {
         ...args,
         workspaceId: "workspace-1",
@@ -83,13 +89,23 @@ test("production repair contributions bind model run aliases to the host mission
       };
     },
     async prepareCycleRecord(args: Record<string, unknown>) {
-      observed.push({ operation: "cycle", runId: String(args.runId) });
+      observed.push({
+        operation: "cycle",
+        runId: String(args.runId),
+        workspaceId: String(args.workspaceId),
+        requestId: String(args.requestId),
+      });
       return { ok: false as const, code: "expected", message: "captured" };
     },
     executePreparedCycleRecord: unavailable,
     reconcileCycleRecord: unavailable,
     async prepareVerifiedCommit(args: Record<string, unknown>) {
-      observed.push({ operation: "commit", runId: String(args.runId) });
+      observed.push({
+        operation: "commit",
+        runId: String(args.runId),
+        workspaceId: String(args.workspaceId),
+        requestId: String(args.requestId),
+      });
       return { ok: false as const, code: "expected", message: "captured" };
     },
     executePreparedVerifiedCommit: unavailable,
@@ -104,23 +120,70 @@ test("production repair contributions bind model run aliases to the host mission
     missionId: "run-2026-07-18t16-48-26.022z-host",
     rootMissionId: "run-2026-07-18t16-00-00.000z-root",
     operationId: "repair-host-scope-test",
+    originalPrompt:
+      "Implement the accepted issue using durable workspace workspace-1 and repair request request-1. Validate and commit it.",
     abortSignal: new AbortController().signal,
     now: () => new Date(NOW),
     reportProgress() {},
   };
   const args = {
     runId: "run-2026-07-18T16-48-26.022Z-display",
-    workspaceId: "workspace-1",
-    requestId: "request-1",
+    workspaceId: "model-workspace-alias",
+    requestId: "model-request-alias",
   };
   await contributions[0].tool.execute(args, context);
   await contributions[1].tool.prepare!(args, context);
   await contributions[2].tool.prepare!(args, context);
   assert.deepEqual(observed, [
-    { operation: "status", runId: context.rootMissionId },
-    { operation: "cycle", runId: context.rootMissionId },
-    { operation: "commit", runId: context.rootMissionId },
+    {
+      operation: "status",
+      runId: context.rootMissionId,
+      workspaceId: "workspace-1",
+      requestId: "request-1",
+    },
+    {
+      operation: "cycle",
+      runId: context.rootMissionId,
+      workspaceId: "workspace-1",
+      requestId: "request-1",
+    },
+    {
+      operation: "commit",
+      runId: context.rootMissionId,
+      workspaceId: "workspace-1",
+      requestId: "request-1",
+    },
   ]);
+});
+
+test("foreground repair scope extraction accepts canonical mission forms and rejects ambiguity", () => {
+  assert.deepEqual(
+    resolveForegroundRepairScopeV1(
+      "Reflect against the issue using durable workspace du06-workspace-1 and repair request du06-request-1. Add files.",
+      "model-alias",
+    ),
+    { workspaceId: "du06-workspace-1", requestId: "du06-request-1" },
+  );
+  assert.deepEqual(
+    resolveForegroundRepairScopeV1(
+      "Create repository workspace du03-workspace-1 and use one repair request id du03-request-1 for every validation and commit call.",
+    ),
+    { workspaceId: "du03-workspace-1", requestId: "du03-request-1" },
+  );
+  assert.deepEqual(
+    resolveForegroundRepairScopeV1(
+      "Execute explicit code repair request canonical-request in trusted workspace canonical-workspace. Use repairRequestId canonical-request for every validation, repair-cycle, status, and commit call.",
+    ),
+    { workspaceId: "canonical-workspace", requestId: "canonical-request" },
+  );
+  assert.throws(
+    () => resolveForegroundRepairScopeV1(
+      "Using durable workspace same-workspace and repair request request-one. Using durable workspace same-workspace and repair request request-two.",
+      "same-workspace",
+    ),
+    /ambiguous/iu,
+  );
+  assert.equal(resolveForegroundRepairScopeV1("Implement and validate the code."), null);
 });
 
 test("repairs a later cycle, validates fresh, and emits only a readback-verified commit", async () => {

@@ -11,6 +11,7 @@ import type {
   CodeRepairCycleReceiptV1,
   VerifiedLocalCommitReceiptV1,
 } from "./types";
+import { bindForegroundRepairScopeV1 } from "./ForegroundRepairScopeV1";
 
 export const CODE_REPAIR_STATUS_TOOL = "code_repair_status" as const;
 export const CODE_REPAIR_RECORD_CYCLE_TOOL = "code_repair_record_cycle" as const;
@@ -118,7 +119,7 @@ export function createCodeRepairToolContributionsV1(
           return handlers.readStatus(
             normalizeScopeArgs(
               hostResolvesDurableProof
-                ? bindRunIdToMissionContext(args, context)
+                ? bindForegroundRepairScopeV1(args, context)
                 : args,
             ),
             context,
@@ -193,7 +194,7 @@ export function createCodeRepairToolContributionsV1(
         },
         prepare: (args, context) => handlers.prepareCycleRecord(
           hostResolvesDurableProof
-            ? bindRunIdToMissionContext(args, context)
+            ? bindForegroundRepairScopeV1(args, context)
             : args,
           context,
         ),
@@ -268,7 +269,7 @@ export function createCodeRepairToolContributionsV1(
         },
         prepare: (args, context) => handlers.prepareVerifiedCommit(
           hostResolvesDurableProof
-            ? bindRunIdToMissionContext(args, context)
+            ? bindForegroundRepairScopeV1(args, context)
             : args,
           context,
         ),
@@ -284,17 +285,6 @@ export function createCodeRepairToolContributionsV1(
       },
     },
   ];
-}
-
-function bindRunIdToMissionContext(
-  args: Record<string, unknown>,
-  context: ScopedExtensionContextV1,
-): Record<string, unknown> {
-  const runId = context.rootMissionId?.trim() || context.missionId?.trim();
-  if (!runId) {
-    throw new Error("Production code repair tools require a host mission identity.");
-  }
-  return { ...args, runId };
 }
 
 function contributionDescriptor(id: string, displayName: string) {
