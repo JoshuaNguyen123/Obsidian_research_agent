@@ -77,7 +77,7 @@ interface ProtectedCredentialOwnership {
   verifyPreservedLinear: boolean;
 }
 
-test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independently cleans providers", async ({}, testInfo) => {
+test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, and retains redacted Linear proof", async ({}, testInfo) => {
   test.setTimeout(120 * 60_000);
   const protectedModel = getE2EAiConfig();
   expect(process.env.E2E_MODEL_PROVIDER?.trim() || "ollama").toBe("ollama");
@@ -156,7 +156,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
         },
         {
           command: "python3",
-          args: ["scripts/verify_project.py"],
+          args: ["-m", "scripts.verify_project"],
           label: "Python protected checkers contract",
         },
       ],
@@ -178,6 +178,10 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
   let pullRequestNumber: number | null = null;
   let publishedBranch: string | null = null;
   let publishedSha: string | null = null;
+  let linearEvidenceTeamId: string | null = null;
+  let retainedLinearEvidence:
+    | { id: string; identifier: string; url: string }
+    | null = null;
   let credentialOwnership: ProtectedCredentialOwnership = {
     linear: false,
     github: false,
@@ -190,6 +194,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
   let approvalCount = 0;
   let modelCallCount = 0;
   let toolCallCount = 0;
+  let acceptanceRecorded = false;
 
   try {
     harness = await startRealAiHarness(
@@ -238,6 +243,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       normalizeLinearDestinationName(LINEAR_EVIDENCE_DESTINATION_NAME),
     );
     expect(connection.linearTeamId).toBeTruthy();
+    linearEvidenceTeamId = connection.linearTeamId;
     if (requestedLinearTeamId) {
       expect(connection.linearTeamId).toBe(requestedLinearTeamId);
     }
@@ -285,7 +291,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       `Turn that accepted research into one Linear initiative, one project, and exactly one implementation issue titled Build a simple Python checkers game. Use logical keys du06-initiative-${suffix}, du06-project-${suffix}, and du06-issue-${suffix}; the issue has no dependencies, uses work-item fingerprint ${issueFingerprint}, and binds the accepted artifact fingerprint and exact source note path.`,
       "The implementation issue acceptance criteria must require an 8 by 8 board with twelve men per side; constants RED, BLACK, RED_KING, and BLACK_KING; CheckersGame(board, turn), CheckersGame.initial(), legal_moves(), apply_move(start, end), and winner(); red moving upward; mandatory captures; same-piece multi-jumps before the turn changes; capture removal; back-rank promotion; kings moving both directions; no-piece or no-legal-move wins; and a runnable CLI.",
       `After creating the hierarchy, explicitly call linear_get_issue for the returned implementation issue. Read back its title, description, acceptance criteria, and ${notePath} binding before opening the code workspace.`,
-      `Reflect against both that Linear issue readback and the notebook while implementing the exact trusted repository ${fixture.root}, using durable workspace ${workspaceId} and repair request ${requestId}. Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py. Leave the protected scripts directory unchanged.`,
+      `Reflect against both that Linear issue readback and the notebook while implementing the exact trusted repository ${fixture.root}, using durable workspace ${workspaceId} and repair request ${requestId}. Read the protected scripts/verify_project.py contract before implementation. Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py. Leave the protected scripts directory unchanged.`,
       `The README must include marker ${marker}, commands python -m checkers.cli and python -m unittest, the exact heading ## Research and Linear traceability, the exact Obsidian path ${notePath}, and the exact Linear issue identifier or URL returned by linear_get_issue.`,
       "Run targeted validation and then a distinct fresh full validation, create one local commit, and independently read back its exact SHA.",
       `Create the exact host-bound private GitHub repository ${githubAccount.login}/${repository}, publish that verified commit to its agent-owned branch, and open one draft pull request with the final Linear and Obsidian backlinks.`,
@@ -594,6 +600,51 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
     expect(cleanedState.privateBindings).toHaveLength(0);
     cleanupVerified = true;
 
+    if (!linearEvidenceTeamId || !publishedSha) {
+      throw new Error(
+        "Retained Linear proof requires the verified dumping-grounds team and exact published SHA.",
+      );
+    }
+    const evidenceTitle = `DU-06 protected checkers evidence ${releaseSha.slice(0, 8)} ${suffix}`;
+    const evidenceDescription = [
+      "Protected application evidence for the native Obsidian agent.",
+      `Release SHA: ${releaseSha}`,
+      `Accepted Obsidian note: ${notePath}`,
+      `Verified implementation commit: ${publishedSha}`,
+      "The disposable Linear hierarchy, draft PR branch, and private GitHub repository were independently cleaned after readback.",
+      "This record intentionally contains no credentials, local filesystem paths, provider payloads, or private repository name.",
+    ].join("\n\n");
+    await harness.submitMission(
+      [
+        "Use exactly linear_create_issue and linear_get_issue.",
+        `Create one retained evidence issue in the configured ${LINEAR_EVIDENCE_DESTINATION_NAME} team with exact teamId ${linearEvidenceTeamId}, exact title ${JSON.stringify(evidenceTitle)}, and exact Markdown description ${JSON.stringify(evidenceDescription)}.`,
+        "Obtain the exact creation approval, then independently read the created issue back by its returned identifier.",
+        "Do not archive, trash, delete, or clean up this retained evidence issue.",
+      ].join(" "),
+      { waitForCompletion: false, timeoutMs: 20 * 60_000 },
+    );
+    approvalCount += await harness.approveUntilMissionComplete(20 * 60_000, {
+      maxContinuations: 3,
+    });
+    retainedLinearEvidence = await expectRetainedLinearEvidence({
+      client: activeLinearClient,
+      teamId: linearEvidenceTeamId,
+      title: evidenceTitle,
+      description: evidenceDescription,
+    });
+    expect(retainedLinearEvidence.url).toMatch(/^https:\/\//u);
+    await testInfo.attach("daily-use-du06-retained-linear-evidence", {
+      body: Buffer.from(
+        `${JSON.stringify({
+          releaseSha,
+          identifier: retainedLinearEvidence.identifier,
+          url: retainedLinearEvidence.url,
+        }, null, 2)}\n`,
+        "utf8",
+      ),
+      contentType: "application/json",
+    });
+
     await recordDailyUseAcceptance(
       testInfo,
       "DU-06",
@@ -606,6 +657,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
           "linear:issue",
           "linear:checkers_implementation_issue",
           "linear:issue_readback",
+          "linear:retained_test_evidence",
           "code:python_checkers",
           "git:local_commit",
           "github:private_repository",
@@ -617,6 +669,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
           "linear:hierarchy_readback",
           "linear:provider_readback",
           "linear:issue_read_before_code",
+          "linear:retained_evidence_readback",
           "code:checkers_rules_contract",
           "code:workspace_validated",
           "validation:fresh_full",
@@ -642,6 +695,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
           "binding:note_commit_pr",
           "binding:linear_commit_pr",
           "binding:project_lineage",
+          "binding:retained_linear_evidence",
         ],
         cleanup: [
           "cleanup:linear_fixture",
@@ -657,9 +711,21 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       },
       { requireComplete: true },
     );
+    acceptanceRecorded = true;
   } catch (error) {
     missionError = error;
+    const approved = /\bapproved=(\d+)\b/u.exec(safeError(error));
+    if (approved) approvalCount += Number.parseInt(approved[1]!, 10);
   } finally {
+    if (harness) {
+      try {
+        const counters = await readRedactedDailyUseCounters(harness.page);
+        modelCallCount = Math.max(modelCallCount, counters.modelCalls);
+        toolCallCount = Math.max(toolCallCount, counters.toolCalls);
+      } catch (error) {
+        cleanupErrors.push(`metrics recovery: ${safeError(error)}`);
+      }
+    }
     if (harness && !cleanupVerified) {
       try {
         const recovered = await readSafeLifecycleState(harness.page, PROFILE_KEY);
@@ -702,6 +768,27 @@ test("DU-06 checkers exact-SHA lifecycle restarts at every stage and independent
       await fixture
         .removeOwnedWorktree(verifiedWorktree.root, verifiedWorktree.branch)
         .catch((error) => cleanupErrors.push(`worktree cleanup: ${safeError(error)}`));
+    }
+    if (!acceptanceRecorded) {
+      await recordDailyUseAcceptance(
+        testInfo,
+        "DU-06",
+        {
+          artifacts: [],
+          proofs: [],
+          approvals: [],
+          bindings: [],
+          cleanup: [],
+        },
+        {
+          modelCalls: modelCallCount,
+          toolCalls: toolCallCount,
+          continuations: restartedStages.length,
+          approvals: approvalCount,
+        },
+      ).catch((error) => {
+        cleanupErrors.push(`metrics attachment: ${safeError(error)}`);
+      });
     }
     await harness?.close().catch((error) => {
       cleanupErrors.push(`harness cleanup: ${safeError(error)}`);
@@ -1221,6 +1308,47 @@ async function expectLinearResource(
   expect(record?.id).toBe(id);
 }
 
+async function expectRetainedLinearEvidence(input: {
+  client: LinearReadbackClient;
+  teamId: string;
+  title: string;
+  description: string;
+}): Promise<{ id: string; identifier: string; url: string }> {
+  const page = await input.client.execute("issues.search" as any, {
+    query: input.title,
+    filter: { team: { id: { eq: input.teamId } } },
+    first: 20,
+    includeArchived: false,
+  }) as any;
+  const matches = (Array.isArray(page?.items)
+    ? page.items
+    : []) as Array<Record<string, any>>;
+  const exactMatches = matches.filter(
+    (item: any) =>
+      item?.title === input.title &&
+      item?.team?.id === input.teamId &&
+      item?.trashed !== true,
+  );
+  const match = requireOne(exactMatches, "retained Linear evidence issue");
+  const readback = await input.client.execute("issues.get" as any, {
+    id: match.id,
+  }) as any;
+  expect(readback).toMatchObject({
+    id: match.id,
+    identifier: match.identifier,
+    title: input.title,
+    description: input.description,
+    trashed: false,
+    team: { id: input.teamId },
+  });
+  expect(readback.url).toMatch(/^https:\/\//u);
+  return {
+    id: String(readback.id),
+    identifier: String(readback.identifier),
+    url: String(readback.url),
+  };
+}
+
 async function expectLinearRemoved(
   client: LinearReadbackClient,
   operation: string,
@@ -1361,6 +1489,31 @@ async function readVaultNote(page: Page, path: string): Promise<string> {
     if (!file) throw new Error(`Expected lifecycle note is missing: ${path}.`);
     return app.vault.read(file);
   }, { path });
+}
+
+async function readRedactedDailyUseCounters(
+  page: Page,
+): Promise<{ modelCalls: number; toolCalls: number }> {
+  return page.evaluate(({ pluginId }) => {
+    const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[
+      pluginId
+    ];
+    const snapshot = plugin?.getMissionRunSnapshot?.();
+    const modelCalls = Array.isArray(snapshot?.modelCallEvidence)
+      ? snapshot.modelCallEvidence.length
+      : Number(snapshot?.providerUsage?.modelCallCount ?? 0);
+    const toolCalls = Array.isArray(snapshot?.missionEvidence)
+      ? snapshot.missionEvidence.length
+      : 0;
+    return {
+      modelCalls: Number.isSafeInteger(modelCalls) && modelCalls >= 0
+        ? modelCalls
+        : 0,
+      toolCalls: Number.isSafeInteger(toolCalls) && toolCalls >= 0
+        ? toolCalls
+        : 0,
+    };
+  }, { pluginId: NATIVE_CORE_PLUGIN_ID });
 }
 
 function requiredEnvironment(name: string): string {

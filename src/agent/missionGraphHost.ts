@@ -21,8 +21,15 @@ import {
 } from "../../packages/headless-runtime/src";
 import {
   extractExplicitNewWorkspaceFilePaths,
+  extractExplicitWorkspaceReadFilePaths,
   extractMarkdownPathMentions,
 } from "./missionScope";
+
+interface PlannedToolStepV1 {
+  name: string;
+  selector?: string;
+  objective?: string;
+}
 
 export interface BuildHostMissionGraphPlanInput {
   missionId: string;
@@ -80,6 +87,8 @@ export async function buildHostMissionGraphPlanV1(
   );
   const explicitNewWorkspaceFilePaths =
     extractExplicitNewWorkspaceFilePaths(input.objective);
+  const explicitWorkspaceReadFilePaths =
+    extractExplicitWorkspaceReadFilePaths(input.objective);
   // Preserve deliberate read multiplicity: two bounded source fetches are two
   // separately budgeted graph nodes even though they use the same descriptor.
   // Effectful tools remain deduplicated except for the explicit Mermaid
@@ -87,25 +96,29 @@ export async function buildHostMissionGraphPlanV1(
   // makes the second mutation a distinct, observable action rather than an
   // accidental duplicate introduced by overlapping host/router requirements.
   const seenEffectfulPlannedNames = new Set<string>();
-  const plannedNames: string[] = [];
+  const basePlannedSteps: PlannedToolStepV1[] = [];
   for (const name of input.plannedToolNames) {
     const descriptor = descriptorByName.get(name);
     if (!descriptor) continue;
     if (descriptor.effect === "read") {
-      plannedNames.push(name);
+      basePlannedSteps.push({ name });
       continue;
     }
     const isVerifiedMermaidRevision =
       name === "upsert_mermaid_block" &&
-      plannedNames.at(-1) === "read_mermaid_block";
+      basePlannedSteps.at(-1)?.name === "read_mermaid_block";
     if (
       name === "code_workspace_create_file" &&
       explicitNewWorkspaceFilePaths.length > 0 &&
       !seenEffectfulPlannedNames.has(name)
     ) {
       seenEffectfulPlannedNames.add(name);
-      plannedNames.push(
-        ...explicitNewWorkspaceFilePaths.map(() => name),
+      basePlannedSteps.push(
+        ...explicitNewWorkspaceFilePaths.map((path) => ({
+          name,
+          selector: path,
+          objective: `Create the exact new workspace file ${path} without overwrite.`,
+        })),
       );
       continue;
     }
@@ -113,19 +126,22 @@ export async function buildHostMissionGraphPlanV1(
       continue;
     }
     seenEffectfulPlannedNames.add(name);
-    plannedNames.push(name);
+    basePlannedSteps.push({ name });
   }
-  const plannedSet = new Set(plannedNames);
+  const plannedSteps = expandBoundedWorkspaceRepairReview({
+    steps: basePlannedSteps,
+    explicitNewWorkspaceFilePaths,
+    explicitWorkspaceReadFilePaths,
+    descriptorByName,
+  });
+  const plannedSet = new Set(plannedSteps.map((step) => step.name));
   const maxToolNodes = MISSION_GRAPH_MAX_DEPTH - 1;
-  if (
-    explicitNewWorkspaceFilePaths.length > 1 &&
-    plannedNames.length > maxToolNodes
-  ) {
+  if (plannedSteps.length > maxToolNodes) {
     throw new Error(
-      `The explicit ${explicitNewWorkspaceFilePaths.length}-file creation set exceeds the bounded mission graph capacity. Split it into smaller approved stages.`,
+      `The explicit code lifecycle requires ${plannedSteps.length} tool nodes, exceeding the bounded mission graph capacity of ${maxToolNodes}. Split it into smaller approved stages.`,
     );
   }
-  const selectedPlanned = plannedNames.slice(0, maxToolNodes);
+  const selectedPlanned = plannedSteps.slice(0, maxToolNodes);
   const postAcceptanceNames = unique([
     ...(input.postAcceptanceToolNames ?? []),
   ])
@@ -302,7 +318,7 @@ export async function buildHostMissionGraphPlanV1(
   });
 
   const deterministicNodes = buildToolNodeProposals({
-    names: selectedPlanned,
+    steps: selectedPlanned,
     objective: input.objective,
     descriptorByName,
     currentNotePath: input.currentNotePath ?? null,
@@ -311,7 +327,6 @@ export async function buildHostMissionGraphPlanV1(
     headlessToolNames,
     preferBackground: input.background?.preferBackground === true,
     bindingIdByTool,
-    explicitNewWorkspaceFilePaths,
   });
   const optionalReadNodes = buildOptionalReadNodeProposals({
     names: optionalReadNames,
@@ -391,8 +406,83 @@ function addPostAcceptanceNodes(input: {
   });
 }
 
+function expandBoundedWorkspaceRepairReview(input: {
+  steps: readonly PlannedToolStepV1[];
+  explicitNewWorkspaceFilePaths: readonly string[];
+  explicitWorkspaceReadFilePaths: readonly string[];
+  descriptorByName: ReadonlyMap<string, ToolDescriptor>;
+}): PlannedToolStepV1[] {
+  const created = new Set(input.explicitNewWorkspaceFilePaths);
+  const protectedReadPaths = input.explicitWorkspaceReadFilePaths.filter(
+    (path) => !created.has(path),
+  );
+  const names = new Set(input.steps.map((step) => step.name));
+  const requiredBaseNames = [
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+  ];
+  const supportsBoundedReview =
+    input.explicitNewWorkspaceFilePaths.length > 0 &&
+    protectedReadPaths.length > 0 &&
+    requiredBaseNames.every((name) => names.has(name)) &&
+    input.descriptorByName.has("code_workspace_read") &&
+    input.descriptorByName.has("code_workspace_write_expected");
+  if (!supportsBoundedReview) return [...input.steps];
+
+  const expanded: PlannedToolStepV1[] = [];
+  let protectedReadsInserted = false;
+  let correctionPassInserted = false;
+  for (const step of input.steps) {
+    expanded.push(step);
+    if (step.name === "code_workspace_create" && !protectedReadsInserted) {
+      protectedReadsInserted = true;
+      expanded.push(
+        ...protectedReadPaths.map((path) => ({
+          name: "code_workspace_read",
+          selector: path,
+          objective: `Read the exact protected workspace contract ${path} before implementation.`,
+        })),
+      );
+    }
+    if (
+      step.name === "code_repair_record_cycle" &&
+      !correctionPassInserted
+    ) {
+      correctionPassInserted = true;
+      expanded.push(
+        ...input.explicitNewWorkspaceFilePaths.map((path) => ({
+          name: "code_workspace_read",
+          selector: path,
+          objective: `Read the exact created workspace file ${path} for the bounded correction pass.`,
+        })),
+        ...input.explicitNewWorkspaceFilePaths.map((path) => ({
+          name: "code_workspace_write_expected",
+          selector: path,
+          objective: `Reconcile the exact workspace file ${path} against the accepted requirements, protected contract, and fast-validation evidence using its observed hash.`,
+        })),
+        {
+          name: "code_validate_fast",
+          objective:
+            "Run the bounded fast validation again after the one correction pass.",
+        },
+        {
+          name: "code_repair_record_cycle",
+          objective:
+            "Record the second repair-cycle checkpoint from the corrected fast-validation evidence.",
+        },
+      );
+    }
+  }
+  return expanded;
+}
+
 function buildToolNodeProposals(input: {
-  names: string[];
+  steps: PlannedToolStepV1[];
   objective: string;
   descriptorByName: ReadonlyMap<string, ToolDescriptor>;
   currentNotePath: string | null;
@@ -401,27 +491,25 @@ function buildToolNodeProposals(input: {
   headlessToolNames: ReadonlySet<string>;
   preferBackground: boolean;
   bindingIdByTool: ReadonlyMap<string, string | null>;
-  explicitNewWorkspaceFilePaths: readonly string[];
 }): Record<string, MissionGraphNodeProposalV1> {
   const result: Record<string, MissionGraphNodeProposalV1> = {};
   const readNodeIds: string[] = [];
   const plannedReadNodes: Array<{ id: string; name: string }> = [];
   const effectfulNodeIds: string[] = [];
   const githubEffectfulNodeIds: string[] = [];
-  let newWorkspaceFileIndex = 0;
-  input.names.forEach((name, index) => {
+  input.steps.forEach((step, index) => {
+    const name = step.name;
     const descriptor = input.descriptorByName.get(name)!;
     const effect = graphEffect(descriptor);
     const nodeId = toolNodeId(index, name);
-    const explicitNewWorkspaceFilePath =
-      name === "code_workspace_create_file"
-        ? input.explicitNewWorkspaceFilePaths[newWorkspaceFileIndex++] ?? null
-        : null;
     const dependencies =
       effect === "read"
-        ? effectfulNodeIds.length > 0
-          ? [effectfulNodeIds.at(-1)!]
-          : plannedReadPrerequisiteIds(name, plannedReadNodes)
+        ? sortedUnique([
+            ...(effectfulNodeIds.length > 0
+              ? [effectfulNodeIds.at(-1)!]
+              : []),
+            ...plannedReadPrerequisiteIds(name, plannedReadNodes),
+          ])
         : sortedUnique([
             ...readNodeIds,
             ...(effectfulNodeIds.length > 0
@@ -443,15 +531,13 @@ function buildToolNodeProposals(input: {
       preferBackground: input.preferBackground,
       bindingId: input.bindingIdByTool.get(name) ?? null,
       selector:
-        explicitNewWorkspaceFilePath ??
+        step.selector ??
         explicitVaultSelector({
           toolName: name,
           objective: input.objective,
           currentNotePath: input.currentNotePath,
         }),
-      objective: explicitNewWorkspaceFilePath
-        ? `Create the exact new workspace file ${explicitNewWorkspaceFilePath} without overwrite.`
-        : undefined,
+      objective: step.objective,
     });
     if (effect === "read") {
       readNodeIds.push(nodeId);
@@ -477,6 +563,10 @@ function plannedReadPrerequisiteIds(
       : toolName === "web_fetch"
         ? new Set(["web_search"])
       : new Set<string>();
+  // Repeated exact workspace reads must be serialized so a same-name frontier
+  // always resolves to one graph selector. Other read lifecycles retain their
+  // established parallelism and explicit prerequisite rules above.
+  if (toolName === "code_workspace_read") prerequisiteNames.add(toolName);
   return priorReads
     .filter((candidate) => prerequisiteNames.has(candidate.name))
     .map((candidate) => candidate.id);

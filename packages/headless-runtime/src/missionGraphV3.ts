@@ -6,9 +6,11 @@ export const MISSION_GRAPH_PATCH_VERSION = 1 as const;
 export const MISSION_GRAPH_JOURNAL_VERSION = 1 as const;
 
 // Compound daily-use lifecycles remain bounded while retaining their composite
-// research, provider, Code, and finalizer nodes in one authoritative graph.
-export const MISSION_GRAPH_MAX_NODES = 24 as const;
-export const MISSION_GRAPH_MAX_DEPTH = 24 as const;
+// research, provider, Code, one correction pass, and finalizer nodes in one
+// authoritative graph. Forty leaves room for the bounded review without
+// turning the graph into an open-ended retry surface.
+export const MISSION_GRAPH_MAX_NODES = 40 as const;
+export const MISSION_GRAPH_MAX_DEPTH = 40 as const;
 export const MISSION_GRAPH_MAX_CONCURRENT_READ_NODES = 3 as const;
 
 export type MissionNodeStatusV3 =

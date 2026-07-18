@@ -426,6 +426,87 @@ test("host graph binds every explicit new repository file to its own ordered nod
   assert.equal(host.capabilityEnvelope.budgets.maxDepth, paths.length + 1);
 });
 
+test("host graph adds one exact protected-contract read and one bounded correction pass", async () => {
+  const planned = [
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+  ];
+  const allowed = [
+    ...planned,
+    "code_workspace_read",
+    "code_workspace_write_expected",
+  ];
+  const createdPaths = [
+    "README.md",
+    "checkers/__init__.py",
+    "checkers/cli.py",
+    "checkers/game.py",
+    "tests/test_checkers.py",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-bounded-code-correction",
+    objective: [
+      "Read the protected scripts/verify_project.py contract before implementation.",
+      `Add only ${createdPaths.slice(0, -1).join(", ")}, and ${createdPaths.at(-1)}.`,
+      "Run fast, targeted, and full validation, record repair evidence, and commit.",
+    ].join(" "),
+    toolRegistry: registryForDescriptors(
+      allowed.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: allowed,
+    modelVisibleToolNames: allowed,
+    plannedToolNames: planned,
+    maxToolCalls: Number.POSITIVE_INFINITY,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.id !== "final",
+  );
+  assert.deepEqual(
+    nodes.map((node) => node.allowedTools[0]),
+    [
+      "code_workspace_create",
+      "code_workspace_read",
+      ...createdPaths.map(() => "code_workspace_create_file"),
+      "code_validate_fast",
+      "code_repair_record_cycle",
+      ...createdPaths.map(() => "code_workspace_read"),
+      ...createdPaths.map(() => "code_workspace_write_expected"),
+      "code_validate_fast",
+      "code_repair_record_cycle",
+      "code_validate_targeted",
+      "code_validate_full",
+      "code_commit_verified",
+    ],
+  );
+  const reads = nodes.filter(
+    (node) => node.allowedTools[0] === "code_workspace_read",
+  );
+  assert.deepEqual(
+    reads.map((node) => {
+      const resource = node.inputs.resource;
+      return resource?.kind === "binding" ? resource.selector : null;
+    }),
+    ["scripts/verify_project.py", ...createdPaths],
+  );
+  assert.ok(reads.at(-1)!.dependencyIds.includes(reads.at(-2)!.id));
+  assert.deepEqual(
+    nodes
+      .filter((node) => node.allowedTools[0] === "code_workspace_write_expected")
+      .map((node) => node.destination?.selector),
+    createdPaths,
+  );
+  assert.equal(host.capabilityEnvelope.budgets.maxDepth, nodes.length + 1);
+  assert.ok(host.capabilityEnvelope.budgets.maxDepth > 24);
+});
+
 test("host graph retains every node in a compound daily-use lifecycle", async () => {
   const descriptors = Array.from({ length: 16 }, (_unused, index) =>
     workspaceLifecycleDescriptor(`compound_stage_${String(index + 1).padStart(2, "0")}`),

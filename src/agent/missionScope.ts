@@ -281,6 +281,36 @@ export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
   return dedupeStrings(paths);
 }
 
+/**
+ * Extracts only repository-relative files that an affirmative clause explicitly
+ * asks the agent to read, inspect, review, or open. This is intentionally
+ * narrower than generic path recognition: protected validation inputs may
+ * constrain a code mission, but merely mentioning or preserving a path must
+ * never manufacture read authority.
+ */
+export function extractExplicitWorkspaceReadFilePaths(prompt: string): string[] {
+  if (prompt.length > 100_000 || prompt.includes("\0")) return [];
+  const paths: string[] = [];
+  for (const clause of prompt.split(/[!?;\r\n]+|\.\s+(?=[A-Z])/gu)) {
+    for (const match of clause.matchAll(
+      /\b(?:read|inspect|review|open)\b(?:[ \t]+(?:the|this|that|exact|existing|protected|workspace|repository|source|file|contract|validator|validation)){0,8}[ \t]+((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})\b/giu,
+    )) {
+      const actionIndex = match.index ?? 0;
+      const prefix = clause.slice(Math.max(0, actionIndex - 100), actionIndex);
+      if (
+        /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(
+          prefix,
+        )
+      ) {
+        continue;
+      }
+      const candidate = match[1] ?? "";
+      if (isSafeExplicitWorkspaceFilePath(candidate)) paths.push(candidate);
+    }
+  }
+  return dedupeStrings(paths);
+}
+
 function isSafeExplicitWorkspaceFilePath(value: string): boolean {
   if (!value || value.length > 240 || value.includes("\\") || value.includes(":")) {
     return false;

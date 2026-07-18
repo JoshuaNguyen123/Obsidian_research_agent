@@ -64,7 +64,7 @@ test("MissionGraphV3 preserves routing fallback, resource locks, and strict shap
   await rejectsCode(parseMissionGraphV3(invalidStatus), "invalid_status");
 });
 
-test("MissionGraphV3 rejects cycles, envelope depth overflow, and more than 24 nodes", async () => {
+test("MissionGraphV3 rejects cycles, envelope depth overflow, and more than 40 nodes", async () => {
   const cyclic = await createRawGraph();
   cyclic.nodes.research.dependencyIds = ["write"];
   await rejectsCode(parseMissionGraphV3(cyclic), "cycle");
@@ -83,7 +83,7 @@ test("MissionGraphV3 rejects cycles, envelope depth overflow, and more than 24 n
 
   const tooMany = await createRawGraph();
   tooMany.nodes = {};
-  for (let index = 1; index <= 25; index += 1) {
+  for (let index = 1; index <= 41; index += 1) {
     const id = `node-${index}`;
     tooMany.nodes[id] = createNode({ id, status: index === 1 ? "ready" : "queued" });
   }

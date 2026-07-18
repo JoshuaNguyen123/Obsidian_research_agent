@@ -321,6 +321,10 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.match(compound, /linearWorkspaceName:\s*workspaceName/u);
   assert.match(compound, /linearTeamName:/u);
   assert.match(compound, /linear_get_issue/u);
+  assert.match(compound, /Read the protected scripts\/verify_project\.py contract/u);
+  assert.match(compound, /args: \["-m", "scripts\.verify_project"\]/u);
+  assert.match(compound, /readRedactedDailyUseCounters/u);
+  assert.match(compound, /metrics attachment/u);
   assert.match(compound, /checkers\/game\.py/u);
   assert.match(compound, /tests\/test_checkers\.py/u);
   assert.match(compound, /verifiedPrivate: true/u);

@@ -15,6 +15,7 @@ import {
 import {
   deriveAutonomyScope,
   extractExplicitNewWorkspaceFilePaths,
+  extractExplicitWorkspaceReadFilePaths,
   extractMarkdownPathMentions,
   hasExplicitCurrentNoteMutationIntent,
 } from "../src/agent/missionScope";
@@ -35,6 +36,27 @@ test("explicit repository file sets are extracted without adjacent mission paths
   assert.deepEqual(
     extractExplicitNewWorkspaceFilePaths(
       "Do not create exactly safe.py, ../escape.py, or C:/private.py.",
+    ),
+    [],
+  );
+});
+
+test("explicit workspace reads recognize affirmative protected contracts only", () => {
+  assert.deepEqual(
+    extractExplicitWorkspaceReadFilePaths(
+      "Read the protected scripts/verify_project.py contract before implementation. Add only checkers/game.py. Leave scripts/verify_project.py unchanged.",
+    ),
+    ["scripts/verify_project.py"],
+  );
+  assert.deepEqual(
+    extractExplicitWorkspaceReadFilePaths(
+      "Do not read secrets/token.txt. Leave scripts/verify_project.py unchanged.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    extractExplicitWorkspaceReadFilePaths(
+      "Inspect ../escape.py and open C:/private.py.",
     ),
     [],
   );

@@ -13,12 +13,14 @@ import {
   extractExactMarkdownReplacementPayload,
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
+  getExplicitLinearReadToolNames,
   getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
   getDurablyProvenCompletedGraphToolNames,
   getRestorableCompletedGraphToolNames,
   hasPreparedBackgroundCodeValidationCommitIntent,
+  insertExplicitLinearReadbacksIntoLifecycleToolNames,
   resolveThinkingMode,
   restoreTrustedWebFetchResultsFromEvidence,
   runAgentMission,
@@ -3908,6 +3910,113 @@ test("workspace creation frontier exposes its exact graph-bound path", () => {
   assert.match(binding ?? "", /EXACT GRAPH-BOUND NEW WORKSPACE FILE/u);
   assert.match(binding ?? "", /path="checkers\/game\.py"/u);
   assert.match(binding ?? "", /complete content for only this file/u);
+});
+
+test("workspace correction frontiers bind exact reads, hashes, content, and Linear traceability", () => {
+  const readTool = [{
+    type: "function" as const,
+    function: {
+      name: "code_workspace_read",
+      parameters: { type: "object", properties: {} },
+    },
+  }];
+  assert.match(
+    buildObservedMissionGraphFrontierBinding(
+      [],
+      readTool,
+      [],
+      "scripts/verify_project.py",
+    ) ?? "",
+    /EXACT GRAPH-BOUND WORKSPACE READ/u,
+  );
+
+  const sha256 = `sha256:${"a".repeat(64)}`;
+  const messages = [
+    {
+      role: "tool" as const,
+      toolName: "linear_get_issue",
+      content: JSON.stringify({
+        ok: true,
+        output: {
+          data: {
+            issue: {
+              id: "issue-id",
+              identifier: "APP-42",
+              title: "Build checkers",
+              url: "https://linear.app/example/issue/APP-42",
+            },
+          },
+        },
+      }),
+    },
+    {
+      role: "tool" as const,
+      toolName: "code_workspace_read",
+      content: JSON.stringify({
+        ok: true,
+        output: {
+          path: "README.md",
+          sha256,
+          content: "# Checkers\n",
+        },
+      }),
+    },
+  ];
+  const binding = buildObservedMissionGraphFrontierBinding(
+    messages,
+    [{
+      type: "function",
+      function: {
+        name: "code_workspace_write_expected",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    [],
+    "README.md",
+  );
+  assert.match(binding ?? "", /EXACT GRAPH-BOUND HASHED WORKSPACE CORRECTION/u);
+  assert.match(binding ?? "", new RegExp(sha256));
+  assert.match(binding ?? "", /currentContent="# Checkers\\n"/u);
+  assert.match(binding ?? "", /APP-42/u);
+  assert.match(binding ?? "", /linear\.app\/example\/issue\/APP-42/u);
+});
+
+test("explicit Linear reads preserve order and obey negation", () => {
+  const allowed = new Set([
+    "linear_get_issue",
+    "linear_list_comments",
+    "linear_create_issue",
+  ]);
+  assert.deepEqual(
+    getExplicitLinearReadToolNames(
+      "Call linear_get_issue, then linear_list_comments.",
+      allowed,
+    ),
+    ["linear_get_issue", "linear_list_comments"],
+  );
+  assert.deepEqual(
+    getExplicitLinearReadToolNames(
+      "Do not call linear_get_issue or linear_list_comments.",
+      allowed,
+    ),
+    [],
+  );
+  assert.deepEqual(
+    insertExplicitLinearReadbacksIntoLifecycleToolNames(
+      [
+        "publish_research_to_linear",
+        "publish_research_project_to_linear",
+        "code_workspace_create",
+      ],
+      ["linear_get_issue"],
+    ),
+    [
+      "publish_research_to_linear",
+      "publish_research_project_to_linear",
+      "linear_get_issue",
+      "code_workspace_create",
+    ],
+  );
 });
 
 test("compound public-web lifecycle reserves exact research reads before effects", () => {
