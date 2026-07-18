@@ -152,6 +152,57 @@ test("prepared workspace creation supports eleven explicit source languages", as
   }
 });
 
+test("continuation segments reuse one durable root-owned workspace with segment-bound approvals", async () => {
+  const fixture = await createFixture("continuation-root");
+  try {
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const firstContext: ScopedExtensionContextV1 = {
+      ...fixture.context("Create a durable workspace in the first segment."),
+      missionId: "segment-run-1",
+      rootMissionId: "root-run-1",
+    };
+    const createWorkspace = await requirePrepared(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "continued-space", kind: "scratch" },
+      firstContext,
+    );
+    assert.equal(createWorkspace.runId, "segment-run-1");
+    assert.equal(createWorkspace.normalizedArgs.ownerRunId, "root-run-1");
+    await tools.get("code_workspace_create")!.executePrepared!(
+      createWorkspace,
+      authorize(firstContext, createWorkspace),
+    );
+
+    const continuedContext: ScopedExtensionContextV1 = {
+      ...fixture.context("Continue the same durable workspace in a child segment."),
+      missionId: "segment-run-2",
+      rootMissionId: "root-run-1",
+    };
+    const createFile = await requirePrepared(
+      tools.get("code_workspace_create_file")!,
+      { workspaceId: "continued-space", path: "continued.py", content: "print('continued')\n" },
+      continuedContext,
+    );
+    assert.equal(createFile.runId, "segment-run-2");
+    await tools.get("code_workspace_create_file")!.executePrepared!(
+      createFile,
+      authorize(continuedContext, createFile),
+    );
+    const manifest = await fixture.manager.loadManifest("continued-space");
+    assert.equal(manifest.ownerRunId, "root-run-1");
+    assert.equal(
+      (await fixture.manager.read("continued-space", "continued.py")).content,
+      "print('continued')\n",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("workspace tools prepare every mutation and return exact readback receipts", async () => {
   const fixture = await createFixture("mutations");
   try {

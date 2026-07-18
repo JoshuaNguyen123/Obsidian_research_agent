@@ -316,11 +316,11 @@ export class CodeExtensionRuntimeV2 {
       resolveExecutionInput: (_action, sandboxAction, context) =>
         this.resolveSandboxExecutionInput(sandboxAction, context),
       observeValidationReceipt: this.validationReceiptRegistry
-        ? async ({ runId, requestId, action, receipt, diagnostics }) => {
+        ? async ({ runId, requestId, action, receipt, diagnostics, context }) => {
             const manifest = await this.workspaceManager.loadManifest(action.workspaceId);
             return await this.validationReceiptRegistry!.capture({
               scope: {
-                runId,
+                runId: context.rootMissionId?.trim() || runId,
                 workspaceId: action.workspaceId,
                 requestId,
               },
@@ -2295,7 +2295,7 @@ function selectForegroundValidationCommand(
 }
 
 function contextRunId(context: ScopedExtensionContextV1): string {
-  return context.missionId ?? context.operationId ?? "adhoc";
+  return context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc";
 }
 
 function samePath(left: string, right: string): boolean {

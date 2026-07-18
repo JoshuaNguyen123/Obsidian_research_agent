@@ -123,6 +123,7 @@ function createScopedContext(
     version: 1,
     extensionId: token.extensionId,
     ...(context.runId ? { missionId: context.runId } : {}),
+    ...(context.rootMissionId ? { rootMissionId: context.rootMissionId } : {}),
     ...(context.operationId ? { operationId: context.operationId } : {}),
     ...(context.originalPrompt ? { originalPrompt: context.originalPrompt } : {}),
     ...(context.deadlineAt !== undefined ? { deadlineAt: context.deadlineAt } : {}),

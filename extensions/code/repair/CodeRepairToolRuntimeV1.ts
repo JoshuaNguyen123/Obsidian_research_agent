@@ -1421,7 +1421,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     const core = {
       version: 1 as const,
       id: `prepared:${input.toolName}:${input.scope.runId}:${input.scope.workspaceId}:${input.scope.requestId}:${input.expectedTargetRevision}`,
-      runId: input.scope.runId,
+      runId: input.context.missionId?.trim() || input.scope.runId,
       toolCallId: input.context.operationId?.trim() ||
         `${input.toolName}:${input.scope.requestId}:prepare`,
       toolName: input.toolName,
@@ -2248,7 +2248,8 @@ function assertContextScope(
   scope: CodeRepairScopeArgsV1,
   context: ScopedExtensionContextV1,
 ): void {
-  if (context.missionId && context.missionId !== scope.runId) {
+  const durableMissionId = context.rootMissionId ?? context.missionId;
+  if (durableMissionId && durableMissionId !== scope.runId) {
     throw new CodeRepairToolRuntimeErrorV1(
       "mission_scope_mismatch",
       "Extension mission context does not match repair runId.",

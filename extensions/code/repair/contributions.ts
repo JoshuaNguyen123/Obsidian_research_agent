@@ -290,7 +290,7 @@ function bindRunIdToMissionContext(
   args: Record<string, unknown>,
   context: ScopedExtensionContextV1,
 ): Record<string, unknown> {
-  const runId = context.missionId?.trim();
+  const runId = context.rootMissionId?.trim() || context.missionId?.trim();
   if (!runId) {
     throw new Error("Production code repair tools require a host mission identity.");
   }

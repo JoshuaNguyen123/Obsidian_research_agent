@@ -1322,6 +1322,7 @@ export async function runAgentMission({
     reportProgress: (message) => events.onStatus?.(message),
     reportCodeOutput: (event) => events.onCodeOutput?.(event),
     runId,
+    rootMissionId: runId,
     abortSignal,
     deadlineAt: runDeadlineAt,
     userApprovalGranted: false,
@@ -1785,6 +1786,10 @@ export async function runAgentMission({
   }
   const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
   const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
+  runToolContext = {
+    ...runToolContext,
+    rootMissionId: resumeSnapshot?.lineage.rootRunId ?? resumeLedger?.runId ?? runId,
+  };
   if (resumeLedger && checkpointResumeContext?.missionResume?.plan.canResume === false) {
     const resumeReason = checkpointResumeContext.missionResume.plan.reason;
     const message =

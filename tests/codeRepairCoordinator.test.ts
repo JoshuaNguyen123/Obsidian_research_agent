@@ -102,6 +102,7 @@ test("production repair contributions bind model run aliases to the host mission
     version: 1 as const,
     extensionId: "agentic-researcher-code",
     missionId: "run-2026-07-18t16-48-26.022z-host",
+    rootMissionId: "run-2026-07-18t16-00-00.000z-root",
     operationId: "repair-host-scope-test",
     abortSignal: new AbortController().signal,
     now: () => new Date(NOW),
@@ -116,9 +117,9 @@ test("production repair contributions bind model run aliases to the host mission
   await contributions[1].tool.prepare!(args, context);
   await contributions[2].tool.prepare!(args, context);
   assert.deepEqual(observed, [
-    { operation: "status", runId: context.missionId },
-    { operation: "cycle", runId: context.missionId },
-    { operation: "commit", runId: context.missionId },
+    { operation: "status", runId: context.rootMissionId },
+    { operation: "cycle", runId: context.rootMissionId },
+    { operation: "commit", runId: context.rootMissionId },
   ]);
 });
 

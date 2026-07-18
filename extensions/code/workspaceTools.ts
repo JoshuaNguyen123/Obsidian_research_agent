@@ -1074,7 +1074,7 @@ function preparedAction(input: {
   const prepared: Omit<PreparedActionV1, "payloadFingerprint"> = {
     version: 1,
     id: `prepared-${input.name}-${seedFingerprint.slice(7, 23)}`,
-    runId: runId(input.context),
+    runId: actionRunId(input.context),
     toolCallId: input.context.operationId ?? `call-${seedFingerprint.slice(7, 19)}`,
     toolName: input.name,
     target,
@@ -1095,7 +1095,7 @@ function preparedAction(input: {
 }
 
 function validatePreparedAction(name: CodeWorkspaceToolNameV2, action: PreparedActionV1, context: ScopedExtensionContextV1): void {
-  if (action.version !== 1 || action.toolName !== name || action.runId !== runId(context) || Date.parse(action.expiresAt) <= context.now().getTime()) throw new WorkspaceManagerErrorV2("prepared_action_invalid", "Prepared workspace action is invalid or expired.");
+  if (action.version !== 1 || action.toolName !== name || action.runId !== actionRunId(context) || Date.parse(action.expiresAt) <= context.now().getTime()) throw new WorkspaceManagerErrorV2("prepared_action_invalid", "Prepared workspace action is invalid or expired.");
   const { payloadFingerprint: _ignored, ...prepared } = action;
   const expected = sha256Canonical(prepared);
   if (expected !== action.payloadFingerprint) throw new WorkspaceManagerErrorV2("prepared_fingerprint_drift", "Prepared workspace action fingerprint changed.");
@@ -1457,8 +1457,9 @@ function description(name: string): string {
     ? `${base} Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`
     : base;
 }
-function workspaceIdFrom(args: Record<string, unknown>, context: ScopedExtensionContextV1): string { return (optionalString(args.workspaceId) ?? context.missionId ?? context.operationId ?? "adhoc").toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 128) || "adhoc"; }
-function runId(context: ScopedExtensionContextV1): string { return context.missionId ?? context.operationId ?? "adhoc"; }
+function workspaceIdFrom(args: Record<string, unknown>, context: ScopedExtensionContextV1): string { return (optionalString(args.workspaceId) ?? context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc").toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 128) || "adhoc"; }
+function runId(context: ScopedExtensionContextV1): string { return context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc"; }
+function actionRunId(context: ScopedExtensionContextV1): string { return context.missionId ?? context.rootMissionId ?? context.operationId ?? "adhoc"; }
 function requiredPath(args: Record<string, unknown>, ...names: string[]): string { for (const name of names) { const value = optionalString(args[name]); if (value) return assertWorkspaceRelativePathV2(value); } throw new WorkspaceManagerErrorV2("invalid_arguments", `${names[0]} is required.`); }
 function requiredString(value: unknown, label: string, allowEmpty = false): string { if (typeof value !== "string" || (!allowEmpty && !value.length)) throw new WorkspaceManagerErrorV2("invalid_arguments", `${label} must be a string${allowEmpty ? "" : " with content"}.`); return value; }
 function optionalString(value: unknown): string | null { return typeof value === "string" && value.trim() ? value.trim() : null; }

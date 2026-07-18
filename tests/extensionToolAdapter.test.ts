@@ -48,6 +48,7 @@ test("extension tool adapter exposes only the scoped execution context", async (
     "operationId",
     "originalPrompt",
     "reportProgress",
+    "rootMissionId",
     "version",
   ]);
   for (const forbidden of [
@@ -63,6 +64,7 @@ test("extension tool adapter exposes only the scoped execution context", async (
   }
   assert.equal(observed[0].context.extensionId, "agentic-researcher-code");
   assert.equal(observed[0].context.missionId, "run-1");
+  assert.equal(observed[0].context.rootMissionId, "root-run-1");
   assert.equal(observed[0].context.operationId, "operation-1");
   assert.equal(observed[0].context.originalPrompt, "Run the extension tool.");
   assert.equal(observed[0].context.deadlineAt, 2_000_000_000_000);
@@ -211,6 +213,7 @@ function toolContext(
     settings: {} as never,
     originalPrompt: "Run the extension tool.",
     runId: "run-1",
+    rootMissionId: "root-run-1",
     operationId: "operation-1",
     deadlineAt: 2_000_000_000_000,
     abortSignal: new AbortController().signal,

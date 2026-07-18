@@ -86,6 +86,8 @@ export interface ToolExecutionContext {
   settings: AgentSettings;
   originalPrompt: string;
   runId?: string;
+  /** Host-verified durable root shared by continuation segments. */
+  rootMissionId?: string;
   operationId?: string;
   abortSignal?: AbortSignal;
   /** Absolute Unix timestamp in milliseconds after which the operation should stop. */

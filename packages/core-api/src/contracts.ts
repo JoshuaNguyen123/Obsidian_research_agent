@@ -200,6 +200,8 @@ export interface ScopedExtensionContextV1 {
   version: 1;
   extensionId: string;
   missionId?: string;
+  /** Durable root identity shared by every verified continuation segment. */
+  rootMissionId?: string;
   operationId?: string;
   originalPrompt?: string;
   deadlineAt?: number;
