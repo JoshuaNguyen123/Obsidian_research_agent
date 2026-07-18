@@ -241,6 +241,7 @@ test.describe("Daily-use Linear integration", () => {
       const hierarchyPrompt = [
         `E2E_LINEAR_PROJECT_HIERARCHY ${harness.marker}:`,
         "Turn this accepted research into a Linear initiative, project, and dependency-aware issues.",
+        `Use the host-accepted research at ${acceptedNotePath}.`,
         "Use one exact grouped approval, independently read every object back, and preserve the note backlink.",
       ].join(" ");
       await harness.submitMission(hierarchyPrompt, { waitForCompletion: false });

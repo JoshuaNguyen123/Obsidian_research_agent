@@ -186,7 +186,7 @@ export function extractMarkdownPathMentions(prompt: string): string[] {
   const labeled = [
     ...prompt.matchAll(
       new RegExp(
-        String.raw`\b(?:markdown\s+file|file|note|path)\s+(?:named\s+|called\s+)?(${path})\b`,
+        String.raw`\b(?:markdown\s+file|file|note|path)\s+(?:(?:named|called|at|to|into)\s+)?(${path})\b`,
         "giu",
       ),
     ),
@@ -207,6 +207,14 @@ export function extractMarkdownPathMentions(prompt: string): string[] {
       ),
     ),
   ].map((match) => match[1] ?? "");
+  const destinationTargets = [
+    ...prompt.matchAll(
+      new RegExp(
+        String.raw`\binto\s+(?:(?:the|a|an)\s+)?(?:(?:existing|new|exact)\s+)?(?:(?:markdown\s+)?(?:file|note|path)\s+)?(${path})(?=\s+(?:with|containing|and|then|only|for|using)\b|\s*[,.;:]|\s*$)`,
+        "giu",
+      ),
+    ),
+  ].map((match) => match[1] ?? "");
   // Unquoted paths containing spaces are ambiguous with surrounding prose.
   // Accept them only after a resource label above. Compact slash paths remain
   // safe to recognize without a label.
@@ -218,6 +226,7 @@ export function extractMarkdownPathMentions(prompt: string): string[] {
     ...labeled,
     ...mutationTargets,
     ...relocationTargets,
+    ...destinationTargets,
   ]
     .map((match) => normalizeMentionedPath(match))
     .filter(Boolean);

@@ -263,6 +263,24 @@ test("autonomy scope extracts a labeled spaced markdown path without preceding p
   ]);
 });
 
+test("markdown path extraction preserves a spaced destination after into", () => {
+  assert.deepEqual(
+    extractMarkdownPathMentions(
+      "Write the accepted research into E2E Agent Tests/DU06-checkers.md with citations.",
+    ),
+    ["E2E Agent Tests/DU06-checkers.md"],
+  );
+});
+
+test("markdown path extraction does not absorb an earlier provider destination", () => {
+  assert.deepEqual(
+    extractMarkdownPathMentions(
+      "Publish this accepted research package to Linear as an issue and save the accepted note at E2E Agent Tests/Accepted Research marker.md.",
+    ),
+    ["E2E Agent Tests/Accepted Research marker.md"],
+  );
+});
+
 test("autonomy scope binds mutation-led spaced paths without widening current-note writes", () => {
   const allowedPath =
     "E2E Agent Tests/Mission Graph Guard/allowed-marker.md";

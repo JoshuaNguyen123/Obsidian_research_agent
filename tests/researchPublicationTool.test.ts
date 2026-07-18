@@ -20,6 +20,7 @@ import {
 } from "../src/integrations/linear";
 import {
   createResearchPublicationTool,
+  resolveResearchPublicationNotePathV1,
 } from "../src/tools/researchPublicationTool";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
 import type { ToolExecutionContext } from "../src/tools/types";
@@ -27,6 +28,49 @@ import type { ToolExecutionContext } from "../src/tools/types";
 const NOW = "2026-07-12T20:00:00.000Z";
 const HASH = `sha256:${"a".repeat(64)}`;
 const DESTINATION = { workspaceId: "workspace-1", teamId: "team-1", projectId: "project-1" };
+
+test("host uses the one explicit mission note path instead of a model transcription", () => {
+  assert.equal(
+    resolveResearchPublicationNotePathV1({
+      requestedPath: "Research.md",
+      originalPrompt:
+        "Write the accepted research into E2E Agent Tests/DU06-checkers.md with citations.",
+      runId: "run-42",
+    }),
+    "E2E Agent Tests/DU06-checkers.md",
+  );
+});
+
+test("host requires an exact selection when the mission names multiple note paths", () => {
+  const originalPrompt =
+    "Read Projects/Checkers/Input.md, then write the accepted research to Projects/Checkers/Research.md.";
+  assert.throws(
+    () => resolveResearchPublicationNotePathV1({
+      requestedPath: "Projects/Checkers/Draft.md",
+      originalPrompt,
+      runId: "run-42",
+    }),
+    /does not exactly match any safe Markdown path/iu,
+  );
+  assert.equal(
+    resolveResearchPublicationNotePathV1({
+      requestedPath: "projects/checkers/research.md",
+      originalPrompt,
+      runId: "run-42",
+    }),
+    "Projects/Checkers/Research.md",
+  );
+});
+
+test("host keeps the deterministic path fallback for a pathless create mission", () => {
+  assert.equal(
+    resolveResearchPublicationNotePathV1({
+      originalPrompt: "Publish the accepted research report to Linear.",
+      runId: "run:42",
+    }),
+    "Accepted research run-42.md",
+  );
+});
 
 test("composite publication uses host lineage/bindings, exact UI approval, one grant, and canonical receipt", async () => {
   const fixture = createFixture("created");

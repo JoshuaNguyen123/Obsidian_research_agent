@@ -9,6 +9,7 @@ import {
 } from "../agent/actions";
 import type { JsonSchemaObject } from "../model/types";
 import type { AuthorityGrantV1 } from "../agent/authority";
+import { extractMarkdownPathMentions } from "../agent/missionScope";
 import {
   ResearchPublicationWorkflow,
   type AcceptedResearchArtifactV1,
@@ -24,6 +25,87 @@ import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 
 export const PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME = "publish_research_to_linear";
+
+export function resolveResearchPublicationNotePathV1(input: {
+  requestedPath?: string;
+  originalPrompt: string;
+  runId: string;
+}): string {
+  const explicitPaths = dedupeVaultPaths(
+    extractMarkdownPathMentions(input.originalPrompt).flatMap((candidate) => {
+      try {
+        return [requireSafeVaultMarkdownPath(candidate)];
+      } catch {
+        return [];
+      }
+    }),
+  );
+
+  // The original user mission is the authority boundary. A model-provided path
+  // is only a transcription hint and cannot redirect an unambiguous write.
+  if (explicitPaths.length === 1) {
+    return explicitPaths[0]!;
+  }
+
+  if (explicitPaths.length > 1) {
+    if (!input.requestedPath) {
+      throw new Error(
+        "The user mission names multiple research publication note paths; one exact path is required.",
+      );
+    }
+    const requestedPath = requireSafeVaultMarkdownPath(input.requestedPath);
+    const selected = explicitPaths.find(
+      (candidate) => candidate.toLowerCase() === requestedPath.toLowerCase(),
+    );
+    if (!selected) {
+      throw new Error(
+        "The requested research publication note path does not exactly match any safe Markdown path in the user mission.",
+      );
+    }
+    return selected;
+  }
+
+  if (!input.requestedPath) {
+    const suffix = input.runId
+      .replace(/[^A-Za-z0-9._-]+/gu, "-")
+      .replace(/^-+|-+$/gu, "")
+      .slice(0, 96) || "run";
+    return `Accepted research ${suffix}.md`;
+  }
+
+  const requestedPath = requireSafeVaultMarkdownPath(input.requestedPath);
+  const prompt = input.originalPrompt.replace(/\\/gu, "/").toLowerCase();
+  if (!prompt.includes(requestedPath.toLowerCase())) {
+    throw new Error(
+      "The requested research publication note path was not explicitly present in the user mission.",
+    );
+  }
+  return requestedPath;
+}
+
+function requireSafeVaultMarkdownPath(value: string): string {
+  const normalized = value.replace(/^\/+|\/+$/gu, "");
+  if (
+    normalized !== value ||
+    normalized.includes("\\") ||
+    /^[A-Za-z]:/u.test(normalized) ||
+    normalized.split("/").some((segment) => !segment || segment === "." || segment === "..") ||
+    !normalized.toLowerCase().endsWith(".md")
+  ) {
+    throw new Error("Research publication note path must be a safe vault-relative Markdown path.");
+  }
+  return normalized;
+}
+
+function dedupeVaultPaths(paths: readonly string[]): string[] {
+  const seen = new Set<string>();
+  return paths.filter((path) => {
+    const key = path.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 export interface ResearchPublicationGrantInputV1 {
   runId: string;

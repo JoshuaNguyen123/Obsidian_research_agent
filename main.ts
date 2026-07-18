@@ -472,6 +472,7 @@ import {
 } from "./src/agent/authority";
 import {
   createResearchPublicationTool,
+  resolveResearchPublicationNotePathV1,
 } from "./src/tools/researchPublicationTool";
 import {
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
@@ -9606,8 +9607,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       lineage: this.researchPublicationCheckpointStore,
       destination,
       vaultBindingKey: "current-vault",
-      resolveNotePath: ({ requestedPath, originalPrompt, runId }) =>
-        resolveResearchPublicationNotePath(requestedPath, originalPrompt, runId),
+      resolveNotePath: resolveResearchPublicationNotePathV1,
       validateTrustedBindings: (package_) => {
         const repositoryKey = package_.repositoryKey;
         if (package_.executionClass !== "code") {
@@ -12699,37 +12699,6 @@ function isQueuedCodePreparedActionAllowed(input: {
       expected.resourceType === descriptor.capability.resourceType &&
       expected.actions.has(descriptor.capability.action),
   );
-}
-
-function resolveResearchPublicationNotePath(
-  requestedPath: string | undefined,
-  originalPrompt: string,
-  runId: string,
-): string {
-  if (!requestedPath) {
-    const suffix = runId
-      .replace(/[^A-Za-z0-9._-]+/gu, "-")
-      .replace(/^-+|-+$/gu, "")
-      .slice(0, 96) || "run";
-    return `Accepted research ${suffix}.md`;
-  }
-  const normalized = requestedPath.replace(/^\/+|\/+$/gu, "");
-  if (
-    normalized !== requestedPath ||
-    normalized.includes("\\") ||
-    /^[A-Za-z]:/u.test(normalized) ||
-    normalized.split("/").some((segment) => !segment || segment === "." || segment === "..") ||
-    !normalized.toLowerCase().endsWith(".md")
-  ) {
-    throw new Error("Research publication note path must be a safe vault-relative Markdown path.");
-  }
-  const prompt = originalPrompt.replace(/\\/gu, "/").toLowerCase();
-  if (!prompt.includes(normalized.toLowerCase())) {
-    throw new Error(
-      "The requested research publication note path was not explicitly present in the user mission.",
-    );
-  }
-  return normalized;
 }
 
 function nextMonotonicIso(...previous: string[]): string {
