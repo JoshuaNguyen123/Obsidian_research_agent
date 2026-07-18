@@ -49,6 +49,14 @@ export interface CreateResearchPublicationToolOptionsV1 {
     artifact: AcceptedResearchArtifactV1;
     package: AcceptedResearchNotePackageV1;
   }): Promise<void>;
+  loadDurableWebEvidence?(runId: string): Promise<readonly {
+    url: string;
+    contentHash: string;
+    usableSource: boolean;
+    title?: string;
+    summary?: string;
+    parserStatus?: string;
+  }[]>;
   isAvailable?: () => boolean;
   now?: () => Date;
 }
@@ -79,6 +87,15 @@ export function createResearchPublicationTool(
       }
       const runId = requireIdentity(context.runId, "run id");
       const toolCallId = requireIdentity(context.operationId, "tool call id");
+      if (
+        options.loadDurableWebEvidence &&
+        !hasTrustedWebEvidence(context.runtimeCache)
+      ) {
+        seedDurableWebEvidence(
+          context.runtimeCache,
+          await options.loadDurableWebEvidence(runId),
+        );
+      }
       const parsedNote = await parseToolArguments({
         value: args,
         runId,
@@ -842,6 +859,65 @@ function hydrateTrustedWebEvidence(
       summary: entry.summary,
     })),
   ];
+}
+
+function hasTrustedWebEvidence(
+  runtimeCache: ToolExecutionContext["runtimeCache"],
+): boolean {
+  return [...(runtimeCache?.trustedWebFetchResults?.values() ?? [])].some(
+    (result) => {
+      if (!result.ok) return false;
+      const output = asRecord(result.output);
+      return Boolean(
+        output &&
+        normalizeTrustedWebReference(output.normalizedUrl ?? output.url) &&
+        typeof output.contentHash === "string" &&
+        /^sha256:[a-f0-9]{64}$/u.test(output.contentHash.trim().toLowerCase()),
+      );
+    },
+  );
+}
+
+function seedDurableWebEvidence(
+  runtimeCache: ToolExecutionContext["runtimeCache"],
+  evidence: readonly {
+    url: string;
+    contentHash: string;
+    usableSource: boolean;
+    title?: string;
+    summary?: string;
+    parserStatus?: string;
+  }[],
+): void {
+  if (!runtimeCache) return;
+  runtimeCache.trustedWebFetchResults ??= new Map();
+  for (const item of evidence) {
+    const url = normalizeTrustedWebReference(item.url);
+    const contentHash = item.contentHash.trim().toLowerCase();
+    if (
+      item.usableSource !== true ||
+      !url ||
+      !/^sha256:[a-f0-9]{64}$/u.test(contentHash)
+    ) {
+      continue;
+    }
+    runtimeCache.trustedWebFetchResults.set(`${url}:${contentHash}`, {
+      ok: true,
+      toolName: "web_fetch",
+      output: {
+        url,
+        normalizedUrl: url,
+        contentHash,
+        title: trustedEvidenceText(item.title, url, 240),
+        content: trustedEvidenceText(
+          item.summary,
+          `Verified fetched source: ${url}`,
+          1_000,
+        ),
+        parserStatus: item.parserStatus ?? "parsed",
+      },
+    });
+  }
 }
 
 function trustedEvidenceText(

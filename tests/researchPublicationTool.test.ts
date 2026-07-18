@@ -356,6 +356,51 @@ test("trusted web readback replaces an empty model evidence list", async () => {
   );
 });
 
+test("durable run evidence replaces an empty model evidence list after runtime cache loss", async () => {
+  let loads = 0;
+  const fixture = createFixture("created", {
+    loadDurableWebEvidence: async (runId) => {
+      loads += 1;
+      assert.equal(runId, "run-42");
+      return [{
+        url: "https://example.test/evidence",
+        contentHash: HASH,
+        usableSource: true,
+        title: "Durably verified source",
+        summary: "Verified source content restored from the mission ledger.",
+        parserStatus: "parsed",
+      }];
+    },
+  });
+  const args = argsFixture();
+  (args.package as Record<string, unknown>).evidence = [];
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.runtimeCache = { toolResults: new Map() };
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-durable-web-evidence",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(loads, 1);
+  assert.deepEqual(fixture.noteWrites[0]?.package.evidence, [{
+    id: `evidence-${"a".repeat(64)}`,
+    kind: "web",
+    reference: "https://example.test/evidence",
+    contentSha256: HASH,
+    label: "Durably verified source",
+    summary: "Verified source content restored from the mission ledger.",
+  }]);
+});
+
 test("same-run web readback rejects a conflicting model-supplied evidence hash", async () => {
   const fixture = createFixture("created");
   const args = argsFixture();
@@ -546,7 +591,12 @@ test("external bindings, origin ids, and unscoped paths fail before note mutatio
 
 function createFixture(
   mode: "created" | "deduplicated",
-  options: { trustRepository?: boolean } = {},
+  options: {
+    trustRepository?: boolean;
+    loadDurableWebEvidence?: Parameters<
+      typeof createResearchPublicationTool
+    >[0]["loadDurableWebEvidence"];
+  } = {},
 ) {
   const noteWrites: AcceptedResearchNoteWriteRequestV1[] = [];
   const checkpoints: ResearchPublicationCheckpointV1[] = [];
@@ -622,6 +672,9 @@ function createFixture(
     persistExternalReceipt: async (receipt) => {
       persistedReceipts.push(receipt);
     },
+    ...(options.loadDurableWebEvidence
+      ? { loadDurableWebEvidence: options.loadDurableWebEvidence }
+      : {}),
     now: () => new Date(NOW),
   });
   return { tool, noteWrites, checkpoints, grants, persistedReceipts, publisher };

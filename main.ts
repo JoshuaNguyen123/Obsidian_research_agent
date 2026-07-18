@@ -9671,6 +9671,31 @@ export default class AgenticResearcherPlugin extends Plugin {
       persistAcceptedProjectLineage: async (input) => {
         await this.persistAcceptedProjectLineage(input);
       },
+      loadDurableWebEvidence: async (runId) => {
+        const stored = await readMissionLedgerByRunId(
+          this.createToolExecutionContext(
+            `Recover verified web evidence for accepted research run ${runId}`,
+          ),
+          runId,
+        );
+        return (stored?.ledger.evidence ?? []).flatMap((evidence) =>
+          evidence.kind === "web_source" &&
+          evidence.usableSource === true &&
+          typeof evidence.url === "string" &&
+          typeof evidence.contentHash === "string"
+            ? [{
+                url: evidence.url,
+                contentHash: evidence.contentHash,
+                usableSource: true,
+                ...(evidence.title ? { title: evidence.title } : {}),
+                ...(evidence.summary ? { summary: evidence.summary } : {}),
+                ...(evidence.parserStatus
+                  ? { parserStatus: evidence.parserStatus }
+                  : {}),
+              }]
+            : [],
+        );
+      },
       isAvailable: () =>
         this.getOptionalExtensionCapabilities().integrations &&
         this.settings.linearEnabled === true &&
