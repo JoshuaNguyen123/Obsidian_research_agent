@@ -17,6 +17,7 @@ import type {
   PreparedActionResult,
   ToolDescriptor,
 } from "../agent/actions";
+import type { ProjectLineageV1 } from "../agent/projectLifecycle";
 
 export type AgentMissionMode =
   | "chat_only"
@@ -123,6 +124,8 @@ export interface ToolExecutionContext {
   setResearchMemoryIndex?: (
     entries: ResearchMemoryIndexEntry[],
   ) => Promise<void> | void;
+  /** Host-validated project lineage used to bind downstream provider reads. */
+  getProjectLineages?: () => ProjectLineageV1[];
   semanticEmbeddingProvider?: SemanticEmbeddingProvider;
   semanticIndexService?: SemanticIndexService;
 }

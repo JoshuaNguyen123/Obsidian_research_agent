@@ -12046,6 +12046,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         this.setCurrentMarkdownContent(file, content),
       getResearchMemoryIndex: () => [...this.researchMemoryIndex],
       setResearchMemoryIndex: (entries) => this.setResearchMemoryIndex(entries),
+      getProjectLineages: () => this.getProjectLineages(),
       semanticEmbeddingProvider: this.getSemanticEmbeddingProvider(),
       semanticIndexService: this.getSemanticIndexService(),
     };

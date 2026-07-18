@@ -6459,6 +6459,81 @@ export async function runAgentMission({
       }
       return blockedResult;
     }
+    if (
+      toolCall.name === "linear_get_issue" &&
+      missionGraphExecution &&
+      missionGraphSession
+    ) {
+      const executionNode =
+        missionGraphSession.graph.nodes[missionGraphExecution.nodeId];
+      const dependencyToolNames = executionNode
+        ? executionNode.dependencyIds.flatMap(
+            (dependencyId) =>
+              missionGraphSession!.graph.nodes[dependencyId]?.allowedTools ?? [],
+          )
+        : [];
+      const binding = resolveLinearIssueReadbackBinding({
+        dependencyToolNames,
+        context: runToolContext,
+        messages,
+        durableReceipts: writeReceipts,
+      });
+      if (binding.required && !binding.issueId) {
+        const blockedResult: ToolExecutionResult = {
+          ok: false,
+          toolName: toolCall.name,
+          mutationState: "not_applied",
+          error: {
+            code: "linear_issue_readback_binding_unavailable",
+            message:
+              "The exact verified Linear issue ID from the completed graph dependency is unavailable or ambiguous.",
+          },
+        };
+        await finishMissionGraphTool(
+          missionGraphExecution,
+          toolCall.name,
+          blockedResult,
+        );
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:linear_get_issue:binding-missing`,
+          kind: "tool_rejected",
+          step,
+          toolName: toolCall.name,
+          message: blockedResult.error!.message,
+          error: blockedResult.error,
+        });
+        if (recordTranscript) {
+          appendToolTranscript({
+            messages,
+            toolCall,
+            resultContent: serializeToolResultForModel(blockedResult),
+            origin,
+            fallbackId: buildToolCallFallbackId(
+              runId,
+              step,
+              toolIndex,
+              toolCall.name,
+            ),
+          });
+        }
+        return blockedResult;
+      }
+      if (binding.issueId) {
+        toolCall = {
+          ...toolCall,
+          arguments: { id: binding.issueId },
+        };
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:linear_get_issue:verified-binding`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message:
+            "Bound the Linear issue readback to the exact verified provider ID from its completed graph dependency.",
+          outputPreview: { source: binding.source },
+        });
+      }
+    }
     observedToolCallCount += 1;
     const toolEventBase: AgentToolRunEvent = {
       id: `${step}:${toolIndex}:${toolCall.name}`,
@@ -8569,6 +8644,7 @@ export async function runAgentMission({
                   missionGraphSession?.graph ?? missionGraph,
                   stepTools,
                 ),
+                getVerifiedLinearHierarchyIssueId(runToolContext),
               ),
             )
           : messages;
@@ -15248,6 +15324,88 @@ function findNestedLinearIssueRecord(
   return null;
 }
 
+export function getVerifiedLinearHierarchyIssueId(
+  context: Pick<
+    ToolExecutionContext,
+    "rootMissionId" | "runId" | "getProjectLineages"
+  >,
+): string | null {
+  const rootMissionId = context.rootMissionId?.trim() || context.runId?.trim();
+  if (!rootMissionId || !context.getProjectLineages) return null;
+  let lineages: ReturnType<NonNullable<ToolExecutionContext["getProjectLineages"]>>;
+  try {
+    lineages = context.getProjectLineages();
+  } catch {
+    return null;
+  }
+  const issueIds = new Set<string>();
+  for (const lineage of lineages) {
+    if (lineage.runId !== rootMissionId || !Array.isArray(lineage.commits)) {
+      continue;
+    }
+    for (const commit of lineage.commits) {
+      if (
+        commit.stage !== "linear_hierarchy" ||
+        commit.proof.stage !== "linear_hierarchy" ||
+        !Array.isArray(commit.proof.issueIds)
+      ) {
+        continue;
+      }
+      for (const issueId of commit.proof.issueIds) {
+        if (typeof issueId === "string" && issueId.trim()) {
+          issueIds.add(issueId.trim());
+        }
+      }
+    }
+  }
+  return issueIds.size === 1 ? [...issueIds][0]! : null;
+}
+
+export function resolveLinearIssueReadbackBinding(input: {
+  dependencyToolNames: readonly string[];
+  context: Pick<
+    ToolExecutionContext,
+    "rootMissionId" | "runId" | "getProjectLineages"
+  >;
+  messages: readonly ModelChatMessage[];
+  durableReceipts?: readonly AgentRunReceipt[];
+}): {
+  required: boolean;
+  issueId: string | null;
+  source: "linear_hierarchy" | "linear_create_issue" | null;
+} {
+  const dependencies = new Set(input.dependencyToolNames);
+  if (dependencies.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME)) {
+    return {
+      required: true,
+      issueId: getVerifiedLinearHierarchyIssueId(input.context),
+      source: "linear_hierarchy",
+    };
+  }
+  if (dependencies.has("linear_create_issue")) {
+    const messageRecord = findNestedLinearIssueRecord(
+      getLatestToolOutput(input.messages, "linear_create_issue"),
+      0,
+    );
+    const messageId = getString(messageRecord?.id);
+    const receiptIds = new Set(
+      [...(input.durableReceipts ?? [])]
+        .filter((receipt) => receipt.toolName === "linear_create_issue")
+        .map((receipt) => receipt.resource?.id)
+        .filter((value): value is string =>
+          typeof value === "string" && value.trim().length > 0
+        ),
+    );
+    if (messageId) receiptIds.add(messageId);
+    return {
+      required: true,
+      issueId: receiptIds.size === 1 ? [...receiptIds][0]! : null,
+      source: "linear_create_issue",
+    };
+  }
+  return { required: false, issueId: null, source: null };
+}
+
 function getFirstWebSearchResultUrl(output: unknown): string | null {
   return getWebSearchResultUrls(output)[0] ?? null;
 }
@@ -18774,8 +18932,35 @@ export function buildObservedMissionGraphFrontierBinding(
   stepTools: readonly ModelToolDefinition[],
   durableReceipts: readonly AgentRunReceipt[] = [],
   graphDestinationSelector: string | null = null,
+  verifiedLinearHierarchyIssueId: string | null = null,
 ): string | null {
   const names = stepTools.map((tool) => tool.function.name);
+  if (names.length === 1 && names[0] === "linear_get_issue") {
+    const createdIssue = findNestedLinearIssueRecord(
+      getLatestToolOutput(messages, "linear_create_issue"),
+      0,
+    );
+    const createdIssueId = getString(createdIssue?.id);
+    const receiptIssueIds = new Set(
+      [...durableReceipts]
+        .filter((receipt) => receipt.toolName === "linear_create_issue")
+        .map((receipt) => receipt.resource?.id)
+        .filter((value): value is string =>
+          typeof value === "string" && value.trim().length > 0
+        ),
+    );
+    if (createdIssueId) receiptIssueIds.add(createdIssueId);
+    const issueId =
+      verifiedLinearHierarchyIssueId ??
+      (receiptIssueIds.size === 1 ? [...receiptIssueIds][0]! : null);
+    if (issueId) {
+      return [
+        "EXACT VERIFIED LINEAR ISSUE READBACK:",
+        `id=${JSON.stringify(issueId)}.`,
+        "Call linear_get_issue with this exact provider ID; the host will replace a model-transcribed alias with the verified graph dependency binding.",
+      ].join(" ");
+    }
+  }
   if (
     names.length === 1 &&
     names[0] === "code_workspace_create_file" &&

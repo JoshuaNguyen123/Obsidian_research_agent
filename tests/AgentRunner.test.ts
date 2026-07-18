@@ -14,6 +14,7 @@ import {
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
   getExplicitLinearReadToolNames,
+  getVerifiedLinearHierarchyIssueId,
   getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
@@ -21,6 +22,7 @@ import {
   getRestorableCompletedGraphToolNames,
   hasPreparedBackgroundCodeValidationCommitIntent,
   insertExplicitLinearReadbacksIntoLifecycleToolNames,
+  resolveLinearIssueReadbackBinding,
   resolveThinkingMode,
   restoreTrustedWebFetchResultsFromEvidence,
   runAgentMission,
@@ -3979,6 +3981,88 @@ test("workspace correction frontiers bind exact reads, hashes, content, and Line
   assert.match(binding ?? "", /currentContent="# Checkers\\n"/u);
   assert.match(binding ?? "", /APP-42/u);
   assert.match(binding ?? "", /linear\.app\/example\/issue\/APP-42/u);
+});
+
+test("Linear issue readback binds the one durable hierarchy issue instead of a model alias", () => {
+  const issueId = "12345678-1234-4234-8234-1234567890ab";
+  const context = {
+    rootMissionId: "root-linear-run",
+    runId: "restart-segment",
+    getProjectLineages: () => [
+      {
+        schemaVersion: 1 as const,
+        kind: "project_lineage" as const,
+        lineageId: "project-test",
+        runId: "root-linear-run",
+        vaultBindingKey: "vault:test",
+        commits: [
+          {
+            stage: "linear_hierarchy" as const,
+            committedAt: "2026-07-18T22:00:00.000Z",
+            proof: {
+              stage: "linear_hierarchy" as const,
+              planFingerprint: `sha256:${"1".repeat(64)}`,
+              workspaceId: "workspace",
+              teamId: "team",
+              initiativeId: "initiative",
+              projectId: "project",
+              issueIds: [issueId],
+              workItemFingerprints: [`sha256:${"2".repeat(64)}`],
+              providerReadbackFingerprints: [`sha256:${"3".repeat(64)}`],
+            },
+            proofFingerprint: `sha256:${"4".repeat(64)}`,
+          },
+        ],
+        updatedAt: "2026-07-18T22:00:00.000Z",
+        fingerprint: `sha256:${"5".repeat(64)}`,
+      },
+    ],
+  };
+  assert.equal(getVerifiedLinearHierarchyIssueId(context), issueId);
+  assert.deepEqual(
+    resolveLinearIssueReadbackBinding({
+      dependencyToolNames: ["publish_research_project_to_linear"],
+      context,
+      messages: [],
+    }),
+    { required: true, issueId, source: "linear_hierarchy" },
+  );
+  const binding = buildObservedMissionGraphFrontierBinding(
+    [],
+    [{
+      type: "function",
+      function: {
+        name: "linear_get_issue",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    [],
+    null,
+    issueId,
+  );
+  assert.match(binding ?? "", /EXACT VERIFIED LINEAR ISSUE READBACK/u);
+  assert.match(binding ?? "", new RegExp(issueId, "u"));
+  assert.deepEqual(
+    resolveLinearIssueReadbackBinding({
+      dependencyToolNames: ["linear_create_issue"],
+      context: {},
+      messages: [{
+        role: "tool",
+        toolName: "linear_create_issue",
+        content: JSON.stringify({
+          ok: true,
+          output: {
+            resourceType: "issue",
+            id: issueId,
+            identifier: "APP-42",
+            title: "Retained evidence",
+            url: "https://linear.app/example/issue/APP-42",
+          },
+        }),
+      }],
+    }),
+    { required: true, issueId, source: "linear_create_issue" },
+  );
 });
 
 test("explicit Linear reads preserve order and obey negation", () => {
