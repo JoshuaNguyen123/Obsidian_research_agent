@@ -10,6 +10,7 @@ import {
   createOperationJournalRecord,
   buildOperationReconciliationInputs,
   normalizeMissionRuntimeSnapshot,
+  reconcilePersistedExactLifecycleJournalRecords,
   reconcilePriorExactLifecycleJournalRecords,
   transitionOperationJournalRecord,
 } from "../src/agent/runStore";
@@ -95,6 +96,16 @@ test("verified exact lifecycle retry closes an older ambiguous WAL row for the s
     "committed",
   ]);
   assert.equal(reconciled[0].receipt?.id, receipt.id);
+
+  const restarted = reconcilePersistedExactLifecycleJournalRecords(
+    [prior, current],
+    new Date("2026-07-18T10:00:07.000Z"),
+  );
+  assert.deepEqual(restarted.map((record) => record.state), [
+    "committed",
+    "committed",
+  ]);
+  assert.equal(restarted[0].receipt?.id, receipt.id);
 });
 
 test("an exact lifecycle composite may re-enter its own durable reconciliation checkpoint", () => {

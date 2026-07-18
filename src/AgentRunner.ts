@@ -388,6 +388,7 @@ import {
   isRuntimeSnapshotWriteAmbiguousError,
   readMissionRuntimeSnapshotByRunId,
   reconcilePriorExactLifecycleJournalRecords,
+  reconcilePersistedExactLifecycleJournalRecords,
   markExternalActionJobSubmittedV1,
   markBackgroundCodeJobSubmittedV1,
   markBackgroundGitHubJobSubmittedV1,
@@ -1808,6 +1809,13 @@ export async function runAgentMission({
     emitDirectAssistantAnswer(message, events, true);
     completeRun(events, "final", 0, runStartedAt, runPlan.maxStepsForRun);
     return;
+  }
+  if (resumeSnapshot) {
+    resumeSnapshot.operationJournal =
+      reconcilePersistedExactLifecycleJournalRecords(
+        resumeSnapshot.operationJournal,
+        runToolContext.now?.() ?? new Date(),
+      );
   }
   const ambiguousResumeOperations = resumeSnapshot
     ? buildOperationReconciliationInputs(resumeSnapshot.operationJournal).filter(

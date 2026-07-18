@@ -1189,7 +1189,7 @@ const EXACT_LIFECYCLE_RECONCILIATION_TOOLS = new Set([
 export function reconcilePriorExactLifecycleJournalRecords(
   records: readonly OperationJournalRecord[],
   current: OperationJournalRecord,
-  receipt: ActionReceipt,
+  receipt: ActionReceipt | MissionRuntimeReceipt,
   now = new Date(),
 ): OperationJournalRecord[] {
   const eligible =
@@ -1199,7 +1199,7 @@ export function reconcilePriorExactLifecycleJournalRecords(
     EXACT_LIFECYCLE_RECONCILIATION_TOOLS.has(current.toolName) &&
     exactLifecycleReceiptMatches(current.toolName, receipt) &&
     receipt.commitKind === "committed" &&
-    receipt.readback.status === "verified" &&
+    receipt.readback?.status === "verified" &&
     typeof receipt.idempotencyKey === "string" &&
     receipt.idempotencyKey.length > 0;
   if (!eligible) return records.map((record) => ({ ...record }));
@@ -1224,9 +1224,32 @@ export function reconcilePriorExactLifecycleJournalRecords(
   });
 }
 
+/**
+ * Replays the same exact-lifecycle reconciliation after restart. A crash or
+ * stage restart may persist the later committed row and its verified receipt
+ * before the older ambiguous row is collapsed. Only the closed composite set,
+ * same root run/node/tool, and canonical verified receipt remain eligible.
+ */
+export function reconcilePersistedExactLifecycleJournalRecords(
+  records: readonly OperationJournalRecord[],
+  now = new Date(),
+): OperationJournalRecord[] {
+  let reconciled = records.map((record) => ({ ...record }));
+  for (const current of records) {
+    if (current.state !== "committed" || !current.receipt) continue;
+    reconciled = reconcilePriorExactLifecycleJournalRecords(
+      reconciled,
+      current,
+      current.receipt,
+      now,
+    );
+  }
+  return reconciled;
+}
+
 function exactLifecycleReceiptMatches(
   compositeToolName: string,
-  receipt: ActionReceipt,
+  receipt: ActionReceipt | MissionRuntimeReceipt,
 ): boolean {
   const expected: Record<string, { system: ResourceRef["system"]; prefix: string }> = {
     publish_research_to_linear: {
@@ -1253,7 +1276,7 @@ function exactLifecycleReceiptMatches(
   const binding = expected[compositeToolName];
   return Boolean(
     binding &&
-    receipt.resource.system === binding.system &&
+    receipt.resource?.system === binding.system &&
     receipt.idempotencyKey?.startsWith(binding.prefix),
   );
 }
