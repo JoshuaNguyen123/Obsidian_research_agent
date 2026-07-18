@@ -97,6 +97,68 @@ test("verified exact lifecycle retry closes an older ambiguous WAL row for the s
   assert.equal(reconciled[0].receipt?.id, receipt.id);
 });
 
+test("an exact lifecycle composite may re-enter its own durable reconciliation checkpoint", () => {
+  const descriptor: ToolDescriptor = {
+    ...descriptorFixture(),
+    name: "publish_research_project_to_linear",
+    capability: {
+      system: "linear",
+      resourceType: "project_hierarchy",
+      action: "publish",
+    },
+    effect: "publish",
+    approval: {
+      allowPromptGrant: false,
+      allowPersistentGrant: false,
+      fallback: "exact",
+    },
+    execution: {
+      preparation: "none",
+      cacheable: false,
+      parallelSafe: false,
+    },
+  };
+  const intent = createOperationJournalRecord({
+    operationId: "hierarchy-segment-1",
+    rootRunId: "run-hierarchy",
+    segmentId: "run-hierarchy",
+    nodeId: "tool-05-publish_research_project_to_linear",
+    toolName: descriptor.name,
+    operation: descriptor.capability.action,
+    inputHash: `sha256:${"a".repeat(64)}`,
+    descriptor,
+    now: new Date("2026-07-18T13:00:00.000Z"),
+  });
+  const applying = transitionOperationJournalRecord(intent, "applying", {
+    message: "The composite checkpoint was persisted before nested execution.",
+    now: new Date("2026-07-18T13:00:01.000Z"),
+  });
+  const pending = transitionOperationJournalRecord(
+    applying,
+    "reconcile_required",
+    {
+      message: "Nested provider readback is pending.",
+      mutationMayHaveApplied: true,
+      now: new Date("2026-07-18T13:00:02.000Z"),
+    },
+  );
+
+  const reconciliation = buildOperationReconciliationInputs([pending])[0];
+  assert.equal(reconciliation.mutationMayHaveApplied, true);
+  assert.equal(reconciliation.recommendedAction, "safe_to_retry");
+
+  const ordinary = {
+    ...pending,
+    operationId: "ordinary-external-mutation",
+    toolName: "linear_create_issue",
+    descriptor: descriptorFixture(),
+  };
+  assert.notEqual(
+    buildOperationReconciliationInputs([ordinary])[0].recommendedAction,
+    "safe_to_retry",
+  );
+});
+
 test("action journal v2 round-trips prepared authority and canonical receipt", async () => {
   const descriptor = descriptorFixture();
   const action = await withPreparedActionFingerprint({

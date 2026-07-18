@@ -3541,6 +3541,9 @@ function getReconciliationAction(
   if (record.state === "intent_recorded" && !record.mutationMayHaveApplied) {
     return "safe_to_retry";
   }
+  if (isExactLifecycleCompositeRetry(record)) {
+    return "safe_to_retry";
+  }
   if (record.state === "readback_verified") {
     return "verify_receipt";
   }
@@ -3561,6 +3564,33 @@ function getReconciliationAction(
     return "inspect_target";
   }
   return "manual_review";
+}
+
+/**
+ * These host-owned composites persist their own provider-specific checkpoint
+ * before returning `reconcile_required`. Re-entering the same graph node does
+ * readback reconciliation from that checkpoint; it does not blindly replay
+ * the nested mutation. The outer WAL remains honest that an effect may have
+ * occurred, while its recovery recommendation permits only this exact,
+ * fingerprinted composite continuation.
+ */
+function isExactLifecycleCompositeRetry(
+  record: OperationJournalRecord,
+): boolean {
+  return (
+    record.state === "reconcile_required" &&
+    record.mutationMayHaveApplied &&
+    EXACT_LIFECYCLE_RECONCILIATION_TOOLS.has(record.toolName) &&
+    typeof record.nodeId === "string" &&
+    record.nodeId.length > 0 &&
+    typeof record.inputHash === "string" &&
+    record.inputHash.length > 0 &&
+    record.preparedAction === undefined &&
+    record.descriptor?.durability.journal === true &&
+    record.descriptor.durability.receipt === true &&
+    record.descriptor.durability.readback === "required" &&
+    record.descriptor.durability.reconciliation === "required"
+  );
 }
 
 function normalizeAcceptance(value: unknown): MissionAcceptanceResult | undefined {
