@@ -326,9 +326,15 @@ async function approveUntilMissionComplete(
         diagnostic.id === "resume-mutation-reconciliation-required" ||
         diagnostic.errorCode === "mutation_reconciliation_required",
     );
+    const previousDiagnostics = Array.isArray(lastDurableState?.diagnostics)
+      ? lastDurableState.diagnostics
+      : [];
+    const preservesRicherFailureState =
+      previousDiagnostics.length > 0 && ui.diagnostics.length === 0;
     if (
       (ui.ledger || ui.graph.length > 0) &&
-      !preAuthorityReconciliationBlock
+      !preAuthorityReconciliationBlock &&
+      !preservesRicherFailureState
     ) {
       lastDurableState = JSON.parse(JSON.stringify(ui)) as Record<string, unknown>;
     }
