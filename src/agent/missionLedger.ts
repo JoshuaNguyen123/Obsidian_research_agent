@@ -820,13 +820,55 @@ export async function readMissionLedgerByRunId(
 
   const path = getMissionLedgerPath(runId);
   const file = context.app.vault.getFileByPath(path);
-  if (!file) {
-    return null;
+  if (file) {
+    const content = await context.app.vault.read(file as TFile);
+    const ledger = parseMissionLedgerFromMarkdown(content);
+    if (ledger?.runId === runId) {
+      return { path, ledger };
+    }
   }
 
-  const content = await context.app.vault.read(file as TFile);
-  const ledger = parseMissionLedgerFromMarkdown(content);
-  return ledger ? { path, ledger } : null;
+  // Obsidian's metadata index can briefly lag a completed vault create or a
+  // plugin restart. Read the exact adapter path as a bounded fallback, but
+  // accept it only when the embedded ledger identity matches the requested
+  // run. This also fails closed on sanitized filename collisions.
+  const adapter = context.app.vault.adapter as unknown as {
+    exists?: (path: string) => Promise<boolean>;
+    read?: (path: string) => Promise<string>;
+  };
+  if (typeof adapter.read === "function") {
+    try {
+      if (
+        typeof adapter.exists !== "function" ||
+        (await adapter.exists(path))
+      ) {
+        const content = await adapter.read(path);
+        const ledger = parseMissionLedgerFromMarkdown(content);
+        if (ledger?.runId === runId) {
+          return { path, ledger };
+        }
+      }
+    } catch {
+      // Fall through to the exact-identity vault scan below.
+    }
+  }
+
+  if (typeof context.app.vault.getFiles === "function") {
+    const candidates = context.app.vault
+      .getFiles()
+      .filter((candidate) => /^Agent Runs\/[^/]+\.md$/iu.test(candidate.path))
+      .slice(0, 256);
+    for (const candidate of candidates) {
+      if (candidate.path === path && file) continue;
+      const content = await context.app.vault.read(candidate);
+      const ledger = parseMissionLedgerFromMarkdown(content);
+      if (ledger?.runId === runId) {
+        return { path: candidate.path, ledger };
+      }
+    }
+  }
+
+  return null;
 }
 
 export async function readLatestMissionLedger(

@@ -92,6 +92,11 @@ type RunExecutor = (
 export interface RunCoordinatorStartOptions {
   /** Receives only events from the run accepted by this start call. */
   eventTap?: AgentRunEvents;
+  /**
+   * Exact durable continuations retain the prior ledger/graph until the child
+   * publishes a ledger-bearing config or a canonical graph update.
+   */
+  preserveExistingProjectionUntilLedger?: boolean;
 }
 
 type BufferedRunEvent = {
@@ -126,6 +131,7 @@ export class RunCoordinator {
   private lastActivityAtMs: number | null = null;
   private activeRunPublishedAuthority = false;
   private activeRunStartedFromPersistedProjection = false;
+  private activeRunRequiresDurableResumeAuthority = false;
 
   isRunning(): boolean {
     return this.activePromise !== null;
@@ -200,11 +206,19 @@ export class RunCoordinator {
       throw new RunAlreadyActiveError();
     }
 
+    const preserveExistingProjection =
+      options.preserveExistingProjectionUntilLedger === true &&
+      this.lastMissionLedger !== null &&
+      this.lastMissionGraph !== null;
+    const preservedRunId = preserveExistingProjection
+      ? this.lastMissionLedger?.runId ?? this.runId
+      : null;
+
     this.bufferedEvents.splice(0, this.bufferedEvents.length);
     this.bufferedEventChars = 0;
     this.droppedEventCount = 0;
     this.eventSequence = 0;
-    this.runId = null;
+    this.runId = preservedRunId;
     this.lastConfig = null;
     this.modelCallEvidence.splice(0, this.modelCallEvidence.length);
     this.missionEvidence.splice(0, this.missionEvidence.length);
@@ -215,7 +229,9 @@ export class RunCoordinator {
     // cancelled while its structured router is in flight; eagerly clearing
     // here would turn that recoverable stop into a blank, non-resumable view.
     this.activeRunPublishedAuthority = false;
-    this.activeRunStartedFromPersistedProjection = this.persistedProjection !== null;
+    this.activeRunStartedFromPersistedProjection = preserveExistingProjection;
+    this.activeRunRequiresDurableResumeAuthority =
+      this.activeRunStartedFromPersistedProjection;
     this.lastReceipts.splice(0, this.lastReceipts.length);
     this.lastComplete = null;
     this.activeController = new AbortController();
@@ -362,12 +378,17 @@ export class RunCoordinator {
     this.lastActivityAtMs = Date.now();
     if (key === "onRunConfig") {
       const config = args[0] as AgentRunConfigEvent | undefined;
-      this.acceptActiveRunAuthority();
-      this.runId = config?.runId ?? this.runId;
       this.lastConfig = config ? { ...config } : this.lastConfig;
-      this.lastMissionLedger = config?.missionLedger
-        ? structuredCloneValue(config.missionLedger)
-        : null;
+      if (
+        !this.activeRunRequiresDurableResumeAuthority ||
+        config?.missionLedger
+      ) {
+        this.acceptActiveRunAuthority();
+        this.runId = config?.runId ?? this.runId;
+        this.lastMissionLedger = config?.missionLedger
+          ? structuredCloneValue(config.missionLedger)
+          : null;
+      }
     } else if (key === "onMissionGraphUpdate") {
       const graph = args[0] as MissionGraphV3 | undefined;
       if (graph) {
@@ -545,6 +566,7 @@ export class RunCoordinator {
   private acceptActiveRunAuthority(): void {
     if (this.activeRunPublishedAuthority) return;
     this.activeRunPublishedAuthority = true;
+    this.activeRunRequiresDurableResumeAuthority = false;
     this.lastMissionGraph = null;
     this.lastMissionLedger = null;
     this.persistedProjection = null;
@@ -566,7 +588,7 @@ function emptyProviderUsage(): ModelUsageAggregateV1 {
 
 function isAttestedDiagnosticTraceId(id: string): boolean {
   return (
-    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|operation-goals:)/u.test(
+    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|checkpoint-resume:|mission-ledger-resume:invalid-handoff$|resume-mutation-reconciliation-required$|operation-goals:)/u.test(
       id,
     ) ||
     id.endsWith(":proof-gated-writeback-rejected") ||

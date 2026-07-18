@@ -125,6 +125,7 @@ import {
   loadLatestPersistedMissionRunProjection,
   loadPersistedMissionRunProjectionByRunId,
 } from "./src/agent/startupMissionHydration";
+import { extractRequestedRunId } from "./src/agent/missionResume";
 import { createAgentRunId } from "./src/agent/checkpoints";
 import {
   DURABLE_MISSION_MAX_MODEL_STEPS,
@@ -7151,6 +7152,15 @@ export default class AgenticResearcherPlugin extends Plugin {
     };
 
     try {
+      const requestedContinuationRunId = extractRequestedRunId(prompt);
+      const coordinatorBeforeStart = this.runCoordinator.getSnapshot();
+      const preserveExistingProjectionUntilLedger = Boolean(
+        requestedContinuationRunId &&
+          coordinatorBeforeStart.lastMissionLedger?.runId ===
+            requestedContinuationRunId &&
+          coordinatorBeforeStart.lastMissionLedger.canResume &&
+          coordinatorBeforeStart.lastMissionGraph,
+      );
       return await this.runCoordinator.start(
         async (abortSignal, events) => {
           if (durableManifest) {
@@ -7363,7 +7373,10 @@ export default class AgenticResearcherPlugin extends Plugin {
             segmentHistory = [];
           }
         },
-        { eventTap: assistantCapture },
+        {
+          eventTap: assistantCapture,
+          preserveExistingProjectionUntilLedger,
+        },
       );
     } finally {
       if (assistantContent.trim()) {

@@ -453,6 +453,68 @@ test("a continuation stopped before publishing authority retains its verified re
   });
 });
 
+test("a durable continuation does not replace its projection with a routing-only config", async () => {
+  const coordinator = new RunCoordinator();
+  const graph = {
+    schemaVersion: 3,
+    missionId: "mission-routing-resume",
+    objective: "Resume the exact Linear hierarchy frontier",
+    revision: 6,
+    nodes: {},
+  } as never;
+  coordinator.hydratePersistedMission({
+    runId: "run-routing-resume",
+    runtimeSnapshotPath: "Agent Runs/run-routing-resume.md",
+    missionLedgerPath: "Agent Runs/run-routing-resume.md",
+    graphStorePath: "Agent Runs/Mission Graphs/run-routing-resume.md",
+    graphReference: {
+      version: 1,
+      missionId: "mission-routing-resume",
+      path: "Agent Runs/Mission Graphs/run-routing-resume.md",
+      storeRevision: 8,
+      graphRevision: 6,
+      recordFingerprint: `sha256:${"c".repeat(64)}`,
+      journalHeadFingerprint: `sha256:${"d".repeat(64)}`,
+    },
+    missionLedger: {
+      runId: "run-routing-resume",
+      status: "budget",
+      evidenceCount: 3,
+      receiptCount: 2,
+      expectedTools: ["publish_research_project_to_linear"],
+      nextAction: "Resume the Linear hierarchy.",
+      remainingActions: ["Resume the Linear hierarchy."],
+      continuationCommand: "continue run run-routing-resume",
+      canResume: true,
+      dependencyStatus: [],
+      iterationCount: 4,
+      progressScore: 0.5,
+      stalledCount: 0,
+    },
+    missionGraph: graph,
+  });
+
+  await coordinator.start(
+    async (_signal, events) => {
+      events.onRunConfig?.({
+        runId: "run-routing-child",
+        maxStepsForRun: 1,
+      } as never);
+      events.onRunComplete?.({ step: 0, maxSteps: 1, stopReason: "error" });
+    },
+    { preserveExistingProjectionUntilLedger: true },
+  );
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.runId, "run-routing-resume");
+  assert.equal(snapshot.lastMissionLedger?.canResume, true);
+  assert.deepEqual(snapshot.lastMissionGraph, graph);
+  assert.equal(
+    snapshot.diagnosticAttestations.at(-1)?.errorCode,
+    "run_returned_before_authority",
+  );
+});
+
 test("run coordinator retains a bounded redacted terminal rejection", async () => {
   const coordinator = new RunCoordinator();
   const secret = `lin_api_${"s".repeat(64)}`;

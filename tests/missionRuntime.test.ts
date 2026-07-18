@@ -336,6 +336,30 @@ test("mission resume parses explicit run ids and formats transient resume contex
   const loaded = await readMissionLedgerByRunId(mock.context, "run:test");
   assert.equal(loaded?.path, "Agent Runs/run-test.md");
 
+  const vault = mock.context.app.vault as unknown as {
+    getFileByPath: (path: string) => unknown;
+    adapter?: unknown;
+  };
+  const indexedGetFileByPath = vault.getFileByPath;
+  vault.getFileByPath = () => null;
+  vault.adapter = {
+    exists: async (path: string) => mock.files.has(path),
+    read: async (path: string) => mock.files.get(path) ?? "",
+  };
+  const adapterLoaded = await readMissionLedgerByRunId(
+    mock.context,
+    "run:test",
+  );
+  assert.equal(adapterLoaded?.ledger.runId, "run:test");
+  vault.getFileByPath = indexedGetFileByPath;
+
+  assert.equal(
+    (await readMissionLedgerByRunId(mock.context, "run-test"))?.ledger.runId ??
+      null,
+    null,
+    "sanitized filename collisions must not substitute another run ledger",
+  );
+
   const resume = await buildMissionResumeContext({
     prompt: "continue run run:test",
     activeIntentPrompt: "continue run run:test",
