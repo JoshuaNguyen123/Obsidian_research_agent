@@ -8717,6 +8717,85 @@ export async function runAgentMission({
           stepTools,
         )
       : null;
+    let stepVerifiedWorkspaceReadObservation = stepGraphDestinationSelector
+      ? getVerifiedWorkspaceReadObservation(
+          runtimeCache,
+          stepGraphDestinationSelector,
+        )
+      : null;
+    if (!stepVerifiedWorkspaceReadObservation) {
+      const refreshBinding = getVerifiedWorkspaceReadRefreshBinding(
+        missionGraphSession?.graph ?? missionGraph,
+        stepTools,
+        writeReceipts,
+        stepGraphDestinationSelector,
+      );
+      const readDescriptor = refreshBinding
+        ? toolRegistry.getDescriptor?.("code_workspace_read") ?? null
+        : null;
+      if (refreshBinding && readDescriptor?.effect === "read") {
+        events.onStatus?.(
+          `Refreshing the exact workspace read precondition for ${refreshBinding.path} after continuation.`,
+        );
+        try {
+          const refreshResult = await executeToolWithMetrics({
+            toolRegistry,
+            toolCall: {
+              name: "code_workspace_read",
+              arguments: {
+                workspaceId: refreshBinding.workspaceId,
+                path: refreshBinding.path,
+              },
+            },
+            toolContext: runToolContext,
+            events,
+            step,
+          });
+          stepVerifiedWorkspaceReadObservation =
+            getVerifiedWorkspaceReadObservation(
+              runtimeCache,
+              refreshBinding.path,
+              refreshBinding.workspaceId,
+            );
+          events.onTrace?.({
+            id: `workspace-read-precondition-refresh-${step}`,
+            kind: refreshResult.ok ? "verification" : "tool_rejected",
+            step,
+            toolName: "code_workspace_read",
+            message: refreshResult.ok
+              ? "Refreshed the exact workspace read precondition from the completed graph dependency."
+              : "The exact workspace read precondition could not be refreshed after continuation.",
+            outputPreview: {
+              path: refreshBinding.path,
+              verified: stepVerifiedWorkspaceReadObservation !== null,
+            },
+            ...(refreshResult.error
+              ? {
+                  error: {
+                    code: refreshResult.error.code,
+                    message:
+                      "The exact workspace read refresh failed before mutation.",
+                  },
+                }
+              : {}),
+          });
+        } catch {
+          events.onTrace?.({
+            id: `workspace-read-precondition-refresh-${step}`,
+            kind: "tool_rejected",
+            step,
+            toolName: "code_workspace_read",
+            message:
+              "The exact workspace read precondition refresh failed before mutation.",
+            error: {
+              code: "workspace_read_refresh_failed",
+              message:
+                "The exact workspace read refresh failed before mutation.",
+            },
+          });
+        }
+      }
+    }
     let response: ModelChatResponse;
     try {
       const stepMessages =
@@ -8730,12 +8809,7 @@ export async function runAgentMission({
                 writeReceipts,
                 stepGraphDestinationSelector,
                 getVerifiedLinearHierarchyIssueId(runToolContext),
-                stepGraphDestinationSelector
-                  ? getVerifiedWorkspaceReadObservation(
-                      runtimeCache,
-                      stepGraphDestinationSelector,
-                    )
-                  : null,
+                stepVerifiedWorkspaceReadObservation,
               ),
             )
           : messages;
@@ -11623,6 +11697,74 @@ export function getMissionGraphFrontierDestinationSelector(
       .filter((value): value is string => typeof value === "string"),
   );
   return selectors.size === 1 ? [...selectors][0]! : null;
+}
+
+export function getVerifiedWorkspaceReadRefreshBinding(
+  graph: MissionGraphV3 | null | undefined,
+  stepTools: readonly ModelToolDefinition[],
+  durableReceipts: readonly AgentRunReceipt[],
+  graphDestinationSelector: string | null,
+): { workspaceId: string; path: string } | null {
+  if (
+    !graph ||
+    stepTools.length !== 1 ||
+    stepTools[0]?.function.name !== "code_workspace_write_expected" ||
+    !graphDestinationSelector ||
+    graphDestinationSelector.startsWith("prompt-scoped-")
+  ) {
+    return null;
+  }
+  const readyWrites = Object.values(graph.nodes).filter(
+    (node) =>
+      node.status === "ready" &&
+      node.allowedTools.length === 1 &&
+      node.allowedTools[0] === "code_workspace_write_expected" &&
+      getMissionGraphNodeSelector(node) === graphDestinationSelector,
+  );
+  if (readyWrites.length !== 1) return null;
+  const completedExactReads = readyWrites[0]!.dependencyIds
+    .map((dependencyId) => graph.nodes[dependencyId])
+    .filter(
+      (node): node is MissionGraphV3["nodes"][string] =>
+        Boolean(
+          node &&
+            node.status === "complete" &&
+            node.allowedTools.length === 1 &&
+            node.allowedTools[0] === "code_workspace_read" &&
+            getMissionGraphNodeSelector(node) === graphDestinationSelector,
+        ),
+    );
+  if (completedExactReads.length !== 1) return null;
+  const workspaceIds = new Set(
+    durableReceipts
+      .filter(
+        (receipt) =>
+          receipt.toolName === "code_workspace_create" &&
+          (receipt.commitKind === "committed" ||
+            receipt.commitKind === "reconciled") &&
+          receipt.readback?.status === "verified" &&
+          receipt.resource?.system === "workspace",
+      )
+      .map((receipt) =>
+        receipt.resource?.workspaceId?.trim() ||
+        receipt.resource?.path?.trim() ||
+        "",
+      )
+      .filter((workspaceId) => workspaceId.length > 0),
+  );
+  if (workspaceIds.size !== 1) return null;
+  return {
+    workspaceId: [...workspaceIds][0]!,
+    path: graphDestinationSelector,
+  };
+}
+
+function getMissionGraphNodeSelector(
+  node: MissionGraphV3["nodes"][string],
+): string | null {
+  if (node.destination?.selector) return node.destination.selector;
+  const resource = node.inputs.resource;
+  return resource?.kind === "binding" ? resource.selector : null;
 }
 
 function safeProjectLifecycleEstimate(

@@ -16,6 +16,7 @@ import {
   getExplicitCodeToolNames,
   getExplicitLinearReadToolNames,
   getVerifiedWorkspaceReadObservation,
+  getVerifiedWorkspaceReadRefreshBinding,
   getVerifiedLinearHierarchyIssueId,
   getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
@@ -4051,6 +4052,90 @@ test("workspace correction preserves the verified read binding after transcript 
     content: "def legal_moves():\n    return [\"forced\"]\n",
     expectedSha256: sha256,
   });
+});
+
+test("workspace correction refreshes only a completed exact read in its durably created workspace", () => {
+  const path = "checkers/game.py";
+  const writeTool = [{
+    type: "function" as const,
+    function: {
+      name: "code_workspace_write_expected",
+      parameters: { type: "object", properties: {} },
+    },
+  }];
+  const graph = {
+    nodes: {
+      read: {
+        id: "read",
+        status: "complete",
+        allowedTools: ["code_workspace_read"],
+        inputs: {
+          resource: {
+            kind: "binding",
+            bindingId: "workspace-binding",
+            selector: path,
+          },
+        },
+      },
+      write: {
+        id: "write",
+        status: "ready",
+        allowedTools: ["code_workspace_write_expected"],
+        dependencyIds: ["read"],
+        inputs: {},
+        destination: {
+          bindingId: "workspace-binding",
+          effect: "workspace_mutation",
+          selector: path,
+        },
+      },
+    },
+  } as any;
+  const receipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-18T23:30:00.000Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "du06-workspace",
+      path: "du06-workspace",
+      workspaceId: "du06-workspace",
+    },
+  };
+  assert.deepEqual(
+    getVerifiedWorkspaceReadRefreshBinding(
+      graph,
+      writeTool,
+      [receipt],
+      path,
+    ),
+    { workspaceId: "du06-workspace", path },
+  );
+  assert.equal(
+    getVerifiedWorkspaceReadRefreshBinding(
+      {
+        ...graph,
+        nodes: {
+          ...graph.nodes,
+          read: { ...graph.nodes.read, status: "queued" },
+        },
+      },
+      writeTool,
+      [receipt],
+      path,
+    ),
+    null,
+  );
+  assert.equal(
+    getVerifiedWorkspaceReadRefreshBinding(graph, writeTool, [], path),
+    null,
+  );
 });
 
 test("Linear issue readback binds the one durable hierarchy issue instead of a model alias", () => {
