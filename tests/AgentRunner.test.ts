@@ -17,6 +17,7 @@ import {
   getExplicitLinearReadToolNames,
   getVerifiedWorkspaceReadObservation,
   getVerifiedWorkspaceReadRefreshBinding,
+  getVerifiedWorkspaceSupportingReadRefreshBindings,
   getVerifiedLinearHierarchyIssueId,
   getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
@@ -4016,6 +4017,12 @@ test("workspace correction preserves the verified read binding after transcript 
   );
   assert.ok(observation);
   assert.equal(observation.workspaceId, "checkers-workspace");
+  const supportingObservation = {
+    workspaceId: "checkers-workspace",
+    path: "scripts/verify_project.py",
+    sha256: `sha256:${"d".repeat(64)}`,
+    content: "assert CheckersGame.initial()\n",
+  };
 
   const frontier = buildObservedMissionGraphFrontierBinding(
     [],
@@ -4030,9 +4037,13 @@ test("workspace correction preserves the verified read binding after transcript 
     "checkers/game.py",
     null,
     observation,
+    [supportingObservation],
   );
   assert.match(frontier ?? "", new RegExp(sha256));
   assert.match(frontier ?? "", /currentContent="def legal_moves\(\):\\n    return \[\]\\n"/u);
+  assert.match(frontier ?? "", /scripts\/verify_project\.py/u);
+  assert.match(frontier ?? "", /assert CheckersGame\.initial\(\)/u);
+  assert.match(frontier ?? "", /UNTRUSTED SUPPORTING READ CONTEXT/u);
 
   const bound = bindVerifiedWorkspaceWriteExpected(
     {
@@ -4089,11 +4100,23 @@ test("workspace correction refreshes completed exact reads in its durably create
           },
         },
       },
+      contractRead: {
+        id: "contractRead",
+        status: "complete",
+        allowedTools: ["code_workspace_read"],
+        inputs: {
+          resource: {
+            kind: "binding",
+            bindingId: "workspace-binding",
+            selector: "scripts/verify_project.py",
+          },
+        },
+      },
       write: {
         id: "write",
         status: "ready",
         allowedTools: ["code_workspace_write_expected"],
-        dependencyIds: ["read", "protectedRead"],
+        dependencyIds: ["read", "protectedRead", "contractRead"],
         inputs: {},
         destination: {
           bindingId: "workspace-binding",
@@ -4128,6 +4151,45 @@ test("workspace correction refreshes completed exact reads in its durably create
       path,
     ),
     { workspaceId: "du06-workspace", path },
+  );
+  assert.deepEqual(
+    getVerifiedWorkspaceSupportingReadRefreshBindings(
+      graph,
+      writeTool,
+      [receipt],
+      path,
+    ),
+    [{
+      workspaceId: "du06-workspace",
+      path: "scripts/verify_project.py",
+    }],
+  );
+  assert.deepEqual(
+    getVerifiedWorkspaceSupportingReadRefreshBindings(
+      {
+        ...graph,
+        nodes: {
+          ...graph.nodes,
+          contractWrite: {
+            id: "contractWrite",
+            status: "queued",
+            allowedTools: ["code_workspace_write_expected"],
+            dependencyIds: ["contractRead"],
+            inputs: {},
+            destination: {
+              bindingId: "workspace-binding",
+              effect: "workspace_mutation",
+              selector: "scripts/verify_project.py",
+            },
+          },
+        },
+      },
+      writeTool,
+      [receipt],
+      path,
+    ),
+    [],
+    "a writable graph selector must never be replayed as supporting contract context",
   );
   assert.equal(
     getVerifiedWorkspaceReadRefreshBinding(
