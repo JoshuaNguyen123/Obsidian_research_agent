@@ -322,6 +322,11 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.match(compound, /independentlyVerifyLinearCleanup/u);
   assert.match(compound, /createPhase4PythonCheckersProjectFixture/u);
   assert.match(compound, /topic: "checkers"/u);
+  assert.match(
+    compound,
+    /completionDrivenLoops: true,\s*thinkingMode: "medium"/u,
+    "the protected compound coding proof must use bounded agentic reasoning",
+  );
   assert.match(compound, /Application Testing Dumping Grounds/u);
   assert.match(
     compound,

@@ -207,6 +207,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         maxAgentSteps: 100,
         maxRunMinutes: 110,
         completionDrivenLoops: true,
+        thinkingMode: "medium",
         orchestratorEnabled: false,
         linearEnabled: true,
         ...(requestedLinearTeamId
