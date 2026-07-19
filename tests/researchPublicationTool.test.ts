@@ -400,12 +400,12 @@ test("trusted web readback replaces an empty model evidence list", async () => {
   );
 });
 
-test("durable run evidence replaces an empty model evidence list when the runtime cache is unavailable", async () => {
+test("durable root-run evidence replaces an empty continuation evidence list", async () => {
   let loads = 0;
   const fixture = createFixture("created", {
     loadDurableWebEvidence: async (runId) => {
       loads += 1;
-      assert.equal(runId, "run-42");
+      assert.equal(runId, "root-run-42");
       return [{
         url: "https://example.test/evidence",
         contentHash: HASH,
@@ -421,6 +421,7 @@ test("durable run evidence replaces an empty model evidence list when the runtim
   const context = contextFixture(
     "Publish this research to Linear in Published.md",
   );
+  context.rootMissionId = "root-run-42";
   context.runtimeCache = undefined;
   context.requestNestedApproval = async (request) => ({
     approved: true,

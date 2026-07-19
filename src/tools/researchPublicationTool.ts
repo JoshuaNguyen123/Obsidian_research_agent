@@ -171,9 +171,13 @@ export function createResearchPublicationTool(
       const toolCallId = requireIdentity(context.operationId, "tool call id");
       const proofCache = context.runtimeCache ?? { toolResults: new Map() };
       if (options.loadDurableWebEvidence) {
+        const evidenceRunId = requireIdentity(
+          context.rootMissionId?.trim() || runId,
+          "durable evidence run id",
+        );
         seedDurableWebEvidence(
           proofCache,
-          await options.loadDurableWebEvidence(runId),
+          await options.loadDurableWebEvidence(evidenceRunId),
         );
       }
       const parsedNote = await parseToolArguments({
