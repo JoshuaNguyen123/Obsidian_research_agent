@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   MAX_AGENT_STEPS,
   attachGroundedPassageCitations,
+  bindAuthoritativeGraphCodeValidation,
   bindVerifiedWorkspaceWriteExpected,
   buildObservedMissionGraphFrontierBinding,
   buildMissionGraphFrontierTurnContext,
@@ -4214,6 +4215,35 @@ test("workspace correction refreshes completed exact reads in its durably create
     getVerifiedWorkspaceReadRefreshBinding(graph, writeTool, [], path),
     null,
   );
+});
+
+test("authoritative graph validation cannot import unmodeled generated artifacts", () => {
+  assert.deepEqual(
+    bindAuthoritativeGraphCodeValidation({
+      name: "code_validate_fast",
+      arguments: {
+        workspaceId: "du06-workspace",
+        repairRequestId: "du06-request",
+        expectedArtifacts: [
+          "README.md",
+          { path: "dist/unmodeled.txt" },
+        ],
+      },
+    }),
+    {
+      name: "code_validate_fast",
+      arguments: {
+        workspaceId: "du06-workspace",
+        repairRequestId: "du06-request",
+        expectedArtifacts: [],
+      },
+    },
+  );
+  const unrelated = {
+    name: "code_workspace_read",
+    arguments: { workspaceId: "du06-workspace", path: "README.md" },
+  };
+  assert.equal(bindAuthoritativeGraphCodeValidation(unrelated), unrelated);
 });
 
 test("Linear issue readback binds the one durable hierarchy issue instead of a model alias", () => {

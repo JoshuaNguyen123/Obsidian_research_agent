@@ -6616,6 +6616,33 @@ export async function runAgentMission({
         },
       });
     }
+    if (
+      missionGraphExecution &&
+      missionGraphSession &&
+      isForegroundCodeValidationToolName(toolCall.name)
+    ) {
+      const requestedArtifactCount = Array.isArray(
+        toolCall.arguments.expectedArtifacts,
+      )
+        ? toolCall.arguments.expectedArtifacts.length
+        : toolCall.arguments.expectedArtifacts === undefined
+          ? 0
+          : 1;
+      toolCall = bindAuthoritativeGraphCodeValidation(toolCall);
+      events.onTrace?.({
+        id: `${step}:${String(toolIndex)}:${toolCall.name}:graph-artifact-binding`,
+        kind: "status",
+        step,
+        toolName: toolCall.name,
+        message:
+          "Bound graph-scoped validation to read-only sandbox proof; generated artifact imports require separately modeled workspace destinations.",
+        outputPreview: {
+          source: "authoritative_mission_graph",
+          expectedArtifacts: 0,
+          discardedUnmodeledArtifactRequests: requestedArtifactCount,
+        },
+      });
+    }
     observedToolCallCount += 1;
     const toolEventBase: AgentToolRunEvent = {
       id: `${step}:${toolIndex}:${toolCall.name}`,
@@ -11839,6 +11866,34 @@ export function getVerifiedWorkspaceReadRefreshBinding(
   return {
     workspaceId: [...workspaceIds][0]!,
     path: graphDestinationSelector,
+  };
+}
+
+const FOREGROUND_CODE_VALIDATION_TOOL_NAMES = new Set([
+  "code_validate_fast",
+  "code_validate_targeted",
+  "code_validate_full",
+]);
+
+function isForegroundCodeValidationToolName(toolName: string): boolean {
+  return FOREGROUND_CODE_VALIDATION_TOOL_NAMES.has(toolName);
+}
+
+/**
+ * An authoritative validation node proves the current hashed workspace. It
+ * does not authorize importing new generated files, because those mutations
+ * need their own exact graph destinations and write receipts.
+ */
+export function bindAuthoritativeGraphCodeValidation(
+  toolCall: ModelToolCall,
+): ModelToolCall {
+  if (!isForegroundCodeValidationToolName(toolCall.name)) return toolCall;
+  return {
+    ...toolCall,
+    arguments: {
+      ...toolCall.arguments,
+      expectedArtifacts: [],
+    },
   };
 }
 
