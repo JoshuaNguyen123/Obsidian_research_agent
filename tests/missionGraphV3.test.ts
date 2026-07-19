@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildMissionCapabilityEnvelopeV1,
+  MISSION_GRAPH_MAX_NODES,
   markMissionGraphJournalAppliedV1,
   MissionGraphValidationError,
   parseMissionCapabilityEnvelopeV1,
@@ -64,7 +65,7 @@ test("MissionGraphV3 preserves routing fallback, resource locks, and strict shap
   await rejectsCode(parseMissionGraphV3(invalidStatus), "invalid_status");
 });
 
-test("MissionGraphV3 rejects cycles, envelope depth overflow, and more than 40 nodes", async () => {
+test("MissionGraphV3 rejects cycles, envelope depth overflow, and nodes above the bounded ceiling", async () => {
   const cyclic = await createRawGraph();
   cyclic.nodes.research.dependencyIds = ["write"];
   await rejectsCode(parseMissionGraphV3(cyclic), "cycle");
@@ -83,7 +84,7 @@ test("MissionGraphV3 rejects cycles, envelope depth overflow, and more than 40 n
 
   const tooMany = await createRawGraph();
   tooMany.nodes = {};
-  for (let index = 1; index <= 41; index += 1) {
+  for (let index = 1; index <= MISSION_GRAPH_MAX_NODES + 1; index += 1) {
     const id = `node-${index}`;
     tooMany.nodes[id] = createNode({ id, status: index === 1 ? "ready" : "queued" });
   }

@@ -512,7 +512,7 @@ test("host graph adds one exact protected-contract read and two bounded correcti
 });
 
 test("host graph retains every node in a compound daily-use lifecycle", async () => {
-  const descriptors = Array.from({ length: 16 }, (_unused, index) =>
+  const descriptors = Array.from({ length: 45 }, (_unused, index) =>
     workspaceLifecycleDescriptor(`compound_stage_${String(index + 1).padStart(2, "0")}`),
   );
   const names = descriptors.map((descriptor) => descriptor.name);
