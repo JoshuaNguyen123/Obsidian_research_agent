@@ -102,6 +102,7 @@ import {
 import {
   detectProjectLifecycleStagesV1,
   estimateProjectLifecycleV1,
+  getProjectLineageFingerprintHistoryV1,
   type ProjectLifecycleEstimateV1,
 } from "./agent/projectLifecycle";
 import {
@@ -16176,7 +16177,9 @@ function getCurrentProjectLineageFingerprints(
       ...new Set(
         context.getProjectLineages()
           .filter((lineage) => acceptedRunIds.has(lineage.runId))
-          .map((lineage) => lineage.fingerprint)
+          .flatMap((lineage) =>
+            getProjectLineageFingerprintHistoryV1(lineage),
+          )
           .filter((value) => /^sha256:[a-f0-9]{64}$/u.test(value)),
       ),
     ].sort();

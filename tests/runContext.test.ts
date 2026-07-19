@@ -104,6 +104,14 @@ test("fingerprinted continuation handoff survives compaction and rejects tamperi
     now: new Date("2026-07-16T00:00:00.000Z"),
   });
   assert.equal(validateContinuationHandoffV1(handoff).ok, true);
+  const verifiedPrefixValidation = validateContinuationHandoffV1(handoff, {
+    ledger,
+    lineageFingerprints: [
+      `sha256:${"b".repeat(64)}`,
+      `sha256:${"c".repeat(64)}`,
+    ],
+  });
+  assert.equal(verifiedPrefixValidation.ok, true);
 
   const messages: ModelChatMessage[] = [
     { role: "system", content: "system" },

@@ -10,6 +10,7 @@ import {
   createResearcherHandoffV1,
   detectProjectLifecycleStagesV1,
   estimateProjectLifecycleV1,
+  getProjectLineageFingerprintHistoryV1,
   parseProjectLineageV1,
   parseProjectLineageNamespaceV1,
   parseResearchProjectPlanV1,
@@ -363,6 +364,10 @@ test("project lineage persistence is additive, idempotent, and timestamp-free in
       providerReadbackFingerprints: [SHA("5"), SHA("6"), SHA("7")],
     },
   });
+  assert.deepEqual(
+    getProjectLineageFingerprintHistoryV1(advanced),
+    [first.fingerprint, advanced.fingerprint],
+  );
   await store.upsert(advanced);
   assert.equal((await store.get(first.lineageId))?.commits.length, 2);
   await assert.rejects(

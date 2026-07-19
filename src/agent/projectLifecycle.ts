@@ -626,6 +626,33 @@ export function parseProjectLineageV1(value: unknown): ProjectLineageV1 {
   return lineage;
 }
 
+/**
+ * Returns the canonical fingerprint for every verified prefix of one lineage.
+ * A restart can observe a newer committed stage than the last handoff if the
+ * host is interrupted immediately after that stage commit. Prefix identities
+ * let the validator prove the older handoff is an ancestor of the current
+ * lineage instead of treating normal monotonic progress as lineage drift.
+ */
+export function getProjectLineageFingerprintHistoryV1(
+  value: unknown,
+): string[] {
+  const lineage = parseProjectLineageV1(value);
+  return lineage.commits.map((_commit, index) => {
+    const commits = lineage.commits.slice(0, index + 1);
+    return buildProjectLineage({
+      lineageId: lineage.lineageId,
+      runId: lineage.runId,
+      vaultBindingKey: lineage.vaultBindingKey,
+      commits: commits.map((candidate) => ({
+        stage: candidate.stage,
+        committedAt: candidate.committedAt,
+        proof: candidate.proof,
+      })),
+      updatedAt: commits.at(-1)!.committedAt,
+    }).fingerprint;
+  });
+}
+
 export function parseProjectLineageNamespaceV1(
   value: unknown,
 ): ProjectLineageNamespaceV1 {
