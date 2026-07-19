@@ -7,6 +7,10 @@ import { expect, test, type Page } from "@playwright/test";
 import { getE2EAiConfig } from "./aiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
+  buildProgressiveDu06Observations,
+  type DailyUseDu06SafeLifecycleState,
+} from "./fixtures/dailyUseDu06Progress";
+import {
   createPhase4PythonCheckersProjectFixture,
   type Phase4PythonCheckersProjectFixture,
 } from "./fixtures/phase4GitRepo";
@@ -64,15 +68,14 @@ interface LinearCleanupInventory {
   projectIds: string[];
 }
 
-interface SafeLifecycleState {
-  lineages: any[];
-  researchPublications: any[];
-  linearHierarchies: any[];
-  privateRepositories: any[];
-  githubPublications: any[];
-  repositoryCleanups: any[];
-  privateBindings: any[];
-  codeHandoff: any | null;
+type SafeLifecycleState = DailyUseDu06SafeLifecycleState;
+
+interface SafeLifecycleScope {
+  notePath: string;
+  marker: string;
+  repositoryBaseSha: string;
+  githubOwner: string;
+  githubRepository: string;
 }
 
 interface LinearReadbackClient {
@@ -196,13 +199,13 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       validationCommands: [
         {
           command: "python3",
-          args: ["-m", "unittest", "discover", "-s", "tests", "-p", "test_checkers.py"],
-          label: "Python targeted checkers tests",
+          args: ["-m", "scripts.verify_all"],
+          label: "Python targeted protected checkers contract and tests",
         },
         {
           command: "python3",
-          args: ["-m", "scripts.verify_project"],
-          label: "Python protected checkers contract",
+          args: ["-m", "scripts.verify_all"],
+          label: "Python fresh full protected checkers contract and tests",
         },
       ],
       protectedPaths: ["scripts"],
@@ -216,6 +219,13 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       requiredChecks: [],
     },
   });
+  const lifecycleScope: SafeLifecycleScope = {
+    notePath,
+    marker,
+    repositoryBaseSha: fixture.baseSha,
+    githubOwner: githubAccount.login,
+    githubRepository: repository,
+  };
 
   let harness: RealAiHarness | null = null;
   let verifiedWorktree: { root: string; branch: string } | null = null;
@@ -260,6 +270,8 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   let modelCallCount = 0;
   let toolCallCount = 0;
   let acceptanceRecorded = false;
+  let recoveredLifecycleState: SafeLifecycleState | null = null;
+  let researchNotebookVerified = false;
 
   try {
     harness = await startRealAiHarness(
@@ -408,7 +420,11 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
               "DU-06 must capture its exact owned worktree as soon as the workspace manifest is created",
             ).toBe(true);
           }
-          const state = await readSafeLifecycleState(harness!.page, PROFILE_KEY);
+          const state = await readSafeLifecycleState(
+            harness!.page,
+            PROFILE_KEY,
+            lifecycleScope,
+          );
           const lineage = requireOne(state.lineages, "project lineage after restart");
           expect(lineage.commits.slice(0, stageIndex + 1).map((item: any) => item.stage))
             .toEqual(MAIN_STAGES.slice(0, stageIndex + 1));
@@ -473,7 +489,11 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       "the production graph must complete an explicit Linear issue read stage",
     ).toBe(true);
 
-    const state = await readSafeLifecycleState(harness.page, PROFILE_KEY);
+    const state = await readSafeLifecycleState(
+      harness.page,
+      PROFILE_KEY,
+      lifecycleScope,
+    );
     const lineage = requireOne(state.lineages, "completed project lineage");
     expect(lineage.commits.map((item: any) => item.stage)).toEqual(MAIN_STAGES);
     const research = requireOne(
@@ -724,6 +744,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         const cleanupState = await readSafeLifecycleState(
           harness!.page,
           PROFILE_KEY,
+          lifecycleScope,
         );
         const cleanupLineage = requireOne(
           cleanupState.lineages,
@@ -753,7 +774,11 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       repository,
     );
     githubRepositoryAbsenceVerified = true;
-    const cleanedState = await readSafeLifecycleState(harness.page, PROFILE_KEY);
+    const cleanedState = await readSafeLifecycleState(
+      harness.page,
+      PROFILE_KEY,
+      lifecycleScope,
+    );
     const cleanedLineage = requireOne(
       cleanedState.lineages,
       "fully reconciled project lineage",
@@ -903,7 +928,12 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     }
     if (harness) {
       try {
-        const recovered = await readSafeLifecycleState(harness.page, PROFILE_KEY);
+        const recovered = await readSafeLifecycleState(
+          harness.page,
+          PROFILE_KEY,
+          lifecycleScope,
+        );
+        recoveredLifecycleState = recovered;
         linearResources ??= resourcesFromStateOrNull(recovered);
         linearCleanupInventory = mergeLinearCleanupInventories(
           linearCleanupInventory,
@@ -921,6 +951,24 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         }
       } catch (error) {
         cleanupErrors.push(`state recovery: ${safeError(error)}`);
+      }
+      try {
+        const note = await readVaultNote(harness.page, notePath);
+        const sourceUrls = new Set(
+          note.match(/https?:\/\/[^\s)\]]+/gu) ?? [],
+        );
+        researchNotebookVerified =
+          note.includes(marker) &&
+          /## Board and setup/iu.test(note) &&
+          /## Movement and kings/iu.test(note) &&
+          /## Mandatory captures and multi-jumps/iu.test(note) &&
+          /## End conditions/iu.test(note) &&
+          /## Implementation implications/iu.test(note) &&
+          /mandatory capture/iu.test(note) &&
+          /multi-jump/iu.test(note) &&
+          sourceUrls.size >= 2;
+      } catch {
+        researchNotebookVerified = false;
       }
     }
     worktreeCaptureController?.abort();
@@ -1008,27 +1056,6 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     } catch (error) {
       cleanupErrors.push(`worktree cleanup: ${safeError(error)}`);
     }
-    if (!acceptanceRecorded) {
-      await recordDailyUseAcceptance(
-        testInfo,
-        "DU-06",
-        {
-          artifacts: [],
-          proofs: [],
-          approvals: [],
-          bindings: [],
-          cleanup: [],
-        },
-        {
-          modelCalls: modelCallCount,
-          toolCalls: toolCallCount,
-          continuations: restartedStages.length,
-          approvals: approvalCount,
-        },
-      ).catch((error) => {
-        cleanupErrors.push(`metrics attachment: ${safeError(error)}`);
-      });
-    }
     await harness?.close().catch((error) => {
       cleanupErrors.push(`harness cleanup: ${safeError(error)}`);
     });
@@ -1105,6 +1132,57 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     }).catch((error) => {
       cleanupErrors.push(`cleanup proof attachment: ${safeError(error)}`);
     });
+    if (!acceptanceRecorded) {
+      const githubOwnedResourceObserved =
+        pullRequestNumber !== null ||
+        Boolean(publishedBranch) ||
+        Boolean(publishedSha) ||
+        Boolean(recoveredLifecycleState?.privateRepositories.some(
+          (item) => item.status === "verified" && Boolean(item.receiptId),
+        ));
+      const localOwnedResourceObserved =
+        worktreeCapturedAfterCreation ||
+        verifiedWorktree !== null ||
+        vaultBackupsRemoved > 0;
+      await recordDailyUseAcceptance(
+        testInfo,
+        "DU-06",
+        buildProgressiveDu06Observations({
+          state: recoveredLifecycleState,
+          expected: {
+            notePath,
+            repositoryProfileKey: PROFILE_KEY,
+            baseSha: fixture.baseSha,
+            githubOwner: githubAccount.login,
+            githubRepository: repository,
+          },
+          researchNotebookVerified,
+          cleanup: {
+            linearOwnedResourceCount: disposableLinearResourceCount,
+            linearAbsenceVerified: linearCleanupReadbackVerified,
+            githubOwnedResourceObserved,
+            githubAbsenceVerified:
+              githubRepositoryAbsenceVerified &&
+              githubBranchAbsenceVerified &&
+              githubPullRequestCleanupVerified,
+            localOwnedResourceObserved,
+            localAbsenceVerified:
+              worktreeAbsenceVerified &&
+              vaultBackupAbsenceVerified &&
+              fixtureRemoved,
+            independentVerified: cleanupStatus === "verified",
+          },
+        }),
+        {
+          modelCalls: modelCallCount,
+          toolCalls: toolCallCount,
+          continuations: restartedStages.length,
+          approvals: approvalCount,
+        },
+      ).catch((error) => {
+        cleanupErrors.push(`metrics attachment: ${safeError(error)}`);
+      });
+    }
     if (cleanupErrors.length > 0) {
       const primary = missionError
         ? `DU-06 failed: ${safeError(missionError)}; `
@@ -1359,13 +1437,33 @@ function createPageBackedLinearReadbackClient(page: Page): LinearReadbackClient 
 async function readSafeLifecycleState(
   page: Page,
   profileKey: string,
+  scope: SafeLifecycleScope,
 ): Promise<SafeLifecycleState> {
-  return page.evaluate(async ({ pluginId, codePluginId, profileKey }) => {
+  return page.evaluate(async ({ pluginId, codePluginId, profileKey, scope }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
     if (!plugin) throw new Error("Agentic Researcher is unavailable.");
     const values = (record: any) => Object.values(record ?? {});
+    const lineages = (plugin.getProjectLineages?.() ?? []).filter(
+      (lineage: any) =>
+        Array.isArray(lineage?.commits) &&
+        lineage.commits.some(
+          (commit: any) =>
+            commit?.stage === "accepted_research" &&
+            commit?.proof?.notePath === scope.notePath,
+        ),
+    );
+    const linearPlanFingerprints = new Set(
+      lineages.flatMap((lineage: any) =>
+        lineage.commits
+          .filter((commit: any) => commit?.stage === "linear_hierarchy")
+          .map((commit: any) => String(commit?.proof?.planFingerprint ?? ""))
+          .filter(Boolean),
+      ),
+    );
     const researchPublications = values(
       plugin.researchPublicationCheckpointNamespace?.checkpoints,
+    ).filter(
+      (checkpoint: any) => checkpoint?.artifact?.notePath === scope.notePath,
     ).map((checkpoint: any) => ({
       publicationId: checkpoint.publicationId,
       status: checkpoint.status,
@@ -1378,6 +1476,10 @@ async function readSafeLifecycleState(
     }));
     const linearHierarchies = values(
       plugin.researchProjectHierarchyCheckpointNamespace?.checkpoints,
+    ).filter(
+      (checkpoint: any) =>
+        linearPlanFingerprints.has(String(checkpoint?.planFingerprint ?? "")) ||
+        JSON.stringify(checkpoint?.items ?? []).includes(scope.marker),
     ).map((checkpoint: any) => ({
       planFingerprint: checkpoint.planFingerprint,
       status: checkpoint.status,
@@ -1393,34 +1495,83 @@ async function readSafeLifecycleState(
       })),
     }));
     const privateRepositories = values(plugin.githubPrivateRepositoryCheckpoints)
+      .filter(
+        (checkpoint: any) =>
+          checkpoint?.profileKey === profileKey &&
+          checkpoint?.owner === scope.githubOwner &&
+          checkpoint?.repository === scope.githubRepository,
+      )
       .map((checkpoint: any) => ({
         creationId: checkpoint.creationId,
+        profileKey: checkpoint.profileKey,
+        owner: checkpoint.owner,
+        repository: checkpoint.repository,
         status: checkpoint.status,
+        approvalId: checkpoint.approvalId,
         receiptId: checkpoint.receipt?.id ?? null,
         binding: checkpoint.binding
           ? {
               owner: checkpoint.binding.owner,
               repository: checkpoint.binding.repository,
-              verifiedPrivate: checkpoint.binding.verifiedPrivate,
+              verifiedPrivate:
+                checkpoint.binding.verifiedPrivate === true ||
+                checkpoint.binding.visibility === "private",
+              fingerprint: checkpoint.binding.fingerprint,
+              repositoryProfileKey:
+                checkpoint.binding.repositoryProfileKey,
+              repositoryProfileFingerprint:
+                checkpoint.binding.repositoryProfileFingerprint,
               repositoryReadbackFingerprint:
                 checkpoint.binding.repositoryReadbackFingerprint,
             }
           : null,
       }));
+    const privateBindingFingerprints = new Set(
+      privateRepositories
+        .map((checkpoint: any) => String(checkpoint?.binding?.fingerprint ?? ""))
+        .filter(Boolean),
+    );
+    const code = plugin.getBundledCapability?.(codePluginId);
+    const resolvedCodeHandoff =
+      await code?.resolveVerifiedCodePublicationHandoff?.(profileKey) ?? null;
+    const codeHandoff =
+      resolvedCodeHandoff?.repositoryProfileKey === profileKey &&
+      resolvedCodeHandoff?.baseSha === scope.repositoryBaseSha
+        ? resolvedCodeHandoff
+        : null;
     const githubPublications = values(
       plugin.githubPublicationCheckpointNamespace?.checkpoints,
+    ).filter(
+      (checkpoint: any) =>
+        privateBindingFingerprints.has(
+          String(checkpoint?.bindingFingerprint ?? ""),
+        ) &&
+        Boolean(codeHandoff?.fingerprint) &&
+        checkpoint?.handoffFingerprint === codeHandoff.fingerprint,
     ).map((checkpoint: any) => ({
       publicationId: checkpoint.publicationId,
       status: checkpoint.status,
+      handoffFingerprint: checkpoint.handoffFingerprint,
+      bindingFingerprint: checkpoint.bindingFingerprint,
       branch: checkpoint.branch,
       headSha: checkpoint.headSha,
       remoteSha: checkpoint.remoteSha,
       pullRequest: checkpoint.pullRequest,
+      publishApprovalFingerprint: checkpoint.publishApprovalFingerprint,
+      proofSnapshotFingerprint:
+        checkpoint.proofSnapshot?.snapshotFingerprint ?? null,
       linearLinkReceiptId: checkpoint.linearLinkReceiptId,
       linearCompletionReceiptId: checkpoint.linearCompletionReceiptId,
       obsidianReceiptId: checkpoint.obsidianReceiptId,
     }));
     const repositoryCleanups = values(plugin.githubPrivateRepositoryCleanupCheckpoints)
+      .filter(
+        (checkpoint: any) =>
+          checkpoint?.profileKey === profileKey &&
+          privateBindingFingerprints.has(
+            String(checkpoint?.bindingFingerprint ?? ""),
+          ),
+      )
       .map((checkpoint: any) => ({
         cleanupId: checkpoint.cleanupId,
         status: checkpoint.status,
@@ -1429,6 +1580,12 @@ async function readSafeLifecycleState(
           checkpoint.receipt?.readback?.observedFingerprint ?? null,
       }));
     const privateBindings = values(plugin.trustedGitHubRepositoryBindingsV2)
+      .filter(
+        (binding: any) =>
+          binding?.repositoryProfileKey === profileKey &&
+          binding?.owner === scope.githubOwner &&
+          binding?.repository === scope.githubRepository,
+      )
       .map((binding: any) => ({
         profileKey: binding.repositoryProfileKey,
         owner: binding.owner,
@@ -1436,10 +1593,8 @@ async function readSafeLifecycleState(
         verifiedPrivate: binding.verifiedPrivate,
         repositoryReadbackFingerprint: binding.repositoryReadbackFingerprint,
       }));
-    const code = plugin.getBundledCapability?.(codePluginId);
-    const codeHandoff = await code?.resolveVerifiedCodePublicationHandoff?.(profileKey) ?? null;
     return {
-      lineages: plugin.getProjectLineages?.() ?? [],
+      lineages,
       researchPublications,
       linearHierarchies,
       privateRepositories,
@@ -1452,6 +1607,7 @@ async function readSafeLifecycleState(
     pluginId: NATIVE_CORE_PLUGIN_ID,
     codePluginId: PHASE4_CODE_PLUGIN_ID,
     profileKey,
+    scope,
   });
 }
 

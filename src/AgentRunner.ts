@@ -36,6 +36,7 @@ import {
 import type {
   AgentMissionMode,
   AgentRuntimeCache,
+  CodeValidationDiagnosticObservation,
   MissionIntent,
   NestedToolApprovalRequest,
   ToolExecutionContext,
@@ -3100,13 +3101,12 @@ export async function runAgentMission({
   if (authoritativeGraphToolNodes.length > 0) {
     loopBudgetPlan = {
       ...loopBudgetPlan,
-      toolStepBudget: Math.min(
-        Math.max(0, loopBudgetPlan.hardCap - loopBudgetPlan.finalizationReserve),
-        Math.max(
-          loopBudgetPlan.toolStepBudget,
-          authoritativeGraphToolNodes.length,
-        ),
-      ),
+      toolStepBudget: reconcileOutstandingMissionGraphToolStepBudget({
+        hardCap: loopBudgetPlan.hardCap,
+        finalizationReserve: loopBudgetPlan.finalizationReserve,
+        toolStepBudget: loopBudgetPlan.toolStepBudget,
+        nodes: authoritativeGraphToolNodes,
+      }),
       expectedTools: [
         ...new Set([
           ...loopBudgetPlan.expectedTools,
@@ -9116,6 +9116,7 @@ export async function runAgentMission({
                 stepVerifiedWorkspaceReadObservation,
                 stepSupportingWorkspaceReadObservations,
                 activeIntentPrompt,
+                getLatestFastValidationDiagnostic(runtimeCache),
               ),
             )
           : messages;
@@ -12109,6 +12110,42 @@ function getSafeMissionCompositeLifecycleActionV1(
   return getSafeMissionCompositeLifecycleSpecV1(node) && isRecord(node.outputs)
     ? getCurrentMissionCompositeLifecycleActionV1(node)
     : null;
+}
+
+/**
+ * One conventional graph node consumes one successful tool step. Composite
+ * lifecycle nodes consume one step per durable action, so count their
+ * remaining actions rather than treating an entire stage as one call. The
+ * caller still applies the configured hard cap and finalization reserve; this
+ * helper changes capacity accounting only and never expands graph authority.
+ */
+export function countOutstandingMissionGraphToolActions(
+  nodes: readonly MissionGraphV3["nodes"][string][],
+): number {
+  return nodes.reduce((total, node) => {
+    const lifecycle = getSafeMissionCompositeLifecycleSpecV1(node);
+    if (!lifecycle) return total + 1;
+    const state = getSafeMissionCompositeLifecycleStateV1(node);
+    return total + Math.max(
+      0,
+      lifecycle.actions.length - (state?.actionCursor ?? 0),
+    );
+  }, 0);
+}
+
+export function reconcileOutstandingMissionGraphToolStepBudget(input: {
+  hardCap: number;
+  finalizationReserve: number;
+  toolStepBudget: number;
+  nodes: readonly MissionGraphV3["nodes"][string][];
+}): number {
+  return Math.min(
+    Math.max(0, input.hardCap - input.finalizationReserve),
+    Math.max(
+      input.toolStepBudget,
+      countOutstandingMissionGraphToolActions(input.nodes),
+    ),
+  );
 }
 
 /**
@@ -19824,6 +19861,7 @@ export function buildObservedMissionGraphFrontierBinding(
   verifiedWorkspaceReadObservation: VerifiedWorkspaceReadObservation | null = null,
   verifiedSupportingWorkspaceReads: readonly VerifiedWorkspaceReadObservation[] = [],
   missionRequirements: string | null = null,
+  verifiedFastValidationDiagnostic: CodeValidationDiagnosticObservation | null = null,
 ): string | null {
   const names = stepTools.map((tool) => tool.function.name);
   if (names.length === 1 && names[0] === "linear_get_issue") {
@@ -19894,10 +19932,11 @@ export function buildObservedMissionGraphFrontierBinding(
     const content = isRecord(readback) ? getString(readback.content) : undefined;
     const linearReference = getLatestLinearIssueReference(messages);
     const latestValidation = getLatestToolOutput(messages, "code_validate_fast");
-    const validationExcerpt = isRecord(latestValidation) &&
-        isRecord(latestValidation.validationDiagnosticExcerpt)
-      ? latestValidation.validationDiagnosticExcerpt
-      : null;
+    const validationExcerpt = verifiedFastValidationDiagnostic ??
+      (isRecord(latestValidation) &&
+          isRecord(latestValidation.validationDiagnosticExcerpt)
+        ? latestValidation.validationDiagnosticExcerpt
+        : null);
     const validationStdout = validationExcerpt &&
         typeof validationExcerpt.stdout === "string"
       ? validationExcerpt.stdout.slice(0, 2_400)
@@ -22776,6 +22815,11 @@ async function executeToolWithMetrics({
       toolContext,
       result,
     );
+    rememberLatestFastValidationDiagnostic(
+      toolContext.runtimeCache,
+      toolCall.name,
+      result,
+    );
     if (cacheKey && result.ok) {
       toolCache?.set(cacheKey, result);
     }
@@ -22841,6 +22885,47 @@ async function executeToolWithMetrics({
 
 const MAX_VERIFIED_WORKSPACE_READ_OBSERVATIONS = 64;
 const MAX_VERIFIED_WORKSPACE_READ_CONTENT_CHARS = 100_000;
+const MAX_FAST_VALIDATION_DIAGNOSTIC_CHARS = 2_400;
+
+export function rememberLatestFastValidationDiagnostic(
+  runtimeCache: AgentRuntimeCache | undefined,
+  toolName: string,
+  result: ToolExecutionResult,
+): void {
+  if (toolName !== "code_validate_fast" || !runtimeCache || !result.ok) return;
+  runtimeCache.latestFastValidationDiagnostic = undefined;
+  const output = isRecord(result.output) ? result.output : null;
+  if (!output || output.status !== "failed") return;
+  const excerpt = isRecord(output.validationDiagnosticExcerpt)
+    ? output.validationDiagnosticExcerpt
+    : null;
+  if (!excerpt) return;
+  const stdout = typeof excerpt.stdout === "string"
+    ? excerpt.stdout.slice(0, MAX_FAST_VALIDATION_DIAGNOSTIC_CHARS)
+    : "";
+  const stderr = typeof excerpt.stderr === "string"
+    ? excerpt.stderr.slice(0, MAX_FAST_VALIDATION_DIAGNOSTIC_CHARS)
+    : "";
+  const redactedLines = typeof excerpt.redactedLines === "number" &&
+      Number.isSafeInteger(excerpt.redactedLines) &&
+      excerpt.redactedLines >= 0
+    ? excerpt.redactedLines
+    : 0;
+  if (!stdout && !stderr) return;
+  runtimeCache.latestFastValidationDiagnostic = {
+    stdout,
+    stderr,
+    truncated: excerpt.truncated === true,
+    redactedLines,
+  };
+}
+
+export function getLatestFastValidationDiagnostic(
+  runtimeCache: AgentRuntimeCache | undefined,
+): CodeValidationDiagnosticObservation | null {
+  const diagnostic = runtimeCache?.latestFastValidationDiagnostic;
+  return diagnostic ? { ...diagnostic } : null;
+}
 
 function normalizeWorkspaceObservationId(value: string): string {
   return (

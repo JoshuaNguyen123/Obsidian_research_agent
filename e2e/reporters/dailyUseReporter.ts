@@ -52,6 +52,14 @@ interface DailyUseRunRecord extends Pick<
   observed: DailyUseObservedAcceptanceV1 | null;
 }
 
+export interface DailyUseAtomicObservationRecord {
+  status: string;
+  retry: number;
+  acceptanceStatus: DailyUseRunMetricsV1["acceptanceStatus"];
+  missingAcceptanceCriteria: string[];
+  observed: DailyUseObservedAcceptanceV1 | null;
+}
+
 export default class DailyUseReporter implements Reporter {
   private readonly records: DailyUseRunRecord[] = [];
 
@@ -154,7 +162,8 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
     .map(([key, group]) => {
       const durations = group.map((record) => record.durationMs).sort((a, b) => a - b);
       const scenarioId = group[0]?.scenarioId;
-      const observed = mergeObserved(group);
+      const atomicRecord = selectAtomicDailyUseObservation(group);
+      const observed = atomicRecord?.observed ?? emptyObserved();
       const metrics = scenarioId
         ? createDailyUseRunMetricsV1({
             scenarioId,
@@ -167,6 +176,16 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
             observedAt: new Date().toISOString(),
           })
         : null;
+      const atomicPass = Boolean(
+        atomicRecord?.status === "passed" &&
+        atomicRecord.acceptanceStatus === "pass" &&
+        metrics?.acceptanceStatus === "pass",
+      );
+      const missingAcceptanceCriteria = atomicPass
+        ? metrics?.missingAcceptanceCriteria ?? []
+        : metrics?.missingAcceptanceCriteria.length
+          ? metrics.missingAcceptanceCriteria
+          : ["test_result:passed"];
       return {
         key,
         runs: group.length,
@@ -180,9 +199,9 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         approvals: metrics?.approvals ?? 0,
         artifactProofCount: metrics?.artifactProofCount ?? 0,
         cleanupProofCount: metrics?.cleanupProofCount ?? 0,
-        acceptanceStatus: metrics?.acceptanceStatus ?? "needs_more_work",
-        missingAcceptanceCriteria:
-          metrics?.missingAcceptanceCriteria ?? [],
+        acceptanceStatus: atomicPass ? "pass" : "needs_more_work",
+        acceptanceRetry: atomicRecord?.retry ?? null,
+        missingAcceptanceCriteria,
       };
     });
 }
@@ -239,19 +258,45 @@ function parseMetricsAnnotation(
   }
 }
 
-function mergeObserved(
-  records: readonly DailyUseRunRecord[],
-): DailyUseObservedAcceptanceV1 {
-  const merge = (key: keyof DailyUseObservedAcceptanceV1) => [
-    ...new Set(records.flatMap((record) => record.observed?.[key] ?? [])),
-  ].sort();
-  return {
-    artifacts: merge("artifacts"),
-    proofs: merge("proofs"),
-    approvals: merge("approvals"),
-    bindings: merge("bindings"),
-    cleanup: merge("cleanup"),
-  };
+/**
+ * Summary acceptance is atomic: retries may contribute aggregate counters,
+ * but their proof tokens are never unioned into a synthetic passing run.
+ */
+export function selectAtomicDailyUseObservation<T extends DailyUseAtomicObservationRecord>(
+  records: readonly T[],
+): T | null {
+  return records.reduce<T | null>((best, candidate) => {
+    if (!best) return candidate;
+    const candidatePass =
+      candidate.status === "passed" && candidate.acceptanceStatus === "pass";
+    const bestPass = best.status === "passed" && best.acceptanceStatus === "pass";
+    if (candidatePass !== bestPass) return candidatePass ? candidate : best;
+    if (
+      candidate.missingAcceptanceCriteria.length !==
+      best.missingAcceptanceCriteria.length
+    ) {
+      return candidate.missingAcceptanceCriteria.length <
+          best.missingAcceptanceCriteria.length
+        ? candidate
+        : best;
+    }
+    const candidateProofCount = countObservedTokens(candidate.observed);
+    const bestProofCount = countObservedTokens(best.observed);
+    if (candidateProofCount !== bestProofCount) {
+      return candidateProofCount > bestProofCount ? candidate : best;
+    }
+    return candidate.retry >= best.retry ? candidate : best;
+  }, null);
+}
+
+function countObservedTokens(
+  observed: DailyUseObservedAcceptanceV1 | null,
+): number {
+  if (!observed) return 0;
+  return Object.values(observed).reduce(
+    (total, values) => total + values.length,
+    0,
+  );
 }
 
 function emptyObserved(): DailyUseObservedAcceptanceV1 {

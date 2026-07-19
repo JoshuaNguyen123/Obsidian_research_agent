@@ -183,6 +183,12 @@ export interface AgentRuntimeCache {
    * These observations are never used to skip a fresh tool execution.
    */
   verifiedWorkspaceReads?: Map<string, VerifiedWorkspaceReadObservation>;
+  /**
+   * Latest already-redacted fast-validation excerpt for the active run only.
+   * It is never serialized and exists solely so loop-context compaction cannot
+   * remove the evidence needed by the next bounded repair turn.
+   */
+  latestFastValidationDiagnostic?: CodeValidationDiagnosticObservation;
   /** First validated accepted-research request for a run/path; retries cannot rewrite it. */
   acceptedResearchPublicationRequests?: Map<string, unknown>;
   semanticProfiles?: Map<string, unknown>;
@@ -194,6 +200,13 @@ export interface VerifiedWorkspaceReadObservation {
   path: string;
   sha256: string;
   content: string;
+}
+
+export interface CodeValidationDiagnosticObservation {
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  redactedLines: number;
 }
 
 export interface AgentTool {

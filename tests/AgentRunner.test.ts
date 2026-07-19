@@ -9,6 +9,7 @@ import {
   buildObservedMissionGraphFrontierBinding,
   buildMissionGraphFrontierTurnContext,
   canonicalMissionGraphId,
+  countOutstandingMissionGraphToolActions,
   constrainToolsToMissionGraphFrontier,
   constrainOrchestratedHandoffTools,
   ensureResearchSourceLoopBudget,
@@ -17,6 +18,7 @@ import {
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
   getExplicitLinearReadToolNames,
+  getLatestFastValidationDiagnostic,
   getVerifiedWorkspaceReadObservation,
   getVerifiedWorkspaceReadRefreshBinding,
   getVerifiedWorkspaceSupportingReadRefreshBindings,
@@ -33,6 +35,8 @@ import {
   resolveLinearIssueReadbackBinding,
   resolveThinkingMode,
   rememberVerifiedWorkspaceReadResult,
+  rememberLatestFastValidationDiagnostic,
+  reconcileOutstandingMissionGraphToolStepBudget,
   resolveMissionGraphExecutionProofContractV1,
   restoreTrustedWebFetchResultsFromEvidence,
   runAgentMission,
@@ -960,6 +964,39 @@ test("composite lifecycle frontier exposes only its durable current action and s
   assert.deepEqual(getPendingMissionGraphWriteToolNames(graph), [
     "code_workspace_write_expected",
   ]);
+  assert.equal(countOutstandingMissionGraphToolActions([lifecycleNode]), 1);
+  assert.equal(
+    countOutstandingMissionGraphToolActions([{
+      ...lifecycleNode,
+      outputs: {
+        lifecycleActionCursor: 0,
+        lifecycleCompletedActionIds: [],
+        lifecycleActionAttemptCounts: {},
+      },
+    }]),
+    3,
+  );
+
+  const conventionalNode = {
+    id: "conventional-read",
+    status: "queued",
+    allowedTools: ["code_workspace_read"],
+    inputs: {},
+    outputs: {},
+  } as any;
+  assert.equal(
+    countOutstandingMissionGraphToolActions([lifecycleNode, conventionalNode]),
+    2,
+  );
+  assert.equal(
+    reconcileOutstandingMissionGraphToolStepBudget({
+      hardCap: 2,
+      finalizationReserve: 1,
+      toolStepBudget: 0,
+      nodes: [{ ...lifecycleNode, outputs: {} }],
+    }),
+    1,
+  );
 
   const receipt: AgentRunReceipt = {
     toolName: "code_workspace_create",
@@ -4304,6 +4341,74 @@ test("workspace correction preserves the verified read binding after transcript 
     content: "def legal_moves():\n    return [\"forced\"]\n",
     expectedSha256: sha256,
   });
+});
+
+test("workspace correction preserves the redacted fast diagnostic after transcript compaction", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  rememberLatestFastValidationDiagnostic(
+    runtimeCache,
+    "code_validate_fast",
+    {
+      ok: true,
+      toolName: "code_validate_fast",
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          version: 1,
+          stdout: "protected checkers contract failed at mandatory capture",
+          stderr: "AssertionError: capture.legal_moves() omitted the forced jump",
+          truncated: false,
+          redactedLines: 1,
+        },
+      },
+    },
+  );
+  const diagnostic = getLatestFastValidationDiagnostic(runtimeCache);
+  assert.deepEqual(diagnostic, {
+    stdout: "protected checkers contract failed at mandatory capture",
+    stderr: "AssertionError: capture.legal_moves() omitted the forced jump",
+    truncated: false,
+    redactedLines: 1,
+  });
+  const binding = buildObservedMissionGraphFrontierBinding(
+    [],
+    [{
+      type: "function",
+      function: {
+        name: "code_workspace_write_expected",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    [],
+    "checkers/game.py",
+    null,
+    {
+      workspaceId: "du06-workspace",
+      path: "checkers/game.py",
+      sha256: `sha256:${"a".repeat(64)}`,
+      content: "class CheckersGame:\n    pass\n",
+    },
+    [],
+    "Implement mandatory captures for American checkers.",
+    diagnostic,
+  );
+  assert.match(binding ?? "", /LATEST REDACTED UNTRUSTED FAST-VALIDATION DIAGNOSTIC/u);
+  assert.match(binding ?? "", /mandatory capture/u);
+  assert.match(binding ?? "", /omitted the forced jump/u);
+
+  rememberLatestFastValidationDiagnostic(
+    runtimeCache,
+    "code_validate_fast",
+    {
+      ok: true,
+      toolName: "code_validate_fast",
+      output: { status: "verified" },
+    },
+  );
+  assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
 });
 
 test("multi-file correction selects the host-verified workspace when path observations are ambiguous", () => {

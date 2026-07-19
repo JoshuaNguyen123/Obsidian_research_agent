@@ -335,6 +335,14 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
     new URL("../e2e/fixtures/realAiHarness.ts", import.meta.url),
     "utf8",
   );
+  const phase4GitRepo = readFileSync(
+    new URL("../e2e/fixtures/phase4GitRepo.ts", import.meta.url),
+    "utf8",
+  );
+  const du06Progress = readFileSync(
+    new URL("../e2e/fixtures/dailyUseDu06Progress.ts", import.meta.url),
+    "utf8",
+  );
   const mainSource = readFileSync(
     new URL("../main.ts", import.meta.url),
     "utf8",
@@ -393,9 +401,20 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   assert.match(compound, /linearTeamName:/u);
   assert.match(compound, /linear_get_issue/u);
   assert.match(compound, /Read the protected scripts\/verify_project\.py contract/u);
-  assert.match(compound, /args: \["-m", "scripts\.verify_project"\]/u);
+  assert.match(compound, /args: \["-m", "scripts\.verify_all"\]/u);
+  assert.match(phase4GitRepo, /scripts", "verify_all\.py"/u);
+  assert.match(phase4GitRepo, /run_module\('scripts\.verify_project'/u);
+  assert.match(phase4GitRepo, /discover\('tests', pattern='test_checkers\.py'\)/u);
   assert.match(compound, /readRedactedDailyUseCounters/u);
   assert.match(compound, /metrics attachment/u);
+  assert.match(compound, /buildProgressiveDu06Observations/u);
+  assert.doesNotMatch(compound, /artifacts: \[\],\s*proofs: \[\]/u);
+  assert.match(du06Progress, /item\.items\.length < 4/u);
+  assert.match(du06Progress, /\["committed", "deduplicated"\]\.includes/u);
+  assert.match(du06Progress, /targetedValidationReceiptId !==/u);
+  assert.match(du06Progress, /item\?\.remoteSha === codeHandoff\?\.commitSha/u);
+  assert.match(compound, /checkpoint\?\.artifact\?\.notePath === scope\.notePath/u);
+  assert.match(compound, /JSON\.stringify\(checkpoint\?\.items \?\? \[\]\)\.includes\(scope\.marker\)/u);
   assert.match(compound, /checkers\/game\.py/u);
   assert.match(compound, /tests\/test_checkers\.py/u);
   assert.match(compound, /verifiedPrivate: true/u);

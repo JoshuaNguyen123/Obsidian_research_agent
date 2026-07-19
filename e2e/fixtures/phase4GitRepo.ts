@@ -269,10 +269,31 @@ export async function createPhase4PythonCheckersProjectFixture(
     ].join("\n"),
     "utf8",
   );
+  await writeFile(
+    path.join(root, "scripts", "verify_all.py"),
+    [
+      "import runpy",
+      "import unittest",
+      "",
+      "",
+      "runpy.run_module('scripts.verify_project', run_name='__main__')",
+      "suite = unittest.defaultTestLoader.discover('tests', pattern='test_checkers.py')",
+      "result = unittest.TextTestRunner(verbosity=2).run(suite)",
+      "if not result.wasSuccessful():",
+      "    raise SystemExit(1)",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
   await git(root, ["init", "--initial-branch=main"]);
   await git(root, ["config", "user.name", "Phase 4 E2E"]);
   await git(root, ["config", "user.email", "phase4-e2e@example.invalid"]);
-  await git(root, ["add", "--", "scripts/verify_project.py"]);
+  await git(root, [
+    "add",
+    "--",
+    "scripts/verify_project.py",
+    "scripts/verify_all.py",
+  ]);
   await git(root, ["commit", "-m", "phase4 Python checkers fixture baseline"]);
   const baseSha = await git(root, ["rev-parse", "HEAD"]);
   if (!/^[a-f0-9]{40}$/u.test(baseSha)) {
