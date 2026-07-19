@@ -439,6 +439,55 @@ test("ungranted mutation is rejected while a bounded envelope-approved read is a
   assert.equal(completed.nodes[read.nodeId].status, "complete");
 });
 
+test("composite lifecycle reserves bounded capacity for an initial host-safe note read", async () => {
+  const harness = createVaultHarness();
+  const graph = await compositeLifecycleGraphFor(
+    "session-composite-initial-safe-read",
+    {
+      includeUnplannedCurrentRead: true,
+      maxToolCalls: Number.POSITIVE_INFINITY,
+    },
+  );
+  const initialNodeCount = Object.keys(graph.nodes).length;
+  const plannedToolCalls = Object.values(graph.nodes).reduce(
+    (total, node) => total + node.budget.toolCalls,
+    0,
+  );
+  assert.ok(
+    graph.capabilityEnvelope.budgets.maxTotalToolCalls > plannedToolCalls,
+  );
+  assert.ok(graph.capabilityEnvelope.budgets.maxNodes > initialNodeCount);
+
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const read = requireExecution(
+    await session.beginToolExecution("read_current_file"),
+  );
+  assert.match(read.nodeId, /^retry-/u);
+  assert.equal(session.graph.nodes[read.nodeId].effect, "read");
+  assert.equal(
+    session.graph.nodes["lifecycle-accepted_research"].status,
+    "ready",
+  );
+  assert.ok(session.graph.nodes.final.dependencyIds.includes(read.nodeId));
+
+  const completed = await session.finishToolExecution(read, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[read.nodeId],
+      "7",
+      harness.nextTimestamp(),
+    ),
+  });
+  assert.equal(completed.nodes[read.nodeId].status, "complete");
+  assert.equal(
+    completed.nodes["lifecycle-accepted_research"].status,
+    "ready",
+  );
+});
+
 test("sequential unplanned reads retain per-node wall-clock capacity across resume", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({
@@ -841,6 +890,10 @@ async function graphFor(input: {
 
 async function compositeLifecycleGraphFor(
   missionId: string,
+  options: {
+    includeUnplannedCurrentRead?: boolean;
+    maxToolCalls?: number;
+  } = {},
 ): Promise<MissionGraphV3> {
   const descriptors = [
     sessionLifecycleDescriptor("web_search", "browser", "read"),
@@ -855,6 +908,9 @@ async function compositeLifecycleGraphFor(
       "publish",
     ),
     sessionLifecycleDescriptor("linear_get_issue", "linear", "read"),
+    ...(options.includeUnplannedCurrentRead
+      ? [sessionLifecycleDescriptor("read_current_file", "vault", "read")]
+      : []),
   ];
   const names = descriptors.map((descriptor) => descriptor.name);
   const byName = new Map(
@@ -885,7 +941,7 @@ async function compositeLifecycleGraphFor(
       "publish_research_project_to_linear",
       "linear_get_issue",
     ],
-    maxToolCalls: 4,
+    maxToolCalls: options.maxToolCalls ?? 4,
     maxWallClockMs: 120_000,
     now: GRAPH_TIME,
   });

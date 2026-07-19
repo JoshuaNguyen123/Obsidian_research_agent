@@ -45,6 +45,12 @@ interface CompositeLifecyclePlanV1 {
   stepsByStage: Map<ProjectLifecycleStageV1, PlannedToolStepV1[]>;
 }
 
+// Composite lifecycle stages deliberately collapse many exact actions into a
+// small durable graph. Keep a separate, bounded node/call reserve for host-safe
+// reads that are discovered after planning (for example the initial active-note
+// observation). This reserve never adds a tool grant or an effectful action.
+const COMPOSITE_SAFE_READ_CONTINUATION_RESERVE = 8;
+
 export interface BuildHostMissionGraphPlanInput {
   missionId: string;
   objective: string;
@@ -177,10 +183,22 @@ export async function buildHostMissionGraphPlanV1(
     .filter((name) => descriptorByName.has(name) && !plannedSet.has(name))
     .filter((name) => descriptorByName.get(name)?.effect !== "read")
     .slice(0, maximumPostAcceptanceNodes);
+  const lifecycleStageCount = compositeLifecyclePlan?.intent.stages.length ?? 0;
+  const mandatoryToolCallCount =
+    selectedPlanned.length + postAcceptanceNames.length;
+  const compositeBaseNodeCount = compositeLifecyclePlan
+    ? lifecycleStageCount + postAcceptanceNames.length + 1
+    : 0;
+  const compositeSafeReadNodeReserveLimit = compositeLifecyclePlan
+    ? Math.min(
+        COMPOSITE_SAFE_READ_CONTINUATION_RESERVE,
+        Math.max(0, MISSION_GRAPH_MAX_DEPTH - compositeBaseNodeCount),
+      )
+    : 0;
   const requestedToolCallCapacity = Number.isFinite(input.maxToolCalls)
     ? Math.max(0, Math.floor(input.maxToolCalls))
     : compositeLifecyclePlan
-      ? selectedPlanned.length + postAcceptanceNames.length
+      ? mandatoryToolCallCount + compositeSafeReadNodeReserveLimit
       : maxToolNodes;
   const toolCallCapacity = Math.min(
     maximumToolCallCapacity,
@@ -189,6 +207,12 @@ export async function buildHostMissionGraphPlanV1(
       requestedToolCallCapacity,
     ),
   );
+  const compositeSafeReadContinuationReserve = compositeLifecyclePlan
+    ? Math.min(
+        compositeSafeReadNodeReserveLimit,
+        Math.max(0, toolCallCapacity - mandatoryToolCallCount),
+      )
+    : 0;
   const optionalReadNames = allowedNames
     .filter((name) => !plannedSet.has(name) && !postAcceptanceNames.includes(name))
     // The capability envelope deliberately contains every host-safe read so a
@@ -258,9 +282,8 @@ export async function buildHostMissionGraphPlanV1(
   // Reserve bounded graph and wall-clock capacity for repeated approved reads
   // (for example, fetching multiple sources with the same descriptor). A
   // completed node remains immutable, so each repeat receives its own node.
-  const lifecycleStageCount = compositeLifecyclePlan?.intent.stages.length ?? 0;
   const maxNodes = compositeLifecyclePlan
-    ? lifecycleStageCount + postAcceptanceNames.length + 1
+    ? compositeBaseNodeCount + compositeSafeReadContinuationReserve
     : toolCallCapacity + 1;
   const totalCatalogToolCalls = toolCallCapacity;
   const budgetNodeCount = toolCallCapacity + 1;
