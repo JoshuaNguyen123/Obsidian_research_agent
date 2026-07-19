@@ -7,11 +7,11 @@ export const MISSION_GRAPH_JOURNAL_VERSION = 1 as const;
 
 // Compound daily-use lifecycles remain bounded while retaining their composite
 // research, provider, Code, two correction passes, and finalizer nodes in one
-// authoritative graph. Forty-eight admits the reviewed 45-tool protected
-// lifecycle plus finalization without turning the graph into an open-ended
-// retry surface.
-export const MISSION_GRAPH_MAX_NODES = 48 as const;
-export const MISSION_GRAPH_MAX_DEPTH = 48 as const;
+// authoritative graph. Sixty-four admits the reviewed 45-tool protected
+// lifecycle, finalization, and eighteen host-journaled safe-read/recovery
+// nodes without turning the graph into an open-ended retry surface.
+export const MISSION_GRAPH_MAX_NODES = 64 as const;
+export const MISSION_GRAPH_MAX_DEPTH = 64 as const;
 export const MISSION_GRAPH_MAX_CONCURRENT_READ_NODES = 3 as const;
 
 export type MissionNodeStatusV3 =
