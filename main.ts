@@ -345,6 +345,8 @@ import {
   type ResearchPublicationDestinationV1,
   type PendingLinearQueueStage,
   type PendingLinearReconciliationStateV1,
+  buildRecoveredNativeLinearOAuthStateV1,
+  selectNativeLinearOAuthRecoveryPairV1,
 } from "./src/integrations/linear";
 import {
   CompanionSecretStoreClientV1,
@@ -672,6 +674,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   private activeLinearOAuthLoopback: LinearOAuthLoopbackResultV1 | null = null;
   private linearOAuthAuthorizationUrl: string | null = null;
   private linearOAuthStatusMessage = "Linear OAuth is not connected.";
+  private linearOAuthRecoveryBlocker: string | null = null;
   private linearOAuthPersistenceRequired = false;
   private linearOAuthDeferredCleanupReferenceIds: string[] = [];
   /** Persisted GitHub state contains only an opaque secret reference and pinned identity. */
@@ -2093,7 +2096,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       message: this.linearOAuthRuntimeState?.pendingRefresh
         ? "Linear OAuth refresh is awaiting replay reconciliation; external work is paused."
         : unavailableSavedReference
-          ? "A saved Linear OAuth reference exists, but its secure token is unavailable. Reconnect Linear; the saved reference was retained for recovery."
+          ? this.linearOAuthRecoveryBlocker
+            ? `A saved Linear OAuth reference exists, but secure recovery stopped at ${this.linearOAuthRecoveryBlocker}. The saved reference was retained.`
+            : "A saved Linear OAuth reference exists, but its secure token is unavailable. Reconnect Linear; the saved reference was retained for recovery."
         : this.linearOAuthStatusMessage,
       authorizationUrl: this.linearOAuthAuthorizationUrl,
     };
@@ -2815,6 +2820,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       };
     }
     if (!this.hasLinearApiKey()) {
+      await this.tryRecoverNativeLinearOAuthCredential();
+    }
+    if (!this.hasLinearApiKey()) {
       return { ok: false, message: "Linear API key is not configured." };
     }
     try {
@@ -2898,6 +2906,120 @@ export default class AgenticResearcherPlugin extends Plugin {
             ? error.message
             : "Linear connection test failed.",
       };
+    }
+  }
+
+  private async tryRecoverNativeLinearOAuthCredential(): Promise<boolean> {
+    const blocked = (code: string): false => {
+      this.linearOAuthRecoveryBlocker = code;
+      return false;
+    };
+    const current = this.linearOAuthRuntimeState;
+    if (!current) return blocked("runtime_state_unavailable");
+    if (this.hasLinearOAuthCredential()) {
+      this.linearOAuthRecoveryBlocker = null;
+      return false;
+    }
+    if (
+      !isObsidianSecretReferenceV1(
+        current.credential.accessTokenReferenceId,
+      ) ||
+      !isObsidianSecretReferenceV1(
+        current.credential.refreshTokenReferenceId,
+      )
+    ) {
+      return blocked("non_native_reference");
+    }
+    const storage = this.app.secretStorage as typeof this.app.secretStorage & {
+      listSecrets?: () => string[];
+    };
+    if (typeof storage.listSecrets !== "function") {
+      return blocked("native_inventory_unavailable");
+    }
+    let referenceIds: string[];
+    try {
+      referenceIds = storage.listSecrets();
+    } catch {
+      return blocked("native_inventory_failed");
+    }
+    if (referenceIds.length < 2 || referenceIds.length > 1_024) {
+      return blocked("native_inventory_out_of_bounds");
+    }
+
+    const store = this.createObsidianSecretStore();
+    const descriptions: SecretDescriptionV1[] = [];
+    for (const referenceId of referenceIds) {
+      if (!isObsidianSecretReferenceV1(referenceId)) continue;
+      try {
+        descriptions.push(await store.describe(referenceId));
+      } catch {
+        // Missing, retired, or unrelated malformed references cannot
+        // participate in recovery.
+      }
+    }
+    const pair = selectNativeLinearOAuthRecoveryPairV1(
+      current,
+      descriptions,
+    );
+    if (!pair) return blocked("candidate_pair_unavailable");
+
+    const expectedWorkspaceIds = new Set(
+      [
+        this.linearCapabilitySnapshot?.workspace.id ?? null,
+        this.linearIntegrationState.workspaceId,
+      ].filter((value): value is string => Boolean(value)),
+    );
+    if (expectedWorkspaceIds.size !== 1) {
+      return blocked("workspace_binding_ambiguous");
+    }
+    const expectedWorkspaceId = [...expectedWorkspaceIds][0]!;
+    const expectedViewerId = this.linearCapabilitySnapshot?.viewer.id ?? null;
+    if (!expectedViewerId) return blocked("viewer_binding_unavailable");
+
+    let lease: Awaited<ReturnType<SecretStoreV1["lease"]>> | null = null;
+    try {
+      lease = await store.lease(pair.access.referenceId, { ttlSeconds: 60 });
+      const snapshot = await lease.withSecret((token) =>
+        discoverLinearCapabilities(
+          createLinearGraphqlClient({
+            transport: requestUrlTransport,
+            apiKey: `Bearer ${token}`,
+            timeoutMs: Math.min(this.settings.requestTimeoutMs, 30_000),
+          }),
+          {
+            deadlineAt:
+              Date.now() + Math.min(this.settings.requestTimeoutMs, 30_000),
+          },
+        ));
+      if (
+        snapshot.workspace.id !== expectedWorkspaceId ||
+        snapshot.viewer.id !== expectedViewerId
+      ) {
+        return blocked("provider_identity_readback_mismatch");
+      }
+
+      const recovered = buildRecoveredNativeLinearOAuthStateV1(
+        current,
+        pair,
+      );
+      const previousLinearEnabled = this.settings.linearEnabled;
+      this.linearOAuthRuntimeState = recovered;
+      this.settings.linearEnabled = true;
+      try {
+        await this.savePluginData();
+      } catch {
+        this.linearOAuthRuntimeState = current;
+        this.settings.linearEnabled = previousLinearEnabled;
+        return blocked("recovered_state_persistence_failed");
+      }
+      this.linearOAuthRecoveryBlocker = null;
+      this.linearOAuthStatusMessage =
+        "Recovered a newer native Linear OAuth token pair after independent workspace readback. The credential remains in Obsidian SecretStorage.";
+      return true;
+    } catch {
+      return blocked("provider_readback_failed");
+    } finally {
+      lease?.dispose();
     }
   }
 

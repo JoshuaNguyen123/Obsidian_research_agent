@@ -52,18 +52,54 @@ test.describe.serial("configured native Linear live proof", () => {
           ?.plugins?.[pluginId];
         if (!plugin) throw new Error("Agentic Researcher is unavailable.");
 
+        const connection = await plugin.testLinearConnection();
         const credential = plugin.getLinearCredentialStatus?.();
         const oauth = plugin.getLinearOAuthStatus?.();
         if (
           oauth?.connected !== true &&
           (credential?.configured !== true || credential?.secure !== true)
         ) {
+          const nativeLinearSecrets = (window as typeof window & { app?: any })
+            .app?.secretStorage?.listSecrets?.()
+            ?.flatMap((referenceId: string) => {
+              try {
+                const value = (window as typeof window & { app?: any }).app
+                  ?.secretStorage?.getSecret?.(referenceId);
+                const envelope = value ? JSON.parse(value) : null;
+                const description = envelope?.description;
+                return description?.metadata?.provider === "linear"
+                  ? [{
+                      kind: String(description.metadata.credentialKind ?? "unknown"),
+                      createdAt: String(description.createdAt ?? "unknown"),
+                    }]
+                  : [];
+              } catch {
+                return [];
+              }
+            }) ?? [];
+          const nativeSummary = Object.fromEntries(
+            ["oauth_access_token", "oauth_refresh_token"].map((kind) => {
+              const entries = nativeLinearSecrets
+                .filter((entry: { kind: string }) => entry.kind === kind)
+                .sort((left: { createdAt: string }, right: { createdAt: string }) =>
+                  left.createdAt.localeCompare(right.createdAt));
+              return [kind, {
+                count: entries.length,
+                latestAt: entries.at(-1)?.createdAt ?? null,
+              }];
+            }),
+          );
+          const diagnostic = [oauth?.message, credential?.message]
+            .filter((value): value is string => typeof value === "string")
+            .join(" ")
+            .replace(/(?:lin_api_|Bearer\s+)[^\s,;]+/giu, "[REDACTED]")
+            .replace(/[A-Za-z0-9_-]{48,}/gu, "[REDACTED]")
+            .slice(0, 500);
           throw new Error(
-            "A persistent opaque Linear OAuth or personal-key credential is required; plaintext fallback is not accepted.",
+            `A persistent opaque Linear OAuth or personal-key credential is required; plaintext fallback is not accepted. ${diagnostic} Native Linear secret metadata: ${JSON.stringify(nativeSummary)}`,
           );
         }
 
-        const connection = await plugin.testLinearConnection();
         if (!connection?.ok) {
           throw new Error(
             `The configured Linear credential failed live discovery: ${String(
@@ -104,7 +140,7 @@ test.describe.serial("configured native Linear live proof", () => {
           }
         }
 
-        const registry = plugin.createToolRegistry?.();
+        let registry = plugin.createToolRegistry?.();
         if (!registry?.prepare || !registry?.executePrepared) {
           throw new Error("The production prepared-action registry is unavailable.");
         }
@@ -112,9 +148,6 @@ test.describe.serial("configured native Linear live proof", () => {
           "linear_create_issue",
           "linear_get_issue",
           "linear_search_issues",
-          "linear_create_initiative",
-          "linear_get_initiative",
-          "linear_trash_initiative",
           "linear_create_project",
           "linear_get_project",
           "linear_trash_project",
@@ -269,22 +302,6 @@ test.describe.serial("configured native Linear live proof", () => {
         };
 
         try {
-          const requestedInitiativeId = crypto.randomUUID();
-          initiativeId = requestedInitiativeId;
-          const createdInitiative = await executeMutation(
-            "linear_create_initiative",
-            {
-              input: {
-                id: requestedInitiativeId,
-                name: `Agentic configured initiative ${suffix}`,
-                description: "Disposable configured-credential initiative proof.",
-                content: `Disposable initiative marker ${suffix}`,
-              },
-            },
-            `configured-linear-create-initiative-${suffix}`,
-          );
-          initiativeId = createdInitiative.receipt.resource.id;
-
           const requestedProjectId = crypto.randomUUID();
           projectId = requestedProjectId;
           const createdProject = await executeMutation(
@@ -301,6 +318,44 @@ test.describe.serial("configured native Linear live proof", () => {
             `configured-linear-create-project-${suffix}`,
           );
           projectId = createdProject.receipt.resource.id;
+
+          const refreshed = await plugin.testLinearConnection();
+          if (!refreshed?.ok) {
+            throw new Error("Linear capability refresh failed after project creation.");
+          }
+          registry = plugin.createToolRegistry?.();
+          const refreshedDefinitions = new Set(
+            (registry?.getDefinitions?.() ?? []).map(
+              (definition: any) => definition?.function?.name,
+            ),
+          );
+          for (const toolName of [
+            "linear_create_initiative",
+            "linear_get_initiative",
+            "linear_trash_initiative",
+          ]) {
+            if (!refreshedDefinitions.has(toolName)) {
+              throw new Error(
+                `Required post-project Linear tool is unavailable: ${toolName}.`,
+              );
+            }
+          }
+
+          const requestedInitiativeId = crypto.randomUUID();
+          initiativeId = requestedInitiativeId;
+          const createdInitiative = await executeMutation(
+            "linear_create_initiative",
+            {
+              input: {
+                id: requestedInitiativeId,
+                name: `Agentic configured initiative ${suffix}`,
+                description: "Disposable configured-credential initiative proof.",
+                content: `Disposable initiative marker ${suffix}`,
+              },
+            },
+            `configured-linear-create-initiative-${suffix}`,
+          );
+          initiativeId = createdInitiative.receipt.resource.id;
 
           const requestedLinkId = crypto.randomUUID();
           initiativeProjectLinkId = requestedLinkId;

@@ -175,6 +175,8 @@ test("configured Linear live routing is explicit and keeps secrets inside Obsidi
   );
   assert.match(harness, /preservedLinearOAuthRuntimeState/u);
   assert.match(harness, /linearOAuthRuntimeState: preservedLinearOAuthRuntimeState/u);
+  assert.match(harness, /linearCapabilitySnapshot: preservedLinearCapabilitySnapshot/u);
+  assert.match(harness, /linearIntegrationState: preservedLinearIntegrationState/u);
   const preflight = readFileSync(
     new URL("../scripts/e2e-preflight.mjs", import.meta.url),
     "utf8",

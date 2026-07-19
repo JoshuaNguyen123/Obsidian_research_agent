@@ -48,4 +48,5 @@ export * from "./WorkItemSpecV2";
 export * from "./LinearOAuth";
 export * from "./LinearOAuthLoopback";
 export * from "./LinearOAuthRuntimeState";
+export * from "./LinearOAuthNativeRecovery";
 export * from "./types";

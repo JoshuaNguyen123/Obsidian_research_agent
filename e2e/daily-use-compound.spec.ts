@@ -832,17 +832,6 @@ async function configureProtectedConnections(
         const linearSaved = await plugin.setLinearApiKey(linearToken);
         if (!linearSaved?.ok) throw new Error("Linear secure credential setup failed.");
         linearOwned = true;
-      } else {
-        const existing = plugin.getLinearCredentialStatus?.();
-        const oauth = plugin.getLinearOAuthStatus?.();
-        if (
-          oauth?.connected !== true &&
-          (existing?.configured !== true || existing?.secure !== true)
-        ) {
-          throw new Error(
-            "Protected DU-06 requires E2E_LINEAR_API_KEY or an existing opaque native Linear OAuth or personal-key credential.",
-          );
-        }
       }
       const linearConnection = await plugin.testLinearConnection();
       if (!linearConnection?.ok) {

@@ -212,6 +212,13 @@ export async function startNativeObsidianHarness(
           await withTimeout(browser.close(), 5_000, "Playwright CDP close")
             .catch(() => undefined);
         }
+        const currentCorePluginData =
+          options.preserveConfiguredLinearCredential === true
+            ? await readOptionalText(pluginDataPaths[0]).catch((error) => {
+                teardownError ??= error;
+                return null;
+              })
+            : null;
         await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch((error) => {
           teardownError ??= error;
         });
@@ -221,9 +228,16 @@ export async function startNativeObsidianHarness(
           },
         );
         for (const [index, pluginDataPath] of pluginDataPaths.entries()) {
+          const baseline = pluginDataBefore[index] ?? null;
           await restorePluginDataSnapshot(
             pluginDataPath,
-            pluginDataBefore[index] ?? null,
+            index === 0
+              ? preserveConfiguredLinearCredentialState(
+                  baseline,
+                  currentCorePluginData,
+                  options.preserveConfiguredLinearCredential === true,
+                )
+              : baseline,
           ).catch((error) => {
             teardownError ??= error;
           });
@@ -250,14 +264,25 @@ export async function startNativeObsidianHarness(
       await withTimeout(browser.close(), 5_000, "Playwright failed-start CDP close")
         .catch(() => undefined);
     }
+    const currentCorePluginData =
+      options.preserveConfiguredLinearCredential === true
+        ? await readOptionalText(pluginDataPaths[0]).catch(() => null)
+        : null;
     await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch(() => undefined);
     await restoreOptionalText(obsidianStatePath, obsidianStateBefore).catch(
       () => undefined,
     );
     for (const [index, pluginDataPath] of pluginDataPaths.entries()) {
+      const baseline = pluginDataBefore[index] ?? null;
       await restorePluginDataSnapshot(
         pluginDataPath,
-        pluginDataBefore[index] ?? null,
+        index === 0
+          ? preserveConfiguredLinearCredentialState(
+              baseline,
+              currentCorePluginData,
+              options.preserveConfiguredLinearCredential === true,
+            )
+          : baseline,
       ).catch(() => undefined);
     }
     await restoreOptionalText(
@@ -329,6 +354,14 @@ async function seedCorePluginData(
   const hasPreservedLinearCredential = Boolean(
     preservedLinearCredentialReference || preservedLinearOAuthRuntimeState,
   );
+  const preservedLinearCapabilitySnapshot =
+    hasPreservedLinearCredential && isRecord(parsed.linearCapabilitySnapshot)
+      ? parsed.linearCapabilitySnapshot
+      : null;
+  const preservedLinearIntegrationState =
+    hasPreservedLinearCredential && isRecord(parsed.linearIntegrationState)
+      ? parsed.linearIntegrationState
+      : null;
   const preservedGitHubCredential =
     preserveConfiguredGitHubCredential && isRecord(parsed.githubCredential)
       ? parsed.githubCredential
@@ -366,11 +399,11 @@ async function seedCorePluginData(
         linearApiKey: "",
         linearCredentialReference: preservedLinearCredentialReference,
         linearOAuthRuntimeState: preservedLinearOAuthRuntimeState,
-        linearCapabilitySnapshot: null,
+        linearCapabilitySnapshot: preservedLinearCapabilitySnapshot,
         authorityGrants: [],
         authorityGrantUsage: {},
         authorityGrantStoreState: null,
-        linearIntegrationState: null,
+        linearIntegrationState: preservedLinearIntegrationState,
         linearQueueState: null,
         pendingLinearReconciliationState: null,
         queueResourceLockState: null,
@@ -773,6 +806,41 @@ function parseObject(content: string | null): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * A configured-credential live test may legitimately rotate OAuth references.
+ * Restore every unrelated baseline byte, but keep a newer secret-free Linear
+ * reference record so teardown cannot point the vault back at retired secrets.
+ */
+export function preserveConfiguredLinearCredentialState(
+  baselineContent: string | null,
+  currentContent: string | null,
+  preserve: boolean,
+): string | null {
+  if (!preserve) return baselineContent;
+  const baseline = parseObject(baselineContent);
+  const current = parseObject(currentContent);
+  if (!baseline || !current) return baselineContent;
+  const fields = [
+    "linearCredentialReference",
+    "linearOAuthRuntimeState",
+  ] as const;
+  if (!fields.some((field) => isRecord(baseline[field]))) {
+    return baselineContent;
+  }
+  const merged = { ...baseline };
+  let changed = false;
+  for (const field of fields) {
+    if (
+      isRecord(current[field]) &&
+      JSON.stringify(current[field]) !== JSON.stringify(baseline[field])
+    ) {
+      merged[field] = current[field];
+      changed = true;
+    }
+  }
+  return changed ? `${JSON.stringify(merged, null, 2)}\n` : baselineContent;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
