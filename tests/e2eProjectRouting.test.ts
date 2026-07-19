@@ -298,13 +298,22 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
     "if (await approveFirstVisiblePreparedAction(page))",
   );
   const durableRestartRead = realHarness.indexOf(
-    "await plugin?.getDurableMissionRestartReadiness?.()",
+    "plugin?.getDurableMissionRestartReadiness?.()",
   );
   assert.ok(approvalPoll >= 0);
   assert.ok(durableRestartRead >= 0);
   assert.ok(
     approvalPoll < durableRestartRead,
     "protected approval polling must run before durable restart projection",
+  );
+  assert.match(
+    realHarness,
+    /Promise\.race\(\[\s*Promise\.resolve\(plugin\?\.getDurableMissionRestartReadiness\?\.\(\)\)/u,
+  );
+  assert.match(
+    realHarness,
+    /setTimeout\(\(\) => resolve\(null\), 500\)/u,
+    "durable restart polling must yield before an exact approval can expire",
   );
   assert.match(mainSource, /after\.ledgerStatus !== "running"/u);
   assert.match(realHarness, /prepareForDurableMissionRestart/u);

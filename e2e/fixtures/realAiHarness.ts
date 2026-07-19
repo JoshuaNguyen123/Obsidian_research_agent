@@ -247,8 +247,15 @@ async function approveUntilMissionComplete(
       const app = (window as typeof window & { app?: any }).app;
       const plugin = app?.plugins?.plugins?.[pluginId];
       const snapshot = plugin?.getMissionRunSnapshot?.();
-      const durableRestart =
-        await plugin?.getDurableMissionRestartReadiness?.() ?? null;
+      // A lifecycle stage can commit and render the next exact approval after
+      // the outer pre-poll but before this durable read acquires its storage
+      // boundary. Never let that read starve the 120-second approval broker:
+      // return to the approval poll quickly and try durability again later.
+      const durableRestart = await Promise.race([
+        Promise.resolve(plugin?.getDurableMissionRestartReadiness?.())
+          .catch(() => null),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+      ]) ?? null;
       const lastError = Array.from(document.querySelectorAll<HTMLElement>(
         ".agentic-researcher-log-error .agentic-researcher-log-message",
       )).at(-1)?.textContent ?? "";
