@@ -274,16 +274,16 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       if (
         validation.status === "failed" &&
         validation.failureFingerprint &&
-        checkpoint.failureHistory.some(
+        checkpoint.failureHistory.filter(
           (entry) =>
             entry.cycle < cycle &&
             entry.fingerprint === validation.failureFingerprint,
-        )
+        ).length >= 2
       ) {
         await this.recordUnchangedFailure(checkpoint, cycle, validation);
         return preparationFailure(
           "unchanged_failure",
-          "The same fast-validation failure fingerprint survived a repair; further repair is stopped.",
+          "The same fast-validation failure fingerprint survived two bounded repair passes; further repair is stopped.",
         );
       }
       const outcome = validation.status === "passed"
@@ -408,14 +408,16 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     }
     const repeated = validation.status === "failed" &&
       validation.failureFingerprint &&
-      checkpoint.failureHistory.some(
-        (entry) => entry.fingerprint === validation.failureFingerprint,
-      );
+      checkpoint.failureHistory.filter(
+        (entry) =>
+          entry.cycle < payload.cycle &&
+          entry.fingerprint === validation.failureFingerprint,
+      ).length >= 2;
     if (repeated) {
       await this.recordUnchangedFailure(checkpoint, payload.cycle, validation);
       throw new CodeRepairToolRuntimeErrorV1(
         "unchanged_failure",
-        "The same validation failure fingerprint survived the previous cycle.",
+        "The same validation failure fingerprint survived two bounded repair passes.",
       );
     }
     const recordedAt = this.timestamp();
@@ -1402,7 +1404,7 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
     }
     next.blocker = {
       code: "unchanged_failure",
-      message: "The same fast-validation failure fingerprint survived a repair.",
+      message: "The same fast-validation failure fingerprint survived two bounded repair passes.",
       evidenceFingerprint: validation.failureFingerprint,
       blockedAt: recordedAt,
     };

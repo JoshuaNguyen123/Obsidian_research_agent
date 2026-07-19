@@ -426,7 +426,7 @@ test("host graph binds every explicit new repository file to its own ordered nod
   assert.equal(host.capabilityEnvelope.budgets.maxDepth, paths.length + 1);
 });
 
-test("host graph adds one exact protected-contract read and one bounded correction pass", async () => {
+test("host graph adds one exact protected-contract read and two bounded correction passes", async () => {
   const planned = [
     "code_workspace_create",
     "code_workspace_create_file",
@@ -481,6 +481,10 @@ test("host graph adds one exact protected-contract read and one bounded correcti
       ...createdPaths.map(() => "code_workspace_write_expected"),
       "code_validate_fast",
       "code_repair_record_cycle",
+      ...createdPaths.map(() => "code_workspace_read"),
+      ...createdPaths.map(() => "code_workspace_write_expected"),
+      "code_validate_fast",
+      "code_repair_record_cycle",
       "code_validate_targeted",
       "code_validate_full",
       "code_commit_verified",
@@ -494,14 +498,14 @@ test("host graph adds one exact protected-contract read and one bounded correcti
       const resource = node.inputs.resource;
       return resource?.kind === "binding" ? resource.selector : null;
     }),
-    ["scripts/verify_project.py", ...createdPaths],
+    ["scripts/verify_project.py", ...createdPaths, ...createdPaths],
   );
   assert.ok(reads.at(-1)!.dependencyIds.includes(reads.at(-2)!.id));
   assert.deepEqual(
     nodes
       .filter((node) => node.allowedTools[0] === "code_workspace_write_expected")
       .map((node) => node.destination?.selector),
-    createdPaths,
+    [...createdPaths, ...createdPaths],
   );
   assert.equal(host.capabilityEnvelope.budgets.maxDepth, nodes.length + 1);
   assert.ok(host.capabilityEnvelope.budgets.maxDepth > 24);

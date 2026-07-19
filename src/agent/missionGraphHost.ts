@@ -436,7 +436,30 @@ function expandBoundedWorkspaceRepairReview(input: {
 
   const expanded: PlannedToolStepV1[] = [];
   let protectedReadsInserted = false;
-  let correctionPassInserted = false;
+  let correctionPassesInserted = false;
+  const boundedCorrectionPass = (
+    ordinal: "first" | "second",
+    cycle: 2 | 3,
+  ): PlannedToolStepV1[] => [
+    ...input.explicitNewWorkspaceFilePaths.map((path) => ({
+      name: "code_workspace_read",
+      selector: path,
+      objective: `Read the exact created workspace file ${path} for the ${ordinal} bounded correction pass.`,
+    })),
+    ...input.explicitNewWorkspaceFilePaths.map((path) => ({
+      name: "code_workspace_write_expected",
+      selector: path,
+      objective: `Reconcile the exact workspace file ${path} against the accepted requirements, protected contract, and fast-validation evidence using its observed hash during the ${ordinal} bounded correction pass.`,
+    })),
+    {
+      name: "code_validate_fast",
+      objective: `Run bounded fast validation again after the ${ordinal} correction pass.`,
+    },
+    {
+      name: "code_repair_record_cycle",
+      objective: `Record repair-cycle checkpoint ${cycle} from the ${ordinal} corrected fast-validation evidence.`,
+    },
+  ];
   for (const step of input.steps) {
     expanded.push(step);
     if (step.name === "code_workspace_create" && !protectedReadsInserted) {
@@ -451,30 +474,12 @@ function expandBoundedWorkspaceRepairReview(input: {
     }
     if (
       step.name === "code_repair_record_cycle" &&
-      !correctionPassInserted
+      !correctionPassesInserted
     ) {
-      correctionPassInserted = true;
+      correctionPassesInserted = true;
       expanded.push(
-        ...input.explicitNewWorkspaceFilePaths.map((path) => ({
-          name: "code_workspace_read",
-          selector: path,
-          objective: `Read the exact created workspace file ${path} for the bounded correction pass.`,
-        })),
-        ...input.explicitNewWorkspaceFilePaths.map((path) => ({
-          name: "code_workspace_write_expected",
-          selector: path,
-          objective: `Reconcile the exact workspace file ${path} against the accepted requirements, protected contract, and fast-validation evidence using its observed hash.`,
-        })),
-        {
-          name: "code_validate_fast",
-          objective:
-            "Run the bounded fast validation again after the one correction pass.",
-        },
-        {
-          name: "code_repair_record_cycle",
-          objective:
-            "Record the second repair-cycle checkpoint from the corrected fast-validation evidence.",
-        },
+        ...boundedCorrectionPass("first", 2),
+        ...boundedCorrectionPass("second", 3),
       );
     }
   }

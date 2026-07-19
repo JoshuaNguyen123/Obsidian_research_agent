@@ -286,7 +286,7 @@ test("red or non-fresh full validation fails closed", async (t) => {
   });
 });
 
-test("unchanged fast failure stops at cycle two and persists the blocker", async (t) => {
+test("unchanged fast failure permits cycle two and stops at cycle three", async (t) => {
   const harness = await createHarness(t, "src/index.ts");
   const first = await validation("fast", "fast-one", true, "fast-failed-one", 0, false, FAILURE_HASH, harness.validationBinding);
   harness.validations.set(first.id, first);
@@ -303,12 +303,26 @@ test("unchanged fast failure stops at cycle two and persists the blocker", async
     cycleArgs(second, 2, 1),
     context(),
   );
-  assert.equal(prepared.ok, false);
-  if (!prepared.ok) assert.equal(prepared.error.code, "unchanged_failure");
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const secondResult = await harness.handlers.executePreparedCycleRecord(
+    prepared.action,
+    authorizedContext(prepared.action),
+  );
+  assert.equal(secondResult.domainReceipt.outcome, "repaired");
+
+  const third = await validation("fast", "fast-three", true, "fast-failed-three", 120_000, false, FAILURE_HASH, harness.validationBinding);
+  harness.validations.set(third.id, third);
+  const thirdPrepared = await harness.handlers.prepareCycleRecord(
+    cycleArgs(third, 3, 2),
+    context(),
+  );
+  assert.equal(thirdPrepared.ok, false);
+  if (!thirdPrepared.ok) assert.equal(thirdPrepared.error.code, "unchanged_failure");
   const status = await harness.handlers.readStatus(SCOPE, context());
   assert.equal(status.terminalStatus, "blocked");
   assert.equal(status.blockerCode, "unchanged_failure");
-  assert.deepEqual(status.attempts.map((attempt) => attempt.outcome), ["repaired", "blocked"]);
+  assert.deepEqual(status.attempts.map((attempt) => attempt.outcome), ["repaired", "repaired", "blocked"]);
   assert.equal(harness.gateway.commitCalls, 0);
 });
 
