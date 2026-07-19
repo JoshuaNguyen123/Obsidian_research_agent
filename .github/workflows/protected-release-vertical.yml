@@ -1,171 +1,134 @@
-name: Protected hosted release checks
+name: Protected targeted release checks
 
 on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: Exact commit SHA to attest
+        description: Exact full commit SHA to attest
         required: true
+        type: string
+      lanes:
+        description: Comma-separated targeted lanes (deterministic,research,code,compound)
+        required: true
+        default: deterministic,research,code,compound
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: protected-hosted-release-${{ inputs.commit_sha }}
+  group: protected-targeted-release-${{ inputs.commit_sha }}
   cancel-in-progress: false
 
 jobs:
-  hosted-proof:
-    name: Exact SHA / hosted daily-use and provider checks
+  self-hosted-proof:
+    name: Exact SHA / free self-hosted targeted proof
     environment: protected-live-release
-    runs-on: windows-2022
-    timeout-minutes: 180
+    # This dedicated label prevents accidental use of paid GitHub-hosted minutes.
+    # Register the local Windows runner with: self-hosted, Windows, X64,
+    # agentic-daily-use. Run it as an unprivileged account with WSL2 and
+    # Obsidian installed; the workflow never installs a privileged service.
+    runs-on: [self-hosted, Windows, X64, agentic-daily-use]
+    timeout-minutes: 240
+    env:
+      E2E_RELEASE_COMMIT_SHA: ${{ inputs.commit_sha }}
+      PROTECTED_TARGETED_LANES: ${{ inputs.lanes }}
     steps:
-      - name: Check out exact SHA
+      - name: Check out exact SHA without persisted credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 1
           persist-credentials: false
+          clean: true
 
-      - name: Verify exact SHA
+      - name: Verify accessible local prerequisites
         shell: pwsh
-        env:
-          E2E_RELEASE_COMMIT_SHA: ${{ inputs.commit_sha }}
         run: |
-          if ($env:E2E_RELEASE_COMMIT_SHA -notmatch '^[0-9a-f]{40}$') {
-            throw "commit_sha must be one full lowercase Git SHA."
+          $ErrorActionPreference = "Stop"
+          if ($env:E2E_RELEASE_COMMIT_SHA -notmatch '^[a-f0-9]{40}$') {
+            throw "commit_sha must be one full lowercase Git commit SHA."
           }
-          $actual = git rev-parse HEAD
-          if ($actual -ne $env:E2E_RELEASE_COMMIT_SHA) {
-            throw "Checked out $actual instead of requested SHA."
+          $actualSha = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($actualSha -ne $env:E2E_RELEASE_COMMIT_SHA) {
+            throw "Checked out $actualSha instead of requested SHA $env:E2E_RELEASE_COMMIT_SHA."
+          }
+          foreach ($command in @("git", "node", "npm", "python", "wsl.exe")) {
+            if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+              throw "Missing local runner prerequisite: $command"
+            }
+          }
+          node --version
+          npm --version
+          python --version
+          if (-not (Test-Path -LiteralPath "$env:LOCALAPPDATA\Obsidian\Obsidian.exe")) {
+            ./scripts/install-verified-obsidian.ps1
           }
 
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
+      - name: Install exact repository dependencies
         run: npm ci
-
-      - name: Install semantic embedding runtime
-        run: python -m pip install --disable-pip-version-check fastembed==0.8.0
-
-      - name: Install verified Obsidian desktop
-        shell: pwsh
-        run: ./scripts/install-verified-obsidian.ps1
 
       - name: Create isolated disposable Obsidian vault
         shell: pwsh
         run: |
-          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-disposable-release-vault"
+          if ($env:E2E_RELEASE_COMMIT_SHA -notmatch '^[a-f0-9]{40}$') {
+            throw "commit_sha must be one full lowercase Git commit SHA."
+          }
+          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-protected-$env:E2E_RELEASE_COMMIT_SHA"
           New-Item -ItemType Directory -Force -Path (Join-Path $vault ".obsidian\plugins") | Out-Null
           Set-Content -LiteralPath (Join-Path $vault ".obsidian\community-plugins.json") -Value "[]" -Encoding utf8
           "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          New-Item -ItemType Directory -Force -Path "test-results\protected-hosted" | Out-Null
 
-      - name: Build exact release artifacts
-        run: npm run build
+      - name: Probe the real WSL2 sandbox boundary
+        run: npx tsx scripts/ci-sandbox-boundary.ts
+        env:
+          AGENTIC_SANDBOX_CI_LIVE: "1"
+          AGENTIC_SANDBOX_CI_EXECUTABLE: ${{ vars.AGENTIC_SANDBOX_CI_EXECUTABLE || 'wsl.exe' }}
+          AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE: ${{ vars.AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE }}
+          AGENTIC_SANDBOX_CI_RUNTIME_DIGEST: ${{ vars.AGENTIC_SANDBOX_CI_RUNTIME_DIGEST }}
+          AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION: ${{ vars.AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION }}
+          AGENTIC_SANDBOX_CI_RUNTIME_ROOT: ${{ vars.AGENTIC_SANDBOX_CI_RUNTIME_ROOT }}
 
-      - name: Run affected deterministic daily-use lanes
-        run: npm run test:e2e:daily-use
+      - name: Run only exact affected daily-use files and selected research cases
+        shell: pwsh
+        run: >-
+          node scripts/run-targeted-protected-release.mjs
+          "--sha=$env:E2E_RELEASE_COMMIT_SHA"
+          "--lanes=$env:PROTECTED_TARGETED_LANES"
         env:
           E2E_TRUST_DISPOSABLE_VAULT: "1"
-
-      - name: Preserve deterministic redacted summary
-        if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath "test-results\daily-use-run-summary.json") {
-            Copy-Item -LiteralPath "test-results\daily-use-run-summary.json" -Destination "test-results\protected-hosted\deterministic.json" -Force
-          }
-
-      - name: Run affected DU-02 live-model scenarios
-        run: npm run test:e2e:daily-use:live-model
-        env:
+          E2E_MODEL_PROVIDER: ollama
           E2E_OLLAMA_API_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
           E2E_AI_MODEL: ${{ vars.E2E_AI_MODEL || 'gpt-oss:120b-cloud' }}
           E2E_OLLAMA_BASE_URL: ${{ vars.E2E_OLLAMA_BASE_URL || 'https://ollama.com/api' }}
-          E2E_TRUST_DISPOSABLE_VAULT: "1"
-
-      - name: Preserve live-model redacted summary
-        if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath "test-results\daily-use-run-summary.json") {
-            Copy-Item -LiteralPath "test-results\daily-use-run-summary.json" -Destination "test-results\protected-hosted\live-model.json" -Force
-          }
-
-      - name: Mutate, verify, deduplicate, and clean up disposable Linear
-        shell: pwsh
-        env:
-          E2E_LIVE_PROVIDER: linear
-          LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: DISPOSABLE_ONLY
-          LIVE_EXTERNAL_TARGET_LABEL: ${{ vars.LIVE_EXTERNAL_TARGET_LABEL }}
-          AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true"
-          E2E_LIVE_LINEAR_PROJECT: ${{ vars.DISPOSABLE_LINEAR_PROJECT_LABEL }}
-          LINEAR_LIVE_TEST_TOKEN: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
+          E2E_LINEAR_API_KEY: ${{ secrets.LINEAR_LIVE_TEST_TOKEN }}
           LINEAR_LIVE_TEST_TEAM_ID: ${{ vars.LINEAR_LIVE_TEST_TEAM_ID }}
-          LINEAR_LIVE_TEST_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
-          E2E_LIVE_ALLOW_MERGE: "0"
-        run: |
-          node scripts/live-external-preflight.mjs --provider linear
-          npm run test:e2e:live
+          E2E_RELEASE_LINEAR_PROJECT_ID: ${{ vars.LINEAR_LIVE_TEST_PROJECT_ID }}
+          E2E_GITHUB_TOKEN: ${{ secrets.GITHUB_LIVE_TEST_TOKEN }}
+          E2E_RELEASE_GITHUB_REPOSITORY_PREFIX: ${{ vars.E2E_RELEASE_GITHUB_REPOSITORY_PREFIX || 'agentic-e2e-disposable' }}
+          AGENTIC_SANDBOX_CI_LIVE: "1"
+          AGENTIC_SANDBOX_CI_EXECUTABLE: ${{ vars.AGENTIC_SANDBOX_CI_EXECUTABLE || 'wsl.exe' }}
+          AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE: ${{ vars.AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE }}
+          AGENTIC_SANDBOX_CI_RUNTIME_DIGEST: ${{ vars.AGENTIC_SANDBOX_CI_RUNTIME_DIGEST }}
+          AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION: ${{ vars.AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION }}
+          AGENTIC_SANDBOX_CI_RUNTIME_ROOT: ${{ vars.AGENTIC_SANDBOX_CI_RUNTIME_ROOT }}
 
-      - name: Preserve Linear redacted summary
+      - name: Upload redacted targeted proof summaries
         if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath "test-results\daily-use-run-summary.json") {
-            Copy-Item -LiteralPath "test-results\daily-use-run-summary.json" -Destination "test-results\protected-hosted\linear.json" -Force
-          }
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protected-targeted-summaries-${{ inputs.commit_sha }}
+          path: test-results/protected-targeted/*.json
+          retention-days: 3
+          if-no-files-found: ignore
 
-      - name: Publish, verify, and clean up disposable GitHub draft
-        shell: pwsh
-        env:
-          E2E_LIVE_PROVIDER: github_draft
-          LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: DISPOSABLE_ONLY
-          LIVE_EXTERNAL_TARGET_LABEL: ${{ vars.LIVE_EXTERNAL_TARGET_LABEL }}
-          AGENTIC_LIVE_EXTERNAL_CLEANUP_REQUIRED: "true"
-          E2E_LIVE_GITHUB_REPOSITORY: ${{ vars.DISPOSABLE_GITHUB_REPOSITORY }}
-          GITHUB_LIVE_TEST_TOKEN: ${{ secrets.GITHUB_LIVE_TEST_TOKEN }}
-          E2E_LIVE_ALLOW_MERGE: "0"
-        run: |
-          node scripts/live-external-preflight.mjs --provider github_draft
-          npm run test:e2e:live
-
-      - name: Preserve GitHub redacted summary
-        if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath "test-results\daily-use-run-summary.json") {
-            Copy-Item -LiteralPath "test-results\daily-use-run-summary.json" -Destination "test-results\protected-hosted\github.json" -Force
-          }
-
-      - name: Record the local WSL2 completion boundary
+      - name: Summarize the free runner boundary
         if: always()
         shell: pwsh
         run: |
           @"
-          ### Protected boundary still requiring local proof
+          ### Targeted protected proof
 
-          The standard GitHub-hosted Windows image cannot attest the dedicated WSL2 runtime used by DU-03 and DU-06. Run those two exact-SHA lanes locally on the protected Windows machine. This hosted job is intentionally not labeled as full release proof.
+          This job ran on the repository owner's self-hosted Windows runner, so it did not consume GitHub-hosted runner minutes. The lane selector is allowlisted by the repository script and cannot expand into the full Playwright suite, deterministic matrix, or real-model soak.
           "@ | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
-
-      - name: Upload redacted hosted proof summaries
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: protected-hosted-summaries-${{ inputs.commit_sha }}
-          path: test-results/protected-hosted/*.json
-          retention-days: 3
-          if-no-files-found: ignore

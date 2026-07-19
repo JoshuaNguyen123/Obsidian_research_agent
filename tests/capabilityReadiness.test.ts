@@ -20,6 +20,7 @@ function inputs(): CapabilityReadinessInputsV2 {
     code: {
       registered: true,
       repositoryProfileCount: 1,
+      runtimeUnresolvedProfileCount: 0,
       editingAvailable: true,
       executionAvailable: true,
       probeObservedAt: "2026-07-16T11:55:00.000Z",
@@ -71,6 +72,17 @@ describe("CapabilityReadinessV2", () => {
     const rows = buildCapabilityReadinessV2(stale, NOW);
     assert.equal(rows.find((row) => row.id === "code")?.status, "Degraded");
     assert.equal(rows.find((row) => row.id === "linear")?.status, "Degraded");
+  });
+
+  it("does not report Ready while a trusted profile lacks an immutable runtime binding", () => {
+    const unresolved = inputs();
+    unresolved.code.runtimeUnresolvedProfileCount = 1;
+    const code = buildCapabilityReadinessV2(unresolved, NOW).find(
+      (row) => row.id === "code",
+    );
+    assert.equal(code?.status, "Degraded");
+    assert.match(code?.reason ?? "", /require a fresh immutable runtime binding/u);
+    assert.equal(code?.nextAction, "Refresh repository runtime binding");
   });
 
   it("requires fresh private-repository readback instead of treating a profile as publication readiness", () => {

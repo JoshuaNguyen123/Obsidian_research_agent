@@ -44,6 +44,11 @@ export type ProjectLifecycleStageName =
 
 export interface CompoundMissionApprovalOptions {
   maxContinuations?: number;
+  /** Redacted harness counters retained even when the mission fails mid-loop. */
+  onProgress?: (counters: {
+    approvals: number;
+    continuations: number;
+  }) => void;
   /** Restart the production plugin immediately after selected durable stage commits. */
   restartAfterProjectStages?: readonly ProjectLifecycleStageName[];
   onStageRestarted?: (stage: ProjectLifecycleStageName) => Promise<void>;
@@ -240,6 +245,7 @@ async function approveUntilMissionComplete(
     // persistence boundary until the approval resolves.
     if (await approveFirstVisiblePreparedAction(page)) {
       approvals += 1;
+      options.onProgress?.({ approvals, continuations });
       await page.waitForTimeout(100);
       continue;
     }
@@ -374,13 +380,17 @@ async function approveUntilMissionComplete(
       await options.restartCorePlugin(committedRestartStage);
       await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
       const continued = await continueLatestRunAfterStageRestart(page);
-      if (continued) continuations += 1;
+      if (continued) {
+        continuations += 1;
+        options.onProgress?.({ approvals, continuations });
+      }
       continue;
     }
     if (ui.hasEnabledApproval) {
       const clicked = await approveFirstVisiblePreparedAction(page);
       if (clicked) {
         approvals += 1;
+        options.onProgress?.({ approvals, continuations });
       }
       await page.waitForTimeout(100);
       continue;
@@ -424,6 +434,7 @@ async function approveUntilMissionComplete(
         }
         missingContinuationPolls = 0;
         continuations += 1;
+        options.onProgress?.({ approvals, continuations });
         if (continuations > maximumContinuations) {
           throw new Error(
             `Mission exceeded ${maximumContinuations} explicit continuations; approved=${approvals}; state=${JSON.stringify(ui)}.`,

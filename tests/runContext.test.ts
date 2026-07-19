@@ -123,6 +123,39 @@ test("fingerprinted continuation handoff survives compaction and rejects tamperi
   const rejected = compactLoopMessages({ messages, ledger, handoff: tampered });
   assert.equal(rejected.applied, false);
   assert.equal(rejected.rejectionReason, "invalid_handoff");
+
+  const malformedNested = {
+    ...handoff,
+    evidence: [{ id: "evidence-without-a-valid-fingerprint", fingerprint: "bad" }],
+  };
+  const malformedValidation = validateContinuationHandoffV1(malformedNested);
+  assert.equal(malformedValidation.ok, false);
+  if (!malformedValidation.ok) {
+    assert.ok(malformedValidation.errors.includes("invalid_evidence_shape"));
+  }
+
+  const durableLedger = createMissionLedger({
+    runId: "run-handoff",
+    mission: "Preserve durable proof",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["read_file"],
+      stopWhenSatisfied: true,
+    },
+  });
+  const authorityValidation = validateContinuationHandoffV1(handoff, {
+    ledger: durableLedger,
+    lineageFingerprints: [`sha256:${"c".repeat(64)}`],
+  });
+  assert.equal(authorityValidation.ok, false);
+  if (!authorityValidation.ok) {
+    assert.ok(authorityValidation.errors.includes("authority_receipt_mismatch"));
+    assert.ok(authorityValidation.errors.includes("authority_approval_mismatch"));
+    assert.ok(authorityValidation.errors.includes("authority_lineage_mismatch"));
+  }
 });
 
 test("run context rejects a compaction candidate that would increase the estimate", () => {

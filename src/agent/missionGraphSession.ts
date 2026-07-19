@@ -4,7 +4,11 @@ import {
   releaseResourceLocks,
 } from "./queue/resourceLocks";
 import {
+  getCurrentMissionCompositeLifecycleActionV1,
+  getMissionCompositeLifecycleSpecV1,
+  getMissionCompositeLifecycleStateV1,
   type MissionBlockerV1,
+  type MissionCompositeLifecycleActionV1,
   type MissionEvidenceRefV1,
   type MissionGraphPatchOperationV1,
   type MissionGraphPatchV1,
@@ -58,6 +62,7 @@ export interface MissionGraphToolExecution {
   nodeId: string;
   toolName: string;
   lockLease: MissionGraphLockLease | null;
+  lifecycleActionId?: string | null;
 }
 
 /**
@@ -235,13 +240,13 @@ export class MissionGraphSession {
       let node = Object.values(this.record.graph.nodes).find(
         (candidate) =>
           candidate.status === "ready" &&
-          candidate.allowedTools.includes(toolName),
+          missionNodeExpectsToolV1(candidate, toolName),
       );
       if (!node) {
         const terminalFailure = Object.values(this.record.graph.nodes).find(
           (candidate) =>
             candidate.status === "blocked" &&
-            candidate.allowedTools.includes(toolName) &&
+            missionNodeExpectsToolV1(candidate, toolName) &&
             (candidate.blocker?.code === "tool_failure_repeated" ||
               candidate.retries.attempts >= candidate.retries.maxAttempts ||
               candidate.retries.consecutiveFailureCount >= 2),
@@ -252,9 +257,29 @@ export class MissionGraphSession {
             reason: `Tool ${toolName} is blocked after repeated unchanged failures in mission node ${terminalFailure.id}.`,
           };
         }
+        const lifecycleNode = Object.values(this.record.graph.nodes).find(
+          (candidate) => missionNodeContainsLifecycleToolV1(candidate, toolName),
+        );
+        if (lifecycleNode) {
+          const expected = getCurrentMissionCompositeLifecycleActionV1(lifecycleNode);
+          const state = getMissionCompositeLifecycleStateV1(lifecycleNode);
+          const replayed = state && getMissionCompositeLifecycleSpecV1(lifecycleNode)
+            ?.actions.slice(0, state.actionCursor)
+            .some((action) => action.toolName === toolName);
+          return {
+            ok: false as const,
+            reason: replayed
+              ? `Tool ${toolName} already completed in composite lifecycle node ${lifecycleNode.id} and cannot be replayed.`
+              : expected
+                ? `Tool ${toolName} is not the current action in composite lifecycle node ${lifecycleNode.id}; expected ${expected.toolName}.`
+                : `Tool ${toolName} cannot continue after composite lifecycle node ${lifecycleNode.id} completed.`,
+          };
+        }
         const grant = this.record.graph.capabilityEnvelope.tools[toolName];
         const template = Object.values(this.record.graph.nodes).find(
-          (candidate) => candidate.allowedTools.includes(toolName),
+          (candidate) =>
+            !getMissionCompositeLifecycleSpecV1(candidate) &&
+            candidate.allowedTools.includes(toolName),
         );
         if (!grant) {
           return {
@@ -560,7 +585,13 @@ export class MissionGraphSession {
         ]);
         return {
           ok: true as const,
-          execution: { nodeId: node.id, toolName, lockLease },
+          execution: {
+            nodeId: node.id,
+            toolName,
+            lockLease,
+            lifecycleActionId:
+              getCurrentMissionCompositeLifecycleActionV1(node)?.id ?? null,
+          },
         };
       } catch (error) {
         if (lockLease) {
@@ -579,6 +610,8 @@ export class MissionGraphSession {
       receipt?: MissionReceiptRefV1;
       failureFingerprint?: string;
       failureMessage?: string;
+      /** Host-verified domain outcome that must not be retried. */
+      terminalFailure?: boolean;
     },
   ): Promise<MissionGraphV3> {
     return this.enqueueMutation(async () => {
@@ -587,6 +620,21 @@ export class MissionGraphSession {
         throw new Error(
           `Mission node ${node.id} is ${node.status}; expected running before result.`,
         );
+      }
+      const lifecycle = getMissionCompositeLifecycleSpecV1(node);
+      const lifecycleState = getMissionCompositeLifecycleStateV1(node);
+      const lifecycleAction = getCurrentMissionCompositeLifecycleActionV1(node);
+      if (lifecycle) {
+        if (
+          !lifecycleState ||
+          !lifecycleAction ||
+          lifecycleAction.toolName !== execution.toolName ||
+          lifecycleAction.id !== execution.lifecycleActionId
+        ) {
+          throw new Error(
+            `Tool ${execution.toolName} does not match the durable composite lifecycle cursor for ${node.id}.`,
+          );
+        }
       }
       const operations: MissionGraphPatchOperationV1[] = [
         {
@@ -614,6 +662,75 @@ export class MissionGraphSession {
       }
 
       if (result.ok) {
+        const lifecycleProofMissing = lifecycleAction
+          ? actionProofMissingV1(lifecycleAction, result)
+          : false;
+        if (lifecycleProofMissing && lifecycleState && lifecycleAction) {
+          operations.push(
+            lifecycleOutputsOperationV1(
+              node.id,
+              lifecycleState,
+              lifecycleAction.id,
+              false,
+            ),
+            {
+              op: "set_status",
+              nodeId: node.id,
+              expectedStatus: "running",
+              status: "blocked",
+              blocker: {
+                code: "completion_proof_missing",
+                message: `Tool ${execution.toolName} returned without the proof required by lifecycle action ${lifecycleAction.id}.`,
+                requiredAction:
+                  "Reconcile the exact lifecycle action and attach its verified evidence or receipt.",
+              },
+            },
+          );
+        } else if (
+          lifecycle &&
+          lifecycleState &&
+          lifecycleAction &&
+          lifecycleState.actionCursor + 1 < lifecycle.actions.length
+        ) {
+          operations.push(
+            lifecycleOutputsOperationV1(
+              node.id,
+              lifecycleState,
+              lifecycleAction.id,
+              true,
+            ),
+            {
+              op: "update_node",
+              nodeId: node.id,
+              changes: {
+                retries: {
+                  maxAttempts: node.retries.maxAttempts,
+                  attempts: 0,
+                  failureFingerprints: [],
+                  consecutiveFailureFingerprint: null,
+                  consecutiveFailureCount: 0,
+                },
+              },
+            },
+            {
+              op: "set_status",
+              nodeId: node.id,
+              expectedStatus: "running",
+              status: "ready",
+              blocker: null,
+            },
+          );
+        } else {
+          if (lifecycleState && lifecycleAction) {
+            operations.push(
+              lifecycleOutputsOperationV1(
+                node.id,
+                lifecycleState,
+                lifecycleAction.id,
+                true,
+              ),
+            );
+          }
         const projectedEvidence = [
           ...node.evidence,
           ...(result.evidence ? [result.evidence] : []),
@@ -681,7 +798,18 @@ export class MissionGraphSession {
             }
           }
         }
+        }
       } else {
+        if (lifecycleState && lifecycleAction) {
+          operations.push(
+            lifecycleOutputsOperationV1(
+              node.id,
+              lifecycleState,
+              lifecycleAction.id,
+              false,
+            ),
+          );
+        }
         const nextAttempts = node.retries.attempts + 1;
         const sameFailureCount =
           result.failureFingerprint &&
@@ -691,7 +819,9 @@ export class MissionGraphSession {
               ? 1
               : 0;
         const terminal =
-          nextAttempts >= node.retries.maxAttempts || sameFailureCount >= 2;
+          result.terminalFailure === true ||
+          nextAttempts >= node.retries.maxAttempts ||
+          sameFailureCount >= 2;
         operations.push({
           op: "set_status",
           nodeId: node.id,
@@ -699,7 +829,9 @@ export class MissionGraphSession {
           status: terminal ? "blocked" : "ready",
           blocker: terminal
             ? {
-                code: "tool_failure_repeated",
+                code: result.terminalFailure === true
+                  ? "tool_failure_terminal"
+                  : "tool_failure_repeated",
                 message:
                   result.failureMessage ??
                   `Tool ${execution.toolName} failed without a safe repair.`,
@@ -1137,7 +1269,13 @@ export class MissionGraphSession {
     expectedStatus: MissionNodeStatusV3,
   ) {
     const node = this.requireNode(execution.nodeId);
-    if (!node.allowedTools.includes(execution.toolName)) {
+    const lifecycleAction = getCurrentMissionCompositeLifecycleActionV1(node);
+    if (
+      lifecycleAction
+        ? lifecycleAction.toolName !== execution.toolName ||
+          lifecycleAction.id !== execution.lifecycleActionId
+        : !node.allowedTools.includes(execution.toolName)
+    ) {
       throw new Error(
         `Tool ${execution.toolName} is not authorized for mission node ${node.id}.`,
       );
@@ -1170,6 +1308,68 @@ export class MissionGraphSession {
 
 function normalizeEvidenceKindToken(value: string): string {
   return value.trim().toLowerCase().replace(/[\s_]+/gu, "-");
+}
+
+function missionNodeExpectsToolV1(
+  node: MissionNodeV3,
+  toolName: string,
+): boolean {
+  const lifecycle = getMissionCompositeLifecycleSpecV1(node);
+  if (!lifecycle) return node.allowedTools.includes(toolName);
+  return getCurrentMissionCompositeLifecycleActionV1(node)?.toolName === toolName;
+}
+
+function missionNodeContainsLifecycleToolV1(
+  node: MissionNodeV3,
+  toolName: string,
+): boolean {
+  return getMissionCompositeLifecycleSpecV1(node)?.actions.some(
+    (action) => action.toolName === toolName,
+  ) ?? false;
+}
+
+function actionProofMissingV1(
+  action: MissionCompositeLifecycleActionV1,
+  result: {
+    evidence?: MissionEvidenceRefV1;
+    receipt?: MissionReceiptRefV1;
+  },
+): boolean {
+  const evidence = result.evidence ? [result.evidence] : [];
+  const receipts = result.receipt ? [result.receipt] : [];
+  return (
+    evidence.length < action.minimumEvidence ||
+    action.requiredEvidenceKinds.some(
+      (kind) => !evidence.some((candidate) => candidate.kind === kind),
+    ) ||
+    receipts.length < action.minimumReceipts ||
+    action.requiredReceiptKinds.some(
+      (kind) => !receipts.some((candidate) => candidate.kind === kind),
+    )
+  );
+}
+
+function lifecycleOutputsOperationV1(
+  nodeId: string,
+  state: NonNullable<ReturnType<typeof getMissionCompositeLifecycleStateV1>>,
+  actionId: string,
+  completed: boolean,
+): MissionGraphPatchOperationV1 {
+  const completedActionIds = completed
+    ? [...state.completedActionIds, actionId]
+    : [...state.completedActionIds];
+  return {
+    op: "set_outputs",
+    nodeId,
+    outputs: {
+      lifecycleActionCursor: state.actionCursor + (completed ? 1 : 0),
+      lifecycleCompletedActionIds: completedActionIds,
+      lifecycleActionAttemptCounts: {
+        ...state.actionAttemptCounts,
+        [actionId]: (state.actionAttemptCounts[actionId] ?? 0) + 1,
+      },
+    },
+  };
 }
 
 function clone<T>(value: T): T {

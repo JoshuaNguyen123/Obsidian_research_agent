@@ -23,7 +23,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Windows, X64, agentic-daily-use]
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -32,15 +32,9 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - name: Archive static site
-        shell: bash
+        shell: pwsh
         run: |
-          tar \
-            --dereference --hard-dereference \
-            --directory public-site \
-            -cvf "$RUNNER_TEMP/artifact.tar" \
-            --exclude=.git \
-            --exclude=.github \
-            .
+          tar.exe --exclude=.git --exclude=.github -C public-site -cf "$env:RUNNER_TEMP\artifact.tar" .
       - name: Upload static site
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

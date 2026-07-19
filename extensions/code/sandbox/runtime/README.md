@@ -15,10 +15,13 @@ Dedicated WSL2/bubblewrap roots install it as
 files at `/runtime/.agentic-runtime-digest` and
 `/runtime/runtime-manifest.json`.
 
-The runtime manifest binds repository/runtime pin hashes to an exact command
-catalog. A runtime must be rebuilt when a new immutable runtime identity is
-approved. Do not put credentials in the image, manifest, command environment,
-or staging bundle.
+The runtime manifest binds the complete immutable runtime-bundle digest to an
+exact command catalog. Repository pins remain profile evidence; they are never
+mistaken for an image or runtime-root identity. The bundled WSL2 setup includes
+Node/npm and Python so TypeScript/JavaScript and Python validation use the same
+freshly attested, read-only boundary. A runtime must be rebuilt when its files
+or command catalog change. Do not put credentials in the image, manifest,
+command environment, or staging bundle.
 
 The boundary probe deliberately fails unless the process is non-root, root and
 runtime mounts are read-only, `/workspace` is isolated tmpfs, no host root or

@@ -17,6 +17,7 @@
     "check:path-hygiene": "node scripts/check-path-hygiene.mjs",
     "test:ci": "npm run check:path-hygiene && npm test && npm run build",
     "sync:test-vault": "node scripts/sync-test-vault.mjs",
+    "cleanup:daily-use-code-runtime": "node scripts/cleanup-owned-daily-use-code-runtime.mjs",
     "e2e:preflight": "node scripts/e2e-preflight.mjs",
     "test:e2e": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-research",
     "test:e2e:mock": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=deterministic-core-mock",

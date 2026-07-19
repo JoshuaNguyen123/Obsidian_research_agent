@@ -22,6 +22,7 @@ import {
 } from "./fixtures/phase4Harness";
 import { startRealAiHarness } from "./fixtures/realAiHarness";
 import { liveProviderConfiguration } from "../scripts/ci-sandbox-boundary";
+import type { DailyUseObservedAcceptanceV1 } from "../src/agent/dailyUseAcceptance";
 
 const SUITE_TIMEOUT_MS = 420_000;
 const MISSION_TIMEOUT_MS = 240_000;
@@ -58,6 +59,14 @@ test.describe("Daily-use Code capability production boundaries", () => {
     const workspaceId = `du03-live-${startedAt}`;
     let liveHarness: Awaited<ReturnType<typeof startRealAiHarness>> | null = null;
     let verifiedWorktree: { root: string; branch: string } | null = null;
+    let acceptanceRecorded = false;
+    let runCounters = {
+      modelCalls: 0,
+      toolCalls: 0,
+      continuations: 0,
+      approvals: 0,
+    };
+    const observed = createMutableDailyUseObserved();
     try {
       liveHarness = await startRealAiHarness(
         "du03-protected-real-model-code",
@@ -95,14 +104,16 @@ test.describe("Daily-use Code capability production boundaries", () => {
       expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? ""))).toBeGreaterThanOrEqual(
         startedAt,
       );
+      observed.proofs.add("sandbox:boundary_attested");
 
       const requestId = `du03-request-${startedAt}`;
       const mission = [
         `Implement a complete TypeScript math package in the exact trusted local repository ${fixture.root}.`,
         `Create repository workspace ${workspaceId} and use one repair request id ${requestId} for every validation and commit call.`,
-        "Create exactly src/math.ts, src/index.ts, test/math.test.mjs, and README.md; do not change package.json, scripts/verify-project.mjs, workflows, hooks, or any other path.",
-        `src/math.ts must export a working add(left, right) function and an exported marker equal to ${marker}. src/index.ts must re-export the public API.`,
-        `The Node test must execute the add behavior and verify marker ${marker}. README.md must document npm test and include ${marker}.`,
+        "First read the exact protected package.json, scripts/import-simple-typescript.mjs, and scripts/verify-project.mjs contracts.",
+        "Create exactly src/math.ts, src/index.ts, test/math.test.mjs, and README.md; do not change package.json, either protected script, workflows, hooks, or any other path.",
+        `src/math.ts must export a working add(left, right) function and an exported marker equal to ${marker}. src/index.ts must re-export the public API from ./math.js, ./math.ts, or the extensionless ./math specifier.`,
+        `The dependency-free Node 18 test must import node:test, node:assert/strict, and importSimpleTypeScript from ../scripts/import-simple-typescript.mjs; call that loader exactly as importSimpleTypeScript("src/math.ts") because it resolves from the repository working directory, test the add behavior, and verify marker ${marker}. Do not use Jest or any third-party package. README.md must document npm test and include ${marker}.`,
         "Detect the repository profile, read back every created file, run targeted validation, then run a distinct fresh full validation, create one local commit with message feat: add protected TypeScript math package, and independently read the exact commit SHA back.",
         "Use the visible exact approval surface whenever required. Stop only after a verified_code_publication_handoff proves the four changed paths, targeted and fresh-full validation, clean worktree, and commit readback.",
       ].join(" ");
@@ -112,10 +123,25 @@ test.describe("Daily-use Code capability production boundaries", () => {
       });
       const approvals = await liveHarness.approveUntilMissionComplete(
         40 * 60_000,
+        {
+          onProgress: (counters) => {
+            runCounters = { ...runCounters, ...counters };
+            if (counters.approvals > 0) {
+              observed.approvals.add("approval:sandbox_execution");
+            }
+          },
+        },
       );
+      runCounters.approvals = approvals;
+      if (approvals > 0) observed.approvals.add("approval:sandbox_execution");
       const snapshot = await liveHarness.attestProductionRun({
         requireStructuredRouting: true,
       });
+      runCounters = {
+        ...runCounters,
+        modelCalls: snapshot.modelCallEvidence.length,
+        toolCalls: snapshot.missionEvidence.length,
+      };
       const statusResult = await executeReadOnlyCodeTool(
         liveHarness.page,
         "code_workspace_status",
@@ -184,42 +210,57 @@ test.describe("Daily-use Code capability production boundaries", () => {
       expect(await fixture.head()).toBe(fixture.baseSha);
       expect(await fixture.status()).toBe("");
 
+      addObserved(observed.artifacts, [
+        "code:source_files",
+        "code:tests",
+        "code:readme",
+        "git:local_commit",
+      ]);
+      addObserved(observed.proofs, [
+        "code:trusted_repository",
+        "code:durable_workspace",
+        "validation:targeted",
+        "validation:fresh_full",
+        "git:commit_readback",
+      ]);
+      observed.bindings.add("git:commit_artifacts");
+
       await recordDailyUseAcceptance(
         testInfo,
         "DU-03",
-        {
-          artifacts: [
-            "code:source_files",
-            "code:tests",
-            "code:readme",
-            "git:local_commit",
-          ],
-          proofs: [
-            "code:trusted_repository",
-            "code:durable_workspace",
-            "sandbox:boundary_attested",
-            "validation:targeted",
-            "validation:fresh_full",
-            "git:commit_readback",
-          ],
-          approvals: ["approval:sandbox_execution"],
-          bindings: ["git:commit_artifacts"],
-          cleanup: [],
-        },
-        {
-          modelCalls: snapshot.modelCallEvidence.length,
-          toolCalls: snapshot.missionEvidence.length,
-          approvals,
-        },
+        snapshotMutableDailyUseObserved(observed),
+        runCounters,
         { requireComplete: true },
       );
+      acceptanceRecorded = true;
     } finally {
+      if (!acceptanceRecorded) {
+        if (liveHarness) {
+          runCounters = await readDailyUseRunCounters(
+            liveHarness.page,
+            runCounters.approvals,
+          ).catch(() => runCounters);
+        }
+        await recordDailyUseAcceptance(
+          testInfo,
+          "DU-03",
+          snapshotMutableDailyUseObserved(observed),
+          runCounters,
+        ).catch(() => undefined);
+      }
+      if (!verifiedWorktree && liveHarness) {
+        verifiedWorktree = await readOwnedRepositoryWorktreeFromCodeStatus(
+          liveHarness.page,
+          workspaceId,
+        ).catch(() => null);
+      }
       if (verifiedWorktree) {
         await fixture
           .removeOwnedWorktree(verifiedWorktree.root, verifiedWorktree.branch)
           .catch(() => undefined);
       }
       await liveHarness?.close().catch(() => undefined);
+      await cleanupOwnedWorkspaceMetadata(workspaceId).catch(() => undefined);
       await fixture.cleanup();
     }
   });
@@ -963,4 +1004,112 @@ async function cleanupOwnedTempDirectory(
     throw new Error(`Refusing to clean unowned Phase 4 temp directory ${verified}.`);
   }
   await rm(verified, { recursive: true, force: true });
+}
+
+interface MutableDailyUseObservedV1 {
+  artifacts: Set<string>;
+  proofs: Set<string>;
+  approvals: Set<string>;
+  bindings: Set<string>;
+  cleanup: Set<string>;
+}
+
+function createMutableDailyUseObserved(): MutableDailyUseObservedV1 {
+  return {
+    artifacts: new Set(),
+    proofs: new Set(),
+    approvals: new Set(),
+    bindings: new Set(),
+    cleanup: new Set(),
+  };
+}
+
+function snapshotMutableDailyUseObserved(
+  observed: MutableDailyUseObservedV1,
+): DailyUseObservedAcceptanceV1 {
+  return {
+    artifacts: [...observed.artifacts],
+    proofs: [...observed.proofs],
+    approvals: [...observed.approvals],
+    bindings: [...observed.bindings],
+    cleanup: [...observed.cleanup],
+  };
+}
+
+function addObserved(target: Set<string>, values: readonly string[]): void {
+  for (const value of values) target.add(value);
+}
+
+async function readDailyUseRunCounters(
+  page: Page,
+  approvals: number,
+): Promise<{
+  modelCalls: number;
+  toolCalls: number;
+  continuations: number;
+  approvals: number;
+}> {
+  return page.evaluate(({ approvals }) => {
+    const plugin = (window as typeof window & { app?: any }).app
+      ?.plugins?.plugins?.["agentic-researcher"];
+    const snapshot = plugin?.getMissionRunSnapshot?.() ?? null;
+    return {
+      modelCalls: Array.isArray(snapshot?.modelCallEvidence)
+        ? snapshot.modelCallEvidence.length
+        : 0,
+      toolCalls: Array.isArray(snapshot?.missionEvidence)
+        ? snapshot.missionEvidence.length
+        : 0,
+      continuations: 0,
+      approvals,
+    };
+  }, { approvals });
+}
+
+async function readOwnedRepositoryWorktreeFromCodeStatus(
+  page: Page,
+  workspaceId: string,
+): Promise<{ root: string; branch: string } | null> {
+  const result = await executeReadOnlyCodeTool(
+    page,
+    "code_workspace_status",
+    { workspaceId },
+    `Read back the test-owned workspace ${workspaceId} for bounded cleanup.`,
+  );
+  if (!result.ok || !isRecord(result.output)) return null;
+  const manifest = isRecord(result.output.manifest)
+    ? result.output.manifest
+    : null;
+  const binding = manifest && isRecord(manifest.repositoryBinding)
+    ? manifest.repositoryBinding
+    : null;
+  if (
+    manifest?.workspaceId !== workspaceId ||
+    typeof binding?.worktreeRoot !== "string" ||
+    typeof binding.branch !== "string"
+  ) return null;
+  return { root: binding.worktreeRoot, branch: binding.branch };
+}
+
+async function cleanupOwnedWorkspaceMetadata(workspaceId: string): Promise<void> {
+  if (!/^du03-live-\d{10,}$/u.test(workspaceId) || !process.env.LOCALAPPDATA) {
+    throw new Error(`Refusing to clean unowned DU-03 workspace metadata ${workspaceId}.`);
+  }
+  const metadataRoot = path.resolve(
+    process.env.LOCALAPPDATA,
+    "AgenticResearcher",
+    "code",
+    "workspaces-v2",
+  );
+  const container = path.join(metadataRoot, workspaceId);
+  const verifiedContainer = await realpath(container).catch(() => null);
+  if (!verifiedContainer) return;
+  const verifiedRoot = await realpath(metadataRoot);
+  if (
+    path.dirname(verifiedContainer) !== verifiedRoot ||
+    path.basename(verifiedContainer) !== workspaceId
+  ) {
+    throw new Error(`Refusing to clean unowned DU-03 workspace metadata ${verifiedContainer}.`);
+  }
+  await rm(verifiedContainer, { recursive: true, force: true });
 }

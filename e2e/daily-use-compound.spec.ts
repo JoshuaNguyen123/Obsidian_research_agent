@@ -56,6 +56,14 @@ interface LinearCleanupResources {
   projectId: string;
 }
 
+interface LinearCleanupInventory {
+  publicationIssueIds: string[];
+  hierarchyIssueIds: string[];
+  initiativeProjectLinkIds: string[];
+  initiativeIds: string[];
+  projectIds: string[];
+}
+
 interface SafeLifecycleState {
   lineages: any[];
   researchPublications: any[];
@@ -75,6 +83,43 @@ interface ProtectedCredentialOwnership {
   linear: boolean;
   github: boolean;
   verifyPreservedLinear: boolean;
+}
+
+interface IndependentStageEntryProbe {
+  version: 1;
+  stage: ProjectLifecycleStageName;
+  proofFingerprint: string;
+  durableResourceFingerprint: string;
+  durableCommitOccurrenceCount: 1;
+  providerResourceCardinality: number;
+}
+
+interface DailyUseDu06CleanupProofV1 {
+  version: 1;
+  scenarioId: "DU-06";
+  releaseSha: string;
+  status: "verified" | "incomplete";
+  linear: {
+    disposableResourceCount: number;
+    independentAbsenceReadback: boolean;
+    retainedEvidencePreserved: boolean;
+  };
+  github: {
+    privateRepositoryAbsenceReadback: boolean;
+    branchAbsenceReadback: boolean;
+    pullRequestClosedUnmergedReadback: boolean;
+  };
+  local: {
+    worktreeCapturedAfterCreation: boolean;
+    worktreeAbsenceReadback: boolean;
+    vaultBackupsRemoved: number;
+    vaultBackupAbsenceReadback: boolean;
+    fixtureRemoved: boolean;
+  };
+  credentials: {
+    nativeSecureStateVerified: boolean;
+  };
+  errors: string[];
 }
 
 test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, and retains redacted Linear proof", async ({}, testInfo) => {
@@ -175,6 +220,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   let harness: RealAiHarness | null = null;
   let verifiedWorktree: { root: string; branch: string } | null = null;
   let linearResources: LinearCleanupResources | null = null;
+  let linearCleanupInventory: LinearCleanupInventory = emptyLinearCleanupInventory();
   let pullRequestNumber: number | null = null;
   let publishedBranch: string | null = null;
   let publishedSha: string | null = null;
@@ -182,6 +228,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   let retainedLinearEvidence:
     | { id: string; identifier: string; url: string }
     | null = null;
+  let retainedLinearEvidencePreserved = false;
   let credentialOwnership: ProtectedCredentialOwnership = {
     linear: false,
     github: false,
@@ -191,6 +238,24 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   let cleanupVerified = false;
   const cleanupErrors: string[] = [];
   const restartedStages: ProjectLifecycleStageName[] = [];
+  const independentStageProbes = new Map<
+    ProjectLifecycleStageName,
+    IndependentStageEntryProbe
+  >();
+  let worktreeCaptureController: AbortController | null = null;
+  let worktreeCapturePromise: Promise<void> | null = null;
+  let worktreeCaptureError: unknown = null;
+  let worktreeCapturedAfterCreation = false;
+  let vaultBackupBaseline: string[] = [];
+  let linearCleanupReadbackVerified = false;
+  let githubRepositoryAbsenceVerified = false;
+  let githubBranchAbsenceVerified = false;
+  let githubPullRequestCleanupVerified = false;
+  let worktreeAbsenceVerified = false;
+  let vaultBackupAbsenceVerified = false;
+  let vaultBackupsRemoved = 0;
+  let credentialStateVerified = false;
+  let fixtureRemoved = false;
   let approvalCount = 0;
   let modelCallCount = 0;
   let toolCallCount = 0;
@@ -284,6 +349,24 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       fixture.root,
     );
     await harness.installOwnedWebBackend({ sourceCount: 2, topic: "checkers" });
+    vaultBackupBaseline = await listVaultBackupPaths(harness.page);
+    worktreeCaptureController = new AbortController();
+    worktreeCapturePromise = captureCreatedRepositoryWorktree({
+      page: harness.page,
+      workspaceId,
+      expectedRepositoryRoot: fixture.root,
+      signal: worktreeCaptureController.signal,
+    })
+      .then((captured) => {
+        if (!captured) return;
+        verifiedWorktree = captured;
+        worktreeCapturedAfterCreation = true;
+      })
+      .catch((error) => {
+        if (!worktreeCaptureController?.signal.aborted) {
+          worktreeCaptureError = error;
+        }
+      });
 
     const mission = [
       `Build a simple American checkers game in Python and use the exact vault destination ${notePath} for its accepted research notebook.`,
@@ -309,25 +392,61 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         restartAfterProjectStages: MAIN_STAGES,
         onStageRestarted: async (stage) => {
           restartedStages.push(stage);
+          const stageIndex = MAIN_STAGES.indexOf(stage);
+          expect(stageIndex).toBeGreaterThanOrEqual(0);
+          expect(restartedStages).toEqual(MAIN_STAGES.slice(0, stageIndex + 1));
           await expectTrustedRepositoryProfile(
             harness!.page,
             PROFILE_KEY,
             fixture.root,
           );
+          if (stage === "code_execution" && worktreeCapturePromise) {
+            await waitForWorktreeCapture(worktreeCapturePromise);
+            if (worktreeCaptureError) throw worktreeCaptureError;
+            expect(
+              worktreeCapturedAfterCreation,
+              "DU-06 must capture its exact owned worktree as soon as the workspace manifest is created",
+            ).toBe(true);
+          }
           const state = await readSafeLifecycleState(harness!.page, PROFILE_KEY);
           const lineage = requireOne(state.lineages, "project lineage after restart");
-          const stageIndex = MAIN_STAGES.indexOf(stage);
           expect(lineage.commits.slice(0, stageIndex + 1).map((item: any) => item.stage))
             .toEqual(MAIN_STAGES.slice(0, stageIndex + 1));
-          await attestIndependentStageEntry({
-            stage,
-            state,
-            fixture,
-            githubClient,
-            linearClient: activeLinearClient,
-            expectedOwner: githubAccount.login,
-            expectedRepository: repository,
-          });
+          for (const priorStage of MAIN_STAGES.slice(0, stageIndex)) {
+            const priorProbe = independentStageProbes.get(priorStage);
+            if (!priorProbe) {
+              throw new Error(
+                `DU-06 lost the ${priorStage} probe before restart ${stageIndex + 1}.`,
+              );
+            }
+            const observedPriorProbe = await test.step(
+              `DU-06 restart ${stageIndex + 1} did not replay ${priorStage}`,
+              () => attestIndependentStageEntry({
+                stage: priorStage,
+                state,
+                fixture,
+                githubClient,
+                linearClient: activeLinearClient,
+                expectedOwner: githubAccount.login,
+                expectedRepository: repository,
+              }),
+            );
+            expect(observedPriorProbe).toEqual(priorProbe);
+          }
+          const probe = await test.step(
+            `DU-06 independent stage entry: ${stage}`,
+            () => attestIndependentStageEntry({
+              stage,
+              state,
+              fixture,
+              githubClient,
+              linearClient: activeLinearClient,
+              expectedOwner: githubAccount.login,
+              expectedRepository: repository,
+            }),
+          );
+          expect(independentStageProbes.has(stage)).toBe(false);
+          independentStageProbes.set(stage, probe);
         },
       },
     );
@@ -506,7 +625,45 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     expect(note).toMatch(/github\.com/iu);
 
     linearResources = resourcesFromState(state);
+    const linearResourcesForCleanup = linearResources;
+    linearCleanupInventory = inventoryFromExactLinearResources(linearResources);
     await independentlyReadLinearResources(activeLinearClient, linearResources);
+    for (const stage of MAIN_STAGES) {
+      const expectedProbe = independentStageProbes.get(stage);
+      if (!expectedProbe) {
+        throw new Error(`DU-06 lost its independent ${stage} stage-entry probe.`);
+      }
+      const observedProbe = await test.step(
+        `DU-06 resume did not replay ${stage}`,
+        () => attestIndependentStageEntry({
+          stage,
+          state,
+          fixture,
+          githubClient,
+          linearClient: activeLinearClient,
+          expectedOwner: githubAccount.login,
+          expectedRepository: repository,
+        }),
+      );
+      expect(observedProbe).toEqual(expectedProbe);
+    }
+    await testInfo.attach("daily-use-du06-stage-entry-proof.json", {
+      body: Buffer.from(
+        `${JSON.stringify({
+          version: 1,
+          scenarioId: "DU-06",
+          releaseSha,
+          replayDetected: false,
+          stages: MAIN_STAGES.map((stage, index) => ({
+            restartOrdinal: index + 1,
+            priorStagesReverified: index,
+            ...independentStageProbes.get(stage),
+          })),
+        }, null, 2)}\n`,
+        "utf8",
+      ),
+      contentType: "application/json",
+    });
 
     await harness.submitMission(
       [
@@ -526,12 +683,14 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     );
     expect(closedPullRequest.state).toBe("closed");
     expect(closedPullRequest.merged).toBe(false);
+    githubPullRequestCleanupVerified = true;
     await expectGitHubBranchAbsent(
       githubClient,
       githubAccount.login,
       repository,
       exactPublishedBranch,
     );
+    githubBranchAbsenceVerified = true;
 
     const linearCleanupPrompt = [
       ...linearResources.initiativeProjectLinkIds.map(
@@ -551,6 +710,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       maxContinuations: 5,
     });
     await independentlyVerifyLinearCleanup(activeLinearClient, linearResources);
+    linearCleanupReadbackVerified = true;
 
     await harness.submitMission(
       `Reconcile and clean up this completed project by permanently deleting the exact private GitHub repository bound to trusted profile ${PROFILE_KEY}. Obtain the separate destructive approval and require independent absence readback.`,
@@ -571,6 +731,19 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         );
         expect(cleanupLineage.commits.map((item: any) => item.stage))
           .toEqual(ALL_STAGES);
+        const cleanupProbe = await test.step(
+          "DU-06 independent stage entry: reconciliation_cleanup",
+          () => attestIndependentCleanupStageEntry({
+            state: cleanupState,
+            linearClient: activeLinearClient,
+            linearResources: linearResourcesForCleanup,
+            githubClient,
+            expectedOwner: githubAccount.login,
+            expectedRepository: repository,
+          }),
+        );
+        expect(independentStageProbes.has(stage)).toBe(false);
+        independentStageProbes.set(stage, cleanupProbe);
       },
     });
     expect(restartedStages).toEqual(ALL_STAGES);
@@ -579,6 +752,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       githubAccount.login,
       repository,
     );
+    githubRepositoryAbsenceVerified = true;
     const cleanedState = await readSafeLifecycleState(harness.page, PROFILE_KEY);
     const cleanedLineage = requireOne(
       cleanedState.lineages,
@@ -727,10 +901,14 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         cleanupErrors.push(`metrics recovery: ${safeError(error)}`);
       }
     }
-    if (harness && !cleanupVerified) {
+    if (harness) {
       try {
         const recovered = await readSafeLifecycleState(harness.page, PROFILE_KEY);
         linearResources ??= resourcesFromStateOrNull(recovered);
+        linearCleanupInventory = mergeLinearCleanupInventories(
+          linearCleanupInventory,
+          partialLinearCleanupInventoryFromState(recovered),
+        );
         const publication = recovered.githubPublications.at(-1);
         pullRequestNumber ??= publication?.pullRequest?.number ?? null;
         publishedBranch ??= publication?.branch ?? null;
@@ -744,10 +922,21 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       } catch (error) {
         cleanupErrors.push(`state recovery: ${safeError(error)}`);
       }
-      if (linearResources && linearClient) {
-        cleanupErrors.push(
-          ...(await bestEffortLinearCleanup(linearClient, linearResources)),
+    }
+    worktreeCaptureController?.abort();
+    await worktreeCapturePromise;
+    if (worktreeCaptureError) {
+      cleanupErrors.push(`worktree capture: ${safeError(worktreeCaptureError)}`);
+    }
+    if (!cleanupVerified) {
+      if (linearClient) {
+        const linearFallback = await bestEffortLinearCleanup(
+          linearClient,
+          linearCleanupInventory,
         );
+        linearCleanupReadbackVerified =
+          linearFallback.independentAbsenceReadback;
+        cleanupErrors.push(...linearFallback.errors);
       }
       cleanupErrors.push(
         ...(await bestEffortGitHubCleanup({
@@ -760,15 +949,64 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         })),
       );
     }
-    if (harness) {
-      await clearProtectedConnections(harness.page, credentialOwnership).catch((error) => {
-        cleanupErrors.push(`credential cleanup: ${safeError(error)}`);
-      });
+    if (linearClient) {
+      try {
+        await independentlyVerifyLinearInventoryCleanup(
+          linearClient,
+          linearCleanupInventory,
+        );
+        linearCleanupReadbackVerified = true;
+      } catch (error) {
+        cleanupErrors.push(`Linear cleanup readback: ${safeError(error)}`);
+      }
+      if (retainedLinearEvidence) {
+        try {
+          await expectRetainedLinearEvidenceStillPresent(
+            linearClient,
+            retainedLinearEvidence.id,
+          );
+          retainedLinearEvidencePreserved = true;
+        } catch (error) {
+          cleanupErrors.push(`retained Linear evidence readback: ${safeError(error)}`);
+        }
+      }
     }
-    if (verifiedWorktree) {
-      await fixture
-        .removeOwnedWorktree(verifiedWorktree.root, verifiedWorktree.branch)
-        .catch((error) => cleanupErrors.push(`worktree cleanup: ${safeError(error)}`));
+    try {
+      await expectGitHubRepositoryAbsent(
+        githubClient,
+        githubAccount.login,
+        repository,
+      );
+      githubRepositoryAbsenceVerified = true;
+      githubBranchAbsenceVerified = true;
+      githubPullRequestCleanupVerified = true;
+    } catch (error) {
+      cleanupErrors.push(`GitHub cleanup readback: ${safeError(error)}`);
+    }
+    if (harness) {
+      try {
+        const backupCleanup = await deleteDu06OwnedVaultBackups({
+          page: harness.page,
+          notePath,
+          baselinePaths: vaultBackupBaseline,
+        });
+        vaultBackupsRemoved = backupCleanup.removed;
+        vaultBackupAbsenceVerified = backupCleanup.absenceVerified;
+      } catch (error) {
+        cleanupErrors.push(`vault backup cleanup: ${safeError(error)}`);
+      }
+      try {
+        await clearProtectedConnections(harness.page, credentialOwnership);
+        credentialStateVerified = true;
+      } catch (error) {
+        cleanupErrors.push(`credential cleanup: ${safeError(error)}`);
+      }
+    }
+    try {
+      await cleanupOwnedFixtureWorktrees(fixture, verifiedWorktree);
+      worktreeAbsenceVerified = true;
+    } catch (error) {
+      cleanupErrors.push(`worktree cleanup: ${safeError(error)}`);
     }
     if (!acceptanceRecorded) {
       await recordDailyUseAcceptance(
@@ -794,8 +1032,78 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     await harness?.close().catch((error) => {
       cleanupErrors.push(`harness cleanup: ${safeError(error)}`);
     });
-    await fixture.cleanup().catch((error) => {
+    try {
+      await fixture.cleanup();
+      fixtureRemoved = true;
+    } catch (error) {
       cleanupErrors.push(`fixture cleanup: ${safeError(error)}`);
+    }
+    const disposableLinearResourceCount = linearCleanupInventory.publicationIssueIds.length +
+      linearCleanupInventory.hierarchyIssueIds.length +
+      linearCleanupInventory.initiativeProjectLinkIds.length +
+      linearCleanupInventory.initiativeIds.length +
+      linearCleanupInventory.projectIds.length;
+    const cleanupStatus =
+      cleanupErrors.length === 0 &&
+      linearCleanupReadbackVerified &&
+      githubRepositoryAbsenceVerified &&
+      githubBranchAbsenceVerified &&
+      githubPullRequestCleanupVerified &&
+      worktreeAbsenceVerified &&
+      vaultBackupAbsenceVerified &&
+      credentialStateVerified &&
+      fixtureRemoved &&
+      (!retainedLinearEvidence || retainedLinearEvidencePreserved)
+        ? "verified"
+        : "incomplete";
+    const cleanupProof: DailyUseDu06CleanupProofV1 = {
+      version: 1,
+      scenarioId: "DU-06",
+      releaseSha,
+      status: cleanupStatus,
+      linear: {
+        disposableResourceCount: disposableLinearResourceCount,
+        independentAbsenceReadback: linearCleanupReadbackVerified,
+        retainedEvidencePreserved: retainedLinearEvidencePreserved,
+      },
+      github: {
+        privateRepositoryAbsenceReadback: githubRepositoryAbsenceVerified,
+        branchAbsenceReadback: githubBranchAbsenceVerified,
+        pullRequestClosedUnmergedReadback: githubPullRequestCleanupVerified,
+      },
+      local: {
+        worktreeCapturedAfterCreation,
+        worktreeAbsenceReadback: worktreeAbsenceVerified,
+        vaultBackupsRemoved,
+        vaultBackupAbsenceReadback: vaultBackupAbsenceVerified,
+        fixtureRemoved,
+      },
+      credentials: {
+        nativeSecureStateVerified: credentialStateVerified,
+      },
+      errors: cleanupErrors.map((error) => safeArtifactError(error, [
+        repository,
+        notePath,
+        fixture.root,
+        verifiedWorktree?.root ?? "",
+        verifiedWorktree?.branch ?? "",
+        publishedBranch ?? "",
+        publishedSha ?? "",
+        githubAccount.login,
+        linearEvidenceTeamId ?? "",
+        retainedLinearEvidence?.id ?? "",
+        ...linearCleanupInventory.publicationIssueIds,
+        ...linearCleanupInventory.hierarchyIssueIds,
+        ...linearCleanupInventory.initiativeProjectLinkIds,
+        ...linearCleanupInventory.initiativeIds,
+        ...linearCleanupInventory.projectIds,
+      ])),
+    };
+    await testInfo.attach("daily-use-du06-cleanup-proof.json", {
+      body: Buffer.from(`${JSON.stringify(cleanupProof, null, 2)}\n`, "utf8"),
+      contentType: "application/json",
+    }).catch((error) => {
+      cleanupErrors.push(`cleanup proof attachment: ${safeError(error)}`);
     });
     if (cleanupErrors.length > 0) {
       const primary = missionError
@@ -1175,6 +1483,275 @@ async function expectTrustedRepositoryProfile(
     .toEqual({ key: profileKey, repositoryRoot });
 }
 
+async function captureCreatedRepositoryWorktree(input: {
+  page: Page;
+  workspaceId: string;
+  expectedRepositoryRoot: string;
+  signal: AbortSignal;
+}): Promise<{ root: string; branch: string } | null> {
+  while (!input.signal.aborted) {
+    const observed = await input.page.evaluate(
+      async ({ corePluginId, codePluginId, workspaceId }) => {
+        const app = (window as typeof window & { app?: any }).app;
+        const code = app?.plugins?.plugins?.[corePluginId]
+          ?.getBundledCapability?.(codePluginId);
+        if (!code?.workspaceManager?.loadManifest) {
+          return { state: "waiting" as const };
+        }
+        try {
+          const manifest = await code.workspaceManager.loadManifest(workspaceId);
+          if (manifest?.kind !== "repository" || !manifest.repositoryBinding) {
+            return { state: "waiting" as const };
+          }
+          return {
+            state: "captured" as const,
+            repositoryRoot: String(manifest.repositoryBinding.repositoryRoot ?? ""),
+            worktreeRoot: String(
+              manifest.repositoryBinding.worktreeRoot ?? manifest.canonicalRoot ?? "",
+            ),
+            branch: String(manifest.repositoryBinding.branch ?? ""),
+          };
+        } catch (error) {
+          if ((error as any)?.code === "workspace_not_found") {
+            return { state: "waiting" as const };
+          }
+          return { state: "error" as const };
+        }
+      },
+      {
+        corePluginId: NATIVE_CORE_PLUGIN_ID,
+        codePluginId: PHASE4_CODE_PLUGIN_ID,
+        workspaceId: input.workspaceId,
+      },
+    );
+    if (observed.state === "error") {
+      throw new Error("DU-06 workspace manifest readback failed during owned-worktree capture.");
+    }
+    if (observed.state === "captured") {
+      if (
+        observed.repositoryRoot !== input.expectedRepositoryRoot ||
+        !observed.worktreeRoot ||
+        observed.worktreeRoot === input.expectedRepositoryRoot ||
+        !observed.branch.startsWith("codex/workspace-")
+      ) {
+        throw new Error("DU-06 workspace creation returned an unexpected repository binding.");
+      }
+      return { root: observed.worktreeRoot, branch: observed.branch };
+    }
+    await abortableDelay(100, input.signal);
+  }
+  return null;
+}
+
+async function waitForWorktreeCapture(capture: Promise<void>): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("DU-06 timed out capturing its created worktree.")),
+      10_000,
+    );
+    capture.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
+async function listVaultBackupPaths(page: Page): Promise<string[]> {
+  return page.evaluate(async () => {
+    const app = (window as typeof window & { app?: any }).app;
+    const adapter = app?.vault?.adapter;
+    if (!adapter?.list || !await adapter.exists?.(".agent-backups")) return [];
+    const files: string[] = [];
+    const folders = [".agent-backups"];
+    while (folders.length > 0) {
+      const folder = folders.pop()!;
+      const listed = await adapter.list(folder);
+      files.push(...(listed?.files ?? []));
+      folders.push(...(listed?.folders ?? []));
+      if (files.length + folders.length > 10_000) {
+        throw new Error("Vault backup inventory exceeded the protected DU-06 bound.");
+      }
+    }
+    return [...new Set(files)].sort();
+  });
+}
+
+async function deleteDu06OwnedVaultBackups(input: {
+  page: Page;
+  notePath: string;
+  baselinePaths: readonly string[];
+}): Promise<{ removed: number; absenceVerified: true }> {
+  return input.page.evaluate(
+    async ({ pluginId, notePath, baselinePaths }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const plugin = app?.plugins?.plugins?.[pluginId];
+      if (!app?.vault?.adapter) {
+        throw new Error("Vault adapter is unavailable for exact DU-06 backup cleanup.");
+      }
+      const baseline = new Set(baselinePaths);
+      const ownedPaths = new Set<string>();
+      const collectBackupPaths = (value: unknown, key = "") => {
+        if (
+          key === "backupPath" &&
+          typeof value === "string" &&
+          value.startsWith(".agent-backups/")
+        ) {
+          ownedPaths.add(value);
+          return;
+        }
+        if (Array.isArray(value)) {
+          for (const entry of value) collectBackupPaths(entry);
+          return;
+        }
+        if (value && typeof value === "object") {
+          for (const [childKey, child] of Object.entries(value)) {
+            collectBackupPaths(child, childKey);
+          }
+        }
+      };
+      const checkpoints = await plugin?.researchPublicationCheckpointStore?.list?.();
+      for (const checkpoint of Array.isArray(checkpoints) ? checkpoints : []) {
+        if (checkpoint?.artifact?.notePath === notePath) {
+          collectBackupPaths(checkpoint);
+        }
+      }
+      const extension = notePath.match(/\.[^.\/]+$/u)?.[0] ?? "";
+      const basename = notePath.split("/").pop()!.slice(0, -extension.length);
+      const safeBasename = basename
+        .replace(/[^A-Za-z0-9._-]+/gu, "-")
+        .slice(0, 120) || "diagram";
+      const adapter = app.vault.adapter;
+      const folders = [".agent-backups"];
+      if (await adapter.exists?.(".agent-backups")) {
+        while (folders.length > 0) {
+          const folder = folders.pop()!;
+          const listed = await adapter.list(folder);
+          folders.push(...(listed?.folders ?? []));
+          for (const candidate of listed?.files ?? []) {
+            const filename = candidate.split("/").pop() ?? "";
+            if (
+              !baseline.has(candidate) &&
+              filename.startsWith(`${safeBasename}.`) &&
+              filename.endsWith(`.backup${extension}`)
+            ) {
+              ownedPaths.add(candidate);
+            }
+          }
+          if (ownedPaths.size + folders.length > 10_000) {
+            throw new Error("DU-06 backup cleanup exceeded its protected bound.");
+          }
+        }
+      }
+      let removed = 0;
+      for (const backupPath of [...ownedPaths].sort()) {
+        const file = app.vault.getAbstractFileByPath?.(backupPath);
+        if (file) {
+          await app.vault.delete(file, true);
+          removed += 1;
+        } else if (await adapter.exists?.(backupPath)) {
+          await adapter.remove(backupPath);
+          removed += 1;
+        }
+      }
+      for (const backupPath of ownedPaths) {
+        if (
+          app.vault.getAbstractFileByPath?.(backupPath) ||
+          await adapter.exists?.(backupPath)
+        ) {
+          throw new Error("An exact DU-06 vault backup remained after cleanup.");
+        }
+      }
+      return { removed, absenceVerified: true as const };
+    },
+    {
+      pluginId: NATIVE_CORE_PLUGIN_ID,
+      notePath: input.notePath,
+      baselinePaths: [...input.baselinePaths],
+    },
+  );
+}
+
+async function cleanupOwnedFixtureWorktrees(
+  fixture: Phase4PythonCheckersProjectFixture,
+  captured: { root: string; branch: string } | null,
+): Promise<void> {
+  let worktrees = await listFixtureWorktrees(fixture.root);
+  const capturedEntry = captured
+    ? worktrees.find((entry) => sameFilesystemPath(entry.root, captured.root))
+    : null;
+  if (capturedEntry) {
+    if (capturedEntry.branch !== captured!.branch) {
+      throw new Error("The captured DU-06 worktree changed branches before cleanup.");
+    }
+    await fixture.removeOwnedWorktree(capturedEntry.root, capturedEntry.branch);
+  }
+  worktrees = await listFixtureWorktrees(fixture.root);
+  for (const entry of worktrees) {
+    if (sameFilesystemPath(entry.root, fixture.root)) continue;
+    if (!entry.branch.startsWith("codex/workspace-")) {
+      throw new Error("DU-06 found an unexpected branch in its disposable fixture.");
+    }
+    await fixture.removeOwnedWorktree(entry.root, entry.branch);
+  }
+  const remaining = (await listFixtureWorktrees(fixture.root)).filter(
+    (entry) => !sameFilesystemPath(entry.root, fixture.root),
+  );
+  if (remaining.length > 0) {
+    throw new Error(`DU-06 left ${remaining.length} disposable worktree(s).`);
+  }
+}
+
+async function listFixtureWorktrees(
+  repositoryRoot: string,
+): Promise<Array<{ root: string; branch: string }>> {
+  const output = (
+    await execFileAsync(
+      "git",
+      ["-C", repositoryRoot, "worktree", "list", "--porcelain"],
+      { windowsHide: true },
+    )
+  ).stdout;
+  return output
+    .split(/\r?\n\r?\n/gu)
+    .map((block) => {
+      const lines = block.split(/\r?\n/gu);
+      const root = lines.find((line) => line.startsWith("worktree "))
+        ?.slice("worktree ".length)
+        .trim() ?? "";
+      const branch = lines.find((line) => line.startsWith("branch refs/heads/"))
+        ?.slice("branch refs/heads/".length)
+        .trim() ?? "";
+      return { root, branch };
+    })
+    .filter((entry) => entry.root.length > 0);
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const normalize = (value: string) => value
+    .trim()
+    .replace(/\\/gu, "/")
+    .replace(/\/+$/u, "")
+    .toLowerCase();
+  return normalize(left) === normalize(right);
+}
+
 async function attestIndependentStageEntry(input: {
   stage: ProjectLifecycleStageName;
   state: SafeLifecycleState;
@@ -1183,22 +1760,73 @@ async function attestIndependentStageEntry(input: {
   linearClient: LinearReadbackClient;
   expectedOwner: string;
   expectedRepository: string;
-}): Promise<void> {
+}): Promise<IndependentStageEntryProbe> {
   const lineage = requireOne(input.state.lineages, "stage-entry project lineage");
-  const commit = lineage.commits.find((item: any) => item.stage === input.stage);
+  const matchingCommits = (Array.isArray(lineage.commits)
+    ? lineage.commits
+    : []).filter(
+    (item: any) => item.stage === input.stage,
+  ) as any[];
+  const commit = requireOne<any>(
+    matchingCommits,
+    `${input.stage} durable stage commit`,
+  );
   expect(commit?.proofFingerprint).toMatch(SHA256);
   if (input.stage === "accepted_research") {
     expect(commit.proof.notePath).toMatch(/\.md$/u);
     expect(commit.proof.noteSha256).toMatch(SHA256);
-    return;
+    const publication = requireOne(
+      input.state.researchPublications.filter(
+        (item) => item.artifactFingerprint === commit.proof.artifactFingerprint,
+      ),
+      "accepted-research stage publication",
+    );
+    expect(publication).toMatchObject({
+      status: "complete",
+      notePath: commit.proof.notePath,
+      artifactFingerprint: commit.proof.artifactFingerprint,
+    });
+    await expectLinearResource(
+      input.linearClient,
+      "issues.get",
+      String(publication.issueId),
+    );
+    return createIndependentStageEntryProbe(
+      input.stage,
+      commit.proofFingerprint,
+      [
+        publication.artifactFingerprint,
+        publication.notePath,
+        publication.issueId,
+      ],
+      1,
+    );
   }
   if (input.stage === "linear_hierarchy") {
+    const hierarchy = requireOne(
+      input.state.linearHierarchies.filter((item) => item.status === "complete"),
+      "Linear stage hierarchy",
+    );
     await expectLinearResource(input.linearClient, "initiatives.get", commit.proof.initiativeId);
     await expectLinearResource(input.linearClient, "projects.get", commit.proof.projectId);
     for (const issueId of commit.proof.issueIds) {
       await expectLinearResource(input.linearClient, "issues.get", issueId);
     }
-    return;
+    const hierarchyIdentities = hierarchy.items
+      .map((item: any) => `${item.kind}:${item.resourceId}`)
+      .sort();
+    expect(hierarchyIdentities.filter((item: string) => item.startsWith("initiative:")))
+      .toHaveLength(1);
+    expect(hierarchyIdentities.filter((item: string) => item.startsWith("project:")))
+      .toHaveLength(1);
+    expect(hierarchyIdentities.filter((item: string) => item.startsWith("issue:")))
+      .toHaveLength(1);
+    return createIndependentStageEntryProbe(
+      input.stage,
+      commit.proofFingerprint,
+      hierarchyIdentities,
+      hierarchyIdentities.length,
+    );
   }
   if (input.stage === "code_execution") {
     expect(input.state.codeHandoff?.status).toBe("verified");
@@ -1208,7 +1836,23 @@ async function attestIndependentStageEntry(input: {
     );
     expect(worktree.head).toBe(commit.proof.commitSha);
     expect(worktree.status).toBe("");
-    return;
+    expect(
+      await countFixtureCommits(
+        input.state.codeHandoff.canonicalWorktreeRoot,
+        input.fixture.baseSha,
+      ),
+      "resuming DU-06 must not create a second implementation commit",
+    ).toBe(1);
+    return createIndependentStageEntryProbe(
+      input.stage,
+      commit.proofFingerprint,
+      [
+        input.state.codeHandoff.commitSha,
+        input.state.codeHandoff.parentSha,
+        ...[...input.state.codeHandoff.changedPaths].sort(),
+      ],
+      1,
+    );
   }
   if (input.stage === "private_github_publication") {
     const repository = await input.githubClient.getRepository(
@@ -1227,7 +1871,104 @@ async function attestIndependentStageEntry(input: {
       merged: false,
       head: { ref: commit.proof.branch, sha: commit.proof.remoteSha },
     });
+    const matchingPullRequests = await input.githubClient.listPullRequestsForHead(
+      input.expectedOwner,
+      input.expectedRepository,
+      commit.proof.branch,
+      repository.defaultBranch,
+    );
+    expect(matchingPullRequests).toHaveLength(1);
+    return createIndependentStageEntryProbe(
+      input.stage,
+      commit.proofFingerprint,
+      [
+        repository.id,
+        commit.proof.branch,
+        commit.proof.remoteSha,
+        commit.proof.pullRequestNumber,
+      ],
+      3,
+    );
   }
+  throw new Error(`Use the dedicated cleanup stage probe for ${input.stage}.`);
+}
+
+function createIndependentStageEntryProbe(
+  stage: ProjectLifecycleStageName,
+  proofFingerprint: string,
+  durableIdentities: readonly unknown[],
+  providerResourceCardinality: number,
+): IndependentStageEntryProbe {
+  return {
+    version: 1,
+    stage,
+    proofFingerprint,
+    durableResourceFingerprint: contractFingerprint(
+      JSON.stringify(durableIdentities),
+    ),
+    durableCommitOccurrenceCount: 1,
+    providerResourceCardinality,
+  };
+}
+
+async function attestIndependentCleanupStageEntry(input: {
+  state: SafeLifecycleState;
+  linearClient: LinearReadbackClient;
+  linearResources: LinearCleanupResources;
+  githubClient: GitHubRestClient;
+  expectedOwner: string;
+  expectedRepository: string;
+}): Promise<IndependentStageEntryProbe> {
+  const lineage = requireOne(input.state.lineages, "cleanup stage-entry project lineage");
+  const commit = requireOne<any>(
+    (Array.isArray(lineage.commits) ? lineage.commits : []).filter(
+      (item: any) => item.stage === "reconciliation_cleanup",
+    ) as any[],
+    "reconciliation cleanup durable stage commit",
+  );
+  expect(commit?.proofFingerprint).toMatch(SHA256);
+  await independentlyVerifyLinearCleanup(
+    input.linearClient,
+    input.linearResources,
+  );
+  await expectGitHubRepositoryAbsent(
+    input.githubClient,
+    input.expectedOwner,
+    input.expectedRepository,
+  );
+  expect(input.state.privateBindings).toHaveLength(0);
+  expect(
+    input.state.repositoryCleanups.filter((item) => item.status === "verified"),
+  ).toHaveLength(1);
+  return createIndependentStageEntryProbe(
+    "reconciliation_cleanup",
+    commit.proofFingerprint,
+    [
+      commit.proof.cleanupReceiptFingerprints,
+      commit.proof.backlinkReceiptFingerprints,
+      "linear_absent",
+      "github_absent",
+    ],
+    0,
+  );
+}
+
+async function countFixtureCommits(
+  worktreeRoot: string,
+  baseSha: string,
+): Promise<number> {
+  const output = (
+    await execFileAsync(
+      "git",
+      ["-C", worktreeRoot, "rev-list", "--count", `${baseSha}..HEAD`],
+      { windowsHide: true },
+    )
+  ).stdout.trim();
+  const count = Number.parseInt(output, 10);
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new Error("DU-06 could not read the exact disposable commit count.");
+  }
+  return count;
 }
 
 function resourcesFromState(state: SafeLifecycleState): LinearCleanupResources {
@@ -1261,6 +2002,87 @@ function resourcesFromStateOrNull(
   }
 }
 
+function emptyLinearCleanupInventory(): LinearCleanupInventory {
+  return {
+    publicationIssueIds: [],
+    hierarchyIssueIds: [],
+    initiativeProjectLinkIds: [],
+    initiativeIds: [],
+    projectIds: [],
+  };
+}
+
+function inventoryFromExactLinearResources(
+  resources: LinearCleanupResources,
+): LinearCleanupInventory {
+  return {
+    publicationIssueIds: [...resources.publicationIssueIds],
+    hierarchyIssueIds: [...resources.hierarchyIssueIds],
+    initiativeProjectLinkIds: [...resources.initiativeProjectLinkIds],
+    initiativeIds: [resources.initiativeId],
+    projectIds: [resources.projectId],
+  };
+}
+
+function partialLinearCleanupInventoryFromState(
+  state: SafeLifecycleState,
+): LinearCleanupInventory {
+  const publicationIssueIds = state.researchPublications
+    .map((publication) => String(publication.issueId ?? "").trim())
+    .filter(Boolean);
+  const hierarchyItems = state.linearHierarchies.flatMap(
+    (hierarchy) => Array.isArray(hierarchy.items) ? hierarchy.items : [],
+  );
+  const ids = (kind: string) => hierarchyItems
+    .filter((item: any) => item.kind === kind)
+    .map((item: any) => String(item.resourceId ?? "").trim())
+    .filter(Boolean);
+  return normalizeLinearCleanupInventory({
+    publicationIssueIds,
+    hierarchyIssueIds: ids("issue"),
+    initiativeProjectLinkIds: ids("initiative_project_link"),
+    initiativeIds: ids("initiative"),
+    projectIds: ids("project"),
+  });
+}
+
+function mergeLinearCleanupInventories(
+  left: LinearCleanupInventory,
+  right: LinearCleanupInventory,
+): LinearCleanupInventory {
+  return normalizeLinearCleanupInventory({
+    publicationIssueIds: [
+      ...left.publicationIssueIds,
+      ...right.publicationIssueIds,
+    ],
+    hierarchyIssueIds: [
+      ...left.hierarchyIssueIds,
+      ...right.hierarchyIssueIds,
+    ],
+    initiativeProjectLinkIds: [
+      ...left.initiativeProjectLinkIds,
+      ...right.initiativeProjectLinkIds,
+    ],
+    initiativeIds: [...left.initiativeIds, ...right.initiativeIds],
+    projectIds: [...left.projectIds, ...right.projectIds],
+  });
+}
+
+function normalizeLinearCleanupInventory(
+  inventory: LinearCleanupInventory,
+): LinearCleanupInventory {
+  const unique = (values: readonly string[]) => [...new Set(
+    values.map((value) => value.trim()).filter(Boolean),
+  )].sort();
+  return {
+    publicationIssueIds: unique(inventory.publicationIssueIds),
+    hierarchyIssueIds: unique(inventory.hierarchyIssueIds),
+    initiativeProjectLinkIds: unique(inventory.initiativeProjectLinkIds),
+    initiativeIds: unique(inventory.initiativeIds),
+    projectIds: unique(inventory.projectIds),
+  };
+}
+
 async function independentlyReadLinearResources(
   client: LinearReadbackClient,
   resources: LinearCleanupResources,
@@ -1279,14 +2101,28 @@ async function independentlyVerifyLinearCleanup(
   client: LinearReadbackClient,
   resources: LinearCleanupResources,
 ): Promise<void> {
+  await independentlyVerifyLinearInventoryCleanup(
+    client,
+    inventoryFromExactLinearResources(resources),
+  );
+}
+
+async function independentlyVerifyLinearInventoryCleanup(
+  client: LinearReadbackClient,
+  resources: LinearCleanupInventory,
+): Promise<void> {
   for (const id of resources.initiativeProjectLinkIds) {
     await expectLinearRemoved(client, "initiative_project_links.get", id);
   }
   for (const id of [...resources.publicationIssueIds, ...resources.hierarchyIssueIds]) {
     await expectLinearRemoved(client, "issues.get", id);
   }
-  await expectLinearRemoved(client, "projects.get", resources.projectId);
-  await expectLinearRemoved(client, "initiatives.get", resources.initiativeId);
+  for (const id of resources.projectIds) {
+    await expectLinearRemoved(client, "projects.get", id);
+  }
+  for (const id of resources.initiativeIds) {
+    await expectLinearRemoved(client, "initiatives.get", id);
+  }
 }
 
 async function expectLinearResource(
@@ -1339,6 +2175,16 @@ async function expectRetainedLinearEvidence(input: {
   };
 }
 
+async function expectRetainedLinearEvidenceStillPresent(
+  client: LinearReadbackClient,
+  id: string,
+): Promise<void> {
+  const readback = await client.execute("issues.get" as any, { id }) as any;
+  expect(readback?.id).toBe(id);
+  expect(readback?.trashed).not.toBe(true);
+  expect(readback?.url).toMatch(/^https:\/\//u);
+}
+
 async function expectLinearRemoved(
   client: LinearReadbackClient,
   operation: string,
@@ -1357,8 +2203,8 @@ async function expectLinearRemoved(
 
 async function bestEffortLinearCleanup(
   client: LinearReadbackClient,
-  resources: LinearCleanupResources,
-): Promise<string[]> {
+  resources: LinearCleanupInventory,
+): Promise<{ errors: string[]; independentAbsenceReadback: boolean }> {
   const errors: string[] = [];
   const execute = async (operation: string, id: string) => {
     try {
@@ -1375,9 +2221,23 @@ async function bestEffortLinearCleanup(
   for (const id of [...resources.publicationIssueIds, ...resources.hierarchyIssueIds]) {
     await execute("issues.trash", id);
   }
-  await execute("projects.trash", resources.projectId);
-  await execute("initiatives.trash", resources.initiativeId);
-  return errors;
+  for (const id of resources.projectIds) {
+    await execute("projects.trash", id);
+  }
+  for (const id of resources.initiativeIds) {
+    await execute("initiatives.trash", id);
+  }
+  let independentAbsenceReadback = false;
+  try {
+    // This readback is deliberately separate from every cleanup mutation so a
+    // partially successful fallback cannot be reported as clean by dispatch
+    // receipts alone.
+    await independentlyVerifyLinearInventoryCleanup(client, resources);
+    independentAbsenceReadback = true;
+  } catch (error) {
+    errors.push(`independent Linear absence readback: ${safeError(error)}`);
+  }
+  return { errors, independentAbsenceReadback };
 }
 
 async function bestEffortGitHubCleanup(input: {
@@ -1554,6 +2414,26 @@ function safeError(error: unknown): string {
       "[REDACTED]",
     )
     .slice(0, 8_000);
+}
+
+function safeArtifactError(
+  error: unknown,
+  exactRedactions: readonly string[] = [],
+): string {
+  let value = safeError(error);
+  for (const exact of [...new Set(exactRedactions)]
+    .filter((entry) => entry.length > 0)
+    .sort((left, right) => right.length - left.length)) {
+    value = value.replace(
+      new RegExp(exact.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "giu"),
+      "[REDACTED_RESOURCE]",
+    );
+  }
+  return value
+    .replace(/(?:\b[A-Za-z]:[\\/]|\\\\)[^\r\n;]+/gu, "[LOCAL_PATH]")
+    .replace(/\/(?:Users|home|tmp|private\/tmp|var\/tmp)\/[^\r\n;]+/gu, "[LOCAL_PATH]")
+    .replace(/(?:\.agent-backups|E2E Agent Tests)\/[^\r\n;]+/giu, "[VAULT_PATH]")
+    .slice(0, 1_000);
 }
 
 const fetchTransport: HttpTransport = async (request) => {

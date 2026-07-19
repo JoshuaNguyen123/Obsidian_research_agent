@@ -56,21 +56,26 @@ test("exclusive E2E runner permits the bounded deterministic matrix", () => {
   assert.equal(normalized.aiMode, "mock");
 });
 
-test("Windows daily-use job explicitly trusts only its created disposable vault", () => {
+test("free self-hosted daily-use job explicitly trusts only its created disposable vault", () => {
   const workflow = readFileSync(
     new URL("../.github/workflows/ci.yml", import.meta.url),
     "utf8",
   );
   assert.match(
     workflow,
-    /\$vault = Join-Path \$env:RUNNER_TEMP "agentic-researcher-e2e-vault"/u,
+    /\$vault = Join-Path \$env:RUNNER_TEMP "agentic-researcher-e2e-\$env:E2E_RELEASE_COMMIT_SHA"/u,
   );
   assert.match(
     workflow,
-    /- name: Run affected daily-use Playwright lanes\s+env:\s+E2E_TRUST_DISPOSABLE_VAULT: "1"\s+run: npm run test:e2e:daily-use/u,
+    /run-targeted-protected-release\.mjs[\s\S]{0,160}"--lanes=deterministic"/u,
   );
-  assert.match(workflow, /runs-on: windows-2022/u);
+  assert.match(
+    workflow,
+    /runs-on: \[self-hosted, Windows, X64, agentic-daily-use\]/u,
+  );
+  assert.doesNotMatch(workflow, /^\s*pull_request:/mu);
   assert.match(workflow, /\.\/scripts\/install-verified-obsidian\.ps1/u);
+  assert.doesNotMatch(workflow, /npm run test:e2e:daily-use/u);
   assert.doesNotMatch(workflow, /npm run test:e2e:deterministic-matrix/u);
   const installer = readFileSync(
     new URL("../scripts/install-verified-obsidian.ps1", import.meta.url),
@@ -87,10 +92,10 @@ test("Windows daily-use job explicitly trusts only its created disposable vault"
 
 test("live Windows workflows publish runner-temp vault paths from a step", () => {
   for (const [file, vaultName] of [
-    ["live-model.yml", "agentic-researcher-live-vault"],
+    ["live-model.yml", "agentic-researcher-live-$env:E2E_RELEASE_COMMIT_SHA"],
     [
       "protected-release-vertical.yml",
-      "agentic-researcher-disposable-release-vault",
+      "agentic-researcher-protected-$env:E2E_RELEASE_COMMIT_SHA",
     ],
   ] as const) {
     const workflow = readFileSync(
@@ -105,7 +110,10 @@ test("live Windows workflows publish runner-temp vault paths from a step", () =>
     assert.match(
       workflow,
       new RegExp(
-        `\\$vault = Join-Path \\$env:RUNNER_TEMP "${vaultName}"`,
+        `\\$vault = Join-Path \\$env:RUNNER_TEMP "${vaultName.replace(
+          /[.*+?^${}()|[\]\\]/gu,
+          "\\$&",
+        )}"`,
         "u",
       ),
     );
@@ -247,30 +255,77 @@ test("daily-use commands route to focused specs and live projects disable reruns
   }
 });
 
-test("protected release workflow is exact-SHA and cannot dispatch broad or merge lanes", () => {
+test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch broad or merge lanes", () => {
   const workflow = readFileSync(
     new URL("../.github/workflows/protected-release-vertical.yml", import.meta.url),
     "utf8",
   );
   assert.match(workflow, /workflow_dispatch:/u);
   assert.match(workflow, /ref: \$\{\{ inputs\.commit_sha \}\}/u);
-  assert.match(workflow, /if \(\$actual -ne \$env:E2E_RELEASE_COMMIT_SHA\)/u);
-  for (const targetedCommand of [
-    "test:e2e:daily-use",
-    "test:e2e:daily-use:live-model",
-    "test:e2e:live",
-  ]) {
-    assert.match(workflow, new RegExp(`npm run ${targetedCommand}`, "u"));
-  }
+  assert.match(workflow, /if \(\$actualSha -ne \$env:E2E_RELEASE_COMMIT_SHA\)/u);
+  assert.match(
+    workflow,
+    /runs-on: \[self-hosted, Windows, X64, agentic-daily-use\]/u,
+  );
+  assert.match(workflow, /PROTECTED_TARGETED_LANES: \$\{\{ inputs\.lanes \}\}/u);
+  assert.match(workflow, /"--lanes=\$env:PROTECTED_TARGETED_LANES"/u);
+  assert.match(workflow, /run-targeted-protected-release\.mjs/u);
+  assert.doesNotMatch(workflow, /run:[^\r\n]*\$\{\{ inputs\.(?:commit_sha|lanes) \}\}/u);
   assert.doesNotMatch(workflow, /^\s*(?:run:\s*)?npm run test:e2e\s*$/mu);
+  assert.doesNotMatch(workflow, /npm run test:e2e:daily-use/u);
   assert.doesNotMatch(workflow, /npm run test:e2e:deterministic-matrix/u);
   assert.doesNotMatch(workflow, /npm run test:e2e:real:soak/u);
   assert.doesNotMatch(workflow, /E2E_LIVE_ALLOW_MERGE:\s*["']?1/u);
   assert.doesNotMatch(workflow, /LIVE_EXTERNAL_MERGE_CONFIRMATION:\s*MERGE/u);
   assert.doesNotMatch(workflow, /git\s+push[^\r\n]*(?:--force|-f\b)/u);
-  assert.match(workflow, /protected-hosted-summaries-\$\{\{ inputs\.commit_sha \}\}/u);
-  assert.match(workflow, /standard GitHub-hosted Windows image cannot attest/u);
-  assert.doesNotMatch(workflow, /self-hosted/u);
+  assert.match(workflow, /protected-targeted-summaries-\$\{\{ inputs\.commit_sha \}\}/u);
+  assert.match(workflow, /did not consume GitHub-hosted runner minutes/u);
+  const installStep = workflow.indexOf("Install exact repository dependencies");
+  const protectedRunStep = workflow.indexOf(
+    "Run only exact affected daily-use files and selected research cases",
+  );
+  assert.ok(installStep >= 0 && protectedRunStep > installStep);
+  for (const credential of [
+    "E2E_OLLAMA_API_KEY:",
+    "E2E_LINEAR_API_KEY:",
+    "E2E_GITHUB_TOKEN:",
+  ]) {
+    assert.ok(
+      workflow.indexOf(credential) > protectedRunStep,
+      `${credential} must be scoped after dependency installation to the exact protected run step`,
+    );
+  }
+
+  const targetedRunner = readFileSync(
+    new URL("../scripts/run-targeted-protected-release.mjs", import.meta.url),
+    "utf8",
+  );
+  for (const focusedFile of [
+    "e2e/daily-use-connections.spec.ts",
+    "e2e/daily-use-note.spec.ts",
+    "e2e/daily-use-memory-reflex.spec.ts",
+    "e2e/daily-use-code.spec.ts",
+    "e2e/daily-use-linear.spec.ts",
+    "e2e/daily-use-github.spec.ts",
+    "e2e/daily-use-research.spec.ts",
+    "e2e/daily-use-compound.spec.ts",
+  ]) {
+    assert.match(targetedRunner, new RegExp(focusedFile.replace(/\./gu, "\\."), "u"));
+  }
+  assert.match(targetedRunner, /DU-02 proof-gated sourced writeback/u);
+  assert.match(targetedRunner, /bounded recovery changes action/u);
+  assert.match(targetedRunner, /DU-03 protected real-model TypeScript project creation/u);
+  assert.match(targetedRunner, /DU-06 checkers exact-SHA lifecycle/u);
+  assert.equal(
+    targetedRunner.match(/verifyExactCleanSha\(options\.sha\)/gu)?.length,
+    4,
+  );
+  assert.match(targetedRunner, /buildCredentialFreeEnvironment\(\)/u);
+  assert.match(
+    targetedRunner,
+    /runNpmScript\("build", credentialFreeEnvironment\)/u,
+  );
+  assert.doesNotMatch(targetedRunner, /deterministic-matrix|real:soak/u);
 
   const compound = readFileSync(
     new URL("../e2e/daily-use-compound.spec.ts", import.meta.url),
@@ -354,7 +409,8 @@ test("protected release workflow is exact-SHA and cannot dispatch broad or merge
   assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);
 });
 
-test("public workflows use only ephemeral hosted runners and SHA-pinned actions", () => {
+test("public workflows use only the free trusted self-hosted runner and SHA-pinned actions", () => {
+  const workflows: string[] = [];
   for (const file of [
     "ci.yml",
     "live-external-smoke.yml",
@@ -368,7 +424,17 @@ test("public workflows use only ephemeral hosted runners and SHA-pinned actions"
       new URL(`../.github/workflows/${file}`, import.meta.url),
       "utf8",
     );
-    assert.doesNotMatch(workflow, /self-hosted/u, `${file} must not run public code on a persistent runner`);
+    workflows.push(workflow);
+    assert.match(
+      workflow,
+      /runs-on: \[self-hosted, Windows, X64, agentic-daily-use\]/u,
+      `${file} must use the free protected local runner`,
+    );
+    assert.doesNotMatch(
+      workflow,
+      /runs-on:\s*(?:ubuntu-|windows-\d|macos-)/u,
+      `${file} must not consume GitHub-hosted runner minutes`,
+    );
     for (const match of workflow.matchAll(/^\s*uses:\s*([^\s#]+).*$/gmu)) {
       assert.match(
         match[1] ?? "",
@@ -377,6 +443,15 @@ test("public workflows use only ephemeral hosted runners and SHA-pinned actions"
       );
     }
   }
+  assert.doesNotMatch(
+    workflows.join("\n"),
+    /^\s*pull_request:/mu,
+    "untrusted fork code must never execute on the persistent self-hosted runner",
+  );
+  assert.doesNotMatch(
+    workflows.join("\n"),
+    /npm run test:e2e:deterministic-matrix|npm run test:e2e:real:soak/u,
+  );
 
   const pagesWorkflow = readFileSync(
     new URL("../.github/workflows/pages.yml", import.meta.url),

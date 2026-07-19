@@ -1014,6 +1014,16 @@ test("CodeExtensionRuntimeV2 persists settings-only immutable providers, invalid
       now: () => new Date(NOW),
     });
     await runtime.initialize();
+    const registeredContributions = runtime.getContributions();
+    const registeredStatusTool = registeredContributions.find(
+      (contribution) =>
+        contribution.descriptor.kind === "tool" &&
+        (contribution as { tool: { name: string } }).tool.name ===
+          "code_sandbox_status",
+    ) as Extract<
+      (typeof registeredContributions)[number],
+      { descriptor: { kind: "tool" } }
+    >;
     const provider: SandboxProviderConfigV2 = {
       version: 1,
       kind: "docker",
@@ -1033,10 +1043,71 @@ test("CodeExtensionRuntimeV2 persists settings-only immutable providers, invalid
       [provider],
     );
 
+    const preProbeRepositoryRoot = path.join(root, "pre-probe-node-repository");
+    await mkdir(preProbeRepositoryRoot);
+    await writeFile(
+      path.join(preProbeRepositoryRoot, "package.json"),
+      '{"private":true,"scripts":{"test":"node --test"}}\n',
+      "utf8",
+    );
+    const preProbeInspection = {
+      repositoryRoot: preProbeRepositoryRoot,
+      baseSha: "e".repeat(40),
+      branch: "main",
+      clean: true,
+    };
+    const unresolved = await runtime.persistDetectedRepositoryProfile({
+      profileKey: "pre-probe-node-runtime",
+      inspection: preProbeInspection,
+      context: extensionContext(true),
+    });
+    assert.equal(unresolved.pinnedRuntimes[0].digest, null);
+    assert.equal(runtime.getRuntimeUnresolvedRepositoryProfileCount(), 1);
+
     const probed = await runtime.probeConfiguredSandboxProviders();
     assert.equal(probed.executionAvailable, true);
     assert.equal(probeCalls, 1);
     assert.ok(runtime.readState().sandbox.lastProbe);
+    const upgraded = await runtime.persistDetectedRepositoryProfile({
+      profileKey: "pre-probe-node-runtime",
+      inspection: preProbeInspection,
+      context: extensionContext(true),
+    });
+    assert.equal(upgraded.pinnedRuntimes[0].digest, provider.runtimeDigest);
+    assert.equal(runtime.getRuntimeUnresolvedRepositoryProfileCount(), 0);
+    assert.equal(
+      (
+        await registeredStatusTool.tool.execute({}, extensionContext()) as {
+          executionAvailable: boolean;
+        }
+      ).executionAvailable,
+      true,
+      "registered tools must resolve the manager configured after registration",
+    );
+
+    const repositoryRoot = path.join(root, "fresh-node-repository");
+    await mkdir(repositoryRoot);
+    await writeFile(
+      path.join(repositoryRoot, "package.json"),
+      '{"private":true,"scripts":{"test":"node --test"}}\n',
+      "utf8",
+    );
+    const detected = await runtime.persistDetectedRepositoryProfile({
+      profileKey: "fresh-node-runtime",
+      inspection: {
+        repositoryRoot,
+        baseSha: "d".repeat(40),
+        branch: "main",
+        clean: true,
+      },
+      context: extensionContext(true),
+    });
+    assert.equal(detected.pinnedRuntimes[0].source, "immutable_digest");
+    assert.equal(
+      detected.pinnedRuntimes[0].digest,
+      provider.runtimeDigest,
+      "an unpinned Node repository may bind only to the freshly probed host runtime",
+    );
 
     const beforeInvalid = canonicalJson(runtime.readState());
     await assert.rejects(

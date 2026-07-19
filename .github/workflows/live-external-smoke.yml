@@ -30,7 +30,7 @@ concurrency:
 jobs:
   smoke:
     name: ${{ inputs.provider }} / mutate, verify, and clean up
-    runs-on: windows-2022
+    runs-on: [self-hosted, Windows, X64, agentic-daily-use]
     timeout-minutes: 45
     environment: disposable-live-external
     steps:
@@ -50,7 +50,10 @@ jobs:
 
       - name: Install verified Obsidian desktop
         shell: pwsh
-        run: ./scripts/install-verified-obsidian.ps1
+        run: |
+          if (-not (Test-Path -LiteralPath "$env:LOCALAPPDATA\Obsidian\Obsidian.exe")) {
+            ./scripts/install-verified-obsidian.ps1
+          }
 
       - name: Create isolated disposable Obsidian vault
         shell: pwsh
@@ -62,8 +65,10 @@ jobs:
           "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Fail-closed disposable-target preflight
-        run: node scripts/live-external-preflight.mjs --provider ${{ inputs.provider }}
+        shell: pwsh
+        run: node scripts/live-external-preflight.mjs --provider "$env:E2E_SELECTED_PROVIDER"
         env:
+          E2E_SELECTED_PROVIDER: ${{ inputs.provider }}
           LIVE_EXTERNAL_DISPOSABLE_CONFIRMATION: ${{ inputs.disposable_confirmation }}
           LIVE_EXTERNAL_MERGE_CONFIRMATION: ${{ inputs.merge_confirmation }}
           LIVE_EXTERNAL_TARGET_LABEL: ${{ vars.LIVE_EXTERNAL_TARGET_LABEL }}

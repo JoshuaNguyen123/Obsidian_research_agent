@@ -1,4 +1,4 @@
-name: Hosted sandbox contract check
+name: Free self-hosted sandbox contract check
 
 on:
   workflow_dispatch:
@@ -12,8 +12,8 @@ concurrency:
 
 jobs:
   contract:
-    name: Ubuntu / secret-free sandbox contract
-    runs-on: ubuntu-24.04
+    name: Windows / secret-free WSL2 sandbox contract
+    runs-on: [self-hosted, Windows, X64, agentic-daily-use]
     timeout-minutes: 15
     steps:
       - name: Check out repository
@@ -33,9 +33,10 @@ jobs:
       - name: Verify the fixed sandbox command contract
         run: node --import tsx scripts/ci-sandbox-boundary.ts
         env:
-          AGENTIC_SANDBOX_CI_PROVIDER: bubblewrap
+          AGENTIC_SANDBOX_CI_PROVIDER: wsl2
 
       - name: Explain the protected WSL2 proof boundary
+        shell: pwsh
         run: >-
-          echo "GitHub-hosted Windows runners do not attest this product's dedicated WSL2 runtime.
-          Run the exact-SHA WSL2 DU-03/DU-06 proof locally on the protected Windows machine."
+          Write-Output "This secret-free job validates the fixed WSL2 command contract only.
+          The protected targeted workflow separately performs the live exact-SHA boundary probe."

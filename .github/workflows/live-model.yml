@@ -1,4 +1,4 @@
-name: Targeted live model contract
+name: Free self-hosted targeted live model contract
 
 on:
   workflow_dispatch:
@@ -12,9 +12,11 @@ concurrency:
 
 jobs:
   live-research:
-    runs-on: windows-2022
+    runs-on: [self-hosted, Windows, X64, agentic-daily-use]
     timeout-minutes: 45
     environment: protected-live-release
+    env:
+      E2E_RELEASE_COMMIT_SHA: ${{ github.sha }}
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -40,19 +42,26 @@ jobs:
 
       - name: Install verified Obsidian desktop
         shell: pwsh
-        run: ./scripts/install-verified-obsidian.ps1
+        run: |
+          if (-not (Test-Path -LiteralPath "$env:LOCALAPPDATA\Obsidian\Obsidian.exe")) {
+            ./scripts/install-verified-obsidian.ps1
+          }
 
       - name: Create isolated disposable Obsidian vault
         shell: pwsh
         run: |
-          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-live-vault"
+          $vault = Join-Path $env:RUNNER_TEMP "agentic-researcher-live-$env:E2E_RELEASE_COMMIT_SHA"
           New-Item -ItemType Directory -Force -Path (Join-Path $vault ".obsidian\plugins") | Out-Null
           Set-Content -LiteralPath (Join-Path $vault ".obsidian\community-plugins.json") -Value "[]" -Encoding utf8
           "OBSIDIAN_VAULT=$vault" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OBSIDIAN_CDP_PORT=11223" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Run affected DU-02 live-model scenarios
-        run: npm run test:e2e:daily-use:live-model
+        shell: pwsh
+        run: >-
+          node scripts/run-targeted-protected-release.mjs
+          "--sha=$env:E2E_RELEASE_COMMIT_SHA"
+          "--lanes=research"
         env:
           E2E_OLLAMA_API_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
           E2E_AI_MODEL: ${{ vars.E2E_AI_MODEL || 'gpt-oss:120b-cloud' }}
@@ -64,6 +73,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: live-model-summary-${{ github.sha }}
-          path: test-results/daily-use-run-summary.json
+          path: test-results/protected-targeted/research.json
           retention-days: 3
           if-no-files-found: ignore

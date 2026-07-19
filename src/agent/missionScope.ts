@@ -246,9 +246,10 @@ export function extractMarkdownPathMentions(prompt: string): string[] {
 
 /**
  * Extracts a bounded, explicit new-file set from phrases such as
- * "Add only README.md, src/app.ts, and tests/app.test.ts." The strict
- * only/exactly wording is intentional: ordinary prose and unrelated note or
- * provider paths must never manufacture extra repository mutations.
+ * "Add only README.md, src/app.ts, and tests/app.test.ts", plus singular
+ * affirmative requests such as "create app.py". Multi-file authority still
+ * requires only/exactly wording; a singular action may bind its one directly
+ * named path without treating unrelated note or provider paths as mutations.
  */
 export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
   if (prompt.length > 100_000 || prompt.includes("\0")) return [];
@@ -277,6 +278,17 @@ export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
       if (!isSafeExplicitWorkspaceFilePath(candidate)) continue;
       paths.push(candidate);
     }
+  }
+  for (const match of prompt.matchAll(
+    /\b(?:add|create|make)\b[ \t]+(?:(?:a|an|the|one|new|exact|source|workspace|repository)[ \t]+){0,4}(?:file[ \t]+)?["'\x60]?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?=$|[\s,):.;"'\x60])/giu,
+  )) {
+    const actionIndex = match.index ?? 0;
+    const prefix = prompt.slice(Math.max(0, actionIndex - 100), actionIndex);
+    if (/(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(prefix)) {
+      continue;
+    }
+    const candidate = match[1] ?? "";
+    if (isSafeExplicitWorkspaceFilePath(candidate)) paths.push(candidate);
   }
   return dedupeStrings(paths);
 }

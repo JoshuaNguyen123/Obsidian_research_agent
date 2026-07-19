@@ -23,6 +23,7 @@ import {
   getVerifiedWorkspaceWriteObservation,
   getVerifiedLinearHierarchyIssueId,
   getCompoundLifecycleResearchGraphToolNames,
+  getMissionGraphFrontierDestinationSelector,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
   getDurablyProvenCompletedGraphToolNames,
@@ -864,6 +865,138 @@ test("authoritative graph writes remain required when router-derived writes are 
   assert.deepEqual(getPendingMissionGraphWriteToolNames(graph), [
     "append_to_current_file",
   ]);
+});
+
+test("composite lifecycle frontier exposes only its durable current action and selector", () => {
+  const lifecycleNode = {
+    id: "lifecycle-code_execution",
+    status: "ready",
+    allowedTools: [
+      "code_workspace_read",
+      "code_workspace_write_expected",
+    ],
+    inputs: {
+      lifecycle: {
+        kind: "literal",
+        value: {
+          version: 1,
+          composite: true,
+          intentFingerprint: `sha256:${"a".repeat(64)}`,
+          stage: "code_execution",
+          actions: [
+            {
+              id: "action-001-code_workspace_read",
+              toolName: "code_workspace_read",
+              effect: "read",
+              bindingId: "binding-workspace",
+              selector: "README.md",
+              objective: "Read the exact workspace file.",
+              minimumEvidence: 1,
+              requiredEvidenceKinds: ["tool-result"],
+              minimumReceipts: 0,
+              requiredReceiptKinds: [],
+            },
+            {
+              id: "action-002-code_workspace_read",
+              toolName: "code_workspace_read",
+              effect: "read",
+              bindingId: "binding-workspace",
+              selector: "scripts/verify_project.py",
+              objective: "Read the protected contract.",
+              minimumEvidence: 1,
+              requiredEvidenceKinds: ["tool-result"],
+              minimumReceipts: 0,
+              requiredReceiptKinds: [],
+            },
+            {
+              id: "action-003-code_workspace_write_expected",
+              toolName: "code_workspace_write_expected",
+              effect: "mutation",
+              bindingId: "binding-workspace",
+              selector: "README.md",
+              objective: "Write the exact observed workspace file.",
+              minimumEvidence: 1,
+              requiredEvidenceKinds: ["tool-result"],
+              minimumReceipts: 1,
+              requiredReceiptKinds: ["action-receipt"],
+            },
+          ],
+        },
+      },
+    },
+    outputs: {
+      lifecycleActionCursor: 2,
+      lifecycleCompletedActionIds: [
+        "action-001-code_workspace_read",
+        "action-002-code_workspace_read",
+      ],
+      lifecycleActionAttemptCounts: {
+        "action-001-code_workspace_read": 1,
+        "action-002-code_workspace_read": 1,
+      },
+    },
+  } as any;
+  const graph = { nodes: { code: lifecycleNode } } as any;
+  const definitions = [
+    "code_workspace_read",
+    "code_workspace_write_expected",
+  ].map((name) => ({
+    type: "function" as const,
+    function: {
+      name,
+      parameters: { type: "object" as const, properties: {} },
+    },
+  }));
+  const frontier = constrainToolsToMissionGraphFrontier(definitions, graph);
+  assert.deepEqual(frontier.map((tool) => tool.function.name), [
+    "code_workspace_write_expected",
+  ]);
+  assert.equal(
+    getMissionGraphFrontierDestinationSelector(graph, frontier),
+    "README.md",
+  );
+  assert.deepEqual(getPendingMissionGraphWriteToolNames(graph), [
+    "code_workspace_write_expected",
+  ]);
+
+  const receipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-18T23:30:00.000Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "du06-workspace",
+      path: "du06-workspace",
+      workspaceId: "du06-workspace",
+    },
+  };
+  assert.deepEqual(
+    getVerifiedWorkspaceReadRefreshBinding(
+      graph,
+      frontier,
+      [receipt],
+      "README.md",
+    ),
+    { workspaceId: "du06-workspace", path: "README.md" },
+  );
+  assert.deepEqual(
+    getVerifiedWorkspaceSupportingReadRefreshBindings(
+      graph,
+      frontier,
+      [receipt],
+      "README.md",
+    ),
+    [{
+      workspaceId: "du06-workspace",
+      path: "scripts/verify_project.py",
+    }],
+  );
 });
 
 test("pending receipt-backed write goals outrank advisory completed-tool entries", () => {
@@ -3944,6 +4077,21 @@ test("workspace correction frontiers bind exact reads, hashes, content, and Line
   const messages = [
     {
       role: "tool" as const,
+      toolName: "code_validate_fast",
+      content: JSON.stringify({
+        status: "success",
+        output: {
+          status: "failed",
+          validationDiagnosticExcerpt: {
+            trust: "untrusted_sandbox_output",
+            stdout: "test/math.test.mjs must import node:test",
+            stderr: "Assertion failed in the protected verifier",
+          },
+        },
+      }),
+    },
+    {
+      role: "tool" as const,
       toolName: "linear_get_issue",
       content: JSON.stringify({
         ok: true,
@@ -3983,12 +4131,20 @@ test("workspace correction frontiers bind exact reads, hashes, content, and Line
     }],
     [],
     "README.md",
+    null,
+    null,
+    [],
+    "Create src/math.ts and test/math.test.mjs; the test must use node:test.",
   );
   assert.match(binding ?? "", /EXACT GRAPH-BOUND HASHED WORKSPACE CORRECTION/u);
   assert.match(binding ?? "", new RegExp(sha256));
   assert.match(binding ?? "", /currentContent="# Checkers\\n"/u);
   assert.match(binding ?? "", /APP-42/u);
   assert.match(binding ?? "", /linear\.app\/example\/issue\/APP-42/u);
+  assert.match(binding ?? "", /LATEST REDACTED UNTRUSTED FAST-VALIDATION DIAGNOSTIC/u);
+  assert.match(binding ?? "", /test\/math\.test\.mjs must import node:test/u);
+  assert.match(binding ?? "", /ORIGINAL USER MISSION REQUIREMENTS/u);
+  assert.match(binding ?? "", /the test must use node:test/u);
 });
 
 test("workspace correction preserves the verified read binding after transcript compaction", () => {
@@ -4168,6 +4324,42 @@ test("multi-file correction selects the host-verified workspace when path observ
       path,
       sha256: `sha256:${"b".repeat(64)}`,
       content: "host-refreshed observation\n",
+    },
+  );
+});
+
+test("workspace correction retains the SHA-bound observation for an empty file", () => {
+  const path = "checkers/__init__.py";
+  const sha256 = `sha256:${"0".repeat(64)}`;
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  rememberVerifiedWorkspaceReadResult(
+    runtimeCache,
+    {
+      name: "code_workspace_read",
+      arguments: { workspaceId: "du06-workspace", path },
+    },
+    { rootMissionId: "du06-root" },
+    {
+      ok: true,
+      toolName: "code_workspace_read",
+      output: { path, sha256, content: "" },
+    },
+  );
+
+  assert.deepEqual(
+    getVerifiedWorkspaceReadObservation(
+      runtimeCache,
+      path,
+      "du06-workspace",
+    ),
+    {
+      workspaceId: "du06-workspace",
+      path,
+      sha256,
+      content: "",
     },
   );
 });
@@ -12026,7 +12218,9 @@ test("generic repository implementation does not expose unrequested path relocat
 });
 
 test("explicit add-only filename lists route to no-overwrite workspace creation", async () => {
+  const chatRequests: ModelChatRequest[] = [];
   const configs: AgentRunConfigEvent[] = [];
+  const traces: string[] = [];
   const graphs: Array<{
     nodes: Record<
       string,
@@ -12049,16 +12243,20 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
   await runAgentMission({
     prompt,
     modelClient: createClient({
-      chatRequests: [],
+      chatRequests,
       chatResponders: [() => responseWithContent("Repository execution is pending.")],
     }),
     toolRegistry: createCodeV2RoutingRegistry(),
-    toolContext: vault.context,
+    toolContext: {
+      ...vault.context,
+      settings: { ...vault.context.settings, maxAgentSteps: 80 },
+    },
     enableStreaming: false,
     maxSteps: 1,
     events: {
       onRunConfig: (event) => configs.push(event),
       onMissionGraphUpdate: (graph) => graphs.push(graph),
+      onTrace: (event) => traces.push(event.message),
     },
   });
 
@@ -12067,6 +12265,17 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
   const graphNodes = Object.values(graphs.at(-1)?.nodes ?? {});
   const graphTools = graphNodes.flatMap(
     (node) => node.allowedTools,
+  );
+  assert.equal(graphTools.includes("append_file"), false);
+  assert.equal(graphTools.includes("create_file"), false);
+  assert.equal(
+    graphNodes.find((node) => node.allowedTools.length > 0)?.allowedTools[0],
+    "code_sandbox_status",
+    traces.join(" | "),
+  );
+  assert.deepEqual(
+    chatRequests[0]?.tools?.map((tool) => tool.function.name),
+    ["code_sandbox_status"],
   );
   assert.equal(
     graphTools.filter((name) => name === "code_workspace_create_file").length,
@@ -12083,6 +12292,22 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
       "checkers/game.py",
       "tests/test_checkers.py",
     ],
+  );
+  assert.equal(
+    graphTools.filter((name) => name === "code_workspace_read").length,
+    10,
+  );
+  assert.equal(
+    graphTools.filter((name) => name === "code_workspace_write_expected").length,
+    10,
+  );
+  assert.equal(
+    graphTools.filter((name) => name === "code_validate_fast").length,
+    3,
+  );
+  assert.equal(
+    graphTools.filter((name) => name === "code_repair_record_cycle").length,
+    3,
   );
   assert.equal(graphTools.includes("code_workspace_patch"), false);
 });

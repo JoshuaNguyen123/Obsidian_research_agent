@@ -41,7 +41,7 @@ export const CODE_EXECUTION_TOOL_NAMES_V2 = [
 ] as const;
 
 export interface CodeExecutionContributionFactoryOptionsV2 {
-  sandboxManager: SandboxManagerV2;
+  sandboxManager: SandboxManagerV2 | (() => SandboxManagerV2);
   getProfile(profileKey: string): Promise<RepositoryProfileV2 | null>;
   /** Resolve mutable workspace proof on the host; model arguments never carry hashes. */
   resolvePreparationInput?(input: {
@@ -156,7 +156,7 @@ function detectProfileContribution(): ExtensionToolContributionV1 {
 }
 
 function sandboxStatusToolContribution(
-  manager: SandboxManagerV2,
+  manager: SandboxManagerV2 | (() => SandboxManagerV2),
 ): ExtensionToolContributionV1 {
   const name = "code_sandbox_status";
   return toolContribution(
@@ -166,7 +166,7 @@ function sandboxStatusToolContribution(
     { type: "object", properties: {}, additionalProperties: false },
     async (args) => {
       assertAllowedArgs(args, []);
-      return manager.readStatus();
+      return resolveSandboxManager(manager).readStatus();
     },
   );
 }
@@ -228,7 +228,9 @@ function preparedSandboxContribution(
           return failure("repository_profile_missing", "The trusted RepositoryProfileV2 is unavailable.");
         }
         parseRepositoryProfileV2(profile);
-        const prepared = await options.sandboxManager.prepareExecution({
+        const prepared = await resolveSandboxManager(
+          options.sandboxManager,
+        ).prepareExecution({
           profile,
           purpose,
           projectId: hostProof?.projectId ?? normalized.projectId!,
@@ -277,7 +279,9 @@ function preparedSandboxContribution(
         sandboxAction,
         context,
       );
-      const result = await options.sandboxManager.executePrepared(sandboxAction, {
+      const result = await resolveSandboxManager(
+        options.sandboxManager,
+      ).executePrepared(sandboxAction, {
         authorization: {
           preparedActionId: sandboxAction.id,
           payloadFingerprint: sandboxAction.payloadFingerprint,
@@ -344,7 +348,10 @@ function preparedSandboxContribution(
           ...(validationReceipt === undefined ? {} : { validationReceipt }),
           ...(sandboxAction.repairRequestId === null
             ? {}
-            : { validationDiagnostics: result.diagnostics }),
+            : {
+                validationDiagnostics: result.diagnostics,
+                validationDiagnosticExcerpt: result.diagnosticExcerpt,
+              }),
           nativeFallbackUsed: false,
         },
         receipt,
@@ -418,7 +425,9 @@ function htmlPreviewContribution(): ExtensionToolContributionV1 {
   );
 }
 
-function sandboxHealthContribution(manager: SandboxManagerV2): ExtensionContributionV1 {
+function sandboxHealthContribution(
+  manager: SandboxManagerV2 | (() => SandboxManagerV2),
+): ExtensionContributionV1 {
   return {
     descriptor: {
       version: 1,
@@ -427,7 +436,7 @@ function sandboxHealthContribution(manager: SandboxManagerV2): ExtensionContribu
       displayName: "Code sandbox health",
     },
     async readStatus(context) {
-      const status = manager.readStatus();
+      const status = resolveSandboxManager(manager).readStatus();
       return {
         status: status.executionAvailable ? "healthy" : "degraded",
         summary: status.executionAvailable
@@ -556,6 +565,12 @@ function sandboxParameters(
           ]),
     ],
   };
+}
+
+function resolveSandboxManager(
+  manager: SandboxManagerV2 | (() => SandboxManagerV2),
+): SandboxManagerV2 {
+  return typeof manager === "function" ? manager() : manager;
 }
 
 function parseSandboxToolArgs(

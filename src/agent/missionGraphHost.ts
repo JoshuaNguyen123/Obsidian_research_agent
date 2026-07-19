@@ -7,6 +7,8 @@ import {
   type MissionAuthorityEffectV1,
   type MissionBindingGrantV1,
   type MissionCapabilityEnvelopeV1,
+  type MissionCompositeLifecycleActionV1,
+  type MissionJsonValueV1,
   type MissionToolGrantV1,
 } from "./missionGraphV3";
 import type {
@@ -24,11 +26,23 @@ import {
   extractExplicitWorkspaceReadFilePaths,
   extractMarkdownPathMentions,
 } from "./missionScope";
+import {
+  buildProjectLifecycleStageNodesV1,
+  createProjectLifecycleIntentV1,
+  detectProjectLifecycleStagesV1,
+  type ProjectLifecycleIntentV1,
+  type ProjectLifecycleStageV1,
+} from "./projectLifecycle";
 
 interface PlannedToolStepV1 {
   name: string;
   selector?: string;
   objective?: string;
+}
+
+interface CompositeLifecyclePlanV1 {
+  intent: ProjectLifecycleIntentV1;
+  stepsByStage: Map<ProjectLifecycleStageV1, PlannedToolStepV1[]>;
 }
 
 export interface BuildHostMissionGraphPlanInput {
@@ -59,6 +73,7 @@ export interface BuildHostMissionGraphPlanInput {
 export interface HostMissionGraphPlanV1 {
   capabilityEnvelope: MissionCapabilityEnvelopeV1;
   deterministicProposal: DeterministicMissionGraphProposalV1;
+  projectLifecycleIntent: ProjectLifecycleIntentV1 | null;
   allowedToolDescriptors: Array<
     ToolDescriptor & { authorityEffect: MissionAuthorityEffectV1 }
   >;
@@ -71,6 +86,7 @@ export interface HostMissionGraphPlanV1 {
 export async function buildHostMissionGraphPlanV1(
   input: BuildHostMissionGraphPlanInput,
 ): Promise<HostMissionGraphPlanV1> {
+  const issuedAt = (input.now ?? new Date()).toISOString();
   const allowedNames = sortedUnique([...input.allowedToolNames]);
   const descriptors = allowedNames.map((name) =>
     input.toolRegistry.getDescriptor?.(name) ?? descriptorFor(name),
@@ -134,25 +150,40 @@ export async function buildHostMissionGraphPlanV1(
     explicitWorkspaceReadFilePaths,
     descriptorByName,
   });
+  const compositeLifecyclePlan = buildCompositeLifecyclePlanV1({
+    missionId: input.missionId,
+    exactUserCommand: input.objective,
+    requestedAt: issuedAt,
+    steps: plannedSteps,
+    descriptorByName,
+  });
   const plannedSet = new Set(plannedSteps.map((step) => step.name));
   const maxToolNodes = MISSION_GRAPH_MAX_DEPTH - 1;
-  if (plannedSteps.length > maxToolNodes) {
+  if (!compositeLifecyclePlan && plannedSteps.length > maxToolNodes) {
     throw new Error(
       `The explicit code lifecycle requires ${plannedSteps.length} tool nodes, exceeding the bounded mission graph capacity of ${maxToolNodes}. Split it into smaller approved stages.`,
     );
   }
-  const selectedPlanned = plannedSteps.slice(0, maxToolNodes);
+  const selectedPlanned = compositeLifecyclePlan
+    ? plannedSteps
+    : plannedSteps.slice(0, maxToolNodes);
+  const maximumToolCallCapacity = compositeLifecyclePlan ? 10_000 : maxToolNodes;
+  const maximumPostAcceptanceNodes = compositeLifecyclePlan
+    ? Math.max(0, maxToolNodes - compositeLifecyclePlan.intent.stages.length)
+    : Math.max(0, maxToolNodes - selectedPlanned.length);
   const postAcceptanceNames = unique([
     ...(input.postAcceptanceToolNames ?? []),
   ])
     .filter((name) => descriptorByName.has(name) && !plannedSet.has(name))
     .filter((name) => descriptorByName.get(name)?.effect !== "read")
-    .slice(0, Math.max(0, maxToolNodes - selectedPlanned.length));
+    .slice(0, maximumPostAcceptanceNodes);
   const requestedToolCallCapacity = Number.isFinite(input.maxToolCalls)
     ? Math.max(0, Math.floor(input.maxToolCalls))
-    : maxToolNodes;
+    : compositeLifecyclePlan
+      ? selectedPlanned.length + postAcceptanceNames.length
+      : maxToolNodes;
   const toolCallCapacity = Math.min(
-    maxToolNodes,
+    maximumToolCallCapacity,
     Math.max(
       selectedPlanned.length + postAcceptanceNames.length,
       requestedToolCallCapacity,
@@ -166,6 +197,7 @@ export async function buildHostMissionGraphPlanV1(
     // current route actually exposes the corresponding model tool.
     .filter((name) => modelVisibleNames.has(name))
     .filter((name) => descriptorByName.get(name)?.effect === "read")
+    .filter(() => compositeLifecyclePlan === null)
     .slice(0, Math.max(0, toolCallCapacity - selectedPlanned.length));
 
   const capabilities = sortedUnique(
@@ -226,7 +258,10 @@ export async function buildHostMissionGraphPlanV1(
   // Reserve bounded graph and wall-clock capacity for repeated approved reads
   // (for example, fetching multiple sources with the same descriptor). A
   // completed node remains immutable, so each repeat receives its own node.
-  const maxNodes = toolCallCapacity + 1;
+  const lifecycleStageCount = compositeLifecyclePlan?.intent.stages.length ?? 0;
+  const maxNodes = compositeLifecyclePlan
+    ? lifecycleStageCount + postAcceptanceNames.length + 1
+    : toolCallCapacity + 1;
   const totalCatalogToolCalls = toolCallCapacity;
   const budgetNodeCount = toolCallCapacity + 1;
   const graphWallClockMs = Math.max(
@@ -237,7 +272,6 @@ export async function buildHostMissionGraphPlanV1(
     graphWallClockMs,
     toolCallCapacity,
   );
-  const issuedAt = (input.now ?? new Date()).toISOString();
   const capabilityEnvelope = await buildMissionCapabilityEnvelopeV1({
     missionId: input.missionId,
     issuedAt,
@@ -300,15 +334,19 @@ export async function buildHostMissionGraphPlanV1(
       maxDepth: Math.min(
         MISSION_GRAPH_MAX_DEPTH,
         Math.max(
-          selectedPlanned.length + 1,
+          compositeLifecyclePlan
+            ? lifecycleStageCount + 1
+            : selectedPlanned.length + 1,
           input.minimumGraphDepth ?? 1,
         ),
       ),
       maxConcurrentReadNodes: 3,
       maxTotalToolCalls: totalCatalogToolCalls,
-      maxExternalActions: descriptors.filter(
-        (descriptor) => graphEffect(descriptor) === "external_action",
-      ).length,
+      maxExternalActions: [
+        ...selectedPlanned.map((step) => descriptorByName.get(step.name)!),
+        ...postAcceptanceNames.map((name) => descriptorByName.get(name)!),
+      ].filter((descriptor) => graphEffect(descriptor) === "external_action")
+        .length,
       maxWallClockMs: graphWallClockMs,
       maxAttemptsPerNode: Math.max(
         1,
@@ -317,17 +355,27 @@ export async function buildHostMissionGraphPlanV1(
     },
   });
 
-  const deterministicNodes = buildToolNodeProposals({
-    steps: selectedPlanned,
-    objective: input.objective,
-    descriptorByName,
-    currentNotePath: input.currentNotePath ?? null,
-    maxAttempts: capabilityEnvelope.budgets.maxAttemptsPerNode,
-    wallClockMs: toolNodeWallClockMs,
-    headlessToolNames,
-    preferBackground: input.background?.preferBackground === true,
-    bindingIdByTool,
-  });
+  const deterministicNodes = compositeLifecyclePlan
+    ? buildCompositeLifecycleNodeProposalsV1({
+        plan: compositeLifecyclePlan,
+        missionObjective: input.objective,
+        descriptorByName,
+        currentNotePath: input.currentNotePath ?? null,
+        maxAttempts: capabilityEnvelope.budgets.maxAttemptsPerNode,
+        wallClockMsPerAction: toolNodeWallClockMs,
+        bindingIdByTool,
+      })
+    : buildToolNodeProposals({
+        steps: selectedPlanned,
+        objective: input.objective,
+        descriptorByName,
+        currentNotePath: input.currentNotePath ?? null,
+        maxAttempts: capabilityEnvelope.budgets.maxAttemptsPerNode,
+        wallClockMs: toolNodeWallClockMs,
+        headlessToolNames,
+        preferBackground: input.background?.preferBackground === true,
+        bindingIdByTool,
+      });
   const optionalReadNodes = buildOptionalReadNodeProposals({
     names: optionalReadNames,
     descriptorByName,
@@ -359,6 +407,7 @@ export async function buildHostMissionGraphPlanV1(
         ? { optionalReadNodes }
         : {}),
     },
+    projectLifecycleIntent: compositeLifecyclePlan?.intent ?? null,
     allowedToolDescriptors: descriptors.map((descriptor) => ({
       ...descriptor,
       authorityEffect: graphEffect(descriptor),
@@ -428,7 +477,6 @@ function expandBoundedWorkspaceRepairReview(input: {
   ];
   const supportsBoundedReview =
     input.explicitNewWorkspaceFilePaths.length > 0 &&
-    protectedReadPaths.length > 0 &&
     requiredBaseNames.every((name) => names.has(name)) &&
     input.descriptorByName.has("code_workspace_read") &&
     input.descriptorByName.has("code_workspace_write_expected");
@@ -484,6 +532,264 @@ function expandBoundedWorkspaceRepairReview(input: {
     }
   }
   return expanded;
+}
+
+function buildCompositeLifecyclePlanV1(input: {
+  missionId: string;
+  exactUserCommand: string;
+  requestedAt: string;
+  steps: readonly PlannedToolStepV1[];
+  descriptorByName: ReadonlyMap<string, ToolDescriptor>;
+}): CompositeLifecyclePlanV1 | null {
+  const stages = detectProjectLifecycleStagesV1(input.exactUserCommand);
+  if (stages.length < 2 || input.steps.length === 0) return null;
+  const stepsByStage = new Map<ProjectLifecycleStageV1, PlannedToolStepV1[]>(
+    stages.map((stage) => [stage, []]),
+  );
+  for (const step of input.steps) {
+    const descriptor = input.descriptorByName.get(step.name);
+    const stage = descriptor
+      ? projectLifecycleStageForToolV1(step.name, descriptor)
+      : null;
+    const stageSteps = stage ? stepsByStage.get(stage) : null;
+    if (!stageSteps || stageSteps.length >= 128) return null;
+    stageSteps.push(step);
+  }
+  if ([...stepsByStage.values()].some((steps) => steps.length === 0)) {
+    return null;
+  }
+  return {
+    intent: createProjectLifecycleIntentV1({
+      runId: input.missionId,
+      exactUserCommand: input.exactUserCommand,
+      stages,
+      requestedAt: input.requestedAt,
+    }),
+    stepsByStage,
+  };
+}
+
+function projectLifecycleStageForToolV1(
+  toolName: string,
+  descriptor: ToolDescriptor,
+): ProjectLifecycleStageV1 | null {
+  const name = toolName.toLowerCase();
+  if (
+    /(?:cleanup|clean_up|delete|trash|archive|close|backlink|reconcile)/u.test(name)
+  ) {
+    return "reconciliation_cleanup";
+  }
+  if (name === "publish_research_to_linear") {
+    return "accepted_research";
+  }
+  if (
+    name === "publish_research_project_to_linear" ||
+    name.startsWith("linear_") ||
+    descriptor.capability.system === "linear"
+  ) {
+    return "linear_hierarchy";
+  }
+  if (
+    name.startsWith("github_") ||
+    descriptor.capability.system === "github"
+  ) {
+    return "private_github_publication";
+  }
+  if (
+    name.startsWith("code_") ||
+    [
+      "workspace",
+      "git",
+    ].includes(descriptor.capability.system) ||
+    [
+      "run_code_block",
+      "render_html_preview",
+      "write_workspace_file",
+      "read_workspace_file",
+      "list_workspace_files",
+      "replace_workspace_text",
+      "preview_workspace_html",
+      "export_workspace_artifact",
+      "install_code_dependency",
+    ].includes(name)
+  ) {
+    return "code_execution";
+  }
+  if (
+    name.startsWith("web_") ||
+    name.startsWith("browser_") ||
+    ["browser", "web", "research"].includes(descriptor.capability.system)
+  ) {
+    return "accepted_research";
+  }
+  return null;
+}
+
+function buildCompositeLifecycleNodeProposalsV1(input: {
+  plan: CompositeLifecyclePlanV1;
+  missionObjective: string;
+  descriptorByName: ReadonlyMap<string, ToolDescriptor>;
+  currentNotePath: string | null;
+  maxAttempts: number;
+  wallClockMsPerAction: number;
+  bindingIdByTool: ReadonlyMap<string, string | null>;
+}): Record<string, MissionGraphNodeProposalV1> {
+  const stageTemplates = buildProjectLifecycleStageNodesV1(input.plan.intent);
+  const result: Record<string, MissionGraphNodeProposalV1> = {};
+  for (const stageTemplate of stageTemplates) {
+    const steps = input.plan.stepsByStage.get(stageTemplate.stage) ?? [];
+    const actions: MissionCompositeLifecycleActionV1[] = steps.map(
+      (step, index) => {
+        const descriptor = input.descriptorByName.get(step.name)!;
+        // A composite stage is resumed by the Obsidian host one action at a
+        // time. Background dispatch remains available to conventional
+        // single-action nodes and never widens this mixed-authority stage.
+        const proposal = proposalForTool({
+          nodeId: `action-template-${index + 1}-${stableToken(step.name)}`,
+          descriptor,
+          dependencies: [],
+          currentNotePath: input.currentNotePath,
+          maxAttempts: input.maxAttempts,
+          wallClockMs: input.wallClockMsPerAction,
+          headlessToolNames: new Set<string>(),
+          preferBackground: false,
+          bindingId: input.bindingIdByTool.get(step.name) ?? null,
+          selector:
+            step.selector ??
+            explicitVaultSelector({
+              toolName: step.name,
+              objective: input.missionObjective,
+              currentNotePath: input.currentNotePath,
+            }),
+          objective: step.objective,
+        });
+        const resourceInput = proposal.inputs.resource;
+        return {
+          id: `action-${String(index + 1).padStart(3, "0")}-${stableToken(step.name)}`,
+          toolName: step.name,
+          effect: proposal.effect,
+          bindingId:
+            proposal.destination?.bindingId ??
+            (resourceInput?.kind === "binding"
+              ? resourceInput.bindingId
+              : null),
+          selector:
+            proposal.destination?.selector ??
+            (resourceInput?.kind === "binding"
+              ? resourceInput.selector
+              : null),
+          objective: proposal.objective,
+          minimumEvidence: proposal.completionContract.minimumEvidence,
+          requiredEvidenceKinds: [
+            ...proposal.completionContract.requiredEvidenceKinds,
+          ],
+          minimumReceipts: proposal.completionContract.minimumReceipts,
+          requiredReceiptKinds: [
+            ...proposal.completionContract.requiredReceiptKinds,
+          ],
+        };
+      },
+    );
+    const effect = strongestGraphEffectV1(actions.map((action) => action.effect));
+    const effectfulBindingIds = sortedUnique(
+      actions.flatMap((action) =>
+        action.effect !== "read" && action.bindingId ? [action.bindingId] : [],
+      ),
+    );
+    result[stageTemplate.id] = {
+      id: stageTemplate.id,
+      dependencyIds: [...stageTemplate.dependencyIds],
+      objective: stageTemplate.objective,
+      executorId: "single-agent",
+      executionHost: "obsidian_core",
+      effect,
+      inputs: {
+        lifecycle: {
+          kind: "literal",
+          value: {
+            version: 1,
+            composite: true,
+            intentFingerprint: input.plan.intent.fingerprint,
+            stage: stageTemplate.stage,
+            actions: actions.map(
+              (action): Record<string, MissionJsonValueV1> => ({
+                id: action.id,
+                toolName: action.toolName,
+                effect: action.effect,
+                bindingId: action.bindingId,
+                selector: action.selector,
+                objective: action.objective,
+                minimumEvidence: action.minimumEvidence,
+                requiredEvidenceKinds: [...action.requiredEvidenceKinds],
+                minimumReceipts: action.minimumReceipts,
+                requiredReceiptKinds: [...action.requiredReceiptKinds],
+              }),
+            ),
+          },
+        },
+      },
+      requiredCapabilities: sortedUnique(
+        actions.flatMap((action) =>
+          input.descriptorByName.get(action.toolName)
+            ? [capabilityId(input.descriptorByName.get(action.toolName)!)]
+            : [],
+        ),
+      ),
+      allowedTools: sortedUnique(actions.map((action) => action.toolName)),
+      destination: null,
+      resourceLocks: effectfulBindingIds.map((bindingId) => ({
+        bindingId,
+        mode: "exclusive" as const,
+      })),
+      budget: {
+        toolCalls: actions.length,
+        externalActions: actions.filter(
+          (action) => action.effect === "external_action",
+        ).length,
+        wallClockMs: Math.max(
+          1_000,
+          input.wallClockMsPerAction * actions.length,
+        ),
+      },
+      maxAttempts: input.maxAttempts,
+      completionContract: {
+        criteria: [
+          `Every ordered ${stageTemplate.stage} lifecycle action produced its required durable proof.`,
+        ],
+        minimumEvidence: actions.reduce(
+          (total, action) => total + action.minimumEvidence,
+          0,
+        ),
+        requiredEvidenceKinds: sortedUnique(
+          actions.flatMap((action) => action.requiredEvidenceKinds),
+        ),
+        minimumReceipts: actions.reduce(
+          (total, action) => total + action.minimumReceipts,
+          0,
+        ),
+        requiredReceiptKinds: sortedUnique(
+          actions.flatMap((action) => action.requiredReceiptKinds),
+        ),
+        verifierId: null,
+      },
+    };
+  }
+  return result;
+}
+
+function strongestGraphEffectV1(
+  effects: readonly MissionAuthorityEffectV1[],
+): MissionAuthorityEffectV1 {
+  const rank: Record<MissionAuthorityEffectV1, number> = {
+    read: 0,
+    mutation: 1,
+    execution: 2,
+    external_action: 3,
+  };
+  return effects.reduce(
+    (strongest, effect) => rank[effect] > rank[strongest] ? effect : strongest,
+    "read" as MissionAuthorityEffectV1,
+  );
 }
 
 function buildToolNodeProposals(input: {

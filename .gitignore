@@ -48,11 +48,11 @@ Thumbs.db
 # Local Obsidian vault/runtime state
 .obsidian/
 .agent-backups/
+/.auth/
+/data.json
 
 # Local-only planning, agent, and skill context
-/AGENTS.md
-/Agents.md
-/agents.md
+/[Aa][Gg][Ee][Nn][Tt][Ss].md
 AGENTS.local.md
 agents.local.md
 skills/

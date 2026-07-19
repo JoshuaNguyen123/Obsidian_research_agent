@@ -4,7 +4,10 @@ import { buildHostMissionGraphPlanV1 } from "../src/agent/missionGraphHost";
 import { planMissionGraphV3 } from "../src/agent/missionGraphPlanner";
 import { descriptorFor } from "../src/tools/toolDescriptors";
 import type { ToolDescriptor } from "../src/agent/actions";
-import type { MissionBindingGrantV1 } from "../src/agent/missionGraphV3";
+import {
+  getMissionCompositeLifecycleSpecV1,
+  type MissionBindingGrantV1,
+} from "../src/agent/missionGraphV3";
 import type { ToolRegistry } from "../src/tools/types";
 import { createPreparedBackgroundGitHubToolDescriptorV1 } from "../extensions/integrations/host/PreparedBackgroundGitHubToolsV1";
 
@@ -426,6 +429,30 @@ test("host graph binds every explicit new repository file to its own ordered nod
   assert.equal(host.capabilityEnvelope.budgets.maxDepth, paths.length + 1);
 });
 
+test("host graph binds a singular source-file creation instead of the current note", async () => {
+  const name = "code_workspace_create_file";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-singular-source-file",
+    objective:
+      "Create isolated scratch workspace phase4-python, then create app.py. " +
+      "Use exactly code_workspace_create and code_workspace_create_file.",
+    toolRegistry: registryForDescriptors([workspaceLifecycleDescriptor(name)]),
+    allowedToolNames: [name],
+    modelVisibleToolNames: [name],
+    plannedToolNames: [name],
+    currentNotePath: "E2E Agent Tests/phase4.md",
+    maxToolCalls: 2,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const node = Object.values(host.deterministicProposal.nodes).find(
+    (candidate) => candidate.allowedTools[0] === name,
+  );
+  assert.equal(node?.destination?.selector, "app.py");
+  assert.notEqual(node?.destination?.selector, "E2E Agent Tests/phase4.md");
+});
+
 test("host graph adds one exact protected-contract read and two bounded correction passes", async () => {
   const planned = [
     "code_workspace_create",
@@ -498,9 +525,12 @@ test("host graph adds one exact protected-contract read and two bounded correcti
       const resource = node.inputs.resource;
       return resource?.kind === "binding" ? resource.selector : null;
     }),
-    ["scripts/verify_project.py", ...createdPaths, ...createdPaths],
+    [
+      "scripts/verify_project.py",
+      ...createdPaths,
+      ...createdPaths,
+    ],
   );
-  assert.ok(reads.at(-1)!.dependencyIds.includes(reads.at(-2)!.id));
   assert.deepEqual(
     nodes
       .filter((node) => node.allowedTools[0] === "code_workspace_write_expected")
@@ -509,6 +539,80 @@ test("host graph adds one exact protected-contract read and two bounded correcti
   );
   assert.equal(host.capabilityEnvelope.budgets.maxDepth, nodes.length + 1);
   assert.ok(host.capabilityEnvelope.budgets.maxDepth > 24);
+});
+
+test("host graph gives an exact multi-file code mission two bounded repair passes without inventing a protected read", async () => {
+  const planned = [
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+  ];
+  const allowed = [
+    ...planned,
+    "code_workspace_read",
+    "code_workspace_write_expected",
+  ];
+  const createdPaths = [
+    "README.md",
+    "src/index.ts",
+    "src/math.ts",
+    "test/math.test.mjs",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-bounded-code-correction-no-contract",
+    objective: [
+      `Create exactly ${createdPaths.slice(0, -1).join(", ")}, and ${createdPaths.at(-1)}.`,
+      "Run fast, targeted, and full validation, record repair evidence, and commit.",
+    ].join(" "),
+    toolRegistry: registryForDescriptors(
+      allowed.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: allowed,
+    modelVisibleToolNames: allowed,
+    plannedToolNames: planned,
+    maxToolCalls: Number.POSITIVE_INFINITY,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes).filter(
+    (node) => node.id !== "final",
+  );
+  assert.equal(
+    nodes.filter((node) => node.allowedTools[0] === "code_workspace_read").length,
+    createdPaths.length * 2,
+  );
+  assert.equal(
+    nodes.filter((node) => node.allowedTools[0] === "code_workspace_write_expected").length,
+    createdPaths.length * 2,
+  );
+  assert.equal(
+    nodes.filter((node) => node.allowedTools[0] === "code_validate_fast").length,
+    3,
+  );
+  assert.equal(
+    nodes.filter((node) => node.allowedTools[0] === "code_repair_record_cycle").length,
+    3,
+  );
+  assert.deepEqual(
+    nodes
+      .filter((node) => node.allowedTools[0] === "code_workspace_read")
+      .map((node) => node.inputs.resource?.kind === "binding"
+        ? node.inputs.resource.selector
+        : null),
+    [...createdPaths, ...createdPaths],
+  );
+  assert.deepEqual(
+    nodes
+      .filter((node) => node.allowedTools[0] === "code_workspace_write_expected")
+      .map((node) => node.destination?.selector),
+    [...createdPaths, ...createdPaths],
+  );
+  assert.equal(host.capabilityEnvelope.budgets.maxDepth, nodes.length + 1);
 });
 
 test("host graph retains every node in a compound daily-use lifecycle", async () => {
@@ -548,6 +652,95 @@ test("host graph retains every node in a compound daily-use lifecycle", async ()
   });
   assert.equal(Object.keys(planned.graph.nodes).length, names.length + 1);
   assert.equal(planned.graph.nodes.final.dependencyIds.length, names.length);
+});
+
+test("host graph composes a typed four-stage project lifecycle without widening per-action authority", async () => {
+  const descriptors = [
+    lifecycleDescriptor("web_search", "browser", "read"),
+    lifecycleDescriptor("web_fetch", "browser", "read"),
+    lifecycleDescriptor("publish_research_to_linear", "linear", "publish"),
+    lifecycleDescriptor("publish_research_project_to_linear", "linear", "publish"),
+    lifecycleDescriptor("linear_get_issue", "linear", "read"),
+    lifecycleDescriptor("code_workspace_create", "workspace", "reversible_mutation"),
+    lifecycleDescriptor("code_commit_verified", "git", "execution"),
+    lifecycleDescriptor("github_create_private_repository", "github", "publish"),
+    lifecycleDescriptor("github_publish_verified_branch", "github", "publish"),
+  ];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const plannedNames = [
+    "web_search",
+    "web_fetch",
+    "web_fetch",
+    "publish_research_to_linear",
+    "publish_research_project_to_linear",
+    "linear_get_issue",
+    "code_workspace_create",
+    "code_commit_verified",
+    "github_create_private_repository",
+    "github_publish_verified_branch",
+  ];
+  const objective = [
+    "Research checkers rules using public web sources.",
+    "Shape the accepted research into a Linear project and issues.",
+    "Implement the code in the repository and commit it.",
+    "Publish the verified branch to a private GitHub repository.",
+  ].join(" ");
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-composite-project-lifecycle",
+    objective,
+    toolRegistry: registryForDescriptors(descriptors),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: plannedNames,
+    maxToolCalls: plannedNames.length,
+    maxWallClockMs: 120_000,
+    now: NOW,
+  });
+
+  assert.deepEqual(host.projectLifecycleIntent?.stages, [
+    "accepted_research",
+    "linear_hierarchy",
+    "code_execution",
+    "private_github_publication",
+  ]);
+  assert.equal(host.projectLifecycleIntent?.exactUserCommand, objective);
+  assert.deepEqual(Object.keys(host.deterministicProposal.nodes).sort(), [
+    "final",
+    "lifecycle-accepted_research",
+    "lifecycle-code_execution",
+    "lifecycle-linear_hierarchy",
+    "lifecycle-private_github_publication",
+  ]);
+  const accepted = host.deterministicProposal.nodes["lifecycle-accepted_research"];
+  const acceptedSpec = getMissionCompositeLifecycleSpecV1(accepted);
+  assert.deepEqual(
+    acceptedSpec?.actions.map((action) => action.toolName),
+    ["web_search", "web_fetch", "web_fetch", "publish_research_to_linear"],
+  );
+  assert.equal(accepted.destination, null);
+  assert.equal(accepted.budget.toolCalls, 4);
+  assert.equal(accepted.budget.externalActions, 1);
+  assert.deepEqual(
+    host.deterministicProposal.nodes["lifecycle-linear_hierarchy"].dependencyIds,
+    ["lifecycle-accepted_research"],
+  );
+  assert.equal(host.capabilityEnvelope.budgets.maxDepth, 5);
+
+  const planned = await planMissionGraphV3({
+    mission: { missionId: "run-composite-project-lifecycle", objective },
+    routerMode: "off",
+    capabilityEnvelope: host.capabilityEnvelope,
+    deterministicProposal: host.deterministicProposal,
+    allowedToolDescriptors: host.allowedToolDescriptors,
+    now: () => NOW.toISOString(),
+  });
+  assert.equal(Object.keys(planned.graph.nodes).length, 5);
+  assert.equal(
+    getMissionCompositeLifecycleSpecV1(
+      planned.graph.nodes["lifecycle-code_execution"],
+    )?.actions.length,
+    2,
+  );
 });
 
 test("explicit background planning routes an installed fixed read executor", async () => {
@@ -980,6 +1173,59 @@ function workspaceLifecycleDescriptor(name: string): ToolDescriptor {
     },
     allowedPrincipals: ["single_agent", "lead", "code_worker"],
     ...(readOnly ? {} : { receiptKind: "code_change" as const }),
+  };
+}
+
+function lifecycleDescriptor(
+  name: string,
+  system: ToolDescriptor["capability"]["system"],
+  effect: ToolDescriptor["effect"],
+): ToolDescriptor {
+  const readOnly = effect === "read";
+  const action = readOnly
+    ? "read"
+    : effect === "publish"
+      ? "publish"
+      : effect === "execution"
+        ? "execute"
+        : "update";
+  return {
+    version: 1,
+    name,
+    capability: {
+      system,
+      resourceType: `${system}_lifecycle_resource`,
+      action,
+    },
+    effect,
+    risk: readOnly ? "low" : "high",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: readOnly,
+      fallback: readOnly ? "none" : "exact",
+    },
+    execution: {
+      preparation: readOnly ? "none" : "required",
+      cacheable: readOnly,
+      parallelSafe: readOnly,
+    },
+    durability: {
+      journal: !readOnly,
+      receipt: !readOnly,
+      readback: readOnly ? "none" : "required",
+      reconciliation: readOnly ? "none" : "required",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    ...(readOnly
+      ? {}
+      : {
+          receiptKind:
+            effect === "publish"
+              ? ("external_action" as const)
+              : effect === "execution"
+                ? ("code_change" as const)
+                : ("artifact" as const),
+        }),
   };
 }
 

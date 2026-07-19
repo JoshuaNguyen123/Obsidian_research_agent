@@ -86,6 +86,18 @@ function summarizeOutput(toolName: string, output: unknown): string {
   if (!isRecord(output)) {
     return `${toolName} completed.`;
   }
+  if (
+    /^code_validate_(?:fast|targeted|full)$/u.test(toolName) &&
+    (output.status === "verified" || output.status === "failed")
+  ) {
+    return `${toolName} completed with ${output.status} validation.`;
+  }
+  if (
+    toolName === "code_repair_record_cycle" &&
+    typeof output.outcome === "string"
+  ) {
+    return `${toolName} recorded cycle ${String(output.cycle ?? "unknown")} as ${output.outcome}.`;
+  }
   if (typeof output.operation === "string") {
     const path = typeof output.path === "string" ? ` ${output.path}` : "";
     return `${output.operation}${path}`.trim();
@@ -162,6 +174,63 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
       keep[key] = output[key];
     }
   }
+  if (/^code_validate_(?:fast|targeted|full)$/u.test(toolName)) {
+    if (output.status === "verified" || output.status === "failed") {
+      keep.status = output.status;
+    }
+    if (isRecord(output.validationReceipt)) {
+      keep.validationReceipt = selectFields(output.validationReceipt, [
+        "id",
+        "kindName",
+        "kind",
+        "status",
+        "fingerprint",
+        "failureFingerprint",
+        "sandboxId",
+        "freshSandbox",
+      ]);
+    }
+    if (isRecord(output.validationDiagnostics)) {
+      keep.validationDiagnostics = selectFields(output.validationDiagnostics, [
+        "version",
+        "stdoutSha256",
+        "stderrSha256",
+        "stdoutBytes",
+        "stderrBytes",
+        "truncated",
+        "redactedLines",
+      ]);
+    }
+    if (isRecord(output.validationDiagnosticExcerpt)) {
+      keep.validationDiagnosticExcerpt = {
+        trust: "untrusted_sandbox_output",
+        stdout: typeof output.validationDiagnosticExcerpt.stdout === "string"
+          ? truncateText(output.validationDiagnosticExcerpt.stdout, 2400)
+          : "",
+        stderr: typeof output.validationDiagnosticExcerpt.stderr === "string"
+          ? truncateText(output.validationDiagnosticExcerpt.stderr, 2400)
+          : "",
+        truncated: output.validationDiagnosticExcerpt.truncated === true,
+        redactedLines: typeof output.validationDiagnosticExcerpt.redactedLines === "number"
+          ? output.validationDiagnosticExcerpt.redactedLines
+          : 0,
+      };
+    }
+  }
+  if (toolName === "code_repair_record_cycle") {
+    for (const key of [
+      "id",
+      "kindName",
+      "cycle",
+      "outcome",
+      "validationReceiptId",
+      "validationFingerprint",
+      "cycleFingerprint",
+      "fingerprint",
+    ]) {
+      if (output[key] !== undefined) keep[key] = output[key];
+    }
+  }
   if (Array.isArray(output.results)) {
     keep.results = output.results
       .slice(0, MAX_RESULT_ITEMS)
@@ -187,6 +256,17 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
     });
   }
   return Object.keys(keep).length > 0 ? keep : undefined;
+}
+
+function selectFields(
+  source: Record<string, unknown>,
+  keys: readonly string[],
+): Record<string, unknown> {
+  const selected: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (source[key] !== undefined) selected[key] = source[key];
+  }
+  return selected;
 }
 
 function slimReceiptForModel(receipt: Record<string, unknown>): Record<string, unknown> {

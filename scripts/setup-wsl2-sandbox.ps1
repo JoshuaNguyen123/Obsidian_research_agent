@@ -23,17 +23,6 @@ function Invoke-Wsl {
   }
 }
 
-function Get-Sha256Text {
-  param([string]$Text)
-  $sha = [System.Security.Cryptography.SHA256]::Create()
-  try {
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
-  } finally {
-    $sha.Dispose()
-  }
-}
-
 $entrypoint = (Resolve-Path (Join-Path $PSScriptRoot "..\extensions\code\sandbox\runtime\sandbox-entrypoint.py")).Path
 $runtimeSetup = (Resolve-Path (Join-Path $PSScriptRoot "setup-wsl2-sandbox-runtime.sh")).Path
 $distributions = @(& wsl.exe --list --quiet) | ForEach-Object { $_.Trim([char]0).Trim() } | Where-Object { $_ }
@@ -69,19 +58,19 @@ if ($LASTEXITCODE -ne 0 -or -not $runtimeSetupLinux) {
   throw "Unable to resolve the sandbox runtime setup helper inside $TargetDistribution."
 }
 
-Write-Host "Installing the fixed bubblewrap and Python runtime boundary..."
+Write-Host "Installing the fixed bubblewrap, Node/npm, and Python runtime boundary..."
 Invoke-Wsl @("--distribution", $TargetDistribution, "--user", "root", "--exec", "bash", $runtimeSetupLinux, "provision", $RuntimeRoot, $entrypointLinux)
 
-$entrypointHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $entrypoint).Hash.ToLowerInvariant()
-$pythonVersion = (& wsl.exe --distribution $TargetDistribution --user root --exec python3 --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or -not $pythonVersion) { throw "Unable to read the sandbox Python version." }
-$runtimeDigest = "sha256:$(Get-Sha256Text "$entrypointHash`n$pythonVersion`nagentic-wsl2-runtime-v1")"
-$manifest = @{ version = 1; commandRuntimeDigests = @{ $runtimeDigest = @("python3") } } | ConvertTo-Json -Compress -Depth 5
+$runtimeDigest = (& wsl.exe --distribution $TargetDistribution --user root --exec bash $runtimeSetupLinux "fingerprint" $RuntimeRoot 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $runtimeDigest -notmatch '^sha256:[a-f0-9]{64}$') {
+  throw "Unable to fingerprint the complete immutable sandbox runtime bundle."
+}
+$manifest = @{ version = 1; commandRuntimeDigests = @{ $runtimeDigest = @("node", "npm", "python", "python3") } } | ConvertTo-Json -Compress -Depth 5
 Invoke-Wsl @("--distribution", $TargetDistribution, "--user", "root", "--exec", "bash", $runtimeSetupLinux, "identity", $RuntimeRoot, $runtimeDigest, $manifest)
 
 $environmentValues = [ordered]@{
   AGENTIC_SANDBOX_CI_EXECUTABLE = "wsl.exe"
-  AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE = "agentic-python-runtime"
+  AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE = "agentic-language-runtime"
   AGENTIC_SANDBOX_CI_RUNTIME_DIGEST = $runtimeDigest
   AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION = $TargetDistribution
   AGENTIC_SANDBOX_CI_RUNTIME_ROOT = $RuntimeRoot

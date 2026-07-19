@@ -35,6 +35,7 @@ export interface CapabilityReadinessInputsV2 {
   code: {
     registered: boolean;
     repositoryProfileCount: number;
+    runtimeUnresolvedProfileCount: number;
     editingAvailable: boolean;
     executionAvailable: boolean;
     probeObservedAt: string | null;
@@ -130,6 +131,8 @@ export function buildCapabilityReadinessV2(
     ? "Blocked"
     : input.code.repositoryProfileCount === 0
       ? "Available"
+      : input.code.runtimeUnresolvedProfileCount > 0
+        ? "Degraded"
       : input.code.executionAvailable && probeFresh
         ? "Ready"
         : input.code.probeObservedAt
@@ -143,6 +146,8 @@ export function buildCapabilityReadinessV2(
       ? "The Code runtime is not registered."
       : input.code.repositoryProfileCount === 0
         ? "Durable editing is available; bind a trusted repository before repository work."
+        : input.code.runtimeUnresolvedProfileCount > 0
+          ? `${input.code.runtimeUnresolvedProfileCount} trusted repository profile(s) still require a fresh immutable runtime binding.`
         : input.code.executionAvailable && probeFresh
           ? `Trusted repository binding and a fresh attested sandbox probe are ready (${input.code.repositoryProfileCount} profile(s)).`
           : input.code.probeBlocker ??
@@ -152,6 +157,8 @@ export function buildCapabilityReadinessV2(
       ? "Reload Code capability"
       : input.code.repositoryProfileCount === 0
         ? "Bind a repository"
+        : input.code.runtimeUnresolvedProfileCount > 0
+          ? "Refresh repository runtime binding"
         : codeStatus === "Ready"
           ? "Review execution setup"
           : "Run sandbox boundary probe",

@@ -29,6 +29,11 @@ export function migrateResearchMemoryIndexV2(
     throw new Error("Research memory migration requires a valid vault scope.");
   }
   return entries.slice(0, 200).map((entry) => {
+    const isCurrentV2Record =
+      entry.version === 2 &&
+      entry.vaultScopeId === vaultScopeId &&
+      typeof entry.id === "string" &&
+      /^research_memory_[a-f0-9]{24}$/.test(entry.id);
     const sourceLabels = normalizeSourceLabels(entry);
     const core = {
       version: 2 as const,
@@ -44,15 +49,20 @@ export function migrateResearchMemoryIndexV2(
       contentHash: entry.contentHash,
       updateCount: entry.updateCount,
       targetId: entry.targetId,
-      verificationState: normalizeVerification(entry.verificationState),
-      verifiedAt: entry.verifiedAt,
-      staleAt: entry.staleAt,
-      supersededAt: entry.supersededAt,
-      supersededById: entry.supersededById,
+      // Legacy entries are useful source-note pointers, not verified authority.
+      // Only an already-valid V2 record in this exact vault may retain its
+      // verification lifecycle during normalization/readback.
+      verificationState: isCurrentV2Record
+        ? normalizeVerification(entry.verificationState)
+        : "unverified" as const,
+      verifiedAt: isCurrentV2Record ? entry.verifiedAt : undefined,
+      staleAt: isCurrentV2Record ? entry.staleAt : undefined,
+      supersededAt: isCurrentV2Record ? entry.supersededAt : undefined,
+      supersededById: isCurrentV2Record ? entry.supersededById : undefined,
       sourceHashes: entry.sourceHashes ? { ...entry.sourceHashes } : undefined,
       sourceLabels,
     };
-    const fingerprint = fingerprintOf(core);
+    const fingerprint = fingerprintResearchMemoryCore(core);
     return {
       ...core,
       lastUpdated: entry.lastUpdated,
@@ -137,6 +147,21 @@ function fingerprintOf(value: unknown): string {
   // JavaScript's non-JSON `undefined` value.
   const jsonValue = JSON.parse(JSON.stringify(value)) as unknown;
   return `sha256:${portableSha256Text(canonicalJson(jsonValue))}`;
+}
+
+function fingerprintResearchMemoryCore(
+  value: Record<string, unknown>,
+): string {
+  // Verification times are observations, not record identity. Excluding them
+  // keeps retry/migration idempotency stable while verificationState and the
+  // actual source/content fields remain authoritative.
+  const {
+    verifiedAt: _verifiedAt,
+    staleAt: _staleAt,
+    supersededAt: _supersededAt,
+    ...stable
+  } = value;
+  return fingerprintOf(stable);
 }
 
 function isIsoTimestamp(value: unknown): value is string {

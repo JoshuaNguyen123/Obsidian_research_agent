@@ -46,6 +46,8 @@ import {
   detectRepositoryProfileV2,
   migrateRepositoryProfileV1,
   parseRepositoryProfileV2,
+  repositoryProfileExecutionBlockersV2,
+  type RepositoryEcosystemV2,
   type RepositoryProfileV2,
   type RepositoryValidationCommandV2,
 } from "./repositories";
@@ -297,7 +299,6 @@ export class CodeExtensionRuntimeV2 {
 
   getContributions(): ExtensionContributionV1[] {
     this.assertInitialized();
-    const sandboxManager = this.requireSandboxManager();
     const workspace = createCodeWorkspaceToolContributionsV2({
       manager: this.workspaceManager,
       repositoryProvisioner: this.repositoryProvisioner!,
@@ -310,7 +311,10 @@ export class CodeExtensionRuntimeV2 {
         ),
     });
     const execution = createCodeExecutionContributionsV2({
-      sandboxManager,
+      // Settings may replace the configured manager after extension
+      // registration. Resolve it per call so tools never retain the empty
+      // startup manager after a verified provider is configured.
+      sandboxManager: () => this.requireSandboxManager(),
       getProfile: (profileKey) => this.getRepositoryProfile(profileKey),
       resolvePreparationInput: ({ purpose, workspaceId, context }) =>
         this.resolveSandboxPreparationInput(purpose, workspaceId, context),
@@ -383,6 +387,13 @@ export class CodeExtensionRuntimeV2 {
     return this.requireState().repositoryProfiles[key]?.profile ?? null;
   }
 
+  getRuntimeUnresolvedRepositoryProfileCount(): number {
+    this.assertInitialized();
+    return Object.values(this.requireState().repositoryProfiles).filter(
+      (record) => repositoryProfileExecutionBlockersV2(record.profile).length > 0,
+    ).length;
+  }
+
   async redetectRepositoryProfile(input: {
     profileKey: string;
     workspaceId: string;
@@ -411,9 +422,12 @@ export class CodeExtensionRuntimeV2 {
       allowedPaths: existing.allowedPaths,
       generatedOutputs: existing.generatedOutputs,
       requiredGitHubChecks: existing.requiredGitHubChecks,
-      runtimeDigests: Object.fromEntries(existing.pinnedRuntimes
-        .filter((runtime) => runtime.digest)
-        .map((runtime) => [runtime.ecosystem, runtime.digest!])),
+      runtimeDigests: {
+        ...Object.fromEntries(existing.pinnedRuntimes
+          .filter((runtime) => runtime.digest)
+          .map((runtime) => [runtime.ecosystem, runtime.digest!])),
+        ...this.verifiedSandboxRuntimeDigests(existing.ecosystems),
+      },
     });
     await this.serializedRefresh(async () => {
       const current = this.requireState();
@@ -459,10 +473,72 @@ export class CodeExtensionRuntimeV2 {
           `Repository profile ${key} is already bound to another canonical root.`,
         );
       }
-      return existing;
+      if (repositoryProfileExecutionBlockersV2(existing).length === 0) {
+        return existing;
+      }
+      const freshRuntimeDigests = this.verifiedSandboxRuntimeDigests(
+        existing.ecosystems,
+      );
+      if (
+        !existing.pinnedRuntimes.some(
+          (runtime) =>
+            !runtime.digest && Boolean(freshRuntimeDigests[runtime.ecosystem]),
+        )
+      ) {
+        return existing;
+      }
+
+      const inventory = await inventoryRepository(root);
+      const upgraded = detectRepositoryProfileV2({
+        key,
+        displayName: existing.displayName,
+        repositoryRoot: root,
+        defaultBranch: existing.defaultBranch,
+        files: inventory.files,
+        fileContents: inventory.fileContents,
+        fileHashes: inventory.fileHashes,
+        allowedPaths: existing.allowedPaths,
+        generatedOutputs: existing.generatedOutputs,
+        requiredGitHubChecks: existing.requiredGitHubChecks,
+        runtimeDigests: {
+          ...Object.fromEntries(existing.pinnedRuntimes
+            .filter((runtime) => runtime.digest)
+            .map((runtime) => [runtime.ecosystem, runtime.digest!])),
+          ...freshRuntimeDigests,
+        },
+      });
+      await this.serializedRefresh(async () => {
+        const current = this.requireState();
+        const prior = current.repositoryProfiles[key];
+        if (!prior || !samePath(prior.profile.repositoryRoot, root)) {
+          throw new WorkspaceManagerErrorV2(
+            "repository_profile_binding_conflict",
+            `Repository profile ${key} changed during runtime binding refresh.`,
+          );
+        }
+        const next = parseCodeRuntimeStateV2({
+          ...current,
+          repositoryProfiles: {
+            ...current.repositoryProfiles,
+            [key]: {
+              ...prior,
+              sourceFingerprint: sha256Canonical({
+                repositoryRoot: root,
+                baseSha: input.inspection.baseSha,
+                inventoryFingerprint: inventory.fingerprint,
+                profile: upgraded,
+              }),
+              profile: upgraded,
+            },
+          },
+          updatedAt: this.isoNow(),
+        });
+        this.state = await this.persistState(next);
+      });
+      return upgraded;
     }
     const inventory = await inventoryRepository(root);
-    const profile = detectRepositoryProfileV2({
+    const detectionInput = {
       key,
       displayName: path.basename(root) || key,
       repositoryRoot: root,
@@ -470,7 +546,14 @@ export class CodeExtensionRuntimeV2 {
       files: inventory.files,
       fileContents: inventory.fileContents,
       fileHashes: inventory.fileHashes,
-    });
+    };
+    const discovered = detectRepositoryProfileV2(detectionInput);
+    const runtimeDigests = this.verifiedSandboxRuntimeDigests(
+      discovered.ecosystems,
+    );
+    const profile = Object.keys(runtimeDigests).length > 0
+      ? detectRepositoryProfileV2({ ...detectionInput, runtimeDigests })
+      : discovered;
     const record: CodeRepositoryProfileRecordV2 = {
       version: 2,
       source: "detected_raw_exact_approval",
@@ -1665,6 +1748,29 @@ export class CodeExtensionRuntimeV2 {
       providers: this.requireState().sandbox.providerConfigs,
       now: this.now,
     });
+  }
+
+  /**
+   * Bind only language runtimes that the bundled local runtime actually
+   * provisions. The selected provider is usable only after its current
+   * in-memory manager has completed a fresh boundary probe; persisted probe
+   * history is deliberately insufficient after restart or settings drift.
+   */
+  private verifiedSandboxRuntimeDigests(
+    ecosystems: readonly RepositoryEcosystemV2[],
+  ): Partial<Record<RepositoryEcosystemV2, string>> {
+    const status = this.requireSandboxManager().readStatus();
+    if (!status.executionAvailable || !status.selectedProvider) return {};
+    const provider = this.requireState().sandbox.providerConfigs.find(
+      (candidate) => candidate.kind === status.selectedProvider,
+    );
+    if (!provider) return {};
+    const bundled = new Set<RepositoryEcosystemV2>(["node", "python"]);
+    return Object.fromEntries(
+      ecosystems
+        .filter((ecosystem) => bundled.has(ecosystem))
+        .map((ecosystem) => [ecosystem, provider.runtimeDigest]),
+    ) as Partial<Record<RepositoryEcosystemV2, string>>;
   }
 
   private assertInitialized(): void {

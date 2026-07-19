@@ -172,6 +172,52 @@ export interface MissionResourceLockRequirementV1 {
   mode: "shared" | "exclusive";
 }
 
+export const MISSION_COMPOSITE_LIFECYCLE_INPUT_KEY_V1 = "lifecycle" as const;
+
+export const MISSION_COMPOSITE_LIFECYCLE_STAGES_V1 = Object.freeze([
+  "accepted_research",
+  "linear_hierarchy",
+  "code_execution",
+  "private_github_publication",
+  "reconciliation_cleanup",
+] as const);
+
+export type MissionCompositeLifecycleStageV1 =
+  (typeof MISSION_COMPOSITE_LIFECYCLE_STAGES_V1)[number];
+
+/**
+ * One host-planned action inside a composite project-lifecycle stage. The
+ * literal carries no provider payload or credential: it records only the
+ * immutable installed tool grant, trusted logical binding, exact selector,
+ * and proof contract needed to resume the next action safely.
+ */
+export interface MissionCompositeLifecycleActionV1 {
+  id: string;
+  toolName: string;
+  effect: MissionAuthorityEffectV1;
+  bindingId: string | null;
+  selector: string | null;
+  objective: string;
+  minimumEvidence: number;
+  requiredEvidenceKinds: string[];
+  minimumReceipts: number;
+  requiredReceiptKinds: string[];
+}
+
+export interface MissionCompositeLifecycleSpecV1 {
+  version: 1;
+  composite: true;
+  intentFingerprint: string;
+  stage: MissionCompositeLifecycleStageV1;
+  actions: MissionCompositeLifecycleActionV1[];
+}
+
+export interface MissionCompositeLifecycleStateV1 {
+  actionCursor: number;
+  completedActionIds: string[];
+  actionAttemptCounts: Record<string, number>;
+}
+
 export interface MissionRoutingDecisionV1 {
   source: "structured_model" | "deterministic";
   fallbackFrom: "structured_model" | null;
@@ -1272,6 +1318,234 @@ function normalizeNode(
   return node;
 }
 
+/** Returns the closed lifecycle literal for a composite node, or null for a
+ * conventional single-authority graph node. Graph callers may use this to
+ * expose only the action at the durable cursor. */
+export function getMissionCompositeLifecycleSpecV1(
+  node: Pick<MissionNodeV3, "id" | "inputs">,
+): MissionCompositeLifecycleSpecV1 | null {
+  const input = node.inputs[MISSION_COMPOSITE_LIFECYCLE_INPUT_KEY_V1];
+  if (!input) return null;
+  if (input.kind !== "literal") {
+    fail(
+      "invalid_shape",
+      `Mission node ${node.id} lifecycle input must be a literal.`,
+    );
+  }
+  return normalizeMissionCompositeLifecycleSpecV1(
+    input.value,
+    `node ${node.id} lifecycle`,
+  );
+}
+
+/** Reads and validates the durable per-action continuation cursor. Fresh
+ * planner nodes begin at action zero with empty outputs. */
+export function getMissionCompositeLifecycleStateV1(
+  node: Pick<MissionNodeV3, "id" | "inputs" | "outputs">,
+): MissionCompositeLifecycleStateV1 | null {
+  const spec = getMissionCompositeLifecycleSpecV1(node);
+  if (!spec) return null;
+  return normalizeMissionCompositeLifecycleStateV1(
+    node.outputs,
+    spec,
+    `node ${node.id} lifecycle outputs`,
+  );
+}
+
+export function getCurrentMissionCompositeLifecycleActionV1(
+  node: Pick<MissionNodeV3, "id" | "inputs" | "outputs">,
+): MissionCompositeLifecycleActionV1 | null {
+  const spec = getMissionCompositeLifecycleSpecV1(node);
+  if (!spec) return null;
+  const state = normalizeMissionCompositeLifecycleStateV1(
+    node.outputs,
+    spec,
+    `node ${node.id} lifecycle outputs`,
+  );
+  return spec.actions[state.actionCursor] ?? null;
+}
+
+function normalizeMissionCompositeLifecycleSpecV1(
+  value: unknown,
+  path: string,
+): MissionCompositeLifecycleSpecV1 {
+  const source = record(value, path);
+  exactKeys(
+    source,
+    ["version", "composite", "intentFingerprint", "stage", "actions"],
+    path,
+  );
+  if (source.version !== 1 || source.composite !== true) {
+    fail("invalid_shape", `${path} must be a composite lifecycle v1 literal.`);
+  }
+  const stage = source.stage;
+  if (
+    typeof stage !== "string" ||
+    !MISSION_COMPOSITE_LIFECYCLE_STAGES_V1.includes(
+      stage as MissionCompositeLifecycleStageV1,
+    )
+  ) {
+    fail("invalid_shape", `${path}.stage is not a supported lifecycle stage.`);
+  }
+  const actionValues = array(source.actions, `${path}.actions`);
+  if (actionValues.length < 1 || actionValues.length > 128) {
+    fail("invalid_shape", `${path}.actions requires 1-128 actions.`);
+  }
+  const actionIds = new Set<string>();
+  const actions = actionValues.map((value, index) => {
+    const actionPath = `${path}.actions[${index}]`;
+    const action = record(value, actionPath);
+    exactKeys(
+      action,
+      [
+        "id",
+        "toolName",
+        "effect",
+        "bindingId",
+        "selector",
+        "objective",
+        "minimumEvidence",
+        "requiredEvidenceKinds",
+        "minimumReceipts",
+        "requiredReceiptKinds",
+      ],
+      actionPath,
+    );
+    const id = stableId(action.id, `${actionPath}.id`);
+    if (actionIds.has(id)) {
+      fail("invalid_id", `${path}.actions cannot contain duplicate action IDs.`);
+    }
+    actionIds.add(id);
+    return {
+      id,
+      toolName: stableId(action.toolName, `${actionPath}.toolName`),
+      effect: authorityEffect(action.effect, `${actionPath}.effect`),
+      bindingId:
+        action.bindingId === null
+          ? null
+          : stableId(action.bindingId, `${actionPath}.bindingId`),
+      selector:
+        action.selector === null
+          ? null
+          : text(action.selector, `${actionPath}.selector`, 1, 1_000),
+      objective: text(action.objective, `${actionPath}.objective`, 1, 4_000),
+      minimumEvidence: integer(
+        action.minimumEvidence,
+        `${actionPath}.minimumEvidence`,
+        1,
+        32,
+      ),
+      requiredEvidenceKinds: stableIdArray(
+        action.requiredEvidenceKinds,
+        `${actionPath}.requiredEvidenceKinds`,
+        1,
+        32,
+      ),
+      minimumReceipts: integer(
+        action.minimumReceipts,
+        `${actionPath}.minimumReceipts`,
+        0,
+        32,
+      ),
+      requiredReceiptKinds: stableIdArray(
+        action.requiredReceiptKinds,
+        `${actionPath}.requiredReceiptKinds`,
+        0,
+        32,
+      ),
+    };
+  });
+  return {
+    version: 1,
+    composite: true,
+    intentFingerprint: fingerprintValue(
+      source.intentFingerprint,
+      `${path}.intentFingerprint`,
+    ),
+    stage: stage as MissionCompositeLifecycleStageV1,
+    actions,
+  };
+}
+
+function normalizeMissionCompositeLifecycleStateV1(
+  outputs: Record<string, MissionJsonValueV1>,
+  spec: MissionCompositeLifecycleSpecV1,
+  path: string,
+): MissionCompositeLifecycleStateV1 {
+  if (Object.keys(outputs).length === 0) {
+    return {
+      actionCursor: 0,
+      completedActionIds: [],
+      actionAttemptCounts: {},
+    };
+  }
+  const source = record(outputs, path);
+  exactKeys(
+    source,
+    [
+      "lifecycleActionCursor",
+      "lifecycleCompletedActionIds",
+      "lifecycleActionAttemptCounts",
+    ],
+    path,
+  );
+  const actionCursor = integer(
+    source.lifecycleActionCursor,
+    `${path}.lifecycleActionCursor`,
+    0,
+    spec.actions.length,
+  );
+  const completedValues = array(
+    source.lifecycleCompletedActionIds,
+    `${path}.lifecycleCompletedActionIds`,
+  );
+  if (completedValues.length !== actionCursor) {
+    fail(
+      "invalid_shape",
+      `${path} completed actions must match the lifecycle cursor.`,
+    );
+  }
+  const completedActionIds = completedValues.map((value, index) =>
+    stableId(value, `${path}.lifecycleCompletedActionIds[${index}]`),
+  );
+  const expectedCompleted = spec.actions
+    .slice(0, actionCursor)
+    .map((action) => action.id);
+  if (!sameJson(completedActionIds, expectedCompleted)) {
+    fail(
+      "invalid_shape",
+      `${path} completed actions must be the exact ordered lifecycle prefix.`,
+    );
+  }
+  const countSource = record(
+    source.lifecycleActionAttemptCounts,
+    `${path}.lifecycleActionAttemptCounts`,
+  );
+  const knownActionIds = new Set(spec.actions.map((action) => action.id));
+  const actionAttemptCounts: Record<string, number> = {};
+  for (const [actionId, count] of Object.entries(countSource)) {
+    const normalizedId = stableId(
+      actionId,
+      `${path}.lifecycleActionAttemptCounts key`,
+    );
+    if (!knownActionIds.has(normalizedId)) {
+      fail("invalid_id", `${path} records an unknown lifecycle action attempt.`);
+    }
+    actionAttemptCounts[normalizedId] = integer(
+      count,
+      `${path}.lifecycleActionAttemptCounts.${normalizedId}`,
+      1,
+      10,
+    );
+  }
+  for (const actionId of completedActionIds) {
+    if (!actionAttemptCounts[actionId]) {
+      fail("invalid_shape", `${path} lacks a completed action attempt count.`);
+    }
+  }
+  return { actionCursor, completedActionIds, actionAttemptCounts };
+}
+
 function validateNodeAuthority(
   node: MissionNodeV3,
   envelope: MissionCapabilityEnvelopeV1,
@@ -1337,84 +1611,93 @@ function validateNodeAuthority(
     return tool;
   });
   const effectfulTools = tools.filter((tool) => tool.effect !== "read");
-  for (const tool of effectfulTools) {
-    if (tool.effect !== node.effect) {
-      fail(
-        "authority_widening",
-        `Tool ${tool.name} effect ${tool.effect} does not match node effect ${node.effect}.`,
-      );
-    }
-  }
-  if (node.effect === "read") {
-    if (effectfulTools.length > 0) {
-      fail("authority_widening", `Read-only mission node ${node.id} allows an effectful tool.`);
-    }
-    if (node.destination !== null) {
-      fail(
-        "authority_widening",
-        `Read-only mission node ${node.id} cannot declare a mutation destination.`,
-      );
-    }
-    if (node.budget.externalActions !== 0) {
-      fail(
-        "budget_exceeded",
-        `Read-only mission node ${node.id} cannot reserve external actions.`,
-      );
-    }
+  const lifecycle = getMissionCompositeLifecycleSpecV1(node);
+  if (lifecycle) {
+    validateMissionCompositeLifecycleAuthorityV1(
+      node,
+      envelope,
+      lifecycle,
+    );
   } else {
-    if (!node.destination) {
-      fail(
-        "unknown_binding",
-        `Effectful mission node ${node.id} requires a trusted destination binding.`,
-      );
-    }
-    const destination = node.destination;
-    const binding = envelope.bindings[destination.bindingId];
-    if (!binding) {
-      fail(
-        "unknown_binding",
-        `Mission node ${node.id} uses unknown destination binding ${destination.bindingId}.`,
-      );
-    }
-    if (!binding.allowedEffects.includes(destination.effect)) {
-      fail(
-        "authority_widening",
-        `Binding ${binding.id} does not allow ${destination.effect}.`,
-      );
-    }
-    if (destination.effect !== node.effect) {
-      fail(
-        "authority_widening",
-        `Mission node ${node.id} destination effect does not match its declared effect.`,
-      );
-    }
-    if (
-      !node.resourceLocks.some(
-        (lock) => lock.bindingId === destination.bindingId && lock.mode === "exclusive",
-      )
-    ) {
-      fail(
-        "authority_widening",
-        `Effectful mission node ${node.id} requires an exclusive destination lock.`,
-      );
-    }
     for (const tool of effectfulTools) {
-      if (tool.bindingKinds.length > 0 && !tool.bindingKinds.includes(binding.kind)) {
+      if (tool.effect !== node.effect) {
         fail(
-          "unknown_binding",
-          `Tool ${tool.name} cannot use binding kind ${binding.kind}.`,
+          "authority_widening",
+          `Tool ${tool.name} effect ${tool.effect} does not match node effect ${node.effect}.`,
         );
       }
     }
-    const hasExternalAction = node.effect === "external_action";
-    if (hasExternalAction !== (node.budget.externalActions > 0)) {
-      fail(
-        "budget_exceeded",
-        `Mission node ${node.id} external-action budget does not match its tool authority.`,
-      );
+    if (node.effect === "read") {
+      if (effectfulTools.length > 0) {
+        fail("authority_widening", `Read-only mission node ${node.id} allows an effectful tool.`);
+      }
+      if (node.destination !== null) {
+        fail(
+          "authority_widening",
+          `Read-only mission node ${node.id} cannot declare a mutation destination.`,
+        );
+      }
+      if (node.budget.externalActions !== 0) {
+        fail(
+          "budget_exceeded",
+          `Read-only mission node ${node.id} cannot reserve external actions.`,
+        );
+      }
+    } else {
+      if (!node.destination) {
+        fail(
+          "unknown_binding",
+          `Effectful mission node ${node.id} requires a trusted destination binding.`,
+        );
+      }
+      const destination = node.destination;
+      const binding = envelope.bindings[destination.bindingId];
+      if (!binding) {
+        fail(
+          "unknown_binding",
+          `Mission node ${node.id} uses unknown destination binding ${destination.bindingId}.`,
+        );
+      }
+      if (!binding.allowedEffects.includes(destination.effect)) {
+        fail(
+          "authority_widening",
+          `Binding ${binding.id} does not allow ${destination.effect}.`,
+        );
+      }
+      if (destination.effect !== node.effect) {
+        fail(
+          "authority_widening",
+          `Mission node ${node.id} destination effect does not match its declared effect.`,
+        );
+      }
+      if (
+        !node.resourceLocks.some(
+          (lock) => lock.bindingId === destination.bindingId && lock.mode === "exclusive",
+        )
+      ) {
+        fail(
+          "authority_widening",
+          `Effectful mission node ${node.id} requires an exclusive destination lock.`,
+        );
+      }
+      for (const tool of effectfulTools) {
+        if (tool.bindingKinds.length > 0 && !tool.bindingKinds.includes(binding.kind)) {
+          fail(
+            "unknown_binding",
+            `Tool ${tool.name} cannot use binding kind ${binding.kind}.`,
+          );
+        }
+      }
+      const hasExternalAction = node.effect === "external_action";
+      if (hasExternalAction !== (node.budget.externalActions > 0)) {
+        fail(
+          "budget_exceeded",
+          `Mission node ${node.id} external-action budget does not match its tool authority.`,
+        );
+      }
     }
   }
-  if (node.budget.toolCalls < node.allowedTools.length) {
+  if (!lifecycle && node.budget.toolCalls < node.allowedTools.length) {
     fail(
       "budget_exceeded",
       `Mission node ${node.id} tool-call budget is smaller than its allowed tool set.`,
@@ -1430,6 +1713,207 @@ function validateNodeAuthority(
   if (verifierId && !envelope.verifiers.includes(verifierId)) {
     fail("unknown_executor", `Mission node ${node.id} uses unknown verifier ${verifierId}.`);
   }
+}
+
+function validateMissionCompositeLifecycleAuthorityV1(
+  node: MissionNodeV3,
+  envelope: MissionCapabilityEnvelopeV1,
+  lifecycle: MissionCompositeLifecycleSpecV1,
+): void {
+  if (
+    Object.keys(node.inputs).length !== 1 ||
+    !node.inputs[MISSION_COMPOSITE_LIFECYCLE_INPUT_KEY_V1]
+  ) {
+    fail(
+      "authority_widening",
+      `Composite lifecycle node ${node.id} may carry only its closed lifecycle literal.`,
+    );
+  }
+  if (node.destination !== null) {
+    fail(
+      "authority_widening",
+      `Composite lifecycle node ${node.id} declares authority per action, not through one widened destination.`,
+    );
+  }
+
+  const expectedTools = [...new Set(
+    lifecycle.actions.map((action) => action.toolName),
+  )].sort();
+  if (!sameJson(node.allowedTools, expectedTools)) {
+    fail(
+      "authority_widening",
+      `Composite lifecycle node ${node.id} tool grants do not match its actions.`,
+    );
+  }
+  const expectedCapabilities = [...new Set(
+    lifecycle.actions.flatMap((action) =>
+      envelope.tools[action.toolName]?.capabilityIds ?? [],
+    ),
+  )].sort();
+  if (!sameJson(node.requiredCapabilities, expectedCapabilities)) {
+    fail(
+      "authority_widening",
+      `Composite lifecycle node ${node.id} capabilities do not match its actions.`,
+    );
+  }
+  const expectedEffect = strongestMissionAuthorityEffectV1(
+    lifecycle.actions.map((action) => action.effect),
+  );
+  if (node.effect !== expectedEffect) {
+    fail(
+      "authority_widening",
+      `Composite lifecycle node ${node.id} aggregate effect does not match its actions.`,
+    );
+  }
+
+  const expectedLockIds = new Set<string>();
+  let externalActions = 0;
+  for (const action of lifecycle.actions) {
+    const tool = envelope.tools[action.toolName];
+    if (!tool) {
+      fail("unknown_tool", `Composite lifecycle action ${action.id} uses an unknown tool.`);
+    }
+    if (tool.effect !== action.effect) {
+      fail(
+        "authority_widening",
+        `Composite lifecycle action ${action.id} effect does not match ${tool.name}.`,
+      );
+    }
+    if (action.effect === "external_action") externalActions += 1;
+    if (action.effect !== "read" && !action.bindingId) {
+      fail(
+        "unknown_binding",
+        `Effectful composite lifecycle action ${action.id} requires a trusted binding.`,
+      );
+    }
+    if (!action.bindingId) continue;
+    const binding = envelope.bindings[action.bindingId];
+    if (!binding) {
+      fail(
+        "unknown_binding",
+        `Composite lifecycle action ${action.id} uses unknown binding ${action.bindingId}.`,
+      );
+    }
+    if (!binding.allowedEffects.includes(action.effect)) {
+      fail(
+        "authority_widening",
+        `Binding ${binding.id} does not allow ${action.effect}.`,
+      );
+    }
+    if (
+      tool.bindingKinds.length > 0 &&
+      !tool.bindingKinds.includes(binding.kind)
+    ) {
+      fail(
+        "unknown_binding",
+        `Tool ${tool.name} cannot use binding kind ${binding.kind}.`,
+      );
+    }
+    if (action.effect !== "read") expectedLockIds.add(binding.id);
+  }
+  const expectedLocks = [...expectedLockIds]
+    .sort()
+    .map((bindingId) => ({ bindingId, mode: "exclusive" as const }));
+  if (!sameJson(node.resourceLocks, expectedLocks)) {
+    fail(
+      "authority_widening",
+      `Composite lifecycle node ${node.id} locks do not exactly match its effectful actions.`,
+    );
+  }
+  if (
+    node.budget.toolCalls !== lifecycle.actions.length ||
+    node.budget.externalActions !== externalActions
+  ) {
+    fail(
+      "budget_exceeded",
+      `Composite lifecycle node ${node.id} budget does not exactly match its actions.`,
+    );
+  }
+
+  const expectedMinimumEvidence = lifecycle.actions.reduce(
+    (total, action) => total + action.minimumEvidence,
+    0,
+  );
+  const expectedMinimumReceipts = lifecycle.actions.reduce(
+    (total, action) => total + action.minimumReceipts,
+    0,
+  );
+  const expectedEvidenceKinds = [...new Set(
+    lifecycle.actions.flatMap((action) => action.requiredEvidenceKinds),
+  )].sort();
+  const expectedReceiptKinds = [...new Set(
+    lifecycle.actions.flatMap((action) => action.requiredReceiptKinds),
+  )].sort();
+  const contract = node.completionContract;
+  if (
+    contract.minimumEvidence !== expectedMinimumEvidence ||
+    contract.minimumReceipts !== expectedMinimumReceipts ||
+    !sameJson(contract.requiredEvidenceKinds, expectedEvidenceKinds) ||
+    !sameJson(contract.requiredReceiptKinds, expectedReceiptKinds) ||
+    contract.verifierId !== null
+  ) {
+    fail(
+      "proof_incomplete",
+      `Composite lifecycle node ${node.id} proof contract does not cover every action.`,
+    );
+  }
+
+  const state = normalizeMissionCompositeLifecycleStateV1(
+    node.outputs,
+    lifecycle,
+    `node ${node.id} lifecycle outputs`,
+  );
+  const completedActions = lifecycle.actions.slice(0, state.actionCursor);
+  const completedMinimumEvidence = completedActions.reduce(
+    (total, action) => total + action.minimumEvidence,
+    0,
+  );
+  const completedMinimumReceipts = completedActions.reduce(
+    (total, action) => total + action.minimumReceipts,
+    0,
+  );
+  const completedEvidenceKinds = new Set(
+    completedActions.flatMap((action) => action.requiredEvidenceKinds),
+  );
+  const completedReceiptKinds = new Set(
+    completedActions.flatMap((action) => action.requiredReceiptKinds),
+  );
+  if (
+    node.evidence.length < completedMinimumEvidence ||
+    [...completedEvidenceKinds].some(
+      (kind) => !node.evidence.some((evidence) => evidence.kind === kind),
+    ) ||
+    node.receipts.length < completedMinimumReceipts ||
+    [...completedReceiptKinds].some(
+      (kind) => !node.receipts.some((receipt) => receipt.kind === kind),
+    )
+  ) {
+    fail(
+      "proof_incomplete",
+      `Composite lifecycle node ${node.id} cursor exceeds its durable action proof.`,
+    );
+  }
+  if (node.status === "complete" && state.actionCursor !== lifecycle.actions.length) {
+    fail(
+      "proof_incomplete",
+      `Completed composite lifecycle node ${node.id} has unfinished actions.`,
+    );
+  }
+}
+
+function strongestMissionAuthorityEffectV1(
+  effects: readonly MissionAuthorityEffectV1[],
+): MissionAuthorityEffectV1 {
+  const rank: Record<MissionAuthorityEffectV1, number> = {
+    read: 0,
+    mutation: 1,
+    execution: 2,
+    external_action: 3,
+  };
+  return effects.reduce(
+    (strongest, effect) => rank[effect] > rank[strongest] ? effect : strongest,
+    "read" as MissionAuthorityEffectV1,
+  );
 }
 
 function normalizePatchOperation(
@@ -1748,6 +2232,17 @@ function authoritySignature(node: MissionNodeV3): string {
 }
 
 function assertNoAuthorityWidening(oldNode: MissionNodeV3, nextNode: MissionNodeV3): void {
+  const oldLifecycle = getMissionCompositeLifecycleSpecV1(oldNode);
+  const nextLifecycle = getMissionCompositeLifecycleSpecV1(nextNode);
+  if (
+    (oldLifecycle !== null || nextLifecycle !== null) &&
+    !sameJson(oldNode.inputs, nextNode.inputs)
+  ) {
+    fail(
+      "authority_widening",
+      `Mission node ${oldNode.id} composite lifecycle actions are immutable.`,
+    );
+  }
   if (!sameJson(oldNode.destination, nextNode.destination)) {
     fail("destination_changed", `Mission node ${oldNode.id} destination is immutable.`);
   }
@@ -2237,6 +2732,14 @@ function getNodeBindingIds(node: MissionNodeV3): string[] {
       input.kind === "binding",
     )
     .map((input) => input.bindingId);
+  const lifecycle = getMissionCompositeLifecycleSpecV1(node);
+  if (lifecycle) {
+    bindings.push(
+      ...lifecycle.actions.flatMap((action) =>
+        action.bindingId ? [action.bindingId] : [],
+      ),
+    );
+  }
   if (node.destination) bindings.push(node.destination.bindingId);
   bindings.push(...node.resourceLocks.map((lock) => lock.bindingId));
   return [...new Set(bindings)].sort();

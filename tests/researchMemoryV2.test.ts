@@ -56,4 +56,54 @@ describe("ResearchMemoryRecordV2", () => {
     assert.match(generated, /^vault_[a-f0-9]{64}$/);
     assert.equal(ensureVaultScopeId(generated), generated);
   });
+
+  it("quarantines legacy verified authority as unverified current-vault memory", () => {
+    const scope = `vault_${"c".repeat(64)}`;
+    const [record] = migrateResearchMemoryIndexV2(
+      [{
+        topic: "Legacy authority",
+        path: "Agent Research Memory/legacy.md",
+        keywords: ["legacy"],
+        lastUpdated: "2026-07-15T00:00:00.000Z",
+        verificationState: "verified",
+        verifiedAt: "2026-07-15T01:00:00.000Z",
+      }],
+      scope,
+      "2026-07-16T12:00:00.000Z",
+    );
+
+    assert.equal(record.verificationState, "unverified");
+    assert.equal(record.verifiedAt, undefined);
+    assert.equal(record.path, "Agent Research Memory/legacy.md");
+    assert.equal(isResearchMemoryRecordV2(record, scope), true);
+  });
+
+  it("excludes volatile verification timestamps from V2 fingerprints", () => {
+    const scope = `vault_${"d".repeat(64)}`;
+    const base = {
+      version: 2 as const,
+      id: `research_memory_${"e".repeat(24)}`,
+      vaultScopeId: scope,
+      topic: "Stable verification identity",
+      path: "Agent Research Memory/stable.md",
+      keywords: ["stable"],
+      lastUpdated: "2026-07-16T00:00:00.000Z",
+      createdAt: "2026-07-16T00:00:00.000Z",
+      verificationState: "verified" as const,
+    };
+    const [first] = migrateResearchMemoryIndexV2(
+      [{ ...base, verifiedAt: "2026-07-16T01:00:00.000Z" }],
+      scope,
+    );
+    const [second] = migrateResearchMemoryIndexV2(
+      [{ ...base, verifiedAt: "2026-07-16T02:00:00.000Z" }],
+      scope,
+    );
+
+    assert.equal(first.verificationState, "verified");
+    assert.equal(second.verificationState, "verified");
+    assert.equal(first.fingerprint, second.fingerprint);
+    assert.equal(isResearchMemoryRecordV2(first, scope), true);
+    assert.equal(isResearchMemoryRecordV2(second, scope), true);
+  });
 });

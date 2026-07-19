@@ -83,17 +83,38 @@ export async function createPhase4TypeScriptProjectFixture(
     "utf8",
   );
   await writeFile(
+    path.join(root, "scripts", "import-simple-typescript.mjs"),
+    [
+      "import { readFile } from 'node:fs/promises';",
+      "export async function importSimpleTypeScript(relativePath) {",
+      "  const source = await readFile(relativePath, 'utf8');",
+      "  const executable = source",
+      "    .replace(/\\s+as\\s+const\\b/g, '')",
+      "    .replace(/:\\s*number\\b/g, '');",
+      "  return import(`data:text/javascript;base64,${Buffer.from(executable).toString('base64')}`);",
+      "}",
+      "export default importSimpleTypeScript;",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(
     path.join(root, "scripts", "verify-project.mjs"),
     [
       "import assert from 'node:assert/strict';",
       "import { readFile } from 'node:fs/promises';",
-      "const [math, index, readme] = await Promise.all([",
+      "const [math, index, testSource, readme] = await Promise.all([",
       "  readFile('src/math.ts', 'utf8'),",
       "  readFile('src/index.ts', 'utf8'),",
+      "  readFile('test/math.test.mjs', 'utf8'),",
       "  readFile('README.md', 'utf8'),",
       "]);",
       "assert.match(math, /export\\s+function\\s+add/);",
-      "assert.match(index, /math\\.js|math\\.ts/);",
+      "assert.match(index, /(?:from\\s+|export\\s+\\*\\s+from\\s+)[\"']\\.\\/math(?:\\.js|\\.ts)?[\"']/);",
+      "assert.match(testSource, /node:test/);",
+      "assert.match(testSource, /import-simple-typescript\\.mjs/);",
+      "assert.match(testSource, /importSimpleTypeScript\\([\\\"']src\\/math\\.ts[\\\"']\\)/);",
+      "assert.doesNotMatch(testSource, /@jest|from ['\\\"]jest/);",
       "assert.match(readme, /npm\\s+test/i);",
       `assert.match(readme, /${marker.replace(/[^A-Za-z0-9_]/gu, "_")}/);`,
       "",
@@ -103,7 +124,13 @@ export async function createPhase4TypeScriptProjectFixture(
   await git(root, ["init", "--initial-branch=main"]);
   await git(root, ["config", "user.name", "Phase 4 E2E"]);
   await git(root, ["config", "user.email", "phase4-e2e@example.invalid"]);
-  await git(root, ["add", "--", "package.json", "scripts/verify-project.mjs"]);
+  await git(root, [
+    "add",
+    "--",
+    "package.json",
+    "scripts/import-simple-typescript.mjs",
+    "scripts/verify-project.mjs",
+  ]);
   await git(root, ["commit", "-m", "phase4 TypeScript fixture baseline"]);
   const baseSha = await git(root, ["rev-parse", "HEAD"]);
   if (!/^[a-f0-9]{40}$/u.test(baseSha)) {

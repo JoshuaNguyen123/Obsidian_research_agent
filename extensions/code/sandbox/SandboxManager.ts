@@ -213,6 +213,19 @@ export interface SandboxValidationDiagnosticsV1 {
   redactedLines: number;
 }
 
+/**
+ * Foreground-only, redacted validation output for the active model repair turn.
+ * This value is deliberately separate from the durable validation receipt and
+ * must never be written to the receipt registry or conversation history.
+ */
+export interface SandboxTransientDiagnosticExcerptV1 {
+  version: 1;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  redactedLines: number;
+}
+
 export type SandboxPreparationResultV2 =
   | { status: "prepared"; action: PreparedSandboxActionV2 }
   | { status: "blocked"; blocker: SandboxDurableBlockerV2 };
@@ -221,8 +234,10 @@ export type SandboxExecutionResultV2 =
   | {
       status: "verified" | "failed";
       receipt: SandboxExecutionReceiptV2;
-      /** Redacted metadata only. Raw child-process output never crosses into tool/model output. */
+      /** Receipt-bound metadata safe for durable loop detection. */
       diagnostics: SandboxValidationDiagnosticsV1;
+      /** Redacted and bounded foreground repair context; never persisted. */
+      diagnosticExcerpt: SandboxTransientDiagnosticExcerptV1;
     }
   | { status: "blocked"; blocker: SandboxDurableBlockerV2 };
 
@@ -408,7 +423,11 @@ export class SandboxManagerV2 {
         input.workspaceManifestFingerprint,
         "workspace manifest fingerprint",
       ),
-      runtimeDigest: runtime.digest,
+      // The repository runtime record proves the declared ecosystem/pin has
+      // been resolved. Command execution is bound to the separately attested
+      // immutable sandbox bundle, whose manifest independently permits the
+      // exact executable. A repository pin hash is not a runtime image hash.
+      runtimeDigest: selected.runtimeDigest,
       probeFingerprint: status.probeFingerprint!,
       command: {
         executable: command.executable,
@@ -615,6 +634,7 @@ export class SandboxManagerV2 {
       status: receipt.status,
       receipt,
       diagnostics: transientDiagnostics(execution.stdout, execution.stderr),
+      diagnosticExcerpt: transientDiagnosticExcerpt(execution.stdout, execution.stderr),
     };
   }
 
@@ -774,7 +794,9 @@ export function parsePreparedSandboxActionV2(value: unknown): PreparedSandboxAct
 }
 
 const TRANSIENT_DIAGNOSTIC_BYTES = 16 * 1024;
-const CREDENTIAL_SHAPED_LINE = /(?:authorization|bearer\s+|api[_-]?key|(?:api|access|refresh)?[_-]?token|password|passwd|secret|cookie|credential)/iu;
+const TRANSIENT_DIAGNOSTIC_STREAM_BYTES = TRANSIENT_DIAGNOSTIC_BYTES / 2;
+const CREDENTIAL_SHAPED_LINE = /(?:authorization|bearer\s+|api[_-]?key|(?:api|access|refresh)?[_-]?token|password|passwd|secret|cookie|credential|(?:gh[pousr]_|github_pat_|lin_api_|sk-(?:proj-)?|glpat-|xox[baprs]-)[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/iu;
+const UNSAFE_DIAGNOSTIC_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu;
 
 function transientDiagnostics(
   stdoutInput: string,
@@ -797,6 +819,56 @@ function transientDiagnostics(
     truncated:
       stdoutBytes > TRANSIENT_DIAGNOSTIC_BYTES ||
       stderrBytes > TRANSIENT_DIAGNOSTIC_BYTES,
+    redactedLines,
+  };
+}
+
+function transientDiagnosticExcerpt(
+  stdoutInput: string,
+  stderrInput: string,
+): SandboxTransientDiagnosticExcerptV1 {
+  const stdout = redactAndBoundDiagnosticStream(stdoutInput);
+  const stderr = redactAndBoundDiagnosticStream(stderrInput);
+  return {
+    version: 1,
+    stdout: stdout.text,
+    stderr: stderr.text,
+    truncated: stdout.truncated || stderr.truncated,
+    redactedLines: stdout.redactedLines + stderr.redactedLines,
+  };
+}
+
+function redactAndBoundDiagnosticStream(input: string): {
+  text: string;
+  truncated: boolean;
+  redactedLines: number;
+} {
+  let redactedLines = 0;
+  const sanitized = input
+    .replace(/\r\n?/gu, "\n")
+    .split("\n")
+    .map((line) => {
+      if (CREDENTIAL_SHAPED_LINE.test(line)) {
+        redactedLines += 1;
+        return "[redacted credential-shaped diagnostic line]";
+      }
+      return line.replace(UNSAFE_DIAGNOSTIC_CONTROL, "�");
+    })
+    .join("\n");
+  if (Buffer.byteLength(sanitized, "utf8") <= TRANSIENT_DIAGNOSTIC_STREAM_BYTES) {
+    return { text: sanitized, truncated: false, redactedLines };
+  }
+  let text = "";
+  let bytes = 0;
+  for (const character of sanitized) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > TRANSIENT_DIAGNOSTIC_STREAM_BYTES) break;
+    text += character;
+    bytes += characterBytes;
+  }
+  return {
+    text: `${text}\n[diagnostic excerpt truncated]`,
+    truncated: true,
     redactedLines,
   };
 }
@@ -866,6 +938,7 @@ function buildProviderCommand(
       "--die-with-parent",
       "--new-session",
       "--ro-bind", provider.runtimeRoot!, "/runtime",
+      "--ro-bind", `${provider.runtimeRoot!}/bin`, "/bin",
       "--ro-bind", `${provider.runtimeRoot!}/lib`, "/lib",
       "--ro-bind", `${provider.runtimeRoot!}/lib64`, "/lib64",
       "--tmpfs", "/workspace",

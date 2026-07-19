@@ -6297,8 +6297,10 @@ export default class AgenticResearcherPlugin extends Plugin {
         repositoryProfiles: Record<string, unknown>;
         sandbox: { lastProbe: { observedAt: string } | null };
       };
+      getRuntimeUnresolvedRepositoryProfileCount?(): number;
     }>("agentic-researcher-code");
     let codeProfileCount = 0;
+    let codeRuntimeUnresolvedProfileCount = 0;
     let codeEditingAvailable = false;
     let codeExecutionAvailable = false;
     let codeProbeObservedAt: string | null = null;
@@ -6307,6 +6309,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       const state = codeRuntime?.readCapabilityState?.();
       const sandbox = codeRuntime?.getSandboxCapabilityStatus?.();
       codeProfileCount = Object.keys(state?.repositoryProfiles ?? {}).length;
+      codeRuntimeUnresolvedProfileCount =
+        codeRuntime?.getRuntimeUnresolvedRepositoryProfileCount?.() ?? 0;
       codeProbeObservedAt = state?.sandbox.lastProbe?.observedAt ?? null;
       codeEditingAvailable = sandbox?.editingAvailable === true;
       codeExecutionAvailable = sandbox?.executionAvailable === true;
@@ -6369,6 +6373,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           registered:
             registered.has("agentic-researcher-code") && codeRuntime !== null,
           repositoryProfileCount: codeProfileCount,
+          runtimeUnresolvedProfileCount: codeRuntimeUnresolvedProfileCount,
           editingAvailable: codeEditingAvailable,
           executionAvailable: codeExecutionAvailable,
           probeObservedAt: codeProbeObservedAt,
@@ -12180,15 +12185,10 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.updateLastActiveMarkdownFile(resolved);
       return resolved;
     }
-
-    if (this.lastActiveMarkdownFile) {
-      const file = this.app.vault.getFileByPath(this.lastActiveMarkdownFile.path);
-      if (file && file.extension === "md") {
-        this.lastActiveMarkdownFile = file;
-        return file;
-      }
-    }
-
+    // A remembered file is context history, not a writable current-note
+    // binding. Once every markdown leaf is closed, active_or_new_note must
+    // allocate a collision-free target instead of mutating the last closed
+    // note.
     return null;
   }
 

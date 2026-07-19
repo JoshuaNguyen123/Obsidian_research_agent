@@ -13,12 +13,15 @@ import {
   persistPreparedMissionGraphPatch,
   readMissionGraphStoreRecord,
 } from "../src/agent/missionGraphStore";
-import type {
-  MissionEvidenceRefV1,
-  MissionGraphPatchV1,
-  MissionGraphV3,
-  MissionNodeV3,
-  MissionReceiptRefV1,
+import type { ToolDescriptor } from "../src/agent/actions";
+import {
+  getMissionCompositeLifecycleStateV1,
+  validateMissionGraphV3,
+  type MissionEvidenceRefV1,
+  type MissionGraphPatchV1,
+  type MissionGraphV3,
+  type MissionNodeV3,
+  type MissionReceiptRefV1,
 } from "../src/agent/missionGraphV3";
 import { descriptorFor } from "../src/tools/toolDescriptors";
 import type { ToolExecutionContext, ToolRegistry } from "../src/tools/types";
@@ -158,6 +161,139 @@ test("successful proof completes a node, promotes dependencies, and persists app
   assert.deepEqual(stored.record.resourceLocks.locks, {});
 });
 
+test("composite lifecycle advances one durable action at a time and rejects wrong or replayed tools", async () => {
+  const harness = createVaultHarness();
+  const graph = await compositeLifecycleGraphFor(
+    "session-composite-lifecycle-cursor",
+  );
+  let session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const acceptedNodeId = "lifecycle-accepted_research";
+  const linearNodeId = "lifecycle-linear_hierarchy";
+
+  const prematurePublish = await session.beginToolExecution(
+    "publish_research_to_linear",
+  );
+  assert.equal(prematurePublish.ok, false);
+  if (!prematurePublish.ok) {
+    assert.match(prematurePublish.reason, /expected web_search/u);
+  }
+
+  const search = requireExecution(
+    await session.beginToolExecution("web_search"),
+  );
+  assert.match(search.lifecycleActionId ?? "", /web_search/u);
+  const afterSearch = await session.finishToolExecution(search, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[acceptedNodeId],
+      "1",
+      harness.nextTimestamp(),
+    ),
+  });
+  assert.equal(afterSearch.nodes[acceptedNodeId].status, "ready");
+  assert.equal(afterSearch.nodes[acceptedNodeId].retries.attempts, 0);
+  assert.deepEqual(
+    getMissionCompositeLifecycleStateV1(afterSearch.nodes[acceptedNodeId]),
+    {
+      actionCursor: 1,
+      completedActionIds: ["action-001-web_search"],
+      actionAttemptCounts: { "action-001-web_search": 1 },
+    },
+  );
+
+  session = await MissionGraphSession.resume({
+    context: harness.context,
+    missionId: graph.missionId,
+  });
+  const replay = await session.beginToolExecution("web_search");
+  assert.equal(replay.ok, false);
+  if (!replay.ok) assert.match(replay.reason, /already completed/u);
+
+  const publication = requireExecution(
+    await session.beginToolExecution("publish_research_to_linear"),
+  );
+  const accepted = session.graph.nodes[acceptedNodeId];
+  const afterAccepted = await session.finishToolExecution(publication, {
+    ok: true,
+    evidence: evidenceFor(accepted, "2", harness.nextTimestamp()),
+    receipt: receiptFor(accepted, "3", harness.nextTimestamp()),
+  });
+  assert.equal(afterAccepted.nodes[acceptedNodeId].status, "complete");
+  assert.equal(afterAccepted.nodes[linearNodeId].status, "ready");
+
+  const wrongLinearRead = await session.beginToolExecution("linear_get_issue");
+  assert.equal(wrongLinearRead.ok, false);
+  if (!wrongLinearRead.ok) {
+    assert.match(wrongLinearRead.reason, /publish_research_project_to_linear/u);
+  }
+
+  const hierarchyFirst = requireExecution(
+    await session.beginToolExecution("publish_research_project_to_linear"),
+  );
+  const failureFingerprint = fp("9");
+  const afterFailure = await session.finishToolExecution(hierarchyFirst, {
+    ok: false,
+    failureFingerprint,
+    failureMessage: "Transient prepared hierarchy failure.",
+  });
+  assert.equal(afterFailure.nodes[linearNodeId].status, "ready");
+  assert.equal(afterFailure.nodes[linearNodeId].retries.attempts, 1);
+
+  const hierarchyRetry = requireExecution(
+    await session.beginToolExecution("publish_research_project_to_linear"),
+  );
+  const linearNode = session.graph.nodes[linearNodeId];
+  const afterHierarchy = await session.finishToolExecution(hierarchyRetry, {
+    ok: true,
+    evidence: evidenceFor(linearNode, "4", harness.nextTimestamp()),
+    receipt: receiptFor(linearNode, "5", harness.nextTimestamp()),
+  });
+  assert.equal(afterHierarchy.nodes[linearNodeId].status, "ready");
+  assert.equal(afterHierarchy.nodes[linearNodeId].retries.attempts, 0);
+
+  const readback = requireExecution(
+    await session.beginToolExecution("linear_get_issue"),
+  );
+  const completed = await session.finishToolExecution(readback, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[linearNodeId],
+      "6",
+      harness.nextTimestamp(),
+    ),
+  });
+  assert.equal(completed.nodes[linearNodeId].status, "complete");
+  assert.equal(completed.nodes.final.status, "ready");
+  assert.deepEqual(
+    getMissionCompositeLifecycleStateV1(completed.nodes[linearNodeId])
+      ?.actionAttemptCounts,
+    {
+      "action-001-publish_research_project_to_linear": 2,
+      "action-002-linear_get_issue": 1,
+    },
+  );
+});
+
+test("composite lifecycle rejects a persisted cursor without completed-prefix proof", async () => {
+  const graph = await compositeLifecycleGraphFor(
+    "session-composite-lifecycle-proof-bound-cursor",
+  );
+  const tampered = JSON.parse(JSON.stringify(graph)) as MissionGraphV3;
+  tampered.nodes["lifecycle-accepted_research"].outputs = {
+    lifecycleActionCursor: 1,
+    lifecycleCompletedActionIds: ["action-001-web_search"],
+    lifecycleActionAttemptCounts: { "action-001-web_search": 1 },
+  };
+
+  assert.throws(
+    () => validateMissionGraphV3(tampered),
+    /cursor exceeds its durable action proof/u,
+  );
+});
+
 test("concurrent mutation starts serialize through the graph frontier and one exclusive lock", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({
@@ -238,6 +374,35 @@ test("two identical failures stop retrying and persist a resumable blocker", asy
   assert.equal(node.retries.consecutiveFailureCount, 2);
   assert.equal(node.blocker?.code, "tool_failure_repeated");
   assert.equal((await session.beginToolExecution("read_current_file")).ok, false);
+});
+
+test("a host-verified terminal domain outcome blocks on its first attempt", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-terminal-domain-outcome",
+    allowedTools: ["read_current_file"],
+    plannedTools: ["read_current_file"],
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const execution = requireExecution(
+    await session.beginToolExecution("read_current_file"),
+  );
+
+  const after = await session.finishToolExecution(execution, {
+    ok: false,
+    failureFingerprint: fp("b"),
+    failureMessage: "The domain checkpoint is terminal.",
+    terminalFailure: true,
+  });
+
+  const node = after.nodes[execution.nodeId];
+  assert.equal(node.status, "blocked");
+  assert.equal(node.retries.attempts, 1);
+  assert.equal(node.blocker?.code, "tool_failure_terminal");
+  assert.equal(node.blocker?.message, "The domain checkpoint is terminal.");
 });
 
 test("ungranted mutation is rejected while a bounded envelope-approved read is added", async () => {
@@ -672,6 +837,106 @@ async function graphFor(input: {
       now: () => GRAPH_TIME.toISOString(),
     })
   ).graph;
+}
+
+async function compositeLifecycleGraphFor(
+  missionId: string,
+): Promise<MissionGraphV3> {
+  const descriptors = [
+    sessionLifecycleDescriptor("web_search", "browser", "read"),
+    sessionLifecycleDescriptor(
+      "publish_research_to_linear",
+      "linear",
+      "publish",
+    ),
+    sessionLifecycleDescriptor(
+      "publish_research_project_to_linear",
+      "linear",
+      "publish",
+    ),
+    sessionLifecycleDescriptor("linear_get_issue", "linear", "read"),
+  ];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const objective = [
+    "Research checkers rules using public web sources.",
+    "Shape the accepted research into a Linear project and issues.",
+  ].join(" ");
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective,
+    toolRegistry: registry,
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: [
+      "web_search",
+      "publish_research_to_linear",
+      "publish_research_project_to_linear",
+      "linear_get_issue",
+    ],
+    maxToolCalls: 4,
+    maxWallClockMs: 120_000,
+    now: GRAPH_TIME,
+  });
+  assert.ok(host.projectLifecycleIntent);
+  return (
+    await planMissionGraphV3({
+      mission: { missionId, objective },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+}
+
+function sessionLifecycleDescriptor(
+  name: string,
+  system: ToolDescriptor["capability"]["system"],
+  effect: ToolDescriptor["effect"],
+): ToolDescriptor {
+  const readOnly = effect === "read";
+  return {
+    version: 1,
+    name,
+    capability: {
+      system,
+      resourceType: `${system}_lifecycle_resource`,
+      action: readOnly ? "read" : "publish",
+    },
+    effect,
+    risk: readOnly ? "low" : "high",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: readOnly,
+      fallback: readOnly ? "none" : "exact",
+    },
+    execution: {
+      preparation: readOnly ? "none" : "required",
+      cacheable: readOnly,
+      parallelSafe: readOnly,
+    },
+    durability: {
+      journal: !readOnly,
+      receipt: !readOnly,
+      readback: readOnly ? "none" : "required",
+      reconciliation: readOnly ? "none" : "required",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    ...(readOnly ? {} : { receiptKind: "external_action" as const }),
+  };
 }
 
 function registryFor(names: string[]): ToolRegistry {

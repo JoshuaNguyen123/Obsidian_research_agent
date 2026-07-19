@@ -264,6 +264,11 @@ test("all provider command specs are shell-free, bounded, and omit host/root/soc
     const prepared = await manager.prepareExecution(prepareInput());
     assert.equal(prepared.status, "prepared");
     if (prepared.status !== "prepared") continue;
+    assert.equal(
+      prepared.action.runtimeDigest,
+      provider.runtimeDigest,
+      "execution must use the freshly probed immutable bundle digest rather than a repository pin hash",
+    );
     const probe = buildSandboxProbeCommandV2(provider);
     const execute = buildSandboxExecutionCommandV2(provider, prepared.action);
     assert.equal(
@@ -289,6 +294,7 @@ test("all provider command specs are shell-free, bounded, and omit host/root/soc
       assert.ok(execute.args.includes("--unshare-all"));
       assert.ok(execute.args.includes("--unshare-net"));
       assert.ok(inSequence(execute.args, ["--ro-bind", "/opt/agentic/runtime", "/runtime"]));
+      assert.ok(inSequence(execute.args, ["--ro-bind", "/opt/agentic/runtime/bin", "/bin"]));
       assert.ok(inSequence(execute.args, ["--ro-bind", "/opt/agentic/runtime/lib", "/lib"]));
       assert.ok(inSequence(execute.args, ["--ro-bind", "/opt/agentic/runtime/lib64", "/lib64"]));
       assert.ok(inSequence(execute.args, ["--remount-ro", "/"]));
@@ -564,8 +570,14 @@ test("validation contribution withholds success when durable receipt persistence
   assert.equal(executions, 1, "sandbox ran once, but no green tool result was returned");
 });
 
-test("failed validation exposes diagnostic metadata only and durable observer sees hashes only", async () => {
+test("failed validation exposes a redacted bounded foreground excerpt while durable observer sees hashes only", async () => {
   const durableSources: unknown[] = [];
+  const bareCredential = `github_pat_${"z".repeat(40)}`;
+  const stderr = [
+    "API_TOKEN=do-not-persist",
+    bareCredential,
+    "AssertionError: expected 2, received 3",
+  ].join("\n");
   const manager = new SandboxManagerV2({
     providers: [dockerProvider()],
     runner: {
@@ -576,7 +588,7 @@ test("failed validation exposes diagnostic metadata only and durable observer se
         return {
           exitCode: 1,
           stdout: "src/index.ts(4,3): TS2322 expected string but received number",
-          stderr: "API_TOKEN=do-not-persist\nAssertionError: expected 2, received 3",
+          stderr,
         };
       },
     },
@@ -591,7 +603,7 @@ test("failed validation exposes diagnostic metadata only and durable observer se
       stagedFiles: [{ path: "src/index.ts", bytes: source }],
     }),
     async observeValidationReceipt(input) {
-      durableSources.push(structuredClone(input.receipt));
+      durableSources.push(structuredClone(input.diagnostics));
       return {
         version: 1,
         kindName: "code_validation",
@@ -635,13 +647,23 @@ test("failed validation exposes diagnostic metadata only and durable observer se
       stderrBytes: number;
       redactedLines: number;
     };
+    validationDiagnosticExcerpt: {
+      stdout: string;
+      stderr: string;
+      truncated: boolean;
+      redactedLines: number;
+    };
   };
   assert.match(output.validationDiagnostics.stdoutSha256, /^sha256:[a-f0-9]{64}$/u);
   assert.match(output.validationDiagnostics.stderrSha256, /^sha256:[a-f0-9]{64}$/u);
   assert.equal(output.validationDiagnostics.stdoutBytes, Buffer.byteLength("src/index.ts(4,3): TS2322 expected string but received number", "utf8"));
-  assert.equal(output.validationDiagnostics.stderrBytes, Buffer.byteLength("API_TOKEN=do-not-persist\nAssertionError: expected 2, received 3", "utf8"));
-  assert.equal(output.validationDiagnostics.redactedLines, 1);
-  assert.doesNotMatch(JSON.stringify(output), /TS2322|AssertionError|do-not-persist/iu);
+  assert.equal(output.validationDiagnostics.stderrBytes, Buffer.byteLength(stderr, "utf8"));
+  assert.equal(output.validationDiagnostics.redactedLines, 2);
+  assert.match(output.validationDiagnosticExcerpt.stdout, /TS2322/iu);
+  assert.match(output.validationDiagnosticExcerpt.stderr, /AssertionError/iu);
+  assert.match(output.validationDiagnosticExcerpt.stderr, /redacted credential-shaped/iu);
+  assert.doesNotMatch(JSON.stringify(output), /do-not-persist/iu);
+  assert.doesNotMatch(JSON.stringify(output), new RegExp(bareCredential, "u"));
   assert.doesNotMatch(JSON.stringify(durableSources), /TS2322|AssertionError|do-not-persist/iu);
 });
 

@@ -636,7 +636,9 @@ async function buildGraphFromProposalNodes({
   });
 }
 
-function initializeNodeProposal(proposal: MissionGraphNodeProposalV1): MissionNodeV3 {
+function initializeNodeProposal(
+  proposal: MissionGraphNodeProposalV1,
+): MissionNodeV3 {
   return {
     id: proposal.id,
     dependencyIds: [...proposal.dependencyIds],

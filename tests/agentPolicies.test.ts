@@ -41,6 +41,21 @@ test("explicit repository file sets are extracted without adjacent mission paths
   );
 });
 
+test("a singular affirmative workspace creation binds only its direct source path", () => {
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Create an isolated scratch workspace phase4-python, then create app.py. Use code_workspace_create_file.",
+    ),
+    ["app.py"],
+  );
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Do not create secrets.py. Create the Linear issue described in Projects/Plan.md.",
+    ),
+    [],
+  );
+});
+
 test("explicit workspace reads recognize affirmative protected contracts only", () => {
   assert.deepEqual(
     extractExplicitWorkspaceReadFilePaths(

@@ -54,6 +54,12 @@ export interface ContinuationHandoffV1 {
   fingerprint: string;
 }
 
+export interface ContinuationHandoffAuthorityV1 {
+  ledger: MissionLedger;
+  graph?: MissionGraphV3 | null;
+  lineageFingerprints?: string[];
+}
+
 export function buildContinuationHandoffV1(input: {
   ledger: MissionLedger;
   graph?: MissionGraphV3 | null;
@@ -160,6 +166,7 @@ export function buildContinuationHandoffV1(input: {
 
 export function validateContinuationHandoffV1(
   value: unknown,
+  authority?: ContinuationHandoffAuthorityV1,
 ): { ok: true; value: ContinuationHandoffV1 } | { ok: false; errors: string[] } {
   const errors: string[] = [];
   if (!isRecord(value)) return { ok: false, errors: ["handoff_not_an_object"] };
@@ -184,10 +191,20 @@ export function validateContinuationHandoffV1(
   if (value.graphFrontier !== null && !isRecord(value.graphFrontier)) {
     errors.push("invalid_graph_frontier");
   }
+  errors.push(...validateContinuationHandoffShape(value));
   if (errors.length > 0) return { ok: false, errors };
   const { createdAt: _createdAt, fingerprint: stored, ...core } = value;
   if (fingerprint(core) !== stored) {
     return { ok: false, errors: ["fingerprint_mismatch"] };
+  }
+  if (authority) {
+    const authorityErrors = validateContinuationAuthority(
+      value as unknown as ContinuationHandoffV1,
+      authority,
+    );
+    if (authorityErrors.length > 0) {
+      return { ok: false, errors: authorityErrors };
+    }
   }
   return { ok: true, value: value as unknown as ContinuationHandoffV1 };
 }
@@ -242,6 +259,229 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isFingerprint(value: unknown): value is string {
   return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
+}
+
+function validateContinuationHandoffShape(
+  value: Record<string, unknown>,
+): string[] {
+  const errors: string[] = [];
+  const exactKeys = new Set([
+    "version",
+    "runId",
+    "graphFrontier",
+    "evidence",
+    "readbackFingerprints",
+    "receiptFingerprints",
+    "approvals",
+    "bindingFingerprints",
+    "lineageFingerprints",
+    "recovery",
+    "proofDebt",
+    "createdAt",
+    "fingerprint",
+  ]);
+  if (Object.keys(value).some((key) => !exactKeys.has(key))) {
+    errors.push("unknown_handoff_field");
+  }
+  if (isRecord(value.graphFrontier)) {
+    const frontierKeys = new Set([
+      "missionId",
+      "revision",
+      "graphFingerprint",
+      "activeNodeIds",
+      "readyNodeIds",
+    ]);
+    if (Object.keys(value.graphFrontier).some((key) => !frontierKeys.has(key))) {
+      errors.push("unknown_graph_frontier_field");
+    }
+    if (
+      typeof value.graphFrontier.missionId !== "string" ||
+      !value.graphFrontier.missionId ||
+      !Number.isInteger(value.graphFrontier.revision) ||
+      (value.graphFrontier.revision as number) < 0 ||
+      !isFingerprint(value.graphFrontier.graphFingerprint) ||
+      !isUniqueStringArray(value.graphFrontier.activeNodeIds) ||
+      !isUniqueStringArray(value.graphFrontier.readyNodeIds)
+    ) {
+      errors.push("invalid_graph_frontier_shape");
+    }
+  }
+  if (
+    !Array.isArray(value.evidence) ||
+    value.evidence.some(
+      (item) =>
+        !isRecord(item) ||
+        !hasExactKeys(item, ["id", "fingerprint"]) ||
+        typeof item.id !== "string" ||
+        !item.id ||
+        !isFingerprint(item.fingerprint),
+    )
+  ) {
+    errors.push("invalid_evidence_shape");
+  }
+  if (
+    !Array.isArray(value.approvals) ||
+    value.approvals.some(
+      (item) =>
+        !isRecord(item) ||
+        !hasExactKeys(item, ["id", "decision", "fingerprint"]) ||
+        typeof item.id !== "string" ||
+        !item.id ||
+        typeof item.decision !== "string" ||
+        !item.decision ||
+        !isFingerprint(item.fingerprint),
+    )
+  ) {
+    errors.push("invalid_approvals_shape");
+  }
+  for (const key of [
+    "readbackFingerprints",
+    "receiptFingerprints",
+    "bindingFingerprints",
+    "lineageFingerprints",
+  ] as const) {
+    if (!isUniqueStringArray(value[key], isFingerprint)) {
+      errors.push(`invalid_${key}_shape`);
+    }
+  }
+  if (
+    !isRecord(value.recovery) ||
+    !hasExactKeys(value.recovery, [
+      "stalledCount",
+      "lastMeaningfulAction",
+      "remainingActions",
+    ]) ||
+    !Number.isInteger(value.recovery.stalledCount) ||
+    (value.recovery.stalledCount as number) < 0 ||
+    (value.recovery.lastMeaningfulAction !== null &&
+      typeof value.recovery.lastMeaningfulAction !== "string") ||
+    !isUniqueStringArray(value.recovery.remainingActions)
+  ) {
+    errors.push("invalid_recovery_shape");
+  }
+  if (
+    !isRecord(value.proofDebt) ||
+    !hasExactKeys(value.proofDebt, ["missing", "blocked", "resumeBlocked"]) ||
+    !isUniqueStringArray(value.proofDebt.missing) ||
+    typeof value.proofDebt.blocked !== "boolean" ||
+    typeof value.proofDebt.resumeBlocked !== "boolean"
+  ) {
+    errors.push("invalid_proof_debt_shape");
+  }
+  return uniqueSorted(errors);
+}
+
+function validateContinuationAuthority(
+  handoff: ContinuationHandoffV1,
+  authority: ContinuationHandoffAuthorityV1,
+): string[] {
+  const errors: string[] = [];
+  if (handoff.runId !== authority.ledger.runId) {
+    errors.push("authority_run_id_mismatch");
+  }
+  const expected = buildContinuationHandoffV1({
+    ledger: authority.ledger,
+    graph: authority.graph ?? null,
+    lineageFingerprints: authority.lineageFingerprints ?? [],
+    now: new Date(handoff.createdAt),
+  });
+  requireSubset(
+    handoff.evidence.map((item) => `${item.id}:${item.fingerprint}`),
+    expected.evidence.map((item) => `${item.id}:${item.fingerprint}`),
+    "authority_evidence_mismatch",
+    errors,
+  );
+  requireSubset(
+    handoff.approvals.map(
+      (item) => `${item.id}:${item.decision}:${item.fingerprint}`,
+    ),
+    expected.approvals.map(
+      (item) => `${item.id}:${item.decision}:${item.fingerprint}`,
+    ),
+    "authority_approval_mismatch",
+    errors,
+  );
+  requireSubset(
+    handoff.readbackFingerprints,
+    expected.readbackFingerprints,
+    "authority_readback_mismatch",
+    errors,
+  );
+  requireSubset(
+    handoff.receiptFingerprints,
+    expected.receiptFingerprints,
+    "authority_receipt_mismatch",
+    errors,
+  );
+  requireSubset(
+    handoff.bindingFingerprints,
+    expected.bindingFingerprints,
+    "authority_binding_mismatch",
+    errors,
+  );
+  requireSubset(
+    handoff.lineageFingerprints,
+    expected.lineageFingerprints,
+    "authority_lineage_mismatch",
+    errors,
+  );
+  if (handoff.graphFrontier) {
+    const graph = authority.graph ?? null;
+    if (!graph || handoff.graphFrontier.missionId !== graph.missionId) {
+      errors.push("authority_graph_mismatch");
+    } else if (handoff.graphFrontier.revision > graph.revision) {
+      errors.push("authority_graph_revision_ahead");
+    } else {
+      const nodeIds = new Set(Object.keys(graph.nodes));
+      if (
+        [...handoff.graphFrontier.activeNodeIds, ...handoff.graphFrontier.readyNodeIds]
+          .some((id) => !nodeIds.has(id))
+      ) {
+        errors.push("authority_graph_frontier_node_missing");
+      }
+      if (
+        handoff.graphFrontier.revision === graph.revision &&
+        handoff.graphFrontier.graphFingerprint !==
+          expected.graphFrontier?.graphFingerprint
+      ) {
+        errors.push("authority_graph_fingerprint_mismatch");
+      }
+    }
+  }
+  return uniqueSorted(errors);
+}
+
+function requireSubset(
+  values: readonly string[],
+  expectedValues: readonly string[],
+  error: string,
+  errors: string[],
+): void {
+  const expected = new Set(expectedValues);
+  if (values.some((value) => !expected.has(value))) errors.push(error);
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const expected = new Set(keys);
+  return (
+    Object.keys(value).length === expected.size &&
+    Object.keys(value).every((key) => expected.has(key))
+  );
+}
+
+function isUniqueStringArray(
+  value: unknown,
+  predicate: (value: unknown) => boolean = (item) =>
+    typeof item === "string" && item.length > 0,
+): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(predicate) &&
+    new Set(value).size === value.length
+  );
 }
 
 export interface ContinuationMemoryBundle {
