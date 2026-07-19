@@ -19,6 +19,7 @@ import {
   getVerifiedWorkspaceReadObservation,
   getVerifiedWorkspaceReadRefreshBinding,
   getVerifiedWorkspaceSupportingReadRefreshBindings,
+  getVerifiedWorkspaceWriteObservation,
   getVerifiedLinearHierarchyIssueId,
   getCompoundLifecycleResearchGraphToolNames,
   getPendingMissionGraphWriteToolNames,
@@ -4079,6 +4080,76 @@ test("workspace correction preserves the verified read binding after transcript 
     content: "def legal_moves():\n    return [\"forced\"]\n",
     expectedSha256: sha256,
   });
+});
+
+test("multi-file correction selects the host-verified workspace when path observations are ambiguous", () => {
+  const path = "checkers/game.py";
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  rememberVerifiedWorkspaceReadResult(
+    runtimeCache,
+    { name: "code_workspace_read", arguments: { path } },
+    { rootMissionId: "root-segment" },
+    {
+      ok: true,
+      toolName: "code_workspace_read",
+      output: {
+        path,
+        sha256: `sha256:${"a".repeat(64)}`,
+        content: "unscoped earlier observation\n",
+      },
+    },
+  );
+  rememberVerifiedWorkspaceReadResult(
+    runtimeCache,
+    {
+      name: "code_workspace_read",
+      arguments: { workspaceId: "du06-workspace", path },
+    },
+    { rootMissionId: "root-segment" },
+    {
+      ok: true,
+      toolName: "code_workspace_read",
+      output: {
+        path,
+        sha256: `sha256:${"b".repeat(64)}`,
+        content: "host-refreshed observation\n",
+      },
+    },
+  );
+  assert.equal(
+    getVerifiedWorkspaceReadObservation(runtimeCache, path),
+    null,
+    "a path-only lookup must remain fail-closed across workspace labels",
+  );
+  const receipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-19T01:40:00.000Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "du06-workspace",
+      path: "du06-workspace",
+      workspaceId: "du06-workspace",
+    },
+  };
+  assert.deepEqual(
+    getVerifiedWorkspaceWriteObservation(runtimeCache, path, [receipt]),
+    {
+      workspaceId: "du06-workspace",
+      path,
+      sha256: `sha256:${"b".repeat(64)}`,
+      content: "host-refreshed observation\n",
+    },
+  );
 });
 
 test("workspace correction refreshes completed exact reads in its durably created workspace", () => {

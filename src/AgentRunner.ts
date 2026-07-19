@@ -6551,7 +6551,11 @@ export async function runAgentMission({
       const observation =
         typeof exactPath === "string" &&
         !exactPath.startsWith("prompt-scoped-")
-          ? getVerifiedWorkspaceReadObservation(runtimeCache, exactPath)
+          ? getVerifiedWorkspaceWriteObservation(
+              runtimeCache,
+              exactPath,
+              writeReceipts,
+            )
           : null;
       const boundToolCall =
         typeof exactPath === "string" && observation
@@ -8745,9 +8749,10 @@ export async function runAgentMission({
         )
       : null;
     let stepVerifiedWorkspaceReadObservation = stepGraphDestinationSelector
-      ? getVerifiedWorkspaceReadObservation(
+      ? getVerifiedWorkspaceWriteObservation(
           runtimeCache,
           stepGraphDestinationSelector,
+          writeReceipts,
         )
       : null;
     if (!stepVerifiedWorkspaceReadObservation) {
@@ -11804,6 +11809,29 @@ export function getMissionGraphFrontierDestinationSelector(
   return selectors.size === 1 ? [...selectors][0]! : null;
 }
 
+function getSingleVerifiedDurableWorkspaceId(
+  durableReceipts: readonly AgentRunReceipt[],
+): string | null {
+  const workspaceIds = new Set(
+    durableReceipts
+      .filter(
+        (receipt) =>
+          receipt.toolName === "code_workspace_create" &&
+          (receipt.commitKind === "committed" ||
+            receipt.commitKind === "reconciled") &&
+          receipt.readback?.status === "verified" &&
+          receipt.resource?.system === "workspace",
+      )
+      .map((receipt) =>
+        receipt.resource?.workspaceId?.trim() ||
+        receipt.resource?.path?.trim() ||
+        "",
+      )
+      .filter((workspaceId) => workspaceId.length > 0),
+  );
+  return workspaceIds.size === 1 ? [...workspaceIds][0]! : null;
+}
+
 export function getVerifiedWorkspaceReadRefreshBinding(
   graph: MissionGraphV3 | null | undefined,
   stepTools: readonly ModelToolDefinition[],
@@ -11845,26 +11873,10 @@ export function getVerifiedWorkspaceReadRefreshBinding(
   // destination ambiguous: the host still performs one fresh read below and
   // binds the write to the newly observed hash and content.
   if (completedExactReads.length === 0) return null;
-  const workspaceIds = new Set(
-    durableReceipts
-      .filter(
-        (receipt) =>
-          receipt.toolName === "code_workspace_create" &&
-          (receipt.commitKind === "committed" ||
-            receipt.commitKind === "reconciled") &&
-          receipt.readback?.status === "verified" &&
-          receipt.resource?.system === "workspace",
-      )
-      .map((receipt) =>
-        receipt.resource?.workspaceId?.trim() ||
-        receipt.resource?.path?.trim() ||
-        "",
-      )
-      .filter((workspaceId) => workspaceId.length > 0),
-  );
-  if (workspaceIds.size !== 1) return null;
+  const workspaceId = getSingleVerifiedDurableWorkspaceId(durableReceipts);
+  if (!workspaceId) return null;
   return {
-    workspaceId: [...workspaceIds][0]!,
+    workspaceId,
     path: graphDestinationSelector,
   };
 }
@@ -22464,6 +22476,23 @@ export function getVerifiedWorkspaceReadObservation(
     (observation) => observation.path === path,
   );
   return matches.length === 1 ? matches[0]! : null;
+}
+
+/**
+ * Resolve a corrective write only against the single durable workspace that
+ * the host independently verified. Earlier model-authored reads may omit or
+ * vary the workspace label, so a path-only lookup can become ambiguous after
+ * the host refreshes sibling files during a multi-file repair.
+ */
+export function getVerifiedWorkspaceWriteObservation(
+  runtimeCache: AgentRuntimeCache | undefined,
+  path: string,
+  durableReceipts: readonly AgentRunReceipt[],
+): VerifiedWorkspaceReadObservation | null {
+  const workspaceId = getSingleVerifiedDurableWorkspaceId(durableReceipts);
+  return workspaceId
+    ? getVerifiedWorkspaceReadObservation(runtimeCache, path, workspaceId)
+    : null;
 }
 
 export function bindVerifiedWorkspaceWriteExpected(
