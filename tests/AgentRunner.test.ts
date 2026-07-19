@@ -4,6 +4,7 @@ import {
   MAX_AGENT_STEPS,
   attachGroundedPassageCitations,
   bindAuthoritativeGraphCodeValidation,
+  bindVerifiedWorkspaceRead,
   bindVerifiedWorkspaceWriteExpected,
   buildObservedMissionGraphFrontierBinding,
   buildMissionGraphFrontierTurnContext,
@@ -4141,6 +4142,25 @@ test("multi-file correction selects the host-verified workspace when path observ
       workspaceId: "du06-workspace",
     },
   };
+  assert.deepEqual(
+    bindVerifiedWorkspaceRead(
+      {
+        name: "code_workspace_read",
+        arguments: {
+          workspaceId: "root-segment",
+          path: "wrong/model/path.py",
+          maxBytes: 10_000,
+        },
+      },
+      path,
+      [receipt],
+    )?.arguments,
+    {
+      workspaceId: "du06-workspace",
+      path,
+      maxBytes: 10_000,
+    },
+  );
   assert.deepEqual(
     getVerifiedWorkspaceWriteObservation(runtimeCache, path, [receipt]),
     {

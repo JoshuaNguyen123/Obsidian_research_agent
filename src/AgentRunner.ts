@@ -6536,6 +6536,90 @@ export async function runAgentMission({
       }
     }
     if (
+      toolCall.name === "code_workspace_read" &&
+      missionGraphExecution &&
+      missionGraphSession
+    ) {
+      const graph = missionGraphSession.graph;
+      const executionNode = graph.nodes[missionGraphExecution.nodeId];
+      const executionResource = executionNode?.inputs.resource;
+      const exactPath =
+        executionNode?.destination?.selector ??
+        (executionResource?.kind === "binding"
+          ? executionResource.selector
+          : null);
+      const readsCreatedWorkspace = Object.values(graph.nodes).some(
+        (node) =>
+          node.status === "complete" &&
+          node.allowedTools.length === 1 &&
+          node.allowedTools[0] === "code_workspace_create",
+      );
+      if (
+        readsCreatedWorkspace &&
+        typeof exactPath === "string" &&
+        !exactPath.startsWith("prompt-scoped-")
+      ) {
+        const boundToolCall = bindVerifiedWorkspaceRead(
+          toolCall,
+          exactPath,
+          writeReceipts,
+        );
+        if (!boundToolCall) {
+          const blockedResult: ToolExecutionResult = {
+            ok: false,
+            toolName: toolCall.name,
+            mutationState: "not_applied",
+            error: {
+              code: "workspace_read_binding_unavailable",
+              message:
+                "The exact independently verified created-workspace binding is unavailable or ambiguous.",
+            },
+          };
+          await finishMissionGraphTool(
+            missionGraphExecution,
+            toolCall.name,
+            blockedResult,
+          );
+          events.onTrace?.({
+            id: `${step}:${String(toolIndex)}:code_workspace_read:binding-missing`,
+            kind: "tool_rejected",
+            step,
+            toolName: toolCall.name,
+            message: blockedResult.error!.message,
+            error: blockedResult.error,
+          });
+          if (recordTranscript) {
+            appendToolTranscript({
+              messages,
+              toolCall,
+              resultContent: serializeToolResultForModel(blockedResult),
+              origin,
+              fallbackId: buildToolCallFallbackId(
+                runId,
+                step,
+                toolIndex,
+                toolCall.name,
+              ),
+            });
+          }
+          return blockedResult;
+        }
+        toolCall = boundToolCall;
+        events.onTrace?.({
+          id: `${step}:${String(toolIndex)}:code_workspace_read:verified-binding`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message:
+            "Bound the exact graph read to the independently verified created workspace and destination path.",
+          outputPreview: {
+            source: "verified_workspace_create_receipt",
+            path: exactPath,
+          },
+        });
+      }
+    }
+    if (
       toolCall.name === "code_workspace_write_expected" &&
       missionGraphExecution &&
       missionGraphSession
@@ -22493,6 +22577,25 @@ export function getVerifiedWorkspaceWriteObservation(
   return workspaceId
     ? getVerifiedWorkspaceReadObservation(runtimeCache, path, workspaceId)
     : null;
+}
+
+export function bindVerifiedWorkspaceRead(
+  toolCall: ModelToolCall,
+  exactPath: string,
+  durableReceipts: readonly AgentRunReceipt[],
+): ModelToolCall | null {
+  const workspaceId = getSingleVerifiedDurableWorkspaceId(durableReceipts);
+  if (toolCall.name !== "code_workspace_read" || !workspaceId || !exactPath) {
+    return null;
+  }
+  return {
+    ...toolCall,
+    arguments: {
+      ...toolCall.arguments,
+      workspaceId,
+      path: exactPath,
+    },
+  };
 }
 
 export function bindVerifiedWorkspaceWriteExpected(
