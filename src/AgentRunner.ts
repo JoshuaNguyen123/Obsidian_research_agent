@@ -11897,7 +11897,7 @@ export function bindAuthoritativeGraphCodeValidation(
   };
 }
 
-const MAX_VERIFIED_WORKSPACE_SUPPORTING_READS = 4;
+const MAX_VERIFIED_WORKSPACE_SUPPORTING_READS = 8;
 
 /**
  * Rehydrate completed exact reads that are prerequisites for a correction but
@@ -11940,7 +11940,7 @@ export function getVerifiedWorkspaceSupportingReadRefreshBindings(
           !selector.startsWith("prompt-scoped-"),
       ),
   );
-  const supportingPaths = new Set<string>();
+  const supportingPaths = new Map<string, 0 | 1>();
   for (const dependencyId of readyWrites[0]!.dependencyIds) {
     const node = graph.nodes[dependencyId];
     if (
@@ -11955,17 +11955,22 @@ export function getVerifiedWorkspaceSupportingReadRefreshBindings(
     if (
       !selector ||
       selector === graphDestinationSelector ||
-      selector.startsWith("prompt-scoped-") ||
-      writableSelectors.has(selector)
+      selector.startsWith("prompt-scoped-")
     ) {
       continue;
     }
-    supportingPaths.add(selector);
+    // Protected/non-writable contracts sort first so they cannot be displaced
+    // by the bounded snapshot. Other declared outputs are still untrusted
+    // context only; the active write remains bound to its own selector/SHA.
+    supportingPaths.set(selector, writableSelectors.has(selector) ? 1 : 0);
   }
   return [...supportingPaths]
-    .sort((left, right) => left.localeCompare(right))
+    .sort(
+      ([leftPath, leftPriority], [rightPath, rightPriority]) =>
+        leftPriority - rightPriority || leftPath.localeCompare(rightPath),
+    )
     .slice(0, MAX_VERIFIED_WORKSPACE_SUPPORTING_READS)
-    .map((path) => ({ workspaceId: primary.workspaceId, path }));
+    .map(([path]) => ({ workspaceId: primary.workspaceId, path }));
 }
 
 function getMissionGraphNodeSelector(
@@ -19461,10 +19466,12 @@ export function buildObservedMissionGraphFrontierBinding(
           observation.content.length <= 40_000 &&
           /^sha256:[a-f0-9]{64}$/u.test(observation.sha256),
       )
-      .sort((left, right) => left.path.localeCompare(right.path))
       .filter((observation) => {
+        if (supportingChars + observation.content.length > 40_000) {
+          return false;
+        }
         supportingChars += observation.content.length;
-        return supportingChars <= 40_000;
+        return true;
       })
       .map(
         (observation) =>

@@ -4024,6 +4024,18 @@ test("workspace correction preserves the verified read binding after transcript 
     sha256: `sha256:${"d".repeat(64)}`,
     content: "assert CheckersGame.initial()\n",
   };
+  const rejectedLargeSibling = {
+    workspaceId: "checkers-workspace",
+    path: "checkers/generated_large.py",
+    sha256: `sha256:${"e".repeat(64)}`,
+    content: "x".repeat(39_990),
+  };
+  const laterSmallSibling = {
+    workspaceId: "checkers-workspace",
+    path: "checkers/cli.py",
+    sha256: `sha256:${"f".repeat(64)}`,
+    content: "def main():\n    return 0\n",
+  };
 
   const frontier = buildObservedMissionGraphFrontierBinding(
     [],
@@ -4038,12 +4050,15 @@ test("workspace correction preserves the verified read binding after transcript 
     "checkers/game.py",
     null,
     observation,
-    [supportingObservation],
+    [supportingObservation, rejectedLargeSibling, laterSmallSibling],
   );
   assert.match(frontier ?? "", new RegExp(sha256));
   assert.match(frontier ?? "", /currentContent="def legal_moves\(\):\\n    return \[\]\\n"/u);
   assert.match(frontier ?? "", /scripts\/verify_project\.py/u);
   assert.match(frontier ?? "", /assert CheckersGame\.initial\(\)/u);
+  assert.doesNotMatch(frontier ?? "", /checkers\/generated_large\.py/u);
+  assert.match(frontier ?? "", /checkers\/cli\.py/u);
+  assert.match(frontier ?? "", /def main/u);
   assert.match(frontier ?? "", /UNTRUSTED SUPPORTING READ CONTEXT/u);
 
   const bound = bindVerifiedWorkspaceWriteExpected(
@@ -4113,11 +4128,35 @@ test("workspace correction refreshes completed exact reads in its durably create
           },
         },
       },
+      siblingRead: {
+        id: "siblingRead",
+        status: "complete",
+        allowedTools: ["code_workspace_read"],
+        inputs: {
+          resource: {
+            kind: "binding",
+            bindingId: "workspace-binding",
+            selector: "checkers/cli.py",
+          },
+        },
+      },
+      siblingWrite: {
+        id: "siblingWrite",
+        status: "queued",
+        allowedTools: ["code_workspace_write_expected"],
+        dependencyIds: ["siblingRead"],
+        inputs: {},
+        destination: {
+          bindingId: "workspace-binding",
+          effect: "workspace_mutation",
+          selector: "checkers/cli.py",
+        },
+      },
       write: {
         id: "write",
         status: "ready",
         allowedTools: ["code_workspace_write_expected"],
-        dependencyIds: ["read", "protectedRead", "contractRead"],
+        dependencyIds: ["read", "protectedRead", "contractRead", "siblingRead"],
         inputs: {},
         destination: {
           bindingId: "workspace-binding",
@@ -4163,6 +4202,9 @@ test("workspace correction refreshes completed exact reads in its durably create
     [{
       workspaceId: "du06-workspace",
       path: "scripts/verify_project.py",
+    }, {
+      workspaceId: "du06-workspace",
+      path: "checkers/cli.py",
     }],
   );
   assert.deepEqual(
@@ -4189,8 +4231,14 @@ test("workspace correction refreshes completed exact reads in its durably create
       [receipt],
       path,
     ),
-    [],
-    "a writable graph selector must never be replayed as supporting contract context",
+    [{
+      workspaceId: "du06-workspace",
+      path: "checkers/cli.py",
+    }, {
+      workspaceId: "du06-workspace",
+      path: "scripts/verify_project.py",
+    }],
+    "another writable selector may be untrusted context but cannot change the active write binding",
   );
   assert.equal(
     getVerifiedWorkspaceReadRefreshBinding(
