@@ -33,6 +33,7 @@ import {
   resolveLinearIssueReadbackBinding,
   resolveThinkingMode,
   rememberVerifiedWorkspaceReadResult,
+  resolveMissionGraphExecutionProofContractV1,
   restoreTrustedWebFetchResultsFromEvidence,
   runAgentMission,
   sanitizeAssistantContent,
@@ -997,6 +998,71 @@ test("composite lifecycle frontier exposes only its durable current action and s
       path: "scripts/verify_project.py",
     }],
   );
+});
+
+test("composite execution maps proof to the current action instead of the stage aggregate", () => {
+  const node = {
+    id: "lifecycle-code_execution",
+    status: "running",
+    allowedTools: ["code_sandbox_status", "code_workspace_create"],
+    inputs: {
+      lifecycle: {
+        kind: "literal",
+        value: {
+          version: 1,
+          composite: true,
+          intentFingerprint: `sha256:${"a".repeat(64)}`,
+          stage: "code_execution",
+          actions: [
+            {
+              id: "action-001-code_sandbox_status",
+              toolName: "code_sandbox_status",
+              effect: "read",
+              bindingId: null,
+              selector: null,
+              objective: "Verify the sandbox boundary.",
+              minimumEvidence: 1,
+              requiredEvidenceKinds: ["sandbox-attestation"],
+              minimumReceipts: 0,
+              requiredReceiptKinds: [],
+            },
+            {
+              id: "action-002-code_workspace_create",
+              toolName: "code_workspace_create",
+              effect: "mutation",
+              bindingId: "binding-workspace",
+              selector: "du06-workspace",
+              objective: "Create the trusted repository workspace.",
+              minimumEvidence: 1,
+              requiredEvidenceKinds: ["tool-result"],
+              minimumReceipts: 1,
+              requiredReceiptKinds: ["code_change"],
+            },
+          ],
+        },
+      },
+    },
+    outputs: {
+      lifecycleActionCursor: 1,
+      lifecycleCompletedActionIds: ["action-001-code_sandbox_status"],
+      lifecycleActionAttemptCounts: {
+        "action-001-code_sandbox_status": 1,
+      },
+    },
+    completionContract: {
+      criteria: ["Complete the whole code stage."],
+      minimumEvidence: 2,
+      requiredEvidenceKinds: ["sandbox-attestation", "tool-result"],
+      minimumReceipts: 1,
+      requiredReceiptKinds: ["artifact", "code_change"],
+      verifierId: null,
+    },
+  } as any;
+
+  assert.deepEqual(resolveMissionGraphExecutionProofContractV1(node), {
+    requiredEvidenceKinds: ["tool-result"],
+    requiredReceiptKinds: ["code_change"],
+  });
 });
 
 test("pending receipt-backed write goals outrank advisory completed-tool entries", () => {

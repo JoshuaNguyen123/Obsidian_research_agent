@@ -2569,6 +2569,7 @@ export async function runAgentMission({
     const canonicalEvidence = result.ok
       ? evidenceFromToolResult(toolName, result)
       : null;
+    const proofContract = resolveMissionGraphExecutionProofContractV1(node);
     const canonicalEvidenceId = canonicalEvidence?.id;
     const graphEvidenceId =
       canonicalEvidenceId &&
@@ -2581,7 +2582,7 @@ export async function runAgentMission({
             missionGraphSession.graph.revision + 1,
           );
     const requiredReceiptKind =
-      node?.completionContract.requiredReceiptKinds[0] ?? "action-receipt";
+      proofContract.requiredReceiptKinds[0] ?? "action-receipt";
     await missionGraphSession.finishToolExecution(execution, {
       ok: graphResultOk,
       evidence: result.ok
@@ -2589,7 +2590,7 @@ export async function runAgentMission({
             id: graphEvidenceId,
             kind: resolveMissionGraphEvidenceKind(
               canonicalEvidence?.kind,
-              node?.completionContract.requiredEvidenceKinds ?? [],
+              proofContract.requiredEvidenceKinds,
             ),
             fingerprint: evidenceFingerprint,
             observedAt,
@@ -12071,6 +12072,34 @@ function getSafeMissionCompositeLifecycleActionV1(
   return getSafeMissionCompositeLifecycleSpecV1(node) && isRecord(node.outputs)
     ? getCurrentMissionCompositeLifecycleActionV1(node)
     : null;
+}
+
+/**
+ * Composite nodes aggregate proof kinds for final stage completion, but one
+ * tool result advances exactly one durable lifecycle action. Map that result
+ * to the current action's proof contract so an earlier/later action's sorted
+ * receipt kind cannot be attached to the wrong operation.
+ */
+export function resolveMissionGraphExecutionProofContractV1(
+  node: MissionGraphV3["nodes"][string] | null | undefined,
+): {
+  requiredEvidenceKinds: string[];
+  requiredReceiptKinds: string[];
+} {
+  if (!node) {
+    return { requiredEvidenceKinds: [], requiredReceiptKinds: [] };
+  }
+  const action = getSafeMissionCompositeLifecycleActionV1(node);
+  return {
+    requiredEvidenceKinds: [
+      ...(action?.requiredEvidenceKinds ??
+        node.completionContract.requiredEvidenceKinds),
+    ],
+    requiredReceiptKinds: [
+      ...(action?.requiredReceiptKinds ??
+        node.completionContract.requiredReceiptKinds),
+    ],
+  };
 }
 
 function getSingleVerifiedDurableWorkspaceId(
