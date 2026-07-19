@@ -247,7 +247,8 @@ export class MissionGraphSession {
           (candidate) =>
             candidate.status === "blocked" &&
             missionNodeExpectsToolV1(candidate, toolName) &&
-            (candidate.blocker?.code === "tool_failure_repeated" ||
+            (candidate.blocker?.code === "tool_failure_terminal" ||
+              candidate.blocker?.code === "tool_failure_repeated" ||
               candidate.retries.attempts >= candidate.retries.maxAttempts ||
               candidate.retries.consecutiveFailureCount >= 2),
         );

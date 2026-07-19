@@ -14,6 +14,7 @@ import {
   constrainOrchestratedHandoffTools,
   ensureResearchSourceLoopBudget,
   ensureRequiredWriteLoopBudget,
+  executePreparedToolWithMetrics,
   extractExactMarkdownReplacementPayload,
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
@@ -32,6 +33,7 @@ import {
   getRestorableCompletedGraphToolNames,
   hasPreparedBackgroundCodeValidationCommitIntent,
   insertExplicitLinearReadbacksIntoLifecycleToolNames,
+  isTerminalMissionGraphBlocker,
   resolveLinearIssueReadbackBinding,
   resolveThinkingMode,
   rememberVerifiedWorkspaceReadResult,
@@ -83,6 +85,8 @@ import { extractEvidencePassages } from "../src/agent/researchDossier";
 import {
   sha256Fingerprint,
   withPreparedActionFingerprint,
+  type AuthorizedActionContext,
+  type PreparedAction,
   type ToolDescriptor,
 } from "../src/agent/actions";
 import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
@@ -4409,6 +4413,86 @@ test("workspace correction preserves the redacted fast diagnostic after transcri
     },
   );
   assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
+});
+
+test("prepared fast validation preserves its redacted diagnostic for bounded repair", async () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  const preparedAction = {
+    toolName: "code_validate_fast",
+    normalizedArgs: {},
+    target: { path: "validation" },
+  } as unknown as PreparedAction;
+  const authorization = {
+    preparedActionId: "prepared-fast-validation",
+    payloadFingerprint: `sha256:${"a".repeat(64)}`,
+    grantId: "grant-fast-validation",
+  } satisfies AuthorizedActionContext;
+  const registry: ToolRegistry = {
+    getDefinitions: () => [],
+    execute: async () => ({
+      ok: false,
+      toolName: "unused",
+      error: { code: "unused", message: "unused" },
+    }),
+    executePrepared: async () => ({
+      ok: true,
+      toolName: "code_validate_fast",
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          stdout: "protected contract failed",
+          stderr: "AssertionError: mandatory capture missing",
+          truncated: false,
+          redactedLines: 1,
+        },
+      },
+    }),
+  };
+
+  await executePreparedToolWithMetrics({
+    toolRegistry: registry,
+    preparedAction,
+    authorization,
+    toolContext: { runtimeCache } as ToolExecutionContext,
+    events: {},
+    step: 7,
+  });
+
+  assert.deepEqual(getLatestFastValidationDiagnostic(runtimeCache), {
+    stdout: "protected contract failed",
+    stderr: "AssertionError: mandatory capture missing",
+    truncated: false,
+    redactedLines: 1,
+  });
+});
+
+test("terminal mission graph blockers stop even before retry counters exhaust", () => {
+  const node = {
+    status: "blocked",
+    blocker: {
+      code: "tool_failure_terminal",
+      message: "Host-classified terminal repair failure.",
+      requiredAction: "Inspect the failure evidence before resuming.",
+    },
+    retries: {
+      maxAttempts: 3,
+      attempts: 1,
+      failureFingerprints: [],
+      consecutiveFailureFingerprint: null,
+      consecutiveFailureCount: 0,
+    },
+  } satisfies Parameters<typeof isTerminalMissionGraphBlocker>[0];
+  assert.equal(isTerminalMissionGraphBlocker(node), true);
+  assert.equal(
+    isTerminalMissionGraphBlocker({
+      ...node,
+      status: "ready",
+    }),
+    false,
+  );
 });
 
 test("multi-file correction selects the host-verified workspace when path observations are ambiguous", () => {

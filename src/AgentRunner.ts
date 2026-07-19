@@ -8880,13 +8880,7 @@ export async function runAgentMission({
     });
     const terminalGraphBlockers = Object.values(
       (missionGraphSession?.graph ?? missionGraph)?.nodes ?? {},
-    ).filter(
-      (node) =>
-        node.status === "blocked" &&
-        (node.blocker?.code === "tool_failure_repeated" ||
-          node.retries.attempts >= node.retries.maxAttempts ||
-          node.retries.consecutiveFailureCount >= 2),
-    );
+    ).filter(isTerminalMissionGraphBlocker);
     if (stepTools.length === 0 && terminalGraphBlockers.length > 0) {
       const blocker = terminalGraphBlockers[0]!;
       const message =
@@ -22654,7 +22648,7 @@ const CACHEABLE_TOOL_NAMES = new Set([
   "suggest_note_links",
 ]);
 
-async function executePreparedToolWithMetrics({
+export async function executePreparedToolWithMetrics({
   toolRegistry,
   preparedAction,
   authorization,
@@ -22687,6 +22681,14 @@ async function executePreparedToolWithMetrics({
       preparedAction,
       toolContext,
       authorization,
+    );
+    // Sandbox validation is always prepared and approved. Preserve its
+    // already-redacted bounded diagnostic on this execution path so transcript
+    // compaction cannot remove the evidence required by the next repair turn.
+    rememberLatestFastValidationDiagnostic(
+      toolContext.runtimeCache,
+      preparedAction.toolName,
+      result,
     );
     if (result.ok && preparedAction.toolName === "code_workspace_write_expected") {
       forgetVerifiedWorkspaceReadObservation(
@@ -22881,6 +22883,19 @@ async function executeToolWithMetrics({
     });
     throw error;
   }
+}
+
+export function isTerminalMissionGraphBlocker(
+  node: Pick<
+    MissionGraphV3["nodes"][string],
+    "status" | "blocker" | "retries"
+  >,
+): boolean {
+  return node.status === "blocked" &&
+    (node.blocker?.code === "tool_failure_terminal" ||
+      node.blocker?.code === "tool_failure_repeated" ||
+      node.retries.attempts >= node.retries.maxAttempts ||
+      node.retries.consecutiveFailureCount >= 2);
 }
 
 const MAX_VERIFIED_WORKSPACE_READ_OBSERVATIONS = 64;

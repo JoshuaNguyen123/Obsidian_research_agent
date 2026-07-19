@@ -41,6 +41,8 @@ const SHA256 = /^sha256:[a-f0-9]{64}$/u;
 const PROFILE_KEY = "du06-checkers-project";
 const VALIDATION_PROFILE_KEY = "du06-python-checkers-validation";
 const LINEAR_EVIDENCE_DESTINATION_NAME = "Application Testing Dumping Grounds";
+const DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT =
+  "__agenticResearcherDu06FastValidationDiagnostic";
 const MAIN_STAGES: readonly ProjectLifecycleStageName[] = [
   "accepted_research",
   "linear_hierarchy",
@@ -123,6 +125,18 @@ interface DailyUseDu06CleanupProofV1 {
     nativeSecureStateVerified: boolean;
   };
   errors: string[];
+}
+
+interface Du06FastValidationDiagnosticV1 {
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  redactedLines: number;
+}
+
+interface Du06TransientRunCaptureV1 {
+  diagnostic: Du06FastValidationDiagnosticV1 | null;
+  toolCalls: number;
 }
 
 test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, and retains redacted Linear proof", async ({}, testInfo) => {
@@ -272,6 +286,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   let acceptanceRecorded = false;
   let recoveredLifecycleState: SafeLifecycleState | null = null;
   let researchNotebookVerified = false;
+  let failedFastValidationDiagnostic: Du06FastValidationDiagnosticV1 | null = null;
 
   try {
     harness = await startRealAiHarness(
@@ -362,6 +377,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     );
     await harness.installOwnedWebBackend({ sourceCount: 2, topic: "checkers" });
     vaultBackupBaseline = await listVaultBackupPaths(harness.page);
+    await armDu06FastValidationDiagnosticCapture(harness.page);
     worktreeCaptureController = new AbortController();
     worktreeCapturePromise = captureCreatedRepositoryWorktree({
       page: harness.page,
@@ -403,6 +419,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         maxContinuations: 10,
         restartAfterProjectStages: MAIN_STAGES,
         onStageRestarted: async (stage) => {
+          await armDu06FastValidationDiagnosticCapture(harness!.page);
           restartedStages.push(stage);
           const stageIndex = MAIN_STAGES.indexOf(stage);
           expect(stageIndex).toBeGreaterThanOrEqual(0);
@@ -740,6 +757,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       maxContinuations: 4,
       restartAfterProjectStages: ["reconciliation_cleanup"],
       onStageRestarted: async (stage) => {
+        await armDu06FastValidationDiagnosticCapture(harness!.page);
         restartedStages.push(stage);
         const cleanupState = await readSafeLifecycleState(
           harness!.page,
@@ -917,6 +935,15 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     const approved = /\bapproved=(\d+)\b/u.exec(safeError(error));
     if (approved) approvalCount += Number.parseInt(approved[1]!, 10);
   } finally {
+    if (harness) {
+      const transientCapture = await takeDu06TransientRunCapture(
+        harness.page,
+      ).catch(() => null);
+      if (transientCapture) {
+        failedFastValidationDiagnostic = transientCapture.diagnostic;
+        toolCallCount = Math.max(toolCallCount, transientCapture.toolCalls);
+      }
+    }
     if (harness) {
       try {
         const counters = await readRedactedDailyUseCounters(harness.page);
@@ -1132,6 +1159,34 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     }).catch((error) => {
       cleanupErrors.push(`cleanup proof attachment: ${safeError(error)}`);
     });
+    if (missionError && failedFastValidationDiagnostic) {
+      const exactRedactions = [
+        repository,
+        notePath,
+        fixture.root,
+        verifiedWorktree?.root ?? "",
+        verifiedWorktree?.branch ?? "",
+        githubAccount.login,
+      ];
+      await testInfo.attach("daily-use-du06-fast-validation-diagnostic.json", {
+        body: Buffer.from(`${JSON.stringify({
+          version: 1,
+          scenarioId: "DU-06",
+          trust: "untrusted_redacted_test_diagnostic",
+          stdout: safeArtifactError(
+            failedFastValidationDiagnostic.stdout,
+            exactRedactions,
+          ),
+          stderr: safeArtifactError(
+            failedFastValidationDiagnostic.stderr,
+            exactRedactions,
+          ),
+          truncated: failedFastValidationDiagnostic.truncated,
+          redactedLines: failedFastValidationDiagnostic.redactedLines,
+        }, null, 2)}\n`, "utf8"),
+        contentType: "application/json",
+      }).catch(() => undefined);
+    }
     if (!acceptanceRecorded) {
       const githubOwnedResourceObserved =
         pullRequestNumber !== null ||
@@ -2495,6 +2550,131 @@ async function readVaultNote(page: Page, path: string): Promise<string> {
     if (!file) throw new Error(`Expected lifecycle note is missing: ${path}.`);
     return app.vault.read(file);
   }, { path });
+}
+
+async function armDu06FastValidationDiagnosticCapture(
+  page: Page,
+): Promise<void> {
+  await page.evaluate(({ pluginId, slotKey }) => {
+    const host = window as typeof window & Record<string, any>;
+    const existing = host[slotKey] as
+      | {
+          diagnostic: Du06FastValidationDiagnosticV1 | null;
+          toolCalls: number;
+          unsubscribe?: () => void;
+        }
+      | undefined;
+    try {
+      existing?.unsubscribe?.();
+    } catch {
+      // A plugin restart can invalidate the old coordinator subscription.
+    }
+    const plugin = (window as typeof window & { app?: any }).app?.plugins
+      ?.plugins?.[pluginId];
+    if (!plugin?.subscribeMissionEvents) {
+      throw new Error("The native mission trace subscription is unavailable.");
+    }
+    const state = {
+      diagnostic: existing?.diagnostic ?? null,
+      toolCalls:
+        Number.isSafeInteger(existing?.toolCalls) && existing!.toolCalls >= 0
+          ? existing!.toolCalls
+          : 0,
+      unsubscribe: undefined as (() => void) | undefined,
+    };
+    host[slotKey] = state;
+    const redact = (value: unknown): string =>
+      (typeof value === "string" ? value : "")
+        .replace(
+          /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
+          "[REDACTED]",
+        )
+        .replace(/(?:\b[A-Za-z]:[\\/]|\\\\)[^\r\n;]+/gu, "[LOCAL_PATH]")
+        .replace(
+          /\/(?:Users|home|tmp|private\/tmp|var\/tmp)\/[^\r\n;]+/gu,
+          "[LOCAL_PATH]",
+        )
+        .slice(0, 1_000);
+    state.unsubscribe = plugin.subscribeMissionEvents({
+      onTrace: (event: any) => {
+        if (event?.kind === "tool_start") {
+          state.toolCalls += 1;
+          return;
+        }
+        if (
+          event?.kind !== "tool_result" ||
+          event?.toolName !== "code_validate_fast"
+        ) {
+          return;
+        }
+        const output = event.outputPreview;
+        if (output?.status !== "failed") {
+          state.diagnostic = null;
+          return;
+        }
+        const excerpt = output.validationDiagnosticExcerpt;
+        if (!excerpt || typeof excerpt !== "object") return;
+        state.diagnostic = {
+          stdout: redact(excerpt.stdout),
+          stderr: redact(excerpt.stderr),
+          truncated: excerpt.truncated === true,
+          redactedLines:
+            Number.isSafeInteger(excerpt.redactedLines) &&
+              excerpt.redactedLines >= 0
+              ? excerpt.redactedLines
+              : 0,
+        };
+      },
+    }, { replay: false });
+  }, {
+    pluginId: NATIVE_CORE_PLUGIN_ID,
+    slotKey: DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT,
+  });
+}
+
+async function takeDu06TransientRunCapture(
+  page: Page,
+): Promise<Du06TransientRunCaptureV1> {
+  return page.evaluate(({ slotKey }) => {
+    const host = window as typeof window & Record<string, any>;
+    const state = host[slotKey] as
+      | {
+          diagnostic?: Du06FastValidationDiagnosticV1 | null;
+          toolCalls?: number;
+          unsubscribe?: () => void;
+        }
+      | undefined;
+    try {
+      state?.unsubscribe?.();
+    } catch {
+      // The diagnostic slot is still removed after a plugin restart.
+    }
+    delete host[slotKey];
+    const diagnostic = state?.diagnostic;
+    const toolCalls = Number.isSafeInteger(state?.toolCalls) && state!.toolCalls! >= 0
+      ? state!.toolCalls!
+      : 0;
+    if (
+      !diagnostic ||
+      typeof diagnostic.stdout !== "string" ||
+      typeof diagnostic.stderr !== "string"
+    ) {
+      return { diagnostic: null, toolCalls };
+    }
+    return {
+      diagnostic: {
+        stdout: diagnostic.stdout.slice(0, 1_000),
+        stderr: diagnostic.stderr.slice(0, 1_000),
+        truncated: diagnostic.truncated === true,
+        redactedLines:
+          Number.isSafeInteger(diagnostic.redactedLines) &&
+            diagnostic.redactedLines >= 0
+            ? diagnostic.redactedLines
+            : 0,
+      },
+      toolCalls,
+    };
+  }, { slotKey: DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT });
 }
 
 async function readRedactedDailyUseCounters(

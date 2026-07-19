@@ -403,6 +403,13 @@ test("a host-verified terminal domain outcome blocks on its first attempt", asyn
   assert.equal(node.retries.attempts, 1);
   assert.equal(node.blocker?.code, "tool_failure_terminal");
   assert.equal(node.blocker?.message, "The domain checkpoint is terminal.");
+  const nodeIds = Object.keys(session.graph.nodes);
+  const replay = await session.beginToolExecution("read_current_file", {
+    allowDynamicReadContinuation: true,
+  });
+  assert.equal(replay.ok, false);
+  if (!replay.ok) assert.match(replay.reason, /blocked/iu);
+  assert.deepEqual(Object.keys(session.graph.nodes), nodeIds);
 });
 
 test("ungranted mutation is rejected while a bounded envelope-approved read is added", async () => {
