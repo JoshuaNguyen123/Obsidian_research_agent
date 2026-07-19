@@ -87,6 +87,7 @@ import { parseMissionRuntimeSnapshotFromMarkdown } from "../src/agent/runStore";
 import { buildOperationReconciliationInputs } from "../src/agent/runStore";
 import { parseMissionGraphStoreRecordFromMarkdown } from "../src/agent/missionGraphStore";
 import { parseMissionLedgerFromMarkdown } from "../src/agent/missionLedger";
+import { validateContinuationHandoffV1 } from "../src/agent/continuationMemory";
 import {
   prepareCompanionJobV1,
   type CompanionJobV1,
@@ -7002,6 +7003,84 @@ test("aborted runs stop before the next model loop step", async () => {
   );
   assert.deepEqual(completions, ["user_stopped"]);
   assert.ok(statuses.includes("Stopped by user."));
+});
+
+test("aborted runs refresh the continuation handoff after same-note evidence changes", async () => {
+  const prompt = "Read the current note twice, compare both observations, and then summarize.";
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.modelRouterMode = "off";
+  const controller = new AbortController();
+  const executedCalls: ModelToolCall[] = [];
+  const baseRegistry = createRegistry(executedCalls);
+  let readCount = 0;
+  const registry: ToolRegistry = {
+    getDefinitions: () => baseRegistry.getDefinitions(),
+    execute: async (call, context) => {
+      if (call.name === "read_current_file") {
+        executedCalls.push(call);
+        readCount += 1;
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            path: "Current.md",
+            content:
+              readCount === 1
+                ? "# Checkers\n\nInitial research evidence."
+                : "# Checkers\n\nUpdated research evidence with Linear traceability.",
+          },
+        };
+      }
+      return baseRegistry.execute(call, context);
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests: [],
+      chatResponders: [
+        () => responseWithToolCall("read_current_file", {}),
+        () => {
+          throw new Error("stop should prevent another model call");
+        },
+      ],
+    }),
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    abortSignal: controller.signal,
+    events: {
+      onToolDone: () => controller.abort(),
+    },
+  });
+
+  assert.equal(readCount, 2);
+  let persistedLedger = [...vault.content.values()]
+    .map((markdown) => parseMissionLedgerFromMarkdown(markdown))
+    .find((ledger) => ledger?.status === "stopped") ?? null;
+  for (let attempt = 0; !persistedLedger && attempt < 20; attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    persistedLedger = [...vault.content.values()]
+      .map((markdown) => parseMissionLedgerFromMarkdown(markdown))
+      .find((ledger) => ledger?.status === "stopped") ?? null;
+  }
+  assert.ok(persistedLedger?.continuationHandoff);
+  const graphMarkdown = [...vault.content.entries()].find(([path]) =>
+    path.startsWith("Agent Runs/Mission Graphs/"),
+  )?.[1];
+  assert.ok(graphMarkdown);
+  const graphRecord = await parseMissionGraphStoreRecordFromMarkdown(graphMarkdown);
+  assert.ok(graphRecord);
+  const validation = validateContinuationHandoffV1(
+    persistedLedger.continuationHandoff,
+    {
+      ledger: persistedLedger,
+      graph: graphRecord.graph,
+      lineageFingerprints: [],
+    },
+  );
+  assert.equal(validation.ok, true);
 });
 
 test("mission wall-clock deadline aborts an in-flight provider request", async () => {

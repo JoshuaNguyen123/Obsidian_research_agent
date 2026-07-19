@@ -14,6 +14,12 @@ import {
   writeMissionLedger,
   type MissionEvidence,
 } from "../src/agent/missionLedger";
+import { buildContinuationHandoffV1 } from "../src/agent/continuationMemory";
+import {
+  createProjectLineageV1,
+  createResearcherHandoffV1,
+} from "../src/agent/projectLifecycle";
+import { createAcceptedResearchArtifactV1 } from "../src/integrations/linear/AcceptedResearchArtifactV1";
 import { appendAgentRunCheckpoint } from "../src/agent/checkpoints";
 import { seedDurableChildRun } from "../src/agent/durableChildSeed";
 import {
@@ -984,6 +990,52 @@ test("continue run hydrates plan, evidence, goals, and lineage into a new segmen
     priorPlan,
     new Date("2026-07-10T12:05:00.000Z"),
   );
+  const fingerprint = (character: string) =>
+    `sha256:${character.repeat(64)}`;
+  const acceptedArtifact = createAcceptedResearchArtifactV1({
+    schemaVersion: 1,
+    artifactId: "accepted-root-lineage",
+    originRunId: rootRunId,
+    vaultBindingKey: "current-vault",
+    notePath: "Research/Durable execution.md",
+    noteSha256: fingerprint("1"),
+    noteReceiptId: "receipt-root-lineage",
+    evidence: [{
+      id: "source-root-lineage",
+      kind: "web",
+      reference: "https://example.com/prior",
+      contentSha256: fingerprint("2"),
+    }],
+    acceptanceCriteria: [{
+      id: "AC-1",
+      text: "The resumed segment retains the original project lineage.",
+    }],
+    riskClass: "medium",
+    acceptedAt: "2026-07-10T12:04:00.000Z",
+    acceptedBy: "host",
+  });
+  const researcherHandoff = createResearcherHandoffV1({
+    artifact: acceptedArtifact,
+    runId: rootRunId,
+    taskId: "research-root-lineage",
+    evidenceIds: ["source-root-lineage"],
+    summary: "Accepted root-bound research survives segmented continuation.",
+    unresolvedQuestions: [],
+    acceptedAt: "2026-07-10T12:04:00.000Z",
+  });
+  const projectLineage = createProjectLineageV1({
+    lineageId: "project-root-lineage",
+    runId: rootRunId,
+    vaultBindingKey: "current-vault",
+    handoff: researcherHandoff,
+    updatedAt: "2026-07-10T12:04:00.000Z",
+  });
+  vault.context.getProjectLineages = () => [projectLineage];
+  ledger.continuationHandoff = buildContinuationHandoffV1({
+    ledger,
+    lineageFingerprints: [projectLineage.fingerprint],
+    now: new Date("2026-07-10T12:05:00.000Z"),
+  });
   await writeMissionLedger(vault.context, ledger);
   await writeMissionRuntimeSnapshot(
     vault.context,

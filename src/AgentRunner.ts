@@ -1685,6 +1685,22 @@ export async function runAgentMission({
         nextAction,
         runToolContext.now?.() ?? new Date(),
       );
+      const stopHandoff = buildContinuationHandoffV1({
+        ledger: missionLedger,
+        graph: missionGraphSession?.graph ?? missionGraph,
+        lineageFingerprints: getCurrentProjectLineageFingerprints(
+          runToolContext,
+          missionLedger.runId,
+        ),
+        now: runToolContext.now?.() ?? new Date(),
+      });
+      if (validateContinuationHandoffV1(stopHandoff).ok) {
+        missionLedger.continuationHandoff = stopHandoff;
+        missionLedger.continuationHandoffInvalid = undefined;
+      } else {
+        missionLedger.continuationHandoff = undefined;
+        missionLedger.continuationHandoffInvalid = true;
+      }
       // Publish the terminal ledger snapshot before onRunComplete fires. The
       // durable write below is asynchronous because this predicate is used at
       // every abort boundary, but Run Details must never retain the prior
@@ -11585,30 +11601,50 @@ async function buildCheckpointResumeContext({
           storedMissionGraph = null;
         }
       }
+      const currentProjectLineageFingerprints =
+        getCurrentProjectLineageFingerprints(
+          {
+            ...toolContext,
+            rootMissionId:
+              storedRuntime?.snapshot.lineage.rootRunId ??
+              toolContext.rootMissionId,
+          },
+          missionResume.ledger.runId,
+        );
       const handoffValidation = storedHandoff
         ? validateContinuationHandoffV1(storedHandoff, {
             ledger: missionResume.ledger,
             graph: storedMissionGraph,
-            lineageFingerprints: getCurrentProjectLineageFingerprints(
-              toolContext,
-              missionResume.ledger.runId,
-            ),
+            lineageFingerprints: currentProjectLineageFingerprints,
           })
         : null;
       if (
         missionResume.ledger.continuationHandoffInvalid === true ||
         (handoffValidation && !handoffValidation.ok)
       ) {
+        const validationErrors =
+          handoffValidation && !handoffValidation.ok
+            ? handoffValidation.errors
+            : ["persisted_handoff_parse_failed"];
+        const validationCode = validationErrors[0] ?? "invalid_handoff";
         events.onTrace?.({
           id: "mission-ledger-resume:invalid-handoff",
           kind: "error",
-          message: `Run ${missionResume.ledger.runId} has an invalid continuation handoff.`,
+          message:
+            `Run ${missionResume.ledger.runId} has an invalid continuation handoff ` +
+            `(${validationErrors.join(", ")}); lineage counts ` +
+            `handoff=${storedHandoff?.lineageFingerprints.length ?? 0}, ` +
+            `authority=${currentProjectLineageFingerprints.length}.`,
+          error: {
+            code: validationCode,
+            message: "Continuation authority validation failed.",
+          },
           outputPreview: {
             runId: missionResume.ledger.runId,
-            errors:
-              handoffValidation && !handoffValidation.ok
-                ? handoffValidation.errors
-                : ["persisted_handoff_parse_failed"],
+            errors: validationErrors,
+            handoffLineageCount:
+              storedHandoff?.lineageFingerprints.length ?? 0,
+            authorityLineageCount: currentProjectLineageFingerprints.length,
           },
         });
         return {
