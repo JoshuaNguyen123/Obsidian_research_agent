@@ -8,7 +8,10 @@ import { appendToolTranscript } from "../model/toolTranscript";
 import { serializeToolResultForModel } from "../model/toolResultPayload";
 import type {
   ModelChatMessage,
+  ModelChatRequest,
+  ModelChatResponse,
   ModelClient,
+  ModelThink,
   ModelToolCall,
   ModelToolDefinition,
 } from "../model/types";
@@ -19,6 +22,7 @@ import type {
 } from "../tools/types";
 import type { WorkerHandoff } from "./types";
 import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
+import { resolveThinkForCall } from "../agent/thinkPolicy";
 import {
   addSourceCandidate,
   claimNextSourceCandidate,
@@ -55,6 +59,23 @@ export const RESEARCH_WORKER_ALLOWED_TOOLS = new Set([
   "search_research_memory",
   "read_research_memory",
 ]);
+
+/** Tools that must stay sequential (leases, browser session, or mutations). */
+const RESEARCH_WORKER_SERIAL_ONLY = new Set([
+  "web_fetch",
+  "browser_open_page",
+  "browser_observe",
+  "browser_extract_markdown",
+]);
+
+const MAX_RESEARCH_WORKER_PARALLEL_READS = 4;
+
+export function isResearchWorkerParallelSafe(toolName: string): boolean {
+  return (
+    RESEARCH_WORKER_ALLOWED_TOOLS.has(toolName) &&
+    !RESEARCH_WORKER_SERIAL_ONLY.has(toolName)
+  );
+}
 
 export interface ResearchWorkerResult {
   handoff: WorkerHandoff;
@@ -154,12 +175,18 @@ export async function runResearchWorker(input: {
     throwIfAborted(input.abortSignal);
     modelSteps = step;
     await input.events?.onStatus?.(`Researcher step ${step}/${maxSteps}`);
-    const response = await input.modelClient.chat({
+    const think = resolveResearcherThink(input);
+    const request: ModelChatRequest = {
       messages,
       tools: registry.getDefinitions(),
-      think: false,
+      think,
       abortSignal: input.abortSignal,
       evidencePhase: "worker",
+    };
+    // Prefer streamChat when streaming is enabled so graded think travels with
+    // tools on the same Ollama-compatible turn (think + tools together).
+    const response = await chatResearcherTurn(input.modelClient, request, {
+      enableStreaming: input.toolContext.settings?.enableStreaming !== false,
     });
     messages.push(response.message);
     if (response.toolCalls.length === 0) {
@@ -182,11 +209,100 @@ export async function runResearchWorker(input: {
       continue;
     }
 
-    for (const rawCall of response.toolCalls) {
+    let callCursor = 0;
+    while (callCursor < response.toolCalls.length) {
       if (toolCalls >= maxToolCalls) {
         finalSummary = "Researcher stopped at the shared tool-call budget.";
         break;
       }
+
+      let batchEnd = callCursor;
+      while (
+        batchEnd < response.toolCalls.length &&
+        toolCalls + (batchEnd - callCursor) < maxToolCalls &&
+        batchEnd - callCursor < MAX_RESEARCH_WORKER_PARALLEL_READS &&
+        isResearchWorkerParallelSafe(response.toolCalls[batchEnd]!.name)
+      ) {
+        batchEnd += 1;
+      }
+      const parallelCount = batchEnd - callCursor;
+      if (parallelCount > 1) {
+        await input.events?.onStatus?.(
+          `Running ${parallelCount} research reads in parallel...`,
+        );
+        const prepared: Array<{ call: ModelToolCall; eventId: string }> = [];
+        for (let offset = 0; offset < parallelCount; offset += 1) {
+          toolCalls += 1;
+          const call = ensureWorkerCallId(
+            response.toolCalls[callCursor + offset]!,
+            input.runId,
+            toolCalls,
+          );
+          const eventId = `${input.participantId}-tool-${toolCalls}`;
+          await input.events?.onToolStart?.({
+            id: eventId,
+            name: call.name,
+            step,
+          });
+          prepared.push({ call, eventId });
+        }
+        throwIfAborted(input.abortSignal);
+        const parallelResults = await Promise.all(
+          prepared.map(({ call }) =>
+            registry.execute(call, {
+              ...input.toolContext,
+              runId: `${input.runId}-${input.participantId}`,
+              originalPrompt: input.assignment,
+              abortSignal: input.abortSignal,
+              writeAutonomy: false,
+              userApprovalGranted: false,
+            }),
+          ),
+        );
+        throwIfAborted(input.abortSignal);
+        for (let offset = 0; offset < prepared.length; offset += 1) {
+          const { call, eventId } = prepared[offset]!;
+          const result = parallelResults[offset]!;
+          await input.events?.onToolDone?.({
+            id: eventId,
+            name: call.name,
+            step,
+            result,
+          });
+          const nextEvidence = evidenceFromToolResult(call.name, result);
+          if (
+            nextEvidence &&
+            !evidence.some((item) => item.id === nextEvidence.id)
+          ) {
+            evidence.push(nextEvidence);
+          }
+          for (const passage of claimPassagesFromToolResult(call.name, result)) {
+            if (!claimPassages.some((item) => item.id === passage.id)) {
+              claimPassages.push(passage);
+            }
+          }
+          if (call.name === "web_search" && result.ok) {
+            sourceLedger = addSearchResultsToLedger(
+              sourceLedger,
+              result.output,
+              input.assignment,
+              input.now?.() ?? new Date(),
+            );
+          }
+          appendToolTranscript({
+            messages,
+            toolCall: call,
+            resultContent: serializeToolResultForModel(result),
+            origin: "model",
+            fallbackId: call.id ?? eventId,
+          });
+        }
+        callCursor = batchEnd;
+        continue;
+      }
+
+      const rawCall = response.toolCalls[callCursor]!;
+      callCursor += 1;
       const call = ensureWorkerCallId(rawCall, input.runId, toolCalls + 1);
       toolCalls += 1;
       const eventId = `${input.participantId}-tool-${toolCalls}`;
@@ -449,6 +565,33 @@ export function createReadOnlyWorkerRegistry(registry: ToolRegistry): ToolRegist
       });
     },
   };
+}
+
+function resolveResearcherThink(input: {
+  modelClient: ModelClient;
+  toolContext: ToolExecutionContext;
+}): ModelThink | undefined {
+  const settings = input.toolContext.settings;
+  const model =
+    input.modelClient.descriptor?.model ?? settings?.model ?? undefined;
+  return resolveThinkForCall({
+    role: "researcher",
+    // Tool turns use the worker phase so role stays researcher (think: low).
+    phase: "worker",
+    settings,
+    model,
+  });
+}
+
+async function chatResearcherTurn(
+  modelClient: ModelClient,
+  request: ModelChatRequest,
+  options: { enableStreaming: boolean },
+): Promise<ModelChatResponse> {
+  if (options.enableStreaming && typeof modelClient.streamChat === "function") {
+    return modelClient.streamChat(request);
+  }
+  return modelClient.chat(request);
 }
 
 function ensureWorkerCallId(

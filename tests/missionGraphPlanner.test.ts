@@ -53,7 +53,9 @@ test("automatic planning accepts a high-confidence semantic DAG without trusting
     "research",
     "write",
   ]);
-  assert.deepEqual(result.graph.nodes.write.dependencyIds, ["context", "research"]);
+  // Optional research may be selected, but it cannot block the host write.
+  assert.deepEqual(result.graph.nodes.write.dependencyIds, ["context"]);
+  assert.equal(result.graph.nodes.research.status, "ready");
   assert.equal(
     result.graph.nodes.write.objective,
     "Append the accepted result to the trusted note.",
@@ -305,7 +307,107 @@ test("safe model-only reads union with deterministic reads inside the host envel
   assert.equal(resolution.graph.nodes.context.effect, "read");
   assert.equal(resolution.graph.nodes.research.effect, "read");
   assert.deepEqual(resolution.graph.nodes.research.allowedTools, ["web-search"]);
-  assert.deepEqual(resolution.graph.nodes.write.dependencyIds, ["context", "research"]);
+  // Optional grounding stays available, but host write readiness keeps only
+  // deterministic prerequisites so streamed note replace cannot deadlock.
+  assert.deepEqual(resolution.graph.nodes.write.dependencyIds, ["context"]);
+  assert.equal(resolution.graph.nodes.write.status, "queued");
+  assert.equal(resolution.graph.nodes.research.status, "ready");
+});
+
+test("optional semantic reads cannot block a host-planned replace write", async () => {
+  const fixture = await createFixture();
+  const deterministic = await buildDeterministicMissionGraphV3({
+    mission: {
+      ...fixture.input.mission,
+      objective: "I prefer that you replace the entire note with a revised version",
+    },
+    capabilityEnvelope: fixture.input.capabilityEnvelope,
+    proposal: fixture.input.deterministicProposal,
+    decidedAt: NOW,
+  });
+  const optional = await optionalNodesForResolution(fixture);
+  const resolution = await resolveAuthoritativeMissionGraphV3({
+    deterministicGraph: deterministic,
+    optionalReadNodes: optional,
+    structuredProposal: {
+      confidence: 0.99,
+      nodes: [
+        semanticNode("context", "Inspect the current note."),
+        semanticNode("research", "Gather optional background."),
+        semanticNode("write", "Rewrite the whole note.", ["context", "research"]),
+      ],
+    },
+    decidedAt: NOW,
+  });
+
+  assert.equal(resolution.ok, true, JSON.stringify(resolution));
+  if (!resolution.ok) return;
+  assert.deepEqual(resolution.graph.nodes.write.dependencyIds, ["context"]);
+  assert.ok(resolution.graph.nodes.research);
+  assert.equal(resolution.graph.nodes.research.status, "ready");
+});
+
+test("optional semantic reads cannot gate final completion", async () => {
+  const fixture = await createFixture();
+  const proposalWithFinal: DeterministicMissionGraphProposalV1 = {
+    ...fixture.input.deterministicProposal,
+    nodes: {
+      ...fixture.input.deterministicProposal.nodes,
+      final: {
+        id: "final",
+        dependencyIds: ["context", "write"],
+        objective: "Deliver a verified final result.",
+        executorId: "core",
+        executionHost: "obsidian_core",
+        effect: "read",
+        inputs: {},
+        requiredCapabilities: [],
+        allowedTools: [],
+        destination: null,
+        resourceLocks: [],
+        budget: { toolCalls: 0, externalActions: 0, wallClockMs: 1_000 },
+        maxAttempts: 1,
+        completionContract: {
+          criteria: ["A relevant final result is visible."],
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["final-output"],
+          minimumReceipts: 0,
+          requiredReceiptKinds: [],
+          verifierId: null,
+        },
+      },
+    },
+  };
+  const deterministic = await buildDeterministicMissionGraphV3({
+    mission: fixture.input.mission,
+    capabilityEnvelope: fixture.input.capabilityEnvelope,
+    proposal: proposalWithFinal,
+    decidedAt: NOW,
+  });
+  const optional = await optionalNodesForResolution(fixture);
+  const resolution = await resolveAuthoritativeMissionGraphV3({
+    deterministicGraph: deterministic,
+    optionalReadNodes: optional,
+    structuredProposal: {
+      confidence: 0.99,
+      nodes: [
+        semanticNode("context", "Inspect the current note."),
+        semanticNode("research", "Gather optional background."),
+        semanticNode("write", "Rewrite the whole note.", ["context"]),
+        semanticNode("final", "Finish after optional research.", [
+          "context",
+          "write",
+          "research",
+        ]),
+      ],
+    },
+    decidedAt: NOW,
+  });
+
+  assert.equal(resolution.ok, true, JSON.stringify(resolution));
+  if (!resolution.ok) return;
+  assert.ok(!resolution.graph.nodes.final.dependencyIds.includes("research"));
+  assert.ok(resolution.graph.nodes.final.dependencyIds.includes("write"));
 });
 
 test("cycles and aggregate model-selected budgets fall back with precise reasons", async () => {
@@ -316,8 +418,8 @@ test("cycles and aggregate model-selected budgets fall back with precise reasons
     modelClient: clientFrom(async () =>
       response(
         structuredJson([
-          semanticNode("context", "Read context.", ["research"]),
-          semanticNode("research", "Research sources.", ["context"]),
+          semanticNode("context", "Read context.", ["write"]),
+          semanticNode("write", "Append verified output.", ["context"]),
         ]),
       ),
     ),

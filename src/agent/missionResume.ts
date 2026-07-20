@@ -1,4 +1,5 @@
 import {
+  isUserDismissedMissionLedger,
   readLatestMissionLedger,
   readMissionLedgerByRunId,
   type MissionLedger,
@@ -109,17 +110,41 @@ export function buildMissionResumePlan(ledger: MissionLedger): MissionResumePlan
   const remainingActions = buildUnpaidResumeActions(ledger, proofDebt);
   const terminalComplete =
     ledger.status === "complete" && ledger.acceptance?.status === "pass";
+  const userDismissed = isUserDismissedMissionLedger(ledger);
+  // Completed vault writes must never be replayed on Continue — surface that
+  // contract in the remaining-action list so Chat/UI can show it.
+  if (ledger.receipts.length > 0) {
+    const noReplay =
+      "Do not replay completed note writes or cloud tool steps with existing receipts.";
+    if (!remainingActions.some((action) => /not replay|no.?replay/i.test(action))) {
+      remainingActions.unshift(noReplay);
+    }
+  }
+  // Resume authority is proof debt + ledger blockers/research. Legacy MissionPlan
+  // may still appear in remainingActions for UI projection, but does not decide
+  // canResume / primary reason when debt or blockers already explain the gap.
+  const hasIncompleteResearch = Boolean(
+    ledger.researchPlan?.subquestions.some(
+      (item) => item.status !== "complete" && item.status !== "blocked",
+    ),
+  );
   return {
     runId: ledger.runId,
-    canResume: !terminalComplete && !proofDebt.resumeBlocked,
+    canResume: !terminalComplete && !userDismissed && !proofDebt.resumeBlocked,
     reason: terminalComplete
       ? "ledger_already_complete"
+      : userDismissed
+        ? "user_dismissed"
       : proofDebt.resumeBlocked
         ? "proof_debt_blocked"
-      : ledger.missionPlan && countRemainingMissionPlanTasks(ledger.missionPlan) > 0
-        ? "mission_plan_has_remaining_work"
+      : !proofDebt.empty
+        ? "proof_debt_has_remaining_work"
       : ledger.blockers.length > 0
         ? "ledger_has_blockers"
+      : hasIncompleteResearch
+        ? "research_plan_has_remaining_work"
+      : ledger.missionPlan && countRemainingMissionPlanTasks(ledger.missionPlan) > 0
+        ? "mission_plan_projection_remaining"
         : "ledger_has_remaining_work",
     remainingActions,
     continuationCommand: ledger.continuationCommand || `continue run ${ledger.runId}`,
@@ -157,18 +182,6 @@ export function buildUnpaidResumeActions(
     push(`Resolve open evidence conflict: ${conflict.summary}`);
   }
 
-  const activeMissionTask = getActiveMissionPlanTask(ledger.missionPlan);
-  if (activeMissionTask && activeMissionTask.status !== "complete") {
-    push(
-      `Continue mission-plan task ${activeMissionTask.id}: ${activeMissionTask.title}`,
-    );
-  }
-
-  const missionPlanAction = getNextMissionPlanAction(ledger.missionPlan);
-  if (missionPlanAction && missionPlanAction.kind !== "final") {
-    push(missionPlanAction.summary);
-  }
-
   const incompleteResearchItem = ledger.researchPlan?.subquestions.find(
     (item) => item.status !== "complete" && item.status !== "blocked",
   );
@@ -188,6 +201,18 @@ export function buildUnpaidResumeActions(
       continue;
     }
     push(action);
+  }
+
+  // Legacy MissionPlan is UI/projection only — append after proof/research authority.
+  const activeMissionTask = getActiveMissionPlanTask(ledger.missionPlan);
+  if (activeMissionTask && activeMissionTask.status !== "complete") {
+    push(
+      `Projection: continue mission-plan task ${activeMissionTask.id}: ${activeMissionTask.title}`,
+    );
+  }
+  const missionPlanAction = getNextMissionPlanAction(ledger.missionPlan);
+  if (missionPlanAction && missionPlanAction.kind !== "final") {
+    push(`Projection: ${missionPlanAction.summary}`);
   }
 
   return actions;

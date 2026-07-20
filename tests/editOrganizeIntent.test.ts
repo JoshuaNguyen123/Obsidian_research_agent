@@ -119,6 +119,31 @@ test("edit/organize intent matrix routes current note, vault clarify, whole note
       namedSection: false,
     },
     {
+      prompt: "Please correct the entire page",
+      route: "whole_note_edit",
+      currentNote: false,
+      vaultWide: false,
+      wholeNote: true,
+      namedSection: false,
+    },
+    {
+      prompt:
+        "This essay is a little over 1000 words. Please correct the entire page.",
+      route: "whole_note_edit",
+      currentNote: false,
+      vaultWide: false,
+      wholeNote: true,
+      namedSection: false,
+    },
+    {
+      prompt: "Correct the Introduction section",
+      route: "named_section_edit",
+      currentNote: false,
+      vaultWide: false,
+      wholeNote: false,
+      namedSection: true,
+    },
+    {
       prompt: "Edit the Introduction section",
       route: "named_section_edit",
       currentNote: false,
@@ -136,6 +161,31 @@ test("edit/organize intent matrix routes current note, vault clarify, whole note
     },
     {
       prompt: "What time is it?",
+      route: "other",
+      currentNote: false,
+      vaultWide: false,
+      wholeNote: false,
+      namedSection: false,
+    },
+    {
+      prompt: "Please correct the entire page.",
+      route: "whole_note_edit",
+      currentNote: false,
+      vaultWide: false,
+      wholeNote: true,
+      namedSection: false,
+    },
+    {
+      prompt:
+        "This essay is a little over 1000 words. Please correct the entire page.",
+      route: "whole_note_edit",
+      currentNote: false,
+      vaultWide: false,
+      wholeNote: true,
+      namedSection: false,
+    },
+    {
+      prompt: "Append a correction section at the bottom.",
       route: "other",
       currentNote: false,
       vaultWide: false,
@@ -177,6 +227,27 @@ test("current-note edit/organize prefers streamed replace; vault-wide does not",
   assert.equal(prefersStreamedReplaceForEditOrganize("Edit this page"), true);
   assert.equal(prefersStreamedReplaceForEditOrganize("Organize my vault"), false);
   assert.equal(prefersStreamedReplaceForEditOrganize("Edit the essay"), true);
+  assert.equal(
+    prefersStreamedReplaceForEditOrganize("Please correct the entire page."),
+    true,
+  );
+  assert.equal(
+    prefersStreamedReplaceForEditOrganize("Append a correction section at the bottom."),
+    false,
+  );
+});
+
+test("whole-page correction prefers streamed replace", () => {
+  assert.equal(
+    prefersStreamedReplaceForEditOrganize("Please correct the entire page"),
+    true,
+  );
+  assert.equal(
+    prefersStreamedReplaceForEditOrganize(
+      "This essay is a little over 1000 words. Please correct the entire page.",
+    ),
+    true,
+  );
 });
 
 test("receiptsSatisfyWriteProof and write_receipt missing helpers", () => {

@@ -204,6 +204,11 @@ export interface MissionLedger {
   continuationHandoffInvalid?: true;
   /** Redacted reflex metadata only; prompts and model text are never persisted. */
   reflexCheckpoints?: ReflexCheckpointReceiptV1[];
+  /**
+   * User dismissed the unfinished-run banner. Persisted so the banner does not
+   * return after reload; the run remains in Agent Runs for inspection.
+   */
+  userDismissedAt?: string;
 }
 
 export interface MissionLedgerWriteResult {
@@ -703,10 +708,33 @@ export function setLedgerLastSafeStep(
   ledger.updatedAt = now.toISOString();
 }
 
+export function isUserDismissedMissionLedger(ledger: MissionLedger): boolean {
+  return (
+    typeof ledger.userDismissedAt === "string" &&
+    Number.isFinite(Date.parse(ledger.userDismissedAt))
+  );
+}
+
+/** Persist a user dismiss so the unfinished-run banner does not keep returning. */
+export function markMissionLedgerUserDismissed(
+  ledger: MissionLedger,
+  now = new Date(),
+): MissionLedger {
+  const timestamp = now.toISOString();
+  ledger.userDismissedAt = timestamp;
+  ledger.status = ledger.status === "complete" ? ledger.status : "stopped";
+  ledger.updatedAt = timestamp;
+  ledger.nextActions = [
+    "User dismissed this unfinished run. Start a new mission or ask to continue explicitly.",
+  ];
+  return ledger;
+}
+
 export function summarizeMissionLedger(
   ledger: MissionLedger,
 ): MissionLedgerSummary {
-  const canResume = !isTerminalCompleteLedger(ledger);
+  const canResume =
+    !isTerminalCompleteLedger(ledger) && !isUserDismissedMissionLedger(ledger);
   const summary: MissionLedgerSummary = {
     runId: ledger.runId,
     status: ledger.status,
@@ -895,10 +923,15 @@ export async function readLatestMissionLedger(
         ledger,
         mtime: file.stat?.mtime ?? 0,
       };
-      if (!isTerminalCompleteLedger(ledger)) {
+      if (
+        !isTerminalCompleteLedger(ledger) &&
+        !isUserDismissedMissionLedger(ledger)
+      ) {
         return loaded;
       }
-      terminalFallback ??= loaded;
+      if (!isUserDismissedMissionLedger(ledger)) {
+        terminalFallback ??= loaded;
+      }
     }
   }
 
@@ -1104,6 +1137,10 @@ function normalizeMissionLedger(value: unknown): MissionLedger | null {
           .filter((item): item is ReflexCheckpointReceiptV1 => item !== null)
           .slice(-64)
       : [],
+    ...(typeof value.userDismissedAt === "string" &&
+    Number.isFinite(Date.parse(value.userDismissedAt))
+      ? { userDismissedAt: value.userDismissedAt }
+      : {}),
   };
 }
 

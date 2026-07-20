@@ -1,5 +1,8 @@
 import type { AgentSettings } from "../settings";
 import type { ModelThink, ModelToolDefinition } from "../model/types";
+import { resolveThinkingMode } from "./thinkPolicy";
+
+export { resolveThinkingMode } from "./thinkPolicy";
 import type { MissionIntent } from "../tools/types";
 import {
   buildRouteBudgetProfile,
@@ -446,41 +449,6 @@ export function createRunPlan({
   });
 }
 
-export function resolveThinkingMode(
-  settings: AgentSettings | undefined,
-): ModelThink | undefined {
-  const mode = settings?.thinkingMode ?? "auto";
-
-  if (mode === "off") {
-    return undefined;
-  }
-
-  if (mode !== "auto") {
-    return mode;
-  }
-
-  const model = settings?.model?.trim().toLowerCase() ?? "";
-
-  if (!model) {
-    return undefined;
-  }
-
-  if (model.startsWith("gpt-oss")) {
-    return "medium";
-  }
-
-  if (
-    model.startsWith("qwen3") ||
-    model.startsWith("deepseek-r1") ||
-    model.startsWith("deepseek-v3.1") ||
-    model.startsWith("kimi-k2.7-code")
-  ) {
-    return true;
-  }
-
-  return undefined;
-}
-
 function parseExplicitModelStepTarget(prompt: string): number | null {
   const match =
     /\b(?:complete|run|perform|use|take)\s+(?:exactly\s+)?(\d{1,3})\s+(?:model|agent|planning|loop)\s+steps?\b/i.exec(
@@ -797,7 +765,7 @@ function hasWholeNoteRevisionIntent(prompt: string): boolean {
   }
 
   const revisionVerb =
-    /\b(edit(?:ing)?|revise|revising|revision|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail)\b/i;
+    /\b(edit(?:ing)?|revise|revising|revision|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b/i;
   const wholeTextTarget =
     /\b(essay|draft|article|paragraphs?|body|content|document)\b|\b(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown)\b|\b(?:note|page|file|markdown)\b[\s\S]{0,40}\b(?:whole|entire|current|this|active)\b/i;
   const updateVerb = /\b(update|updating)\b/i;

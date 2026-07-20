@@ -43,6 +43,55 @@ export function modelRetryExhaustedFailureCopy(detail?: string): FailureCopy {
   };
 }
 
+export function modelRateLimitFailureCopy(detail?: string): FailureCopy {
+  return {
+    what: "Cloud model rate limit reached.",
+    why:
+      detail?.trim() ||
+      "The provider returned HTTP 429 or exhausted the request budget for this API key.",
+    next: "Wait for the Retry-After window, then Continue Latest Run or retry the mission. Switch model if the limit persists.",
+  };
+}
+
+export function modelMissingApiKeyFailureCopy(detail?: string): FailureCopy {
+  return {
+    what: "Cloud API key is missing.",
+    why:
+      detail?.trim() ||
+      "The configured cloud endpoint requires a BYOK API key before chat or tool calls.",
+    next: "Open settings, add the provider API key, then Test connection before Run Mission.",
+  };
+}
+
+/** Structured Chat blocker payload for provider failures. */
+export function cloudProviderBlockerFromError(error: {
+  category?: string;
+  message?: string;
+}): FailureCopy {
+  const message = error.message?.trim() || "Unknown model error.";
+  const category = error.category ?? "";
+  if (category === "missing_api_key") {
+    return modelMissingApiKeyFailureCopy(message);
+  }
+  if (category === "auth") {
+    return providerAuthFailureCopy(message);
+  }
+  if (category === "rate_limit" || category === "provider_budget_exhausted") {
+    return modelRateLimitFailureCopy(message);
+  }
+  if (/timeout|timed out|aborted/i.test(message)) {
+    return modelTimeoutFailureCopy(message);
+  }
+  if (category === "network" || /retry|transient|temporarily/i.test(message)) {
+    return modelRetryExhaustedFailureCopy(message);
+  }
+  return {
+    what: "Cloud model request failed.",
+    why: message,
+    next: "Open Run Details for the error, fix settings if needed, then send the next message or Continue Latest Run.",
+  };
+}
+
 export function policyBlockFailureCopy(
   toolName: string,
   reason?: string,
@@ -281,18 +330,18 @@ export function formatModelFailureCopy(error: {
 }): string {
   const message = error.message?.trim() || "Unknown model error.";
   const category = error.category ?? "";
-  if (category === "missing_api_key" || category === "auth") {
-    return formatFailureCopy(providerAuthFailureCopy(message));
-  }
-  if (/timeout|timed out|aborted/i.test(message)) {
-    return formatFailureCopy(modelTimeoutFailureCopy(message));
-  }
+  // Structured What/Why/Next only for known cloud provider failure classes.
   if (
-    category === "network" ||
+    category === "missing_api_key" ||
+    category === "auth" ||
     category === "rate_limit" ||
-    /retry|transient|rate limit|temporarily/i.test(message)
+    category === "provider_budget_exhausted" ||
+    category === "network" ||
+    /timeout|timed out|aborted|rate limit|retry|transient|temporarily/i.test(
+      message,
+    )
   ) {
-    return formatFailureCopy(modelRetryExhaustedFailureCopy(message));
+    return formatFailureCopy(cloudProviderBlockerFromError(error));
   }
   return message;
 }

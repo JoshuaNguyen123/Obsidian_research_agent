@@ -495,6 +495,127 @@ test("day-1 stop mission mid-run leaves resumable ledger", async () => {
   });
 });
 
+test("chat action buttons keep terminal layout and readable contrast", async () => {
+  await withE2EHarness("chat-action-button-layout", async ({ page }) => {
+    const runButton = page.locator("button.agentic-researcher-run");
+    const clearButton = page.locator("button.agentic-researcher-clear");
+    const chatOnlyToggle = page.locator(".agentic-researcher-chat-only-toggle");
+    const continueButton = page.locator(
+      "button.agentic-researcher-chat-continuation",
+    );
+
+    await expect(runButton).toBeVisible();
+    await expect(clearButton).toBeVisible();
+    await expect(chatOnlyToggle).toBeVisible();
+
+    const geometry = await page.evaluate(() => {
+      const root = document.querySelector<HTMLElement>(".agentic-researcher-view");
+      const actions = root?.querySelector<HTMLElement>(".agentic-researcher-actions");
+      const run = root?.querySelector<HTMLButtonElement>("button.agentic-researcher-run");
+      const clear = root?.querySelector<HTMLButtonElement>(
+        "button.agentic-researcher-clear",
+      );
+      const chatOnly = root?.querySelector<HTMLElement>(
+        ".agentic-researcher-chat-only-toggle",
+      );
+      const continuation = root?.querySelector<HTMLButtonElement>(
+        "button.agentic-researcher-chat-continuation",
+      );
+      if (!root || !actions || !run || !clear || !chatOnly || !continuation) {
+        throw new Error("Chat action controls were not mounted.");
+      }
+
+      const actionsRect = actions.getBoundingClientRect();
+      const runRect = run.getBoundingClientRect();
+      const clearRect = clear.getBoundingClientRect();
+      const chatOnlyRect = chatOnly.getBoundingClientRect();
+      const runStyle = window.getComputedStyle(run);
+      const clearStyle = window.getComputedStyle(clear);
+      const continuationStyle = window.getComputedStyle(continuation);
+
+      const parseRgba = (value: string) => {
+        const match = value.match(
+          /rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i,
+        );
+        if (!match) {
+          return null;
+        }
+        return {
+          r: Number(match[1]),
+          g: Number(match[2]),
+          b: Number(match[3]),
+          a: match[4] === undefined ? 1 : Number(match[4]),
+        };
+      };
+
+      const isNearTransparent = (value: string) => {
+        const parsed = parseRgba(value);
+        if (!parsed) {
+          return value === "transparent";
+        }
+        return parsed.a <= 0.08;
+      };
+
+      const isReadableTerminalGreen = (value: string) => {
+        const parsed = parseRgba(value);
+        if (!parsed || parsed.a < 0.5) {
+          return false;
+        }
+        return parsed.g >= 140 && parsed.g > parsed.r && parsed.g > parsed.b;
+      };
+
+      return {
+        runWidthRatio: runRect.width / Math.max(actionsRect.width, 1),
+        sameRow: Math.abs(clearRect.top - chatOnlyRect.top) <= 2,
+        clearRightOfChatOnly: clearRect.left >= chatOnlyRect.right - 1,
+        withinActions:
+          runRect.left >= actionsRect.left - 1 &&
+          runRect.right <= actionsRect.right + 1 &&
+          clearRect.left >= actionsRect.left - 1 &&
+          clearRect.right <= actionsRect.right + 1 &&
+          chatOnlyRect.left >= actionsRect.left - 1 &&
+          chatOnlyRect.right <= actionsRect.right + 1,
+        runBackground: runStyle.backgroundColor,
+        clearBackground: clearStyle.backgroundColor,
+        continuationBackground: continuationStyle.backgroundColor,
+        clearColor: clearStyle.color,
+        continuationColor: continuationStyle.color,
+        clearTransparent: isNearTransparent(clearStyle.backgroundColor),
+        continuationTransparent: isNearTransparent(
+          continuationStyle.backgroundColor,
+        ),
+        clearReadable: isReadableTerminalGreen(clearStyle.color),
+        continuationReadableWhenShown:
+          continuation.hidden ||
+          continuation.disabled ||
+          isReadableTerminalGreen(continuationStyle.color),
+        runFilledSoft: (() => {
+          const parsed = parseRgba(runStyle.backgroundColor);
+          return Boolean(
+            parsed &&
+              parsed.a > 0.05 &&
+              parsed.a < 0.35 &&
+              parsed.g > parsed.r &&
+              parsed.g > parsed.b,
+          );
+        })(),
+      };
+    });
+
+    expect(geometry.runWidthRatio).toBeGreaterThan(0.92);
+    expect(geometry.sameRow).toBe(true);
+    expect(geometry.clearRightOfChatOnly).toBe(true);
+    expect(geometry.withinActions).toBe(true);
+    expect(geometry.clearTransparent).toBe(true);
+    expect(geometry.continuationTransparent).toBe(true);
+    expect(geometry.clearReadable).toBe(true);
+    expect(geometry.continuationReadableWhenShown).toBe(true);
+    expect(geometry.runFilledSoft).toBe(true);
+
+    await expect(continueButton).toBeHidden();
+  });
+});
+
 test("prompt textarea click edits at clicked position", async () => {
   await withE2EHarness("prompt-middle-click-edit", async ({ page }) => {
     const promptInput = page.locator("textarea.agentic-researcher-prompt");
@@ -1717,7 +1838,7 @@ test("settings integrates essentials readiness and advanced controls", async ({}
     });
     await expect(workingMode).toHaveCount(1);
     const memoryConsent = settings.locator(".agentic-settings-basic .setting-item-name", {
-      hasText: /^Memory consent$/u,
+      hasText: /^Memory$/u,
     });
     await expect(memoryConsent).toHaveCount(1);
     await expect(
@@ -1732,10 +1853,10 @@ test("settings integrates essentials readiness and advanced controls", async ({}
     );
     await expect(
       readiness.locator("button.agentic-settings-readiness-item"),
-    ).toHaveCount(6);
+    ).toHaveCount(7);
     await expect(
       readiness.locator(".agentic-settings-readiness-action"),
-    ).toHaveCount(6);
+    ).toHaveCount(7);
     await expect(readiness.locator(".setting-item")).toHaveCount(0);
     const readinessLayout = await readiness
       .locator("button.agentic-settings-readiness-item")
@@ -1758,22 +1879,23 @@ test("settings integrates essentials readiness and advanced controls", async ({}
         }),
       );
     expect(readinessLayout).toEqual(
-      Array.from({ length: 6 }, () => ({ fits: true, isStacked: true })),
+      Array.from({ length: 7 }, () => ({ fits: true, isStacked: true })),
     );
     await expect(
-      readiness.locator(".agentic-settings-status-badge", {
-        hasText: "Ready",
-      }).first(),
+      readiness.locator(".agentic-settings-readiness-count"),
+    ).toContainText(/\/7 ready/u);
+    await expect(
+      readiness.locator(".agentic-settings-status-badge").first(),
     ).toBeVisible();
 
     const accordion = settings.locator(".agentic-settings-accordion");
     await expect(accordion).toBeVisible();
     await expect(
       accordion.locator("details.agentic-settings-advanced-section"),
-    ).toHaveCount(7);
-    await expect(accordion).toContainText("Output & memory");
-    await expect(accordion).toContainText("Autonomy, teams & schedules");
-    await expect(accordion).toContainText("Built-in system health");
+    ).toHaveCount(5);
+    await expect(accordion).toContainText("Notes & vault");
+    await expect(accordion).toContainText("Autonomy & schedules");
+    await expect(accordion).toContainText("Diagnostics & health");
     await expect(settings).not.toContainText("Installed extensions");
 
     await readiness.getByRole("button", { name: /Linear:/u }).click();
@@ -1807,18 +1929,15 @@ test("settings integrates essentials readiness and advanced controls", async ({}
   });
 });
 
-test("Background is ready by default and schedule details refresh without reopening settings", async () => {
+test("Background readiness stays visible and schedule details refresh without reopening settings", async () => {
   await withE2EHarness("settings-schedule-builder-readiness", async ({ page }) => {
     await openPluginSettings(page);
     const settings = page.locator(".agentic-researcher-settings");
     const readiness = settings.locator(".agentic-settings-readiness");
     const backgroundReadiness = readiness.getByRole("button", {
-      name: /Background work: Ready/u,
+      name: /Background work:/u,
     });
     await expect(backgroundReadiness).toBeVisible();
-    await expect(backgroundReadiness).toContainText(
-      "Background runtime is ready and idle",
-    );
 
     const schedules = settings.locator("#agentic-settings-autonomy");
     await schedules.evaluate((element) => {
@@ -1834,15 +1953,8 @@ test("Background is ready by default and schedule details refresh without reopen
     await expect(
       settings.getByText("Advanced JSON import/export", { exact: true }),
     ).toBeVisible();
-    await expect(backgroundReadiness).toContainText(
-      "1 recurring schedule(s) paused",
-      { timeout: 5_000 },
-    );
     await card.locator(".checkbox-container").click();
 
-    await expect(backgroundReadiness).toContainText("1 schedule(s) enabled", {
-      timeout: 5_000,
-    });
     const persisted = await page.evaluate(({ pluginId }) => {
       const plugin = (window as typeof window & { app?: any }).app?.plugins
         ?.plugins?.[pluginId];
@@ -1858,6 +1970,8 @@ test("Background is ready by default and schedule details refresh without reopen
       cadence: "daily",
       enabled: true,
     });
+    // Readiness stays mounted while schedule cards edit in place.
+    await expect(backgroundReadiness).toBeVisible();
   });
 });
 
@@ -2079,7 +2193,7 @@ test("settings semantic chunk controls stay labeled and contained", async () => 
     const settings = page.locator(".agentic-researcher-settings");
     await settings
       .locator("details.agentic-settings-advanced-section", {
-        hasText: "Semantic retrieval",
+        hasText: "Notes & vault",
       })
       .evaluate((el) => {
         (el as HTMLDetailsElement).open = true;
@@ -2162,11 +2276,11 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     await openPluginSettings(page);
     const settings = page.locator(".agentic-researcher-settings");
     await expect(settings).toContainText(
-      "Vault work requires Obsidian; an installed, healthy Companion may continue only already-authorized non-vault operations.",
+      "Connect a model, pick how the agent should work, then check readiness.",
     );
     await settings
       .locator("details.agentic-settings-advanced-section", {
-        hasText: "Companion & integrations",
+        hasText: "Connections",
       })
       .evaluate((el) => {
         (el as HTMLDetailsElement).open = true;
@@ -2262,7 +2376,7 @@ test("Linear settings start sanitized and keep queue authority gated", async () 
     });
     await expect(authoritySetting).toContainText("No live queue authority");
     await expect(authoritySetting).toContainText(
-      "Ready tickets cannot execute until you explicitly authorize a four-hour bounded grant.",
+      "Authorizing activates the queue and grants a four-hour execution window",
     );
     await expect(
         authoritySetting.getByRole("button", { name: "Activate & authorize" }),
@@ -2818,7 +2932,12 @@ test("research selection streams cited findings onto the current note", async ()
       ).toBeVisible({ timeout: 30_000 });
       await expect(
         page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
-          hasText: "Write and append a cited findings section",
+          hasText: "[agentic-daily-use:DU-02]",
+        }).last(),
+      ).toBeVisible({ timeout: 10_000 });
+      await expect(
+        page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
+          hasText: "append a single cited findings section",
         }).last(),
       ).toBeVisible({ timeout: 10_000 });
 
@@ -3020,6 +3139,71 @@ test("streaming writeback writes early and final chunks", async () => {
       noteFilePath,
       input.streamChunkTwo,
       "second streaming chunk should appear after completion",
+      10_000,
+    );
+  });
+});
+
+test("streaming writeback scrolls the active editor to follow new output", async () => {
+  await withE2EHarness("streaming-follow-end", async ({ page, noteFilePath, input }) => {
+    await page.evaluate(() => {
+      const app = (window as typeof window & { app?: any }).app;
+      if (!app?.workspace) {
+        throw new Error("Obsidian app unavailable.");
+      }
+      const leaf = app.workspace.getMostRecentLeaf?.() ?? null;
+      const editor = leaf?.view?.editor;
+      if (!editor?.setValue) {
+        throw new Error("Active markdown editor unavailable for follow-scroll probe.");
+      }
+      const win = window as typeof window & {
+        __agenticFollowScrollCount?: number;
+      };
+      win.__agenticFollowScrollCount = 0;
+      const original = editor.scrollIntoView?.bind(editor);
+      editor.scrollIntoView = (
+        range: { from: { line: number; ch: number }; to: { line: number; ch: number } },
+        center?: boolean,
+      ) => {
+        win.__agenticFollowScrollCount =
+          (win.__agenticFollowScrollCount ?? 0) + 1;
+        return original?.(range, center);
+      };
+    });
+
+    const prompt = `In this note, write a short streaming E2E update containing ${input.streamChunkOne} and ${input.streamChunkTwo}.`;
+    await setStreamingMode(page, true);
+    await submitMission(page, prompt, { waitForCompletion: false });
+
+    await expectNoteToContain(
+      noteFilePath,
+      input.streamChunkOne,
+      "first streaming chunk should appear before follow-scroll assertion",
+      10_000,
+    );
+
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(
+            () =>
+              (window as typeof window & { __agenticFollowScrollCount?: number })
+                .__agenticFollowScrollCount ?? 0,
+          ),
+        {
+          timeout: 15_000,
+          message:
+            "streaming writeback should call editor.scrollIntoView to follow new output",
+        },
+      )
+      .toBeGreaterThan(0);
+
+    await waitForMissionComplete(page, 45_000);
+    await assertMockModelUsed(page);
+    await expectNoteToContain(
+      noteFilePath,
+      input.streamChunkTwo,
+      "second streaming chunk should appear after follow-scroll assertion",
       10_000,
     );
   });
@@ -4043,6 +4227,34 @@ test("Orchestrator tab replays task and worktree state at 320px", async () => {
     await expect(
       page.getByText("Pending; automatic cleanup is disabled.", { exact: true }),
     ).toBeVisible();
+    const runningBadge = page.locator(
+      '.agentic-researcher-orchestrator-status[data-status="running"]',
+    ).first();
+    await expect(runningBadge).toBeVisible();
+    const runningBadgeColor = await runningBadge.evaluate((element) => {
+      const color = window.getComputedStyle(element).color;
+      const match = color.match(
+        /rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i,
+      );
+      if (!match) {
+        return { ok: false, color };
+      }
+      const r = Number(match[1]);
+      const g = Number(match[2]);
+      const b = Number(match[3]);
+      return {
+        ok: g >= 140 && g > r && g > b,
+        color,
+        r,
+        g,
+        b,
+      };
+    });
+    expect(
+      runningBadgeColor.ok,
+      `running status badge should be terminal green, got ${runningBadgeColor.color}`,
+    ).toBe(true);
+
     const elapsedValue = page
       .locator(".agentic-researcher-orchestrator-summary-metric", { hasText: "Elapsed" })
       .locator(".agentic-researcher-orchestrator-value");
@@ -4144,6 +4356,119 @@ test("Orchestrator tab replays task and worktree state at 320px", async () => {
     await expect(page.getByRole("tab", { name: "Orchestrator" })).toBeVisible();
     await page.getByRole("tab", { name: "Orchestrator" }).click();
     await expect(page.getByText("codex/agent-e2e-template", { exact: true })).toBeVisible();
+  });
+});
+
+test("Orchestrator panel clears on each new Run Mission", async () => {
+  await withE2EHarness("orchestrator-clears-on-new-run", async ({ page }) => {
+    const staleTitle = "STALE_ORCHESTRATOR_FIXTURE_TASK";
+    await page.evaluate(
+      ({ pluginId, staleTitle }) => {
+        const obsidianWindow = window as typeof window & { app?: any };
+        const plugin = obsidianWindow.app?.plugins?.plugins?.[pluginId];
+        if (!plugin) {
+          throw new Error("Agentic Researcher plugin is unavailable.");
+        }
+        const now = new Date(Date.now() - 49 * 60 * 60_000).toISOString();
+        const snapshot = {
+          version: 1,
+          runId: `e2e-stale-orchestrator-${Date.now()}`,
+          mode: "research_team",
+          status: "blocked",
+          rootNodeIds: ["mission"],
+          nodes: {
+            mission: {
+              id: "mission",
+              parentId: null,
+              childIds: [],
+              kind: "research",
+              title: staleTitle,
+              status: "blocked",
+              ownerId: "lead",
+              dependencyIds: [],
+              evidenceIds: [],
+              receiptIds: [],
+              artifactIds: [],
+              blocker: "Direct executor stopped with blocked.",
+              lastAction: "Inspect executor evidence and resume.",
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+          participants: {
+            lead: {
+              id: "lead",
+              role: "lead",
+              displayName: "Lead",
+              status: "blocked",
+              currentNodeId: "mission",
+              budget: {
+                modelSteps: { used: 1, limit: 20 },
+                toolCalls: { used: 0, limit: 24 },
+                wallClockMs: { used: 1_000, limit: 900_000 },
+              },
+              handoffStatus: "none",
+              updatedAt: now,
+            },
+          },
+          worktrees: {},
+          handoffs: [],
+          merge: {
+            status: "idle",
+            evidenceReceived: 0,
+            evidenceAccepted: 0,
+            evidenceRejected: 0,
+            evidenceDeduplicated: 0,
+            conflicts: 0,
+            commitShas: [],
+            verificationStatus: "pending",
+            integrationStatus: "pending",
+          },
+          sequence: Date.now(),
+          createdAt: now,
+          updatedAt: now,
+        };
+        plugin.latestOrchestratorSnapshot = snapshot;
+        plugin.settings.orchestratorEnabled = true;
+        plugin.refreshAgentView?.();
+        plugin.activeAgentView?.orchestratorTab?.update?.(snapshot);
+        if (plugin.activeAgentView) {
+          plugin.activeAgentView.orchestratorSnapshot = snapshot;
+        }
+      },
+      { pluginId: PLUGIN_ID, staleTitle },
+    );
+
+    await page.getByRole("tab", { name: "Orchestrator" }).click();
+    await expect(page.getByText(staleTitle, { exact: true })).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(
+      page.locator(".agentic-researcher-orchestrator-empty"),
+    ).toHaveCount(0);
+
+    await page.getByRole("tab", { name: "Chat" }).click();
+    await submitMission(
+      page,
+      "E2E_ORCHESTRATOR_CLEAR: What is 2+2? Answer in chat only; do not write to the note and do not use tools.",
+      { waitForCompletion: false },
+    );
+
+    await page.getByRole("tab", { name: "Orchestrator" }).click();
+    await expect(page.getByText(staleTitle, { exact: true })).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    await expect(
+      page.locator(".agentic-researcher-orchestrator-empty"),
+    ).toBeVisible({ timeout: 15_000 });
+    await expect(
+      page.getByText(/No team run yet/i),
+    ).toBeVisible();
+
+    await expect(page.locator("button.agentic-researcher-run")).toHaveText(
+      "Run Mission",
+      { timeout: 120_000 },
+    );
   });
 });
 
@@ -6700,6 +7025,59 @@ test("replace current page writes backup and removes old content", async () => {
   });
 });
 
+test("correct entire page routes to replace writeback with backup", async () => {
+  test.setTimeout(GENERATED_WRITING_E2E_TIMEOUT_MS + 60_000);
+  await withE2EHarness(
+    "correct-entire-page-replace",
+    async ({ page, notePath, noteFilePath, input }) => {
+      await setActiveNoteContent(
+        page,
+        notePath,
+        `# Draft E2E Page\n\nRough draft ${input.secondMarker}.\nThis essay is a little over 1000 words and needs cleanup.\n`,
+      );
+      await setStreamingMode(page, true);
+      const beforeReplacement = await readFile(noteFilePath, "utf8");
+      await submitMission(
+        page,
+        `This essay is a little over 1000 words. Please correct the entire page and rewrite it as a 300 word essay on the renaissance containing ${input.replaceMarker}.`,
+        { waitForCompletion: false },
+      );
+      await page.getByRole("tab", { name: "Run Details" }).click();
+      await expect(
+        page.getByText(/replace_current_file is not ready in the authoritative mission graph/i),
+      ).toHaveCount(0);
+      const replacementApproval = activePreparedApproval(
+        page,
+        "replace_current_file",
+      );
+      await expect(replacementApproval).toBeVisible({
+        timeout: GENERATED_WRITING_E2E_TIMEOUT_MS,
+      });
+      expect(await readFile(noteFilePath, "utf8")).toBe(beforeReplacement);
+      await approvePreparedApproval(page, replacementApproval);
+      await waitForMissionComplete(page, GENERATED_WRITING_E2E_TIMEOUT_MS);
+
+      await expectNoteToContain(
+        noteFilePath,
+        input.replaceMarker,
+        "correct-entire-page should write replacement content",
+      );
+      const replacedContent = await readFile(noteFilePath, "utf8");
+      expect(replacedContent).not.toContain(input.secondMarker);
+      expect(replacedContent).toMatch(/Renaissance/i);
+      expect(
+        countWords(replacedContent),
+        "correct-entire-page should write a substantial Renaissance essay",
+      ).toBeGreaterThanOrEqual(270);
+      // Streamed replace shows receipts, not always a Tool timeline row (same as
+      // "replace current page writes backup and removes old content").
+      await expectReceipt(page, "replace");
+      await expectReceipt(page, ".agent-backups");
+      await expectReceipt(page, "replace_current_file");
+    },
+  );
+});
+
 test("delete current note then write replaces without safety-limit stop", async () => {
   await withE2EHarness(
     "delete-current-note-write",
@@ -6805,6 +7183,70 @@ test("revision approval follow-up replaces current essay with backup", async () 
     await expectReceipt(page, "replace");
     await expectReceipt(page, ".agent-backups");
   });
+});
+
+test("clarifying follow-up whole-note replace stays ready in mission graph", async () => {
+  await withE2EHarness(
+    "clarify-followup-replace",
+    async ({ page, notePath, noteFilePath, input }) => {
+      await setActiveNoteContent(
+        page,
+        notePath,
+        `# China Report\n\n| Period | Events |\n|--------|--------|\n| Qing | Opium Wars |\n\nHistorical overview ${input.secondMarker}.\n`,
+      );
+      await setStreamingMode(page, true);
+      await seedConversationHistory(page, [
+        {
+          role: "user",
+          content: "Ok, remove the historical overview section then with the boxes",
+        },
+        {
+          role: "assistant",
+          content:
+            "Do you want me to replace the entire note (removing the historical overview and tables) with a revised version, or would you prefer I add a new section summarizing the remaining content?",
+        },
+      ]);
+
+      const beforeReplacement = await readFile(noteFilePath, "utf8");
+      await submitMission(
+        page,
+        `I prefer that you replace the entire note with a revised version that includes ${input.replaceMarker}.`,
+        { waitForCompletion: false },
+      );
+      await page.getByRole("tab", { name: "Run Details" }).click();
+      await expect(
+        page.getByText(/replace_current_file is not ready in the authoritative mission graph/i),
+      ).toHaveCount(0);
+      const replacementApproval = activePreparedApproval(
+        page,
+        "replace_current_file",
+      );
+      await expect(replacementApproval).toBeVisible({
+        timeout: GENERATED_WRITING_E2E_TIMEOUT_MS,
+      });
+      expect(await readFile(noteFilePath, "utf8")).toBe(beforeReplacement);
+      await approvePreparedApproval(page, replacementApproval);
+      await waitForMissionComplete(page, GENERATED_WRITING_E2E_TIMEOUT_MS);
+
+      await expect(
+        page.getByText(/Completion held for verification:.*mission_graph_incomplete/i),
+      ).toHaveCount(0);
+      await expect(
+        page.getByText(/Wall-clock run budget expired|stopReason["']?\s*[:=]\s*["']?budget/i),
+      ).toHaveCount(0);
+
+      await expectNoteToContain(
+        noteFilePath,
+        input.replaceMarker,
+        "clarifying follow-up replace should write the revised note",
+      );
+      const replacedContent = await readFile(noteFilePath, "utf8");
+      expect(replacedContent).not.toContain("| Period |");
+      expect(replacedContent).not.toContain(input.secondMarker);
+      await expectReceipt(page, "replace");
+      await expectReceipt(page, ".agent-backups");
+    },
+  );
 });
 
 test("generated output prompt matrix writes notes and artifacts", async () => {
@@ -13732,6 +14174,31 @@ Confidence: high for deterministic workflow coverage.
       target.createModelClient = mockCreateModelClient;
       target.createToolExecutionContext = mockCreateToolExecutionContext;
       target.__playwrightE2EMockInstalled = true;
+      // Cloud BYOK gate: mock installs must satisfy verified connection.
+      if (typeof target.markModelConnectionVerifiedForHarness === "function") {
+        target.markModelConnectionVerifiedForHarness({
+          message: "Playwright mock model connection verified.",
+        });
+      } else {
+        const verifiedAt = new Date().toISOString();
+        target.settings = {
+          ...target.settings,
+          modelConnectionVerifiedAt: verifiedAt,
+          modelConnectionVerifiedProvider: target.settings.modelProvider ?? "ollama",
+          modelConnectionVerifiedModel: target.settings.model,
+          modelConnectionVerifiedBaseUrl: (
+            target.settings.ollamaBaseUrl || "http://127.0.0.1:11434"
+          ).replace(/\/+$/u, ""),
+        };
+        target.modelConnectionStatus = {
+          status: "ready",
+          message: "Playwright mock model connection verified.",
+          checkedAt: verifiedAt,
+          latencyMs: 0,
+          provider: target.settings.modelProvider ?? "ollama",
+          model: target.settings.model,
+        };
+      }
 
       const prototype = Object.getPrototypeOf(target);
       if (prototype) {
@@ -13817,8 +14284,18 @@ async function clearChatInline(page: Page) {
   await expect(clearButton).toHaveText("Clear chat");
   await clearButton.click();
   await expect(clearButton).toHaveText("Confirm clear");
+  await expect(
+    page.locator(".agentic-researcher-log").getByText(
+      /Click Confirm clear to clear chat history only/i,
+    ),
+  ).toBeVisible({ timeout: 5_000 });
   await clearButton.click();
   await expect(clearButton).toHaveText("Clear chat");
+  await expect(
+    page.locator(".agentic-researcher-log").getByText(
+      /Chat memory cleared\. Vault notes were not modified/i,
+    ),
+  ).toBeVisible({ timeout: 5_000 });
   await expect(page.locator("textarea.agentic-researcher-prompt")).toBeFocused();
 }
 

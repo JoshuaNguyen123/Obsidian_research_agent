@@ -37,10 +37,10 @@ export function isCurrentNoteEditOrganizeIntent(prompt: string): boolean {
   }
 
   const editOrganizeCurrent =
-    /\b(edit|organize|restructure|improve)\b[\s\S]{0,48}\b(?:the|this|current|active)\s+(?:page|note|file|document)\b/i.test(
+    /\b(edit|organize|restructure|improve|correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b[\s\S]{0,48}\b(?:the|this|current|active)\s+(?:page|note|file|document)\b/i.test(
       prompt,
     ) ||
-    /\b(?:the|this|current|active)\s+(?:page|note|file|document)\b[\s\S]{0,48}\b(edit|organize|restructure|improve)\b/i.test(
+    /\b(?:the|this|current|active)\s+(?:page|note|file|document)\b[\s\S]{0,48}\b(edit|organize|restructure|improve|correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b/i.test(
       prompt,
     );
 
@@ -108,7 +108,7 @@ export function isWholeNoteEditIntent(prompt: string): boolean {
 
   const primaryWriteVerb =
     /\b(write|draft|compose|generate|append|add)\b/i.test(prompt) &&
-    !/\b(edit|revise|rewrite|improve|reorganize|organize|restructure)\b/i.test(
+    !/\b(edit|revise|rewrite|improve|reorganize|organize|restructure|correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b/i.test(
       prompt,
     );
   if (primaryWriteVerb) {
@@ -116,8 +116,14 @@ export function isWholeNoteEditIntent(prompt: string): boolean {
   }
 
   // Prefer clear revise verbs; treat "update" only as a verb before the target.
+  const revisionVerb =
+    /\b(edit|revise|rewrite|improve|expand|iterate|correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b/i;
+  const wholeTextTarget =
+    /\b(essay|page|note|draft|article|paragraphs?|content|body)\b|\b(?:whole|entire)\s+(?:page|note|file|document|essay|draft|article)\b/i;
+
   const reviseThenTarget =
-    /\b(edit|revise|rewrite|improve|expand|iterate)\b[\s\S]{0,80}\b(essay|page|note|draft|article|paragraphs?|content|body)\b/i.test(
+    revisionVerb.test(prompt) && wholeTextTarget.test(prompt) ||
+    /\b(correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b[\s\S]{0,80}\b(?:entire|whole)\s+(?:page|note|file|document|essay|draft|article|content|body)\b/i.test(
       prompt,
     ) ||
     /\bupdate\b[\s\S]{0,40}\b(?:the|this|current|active|my|whole|entire)\s+(?:essay|page|note|draft|article|paragraphs?|content|body)\b/i.test(
@@ -125,9 +131,7 @@ export function isWholeNoteEditIntent(prompt: string): boolean {
     );
 
   const targetThenRevise =
-    /\b(essay|page|note|draft|article|paragraphs?|content|body)\b[\s\S]{0,80}\b(edit|revise|rewrite|improve|expand|iterate)\b/i.test(
-      prompt,
-    ) ||
+    wholeTextTarget.test(prompt) && revisionVerb.test(prompt) ||
     /\b(?:the|this|current|active|my|whole|entire)\s+(?:essay|page|note|draft|article|paragraphs?|content|body)\b[\s\S]{0,40}\bupdate\b/i.test(
       prompt,
     );
@@ -141,7 +145,9 @@ export function isWholeNoteEditIntent(prompt: string): boolean {
 export function isNamedSectionEditIntent(prompt: string): boolean {
   if (
     !/\b(section|heading)\b/i.test(prompt) ||
-    !/\b(edit|revise|update|replace|rewrite)\b/i.test(prompt)
+    !/\b(edit|revise|update|replace|rewrite|correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b/i.test(
+      prompt,
+    )
   ) {
     return false;
   }
@@ -156,7 +162,7 @@ export function isNamedSectionEditIntent(prompt: string): boolean {
 
   // "edit the Introduction section" / "revise Goals heading"
   if (
-    /\b(edit|revise|update|replace|rewrite)\b[\s\S]{0,100}\b(?:the\s+)?(?!(?:the|a|an|this|current|active|whole|entire|named)\b)([A-Za-z][\w-]{0,48})(?:\s+[A-Za-z][\w-]{0,48}){0,5}\s+(?:section|heading)\b/i.test(
+    /\b(edit|revise|update|replace|rewrite|correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b[\s\S]{0,100}\b(?:the\s+)?(?!(?:the|a|an|this|current|active|whole|entire|named)\b)([A-Za-z][\w-]{0,48})(?:\s+[A-Za-z][\w-]{0,48}){0,5}\s+(?:section|heading)\b/i.test(
       prompt,
     )
   ) {
@@ -165,7 +171,7 @@ export function isNamedSectionEditIntent(prompt: string): boolean {
 
   // "edit section Introduction" / "revise heading Goals"
   if (
-    /\b(edit|revise|update|replace|rewrite)\b[\s\S]{0,48}\b(?:section|heading)\s+(?!(?:in|of|on|to|from|with|the|a|an|this|current)\b)([A-Za-z][\w-]{0,48})\b/i.test(
+    /\b(edit|revise|update|replace|rewrite|correct|fix|proofread|polish|correcting|fixing|proofreading|polishing)\b[\s\S]{0,48}\b(?:section|heading)\s+(?!(?:in|of|on|to|from|with|the|a|an|this|current)\b)([A-Za-z][\w-]{0,48})\b/i.test(
       prompt,
     )
   ) {

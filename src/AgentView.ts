@@ -21,16 +21,24 @@ import {
 import {
   approvalDeniedFailureCopy,
   claimGroundingFailureCopy,
+  cloudProviderBlockerFromError,
   formatFailureCopy,
+  formatModelFailureCopy,
 } from "./agent/failureCopy";
-import { formatModelClientError } from "./model/types";
+import { evaluateCloudConnectionGate } from "./agent/cloudModelReadiness";
+import { formatModelClientError, ModelClientError } from "./model/types";
 import { renderSandboxedHtmlPreview } from "./ui/htmlPreview";
 import { getConnectedRegistryElement } from "./ui/connectedElementRegistry";
 import {
+  markMissionLedgerUserDismissed,
   readLatestMissionLedger,
+  writeMissionLedger,
   type MissionLedgerSummary,
 } from "./agent/missionLedger";
-import { buildMissionResumePlan } from "./agent/missionResume";
+import {
+  buildMissionResumePlan,
+  extractRequestedRunId,
+} from "./agent/missionResume";
 import {
   computeProofDebt,
   proofDebtSnapshotFromLedger,
@@ -39,11 +47,47 @@ import {
 import { readMissionRuntimeSnapshotByRunId } from "./agent/runStore";
 import type { RunOutcome } from "./agent/runCoordinator";
 import type { OrchestratorSnapshotV1 } from "./orchestrator/types";
-import { inferCapabilitySetupTarget } from "./agent/capabilitySetup";
+import {
+  inferCapabilitySetupTarget,
+  type CapabilitySetupTarget,
+} from "./agent/capabilitySetup";
+import {
+  compoundLifecycleStageLabel,
+  evaluateCompoundLifecycleReadinessV1,
+  formatCompoundLifecycleStageStrip,
+  type CompoundLifecycleBlockerV1,
+} from "./agent/compoundLifecycleReadiness";
+import {
+  extractReceiptArtifactUrl,
+  inferArtifactSystem,
+  type MissionReceiptArtifactLinkV1,
+} from "./agent/missionReceiptNote";
+import type { ProjectLifecycleStageV1 } from "./agent/projectLifecycle";
 import {
   OrchestratorTab,
   type OrchestratorDetailsTarget,
 } from "./ui/OrchestratorTab";
+import {
+  fromAgentRunStopReason,
+  stopReasonChatLine,
+  formatStopReasonLabel,
+} from "./agent/missionStopReason";
+import {
+  artifactLinkChatLine,
+  clearChatConfirmCopy,
+  clearChatDoneCopy,
+  chatApprovalAttentionTitle,
+  chatModelConnectionGateTitle,
+  chatProviderBlockerTitle,
+  compoundLifecycleReadinessChatLine,
+  compoundLifecycleReadinessTitle,
+  continueLatestRunSafeCopy,
+  endToEndStarterMissionLabel,
+  endToEndStarterMissionPrompt,
+  missionReceiptWrittenChatLine,
+  noteStreamingActiveChatLine,
+  toolStepChatLine,
+} from "./ui/agentViewCopy";
 import {
   projectMissionGraphRunDetails,
   type MissionGraphRunDetailsProjectionV1,
@@ -90,7 +134,13 @@ export class AgentView extends ItemView {
   private orchestratorSnapshot: OrchestratorSnapshotV1 | null = null;
   private orchestratorReferenceRunId: string | null = null;
   private resumeBannerEl: HTMLElement | null = null;
+  private chatAttentionEl: HTMLElement | null = null;
   private firstRunEl: HTMLElement | null = null;
+  private starterMissionEl: HTMLElement | null = null;
+  private liveWorkstreamEl: HTMLElement | null = null;
+  private lifecycleStageStripEl: HTMLElement | null = null;
+  private thinkingStreamEl: HTMLElement | null = null;
+  private liveThinkingMessageEl: HTMLElement | null = null;
   private phaseValueEl: HTMLElement | null = null;
   private stepValueEl: HTMLElement | null = null;
   private activeToolValueEl: HTMLElement | null = null;
@@ -126,6 +176,12 @@ export class AgentView extends ItemView {
   private readonly approvalCardEls = new Map<string, HTMLElement>();
   private readonly receiptKeys = new Set<string>();
   private readonly dismissedResumeRunIds = new Set<string>();
+  private readonly runArtifactLinks: MissionReceiptArtifactLinkV1[] = [];
+  private readonly runLinearIssueIds: string[] = [];
+  private readonly runValidationShas: string[] = [];
+  private runCommitSha: string | null = null;
+  private runResearchNotePath: string | null = null;
+  private noteStreamingAnnounced = false;
   private activeTab: AgentViewTab = "chat";
   private isRunning = false;
   private isClearingChat = false;
@@ -223,7 +279,31 @@ export class AgentView extends ItemView {
   }
 
   canStartMission(): boolean {
-    return !this.isRunning && !this.plugin.isMissionRunning();
+    return (
+      !this.isRunning &&
+      !this.plugin.isMissionRunning() &&
+      this.plugin.hasVerifiedModelConnection()
+    );
+  }
+
+  private getCloudConnectionGate() {
+    const settings = this.plugin.settings;
+    const provider = settings.modelProvider ?? "ollama";
+    const baseUrl =
+      provider === "openai_compatible"
+        ? settings.openAiCompatibleBaseUrl
+        : settings.ollamaBaseUrl;
+    const hasApiKey =
+      provider === "openai_compatible"
+        ? Boolean(settings.openAiCompatibleApiKey?.trim())
+        : Boolean(settings.ollamaApiKey?.trim());
+    return evaluateCloudConnectionGate({
+      verified: this.plugin.hasVerifiedModelConnection(),
+      provider,
+      model: settings.model,
+      hasApiKey,
+      baseUrl,
+    });
   }
 
   refreshConversationLog() {
@@ -232,6 +312,7 @@ export class AgentView extends ItemView {
 
   refreshFirstRunState(): void {
     this.renderFirstRunEmptyState();
+    this.updateRunButtonState();
   }
 
   /** Refreshes the restart-safe Run Details projection from coordinator state. */
@@ -425,6 +506,7 @@ export class AgentView extends ItemView {
     if (this.plugin.hasVerifiedModelConnection()) {
       emptyState.hide();
       emptyState.addClass("is-hidden");
+      this.renderStarterMissionChip();
       return;
     }
     emptyState.show();
@@ -447,6 +529,39 @@ export class AgentView extends ItemView {
       event.stopPropagation();
       void this.plugin.openFirstRunModelSetup();
     });
+    this.renderStarterMissionChip();
+  }
+
+  private renderStarterMissionChip(): void {
+    const host = this.starterMissionEl;
+    if (!host) return;
+    host.empty();
+    if (!this.plugin.hasVerifiedModelConnection()) {
+      host.addClass("is-hidden");
+      host.hide();
+      return;
+    }
+    host.removeClass("is-hidden");
+    host.show();
+    host.createSpan({
+      text: "STARTER",
+      cls: "agentic-researcher-starter-mission-kicker",
+    });
+    const button = host.createEl("button", {
+      text: endToEndStarterMissionLabel(),
+      cls: "agentic-researcher-starter-mission-action",
+      attr: {
+        type: "button",
+        "data-testid": "end-to-end-starter-mission-button",
+      },
+    });
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!this.promptEl) return;
+      this.promptEl.value = endToEndStarterMissionPrompt();
+      this.focusPrompt({ moveCaretToEnd: true });
+    });
   }
 
   private renderChat(container: HTMLElement) {
@@ -458,11 +573,43 @@ export class AgentView extends ItemView {
     });
     this.renderFirstRunEmptyState();
 
+    this.starterMissionEl = container.createDiv({
+      cls: "agentic-researcher-starter-mission",
+      attr: { "data-testid": "end-to-end-starter-mission" },
+    });
+    this.renderStarterMissionChip();
+
+    this.lifecycleStageStripEl = container.createDiv({
+      cls: "agentic-researcher-lifecycle-strip is-hidden",
+      attr: {
+        "data-testid": "lifecycle-stage-strip",
+        "aria-live": "polite",
+      },
+    });
+    this.lifecycleStageStripEl.hide();
+
+    this.liveWorkstreamEl = container.createDiv({
+      cls: "agentic-researcher-live-workstream",
+      attr: {
+        "data-testid": "live-workstream",
+        "aria-live": "polite",
+      },
+    });
+    this.setSectionPlaceholder(this.liveWorkstreamEl, "Live workstream idle.");
+
     this.logEl = container.createDiv({
       cls: "agentic-researcher-log",
       attr: { "aria-live": "polite" },
     });
     this.renderConversationLog();
+    this.chatAttentionEl = container.createDiv({
+      cls: "agentic-researcher-chat-attention is-hidden",
+      attr: {
+        "data-testid": "chat-attention-banner",
+        "aria-live": "polite",
+      },
+    });
+    this.chatAttentionEl.hide();
     this.resumeBannerEl = container.createDiv({
       cls: "agentic-researcher-resume-banner is-hidden",
     });
@@ -542,6 +689,13 @@ export class AgentView extends ItemView {
     formEl.addEventListener("submit", (event) => {
       event.preventDefault();
       event.stopPropagation();
+      if (!this.isRunning && !this.plugin.hasVerifiedModelConnection()) {
+        const gate = this.getCloudConnectionGate();
+        this.appendLog("error", gate.chatLine);
+        this.renderChatProviderBlocker(gate, chatModelConnectionGateTitle());
+        void this.plugin.openFirstRunModelSetup();
+        return;
+      }
       void this.capturePrompt();
     });
     const stopPromptEvent = (event: Event) => {
@@ -572,6 +726,13 @@ export class AgentView extends ItemView {
     this.runButtonEl.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
+      if (!this.isRunning && !this.plugin.hasVerifiedModelConnection()) {
+        const gate = this.getCloudConnectionGate();
+        this.appendLog("error", gate.chatLine);
+        this.renderChatProviderBlocker(gate, chatModelConnectionGateTitle());
+        void this.plugin.openFirstRunModelSetup();
+        return;
+      }
       void this.capturePrompt();
     });
     this.continueButtonEl.addEventListener("click", (event) => {
@@ -750,12 +911,29 @@ export class AgentView extends ItemView {
       const dismissButton = controlsEl.createEl("button", {
         text: "Dismiss",
         cls: "agentic-researcher-secondary-action",
-        attr: { type: "button" },
+        attr: {
+          type: "button",
+          title: "Hide this unfinished run permanently (keeps the Agent Runs note)",
+        },
       });
       dismissButton.addEventListener("click", (event) => {
         event.preventDefault();
         this.dismissedResumeRunIds.add(loaded.ledger.runId);
         this.hideStartupResumeBanner();
+        // Persist dismiss so reload / remount does not keep resurfacing the banner.
+        void (async () => {
+          try {
+            const toolContext = this.plugin.createToolExecutionContext("continue");
+            markMissionLedgerUserDismissed(loaded.ledger);
+            await writeMissionLedger(toolContext, loaded.ledger);
+            this.appendLog(
+              "system",
+              `Dismissed unfinished run ${loaded.ledger.runId}. It will not keep asking to resume.`,
+            );
+          } catch (error) {
+            console.warn("Unable to persist dismissed unfinished run", error);
+          }
+        })();
       });
     } catch (error) {
       console.warn("Unable to render agent resume banner", error);
@@ -801,6 +979,12 @@ export class AgentView extends ItemView {
       "Status",
       "status",
     );
+    this.thinkingStreamEl = this.createDashboardSection(
+      dashboardEl,
+      "Thinking",
+      "thinking",
+      { collapseUntilPopulated: true },
+    );
 
     const streamsEl = dashboardEl.createDiv({
       cls: "agentic-researcher-stream-grid",
@@ -835,6 +1019,7 @@ export class AgentView extends ItemView {
       dashboardEl,
       "Browser",
       "browser",
+      { collapseUntilPopulated: true },
     );
     this.actionsDetailsEl = this.createDashboardSection(
       dashboardEl,
@@ -845,42 +1030,50 @@ export class AgentView extends ItemView {
       dashboardEl,
       "Code output",
       "code-output",
+      { collapseUntilPopulated: true },
     );
     this.milestonesDetailsEl = this.createDashboardSection(
       dashboardEl,
       "Milestones",
       "milestones",
+      { collapseUntilPopulated: true },
     );
     this.memoryDetailsEl = this.createDashboardSection(
       dashboardEl,
       "Memory",
       "memory",
+      { collapseUntilPopulated: true },
     );
     this.evidenceDetailsEl = this.createDashboardSection(
       dashboardEl,
       "Evidence",
       "evidence",
+      { collapseUntilPopulated: true },
     );
     this.artifactsDetailsEl = this.createDashboardSection(
       dashboardEl,
       "Artifacts",
       "artifacts",
+      { collapseUntilPopulated: true },
     );
     this.verificationEl = this.createDashboardSection(
       dashboardEl,
       "Verification",
       "verification",
+      { collapseUntilPopulated: true },
     );
     this.previewEl = this.createDashboardSection(
       dashboardEl,
       "Preview",
       "preview",
+      { collapseUntilPopulated: true },
     );
     this.runLogEl = this.createDashboardSection(dashboardEl, "Run log", "run-log");
 
     this.setSectionPlaceholder(this.modelConfigEl, "No run yet.");
     this.setSectionPlaceholder(this.missionGraphEl, "No mission graph yet.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
+    this.setSectionPlaceholder(this.thinkingStreamEl, "No model thinking yet.");
     this.setSectionPlaceholder(this.planningStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
@@ -921,10 +1114,22 @@ export class AgentView extends ItemView {
     container: HTMLElement,
     label: string,
     key: string,
+    options: { collapseUntilPopulated?: boolean } = {},
   ): HTMLElement {
     const sectionEl = container.createDiv({
-      cls: `agentic-researcher-dashboard-section agentic-researcher-dashboard-section-${key}`,
+      cls: [
+        `agentic-researcher-dashboard-section agentic-researcher-dashboard-section-${key}`,
+        options.collapseUntilPopulated
+          ? "agentic-researcher-dashboard-section-collapsed"
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
     });
+    if (options.collapseUntilPopulated) {
+      sectionEl.setAttribute("hidden", "true");
+      sectionEl.dataset.collapseUntilPopulated = "true";
+    }
     const labelEl = sectionEl.createDiv({
       cls: "agentic-researcher-dashboard-label-row",
     });
@@ -937,6 +1142,17 @@ export class AgentView extends ItemView {
     });
     this.createCopyButton(labelEl, () => bodyEl.textContent ?? "", `Copy ${label}`);
     return bodyEl;
+  }
+
+  private revealDashboardSection(bodyEl: HTMLElement | null) {
+    const sectionEl = bodyEl?.closest(
+      ".agentic-researcher-dashboard-section",
+    ) as HTMLElement | null;
+    if (!sectionEl || sectionEl.dataset.collapseUntilPopulated !== "true") {
+      return;
+    }
+    sectionEl.removeAttribute("hidden");
+    sectionEl.removeClass("agentic-researcher-dashboard-section-collapsed");
   }
 
   private async capturePrompt(): Promise<RunOutcome | null> {
@@ -955,12 +1171,50 @@ export class AgentView extends ItemView {
       return null;
     }
 
+    const connectionGate = this.getCloudConnectionGate();
+    if (!connectionGate.ok) {
+      this.appendLog("error", connectionGate.chatLine);
+      this.renderChatProviderBlocker(
+        connectionGate,
+        chatModelConnectionGateTitle(),
+      );
+      this.promptEl?.focus();
+      return null;
+    }
+
+    const lifecycleReadiness = evaluateCompoundLifecycleReadinessV1({
+      prompt,
+      readiness: this.plugin.getCapabilityReadiness(),
+    });
+    if (!lifecycleReadiness.ok) {
+      const summaries = lifecycleReadiness.blockers.map(
+        (blocker) =>
+          `${compoundLifecycleStageLabel(blocker.stage)}: ${blocker.nextAction}`,
+      );
+      this.appendLog("error", compoundLifecycleReadinessChatLine(summaries));
+      this.renderCompoundLifecycleReadinessBlocker(lifecycleReadiness.blockers);
+      this.promptEl?.focus();
+      return null;
+    }
+
     const conversationHistory = [...this.plugin.conversationHistory];
     this.missionSubmittedSinceOpen = true;
     this.hideStartupResumeBanner();
     this.stopRequested = false;
-    this.resetDashboardForRun();
+    const preserveOrchestrator = this.shouldPreserveOrchestratorForPrompt(prompt);
+    if (!preserveOrchestrator) {
+      // Clear persisted projection before any async work so a refresh cannot
+      // rehydrate the prior run into the empty Orchestrator panel.
+      await this.plugin.clearLatestOrchestratorSnapshot();
+    }
+    this.resetDashboardForRun({ preserveOrchestrator });
     this.pendingAssistantContent = "";
+    if (lifecycleReadiness.compound) {
+      this.showLifecycleStageStrip(lifecycleReadiness.stages);
+      this.appendWorkstreamLine(
+        `Lifecycle: ${formatCompoundLifecycleStageStrip(lifecycleReadiness.stages)}`,
+      );
+    }
     this.appendStatus("Starting mission...");
     const userLogItem = this.appendLog("user", prompt);
     this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
@@ -985,10 +1239,16 @@ export class AgentView extends ItemView {
         forceChatOnly,
       });
     } catch (error) {
-      const message = formatModelClientError(error);
+      const message =
+        error instanceof ModelClientError
+          ? formatModelFailureCopy(error)
+          : formatModelClientError(error);
       this.updatePhase("error", "Error");
       this.setSectionPlaceholder(this.finalStreamEl, message);
       this.appendLog("error", message);
+      if (error instanceof ModelClientError) {
+        this.renderChatProviderBlocker(cloudProviderBlockerFromError(error));
+      }
     } finally {
       this.setRunning(false);
       this.stopRequested = false;
@@ -1016,12 +1276,14 @@ export class AgentView extends ItemView {
       onAssistantReplace: (content) => this.replaceAssistantContent(content),
       onAssistantMessageDone: () => this.finishLiveAssistantMessage(),
       onThinkingMessageStart: () => this.startLiveThinkingMessage(),
-      onThinkingDelta: () => undefined,
+      onThinkingDelta: (delta) => this.appendThinkingDelta(delta),
       onThinkingMessageDone: () => this.finishLiveThinkingMessage(),
       onStreamLifecycle: (event) => this.handleStreamLifecycle(event),
       onMetric: (event) => this.appendMetric(event),
       onRunConfig: (event) => this.handleRunConfig(event),
-      onRunComplete: (event) => this.handleRunComplete(event),
+      onRunComplete: (event) => {
+        void this.handleRunComplete(event);
+      },
       onApprovalRequest: (request) => this.renderApprovalRequest(request),
       onApprovalResolved: (event) =>
         this.renderApprovalResolved(event.request, event.decision),
@@ -1030,6 +1292,7 @@ export class AgentView extends ItemView {
       onMissionGraphUpdate: (graph) => {
         this.missionGraphProjection = projectMissionGraphRunDetails(graph);
         this.renderMissionGraph();
+        this.syncLifecycleStageStripFromGraph();
       },
       onOrchestratorEvent: (_event, snapshot) => {
         if (!this.shouldAcceptOrchestratorSnapshot(snapshot)) {
@@ -1098,9 +1361,10 @@ export class AgentView extends ItemView {
 
     if (!this.clearConfirmPending) {
       this.setClearConfirmPending(true);
-      this.appendStatus(
-        "Click Confirm clear to clear chat history only. Notes, memory, backups, receipts, and settings are unchanged.",
-      );
+      const confirmMessage = clearChatConfirmCopy();
+      this.appendStatus(confirmMessage);
+      this.appendLog("system", confirmMessage);
+      new Notice(confirmMessage);
       this.restorePromptInteractivity();
       return;
     }
@@ -1113,6 +1377,8 @@ export class AgentView extends ItemView {
       this.pendingAssistantContent = "";
       this.liveAssistantMessageEl = null;
       this.renderConversationLog();
+      this.appendLog("system", clearChatDoneCopy());
+      new Notice("Chat cleared. Notes, backups, and settings unchanged.");
     } finally {
       this.isClearingChat = false;
       this.restorePromptInteractivity();
@@ -1156,13 +1422,22 @@ export class AgentView extends ItemView {
     }
   }
 
-  private resetDashboardForRun() {
+  private resetDashboardForRun(
+    options: { preserveOrchestrator?: boolean } = {},
+  ) {
     this.toolTimelineItems.clear();
     this.traceRowEls.clear();
     this.approvalCardEls.clear();
     this.receiptKeys.clear();
+    this.runArtifactLinks.length = 0;
+    this.runLinearIssueIds.length = 0;
+    this.runValidationShas.length = 0;
+    this.runCommitSha = null;
+    this.runResearchNotePath = null;
+    this.noteStreamingAnnounced = false;
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
+    this.liveThinkingMessageEl = null;
     this.runConfig = null;
     this.missionGraphProjection = null;
     this.usageTotals = this.createEmptyUsageTotals();
@@ -1173,6 +1448,7 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.modelConfigEl, "Starting run.");
     this.setSectionPlaceholder(this.missionGraphEl, "Building mission graph.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
+    this.setSectionPlaceholder(this.thinkingStreamEl, "No model thinking yet.");
     this.setSectionPlaceholder(this.planningStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
@@ -1191,6 +1467,36 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.verificationEl, "No artifacts verified yet.");
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
+    this.setSectionPlaceholder(this.liveWorkstreamEl, "Live workstream starting…");
+    this.hideLifecycleStageStrip();
+    if (!options.preserveOrchestrator) {
+      this.resetOrchestratorPanelForNewRun();
+    }
+  }
+
+  private shouldPreserveOrchestratorForPrompt(prompt: string): boolean {
+    const requestedRunId = extractRequestedRunId(prompt)?.trim();
+    if (!requestedRunId) {
+      return false;
+    }
+    const snapshotRunId =
+      this.orchestratorSnapshot?.runId ??
+      this.plugin.getLatestOrchestratorSnapshot()?.runId;
+    if (snapshotRunId === requestedRunId) {
+      return true;
+    }
+    const ledger = this.getLatestContinuationLedger();
+    return Boolean(
+      ledger?.canResume &&
+        ledger.runId === requestedRunId &&
+        ledger.continuationCommand.trim(),
+    );
+  }
+
+  private resetOrchestratorPanelForNewRun(): void {
+    this.orchestratorSnapshot = null;
+    this.clearOrchestratorRunDetailReferences();
+    this.orchestratorTab?.renderEmpty();
   }
 
   private updatePhase(phase: AgentRunPhase, message: string) {
@@ -1229,6 +1535,7 @@ export class AgentView extends ItemView {
     this.statusStreamEl.scrollTop = this.statusStreamEl.scrollHeight;
     if (kind === "status") {
       this.updateChatLoader(message);
+      this.appendWorkstreamLine(message);
     }
     this.appendTrace(kind, message);
   }
@@ -1267,6 +1574,7 @@ export class AgentView extends ItemView {
     this.setMetric(this.stepValueEl, this.formatStepMetric(event.step));
     this.setMetric(this.activeToolValueEl, event.name);
     this.updateChatLoader(`RUN> ${event.name}`);
+    this.appendWorkstreamLine(`Tool start: ${event.name}`);
 
     const itemEl = this.ensureToolTimelineItem(event);
     itemEl.removeClass("is-complete");
@@ -1292,6 +1600,9 @@ export class AgentView extends ItemView {
       ok ? "tool" : "error",
       event.message ?? `${event.name} ${ok ? "complete" : "error"}`,
     );
+    const toolLine = toolStepChatLine(event.name, ok, event.message);
+    this.appendLog("system", toolLine);
+    this.appendWorkstreamLine(toolLine);
   }
 
   private renderToolVerification(event: AgentToolRunEvent) {
@@ -1502,17 +1813,81 @@ export class AgentView extends ItemView {
     });
   }
 
-  private handleRunComplete(event: AgentRunCompleteEvent) {
+  private async handleRunComplete(event: AgentRunCompleteEvent) {
     this.appendSilentTurnFallbackIfNeeded(event);
+    this.clearChatAttention();
+    this.setRunDetailsNeedsAttention(false);
+    const missionStop = fromAgentRunStopReason(
+      event.stopReason,
+      event.stopDetail ?? event.autoContinueReason,
+    );
     this.setMetric(this.stepValueEl, this.formatStepMetric(event.step, event.maxSteps));
-    this.setMetric(this.phaseValueEl, this.formatStopReason(event.stopReason));
-    this.setMetric(this.activityValueEl, this.formatStopReason(event.stopReason));
+    this.setMetric(this.phaseValueEl, formatStopReasonLabel(missionStop));
+    this.setMetric(this.activityValueEl, formatStopReasonLabel(missionStop));
     this.setMetric(this.activeToolValueEl, "None");
-    this.appendTrace("complete", this.formatStopReason(event.stopReason));
+    this.appendTrace("complete", formatStopReasonLabel(missionStop));
+    const stopLine = stopReasonChatLine(missionStop);
+    this.appendLog("system", stopLine);
+    this.appendWorkstreamLine(stopLine);
+    if (
+      missionStop === "provider_error" ||
+      missionStop === "graph_blocked" ||
+      missionStop === "approval_denied" ||
+      missionStop === "required_tools_failed"
+    ) {
+      this.renderChatProviderBlocker({
+        what: formatStopReasonLabel(missionStop),
+        why: event.stopDetail?.trim() || stopLine,
+        next: "Open Run Details for the blocker, then Continue Latest Run or send the next message.",
+      });
+      this.setRunDetailsNeedsAttention(true);
+    }
+    await this.maybeWriteMissionReceiptNote(event);
     this.renderModelConfig();
     this.stopRequested = false;
     this.setRunning(false);
     this.currentRunChatId = null;
+  }
+
+  private async maybeWriteMissionReceiptNote(
+    event: AgentRunCompleteEvent,
+  ): Promise<void> {
+    const stages = this.runConfig?.projectLifecycleEstimate?.stages.map(
+      (stage) => compoundLifecycleStageLabel(stage.stage),
+    );
+    if (!stages || stages.length <= 1) {
+      return;
+    }
+    if (
+      this.runArtifactLinks.length === 0 &&
+      this.runLinearIssueIds.length === 0 &&
+      !this.runCommitSha
+    ) {
+      return;
+    }
+    const runId = this.runConfig?.runId?.trim();
+    if (!runId) return;
+    const written = await this.plugin.writeMissionReceiptNote({
+      runId,
+      completedAt: new Date().toISOString(),
+      stages,
+      notePath: this.runResearchNotePath,
+      linearIssueIds: this.runLinearIssueIds,
+      validationShas: this.runValidationShas,
+      commitSha: this.runCommitSha,
+      artifacts: [...this.runArtifactLinks],
+      summary: event.stopDetail?.trim() || stopReasonChatLine(
+        fromAgentRunStopReason(
+          event.stopReason,
+          event.stopDetail ?? event.autoContinueReason,
+        ),
+      ),
+    });
+    if (written?.created) {
+      const line = missionReceiptWrittenChatLine(written.path);
+      this.appendLog("system", line);
+      this.appendWorkstreamLine(line);
+    }
   }
 
   private appendSilentTurnFallbackIfNeeded(event: AgentRunCompleteEvent) {
@@ -1520,7 +1895,10 @@ export class AgentView extends ItemView {
       return;
     }
 
-    const message = this.getSilentTurnFallbackMessage(event.stopReason);
+    const message = this.getSilentTurnFallbackMessage(
+      event.stopReason,
+      event.stopDetail ?? event.autoContinueReason,
+    );
     this.appendLog("assistant", message);
     this.pendingAssistantContent = message;
     void this.plugin.appendConversationMessage({
@@ -1529,20 +1907,11 @@ export class AgentView extends ItemView {
     });
   }
 
-  private getSilentTurnFallbackMessage(stopReason: AgentRunStopReason): string {
-    if (stopReason === "user_stopped") {
-      return "Stopped. Send the next message when you are ready and I will continue from this chat.";
-    }
-
-    if (stopReason === "budget") {
-      return "I paused before producing a visible answer because the run hit its budget. Ask me to continue and I will keep going from this chat.";
-    }
-
-    if (stopReason === "error") {
-      return "I could not complete that turn before producing a visible answer. Check Run Details for the blocker, then send the next message and I will continue from this chat.";
-    }
-
-    return "I finished that turn but did not receive visible answer text. Send the next message and I will continue from this chat.";
+  private getSilentTurnFallbackMessage(
+    stopReason: AgentRunStopReason,
+    detail?: string | null,
+  ): string {
+    return stopReasonChatLine(fromAgentRunStopReason(stopReason, detail));
   }
 
   private renderApprovalRequest(request: ApprovalRequest) {
@@ -1550,7 +1919,10 @@ export class AgentView extends ItemView {
       return;
     }
 
+    this.revealDashboardSection(this.actionsDetailsEl);
     this.clearPlaceholder(this.actionsDetailsEl);
+    this.setRunDetailsNeedsAttention(true);
+    this.renderChatApprovalAttention(request);
     const cardEl = this.actionsDetailsEl.createDiv({
       cls: "agentic-researcher-approval-card",
       attr: { "data-approval-id": request.id },
@@ -1667,6 +2039,7 @@ export class AgentView extends ItemView {
         cardEl.querySelectorAll("button").forEach((button) => {
           (button as HTMLButtonElement).disabled = true;
         });
+        this.clearChatAttention();
       }
     };
     approveButton.addEventListener("click", (event) => {
@@ -1685,6 +2058,8 @@ export class AgentView extends ItemView {
     request: ApprovalRequest,
     decision: ApprovalDecision,
   ) {
+    this.clearChatAttention();
+    this.setRunDetailsNeedsAttention(false);
     const cardEl = this.approvalCardEls.get(request.id);
     if (!cardEl) {
       return;
@@ -1728,6 +2103,10 @@ export class AgentView extends ItemView {
       ".agentic-researcher-code-output-row",
       MAX_CODE_OUTPUT_ROWS,
     );
+    const preview = event.chunk.replace(/\s+/g, " ").trim().slice(0, 120);
+    if (preview) {
+      this.appendWorkstreamLine(`code ${event.stream}: ${preview}`);
+    }
   }
 
   private handleStreamLifecycle(event: AgentStreamLifecycleEvent) {
@@ -1745,6 +2124,14 @@ export class AgentView extends ItemView {
 
     this.appendStatus(parts.join(" "));
     this.updateChatLoader(event.message);
+    if (
+      (event.kind === "first_note_write" || streamLabel === "note_stream") &&
+      !this.noteStreamingAnnounced
+    ) {
+      this.noteStreamingAnnounced = true;
+      this.appendLog("system", noteStreamingActiveChatLine());
+      this.appendWorkstreamLine(noteStreamingActiveChatLine());
+    }
   }
 
   private formatStreamLifecycleLabel(
@@ -1958,6 +2345,7 @@ export class AgentView extends ItemView {
       });
     }
 
+    this.renderReceiptArtifactLink(receiptEl, receipt);
     this.setExpandablePayload(receiptEl, receipt.output ?? receipt);
     this.trimRows(
       this.receiptsEl,
@@ -1965,6 +2353,89 @@ export class AgentView extends ItemView {
       MAX_RECEIPT_ROWS,
     );
     this.appendTrace("receipt", receipt.message);
+  }
+
+  private renderReceiptArtifactLink(
+    receiptEl: HTMLElement,
+    receipt: AgentRunReceipt,
+  ): void {
+    const url =
+      extractReceiptArtifactUrl(receipt.resource) ??
+      extractReceiptArtifactUrl(receipt.output);
+    if (!url) {
+      this.trackReceiptMetadata(receipt);
+      return;
+    }
+    const system = inferArtifactSystem(
+      receipt.toolName,
+      receipt.resource?.system,
+    );
+    const label =
+      receipt.resource?.id?.trim() ||
+      receipt.message.slice(0, 80) ||
+      system;
+    const linkEl = receiptEl.createEl("a", {
+      text: url,
+      cls: "agentic-researcher-receipt-artifact-link",
+      attr: {
+        href: url,
+        target: "_blank",
+        rel: "noopener noreferrer",
+        "data-testid": "receipt-artifact-link",
+      },
+    });
+    linkEl.addEventListener("click", (event) => event.stopPropagation());
+    const artifact: MissionReceiptArtifactLinkV1 = { system, label, url };
+    if (!this.runArtifactLinks.some((item) => item.url === url)) {
+      this.runArtifactLinks.push(artifact);
+      this.appendLog("system", artifactLinkChatLine(system, url));
+      this.appendWorkstreamLine(artifactLinkChatLine(system, url));
+    }
+    this.trackReceiptMetadata(receipt);
+  }
+
+  private trackReceiptMetadata(receipt: AgentRunReceipt): void {
+    if (receipt.path?.trim() && !this.runResearchNotePath) {
+      const tool = (receipt.toolName ?? "").toLowerCase();
+      if (
+        tool.includes("research") ||
+        tool.includes("append") ||
+        tool.includes("replace") ||
+        tool.includes("write")
+      ) {
+        this.runResearchNotePath = receipt.path.trim();
+      }
+    }
+    const resourceId = receipt.resource?.id?.trim();
+    if (
+      resourceId &&
+      inferArtifactSystem(receipt.toolName, receipt.resource?.system) ===
+        "linear" &&
+      !this.runLinearIssueIds.includes(resourceId)
+    ) {
+      this.runLinearIssueIds.push(resourceId);
+    }
+    const output = isPlainRecord(receipt.output) ? receipt.output : null;
+    const commitSha =
+      (typeof output?.commitSha === "string" && output.commitSha) ||
+      (typeof output?.sha === "string" && output.sha) ||
+      null;
+    if (commitSha && /^[a-f0-9]{40}$/i.test(commitSha)) {
+      this.runCommitSha = commitSha.toLowerCase();
+    }
+    const validationFingerprint =
+      (typeof output?.validationReceiptFingerprint === "string" &&
+        output.validationReceiptFingerprint) ||
+      (typeof output?.fingerprint === "string" &&
+        (receipt.toolName ?? "").includes("validate") &&
+        output.fingerprint) ||
+      null;
+    if (
+      validationFingerprint &&
+      !this.runValidationShas.includes(validationFingerprint)
+    ) {
+      this.runValidationShas.push(validationFingerprint);
+    }
   }
 
   private getReceiptKey(receipt: AgentRunReceipt): string {
@@ -1992,6 +2463,12 @@ export class AgentView extends ItemView {
     this.runConfig = event;
     if (this.plugin.isMissionRunning() && !this.isRunning) {
       this.setRunning(true, "SYS> reattached to active mission");
+    }
+    const lifecycleStages = event.projectLifecycleEstimate?.stages.map(
+      (item) => item.stage,
+    );
+    if (lifecycleStages && lifecycleStages.length > 1) {
+      this.showLifecycleStageStrip(lifecycleStages);
     }
     this.renderModelConfig();
     this.renderMissionAcceptance(event.missionLedger?.acceptance ?? null, "ledger");
@@ -2389,18 +2866,22 @@ export class AgentView extends ItemView {
       ledger.acceptance?.nextAction?.trim() ||
       ledger.nextAction?.trim() ||
       "";
-    if (nextAction) {
-      actionEl.createDiv({
-        text: `Next: ${nextAction}`,
-        cls: "agentic-researcher-config-line agentic-researcher-proof-debt-next",
-      });
-    }
+    const completedWriteCount =
+      typeof ledger.receiptCount === "number" ? ledger.receiptCount : 0;
+    actionEl.createDiv({
+      text: continueLatestRunSafeCopy({
+        runId: ledger.runId,
+        nextAction: nextAction || undefined,
+        completedWriteCount,
+      }),
+      cls: "agentic-researcher-config-line agentic-researcher-proof-debt-next",
+    });
     const buttonEl = actionEl.createEl("button", {
       text: "Continue Latest Run",
       cls: "agentic-researcher-secondary-action",
       attr: {
         type: "button",
-        "aria-label": `Continue latest run ${ledger.runId}`,
+        "aria-label": `Continue latest run ${ledger.runId} without replaying completed writes`,
       },
     });
     buttonEl.disabled = this.isRunning;
@@ -2604,7 +3085,13 @@ export class AgentView extends ItemView {
     this.appendText(this.liveAssistantMessageEl, delta);
 
     if (this.logEl) {
-      this.logEl.scrollTop = this.logEl.scrollHeight;
+      // Stay pinned to new tokens while the user is already near the bottom;
+      // do not yank them if they scrolled up to re-read earlier chat.
+      const distanceFromBottom =
+        this.logEl.scrollHeight - this.logEl.scrollTop - this.logEl.clientHeight;
+      if (distanceFromBottom < 96) {
+        this.logEl.scrollTop = this.logEl.scrollHeight;
+      }
     }
   }
 
@@ -2632,10 +3119,33 @@ export class AgentView extends ItemView {
 
   private startLiveThinkingMessage() {
     this.appendStatus("Thinking...");
+    if (!this.thinkingStreamEl) return;
+    this.revealDashboardSection(this.thinkingStreamEl);
+    this.clearPlaceholder(this.thinkingStreamEl);
+    this.liveThinkingMessageEl = this.thinkingStreamEl.createDiv({
+      cls: "agentic-researcher-thinking-stream",
+      attr: { "data-testid": "thinking-stream" },
+    });
+  }
+
+  private appendThinkingDelta(delta: string) {
+    if (!delta || !this.thinkingStreamEl) return;
+    // Thinking is Run Details only — never chat history or note writeback.
+    this.revealDashboardSection(this.thinkingStreamEl);
+    if (!this.liveThinkingMessageEl) {
+      this.clearPlaceholder(this.thinkingStreamEl);
+      this.liveThinkingMessageEl = this.thinkingStreamEl.createDiv({
+        cls: "agentic-researcher-thinking-stream",
+        attr: { "data-testid": "thinking-stream" },
+      });
+    }
+    this.appendText(this.liveThinkingMessageEl, delta);
+    this.thinkingStreamEl.scrollTop = this.thinkingStreamEl.scrollHeight;
   }
 
   private finishLiveThinkingMessage() {
     this.appendStatus("Thinking complete.");
+    this.liveThinkingMessageEl = null;
   }
 
   private getLogLabel(kind: LogKind) {
@@ -2798,7 +3308,10 @@ export class AgentView extends ItemView {
       return;
     }
 
-    this.runButtonEl.disabled = this.isRunning && this.stopRequested;
+    const connectionReady = this.plugin.hasVerifiedModelConnection();
+    const idleBlocked = !this.isRunning && !connectionReady;
+    this.runButtonEl.disabled =
+      (this.isRunning && this.stopRequested) || idleBlocked;
     this.runButtonEl.classList.toggle(
       "is-stop",
       this.isRunning && !this.stopRequested,
@@ -2807,20 +3320,25 @@ export class AgentView extends ItemView {
       "is-stopping",
       this.isRunning && this.stopRequested,
     );
+    this.runButtonEl.classList.toggle("is-connection-blocked", idleBlocked);
     this.runButtonEl.setAttribute(
       "aria-label",
       this.isRunning
         ? this.stopRequested
           ? "Stopping mission"
           : "Stop mission"
-        : "Run Mission",
+        : idleBlocked
+          ? "Connect and test a model before Run Mission"
+          : "Run Mission",
     );
     this.runButtonEl.setText(
       this.isRunning
         ? this.stopRequested
           ? "Stopping..."
           : "Stop Mission"
-        : "Run Mission",
+        : idleBlocked
+          ? "Connect model"
+          : "Run Mission",
     );
   }
 
@@ -3122,6 +3640,7 @@ export class AgentView extends ItemView {
   }
 
   private clearPlaceholder(element: HTMLElement) {
+    this.revealDashboardSection(element);
     const placeholderEl = element.querySelector(".agentic-researcher-placeholder");
     placeholderEl?.remove();
   }
@@ -3582,21 +4101,231 @@ export class AgentView extends ItemView {
   }
 
   private formatStopReason(stopReason: AgentRunCompleteEvent["stopReason"]) {
-    switch (stopReason) {
-      case "write_completed":
-        return "Write complete";
-      case "clarifying_question":
-        return "Needs clarification";
-      case "user_stopped":
-        return "Stopped by user";
-      case "budget":
-        return "Stopped at safety limit";
-      case "error":
-        return "Error";
-      case "final":
-      default:
-        return "Done";
+    return formatStopReasonLabel(fromAgentRunStopReason(stopReason));
+  }
+
+  private appendWorkstreamLine(message: string): void {
+    if (!message.trim() || !this.liveWorkstreamEl) return;
+    this.clearPlaceholder(this.liveWorkstreamEl);
+    this.liveWorkstreamEl.createDiv({
+      text: message.trim(),
+      cls: "agentic-researcher-live-workstream-line",
+    });
+    this.trimRows(
+      this.liveWorkstreamEl,
+      ".agentic-researcher-live-workstream-line",
+      MAX_STATUS_ROWS,
+    );
+    this.liveWorkstreamEl.scrollTop = this.liveWorkstreamEl.scrollHeight;
+  }
+
+  private showLifecycleStageStrip(
+    stages: readonly ProjectLifecycleStageV1[],
+    activeStage?: ProjectLifecycleStageV1 | null,
+  ): void {
+    const strip = this.lifecycleStageStripEl;
+    if (!strip || stages.length === 0) return;
+    strip.empty();
+    strip.removeClass("is-hidden");
+    strip.show();
+    strip.createSpan({
+      text: formatCompoundLifecycleStageStrip(stages, activeStage),
+      cls: "agentic-researcher-lifecycle-strip-text",
+    });
+  }
+
+  private hideLifecycleStageStrip(): void {
+    this.lifecycleStageStripEl?.empty();
+    this.lifecycleStageStripEl?.addClass("is-hidden");
+    this.lifecycleStageStripEl?.hide();
+  }
+
+  private syncLifecycleStageStripFromGraph(): void {
+    const stages = this.runConfig?.projectLifecycleEstimate?.stages.map(
+      (item) => item.stage,
+    );
+    if (!stages || stages.length <= 1) return;
+    const activeId = this.missionGraphProjection?.activeNode?.id ?? "";
+    const activeStage =
+      stages.find((stage) => activeId.includes(stage)) ?? null;
+    this.showLifecycleStageStrip(stages, activeStage);
+  }
+
+  private renderCompoundLifecycleReadinessBlocker(
+    blockers: readonly CompoundLifecycleBlockerV1[],
+  ): void {
+    const banner = this.chatAttentionEl;
+    if (!banner) return;
+    const primary = blockers[0];
+    const setupTarget: CapabilitySetupTarget = primary?.setupTarget ?? "model";
+    banner.empty();
+    banner.removeClass("is-hidden");
+    banner.show();
+    banner.createDiv({
+      text: compoundLifecycleReadinessTitle(),
+      cls: "agentic-researcher-chat-attention-title",
+    });
+    banner.createDiv({
+      text: `What: End-to-end workflow needs ${blockers
+        .map((b) => compoundLifecycleStageLabel(b.stage))
+        .join(", ")} setup.`,
+      cls: "agentic-researcher-chat-attention-body",
+    });
+    banner.createDiv({
+      text: `Why: ${primary?.reason ?? "Required capabilities are not ready."}`,
+      cls: "agentic-researcher-chat-attention-body",
+    });
+    banner.createDiv({
+      text: `Next: ${primary?.nextAction ?? "Open settings and finish connection setup."}`,
+      cls: "agentic-researcher-chat-attention-body",
+    });
+    const controls = banner.createDiv({
+      cls: "agentic-researcher-chat-attention-controls",
+    });
+    const openSettings = controls.createEl("button", {
+      text: "Open settings",
+      cls: "agentic-researcher-secondary-action",
+      attr: {
+        type: "button",
+        "data-testid": "chat-compound-readiness-open-settings",
+      },
+    });
+    openSettings.addEventListener("click", (event) => {
+      event.preventDefault();
+      void this.plugin.openCapabilitySetup(setupTarget);
+    });
+    this.setRunDetailsNeedsAttention(true);
+  }
+
+  private renderChatProviderBlocker(
+    copy: {
+      what: string;
+      why: string;
+      next: string;
+    },
+    title: string = chatProviderBlockerTitle(),
+  ) {
+    const banner = this.chatAttentionEl;
+    if (!banner) {
+      return;
     }
+    banner.empty();
+    banner.removeClass("is-hidden");
+    banner.show();
+    banner.createDiv({
+      text: title,
+      cls: "agentic-researcher-chat-attention-title",
+    });
+    banner.createDiv({
+      text: `What: ${copy.what}`,
+      cls: "agentic-researcher-chat-attention-body",
+    });
+    banner.createDiv({
+      text: `Why: ${copy.why}`,
+      cls: "agentic-researcher-chat-attention-body",
+    });
+    banner.createDiv({
+      text: `Next: ${copy.next}`,
+      cls: "agentic-researcher-chat-attention-body",
+    });
+    const controls = banner.createDiv({
+      cls: "agentic-researcher-chat-attention-controls",
+    });
+    const openSettings = controls.createEl("button", {
+      text: "Open settings",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button", "data-testid": "chat-provider-open-settings" },
+    });
+    const openDetails = controls.createEl("button", {
+      text: "Open Run Details",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button" },
+    });
+    openSettings.addEventListener("click", (event) => {
+      event.preventDefault();
+      void this.plugin.openFirstRunModelSetup();
+    });
+    openDetails.addEventListener("click", (event) => {
+      event.preventDefault();
+      this.setActiveTab("details");
+    });
+    this.setRunDetailsNeedsAttention(true);
+  }
+
+  private renderChatApprovalAttention(request: ApprovalRequest) {
+    const banner = this.chatAttentionEl;
+    if (!banner) {
+      return;
+    }
+    banner.empty();
+    banner.removeClass("is-hidden");
+    banner.show();
+    banner.createDiv({
+      text: chatApprovalAttentionTitle(request.toolName),
+      cls: "agentic-researcher-chat-attention-title",
+    });
+    banner.createDiv({
+      text: request.reason,
+      cls: "agentic-researcher-chat-attention-body",
+    });
+    const controls = banner.createDiv({
+      cls: "agentic-researcher-chat-attention-controls",
+    });
+    const approveButton = controls.createEl("button", {
+      text: "Approve",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button", "data-testid": "chat-approval-approve" },
+    });
+    const denyButton = controls.createEl("button", {
+      text: "Deny",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button", "data-testid": "chat-approval-deny" },
+    });
+    const openDetails = controls.createEl("button", {
+      text: "Open Run Details",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button" },
+    });
+    const resolve = (decision: "approved" | "denied") => {
+      const accepted = this.plugin.resolveMissionApproval(request.id, decision);
+      if (accepted) {
+        approveButton.disabled = true;
+        denyButton.disabled = true;
+        this.clearChatAttention();
+      }
+    };
+    approveButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      resolve("approved");
+    });
+    denyButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      resolve("denied");
+    });
+    openDetails.addEventListener("click", (event) => {
+      event.preventDefault();
+      this.setActiveTab("details");
+    });
+  }
+
+  private clearChatAttention() {
+    if (!this.chatAttentionEl) {
+      return;
+    }
+    this.chatAttentionEl.empty();
+    this.chatAttentionEl.addClass("is-hidden");
+    this.chatAttentionEl.hide();
+  }
+
+  private setRunDetailsNeedsAttention(on: boolean) {
+    if (!this.detailsTabButtonEl) {
+      return;
+    }
+    this.detailsTabButtonEl.classList.toggle("needs-attention", on);
+    this.detailsTabButtonEl.setAttribute(
+      "aria-description",
+      on ? "Attention needed in Run Details" : "",
+    );
   }
 
   private formatPhase(phase: AgentRunPhase): string {

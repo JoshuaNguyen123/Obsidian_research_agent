@@ -244,3 +244,64 @@ test("completion-driven budget stop still refuses non-recoverable acceptance fai
     );
   }
 });
+
+test("completion-driven continue when acceptance still owes despite empty debt", () => {
+  const staleEmptyDebt = computeProofDebt({
+    status: "complete",
+    acceptance: { status: "pass", missing: [] },
+  });
+  assert.equal(staleEmptyDebt.empty, true);
+
+  const acceptance = {
+    status: "needs_more_work",
+    missing: ["web_evidence", "fetched_sources"],
+    reasons: ["required_evidence_or_tool_missing"],
+  };
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance,
+      proofDebt: staleEmptyDebt,
+      completionDriven: true,
+      reflection: {
+        done: true,
+        confidence: 0.9,
+        reason: "stale_empty_debt",
+        remainingActions: [],
+      },
+      segmentsUsed: 1,
+      maxSegments: 8,
+    }),
+    { recommended: true, reason: "budget_exhausted" },
+  );
+
+  // Non-completion path still lets empty debt override narrative acceptance.
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance,
+      proofDebt: staleEmptyDebt,
+      completionDriven: false,
+    }),
+    { recommended: false, reason: "proof_satisfied" },
+  );
+});
+
+test("completion-driven null debt stops when acceptance already passed", () => {
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance: { status: "pass", missing: [] },
+      completionDriven: true,
+      reflection: {
+        done: true,
+        confidence: 1,
+        reason: "done",
+        remainingActions: [],
+      },
+      segmentsUsed: 1,
+      maxSegments: 8,
+    }),
+    { recommended: false, reason: "proof_satisfied" },
+  );
+});

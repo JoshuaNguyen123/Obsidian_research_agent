@@ -43,4 +43,20 @@ test("capability setup inference is bounded and labels consolidated targets", ()
   assert.equal(inferCapabilitySetupTarget({ summary: "Try the next proof step." }), null);
   assert.equal(capabilitySetupLabel("notes_research"), "Notes & research");
   assert.equal(capabilitySetupLabel("github"), "GitHub");
+  assert.equal(capabilitySetupLabel("linear"), "Linear");
+  assert.equal(capabilitySetupLabel("code"), "Code");
+  assert.equal(capabilitySetupLabel("model"), "Model");
+  assert.equal(capabilitySetupLabel("browser_web"), "Browser & web");
+  assert.equal(capabilitySetupLabel("background"), "Background work");
+});
+
+test("mission-graph authority failures do not route to settings setup", () => {
+  assert.equal(
+    inferCapabilitySetupTarget({
+      summary:
+        "Model step failed: Tool replace_current_file is not ready in the authoritative mission graph.",
+      toolName: "replace_current_file",
+    }),
+    null,
+  );
 });

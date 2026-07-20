@@ -87,7 +87,7 @@ test("formatModelFailureCopy maps auth timeout and retry categories", () => {
       category: "missing_api_key",
       message: "Ollama cloud API key is required.",
     }),
-    /What: Model provider authentication failed/,
+    /What: Cloud API key is missing/,
   );
   assert.match(
     formatModelFailureCopy({
@@ -101,7 +101,7 @@ test("formatModelFailureCopy maps auth timeout and retry categories", () => {
       category: "rate_limit",
       message: "Too many requests",
     }),
-    /What: Model retries were exhausted/,
+    /What: Cloud model rate limit reached/,
   );
 });
 

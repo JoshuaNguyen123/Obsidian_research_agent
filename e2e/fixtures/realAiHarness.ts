@@ -115,6 +115,8 @@ export async function startRealAiHarness(
     autoTitleOnWrite: false,
     orchestratorEnabled: false,
     agenticReflexEnabled: true,
+    autoContinueLongRuns: false,
+    completionDrivenLoops: false,
     ...pluginDataOverrides,
   };
   if (provider === "openai_compatible") {

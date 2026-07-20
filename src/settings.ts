@@ -2,6 +2,12 @@ import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
 import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
 import type { ModelProvider } from "./model/types";
+import {
+  applyCloudProviderPreset,
+  CLOUD_PROVIDER_PRESETS,
+  getCloudProviderPreset,
+  type CloudProviderPresetId,
+} from "./model/cloudProviderPresets";
 import { MAX_AGENT_STEPS, MAX_CODE_RUNS_PER_MISSION } from "./tools/constants";
 import {
   normalizeScheduledMissions,
@@ -258,7 +264,7 @@ export class AgentSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "Agentic Researcher" });
     containerEl.createEl("p", {
-      text: "Native right-side co-researcher for Obsidian. Basic settings stay compact; tuning lives under Advanced. Vault work requires Obsidian; an installed, healthy Companion may continue only already-authorized non-vault operations.",
+      text: "Connect a model, pick how the agent should work, then check readiness. Advanced tuning stays collapsed until you need it.",
       cls: "setting-item-description agentic-settings-intro",
     });
 
@@ -329,17 +335,20 @@ export class AgentSettingTab extends PluginSettingTab {
     });
     basicEl.createEl("h3", { text: "Essentials" });
     basicEl.createEl("p", {
-      text: "Choose the model and the default way Agentic Researcher works. Everything else can stay collapsed.",
+      text: "These three choices cover most daily use: model, working style, and memory.",
       cls: "setting-item-description agentic-settings-section-intro",
     });
 
     const provider = this.plugin.settings.modelProvider;
 
+    basicEl.createEl("h4", {
+      text: "Model",
+      cls: "agentic-settings-subgroup-title",
+    });
+
     new Setting(basicEl)
-      .setName("Model provider")
-      .setDesc(
-        "Provider adapter for chat, tool calling, and streaming. The agent loop stays provider-agnostic.",
-      )
+      .setName("Provider")
+      .setDesc("Where chat and tool calls are sent.")
       .addDropdown((dropdown) =>
         dropdown
           .addOption("ollama", "Ollama-compatible")
@@ -357,10 +366,8 @@ export class AgentSettingTab extends PluginSettingTab {
 
     if (provider === "openai_compatible") {
       new Setting(basicEl)
-        .setName("GPT/OpenAI-compatible API key")
-        .setDesc(
-          "Bearer token for OpenAI Chat Completions or a compatible gateway. Saved in Obsidian SecretStorage; plugin data keeps only an opaque reference.",
-        )
+        .setName("API key")
+        .setDesc("Stored in Obsidian SecretStorage.")
         .addText((text) => {
           text
             .setPlaceholder("sk-...")
@@ -374,10 +381,8 @@ export class AgentSettingTab extends PluginSettingTab {
         });
     } else {
       new Setting(basicEl)
-        .setName("Ollama API key")
-        .setDesc(
-          "Used for Ollama Cloud or a compatible endpoint. Saved in Obsidian SecretStorage; plugin data keeps only an opaque reference.",
-        )
+        .setName("API key")
+        .setDesc("For Ollama Cloud or a compatible endpoint. Stored in Obsidian SecretStorage.")
         .addText((text) => {
           text
             .setPlaceholder("ollama_...")
@@ -396,7 +401,7 @@ export class AgentSettingTab extends PluginSettingTab {
     modelSetting.descEl.id = modelHelpId;
     if (provider === "ollama") {
       modelSetting.descEl.createSpan({
-        text: "Paste an exact model tag. For cloud-first use, choose a current tool-capable model from the ",
+        text: "Catalog and account availability are authoritative; no model is selected automatically. Browse the ",
       });
       modelSetting.descEl.createEl("a", {
         text: "Ollama Cloud + Thinking catalog",
@@ -407,10 +412,10 @@ export class AgentSettingTab extends PluginSettingTab {
         },
       });
       modelSetting.descEl.createSpan({
-        text: ", then use Test connection. Catalog and account availability are authoritative; no model is selected automatically.",
+        text: ", paste the exact model tag, then Test connection.",
       });
     } else {
-      modelSetting.setDesc("Exact model name for agent missions; then use Test connection.");
+      modelSetting.setDesc("Exact model name, then Test connection.");
     }
     modelSetting.addText((text) => {
       text.inputEl.setAttribute("aria-describedby", modelHelpId);
@@ -418,15 +423,25 @@ export class AgentSettingTab extends PluginSettingTab {
         "aria-label",
         provider === "ollama" ? "Ollama model tag" : "Model name",
       );
+      // Commit the typed tag as-is. Do not snap empty edits back to the default
+      // cloud model on every keystroke — that blocks changing models in Obsidian.
       return text
-        .setPlaceholder(DEFAULT_SETTINGS.model)
+        .setPlaceholder(
+          provider === "ollama" ? "e.g. qwen3.5:cloud" : "e.g. gpt-4o-mini",
+        )
         .setValue(this.plugin.settings.model)
         .onChange(async (value) => {
-          this.plugin.settings.model = value.trim() || DEFAULT_SETTINGS.model;
+          const next = value.trim();
+          if (next === this.plugin.settings.model) {
+            return;
+          }
+          this.plugin.settings.model = next;
           this.plugin.invalidateModelConnectionStatus();
           await this.plugin.saveSettings();
         });
     });
+
+    this.renderCloudProviderPresets(basicEl, provider);
 
     const endpointDetails = basicEl.createEl("details", {
       cls: "agentic-settings-disclosure",
@@ -434,8 +449,8 @@ export class AgentSettingTab extends PluginSettingTab {
     endpointDetails.createEl("summary", { text: "Custom endpoint" });
     if (provider === "openai_compatible") {
       new Setting(endpointDetails)
-        .setName("GPT/OpenAI-compatible base URL")
-        .setDesc("Base URL ending at /v1 for Chat Completions-compatible APIs.")
+        .setName("Base URL")
+        .setDesc("Usually ends with /v1.")
         .addText((text) =>
           text
             .setPlaceholder(DEFAULT_SETTINGS.openAiCompatibleBaseUrl)
@@ -450,8 +465,8 @@ export class AgentSettingTab extends PluginSettingTab {
         );
     } else {
       new Setting(endpointDetails)
-        .setName("Ollama base URL")
-        .setDesc("Base URL for the Ollama-compatible /chat API.")
+        .setName("Base URL")
+        .setDesc("Ollama-compatible /chat endpoint.")
         .addText((text) =>
           text
             .setPlaceholder(DEFAULT_SETTINGS.ollamaBaseUrl)
@@ -467,10 +482,15 @@ export class AgentSettingTab extends PluginSettingTab {
 
     this.renderConnectionStatusRow(basicEl);
 
+    basicEl.createEl("h4", {
+      text: "Behavior",
+      cls: "agentic-settings-subgroup-title",
+    });
+
     const workingModeSetting = new Setting(basicEl)
       .setName("Working mode")
       .setDesc(
-        "Automatic is note-first and agentic; Chat only keeps ordinary answers in chat; Custom exposes expert overrides under Advanced.",
+        "Automatic writes useful notes. Chat only keeps answers in chat. Custom unlocks Advanced overrides.",
       )
       .addDropdown((dropdown) =>
         dropdown
@@ -499,9 +519,9 @@ export class AgentSettingTab extends PluginSettingTab {
     );
 
     new Setting(basicEl)
-      .setName("Memory consent")
+      .setName("Memory")
       .setDesc(
-        "Choose durable local memory. Research memory is stored as Markdown; Clear chat never removes it.",
+        "Optional durable research notes. Clear chat never deletes them.",
       )
       .addDropdown((dropdown) =>
         dropdown
@@ -518,6 +538,50 @@ export class AgentSettingTab extends PluginSettingTab {
       );
   }
 
+  private renderCloudProviderPresets(
+    containerEl: HTMLElement,
+    provider: ModelProvider,
+  ): void {
+    const presets = CLOUD_PROVIDER_PRESETS.filter(
+      (preset) => preset.provider === provider,
+    );
+    if (presets.length === 0) {
+      return;
+    }
+    const setting = new Setting(containerEl)
+      .setName("Endpoint preset")
+      .setDesc(
+        provider === "openai_compatible"
+          ? "Apply a known OpenAI-compatible base URL and suggested model, then Test connection."
+          : "Apply the Ollama Cloud base URL only. Your model tag is unchanged — pick it from the catalog, then Test connection.",
+      );
+    setting.addDropdown((dropdown) => {
+      dropdown.addOption("", "Choose a preset…");
+      for (const preset of presets) {
+        dropdown.addOption(preset.id, preset.label);
+      }
+      dropdown.setValue("");
+      dropdown.onChange(async (value) => {
+        if (!value) {
+          return;
+        }
+        const preset = getCloudProviderPreset(value as CloudProviderPresetId);
+        if (!preset) {
+          return;
+        }
+        applyCloudProviderPreset(this.plugin.settings, preset);
+        this.plugin.invalidateModelConnectionStatus();
+        await this.plugin.saveSettings();
+        new Notice(
+          preset.provider === "ollama"
+            ? `${preset.label} endpoint applied. Set your model tag from the catalog, add your API key, then Test connection.`
+            : `${preset.label} preset applied. Add your API key, then Test connection.`,
+        );
+        this.display();
+      });
+    });
+  }
+
   private renderConnectionStatusRow(containerEl: HTMLElement): void {
     const rows = buildSettingsDependencyRows(this.plugin.settings);
     const preflight = runDependencyPreflight(rows);
@@ -527,14 +591,19 @@ export class AgentSettingTab extends PluginSettingTab {
       .join(" ");
 
     const setting = new Setting(containerEl)
-      .setName("Connection status")
-      .setDesc(
-        `${live.message} Configuration preflight: ${preflight.status}. ${summary}`,
-      );
+      .setName("Connection")
+      .setDesc(live.message);
     setting.settingEl.addClass("agentic-settings-model-connection");
+    if (preflight.status !== "ok") {
+      setting.descEl.createDiv({
+        text: `Setup tip: ${summary}`,
+        cls: "agentic-settings-connection-hint",
+      });
+    }
     setting.addButton((button) =>
       button
         .setButtonText(live.status === "testing" ? "Testing..." : "Test connection")
+        .setCta()
         .setDisabled(live.status === "testing")
         .onClick(async () => {
           const pending = this.plugin.testModelConnection();
@@ -563,7 +632,7 @@ export class AgentSettingTab extends PluginSettingTab {
     const headerCopy = header.createDiv();
     headerCopy.createEl("h3", { text: "System readiness" });
     headerCopy.createEl("p", {
-      text: "Choose a status to perform its displayed next action in Chat or jump directly to its controls.",
+      text: "Tap a row to open its setup controls or Chat.",
       cls: "setting-item-description agentic-settings-section-intro",
     });
     header.createEl("span", {
@@ -581,6 +650,9 @@ export class AgentSettingTab extends PluginSettingTab {
           type: "button",
           "data-status": capabilityStatusSlug(row.status),
           "data-action-destination": actionDestination,
+          title: row.evidenceAt
+            ? `Evidence: ${row.evidenceAt}`
+            : "Evidence not yet observed",
           "aria-label": `${row.name}: ${row.status}. Next action: ${row.nextAction}. ${
             actionDestination === "chat" ? "Open Chat." : "Open settings."
           }`,
@@ -602,13 +674,10 @@ export class AgentSettingTab extends PluginSettingTab {
         cls: "agentic-settings-readiness-detail",
       });
       item.createEl("span", {
-        text: `Evidence: ${row.evidenceAt ?? "not yet observed"}`,
-        cls: "agentic-settings-readiness-evidence",
-      });
-      item.createEl("span", {
-        text: `${row.nextAction} · ${
-          actionDestination === "chat" ? "Open Chat" : "Open settings"
-        }`,
+        text:
+          actionDestination === "chat"
+            ? `${row.nextAction} · Open Chat`
+            : `${row.nextAction} · Open settings`,
         cls: "agentic-settings-readiness-action",
       });
       item.addEventListener("click", () => {
@@ -669,9 +738,9 @@ export class AgentSettingTab extends PluginSettingTab {
     const advancedRoot = containerEl.createDiv({
       cls: "agentic-settings-advanced agentic-settings-panel",
     });
-    advancedRoot.createEl("h3", { text: "Advanced controls" });
+    advancedRoot.createEl("h3", { text: "Advanced" });
     advancedRoot.createEl("p", {
-      text: "Power-user controls are grouped by job. Readiness stays visible while the details remain out of the way.",
+      text: "Optional tuning by job. Leave these closed unless you need a specific override.",
       cls: "setting-item-description agentic-settings-section-intro",
     });
 
@@ -681,10 +750,8 @@ export class AgentSettingTab extends PluginSettingTab {
     this.renderAdvancedModelRouting(accordion);
     this.renderAdvancedOutputOverrides(accordion);
     this.renderAdvancedAutonomyBudgets(accordion);
-    this.renderAdvancedSemantic(accordion);
     this.renderAdvancedBrowserIntegrations(accordion);
     this.renderAdvancedExtensionContributions(accordion);
-    this.renderAdvancedDiagnostics(accordion);
   }
 
   private createAdvancedDetails(
@@ -735,8 +802,8 @@ export class AgentSettingTab extends PluginSettingTab {
     const section = this.createAdvancedDetails(
       parent,
       "agentic-settings-model-routing",
-      "Model & routing",
-      "Provider behavior, request limits and generation controls.",
+      "Model tuning",
+      "Router, thinking, sampling, and timeouts.",
     );
 
     new Setting(section)
@@ -869,8 +936,8 @@ export class AgentSettingTab extends PluginSettingTab {
     const section = this.createAdvancedDetails(
       parent,
       "agentic-settings-output-memory",
-      "Output & memory",
-      "Note targeting, streaming, titles and durable research memory.",
+      "Notes & vault",
+      "Streaming, titles, templates, memory folders, and semantic search.",
       ["Notes & research"],
     );
 
@@ -972,14 +1039,16 @@ export class AgentSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    this.renderAdvancedSemanticControls(section);
   }
 
   private renderAdvancedAutonomyBudgets(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
       "agentic-settings-autonomy",
-      "Autonomy, teams & schedules",
-      "Budgets, long runs, Lead + Worker routing and recurring missions.",
+      "Autonomy & schedules",
+      "Step budgets, overnight runs, team workers, and recurring missions.",
       ["Background work"],
     );
 
@@ -1297,14 +1366,19 @@ export class AgentSettingTab extends PluginSettingTab {
     this.renderScheduledMissionControls(section);
   }
 
-  private renderAdvancedSemantic(parent: HTMLElement): void {
-    const section = this.createAdvancedDetails(
-      parent,
-      "agentic-settings-semantic",
-      "Semantic retrieval",
-      "Local embeddings, chunking and index persistence.",
-      ["Notes & research"],
-    );
+  private renderAdvancedSemanticControls(section: HTMLElement): void {
+    const semanticAnchor = section.createDiv({
+      attr: { id: "agentic-settings-semantic" },
+      cls: "agentic-settings-nested-anchor",
+    });
+    semanticAnchor.createEl("h4", {
+      text: "Semantic search",
+      cls: "agentic-settings-subgroup-title",
+    });
+    semanticAnchor.createEl("p", {
+      text: "Optional local embeddings for conceptual vault search.",
+      cls: "setting-item-description agentic-settings-subsection-intro",
+    });
 
     new Setting(section)
       .setName("Semantic search")
@@ -1527,9 +1601,9 @@ export class AgentSettingTab extends PluginSettingTab {
     const section = this.createAdvancedDetails(
       parent,
       "agentic-settings-connections",
-      "Companion & integrations",
-      "Browser tools plus Linear and GitHub connections.",
-      ["Browser & web", "Linear", "GitHub"],
+      "Connections",
+      "Companion, browser automation, Linear, and GitHub.",
+      ["Web research", "Linear", "GitHub"],
     );
 
     new Setting(section)
@@ -2360,13 +2434,11 @@ export class AgentSettingTab extends PluginSettingTab {
       );
   }
 
-  private renderAdvancedDiagnostics(parent: HTMLElement): void {
-    const section = this.createAdvancedDetails(
-      parent,
-      "agentic-settings-diagnostics",
-      "Diagnostics",
-      "Effective runtime settings, dependency checks and reflex visibility.",
-    );
+  private renderAdvancedDiagnosticsControls(section: HTMLElement): void {
+    const diagnosticsAnchor = section.createDiv({
+      attr: { id: "agentic-settings-diagnostics" },
+      cls: "agentic-settings-nested-anchor",
+    });
     const s = this.plugin.settings;
     const provider = s.modelProvider ?? "ollama";
     const base =
@@ -2374,7 +2446,7 @@ export class AgentSettingTab extends PluginSettingTab {
         ? s.openAiCompatibleBaseUrl
         : s.ollamaBaseUrl;
 
-    section.createEl("p", {
+    diagnosticsAnchor.createEl("p", {
       text: `Effective profile: working=${s.workingMode ?? "automatic"}, memory=${s.memoryMode ?? "research"}, autonomy=${s.autonomyProfile ?? "automatic"}, output=${s.outputProfile ?? "active_or_new_note"}, schema=${s.settingsSchemaVersion ?? 1}. Provider=${provider}, model=${s.model}, thinking=${s.thinkingMode}, base=${base}. Streaming=${s.enableStreaming ? "on" : "off"}, note_stream=${s.streamWritebackMode}, auto_title=${s.autoTitleOnWrite !== false ? "on" : "off"}, orchestrator=${s.orchestratorEnabled !== false ? "on" : "off"}, router=${normalizeModelRouterMode(s.modelRouterMode, s.modelRouterEnabled)}, reflex=${s.agenticReflexEnabled ? "on" : "off"}.`,
       cls: "setting-item-description agentic-settings-diagnostics-summary",
     });
@@ -2416,14 +2488,21 @@ export class AgentSettingTab extends PluginSettingTab {
     const section = this.createAdvancedDetails(
       parent,
       "agentic-settings-system-health",
-      "Built-in system health",
-      "Internal Code, Companion and Integrations contracts.",
+      "Diagnostics & health",
+      "Effective profile, dependency checks, reflex toggles, and built-in capability health.",
       ["Code", "Background work"],
     );
     this.extensionContributionsEl = section;
+
+    this.renderAdvancedDiagnosticsControls(section);
+
+    section.createEl("h4", {
+      text: "Built-in capability health",
+      cls: "agentic-settings-subgroup-title",
+    });
     section.createEl("p", {
-      text: "Code, Companion, and Integrations ship inside Agentic Researcher. Their internal boundaries stay isolated and appear here only for health and migration diagnostics.",
-      cls: "setting-item-description",
+      text: "Code, Companion, and Integrations ship inside Agentic Researcher. This is diagnostic metadata only.",
+      cls: "setting-item-description agentic-settings-subsection-intro",
     });
 
     const contributions = this.plugin.getExtensionSettingsSections();
@@ -2572,11 +2651,11 @@ function capabilitySetupTargetId(target: CapabilitySetupTarget): string {
   if (
     target === "browser_web" ||
     target === "linear" ||
-    target === "github" ||
-    target === "background"
+    target === "github"
   ) {
     return "agentic-settings-connections";
   }
+  // code + background land on Diagnostics & health (Companion/Code metadata).
   return "agentic-settings-system-health";
 }
 

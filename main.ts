@@ -44,6 +44,11 @@ import {
   type CapabilityReadinessV2,
 } from "./src/agent/capabilityReadiness";
 import {
+  formatMissionReceiptMarkdown,
+  missionReceiptNotePath,
+  type MissionReceiptNoteInputV1,
+} from "./src/agent/missionReceiptNote";
+import {
   detectInstallKind,
   normalizeAgentSettings,
   normalizeCompanionLoopbackBaseUrl,
@@ -131,6 +136,11 @@ import {
 } from "./src/agent/startupMissionHydration";
 import { extractRequestedRunId } from "./src/agent/missionResume";
 import { createAgentRunId } from "./src/agent/checkpoints";
+import {
+  followEditorStreamingEnd,
+  setEditorValueFollowingStreamEnd,
+  type SetCurrentMarkdownContentOptions,
+} from "./src/obsidianEditorFollow";
 import {
   DURABLE_MISSION_MAX_MODEL_STEPS,
   DURABLE_MISSION_MAX_TOOL_CALLS,
@@ -1237,11 +1247,49 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   hasVerifiedModelConnection(): boolean {
-    return (
+    if (
       this.modelConnectionStatus.status === "ready" &&
       this.modelConnectionStatus.provider === this.settings.modelProvider &&
       this.modelConnectionStatus.model === this.settings.model
+    ) {
+      return true;
+    }
+    // Persist across restart: verified settings still match current config.
+    return (
+      typeof this.settings.modelConnectionVerifiedAt === "string" &&
+      Number.isFinite(Date.parse(this.settings.modelConnectionVerifiedAt)) &&
+      this.settings.modelConnectionVerifiedProvider === this.settings.modelProvider &&
+      this.settings.modelConnectionVerifiedModel === this.settings.model &&
+      this.settings.modelConnectionVerifiedBaseUrl ===
+        getConfiguredModelBaseUrl(this.settings)
     );
+  }
+
+  /** E2E / harness helper: mark the current provider+model as connection-ready. */
+  markModelConnectionVerifiedForHarness(detail?: {
+    latencyMs?: number;
+    message?: string;
+  }): void {
+    const provider = this.settings.modelProvider;
+    const model = this.settings.model;
+    const checkedAt = new Date().toISOString();
+    this.settings.modelConnectionVerifiedAt = checkedAt;
+    this.settings.modelConnectionVerifiedProvider = provider;
+    this.settings.modelConnectionVerifiedModel = model;
+    this.settings.modelConnectionVerifiedBaseUrl = getConfiguredModelBaseUrl(
+      this.settings,
+    );
+    this.modelConnectionStatus = {
+      status: "ready",
+      message:
+        detail?.message?.trim() ||
+        `Connection verified for harness (${provider} / ${model}).`,
+      checkedAt,
+      latencyMs: detail?.latencyMs ?? 0,
+      provider,
+      model,
+    };
+    this.activeAgentView?.refreshFirstRunState();
   }
 
   invalidateModelConnectionStatus(): void {
@@ -1415,6 +1463,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
     if (built.truncated) {
       new Notice("Selection was truncated for the research mission.");
+    }
+    // Selection research is the DU-02 cloud happy path (cited append / chat).
+    if (built.dailyUseId === "DU-02" && input.mode === "stream_page") {
+      new Notice("Research selection: cited findings will append to this note (DU-02).");
     }
 
     // Pin the selection's note as the current markdown target before revealing
@@ -6301,6 +6353,28 @@ export default class AgenticResearcherPlugin extends Plugin {
     return this.coreApiHost.getRegisteredExtensionIds();
   }
 
+  /**
+   * Host-owned compound-lifecycle receipt note. Append-first under
+   * Agent Work/Mission Receipts; never overwrites an existing receipt.
+   */
+  async writeMissionReceiptNote(
+    input: MissionReceiptNoteInputV1,
+  ): Promise<{ path: string; created: boolean } | null> {
+    const path = missionReceiptNotePath(input.runId);
+    try {
+      await ensureVaultFolderPath(this.app, getVaultParentPath(path));
+      const existing = this.app.vault.getFileByPath(path);
+      if (existing) {
+        return { path, created: false };
+      }
+      await this.app.vault.create(path, formatMissionReceiptMarkdown(input));
+      return { path, created: true };
+    } catch (error) {
+      console.warn(`Unable to write mission receipt ${path}`, error);
+      return null;
+    }
+  }
+
   getCapabilityReadiness(): CapabilityReadinessV2[] {
     const registered = new Set(this.getRegisteredCapabilityIds());
     const codeRuntime = this.getCapabilityRuntime<{
@@ -6666,6 +6740,21 @@ export default class AgenticResearcherPlugin extends Plugin {
     return this.latestOrchestratorSnapshot
       ? normalizeOrchestratorSnapshot(this.latestOrchestratorSnapshot)
       : null;
+  }
+
+  /**
+   * Clears the retained Orchestrator projection so a new mission cannot leave
+   * a prior run's task tree / elapsed clock / blockers visible. Continuation
+   * prompts that preserve MissionGraph authority must skip this.
+   */
+  async clearLatestOrchestratorSnapshot(): Promise<void> {
+    if (this.latestOrchestratorSnapshot === null) {
+      this.activeAgentView?.refreshOrchestratorAvailability();
+      return;
+    }
+    this.latestOrchestratorSnapshot = null;
+    await this.savePluginData();
+    this.activeAgentView?.refreshOrchestratorAvailability();
   }
 
   private async setLatestOrchestratorSnapshot(
@@ -7314,6 +7403,15 @@ export default class AgenticResearcherPlugin extends Plugin {
           coordinatorBeforeStart.lastMissionLedger.canResume &&
           coordinatorBeforeStart.lastMissionGraph,
       );
+      const preserveOrchestratorSnapshot = Boolean(
+        preserveExistingProjectionUntilLedger ||
+          (requestedContinuationRunId &&
+            this.latestOrchestratorSnapshot?.runId ===
+              requestedContinuationRunId),
+      );
+      if (!preserveOrchestratorSnapshot) {
+        await this.clearLatestOrchestratorSnapshot();
+      }
       return await this.runCoordinator.start(
         async (abortSignal, events) => {
           if (durableManifest) {
@@ -12186,8 +12284,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       httpTransport: requestUrlTransport,
       getCurrentMarkdownFile: () => this.getCurrentMarkdownFile(),
       getCurrentMarkdownContent: (file) => this.getCurrentMarkdownContent(file),
-      setCurrentMarkdownContent: (file, content) =>
-        this.setCurrentMarkdownContent(file, content),
+      setCurrentMarkdownContent: (file, content, options) =>
+        this.setCurrentMarkdownContent(file, content, options),
       getResearchMemoryIndex: () => [...this.researchMemoryIndex],
       setResearchMemoryIndex: (entries) => this.setResearchMemoryIndex(entries),
       getProjectLineages: () => this.getProjectLineages(),
@@ -12233,20 +12331,33 @@ export default class AgenticResearcherPlugin extends Plugin {
     return null;
   }
 
-  setCurrentMarkdownContent(file: TFile, content: string): boolean {
+  setCurrentMarkdownContent(
+    file: TFile,
+    content: string,
+    options: SetCurrentMarkdownContentOptions = {},
+  ): boolean {
     const recentEditor = getMarkdownEditorFromLeaf(
       this.app.workspace.getMostRecentLeaf(),
       file,
     );
     if (recentEditor?.setValue) {
-      recentEditor.setValue(content);
+      setEditorValueFollowingStreamEnd(recentEditor, content, options);
+      if (options.followStreamingEnd) {
+        // Re-follow after Obsidian finishes layout from the writeback.
+        queueMicrotask(() =>
+          followEditorStreamingEnd(recentEditor, content),
+        );
+      }
       return true;
     }
 
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const editor = getMarkdownEditorFromLeaf(leaf, file);
       if (editor?.setValue) {
-        editor.setValue(content);
+        setEditorValueFollowingStreamEnd(editor, content, options);
+        if (options.followStreamingEnd) {
+          queueMicrotask(() => followEditorStreamingEnd(editor, content));
+        }
         return true;
       }
     }
@@ -13587,6 +13698,16 @@ function getMarkdownEditorFromLeaf(
   | {
       getValue?: () => string;
       setValue?: (value: string) => void;
+      offsetToPos?: (offset: number) => { line: number; ch: number };
+      lastLine?: () => number;
+      getLine?: (line: number) => string;
+      scrollIntoView?: (
+        range: {
+          from: { line: number; ch: number };
+          to: { line: number; ch: number };
+        },
+        center?: boolean,
+      ) => void;
     }
   | null {
   const view = leaf?.view as
@@ -13595,6 +13716,16 @@ function getMarkdownEditorFromLeaf(
         editor?: {
           getValue?: () => string;
           setValue?: (value: string) => void;
+          offsetToPos?: (offset: number) => { line: number; ch: number };
+          lastLine?: () => number;
+          getLine?: (line: number) => string;
+          scrollIntoView?: (
+            range: {
+              from: { line: number; ch: number };
+              to: { line: number; ch: number };
+            },
+            center?: boolean,
+          ) => void;
         };
       }
     | undefined;

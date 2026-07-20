@@ -50,8 +50,10 @@ export interface AutoContinuationDecisionInput {
  * visible user/recovery decision instead of replaying the same failure through
  * every configured segment. Empty or blocked proof debt also refuses continue.
  *
- * When completionDriven is on, continue while unpaid debt or incomplete
- * reflection remains and the soft segment budget has room.
+ * When completionDriven is on, continue while unpaid proof debt or incomplete
+ * reflection remains and the soft segment budget has room. Acceptance gaps
+ * (`needs_more_work` / `fail` / non-empty `missing`) still count as unpaid debt
+ * even if a stale `ProofDebt.empty` flag says otherwise.
  */
 export function decideAutoContinuation({
   stopReason,
@@ -113,8 +115,13 @@ export function decideAutoContinuation({
   const reflectionDone = reflection?.done === true;
   const debtEmpty = debt?.empty === true;
   const acceptancePass = acceptance?.status === "pass";
+  const unpaidProofDebt = hasUnpaidProofDebt({
+    debt,
+    acceptance,
+    completionDriven,
+  });
 
-  if (reflectionDone && debtEmpty && acceptancePass) {
+  if (reflectionDone && !unpaidProofDebt && acceptancePass) {
     return { recommended: false, reason: "proof_satisfied" };
   }
 
@@ -126,13 +133,14 @@ export function decideAutoContinuation({
     if (!withinSegmentBudget) {
       return { recommended: false, reason: "segment_cap" };
     }
-    if (!debtEmpty || !reflectionDone) {
+    // Keep looping while proof debt remains or reflection is incomplete.
+    if (unpaidProofDebt || !reflectionDone) {
       return { recommended: true, reason: "budget_exhausted" };
     }
     return { recommended: false, reason: "proof_satisfied" };
   }
 
-  if (debtEmpty) {
+  if (debtEmpty || !unpaidProofDebt) {
     return { recommended: false, reason: "proof_satisfied" };
   }
 
@@ -141,6 +149,39 @@ export function decideAutoContinuation({
   }
 
   return { recommended: true, reason: "budget_exhausted" };
+}
+
+/**
+ * Unpaid proof for auto-continue.
+ * - Non-empty debt always counts.
+ * - Non-completion paths: empty debt overrides narrative acceptance (legacy).
+ * - Completion-driven paths: acceptance gaps still count when debt is empty/missing
+ *   so loops cannot stop early while `missing` / needs_more_work remain.
+ */
+function hasUnpaidProofDebt(input: {
+  debt: ProofDebt | null;
+  acceptance: AutoContinuationDecisionInput["acceptance"];
+  completionDriven: boolean;
+}): boolean {
+  const { debt, acceptance, completionDriven } = input;
+  if (debt && !debt.empty) {
+    return true;
+  }
+  if (debt?.empty === true && !completionDriven) {
+    return false;
+  }
+  return acceptanceStillOwesProof(acceptance);
+}
+
+function acceptanceStillOwesProof(
+  acceptance: AutoContinuationDecisionInput["acceptance"],
+): boolean {
+  if (!acceptance) return false;
+  if (acceptance.status === "pass") return false;
+  if ((acceptance.missing?.length ?? 0) > 0) return true;
+  return (
+    acceptance.status === "needs_more_work" || acceptance.status === "fail"
+  );
 }
 
 function hasNonRecoverableAcceptanceFailure(

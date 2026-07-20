@@ -337,6 +337,11 @@ export function createResearchTeamScaffold(input: {
   };
 }
 
+/**
+ * Opt into Lead + Researcher orchestration only for source/verify-style
+ * missions. Bare "research" / "research this topic" must stay false so ordinary
+ * note writebacks do not open a research_team runtime.
+ */
 export function shouldUseResearchTeam(
   prompt: string,
   previewEnabled: boolean,

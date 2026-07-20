@@ -9,6 +9,7 @@ import type {
   ModelRequestOptions,
   ModelThink,
 } from "./model/types";
+import type { AgentSettings } from "./settings";
 import { ModelClientError } from "./model/types";
 import { appendToolTranscript } from "./model/toolTranscript";
 import { serializeToolResultForModel } from "./model/toolResultPayload";
@@ -141,6 +142,22 @@ import {
   type LoopLedger,
 } from "./agent/loopDecision";
 import {
+  isMissionGraphAcceptablyComplete as isMissionGraphAcceptablyCompleteFromAuthority,
+  collectRequiredDependencyIds,
+} from "./agent/missionGraphAuthority";
+import {
+  createStreamWriteSession,
+  recordAppliedBytes,
+  shouldAbortReleasedChunk,
+  shouldKeepPostReleaseBuffer as shouldKeepPostReleaseBufferFromGuard,
+  createIdempotentStreamRetryPolicy,
+  type StreamWriteSession,
+} from "./agent/streamedWritebackGuard";
+import {
+  mapRunRouteToSchemaRoute,
+  schemasForStep,
+} from "./agent/toolSchemaPolicy";
+import {
   createRunPlan,
   resolveThinkingMode,
   type RunPlan,
@@ -149,6 +166,7 @@ import {
   type SlowPathReason,
   type StreamingWritebackKind,
 } from "./agent/runPlan";
+import { resolveThinkForCall } from "./agent/thinkPolicy";
 import {
   deriveAutonomyScope,
   extractExplicitNewWorkspaceFilePaths,
@@ -306,10 +324,12 @@ import {
 import {
   applyResearchEvidence,
   createResearchPlan,
+  createResearchPlanWithAssist,
   formatResearchPlanForPrompt,
   parseExplicitResearchSourceCount,
   type ResearchPlan,
 } from "./agent/researchPlan";
+import { missionGraphPlannerFallbackCopy } from "./ui/agentViewCopy";
 import {
   isExplicitVisibleFileRenameIntent,
   isMarkdownTitleContentIntent,
@@ -703,6 +723,8 @@ export interface AgentRunCompleteEvent {
   step: number;
   maxSteps: number;
   stopReason: AgentRunStopReason;
+  /** Extra classifier detail for Chat stop taxonomy (wall_clock, graph_blocked, …). */
+  stopDetail?: string | null;
   autoContinueRecommended?: boolean;
   autoContinueReason?: AutoContinuationReason;
 }
@@ -896,6 +918,9 @@ const FINAL_ANSWER_PROMPT = [
   "Do not request tools.",
   "Do not mention hidden planning unless it is directly useful to the user.",
 ].join(" ");
+
+const MULTI_TURN_TOOL_LOOP_CUE =
+  "You may call tools across multiple turns before the final answer. Keep using tools until you have enough evidence, then stop requesting tools and produce the final answer.";
 
 function buildFinalAnswerPrompt(prompt: string): string {
   return [
@@ -2167,10 +2192,17 @@ export async function runAgentMission({
         });
         const bootstrapResearchPlan = proofBoundProviderLifecycle
           ? null
-          : createResearchPlan({
+          : await createResearchPlanWithAssist({
               prompt: activeIntentPrompt,
               missionIntent,
               runPlan,
+              utilityModelConfigured: Boolean(
+                runToolContext.settings?.utilityModel?.trim(),
+              ),
+              assist: buildResearchSubquestionAssist(
+                modelClient,
+                runToolContext.settings?.utilityModel?.trim() || undefined,
+              ),
             });
         const requiredGraphFetchCount = requiresWebEvidenceProof(
           activeIntentPrompt,
@@ -2503,6 +2535,18 @@ export async function runAgentMission({
               hostPlan.projectLifecycleIntent?.stages ?? [],
           },
         });
+        const fallbackCopy = missionGraphPlannerFallbackCopy(
+          graphPlan.fallbackReason,
+        );
+        if (fallbackCopy) {
+          events.onStatus?.(fallbackCopy);
+          events.onTrace?.({
+            id: "mission-graph-planner-fallback",
+            kind: "status",
+            message: fallbackCopy,
+            outputPreview: { fallbackReason: graphPlan.fallbackReason },
+          });
+        }
       }
       if (missionGraphSession && backgroundContinuation) {
         backgroundDispatchSummary = await dispatchPersistedBackgroundNodesV1({
@@ -3022,10 +3066,17 @@ export async function runAgentMission({
   }
   researchPlan = proofBoundProviderLifecycle
     ? null
-    : createResearchPlan({
+    : await createResearchPlanWithAssist({
         prompt: activeIntentPrompt,
         missionIntent,
         runPlan,
+        utilityModelConfigured: Boolean(
+          runToolContext.settings?.utilityModel?.trim(),
+        ),
+        assist: buildResearchSubquestionAssist(
+          modelClient,
+          runToolContext.settings?.utilityModel?.trim() || undefined,
+        ),
       });
   const restoredResearchPlan =
     resumeSnapshot?.researchPlan ?? resumeLedger?.researchPlan;
@@ -4268,6 +4319,12 @@ export async function runAgentMission({
       await persistMissionLedger("mission-ledger-preflight-blocked");
     }
     events.onStatus?.(message);
+    events.onTrace?.({
+      id: "dependency-preflight-blocked-chat",
+      kind: "error",
+      message: `Blocked before tools: ${message}`,
+      outputPreview: { preflight },
+    });
     emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
     completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
     return;
@@ -4784,11 +4841,7 @@ export async function runAgentMission({
     if (stopReason === "final" && acceptance.status === "pass") {
       await maybeExtractResearchMemory(acceptance, stopReason, step);
     }
-    const graphComplete =
-      !missionGraph ||
-      Object.values(missionGraph.nodes).every(
-        (node) => node.status === "complete" || node.status === "cancelled",
-      );
+    const graphComplete = isMissionGraphAcceptablyComplete(missionGraph);
     const effectiveStopReason =
       (stopReason === "final" || stopReason === "write_completed") &&
         (acceptance.status !== "pass" || !graphComplete)
@@ -4909,6 +4962,23 @@ export async function runAgentMission({
         outputPreview: gate,
       });
     }
+    const stopDetail =
+      effectiveStopReason === "budget"
+        ? [
+            autoContinuation.reason !== "not_budget"
+              ? autoContinuation.reason
+              : null,
+            acceptance.status !== "pass"
+              ? acceptance.missing.join(",")
+              : null,
+            !graphComplete ? "mission_graph_incomplete" : null,
+            nextAction?.trim() || null,
+          ]
+            .filter(Boolean)
+            .join(";") || "step_budget"
+        : effectiveStopReason === "error"
+          ? nextAction?.trim() || null
+          : null;
     completeRun(
       events,
       effectiveStopReason,
@@ -4916,6 +4986,7 @@ export async function runAgentMission({
       runStartedAt,
       maxSteps,
       autoContinuation,
+      stopDetail,
     );
   };
   const backgroundDispatchTerminalCount = backgroundDispatchSummary
@@ -8290,6 +8361,14 @@ export async function runAgentMission({
       role: "system" as const,
       content: formatToolAuthorityContext(tools),
     },
+    ...(runPlan.route === "tool_required" || runPlan.route === "grounded_workflow"
+      ? [
+          {
+            role: "system" as const,
+            content: MULTI_TURN_TOOL_LOOP_CUE,
+          },
+        ]
+      : []),
     ...(streamingWritebackKind === null
       ? []
       : [
@@ -9051,6 +9130,8 @@ export async function runAgentMission({
           // MissionGraphSession materializes each such call as a bounded dynamic
           // node. Explicit ordered workflows expose the exact ready node only.
           includeCapabilityReads: !missionGraphUsesExactPlannedFrontier,
+          // Shrink schemas for cloud tool-calling models by route bucket.
+          route: runPlan.route,
         },
       ),
       missionGraphUsesExactPlannedFrontier ? stepGraph : null,
@@ -9316,6 +9397,7 @@ export async function runAgentMission({
         events,
         step,
         disableThinkingForRun,
+        enableStreaming,
       );
     } catch (error) {
       if (stopIfRequested(step)) {
@@ -9383,9 +9465,13 @@ export async function runAgentMission({
         (requiredWriteTools.includes(toolCall.name) &&
           !successfulToolNames.includes(toolCall.name)),
     );
+    const pendingStreamingWritebackBeforeTool =
+      hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
     const shouldReserveFinalizationBeforeTool =
       responseToolCalls.length > 0 &&
       !responseRequestsPendingRequiredWrite &&
+      pendingRequiredWritesBeforeToolUse.length === 0 &&
+      !pendingStreamingWritebackBeforeTool &&
       loopBudgetPlan.finalizationReserve > 0 &&
       step < stepLimit &&
       ((loopBudgetPlan.toolStepBudget > 0 &&
@@ -9409,16 +9495,21 @@ export async function runAgentMission({
       continue;
     }
 
+    const assistantStepMessage = recoveredTextToolCalls
+      ? {
+          ...response.message,
+          content: "",
+          toolCalls: responseToolCalls,
+        }
+      : response.message;
+    // Ollama/Qwen3.x: keep thinking on in-flight assistant tool turns so the
+    // next tool round retains reasoning context. Strip thinking on terminal
+    // assistant turns; chat persistence and writeback completion still use
+    // withoutThinking on their own paths.
     messages.push(
-      withoutThinking(
-        recoveredTextToolCalls
-          ? {
-              ...response.message,
-              content: "",
-              toolCalls: responseToolCalls,
-            }
-          : response.message,
-      ),
+      responseToolCalls.length > 0
+        ? assistantStepMessage
+        : withoutThinking(assistantStepMessage),
     );
 
     if (responseToolCalls.length === 0) {
@@ -10246,6 +10337,7 @@ export async function runAgentMission({
             refreshedGraph,
             {
               includeCapabilityReads: !missionGraphUsesExactPlannedFrontier,
+              route: runPlan.route,
             },
           ),
           missionGraphUsesExactPlannedFrontier ? refreshedGraph : null,
@@ -10925,7 +11017,7 @@ export async function runAgentMission({
             toolContext: runToolContext,
             knownToolNames,
             relevancePrompt: finalAnswerRelevancePrompt,
-            think: false,
+            think: resolveWritebackThink(runToolContext.settings),
             options: modelOptions,
             abortSignal,
             onThinkingUnsupported: disableThinkingForRun,
@@ -11004,7 +11096,16 @@ export async function runAgentMission({
       toolNames: responseToolCalls.map((toolCall) => toolCall.name),
     });
 
-    if (missionGraphCapacityExhausted && step < stepLimit) {
+    const pendingRequiredWriteToolsBeforeCapacityClear =
+      getPendingRequiredWriteToolNames(operationGoals, requiredWriteTools);
+    const pendingStreamingWritebackBeforeCapacityClear =
+      hasPendingStreamingWritebackGoal(operationGoals, streamingWritebackKind);
+    if (
+      missionGraphCapacityExhausted &&
+      step < stepLimit &&
+      pendingRequiredWriteToolsBeforeCapacityClear.length === 0 &&
+      !pendingStreamingWritebackBeforeCapacityClear
+    ) {
       events.onStatus?.(
         "Mission graph capacity reached; drafting the final result from accepted evidence.",
       );
@@ -11096,7 +11197,7 @@ export async function runAgentMission({
             toolContext: runToolContext,
             knownToolNames,
             relevancePrompt: finalAnswerRelevancePrompt,
-            think: false,
+            think: resolveWritebackThink(runToolContext.settings),
             options: modelOptions,
             abortSignal,
             onThinkingUnsupported: disableThinkingForRun,
@@ -11448,16 +11549,31 @@ export async function runAgentMission({
       await finishRun("budget", lastStep, stepLimit, message);
       return;
     }
-    if (loopDecision.action === "stop_verified_complete" && step < stepLimit) {
-      events.onStatus?.("Mission plan complete; asking model for final synthesis...");
-      tools = [];
-      allowedToolNames = new Set();
-      messages.push({
-        role: "system" as const,
-        content:
-          "The mission plan is complete. Do not request more tools. Provide the final answer now using the gathered evidence and receipts.",
-      });
-      continue;
+    if (loopDecision.action === "stop_verified_complete") {
+      if (loopDecision.reason === "write_completed") {
+        emitRunDiagnostics({
+          events,
+          toolContext: runToolContext,
+          tools,
+          enableStreaming,
+          finalMode: "none",
+          runPlan,
+        });
+        emitLocalWriteSummary(events, writeReceipts);
+        await finishRun("write_completed", lastStep, stepLimit);
+        return;
+      }
+      if (step < stepLimit) {
+        events.onStatus?.("Mission plan complete; asking model for final synthesis...");
+        tools = [];
+        allowedToolNames = new Set();
+        messages.push({
+          role: "system" as const,
+          content:
+            "The mission plan is complete. Do not request more tools. Provide the final answer now using the gathered evidence and receipts.",
+        });
+        continue;
+      }
     }
     if (
       loopDecision.action === "force_final_no_tools" &&
@@ -12117,10 +12233,29 @@ function formatCheckpointResumeContext(
 export function constrainToolsToMissionGraphFrontier(
   tools: ModelToolDefinition[],
   graph: MissionGraphV3 | null | undefined,
-  options: { includeCapabilityReads?: boolean } = {},
+  options: { includeCapabilityReads?: boolean; route?: string } = {},
 ): ModelToolDefinition[] {
   if (!graph) {
-    return tools;
+    // Without a MissionGraph frontier, still shrink note/research/vault routes
+    // so cloud models do not see Linear/GitHub. Code/default keep the fuller
+    // catalog until graph/intent filters apply.
+    if (!options.route) {
+      return tools;
+    }
+    const schemaRoute = mapRunRouteToSchemaRoute(options.route);
+    if (
+      schemaRoute !== "current_note" &&
+      schemaRoute !== "research" &&
+      schemaRoute !== "vault"
+    ) {
+      return tools;
+    }
+    return schemasForStep({
+      route: options.route,
+      frontier: [],
+      graphRequired: [],
+      allSchemas: tools,
+    }) as ModelToolDefinition[];
   }
   const frontierNames = new Set(
     Object.values(graph.nodes)
@@ -12136,7 +12271,43 @@ export function constrainToolsToMissionGraphFrontier(
       }
     }
   }
-  return tools.filter((tool) => frontierNames.has(tool.function.name));
+  const frontierConstrained = tools.filter((tool) =>
+    frontierNames.has(tool.function.name),
+  );
+  if (!options.route) {
+    return frontierConstrained;
+  }
+  // Second pass: keep only route-base ∪ frontier ∪ graph-required names to
+  // shrink cloud/local schema noise (drops Linear/GitHub on note routes).
+  const graphRequired = Object.values(graph.nodes)
+    .filter((node) => node.status === "ready" || node.status === "running")
+    .flatMap((node) => node.allowedTools);
+  return schemasForStep({
+    route: options.route,
+    frontier: [...frontierNames],
+    graphRequired,
+    allSchemas: frontierConstrained,
+  }) as ModelToolDefinition[];
+}
+
+/**
+ * Terminal acceptance only requires the final node and its transitive host
+ * prerequisites. Optional catalog reads that joined as siblings may remain
+ * unread without forcing a budget downgrade after a successful write.
+ */
+export function isMissionGraphAcceptablyComplete(
+  graph: MissionGraphV3 | null | undefined,
+): boolean {
+  return isMissionGraphAcceptablyCompleteFromAuthority(graph);
+}
+
+export function collectMissionGraphTransitiveDependencyIds(
+  graph: MissionGraphV3,
+  rootId: string,
+): Set<string> {
+  // Preserve export name; skip optional-* enrichment nodes so they cannot
+  // re-enter the required set via a mistaken dependency edge.
+  return collectRequiredDependencyIds(graph, rootId);
 }
 
 export function getPendingMissionGraphWriteToolNames(
@@ -13264,6 +13435,20 @@ function formatResolvedThink(think: ModelThink | undefined): string {
   return think === undefined ? "off" : String(think);
 }
 
+/** Content-only writeback: off for most models; GPT-OSS coerced to low. Never omit (defaults ON). */
+function resolveWritebackThink(
+  settings: AgentSettings | undefined,
+): ModelThink {
+  const resolved = resolveThinkForCall({
+    role: "lead",
+    phase: "streaming",
+    route: "direct_writeback",
+    settings,
+    model: settings?.model,
+  });
+  return resolved === undefined ? false : resolved;
+}
+
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -13845,16 +14030,31 @@ async function chatForAgentStep(
   events: AgentRunEvents,
   step: number,
   onThinkingUnsupported: () => void,
+  enableStreaming = false,
 ): Promise<ModelChatResponse> {
   request = { ...request, evidencePhase: request.evidencePhase ?? "agent_step" };
   const startedAt = nowMs();
   const requestChars = measureSerializedChars(request);
+  const useStreamForToolStep =
+    enableStreaming && (request.tools?.length ?? 0) > 0;
   emitModelCallTrace(events, {
     id: `model-call-agent-step-${step}`,
     step,
     message: `Model call: agent step ${step}`,
     request,
   });
+
+  if (useStreamForToolStep) {
+    return chatForAgentStepStreaming(
+      modelClient,
+      request,
+      events,
+      step,
+      onThinkingUnsupported,
+      startedAt,
+      requestChars,
+    );
+  }
 
   try {
     const response = await withModelRetry(
@@ -13973,6 +14173,95 @@ async function chatForAgentStep(
 
     emitMetricEvent(events, {
       kind: "model_chat",
+      name: "agent_step",
+      step,
+      durationMs: elapsedMs(startedAt),
+      requestChars,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Stream an agent step that still has tools. Accumulates thinking/content/
+ * tool_calls via the provider stream; emits thinking deltas to the UI only.
+ * Pre-tool content is never released as note writeback from this path.
+ */
+async function chatForAgentStepStreaming(
+  modelClient: ModelClient,
+  request: ModelChatRequest,
+  events: AgentRunEvents,
+  step: number,
+  onThinkingUnsupported: () => void,
+  startedAt: number,
+  requestChars: number,
+): Promise<ModelChatResponse> {
+  const thinkingStream = createThinkingStream(events);
+  const streamEvents: ModelChatStreamEvents = {
+    onThinkingDelta: (delta) => thinkingStream.onDelta(delta),
+    // Content deltas are accumulated by the model client into the response
+    // only. Do not emit them as chat/note writeback while tools remain in play.
+  };
+
+  try {
+    const response = await streamChatWithThinkingFallback({
+      modelClient,
+      request,
+      events,
+      streamEvents,
+      onThinkingUnsupported,
+    });
+    thinkingStream.done();
+    emitMetricEvent(events, {
+      kind: "model_stream",
+      name: "agent_step",
+      step,
+      durationMs: elapsedMs(startedAt),
+      requestChars,
+      responseChars: measureSerializedChars(response.raw ?? response.message),
+      ...extractTokenUsageFields(response.raw),
+    });
+    return response;
+  } catch (error) {
+    thinkingStream.done();
+
+    if (request.think !== undefined && isTransientModelError(error)) {
+      events.onStatus?.(
+        "Transient model provider error persisted; retrying without thinking mode...",
+      );
+      onThinkingUnsupported();
+      const noThinkRequest = {
+        ...request,
+        think: undefined,
+        evidencePhase: "retry" as const,
+      };
+      const retryThinkingStream = createThinkingStream(events);
+      const noThinkResponse = await streamChatWithThinkingFallback({
+        modelClient,
+        request: noThinkRequest,
+        events,
+        streamEvents: {
+          onThinkingDelta: (delta) => retryThinkingStream.onDelta(delta),
+        },
+        onThinkingUnsupported,
+      });
+      retryThinkingStream.done();
+      emitMetricEvent(events, {
+        kind: "model_stream",
+        name: "agent_step",
+        step,
+        durationMs: elapsedMs(startedAt),
+        requestChars: measureSerializedChars(noThinkRequest),
+        responseChars: measureSerializedChars(
+          noThinkResponse.raw ?? noThinkResponse.message,
+        ),
+        ...extractTokenUsageFields(noThinkResponse.raw),
+      });
+      return noThinkResponse;
+    }
+
+    emitMetricEvent(events, {
+      kind: "model_stream",
       name: "agent_step",
       step,
       durationMs: elapsedMs(startedAt),
@@ -15148,11 +15437,18 @@ function getAllowedToolDefinitions(
   const allowDelete = hasDeleteIntent(prompt);
   const allowDeletePath = hasDeletePathIntent(prompt);
   const allowWholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
-  const allowEdit = hasEditIntent(prompt) && !allowWholeNoteReplace;
+  const preferHostOwnedReplace =
+    prefersStreamedReplaceForEditOrganize(prompt) ||
+    allowWholeNoteReplace ||
+    streamingWritebackKind === "replace";
+  const allowEdit =
+    hasEditIntent(prompt) && !allowWholeNoteReplace && !preferHostOwnedReplace;
   const allowHighlight = hasHighlightIntent(prompt);
   const allowRestore = hasRestoreIntent(prompt);
   const allowReplace =
-    hasReplaceIntent(prompt) && (!allowEdit || allowWholeNoteReplace) && !allowDelete;
+    (hasReplaceIntent(prompt) || preferHostOwnedReplace) &&
+    (!allowEdit || allowWholeNoteReplace || preferHostOwnedReplace) &&
+    !allowDelete;
   const allowMarkdownRetitle = hasMarkdownTitleContentIntent(prompt);
   const allowVisibleRename =
     isExplicitVisibleFileRenameIntent(prompt) ||
@@ -15266,6 +15562,7 @@ function getAllowedToolDefinitions(
   const allowAutonomousAppend =
     allowCurrentNoteOutput &&
     !allowWholeNoteReplace &&
+    !preferHostOwnedReplace &&
     !allowEdit &&
     !allowDelete &&
     (!allowRetitle || !hasTitleOnlyIntent(prompt));
@@ -15568,6 +15865,7 @@ function getAllowedToolDefinitions(
       return (
         (allowAppend || allowAutonomousAppend) &&
         (!preferPathTarget || hasCurrentMutationTarget) &&
+        !preferHostOwnedReplace &&
         !hasTitleOnlyIntent(prompt) &&
         !allowSectionAppend &&
         !allowHighlight &&
@@ -17127,6 +17425,8 @@ function shouldOmitCurrentNoteReadForTargetOnlyWrite(
   prompt: string,
   missionIntent: MissionIntent,
 ): boolean {
+  // Cloud fast path: skip redundant current-note reads when writeback does not
+  // depend on existing note body. Web/tool loops may still run without a read.
   return (
     missionIntent.noteOutput &&
     !missionIntent.vaultContext &&
@@ -17352,6 +17652,8 @@ function classifyPromptOnCurrentPageMissionIntent(prompt: string): MissionIntent
 
 function promptRequiresToolLoop(prompt: string): boolean {
   return (
+    // Selection research (DU-02) must always take the web/tool path before writeback.
+    /\[agentic-daily-use:DU-02\]/i.test(prompt) ||
     hasWebSearchIntent(prompt) ||
     hasVaultContextQuestionIntent(prompt) ||
     hasVaultBrowseIntent(prompt) ||
@@ -19082,7 +19384,7 @@ function hasWholeNoteRevisionIntent(prompt: string): boolean {
   }
 
   const revisionVerb =
-    /\b(edit(?:ing)?|revise|revising|revision|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail)\b/i;
+    /\b(edit(?:ing)?|revise|revising|revision|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b/i;
   const wholeTextTarget =
     /\b(essay|draft|article|paragraphs?|body|content|document)\b|\b(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown)\b|\b(?:note|page|file|markdown)\b[\s\S]{0,40}\b(?:whole|entire|current|this|active)\b/i;
   const updateVerb = /\b(update|updating)\b/i;
@@ -21141,6 +21443,7 @@ async function streamCurrentNoteWriteback({
     toolRequestDetected: boolean;
     content: string;
     wroteContent: boolean;
+    allowRetry: boolean;
   }> => {
     const instruction = buildStreamingWritebackPrompt(
       kind,
@@ -21162,11 +21465,9 @@ async function streamCurrentNoteWriteback({
           content: instruction,
         },
       ],
-      // `undefined` lets Ollama Cloud choose the model default. Some reasoning
-      // models then spend the whole response on thinking and return no content.
-      // Streamed writeback is already a content-only finalization turn, so make
-      // the non-thinking default explicit and force retries to stay content-only.
-      think: retry ? false : (think ?? false),
+      // Content-only finalization: never omit think (Ollama may default ON).
+      // Prefer host writeback policy (off / gpt-oss low) over agent-step think.
+      think: resolveWritebackThink(toolContext.settings),
       options,
       abortSignal,
     };
@@ -21266,6 +21567,7 @@ async function streamCurrentNoteWriteback({
           toolRequestDetected: true,
           content: "",
           wroteContent: liveState.wroteContent,
+          allowRetry: liveState.retryPolicy.allowRetry,
         };
       }
 
@@ -21274,6 +21576,7 @@ async function streamCurrentNoteWriteback({
         toolRequestDetected: false,
         content: attemptContent,
         wroteContent: liveState.wroteContent,
+        allowRetry: liveState.retryPolicy.allowRetry,
       };
     } catch (error) {
       emitMetricEvent(events, {
@@ -21296,6 +21599,14 @@ async function streamCurrentNoteWriteback({
       const liveState = liveEmitter.finish();
       if (liveState.wroteContent) {
         emittedContent += attemptContent;
+      }
+      // Partial note apply: do not let outer retry re-stream from byte 0.
+      if (!liveState.retryPolicy.allowRetry) {
+        const detail =
+          error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Streamed writeback cannot safely retry after partial note apply (${liveState.retryPolicy.reason}). Underlying error: ${detail}`,
+        );
       }
       throw error;
     }
@@ -21338,7 +21649,7 @@ async function streamCurrentNoteWriteback({
     response = attempt.response;
 
     if (attempt.toolRequestDetected) {
-      if (attempt.wroteContent) {
+      if (attempt.wroteContent || attempt.allowRetry === false) {
         throw new Error(
           "The model requested a tool after streamed writeback had started. Partial content may have been written.",
         );
@@ -21628,11 +21939,23 @@ function createLiveWritebackEmitter({
   let live = false;
   let wroteContent = false;
   let toolRequestDetected = false;
+  const writeSession: StreamWriteSession = createStreamWriteSession();
   const relevanceGate = createFinalAnswerRelevanceGate(relevancePrompt, events);
   const englishGuard = isLikelyEnglishPrompt(relevancePrompt ?? "");
 
   const emit = (delta: string) => {
     if (!delta) {
+      return;
+    }
+
+    if (writeSession.released && shouldAbortReleasedChunk(writeSession, delta)) {
+      toolRequestDetected = true;
+      lifecycle.mark("buffering_safety", "Aborted writeback: tool markup after release.", {
+        bufferedChars: delta.length,
+      });
+      events.onStatus?.(
+        "Writeback aborted: cloud stream injected tool-call markup after note bytes were applied. Partial write kept; retry will not re-stream from byte 0.",
+      );
       return;
     }
 
@@ -21649,6 +21972,7 @@ function createLiveWritebackEmitter({
     }
 
     wroteContent = true;
+    recordAppliedBytes(writeSession, topicalDelta);
     lifecycle.mark("first_visible_content", "Showing safe answer text...", {
       releasedChars: topicalDelta.length,
     });
@@ -21739,15 +22063,29 @@ function createLiveWritebackEmitter({
       if (!toolRequestDetected) {
         const trailingTopicalContent = relevanceGate.finish();
         if (trailingTopicalContent) {
-          wroteContent = true;
-          events.onFinalDelta?.(trailingTopicalContent);
-          events.onAssistantDelta?.(trailingTopicalContent);
-          writer.push(trailingTopicalContent);
+          if (
+            writeSession.released &&
+            shouldAbortReleasedChunk(writeSession, trailingTopicalContent)
+          ) {
+            toolRequestDetected = true;
+          } else {
+            wroteContent = true;
+            recordAppliedBytes(writeSession, trailingTopicalContent);
+            events.onFinalDelta?.(trailingTopicalContent);
+            events.onAssistantDelta?.(trailingTopicalContent);
+            writer.push(trailingTopicalContent);
+          }
         }
       }
 
-      return { toolRequestDetected, wroteContent };
+      return {
+        toolRequestDetected,
+        wroteContent,
+        writeSession,
+        retryPolicy: createIdempotentStreamRetryPolicy(writeSession),
+      };
     },
+    getWriteSession: () => writeSession,
   };
 }
 
@@ -21786,15 +22124,7 @@ function shouldKeepWritebackSafetyBuffer(content: string): boolean {
 }
 
 function shouldKeepPostReleaseBuffer(content: string): boolean {
-  const trimmed = content.trimStart();
-  const lower = trimmed.toLowerCase();
-
-  return (
-    lower.startsWith("<requested_tool_call") ||
-    trimmed.startsWith("{") ||
-    trimmed.startsWith("[") ||
-    /^\\?`\\?`?\\?`?\s*(json|tool|tool_call|function)\b/i.test(trimmed)
-  );
+  return shouldKeepPostReleaseBufferFromGuard(content);
 }
 
 function isInvalidResponseError(error: unknown): boolean {
@@ -22233,7 +22563,9 @@ async function createStreamingNoteWriter({
   const hasNoteMutation = () => baseContentChanged || hasWritableContent();
   const writeContent = async (content: string) => {
     const target = await ensureFile();
-    toolContext.setCurrentMarkdownContent?.(target, content);
+    toolContext.setCurrentMarkdownContent?.(target, content, {
+      followStreamingEnd: true,
+    });
     await toolContext.app.vault.modify(target, content);
   };
   const consumeLeadingTitleIfPresent = (
@@ -22930,6 +23262,7 @@ function completeRun(
   runStartedAt?: number,
   maxSteps = MAX_AGENT_STEPS,
   autoContinuation?: AutoContinuationDecision,
+  stopDetail?: string | null,
 ) {
   const message = getStopReasonMessage(stopReason);
   emitStatus(
@@ -22943,6 +23276,7 @@ function completeRun(
     step,
     maxSteps,
     stopReason,
+    stopDetail: stopDetail ?? autoContinuation?.reason ?? null,
     ...(autoContinuation
       ? {
           autoContinueRecommended: autoContinuation.recommended,
@@ -22959,6 +23293,7 @@ function completeRun(
       step,
       maxSteps,
       stopReason,
+      stopDetail: stopDetail ?? autoContinuation?.reason ?? null,
       autoContinueRecommended: autoContinuation?.recommended ?? false,
       autoContinueReason: autoContinuation?.reason ?? "not_budget",
     },
@@ -22978,6 +23313,8 @@ function isToolArgumentErrorCode(code: string | undefined): boolean {
 }
 
 function getStopReasonMessage(stopReason: AgentRunStopReason): string {
+  // Status-stream copy stays stable for Run Details + existing tests.
+  // Chat uses stopReasonChatLine() for the friendlier taxonomy.
   switch (stopReason) {
     case "write_completed":
       return "Write complete.";
@@ -24672,3 +25009,64 @@ function measureSerializedChars(value: unknown): number {
     return 0;
   }
 }
+
+/**
+ * Dedicated utility-model assist for research subquestions. Returns null when
+ * no utility model is configured so createResearchPlanWithAssist stays deterministic.
+ */
+function buildResearchSubquestionAssist(
+  modelClient: ModelClient,
+  utilityModel: string | undefined,
+):
+  | ((request: {
+      prompt: string;
+      mode: import("./agent/researchPlan").ResearchMode;
+      seedQuestions: string[];
+    }) => Promise<string[] | null>)
+  | undefined {
+  const model = utilityModel?.trim();
+  if (!model) {
+    return undefined;
+  }
+  return async (request) => {
+    const response = await modelClient.chat({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Return only a JSON array of 2-6 short research subquestions as strings. No markdown.",
+        },
+        {
+          role: "user",
+          content: [
+            `Mode: ${request.mode}`,
+            `Mission: ${request.prompt}`,
+            `Seed questions: ${JSON.stringify(request.seedQuestions)}`,
+          ].join("\n"),
+        },
+      ],
+      think: false,
+    });
+    const raw = response.message.content.trim();
+    const start = raw.indexOf("[");
+    const end = raw.lastIndexOf("]");
+    if (start < 0 || end <= start) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(raw.slice(start, end + 1)) as unknown;
+      if (!Array.isArray(parsed)) {
+        return null;
+      }
+      return parsed
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.replace(/\s+/g, " ").trim())
+        .filter((item) => item.length >= 8)
+        .slice(0, 8);
+    } catch {
+      return null;
+    }
+  };
+}
+

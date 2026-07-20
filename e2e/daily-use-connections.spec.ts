@@ -215,6 +215,19 @@ test.describe("daily-use connections and setup", () => {
         modelHelp.getByRole("link", { name: "Ollama Cloud + Thinking catalog" }),
       ).toHaveAttribute("href", "https://ollama.com/search?c=cloud&c=thinking");
 
+      // Model tag must stay editable on cloud (no snap-back to the default tag).
+      await modelInput.fill("qwen3.5:cloud");
+      await expect(modelInput).toHaveValue("qwen3.5:cloud");
+      await expect
+        .poll(async () =>
+          page.evaluate((pluginId) => {
+            const plugin = (window as typeof window & { app?: any }).app?.plugins
+              ?.plugins?.[pluginId];
+            return plugin?.settings?.model ?? null;
+          }, NATIVE_CORE_PLUGIN_ID),
+        )
+        .toBe("qwen3.5:cloud");
+
       const readiness = settings.locator(".agentic-settings-readiness");
       const runtimeRows = await page.evaluate((pluginId) => {
         const plugin = (window as typeof window & { app?: any }).app?.plugins
@@ -319,6 +332,10 @@ test.describe("daily-use connections and setup", () => {
       const emptyState = page.getByTestId("first-run-model-setup");
       await expect(emptyState).toBeVisible();
       await expect(emptyState).toContainText("Connect a model to start");
+      // Cloud BYOK hard gate: Run Mission stays blocked until Test connection passes.
+      const runButton = page.locator("button.agentic-researcher-run");
+      await expect(runButton).toHaveText("Connect model");
+      await expect(runButton).toBeDisabled();
       const prompt = page.locator("textarea.agentic-researcher-prompt");
       const preservedPrompt = `Preserve this setup prompt ${harness.marker}`;
       await prompt.fill(preservedPrompt);
@@ -405,6 +422,138 @@ test.describe("daily-use connections and setup", () => {
       }).catch(() => undefined);
       if (harness) {
         await closeObsidianSettings(harness.page).catch(() => undefined);
+      }
+      await harness?.close();
+    }
+  });
+
+  test("end-to-end starter mission and compound readiness gate surface before a long run", async () => {
+    let harness: NativeObsidianHarness | null = null;
+    try {
+      harness = await startNativeObsidianHarness({
+        label: "daily-use-compound-readiness-gate",
+        corePluginDataOverrides: {
+          modelProvider: "ollama",
+          model: "playwright-compound-readiness-mock",
+          ollamaBaseUrl: "http://127.0.0.1:11434",
+          modelConnectionVerifiedAt: new Date().toISOString(),
+          modelConnectionVerifiedProvider: "ollama",
+          modelConnectionVerifiedModel: "playwright-compound-readiness-mock",
+          modelConnectionVerifiedBaseUrl: "http://127.0.0.1:11434",
+        },
+        setup: setupDailyUsePage,
+      });
+      const page = harness.page;
+      const starter = page.getByTestId("end-to-end-starter-mission");
+      await expect(starter).toBeVisible({ timeout: 15_000 });
+      await expect(
+        page.getByTestId("end-to-end-starter-mission-button"),
+      ).toContainText("End-to-end checkers workflow");
+      await expect(page.getByTestId("live-workstream")).toBeVisible();
+
+      await page.getByTestId("end-to-end-starter-mission-button").click();
+      const prompt = page.locator("textarea.agentic-researcher-prompt");
+      await expect(prompt).toHaveValue(/end to end/i);
+
+      await page.evaluate((pluginId) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        if (!plugin) throw new Error("Agentic Researcher plugin is unavailable.");
+        plugin.__e2eOriginalCapabilityReadiness = plugin.getCapabilityReadiness;
+        plugin.getCapabilityReadiness = () => [
+          {
+            version: 2,
+            id: "model",
+            name: "Model connection",
+            status: "Ready",
+            reason: "ready",
+            evidenceAt: new Date().toISOString(),
+            nextAction: "Review model setup",
+            setupTarget: "model",
+          },
+          {
+            version: 2,
+            id: "notes",
+            name: "Notes & research",
+            status: "Ready",
+            reason: "ready",
+            evidenceAt: new Date().toISOString(),
+            nextAction: "Review note setup",
+            setupTarget: "notes_research",
+          },
+          {
+            version: 2,
+            id: "code",
+            name: "Code",
+            status: "Available",
+            reason: "No repository bound",
+            evidenceAt: null,
+            nextAction: "Bind a repository",
+            setupTarget: "code",
+          },
+          {
+            version: 2,
+            id: "linear",
+            name: "Linear",
+            status: "Setup needed",
+            reason: "No verified Linear credential is available.",
+            evidenceAt: null,
+            nextAction: "Connect Linear",
+            setupTarget: "linear",
+          },
+          {
+            version: 2,
+            id: "github",
+            name: "GitHub",
+            status: "Setup needed",
+            reason: "No verified GitHub credential is available.",
+            evidenceAt: null,
+            nextAction: "Connect GitHub",
+            setupTarget: "github",
+          },
+          {
+            version: 2,
+            id: "browser",
+            name: "Web research",
+            status: "Available",
+            reason: "web available",
+            evidenceAt: null,
+            nextAction: "Use web research",
+            setupTarget: "browser_web",
+          },
+          {
+            version: 2,
+            id: "background",
+            name: "Background work",
+            status: "Setup needed",
+            reason: "companion unset",
+            evidenceAt: null,
+            nextAction: "Connect and test Companion",
+            setupTarget: "background",
+          },
+        ];
+      }, NATIVE_CORE_PLUGIN_ID);
+
+      await page.locator("button.agentic-researcher-run").click();
+      const attention = page.getByTestId("chat-attention-banner");
+      await expect(attention).toBeVisible({ timeout: 10_000 });
+      await expect(attention).toContainText("End-to-end workflow setup required");
+      await expect(attention).toContainText("Connect Linear");
+      await expect(
+        page.getByTestId("chat-compound-readiness-open-settings"),
+      ).toBeVisible();
+      await expect(page.getByTestId("lifecycle-stage-strip")).toBeHidden();
+    } finally {
+      if (harness) {
+        await harness.page.evaluate((pluginId) => {
+          const plugin = (window as typeof window & { app?: any }).app?.plugins
+            ?.plugins?.[pluginId];
+          if (plugin?.__e2eOriginalCapabilityReadiness) {
+            plugin.getCapabilityReadiness =
+              plugin.__e2eOriginalCapabilityReadiness;
+            delete plugin.__e2eOriginalCapabilityReadiness;
+          }
+        }, NATIVE_CORE_PLUGIN_ID).catch(() => undefined);
       }
       await harness?.close();
     }

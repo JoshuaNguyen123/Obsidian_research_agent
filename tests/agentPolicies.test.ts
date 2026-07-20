@@ -83,6 +83,26 @@ import {
 } from "../src/agent/evidenceIntent";
 import type { MissionIntent } from "../src/tools/types";
 
+test("generated output policy treats correct entire page as replace", () => {
+  for (const prompt of [
+    "Please correct the entire page.",
+    "This essay is a little over 1000 words. Please correct the entire page.",
+  ]) {
+    const policy = analyzeGeneratedOutputPrompt(prompt);
+    assert.equal(policy.target, "current_note_replace", prompt);
+  }
+
+  const negatives = [
+    ["Append a correction section at the bottom.", "current_note_append"],
+    ["Write a 1000 word essay on Grapes of Wrath.", "current_note_append"],
+  ] as const;
+
+  for (const [prompt, target] of negatives) {
+    const policy = analyzeGeneratedOutputPrompt(prompt);
+    assert.equal(policy.target, target, prompt);
+  }
+});
+
 test("generated output policy classifies prompt matrix targets", () => {
   const revolutionary = analyzeGeneratedOutputPrompt(
     "Generate me a 100 word essay on the history of the revolutionary war.",
@@ -91,6 +111,27 @@ test("generated output policy classifies prompt matrix targets", () => {
   assert.equal(revolutionary.target, "current_note_append");
   assert.deepEqual(revolutionary.wordTarget, {
     target: 100,
+    exact: false,
+    tolerancePct: 10,
+  });
+
+  const wholePageCorrection = analyzeGeneratedOutputPrompt(
+    "This essay is a little over 1000 words. Please correct the entire page.",
+  );
+  assert.equal(wholePageCorrection.kind, "essay");
+  assert.equal(wholePageCorrection.target, "current_note_replace");
+  assert.deepEqual(wholePageCorrection.wordTarget, {
+    target: 1000,
+    exact: false,
+    tolerancePct: 10,
+  });
+
+  const freshEssay = analyzeGeneratedOutputPrompt(
+    "Write a 1000 word essay about the moon landing.",
+  );
+  assert.equal(freshEssay.target, "current_note_append");
+  assert.deepEqual(freshEssay.wordTarget, {
+    target: 1000,
     exact: false,
     tolerancePct: 10,
   });

@@ -19,6 +19,7 @@ import {
   countOutstandingMissionGraphToolActions,
   countReadyMissionGraphToolSlots,
   constrainToolsToMissionGraphFrontier,
+  isMissionGraphAcceptablyComplete,
   constrainOrchestratedHandoffTools,
   ensureResearchSourceLoopBudget,
   ensureRequiredWriteLoopBudget,
@@ -504,6 +505,101 @@ test("tool-loop turns use chat only and emit direct final answer without synthes
   assert.deepEqual(thinkingDeltas, ["thinking from final"]);
 });
 
+test("streaming tool-loop steps stream thinking, keep in-flight thinking, and skip note writeback for pre-tool content", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const streamToolRequests: ModelChatRequest[] = [];
+  const assistantDeltas: string[] = [];
+  const thinkingDeltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const vault = createRunnerVaultContext({
+    prompt: "Search the web and give me a short overview of WW2.",
+    content: "Do not overwrite this note.",
+  });
+  vault.context.settings = createRunnerSettings({
+    enableStreaming: true,
+    streamWritebackMode: "off",
+    thinkingMode: "high",
+    model: "qwen3:8b",
+    modelRouterMode: "off",
+    workingMode: "chat_only",
+    outputProfile: "chat_first",
+  });
+
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    streamToolRequests,
+    chatResponders: [
+      () => ({
+        ...responseWithToolCall("web_search", { query: "WW2 causes" }, ""),
+        message: {
+          role: "assistant" as const,
+          content: "pre-tool prose must not hit the note",
+          thinking: "planning web search",
+          toolCalls: [
+            { name: "web_search", arguments: { query: "WW2 causes" } },
+          ],
+        },
+        thinkingDeltas: ["planning web search"],
+        contentDeltas: ["pre-tool prose must not hit the note"],
+      }),
+      () =>
+        responseWithContent(
+          "Final WW2 answer. Source: https://example.com/source",
+          "final private thinking",
+        ),
+    ],
+  });
+
+  await runAgentMission({
+    prompt: "Search the web and give me a short overview of WW2.",
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    forceChatOnly: true,
+    events: {
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onThinkingDelta: (delta) => thinkingDeltas.push(delta),
+    },
+  });
+
+  assert.ok(
+    streamToolRequests.length > 0,
+    "tool steps should use streamChat when streaming is enabled",
+  );
+  assert.ok(
+    chatRequests.some((request) =>
+      request.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          (message.toolCalls?.length ?? 0) > 0 &&
+          message.thinking === "planning web search",
+      ),
+    ),
+    "in-flight assistant tool turns must retain thinking for the next model call",
+  );
+  assert.ok(
+    thinkingDeltas.includes("planning web search"),
+    thinkingDeltas.join(" | "),
+  );
+  assert.ok(
+    !assistantDeltas.some((delta) =>
+      delta.includes("pre-tool prose must not hit the note"),
+    ),
+    assistantDeltas.join(" | "),
+  );
+  assert.equal(
+    vault.content.get("Current.md"),
+    "Do not overwrite this note.",
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["web_search"],
+  );
+});
+
 test("assistant JSON tool blocks are recovered and executed as tool calls", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const deltas: string[] = [];
@@ -873,6 +969,92 @@ test("model tool schemas narrow to the authoritative ready graph frontier", () =
   assert.deepEqual(
     constrained.map((tool) => tool.function.name),
     ["append_to_current_file"],
+  );
+});
+
+test("mission graph acceptance ignores unread optional sibling reads", () => {
+  assert.equal(
+    isMissionGraphAcceptablyComplete({
+      nodes: {
+        context: {
+          status: "complete",
+          dependencyIds: [],
+          allowedTools: ["read_current_file"],
+          completionContract: { requiredEvidenceKinds: [] },
+        },
+        research: {
+          status: "ready",
+          dependencyIds: [],
+          allowedTools: ["web_search"],
+          completionContract: { requiredEvidenceKinds: [] },
+        },
+        write: {
+          status: "complete",
+          dependencyIds: ["context"],
+          allowedTools: ["replace_current_file"],
+          completionContract: { requiredEvidenceKinds: [] },
+        },
+        final: {
+          status: "complete",
+          dependencyIds: ["context", "write"],
+          allowedTools: [],
+          completionContract: {
+            requiredEvidenceKinds: ["final-output"],
+          },
+        },
+      },
+    } as never),
+    true,
+  );
+  assert.equal(
+    isMissionGraphAcceptablyComplete({
+      nodes: {
+        write: {
+          status: "complete",
+          dependencyIds: [],
+          allowedTools: ["replace_current_file"],
+          completionContract: { requiredEvidenceKinds: [] },
+        },
+        final: {
+          status: "queued",
+          dependencyIds: ["write"],
+          allowedTools: [],
+          completionContract: {
+            requiredEvidenceKinds: ["final-output"],
+          },
+        },
+      },
+    } as never),
+    false,
+  );
+  // Optional enrichment wrongly listed under final deps must not block.
+  assert.equal(
+    isMissionGraphAcceptablyComplete({
+      nodes: {
+        "optional-web_search": {
+          status: "ready",
+          dependencyIds: [],
+          allowedTools: ["web_search"],
+          objective: "optional enrichment",
+          completionContract: { requiredEvidenceKinds: [] },
+        },
+        write: {
+          status: "complete",
+          dependencyIds: [],
+          allowedTools: ["replace_current_file"],
+          completionContract: { requiredEvidenceKinds: [] },
+        },
+        final: {
+          status: "complete",
+          dependencyIds: ["write", "optional-web_search"],
+          allowedTools: [],
+          completionContract: {
+            requiredEvidenceKinds: ["final-output"],
+          },
+        },
+      },
+    } as never),
+    true,
   );
 });
 
@@ -10595,7 +10777,7 @@ test("auto thinking resolves known model families and omits unknown models", () 
     resolveThinkingMode(
       createRunnerSettings({ model: "gpt-oss:120b", thinkingMode: "off" }),
     ),
-    undefined,
+    "low",
   );
 });
 
@@ -11486,6 +11668,229 @@ test("replace writeback creates a backup before streaming replacement content", 
   assert.equal(receipts[0].operation, "replace");
 });
 
+test("clarifying follow-up whole-note replace streams through mission graph", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const statuses: string[] = [];
+  const traces: string[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
+  const prompt =
+    "I prefer that you replace the entire note with a revised version";
+  const original =
+    "# China: History and Government\n\n| Period | Events |\n|--------|--------|\n| Qing | Opium Wars |\n\nHistorical overview remains.\n";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: original,
+    now: new Date(789),
+  });
+  // Match Automatic profile: authority planning is what hung optional reads on
+  // replace_current_file before the planner filter.
+  vault.context.settings.modelRouterMode = "authority";
+  vault.context.settings.workingMode = "automatic";
+  let graphPlannerSawOptionalReads = false;
+  let planningChats = 0;
+  const client: ModelClient = {
+    chat: async (request) => {
+      chatRequests.push(cloneRequest(request));
+      if (isMissionRouterFormat(request)) {
+        return responseWithContent(
+          JSON.stringify({
+            mode: "vault_write",
+            writeScope: "current_note_replace",
+            needsWebEvidence: false,
+            needsVaultContext: true,
+            needsCodeExecution: false,
+            wordTarget: null,
+            confidence: 0.94,
+            rationale: "User confirmed a whole-note replace after clarification.",
+          }),
+        );
+      }
+      if (isMissionGraphPlannerFormat(request)) {
+        const catalog = parseMissionGraphHostCatalog(request);
+        const optionalIds = catalog
+          .filter((node) => !node.required && node.effect === "read")
+          .map((node) => node.id);
+        graphPlannerSawOptionalReads = optionalIds.length > 0;
+        // Reproduce the pre-fix bug shape: optional reads as write deps.
+        const nodes = catalog
+          .filter((node) => node.required || optionalIds.includes(node.id))
+          .filter((node) => node.id !== "final")
+          .map((node) => ({
+            id: node.id,
+            objective: node.hostObjective,
+            dependencyIds:
+              node.required && node.effect !== "read"
+                ? sortedUnique([...node.hostDependencyIds, ...optionalIds])
+                : [...node.hostDependencyIds],
+          }));
+        return responseWithContent(
+          JSON.stringify({ confidence: 0.93, nodes }),
+        );
+      }
+      planningChats += 1;
+      return responseWithContent("Ready to replace the note.");
+    },
+    streamChat: async (request, events = {}) => {
+      streamRequests.push(cloneRequest(request));
+      const response = responseWithContentDeltas([
+        "# China: History and Government\n\n",
+        "China’s trajectory over the past century has been shaped by imperial collapse and reform.\n",
+      ]);
+      for (const delta of response.contentDeltas ?? []) {
+        events.onContentDelta?.(delta);
+      }
+      return response;
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: true,
+    conversationHistory: [
+      {
+        role: "user",
+        content: "Ok, remove the historical overview section then with the boxes",
+      },
+      {
+        role: "assistant",
+        content:
+          "Do you want me to replace the entire note (removing the historical overview and tables) with a revised version, or would you prefer I add a new section summarizing the remaining content?",
+      },
+    ],
+    approvalBroker: broker,
+    events: {
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traces.push(event.message),
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  assert.ok(
+    statuses.some((message) =>
+      /Classifying mission with structured router/i.test(message),
+    ),
+    "authority mode should run the structured router before tool selection",
+  );
+  assert.ok(
+    traces.some((message) =>
+      /Structured MissionGraphV3 accepted as authoritative|Deterministic MissionGraphV3 is authoritative/i.test(
+        message,
+      ),
+    ),
+    traces.join(" | "),
+  );
+  assert.ok(
+    !statuses.some((message) =>
+      /replace_current_file is not ready in the authoritative mission graph/i.test(
+        message,
+      ),
+    ),
+    statuses.join(" | "),
+  );
+  assert.ok(
+    !statuses.some((message) =>
+      /Completion held for verification:.*mission_graph_incomplete/i.test(
+        message,
+      ),
+    ),
+    "successful replace must not downgrade to budget for unread optional sibling reads",
+  );
+  assert.ok(
+    !statuses.some((message) =>
+      /Wall-clock run budget expired|Repeated tool loop stopped before full safety limit/i.test(
+        message,
+      ),
+    ),
+    statuses.join(" | "),
+  );
+  assert.ok(
+    planningChats >= 1,
+    "authority replace should still reach a normal planning chat after graph selection",
+  );
+  assert.equal(streamRequests.length, 1);
+  assert.match(
+    vault.content.get("Current.md") ?? "",
+    /imperial collapse and reform/i,
+  );
+  assert.ok(!(vault.content.get("Current.md") ?? "").includes("| Period |"));
+  assert.equal(receipts[0]?.operation, "replace");
+  assert.ok(receipts[0]?.backupPath);
+  if (graphPlannerSawOptionalReads) {
+    assert.ok(
+      traces.some((message) =>
+        /Structured MissionGraphV3 accepted as authoritative/i.test(message),
+      ),
+      "optional catalog reads must not leave replace queued behind unread grounding",
+    );
+  }
+});
+
+test("correct entire page exposes replace and suppresses append", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const broker = new ApprovalBroker();
+  const prompt =
+    "This essay is a little over 1000 words. Please correct the entire page.";
+  const original = "# Essay\n\nDraft with mistakes.\n";
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: original,
+    now: new Date(4242),
+  });
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [() => responseWithContent("Ready to correct.")],
+    streamResponders: [
+      () =>
+        responseWithContentDeltas([
+          "# Essay\n",
+          "\nCorrected page body with clearer prose.",
+        ]),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    approvalBroker: broker,
+    events: {
+      onApprovalRequest: (request) => {
+        broker.resolve(request.id, "approved");
+      },
+      onReceipt: (receipt) => receipts.push(receipt),
+    },
+  });
+
+  const firstStepToolNames =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.ok(
+    firstStepToolNames.includes("replace_current_file") ||
+      streamRequests.length === 1,
+    "host-owned replace must be available via tool allowlist or streamed writeback",
+  );
+  assert.ok(!firstStepToolNames.includes("append_to_current_file"));
+  assert.ok(!executedCalls.some((call) => call.name === "append_to_current_file"));
+  assert.equal(receipts[0]?.operation, "replace");
+  assert.equal(
+    vault.content.get("Current.md"),
+    "# Essay\n\nCorrected page body with clearer prose.",
+  );
+});
+
 test("direct essay edit routes to whole-note replace instead of section edit", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
@@ -11892,11 +12297,14 @@ type ChatResponder = (request: ModelChatRequest) => TestModelChatResponse;
 function createClient({
   chatRequests,
   streamRequests = [],
+  streamToolRequests = [],
   chatResponders = [],
   streamResponders,
 }: {
   chatRequests: ModelChatRequest[];
   streamRequests?: ModelChatRequest[];
+  /** Agent-step streamChat calls that still expose tools (stream+tools path). */
+  streamToolRequests?: ModelChatRequest[];
   chatResponders?: ChatResponder[];
   streamResponders?: ChatResponder[];
 }): ModelClient {
@@ -11912,15 +12320,34 @@ function createClient({
       return responder(request);
     },
     streamChat: async (request, events: ModelChatStreamEvents = {}) => {
-      streamRequests.push(cloneRequest(request));
-      const responders = streamResponders ?? chatResponders;
-      const responder = responders[streamRequests.length - 1];
-
-      if (!responder) {
-        throw new Error(`No stream responder for request ${streamRequests.length}`);
+      const hasTools = Boolean(request.tools?.length);
+      // Agent-step stream+tools share the chat responder queue so existing
+      // enableStreaming+tools tests keep chatResponders for tool turns and
+      // streamResponders / streamRequests for writeback-only (tool-less) streams.
+      let response: TestModelChatResponse;
+      if (hasTools) {
+        const cloned = cloneRequest(request);
+        chatRequests.push(cloned);
+        streamToolRequests.push(cloned);
+        const responder = chatResponders[chatRequests.length - 1];
+        if (!responder) {
+          throw new Error(
+            `No chat responder for streamed tool request ${chatRequests.length}`,
+          );
+        }
+        response = responder(request);
+      } else {
+        streamRequests.push(cloneRequest(request));
+        const responders = streamResponders ?? chatResponders;
+        const responder = responders[streamRequests.length - 1];
+        if (!responder) {
+          throw new Error(
+            `No stream responder for request ${streamRequests.length}`,
+          );
+        }
+        response = responder(request);
       }
 
-      const response = responder(request);
       const thinkingDeltas =
         response.thinkingDeltas ??
         (response.message.thinking ? [response.message.thinking] : []);
@@ -11959,6 +12386,46 @@ function cloneRequest(request: ModelChatRequest): ModelChatRequest {
     messages: [...request.messages],
     tools: request.tools ? [...request.tools] : undefined,
   };
+}
+
+function isMissionRouterFormat(request: ModelChatRequest): boolean {
+  const required = request.format?.required;
+  return Array.isArray(required) && required.includes("writeScope");
+}
+
+function isMissionGraphPlannerFormat(request: ModelChatRequest): boolean {
+  const required = request.format?.required;
+  return (
+    Array.isArray(required) &&
+    required.includes("confidence") &&
+    required.includes("nodes")
+  );
+}
+
+type MissionGraphHostCatalogNode = {
+  id: string;
+  required: boolean;
+  effect: string;
+  hostObjective: string;
+  hostDependencyIds: string[];
+};
+
+function parseMissionGraphHostCatalog(
+  request: ModelChatRequest,
+): MissionGraphHostCatalogNode[] {
+  const system = request.messages.find((message) => message.role === "system");
+  const match = /Host node catalog:\s*(\[[\s\S]*\])\s*$/u.exec(
+    system?.content ?? "",
+  );
+  if (!match) {
+    return [];
+  }
+  const parsed = JSON.parse(match[1]) as MissionGraphHostCatalogNode[];
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function sortedUnique(values: string[]): string[] {
+  return [...new Set(values)].sort();
 }
 
 function createRunnerSettings(

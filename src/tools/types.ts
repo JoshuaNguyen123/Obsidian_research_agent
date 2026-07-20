@@ -119,7 +119,11 @@ export interface ToolExecutionContext {
   now?: () => Date;
   getCurrentMarkdownFile?: () => TFile | null;
   getCurrentMarkdownContent?: (file: TFile) => string | null;
-  setCurrentMarkdownContent?: (file: TFile, content: string) => boolean;
+  setCurrentMarkdownContent?: (
+    file: TFile,
+    content: string,
+    options?: { followStreamingEnd?: boolean },
+  ) => boolean;
   getResearchMemoryIndex?: () => ResearchMemoryIndexEntry[];
   setResearchMemoryIndex?: (
     entries: ResearchMemoryIndexEntry[],

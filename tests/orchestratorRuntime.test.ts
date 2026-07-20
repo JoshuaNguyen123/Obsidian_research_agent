@@ -36,13 +36,50 @@ test("research runtime projects progressive nodes and terminal state", async () 
   assert.deepEqual(observed, [1, 2, 3, 4]);
 });
 
-test("team routing remains conditional and prompt-first", () => {
-  assert.equal(shouldUseResearchTeam("Deep research current sources", true), true);
-  assert.equal(shouldUseResearchTeam("Verify these citations", true), true);
-  assert.equal(shouldUseResearchTeam("Research this topic", true), false);
-  assert.equal(shouldUseResearchTeam("Write a poem", true), false);
+test("research_team trigger matrix stays prompt-first (bare research false)", () => {
+  const shouldTrigger = [
+    "Deep research current sources",
+    "Please investigate this claim",
+    "Find sources and write a brief",
+    "Add citations for every claim",
+    "Verify these citations",
+    "Fact-check the timeline",
+    "Gather evidence before writing",
+    "Compare sources on this debate",
+    "Summarize current events with sources",
+    "Pull the latest research on the topic",
+    "Do web research with fetched passages",
+    "Do vault research across related notes",
+  ];
+  const shouldNotTrigger = [
+    "research",
+    "Research",
+    "Research this topic",
+    "Please research and summarize",
+    "Do some research for me",
+    "Write a poem",
+    "Append a short note",
+    "Correct the entire page",
+  ];
+
+  for (const prompt of shouldTrigger) {
+    assert.equal(
+      shouldUseResearchTeam(prompt, true),
+      true,
+      `expected research_team for: ${prompt}`,
+    );
+  }
+  for (const prompt of shouldNotTrigger) {
+    assert.equal(
+      shouldUseResearchTeam(prompt, true),
+      false,
+      `expected no research_team for: ${prompt}`,
+    );
+  }
+
   assert.equal(shouldUseResearchTeam("Research sources", false), false);
   assert.equal(shouldUseResearchTeam("Verify sources", true, true), false);
+  assert.equal(shouldUseResearchTeam("Deep research", false), false);
 });
 
 test("budget rejection is terminal to callers instead of silently observational", async () => {

@@ -64,7 +64,7 @@ const EXPLICIT_NEW_NOTE_PATTERN =
   /\b(create|make|new)\b[\s\S]{0,80}\b(note|markdown\s+file|file)\b|\b(note|markdown\s+file)\b[\s\S]{0,40}\b(named|called|titled)\b/i;
 
 const EXPLICIT_REPLACE_PATTERN =
-  /\b(replace|rewrite|overwrite|start\s+fresh|reset|clear\s+(?:and\s+)?write|delete\s+(?:the\s+)?(?:content|body)\s+and\s+write)\b/i;
+  /\b(replace|rewrite|overwrite|start\s+fresh|reset|clear\s+(?:and\s+)?write|delete\s+(?:the\s+)?(?:content|body)\s+and\s+write|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b[\s\S]{0,120}\b(?:entire|whole)\s+(?:page|note|file|document|essay|draft|article|content|body)\b|\b(replace|rewrite|overwrite|start\s+fresh|reset|clear\s+(?:and\s+)?write|delete\s+(?:the\s+)?(?:content|body)\s+and\s+write)\b/i;
 
 const PRESERVE_TITLE_PATTERN =
   /\b(keep|preserve|do\s+not\s+(?:change|rename|retitle)|don'?t\s+(?:change|rename|retitle))\b[\s\S]{0,40}\b(title|name|filename)\b/i;

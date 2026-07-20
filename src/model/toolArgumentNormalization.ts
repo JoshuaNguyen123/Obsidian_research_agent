@@ -29,8 +29,22 @@ function unwrapSingleEnvelope(
   const keys = Object.keys(value);
   if (keys.length !== 1) return value;
   const key = keys[0];
-  if (!["arguments", "args", "input", "parameters"].includes(key)) return value;
+  if (
+    !["arguments", "args", "input", "parameters", "kwargs", "tool_input"].includes(
+      key,
+    )
+  ) {
+    return value;
+  }
   const nested = value[key];
+  if (typeof nested === "string" && nested.trim()) {
+    try {
+      const parsed = JSON.parse(nested);
+      return isRecord(parsed) ? parsed : value;
+    } catch {
+      return value;
+    }
+  }
   return isRecord(nested) ? nested : value;
 }
 

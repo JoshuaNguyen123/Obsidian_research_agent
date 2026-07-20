@@ -125,6 +125,27 @@ describe("noteOutputPolicy decision table", () => {
     assert.equal(result.reason, "replace_explicit");
   });
 
+  it("whole-page correction uses replace even when prompt mentions word count", () => {
+    const result = plan({
+      prompt:
+        "This essay is a little over 1000 words. Please correct the entire page.",
+      hasActiveMarkdownNote: true,
+    });
+    assert.equal(result.destination, "active_note");
+    assert.equal(result.mutation, "replace");
+    assert.equal(result.reason, "replace_explicit");
+  });
+
+  it("fresh word-count essay stays append", () => {
+    const result = plan({
+      prompt: "Write a 1000 word essay about the moon landing.",
+      hasActiveMarkdownNote: true,
+    });
+    assert.equal(result.destination, "active_note");
+    assert.equal(result.mutation, "append");
+    assert.equal(result.reason, "active_note_available");
+  });
+
   it("preserve title wording suppresses automatic title", () => {
     const result = plan({
       prompt: "Write an essay about forests. Keep the title unchanged.",
@@ -141,5 +162,32 @@ describe("noteOutputPolicy decision table", () => {
       detectContentProducingIntent("Write a summary of the Vietnam War"),
       true,
     );
+  });
+
+  it("correct entire page uses replace not append", () => {
+    for (const prompt of [
+      "Please correct the entire page.",
+      "This essay is a little over 1000 words. Please correct the entire page.",
+    ]) {
+      const result = plan({ prompt, hasActiveMarkdownNote: true });
+      assert.equal(result.mutation, "replace", prompt);
+      assert.equal(result.reason, "replace_explicit", prompt);
+    }
+  });
+
+  it("section correction and fresh essay prompts stay append", () => {
+    const sectionCorrection = plan({
+      prompt: "Append a correction section at the bottom with grammar fixes.",
+      hasActiveMarkdownNote: true,
+    });
+    assert.equal(sectionCorrection.mutation, "append");
+    assert.equal(sectionCorrection.reason, "active_note_available");
+
+    const freshEssay = plan({
+      prompt: "Write a 1000 word essay on Grapes of Wrath.",
+      hasActiveMarkdownNote: true,
+    });
+    assert.equal(freshEssay.mutation, "append");
+    assert.equal(freshEssay.reason, "active_note_available");
   });
 });

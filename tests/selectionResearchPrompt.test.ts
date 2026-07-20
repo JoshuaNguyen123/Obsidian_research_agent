@@ -18,8 +18,11 @@ describe("selectionResearchPrompt", () => {
     assert.equal(result.truncated, false);
     assert.match(result.prompt, /Notes\/Research\.md/);
     assert.match(result.prompt, /quantum battery density/);
-    assert.match(result.prompt, /Write and append a cited findings section/);
+    assert.match(result.prompt, /\[agentic-daily-use:DU-02\]/);
+    assert.equal(result.dailyUseId, "DU-02");
+    assert.match(result.prompt, /append a single cited findings section/);
     assert.match(result.prompt, /stream writeback onto the page/);
+    assert.match(result.prompt, /web_search then web_fetch/);
     assert.doesNotMatch(result.prompt, /\bDo not replace\b/i);
     assert.doesNotMatch(result.prompt, /\ba clear\b/i);
     assert.doesNotMatch(result.prompt, /chat only/i);

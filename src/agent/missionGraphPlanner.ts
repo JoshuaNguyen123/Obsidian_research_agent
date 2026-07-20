@@ -314,9 +314,32 @@ export async function resolveAuthoritativeMissionGraphV3({
     if (!deterministicIds.has(id) && hostNode.effect !== "read") {
       return { ok: false, reason: "structured_model_authority_widening" };
     }
+    // Optional catalog reads may join the graph as siblings, but they must not
+    // gate host-planned effectful writes, final completion, or other required
+    // host nodes. Otherwise streamed current-note replace/append can deadlock,
+    // and a finished write can be downgraded to a budget stop while unread
+    // optional grounding still sits ready. Deterministic host prerequisites
+    // remain authoritative; optional→optional edges stay allowed among catalog
+    // reads.
+    const semanticDependencyIds = (semantic?.dependencyIds ?? []).filter(
+      (dependencyId) => {
+        if (
+          deterministicIds.has(dependencyId) ||
+          hostNode.dependencyIds.includes(dependencyId)
+        ) {
+          return true;
+        }
+        return (
+          id !== "final" &&
+          optionalIds.has(id) &&
+          optionalIds.has(dependencyId) &&
+          hostNode.effect === "read"
+        );
+      },
+    );
     const dependencyIds = sortedUnique([
       ...hostNode.dependencyIds,
-      ...(semantic?.dependencyIds ?? []),
+      ...semanticDependencyIds,
     ]);
     nodes[id] = initializeNodeFromHostTemplate(
       hostNode,
@@ -518,6 +541,7 @@ async function requestStructuredMissionGraph({
         "Include every required=true catalog node exactly once. If dependencyIds references an optional node, include that optional node exactly once too.",
         "hostDependencyIds are immutable prerequisite edges. Never add an edge that reverses or cycles through those host edges; no node may depend on final.",
         "You may add optional read-only nodes when they improve grounding.",
+        "Do not make a required effectful/write node or final depend on an optional read-only node; optional reads stay as independent siblings. Only required=true host prerequisites may gate writes or final completion.",
         "Do not invent paths, commands, bindings, tools, destinations, capabilities, hosts, budgets, or authority.",
         "Dependencies express semantic prerequisites. Keep graph depth within the supplied route-derived envelope.",
         "Return JSON only: no markdown fence, prose, authority fields, or alternate property names.",

@@ -277,12 +277,14 @@ export async function parseOllamaChatStream(
   events: ModelChatStreamEvents = {},
 ): Promise<ModelChatResponse> {
   const chunks: unknown[] = [];
-  const toolCalls: ModelToolCall[] = [];
+  const toolCallsByIndex = new Map<number, ModelToolCall>();
+  const toolCallsUnordered: ModelToolCall[] = [];
   let buffer = "";
   let content = "";
   let thinking = "";
   let role: ModelRole = "assistant";
   let doneReason: string | undefined;
+  let skippedCorruptLines = 0;
 
   const processLine = (line: string) => {
     const trimmed = line.trim();
@@ -294,11 +296,15 @@ export async function parseOllamaChatStream(
     try {
       parsed = JSON.parse(trimmed);
     } catch (error) {
-      throw new ModelClientError(
-        "invalid_response",
-        "Ollama returned invalid streaming JSON.",
-        { details: trimmed, originalError: error },
-      );
+      skippedCorruptLines += 1;
+      if (skippedCorruptLines > 5) {
+        throw new ModelClientError(
+          "invalid_response",
+          "Ollama returned too many invalid streaming JSON lines.",
+          { details: trimmed, originalError: error },
+        );
+      }
+      return;
     }
 
     if (isRecord(parsed) && typeof parsed.error === "string") {
@@ -308,11 +314,15 @@ export async function parseOllamaChatStream(
     chunks.push(parsed);
 
     if (!isRecord(parsed)) {
-      throw new ModelClientError(
-        "invalid_response",
-        "Ollama returned an invalid streaming chunk.",
-        { details: parsed },
-      );
+      skippedCorruptLines += 1;
+      if (skippedCorruptLines > 5) {
+        throw new ModelClientError(
+          "invalid_response",
+          "Ollama returned too many invalid streaming chunks.",
+          { details: parsed },
+        );
+      }
+      return;
     }
 
     const rawMessage = parsed.message;
@@ -329,7 +339,11 @@ export async function parseOllamaChatStream(
         events.onContentDelta?.(rawMessage.content);
       }
 
-      toolCalls.push(...parseOllamaToolCalls(rawMessage.tool_calls));
+      mergeOllamaToolCallDeltas(
+        toolCallsByIndex,
+        toolCallsUnordered,
+        parseOllamaToolCalls(rawMessage.tool_calls),
+      );
     }
 
     if (typeof parsed.done_reason === "string") {
@@ -352,6 +366,13 @@ export async function parseOllamaChatStream(
 
   processLine(buffer);
 
+  const toolCalls = [
+    ...[...toolCallsByIndex.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, call]) => call),
+    ...toolCallsUnordered,
+  ];
+
   const message: ModelChatMessage = {
     role,
     content,
@@ -372,6 +393,12 @@ function toOllamaMessage(message: ModelChatMessage): OllamaMessage {
     role: message.role,
     content: message.content,
   };
+
+  // Qwen3.x / thinking models: round-trip assistant thinking on tool turns so
+  // follow-up requests keep in-flight reasoning context (Ollama tool+think API).
+  if (typeof message.thinking === "string" && message.thinking) {
+    ollamaMessage.thinking = message.thinking;
+  }
 
   if (message.toolName) {
     ollamaMessage.tool_name = message.toolName;
@@ -406,6 +433,38 @@ function parseModelRole(role: unknown): ModelRole {
     "Ollama returned a message with an unknown role.",
     { details: role },
   );
+}
+
+function mergeOllamaToolCallDeltas(
+  byIndex: Map<number, ModelToolCall>,
+  unordered: ModelToolCall[],
+  deltas: ModelToolCall[],
+): void {
+  for (const delta of deltas) {
+    if (typeof delta.index === "number") {
+      const existing = byIndex.get(delta.index);
+      if (!existing) {
+        byIndex.set(delta.index, { ...delta });
+        continue;
+      }
+      byIndex.set(delta.index, {
+        ...existing,
+        name: delta.name || existing.name,
+        arguments: mergeToolArgumentRecords(existing.arguments, delta.arguments),
+        id: delta.id ?? existing.id,
+        raw: delta.raw ?? existing.raw,
+      });
+      continue;
+    }
+    unordered.push(delta);
+  }
+}
+
+function mergeToolArgumentRecords(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): Record<string, unknown> {
+  return { ...left, ...right };
 }
 
 function parseOllamaToolCalls(toolCalls: unknown): ModelToolCall[] {

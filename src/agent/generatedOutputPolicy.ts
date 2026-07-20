@@ -1,4 +1,10 @@
 import { hasDesignIntent } from "./codeDesignIntent";
+import {
+  isCurrentNoteEditOrganizeIntent,
+  isNamedSectionEditIntent,
+  isWholeNoteEditIntent,
+} from "./editOrganizeIntent";
+import { detectExplicitReplaceIntent } from "./noteOutputPolicy";
 
 export type GeneratedOutputKind =
   | "essay"
@@ -109,6 +115,10 @@ function getGeneratedOutputTarget(
     return "chat_only";
   }
 
+  if (shouldPreferWholeNoteReplace(prompt)) {
+    return "current_note_replace";
+  }
+
   if (
     /\b(replace|overwrite|rewrite|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b[\s\S]{0,180}\b(write|generate|draft|compose|create)\b|\b(write|generate|draft|compose|create)\b[\s\S]{0,180}\b(replace|overwrite|rewrite|start\s+(?:fresh|cleanly)|reset|delete|remove|empty|edit\s+over)\b|\bclear\s+(?:(?:the|this|active|current|whole|entire)\s+)?(?:note|page|document|file|contents?|body|text|writing)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i.test(
       prompt,
@@ -129,6 +139,18 @@ function getGeneratedOutputTarget(
   }
 
   return "chat_only";
+}
+
+function shouldPreferWholeNoteReplace(prompt: string): boolean {
+  if (isNamedSectionEditIntent(prompt)) {
+    return false;
+  }
+
+  return (
+    detectExplicitReplaceIntent(prompt) ||
+    isWholeNoteEditIntent(prompt) ||
+    isCurrentNoteEditOrganizeIntent(prompt)
+  );
 }
 
 function hasDiagramIntent(prompt: string): boolean {

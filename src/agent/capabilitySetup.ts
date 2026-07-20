@@ -45,6 +45,15 @@ export function inferCapabilitySetupTarget(
     .toLowerCase();
 
   if (!haystack) return null;
+  // Mission-graph / tool-frontier failures are host authority issues, not
+  // missing credentials. Settings setup cannot unblock them.
+  if (
+    /authoritative mission graph|not ready in the (?:exact )?authoritative|off-frontier|plan_dependency|mission_graph_authority/i.test(
+      haystack,
+    )
+  ) {
+    return null;
+  }
   if (/\blinear\b/.test(haystack)) return "linear";
   if (/\bgithub\b|pull request|\bpr\b|remote repository/.test(haystack)) {
     return "github";
@@ -69,17 +78,29 @@ export function inferCapabilitySetupTarget(
   if (/browser|web action|web fetch|web search|playwright/.test(haystack)) {
     return "browser_web";
   }
-  if (/vault|note|semantic|research memory|writeback/.test(haystack)) {
+  if (
+    /\b(?:vault|semantic|research memory|writeback)\b|\bnotes?\b/.test(haystack)
+  ) {
     return "notes_research";
   }
   return null;
 }
 
 export function capabilitySetupLabel(target: CapabilitySetupTarget): string {
-  if (target === "model") return "Model";
-  if (target === "notes_research") return "Notes & research";
-  if (target === "browser_web") return "Browser & web";
-  if (target === "background") return "Background work";
-  if (target === "github") return "GitHub";
-  return target.charAt(0).toUpperCase() + target.slice(1);
+  switch (target) {
+    case "model":
+      return "Model";
+    case "notes_research":
+      return "Notes & research";
+    case "browser_web":
+      return "Browser & web";
+    case "background":
+      return "Background work";
+    case "github":
+      return "GitHub";
+    case "linear":
+      return "Linear";
+    case "code":
+      return "Code";
+  }
 }

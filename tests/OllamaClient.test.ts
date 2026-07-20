@@ -148,6 +148,52 @@ test("sends auth headers, non-streaming chat body, and tool definitions", async 
   assert.deepEqual(response.toolCalls[0].arguments, { query: "MCP servers" });
 });
 
+test("round-trips assistant thinking on tool turns for follow-up chat requests", async () => {
+  let capturedRequest: HttpRequest | undefined;
+  const client = new OllamaClient({
+    baseUrl: "https://ollama.com/api/",
+    apiKey: "test-key",
+    model: "qwen3:8b",
+    transport: async (request) => {
+      capturedRequest = request;
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          message: { role: "assistant", content: "ok" },
+          done: true,
+        },
+        text: "",
+      };
+    },
+  });
+
+  await client.chat({
+    messages: [
+      { role: "user", content: "Search MCP" },
+      {
+        role: "assistant",
+        content: "",
+        thinking: "need web_search first",
+        toolCalls: [
+          { name: "web_search", arguments: { query: "MCP" } },
+        ],
+      },
+      {
+        role: "tool",
+        toolName: "web_search",
+        content: '{"results":[]}',
+      },
+    ],
+    think: true,
+  });
+
+  assert.ok(capturedRequest);
+  const body = JSON.parse(String(capturedRequest.body));
+  assert.equal(body.messages[1].thinking, "need web_search first");
+  assert.equal(body.messages[1].tool_calls[0].function.name, "web_search");
+});
+
 test("passes request timeout to chat transport and maps timeout errors", async () => {
   let capturedTimeoutMs = 0;
   const client = new OllamaClient({

@@ -8,6 +8,7 @@ import type {
 } from "../src/model/types";
 import {
   createReadOnlyWorkerRegistry,
+  isResearchWorkerParallelSafe,
   runResearchWorker,
 } from "../src/orchestrator/researchWorker";
 import type {
@@ -282,6 +283,173 @@ test("read-only worker registry blocks mutation tools without delegation", async
   assert.equal(result.ok, false);
   assert.equal(result.error?.code, "orchestrator_worker_policy_blocked");
   assert.equal(delegated, false);
+});
+
+test("researcher tool turns pass graded think and prefer streamChat", async () => {
+  const requests: ModelChatRequest[] = [];
+  let chatCalls = 0;
+  let streamCalls = 0;
+  const model: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "qwen3:32b",
+      endpointCategory: "local",
+      transportKind: "test_mock",
+    },
+    async chat(request) {
+      chatCalls += 1;
+      requests.push(request);
+      return finalResponse("Handoff ready with one usable source.");
+    },
+    async streamChat(request) {
+      streamCalls += 1;
+      requests.push(request);
+      return finalResponse("Handoff ready with one usable source.");
+    },
+  };
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      ["web_search", "web_fetch"].map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    async execute(call) {
+      return { ok: true, toolName: call.name, output: {} };
+    },
+  };
+
+  await runResearchWorker({
+    runId: "run-think",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Gather one usable source.",
+    originalMission: "Research with one source.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {
+      settings: {
+        model: "qwen3:32b",
+        thinkingMode: "auto",
+        enableStreaming: true,
+      },
+    } as ToolExecutionContext,
+    maxSteps: 1,
+  });
+
+  assert.equal(streamCalls, 1);
+  assert.equal(chatCalls, 0);
+  assert.equal(requests.length, 1);
+  assert.ok((requests[0].tools?.length ?? 0) > 0);
+  assert.equal(requests[0].think, "low");
+});
+
+test("researcher falls back to chat when streaming is disabled", async () => {
+  let chatCalls = 0;
+  let streamCalls = 0;
+  const model: ModelClient = {
+    async chat() {
+      chatCalls += 1;
+      return finalResponse("Done.");
+    },
+    async streamChat() {
+      streamCalls += 1;
+      return finalResponse("Done.");
+    },
+  };
+  const registry: ToolRegistry = {
+    getDefinitions: () => [],
+    async execute(call) {
+      return { ok: true, toolName: call.name, output: {} };
+    },
+  };
+
+  await runResearchWorker({
+    runId: "run-no-stream",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Summarize.",
+    originalMission: "Research with one source.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {
+      settings: { enableStreaming: false, model: "qwen3:32b" },
+    } as ToolExecutionContext,
+    maxSteps: 1,
+  });
+
+  assert.equal(chatCalls, 1);
+  assert.equal(streamCalls, 0);
+});
+
+test("research worker parallel-safe classifier keeps web_fetch serial", () => {
+  assert.equal(isResearchWorkerParallelSafe("read_file"), true);
+  assert.equal(isResearchWorkerParallelSafe("web_search"), true);
+  assert.equal(isResearchWorkerParallelSafe("web_fetch"), false);
+  assert.equal(isResearchWorkerParallelSafe("browser_open_page"), false);
+});
+
+test("research worker runs parallel-safe reads concurrently", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const model = sequenceModel([
+    {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          { name: "read_file", arguments: { path: "a.md" }, id: "1" },
+          { name: "read_file", arguments: { path: "b.md" }, id: "2" },
+        ],
+      },
+      toolCalls: [
+        { name: "read_file", arguments: { path: "a.md" }, id: "1" },
+        { name: "read_file", arguments: { path: "b.md" }, id: "2" },
+      ],
+    },
+    finalResponse("Read both notes."),
+  ]);
+  const registry: ToolRegistry = {
+    getDefinitions: () => [
+      {
+        type: "function",
+        function: { name: "read_file", parameters: { type: "object" } },
+      },
+    ],
+    async execute(call) {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      inFlight -= 1;
+      return {
+        ok: true,
+        toolName: call.name,
+        output: { path: call.arguments.path, content: "note" },
+      };
+    },
+  };
+  const statuses: string[] = [];
+  await runResearchWorker({
+    runId: "run-parallel",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Read a.md and b.md in parallel",
+    originalMission: "Read vault notes in parallel.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 3,
+    maxToolCalls: 4,
+    events: {
+      onStatus: (status) => {
+        statuses.push(status);
+      },
+    },
+  });
+  assert.ok(maxInFlight >= 2, `expected concurrent reads, maxInFlight=${maxInFlight}`);
+  assert.ok(statuses.some((item) => /parallel/i.test(item)));
 });
 
 function sequenceModel(responses: ModelChatResponse[]): ModelClient {

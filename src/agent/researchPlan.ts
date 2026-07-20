@@ -119,6 +119,54 @@ export function createResearchPlan({
   return plan;
 }
 
+export type ResearchSubquestionAssist = (request: {
+  prompt: string;
+  mode: ResearchMode;
+  seedQuestions: string[];
+}) => Promise<string[] | null>;
+
+/**
+ * Same as {@link createResearchPlan}, then optionally merges utility-model
+ * subquestions when configured and deterministic confidence is low.
+ * Never calls the main mission model for planning — pass a dedicated utility assist.
+ */
+export async function createResearchPlanWithAssist(
+  input: CreateResearchPlanInput & {
+    utilityModelConfigured?: boolean;
+    assist?: ResearchSubquestionAssist;
+  },
+): Promise<ResearchPlan | null> {
+  const plan = createResearchPlan(input);
+  if (!plan) {
+    return null;
+  }
+  const deterministicQuestions = plan.subquestions.map((item) => item.question);
+  const assisted = await maybeAssistResearchSubquestions({
+    prompt: input.prompt,
+    mode: plan.mode,
+    deterministicQuestions,
+    utilityModelConfigured: input.utilityModelConfigured === true,
+    assist: input.assist,
+  });
+  if (assisted.source !== "utility_assist") {
+    return plan;
+  }
+  const rebuilt = assisted.questions.map((question, index) =>
+    makeSubquestion(
+      `rq-${index + 1}`,
+      question,
+      evidenceTypeForSubquestion(plan.mode, index, assisted.questions.length),
+      minEvidenceForSubquestion(plan.mode, index, assisted.questions.length),
+    ),
+  );
+  if (rebuilt[0]) {
+    rebuilt[0] = { ...rebuilt[0], status: "in_progress" };
+  }
+  plan.subquestions = rebuilt;
+  plan.nextAction = getNextResearchAction(plan);
+  return plan;
+}
+
 export function parseExplicitResearchSourceCount(prompt: string): number | null {
   const normalized = prompt.replace(/\s+/g, " ").trim().toLowerCase();
   if (!normalized) return null;
@@ -522,9 +570,9 @@ function classifyResearchMode(
  * Mission-specific research decomposition (S9 / A3).
  * Deterministic-only for v1: numbered lists, ? sentences, compare X vs Y,
  * pros/cons, risks, and explicit research-question sections.
- * TODO(utility-model): optional structured JSON assist when utilityModel is
- * configured and deterministic confidence is low — do not call the main chat
- * model solely to plan when deterministic parse succeeds.
+ * Utility-model assist is available via {@link maybeAssistResearchSubquestions}
+ * when deterministic confidence is low — never call the main chat model solely
+ * to plan when deterministic parse succeeds.
  */
 function createSubquestions(
   prompt: string,
@@ -546,6 +594,81 @@ function createSubquestions(
       minEvidenceForSubquestion(mode, index, capped.length),
     ),
   );
+}
+
+/**
+ * Optional structured JSON assist when a utility model is configured and
+ * deterministic confidence is low. Host still validates / caps the result.
+ * Pass `assist` only from a dedicated utility client — never the main mission model.
+ */
+export async function maybeAssistResearchSubquestions(input: {
+  prompt: string;
+  mode: ResearchMode;
+  deterministicQuestions: string[];
+  utilityModelConfigured: boolean;
+  assist?: (request: {
+    prompt: string;
+    mode: ResearchMode;
+    seedQuestions: string[];
+  }) => Promise<string[] | null>;
+}): Promise<{ questions: string[]; source: "deterministic" | "utility_assist" }> {
+  const confidence = estimateDeterministicResearchConfidence(
+    input.prompt,
+    input.deterministicQuestions,
+  );
+  if (
+    confidence >= 0.55 ||
+    !input.utilityModelConfigured ||
+    typeof input.assist !== "function"
+  ) {
+    return {
+      questions: input.deterministicQuestions,
+      source: "deterministic",
+    };
+  }
+  try {
+    const assisted = await input.assist({
+      prompt: input.prompt,
+      mode: input.mode,
+      seedQuestions: input.deterministicQuestions,
+    });
+    if (!assisted || assisted.length === 0) {
+      return {
+        questions: input.deterministicQuestions,
+        source: "deterministic",
+      };
+    }
+    const merged = capAndMergeSubquestionTexts(
+      [...input.deterministicQuestions, ...assisted]
+        .map((item) => item.replace(/\s+/g, " ").trim())
+        .filter((item) => item.length >= 8),
+      2,
+      8,
+    );
+    return { questions: merged, source: "utility_assist" };
+  } catch {
+    return {
+      questions: input.deterministicQuestions,
+      source: "deterministic",
+    };
+  }
+}
+
+export function estimateDeterministicResearchConfidence(
+  prompt: string,
+  questions: string[],
+): number {
+  const decomposed = decomposePromptIntoResearchQuestions(prompt);
+  // Prefer structured decomposition over post-cap question counts so default
+  // template questions (deep_web always seeds two) still allow utility assist.
+  if (decomposed.length >= 3) return 0.85;
+  if (decomposed.length === 2) return 0.7;
+  if (decomposed.length === 1) return 0.45;
+  if (questions.length > 0 && decomposed.length === 0) return 0.35;
+  if (/\?/.test(prompt) || /\bcompare\b|\bpros\b|\brisks?\b/i.test(prompt)) {
+    return 0.4;
+  }
+  return 0.2;
 }
 
 /** Exported for unit tests and future utility-model assist fallback. */

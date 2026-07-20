@@ -37,7 +37,9 @@ export function decideNextLoopAction(
   budget: LoopBudgetPlan,
 ): LoopDecision {
   if (ledger.writeCompleted) {
-    return { action: "stop_budget", reason: "write_completed" };
+    // Distinct from step/model budget so Chat and finishRun can label
+    // successful writeback as write_completed instead of a safety-limit stop.
+    return { action: "stop_verified_complete", reason: "write_completed" };
   }
 
   if (ledger.wallClockExpired) {

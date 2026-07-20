@@ -1027,6 +1027,47 @@ export class MissionGraphSession {
           blocker: null,
         },
       );
+      // Optional catalog reads may remain ready after a finished write. Cancel
+      // those off-critical-path siblings so terminal acceptance does not treat
+      // the graph as incomplete and downgrade a successful write to budget.
+      const requiredIds = new Set<string>([node.id, ...node.dependencyIds]);
+      const stack = [...node.dependencyIds];
+      while (stack.length > 0) {
+        const dependencyId = stack.pop()!;
+        const dependency = this.record.graph.nodes[dependencyId];
+        if (!dependency) continue;
+        for (const nestedId of dependency.dependencyIds) {
+          if (requiredIds.has(nestedId)) continue;
+          requiredIds.add(nestedId);
+          stack.push(nestedId);
+        }
+      }
+      for (const [id, candidate] of Object.entries(this.record.graph.nodes)) {
+        if (requiredIds.has(id)) continue;
+        if (candidate.effect !== "read") continue;
+        if (
+          candidate.status === "complete" ||
+          candidate.status === "cancelled" ||
+          candidate.status === "blocked"
+        ) {
+          continue;
+        }
+        if (
+          candidate.status === "running" ||
+          candidate.status === "waiting_approval" ||
+          candidate.status === "waiting_obsidian" ||
+          candidate.status === "verifying"
+        ) {
+          continue;
+        }
+        operations.push({
+          op: "set_status",
+          nodeId: id,
+          expectedStatus: candidate.status,
+          status: "cancelled",
+          blocker: null,
+        });
+      }
       return this.applyUnlocked("Record accepted final output.", operations);
     });
   }

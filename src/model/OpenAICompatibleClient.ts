@@ -64,6 +64,7 @@ export class OpenAICompatibleClient implements ModelClient {
     if (!model) {
       throw new ModelClientError("api", "Model name is required.");
     }
+    this.assertApiKeyForRemoteEndpoint();
 
     const httpRequest: HttpRequest = {
       url: getOpenAIChatCompletionsUrl(this.baseUrl),
@@ -109,6 +110,7 @@ export class OpenAICompatibleClient implements ModelClient {
     if (!model) {
       throw new ModelClientError("api", "Model name is required.");
     }
+    this.assertApiKeyForRemoteEndpoint();
 
     const httpRequest: HttpRequest = {
       url: getOpenAIChatCompletionsUrl(this.baseUrl),
@@ -150,6 +152,19 @@ export class OpenAICompatibleClient implements ModelClient {
       headers.Authorization = `Bearer ${apiKey}`;
     }
     return headers;
+  }
+
+  private assertApiKeyForRemoteEndpoint(): void {
+    if (this.apiKey.trim()) {
+      return;
+    }
+    if (isLocalBaseUrl(this.baseUrl)) {
+      return;
+    }
+    throw new ModelClientError(
+      "missing_api_key",
+      "OpenAI-compatible cloud endpoints require an API key. Add one in Agentic Researcher settings.",
+    );
   }
 }
 
@@ -409,7 +424,8 @@ function parseOpenAIToolCalls(toolCalls: unknown): ModelToolCall[] {
   });
 }
 
-function accumulateOpenAIStreamToolCalls(
+/** Exported for unit tests covering parallel SSE tool-call deltas. */
+export function accumulateOpenAIStreamToolCalls(
   rawToolCalls: unknown,
   accumulators: Map<number, OpenAIToolCallAccumulator>,
 ) {
@@ -420,7 +436,7 @@ function accumulateOpenAIStreamToolCalls(
     if (!isRecord(item)) {
       continue;
     }
-    const index = typeof item.index === "number" ? item.index : accumulators.size;
+    const index = resolveOpenAIStreamToolCallIndex(item, accumulators);
     const existing =
       accumulators.get(index) ?? { argumentsText: "", raw: item };
     if (typeof item.id === "string") {
@@ -432,11 +448,46 @@ function accumulateOpenAIStreamToolCalls(
       }
       if (typeof item.function.arguments === "string") {
         existing.argumentsText += item.function.arguments;
+      } else if (
+        item.function.arguments !== undefined &&
+        item.function.arguments !== null &&
+        typeof item.function.arguments !== "string"
+      ) {
+        // Some compatible hosts send a partial object; merge as JSON text.
+        try {
+          existing.argumentsText += JSON.stringify(item.function.arguments);
+        } catch {
+          // ignore non-serializable fragments
+        }
       }
     }
     existing.raw = item;
     accumulators.set(index, existing);
   }
+}
+
+function resolveOpenAIStreamToolCallIndex(
+  item: Record<string, unknown>,
+  accumulators: Map<number, OpenAIToolCallAccumulator>,
+): number {
+  if (typeof item.index === "number" && Number.isFinite(item.index)) {
+    return item.index;
+  }
+  if (typeof item.id === "string" && item.id.trim()) {
+    for (const [index, existing] of accumulators) {
+      if (existing.id === item.id) {
+        return index;
+      }
+    }
+  }
+  return accumulators.size;
+}
+
+/** Exported for unit tests covering parallel SSE tool-call finalization. */
+export function finalizeOpenAIStreamToolCallsForTest(
+  accumulators: Map<number, OpenAIToolCallAccumulator>,
+): ModelToolCall[] {
+  return finalizeOpenAIStreamToolCalls(accumulators);
 }
 
 function finalizeOpenAIStreamToolCalls(
@@ -551,17 +602,26 @@ function mapOpenAIHttpError(
 ): ModelClientError {
   const detail = getErrorDetail(body);
   if (status === 401 || status === 403) {
+    const looksLikeMissingKey =
+      /api[_ ]?key|authentication|unauthorized|invalid.?api.?key/i.test(
+        detail || "",
+      );
     return new ModelClientError(
-      "auth",
+      looksLikeMissingKey ? "missing_api_key" : "auth",
       detail || "OpenAI-compatible API rejected the request. Check the API key.",
       { status, details: body },
     );
   }
   if (status === 429) {
+    const retryAfterMs = parseRetryAfterMs(headers);
+    const budgetExhausted = /quota|billing|insufficient/i.test(detail || "");
     return new ModelClientError(
-      "rate_limit",
-      detail || "OpenAI-compatible API rate limit reached. Try again later.",
-      { status, details: { body, retryAfterMs: parseRetryAfterMs(headers) } },
+      budgetExhausted ? "provider_budget_exhausted" : "rate_limit",
+      detail ||
+        (retryAfterMs
+          ? `OpenAI-compatible API rate limit reached. Retry after ${retryAfterMs}ms.`
+          : "OpenAI-compatible API rate limit reached. Try again later."),
+      { status, details: { body, retryAfterMs } },
     );
   }
   return new ModelClientError(
