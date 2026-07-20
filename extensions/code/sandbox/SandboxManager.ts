@@ -624,7 +624,7 @@ export class SandboxManagerV2 {
       stderrSha256: sha256Text(execution.stderr),
       stdoutBytes: Buffer.byteLength(execution.stdout, "utf8"),
       stderrBytes: Buffer.byteLength(execution.stderr, "utf8"),
-      importedArtifacts: imported.sort((left, right) => left.path.localeCompare(right.path)),
+      importedArtifacts: imported.sort((left, right) => compareCanonicalText(left.path, right.path)),
       authorizationGrantId: input.authorization.grantId,
       startedAt,
       completedAt: this.now().toISOString(),
@@ -908,7 +908,7 @@ function buildProviderCommand(
       ];
   let args: string[];
   const guestEnvironment = Object.entries(action?.environment ?? {})
-    .sort(([left], [right]) => left.localeCompare(right));
+    .sort(([left], [right]) => compareCanonicalText(left, right));
   if (provider.kind === "docker" || provider.kind === "podman") {
     const image = `${provider.runtimeReference}@${provider.runtimeDigest}`;
     args = [
@@ -1047,7 +1047,7 @@ function parseStagingManifest(value: readonly SandboxStagingEntryV2[]): SandboxS
     const bytes = boundedInteger(record.bytes, "staged bytes", 0, MAX_STAGED_FILE_BYTES);
     total += bytes;
     return { path: safeRelativePath(record.path, "staged path", false), sha256: fingerprint(record.sha256, "staged hash"), bytes };
-  }).sort((left, right) => left.path.localeCompare(right.path));
+  }).sort((left, right) => compareCanonicalText(left.path, right.path));
   if (total > MAX_STAGED_TOTAL_BYTES) throw new SandboxManagerV2Error("Staging manifest exceeds 10 MB.");
   if (new Set(output.map((entry) => entry.path)).size !== output.length) throw new SandboxManagerV2Error("Staging paths must be unique.");
   return output;
@@ -1092,7 +1092,7 @@ function parseExpectedArtifactsWithoutProfile(value: unknown): SandboxExpectedAr
       maxBytes: boundedInteger(record.maxBytes, "artifact bytes", 1, MAX_ARTIFACT_BYTES),
       required: record.required,
     };
-  }).sort((left, right) => left.path.localeCompare(right.path));
+  }).sort((left, right) => compareCanonicalText(left.path, right.path));
 }
 
 function parseEnvironment(value: Readonly<Record<string, string>>): Record<string, string> {
@@ -1105,7 +1105,7 @@ function parseEnvironment(value: Readonly<Record<string, string>>): Record<strin
     }
     output[key] = content;
   }
-  return Object.fromEntries(Object.entries(output).sort(([left], [right]) => left.localeCompare(right)));
+  return Object.fromEntries(Object.entries(output).sort(([left], [right]) => compareCanonicalText(left, right)));
 }
 
 function parseResources(
@@ -1256,6 +1256,10 @@ function summarizeUnavailableProviders(
 
 function sha256Bytes(value: Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function sha256Text(value: string): string {

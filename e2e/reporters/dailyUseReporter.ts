@@ -133,9 +133,7 @@ export default class DailyUseReporter implements Reporter {
   async onEnd(result: FullResult): Promise<void> {
     // Playwright --list and an accidental zero-test selection must not erase a
     // valid exact-SHA daily-use summary from the most recent real run.
-    if (!shouldWriteDailyUseSummary(this.records.length)) return;
     const outputDirectory = path.resolve(process.cwd(), "test-results");
-    await mkdir(outputDirectory, { recursive: true });
     const payload = {
       version: 1,
       status: result.status,
@@ -143,12 +141,23 @@ export default class DailyUseReporter implements Reporter {
       summaries: summarizeRecords(this.records),
       records: this.records,
     };
-    await writeFile(
+    await writeDailyUseSummaryIfAny(
       path.join(outputDirectory, "daily-use-run-summary.json"),
-      `${JSON.stringify(payload, null, 2)}\n`,
-      "utf8",
+      this.records.length,
+      payload,
     );
   }
+}
+
+export async function writeDailyUseSummaryIfAny(
+  outputPath: string,
+  recordCount: number,
+  payload: unknown,
+): Promise<boolean> {
+  if (!shouldWriteDailyUseSummary(recordCount)) return false;
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  await writeFile(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return true;
 }
 
 function summarizeRecords(records: readonly DailyUseRunRecord[]) {

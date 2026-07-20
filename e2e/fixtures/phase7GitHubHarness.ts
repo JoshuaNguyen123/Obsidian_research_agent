@@ -46,6 +46,16 @@ export interface Phase7PushObservation {
   fastForwardVerified: boolean;
 }
 
+export interface Phase7FreshFullValidationProofV1 {
+  version: 1;
+  commitSha: string;
+  command: readonly ["npm", "test"];
+  testCount: number;
+  passCount: number;
+  cleanReadback: true;
+  fingerprint: string;
+}
+
 export interface Phase7GitFixture {
   root: string;
   repositoryRoot: string;
@@ -55,6 +65,7 @@ export interface Phase7GitFixture {
   firstCommitSha: string;
   firstTreeSha: string;
   commitRepair(): Promise<{ commitSha: string; treeSha: string; parentSha: string }>;
+  validateFreshFull(commitSha: string): Promise<Phase7FreshFullValidationProofV1>;
   pushVerified(commitSha: string): Promise<Phase7PushObservation>;
   remoteBranchSha(): Promise<string | null>;
   cleanup(): Promise<void>;
@@ -64,6 +75,7 @@ export interface Phase7GitHubHarness {
   fixture: Phase7GitFixture;
   provider: Phase7FakeGitHubProvider;
   workflow: GitHubPublicationWorkflowV1;
+  createRestartedWorkflow(): GitHubPublicationWorkflowV1;
   binding: TrustedGitHubPublicationBindingV1;
   approvals: Phase7ApprovalObservation[];
   checkpoints: GitHubPublicationCheckpointV1[];
@@ -74,6 +86,7 @@ export interface Phase7GitHubHarness {
     commitSha: string;
     treeSha: string;
     baseSha: string;
+    validation: Phase7FreshFullValidationProofV1;
     completionProof?: "draft_pr" | "merged_pr";
   }): PublishVerifiedCodeRequestV1;
   driftNextMergeApproval(): void;
@@ -202,12 +215,26 @@ export async function createPhase7GitHubHarness(
     fixture,
     provider,
     workflow: new GitHubPublicationWorkflowV1(options),
+    createRestartedWorkflow: () => new GitHubPublicationWorkflowV1(options),
     binding,
     approvals,
     checkpoints,
     pushes,
     finalizerReceiptIds,
     request(input) {
+      if (
+        !input.validation ||
+        input.validation.commitSha !== input.commitSha ||
+        input.validation.command.join(" ") !== "npm test" ||
+        input.validation.testCount < 1 ||
+        input.validation.passCount !== input.validation.testCount ||
+        input.validation.cleanReadback !== true ||
+        !/^sha256:[a-f0-9]{64}$/u.test(input.validation.fingerprint)
+      ) {
+        throw new Error(
+          "Phase 7 publication requires exact-commit fresh-full validation proof.",
+        );
+      }
       const handoff: GitHubPublicationHandoffV1 = {
         profileKey: binding.profileKey,
         workspaceId: `phase7-workspace-${safeMarker(marker)}`,
@@ -218,7 +245,7 @@ export async function createPhase7GitHubHarness(
         diffFingerprint: fingerprint(`diff:${input.commitSha}`),
         validationReceiptFingerprints: [
           fingerprint(`targeted:${input.commitSha}`),
-          fingerprint(`full:${input.commitSha}`),
+          input.validation.fingerprint,
         ],
         handoffFingerprint: fingerprint(`handoff:${input.commitSha}`),
       };
@@ -449,12 +476,38 @@ async function createPhase7GitFixture(marker: string): Promise<Phase7GitFixture>
     `${JSON.stringify({
       name: "agentic-phase7-fixture",
       private: true,
-      scripts: { test: "node --test" },
+      scripts: { test: "node --test --test-reporter=tap test/value.test.mjs" },
     }, null, 2)}\n`,
     "utf8",
   );
   await writeFile(path.join(repositoryRoot, "value.txt"), `base:${marker}\n`, "utf8");
-  await git(repositoryRoot, hooksRoot, ["add", "--", "package.json", "value.txt"]);
+  await mkdir(path.join(repositoryRoot, "test"), { recursive: true });
+  await writeFile(
+    path.join(repositoryRoot, "test", "value.test.mjs"),
+    [
+      "import assert from 'node:assert/strict';",
+      "import { readFile } from 'node:fs/promises';",
+      "import test from 'node:test';",
+      "",
+      `const accepted = new Set(${JSON.stringify([
+        `base:${marker}\n`,
+        `published:${marker}:1\n`,
+        `published:${marker}:2\n`,
+      ])});`,
+      "test('exact publication value is repository-valid', async () => {",
+      "  assert.equal(accepted.has(await readFile('value.txt', 'utf8')), true);",
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await git(repositoryRoot, hooksRoot, [
+    "add",
+    "--",
+    "package.json",
+    "value.txt",
+    "test/value.test.mjs",
+  ]);
   await git(repositoryRoot, hooksRoot, ["commit", "-m", "phase7 fixture base"]);
   const baseSha = await git(repositoryRoot, hooksRoot, ["rev-parse", "HEAD"]);
   await git(root, hooksRoot, ["init", "--bare", bareRemoteRoot]);
@@ -495,6 +548,8 @@ async function createPhase7GitFixture(marker: string): Promise<Phase7GitFixture>
         treeSha: await git(repositoryRoot, hooksRoot, ["rev-parse", "HEAD^{tree}"]),
       };
     },
+    validateFreshFull: (commitSha) =>
+      validatePhase7CommitFreshFull(repositoryRoot, hooksRoot, commitSha),
     async pushVerified(commitSha) {
       const head = await git(repositoryRoot, hooksRoot, ["rev-parse", "HEAD"]);
       const currentBranch = await git(repositoryRoot, hooksRoot, ["branch", "--show-current"]);
@@ -527,6 +582,86 @@ async function createPhase7GitFixture(marker: string): Promise<Phase7GitFixture>
     remoteBranchSha: () => readRemoteBranchSha(repositoryRoot, hooksRoot, bareRemoteRoot, branch),
     cleanup: () => cleanupPhase7Fixture(root),
   };
+}
+
+async function validatePhase7CommitFreshFull(
+  repositoryRoot: string,
+  hooksRoot: string,
+  commitSha: string,
+): Promise<Phase7FreshFullValidationProofV1> {
+  if (!GIT_SHA.test(commitSha)) {
+    throw new Error("Fresh-full validation requires an exact commit SHA.");
+  }
+  const validationRoot = await mkdtemp(
+    path.join(tmpdir(), "agentic-phase7-fresh-full-"),
+  );
+  const worktreeRoot = path.join(validationRoot, "worktree");
+  let worktreeAdded = false;
+  try {
+    await git(repositoryRoot, hooksRoot, [
+      "worktree",
+      "add",
+      "--detach",
+      worktreeRoot,
+      commitSha,
+    ]);
+    worktreeAdded = true;
+    const checkedOutSha = await git(worktreeRoot, hooksRoot, [
+      "rev-parse",
+      "HEAD",
+    ]);
+    if (checkedOutSha !== commitSha) {
+      throw new Error("Fresh validation worktree did not read back the exact commit.");
+    }
+    const npmExecutable = process.platform === "win32"
+      ? process.env.ComSpec || "cmd.exe"
+      : "npm";
+    const npmArguments = process.platform === "win32"
+      ? ["/d", "/s", "/c", "npm.cmd test"]
+      : ["test"];
+    await execFileAsync(npmExecutable, npmArguments, {
+      cwd: worktreeRoot,
+      windowsHide: true,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      maxBuffer: 1_048_576,
+    });
+    const testSource = await readFile(
+      path.join(worktreeRoot, "test", "value.test.mjs"),
+      "utf8",
+    );
+    const testCount = testSource.match(/\btest\s*\(/gu)?.length ?? 0;
+    const passCount = testCount;
+    if (testCount < 1) {
+      throw new Error(
+        "Fresh-full validation did not execute a committed repository test.",
+      );
+    }
+    if ((await git(worktreeRoot, hooksRoot, ["status", "--short"])) !== "") {
+      throw new Error("Fresh-full validation changed the detached worktree.");
+    }
+    const unsigned = {
+      version: 1 as const,
+      commitSha,
+      command: ["npm", "test"] as const,
+      testCount,
+      passCount,
+      cleanReadback: true as const,
+    };
+    return {
+      ...unsigned,
+      fingerprint: fingerprint(JSON.stringify(unsigned)),
+    };
+  } finally {
+    if (worktreeAdded) {
+      await git(repositoryRoot, hooksRoot, [
+        "worktree",
+        "remove",
+        "--force",
+        worktreeRoot,
+      ]).catch(() => "");
+    }
+    await rm(validationRoot, { recursive: true, force: true });
+  }
 }
 
 async function readRemoteBranchSha(

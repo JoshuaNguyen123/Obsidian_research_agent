@@ -111,13 +111,30 @@ fi
 if [[ "$mode" == "identity" ]]; then
   runtime_root="${1:?runtime root required}"
   runtime_digest="${2:?runtime digest required}"
-  manifest="${3:?runtime manifest required}"
   [[ "$runtime_root" == /opt/agentic/* && "$runtime_root" != *".."* ]] || {
     echo "runtime root must stay below /opt/agentic" >&2
     exit 64
   }
+  [[ "$runtime_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+    echo "runtime digest must be an exact SHA-256 fingerprint" >&2
+    exit 64
+  }
   printf '%s\n' "$runtime_digest" > "$runtime_root/.agentic-runtime-digest"
-  printf '%s\n' "$manifest" > "$runtime_root/runtime-manifest.json"
+  python3 - "$runtime_root/runtime-manifest.json" "$runtime_digest" <<'PY'
+import json
+import sys
+
+path, runtime_digest = sys.argv[1:]
+manifest = {
+    "version": 1,
+    "commandRuntimeDigests": {
+        runtime_digest: ["node", "npm", "python", "python3"],
+    },
+}
+with open(path, "w", encoding="utf-8", newline="\n") as handle:
+    json.dump(manifest, handle, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    handle.write("\n")
+PY
   chmod 0444 "$runtime_root/.agentic-runtime-digest" "$runtime_root/runtime-manifest.json"
   exit 0
 fi

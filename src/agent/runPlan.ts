@@ -472,7 +472,8 @@ export function resolveThinkingMode(
   if (
     model.startsWith("qwen3") ||
     model.startsWith("deepseek-r1") ||
-    model.startsWith("deepseek-v3.1")
+    model.startsWith("deepseek-v3.1") ||
+    model.startsWith("kimi-k2.7-code")
   ) {
     return true;
   }

@@ -48,17 +48,49 @@ export type ReflexCheckpointKind =
   | "terminal_attempt"
   | "retryable_recovery";
 
+export interface ReflexReadinessSummaryV1 {
+  total: number;
+  ok: number;
+  degraded: number;
+  blocked: number;
+  unknown: number;
+}
+
+export type ReflexRecoveryOutcomeV1 =
+  | "not_applicable"
+  | "retry_scheduled"
+  | "replan_scheduled"
+  | "recovered"
+  | "blocked";
+
 export interface ReflexCheckpointReceiptV1 {
   version: 1;
   runId: string;
   checkpoint: ReflexCheckpointKind;
   label: ReflexLabel;
+  /** Optional only so persisted pre-extension v1 receipts remain readable. */
+  confidence?: number;
   confidenceBand: ReflexDecisionV2["confidenceBand"];
+  /** Optional only so persisted pre-extension v1 receipts remain readable. */
+  winningMargin?: number;
   reasonCode: ReflexDecisionV2["reasonCode"];
   applied: boolean;
+  /** Stable safe-read tool name only; prompt text and rationale are excluded. */
+  suggestedAction?: string | null;
+  /** Stable host-allowed safe-read tool name only. */
+  allowedAction?: string | null;
   actionCount: number;
   evidenceCount: number;
   receiptCount: number;
+  /** Aggregate dependency health only; summaries and next actions are excluded. */
+  readinessSummary?: ReflexReadinessSummaryV1;
+  progressScore?: number;
+  loopRiskScore?: number;
+  /** Bounded diagnostic codes only, never provider or note content. */
+  completionMissing?: string[];
+  /** Bounded diagnostic codes recomputed from durable state. */
+  proofDebt?: string[];
+  recoveryOutcome?: ReflexRecoveryOutcomeV1;
   frontierFingerprint: string | null;
   observedAt: string;
   fingerprint: string;

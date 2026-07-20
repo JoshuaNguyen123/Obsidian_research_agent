@@ -861,6 +861,32 @@ test("approval denial blocks the node and releases its prepared-action lock", as
   assert.deepEqual(stored.record.resourceLocks.locks, {});
 });
 
+test("approval expiry is not misreported as a user denial", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-approval-expiry",
+    allowedTools: ["replace_current_file"],
+    plannedTools: ["replace_current_file"],
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const execution = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  await session.waitForToolApproval(execution);
+  const expired = await session.resolveToolApproval(execution, "expired");
+  assert.equal(expired.nodes[execution.nodeId].status, "blocked");
+  assert.equal(expired.nodes[execution.nodeId].blocker?.code, "approval_expired");
+  assert.doesNotMatch(
+    expired.nodes[execution.nodeId].blocker?.message ?? "",
+    /User denied/u,
+  );
+  const stored = await requireStored(harness.context, graph.missionId);
+  assert.deepEqual(stored.record.resourceLocks.locks, {});
+});
+
 async function graphFor(input: {
   missionId: string;
   allowedTools: string[];

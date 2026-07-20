@@ -75,6 +75,7 @@ export interface RepositoryWorktreeProvisionV2 extends RepositoryInspectionV2 {
 export interface WorkspaceRepositoryProvisionerV2 {
   resolveProfile?(profileKey: string, context: ScopedExtensionContextV1): Promise<string | null>;
   resolveProfileContract?(profileKey: string, context: ScopedExtensionContextV1): Promise<RepositoryProfileV2 | null>;
+  resolveProfileByRoot?(repositoryRoot: string, context: ScopedExtensionContextV1): Promise<RepositoryProfileV2 | null>;
   redetectProfile?(profileKey: string, workspaceId: string, context: ScopedExtensionContextV1): Promise<void>;
   inspect(repositoryRoot: string, context: ScopedExtensionContextV1): Promise<RepositoryInspectionV2>;
   provision(input: {
@@ -698,7 +699,22 @@ class WorkspaceToolRuntimeV2 {
       if (!this.isForegroundUserMission(canonical, context) || !context.originalPrompt?.includes(canonical)) {
         throw new WorkspaceManagerErrorV2("raw_repository_authority_missing", "Raw repository roots require an explicit foreground user mission containing the exact canonical path.");
       }
-      repositoryRoot = canonical;
+      const trustedProfile = await this.repositories.resolveProfileByRoot?.(
+        canonical,
+        context,
+      ) ?? null;
+      if (trustedProfile) {
+        if (!samePath(trustedProfile.repositoryRoot, canonical)) {
+          throw new WorkspaceManagerErrorV2(
+            "repository_profile_binding_conflict",
+            "Trusted repository profile root changed during exact-root resolution.",
+          );
+        }
+        profileKey = trustedProfile.key;
+        repositoryRoot = trustedProfile.repositoryRoot;
+      } else {
+        repositoryRoot = canonical;
+      }
     }
     const inspection = await this.repositories.inspect(repositoryRoot, context);
     const normalizedArgs: Record<string, JsonValueV1> = {
@@ -1454,7 +1470,7 @@ function description(name: string): string {
     "code_workspace_write_expected",
     "write_workspace_file",
   ].includes(name)
-    ? `${base} Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`
+    ? `${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`
     : base;
 }
 function workspaceIdFrom(args: Record<string, unknown>, context: ScopedExtensionContextV1): string { return (optionalString(args.workspaceId) ?? context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc").toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 128) || "adhoc"; }

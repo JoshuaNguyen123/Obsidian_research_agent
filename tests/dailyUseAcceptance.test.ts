@@ -48,4 +48,22 @@ describe("DailyUseAcceptanceV1", () => {
       { status: "pass", missing: [] },
     );
   });
+
+  it("requires transport-free cache reuse evidence for DU-02", () => {
+    const contract = DAILY_USE_ACCEPTANCE_V1["DU-02"];
+    assert.ok(contract.requiredProofs.includes("research:cache_reuse"));
+    const observed = {
+      artifacts: contract.requestedArtifacts,
+      proofs: contract.requiredProofs.filter(
+        (proof) => proof !== "research:cache_reuse",
+      ),
+      approvals: contract.approvalBoundaries,
+      bindings: contract.finalBindings,
+      cleanup: contract.cleanupObligations,
+    };
+    assert.deepEqual(evaluateDailyUseAcceptanceV1(contract, observed), {
+      status: "needs_more_work",
+      missing: ["research:cache_reuse"],
+    });
+  });
 });

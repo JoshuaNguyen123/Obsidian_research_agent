@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 // @ts-ignore The production runner is an intentionally unbundled Node ESM script.
-import { applyE2eAiMode, applyE2eLane, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
+import { applyE2eAiMode, applyE2eLane, applyE2eProviderDefaults, applyPersistedWindowsSandboxEnvironment, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
 
@@ -22,6 +22,26 @@ test("DU-04 Linear scenarios are owned by the dedicated file-routed spec", () =>
     "rereads claims executes vault work and reconciles completion without replay",
   ]) {
     assert.equal(phase6.includes(title), true, `missing Phase 6 title: ${title}`);
+    assert.equal(monolith.includes(title), false, `duplicate monolith title: ${title}`);
+  }
+});
+
+test("daily-use memory and reflex UI scenarios are physically owned by the focused spec", () => {
+  const focused = readFileSync(
+    new URL("../e2e/daily-use-memory-reflex.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const monolith = readFileSync(
+    new URL("../e2e/obsidian-agent.spec.ts", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(focused, /import\s+["']\.\/obsidian-agent\.spec["']/u);
+  for (const title of [
+    "agentic reflex routes ambiguous semantic prompt",
+    "small context budget compacts loop messages mid-run",
+    "research memory save clear reload recall",
+  ]) {
+    assert.equal(focused.includes(title), true, `missing focused title: ${title}`);
     assert.equal(monolith.includes(title), false, `duplicate monolith title: ${title}`);
   }
 });
@@ -198,14 +218,98 @@ test("configured Linear live routing is explicit and keeps secrets inside Obsidi
 test("runner mode exports explicit child-process environment without secrets", () => {
   const env: NodeJS.ProcessEnv = {};
   applyE2eAiMode("real", env);
+  applyE2eProviderDefaults(
+    { aiMode: "real", projects: ["real-ai-contract"] },
+    env,
+  );
   applyE2eLane({ liveExternal: false, projects: ["real-ai-contract"] }, env);
   assert.deepEqual(env, {
     E2E_AI_MODE: "real",
     E2E_REAL_AI: "1",
     E2E_AI_MODEL: "gpt-oss:120b-cloud",
+    E2E_MODEL_PROVIDER: "ollama",
     E2E_PLAYWRIGHT_LANE: "real-ai-contract",
     E2E_LIVE_EXTERNAL: "0",
   });
+});
+
+test("provider canary binds preflight and runtime to its exact requested model", () => {
+  const env: NodeJS.ProcessEnv = {
+    E2E_AI_MODEL: "stale-default",
+    E2E_CANARY_MODEL: "current-coding-model:cloud",
+  };
+  applyE2eProviderDefaults(
+    { aiMode: "real", projects: ["provider-canary"] },
+    env,
+  );
+  assert.equal(env.E2E_MODEL_PROVIDER, "ollama");
+  assert.equal(env.E2E_AI_MODEL, "current-coding-model:cloud");
+});
+
+test("sandbox E2E lanes import only missing persisted Windows runtime declarations", () => {
+  const env: NodeJS.ProcessEnv = {
+    AGENTIC_SANDBOX_CI_EXECUTABLE: "explicit-wsl.exe",
+  };
+  const persisted: Record<string, string> = {
+    AGENTIC_SANDBOX_CI_EXECUTABLE: "persisted-wsl.exe",
+    AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE: "agentic-language-runtime",
+    AGENTIC_SANDBOX_CI_RUNTIME_DIGEST: `sha256:${"a".repeat(64)}`,
+    AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION: "AgenticResearcherSandbox",
+    AGENTIC_SANDBOX_CI_RUNTIME_ROOT: "/opt/agentic/runtime",
+  };
+  const imported = applyPersistedWindowsSandboxEnvironment(
+    { projects: ["daily-use-compound"] },
+    env,
+    {
+      platform: "win32",
+      readUserValue: (name: string) => persisted[name] ?? null,
+    },
+  );
+  assert.equal(env.AGENTIC_SANDBOX_CI_EXECUTABLE, "explicit-wsl.exe");
+  assert.equal(
+    env.AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION,
+    "AgenticResearcherSandbox",
+  );
+  assert.deepEqual(imported.sort(), [
+    "AGENTIC_SANDBOX_CI_RUNTIME_DIGEST",
+    "AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE",
+    "AGENTIC_SANDBOX_CI_RUNTIME_ROOT",
+    "AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION",
+  ]);
+
+  const untouched: NodeJS.ProcessEnv = {};
+  assert.deepEqual(
+    applyPersistedWindowsSandboxEnvironment(
+      { projects: ["daily-use-research"] },
+      untouched,
+      {
+        platform: "win32",
+        readUserValue: () => "must-not-be-read",
+      },
+    ),
+    [],
+  );
+  assert.deepEqual(untouched, {});
+});
+
+test("protected DU-06 binds retained Linear evidence to one verified project", () => {
+  const source = readFileSync(
+    new URL("../e2e/daily-use-compound.spec.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /requestedLinearProjectId \?\? plugin\.settings\?\.linearQueueProjectId/u,
+  );
+  assert.match(
+    source,
+    /configured protected test-evidence project with exact teamId \$\{linearEvidenceTeamId\}, exact projectId \$\{linearEvidenceProjectId\}/u,
+  );
+  assert.match(source, /project: \{ id: input\.projectId \}/u);
+  assert.doesNotMatch(
+    source,
+    /requestedLinearTeamId \?\? plugin\.settings\?\.linearDefaultTeamId \?\? ""/u,
+  );
 });
 
 test("daily-use commands route to focused specs and live projects disable reruns", () => {
@@ -262,7 +366,7 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   );
   assert.match(workflow, /workflow_dispatch:/u);
   assert.match(workflow, /ref: \$\{\{ inputs\.commit_sha \}\}/u);
-  assert.match(workflow, /if \(\$actualSha -ne \$env:E2E_RELEASE_COMMIT_SHA\)/u);
+  assert.match(workflow, /if \(\$actualSha -ne \$env:REQUESTED_COMMIT_SHA\)/u);
   assert.match(
     workflow,
     /runs-on: \[self-hosted, Windows, X64, agentic-daily-use\]/u,
@@ -278,7 +382,25 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   assert.doesNotMatch(workflow, /E2E_LIVE_ALLOW_MERGE:\s*["']?1/u);
   assert.doesNotMatch(workflow, /LIVE_EXTERNAL_MERGE_CONFIRMATION:\s*MERGE/u);
   assert.doesNotMatch(workflow, /git\s+push[^\r\n]*(?:--force|-f\b)/u);
-  assert.match(workflow, /protected-targeted-summaries-\$\{\{ inputs\.commit_sha \}\}/u);
+  assert.match(workflow, /protected-targeted-summaries-\$\{\{ steps\.verify-sha\.outputs\.sha \}\}/u);
+  for (const artifact of [
+    "compound.json",
+    "compound--daily-use-du06-stage-entry-proof.json",
+    "compound--daily-use-du06-cleanup-proof.json",
+    "compound--daily-use-du06-retained-linear-evidence.json",
+  ]) {
+    assert.ok(
+      workflow.includes(
+        `.agentic-proof/\${{ steps.verify-sha.outputs.sha }}/${artifact}`,
+      ),
+      `protected proof manifest must include ${artifact}`,
+    );
+  }
+  assert.doesNotMatch(
+    workflow,
+    /\.agentic-proof\/\$\{\{ steps\.verify-sha\.outputs\.sha \}\}\/\*\.json/u,
+    "protected proof uploads must enumerate the exact public artifact manifest",
+  );
   assert.match(workflow, /did not consume GitHub-hosted runner minutes/u);
   const installStep = workflow.indexOf("Install exact repository dependencies");
   const protectedRunStep = workflow.indexOf(
@@ -389,16 +511,13 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   assert.match(compound, /topic: "checkers"/u);
   assert.match(
     compound,
-    /completionDrivenLoops: true,\s*thinkingMode: "medium"/u,
-    "the protected compound coding proof must use bounded agentic reasoning",
+    /completionDrivenLoops: true,\s*thinkingMode: resolveProtectedThinkingMode\(protectedModel\.model\)/u,
+    "the protected compound coding proof must select a bounded model-aware reasoning mode",
   );
-  assert.match(compound, /Application Testing Dumping Grounds/u);
-  assert.match(
-    compound,
-    /linearEvidenceDestinationName:\s*LINEAR_EVIDENCE_DESTINATION_NAME/u,
-  );
-  assert.match(compound, /linearWorkspaceName:\s*workspaceName/u);
-  assert.match(compound, /linearTeamName:/u);
+  assert.match(compound, /LINEAR_LIVE_TEST_TEAM_ID/u);
+  assert.match(compound, /plugin\.settings\?\.linearDefaultTeamId/u);
+  assert.match(compound, /plugin\.settings\?\.linearQueueProjectId/u);
+  assert.match(compound, /configured protected test-evidence project/u);
   assert.match(compound, /linear_get_issue/u);
   assert.match(compound, /Read the protected scripts\/verify_project\.py contract/u);
   assert.match(compound, /args: \["-m", "scripts\.verify_all"\]/u);

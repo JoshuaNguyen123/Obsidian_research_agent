@@ -455,6 +455,10 @@ test("a continuation stopped before publishing authority retains its verified re
 
 test("a durable continuation does not replace its projection with a routing-only config", async () => {
   const coordinator = new RunCoordinator();
+  const completions: string[] = [];
+  coordinator.subscribe({
+    onRunComplete: (event) => completions.push(event.stopReason),
+  });
   const graph = {
     schemaVersion: 3,
     missionId: "mission-routing-resume",
@@ -494,18 +498,25 @@ test("a durable continuation does not replace its projection with a routing-only
     missionGraph: graph,
   });
 
-  await coordinator.start(
+  const outcome = await coordinator.start(
     async (_signal, events) => {
       events.onRunConfig?.({
         runId: "run-routing-child",
         maxStepsForRun: 1,
       } as never);
-      events.onRunComplete?.({ step: 0, maxSteps: 1, stopReason: "error" });
+      events.onRunComplete?.({
+        step: 0,
+        maxSteps: 1,
+        stopReason: "clarifying_question",
+      });
     },
     { preserveExistingProjectionUntilLedger: true },
   );
 
   const snapshot = coordinator.getSnapshot();
+  assert.equal(outcome.stopReason, "budget");
+  assert.deepEqual(completions, ["budget"]);
+  assert.equal(snapshot.lastComplete?.stopReason, "budget");
   assert.equal(snapshot.runId, "run-routing-resume");
   assert.equal(snapshot.lastMissionLedger?.canResume, true);
   assert.deepEqual(snapshot.lastMissionGraph, graph);

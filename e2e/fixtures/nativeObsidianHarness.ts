@@ -496,6 +496,16 @@ async function ensurePluginRuntimesLoaded(
   page: Page,
   pluginIds: readonly string[],
 ): Promise<void> {
+  await page.waitForFunction(
+    () => {
+      const app = (window as typeof window & { app?: any }).app;
+      return Boolean(app?.workspace && app?.plugins);
+    },
+    undefined,
+    { timeout: 20_000, polling: 250 },
+  ).catch(() => {
+    throw new Error("Obsidian app services did not become available within 20 seconds.");
+  });
   await page.evaluate(async ({ requiredPluginIds, corePluginId }) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.workspace || !app?.plugins) {

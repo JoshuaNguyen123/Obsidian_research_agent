@@ -299,7 +299,7 @@ function buildStdin(
         contentBase64: Buffer.from(file.bytes).toString("base64"),
       };
     })
-    .sort((left, right) => left.path.localeCompare(right.path));
+    .sort((left, right) => compareCanonicalText(left.path, right.path));
   if (total > 10_000_000 || new Set(files.map((file) => file.path)).size !== files.length) {
     unsupportedStaging("Staging bundle exceeds 10 MB or contains duplicate paths.");
   }
@@ -640,6 +640,10 @@ function safeDiagnostic(error: unknown): string {
 
 function sha256Bytes(value: Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function sha256Canonical(value: unknown): string {

@@ -51,7 +51,9 @@ if (playwrightLanes.some((lane) => [
 }
 
 console.log(
-  `E2E preflight passed for ${vaultRoot}; lanes=${playwrightLanes.join(",")}; verified ${[...expectedPluginIds].join(", ")}`,
+  process.env.CI
+    ? `E2E preflight passed for the isolated test vault; lanes=${playwrightLanes.join(",")}; verified ${[...expectedPluginIds].join(", ")}`
+    : `E2E preflight passed for ${vaultRoot}; lanes=${playwrightLanes.join(",")}; verified ${[...expectedPluginIds].join(", ")}`,
 );
 
 async function resolveExpectedPluginIds() {

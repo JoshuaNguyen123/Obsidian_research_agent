@@ -595,7 +595,12 @@ async function createHarness(
     validatedWorkspaceManifestFingerprint: validationManifest.hashes.indexFingerprint,
     workspaceChangedPaths: [...validationManifest.budget.changedPaths],
     stagingManifestFingerprint: `sha256:${"6".repeat(64)}`,
-    stagedFiles: [{ path: changedPath, sha256: AFTER_HASH, bytes: 6 }],
+    stagedFiles: [
+      { path: "README.md", sha256: `sha256:${"9".repeat(64)}`, bytes: 12 },
+      { path: changedPath, sha256: AFTER_HASH, bytes: 6 },
+    ].sort((left, right) =>
+      Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8")),
+    ),
     importedArtifacts: [],
   };
   const files = ["package.json", changedPath];

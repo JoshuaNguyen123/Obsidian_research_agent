@@ -543,6 +543,11 @@ test("raw repository roots require exact foreground prompt binding while logical
       { workspaceId: "raw-allowed", kind: "repository", repositoryRoot: canonicalRepo },
       rawContext,
     );
+    assert.equal(
+      rawPrepared.normalizedArgs.profileKey,
+      "fixture-profile",
+      "an exact foreground root reuses its unique trusted profile instead of raw marker discovery",
+    );
     assert.equal(rawPrepared.target.system, "workspace");
     assert.equal(rawPrepared.target.resourceType, "code_workspace");
     assert.equal(await verifyPreparedActionFingerprint(rawPrepared), true);
@@ -708,6 +713,8 @@ async function createFixture(name: string) {
     resolveProfile: async (profileKey) =>
       profileKey === "fixture-profile" ? inspection.repositoryRoot : null,
     resolveProfileContract: async (profileKey) => profileKey === "fixture-profile" ? profile : null,
+    resolveProfileByRoot: async (repositoryRoot) =>
+      sameTestPath(repositoryRoot, inspection.repositoryRoot) ? profile : null,
     redetectProfile: async () => { redetections += 1; },
     inspect: async (rootPath) => {
       assert.equal(await realpath(rootPath), inspection.repositoryRoot);
@@ -755,6 +762,12 @@ async function createFixture(name: string) {
     context,
     cleanup: () => rm(root, { recursive: true, force: true }),
   };
+}
+
+function sameTestPath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase()
+    : path.resolve(left) === path.resolve(right);
 }
 
 function toolMap(contributions: ExtensionToolContributionV1[]) {

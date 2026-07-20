@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -25,6 +25,7 @@ import {
 import { CODE_WORKSPACE_TOOL_NAMES_V2 } from "../extensions/code/workspaceTools";
 import {
   CODE_EXECUTION_TOOL_NAMES_V2,
+  CodeSandboxContributionErrorV2,
   type SandboxCommandRunnerV2,
   type SandboxProviderConfigV2,
 } from "../extensions/code/sandbox";
@@ -85,6 +86,63 @@ test("CodeExtensionRuntimeV2 migrates RepositoryProfileV1 once and preserves the
     await second.initialize();
     assert.equal(plugin.saveCount, savesAfterFirstLoad, "idempotent startup must not rewrite verified state");
     assert.deepEqual(second.readState(), first.readState());
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 resolves only a unique trusted profile for a marker-free repository root", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-profile-root-"));
+  try {
+    const profile = createRepositoryProfile({
+      key: "marker-free-python",
+      displayName: "Marker-free Python bootstrap repository",
+      repositoryRoot: root,
+      defaultBranch: "main",
+      allowedPathPrefixes: ["README.md", "src", "tests"],
+      validationProfile: {
+        id: "python-bootstrap-validation",
+        bootstrapCommands: [],
+        validationCommands: [{
+          command: "python3",
+          args: ["-m", "unittest", "discover", "-s", "tests"],
+          label: "Python unit tests",
+        }],
+        protectedPaths: ["scripts"],
+        allowedGeneratedPaths: [],
+      },
+      runtimeDigests: { python: SHA("a") },
+    });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: new MemoryPluginData({
+        schemaVersion: 1,
+        extensionStateMigration: migrationRecord(codeSnapshot([profile])),
+      }) as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({ applicationDataRoot: path.join(root, "app-data") }),
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    assert.equal((await runtime.getRepositoryProfileByRoot(root))?.key, profile.key);
+
+    const conflictingProfile = createRepositoryProfile({
+      ...profile,
+      key: "marker-free-python-conflict",
+    });
+    const ambiguous = new CodeExtensionRuntimeV2({
+      plugin: new MemoryPluginData({
+        schemaVersion: 1,
+        extensionStateMigration: migrationRecord(
+          codeSnapshot([profile, conflictingProfile]),
+        ),
+      }) as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({ applicationDataRoot: path.join(root, "ambiguous-app-data") }),
+      now: () => new Date(NOW),
+    });
+    await ambiguous.initialize();
+    await assert.rejects(
+      ambiguous.getRepositoryProfileByRoot(root),
+      /more than one trusted repository profile/iu,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -423,6 +481,11 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
     await mkdir(repositoryRoot);
     await mkdir(worktreeRoot);
     await writeFile(path.join(worktreeRoot, ".git"), "gitdir: fixture\n", "utf8");
+    await writeFile(
+      path.join(worktreeRoot, "package.json"),
+      '{"scripts":{"test":"node --test","build":"node --check src/value.ts"}}\n',
+      "utf8",
+    );
     const profile = createRepositoryProfile({
       key: "trusted-repository",
       displayName: "Trusted repository",
@@ -505,6 +568,12 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
     );
     const manifest = await manager.loadManifest("fixture-workspace");
     const readback = await manager.read("fixture-workspace", "src/value.ts");
+    const protectedReadback = await manager.read("fixture-workspace", "package.json");
+    assert.equal(
+      manifest.hashes.files[protectedReadback.path],
+      undefined,
+      "the protected baseline fixture must prove staging is not limited to manager-created files",
+    );
     const hostPreparation = await runtime.resolveSandboxPreparationInput(
       "validation_fast",
       manifest.workspaceId,
@@ -523,11 +592,18 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
       hostPreparation.workspaceManifestFingerprint,
       manifest.hashes.indexFingerprint,
     );
-    assert.deepEqual(hostPreparation.stagingManifest, [{
-      path: readback.path,
-      sha256: readback.sha256,
-      bytes: readback.bytes,
-    }]);
+    assert.deepEqual(hostPreparation.stagingManifest, [
+      {
+        path: protectedReadback.path,
+        sha256: protectedReadback.sha256,
+        bytes: protectedReadback.bytes,
+      },
+      {
+        path: readback.path,
+        sha256: readback.sha256,
+        bytes: readback.bytes,
+      },
+    ]);
     const foregroundPreparation = await runtime.resolveSandboxPreparationInput(
       "validation_fast",
       "model-workspace-alias",
@@ -733,6 +809,159 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
     );
 
     await writeFile(path.join(worktreeRoot, "src", "value.ts"), readback.content, "utf8");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 rejects oversized staging metadata before hashing workspace content", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-stage-bounds-"));
+  try {
+    const repositoryRoot = path.join(root, "repository");
+    const worktreeRoot = path.join(root, "worktree");
+    await mkdir(repositoryRoot);
+    await mkdir(worktreeRoot);
+    await mkdir(path.join(worktreeRoot, "src"));
+    await writeFile(path.join(worktreeRoot, ".git"), "gitdir: fixture\n", "utf8");
+    const largePath = path.join(worktreeRoot, "src", "large.bin");
+    const handle = await open(largePath, "w");
+    try {
+      await handle.truncate(10 * 1024 * 1024 + 1);
+    } finally {
+      await handle.close();
+    }
+    const profile = createRepositoryProfile({
+      key: "bounded-staging-repository",
+      displayName: "Bounded staging repository",
+      repositoryRoot,
+      defaultBranch: "main",
+      allowedPathPrefixes: ["src"],
+      validationProfile: createNodeNpmValidationProfile(),
+    });
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(root, "app-data"),
+      now: () => new Date(NOW),
+    });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: new MemoryPluginData({
+        schemaVersion: 1,
+        extensionStateMigration: migrationRecord(codeSnapshot([profile])),
+      }) as unknown as Plugin,
+      workspaceManager: manager,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await manager.registerTrustedRepositoryWorkspace({
+      workspaceId: "bounded-staging-workspace",
+      ownerRunId: "bounded-staging-run",
+      profileKey: profile.key,
+      repositoryRoot,
+      worktreeRoot,
+      branch: "codex/workspace-bounded-staging-workspace",
+      baseSha: "a".repeat(40),
+      bindingFingerprint: SHA("b"),
+      trusted: true,
+    });
+
+    await assert.rejects(
+      runtime.resolveSandboxPreparationInput(
+        "validation_targeted",
+        "bounded-staging-workspace",
+      ),
+      (error: unknown) =>
+        error instanceof CodeSandboxContributionErrorV2 &&
+        error.code === "sandbox_staging_file_too_large",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 bounds empty-directory staging breadth and depth before sandbox execution", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-stage-tree-bounds-"));
+  try {
+    const repositoryRoot = path.join(root, "repository");
+    const wideWorktreeRoot = path.join(root, "wide-worktree");
+    const deepWorktreeRoot = path.join(root, "deep-worktree");
+    await mkdir(repositoryRoot);
+    await mkdir(path.join(wideWorktreeRoot, "src"), { recursive: true });
+    await mkdir(path.join(deepWorktreeRoot, "src"), { recursive: true });
+    await writeFile(path.join(wideWorktreeRoot, ".git"), "gitdir: fixture\n", "utf8");
+    await writeFile(path.join(deepWorktreeRoot, ".git"), "gitdir: fixture\n", "utf8");
+
+    await Promise.all(
+      Array.from({ length: 300 }, (_, index) =>
+        mkdir(path.join(wideWorktreeRoot, "src", `empty-${String(index).padStart(3, "0")}`)),
+      ),
+    );
+    let deepCursor = path.join(deepWorktreeRoot, "src");
+    for (let index = 0; index < 33; index += 1) {
+      deepCursor = path.join(deepCursor, `level-${String(index).padStart(2, "0")}`);
+      await mkdir(deepCursor);
+    }
+
+    const profile = createRepositoryProfile({
+      key: "tree-bounded-staging-repository",
+      displayName: "Tree-bounded staging repository",
+      repositoryRoot,
+      defaultBranch: "main",
+      allowedPathPrefixes: ["src"],
+      validationProfile: createNodeNpmValidationProfile(),
+    });
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(root, "app-data"),
+      now: () => new Date(NOW),
+    });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: new MemoryPluginData({
+        schemaVersion: 1,
+        extensionStateMigration: migrationRecord(codeSnapshot([profile])),
+      }) as unknown as Plugin,
+      workspaceManager: manager,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await manager.registerTrustedRepositoryWorkspace({
+      workspaceId: "wide-tree-staging-workspace",
+      ownerRunId: "tree-bounded-staging-run",
+      profileKey: profile.key,
+      repositoryRoot,
+      worktreeRoot: wideWorktreeRoot,
+      branch: "codex/workspace-wide-tree-staging-workspace",
+      baseSha: "a".repeat(40),
+      bindingFingerprint: SHA("b"),
+      trusted: true,
+    });
+    await manager.registerTrustedRepositoryWorkspace({
+      workspaceId: "deep-tree-staging-workspace",
+      ownerRunId: "tree-bounded-staging-run",
+      profileKey: profile.key,
+      repositoryRoot,
+      worktreeRoot: deepWorktreeRoot,
+      branch: "codex/workspace-deep-tree-staging-workspace",
+      baseSha: "c".repeat(40),
+      bindingFingerprint: SHA("d"),
+      trusted: true,
+    });
+
+    await assert.rejects(
+      runtime.resolveSandboxPreparationInput(
+        "validation_targeted",
+        "wide-tree-staging-workspace",
+      ),
+      (error: unknown) =>
+        error instanceof CodeSandboxContributionErrorV2 &&
+        error.code === "sandbox_staging_too_large",
+    );
+    await assert.rejects(
+      runtime.resolveSandboxPreparationInput(
+        "validation_targeted",
+        "deep-tree-staging-workspace",
+      ),
+      (error: unknown) =>
+        error instanceof CodeSandboxContributionErrorV2 &&
+        error.code === "sandbox_staging_depth_exceeded",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

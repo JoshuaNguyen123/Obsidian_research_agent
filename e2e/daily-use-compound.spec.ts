@@ -1,13 +1,15 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
 import { getE2EAiConfig } from "./aiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
   buildProgressiveDu06Observations,
+  createDu06RetainedLinearEvidenceProof,
   type DailyUseDu06SafeLifecycleState,
 } from "./fixtures/dailyUseDu06Progress";
 import {
@@ -40,9 +42,18 @@ const FULL_SHA = /^[a-f0-9]{40}$/u;
 const SHA256 = /^sha256:[a-f0-9]{64}$/u;
 const PROFILE_KEY = "du06-checkers-project";
 const VALIDATION_PROFILE_KEY = "du06-python-checkers-validation";
-const LINEAR_EVIDENCE_DESTINATION_NAME = "Application Testing Dumping Grounds";
+const CODE_STAGE_PROFILE_KEY = "du06-checkers-code-stage";
+const CODE_STAGE_VALIDATION_PROFILE_KEY = "du06-python-checkers-code-stage-validation";
 const DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT =
   "__agenticResearcherDu06FastValidationDiagnostic";
+const PROTECTED_THINKING_MODES = new Set([
+  "auto",
+  "off",
+  "low",
+  "medium",
+  "high",
+  "max",
+]);
 const MAIN_STAGES: readonly ProjectLifecycleStageName[] = [
   "accepted_research",
   "linear_hierarchy",
@@ -137,6 +148,26 @@ interface Du06FastValidationDiagnosticV1 {
 interface Du06TransientRunCaptureV1 {
   diagnostic: Du06FastValidationDiagnosticV1 | null;
   toolCalls: number;
+}
+
+function resolveProtectedThinkingMode(model: string): string {
+  const requested = process.env.E2E_PROTECTED_THINKING_MODE?.trim().toLowerCase();
+  if (requested) {
+    if (!PROTECTED_THINKING_MODES.has(requested)) {
+      throw new Error(
+        "E2E_PROTECTED_THINKING_MODE must be auto, off, low, medium, high, or max.",
+      );
+    }
+    return requested;
+  }
+
+  const normalizedModel = model.trim().toLowerCase();
+  // GPT-OSS accepts bounded effort levels. Kimi's coding model exposes a
+  // native thinking channel, which the ordinary auto resolver maps to the
+  // provider's boolean contract instead of assuming GPT-OSS effort strings.
+  if (normalizedModel.startsWith("gpt-oss")) return "medium";
+  if (normalizedModel.startsWith("kimi-k2.7-code")) return "auto";
+  return "off";
 }
 
 test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, and retains redacted Linear proof", async ({}, testInfo) => {
@@ -249,6 +280,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   let publishedBranch: string | null = null;
   let publishedSha: string | null = null;
   let linearEvidenceTeamId: string | null = null;
+  let linearEvidenceProjectId: string | null = null;
   let retainedLinearEvidence:
     | { id: string; identifier: string; url: string }
     | null = null;
@@ -299,7 +331,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         maxAgentSteps: 100,
         maxRunMinutes: 110,
         completionDrivenLoops: true,
-        thinkingMode: "medium",
+        thinkingMode: resolveProtectedThinkingMode(protectedModel.model),
         orchestratorEnabled: false,
         linearEnabled: true,
         ...(requestedLinearTeamId
@@ -329,14 +361,10 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       githubConnected: true,
       githubLogin: githubAccount.login,
     });
-    expect(normalizeLinearDestinationName(connection.linearWorkspaceName)).toBe(
-      normalizeLinearDestinationName(LINEAR_EVIDENCE_DESTINATION_NAME),
-    );
-    expect(normalizeLinearDestinationName(connection.linearTeamName)).toBe(
-      normalizeLinearDestinationName(LINEAR_EVIDENCE_DESTINATION_NAME),
-    );
     expect(connection.linearTeamId).toBeTruthy();
+    expect(connection.linearProjectId).toBeTruthy();
     linearEvidenceTeamId = connection.linearTeamId;
+    linearEvidenceProjectId = connection.linearProjectId;
     if (requestedLinearTeamId) {
       expect(connection.linearTeamId).toBe(requestedLinearTeamId);
     }
@@ -401,7 +429,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       `Research American checkers rules marked ${marker} using exactly two public web sources and fetch both sources before accepting findings. The notebook must cite both fetched source URLs and passages and use the exact headings ## Board and setup, ## Movement and kings, ## Mandatory captures and multi-jumps, ## End conditions, and ## Implementation implications.`,
       `Publish the accepted checkers research note to Linear in the configured destination. The package is code work for repository key ${PROFILE_KEY} and validation requirement ${VALIDATION_PROFILE_KEY}.`,
       `Turn that accepted research into one Linear initiative, one project, and exactly one implementation issue titled Build a simple Python checkers game. Use logical keys du06-initiative-${suffix}, du06-project-${suffix}, and du06-issue-${suffix}; the issue has no dependencies, uses work-item fingerprint ${issueFingerprint}, and binds the accepted artifact fingerprint and exact source note path.`,
-      "The implementation issue acceptance criteria must require an 8 by 8 board with twelve men per side; constants RED, BLACK, RED_KING, and BLACK_KING; CheckersGame(board, turn), CheckersGame.initial(), legal_moves(), apply_move(start, end), and winner(); red moving upward; mandatory captures; same-piece multi-jumps before the turn changes; capture removal; back-rank promotion; kings moving both directions; no-piece or no-legal-move wins; and a runnable CLI.",
+      "The implementation issue acceptance criteria must require an 8 by 8 board with twelve men per side; constants RED, BLACK, RED_KING, and BLACK_KING; CheckersGame(board, turn), CheckersGame.initial(), legal_moves(), apply_move(start, end), and winner(); legal_moves() start/end coordinate pairs shaped ((row, column), (row, column)) with capture-only output whenever any capture exists; apply_move() mutating the same game in place and returning None; red moving upward; mandatory captures; same-piece multi-jumps before the turn changes; capture removal; back-rank promotion; kings moving both directions; a winner when the opponent has no pieces or the side to move has no legal move; None only while the side to move still has a legal move and both colors remain; and a runnable CLI.",
       `After creating the hierarchy, explicitly call linear_get_issue for the returned implementation issue. Read back its title, description, acceptance criteria, and ${notePath} binding before opening the code workspace.`,
       `Reflect against both that Linear issue readback and the notebook while implementing the exact trusted repository ${fixture.root}, using durable workspace ${workspaceId} and repair request ${requestId}. Read the protected scripts/verify_project.py contract before implementation. Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py. Leave the protected scripts directory unchanged.`,
       `The README must include marker ${marker}, commands python -m checkers.cli and python -m unittest, the exact heading ## Research and Linear traceability, the exact Obsidian path ${notePath}, and the exact Linear issue identifier or URL returned by linear_get_issue.`,
@@ -480,6 +508,11 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
           );
           expect(independentStageProbes.has(stage)).toBe(false);
           independentStageProbes.set(stage, probe);
+          await writeDu06StageEntryProof(
+            testInfo,
+            releaseSha,
+            independentStageProbes,
+          );
         },
       },
     );
@@ -684,21 +717,13 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       );
       expect(observedProbe).toEqual(expectedProbe);
     }
+    const stageEntryProofPath = await writeDu06StageEntryProof(
+      testInfo,
+      releaseSha,
+      independentStageProbes,
+    );
     await testInfo.attach("daily-use-du06-stage-entry-proof.json", {
-      body: Buffer.from(
-        `${JSON.stringify({
-          version: 1,
-          scenarioId: "DU-06",
-          releaseSha,
-          replayDetected: false,
-          stages: MAIN_STAGES.map((stage, index) => ({
-            restartOrdinal: index + 1,
-            priorStagesReverified: index,
-            ...independentStageProbes.get(stage),
-          })),
-        }, null, 2)}\n`,
-        "utf8",
-      ),
+      path: stageEntryProofPath,
       contentType: "application/json",
     });
 
@@ -818,9 +843,9 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     expect(cleanedState.privateBindings).toHaveLength(0);
     cleanupVerified = true;
 
-    if (!linearEvidenceTeamId || !publishedSha) {
+    if (!linearEvidenceTeamId || !linearEvidenceProjectId || !publishedSha) {
       throw new Error(
-        "Retained Linear proof requires the verified dumping-grounds team and exact published SHA.",
+        "Retained Linear proof requires the verified configured test-evidence project, its team, and exact published SHA.",
       );
     }
     const evidenceTitle = `DU-06 protected checkers evidence ${releaseSha.slice(0, 8)} ${suffix}`;
@@ -835,7 +860,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     await harness.submitMission(
       [
         "Use exactly linear_create_issue and linear_get_issue.",
-        `Create one retained evidence issue in the configured ${LINEAR_EVIDENCE_DESTINATION_NAME} team with exact teamId ${linearEvidenceTeamId}, exact title ${JSON.stringify(evidenceTitle)}, and exact Markdown description ${JSON.stringify(evidenceDescription)}.`,
+        `Create one retained evidence issue in the configured protected test-evidence project with exact teamId ${linearEvidenceTeamId}, exact projectId ${linearEvidenceProjectId}, exact title ${JSON.stringify(evidenceTitle)}, and exact Markdown description ${JSON.stringify(evidenceDescription)}.`,
         "Obtain the exact creation approval, then independently read the created issue back by its returned identifier.",
         "Do not archive, trash, delete, or clean up this retained evidence issue.",
       ].join(" "),
@@ -847,19 +872,25 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     retainedLinearEvidence = await expectRetainedLinearEvidence({
       client: activeLinearClient,
       teamId: linearEvidenceTeamId,
+      projectId: linearEvidenceProjectId,
       title: evidenceTitle,
       description: evidenceDescription,
     });
     expect(retainedLinearEvidence.url).toMatch(/^https:\/\//u);
-    await testInfo.attach("daily-use-du06-retained-linear-evidence", {
-      body: Buffer.from(
-        `${JSON.stringify({
-          releaseSha,
-          identifier: retainedLinearEvidence.identifier,
-          url: retainedLinearEvidence.url,
-        }, null, 2)}\n`,
-        "utf8",
-      ),
+    const retainedLinearEvidenceProof = createDu06RetainedLinearEvidenceProof({
+      releaseSha,
+      providerIssueId: retainedLinearEvidence.id,
+    });
+    const retainedLinearEvidencePath = testInfo.outputPath(
+      "daily-use-du06-retained-linear-evidence.json",
+    );
+    await writeFile(
+      retainedLinearEvidencePath,
+      `${JSON.stringify(retainedLinearEvidenceProof, null, 2)}\n`,
+      "utf8",
+    );
+    await testInfo.attach("daily-use-du06-retained-linear-evidence.json", {
+      path: retainedLinearEvidencePath,
       contentType: "application/json",
     });
 
@@ -924,7 +955,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       {
         modelCalls: modelCallCount,
         toolCalls: toolCallCount + hierarchy.items.length,
-        continuations: restartedStages.length,
+        continuations: harness.readProgressCounters().continuations,
         approvals: approvalCount,
       },
       { requireComplete: true },
@@ -1145,6 +1176,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         publishedSha ?? "",
         githubAccount.login,
         linearEvidenceTeamId ?? "",
+        linearEvidenceProjectId ?? "",
         retainedLinearEvidence?.id ?? "",
         ...linearCleanupInventory.publicationIssueIds,
         ...linearCleanupInventory.hierarchyIssueIds,
@@ -1153,13 +1185,22 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         ...linearCleanupInventory.projectIds,
       ])),
     };
-    await testInfo.attach("daily-use-du06-cleanup-proof.json", {
-      body: Buffer.from(`${JSON.stringify(cleanupProof, null, 2)}\n`, "utf8"),
-      contentType: "application/json",
-    }).catch((error) => {
+    const cleanupProofPath = testInfo.outputPath(
+      "daily-use-du06-cleanup-proof.json",
+    );
+    await writeFile(
+      cleanupProofPath,
+      `${JSON.stringify(cleanupProof, null, 2)}\n`,
+      "utf8",
+    ).then(
+      () => testInfo.attach("daily-use-du06-cleanup-proof.json", {
+        path: cleanupProofPath,
+        contentType: "application/json",
+      }),
+    ).catch((error) => {
       cleanupErrors.push(`cleanup proof attachment: ${safeError(error)}`);
     });
-    if (missionError && failedFastValidationDiagnostic) {
+    if (missionError) {
       const exactRedactions = [
         repository,
         notePath,
@@ -1168,8 +1209,8 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         verifiedWorktree?.branch ?? "",
         githubAccount.login,
       ];
-      await testInfo.attach("daily-use-du06-fast-validation-diagnostic.json", {
-        body: Buffer.from(`${JSON.stringify({
+      const diagnosticProof = failedFastValidationDiagnostic
+        ? {
           version: 1,
           scenarioId: "DU-06",
           trust: "untrusted_redacted_test_diagnostic",
@@ -1183,9 +1224,30 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
           ),
           truncated: failedFastValidationDiagnostic.truncated,
           redactedLines: failedFastValidationDiagnostic.redactedLines,
-        }, null, 2)}\n`, "utf8"),
-        contentType: "application/json",
-      }).catch(() => undefined);
+        }
+        : {
+          version: 1,
+          scenarioId: "DU-06",
+          trust: "untrusted_redacted_test_diagnostic",
+          status: "unavailable",
+          stdout: "",
+          stderr: "",
+          truncated: false,
+          redactedLines: 0,
+        };
+      const diagnosticPath = testInfo.outputPath(
+        "daily-use-du06-fast-validation-diagnostic.json",
+      );
+      await writeFile(
+        diagnosticPath,
+        `${JSON.stringify(diagnosticProof, null, 2)}\n`,
+        "utf8",
+      ).then(
+        () => testInfo.attach("daily-use-du06-fast-validation-diagnostic.json", {
+          path: diagnosticPath,
+          contentType: "application/json",
+        }),
+      ).catch(() => undefined);
     }
     if (!acceptanceRecorded) {
       const githubOwnedResourceObserved =
@@ -1231,7 +1293,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
         {
           modelCalls: modelCallCount,
           toolCalls: toolCallCount,
-          continuations: restartedStages.length,
+          continuations: harness?.readProgressCounters().continuations ?? 0,
           approvals: approvalCount,
         },
       ).catch((error) => {
@@ -1248,6 +1310,356 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   if (missionError) throw missionError;
 });
 
+test("DU-03 protected real-model Python checkers code stage validates and commits independently", async ({}, testInfo) => {
+  test.setTimeout(50 * 60_000);
+  const protectedModel = getE2EAiConfig();
+  expect(process.env.E2E_MODEL_PROVIDER?.trim() || "ollama").toBe("ollama");
+  expect(normalizeEndpoint(protectedModel.baseUrl)).toBe("https://ollama.com/api");
+  const startedAt = Date.now();
+  const suffix = randomUUID().replace(/-/gu, "").slice(0, 16);
+  const marker = `DU03_CHECKERS_${suffix}`;
+  const workspaceId = `du03-checkers-${suffix}`;
+  const requestId = `du03-checkers-request-${suffix}`;
+  const fixture = await createPhase4PythonCheckersProjectFixture(marker);
+  const sandboxConfiguration = liveProviderConfiguration("wsl2");
+  const profile = createRepositoryProfile({
+    key: CODE_STAGE_PROFILE_KEY,
+    displayName: "Protected DU-03 Python checkers code stage",
+    repositoryRoot: fixture.root,
+    defaultBranch: "main",
+    allowedPathPrefixes: ["README.md", "checkers", "tests"],
+    validationProfile: {
+      id: CODE_STAGE_VALIDATION_PROFILE_KEY,
+      bootstrapCommands: [],
+      validationCommands: [
+        {
+          command: "python3",
+          args: ["-m", "scripts.verify_all"],
+          label: "Python targeted protected checkers contract and tests",
+        },
+        {
+          command: "python3",
+          args: ["-m", "scripts.verify_all"],
+          label: "Python fresh full protected checkers contract and tests",
+        },
+      ],
+      protectedPaths: ["scripts"],
+      allowedGeneratedPaths: [],
+    },
+    runtimeDigests: { python: sandboxConfiguration.runtimeDigest },
+    promotionPolicy: {
+      localBasePromotion: "disabled",
+      completionProof: "local_verified",
+      requiredChecks: [],
+    },
+  });
+  let harness: RealAiHarness | null = null;
+  let verifiedWorktree: { root: string; branch: string } | null = null;
+  let worktreeCaptureController: AbortController | null = null;
+  let worktreeCapturePromise: Promise<void> | null = null;
+  let worktreeCaptureError: unknown = null;
+  let missionError: unknown = null;
+  let failedFastValidationDiagnostic: Du06FastValidationDiagnosticV1 | null = null;
+  let approvalCount = 0;
+  let modelCallCount = 0;
+  let toolCallCount = 0;
+  let acceptanceRecorded = false;
+  try {
+    harness = await startRealAiHarness(
+      `du03-checkers-${suffix}`,
+      {
+        missionTimeoutMs: 45 * 60_000,
+        completionTimeoutMs: 45 * 60_000,
+      },
+      {
+        maxAgentSteps: 80,
+        maxRunMinutes: 45,
+        completionDrivenLoops: true,
+        thinkingMode: resolveProtectedThinkingMode(protectedModel.model),
+        orchestratorEnabled: false,
+        repositoryProfileRegistry: createRepositoryProfileRegistry([profile]),
+      },
+    );
+    const sandboxProbe = await harness.page.evaluate(
+      async ({ codePluginId, config }) => {
+        const app = (window as typeof window & { app?: any }).app;
+        const code = app?.plugins?.plugins?.["agentic-researcher"]
+          ?.getBundledCapability?.(codePluginId);
+        if (!code?.configureSandboxProvider || !code?.probeConfiguredSandboxProviders) {
+          throw new Error("The built-in Code sandbox configuration API is unavailable.");
+        }
+        await code.configureSandboxProvider(config);
+        const status = await code.probeConfiguredSandboxProviders();
+        return { status, persisted: code.readState?.()?.sandbox?.lastProbe ?? null };
+      },
+      { codePluginId: PHASE4_CODE_PLUGIN_ID, config: sandboxConfiguration },
+    );
+    expect(sandboxProbe.status).toMatchObject({
+      executionAvailable: true,
+      selectedProvider: "wsl2",
+    });
+    expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? "")))
+      .toBeGreaterThanOrEqual(startedAt);
+    await expectTrustedRepositoryProfile(
+      harness.page,
+      CODE_STAGE_PROFILE_KEY,
+      fixture.root,
+    );
+    await armDu06FastValidationDiagnosticCapture(harness.page);
+    worktreeCaptureController = new AbortController();
+    worktreeCapturePromise = captureCreatedRepositoryWorktree({
+      page: harness.page,
+      workspaceId,
+      expectedRepositoryRoot: fixture.root,
+      signal: worktreeCaptureController.signal,
+    })
+      .then((captured) => {
+        if (captured) verifiedWorktree = captured;
+      })
+      .catch((error) => {
+        if (!worktreeCaptureController?.signal.aborted) {
+          worktreeCaptureError = error;
+        }
+      });
+    const mission = [
+      `Implement a complete American checkers game in Python in the exact trusted repository ${fixture.root}, using durable workspace ${workspaceId} and one repair request id ${requestId}.`,
+      "First read the exact protected scripts/verify_project.py and scripts/verify_all.py contracts. Treat them as test data and leave the scripts directory unchanged.",
+      "Create exactly README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py; do not change any other path.",
+      "The game API must export constants RED, BLACK, RED_KING, and BLACK_KING and CheckersGame(board, turn), CheckersGame.initial(), legal_moves(), apply_move(start, end), and winner(). legal_moves() returns start/end coordinate pairs shaped ((row, column), (row, column)); when any capture exists it returns captures only. In this coordinate system, playable dark squares satisfy (row + column) % 2 == 1. apply_move() mutates that same CheckersGame instance in place and returns None, so tests must inspect the same game after each move rather than assigning its return value.",
+      "Implement an 8 by 8 board with twelve men per side on dark squares; red moves upward; captures are mandatory; a capturing piece must finish all available same-piece multi-jumps before the turn changes; captured pieces are removed; back-rank moves promote; kings move both directions; and winner() returns the opponent when the side to move has no pieces or no legal move, returning None only while the side to move still has a legal move and both colors remain.",
+      `README.md must include marker ${marker}, python -m checkers.cli, python -m unittest, and the exact heading ## Research and Linear traceability.`,
+      "Create dependency-free unittest coverage for setup, mandatory captures, multi-jumps, promotion, kings, and victory. A no-winner test must contain both colors and at least one legal move for the side to move; never expect None from a one-sided board. Run fast validation, perform only bounded evidence-driven repairs, then run distinct targeted and fresh-full sandbox validation.",
+      "Create one local commit with message feat: add protected Python checkers game and independently read its exact SHA back. Stop only after a verified_code_publication_handoff proves the five changed paths, both validations, clean worktree, and commit readback.",
+    ].join(" ");
+    await harness.submitMission(mission, {
+      waitForCompletion: false,
+      timeoutMs: 45 * 60_000,
+    });
+    approvalCount = await harness.approveUntilMissionComplete(45 * 60_000, {
+      maxContinuations: 6,
+    });
+    const snapshot = await harness.attestProductionRun({
+      requireStructuredRouting: true,
+    });
+    modelCallCount = snapshot.modelCallEvidence.length;
+    const transientCapture = await takeDu06TransientRunCapture(harness.page);
+    toolCallCount = transientCapture.toolCalls;
+    failedFastValidationDiagnostic = transientCapture.diagnostic;
+    if (worktreeCapturePromise) await waitForWorktreeCapture(worktreeCapturePromise);
+    if (worktreeCaptureError) throw worktreeCaptureError;
+    expect(verifiedWorktree).not.toBeNull();
+    const handoff = await harness.page.evaluate(
+      async ({ codePluginId, profileKey }) => {
+        const app = (window as typeof window & { app?: any }).app;
+        const code = app?.plugins?.plugins?.["agentic-researcher"]
+          ?.getBundledCapability?.(codePluginId);
+        return code?.resolveVerifiedCodePublicationHandoff?.(profileKey) ?? null;
+      },
+      {
+        codePluginId: PHASE4_CODE_PLUGIN_ID,
+        profileKey: CODE_STAGE_PROFILE_KEY,
+      },
+    );
+    expect(handoff?.status).toBe("verified");
+    expect(handoff?.workspaceId).toBe(workspaceId);
+    expect(handoff?.baseSha).toBe(fixture.baseSha);
+    expect(handoff?.commitSha).toMatch(/^[a-f0-9]{40}$/u);
+    expect(handoff?.targetedValidationReceiptId).not.toBe(
+      handoff?.fullValidationReceiptId,
+    );
+    expect([...handoff.changedPaths].sort()).toEqual([
+      "README.md",
+      "checkers/__init__.py",
+      "checkers/cli.py",
+      "checkers/game.py",
+      "tests/test_checkers.py",
+    ]);
+    const worktree = await fixture.inspectWorktree(verifiedWorktree!.root);
+    expect(worktree.head).toBe(handoff.commitSha);
+    expect(worktree.status).toBe("");
+    expect(worktree.changedPaths).toEqual([...handoff.changedPaths].sort());
+    expect(worktree.files["README.md"]).toContain(marker);
+    expect(worktree.files["checkers/game.py"]).toContain("class CheckersGame");
+    expect(await fixture.head()).toBe(fixture.baseSha);
+    expect(await fixture.status()).toBe("");
+    await recordDailyUseAcceptance(
+      testInfo,
+      "DU-03",
+      {
+        artifacts: [
+          "code:source_files",
+          "code:tests",
+          "code:readme",
+          "git:local_commit",
+        ],
+        proofs: [
+          "code:trusted_repository",
+          "code:durable_workspace",
+          "sandbox:boundary_attested",
+          "validation:targeted",
+          "validation:fresh_full",
+          "git:commit_readback",
+        ],
+        approvals: ["approval:sandbox_execution"],
+        bindings: ["git:commit_artifacts"],
+        cleanup: [],
+      },
+      {
+        modelCalls: modelCallCount,
+        toolCalls: toolCallCount,
+        continuations: harness.readProgressCounters().continuations,
+        approvals: approvalCount,
+      },
+      { requireComplete: true },
+    );
+    acceptanceRecorded = true;
+  } catch (error) {
+    missionError = error;
+    const approved = /\bapproved=(\d+)\b/u.exec(safeError(error));
+    if (approved) approvalCount = Number.parseInt(approved[1]!, 10);
+  } finally {
+    if (missionError && worktreeCapturePromise && !verifiedWorktree) {
+      await waitForWorktreeCapture(worktreeCapturePromise).catch((error) => {
+        worktreeCaptureError ??= error;
+      });
+    }
+    if (missionError && harness && !verifiedWorktree) {
+      verifiedWorktree = await readCreatedRepositoryWorktreeOnce({
+        page: harness.page,
+        workspaceId,
+        expectedRepositoryRoot: fixture.root,
+      }).catch((error) => {
+        worktreeCaptureError ??= error;
+        return null;
+      });
+    }
+    if (harness && !acceptanceRecorded) {
+      const transientCapture = await takeDu06TransientRunCapture(
+        harness.page,
+      ).catch(() => null);
+      if (transientCapture) {
+        toolCallCount = Math.max(toolCallCount, transientCapture.toolCalls);
+        failedFastValidationDiagnostic ??= transientCapture.diagnostic;
+      }
+      const counters = await readRedactedDailyUseCounters(harness.page)
+        .catch(() => ({ modelCalls: 0, toolCalls: 0 }));
+      modelCallCount = Math.max(modelCallCount, counters.modelCalls);
+      toolCallCount = Math.max(toolCallCount, counters.toolCalls);
+      await recordDailyUseAcceptance(
+        testInfo,
+        "DU-03",
+        {
+          artifacts: [],
+          proofs: ["code:trusted_repository", "sandbox:boundary_attested"],
+          approvals: approvalCount > 0 ? ["approval:sandbox_execution"] : [],
+          bindings: [],
+          cleanup: [],
+        },
+        {
+          modelCalls: modelCallCount,
+          toolCalls: toolCallCount,
+          continuations: harness.readProgressCounters().continuations,
+          approvals: approvalCount,
+        },
+      ).catch(() => undefined);
+    }
+    worktreeCaptureController?.abort();
+    if (worktreeCapturePromise) await worktreeCapturePromise;
+    if (missionError) {
+      const capturedWorktree = verifiedWorktree as
+        | { root: string; branch: string }
+        | null;
+      const diagnosticProof = failedFastValidationDiagnostic
+        ? {
+            version: 1,
+            scenarioId: "DU-03",
+            trust: "untrusted_redacted_test_diagnostic",
+            stdout: safeArtifactError(
+              failedFastValidationDiagnostic.stdout,
+              [fixture.root, capturedWorktree?.root ?? ""],
+            ),
+            stderr: safeArtifactError(
+              failedFastValidationDiagnostic.stderr,
+              [fixture.root, capturedWorktree?.root ?? ""],
+            ),
+            truncated: failedFastValidationDiagnostic.truncated,
+            redactedLines: failedFastValidationDiagnostic.redactedLines,
+          }
+        : {
+            version: 1,
+            scenarioId: "DU-03",
+            trust: "untrusted_redacted_test_diagnostic",
+            status: "unavailable",
+            stdout: "",
+            stderr: "",
+            truncated: false,
+            redactedLines: 0,
+          };
+      const diagnosticPath = testInfo.outputPath(
+        "daily-use-du03-checkers-fast-validation-diagnostic.json",
+      );
+      await writeFile(
+        diagnosticPath,
+        `${JSON.stringify(diagnosticProof, null, 2)}\n`,
+        "utf8",
+      ).then(
+        () => testInfo.attach(
+          "daily-use-du03-checkers-fast-validation-diagnostic.json",
+          { path: diagnosticPath, contentType: "application/json" },
+        ),
+      ).catch(() => undefined);
+      if (capturedWorktree) {
+        const generatedWorktree = await fixture
+          .inspectWorktree(capturedWorktree.root)
+          .catch(() => null);
+        if (generatedWorktree) {
+          const generatedProof = {
+            version: 1,
+            scenarioId: "DU-03",
+            trust: "untrusted_redacted_generated_source",
+            head: generatedWorktree.head,
+            status: safeGeneratedSourceArtifact(generatedWorktree.status),
+            changedPaths: generatedWorktree.changedPaths,
+            files: Object.fromEntries(
+              Object.entries(generatedWorktree.files).map(([path, content]) => [
+                path,
+                safeGeneratedSourceArtifact(content, [
+                  fixture.root,
+                  capturedWorktree.root,
+                ]),
+              ]),
+            ),
+          };
+          const generatedPath = testInfo.outputPath(
+            "daily-use-du03-checkers-generated-source.json",
+          );
+          await writeFile(
+            generatedPath,
+            `${JSON.stringify(generatedProof, null, 2)}\n`,
+            "utf8",
+          ).then(
+            () => testInfo.attach(
+              "daily-use-du03-checkers-generated-source.json",
+              { path: generatedPath, contentType: "application/json" },
+            ),
+          ).catch(() => undefined);
+        }
+      }
+    }
+    await cleanupOwnedFixtureWorktrees(fixture, verifiedWorktree)
+      .catch((error) => {
+        if (!missionError) missionError = error;
+      });
+    await harness?.close().catch((error) => {
+      if (!missionError) missionError = error;
+    });
+    await fixture.cleanup().catch((error) => {
+      if (!missionError) missionError = error;
+    });
+  }
+  if (missionError) throw missionError;
+});
+
 async function configureProtectedConnections(
   page: Page,
   requestedLinearTeamId: string | null,
@@ -1255,7 +1667,6 @@ async function configureProtectedConnections(
 ) {
   return page.evaluate(async ({
     pluginId,
-    linearEvidenceDestinationName,
     requestedLinearTeamId,
     requestedLinearProjectId,
   }) => {
@@ -1293,65 +1704,57 @@ async function configureProtectedConnections(
         throw new Error("Linear credential did not land in native secure storage.");
       }
       const snapshot = plugin.getLinearCapabilitySnapshot?.();
-      const normalizeDestinationName = (value: unknown) =>
-        String(value ?? "")
-          .trim()
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/gu, "");
-      const expectedDestinationName = normalizeDestinationName(
-        linearEvidenceDestinationName,
+      const configuredProjectId = String(
+        requestedLinearProjectId ?? plugin.settings?.linearQueueProjectId ?? "",
+      ).trim();
+      if (!configuredProjectId) {
+        throw new Error(
+          "Select a dedicated Linear project for protected test evidence or set E2E_RELEASE_LINEAR_PROJECT_ID.",
+        );
+      }
+      const requestedProject = (snapshot?.projects ?? []).find(
+        (project: any) =>
+          String(project?.id ?? "").trim() === configuredProjectId,
       );
-      const workspaceName = String(snapshot?.workspace?.name ?? "").trim();
+      if (!requestedProject) {
+        throw new Error(
+          "The configured protected Linear project ID did not resolve in authenticated discovery.",
+        );
+      }
+      const projectTeamIds = Array.isArray(requestedProject?.teamIds)
+        ? requestedProject.teamIds
+            .map((teamId: unknown) => String(teamId ?? "").trim())
+            .filter(Boolean)
+        : [];
+      const configuredTeamId = String(
+        requestedLinearTeamId ??
+          (projectTeamIds.length === 1 ? projectTeamIds[0] : null) ??
+          plugin.settings?.linearDefaultTeamId ??
+          "",
+      ).trim();
+      if (!configuredTeamId) {
+        throw new Error(
+          "The protected Linear project does not identify one team; select its exact team or set LINEAR_LIVE_TEST_TEAM_ID.",
+        );
+      }
       const evidenceTeam = (snapshot?.teams ?? []).find(
-        (team: any) =>
-          normalizeDestinationName(team?.name) === expectedDestinationName,
+        (team: any) => String(team?.id ?? "").trim() === configuredTeamId,
       );
-      if (
-        normalizeDestinationName(workspaceName) !== expectedDestinationName ||
-        !evidenceTeam
-      ) {
+      if (!evidenceTeam) {
         throw new Error(
-          `Linear discovery did not verify the required ${linearEvidenceDestinationName} workspace and team.`,
-        );
-      }
-      const requestedTeam = requestedLinearTeamId
-        ? (snapshot?.teams ?? []).find(
-            (team: any) => String(team?.id ?? "").trim() === requestedLinearTeamId,
-          )
-        : null;
-      if (requestedLinearTeamId && !requestedTeam) {
-        throw new Error(
-          `E2E_RELEASE_LINEAR_TEAM_ID did not resolve to ${linearEvidenceDestinationName}.`,
-        );
-      }
-      if (requestedTeam && requestedTeam?.id !== evidenceTeam?.id) {
-        throw new Error(
-          `E2E_RELEASE_LINEAR_TEAM_ID must identify ${linearEvidenceDestinationName}.`,
+          "The configured protected Linear team ID did not resolve in authenticated discovery.",
         );
       }
       const linearTeamId = String(evidenceTeam?.id ?? "").trim();
-      const requestedProject = requestedLinearProjectId
-        ? (snapshot?.projects ?? []).find(
-            (project: any) =>
-              String(project?.id ?? "").trim() === requestedLinearProjectId,
-          )
-        : null;
-      if (requestedLinearProjectId && !requestedProject) {
-        throw new Error(
-          "E2E_RELEASE_LINEAR_PROJECT_ID did not resolve in the verified Linear workspace.",
-        );
-      }
       if (
-        requestedProject &&
-        Array.isArray(requestedProject?.teamIds) &&
-        requestedProject.teamIds.length > 0 &&
-        !requestedProject.teamIds.includes(linearTeamId)
+        projectTeamIds.length > 0 &&
+        !projectTeamIds.includes(linearTeamId)
       ) {
         throw new Error(
-          `E2E_RELEASE_LINEAR_PROJECT_ID must belong to ${linearEvidenceDestinationName}.`,
+          "The configured protected Linear project must belong to the configured protected Linear team.",
         );
       }
-      const linearProjectId = String(requestedProject?.id ?? "").trim();
+      const linearProjectId = String(requestedProject.id ?? "").trim();
       if (!linearTeamId) {
         throw new Error("Linear discovery did not provide a usable team destination.");
       }
@@ -1392,8 +1795,6 @@ async function configureProtectedConnections(
         linearCredentialSecure: true,
         linearTeamId,
         linearProjectId,
-        linearWorkspaceName: workspaceName,
-        linearTeamName: String(evidenceTeam?.name ?? "").trim(),
         linearProjectName: String(
           requestedProject?.name ?? "",
         ).trim(),
@@ -1415,17 +1816,9 @@ async function configureProtectedConnections(
     }
   }, {
     pluginId: NATIVE_CORE_PLUGIN_ID,
-    linearEvidenceDestinationName: LINEAR_EVIDENCE_DESTINATION_NAME,
     requestedLinearTeamId,
     requestedLinearProjectId,
   });
-}
-
-function normalizeLinearDestinationName(value: unknown): string {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/gu, "");
 }
 
 async function clearProtectedConnections(
@@ -1754,6 +2147,51 @@ async function captureCreatedRepositoryWorktree(input: {
   return null;
 }
 
+async function readCreatedRepositoryWorktreeOnce(input: {
+  page: Page;
+  workspaceId: string;
+  expectedRepositoryRoot: string;
+}): Promise<{ root: string; branch: string } | null> {
+  const observed = await input.page.evaluate(
+    async ({ corePluginId, codePluginId, workspaceId }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const code = app?.plugins?.plugins?.[corePluginId]
+        ?.getBundledCapability?.(codePluginId);
+      if (!code?.workspaceManager?.loadManifest) return null;
+      try {
+        const manifest = await code.workspaceManager.loadManifest(workspaceId);
+        if (manifest?.kind !== "repository" || !manifest.repositoryBinding) {
+          return null;
+        }
+        return {
+          repositoryRoot: String(manifest.repositoryBinding.repositoryRoot ?? ""),
+          worktreeRoot: String(
+            manifest.repositoryBinding.worktreeRoot ?? manifest.canonicalRoot ?? "",
+          ),
+          branch: String(manifest.repositoryBinding.branch ?? ""),
+        };
+      } catch {
+        return null;
+      }
+    },
+    {
+      corePluginId: NATIVE_CORE_PLUGIN_ID,
+      codePluginId: PHASE4_CODE_PLUGIN_ID,
+      workspaceId: input.workspaceId,
+    },
+  );
+  if (!observed) return null;
+  if (
+    observed.repositoryRoot !== input.expectedRepositoryRoot ||
+    !observed.worktreeRoot ||
+    observed.worktreeRoot === input.expectedRepositoryRoot ||
+    observed.branch !== `codex/workspace-${input.workspaceId}`
+  ) {
+    throw new Error("DU-03 fallback worktree readback returned an unexpected repository binding.");
+  }
+  return { root: observed.worktreeRoot, branch: observed.branch };
+}
+
 async function waitForWorktreeCapture(capture: Promise<void>): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(
@@ -1961,6 +2399,37 @@ function sameFilesystemPath(left: string, right: string): boolean {
     .replace(/\/+$/u, "")
     .toLowerCase();
   return normalize(left) === normalize(right);
+}
+
+async function writeDu06StageEntryProof(
+  testInfo: TestInfo,
+  releaseSha: string,
+  probes: ReadonlyMap<ProjectLifecycleStageName, IndependentStageEntryProbe>,
+): Promise<string> {
+  const completedStages = MAIN_STAGES.filter((stage) => probes.has(stage));
+  const destination = testInfo.outputPath(
+    "daily-use-du06-stage-entry-proof.json",
+  );
+  await writeFile(
+    destination,
+    `${JSON.stringify({
+      version: 1,
+      scenarioId: "DU-06",
+      releaseSha,
+      replayDetected: false,
+      complete: completedStages.length === MAIN_STAGES.length,
+      stages: completedStages.map((stage) => {
+        const index = MAIN_STAGES.indexOf(stage);
+        return {
+          restartOrdinal: index + 1,
+          priorStagesReverified: index,
+          ...probes.get(stage),
+        };
+      }),
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  return destination;
 }
 
 async function attestIndependentStageEntry(input: {
@@ -2348,6 +2817,7 @@ async function expectLinearResource(
 async function expectRetainedLinearEvidence(input: {
   client: LinearReadbackClient;
   teamId: string;
+  projectId: string;
   title: string;
   description: string;
 }): Promise<{ id: string; identifier: string; url: string }> {
@@ -2364,6 +2834,7 @@ async function expectRetainedLinearEvidence(input: {
     (item: any) =>
       item?.title === input.title &&
       item?.team?.id === input.teamId &&
+      item?.project?.id === input.projectId &&
       item?.trashed !== true,
   );
   const match = requireOne(exactMatches, "retained Linear evidence issue");
@@ -2377,6 +2848,7 @@ async function expectRetainedLinearEvidence(input: {
     description: input.description,
     trashed: false,
     team: { id: input.teamId },
+    project: { id: input.projectId },
   });
   expect(readback.url).toMatch(/^https:\/\//u);
   return {
@@ -2583,8 +3055,8 @@ async function armDu06FastValidationDiagnosticCapture(
       unsubscribe: undefined as (() => void) | undefined,
     };
     host[slotKey] = state;
-    const redact = (value: unknown): string =>
-      (typeof value === "string" ? value : "")
+    const redact = (value: unknown): string => {
+      const sanitized = (typeof value === "string" ? value : "")
         .replace(
           /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
           "[REDACTED]",
@@ -2593,8 +3065,32 @@ async function armDu06FastValidationDiagnosticCapture(
         .replace(
           /\/(?:Users|home|tmp|private\/tmp|var\/tmp)\/[^\r\n;]+/gu,
           "[LOCAL_PATH]",
-        )
-        .slice(0, 1_000);
+        );
+      if (sanitized.length <= 1_000) return sanitized;
+      return `${sanitized.slice(0, 480)}\n[bounded diagnostic middle omitted]\n${sanitized.slice(-480)}`;
+    };
+    const observeValidationOutput = (rawOutput: any) => {
+      const output = rawOutput?.output && typeof rawOutput.output === "object"
+        ? rawOutput.output
+        : rawOutput;
+      if (output?.status === "verified") {
+        state.diagnostic = null;
+        return;
+      }
+      if (output?.status !== "failed") return;
+      const excerpt = output.validationDiagnosticExcerpt;
+      if (!excerpt || typeof excerpt !== "object") return;
+      state.diagnostic = {
+        stdout: redact(excerpt.stdout),
+        stderr: redact(excerpt.stderr),
+        truncated: excerpt.truncated === true,
+        redactedLines:
+          Number.isSafeInteger(excerpt.redactedLines) &&
+            excerpt.redactedLines >= 0
+            ? excerpt.redactedLines
+            : 0,
+      };
+    };
     state.unsubscribe = plugin.subscribeMissionEvents({
       onTrace: (event: any) => {
         if (event?.kind === "tool_start") {
@@ -2607,23 +3103,12 @@ async function armDu06FastValidationDiagnosticCapture(
         ) {
           return;
         }
-        const output = event.outputPreview;
-        if (output?.status !== "failed") {
-          state.diagnostic = null;
-          return;
+        observeValidationOutput(event.outputPreview);
+      },
+      onToolDone: (event: any) => {
+        if (event?.name === "code_validate_fast") {
+          observeValidationOutput(event.output);
         }
-        const excerpt = output.validationDiagnosticExcerpt;
-        if (!excerpt || typeof excerpt !== "object") return;
-        state.diagnostic = {
-          stdout: redact(excerpt.stdout),
-          stderr: redact(excerpt.stderr),
-          truncated: excerpt.truncated === true,
-          redactedLines:
-            Number.isSafeInteger(excerpt.redactedLines) &&
-              excerpt.redactedLines >= 0
-              ? excerpt.redactedLines
-              : 0,
-        };
       },
     }, { replay: false });
   }, {
@@ -2635,7 +3120,7 @@ async function armDu06FastValidationDiagnosticCapture(
 async function takeDu06TransientRunCapture(
   page: Page,
 ): Promise<Du06TransientRunCaptureV1> {
-  return page.evaluate(({ slotKey }) => {
+  return page.evaluate(({ pluginId, slotKey }) => {
     const host = window as typeof window & Record<string, any>;
     const state = host[slotKey] as
       | {
@@ -2644,16 +3129,85 @@ async function takeDu06TransientRunCapture(
           unsubscribe?: () => void;
         }
       | undefined;
+    let replayToolCalls = 0;
+    let replayValidationSeen = false;
+    let replayDiagnostic: Du06FastValidationDiagnosticV1 | null = null;
+    const redact = (value: unknown): string => {
+      const sanitized = (typeof value === "string" ? value : "")
+        .replace(
+          /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
+          "[REDACTED]",
+        )
+        .replace(/(?:\b[A-Za-z]:[\\/]|\\\\)[^\r\n;]+/gu, "[LOCAL_PATH]")
+        .replace(
+          /\/(?:Users|home|tmp|private\/tmp|var\/tmp)\/[^\r\n;]+/gu,
+          "[LOCAL_PATH]",
+        );
+      if (sanitized.length <= 1_000) return sanitized;
+      return `${sanitized.slice(0, 480)}\n[bounded diagnostic middle omitted]\n${sanitized.slice(-480)}`;
+    };
+    const observeReplayValidationOutput = (rawOutput: any) => {
+      const output = rawOutput?.output && typeof rawOutput.output === "object"
+        ? rawOutput.output
+        : rawOutput;
+      if (output?.status !== "failed" && output?.status !== "verified") return;
+      replayValidationSeen = true;
+      if (output.status === "verified") {
+        replayDiagnostic = null;
+        return;
+      }
+      const excerpt = output.validationDiagnosticExcerpt;
+      if (!excerpt || typeof excerpt !== "object") return;
+      replayDiagnostic = {
+        stdout: redact(excerpt.stdout),
+        stderr: redact(excerpt.stderr),
+        truncated: excerpt.truncated === true,
+        redactedLines:
+          Number.isSafeInteger(excerpt.redactedLines) && excerpt.redactedLines >= 0
+            ? excerpt.redactedLines
+            : 0,
+      };
+    };
+    const plugin = (window as typeof window & { app?: any }).app?.plugins
+      ?.plugins?.[pluginId];
+    let replayUnsubscribe: (() => void) | undefined;
+    if (plugin?.subscribeMissionEvents) {
+      replayUnsubscribe = plugin.subscribeMissionEvents({
+        onTrace: (event: any) => {
+          if (event?.kind === "tool_start") replayToolCalls += 1;
+          if (
+            event?.kind === "tool_result" &&
+            event?.toolName === "code_validate_fast"
+          ) {
+            observeReplayValidationOutput(event.outputPreview);
+          }
+        },
+        onToolDone: (event: any) => {
+          if (event?.name === "code_validate_fast") {
+            observeReplayValidationOutput(event.output);
+          }
+        },
+      }, { replay: true });
+    }
+    try {
+      replayUnsubscribe?.();
+    } catch {
+      // The replay snapshot has already been copied into local scalars.
+    }
     try {
       state?.unsubscribe?.();
     } catch {
       // The diagnostic slot is still removed after a plugin restart.
     }
     delete host[slotKey];
-    const diagnostic = state?.diagnostic;
-    const toolCalls = Number.isSafeInteger(state?.toolCalls) && state!.toolCalls! >= 0
-      ? state!.toolCalls!
-      : 0;
+    const diagnostic = replayValidationSeen
+      ? replayDiagnostic
+      : state?.diagnostic;
+    const liveToolCalls =
+      Number.isSafeInteger(state?.toolCalls) && state!.toolCalls! >= 0
+        ? state!.toolCalls!
+        : 0;
+    const toolCalls = Math.max(liveToolCalls, replayToolCalls);
     if (
       !diagnostic ||
       typeof diagnostic.stdout !== "string" ||
@@ -2674,7 +3228,10 @@ async function takeDu06TransientRunCapture(
       },
       toolCalls,
     };
-  }, { slotKey: DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT });
+  }, {
+    pluginId: NATIVE_CORE_PLUGIN_ID,
+    slotKey: DU06_FAST_VALIDATION_DIAGNOSTIC_SLOT,
+  });
 }
 
 async function readRedactedDailyUseCounters(
@@ -2765,11 +3322,36 @@ function safeArtifactError(
       "[REDACTED_RESOURCE]",
     );
   }
-  return value
+  const sanitized = value
     .replace(/(?:\b[A-Za-z]:[\\/]|\\\\)[^\r\n;]+/gu, "[LOCAL_PATH]")
     .replace(/\/(?:Users|home|tmp|private\/tmp|var\/tmp)\/[^\r\n;]+/gu, "[LOCAL_PATH]")
-    .replace(/(?:\.agent-backups|E2E Agent Tests)\/[^\r\n;]+/giu, "[VAULT_PATH]")
-    .slice(0, 1_000);
+    .replace(/(?:\.agent-backups|E2E Agent Tests)\/[^\r\n;]+/giu, "[VAULT_PATH]");
+  if (sanitized.length <= 1_000) return sanitized;
+  return `${sanitized.slice(0, 480)}\n[bounded artifact middle omitted]\n${sanitized.slice(-480)}`;
+}
+
+function safeGeneratedSourceArtifact(
+  value: unknown,
+  exactRedactions: readonly string[] = [],
+): string {
+  let output = String(value ?? "");
+  for (const exact of [...new Set(exactRedactions)]
+    .filter((entry) => entry.length > 0)
+    .sort((left, right) => right.length - left.length)) {
+    output = output.replace(
+      new RegExp(exact.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "giu"),
+      "[REDACTED_RESOURCE]",
+    );
+  }
+  output = output
+    .replace(
+      /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
+      "[REDACTED]",
+    )
+    .replace(/(?:\b[A-Za-z]:[\\/]|\\\\)[^\r\n;]+/gu, "[LOCAL_PATH]")
+    .replace(/\/(?:Users|home|tmp|private\/tmp|var\/tmp)\/[^\r\n;]+/gu, "[LOCAL_PATH]");
+  if (output.length <= 20_000) return output;
+  return `${output.slice(0, 9_980)}\n[bounded generated source middle omitted]\n${output.slice(-9_980)}`;
 }
 
 const fetchTransport: HttpTransport = async (request) => {

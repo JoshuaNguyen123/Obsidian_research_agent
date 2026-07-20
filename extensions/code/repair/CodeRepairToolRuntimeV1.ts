@@ -1872,7 +1872,7 @@ function normalizePathSet(input: string[], label: string): string[] {
   }
   const values = input
     .map((entry) => assertSafeRepositoryRelativePath(entry))
-    .sort();
+    .sort(compareCanonicalText);
   if (new Set(values).size !== values.length) {
     throw new Error(`${label} repeat a path.`);
   }
@@ -2439,11 +2439,16 @@ function assertExactKeys(
 }
 
 function comparePath<T extends { path: string }>(left: T, right: T): number {
-  return left.path.localeCompare(right.path);
+  return compareCanonicalText(left.path, right.path);
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function sameStrings(left: string[], right: string[]): boolean {
-  return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
+  return JSON.stringify([...left].sort(compareCanonicalText)) ===
+    JSON.stringify([...right].sort(compareCanonicalText));
 }
 
 function sameHostPath(left: string, right: string): boolean {

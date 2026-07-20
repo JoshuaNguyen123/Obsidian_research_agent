@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -675,6 +675,43 @@ test("ordinary workspace mutations roll filesystem state back when manifest pers
     await assert.rejects(fixture.manager.restore("rollback-space", lease, trash.trashId, trash.fingerprint), /injected manifest failure/u);
     await assert.rejects(fixture.manager.stat("rollback-space", "source.txt"), /does not exist/u);
     assert.equal((await fixture.manager.inspectTrash("rollback-space", trash.trashId)).fingerprint, trash.fingerprint);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("workspace metadata inventory rejects no file merely because hashing would exceed the artifact boundary", async () => {
+  const fixture = await fixtureManager("metadata-inventory");
+  try {
+    const manifest = await fixture.manager.createScratchWorkspace({
+      workspaceId: "metadata-inventory-workspace",
+      ownerRunId: "run-metadata-inventory",
+    });
+    const largePath = path.join(manifest.canonicalRoot, "large.bin");
+    const handle = await open(largePath, "w");
+    try {
+      await handle.truncate(10 * 1024 * 1024 + 1);
+    } finally {
+      await handle.close();
+    }
+
+    const metadata = await fixture.manager.listMetadata(
+      "metadata-inventory-workspace",
+    );
+    assert.deepEqual(metadata.map(({ path: itemPath, kind, bytes }) => ({
+      path: itemPath,
+      kind,
+      bytes,
+    })), [{
+      path: "large.bin",
+      kind: "file",
+      bytes: 10 * 1024 * 1024 + 1,
+    }]);
+    await assert.rejects(
+      fixture.manager.list("metadata-inventory-workspace"),
+      (error: unknown) =>
+        error instanceof WorkspaceManagerErrorV2 && error.code === "file_too_large",
+    );
   } finally {
     await fixture.cleanup();
   }

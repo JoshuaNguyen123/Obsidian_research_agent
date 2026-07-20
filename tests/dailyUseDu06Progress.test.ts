@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildProgressiveDu06Observations,
+  createDu06RetainedLinearEvidenceProof,
   type DailyUseDu06ProgressInput,
   type DailyUseDu06SafeLifecycleState,
 } from "../e2e/fixtures/dailyUseDu06Progress";
@@ -107,6 +108,37 @@ test("DU-06 progressive cleanup never credits vacuous absence", () => {
     },
   });
   assert.deepEqual(observed.cleanup, []);
+});
+
+test("DU-06 retained Linear evidence fingerprints only the opaque provider ID", () => {
+  const providerIssueId = "550e8400-e29b-41d4-a716-446655440000";
+  const proof = createDu06RetainedLinearEvidenceProof({
+    releaseSha: commitSha,
+    providerIssueId,
+  });
+  assert.deepEqual(
+    {
+      version: proof.version,
+      scenarioId: proof.scenarioId,
+      releaseSha: proof.releaseSha,
+      providerReadbackVerified: proof.providerReadbackVerified,
+    },
+    {
+      version: 1,
+      scenarioId: "DU-06",
+      releaseSha: commitSha,
+      providerReadbackVerified: true,
+    },
+  );
+  assert.match(proof.providerIssueFingerprint, /^sha256:[a-f0-9]{64}$/u);
+  assert.doesNotMatch(JSON.stringify(proof), new RegExp(providerIssueId, "u"));
+  assert.throws(
+    () => createDu06RetainedLinearEvidenceProof({
+      releaseSha: commitSha,
+      providerIssueId: "APP-42",
+    }),
+    /opaque provider issue ID/u,
+  );
 });
 
 function observe(state: DailyUseDu06SafeLifecycleState) {

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const FULL_SHA = /^[a-f0-9]{40}$/u;
 const SHA256 = /^sha256:[a-f0-9]{64}$/u;
 const LIFECYCLE_STAGES = [
@@ -46,6 +48,39 @@ export interface DailyUseDu06ProgressObservations {
   approvals: string[];
   bindings: string[];
   cleanup: string[];
+}
+
+export interface DailyUseDu06RetainedLinearEvidenceV1 {
+  version: 1;
+  scenarioId: "DU-06";
+  releaseSha: string;
+  providerIssueFingerprint: string;
+  providerReadbackVerified: true;
+}
+
+export function createDu06RetainedLinearEvidenceProof(input: {
+  releaseSha: string;
+  providerIssueId: string;
+}): DailyUseDu06RetainedLinearEvidenceV1 {
+  const releaseSha = input.releaseSha.trim().toLowerCase();
+  const providerIssueId = input.providerIssueId.trim().toLowerCase();
+  if (!FULL_SHA.test(releaseSha)) {
+    throw new Error("DU-06 retained Linear evidence requires one exact release SHA.");
+  }
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(providerIssueId)) {
+    throw new Error("DU-06 retained Linear evidence requires one opaque provider issue ID.");
+  }
+  return {
+    version: 1,
+    scenarioId: "DU-06",
+    releaseSha,
+    providerIssueFingerprint: sha256(providerIssueId),
+    providerReadbackVerified: true,
+  };
+}
+
+function sha256(value: string): string {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
 /**

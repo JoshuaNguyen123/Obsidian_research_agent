@@ -76,6 +76,7 @@ export class AgentView extends ItemView {
   private logEl: HTMLElement | null = null;
   private promptEl: HTMLTextAreaElement | null = null;
   private runButtonEl: HTMLButtonElement | null = null;
+  private continueButtonEl: HTMLButtonElement | null = null;
   private chatOnlyToggleEl: HTMLInputElement | null = null;
   private clearButtonEl: HTMLButtonElement | null = null;
   private tabsEl: HTMLElement | null = null;
@@ -361,6 +362,7 @@ export class AgentView extends ItemView {
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
     this.firstRunEl = null;
+    this.continueButtonEl = null;
     this.orchestratorTab?.destroy();
     this.orchestratorTab = null;
     this.orchestratorReferenceRunId = null;
@@ -491,6 +493,16 @@ export class AgentView extends ItemView {
       },
     });
 
+    this.continueButtonEl = actionsEl.createEl("button", {
+      text: "Continue Latest Run",
+      cls: "agentic-researcher-secondary-action agentic-researcher-chat-continuation",
+      attr: {
+        type: "button",
+        "aria-label": "Continue latest run",
+      },
+    });
+    this.continueButtonEl.hidden = true;
+
     const chatOnlyLabelEl = actionsEl.createEl("label", {
       cls: "agentic-researcher-chat-only-toggle",
       attr: {
@@ -561,6 +573,20 @@ export class AgentView extends ItemView {
       event.preventDefault();
       event.stopPropagation();
       void this.capturePrompt();
+    });
+    this.continueButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const ledger = this.getLatestContinuationLedger();
+      if (
+        this.isRunning ||
+        this.plugin.isMissionRunning() ||
+        !ledger?.canResume ||
+        !ledger.continuationCommand.trim()
+      ) {
+        return;
+      }
+      void this.submitMissionContinuation(ledger.continuationCommand);
     });
     chatOnlyLabelEl.addEventListener("pointerdown", (event) => {
       event.stopPropagation();
@@ -1527,6 +1553,7 @@ export class AgentView extends ItemView {
     this.clearPlaceholder(this.actionsDetailsEl);
     const cardEl = this.actionsDetailsEl.createDiv({
       cls: "agentic-researcher-approval-card",
+      attr: { "data-approval-id": request.id },
     });
     cardEl.createDiv({
       text: `${request.toolName}: ${request.action}`,
@@ -1631,13 +1658,24 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-secondary-action agentic-researcher-approval-deny",
       attr: { type: "button" },
     });
+    const resolveApproval = (decision: "approved" | "denied") => {
+      const accepted = this.plugin.resolveMissionApproval(request.id, decision);
+      if (accepted) {
+        // Disable synchronously. Long runs can render the next approval before
+        // the resolved event returns; leaving this card enabled lets an
+        // automation or double-click select a stale approval repeatedly.
+        cardEl.querySelectorAll("button").forEach((button) => {
+          (button as HTMLButtonElement).disabled = true;
+        });
+      }
+    };
     approveButton.addEventListener("click", (event) => {
       event.preventDefault();
-      this.plugin.resolveMissionApproval(request.id, "approved");
+      resolveApproval("approved");
     });
     denyButton.addEventListener("click", (event) => {
       event.preventDefault();
-      this.plugin.resolveMissionApproval(request.id, "denied");
+      resolveApproval("denied");
     });
     this.approvalCardEls.set(request.id, cardEl);
     this.appendTrace("status", `Approval requested: ${request.toolName}`);
@@ -2057,6 +2095,7 @@ export class AgentView extends ItemView {
       } else {
         this.renderModelConfigFallback();
       }
+      this.refreshChatContinuationAction();
       return;
     }
 
@@ -2175,6 +2214,40 @@ export class AgentView extends ItemView {
     }
 
     this.renderContinuationAction(this.modelConfigEl, ledger);
+    this.refreshChatContinuationAction();
+  }
+
+  private getLatestContinuationLedger():
+    | AgentRunConfigEvent["missionLedger"]
+    | MissionLedgerSummary
+    | undefined {
+    const snapshotLedger = this.plugin.getMissionRunSnapshot().lastMissionLedger;
+    const configLedger = this.runConfig?.missionLedger;
+    if (
+      snapshotLedger &&
+      (!configLedger || snapshotLedger.runId === this.runConfig?.runId)
+    ) {
+      return snapshotLedger;
+    }
+    return configLedger ?? snapshotLedger ?? undefined;
+  }
+
+  private refreshChatContinuationAction(): void {
+    if (!this.continueButtonEl) return;
+    const ledger = this.getLatestContinuationLedger();
+    const available = Boolean(
+      !this.isRunning &&
+        ledger?.canResume &&
+        ledger.continuationCommand.trim(),
+    );
+    this.continueButtonEl.hidden = !available;
+    this.continueButtonEl.disabled = !available;
+    this.continueButtonEl.setAttribute(
+      "aria-label",
+      available && ledger
+        ? `Continue latest run ${ledger.runId}`
+        : "Continue latest run",
+    );
   }
 
   private renderPersistedMissionConfig(ledger: MissionLedgerSummary): void {
@@ -2283,6 +2356,7 @@ export class AgentView extends ItemView {
 
   refreshExtensionCapabilities(): void {
     this.renderModelConfig();
+    this.refreshChatContinuationAction();
   }
 
   private formatDependencyStatusLine(
@@ -3202,7 +3276,7 @@ export class AgentView extends ItemView {
       this.appendDetailLine(this.milestonesDetailsEl, event);
     }
 
-    if (toolName.startsWith("memory_")) {
+    if (toolName.startsWith("memory_") || toolName.includes("memory")) {
       this.appendDetailLine(this.memoryDetailsEl, event);
     }
 

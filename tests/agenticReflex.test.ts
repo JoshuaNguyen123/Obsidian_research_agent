@@ -6,6 +6,11 @@ import { evaluateProgress } from "../src/agent/reflex/progressMonitor";
 import { buildReflexCheckpointReceiptV1 } from "../src/agent/reflex/checkpointReceipt";
 import type { AgenticReflexInput } from "../src/agent/reflex/types";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
+import {
+  createMissionLedger,
+  formatMissionLedgerBlock,
+  parseMissionLedgerFromMarkdown,
+} from "../src/agent/missionLedger";
 import type { SemanticEmbeddingProvider } from "../src/embeddings/types";
 import type { MissionIntent } from "../src/tools/types";
 import type { AgentSettings } from "../src/settings";
@@ -210,13 +215,104 @@ test("reflex checkpoint receipts contain only redacted metadata and stable count
     actionCount: 2,
     evidenceCount: 1,
     receiptCount: 0,
+    readinessSummary: {
+      total: 99,
+      ok: 2,
+      degraded: 1,
+      blocked: 0,
+      unknown: 1,
+    },
+    progressScore: 0.75,
+    loopRiskScore: 0.25,
+    completionMissing: ["vault_evidence", "private path C:\\Users\\secret"],
+    proofDebt: ["mission_plan:semantic_search_notes"],
+    recoveryOutcome: "replan_scheduled",
     frontierFingerprint: `sha256:${"a".repeat(64)}`,
     observedAt: "2026-07-16T00:00:00.000Z",
   });
   const serialized = JSON.stringify(receipt);
   assert.match(receipt.fingerprint, /^sha256:[a-f0-9]{64}$/);
   assert.equal(serialized.includes("What do my notes say"), false);
+  assert.equal(serialized.includes("Users"), false);
   assert.equal(receipt.actionCount, 2);
+  assert.equal(receipt.confidence, output.intent.confidence);
+  assert.equal(receipt.winningMargin, output.intent.winningMargin);
+  assert.equal(receipt.suggestedAction, "semantic_search_notes");
+  assert.equal(receipt.allowedAction, "semantic_search_notes");
+  assert.deepEqual(receipt.readinessSummary, {
+    total: 4,
+    ok: 2,
+    degraded: 1,
+    blocked: 0,
+    unknown: 1,
+  });
+  assert.equal(receipt.progressScore, 0.75);
+  assert.equal(receipt.loopRiskScore, 0.25);
+  assert.deepEqual(receipt.completionMissing, ["redacted", "vault_evidence"]);
+  assert.deepEqual(receipt.proofDebt, ["mission_plan:semantic_search_notes"]);
+  assert.equal(receipt.recoveryOutcome, "replan_scheduled");
+
+  const laterReceipt = buildReflexCheckpointReceiptV1({
+    runId: "run-reflex",
+    checkpoint: "initial_routing",
+    decision: output.intent,
+    actionCount: 2,
+    evidenceCount: 1,
+    receiptCount: 0,
+    readinessSummary: receipt.readinessSummary,
+    progressScore: 0.75,
+    loopRiskScore: 0.25,
+    completionMissing: ["vault_evidence", "private path C:\\Users\\secret"],
+    proofDebt: ["mission_plan:semantic_search_notes"],
+    recoveryOutcome: "replan_scheduled",
+    frontierFingerprint: `sha256:${"a".repeat(64)}`,
+    observedAt: "2026-07-17T00:00:00.000Z",
+  });
+  assert.equal(laterReceipt.fingerprint, receipt.fingerprint);
+});
+
+test("legacy reflex checkpoint receipts remain readable without new diagnostics", async () => {
+  const output = await new AgenticReflexController().evaluate(input());
+  const current = buildReflexCheckpointReceiptV1({
+    runId: "run-reflex-legacy",
+    checkpoint: "initial_routing",
+    decision: output.intent,
+    actionCount: 1,
+    evidenceCount: 0,
+    receiptCount: 0,
+    observedAt: "2026-07-16T00:00:00.000Z",
+  });
+  const {
+    confidence: _confidence,
+    winningMargin: _winningMargin,
+    suggestedAction: _suggestedAction,
+    allowedAction: _allowedAction,
+    readinessSummary: _readinessSummary,
+    progressScore: _progressScore,
+    loopRiskScore: _loopRiskScore,
+    completionMissing: _completionMissing,
+    proofDebt: _proofDebt,
+    recoveryOutcome: _recoveryOutcome,
+    ...legacy
+  } = current;
+  const ledger = createMissionLedger({
+    runId: "run-reflex-legacy",
+    mission: "Legacy checkpoint normalization",
+    route: "direct",
+    loopBudget: {
+      hardCap: 4,
+      toolStepBudget: 3,
+      finalizationReserve: 1,
+      expectedTools: [],
+      stopWhenSatisfied: true,
+    },
+    now: new Date("2026-07-16T00:00:00.000Z"),
+  });
+  ledger.reflexCheckpoints = [legacy];
+  const restored = parseMissionLedgerFromMarkdown(formatMissionLedgerBlock(ledger));
+  assert.equal(restored?.reflexCheckpoints?.length, 1);
+  assert.equal(restored?.reflexCheckpoints?.[0]?.fingerprint, legacy.fingerprint);
+  assert.equal(restored?.reflexCheckpoints?.[0]?.confidence, undefined);
 });
 
 test("completion evaluator requires vault evidence and write receipts", () => {

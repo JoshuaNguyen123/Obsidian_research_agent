@@ -485,7 +485,23 @@ export class RunCoordinator {
         }
       }
     } else if (key === "onRunComplete") {
-      this.lastComplete = { ...(args[0] as AgentRunCompleteEvent) };
+      const reported = args[0] as AgentRunCompleteEvent;
+      const complete =
+        this.activeRunRequiresDurableResumeAuthority &&
+        !this.activeRunPublishedAuthority &&
+        !this.activeController?.signal.aborted
+          ? {
+              ...reported,
+              // A routing child cannot clarify, fail, or finish an already
+              // accepted durable mission before it publishes the exact ledger
+              // or graph authority it is acting on. Keep the verified
+              // continuation resumable and let loop/stall controls decide if a
+              // repeated internal yield must eventually block.
+              stopReason: "budget" as const,
+            }
+          : reported;
+      args[0] = complete;
+      this.lastComplete = { ...complete };
     }
 
     const event: BufferedRunEvent = {

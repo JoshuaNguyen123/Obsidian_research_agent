@@ -58,14 +58,34 @@ test.describe("Daily-use live research contract", () => {
     let harness: RealAiHarness | null = null;
     try {
       harness = await startRealAiHarness("live-owned-source-writeback");
-      await harness.installOwnedWebBackend();
+      await harness.installOwnedWebBackend({ conflictingEvidence: true });
       const before = await readFile(harness.noteFilePath, "utf8");
       await harness.submitMission(
-        `Search the web for the owned alpha and beta evidence, fetch both returned sources, verify exactly two finding sentences against the fetched passages, then append a short cited synthesis to the current note. End each finding sentence with the exact source:<id>:passage:<start>-<end> identifier returned by the fetch result that supports it, and use both fetched passage identifiers. Include ${harness.marker}. Do not write before fetch and verification.`,
+        `Read the current note as vault context. Search the web for the owned alpha and beta evidence, fetch both returned sources, and compare their deliberately conflicting conclusions about controlled onboarding validation. Append a ## Findings section with exactly two cited finding sentences and a ## Limitations section that explicitly says the two sources conflict. End each finding sentence with the exact source:<id>:passage:<start>-<end> identifier returned by the fetch result that supports it, and use both fetched passage identifiers. Include ${harness.marker}. Do not write before fetch, comparison, and verification.`,
       );
       const after = await readFile(harness.noteFilePath, "utf8");
       const snapshot = await harness.attestProductionRun({ requireStructuredRouting: true });
       const graphNodes = Object.values(snapshot.lastMissionGraph.nodes) as any[];
+      const fetchedEvidence = snapshot.missionEvidence.filter(
+        (item: any) =>
+          item.kind === "web_source" &&
+          item.usableSource === true &&
+          item.parserStatus === "parsed" &&
+          Array.isArray(item.passageIds) &&
+          item.passageIds.length > 0,
+      );
+      const fetchedPassageIds = new Set<string>(
+        fetchedEvidence.flatMap((item: any) => item.passageIds),
+      );
+      const citedPassageIds = [
+        ...after.matchAll(/source:[a-z0-9-]+:passage:\d+-\d+/gu),
+      ].map((match) => match[0]);
+      const persistedPassageIds = new Set<string>(
+        snapshot.redactedClaimPassageIds ?? [],
+      );
+      const conflicts = Array.isArray(snapshot.redactedEvidenceConflicts)
+        ? snapshot.redactedEvidenceConflicts
+        : [];
       const safeState = {
         complete: snapshot.lastComplete,
         acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
@@ -79,6 +99,10 @@ test.describe("Daily-use live research contract", () => {
         })),
         receiptOperations: snapshot.lastReceipts.map((receipt: any) => receipt.operation),
         missionEvidence: snapshot.missionEvidence,
+        persistedPassageCount: persistedPassageIds.size,
+        fetchedPassageCount: fetchedPassageIds.size,
+        citedPassageCount: new Set(citedPassageIds).size,
+        conflicts,
         diagnostics: snapshot.diagnosticAttestations,
         providerUsage: snapshot.providerUsage,
       };
@@ -93,38 +117,155 @@ test.describe("Daily-use live research contract", () => {
       expect(
         snapshot.missionEvidence.some(
           (item: any) =>
+            item.kind === "vault_note" &&
+            Array.isArray(item.passageIds) &&
+            item.passageIds.length > 0,
+        ),
+        JSON.stringify(safeState),
+      ).toBe(true);
+      expect(fetchedEvidence.length, JSON.stringify(safeState)).toBeGreaterThanOrEqual(2);
+      expect(fetchedPassageIds.size, JSON.stringify(safeState)).toBeGreaterThanOrEqual(2);
+      expect(persistedPassageIds.size, JSON.stringify(safeState)).toBeGreaterThanOrEqual(2);
+      expect(
+        [...fetchedPassageIds].every((id) => persistedPassageIds.has(id)),
+        JSON.stringify(safeState),
+      ).toBe(true);
+      expect(new Set(citedPassageIds).size, JSON.stringify(safeState)).toBeGreaterThanOrEqual(2);
+      expect(
+        citedPassageIds.every((id) => fetchedPassageIds.has(id)),
+        JSON.stringify(safeState),
+      ).toBe(true);
+      expect(conflicts.length, JSON.stringify(safeState)).toBeGreaterThan(0);
+      expect(
+        conflicts.every(
+          (conflict: any) =>
+            conflict.status === "acknowledged_limitation" ||
+            conflict.status === "resolved",
+        ),
+        JSON.stringify(safeState),
+      ).toBe(true);
+      expect(after).toMatch(/limitations/iu);
+      expect(after).toMatch(/conflict|contradict|disagree/iu);
+
+      const metricsBeforeCacheRead = await harness.readOwnedWebMetrics();
+      expect(metricsBeforeCacheRead.searchTransportCalls).toBeGreaterThanOrEqual(1);
+      expect(metricsBeforeCacheRead.fetchTransportCalls).toBeGreaterThanOrEqual(2);
+      const cachedSourceUrl = `https://primary.owned.example/evidence/${encodeURIComponent(harness.marker)}`;
+      await harness.submitMission(
+        `Call web_fetch once for the exact already-fetched URL ${cachedSourceUrl} with refresh=false. Verify the cached passage is readable, do not search, and do not write or edit any note.`,
+      );
+      const cacheSnapshot = await harness.attestProductionRun({
+        requireStructuredRouting: true,
+      });
+      const metricsAfterCacheRead = await harness.readOwnedWebMetrics();
+      expect(
+        cacheSnapshot.missionEvidence.some(
+          (item: any) =>
             item.kind === "web_source" &&
             item.usableSource === true &&
             item.parserStatus === "parsed" &&
             Array.isArray(item.passageIds) &&
-            item.passageIds.some((id: unknown) =>
-              typeof id === "string" &&
-              /^source:[a-z0-9-]+:passage:\d+-\d+$/u.test(id),
-            ),
+            item.passageIds.length > 0,
         ),
-        JSON.stringify(safeState),
       ).toBe(true);
+      expect(metricsAfterCacheRead.searchTransportCalls).toBe(
+        metricsBeforeCacheRead.searchTransportCalls,
+      );
+      expect(metricsAfterCacheRead.fetchTransportCalls).toBe(
+        metricsBeforeCacheRead.fetchTransportCalls,
+      );
+      expect(await readFile(harness.noteFilePath, "utf8")).toBe(after);
+      const observed = {
+        artifacts: [] as string[],
+        proofs: [] as string[],
+        approvals: [] as string[],
+        bindings: [] as string[],
+        cleanup: [] as string[],
+      };
+      const attest = (
+        target: string[],
+        key: string,
+        condition: boolean,
+      ) => {
+        expect(condition, `Missing observed DU-02 evidence: ${key}`).toBe(true);
+        if (condition) target.push(key);
+      };
+      attest(
+        observed.artifacts,
+        "vault:cited_findings_section",
+        /##\s+findings/iu.test(after) && new Set(citedPassageIds).size >= 2,
+      );
+      attest(
+        observed.proofs,
+        "evidence:vault",
+        snapshot.missionEvidence.some(
+          (item: any) =>
+            item.kind === "vault_note" &&
+            Array.isArray(item.passageIds) &&
+            item.passageIds.length > 0,
+        ),
+      );
+      attest(
+        observed.proofs,
+        "evidence:web_fetch",
+        fetchedEvidence.length >= 2,
+      );
+      attest(
+        observed.proofs,
+        "evidence:persisted_passages",
+        fetchedPassageIds.size >= 2 &&
+          [...fetchedPassageIds].every((id) => persistedPassageIds.has(id)),
+      );
+      attest(
+        observed.proofs,
+        "receipt:single_append",
+        snapshot.lastReceipts.filter(
+          (receipt: any) => receipt.operation === "append",
+        ).length === 1,
+      );
+      attest(
+        observed.proofs,
+        "research:conflicts_visible",
+        conflicts.length > 0 &&
+          conflicts.every(
+            (conflict: any) =>
+              conflict.status === "acknowledged_limitation" ||
+              conflict.status === "resolved",
+          ),
+      );
+      attest(
+        observed.proofs,
+        "research:cache_reuse",
+        cacheSnapshot.missionEvidence.some(
+          (item: any) =>
+            item.kind === "web_source" &&
+            item.usableSource === true &&
+            item.parserStatus === "parsed" &&
+            Array.isArray(item.passageIds) &&
+            item.passageIds.length > 0,
+        ) &&
+          metricsAfterCacheRead.searchTransportCalls ===
+            metricsBeforeCacheRead.searchTransportCalls &&
+          metricsAfterCacheRead.fetchTransportCalls ===
+            metricsBeforeCacheRead.fetchTransportCalls,
+      );
+      attest(
+        observed.bindings,
+        "citation:fetched_source",
+        new Set(citedPassageIds).size >= 2 &&
+          citedPassageIds.every((id) => fetchedPassageIds.has(id)),
+      );
       await recordDailyUseAcceptance(
         testInfo,
         "DU-02",
+        observed,
         {
-          artifacts: ["vault:cited_findings_section"],
-          proofs: [
-            "evidence:vault",
-            "evidence:web_fetch",
-            "evidence:persisted_passages",
-            "receipt:single_append",
-            "research:conflicts_visible",
-          ],
-          approvals: [],
-          bindings: ["citation:fetched_source"],
-          cleanup: [],
-        },
-        {
-          modelCalls: snapshot.modelCallEvidence.length,
-          toolCalls: snapshot.missionEvidence.filter(
-            (item: any) => item.kind === "tool_result",
-          ).length,
+          modelCalls:
+            snapshot.modelCallEvidence.length +
+            cacheSnapshot.modelCallEvidence.length,
+          toolCalls:
+            snapshot.missionEvidence.length +
+            cacheSnapshot.missionEvidence.length,
         },
         { requireComplete: true },
       );

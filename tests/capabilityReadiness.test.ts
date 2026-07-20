@@ -65,6 +65,26 @@ describe("CapabilityReadinessV2", () => {
     assert.ok(rows.every((row) => row.nextAction.length > 0));
   });
 
+  it("gives every capability one stable setup target and plain-language next action", () => {
+    const rows = buildCapabilityReadinessV2(inputs(), NOW);
+    assert.deepEqual(
+      rows.map((row) => [row.id, row.setupTarget]),
+      [
+        ["model", "model"],
+        ["notes", "notes_research"],
+        ["code", "code"],
+        ["linear", "linear"],
+        ["github", "github"],
+        ["browser", "browser_web"],
+        ["background", "background"],
+      ],
+    );
+    for (const row of rows) {
+      assert.match(row.nextAction, /^[A-Z][^\r\n]{2,79}$/u);
+      assert.equal(row.nextAction.endsWith("."), false);
+    }
+  });
+
   it("degrades a stale sandbox probe and stale provider discovery", () => {
     const stale = inputs();
     stale.code.probeObservedAt = "2026-07-16T10:00:00.000Z";

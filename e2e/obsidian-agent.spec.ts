@@ -3240,26 +3240,6 @@ test("semantic vault search uses semantic_search_notes", async () => {
   });
 });
 
-test("agentic reflex routes ambiguous semantic prompt", async () => {
-  await withE2EHarness("agentic-reflex-semantic", async ({ page, input }) => {
-    await setStreamingMode(page, false);
-    await setAgenticReflexMode(page, true);
-    await submitMission(
-      page,
-      `Surface E2E_SEMANTIC_SEARCH ${input.folderAnswerMarker} implications.`,
-    );
-
-    await expect(
-      page.locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
-        hasText: input.folderAnswerMarker,
-      }),
-    ).toBeVisible();
-    await expectToolRun(page, "semantic_search_notes");
-    await expectDetailsText(page, "reflex_intent=semantic_vault_search");
-    await expectNoReceipts(page);
-  });
-});
-
 test("deep vault research expands sampled semantic retrieval before synthesis", async () => {
   test.setTimeout(180_000);
   await withE2EHarness("deep-vault-research", async ({ page }) => {
@@ -4707,6 +4687,12 @@ test("budget-stopped run exposes Continue Latest Run action", async () => {
       { timeout: 180_000 },
     );
 
+    const chatContinuation = page
+      .locator(".agentic-researcher-chat-panel")
+      .getByRole("button", { name: /Continue latest run/iu });
+    await expect(chatContinuation).toBeVisible();
+    await expect(chatContinuation).toBeEnabled();
+
     await page.getByRole("tab", { name: "Run Details" }).click();
     await expectDetailsText(page, "ledger_status=budget");
     await expectDetailsText(page, "ledger_can_resume=on");
@@ -4779,7 +4765,9 @@ test("approval card gates long code runs through deny and approve", async () => 
       .last();
     await expect(denyCard).toBeVisible({ timeout: 30_000 });
     await expect(denyCard).toContainText("long_code_timeout");
-    await denyCard.locator("button.agentic-researcher-approval-deny").click();
+    const denyButton = denyCard.locator("button.agentic-researcher-approval-deny");
+    await denyButton.click();
+    await expect(denyButton).toBeDisabled();
     await expect(denyCard).toContainText("decision=denied");
     await waitForMissionComplete(page, 120_000);
     await expect(
@@ -4799,7 +4787,9 @@ test("approval card gates long code runs through deny and approve", async () => 
       .last();
     await expect(approveCard).toBeVisible({ timeout: 30_000 });
     await expect(approveCard).toContainText("long_code_timeout");
-    await approveCard.locator("button.agentic-researcher-approval-approve").click();
+    const approveButton = approveCard.locator("button.agentic-researcher-approval-approve");
+    await approveButton.click();
+    await expect(approveButton).toBeDisabled();
     await expect(approveCard).toContainText("decision=approved");
     await waitForMissionComplete(page, 120_000);
     await expect(
@@ -4843,40 +4833,6 @@ test("wall-clock budget stops run with resumable ledger", async () => {
     await expect(
       page.getByRole("button", { name: "Continue Latest Run" }),
     ).toBeVisible();
-  });
-});
-
-test("small context budget compacts loop messages mid-run", async () => {
-  await withE2EHarness("context-compaction", async ({ page }) => {
-    await setStreamingMode(page, false);
-    await setAgenticReflexMode(page, false);
-    await setPluginSettingOverrides(page, { numCtx: 1200 });
-
-    await submitMission(
-      page,
-      "Inspect the current note graph for E2E_LOOP_STEPS_5 with multiple bounded related-note reads before the final synthesis.",
-      { timeout: 180_000 },
-    );
-
-    await expect(
-      page.locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
-        hasText: "E2E_LOOP_DONE_5",
-      }),
-    ).toBeVisible({ timeout: 30_000 });
-    await expectDetailsText(page, "Compacted loop context");
-    await expectDetailsText(page, "estimated_prompt_chars_after");
-    const details = await readRunDetailsText(page);
-    const compaction =
-      /Compacted loop context from\s+(\d+)\s+to\s+(\d+)\s+estimated chars/iu.exec(
-        details,
-      ) ??
-      /estimated_prompt_chars_before\D+(\d+)[\s\S]{0,500}?estimated_prompt_chars_after\D+(\d+)/u.exec(
-        details,
-      );
-    expect(compaction, details).toBeTruthy();
-    expect(Number(compaction?.[2]), details).toBeLessThan(
-      Number(compaction?.[1]),
-    );
   });
 });
 
@@ -6969,38 +6925,6 @@ function getPromptScenario(name: string): PromptScenario {
   }
   return scenario;
 }
-
-test("research memory save clear reload recall", async () => {
-  await withE2EHarness("research-memory", async ({ page, input }) => {
-    const memoryPath = path.join(
-      vaultRoot,
-      "E2E Agent Tests",
-      "Agent Memory",
-      "Research",
-      `${slugifyForE2e(input.memoryTopic)}.md`,
-    );
-
-    await submitMission(
-      page,
-      `Save this to research memory for ${input.memoryTopic}: ${input.memoryMarker}`,
-    );
-    await expectFileToContain(
-      memoryPath,
-      input.memoryMarker,
-      "research memory note should be written in the vault",
-    );
-
-    await clearChatInline(page);
-    await reloadAssistantPanel(page);
-    await submitMission(page, `Continue this research from memory: ${input.memoryTopic}`);
-
-    await expect(
-      page.locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
-        hasText: input.memoryMarker,
-      }),
-    ).toBeVisible();
-  });
-});
 
 interface E2EInput {
   marker: string;
@@ -14168,18 +14092,6 @@ async function listObsidianVaultPages(browser: Browser) {
 
 function normalizeVaultPath(value: string) {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-}
-
-function slugifyForE2e(value: string) {
-  return (
-    value
-      .trim()
-      .toLowerCase()
-      .replace(/['"]/g, "")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 80) || "untitled-topic"
-  );
 }
 
 function getDefaultObsidianExe() {

@@ -1134,11 +1134,84 @@ function normalizeReflexCheckpointReceipt(
     (value.frontierFingerprint !== null && typeof value.frontierFingerprint !== "string") ||
     typeof value.observedAt !== "string" ||
     typeof value.fingerprint !== "string" ||
-    !/^sha256:[a-f0-9]{64}$/.test(value.fingerprint)
+    !/^sha256:[a-f0-9]{64}$/.test(value.fingerprint) ||
+    !hasValidOptionalReflexScore(value, "confidence") ||
+    !hasValidOptionalReflexScore(value, "winningMargin") ||
+    !hasValidOptionalReflexAction(value, "suggestedAction") ||
+    !hasValidOptionalReflexAction(value, "allowedAction") ||
+    !hasValidOptionalReflexReadinessSummary(value.readinessSummary) ||
+    !hasValidOptionalReflexScore(value, "progressScore") ||
+    !hasValidOptionalReflexScore(value, "loopRiskScore") ||
+    !hasValidOptionalReflexDiagnosticCodes(value.completionMissing) ||
+    !hasValidOptionalReflexDiagnosticCodes(value.proofDebt) ||
+    !hasValidOptionalReflexRecoveryOutcome(value.recoveryOutcome)
   ) {
     return null;
   }
   return value as unknown as ReflexCheckpointReceiptV1;
+}
+
+function hasValidOptionalReflexScore(
+  value: Record<string, unknown>,
+  key: string,
+): boolean {
+  if (!Object.prototype.hasOwnProperty.call(value, key)) return true;
+  const score = value[key];
+  return typeof score === "number" &&
+    Number.isFinite(score) &&
+    score >= 0 &&
+    score <= 1;
+}
+
+function hasValidOptionalReflexAction(
+  value: Record<string, unknown>,
+  key: string,
+): boolean {
+  if (!Object.prototype.hasOwnProperty.call(value, key)) return true;
+  const action = value[key];
+  return action === null ||
+    (typeof action === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(action));
+}
+
+function hasValidOptionalReflexReadinessSummary(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value)) return false;
+  const keys = ["total", "ok", "degraded", "blocked", "unknown"] as const;
+  if (
+    !keys.every(
+      (key) =>
+        typeof value[key] === "number" &&
+        Number.isInteger(value[key]) &&
+        (value[key] as number) >= 0,
+    )
+  ) {
+    return false;
+  }
+  return value.total ===
+    (value.ok as number) +
+      (value.degraded as number) +
+      (value.blocked as number) +
+      (value.unknown as number);
+}
+
+function hasValidOptionalReflexDiagnosticCodes(value: unknown): boolean {
+  return value === undefined ||
+    (Array.isArray(value) &&
+      value.length <= 32 &&
+      value.every(
+        (item) =>
+          typeof item === "string" &&
+          /^[a-z0-9][a-z0-9_.:-]{0,127}$/u.test(item),
+      ));
+}
+
+function hasValidOptionalReflexRecoveryOutcome(value: unknown): boolean {
+  return value === undefined ||
+    value === "not_applicable" ||
+    value === "retry_scheduled" ||
+    value === "replan_scheduled" ||
+    value === "recovered" ||
+    value === "blocked";
 }
 
 function normalizeApprovalRecord(value: unknown): MissionApprovalRecord | null {

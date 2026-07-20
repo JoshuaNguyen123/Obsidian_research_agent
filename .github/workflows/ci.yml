@@ -1,9 +1,9 @@
 name: Free targeted CI
 
 on:
-  push:
-    branches:
-      - main
+  # Manual-only while the repository owner has no GitHub-hosted minutes and
+  # no always-on self-hosted runner. A normal push must never leave a surprise
+  # job queued against a personal machine.
   workflow_dispatch:
 
 permissions:
@@ -16,17 +16,33 @@ concurrency:
 jobs:
   validate:
     name: Self-hosted Windows / validation and affected daily-use lanes
+    if: github.ref == 'refs/heads/main'
+    environment: protected-live-release
     # Never execute untrusted pull-request code on this persistent machine.
     runs-on: [self-hosted, Windows, X64, agentic-daily-use]
     timeout-minutes: 150
     env:
       E2E_RELEASE_COMMIT_SHA: ${{ github.sha }}
+      E2E_PROTECTED_LOG_MODE: "1"
       E2E_TRUST_DISPOSABLE_VAULT: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Verify exact trusted main tip
+        id: verify-main
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $trusted = (git rev-parse refs/remotes/origin/main).Trim().ToLowerInvariant()
+          if ($actual -ne $trusted -or $actual -ne "${{ github.sha }}") {
+            throw "Self-hosted execution accepts only the exact trusted origin/main tip."
+          }
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -89,10 +105,10 @@ jobs:
           "--lanes=deterministic"
 
       - name: Upload redacted daily-use summary
-        if: always()
+        if: always() && steps.verify-main.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: daily-use-summary-${{ github.sha }}
-          path: test-results/protected-targeted/deterministic.json
+          path: .agentic-proof/${{ github.sha }}/deterministic.json
           retention-days: 3
           if-no-files-found: ignore

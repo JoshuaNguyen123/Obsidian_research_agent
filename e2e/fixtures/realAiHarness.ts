@@ -23,13 +23,16 @@ export interface RealAiHarness extends NativeObsidianHarness {
     failFirstFetch?: boolean;
     sourceCount?: 2 | 3;
     topic?: "generic" | "checkers";
+    conflictingEvidence?: boolean;
   }): Promise<void>;
+  readOwnedWebMetrics(): Promise<OwnedWebMetricsV1>;
   attestProductionRun(options?: { requireStructuredRouting?: boolean }): Promise<any>;
   restartCorePlugin(): Promise<void>;
   approveUntilMissionComplete(
     timeoutMs?: number,
     options?: CompoundMissionApprovalOptions,
   ): Promise<number>;
+  readProgressCounters(): { approvals: number; continuations: number };
   activePreparedApproval(toolName: string): Locator;
   approve(approval: Locator): Promise<void>;
   deny(approval: Locator): Promise<void>;
@@ -59,6 +62,13 @@ export interface RealAiHarnessNativeOptions {
   preserveConfiguredLinearCredential?: boolean;
   /** Reuse only the vault's opaque native GitHub reference; never copy a token. */
   preserveConfiguredGitHubCredential?: boolean;
+}
+
+export interface OwnedWebMetricsV1 {
+  version: 1;
+  searchTransportCalls: number;
+  fetchTransportCalls: number;
+  failedFetchTransportCalls: number;
 }
 
 const PROJECT_STAGE_COMPLETION_TOOL: Readonly<
@@ -126,6 +136,8 @@ export async function startRealAiHarness(
     setup: installRealAiPageHarness,
     beforeClose: async ({ page }) => restoreOwnedWebBackend(page),
   });
+  let recordedApprovals = 0;
+  let recordedContinuations = 0;
   try {
     await expect(native.page.locator(".agentic-researcher-view")).toHaveCount(1, {
       timeout: 30_000,
@@ -151,21 +163,42 @@ export async function startRealAiHarness(
     readNote: async (target = native.noteFilePath) => readFile(target, "utf8"),
     installOwnedWebBackend: (options = {}) =>
       installOwnedWebBackend(native.page, native.marker, options),
+    readOwnedWebMetrics: () => readOwnedWebMetrics(native.page),
     attestProductionRun: (options = {}) =>
       attestProductionRun(native.page, config, options),
     restartCorePlugin: () =>
       restartCorePlugin(native.page, config, provider),
-    approveUntilMissionComplete: (
+    approveUntilMissionComplete: async (
       timeoutMs = config.completionTimeoutMs,
       options = {},
-    ) =>
-      approveUntilMissionComplete(native.page, timeoutMs, {
-        ...options,
-        restartCorePlugin: (stage) =>
-          restartCorePlugin(native.page, config, provider, stage).then(async () => {
-            await options.onStageRestarted?.(stage);
-          }),
-      }),
+    ) => {
+      let callApprovals = 0;
+      let callContinuations = 0;
+      try {
+        return await approveUntilMissionComplete(native.page, timeoutMs, {
+          ...options,
+          onProgress: (counters) => {
+            callApprovals = Math.max(callApprovals, counters.approvals);
+            callContinuations = Math.max(
+              callContinuations,
+              counters.continuations,
+            );
+            options.onProgress?.(counters);
+          },
+          restartCorePlugin: (stage) =>
+            restartCorePlugin(native.page, config, provider, stage).then(async () => {
+              await options.onStageRestarted?.(stage);
+            }),
+        });
+      } finally {
+        recordedApprovals += callApprovals;
+        recordedContinuations += callContinuations;
+      }
+    },
+    readProgressCounters: () => ({
+      approvals: recordedApprovals,
+      continuations: recordedContinuations,
+    }),
     activePreparedApproval: (toolName) => activePreparedApproval(native.page, toolName),
     approve: (approval) => resolveApproval(approval, "approve"),
     deny: (approval) => resolveApproval(approval, "deny"),
@@ -399,10 +432,20 @@ async function approveUntilMissionComplete(
       if (ui.acceptanceStatus === "pass" || ui.ledgerStatus === "complete") {
         return approvals;
       }
+      const latestModelCall = ui.modelCallPhases.at(-1);
+      const retryableProviderStop =
+        ui.stopReason === "error" &&
+        ui.canResume &&
+        Boolean(ui.continuationCommand) &&
+        latestModelCall?.phase === "retry" &&
+        latestModelCall.outcome === "error" &&
+        typeof ui.ledger?.nextAction === "string" &&
+        ui.ledger.nextAction.startsWith("Model step failed:");
       if (
         !ui.hasGraphBlocker &&
         (
           ui.stopReason === "budget" ||
+          retryableProviderStop ||
           (
             ui.stopReason === null &&
             ui.canResume &&
@@ -439,6 +482,13 @@ async function approveUntilMissionComplete(
           throw new Error(
             `Mission exceeded ${maximumContinuations} explicit continuations; approved=${approvals}; state=${JSON.stringify(ui)}.`,
           );
+        }
+        // A provider terminal stop is already the result of the production
+        // client's bounded retry policy. Briefly yield before exercising the
+        // durable continuation so a transient upstream outage is not retried
+        // in a tight loop by the harness.
+        if (retryableProviderStop) {
+          await page.waitForTimeout(1_000);
         }
         await continuation.click();
         await page.waitForTimeout(250);
@@ -512,10 +562,12 @@ async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
   return page.evaluate(() => {
     const button = Array.from(document.querySelectorAll<HTMLButtonElement>(
       "button.agentic-researcher-approval-approve:not(:disabled)",
-    )).find((candidate) => candidate.getClientRects().length > 0);
+    ))
+      .filter((candidate) => candidate.getClientRects().length > 0)
+      .at(-1);
     if (!button) return false;
     button.click();
-    return true;
+    return button.disabled;
   });
 }
 
@@ -723,13 +775,24 @@ async function installOwnedWebBackend(
     failFirstFetch?: boolean;
     sourceCount?: 2 | 3;
     topic?: "generic" | "checkers";
+    conflictingEvidence?: boolean;
   },
 ): Promise<void> {
-  await page.evaluate(({ pluginId, failFirstFetch, sourceCount, marker, topic }) => {
-    const w = window as typeof window & { app?: any; __realAiWebRestore?: () => void };
+  await page.evaluate(({ pluginId, failFirstFetch, sourceCount, marker, topic, conflictingEvidence }) => {
+    const w = window as typeof window & {
+      app?: any;
+      __realAiWebRestore?: () => void;
+      __realAiWebMetrics?: OwnedWebMetricsV1;
+    };
     const plugin = w.app?.plugins?.plugins?.[pluginId];
     if (!plugin) throw new Error("Core plugin unavailable.");
     w.__realAiWebRestore?.();
+    w.__realAiWebMetrics = {
+      version: 1,
+      searchTransportCalls: 0,
+      fetchTransportCalls: 0,
+      failedFetchTransportCalls: 0,
+    };
     const original = plugin.createToolExecutionContext;
     let fetchCalls = 0;
     plugin.createToolExecutionContext = function (prompt: string) {
@@ -737,6 +800,9 @@ async function installOwnedWebBackend(
       const realTransport = context.httpTransport;
       context.httpTransport = async (request: any) => {
         if (String(request.url).endsWith("/web_search")) {
+          if (w.__realAiWebMetrics) {
+            w.__realAiWebMetrics.searchTransportCalls += 1;
+          }
           const markerPath = encodeURIComponent(marker);
           const results = topic === "checkers"
             ? [
@@ -768,8 +834,14 @@ async function installOwnedWebBackend(
         }
         if (String(request.url).endsWith("/web_fetch")) {
           fetchCalls += 1;
+          if (w.__realAiWebMetrics) {
+            w.__realAiWebMetrics.fetchTransportCalls += 1;
+          }
           const body = JSON.parse(String(request.body ?? "{}"));
           if (failFirstFetch && fetchCalls === 1) {
+            if (w.__realAiWebMetrics) {
+              w.__realAiWebMetrics.failedFetchTransportCalls += 1;
+            }
             return { status: 503, headers: { "retry-after": "0" }, json: { error: "owned retryable source failure" } };
           }
           const alternate = String(body.url).includes("alternate");
@@ -787,8 +859,12 @@ async function installOwnedWebBackend(
               : corroborating
                 ? "Gamma evidence is a third independently fetched passage. It positively corroborates the bounded synthesis and preserves the existing tool authority."
                 : alternate
-                  ? "Beta evidence is the independently fetched second passage. It supports bounded recovery and source verification."
-                  : "Alpha evidence is the fetched primary passage. It supports the first verified claim with owned deterministic content.",
+                  ? conflictingEvidence
+                    ? "The controlled onboarding validation evidence does not show improved user retention rate or reduced errors. The alternate study reports no reliable benefit."
+                    : "Beta evidence is the independently fetched second passage. It supports bounded recovery and source verification."
+                  : conflictingEvidence
+                    ? "The controlled onboarding validation evidence shows improved user retention rate and reduced errors. The primary study reports a reliable benefit."
+                    : "Alpha evidence is the fetched primary passage. It supports the first verified claim with owned deterministic content.",
             links: [],
           } };
         }
@@ -806,12 +882,30 @@ async function installOwnedWebBackend(
     sourceCount: options.sourceCount ?? 2,
     marker,
     topic: options.topic ?? "generic",
+    conflictingEvidence: options.conflictingEvidence === true,
+  });
+}
+
+async function readOwnedWebMetrics(page: Page): Promise<OwnedWebMetricsV1> {
+  return page.evaluate(() => {
+    const metrics = (window as typeof window & {
+      __realAiWebMetrics?: OwnedWebMetricsV1;
+    }).__realAiWebMetrics;
+    if (!metrics) {
+      throw new Error("Owned web metrics are unavailable.");
+    }
+    return { ...metrics };
   });
 }
 
 async function restoreOwnedWebBackend(page: Page): Promise<void> {
   await page.evaluate(() => {
-    (window as typeof window & { __realAiWebRestore?: () => void }).__realAiWebRestore?.();
+    const w = window as typeof window & {
+      __realAiWebRestore?: () => void;
+      __realAiWebMetrics?: OwnedWebMetricsV1;
+    };
+    w.__realAiWebRestore?.();
+    delete w.__realAiWebMetrics;
   });
 }
 
@@ -841,8 +935,19 @@ async function attestProductionRun(
               : [],
           }))
         : [];
+      current.redactedClaimPassageIds = Array.isArray(ledger?.claimPassages)
+        ? ledger.claimPassages
+            .map((passage: any) => passage?.id)
+            .filter(
+              (id: unknown) =>
+                typeof id === "string" &&
+                /^source:[a-z0-9-]+:passage:\d+-\d+$/u.test(id),
+            )
+            .slice(0, 24)
+        : [];
     } catch {
       current.redactedEvidenceConflicts = [];
+      current.redactedClaimPassageIds = [];
     }
     return current;
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
@@ -851,7 +956,21 @@ async function attestProductionRun(
   const successes = snapshot.modelCallEvidence.filter(
     (item: any) => item.outcome === "success" && item.transportKind === "production",
   );
-  expect(successes.length).toBeGreaterThan(0);
+  if (successes.length === 0) {
+    const redactedCalls = snapshot.modelCallEvidence.slice(-8).map((item: any) => ({
+      phase: item.phase ?? null,
+      attempt: item.attempt ?? null,
+      outcome: item.outcome ?? null,
+      transportKind: item.transportKind ?? null,
+      model: item.model ?? null,
+      errorCategory: item.errorCategory ?? null,
+      responseChars: item.responseChars ?? 0,
+      tokenUsageReported: item.tokenUsageReported === true,
+    }));
+    throw new Error(
+      `No successful production model call was attested: ${JSON.stringify(redactedCalls)}.`,
+    );
+  }
   expect(successes.some((item: any) => item.model === config.model && item.responseChars > 0)).toBe(true);
   for (const item of successes.filter((candidate: any) => candidate.tokenUsageReported)) {
     expect(item.totalTokens).toBeGreaterThan(0);

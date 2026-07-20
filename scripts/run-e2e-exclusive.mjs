@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   mkdir,
@@ -42,6 +42,18 @@ const SIGNAL_EXIT_CODES = {
   SIGINT: 130,
   SIGTERM: 143,
 };
+const WINDOWS_USER_SANDBOX_ENV_NAMES = Object.freeze([
+  "AGENTIC_SANDBOX_CI_EXECUTABLE",
+  "AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE",
+  "AGENTIC_SANDBOX_CI_RUNTIME_DIGEST",
+  "AGENTIC_SANDBOX_CI_WSL_DISTRIBUTION",
+  "AGENTIC_SANDBOX_CI_RUNTIME_ROOT",
+]);
+const SANDBOX_E2E_PROJECTS = new Set([
+  "daily-use-code-live",
+  "daily-use-compound",
+  "release-vertical",
+]);
 
 let activeChild = null;
 let activeLock = null;
@@ -193,7 +205,9 @@ async function main() {
   const normalized = normalizeExclusiveArgs(process.argv.slice(2));
   const { playwrightArgs, aiMode, liveExternal, projects } = normalized;
   applyE2eAiMode(aiMode);
+  applyE2eProviderDefaults({ aiMode, projects });
   applyE2eLane({ liveExternal, projects });
+  applyPersistedWindowsSandboxEnvironment({ projects });
   installSignalHandlers();
 
   try {
@@ -202,7 +216,9 @@ async function main() {
       isCancelled: () => Boolean(interruptedSignal),
     });
     console.log(
-      `Acquired exclusive Obsidian e2e lock for PID ${process.pid}: ${activeLock.lockPath}`,
+      process.env.CI
+        ? "Acquired exclusive Obsidian e2e lock."
+        : `Acquired exclusive Obsidian e2e lock for PID ${process.pid}: ${activeLock.lockPath}`,
     );
     console.log(
       `E2E AI mode=${process.env.E2E_AI_MODE} model=${process.env.E2E_AI_MODEL || "(unset)"}`,
@@ -531,12 +547,95 @@ export function applyE2eAiMode(aiMode, env = process.env) {
   }
 }
 
+/**
+ * Keep the real-provider wrapper, preflight, and Playwright worker on one
+ * explicit provider/model selection. The provider canary is intentionally
+ * authoritative: its required model must also be the model named by preflight
+ * and run diagnostics.
+ */
+export function applyE2eProviderDefaults(
+  { aiMode, projects },
+  env = process.env,
+) {
+  if (aiMode !== "real") return;
+
+  if (!env.E2E_MODEL_PROVIDER?.trim()) {
+    env.E2E_MODEL_PROVIDER = "ollama";
+  }
+
+  if (projects.includes("provider-canary")) {
+    const canaryModel = env.E2E_CANARY_MODEL?.trim();
+    if (canaryModel) {
+      env.E2E_AI_MODEL = canaryModel;
+    }
+  }
+}
+
 export function applyE2eLane(
   { liveExternal, projects },
   env = process.env,
 ) {
   env.E2E_PLAYWRIGHT_LANE = projects.join(",");
   env.E2E_LIVE_EXTERNAL = liveExternal ? "1" : "0";
+}
+
+/**
+ * The WSL2 setup script can persist its non-secret runtime declaration at
+ * Windows user scope, but an already-open terminal cannot inherit that update.
+ * Import only this fixed allowlist, only for sandbox lanes, and never replace
+ * an explicit process value. The normal boundary parser remains authoritative.
+ */
+export function applyPersistedWindowsSandboxEnvironment(
+  { projects },
+  env = process.env,
+  options = {},
+) {
+  const platform = options.platform ?? process.platform;
+  if (
+    platform !== "win32" ||
+    !projects.some((project) => SANDBOX_E2E_PROJECTS.has(project))
+  ) {
+    return [];
+  }
+  const readUserValue =
+    options.readUserValue ?? readWindowsUserEnvironmentVariable;
+  const imported = [];
+  for (const name of WINDOWS_USER_SANDBOX_ENV_NAMES) {
+    if (env[name]?.trim()) continue;
+    const value = readUserValue(name);
+    if (!isSafePersistedEnvironmentValue(value)) continue;
+    env[name] = value.trim();
+    imported.push(name);
+  }
+  return imported;
+}
+
+function readWindowsUserEnvironmentVariable(name) {
+  const result = spawnSync(
+    "reg.exe",
+    ["query", "HKCU\\Environment", "/v", name],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5_000,
+    },
+  );
+  if (result.status !== 0 || typeof result.stdout !== "string") return null;
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = new RegExp(
+    `^\\s*${escapedName}\\s+REG_(?:SZ|EXPAND_SZ)\\s+(.+?)\\s*$`,
+    "mu",
+  ).exec(result.stdout);
+  return match?.[1] ?? null;
+}
+
+function isSafePersistedEnvironmentValue(value) {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= 512 &&
+    !/[\0\r\n]/u.test(value)
+  );
 }
 
 function readRequestedProjects(args) {

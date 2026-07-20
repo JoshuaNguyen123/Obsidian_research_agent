@@ -706,13 +706,23 @@ test("SpawnSandboxCommandRunnerV2 launches only fixed provider argv with clean b
     now: () => new Date("2026-07-12T12:00:00.000Z"),
   });
   await manager.probeProviders();
-  const prepared = await manager.prepareExecution(prepareInput());
+  const readme = new TextEncoder().encode("# Fixture\n");
+  const prepared = await manager.prepareExecution({
+    ...prepareInput(),
+    stagingManifest: [
+      ...prepareInput().stagingManifest,
+      { path: "README.md", bytes: readme.byteLength, sha256: sha256(readme) },
+    ],
+  });
   assert.equal(prepared.status, "prepared");
   if (prepared.status !== "prepared") return;
   const source = new TextEncoder().encode("export const value = 1;\n");
   const result = await manager.executePrepared(prepared.action, {
     authorization: authorization(prepared.action),
-    stagedFiles: [{ path: "src/index.ts", bytes: source }],
+    stagedFiles: [
+      { path: "src/index.ts", bytes: source },
+      { path: "README.md", bytes: readme },
+    ],
   });
   assert.equal(result.status, "verified");
   assert.equal(calls.length, 3, "initial probe, fresh probe, then one provider execution");
@@ -736,13 +746,24 @@ test("SpawnSandboxCommandRunnerV2 launches only fixed provider argv with clean b
     manifestFingerprint: string;
   };
   assert.equal(stagingBundle.version, 1);
-  assert.equal(stagingBundle.files[0].path, "src/index.ts");
-  assert.equal(stagingBundle.files[0].sha256, sha256(source));
+  assert.deepEqual(
+    stagingBundle.files.map((file) => file.path),
+    ["README.md", "src/index.ts"],
+    "staging order must use canonical UTF-8 bytes, never host locale collation",
+  );
+  assert.equal(stagingBundle.files[1].sha256, sha256(source));
   assert.equal(
-    Buffer.from(stagingBundle.files[0].contentBase64, "base64").toString("utf8"),
+    Buffer.from(stagingBundle.files[1].contentBase64, "base64").toString("utf8"),
     "export const value = 1;\n",
   );
-  assert.match(stagingBundle.manifestFingerprint, /^sha256:[0-9a-f]{64}$/);
+  const pythonCanonicalManifest = stagingBundle.files.map(
+    ({ path, sha256: fileSha256, bytes }) => ({ bytes, path, sha256: fileSha256 }),
+  );
+  assert.equal(
+    stagingBundle.manifestFingerprint,
+    sha256(new TextEncoder().encode(JSON.stringify(pythonCanonicalManifest))),
+    "host fingerprint must match the Python runtime's sorted canonical JSON",
+  );
 
   const spec = buildSandboxExecutionCommandV2(dockerProvider(), prepared.action);
   await assert.rejects(

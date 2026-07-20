@@ -890,9 +890,18 @@ export class MissionGraphSession {
    */
   async resolveToolApproval(
     execution: MissionGraphToolExecution,
-    approved: boolean,
+    resolution: boolean | "approved" | "denied" | "expired" | "aborted",
   ): Promise<MissionGraphV3> {
     return this.enqueueMutation(async () => {
+      const approved = resolution === true || resolution === "approved";
+      const deniedCode = resolution === false || resolution === "denied"
+        ? "approval_denied"
+        : `approval_${resolution}`;
+      const deniedMessage = deniedCode === "approval_denied"
+        ? `User denied approval for ${execution.toolName}.`
+        : deniedCode === "approval_expired"
+          ? `Approval expired before ${execution.toolName} could run.`
+          : `Approval for ${execution.toolName} was aborted before execution.`;
       const node = this.requireExecutionNode(execution, "waiting_approval");
       const graph = await this.applyUnlocked(
         approved
@@ -907,8 +916,8 @@ export class MissionGraphSession {
             blocker: approved
               ? null
               : {
-                  code: "approval_denied",
-                  message: `User denied approval for ${execution.toolName}.`,
+                  code: deniedCode,
+                  message: deniedMessage,
                   requiredAction:
                     "Revise the mission or request a new exact approval before retrying.",
                 },

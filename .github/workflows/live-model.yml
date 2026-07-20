@@ -12,16 +12,31 @@ concurrency:
 
 jobs:
   live-research:
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Windows, X64, agentic-daily-use]
     timeout-minutes: 45
     environment: protected-live-release
     env:
       E2E_RELEASE_COMMIT_SHA: ${{ github.sha }}
+      E2E_PROTECTED_LOG_MODE: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Verify exact trusted main tip
+        id: verify-main
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $trusted = (git rev-parse refs/remotes/origin/main).Trim().ToLowerInvariant()
+          if ($actual -ne $trusted -or $actual -ne "${{ github.sha }}") {
+            throw "Self-hosted execution accepts only the exact trusted origin/main tip."
+          }
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -69,10 +84,10 @@ jobs:
           E2E_TRUST_DISPOSABLE_VAULT: "1"
 
       - name: Upload redacted live summary
-        if: always()
+        if: always() && steps.verify-main.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: live-model-summary-${{ github.sha }}
-          path: test-results/protected-targeted/research.json
+          path: .agentic-proof/${{ github.sha }}/research.json
           retention-days: 3
           if-no-files-found: ignore

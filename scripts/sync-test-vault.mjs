@@ -64,7 +64,9 @@ async function main() {
   if (dataJsonError) throw dataJsonError;
 
   console.log(
-    `Synced ${PLUGIN_CATALOG.length} plugin artifact sets to ${pluginsRoot}`,
+    process.env.CI
+      ? `Synced ${PLUGIN_CATALOG.length} plugin artifact sets to the isolated test vault.`
+      : `Synced ${PLUGIN_CATALOG.length} plugin artifact sets to ${pluginsRoot}`,
   );
   console.log(
     `Verified only ${PLUGIN_ARTIFACTS.join(", ")} were copied for each plugin.`,

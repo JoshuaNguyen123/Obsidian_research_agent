@@ -31,8 +31,8 @@ jobs:
     runs-on: [self-hosted, Windows, X64, agentic-daily-use]
     timeout-minutes: 240
     env:
-      E2E_RELEASE_COMMIT_SHA: ${{ inputs.commit_sha }}
       PROTECTED_TARGETED_LANES: ${{ inputs.lanes }}
+      E2E_PROTECTED_LOG_MODE: "1"
     steps:
       - name: Check out exact SHA without persisted credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -43,16 +43,26 @@ jobs:
           clean: true
 
       - name: Verify accessible local prerequisites
+        id: verify-sha
         shell: pwsh
+        env:
+          REQUESTED_COMMIT_SHA: ${{ inputs.commit_sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ($env:E2E_RELEASE_COMMIT_SHA -notmatch '^[a-f0-9]{40}$') {
+          if ($env:REQUESTED_COMMIT_SHA -notmatch '^[a-f0-9]{40}$') {
             throw "commit_sha must be one full lowercase Git commit SHA."
           }
           $actualSha = (git rev-parse HEAD).Trim().ToLowerInvariant()
-          if ($actualSha -ne $env:E2E_RELEASE_COMMIT_SHA) {
-            throw "Checked out $actualSha instead of requested SHA $env:E2E_RELEASE_COMMIT_SHA."
+          if ($actualSha -ne $env:REQUESTED_COMMIT_SHA) {
+            throw "Checked out $actualSha instead of requested SHA $env:REQUESTED_COMMIT_SHA."
           }
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor $env:REQUESTED_COMMIT_SHA refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Protected proof accepts only a commit already reachable from trusted origin/main."
+          }
+          "sha=$actualSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "E2E_RELEASE_COMMIT_SHA=$actualSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           foreach ($command in @("git", "node", "npm", "python", "wsl.exe")) {
             if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
               throw "Missing local runner prerequisite: $command"
@@ -115,11 +125,39 @@ jobs:
           AGENTIC_SANDBOX_CI_RUNTIME_ROOT: ${{ vars.AGENTIC_SANDBOX_CI_RUNTIME_ROOT }}
 
       - name: Upload redacted targeted proof summaries
-        if: always()
+        if: always() && steps.verify-sha.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: protected-targeted-summaries-${{ inputs.commit_sha }}
-          path: test-results/protected-targeted/*.json
+          name: protected-targeted-summaries-${{ steps.verify-sha.outputs.sha }}
+          path: |
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic-summary-unavailable.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du03-checkers-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-stage-entry-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-cleanup-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-retained-linear-evidence.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research-summary-unavailable.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research--daily-use-du03-checkers-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research--daily-use-du06-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research--daily-use-du06-stage-entry-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research--daily-use-du06-cleanup-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research--daily-use-du06-retained-linear-evidence.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/code.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/code-summary-unavailable.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/code--daily-use-du03-checkers-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/code--daily-use-du06-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/code--daily-use-du06-stage-entry-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/code--daily-use-du06-cleanup-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/code--daily-use-du06-retained-linear-evidence.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/compound.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/compound-summary-unavailable.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/compound--daily-use-du03-checkers-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/compound--daily-use-du06-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/compound--daily-use-du06-stage-entry-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/compound--daily-use-du06-cleanup-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/compound--daily-use-du06-retained-linear-evidence.json
           retention-days: 3
           if-no-files-found: ignore
 

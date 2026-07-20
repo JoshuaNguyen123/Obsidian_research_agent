@@ -6,6 +6,7 @@ const activeLanes = new Set(
     .map((value) => value.trim())
     .filter(Boolean),
 );
+const protectedLogMode = process.env.E2E_PROTECTED_LOG_MODE === "1";
 const liveGlobalTimeout = activeLanes.has("release-vertical") ||
     activeLanes.has("daily-use-compound")
   ? 120 * 60_000
@@ -56,15 +57,17 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   timeout: 120_000,
   workers: 1,
-  reporter: [
-    ["list"],
-    ["html", { open: "never" }],
-    ["./e2e/reporters/dailyUseReporter.ts"],
-  ],
+  reporter: protectedLogMode
+    ? [["./e2e/reporters/dailyUseReporter.ts"]]
+    : [
+        ["list"],
+        ["html", { open: "never" }],
+        ["./e2e/reporters/dailyUseReporter.ts"],
+      ],
   use: {
-    screenshot: "only-on-failure",
-    trace: "retain-on-failure",
-    video: "retain-on-failure",
+    screenshot: protectedLogMode ? "off" : "only-on-failure",
+    trace: protectedLogMode ? "off" : "retain-on-failure",
+    video: protectedLogMode ? "off" : "retain-on-failure",
   },
   projects: [
     {

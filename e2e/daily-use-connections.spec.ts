@@ -136,6 +136,172 @@ test.describe("daily-use connections and setup", () => {
     }
   });
 
+  test("readiness exposes accessible next actions and cloud-first model guidance", async () => {
+    let harness: NativeObsidianHarness | null = null;
+    const continuationCommand = "continue run run-e2e-readiness-action";
+    try {
+      harness = await startNativeObsidianHarness({
+        label: "daily-use-accessible-readiness-actions",
+        corePluginDataOverrides: {
+          modelProvider: "ollama",
+        },
+        setup: setupDailyUsePage,
+      });
+      const page = harness.page;
+      await page.evaluate(
+        async ({ pluginId, continuationCommand }) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const plugin = app?.plugins?.plugins?.[pluginId];
+          if (!plugin) throw new Error("Agentic Researcher plugin is unavailable.");
+          plugin.__e2eOriginalCapabilityReadiness = plugin.getCapabilityReadiness;
+          plugin.getCapabilityReadiness = () =>
+            plugin.__e2eOriginalCapabilityReadiness.call(plugin).map(
+              (row: Record<string, unknown>) => {
+                if (row.id === "code") {
+                  return {
+                    ...row,
+                    status: "Available",
+                    nextAction: "Bind a repository",
+                  };
+                }
+                if (row.id === "browser") {
+                  return {
+                    ...row,
+                    status: "Available",
+                    nextAction: "Use web research",
+                  };
+                }
+                if (row.id === "github") {
+                  return {
+                    ...row,
+                    status: "Available",
+                    nextAction: "Bind a private repository",
+                  };
+                }
+                if (row.id === "background") {
+                  return {
+                    ...row,
+                    status: "Setup needed",
+                    nextAction: "Connect and test Companion",
+                  };
+                }
+                return row;
+              },
+            );
+          await plugin.openCapabilitySetup("code", {
+            runId: "run-e2e-readiness-action",
+            continuationCommand,
+            reason: "Preserve this exact continuation while opening Chat.",
+          });
+        },
+        { pluginId: NATIVE_CORE_PLUGIN_ID, continuationCommand },
+      );
+
+      const settings = page.locator(".agentic-researcher-settings");
+      await expect(settings).toBeVisible();
+      const modelInput = settings.getByRole("textbox", {
+        name: "Ollama model tag",
+      });
+      await expect(modelInput).toHaveAttribute(
+        "aria-describedby",
+        "agentic-settings-model-help",
+      );
+      const modelHelp = settings.locator("#agentic-settings-model-help");
+      await expect(modelHelp).toContainText(
+        "Catalog and account availability are authoritative",
+      );
+      await expect(modelHelp).toContainText("no model is selected automatically");
+      await expect(
+        modelHelp.getByRole("link", { name: "Ollama Cloud + Thinking catalog" }),
+      ).toHaveAttribute("href", "https://ollama.com/search?c=cloud&c=thinking");
+
+      const readiness = settings.locator(".agentic-settings-readiness");
+      const runtimeRows = await page.evaluate((pluginId) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        return plugin?.getCapabilityReadiness?.() ?? [];
+      }, NATIVE_CORE_PLUGIN_ID);
+      await expect(
+        readiness.locator("button.agentic-settings-readiness-item"),
+      ).toHaveCount(runtimeRows.length);
+      for (const row of runtimeRows as Array<{
+        id: string;
+        name: string;
+        nextAction: string;
+      }>) {
+        const card = readiness
+          .locator(`button.agentic-settings-readiness-item`)
+          .filter({ hasText: row.name })
+          .first();
+        await expect(card).toBeVisible();
+        expect(await card.getAttribute("aria-label")).toContain(
+          `Next action: ${row.nextAction}.`,
+        );
+        await expect(
+          card.locator(".agentic-settings-readiness-action"),
+        ).toContainText(row.nextAction);
+      }
+
+      const backgroundCard = readiness
+        .locator("button.agentic-settings-readiness-item")
+        .filter({ hasText: "Background work" });
+      await expect(backgroundCard).toHaveAttribute(
+        "data-action-destination",
+        "settings",
+      );
+      await backgroundCard.click();
+      await expect(
+        settings.locator("#agentic-settings-connections"),
+      ).toHaveJSProperty("open", true);
+
+      for (const name of ["Code", "Web research", "GitHub"]) {
+        const card = readiness
+          .locator("button.agentic-settings-readiness-item")
+          .filter({ hasText: name });
+        await expect(card).toHaveAttribute("data-action-destination", "chat");
+        await expect(
+          card.locator(".agentic-settings-readiness-action"),
+        ).toContainText("Open Chat");
+      }
+
+      await readiness
+        .locator("button.agentic-settings-readiness-item")
+        .filter({ hasText: "Code" })
+        .click();
+      await expect(settings).toHaveCount(0, { timeout: 10_000 });
+      await expect(page.getByRole("tab", { name: "Chat" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      const pending = await page.evaluate((pluginId) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        return plugin?.getPendingCapabilityResume?.() ?? null;
+      }, NATIVE_CORE_PLUGIN_ID);
+      expect(pending).toEqual(
+        expect.objectContaining({
+          runId: "run-e2e-readiness-action",
+          continuationCommand,
+          target: "code",
+        }),
+      );
+    } finally {
+      await harness?.page.evaluate((pluginId) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        if (plugin?.__e2eOriginalCapabilityReadiness) {
+          plugin.getCapabilityReadiness = plugin.__e2eOriginalCapabilityReadiness;
+          delete plugin.__e2eOriginalCapabilityReadiness;
+        }
+        plugin?.clearPendingCapabilityResume?.();
+      }, NATIVE_CORE_PLUGIN_ID).catch(() => undefined);
+      if (harness) {
+        await closeObsidianSettings(harness.page).catch(() => undefined);
+      }
+      await harness?.close();
+    }
+  });
+
   test("first-run model setup returns to Chat and removes the empty state only after a successful probe", async () => {
     let harness: NativeObsidianHarness | null = null;
     try {

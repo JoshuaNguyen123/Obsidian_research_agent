@@ -52,9 +52,8 @@ Thumbs.db
 /data.json
 
 # Local-only planning, agent, and skill context
-/[Aa][Gg][Ee][Nn][Tt][Ss].md
-AGENTS.local.md
-agents.local.md
+[Aa][Gg][Ee][Nn][Tt][Ss].md
+[Aa][Gg][Ee][Nn][Tt][Ss].local.md
 skills/
 .agents/
 .codex/
@@ -65,6 +64,7 @@ skills/
 /blob-report/
 /playwright/.cache/
 /playwright/.auth/
+/.agentic-proof/
 
 # Local companion service runtime
 companion/.venv/

@@ -65,8 +65,7 @@ $runtimeDigest = (& wsl.exe --distribution $TargetDistribution --user root --exe
 if ($LASTEXITCODE -ne 0 -or $runtimeDigest -notmatch '^sha256:[a-f0-9]{64}$') {
   throw "Unable to fingerprint the complete immutable sandbox runtime bundle."
 }
-$manifest = @{ version = 1; commandRuntimeDigests = @{ $runtimeDigest = @("node", "npm", "python", "python3") } } | ConvertTo-Json -Compress -Depth 5
-Invoke-Wsl @("--distribution", $TargetDistribution, "--user", "root", "--exec", "bash", $runtimeSetupLinux, "identity", $RuntimeRoot, $runtimeDigest, $manifest)
+Invoke-Wsl @("--distribution", $TargetDistribution, "--user", "root", "--exec", "bash", $runtimeSetupLinux, "identity", $RuntimeRoot, $runtimeDigest)
 
 $environmentValues = [ordered]@{
   AGENTIC_SANDBOX_CI_EXECUTABLE = "wsl.exe"

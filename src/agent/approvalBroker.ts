@@ -82,8 +82,13 @@ export class ApprovalBroker {
         // Async listeners are a durability barrier: an instant UI approval
         // cannot authorize the tool until pending approval state is persisted.
         await options.onRequest?.(cloneApprovalRequest(approvalRequest));
-      } catch {
-        settleDecision("denied");
+      } catch (error) {
+        // A UI/persistence listener failure is not a user denial. Settle the
+        // pending request before surfacing the infrastructure error so the
+        // graph can record an aborted approval without leaking a live timer.
+        settleDecision("aborted");
+        await decisionPromise;
+        throw error;
       }
     }
 

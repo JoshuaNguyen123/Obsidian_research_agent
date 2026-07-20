@@ -46,6 +46,28 @@ test("approval broker expires unresolved requests", async () => {
   assert.equal(decision, "expired");
 });
 
+test("approval presentation failure aborts instead of fabricating a denial", async () => {
+  const broker = new ApprovalBroker();
+  await assert.rejects(
+    broker.request(
+      {
+        runId: "run-presentation-failure",
+        toolName: "code_validate_fast",
+        action: "validate workspace",
+        reason: "Sandbox execution requires exact approval.",
+        policyTags: ["sandbox_execution"],
+      },
+      {
+        onRequest: () => {
+          throw new Error("approval surface unavailable");
+        },
+      },
+    ),
+    /approval surface unavailable/u,
+  );
+  assert.deepEqual(broker.getPending(), []);
+});
+
 test("approval cannot settle before async request persistence completes", async () => {
   const broker = new ApprovalBroker();
   let releasePersistence!: () => void;

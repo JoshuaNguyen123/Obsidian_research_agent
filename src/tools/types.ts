@@ -184,9 +184,10 @@ export interface AgentRuntimeCache {
    */
   verifiedWorkspaceReads?: Map<string, VerifiedWorkspaceReadObservation>;
   /**
-   * Latest already-redacted fast-validation excerpt for the active run only.
-   * It is never serialized and exists solely so loop-context compaction cannot
-   * remove the evidence needed by the next bounded repair turn.
+   * Latest already-redacted fast-validation excerpt for the active segment.
+   * The cache itself is never serialized; a continuation may rehydrate it only
+   * from a canonical committed receipt with verified readback so compaction or
+   * restart cannot remove the evidence needed by the next bounded repair turn.
    */
   latestFastValidationDiagnostic?: CodeValidationDiagnosticObservation;
   /** First validated accepted-research request for a run/path; retries cannot rewrite it. */

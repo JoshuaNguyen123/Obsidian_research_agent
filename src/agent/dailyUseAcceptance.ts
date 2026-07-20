@@ -54,6 +54,7 @@ export const DAILY_USE_ACCEPTANCE_V1: Readonly<
       "evidence:persisted_passages",
       "receipt:single_append",
       "research:conflicts_visible",
+      "research:cache_reuse",
     ],
     finalBindings: ["citation:fetched_source"],
   }),

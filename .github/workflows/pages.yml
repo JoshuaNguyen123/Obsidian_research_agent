@@ -1,12 +1,8 @@
 name: Publish public site
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "public-site/**"
-      - ".github/workflows/pages.yml"
+  # Manual-only so a normal source push never queues the owner's personal
+  # self-hosted runner. Deploy after reviewing the static artifact.
   workflow_dispatch:
 
 permissions:
@@ -20,6 +16,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -28,7 +25,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify exact trusted main tip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $trusted = (git rev-parse refs/remotes/origin/main).Trim().ToLowerInvariant()
+          if ($actual -ne $trusted -or $actual -ne "${{ github.sha }}") {
+            throw "Pages publication accepts only the exact trusted origin/main tip."
+          }
       - name: Configure Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - name: Archive static site

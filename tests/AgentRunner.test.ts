@@ -2,23 +2,33 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_AGENT_STEPS,
+  applyExactWorkspaceCorrectionReplacements,
+  applyExactWorkspaceLineRangeCorrections,
   attachGroundedPassageCitations,
   bindAuthoritativeGraphCodeValidation,
+  bindExactWorkspaceDestinationToolSchemas,
+  bindIncompleteWorkspaceReplacementToVerifiedNoop,
+  isIncompleteWorkspaceReplacementContent,
+  bindVerifiedWorkspaceCreateFile,
   bindVerifiedWorkspaceRead,
   bindVerifiedWorkspaceWriteExpected,
   buildObservedMissionGraphFrontierBinding,
+  buildValidatorFailureSourceContext,
   buildMissionGraphFrontierTurnContext,
   canonicalMissionGraphId,
   countOutstandingMissionGraphToolActions,
+  countReadyMissionGraphToolSlots,
   constrainToolsToMissionGraphFrontier,
   constrainOrchestratedHandoffTools,
   ensureResearchSourceLoopBudget,
   ensureRequiredWriteLoopBudget,
   executePreparedToolWithMetrics,
   extractExactMarkdownReplacementPayload,
+  findExactGraphBoundToolCallIndex,
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
   getExplicitLinearReadToolNames,
+  getDiagnosticSelectedWorkspaceCorrectionPaths,
   getLatestFastValidationDiagnostic,
   getVerifiedWorkspaceReadObservation,
   getVerifiedWorkspaceReadRefreshBinding,
@@ -32,18 +42,21 @@ import {
   getDurablyProvenCompletedGraphToolNames,
   getRestorableCompletedGraphToolNames,
   hasPreparedBackgroundCodeValidationCommitIntent,
+  hasIgnoreRememberedContextIntent,
   insertExplicitLinearReadbacksIntoLifecycleToolNames,
   isTerminalMissionGraphBlocker,
   resolveLinearIssueReadbackBinding,
   resolveThinkingMode,
   rememberVerifiedWorkspaceReadResult,
   rememberLatestFastValidationDiagnostic,
+  restoreLatestFastValidationDiagnosticFromReceipts,
   reconcileOutstandingMissionGraphToolStepBudget,
   resolveMissionGraphExecutionProofContractV1,
   restoreTrustedWebFetchResultsFromEvidence,
   runAgentMission,
   sanitizeAssistantContent,
   shouldDeferAdditionalProjectLifecycleMutation,
+  shouldDeferAdditionalWorkspaceCorrection,
   buildStreamingWritebackPromptForTests,
   type AgentRunCompleteEvent,
   type AgentRunConfigEvent,
@@ -877,6 +890,545 @@ test("authoritative graph writes remain required when router-derived writes are 
   ]);
 });
 
+test("remembered research context can be suppressed for one mission in plain language", () => {
+  assert.equal(
+    hasIgnoreRememberedContextIntent(
+      "Research checkers, but ignore remembered context for this mission.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasIgnoreRememberedContextIntent(
+      "Use remembered research context and verify it against fresh sources.",
+    ),
+    false,
+  );
+});
+
+test("exact graph parallel reads cannot reserve duplicate calls against one ready slot", () => {
+  const graph = {
+    nodes: {
+      current: {
+        status: "ready",
+        allowedTools: ["code_workspace_read"],
+      },
+      later: {
+        status: "queued",
+        allowedTools: ["code_workspace_read"],
+      },
+    },
+  } as never;
+
+  assert.equal(
+    countReadyMissionGraphToolSlots(graph, "code_workspace_read"),
+    1,
+  );
+});
+
+test("same-response workspace creates select the exact current graph destination", () => {
+  const calls: ModelToolCall[] = [
+    {
+      name: "code_workspace_create_file",
+      arguments: { path: "checkers/game.py", content: "game" },
+    },
+    {
+      name: "code_workspace_create_file",
+      arguments: { path: "README.md", content: "readme" },
+    },
+  ];
+  assert.equal(
+    findExactGraphBoundToolCallIndex(
+      calls,
+      0,
+      "code_workspace_create_file",
+      "README.md",
+    ),
+    1,
+  );
+  assert.equal(
+    findExactGraphBoundToolCallIndex(
+      calls,
+      0,
+      "code_workspace_create_file",
+      "tests/test_checkers.py",
+    ),
+    -1,
+  );
+});
+
+test("exact workspace frontier exposes only its authoritative path in tool schema", () => {
+  const definitions = [{
+    type: "function" as const,
+    function: {
+      name: "code_workspace_create_file",
+      parameters: {
+        type: "object",
+        properties: {
+          workspaceId: { type: "string" },
+          path: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["workspaceId", "path", "content"],
+      },
+    },
+  }];
+  const graph = {
+    nodes: {
+      createReadme: {
+        status: "ready",
+        allowedTools: ["code_workspace_create_file"],
+        destination: { selector: "README.md" },
+      },
+    },
+  } as never;
+  const bound = bindExactWorkspaceDestinationToolSchemas(definitions, graph);
+  assert.deepEqual(
+    bound[0]?.function.parameters.properties?.path?.enum,
+    ["README.md"],
+  );
+  assert.deepEqual(
+    definitions[0]?.function.parameters.properties?.path,
+    { type: "string" },
+    "schema binding must not mutate the shared registry definition",
+  );
+});
+
+test("exact hash-bound correction schema requires complete replacement content", () => {
+  const definitions = [{
+    type: "function" as const,
+    function: {
+      name: "code_workspace_write_expected",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["path", "content"],
+      },
+    },
+  }];
+  const graph = {
+    nodes: {
+      repairGame: {
+        status: "ready",
+        allowedTools: ["code_workspace_write_expected"],
+        destination: { selector: "checkers/game.py" },
+      },
+    },
+  } as never;
+  const bound = bindExactWorkspaceDestinationToolSchemas(definitions, graph);
+  assert.match(
+    String(
+      bound[0]?.function.parameters.properties?.content?.description ?? "",
+    ),
+    /complete replacement content/iu,
+  );
+  assert.equal(
+    (definitions[0]?.function.parameters.properties?.content as {
+      description?: string;
+    })?.description,
+    undefined,
+    "schema binding must not mutate the registry content schema",
+  );
+});
+
+test("red diagnostic switches only its exact correction target to localized patches", () => {
+  const definitions = [{
+    type: "function" as const,
+    function: {
+      name: "code_workspace_write_expected",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["path", "content"],
+      },
+    },
+  }];
+  const graph = {
+    nodes: {
+      repairGame: {
+        status: "ready",
+        allowedTools: ["code_workspace_write_expected"],
+        destination: { selector: "checkers/game.py" },
+      },
+    },
+  } as never;
+  const bound = bindExactWorkspaceDestinationToolSchemas(
+    definitions,
+    graph,
+    {
+      stdout: "",
+      stderr:
+        "ImportError: cannot import name 'CheckersGame' from 'checkers.game' (/workspace/checkers/game.py)",
+      truncated: false,
+      redactedLines: 0,
+    },
+  );
+  assert.equal(
+    bound[0]?.function.parameters.properties?.content,
+    undefined,
+  );
+  assert.ok(bound[0]?.function.parameters.properties?.lineReplacements);
+  assert.deepEqual(
+    bound[0]?.function.parameters.required,
+    ["path", "lineReplacements"],
+  );
+  assert.ok(definitions[0]?.function.parameters.properties.content);
+});
+
+test("unselected or ambiguous validator evidence exposes preservation only", () => {
+  const definitions = [{
+    type: "function" as const,
+    function: {
+      name: "code_workspace_write_expected",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["path", "content"],
+      },
+    },
+  }];
+  const graph = {
+    nodes: {
+      repairReadme: {
+        status: "ready",
+        allowedTools: ["code_workspace_write_expected"],
+        destination: { selector: "README.md" },
+      },
+      repairBoard: {
+        status: "queued",
+        allowedTools: ["code_workspace_write_expected"],
+        destination: { selector: "src/board.ts" },
+      },
+      repairGame: {
+        status: "queued",
+        allowedTools: ["code_workspace_write_expected"],
+        destination: { selector: "src/game.ts" },
+      },
+    },
+  } as never;
+  const bound = bindExactWorkspaceDestinationToolSchemas(
+    definitions,
+    graph,
+    {
+      stdout: "",
+      stderr: "AssertionError: protected behavior mismatch",
+      truncated: false,
+      redactedLines: 0,
+    },
+  );
+  assert.equal(bound[0]?.function.parameters.properties?.content, undefined);
+  assert.equal(
+    bound[0]?.function.parameters.properties?.lineReplacements,
+    undefined,
+  );
+  assert.deepEqual(
+    bound[0]?.function.parameters.properties?.preserveCurrent?.enum,
+    [true],
+  );
+  assert.deepEqual(
+    bound[0]?.function.parameters.required,
+    ["path", "preserveCurrent"],
+  );
+});
+
+test("localized correction materializes against the complete SHA-read file", () => {
+  const current = [
+    "RED = 'r'",
+    "BLACK = 'b'",
+    "",
+    "class CheckersGame:",
+    "    def winner(self):",
+    "        return None",
+    "",
+  ].join("\n");
+  const next = applyExactWorkspaceCorrectionReplacements(current, [{
+    oldText: "    def winner(self):\n        return None",
+    newText: "    def winner(self):\n        return BLACK",
+    expectedOccurrences: 1,
+  }]);
+  assert.equal(
+    next,
+    current.replace("return None", "return BLACK"),
+  );
+  assert.match(next ?? "", /class CheckersGame/u);
+  assert.match(next ?? "", /RED = 'r'/u);
+  assert.equal(
+    applyExactWorkspaceCorrectionReplacements("same\nsame\n", [{
+      oldText: "same",
+      newText: "changed",
+    }]),
+    null,
+    "ambiguous text must fail closed instead of patching the first match",
+  );
+  assert.equal(
+    applyExactWorkspaceCorrectionReplacements("same\nsame\n", [{
+      oldText: "same",
+      newText: "changed",
+      expectedOccurrences: 2,
+    }]),
+    "changed\nchanged\n",
+    "an explicit bounded count permits the exact repeated correction",
+  );
+  assert.equal(
+    applyExactWorkspaceCorrectionReplacements("same\nsame\n", [{
+      oldText: "same",
+      newText: "changed",
+      expectedOccurrences: 3,
+    }]),
+    null,
+    "an incorrect declared count must fail closed",
+  );
+  assert.equal(
+    applyExactWorkspaceCorrectionReplacements("same\n", [{
+      oldText: "same",
+      newText: "changed",
+      expectedOccurrences: 13,
+    }]),
+    null,
+    "the declared count remains bounded",
+  );
+});
+
+test("SHA-bound line-range correction preserves bytes outside non-overlapping ranges", () => {
+  const current = [
+    "RED = 'r'",
+    "",
+    "class CheckersGame:",
+    "    def legal_moves(self):",
+    "        return self._multi_jump_endpoints()",
+    "",
+    "    def apply_move(self, start, end):",
+    "        return None",
+    "",
+  ].join("\n");
+  const next = applyExactWorkspaceLineRangeCorrections(current, [{
+    startLine: 4,
+    endLine: 5,
+    newText: [
+      "    def legal_moves(self):",
+      "        return self._next_capture_hops()",
+    ].join("\n"),
+  }]);
+  assert.equal(
+    next,
+    current.replace("self._multi_jump_endpoints()", "self._next_capture_hops()"),
+  );
+  assert.match(next ?? "", /^RED = 'r'/u);
+  assert.match(next ?? "", /def apply_move/u);
+  assert.equal(
+    applyExactWorkspaceLineRangeCorrections(current, [{
+      startLine: 4,
+      endLine: 6,
+      newText: "    def legal_moves(self):\n        return []",
+    }, {
+      startLine: 6,
+      endLine: 7,
+      newText: "    def apply_move(self, start, end):\n        return None",
+    }]),
+    null,
+    "overlapping ranges must fail closed",
+  );
+  assert.equal(
+    applyExactWorkspaceLineRangeCorrections(current, [{
+      startLine: 0,
+      endLine: 1,
+      newText: "unsafe",
+    }]),
+    null,
+    "out-of-bounds ranges must fail closed",
+  );
+  assert.equal(
+    applyExactWorkspaceLineRangeCorrections(current, [{
+      startLine: 1.5,
+      endLine: 2,
+      newText: "unsafe",
+    }]),
+    null,
+    "fractional line numbers must fail closed",
+  );
+  assert.equal(
+    applyExactWorkspaceLineRangeCorrections(current, [{
+      startLine: 1,
+      endLine: 1,
+      newText: "RED = 'r'",
+    }]),
+    null,
+    "a byte-identical selected correction must not masquerade as progress",
+  );
+  const crlf = "alpha\r\nbeta\r\ngamma\r\n";
+  assert.equal(
+    applyExactWorkspaceLineRangeCorrections(crlf, [{
+      startLine: 2,
+      endLine: 2,
+      newText: "BETA",
+    }]),
+    "alpha\r\nBETA\r\ngamma\r\n",
+    "line-range edits preserve CRLF and the trailing EOF newline",
+  );
+});
+
+test("hash-bound corrections classify only whole-payload omitted-content stubs", () => {
+  for (const value of [
+    "",
+    "placeholder",
+    "# TODO",
+    "/* implementation omitted */",
+    "```python\npass\n```",
+    "same as above",
+    undefined,
+  ]) {
+    assert.equal(
+      isIncompleteWorkspaceReplacementContent(value),
+      true,
+      `expected incomplete replacement: ${String(value)}`,
+    );
+  }
+  for (const value of [
+    "placeholder = None\n",
+    "def main():\n    pass\n",
+    "# TODO: add animation\nexport function play() { return true; }\n",
+    "Complete source content.",
+  ]) {
+    assert.equal(
+      isIncompleteWorkspaceReplacementContent(value),
+      false,
+      `expected complete replacement: ${value}`,
+    );
+  }
+});
+
+test("omitted-content repair shorthand becomes only a verified byte-identical no-op", () => {
+  const observation = {
+    workspaceId: "verified-workspace",
+    path: "checkers/__init__.py",
+    sha256: `sha256:${"a".repeat(64)}`,
+    content: "from .game import CheckersGame\n",
+  };
+  const bound = bindIncompleteWorkspaceReplacementToVerifiedNoop(
+    {
+      name: "code_workspace_write_expected",
+      arguments: {
+        workspaceId: "model-workspace",
+        path: "checkers/__init__.py",
+        content: "placeholder",
+        replacements: [{
+          oldText: "not present",
+          newText: "unsafe",
+        }],
+        expectedSha256: `sha256:${"b".repeat(64)}`,
+      },
+    },
+    observation,
+  );
+  assert.deepEqual(bound.arguments, {
+    workspaceId: observation.workspaceId,
+    path: observation.path,
+    content: observation.content,
+    expectedSha256: observation.sha256,
+  });
+});
+
+test("graph-bound workspace creation keeps content but replaces workspace transcription", () => {
+  const bound = bindVerifiedWorkspaceCreateFile(
+    {
+      name: "code_workspace_create_file",
+      arguments: {
+        workspaceId: "model-transcribed",
+        path: "README.md",
+        content: "# Checkers",
+      },
+    },
+    "README.md",
+    [{
+      toolName: "code_workspace_create",
+      operation: "create",
+      message: "Created durable workspace.",
+      commitKind: "committed",
+      readback: {
+        status: "verified",
+        checkedAt: "2026-07-19T17:30:00.000Z",
+      },
+      resource: {
+        system: "workspace",
+        resourceType: "code_workspace",
+        id: "verified-workspace",
+        path: "verified-workspace",
+        workspaceId: "verified-workspace",
+      },
+    }],
+  );
+  assert.deepEqual(bound?.arguments, {
+    workspaceId: "verified-workspace",
+    path: "README.md",
+    content: "# Checkers",
+  });
+});
+
+test("graph-bound workspace creation discards a stale or unsafe model path", () => {
+  const bound = bindVerifiedWorkspaceCreateFile(
+    {
+      name: "code_workspace_create_file",
+      arguments: {
+        workspaceId: "model-transcribed",
+        path: "C:\\unsafe\\stale.py",
+        content: "from unittest import TestCase\n",
+      },
+    },
+    "tests/test_checkers.py",
+    [{
+      toolName: "code_workspace_create",
+      operation: "create",
+      message: "Created durable workspace.",
+      commitKind: "committed",
+      readback: {
+        status: "verified",
+        checkedAt: "2026-07-19T19:45:00.000Z",
+      },
+      resource: {
+        system: "workspace",
+        resourceType: "code_workspace",
+        id: "verified-workspace",
+        path: "verified-workspace",
+        workspaceId: "verified-workspace",
+      },
+    }],
+  );
+  assert.deepEqual(bound?.arguments, {
+    workspaceId: "verified-workspace",
+    path: "tests/test_checkers.py",
+    content: "from unittest import TestCase\n",
+  });
+});
+
+test("hash-bound workspace corrections require fresh per-target provider turns", () => {
+  assert.equal(
+    shouldDeferAdditionalWorkspaceCorrection(
+      "code_workspace_write_expected",
+      false,
+    ),
+    false,
+  );
+  assert.equal(
+    shouldDeferAdditionalWorkspaceCorrection(
+      "code_workspace_write_expected",
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    shouldDeferAdditionalWorkspaceCorrection("code_workspace_read", true),
+    false,
+  );
+});
+
 test("composite lifecycle frontier exposes only its durable current action and selector", () => {
   const lifecycleNode = {
     id: "lifecycle-code_execution",
@@ -1000,6 +1552,18 @@ test("composite lifecycle frontier exposes only its durable current action and s
       nodes: [{ ...lifecycleNode, outputs: {} }],
     }),
     1,
+  );
+  assert.equal(
+    reconcileOutstandingMissionGraphToolStepBudget({
+      hardCap: 80,
+      finalizationReserve: 4,
+      toolStepBudget: 5,
+      nodes: Array.from({ length: 38 }, (_unused, index) => ({
+        ...conventionalNode,
+        id: `bounded-repair-${index}`,
+      })),
+    }),
+    54,
   );
 
   const receipt: AgentRunReceipt = {
@@ -4253,6 +4817,18 @@ test("workspace correction frontiers bind exact reads, hashes, content, and Line
   assert.match(binding ?? "", /test\/math\.test\.mjs must import node:test/u);
   assert.match(binding ?? "", /ORIGINAL USER MISSION REQUIREMENTS/u);
   assert.match(binding ?? "", /the test must use node:test/u);
+  assert.match(
+    binding ?? "",
+    /If a self-authored test conflicts with those authorities, correct the test instead/u,
+  );
+  assert.match(binding ?? "", /Never weaken or rewrite a protected control file/u);
+  assert.match(binding ?? "", /AUTHORITATIVE CURRENT TARGET "README\.md"/u);
+  assert.match(binding ?? "", /A module must never import itself/u);
+  assert.match(binding ?? "", /preserve the current content byte-for-byte/u);
+  assert.ok(
+    (binding ?? "").lastIndexOf('currentContent="# Checkers\\n"') >
+      (binding ?? "").indexOf("BOUNDED UNTRUSTED SUPPORTING READ CONTEXT"),
+  );
 });
 
 test("workspace correction preserves the verified read binding after transcript compaction", () => {
@@ -4412,6 +4988,201 @@ test("workspace correction preserves the redacted fast diagnostic after transcri
       output: { status: "verified" },
     },
   );
+  assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
+});
+
+test("workspace correction surfaces the bounded protected assertion around a traceback line", () => {
+  const verifier = [
+    "from checkers.game import CheckersGame",
+    "",
+    ...Array.from({ length: 18 }, (_, index) => `# contract ${index + 1}`),
+    "assert all(",
+    "    piece is None or (row_index + column_index) % 2 == 1",
+    "    for row_index, row in enumerate(CheckersGame.initial().board)",
+    "    for column_index, piece in enumerate(row)",
+    ")",
+  ].join("\n");
+  const supporting = [{
+    workspaceId: "du03-workspace",
+    path: "scripts/verify_project.py",
+    sha256: `sha256:${"d".repeat(64)}`,
+    content: verifier,
+  }];
+  const diagnostic = {
+    stdout: "",
+    stderr: [
+      "Traceback (most recent call last):",
+      '  File "/workspace/scripts/verify_project.py", line 21, in <module>',
+      "    assert all(",
+      "AssertionError",
+    ].join("\n"),
+    truncated: false,
+    redactedLines: 0,
+  };
+  const excerpt = buildValidatorFailureSourceContext(
+    diagnostic.stdout,
+    diagnostic.stderr,
+    supporting,
+  );
+  assert.match(excerpt, /scripts\/verify_project\.py/u);
+  assert.match(excerpt, /failingLine=21/u);
+  assert.match(excerpt, /21\|assert all\(/u);
+  assert.match(excerpt, /row_index \+ column_index/u);
+
+  const binding = buildObservedMissionGraphFrontierBinding(
+    [],
+    [{
+      type: "function",
+      function: {
+        name: "code_workspace_write_expected",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    [],
+    "checkers/game.py",
+    null,
+    {
+      workspaceId: "du03-workspace",
+      path: "checkers/game.py",
+      sha256: `sha256:${"a".repeat(64)}`,
+      content: "class CheckersGame:\n    pass\n",
+    },
+    supporting,
+    "Place pieces on playable dark squares.",
+    diagnostic,
+  );
+  assert.match(binding ?? "", /BOUNDED UNTRUSTED FAILING VALIDATOR SOURCE CONTEXT/u);
+  assert.match(binding ?? "", /row_index \+ column_index/u);
+});
+
+test("workspace correction preserves both ends of a bounded fast-validation diagnostic", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  rememberLatestFastValidationDiagnostic(
+    runtimeCache,
+    "code_validate_fast",
+    {
+      ok: true,
+      toolName: "code_validate_fast",
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          version: 1,
+          stdout: "",
+          stderr: `FIRST_ASSERTION\n${"x".repeat(8_000)}\nFINAL_TRACEBACK`,
+          truncated: false,
+          redactedLines: 0,
+        },
+      },
+    },
+  );
+  const diagnostic = getLatestFastValidationDiagnostic(runtimeCache);
+  assert.ok(diagnostic);
+  assert.equal(diagnostic.truncated, true);
+  assert.ok(diagnostic.stderr.length <= 6_000);
+  assert.match(diagnostic.stderr, /FIRST_ASSERTION/u);
+  assert.match(diagnostic.stderr, /bounded diagnostic middle omitted/u);
+  assert.match(diagnostic.stderr, /FINAL_TRACEBACK/u);
+});
+
+test("durable continuation restores the latest verified fast-validation diagnostic", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  const canonical = {
+    version: 1 as const,
+    toolName: "code_validate_fast",
+    actionId: "validate-fast-action",
+    payloadFingerprint: `sha256:${"a".repeat(64)}`,
+    grantId: "validate-fast-grant",
+    commitKind: "committed" as const,
+    readback: {
+      status: "verified" as const,
+      checkedAt: "2026-07-19T08:00:00.000Z",
+    },
+  };
+  restoreLatestFastValidationDiagnosticFromReceipts(runtimeCache, [
+    {
+      ...canonical,
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          stdout: "",
+          stderr: "ImportError: cannot import name 'main' from 'checkers.cli'",
+          truncated: false,
+          redactedLines: 0,
+        },
+      },
+    },
+  ]);
+
+  assert.deepEqual(getLatestFastValidationDiagnostic(runtimeCache), {
+    stdout: "",
+    stderr: "ImportError: cannot import name 'main' from 'checkers.cli'",
+    truncated: false,
+    redactedLines: 0,
+  });
+});
+
+test("durable continuation does not revive an older validation failure", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  const canonical = {
+    version: 1 as const,
+    toolName: "code_validate_fast",
+    actionId: "validate-fast-action",
+    payloadFingerprint: `sha256:${"b".repeat(64)}`,
+    grantId: "validate-fast-grant",
+    commitKind: "reconciled" as const,
+    readback: {
+      status: "verified" as const,
+      checkedAt: "2026-07-19T08:05:00.000Z",
+    },
+  };
+  restoreLatestFastValidationDiagnosticFromReceipts(runtimeCache, [
+    {
+      ...canonical,
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          stdout: "old failure",
+          stderr: "",
+        },
+      },
+    },
+    {
+      ...canonical,
+      actionId: "validate-fast-action-2",
+      output: { status: "verified" },
+    },
+  ]);
+
+  assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
+});
+
+test("durable continuation ignores non-canonical validation evidence", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  restoreLatestFastValidationDiagnosticFromReceipts(runtimeCache, [
+    {
+      toolName: "code_validate_fast",
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          stdout: "unverified failure",
+          stderr: "",
+        },
+      },
+    },
+  ]);
+
   assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
 });
 
@@ -4617,6 +5388,190 @@ test("workspace correction retains the SHA-bound observation for an empty file",
       sha256,
       content: "",
     },
+  );
+});
+
+test("workspace correction narrows mutations to files named by validator evidence", () => {
+  const paths = [
+    "README.md",
+    "checkers/__init__.py",
+    "checkers/cli.py",
+    "checkers/game.py",
+    "tests/test_checkers.py",
+  ];
+  const graph = {
+    nodes: Object.fromEntries(
+      paths.map((path, index) => [
+        `write-${index}`,
+        {
+          id: `write-${index}`,
+          status: "queued",
+          allowedTools: ["code_workspace_write_expected"],
+          inputs: {},
+          destination: {
+            bindingId: "workspace-binding",
+            effect: "workspace_mutation",
+            selector: path,
+          },
+        },
+      ]),
+    ),
+  } as any;
+
+  assert.deepEqual(
+    getDiagnosticSelectedWorkspaceCorrectionPaths(graph, {
+      stdout: "",
+      stderr:
+        "ImportError: cannot import name 'main' from 'checkers.cli' (/workspace/checkers/cli.py)",
+      truncated: false,
+      redactedLines: 0,
+    }),
+    ["checkers/cli.py"],
+  );
+  assert.deepEqual(
+    getDiagnosticSelectedWorkspaceCorrectionPaths(graph, {
+      stdout: "",
+      stderr: [
+        'File "/workspace/checkers/__init__.py", line 3, in <module>',
+        "from .game import RED",
+        "ImportError: cannot import name 'RED' from 'checkers.game' (/workspace/checkers/game.py)",
+      ].join("\n"),
+      truncated: false,
+      redactedLines: 0,
+    }),
+    ["checkers/__init__.py", "checkers/game.py"],
+  );
+});
+
+test("workspace correction selects the sole implementation file for a pathless assertion", () => {
+  const graph = {
+    nodes: {
+      readme: {
+        id: "readme",
+        status: "ready",
+        allowedTools: ["code_workspace_write_expected"],
+        inputs: {},
+        destination: {
+          bindingId: "workspace-binding",
+          effect: "workspace_mutation",
+          selector: "README.md",
+        },
+      },
+      entrypoint: {
+        id: "entrypoint",
+        status: "queued",
+        allowedTools: ["code_workspace_write_expected"],
+        inputs: {},
+        destination: {
+          bindingId: "workspace-binding",
+          effect: "workspace_mutation",
+          selector: "src/index.ts",
+        },
+      },
+      implementation: {
+        id: "implementation",
+        status: "queued",
+        allowedTools: ["code_workspace_write_expected"],
+        inputs: {},
+        destination: {
+          bindingId: "workspace-binding",
+          effect: "workspace_mutation",
+          selector: "src/game.ts",
+        },
+      },
+      test: {
+        id: "test",
+        status: "queued",
+        allowedTools: ["code_workspace_write_expected"],
+        inputs: {},
+        destination: {
+          bindingId: "workspace-binding",
+          effect: "workspace_mutation",
+          selector: "tests/game.test.ts",
+        },
+      },
+    },
+  } as any;
+  assert.deepEqual(
+    getDiagnosticSelectedWorkspaceCorrectionPaths(graph, {
+      stdout: "protected contract failed",
+      stderr: "AssertionError: mandatory capture mismatch",
+      truncated: false,
+      redactedLines: 0,
+    }),
+    ["src/game.ts"],
+  );
+});
+
+test("workspace correction treats an assertion traceback test path as evidence, not the repair target", () => {
+  const paths = [
+    "README.md",
+    "checkers/__init__.py",
+    "checkers/game.py",
+    "tests/__init__.py",
+    "tests/test_checkers.py",
+  ];
+  const graph = {
+    nodes: Object.fromEntries(
+      paths.map((path, index) => [
+        `write-${index}`,
+        {
+          id: `write-${index}`,
+          status: index === 0 ? "ready" : "queued",
+          allowedTools: ["code_workspace_write_expected"],
+          inputs: {},
+          destination: {
+            bindingId: "workspace-binding",
+            effect: "workspace_mutation",
+            selector: path,
+          },
+        },
+      ]),
+    ),
+  } as any;
+
+  assert.deepEqual(
+    getDiagnosticSelectedWorkspaceCorrectionPaths(graph, {
+      stdout: "",
+      stderr: [
+        "FAIL: test_multi_jump (test_checkers.TestCheckersGame.test_multi_jump)",
+        '  File "/workspace/tests/test_checkers.py", line 55, in test_multi_jump',
+        "AssertionError: ((5, 0), (1, 4)) not found in [((5, 0), (3, 2))]",
+      ].join("\n"),
+      truncated: false,
+      redactedLines: 0,
+    }),
+    ["checkers/game.py"],
+  );
+});
+
+test("workspace correction does not guess between multiple pathless implementation targets", () => {
+  const graph = {
+    nodes: Object.fromEntries(
+      ["src/board.ts", "src/game.ts"].map((selector, index) => [
+        `write-${index}`,
+        {
+          id: `write-${index}`,
+          status: index === 0 ? "ready" : "queued",
+          allowedTools: ["code_workspace_write_expected"],
+          inputs: {},
+          destination: {
+            bindingId: "workspace-binding",
+            effect: "workspace_mutation",
+            selector,
+          },
+        },
+      ]),
+    ),
+  } as any;
+  assert.deepEqual(
+    getDiagnosticSelectedWorkspaceCorrectionPaths(graph, {
+      stdout: "",
+      stderr: "AssertionError: legal move mismatch",
+      truncated: false,
+      redactedLines: 0,
+    }),
+    [],
   );
 });
 
@@ -9555,6 +10510,12 @@ test("auto thinking resolves known model families and omits unknown models", () 
   );
   assert.equal(
     resolveThinkingMode(createRunnerSettings({ model: "deepseek-v3.1:671b" })),
+    true,
+  );
+  assert.equal(
+    resolveThinkingMode(
+      createRunnerSettings({ model: "kimi-k2.7-code:cloud" }),
+    ),
     true,
   );
   assert.equal(

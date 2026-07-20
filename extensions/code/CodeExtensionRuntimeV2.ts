@@ -64,6 +64,7 @@ import {
   WorkspaceManagerV2,
   assertWorkspaceRelativePathV2,
   createVerifiedWorkspaceBaseReadbackV2,
+  type WorkspaceEntryMetadataV2,
 } from "./workspaces";
 import {
   DurableValidationReceiptRegistryV1,
@@ -104,6 +105,12 @@ const EXTENSION_ID = "agentic-researcher-code";
 const MAX_PROFILE_INVENTORY_ENTRIES = 20_000;
 const MAX_PROFILE_INVENTORY_DEPTH = 32;
 const MAX_PIN_BYTES = 64 * 1024;
+const MAX_SANDBOX_STAGING_FILES = 100;
+const MAX_SANDBOX_STAGING_FILE_BYTES = 2_000_000;
+const MAX_SANDBOX_STAGING_TOTAL_BYTES = 10_000_000;
+const MAX_SANDBOX_STAGING_DIRECTORIES = 256;
+const MAX_SANDBOX_STAGING_METADATA_ENTRIES = 2_000;
+const MAX_SANDBOX_STAGING_DEPTH = 32;
 const IGNORED_INVENTORY_DIRECTORIES = new Set([
   ".git",
   ".agent-backups",
@@ -385,6 +392,23 @@ export class CodeExtensionRuntimeV2 {
     await this.refreshMigratedProfiles();
     const key = boundedIdentifier(profileKey, "repository profile key");
     return this.requireState().repositoryProfiles[key]?.profile ?? null;
+  }
+
+  async getRepositoryProfileByRoot(
+    repositoryRoot: string,
+  ): Promise<RepositoryProfileV2 | null> {
+    await this.refreshMigratedProfiles();
+    const root = await canonicalSafeDirectory(repositoryRoot);
+    const matches = Object.values(this.requireState().repositoryProfiles)
+      .map((record) => record.profile)
+      .filter((profile) => samePath(profile.repositoryRoot, root));
+    if (matches.length > 1) {
+      throw new WorkspaceManagerErrorV2(
+        "repository_profile_binding_conflict",
+        "More than one trusted repository profile is bound to the exact canonical root.",
+      );
+    }
+    return matches[0] ?? null;
   }
 
   getRuntimeUnresolvedRepositoryProfileCount(): number {
@@ -739,7 +763,7 @@ export class CodeExtensionRuntimeV2 {
             expectedExistingSha256: declared.expectedExistingSha256,
             maxBytes: declared.maxBytes,
           };
-        }).sort((left, right) => left.path.localeCompare(right.path));
+        }).sort((left, right) => compareCanonicalText(left.path, right.path));
         if (new Set(prepared.map((artifact) => artifact.path)).size !== prepared.length) {
           throw new CodeSandboxContributionErrorV2(
             "sandbox_artifact_batch_invalid",
@@ -823,17 +847,26 @@ export class CodeExtensionRuntimeV2 {
     }
     const project = projects[0];
     const command = selectForegroundValidationCommand(profile, project.id, purpose);
-    const stagingManifest = Object.entries(manifest.hashes.files)
-      .filter(([relativePath]) =>
-        project.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath)) ||
-        profile.protectedControls.some((control) => pathAtOrBelow(control.path, relativePath)),
-      )
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([relativePath, evidence]) => ({
-        path: relativePath,
-        sha256: evidence.sha256,
-        bytes: evidence.bytes,
-      }));
+    const stagingManifest = await collectSandboxStagingManifest(
+      this.workspaceManager,
+      manifest.workspaceId,
+      [
+        ...project.allowedPaths,
+        ...profile.protectedControls.map((control) => control.path),
+      ],
+    );
+    for (const entry of stagingManifest) {
+      const tracked = manifest.hashes.files[entry.path];
+      if (
+        tracked &&
+        (tracked.sha256 !== entry.sha256 || tracked.bytes !== entry.bytes)
+      ) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_workspace_manifest_drift",
+          `Workspace hash index drifted before sandbox preparation: ${entry.path}.`,
+        );
+      }
+    }
     if (stagingManifest.length === 0) {
       throw new CodeSandboxContributionErrorV2(
         "sandbox_staging_empty",
@@ -1804,6 +1837,13 @@ export class ProfileAwareRepositoryProvisionerV2
     return this.runtime.getRepositoryProfile(profileKey);
   }
 
+  async resolveProfileByRoot(
+    repositoryRoot: string,
+    _context: ScopedExtensionContextV1,
+  ): Promise<RepositoryProfileV2 | null> {
+    return this.runtime.getRepositoryProfileByRoot(repositoryRoot);
+  }
+
   async redetectProfile(
     profileKey: string,
     workspaceId: string,
@@ -2361,6 +2401,159 @@ async function canonicalSafeDirectory(value: string): Promise<string> {
 
 function pathAtOrBelow(root: string, candidate: string): boolean {
   return root === "." || candidate === root || candidate.startsWith(`${root}/`);
+}
+
+async function collectSandboxStagingManifest(
+  manager: WorkspaceManagerV2,
+  workspaceId: string,
+  roots: readonly string[],
+): Promise<Array<{ path: string; sha256: string; bytes: number }>> {
+  const files = new Map<string, WorkspaceEntryMetadataV2>();
+  const visitedDirectories = new Set<string>();
+  const visitedMetadataEntries = new Set<string>();
+  let totalBytes = 0;
+
+  const assertTraversalDepth = (relativePath: string): void => {
+    const depth = relativePath ? relativePath.split("/").length : 0;
+    if (depth > MAX_SANDBOX_STAGING_DEPTH) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_depth_exceeded",
+        `Sandbox staging traversal exceeds depth ${MAX_SANDBOX_STAGING_DEPTH}: ${relativePath}.`,
+      );
+    }
+  };
+
+  const addFileMetadata = (entry: WorkspaceEntryMetadataV2): void => {
+    if (entry.kind !== "file") return;
+    const existing = files.get(entry.path);
+    if (existing) {
+      if (existing.bytes !== entry.bytes) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_staging_inventory_drift",
+          `Sandbox staging file size changed during bounded inventory: ${entry.path}.`,
+        );
+      }
+      return;
+    }
+    if (entry.bytes > MAX_SANDBOX_STAGING_FILE_BYTES) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_file_too_large",
+        `Sandbox staging file exceeds 2 MB: ${entry.path}.`,
+      );
+    }
+    if (files.size >= MAX_SANDBOX_STAGING_FILES) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_too_large",
+        "Sandbox staging scope exceeds 100 files.",
+      );
+    }
+    totalBytes += entry.bytes;
+    if (totalBytes > MAX_SANDBOX_STAGING_TOTAL_BYTES) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_too_large",
+        "Sandbox staging scope exceeds 10 MB.",
+      );
+    }
+    files.set(entry.path, entry);
+  };
+
+  const addMetadataEntry = (entry: WorkspaceEntryMetadataV2): void => {
+    assertTraversalDepth(entry.path);
+    if (visitedMetadataEntries.has(entry.path)) {
+      addFileMetadata(entry);
+      return;
+    }
+    if (visitedMetadataEntries.size >= MAX_SANDBOX_STAGING_METADATA_ENTRIES) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_too_large",
+        `Sandbox staging scope exceeds ${MAX_SANDBOX_STAGING_METADATA_ENTRIES} metadata entries.`,
+      );
+    }
+    visitedMetadataEntries.add(entry.path);
+    addFileMetadata(entry);
+  };
+
+  const visitDirectory = async (relativePath: string): Promise<void> => {
+    assertTraversalDepth(relativePath);
+    if (visitedDirectories.has(relativePath)) return;
+    if (visitedDirectories.size >= MAX_SANDBOX_STAGING_DIRECTORIES) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_too_large",
+        `Sandbox staging scope exceeds ${MAX_SANDBOX_STAGING_DIRECTORIES} directories.`,
+      );
+    }
+    visitedDirectories.add(relativePath);
+    const entries = await manager.listMetadata(workspaceId, relativePath);
+    if (entries.length >= 500) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_too_large",
+        `Sandbox staging directory reached the 500-entry read boundary: ${relativePath || "."}.`,
+      );
+    }
+    for (const entry of entries) {
+      addMetadataEntry(entry);
+      if (entry.kind === "file") {
+        continue;
+      }
+      const basename = entry.path.slice(entry.path.lastIndexOf("/") + 1).toLowerCase();
+      if (IGNORED_INVENTORY_DIRECTORIES.has(basename)) continue;
+      await visitDirectory(entry.path);
+    }
+  };
+
+  for (const root of [...new Set(roots)].sort(compareCanonicalText)) {
+    const relativeRoot = root === "."
+      ? ""
+      : assertWorkspaceRelativePathV2(root, "sandbox staging scope");
+    assertTraversalDepth(relativeRoot);
+    if (!relativeRoot) {
+      await visitDirectory("");
+      continue;
+    }
+    const observed = await manager.inspectMetadata(workspaceId, relativeRoot).catch((error) => {
+      if (
+        error instanceof WorkspaceManagerErrorV2 &&
+        (error.code === "path_not_found" || error.code === "parent_missing")
+      ) {
+        return null;
+      }
+      throw error;
+    });
+    if (!observed) continue;
+    addMetadataEntry(observed);
+    if (observed.kind === "directory") {
+      const basename = relativeRoot.slice(relativeRoot.lastIndexOf("/") + 1).toLowerCase();
+      if (!IGNORED_INVENTORY_DIRECTORIES.has(basename)) {
+        await visitDirectory(relativeRoot);
+      }
+    }
+  }
+
+  const manifest: Array<{ path: string; sha256: string; bytes: number }> = [];
+  for (const expected of [...files.values()].sort((left, right) =>
+    compareCanonicalText(left.path, right.path))) {
+    const observed = await manager.stat(workspaceId, expected.path);
+    if (
+      observed.kind !== "file" ||
+      observed.bytes !== expected.bytes ||
+      !observed.sha256
+    ) {
+      throw new CodeSandboxContributionErrorV2(
+        "sandbox_staging_inventory_drift",
+        `Sandbox staging file changed before hash-bound readback: ${expected.path}.`,
+      );
+    }
+    manifest.push({
+      path: observed.path,
+      sha256: observed.sha256,
+      bytes: observed.bytes,
+    });
+  }
+  return manifest;
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function selectForegroundValidationCommand(

@@ -35,6 +35,7 @@
     "test:e2e:daily-use:github": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=daily-use-github --grep=DU-05",
     "test:e2e:daily-use:compound": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-compound --grep=DU-06",
     "test:e2e:daily-use:checkers": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-compound --grep=\"DU-06 checkers\"",
+    "test:e2e:daily-use:checkers-code": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-compound --grep=\"DU-03 protected real-model Python checkers code stage\"",
     "setup:sandbox:wsl2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-wsl2-sandbox.ps1 -PersistUserEnvironment",
     "test:e2e:integration": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=integration-mock --project=integration-mock-legacy",
     "test:e2e:sandbox": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=daily-use-code",

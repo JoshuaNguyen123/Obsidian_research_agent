@@ -15,6 +15,8 @@ export interface ResearchHypothesis {
  * ranking). Content is treated as unverified prior memory, never as proof.
  */
 export interface ResearchMemorySearchHit {
+  recordId?: string;
+  sourceCategories?: Array<"note" | "public_url" | "receipt">;
   topic?: string;
   path?: string;
   content?: string;
@@ -74,6 +76,10 @@ export function selectHypothesisHitsFromIndex(
   return rankResearchMemoryEntries(entries, query)
     .slice(0, Math.max(1, limit))
     .map((entry) => ({
+      recordId: entry.id,
+      sourceCategories: [...new Set(
+        (entry.sourceLabels ?? []).map((label) => label.kind),
+      )],
       topic: entry.topic,
       path: entry.path,
       keywords: entry.keywords,
@@ -90,6 +96,39 @@ export function selectHypothesisHitsFromIndex(
         .filter(Boolean)
         .join(". "),
     }));
+}
+
+export interface ResearchMemoryUseReceiptV1 {
+  version: 1;
+  domain: "research";
+  recordIds: string[];
+  recordCount: number;
+  sourceCategories: Array<"note" | "public_url" | "receipt">;
+  relevance: "keyword_match_to_current_mission";
+  verification: "unverified_prior_context";
+}
+
+export function buildResearchMemoryUseReceiptV1(
+  entries: ResearchMemoryIndexEntry[],
+  query: string,
+  limit = MAX_WORKING_HYPOTHESES,
+): ResearchMemoryUseReceiptV1 | null {
+  const hits = selectHypothesisHitsFromIndex(entries, query, limit);
+  if (hits.length === 0) return null;
+  return {
+    version: 1,
+    domain: "research",
+    recordIds: hits
+      .map((hit) => hit.recordId)
+      .filter((id): id is string => typeof id === "string" && id.length > 0)
+      .sort(),
+    recordCount: hits.length,
+    sourceCategories: [...new Set(
+      hits.flatMap((hit) => hit.sourceCategories ?? []),
+    )].sort(),
+    relevance: "keyword_match_to_current_mission",
+    verification: "unverified_prior_context",
+  };
 }
 
 export function buildHypothesisSystemHint(

@@ -391,19 +391,42 @@ export class AgentSettingTab extends PluginSettingTab {
         });
     }
 
-    new Setting(basicEl)
-      .setName("Model")
-      .setDesc("Default model for agent missions.")
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.model)
-          .setValue(this.plugin.settings.model)
-          .onChange(async (value) => {
-            this.plugin.settings.model = value.trim() || DEFAULT_SETTINGS.model;
-            this.plugin.invalidateModelConnectionStatus();
-            await this.plugin.saveSettings();
-          }),
+    const modelSetting = new Setting(basicEl).setName("Model");
+    const modelHelpId = "agentic-settings-model-help";
+    modelSetting.descEl.id = modelHelpId;
+    if (provider === "ollama") {
+      modelSetting.descEl.createSpan({
+        text: "Paste an exact model tag. For cloud-first use, choose a current tool-capable model from the ",
+      });
+      modelSetting.descEl.createEl("a", {
+        text: "Ollama Cloud + Thinking catalog",
+        attr: {
+          href: "https://ollama.com/search?c=cloud&c=thinking",
+          rel: "noopener noreferrer",
+          target: "_blank",
+        },
+      });
+      modelSetting.descEl.createSpan({
+        text: ", then use Test connection. Catalog and account availability are authoritative; no model is selected automatically.",
+      });
+    } else {
+      modelSetting.setDesc("Exact model name for agent missions; then use Test connection.");
+    }
+    modelSetting.addText((text) => {
+      text.inputEl.setAttribute("aria-describedby", modelHelpId);
+      text.inputEl.setAttribute(
+        "aria-label",
+        provider === "ollama" ? "Ollama model tag" : "Model name",
       );
+      return text
+        .setPlaceholder(DEFAULT_SETTINGS.model)
+        .setValue(this.plugin.settings.model)
+        .onChange(async (value) => {
+          this.plugin.settings.model = value.trim() || DEFAULT_SETTINGS.model;
+          this.plugin.invalidateModelConnectionStatus();
+          await this.plugin.saveSettings();
+        });
+    });
 
     const endpointDetails = basicEl.createEl("details", {
       cls: "agentic-settings-disclosure",
@@ -540,7 +563,7 @@ export class AgentSettingTab extends PluginSettingTab {
     const headerCopy = header.createDiv();
     headerCopy.createEl("h3", { text: "System readiness" });
     headerCopy.createEl("p", {
-      text: "Open a status to jump directly to its controls.",
+      text: "Choose a status to perform its displayed next action in Chat or jump directly to its controls.",
       cls: "setting-item-description agentic-settings-section-intro",
     });
     header.createEl("span", {
@@ -551,15 +574,19 @@ export class AgentSettingTab extends PluginSettingTab {
     const grid = statusEl.createDiv({ cls: "agentic-settings-readiness-grid" });
     for (const row of rows) {
       const targetId = capabilitySetupTargetId(row.setupTarget);
+      const actionDestination = readinessActionDestination(row);
       const item = grid.createEl("button", {
         cls: "agentic-settings-readiness-item",
         attr: {
           type: "button",
           "data-status": capabilityStatusSlug(row.status),
-          "aria-label": `${row.name}: ${row.status}. Open settings.`,
+          "data-action-destination": actionDestination,
+          "aria-label": `${row.name}: ${row.status}. Next action: ${row.nextAction}. ${
+            actionDestination === "chat" ? "Open Chat." : "Open settings."
+          }`,
         },
       });
-      const itemHeader = item.createDiv({
+      const itemHeader = item.createSpan({
         cls: "agentic-settings-readiness-item-header",
       });
       itemHeader.createEl("span", {
@@ -579,10 +606,16 @@ export class AgentSettingTab extends PluginSettingTab {
         cls: "agentic-settings-readiness-evidence",
       });
       item.createEl("span", {
-        text: row.nextAction,
+        text: `${row.nextAction} · ${
+          actionDestination === "chat" ? "Open Chat" : "Open settings"
+        }`,
         cls: "agentic-settings-readiness-action",
       });
       item.addEventListener("click", () => {
+        if (actionDestination === "chat") {
+          void this.openChatForCapabilityAction();
+          return;
+        }
         const target = this.containerEl.querySelector<HTMLDetailsElement>(
           `#${targetId}`,
         );
@@ -591,6 +624,15 @@ export class AgentSettingTab extends PluginSettingTab {
         target.scrollIntoView({ behavior: "smooth", block: "start" });
       });
     }
+  }
+
+  private async openChatForCapabilityAction(): Promise<void> {
+    this.stopReadinessRefresh();
+    const setting = (
+      this.app as typeof this.app & { setting?: { close(): void } }
+    ).setting;
+    setting?.close();
+    await this.plugin.activateView();
   }
 
   private startReadinessRefresh(): void {
@@ -2530,11 +2572,32 @@ function capabilitySetupTargetId(target: CapabilitySetupTarget): string {
   if (
     target === "browser_web" ||
     target === "linear" ||
-    target === "github"
+    target === "github" ||
+    target === "background"
   ) {
     return "agentic-settings-connections";
   }
   return "agentic-settings-system-health";
+}
+
+function readinessActionDestination(
+  row: CapabilityReadinessV2,
+): "chat" | "settings" {
+  if (row.id === "browser" && row.status === "Available") return "chat";
+  if (
+    row.id === "code" &&
+    row.status !== "Ready" &&
+    row.status !== "Blocked"
+  ) {
+    return "chat";
+  }
+  if (
+    row.id === "github" &&
+    (row.status === "Available" || row.status === "Degraded")
+  ) {
+    return "chat";
+  }
+  return "settings";
 }
 
 function capabilityStatusShortName(name: string): string {

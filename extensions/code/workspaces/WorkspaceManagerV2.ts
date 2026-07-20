@@ -20,6 +20,7 @@ const MANIFEST_FILE = "manifest.v2.json";
 const ROOT_FOLDER = "root";
 const TRASH_FOLDER = "trash";
 const MAX_TREE_ENTRIES = 10_000;
+const MAX_LIST_ENTRIES = 500;
 const DEFAULT_EXPIRY_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export class WorkspaceManagerErrorV2 extends Error {
@@ -59,6 +60,13 @@ export interface WorkspaceStatResultV2 {
   kind: "file" | "directory";
   bytes: number;
   sha256: string;
+  modifiedAt: string;
+}
+
+export interface WorkspaceEntryMetadataV2 {
+  path: string;
+  kind: "file" | "directory";
+  bytes: number;
   modifiedAt: string;
 }
 
@@ -562,6 +570,52 @@ export class WorkspaceManagerV2 {
     return { path: target.relativePath, kind: "directory", bytes: tree.bytes, sha256: tree.fingerprint, modifiedAt: stat.mtime.toISOString() };
   }
 
+  async inspectMetadata(
+    workspaceId: string,
+    relativePath: string,
+  ): Promise<WorkspaceEntryMetadataV2> {
+    const manifest = await this.requireReadable(await this.loadManifest(workspaceId));
+    const target = await this.resolveSafePath(manifest, relativePath, {
+      mustExist: true,
+      mutation: false,
+    });
+    return inspectWorkspaceEntryMetadata(target.absolutePath, target.relativePath);
+  }
+
+  async listMetadata(
+    workspaceId: string,
+    relativePath = "",
+  ): Promise<WorkspaceEntryMetadataV2[]> {
+    const manifest = await this.requireReadable(await this.loadManifest(workspaceId));
+    const target = relativePath
+      ? await this.resolveSafePath(manifest, relativePath, {
+          mustExist: true,
+          mutation: false,
+        })
+      : { absolutePath: manifest.canonicalRoot, relativePath: "" };
+    const names: string[] = [];
+    for await (const entry of await fs.opendir(target.absolutePath)) {
+      if (entry.name.toLowerCase() === ".git") continue;
+      if (names.length >= MAX_LIST_ENTRIES) {
+        throw new WorkspaceManagerErrorV2(
+          "directory_too_large",
+          `Workspace directory exceeds ${MAX_LIST_ENTRIES} entries.`,
+        );
+      }
+      names.push(entry.name);
+    }
+    const output: WorkspaceEntryMetadataV2[] = [];
+    for (const name of names.sort((left, right) => left.localeCompare(right))) {
+      const relative = target.relativePath ? `${target.relativePath}/${name}` : name;
+      const safe = await this.resolveSafePath(manifest, relative, {
+        mustExist: true,
+        mutation: false,
+      });
+      output.push(await inspectWorkspaceEntryMetadata(safe.absolutePath, relative));
+    }
+    return output;
+  }
+
   async list(workspaceId: string, relativePath = ""): Promise<Array<{ path: string; kind: "file" | "directory"; bytes: number; sha256: string | null }>> {
     const manifest = await this.requireReadable(await this.loadManifest(workspaceId));
     const target = relativePath
@@ -581,7 +635,7 @@ export class WorkspaceManagerV2 {
       } else if (stat.isDirectory()) {
         output.push({ path: relative, kind: "directory", bytes: 0, sha256: null });
       }
-      if (output.length >= 500) break;
+      if (output.length >= MAX_LIST_ENTRIES) break;
     }
     return output;
   }
@@ -1375,6 +1429,40 @@ function sandboxArtifactParentPaths(paths: readonly string[]): string[] {
   }
   return [...parents].sort((left, right) =>
     left.split("/").length - right.split("/").length || left.localeCompare(right));
+}
+
+async function inspectWorkspaceEntryMetadata(
+  absolutePath: string,
+  relativePath: string,
+): Promise<WorkspaceEntryMetadataV2> {
+  const stat = await fs.lstat(absolutePath);
+  if (stat.isSymbolicLink()) {
+    throw new WorkspaceManagerErrorV2(
+      "reparse_path",
+      "Workspace inventory cannot include symlinks, junctions, or reparse points.",
+    );
+  }
+  if (stat.isFile()) {
+    assertSafeRegularFile(stat, relativePath, false);
+    return {
+      path: relativePath,
+      kind: "file",
+      bytes: stat.size,
+      modifiedAt: stat.mtime.toISOString(),
+    };
+  }
+  if (stat.isDirectory()) {
+    return {
+      path: relativePath,
+      kind: "directory",
+      bytes: 0,
+      modifiedAt: stat.mtime.toISOString(),
+    };
+  }
+  throw new WorkspaceManagerErrorV2(
+    "unsupported_entry",
+    "Workspace inventory encountered an unsupported entry.",
+  );
 }
 
 async function captureParentGuard(parent: string, root: string): Promise<ParentGuard> {
