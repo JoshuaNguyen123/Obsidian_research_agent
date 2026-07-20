@@ -1741,25 +1741,26 @@ async function configureProtectedConnections(
             "Native Linear client unavailable to create a protected evidence project.",
           );
         }
+        // projects.create only acknowledges success; the catalog mutation does
+        // not return the provider id. Pin a client-generated UUID in input.id
+        // (supported by ProjectCreateInput) so the evidence destination is known.
+        const evidenceProjectId = randomUUID();
         const created = await plugin.createSecretBackedLinearClient().execute(
           "projects.create",
           {
             input: {
+              id: evidenceProjectId,
               name: `Agentic E2E Evidence ${Date.now().toString(36)}`,
               teamIds: [linearTeamId],
             },
           },
         );
-        configuredProjectId = String(
-          (created as any)?.id ??
-            (created as any)?.project?.id ??
-            "",
-        ).trim();
-        if (!configuredProjectId) {
+        if ((created as { success?: boolean } | null)?.success !== true) {
           throw new Error(
-            "Linear project create did not return an evidence project id.",
+            "Linear project create was not acknowledged for the evidence project.",
           );
         }
+        configuredProjectId = evidenceProjectId;
         const refreshed = await plugin.testLinearConnection();
         if (!refreshed?.ok) {
           throw new Error(
