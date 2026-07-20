@@ -842,11 +842,13 @@ async function buildExactApprovalRequest(
   preview: Extract<ResearchTicketPreviewResult, { ok: true }>,
 ): Promise<ResearchPublicationExactApprovalRequestV1> {
   const duplicate = preview.duplicate ? issueReference(preview.duplicate) : null;
-  const exact = {
+  // toolCallId stays on the request for host correlation but is omitted from the
+  // fingerprint payload so a same-run tool retry of the exact research contract
+  // does not rewrite durable checkpoint identity after a partial attempt.
+  const fingerprintPayload = {
     schemaVersion: 1 as const,
     kind: "linear_research_publication" as const,
     runId: request.runId,
-    toolCallId: request.toolCallId,
     destination: { ...request.destination },
     artifactFingerprint: artifact.artifactFingerprint,
     noteSha256: artifact.noteSha256,
@@ -860,8 +862,9 @@ async function buildExactApprovalRequest(
     candidatesExamined: preview.candidatesExamined,
   };
   return {
-    ...exact,
-    approvalFingerprint: await sha256LinearValue(exact),
+    ...fingerprintPayload,
+    toolCallId: request.toolCallId,
+    approvalFingerprint: await sha256LinearValue(fingerprintPayload),
   };
 }
 

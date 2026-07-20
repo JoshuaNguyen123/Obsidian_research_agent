@@ -62,6 +62,60 @@ test("reconcile_required and waiting_obsidian checkpoints survive plugin-data ro
   assert.equal((await restarted.get(waiting.publicationId))?.binding?.issueIdentifier, "ENG-42");
 });
 
+test("failed publication may restart at note_verified for the same research contract", async () => {
+  const persistence = new MemoryPersistence();
+  const store = new ResearchPublicationCheckpointStoreV1(persistence);
+  const publicationId = "publication-retry-failed";
+  await store.persist({
+    ...noteVerifiedCheckpoint(publicationId),
+    status: "failed",
+    updatedAt: LATER_AT,
+    approvalFingerprint: APPROVAL_HASH,
+    workItemFingerprint: WORK_ITEM_HASH,
+    lineage: noteLineage(),
+    error: {
+      code: "research_publication_failed",
+      message: "Linear create failed before readback.",
+    },
+  });
+
+  await store.persist({
+    ...noteVerifiedCheckpoint(publicationId),
+    updatedAt: "2026-07-12T20:03:00.000Z",
+    approvalFingerprint: null,
+  });
+
+  const restarted = await store.get(publicationId);
+  assert.equal(restarted?.status, "note_verified");
+  assert.equal(restarted?.approvalFingerprint, null);
+  assert.equal(restarted?.workItemFingerprint, WORK_ITEM_HASH);
+});
+
+test("reconcile_required may persist a fresh failed approval fingerprint for the same work item", async () => {
+  const persistence = new MemoryPersistence();
+  const store = new ResearchPublicationCheckpointStoreV1(persistence);
+  const publicationId = "publication-retry-approval";
+  await store.persist(reconcileCheckpoint(publicationId));
+
+  await store.persist({
+    ...noteVerifiedCheckpoint(publicationId),
+    status: "failed",
+    updatedAt: "2026-07-12T20:03:00.000Z",
+    approvalFingerprint: REFRESHED_APPROVAL_HASH,
+    workItemFingerprint: WORK_ITEM_HASH,
+    lineage: noteLineage(),
+    pendingAction: null,
+    error: {
+      code: "research_publication_failed",
+      message: "Linear create failed on retry.",
+    },
+  });
+
+  const failed = await store.get(publicationId);
+  assert.equal(failed?.status, "failed");
+  assert.equal(failed?.approvalFingerprint, REFRESHED_APPROVAL_HASH);
+});
+
 test("reconciliation may adopt the same pending issue after a fresh exact approval and verified binding", async () => {
   const persistence = new MemoryPersistence();
   const store = new ResearchPublicationCheckpointStoreV1(persistence);

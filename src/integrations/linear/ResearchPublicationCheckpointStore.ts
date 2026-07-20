@@ -447,14 +447,24 @@ function validateCheckpointTransition(
       "Research publication checkpoints cannot move backwards in time.",
     );
   }
+  const sameArtifact =
+    previous.artifact.artifactFingerprint === next.artifact.artifactFingerprint;
+  const sameWorkItem =
+    !previous.workItemFingerprint ||
+    previous.workItemFingerprint === next.workItemFingerprint;
+  if (!sameArtifact || !sameWorkItem) {
+    throw new ResearchPublicationCheckpointStoreError(
+      "research_publication_checkpoint_identity_changed",
+      "A durable research publication identity cannot be rewritten.",
+    );
+  }
+  const approvalChanged =
+    !!previous.approvalFingerprint &&
+    previous.approvalFingerprint !== next.approvalFingerprint;
   if (
-    previous.artifact.artifactFingerprint !== next.artifact.artifactFingerprint ||
-    (previous.workItemFingerprint && previous.workItemFingerprint !== next.workItemFingerprint) ||
-    (
-      previous.approvalFingerprint &&
-      previous.approvalFingerprint !== next.approvalFingerprint &&
-      !isVerifiedReconciliationAdoption(previous, next)
-    )
+    approvalChanged &&
+    !isVerifiedReconciliationAdoption(previous, next) &&
+    !isSameContractApprovalRefresh(previous, next)
   ) {
     throw new ResearchPublicationCheckpointStoreError(
       "research_publication_checkpoint_identity_changed",
@@ -490,13 +500,52 @@ function isVerifiedReconciliationAdoption(
   );
 }
 
+/**
+ * Same accepted research + work item may receive a fresh exact approval on tool
+ * retry (new tool-call id) or clear approval state when restarting from failed.
+ */
+function isSameContractApprovalRefresh(
+  previous: ResearchPublicationCheckpointV1,
+  next: ResearchPublicationCheckpointV1,
+): boolean {
+  if (
+    previous.artifact.artifactFingerprint !== next.artifact.artifactFingerprint
+  ) {
+    return false;
+  }
+  if (
+    previous.workItemFingerprint &&
+    previous.workItemFingerprint !== next.workItemFingerprint
+  ) {
+    return false;
+  }
+  if (previous.status === "reconcile_required") {
+    return (
+      next.status === "failed" ||
+      next.status === "reconcile_required" ||
+      next.status === "linear_verified"
+    );
+  }
+  if (previous.status === "failed" || previous.status === "approval_denied") {
+    return next.status === "note_verified" || next.status === "failed";
+  }
+  if (previous.status === "note_verified") {
+    return (
+      next.status === "failed" ||
+      next.status === "reconcile_required" ||
+      next.status === "approval_denied"
+    );
+  }
+  return false;
+}
+
 const STATUS_TRANSITIONS: Readonly<Record<
   ResearchPublicationCheckpointStatusV1,
   readonly ResearchPublicationCheckpointStatusV1[]
 >> = {
   note_verified: ["note_verified", "approval_denied", "failed", "reconcile_required", "linear_verified"],
-  approval_denied: ["approval_denied"],
-  failed: ["failed"],
+  approval_denied: ["approval_denied", "note_verified"],
+  failed: ["failed", "note_verified"],
   reconcile_required: ["reconcile_required", "failed", "linear_verified"],
   linear_verified: ["linear_verified", "reconcile_required", "waiting_obsidian", "complete"],
   waiting_obsidian: ["waiting_obsidian", "complete"],
