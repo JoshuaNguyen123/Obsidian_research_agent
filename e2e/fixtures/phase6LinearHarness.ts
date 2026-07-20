@@ -248,6 +248,37 @@ async function installPhase6LinearPageHarness(context: {
               `E2E_LINEAR_PROJECT_HIERARCHY:${marker}:${activeRunId}`;
             const hierarchyStep = stepCounts.get(hierarchyKey) ?? 0;
             if (hierarchyStep === 0) {
+              if (
+                !tools.includes("read_template") ||
+                tools.includes("publish_research_project_to_linear")
+              ) {
+                throw new Error(
+                  `The Linear issue template must be the first hierarchy frontier. Tools: ${tools.join(", ")}`,
+                );
+              }
+              stepCounts.set(hierarchyKey, 1);
+              const toolCall = {
+                id: "playwright-e2e-linear-project-template",
+                index: 0,
+                name: "read_template",
+                arguments: {
+                  path: "Agent Work/templates/Linear issue.md",
+                  maxChars: 12_000,
+                },
+              };
+              return {
+                message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                toolCalls: [toolCall],
+                raw: { playwrightPhase6Linear: true },
+              };
+            }
+            if (hierarchyStep === 1) {
+              if (
+                !requestText.includes("{{problem_impact}}") ||
+                !requestText.includes("## Acceptance criteria")
+              ) {
+                throw new Error("The hierarchy mission did not receive the canonical Linear issue template.");
+              }
               if (!tools.includes("publish_research_project_to_linear")) {
                 throw new Error(
                   `Explicit project hierarchy intent did not expose its composite tool. Tools: ${tools.join(", ")}`,
@@ -268,7 +299,7 @@ async function installPhase6LinearPageHarness(context: {
                   "The hierarchy mission could not resolve its accepted research binding.",
                 );
               }
-              stepCounts.set(hierarchyKey, 1);
+              stepCounts.set(hierarchyKey, 2);
               const toolCall = {
                 id: "playwright-e2e-linear-project-hierarchy",
                 index: 0,
@@ -339,16 +370,45 @@ async function installPhase6LinearPageHarness(context: {
                 raw: { playwrightPhase6Linear: true },
               };
             }
-            if (!tools.includes("publish_research_to_linear")) {
-              return {
-                message: { role: "assistant", content: "" },
-                toolCalls: [],
-                raw: { playwrightPhase6Linear: true },
-              };
-            }
             const publicationKey = `E2E_LINEAR_RESEARCH_PUBLICATION:${marker}`;
             const publicationStep = stepCounts.get(publicationKey) ?? 0;
             if (publicationStep === 0) {
+              if (
+                !tools.includes("read_template") ||
+                tools.includes("publish_research_to_linear")
+              ) {
+                throw new Error(
+                  `The Linear issue template must be the first publication frontier. Tools: ${tools.join(", ")}`,
+                );
+              }
+              stepCounts.set(publicationKey, 1);
+              const toolCall = {
+                id: "playwright-e2e-linear-research-template",
+                index: 0,
+                name: "read_template",
+                arguments: {
+                  path: "Agent Work/templates/Linear issue.md",
+                  maxChars: 12_000,
+                },
+              };
+              return {
+                message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                toolCalls: [toolCall],
+                raw: { playwrightPhase6Linear: true },
+              };
+            }
+            if (publicationStep === 1) {
+              if (
+                !requestText.includes("{{problem_impact}}") ||
+                !requestText.includes("## Acceptance criteria")
+              ) {
+                throw new Error("The publication mission did not receive the canonical Linear issue template.");
+              }
+              if (!tools.includes("publish_research_to_linear")) {
+                throw new Error(
+                  `Explicit research publication did not expose its composite tool. Tools: ${tools.join(", ")}`,
+                );
+              }
               const activeRunId =
                 plugin.getMissionRunSnapshot?.()?.lastConfig?.runId;
               if (typeof activeRunId !== "string" || !activeRunId.trim()) {
@@ -356,7 +416,7 @@ async function installPhase6LinearPageHarness(context: {
                   "The active host run id was unavailable for accepted research publication.",
                 );
               }
-              stepCounts.set(publicationKey, 1);
+              stepCounts.set(publicationKey, 2);
               const toolCall = {
                 id: "playwright-e2e-linear-research-publication",
                 index: 0,

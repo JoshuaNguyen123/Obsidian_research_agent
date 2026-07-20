@@ -3011,6 +3011,55 @@ test("template prompts expose template tools without generic file creation", asy
   }
 });
 
+test("affirmative Linear issue creation routes through the canonical template first", async () => {
+  const prompt = "Create an issue in Linear for the accepted research.";
+  const chatRequests: ModelChatRequest[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.linearEnabled = true;
+  const client = createClient({
+    chatRequests,
+    chatResponders: [() => responseWithContent("Done")],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createDefaultToolRegistry(),
+    toolContext: vault.context,
+    enableStreaming: false,
+  });
+
+  const firstFrontier =
+    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+  assert.equal(firstFrontier.includes("read_template"), true);
+  assert.equal(firstFrontier.includes("list_templates"), false);
+  assert.equal(firstFrontier.includes("linear_create_issue"), false);
+
+  for (const negativePrompt of [
+    "Read Linear issue ENG-42 from the workspace.",
+    "Do not create an issue in Linear; explain the workflow only.",
+    "Explain why eigenvectors matter in linear algebra.",
+  ]) {
+    const negativeRequests: ModelChatRequest[] = [];
+    const negativeVault = createRunnerVaultContext({ prompt: negativePrompt });
+    negativeVault.context.settings.linearEnabled = true;
+    await runAgentMission({
+      prompt: negativePrompt,
+      modelClient: createClient({
+        chatRequests: negativeRequests,
+        chatResponders: [() => responseWithContent("Done")],
+      }),
+      toolRegistry: createDefaultToolRegistry(),
+      toolContext: negativeVault.context,
+      enableStreaming: false,
+    });
+    const exposed =
+      negativeRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
+    assert.equal(exposed.includes("read_template"), false, negativePrompt);
+    assert.equal(exposed.includes("list_templates"), false, negativePrompt);
+  }
+});
+
 test("path write prompts require the matching path-based write tool", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
@@ -3134,8 +3183,8 @@ test("default template seed prompts require seed_default_templates and emit rece
     executedCalls.map((call) => call.name),
     ["seed_default_templates"],
   );
-  assert.ok(statuses.includes("Created 6 default templates."));
-  assert.deepEqual(receipts, ["create Templates; affected: 6"]);
+  assert.ok(statuses.includes("Created 7 default templates."));
+  assert.deepEqual(receipts, ["create Templates; affected: 7"]);
 });
 
 test("design prompts expose and require native artifact write tools", async () => {
@@ -12793,13 +12842,14 @@ function createRegistry(
                   createdTemplates: [
                     { path: "Templates/Research brief.md" },
                     { path: "Templates/Research note.md" },
+                    { path: "Templates/Linear issue.md" },
                     { path: "Templates/Linear ticket.md" },
                     { path: "Templates/Experiment log.md" },
                     { path: "Templates/Essay section.md" },
                     { path: "Templates/Design brief.md" },
                   ],
                   skippedExisting: [],
-                  affectedCount: 6,
+                  affectedCount: 7,
                 }
             : call.name === "create_template"
               ? {

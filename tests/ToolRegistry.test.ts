@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import { DEFAULT_TEMPLATE_SEEDS } from "../src/tools/vaultTools";
+import {
+  AGENT_TEMPLATE_FOLDER,
+  LINEAR_ISSUE_TEMPLATE_V1,
+} from "../src/tools/agentTemplateLibrary";
 import { chunkMarkdownForSemanticSearch } from "../src/tools/semanticSearchTools";
 import {
   createSemanticIndexService,
@@ -1489,6 +1493,152 @@ test("template tools list, read, create, and fill saved templates", async () => 
       "# Product Sync\n\nDate: 2026-07-04\nAttendees: Alex, Jordan",
     ).length,
   });
+});
+
+test("template reads prefer configured templates and fall back to the managed agent library", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Use the Linear issue template to create a shaped work note.",
+  });
+  const configuredPath = "Templates/Linear issue.md";
+  const managedPath = `${AGENT_TEMPLATE_FOLDER}/Linear issue.md`;
+  mock.content.set(configuredPath, "# Configured {{title}}");
+  mock.content.set(managedPath, LINEAR_ISSUE_TEMPLATE_V1);
+
+  const preferred = await registry.execute(
+    { name: "read_template", arguments: { path: "Linear issue.md" } },
+    mock.context,
+  );
+  assert.equal(preferred.ok, true);
+  assert.equal((preferred.output as { path: string }).path, configuredPath);
+
+  mock.content.delete(configuredPath);
+
+  const listed = await registry.execute(
+    { name: "list_templates", arguments: { includePlaceholders: true } },
+    mock.context,
+  );
+  assert.equal(listed.ok, true);
+  assert.deepEqual(
+    (listed.output as { templates: Array<{ path: string }> }).templates.map(
+      (template) => template.path,
+    ),
+    [managedPath],
+  );
+
+  const fallback = await registry.execute(
+    { name: "read_template", arguments: { path: "Linear issue.md" } },
+    mock.context,
+  );
+  assert.equal(fallback.ok, true);
+  assert.deepEqual(fallback.output, {
+    path: managedPath,
+    content: LINEAR_ISSUE_TEMPLATE_V1,
+    placeholders: [
+      "title",
+      "problem_impact",
+      "evidence",
+      "confidence_limitations",
+      "proposed_work",
+      "non_goals",
+      "scope",
+      "dependencies",
+      "acceptance_criteria",
+      "validation",
+    ],
+    truncated: false,
+  });
+
+  const filled = await registry.execute(
+    {
+      name: "fill_template",
+      arguments: {
+        templatePath: "Linear issue.md",
+        targetPath: "Agent Work/Linear Queue/Shaped issue.md",
+        values: {
+          title: "Shaped issue",
+          problem_impact: "Operators need a predictable work item.",
+          evidence: "Accepted research and source links.",
+          confidence_limitations: "High confidence; provider readback remains required.",
+          proposed_work: "Implement the bounded change.",
+          non_goals: "No unrelated cleanup.",
+          scope: "One provider work item.",
+          dependencies: "None.",
+          acceptance_criteria: "The issue is independently readable.",
+          validation: "Verify the provider response and readback.",
+        },
+      },
+    },
+    mock.context,
+  );
+  assert.equal(filled.ok, true);
+  assert.equal(
+    (filled.output as { templatePath: string }).templatePath,
+    managedPath,
+  );
+  assert.match(
+    mock.content.get("Agent Work/Linear Queue/Shaped issue.md") ?? "",
+    /## Acceptance criteria\s+The issue is independently readable\./,
+  );
+});
+
+test("read_template narrowly permits the managed Linear issue template for explicit Linear mutations", async () => {
+  const registry = createDefaultToolRegistry();
+  const managedPath = `${AGENT_TEMPLATE_FOLDER}/Linear issue.md`;
+  const allowed = createMockContext({
+    prompt: "Prepare exactly one Linear issue from the accepted research.",
+  });
+  allowed.content.set(managedPath, LINEAR_ISSUE_TEMPLATE_V1);
+
+  const result = await registry.execute(
+    { name: "read_template", arguments: { path: managedPath } },
+    allowed.context,
+  );
+  assert.equal(result.ok, true);
+  assert.equal((result.output as { path: string }).path, managedPath);
+
+  const hierarchy = createMockContext({
+    prompt:
+      "Turn this accepted research into a Linear initiative, project, and dependency-aware issues.",
+  });
+  hierarchy.content.set(managedPath, LINEAR_ISSUE_TEMPLATE_V1);
+  const hierarchyResult = await registry.execute(
+    { name: "read_template", arguments: { path: managedPath } },
+    hierarchy.context,
+  );
+  assert.equal(hierarchyResult.ok, true);
+  assert.equal((hierarchyResult.output as { path: string }).path, managedPath);
+
+  const readOnly = createMockContext({
+    prompt: "Read Linear issue ENG-42 from the workspace.",
+  });
+  readOnly.content.set(managedPath, LINEAR_ISSUE_TEMPLATE_V1);
+  const blockedReadOnly = await registry.execute(
+    { name: "read_template", arguments: { path: managedPath } },
+    readOnly.context,
+  );
+  assert.equal(blockedReadOnly.ok, false);
+  assert.match(blockedReadOnly.error?.message ?? "", /ask about templates/i);
+
+  const negated = createMockContext({
+    prompt: "Do not create an issue in Linear; explain the workflow only.",
+  });
+  negated.content.set(managedPath, LINEAR_ISSUE_TEMPLATE_V1);
+  const blockedNegated = await registry.execute(
+    { name: "read_template", arguments: { path: managedPath } },
+    negated.context,
+  );
+  assert.equal(blockedNegated.ok, false);
+  assert.match(blockedNegated.error?.message ?? "", /ask about templates/i);
+
+  const otherManagedTemplate = `${AGENT_TEMPLATE_FOLDER}/Research brief.md`;
+  allowed.content.set(otherManagedTemplate, "# {{topic}}");
+  const blockedOtherTemplate = await registry.execute(
+    { name: "read_template", arguments: { path: otherManagedTemplate } },
+    allowed.context,
+  );
+  assert.equal(blockedOtherTemplate.ok, false);
+  assert.match(blockedOtherTemplate.error?.message ?? "", /ask about templates/i);
 });
 
 test("seed_default_templates creates starter templates without overwriting existing files", async () => {

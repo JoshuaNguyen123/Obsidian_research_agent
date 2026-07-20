@@ -61,6 +61,7 @@ import {
   normalizeVaultPath,
   serializeToolResult,
 } from "./tools/validation";
+import { LINEAR_ISSUE_TEMPLATE_PATH } from "./tools/agentTemplateLibrary";
 import { descriptorFor } from "./tools/toolDescriptors";
 import {
   type AgentConversationMessage,
@@ -862,7 +863,7 @@ Operating rules:
 27. When you have enough context and no note write is required, stop requesting tools and write the final answer.
 28. If a web tool fails, explain that web access failed and include the tool error instead of inventing sourced facts.
 29. Default to English for English user missions. Use another language only when the current user mission is written primarily in that language or explicitly requests it.
-30. Use template tools only when the user asks to create, list, read, use, apply, or fill templates. Saved templates live in the configured template folder and use {{field}} placeholders.
+30. For every explicit Linear issue create, accepted-research publication, or research-project hierarchy mission, first call read_template with the exact path "${LINEAR_ISSUE_TEMPLATE_PATH}" before composing provider-visible Linear fields. Fill the template with clean user-facing prose; never publish unresolved {{field}} placeholders, fingerprints, idempotency markers, or machine contracts. For other missions, use template tools only when the user asks to create, list, read, use, apply, or fill templates. Saved templates live in the configured template folder or the managed Agent Work/templates library.
 31. When filling a template, prefer fill_template over generic file creation. Use templateText for ad hoc templates supplied in the mission, or templatePath for saved templates. For an explicit multi-note research pack, use create_research_pack so Brief, Sources, Synthesis, and Index are created and verified transactionally.
 32. For conceptual vault questions, first inspect the semantic index when available, then call semantic_search_notes for ranked evidence before broad file reads. Use exact path/title/heading tools for exact requests. Never use semantic index tools for delete, move, replace, or direct write-only requests. Treat index summaries as navigation aids; cite and rely on source note paths.
 33. Stay on the user's requested topic and task. Do not substitute unrelated coding problems, examples, translations, or template answers.`;
@@ -15180,6 +15181,7 @@ function getAllowedToolDefinitions(
     hasGraphConnectionIntent(prompt) ||
     allowParallelVaultInspection ||
     hasReflexReadLabel(["graph_context"]);
+  const allowLinearIssueTemplate = hasLinearIssueTemplateIntent(prompt);
   const allowGraphLinkWrite = hasGraphLinkWriteIntent(prompt);
   const allowTemplateTools = hasTemplateIntent(prompt);
   const allowTemplateSeed = hasTemplateSeedIntent(prompt);
@@ -15478,8 +15480,12 @@ function getAllowedToolDefinitions(
       return allowVaultBrowse || allowSpecificFileRead;
     }
 
-    if (name === "list_templates" || name === "read_template") {
+    if (name === "list_templates") {
       return allowTemplateTools;
+    }
+
+    if (name === "read_template") {
+      return allowTemplateTools || allowLinearIssueTemplate;
     }
 
     if (name === "seed_default_templates") {
@@ -16150,6 +16156,12 @@ function getRequiredWriteToolNames(
   const lifecycleStages = detectProjectLifecycleStagesV1(prompt);
   const compoundLifecycle = lifecycleStages.length > 1;
   const lifecycleRequiredToolNames: string[] = [];
+  if (
+    hasLinearIssueTemplateIntent(prompt) &&
+    allowedToolNames.has("read_template")
+  ) {
+    lifecycleRequiredToolNames.push("read_template");
+  }
   if (compoundLifecycle) {
     if (
       lifecycleStages.includes("accepted_research") &&
@@ -16190,21 +16202,38 @@ function getRequiredWriteToolNames(
     allowedToolNames.has(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) &&
     hasExplicitResearchProjectHierarchyIntent(prompt)
   ) {
-    return [PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME];
+    return [
+      ...lifecycleRequiredToolNames,
+      PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+    ];
   }
   if (
     !compoundLifecycle &&
     allowedToolNames.has(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) &&
     hasExplicitResearchPublicationIntent(prompt)
   ) {
-    return [PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME];
+    return [
+      ...lifecycleRequiredToolNames,
+      PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+    ];
   }
   const explicitlyNamedLinearMutations = getExplicitLinearMutationToolNames(
     prompt,
     allowedToolNames,
   );
   if (!compoundLifecycle && explicitlyNamedLinearMutations.length > 0) {
-    return explicitlyNamedLinearMutations;
+    return [
+      ...lifecycleRequiredToolNames,
+      ...explicitlyNamedLinearMutations,
+    ];
+  }
+  if (
+    !compoundLifecycle &&
+    hasLinearIssueTemplateIntent(prompt) &&
+    /\bcreate\b/iu.test(prompt) &&
+    allowedToolNames.has("linear_create_issue")
+  ) {
+    return [...lifecycleRequiredToolNames, "linear_create_issue"];
   }
   const preparedBackgroundGitHubTools =
     getRequestedPreparedBackgroundGitHubTools(prompt).filter((name) =>
@@ -18479,9 +18508,54 @@ function hasLongResearchIntent(prompt: string): boolean {
 }
 
 function hasTemplateIntent(prompt: string): boolean {
+  if (
+    /\bwithout\s+(?:opening|reading|using)\s+(?:it|them)?[\s\S]{0,120}\btemplates?[\\/]\S+\.md\b/iu.test(
+      prompt,
+    )
+  ) {
+    return false;
+  }
   return /\b(template|templates|templated|form|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i.test(
     prompt,
   );
+}
+
+/**
+ * Linear issue mutations are shaped from the managed vault template even when
+ * the user does not mention templates. Reads, comments, and ordinary uses of
+ * the word "linear" must not gain template access.
+ */
+function hasLinearIssueTemplateIntent(prompt: string): boolean {
+  if (!detectLinearIntent(prompt).explicit) {
+    return false;
+  }
+  const normalized = prompt.replace(/\r\n?/gu, "\n");
+  if (
+    /\b(?:do\s+not|don't|never)\b[\s\S]{0,80}\b(?:create|draft|write|prepare|shape|format|publish)\b[\s\S]{0,120}\b(?:linear|issues?|tickets?)\b/iu.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  if (
+    hasExplicitResearchPublicationIntent(normalized) ||
+    hasExplicitResearchProjectHierarchyIntent(normalized)
+  ) {
+    return true;
+  }
+  if (/\blinear_create_issue\b/iu.test(normalized)) {
+    return true;
+  }
+  const mutationIndex = normalized.search(
+    /\b(?:create|draft|write|prepare|shape|format|publish)\b/iu,
+  );
+  const issueIndex = normalized.search(/\b(?:issue|ticket)s?\b/iu);
+  const linearIndex = normalized.search(/\blinear\b/iu);
+  if (mutationIndex < 0 || issueIndex < 0 || linearIndex < 0) {
+    return false;
+  }
+  const positions = [mutationIndex, issueIndex, linearIndex];
+  return Math.max(...positions) - Math.min(...positions) <= 240;
 }
 
 function hasTemplateCreateIntent(prompt: string): boolean {

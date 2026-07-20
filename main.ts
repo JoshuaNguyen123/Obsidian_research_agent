@@ -31,6 +31,10 @@ import type { SemanticIndexService } from "./src/embeddings/semanticIndexTypes";
 import type { SemanticEmbeddingProvider } from "./src/embeddings/types";
 import { formatModelClientError, type ModelClient } from "./src/model/types";
 import { AgentSettings, AgentSettingTab, DEFAULT_SETTINGS } from "./src/settings";
+import {
+  ensureAgentTemplateLibrary,
+  getAgentTemplateLibraryErrorCode,
+} from "./src/tools/agentTemplateLibrary";
 import type {
   CapabilitySetupTarget,
   PendingCapabilityResume,
@@ -924,6 +928,18 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.startupFailure = error instanceof Error ? error.message : String(error);
       console.error("Agentic Researcher failed to load persisted settings.", error);
       throw error;
+    }
+    this.startupPhase = "initializing_agent_templates";
+    try {
+      await ensureAgentTemplateLibrary(this.app.vault);
+    } catch (error) {
+      const failureCode = getAgentTemplateLibraryErrorCode(error);
+      console.warn(
+        `Agentic Researcher could not initialize its no-overwrite template library (${failureCode}). Existing vault files were left unchanged.`,
+      );
+      new Notice(
+        "Agent templates could not be initialized. Existing vault files were left unchanged.",
+      );
     }
     this.startupPhase = "loading_runtime";
     void cleanupOldWorkspaces(7);

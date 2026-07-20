@@ -95,6 +95,11 @@ test.describe("Daily-use Linear integration", () => {
         expect(exposure.toolNames.some((name) => name.startsWith("linear_"))).toBe(
           false,
         );
+        expect(
+          exposure.toolNames.some(
+            (name) => name === "list_templates" || name === "read_template",
+          ),
+        ).toBe(false);
       }
     } finally {
       if (harness) {
@@ -118,6 +123,27 @@ test.describe("Daily-use Linear integration", () => {
         harness.vaultRoot,
         ...acceptedNotePath.split("/"),
       );
+      const linearTemplateFilePath = path.join(
+        harness.vaultRoot,
+        "Agent Work",
+        "templates",
+        "Linear issue.md",
+      );
+      const linearTemplate = await readOptionalText(linearTemplateFilePath);
+      expect(linearTemplate).not.toBeNull();
+      for (const heading of [
+        "## Problem / impact",
+        "## Evidence / source links",
+        "## Confidence / limitations",
+        "## Proposed work",
+        "## Non-goals",
+        "## Scope",
+        "## Dependencies",
+        "## Acceptance criteria",
+        "## Validation",
+      ]) {
+        expect(linearTemplate).toContain(heading);
+      }
       await harness.installResearchPublicationClient();
       await harness.submitMission(
         `E2E_LINEAR_RESEARCH_PUBLICATION ${harness.marker}: Publish this accepted research package to Linear as an issue and save the accepted note at ${acceptedNotePath}.`,
@@ -211,8 +237,22 @@ test.describe("Daily-use Linear integration", () => {
         project: { id: "e2e-project" },
         team: { id: "e2e-team" },
       });
-      expect(completed.issue?.description).toContain(
-        "agentic-researcher:work-item:v2:start",
+      const providerIssueDescription = String(completed.issue?.description ?? "");
+      for (const heading of [
+        "## Problem / impact",
+        "## Evidence / source links",
+        "## Confidence / limitations",
+        "## Proposed work",
+        "## Non-goals",
+        "## Scope",
+        "## Dependencies",
+        "## Acceptance criteria",
+        "## Validation",
+      ]) {
+        expect(providerIssueDescription).toContain(heading);
+      }
+      expect(providerIssueDescription).not.toMatch(
+        /sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract|agentic-idempotency|\{\{[^}]+\}\}/iu,
       );
       expect(completed.checkpoint).toMatchObject({
         status: "complete",
@@ -230,6 +270,13 @@ test.describe("Daily-use Linear integration", () => {
         completed.checkpoint?.lineage?.events?.length ?? 0,
       ).toBeGreaterThan(2);
       await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      await expect(
+        harness.page
+          .locator(".agentic-researcher-tool-item", {
+            hasText: "read_template",
+          })
+          .first(),
+      ).toBeVisible();
       await expect(
         harness.page
           .locator(".agentic-researcher-tool-item", {
@@ -265,6 +312,13 @@ test.describe("Daily-use Linear integration", () => {
       ).toHaveCount(1);
       await harness.approvePreparedApproval(hierarchyApproval);
       await harness.waitForMissionComplete(180_000);
+      await expect(
+        harness.page
+          .locator(".agentic-researcher-tool-item", {
+            hasText: "read_template",
+          })
+          .first(),
+      ).toBeVisible();
 
       const firstHierarchy =
         await harness.readResearchPublicationState(acceptedNotePath);

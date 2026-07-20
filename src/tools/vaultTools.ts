@@ -49,6 +49,13 @@ import { countMarkdownVisibleText } from "./wordCount";
 import { getProjectMemoryLocation } from "../agent/projectMemory";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import {
+  AGENT_TEMPLATE_FOLDER,
+  LINEAR_ISSUE_TEMPLATE_PATH,
+  LINEAR_ISSUE_TEMPLATE_V1,
+} from "./agentTemplateLibrary";
+import { hasExplicitResearchPublicationIntent } from "./researchPublicationTool";
+import { hasExplicitResearchProjectHierarchyIntent } from "./researchProjectHierarchyTool";
+import {
   analyzeTemplateDocument,
   discoverAndRankTemplates,
   dryRenderTemplate,
@@ -111,6 +118,7 @@ export const DEFAULT_TEMPLATE_SEEDS: Record<string, string> = {
     "# {{title}}\n\n## Question\n{{question}}\n\n## Sources\n{{sources}}\n\n## Findings\n{{findings}}\n",
   "Research note.md":
     "# {{title}}\n\n## Claim\n{{claim}}\n\n## Evidence\n{{evidence}}\n\n## Open Questions\n{{open_questions}}\n",
+  "Linear issue.md": LINEAR_ISSUE_TEMPLATE_V1,
   "Linear ticket.md":
     "# {{title}}\n\n## Problem\n{{problem}}\n\n## Proposed Change\n{{proposed_change}}\n\n## Acceptance Criteria\n{{acceptance_criteria}}\n",
   "Experiment log.md":
@@ -1256,7 +1264,7 @@ export const deleteResearchMemoryEntryTool: AgentTool = {
 export const listTemplatesTool: AgentTool = {
   name: "list_templates",
   description:
-    "List reusable markdown templates from the configured template folder.",
+    "List reusable markdown templates from the configured template folder and the managed Agent Work/templates library.",
   parameters: {
     type: "object",
     properties: {
@@ -1282,6 +1290,7 @@ export const listTemplatesTool: AgentTool = {
   async execute(args, context) {
     assertTemplateIntent(context, "list_templates");
     const templateFolder = getTemplateFolder(context);
+    const readableTemplateFolders = getReadableTemplateFolders(context);
     const limit = clampPositiveInteger(
       getOptionalInteger(args, "limit") ?? DEFAULT_TEMPLATE_LIST_LIMIT,
       1,
@@ -1293,7 +1302,11 @@ export const listTemplatesTool: AgentTool = {
     const requestedKind = getOptionalString(args, "kind")?.trim();
     const templateFiles = getVaultEntries(context)
       .filter((entry) => getEntryExtension(entry) === "md")
-      .filter((entry) => isPathInFolder(entry.path, templateFolder))
+      .filter((entry) =>
+        readableTemplateFolders.some((folder) =>
+          isPathInFolder(entry.path, folder),
+        ),
+      )
       .filter((entry) => !isBlockedSystemPath(entry.path))
       .sort((a, b) => a.path.localeCompare(b.path));
     if (query || requestedKind) {
@@ -1362,7 +1375,7 @@ export const listTemplatesTool: AgentTool = {
 export const readTemplateTool: AgentTool = {
   name: "read_template",
   description:
-    "Read a reusable markdown template from the configured template folder.",
+    "Read a reusable markdown template from the configured template folder or the managed Agent Work/templates library.",
   parameters: {
     type: "object",
     required: ["path"],
@@ -1370,7 +1383,7 @@ export const readTemplateTool: AgentTool = {
       path: {
         type: "string",
         description:
-          "Template path. Bare filenames are resolved inside the configured template folder.",
+          "Template path. Bare filenames prefer the configured template folder and fall back to Agent Work/templates.",
       },
       maxChars: {
         type: "integer",
@@ -1380,11 +1393,11 @@ export const readTemplateTool: AgentTool = {
     additionalProperties: false,
   },
   async execute(args, context) {
-    assertTemplateIntent(context, "read_template");
-    const path = normalizeTemplatePath(
+    const path = resolveReadableTemplatePath(
       context,
       getRequiredString(args, "path"),
     );
+    assertReadTemplateIntent(context, path);
     const maxChars = clampPositiveInteger(
       getOptionalInteger(args, "maxChars") ?? MAX_FILE_READ_CHARS,
       1,
@@ -1519,7 +1532,7 @@ export const fillTemplateTool: AgentTool = {
       templatePath: {
         type: "string",
         description:
-          "Optional saved template path. Bare filenames are resolved inside the configured template folder.",
+          "Optional saved template path. Bare filenames prefer the configured template folder and fall back to Agent Work/templates.",
       },
       templateText: {
         type: "string",
@@ -1577,7 +1590,7 @@ export const fillTemplateTool: AgentTool = {
       templatePathArg !== undefined ? "saved_template" : "ad_hoc_template";
     const templatePath =
       templatePathArg !== undefined
-        ? normalizeTemplatePath(context, templatePathArg)
+        ? resolveReadableTemplatePath(context, templatePathArg)
         : undefined;
     const templateText =
       templatePath !== undefined
@@ -2689,6 +2702,42 @@ function assertTemplateIntent(context: ToolExecutionContext, toolName: string) {
   }
 }
 
+function assertReadTemplateIntent(
+  context: ToolExecutionContext,
+  resolvedPath: string,
+) {
+  if (
+    resolvedPath === LINEAR_ISSUE_TEMPLATE_PATH &&
+    !hasNegatedLinearIssueMutationIntent(context.originalPrompt) &&
+    (hasExplicitResearchPublicationIntent(context.originalPrompt) ||
+      hasExplicitResearchProjectHierarchyIntent(context.originalPrompt) ||
+      hasExplicitLinearIssueMutationIntent(context.originalPrompt))
+  ) {
+    return;
+  }
+
+  assertTemplateIntent(context, "read_template");
+}
+
+function hasExplicitLinearIssueMutationIntent(prompt: string): boolean {
+  const explicitMutation =
+    /\blinear\b/i.test(prompt) &&
+    /\b(issue|issues|ticket|tickets|work\s+item|work\s+items)\b/i.test(prompt) &&
+    /\b(create|make|publish|prepare|shape|format|write|draft|update|edit)\b/i.test(
+      prompt,
+    );
+  if (!explicitMutation) {
+    return false;
+  }
+  return !hasNegatedLinearIssueMutationIntent(prompt);
+}
+
+function hasNegatedLinearIssueMutationIntent(prompt: string): boolean {
+  return /\b(?:do\s+not|don't|never)\b[\s\S]{0,80}\b(?:create|make|publish|prepare|shape|format|write|draft|update|edit)\b[\s\S]{0,120}\b(?:linear|issues?|tickets?|work\s+items?)\b/iu.test(
+    prompt,
+  );
+}
+
 function assertTemplateCreateIntent(
   context: ToolExecutionContext,
   toolName: string,
@@ -3058,6 +3107,33 @@ function normalizeTemplatePath(
   }
 
   return path;
+}
+
+function getReadableTemplateFolders(context: ToolExecutionContext): string[] {
+  return dedupeStrings([getTemplateFolder(context), AGENT_TEMPLATE_FOLDER]);
+}
+
+function resolveReadableTemplatePath(
+  context: ToolExecutionContext,
+  rawPath: string,
+): string {
+  const inputPath = normalizeVaultPath(rawPath, { requireMarkdown: true });
+  const readableFolders = getReadableTemplateFolders(context);
+  const isExplicitReadablePath = readableFolders.some((folder) =>
+    isPathInFolder(inputPath, folder),
+  );
+
+  if (isExplicitReadablePath) {
+    return inputPath;
+  }
+
+  const candidates = readableFolders.map((folder) =>
+    normalizeVaultPath(`${folder}/${inputPath}`, { requireMarkdown: true }),
+  );
+  return (
+    candidates.find((candidate) => getAbstractPath(context, candidate)) ??
+    candidates[0]
+  );
 }
 
 function normalizeTemplateTargetPath({
