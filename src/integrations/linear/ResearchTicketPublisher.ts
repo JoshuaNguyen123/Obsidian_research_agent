@@ -7,9 +7,8 @@ import type {
   LinearAuthoritySubject,
 } from "./HostLinearActionExecutor";
 import type { LinearToolClient } from "./LinearTools";
-import { parseRenderedCompatibleWorkItemSpec } from "./WorkItemParser";
 import {
-  renderCompatibleWorkItemSpec,
+  renderHumanCompatibleWorkItemSpec,
   type WorkItemRenderDetailsV1,
 } from "./WorkItemRenderer";
 import {
@@ -224,22 +223,14 @@ export class ResearchTicketPublisher {
       scope: normalizedSections.scope,
       dependencies: normalizedSections.dependencies,
     };
-    const description = renderCompatibleWorkItemSpec(spec, renderDetails);
+    const description = renderHumanCompatibleWorkItemSpec(spec, renderDetails);
     if (description.length > MAX_RENDERED_DESCRIPTION_CHARS) {
       throw new ResearchTicketPublisherError(
         "research_ticket_description_too_large",
         `Rendered research ticket exceeds ${MAX_RENDERED_DESCRIPTION_CHARS} characters.`,
       );
     }
-    // Validate the exact serialized contract before it can reach an adapter.
-    const parsed = parseRenderedCompatibleWorkItemSpec(description);
-    if (parsed.spec.fingerprint !== spec.fingerprint) {
-      throw new ResearchTicketPublisherError(
-        "research_ticket_contract_mismatch",
-        "Rendered research ticket changed its machine-contract fingerprint.",
-      );
-    }
-    const parsedSpec = parseCompatibleWorkItemSpec(parsed.spec);
+    const parsedSpec = parseCompatibleWorkItemSpec(spec);
     const built = {
       title: normalizedSections.title,
       description,
@@ -270,7 +261,7 @@ export class ResearchTicketPublisher {
       };
     }
     try {
-      const duplicate = await this.findDuplicate(ticket.spec, request.context);
+      const duplicate = await this.findDuplicate(ticket, request.context);
       return {
         ok: true,
         status: duplicate.issue ? "deduplicated" : "create",
@@ -368,7 +359,7 @@ export class ResearchTicketPublisher {
     }
 
     // The adapter's mutation readback proves its field-level postcondition. A
-    // separate fixed read then proves the embedded ticket contract and pinned
+    // separate fixed read then proves the exact clean human payload and pinned
     // queue project before publication is reported as successful.
     let readback: LinearIssueRecord;
     try {
@@ -386,7 +377,7 @@ export class ResearchTicketPublisher {
     }
     const mismatch = ticketReadbackMismatch(
       readback,
-      ticket.spec,
+      ticket,
       this.queueTeamId,
       this.queueProjectId,
     );
@@ -418,14 +409,13 @@ export class ResearchTicketPublisher {
   }
 
   private async findDuplicate(
-    spec: ParsedCompatibleWorkItemSpec,
+    ticket: BuiltResearchTicket,
     context: ToolExecutionContext,
   ): Promise<DuplicateSearchResult> {
     const candidates = new Map<string, LinearIssueRecord>();
-    // Search both the signed contract fingerprint and the trusted origin run
-    // identifier. Exact deduplication is still decided by the parsed signed
-    // contract, never by search ranking or title similarity.
-    for (const query of uniqueStrings([spec.fingerprint, spec.originRunId])) {
+    // Search with human-facing text only. Exact deduplication still requires
+    // an independent readback of the complete title and clean description.
+    for (const query of uniqueStrings([ticket.title, ticket.spec.objective])) {
       const remaining = this.duplicateCandidateLimit - candidates.size;
       if (remaining <= 0) break;
       const result = await this.options.readClient.execute(
@@ -453,7 +443,7 @@ export class ResearchTicketPublisher {
     }
 
     for (const candidate of candidates.values()) {
-      if (!hasExactContractFingerprint(candidate, spec.fingerprint)) continue;
+      if (!hasExactHumanTicketContent(candidate, ticket)) continue;
       let readback: LinearIssueRecord;
       try {
         readback = await this.readIssue(candidate.id, context);
@@ -465,7 +455,7 @@ export class ResearchTicketPublisher {
       }
       if (!ticketReadbackMismatch(
         readback,
-        spec,
+        ticket,
         this.queueTeamId,
         this.queueProjectId,
       )) {
@@ -778,7 +768,7 @@ function deterministicIssueUuid(fingerprint: string): string {
 
 function ticketReadbackMismatch(
   issue: LinearIssueRecord,
-  expected: ParsedCompatibleWorkItemSpec,
+  expected: BuiltResearchTicket,
   queueTeamId: string,
   queueProjectId: string | null,
 ): string | null {
@@ -788,35 +778,20 @@ function ticketReadbackMismatch(
   if ((issue.project?.id ?? null) !== queueProjectId) {
     return "Linear issue readback is outside the pinned queue project.";
   }
-  if (typeof issue.description !== "string") {
-    return "Linear issue readback does not contain the rendered ticket contract.";
+  if (issue.title !== expected.title) {
+    return "Linear issue readback contains a different title.";
   }
-  try {
-    const parsed = parseRenderedCompatibleWorkItemSpec(issue.description);
-    if (parsed.spec.fingerprint !== expected.fingerprint) {
-      return "Linear issue readback contains a different contract fingerprint.";
-    }
-    if (parsed.spec.originRunId !== expected.originRunId) {
-      return "Linear issue readback contains a different origin run.";
-    }
-  } catch {
-    return "Linear issue readback contains an invalid ticket contract.";
+  if (issue.description !== expected.description) {
+    return "Linear issue readback contains a different clean description.";
   }
   return null;
 }
 
-function hasExactContractFingerprint(
+function hasExactHumanTicketContent(
   issue: LinearIssueRecord,
-  fingerprint: string,
+  expected: BuiltResearchTicket,
 ): boolean {
-  if (typeof issue.description !== "string") return false;
-  try {
-    return (
-      parseRenderedCompatibleWorkItemSpec(issue.description).spec.fingerprint === fingerprint
-    );
-  } catch {
-    return false;
-  }
+  return issue.title === expected.title && issue.description === expected.description;
 }
 
 function expectIssuePage(

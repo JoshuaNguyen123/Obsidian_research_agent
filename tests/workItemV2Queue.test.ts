@@ -22,7 +22,6 @@ import {
   createWorkItemSpecV1,
   createWorkItemSpecV2,
   parseRenderedCompatibleWorkItemSpec,
-  parseRenderedWorkItemSpecV2,
   renderWorkItemSpecV1,
   renderWorkItemSpecV2,
   type LinearIssueRecord,
@@ -63,7 +62,7 @@ const V2_DRAFT: ResearchTicketWorkItemDraftV2 = {
   generation: 0,
 };
 
-test("v2 publisher round-trips its signed contract and deduplicates by exact fingerprint", async () => {
+test("v2 publisher keeps identity host-side and deduplicates exact clean human content", async () => {
   let duplicateDescription = "";
   const duplicate = issue("issue-v2", T0, duplicateDescription);
   const publisher = new ResearchTicketPublisher({
@@ -72,10 +71,10 @@ test("v2 publisher round-trips its signed contract and deduplicates by exact fin
     readClient: {
       execute: async (operation) => {
         if (operation === "issues.search") {
-          return page([{ ...duplicate, description: duplicateDescription }]);
+          return page([{ ...duplicate, title: SECTIONS.title, description: duplicateDescription }]);
         }
         if (operation === "issues.get") {
-          return { ...duplicate, description: duplicateDescription };
+          return { ...duplicate, title: SECTIONS.title, description: duplicateDescription };
         }
         throw new Error(`Unexpected operation ${operation}`);
       },
@@ -88,12 +87,16 @@ test("v2 publisher round-trips its signed contract and deduplicates by exact fin
     assert.fail("V2 publisher draft must build a v2 contract.");
   }
 
-  const parsed = parseRenderedWorkItemSpecV2(built.description).spec;
-  assert.equal(parsed.fingerprint, built.spec.fingerprint);
-  assert.equal(parsed.acceptedResearchArtifactFingerprint, ARTIFACT_FINGERPRINT);
-  assert.deepEqual(parsed.validationRequirementKeys, ["tests.unit", "build.production"]);
-  assert.match(built.description, /logical profile keys, not commands/i);
+  assert.match(built.spec.fingerprint, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(built.spec.acceptedResearchArtifactFingerprint, ARTIFACT_FINGERPRINT);
+  assert.deepEqual(built.spec.validationRequirementKeys, ["tests.unit", "build.production"]);
+  assert.match(built.description, /## Validation/u);
+  assert.match(built.description, /tests\.unit/u);
+  assert.doesNotMatch(
+    built.description,
 
+    /sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract|\bWork item:\s*sha256:/iu,
+  );
   const preview = await publisher.preview({
     context: {} as ToolExecutionContext,
     sections: SECTIONS,

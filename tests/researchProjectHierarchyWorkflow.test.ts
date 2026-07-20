@@ -38,6 +38,8 @@ import type { ToolExecutionContext } from "../src/tools/types";
 
 const NOW = "2026-07-16T15:00:00.000Z";
 const HASH = (character: string) => `sha256:${character.repeat(64)}`;
+const LINEAR_INTERNAL_METADATA =
+  /sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract|\bWork item:\s*sha256:/iu;
 
 test("hierarchy intent does not capture single accepted-research issue publication", () => {
   assert.equal(
@@ -270,10 +272,14 @@ test("Linear hierarchy checkpoints every prepared action before one grouped appr
   const projectInput = fixture.preparedArguments.find(
     (item) => item.toolName === "linear_create_project",
   )?.arguments.input as Record<string, unknown>;
-  assert.equal(initiativeInput.description, fixture.plan.initiative.description);
-  assert.match(String(initiativeInput.content), /agentic-idempotency:/u);
-  assert.equal(projectInput.description, fixture.plan.project.description);
-  assert.match(String(projectInput.content), /agentic-idempotency:/u);
+  assert.equal(initiativeInput.description, providerSummary(fixture.plan.initiative.description));
+  assert.equal(initiativeInput.content, fixture.plan.initiative.description);
+  assert.equal(projectInput.description, providerSummary(fixture.plan.project.description));
+  assert.equal(projectInput.content, fixture.plan.project.description);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.preparedArguments.map((item) => item.arguments)),
+    LINEAR_INTERNAL_METADATA,
+  );
   assert.equal(
     result.receipt.toolName,
     LINEAR_RESEARCH_PROJECT_HIERARCHY_RECEIPT_TOOL_NAME,
@@ -319,13 +325,13 @@ test("receipt-ledger failure resumes from the committed provider checkpoint with
   assert.equal(fixture.externalReceipts.has(resumed.ok ? resumed.receipt.id : ""), true);
 });
 
-test("hierarchy deduplicates an exact idempotency marker before preparing mutations", async () => {
+test("hierarchy deduplicates exact clean human content before preparing mutations", async () => {
   const plan = planFixture();
   const existing: LinearBaseRecord = {
     id: "initiative-existing",
     resourceType: "initiative",
     name: plan.initiative.title,
-    content: `${plan.initiative.description}\n\n<!-- agentic-idempotency:${plan.initiative.idempotencyKey} -->`,
+    content: plan.initiative.description,
     snapshotHash: HASH("e"),
   };
   const fixture = await hierarchyFixture({ plan, seed: [existing] });
@@ -337,6 +343,28 @@ test("hierarchy deduplicates an exact idempotency marker before preparing mutati
   assert.equal(initiative?.resourceId, "initiative-existing");
   assert.equal(fixture.mutations.length, 5);
 });
+test("hierarchy rejects ambiguous exact clean duplicates before any mutation", async () => {
+  const plan = planFixture();
+  const duplicate = (id: string): LinearBaseRecord => ({
+    id,
+    resourceType: "initiative",
+    name: plan.initiative.title,
+    content: plan.initiative.description,
+    snapshotHash: HASH(id === "initiative-one" ? "1" : "2"),
+  });
+  const fixture = await hierarchyFixture({
+    plan,
+    seed: [duplicate("initiative-one"), duplicate("initiative-two")],
+  });
+  const result = await fixture.workflow.execute(fixture.request());
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "linear_hierarchy_dedupe_failed");
+  assert.match(result.error.message, /matches multiple resources/i);
+  assert.equal(fixture.mutations.length, 0);
+});
+
 
 test("hierarchy deduplicates an existing initiative-project relation after parent recovery", async () => {
   const plan = planFixture();
@@ -344,14 +372,14 @@ test("hierarchy deduplicates an existing initiative-project relation after paren
     id: "initiative-existing",
     resourceType: "initiative",
     name: plan.initiative.title,
-    content: `${plan.initiative.description}\n\n<!-- agentic-idempotency:${plan.initiative.idempotencyKey} -->`,
+    content: plan.initiative.description,
     snapshotHash: HASH("e"),
   };
   const project: LinearBaseRecord = {
     id: "project-existing",
     resourceType: "project",
     name: plan.project.title,
-    content: `${plan.project.description}\n\n<!-- agentic-idempotency:${plan.project.idempotencyKey} -->`,
+    content: plan.project.description,
     snapshotHash: HASH("f"),
   };
   const link: LinearBaseRecord = {
@@ -386,25 +414,29 @@ test("hierarchy deduplicates an existing dependency relation after issue recover
     {
       id: "initiative-existing",
       resourceType: "initiative",
-      content: `<!-- agentic-idempotency:${plan.initiative.idempotencyKey} -->`,
+      name: plan.initiative.title,
+      content: plan.initiative.description,
       snapshotHash: HASH("1"),
     },
     {
       id: "project-existing",
       resourceType: "project",
-      content: `<!-- agentic-idempotency:${plan.project.idempotencyKey} -->`,
+      name: plan.project.title,
+      content: plan.project.description,
       snapshotHash: HASH("2"),
     },
     {
       id: "foundation-existing",
       resourceType: "issue",
-      description: `<!-- agentic-idempotency:${foundation.idempotencyKey} -->`,
+      title: foundation.title,
+      description: cleanHierarchyIssueDescription(foundation),
       snapshotHash: HASH("3"),
     },
     {
       id: "integration-existing",
       resourceType: "issue",
-      description: `<!-- agentic-idempotency:${integration.idempotencyKey} -->`,
+      title: integration.title,
+      description: cleanHierarchyIssueDescription(integration),
       snapshotHash: HASH("4"),
     },
     {
@@ -674,6 +706,14 @@ function planFixture() {
   });
 }
 
+function cleanHierarchyIssueDescription(
+  issue: ReturnType<typeof planFixture>["issues"][number],
+): string {
+  return `${issue.description}\n\n## Acceptance criteria\n${issue.acceptanceCriteria
+    .map((criterion) => `- [ ] ${criterion}`)
+    .join("\n")}`;
+}
+
 async function hierarchyGrant(): Promise<AuthorityGrantV1> {
   return createBoundedGrant({
     id: "grant-hierarchy-1",
@@ -712,6 +752,7 @@ function recordFromAction(action: PreparedAction, sequence: number): LinearBaseR
   return {
     id: action.target.id,
     resourceType: action.target.resourceType as LinearBaseRecord["resourceType"],
+    content: typeof input.content === "string" ? input.content : undefined,
     name: typeof input.name === "string" ? input.name : undefined,
     title: typeof args.title === "string" ? args.title : undefined,
     description:

@@ -10,6 +10,7 @@ import type {
   HostLinearActionExecutor,
   LinearAuthoritySubject,
 } from "./HostLinearActionExecutor";
+import { assertCleanLinearHumanOutputV1 } from "./WorkItemRenderer";
 import type { LinearToolClient } from "./LinearTools";
 import {
   DurableLinearContractError,
@@ -601,6 +602,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
     plan: ResearchProjectPlanV1,
     request: ResearchProjectHierarchyRequestV1,
   ): Promise<HierarchyOperationV1[]> {
+    assertCleanResearchProjectPlanV1(plan);
     const duplicates = await this.findDuplicates(plan, request.context);
     const operations: HierarchyOperationV1[] = [];
     const initiative = operation({
@@ -613,10 +615,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
         input: {
           name: plan.initiative.title,
           description: providerSummary(plan.initiative.description),
-          content: taggedDescription(
-            plan.initiative.description,
-            plan.initiative.idempotencyKey,
-          ),
+          content: plan.initiative.description,
         },
       },
       duplicate: duplicates.get(plan.initiative.idempotencyKey),
@@ -634,10 +633,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
         input: {
           name: plan.project.title,
           description: providerSummary(plan.project.description),
-          content: taggedDescription(
-            plan.project.description,
-            plan.project.idempotencyKey,
-          ),
+          content: plan.project.description,
           teamIds: [plan.destination.teamId],
         },
       },
@@ -676,10 +672,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
           teamId: plan.destination.teamId,
           projectId,
           title: issue.title,
-          description: taggedDescription(
-            `${issue.description}\n\nAcceptance criteria:\n${issue.acceptanceCriteria.map((criterion) => `- ${criterion}`).join("\n")}\n\nWork item: ${issue.workItemFingerprint}`,
-            issue.idempotencyKey,
-          ),
+          description: renderHierarchyIssueDescriptionV1(issue),
         },
         duplicate: duplicates.get(issue.idempotencyKey),
       });
@@ -757,24 +750,48 @@ export class ResearchProjectHierarchyWorkflowV1 {
       this.list("projects.list", context),
       this.list("issues.list", context),
     ]);
-    const expectedKeys = new Set([
-      plan.initiative.idempotencyKey,
-      plan.project.idempotencyKey,
-      ...plan.issues.map((issue) => issue.idempotencyKey),
-    ]);
+    const expected: Array<{
+      key: string;
+      label: string;
+      matches: (record: LinearBaseRecord) => boolean;
+    }> = [
+      {
+        key: plan.initiative.idempotencyKey,
+        label: `initiative ${plan.initiative.title}`,
+        matches: (record) =>
+          record.resourceType === "initiative" &&
+          record.name === plan.initiative.title &&
+          record.content === plan.initiative.description,
+      },
+      {
+        key: plan.project.idempotencyKey,
+        label: `project ${plan.project.title}`,
+        matches: (record) =>
+          record.resourceType === "project" &&
+          record.name === plan.project.title &&
+          record.content === plan.project.description,
+      },
+      ...plan.issues.map((issue) => ({
+        key: issue.idempotencyKey,
+        label: `issue ${issue.title}`,
+        matches: (record: LinearBaseRecord) =>
+          record.resourceType === "issue" &&
+          record.title === issue.title &&
+          record.description === renderHierarchyIssueDescriptionV1(issue),
+      })),
+    ];
     for (const record of catalogs.flat()) {
-      const content = [record.description, record.content, record.body]
-        .filter((value): value is string => typeof value === "string")
-        .join("\n");
-      for (const key of expectedKeys) {
-        if (content.includes(idempotencyMarker(key))) {
-          const previous = result.get(key);
-          if (previous && previous.id !== record.id) {
-            throw new Error(`Linear idempotency key ${key} matches multiple resources.`);
-          }
-          result.set(key, record);
-        }
+      const matches = expected.filter((candidate) => candidate.matches(record));
+      if (matches.length > 1) {
+        throw new Error("One Linear resource matches multiple clean hierarchy items.");
       }
+      const match = matches[0];
+      if (!match) continue;
+      const previous = result.get(match.key);
+      if (previous && previous.id !== record.id) {
+        throw new Error(`Linear ${match.label} matches multiple resources.`);
+      }
+      result.set(match.key, record);
     }
     return result;
   }
@@ -894,24 +911,47 @@ function stableToolCallId(planFingerprint: string, key: string): string {
     .slice(0, 150);
 }
 
-function taggedDescription(description: string, idempotencyKey: string): string {
-  return `${description}\n\n${idempotencyMarker(idempotencyKey)}`;
+function renderHierarchyIssueDescriptionV1(
+  issue: ResearchProjectPlanV1["issues"][number],
+): string {
+  const description = `${issue.description}\n\n## Acceptance criteria\n${issue.acceptanceCriteria
+    .map((criterion) => `- [ ] ${criterion}`)
+    .join("\n")}`;
+  assertCleanLinearHumanOutputV1(description, `Linear issue ${issue.title}`);
+  return description;
+}
+
+function assertCleanResearchProjectPlanV1(plan: ResearchProjectPlanV1): void {
+  const fields: Array<[string, string]> = [
+    ["Linear initiative title", plan.initiative.title],
+    ["Linear initiative description", plan.initiative.description],
+    ["Linear project title", plan.project.title],
+    ["Linear project description", plan.project.description],
+    ...plan.issues.flatMap((issue): Array<[string, string]> => [
+      [`Linear issue ${issue.key} title`, issue.title],
+      [`Linear issue ${issue.key} description`, issue.description],
+      ...issue.acceptanceCriteria.map(
+        (criterion): [string, string] => [
+          `Linear issue ${issue.key} acceptance criterion`,
+          criterion,
+        ],
+      ),
+    ]),
+  ];
+  for (const [label, value] of fields) {
+    assertCleanLinearHumanOutputV1(value, label);
+  }
 }
 
 /**
  * Linear's project and initiative `description` is the bounded list synopsis;
- * their full markdown belongs in `content`. Keep the synopsis comfortably
- * below the provider boundary while preserving the complete source text and
- * idempotency marker in content.
+ * their full clean markdown belongs in `content`.
  */
 export function providerSummary(description: string): string {
+  assertCleanLinearHumanOutputV1(description, "Linear project summary");
   const compact = description.replace(/\s+/gu, " ").trim();
   if (compact.length <= 240) return compact;
   return `${compact.slice(0, 237).trimEnd()}...`;
-}
-
-function idempotencyMarker(key: string): string {
-  return `<!-- agentic-idempotency:${key} -->`;
 }
 
 function fingerprintHierarchyApproval(

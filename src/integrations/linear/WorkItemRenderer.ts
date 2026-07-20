@@ -201,6 +201,56 @@ export function renderCompatibleWorkItemSpec(
   ].join("\n\n");
 }
 
+/** Render provider-visible issue prose without host fingerprints or machine metadata. */
+export function renderHumanCompatibleWorkItemSpec(
+  value: ParsedCompatibleWorkItemSpec,
+  renderDetails: WorkItemRenderDetailsV1 = {},
+): string {
+  const spec = value.schemaVersion === 1
+    ? parseWorkItemSpecV1(value)
+    : parseWorkItemSpecV2(value);
+  const details = normalizeRenderDetails(renderDetails);
+  const acceptanceCriteria = spec.acceptanceCriteria
+    .map((criterion) => `- [ ] **${escapeInline(criterion.id)}** - ${criterion.text}`)
+    .join("\n");
+  const validationValues = spec.schemaVersion === 1
+    ? spec.validationRequirements
+    : spec.validationRequirementKeys;
+  const description = [
+    "## Problem / impact",
+    details.problemImpact ?? spec.objective,
+    "## Evidence / source links",
+    renderStringList(spec.evidenceRefs, "No evidence references recorded."),
+    "## Confidence / limitations",
+    details.confidenceLimitations ?? "_No additional confidence or limitation note recorded._",
+    "## Proposed work",
+    renderStringList(
+      details.proposedWork.length > 0 ? details.proposedWork : [spec.objective],
+      "No proposed work recorded.",
+    ),
+    "## Non-goals",
+    renderStringList(details.nonGoals, "No non-goals recorded."),
+    "## Scope",
+    renderStringList(details.scope, "No scope recorded."),
+    "## Dependencies",
+    renderStringList(details.dependencies, "No dependencies recorded."),
+    "## Acceptance criteria",
+    acceptanceCriteria,
+    "## Validation",
+    renderStringList(validationValues, "No validation requirements recorded."),
+  ].join("\n\n");
+  assertCleanLinearHumanOutputV1(description, "Linear issue description");
+  return description;
+}
+
+export function assertCleanLinearHumanOutputV1(value: string, label: string): void {
+  if (
+    /sha256:[a-f0-9]{64}|<!--\s*agentic-[^>]*-->|##\s*Machine contract|\bWork item:\s*sha256:/iu.test(value)
+  ) {
+    throw new Error(`${label} contains internal agent metadata.`);
+  }
+}
+
 function renderStringList(values: readonly string[], emptyText: string): string {
   return values.length > 0
     ? values.map((value) => `- ${value}`).join("\n")

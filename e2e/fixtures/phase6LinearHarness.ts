@@ -930,12 +930,16 @@ async function installFixedLinearPublicationClient(page: Page): Promise<void> {
             return JSON.parse(JSON.stringify(record));
           }
           case "issues.create": {
+            const candidateInput =
+              variables.input && typeof variables.input === "object"
+                ? variables.input as Record<string, unknown>
+                : variables;
             if (
-              String(
-                (variables.input as Record<string, unknown> | undefined)?.description ??
-                  variables.description ??
-                  "",
-              ).includes("agentic-idempotency:")
+              [...state.records.values()].some(
+                (record) =>
+                  record.resourceType === "project" &&
+                  record.id === String(candidateInput.projectId ?? ""),
+              )
             ) {
               return createHierarchyRecord("issue", variables, operationKey);
             }
@@ -1062,6 +1066,7 @@ async function installFixedLinearPublicationClient(page: Page): Promise<void> {
                 name: String(input.name ?? input.title ?? resourceType),
                 title: String(input.title ?? input.name ?? resourceType),
                 description: String(input.description ?? ""),
+                content: String(input.content ?? ""),
                 url: `https://linear.app/e2e/${resourceType}/${id}`,
                 createdAt: timestamp,
                 updatedAt: timestamp,

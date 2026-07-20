@@ -13,6 +13,7 @@ import {
 } from "../src/integrations/linear/WorkItemParser";
 import {
   renderWorkItemSpecV1,
+  renderHumanCompatibleWorkItemSpec,
   WORK_ITEM_CONTRACT_END,
 } from "../src/integrations/linear/WorkItemRenderer";
 import {
@@ -91,6 +92,33 @@ test("rendered Linear descriptions round-trip through the machine contract", () 
   assert.match(markdown, /- \[ \] \*\*AC-1\*\*/);
   assert.ok(markdown.endsWith(WORK_ITEM_CONTRACT_END));
 });
+test("normal Linear issue prose stays human-readable and excludes host metadata", () => {
+  const spec = createWorkItemSpecV1(UNSIGNED);
+  const markdown = renderHumanCompatibleWorkItemSpec(spec, {
+    problemImpact: "Duplicate execution could corrupt an autonomous coding run.",
+    confidenceLimitations: "Webhook delivery is outside this issue.",
+    proposedWork: ["Persist a revisioned queue and expiring leases."],
+    nonGoals: ["Automatic pull-request merging."],
+    scope: ["Linear issue ingestion and queue state."],
+    dependencies: ["A configured Linear workspace."],
+  });
+
+  assert.match(markdown, /## Problem \/ impact/u);
+  assert.match(markdown, /## Acceptance criteria/u);
+  assert.match(markdown, /## Validation/u);
+  assert.doesNotMatch(
+    markdown,
+    /sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract|\bWork item:\s*sha256:/iu,
+  );
+  assert.throws(
+    () =>
+      renderHumanCompatibleWorkItemSpec(spec, {
+        problemImpact: `Work item: ${spec.fingerprint}`,
+      }),
+    /internal agent metadata/i,
+  );
+});
+
 
 test("tampering, unknown fields, duplicate markers, and unsafe readiness fail closed", () => {
   const spec = createWorkItemSpecV1(UNSIGNED);

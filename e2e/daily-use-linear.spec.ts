@@ -312,6 +312,28 @@ test.describe("Daily-use Linear integration", () => {
         ]),
       });
       expect(firstHierarchy.hierarchyRecords).toHaveLength(6);
+      const providerVisibleHierarchyText = firstHierarchy.hierarchyRecords
+        .flatMap((record: any) => {
+          const attributes =
+            record.attributes && typeof record.attributes === "object"
+              ? record.attributes
+              : {};
+          return [
+            record.name,
+            record.title,
+            record.description,
+            record.content,
+            attributes.name,
+            attributes.title,
+            attributes.description,
+            attributes.content,
+          ];
+        })
+        .filter((value: unknown) => typeof value === "string")
+        .join("\n");
+      expect(providerVisibleHierarchyText).not.toMatch(
+        /sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract|\bWork item:\s*sha256:/iu,
+      );
       expect(firstHierarchy.hierarchyCheckpoint).toMatchObject({
         status: "complete",
         items: expect.arrayContaining([

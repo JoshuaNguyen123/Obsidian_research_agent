@@ -5,7 +5,6 @@ import type { ActionReceipt, PreparedAction } from "../src/agent/actions";
 import type { ToolExecutionContext } from "../src/tools/types";
 import {
   ResearchTicketPublisher,
-  parseRenderedWorkItemSpecV1,
   type HostLinearActionExecution,
   type HostLinearActionPreparation,
   type LinearIssueRecord,
@@ -22,6 +21,8 @@ const QUEUE_TEAM_ID = "team-research";
 const QUEUE_PROJECT_ID = "project-agent-queue";
 const SUBJECT = { type: "schedule" as const, id: "linear-queue" };
 
+const LINEAR_INTERNAL_METADATA =
+  /sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract|\bWork item:\s*sha256:/iu;
 const DRAFT: ResearchTicketWorkItemDraftV1 = {
   schemaVersion: 1,
   ready: true,
@@ -56,10 +57,10 @@ test("publisher rebuilds, fingerprints, renders, and bounds synthesized ticket i
 
   assert.match(built.spec.fingerprint, /^sha256:[a-f0-9]{64}$/);
   assert.notEqual(built.spec.fingerprint, DRAFT.fingerprint);
-  assert.equal(
-    parseRenderedWorkItemSpecV1(built.description).spec.fingerprint,
-    built.spec.fingerprint,
-  );
+  assert.match(built.description, /## Problem \/ impact/u);
+  assert.match(built.description, /## Acceptance criteria/u);
+  assert.match(built.description, /## Validation/u);
+  assert.doesNotMatch(built.description, LINEAR_INTERNAL_METADATA);
   assert.match(
     built.deterministicIssueId,
     /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
@@ -113,15 +114,12 @@ test("publisher preview builds and deduplicates without preparing or dispatching
   if (!preview.ok) return;
   assert.equal(preview.status, "create");
   assert.equal(preview.duplicate, null);
-  assert.match(
-    preview.ticket.description,
-    /agentic-researcher:work-item:v1:start/u,
-  );
+  assert.doesNotMatch(preview.ticket.description, LINEAR_INTERNAL_METADATA);
   assert.equal(prepareCount, 0);
   assert.equal(executeCount, 0);
 });
 
-test("publisher deduplicates only an exact signed contract in the pinned queue project", async () => {
+test("publisher deduplicates only exact clean human content in the pinned queue project", async () => {
   let executeCalls = 0;
   const searches: Array<Record<string, unknown>> = [];
   let duplicateDescription = "";
@@ -247,10 +245,8 @@ test("publisher prepares one deterministic pinned create and verifies independen
   assert.equal(preparedArguments?.id, result.ticket.deterministicIssueId);
   assert.equal(result.issue.id, result.ticket.deterministicIssueId);
   assert.equal(result.issue.project?.id, QUEUE_PROJECT_ID);
-  assert.equal(
-    parseRenderedWorkItemSpecV1(result.issue.description ?? "").spec.fingerprint,
-    result.ticket.spec.fingerprint,
-  );
+  assert.equal(result.issue.description, result.ticket.description);
+  assert.doesNotMatch(result.issue.description ?? "", LINEAR_INTERNAL_METADATA);
   assert.equal(result.receipt.grantId, "grant-queue");
   assert.equal(searches.length, 2);
 });
@@ -303,8 +299,8 @@ test("publisher supports an exact team-scoped destination when Linear has no pro
   }
 });
 
-test("publisher fails closed when created issue readback changes project or contract", async (t) => {
-  for (const mismatch of ["project", "contract"] as const) {
+test("publisher fails closed when created issue readback changes project or description", async (t) => {
+  for (const mismatch of ["project", "description"] as const) {
     await t.test(mismatch, async () => {
       let preparedArguments: Record<string, unknown> | undefined;
       const readClient: LinearToolClient = {
@@ -313,13 +309,13 @@ test("publisher fails closed when created issue readback changes project or cont
           if (operationKey === "issues.get" && preparedArguments) {
             const different = publisherFixture(emptyReadClient(), unusedExecutor())
               .build(
-                { ...SECTIONS, title: "Different accepted ticket" },
-                { ...DRAFT, objective: "A different contract." },
+                { ...SECTIONS, problemImpact: "A different clean issue description." },
+                DRAFT,
               )
               .description;
             return issue(
               String(preparedArguments.id),
-              mismatch === "contract"
+              mismatch === "description"
                 ? different
                 : String(preparedArguments.description),
               mismatch === "project" ? "wrong-project" : QUEUE_PROJECT_ID,
@@ -343,7 +339,7 @@ test("publisher fails closed when created issue readback changes project or cont
       if (result.ok) return;
       assert.equal(result.status, "reconcile_required");
       assert.equal(result.error.code, "research_ticket_readback_mismatch");
-      assert.match(result.error.message, mismatch === "project" ? /project/i : /fingerprint/i);
+      assert.match(result.error.message, mismatch === "project" ? /project/i : /description/i);
     });
   }
 });
