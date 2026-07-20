@@ -332,6 +332,7 @@ async function parseToolArguments(input: {
   const { value, runId } = input;
   assertExactKeys(value, ["mode", "package"], ["notePath", "baseHash"]);
   const packageRecord = expectRecord(value.package, "accepted research package");
+  hydratePackageObjective(packageRecord);
   assertExactKeys(
     packageRecord,
     [
@@ -757,7 +758,11 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
           description:
             "Use code when repositoryKey is present; repository-bound implementation research is code work.",
         },
-        objective: STRING,
+        objective: {
+          type: "string",
+          description:
+            "Optional short objective. Omit when unavailable; the host derives it from title or problemImpact.",
+        },
         repositoryKey: {
           type: "string",
           description:
@@ -768,12 +773,40 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
         "schemaVersion", "title", "problemImpact", "evidence",
         "confidenceLimitations", "proposedWork", "nonGoals", "scope",
         "dependencies", "acceptanceCriteria", "validationRequirementKeys",
-        "riskClass", "executionClass", "objective",
+        "riskClass", "executionClass",
       ],
     },
   },
   required: ["mode", "package"],
 };
+
+function hydratePackageObjective(packageRecord: Record<string, unknown>): void {
+  if (
+    typeof packageRecord.objective === "string" &&
+    packageRecord.objective.trim()
+  ) {
+    packageRecord.objective = packageRecord.objective.trim();
+    return;
+  }
+  const title =
+    typeof packageRecord.title === "string" ? packageRecord.title.trim() : "";
+  const problemImpact =
+    typeof packageRecord.problemImpact === "string"
+      ? packageRecord.problemImpact.trim()
+      : "";
+  if (title) {
+    packageRecord.objective = `Deliver the accepted research for: ${title}`.slice(
+      0,
+      500,
+    );
+    return;
+  }
+  if (problemImpact) {
+    packageRecord.objective = problemImpact.slice(0, 500);
+    return;
+  }
+  packageRecord.objective = "Deliver the accepted research work item.";
+}
 
 function assertExactKeys(
   record: Record<string, unknown>,

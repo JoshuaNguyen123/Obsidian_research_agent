@@ -243,6 +243,32 @@ test("host derives missing package identifiers from canonical evidence and order
   assert.equal(fixture.noteWrites[0]?.package.acceptanceCriteria[0]?.id, "AC-1");
 });
 
+test("host derives a missing package objective from the title", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  const package_ = args.package as Record<string, unknown>;
+  delete package_.objective;
+  const context = contextFixture(
+    "Publish this research to Linear in Published.md",
+  );
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-host-derived-objective",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    fixture.noteWrites[0]?.package.objective,
+    "Deliver the accepted research for: Accepted research",
+  );
+});
+
 test("same-run publication retry reuses the first validated package and stable artifact identity", async () => {
   const fixture = createFixture("created");
   const context = contextFixture(
