@@ -1703,38 +1703,16 @@ async function configureProtectedConnections(
       ) {
         throw new Error("Linear credential did not land in native secure storage.");
       }
-      const snapshot = plugin.getLinearCapabilitySnapshot?.();
-      const configuredProjectId = String(
-        requestedLinearProjectId ?? plugin.settings?.linearQueueProjectId ?? "",
-      ).trim();
-      if (!configuredProjectId) {
-        throw new Error(
-          "Select a dedicated Linear project for protected test evidence or set E2E_RELEASE_LINEAR_PROJECT_ID.",
-        );
-      }
-      const requestedProject = (snapshot?.projects ?? []).find(
-        (project: any) =>
-          String(project?.id ?? "").trim() === configuredProjectId,
-      );
-      if (!requestedProject) {
-        throw new Error(
-          "The configured protected Linear project ID did not resolve in authenticated discovery.",
-        );
-      }
-      const projectTeamIds = Array.isArray(requestedProject?.teamIds)
-        ? requestedProject.teamIds
-            .map((teamId: unknown) => String(teamId ?? "").trim())
-            .filter(Boolean)
-        : [];
+      let snapshot = plugin.getLinearCapabilitySnapshot?.();
       const configuredTeamId = String(
         requestedLinearTeamId ??
-          (projectTeamIds.length === 1 ? projectTeamIds[0] : null) ??
           plugin.settings?.linearDefaultTeamId ??
+          snapshot?.teams?.[0]?.id ??
           "",
       ).trim();
       if (!configuredTeamId) {
         throw new Error(
-          "The protected Linear project does not identify one team; select its exact team or set LINEAR_LIVE_TEST_TEAM_ID.",
+          "Linear discovery did not provide a usable team; connect Linear or set LINEAR_LIVE_TEST_TEAM_ID.",
         );
       }
       const evidenceTeam = (snapshot?.teams ?? []).find(
@@ -1746,6 +1724,62 @@ async function configureProtectedConnections(
         );
       }
       const linearTeamId = String(evidenceTeam?.id ?? "").trim();
+
+      let configuredProjectId = String(
+        requestedLinearProjectId ?? plugin.settings?.linearQueueProjectId ?? "",
+      ).trim();
+      let requestedProject = (snapshot?.projects ?? []).find(
+        (project: any) =>
+          String(project?.id ?? "").trim() === configuredProjectId,
+      );
+      // When no evidence project is configured, create one on the discovered
+      // team. Compound missions already create work hierarchy projects/issues;
+      // this destination is only for retained DU-06 evidence.
+      if (!requestedProject) {
+        if (!plugin.createSecretBackedLinearClient) {
+          throw new Error(
+            "Native Linear client unavailable to create a protected evidence project.",
+          );
+        }
+        const created = await plugin.createSecretBackedLinearClient().execute(
+          "projects.create",
+          {
+            input: {
+              name: `Agentic E2E Evidence ${Date.now().toString(36)}`,
+              teamIds: [linearTeamId],
+            },
+          },
+        );
+        configuredProjectId = String(
+          (created as any)?.id ??
+            (created as any)?.project?.id ??
+            "",
+        ).trim();
+        if (!configuredProjectId) {
+          throw new Error(
+            "Linear project create did not return an evidence project id.",
+          );
+        }
+        const refreshed = await plugin.testLinearConnection();
+        if (!refreshed?.ok) {
+          throw new Error(
+            "Linear rediscovery failed after creating the evidence project.",
+          );
+        }
+        snapshot = plugin.getLinearCapabilitySnapshot?.();
+        requestedProject = (snapshot?.projects ?? []).find(
+          (project: any) =>
+            String(project?.id ?? "").trim() === configuredProjectId,
+        ) ?? {
+          id: configuredProjectId,
+          teamIds: [linearTeamId],
+        };
+      }
+      const projectTeamIds = Array.isArray(requestedProject?.teamIds)
+        ? requestedProject.teamIds
+            .map((teamId: unknown) => String(teamId ?? "").trim())
+            .filter(Boolean)
+        : [];
       if (
         projectTeamIds.length > 0 &&
         !projectTeamIds.includes(linearTeamId)
@@ -1755,8 +1789,8 @@ async function configureProtectedConnections(
         );
       }
       const linearProjectId = String(requestedProject.id ?? "").trim();
-      if (!linearTeamId) {
-        throw new Error("Linear discovery did not provide a usable team destination.");
+      if (!linearTeamId || !linearProjectId) {
+        throw new Error("Linear discovery did not provide a usable team/project destination.");
       }
       plugin.settings.linearDefaultTeamId = linearTeamId;
       plugin.settings.linearQueueProjectId = linearProjectId;
