@@ -336,6 +336,20 @@ export class ResearchTicketPublisher {
       context: request.context,
     });
     if (!prepared.ok) {
+      const adopted = await this.tryAdoptDeterministicIssue(
+        ticket,
+        request.context,
+        prepared.error,
+      );
+      if (adopted) {
+        return {
+          ok: true,
+          status: "deduplicated",
+          ticket,
+          issue: adopted,
+          candidatesExamined: preview.candidatesExamined,
+        };
+      }
       return {
         ok: false,
         status: "rejected",
@@ -412,6 +426,26 @@ export class ResearchTicketPublisher {
     ticket: BuiltResearchTicket,
     context: ToolExecutionContext,
   ): Promise<DuplicateSearchResult> {
+    // Idempotent retry: a prior create may have committed under the deterministic
+    // id even when search indexing or an earlier ack path missed it.
+    try {
+      const byId = await this.readIssue(ticket.deterministicIssueId, context);
+      if (
+        !ticketReadbackMismatch(
+          byId,
+          ticket,
+          this.queueTeamId,
+          this.queueProjectId,
+        )
+      ) {
+        return { issue: byId, candidatesExamined: 1 };
+      }
+    } catch (error) {
+      if (!(error instanceof LinearClientError && error.code === "linear_not_found")) {
+        throw error;
+      }
+    }
+
     const candidates = new Map<string, LinearIssueRecord>();
     // Search with human-facing text only. Exact deduplication still requires
     // an independent readback of the complete title and clean description.
@@ -482,6 +516,32 @@ export class ResearchTicketPublisher {
     }
     return result;
   }
+
+  private async tryAdoptDeterministicIssue(
+    ticket: BuiltResearchTicket,
+    context: ToolExecutionContext,
+    error: { code: string; message: string },
+  ): Promise<LinearIssueRecord | null> {
+    if (error.code !== "linear_duplicate_target") {
+      return null;
+    }
+    try {
+      const issue = await this.readIssue(ticket.deterministicIssueId, context);
+      if (
+        ticketReadbackMismatch(
+          issue,
+          ticket,
+          this.queueTeamId,
+          this.queueProjectId,
+        )
+      ) {
+        return null;
+      }
+      return issue;
+    } catch {
+      return null;
+    }
+  }
 }
 
 function compareApprovedPreview(
@@ -490,6 +550,17 @@ function compareApprovedPreview(
 ): string | null {
   const duplicateId = current.duplicate?.id ?? null;
   const duplicateSnapshotHash = current.duplicate?.snapshotHash ?? null;
+  // An approved create may observe the deterministic issue already present on
+  // retry after a prior create committed without a clean host ack.
+  if (
+    approved.status === "create" &&
+    current.status === "deduplicated" &&
+    approved.workItemFingerprint === current.ticket.spec.fingerprint &&
+    approved.duplicateId === null &&
+    duplicateId === current.ticket.deterministicIssueId
+  ) {
+    return null;
+  }
   if (
     approved.status !== current.status ||
     approved.workItemFingerprint !== current.ticket.spec.fingerprint ||

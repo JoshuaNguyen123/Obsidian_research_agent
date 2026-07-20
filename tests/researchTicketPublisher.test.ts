@@ -4,6 +4,7 @@ import test from "node:test";
 import type { ActionReceipt, PreparedAction } from "../src/agent/actions";
 import type { ToolExecutionContext } from "../src/tools/types";
 import {
+  LinearClientError,
   ResearchTicketPublisher,
   type HostLinearActionExecution,
   type HostLinearActionPreparation,
@@ -123,6 +124,7 @@ test("publisher deduplicates only exact clean human content in the pinned queue 
   let executeCalls = 0;
   const searches: Array<Record<string, unknown>> = [];
   let duplicateDescription = "";
+  let deterministicId = "";
   const readClient: LinearToolClient = {
     execute: async (operationKey, variables = {}) => {
       if (operationKey === "issues.search") {
@@ -136,7 +138,15 @@ test("publisher deduplicates only exact clean human content in the pinned queue 
         return page([]);
       }
       if (operationKey === "issues.get") {
-        assert.deepEqual(variables, { id: "duplicate" });
+        const id = String(variables.id ?? "");
+        if (id === deterministicId) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
+        assert.equal(id, "duplicate");
         return issue("duplicate", duplicateDescription, QUEUE_PROJECT_ID);
       }
       throw new Error(`Unexpected operation ${operationKey}`);
@@ -149,7 +159,9 @@ test("publisher deduplicates only exact clean human content in the pinned queue 
     },
   });
   const publisher = publisherFixture(readClient, executor);
-  duplicateDescription = publisher.build(SECTIONS, DRAFT).description;
+  const built = publisher.build(SECTIONS, DRAFT);
+  deterministicId = built.deterministicIssueId;
+  duplicateDescription = built.description;
 
   const result = await publisher.publish(requestFixture({
     status: "deduplicated",
@@ -176,13 +188,22 @@ test("publisher deduplicates only exact clean human content in the pinned queue 
 test("publisher rejects create-to-deduplicate drift after exact approval", async () => {
   let executeCalls = 0;
   let duplicateDescription = "";
+  let deterministicId = "";
   const readClient: LinearToolClient = {
     execute: async (operationKey, variables = {}) => {
       if (operationKey === "issues.search") {
         return page([issue("late-duplicate", duplicateDescription, QUEUE_PROJECT_ID)]);
       }
       if (operationKey === "issues.get") {
-        assert.deepEqual(variables, { id: "late-duplicate" });
+        const id = String(variables.id ?? "");
+        if (id === deterministicId) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
+        assert.equal(id, "late-duplicate");
         return issue("late-duplicate", duplicateDescription, QUEUE_PROJECT_ID);
       }
       throw new Error(`Unexpected operation ${operationKey}`);
@@ -191,7 +212,9 @@ test("publisher rejects create-to-deduplicate drift after exact approval", async
   const publisher = publisherFixture(readClient, fakeExecutor({
     onExecute: () => { executeCalls += 1; },
   }));
-  duplicateDescription = publisher.build(SECTIONS, DRAFT).description;
+  const built = publisher.build(SECTIONS, DRAFT);
+  deterministicId = built.deterministicIssueId;
+  duplicateDescription = built.description;
 
   const result = await publisher.publish(requestFixture());
 
@@ -200,6 +223,111 @@ test("publisher rejects create-to-deduplicate drift after exact approval", async
   assert.equal(result.status, "rejected");
   assert.equal(result.error.code, "research_ticket_approved_preview_changed");
   assert.equal(executeCalls, 0);
+});
+
+test("publisher adopts deterministic issue when approved create observes it already present", async () => {
+  let prepareCount = 0;
+  let executeCount = 0;
+  let deterministicId = "";
+  let description = "";
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") return page([]);
+      if (operationKey === "issues.get") {
+        assert.equal(variables.id, deterministicId);
+        return issue(deterministicId, description, QUEUE_PROJECT_ID);
+      }
+      throw new Error(`Unexpected operation ${operationKey}`);
+    },
+  };
+  const publisher = publisherFixture(
+    readClient,
+    fakeExecutor({
+      onPrepare: () => {
+        prepareCount += 1;
+      },
+      onExecute: () => {
+        executeCount += 1;
+      },
+    }),
+  );
+  const built = publisher.build(SECTIONS, DRAFT);
+  deterministicId = built.deterministicIssueId;
+  description = built.description;
+
+  const result = await publisher.publish(
+    requestFixture({
+      approvedPreview: {
+        status: "create",
+        workItemFingerprint: built.spec.fingerprint,
+        duplicateId: null,
+        duplicateSnapshotHash: null,
+      },
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  if (!result.ok || result.status !== "deduplicated") return;
+  assert.equal(result.issue.id, deterministicId);
+  assert.equal(prepareCount, 0);
+  assert.equal(executeCount, 0);
+});
+
+test("publisher adopts deterministic issue after prepare reports duplicate target", async () => {
+  let prepareCount = 0;
+  let executeCount = 0;
+  let getCount = 0;
+  let deterministicId = "";
+  let description = "";
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") return page([]);
+      if (operationKey === "issues.get") {
+        getCount += 1;
+        assert.equal(variables.id, deterministicId);
+        // First get during findDuplicate misses; prepare then fails as duplicate.
+        if (getCount === 1) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
+        return issue(deterministicId, description, QUEUE_PROJECT_ID);
+      }
+      throw new Error(`Unexpected operation ${operationKey}`);
+    },
+  };
+  const publisher = publisherFixture(
+    readClient,
+    fakeExecutor({
+      onPrepare: () => {
+        prepareCount += 1;
+        return {
+          ok: false as const,
+          error: {
+            code: "linear_duplicate_target",
+            message: `Linear issue ${deterministicId} already exists.`,
+          },
+        };
+      },
+      onExecute: () => {
+        executeCount += 1;
+      },
+    }),
+  );
+  const built = publisher.build(SECTIONS, DRAFT);
+  deterministicId = built.deterministicIssueId;
+  description = built.description;
+
+  const result = await publisher.publish(requestFixture());
+
+  assert.equal(result.ok, true);
+  if (!result.ok || result.status !== "deduplicated") return;
+  assert.equal(result.issue.id, deterministicId);
+  assert.equal(prepareCount, 1);
+  assert.equal(executeCount, 0);
+  assert.equal(getCount, 2);
 });
 
 test("publisher prepares one deterministic pinned create and verifies independent readback", async () => {
@@ -213,7 +341,14 @@ test("publisher prepares one deterministic pinned create and verifies independen
         searches.push(variables);
         return page([]);
       }
-      if (operationKey === "issues.get" && preparedArguments) {
+      if (operationKey === "issues.get") {
+        if (!preparedArguments) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
         return issue(
           String(preparedArguments.id),
           String(preparedArguments.description),
@@ -260,7 +395,14 @@ test("publisher supports an exact team-scoped destination when Linear has no pro
         searches.push(variables);
         return page([]);
       }
-      if (operationKey === "issues.get" && preparedArguments) {
+      if (operationKey === "issues.get") {
+        if (!preparedArguments) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
         return issue(
           String(preparedArguments.id),
           String(preparedArguments.description),
@@ -306,7 +448,14 @@ test("publisher fails closed when created issue readback changes project or desc
       const readClient: LinearToolClient = {
         execute: async (operationKey) => {
           if (operationKey === "issues.search") return page([]);
-          if (operationKey === "issues.get" && preparedArguments) {
+          if (operationKey === "issues.get") {
+            if (!preparedArguments) {
+              throw new LinearClientError(
+                "linear_not_found",
+                "Linear resource was not found.",
+                { operationKey },
+              );
+            }
             const different = publisherFixture(emptyReadClient(), unusedExecutor())
               .build(
                 { ...SECTIONS, problemImpact: "A different clean issue description." },
@@ -353,6 +502,13 @@ test("ambiguous create surfaces reconcile_required without retry or automatic re
       if (operationKey === "issues.search") return page([]);
       if (operationKey === "issues.get") {
         readbackCount += 1;
+        if (readbackCount === 1) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
         throw new Error("Publisher must not read after an ambiguous executor result.");
       }
       throw new Error(`Unexpected operation ${operationKey}`);
@@ -386,7 +542,7 @@ test("ambiguous create surfaces reconcile_required without retry or automatic re
   assert.equal(result.error.code, "linear_mutation_uncertain");
   assert.equal(prepareCount, 1);
   assert.equal(executeCount, 1);
-  assert.equal(readbackCount, 0);
+  assert.equal(readbackCount, 1);
 });
 
 function publisherFixture(
@@ -405,6 +561,12 @@ function requestFixture(overrides: Partial<{
   status: "create" | "deduplicated";
   duplicateId: string | null;
   duplicateSnapshotHash: string | null;
+  approvedPreview: {
+    status: "create" | "deduplicated";
+    workItemFingerprint: string;
+    duplicateId: string | null;
+    duplicateSnapshotHash: string | null;
+  };
 }> = {}) {
   const ticket = publisherFixture(emptyReadClient(), unusedExecutor()).build(SECTIONS, DRAFT);
   return {
@@ -414,7 +576,7 @@ function requestFixture(overrides: Partial<{
     context: contextFixture(),
     sections: SECTIONS,
     draft: DRAFT,
-    approvedPreview: {
+    approvedPreview: overrides.approvedPreview ?? {
       status: overrides.status ?? "create",
       workItemFingerprint: ticket.spec.fingerprint,
       duplicateId: overrides.duplicateId ?? null,
@@ -480,6 +642,13 @@ function emptyReadClient(): LinearToolClient {
   return {
     execute: async (operationKey): Promise<LinearOperationResult> => {
       if (operationKey === "issues.search") return page([]);
+      if (operationKey === "issues.get") {
+        throw new LinearClientError(
+          "linear_not_found",
+          "Linear resource was not found.",
+          { operationKey },
+        );
+      }
       throw new Error(`Unexpected operation ${operationKey}`);
     },
   };
