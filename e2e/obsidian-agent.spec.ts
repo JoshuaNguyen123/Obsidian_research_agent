@@ -6428,6 +6428,96 @@ test("native design drawing creates canvas and svg artifacts", async () => {
   });
 });
 
+test("distributed-system architecture creates editable Canvas, SVG image, and scale brief", async () => {
+  test.setTimeout(300_000);
+  await withE2EHarness("distributed-system-package", async ({ page, input }) => {
+    const artifactId = path.basename(input.designCanvasPath, ".canvas");
+    const slug = `e2e-distributed-orders-${artifactId}`;
+    const folder = "E2E Agent Tests/Generated";
+    const canvasPath = `${folder}/${slug}.canvas`;
+    const svgPath = `${folder}/${slug}.svg`;
+    const briefPath = `${folder}/${slug}.md`;
+
+    await submitMission(
+      page,
+      "Architect E2E_DISTRIBUTED_SYSTEM_PACKAGE as a globally distributed order system at scale. Create an editable Canvas, SVG image, and brief covering capacity, failover, security, observability, and data flow.",
+      { timeout: 180_000 },
+    );
+    await expectToolRun(page, "create_design_package");
+
+    const canvasFile = path.join(vaultRoot, ...canvasPath.split("/"));
+    const svgFile = path.join(vaultRoot, ...svgPath.split("/"));
+    const briefFile = path.join(vaultRoot, ...briefPath.split("/"));
+    for (const term of [
+      "Clients & Edge",
+      "Compute & Services",
+      "Messaging",
+      "Data & State",
+      "Operations & Governance",
+      "API Gateway",
+      "Order Service",
+      "Event Bus",
+      "Orders Database",
+      "Observability",
+    ]) {
+      await expectFileToContain(canvasFile, term, `distributed Canvas should contain ${term}`, 30_000);
+    }
+    await expectFileToContain(svgFile, "<svg", "distributed package should create an SVG image", 30_000);
+    await expectFileToContain(svgFile, "API Gateway", "distributed SVG should include architecture labels", 30_000);
+    await expectFileToContain(briefFile, "Scale, Reliability, Security, and Operations Review", "brief should include the scale readiness review", 30_000);
+    await expectFileToContain(briefFile, `SVG image: ![[${svgPath}]]`, "brief should embed the generated SVG", 30_000);
+    await expectFileToContain(briefFile, "None detected by the structural domain review", "complete fixture should leave no structural proof debt", 30_000);
+    await expectToolRun(page, "create_design_package");
+    await expectReceipt(page, briefPath);
+    await expectSvgImageRendered(page, svgPath);
+  });
+});
+
+test("manufacturing business process creates swimlanes, quality controls, and visual artifacts", async () => {
+  test.setTimeout(300_000);
+  await withE2EHarness("manufacturing-process-package", async ({ page, input }) => {
+    const artifactId = path.basename(input.designCanvasPath, ".canvas");
+    const slug = `e2e-manufacturing-order-flow-${artifactId}`;
+    const folder = "E2E Agent Tests/Generated";
+    const canvasPath = `${folder}/${slug}.canvas`;
+    const svgPath = `${folder}/${slug}.svg`;
+    const briefPath = `${folder}/${slug}.md`;
+
+    await submitMission(
+      page,
+      "Map E2E_MANUFACTURING_PROCESS_PACKAGE as a manufacturing business process. Create editable swimlanes and an SVG image from suppliers through material flow, assembly, inspection, rework, finished goods, safety traceability, and OEE controls.",
+      { timeout: 180_000 },
+    );
+    await expectToolRun(page, "create_design_package");
+
+    const canvasFile = path.join(vaultRoot, ...canvasPath.split("/"));
+    const svgFile = path.join(vaultRoot, ...svgPath.split("/"));
+    const briefFile = path.join(vaultRoot, ...briefPath.split("/"));
+    for (const term of [
+      "Inputs & Suppliers",
+      "Material Flow",
+      "Production",
+      "Quality & Control",
+      "Outputs & Distribution",
+      "Supplier",
+      "Raw Materials",
+      "Assembly Cell",
+      "Quality Inspection",
+      "Finished Goods",
+      "OEE",
+    ]) {
+      await expectFileToContain(canvasFile, term, `manufacturing Canvas should contain ${term}`, 30_000);
+    }
+    await expectFileToContain(svgFile, "<svg", "manufacturing package should create an SVG image", 30_000);
+    await expectFileToContain(svgFile, "Assembly Cell", "manufacturing SVG should include process labels", 30_000);
+    await expectFileToContain(briefFile, "Flow, Quality, Safety, and Performance Review", "brief should include the manufacturing readiness review", 30_000);
+    await expectFileToContain(briefFile, "None detected by the structural domain review", "complete fixture should leave no structural proof debt", 30_000);
+    await expectToolRun(page, "create_design_package");
+    await expectReceipt(page, briefPath);
+    await expectSvgImageRendered(page, svgPath);
+  });
+});
+
 test("design graph conversion creates a native canvas instead of appending a render disclaimer", async () => {
   test.setTimeout(240_000);
   await withE2EHarness(
@@ -7568,6 +7658,26 @@ async function expectVerification(page: Page, text: string) {
   ).toBeVisible();
 }
 
+async function expectSvgImageRendered(page: Page, svgPath: string) {
+  await page.evaluate(async (vaultPath) => {
+    const app = (window as typeof window & { app?: any }).app;
+    const file = app?.vault?.getFileByPath?.(vaultPath);
+    if (!file) throw new Error(`SVG missing for rendered QA: ${vaultPath}`);
+    await app.workspace.getLeaf("tab").openFile(file);
+  }, svgPath);
+  const imageView = page.locator(
+    '.workspace-leaf-content[data-type="image"]',
+  ).last();
+  await expect(imageView).toBeVisible({ timeout: 30_000 });
+  const image = imageView.locator("img").last();
+  await expect(image).toBeVisible({ timeout: 30_000 });
+  await expect
+    .poll(() => image.evaluate((element: HTMLImageElement) => element.naturalWidth), {
+      timeout: 30_000,
+    })
+    .toBeGreaterThan(0);
+}
+
 async function expectDetailsText(page: Page, text: string) {
   await page.getByRole("tab", { name: "Run Details" }).click();
   await expect(
@@ -8344,6 +8454,9 @@ async function setupVaultNoteAndMockModel(
     const missionGraphRestartStepCounts = new Map<string, number>();
     const phase3ResumeStepCounts = new Map<string, number>();
     const crudStepCounts = new Map<string, number>();
+    const designArtifactId =
+      designCanvasPath.split("/").pop()?.replace(/\.canvas$/iu, "") ??
+      "e2e-design";
     plugin.createModelClient = function createModelClient() {
       return {
         playwrightE2EMock: true,
@@ -11441,6 +11554,147 @@ async function setupVaultNoteAndMockModel(
                 content: "",
                 toolCalls: [toolCall],
               },
+              toolCalls: [toolCall],
+              raw: { playwrightE2E: true },
+            };
+          }
+
+          if (latestUserText.includes("E2E_DISTRIBUTED_SYSTEM_PACKAGE")) {
+            if (!toolNames.includes("create_design_package")) {
+              throw new Error(
+                `create_design_package was not available for distributed architecture. Tools: ${toolNames.join(", ")}`,
+              );
+            }
+            const toolCall = {
+              id: "playwright-e2e-distributed-system-package",
+              index: 0,
+              name: "create_design_package",
+              arguments: {
+                title: `E2E Distributed Orders ${designArtifactId}`,
+                kind: "distributed_system",
+                targetFolder: "E2E Agent Tests/Generated",
+                includeSvg: true,
+                items: [
+                  {
+                    id: "gateway",
+                    kind: "gateway",
+                    title: "API Gateway",
+                    summary: "TLS identity boundary with regional load balancing and rate limits.",
+                    details: ["Zero-trust authentication and least-privilege routing."],
+                  },
+                  {
+                    id: "orders",
+                    kind: "service",
+                    title: "Order Service",
+                    summary: "Stateless compute with autoscaling replicas and capacity targets.",
+                    details: ["Idempotent retries, timeouts, and circuit breakers support failover."],
+                  },
+                  {
+                    id: "events",
+                    kind: "broker",
+                    title: "Event Bus",
+                    summary: "Partitioned asynchronous delivery with backpressure and dead-letter recovery.",
+                  },
+                  {
+                    id: "database",
+                    kind: "database",
+                    title: "Orders Database",
+                    summary: "Encrypted sharded state with multi-region failover replicas.",
+                  },
+                  {
+                    id: "telemetry",
+                    kind: "metric",
+                    title: "Observability",
+                    summary: "Metrics, traces, logs, alerts, health checks, and service-level objectives.",
+                  },
+                ],
+                edges: [
+                  { id: "gateway-orders", from: "gateway", to: "orders", label: "authenticated request" },
+                  { id: "orders-events", from: "orders", to: "events", label: "publishes idempotent event" },
+                  { id: "orders-database", from: "orders", to: "database", label: "bounded transaction" },
+                  { id: "telemetry-orders", from: "telemetry", to: "orders", label: "observes SLO" },
+                ],
+              },
+            };
+            return {
+              message: { role: "assistant", content: "", toolCalls: [toolCall] },
+              toolCalls: [toolCall],
+              raw: { playwrightE2E: true },
+            };
+          }
+
+          if (latestUserText.includes("E2E_MANUFACTURING_PROCESS_PACKAGE")) {
+            if (!toolNames.includes("create_design_package")) {
+              throw new Error(
+                `create_design_package was not available for manufacturing process design. Tools: ${toolNames.join(", ")}`,
+              );
+            }
+            const toolCall = {
+              id: "playwright-e2e-manufacturing-process-package",
+              index: 0,
+              name: "create_design_package",
+              arguments: {
+                title: `E2E Manufacturing Order Flow ${designArtifactId}`,
+                kind: "manufacturing_process",
+                targetFolder: "E2E Agent Tests/Generated",
+                includeSvg: true,
+                items: [
+                  {
+                    id: "supplier",
+                    kind: "supplier",
+                    title: "Supplier",
+                    summary: "Provides traceable lots with safety and compliance records.",
+                  },
+                  {
+                    id: "materials",
+                    kind: "inventory",
+                    title: "Raw Materials",
+                    summary: "Lot-controlled input buffer with WIP and takt limits.",
+                  },
+                  {
+                    id: "assembly",
+                    kind: "workcell",
+                    title: "Assembly Cell",
+                    summary: "Transforms material at the target cycle time with lockout safety controls.",
+                  },
+                  {
+                    id: "inspection",
+                    kind: "inspection",
+                    title: "Quality Inspection",
+                    summary: "Measures yield and routes nonconforming units to rework.",
+                  },
+                  {
+                    id: "mes",
+                    kind: "service",
+                    title: "MES",
+                    summary: "Records serial traceability, batch history, downtime, and control status.",
+                  },
+                  {
+                    id: "oee",
+                    kind: "metric",
+                    title: "OEE",
+                    summary: "Tracks availability, performance, quality, scrap, and bottlenecks.",
+                  },
+                  {
+                    id: "finished",
+                    kind: "output",
+                    title: "Finished Goods",
+                    summary: "Released output with complete lot genealogy and quality approval.",
+                  },
+                ],
+                edges: [
+                  { id: "supplier-materials", from: "supplier", to: "materials", label: "material and lot record" },
+                  { id: "materials-assembly", from: "materials", to: "assembly", label: "kanban replenishment" },
+                  { id: "assembly-inspection", from: "assembly", to: "inspection", label: "completed unit" },
+                  { id: "inspection-assembly", from: "inspection", to: "assembly", label: "exception and rework" },
+                  { id: "inspection-finished", from: "inspection", to: "finished", label: "quality release" },
+                  { id: "mes-assembly", from: "mes", to: "assembly", label: "work instruction and traceability" },
+                  { id: "oee-assembly", from: "oee", to: "assembly", label: "performance control" },
+                ],
+              },
+            };
+            return {
+              message: { role: "assistant", content: "", toolCalls: [toolCall] },
               toolCalls: [toolCall],
               raw: { playwrightE2E: true },
             };

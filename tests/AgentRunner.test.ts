@@ -3161,6 +3161,20 @@ test("design prompts expose and require native artifact write tools", async () =
       expectedReceipt: "create Designs/Product Flow.canvas",
     },
     {
+      prompt: "Architect E2E_DISTRIBUTED_SYSTEM_PACKAGE as a globally distributed order system at scale. Create an editable Canvas, SVG image, and brief covering capacity, failover, security, observability, and data flow.",
+      requiredTool: "create_design_package",
+      absentTool: "create_svg_design",
+      expectedStatus: "Created design package Design Packages/System Architecture.md with canvas Design Packages/System Architecture.canvas.",
+      expectedReceipt: "create Design Packages/System Architecture.md",
+    },
+    {
+      prompt: "Map a manufacturing business process with production, quality-control, and OEE swimlanes.",
+      requiredTool: "create_design_package",
+      absentTool: "create_svg_design",
+      expectedStatus: "Created design package Design Packages/System Architecture.md with canvas Design Packages/System Architecture.canvas.",
+      expectedReceipt: "create Design Packages/System Architecture.md",
+    },
+    {
       prompt: "Create an SVG wireframe mockup for the settings screen.",
       requiredTool: "create_svg_design",
       absentTool: "create_design_canvas",
@@ -12503,6 +12517,13 @@ function createRegistry(
       {
         type: "function",
         function: {
+          name: "create_design_package",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
           name: "read_design_canvas",
           parameters: { type: "object", properties: {} },
         },
@@ -12935,6 +12956,22 @@ function createRegistry(
                   canvas: {
                     nodes: [{ id: "start" }, { id: "end" }],
                     edges: [{ id: "edge" }],
+                  },
+                }
+            : call.name === "create_design_package"
+              ? {
+                  path: "Design Packages/System Architecture.md",
+                  operation: "create",
+                  canvasPath: "Design Packages/System Architecture.canvas",
+                  svgPath: "Design Packages/System Architecture.svg",
+                  briefPath: "Design Packages/System Architecture.md",
+                  itemCount: 5,
+                  edgeCount: 4,
+                  assessment: {
+                    version: 1,
+                    profile: "distributed_system",
+                    coveredConcerns: ["capacity and scaling"],
+                    warnings: [],
                   },
                 }
             : call.name === "read_design_canvas"

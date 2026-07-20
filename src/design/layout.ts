@@ -15,7 +15,10 @@ export type CanvasLayoutDiagramType =
   | "service_blueprint"
   | "project_ideation"
   | "architecture"
-  | "mind_map";
+  | "mind_map"
+  | "distributed_system"
+  | "business_process"
+  | "manufacturing_process";
 export type CanvasConnectionMode = "none" | "sequence";
 export type CanvasLayoutItemKind =
   | "step"
@@ -33,7 +36,26 @@ export type CanvasLayoutItemKind =
   | "metric"
   | "dependency"
   | "note"
-  | "external";
+  | "external"
+  | "client"
+  | "gateway"
+  | "worker"
+  | "broker"
+  | "cache"
+  | "external_system"
+  | "event"
+  | "process"
+  | "subprocess"
+  | "document"
+  | "supplier"
+  | "material"
+  | "inventory"
+  | "operation"
+  | "workcell"
+  | "facility"
+  | "inspection"
+  | "control"
+  | "output";
 
 export interface CanvasLayoutItem {
   id?: string;
@@ -80,7 +102,10 @@ export function buildLayoutCanvas(input: CanvasLayoutInput): JsonCanvas {
     diagramType === "ui_flow" ||
     diagramType === "service_blueprint" ||
     diagramType === "logistics_system" ||
-    diagramType === "architecture"
+    diagramType === "architecture" ||
+    diagramType === "distributed_system" ||
+    diagramType === "business_process" ||
+    diagramType === "manufacturing_process"
   ) {
     return buildLaneCanvas(input, items, diagramType);
   }
@@ -286,15 +311,163 @@ function uniqueLaneNames(
   items: CanvasLayoutItem[],
   diagramType: CanvasLayoutDiagramType,
 ): string[] {
-  const lanes = items.map((item) => getItemLane(item, diagramType));
-  return [...new Set(lanes.length > 0 ? lanes : [getDefaultLane(diagramType)])];
+  const lanes = [
+    ...new Set(
+      items.length > 0
+        ? items.map((item) => getItemLane(item, diagramType))
+        : [getDefaultLane(diagramType)],
+    ),
+  ];
+  const preferredOrder = getPreferredLaneOrder(diagramType);
+  return [
+    ...preferredOrder.filter((lane) => lanes.includes(lane)),
+    ...lanes.filter((lane) => !preferredOrder.includes(lane)),
+  ];
 }
 
 function getItemLane(
   item: CanvasLayoutItem,
   diagramType: CanvasLayoutDiagramType,
 ): string {
-  return item.lane?.trim() || getDefaultLane(diagramType);
+  return item.lane?.trim() || inferCanvasLane(diagramType, item.kind);
+}
+
+/**
+ * Infers a stable system tier or process swimlane. An item's explicit lane
+ * always wins, allowing a model to express a specific trust zone, owner, or
+ * plant area without losing useful defaults for simpler prompts.
+ */
+export function inferCanvasLane(
+  diagramType: CanvasLayoutDiagramType,
+  itemKind?: CanvasLayoutItemKind,
+): string {
+  if (diagramType === "distributed_system") {
+    if (itemKind === "client" || itemKind === "gateway") return "Clients & Edge";
+    if (itemKind === "queue" || itemKind === "broker" || itemKind === "event") {
+      return "Messaging";
+    }
+    if (itemKind === "database" || itemKind === "cache" || itemKind === "inventory") {
+      return "Data & State";
+    }
+    if (
+      itemKind === "metric" ||
+      itemKind === "risk" ||
+      itemKind === "control" ||
+      itemKind === "inspection"
+    ) {
+      return "Operations & Governance";
+    }
+    if (
+      itemKind === "external" ||
+      itemKind === "external_system" ||
+      itemKind === "dependency"
+    ) {
+      return "External Systems";
+    }
+    return "Compute & Services";
+  }
+
+  if (diagramType === "business_process") {
+    if (itemKind === "persona" || itemKind === "actor" || itemKind === "client") {
+      return "Participants";
+    }
+    if (
+      itemKind === "service" ||
+      itemKind === "screen" ||
+      itemKind === "database" ||
+      itemKind === "document" ||
+      itemKind === "external_system"
+    ) {
+      return "Systems & Records";
+    }
+    if (
+      itemKind === "metric" ||
+      itemKind === "risk" ||
+      itemKind === "control" ||
+      itemKind === "inspection" ||
+      itemKind === "output"
+    ) {
+      return "Controls & Outcomes";
+    }
+    return "Process Flow";
+  }
+
+  if (diagramType === "manufacturing_process") {
+    if (itemKind === "supplier" || itemKind === "material") {
+      return "Inputs & Suppliers";
+    }
+    if (itemKind === "inventory" || itemKind === "queue" || itemKind === "resource") {
+      return "Material Flow";
+    }
+    if (
+      itemKind === "inspection" ||
+      itemKind === "control" ||
+      itemKind === "risk" ||
+      itemKind === "metric" ||
+      itemKind === "decision"
+    ) {
+      return "Quality & Control";
+    }
+    if (
+      itemKind === "service" ||
+      itemKind === "database" ||
+      itemKind === "external_system" ||
+      itemKind === "gateway"
+    ) {
+      return "Systems & Automation";
+    }
+    if (itemKind === "output") return "Outputs & Distribution";
+    return "Production";
+  }
+
+  if (diagramType === "service_blueprint") {
+    if (itemKind === "persona" || itemKind === "actor") return "Actors";
+    if (itemKind === "screen") return "Frontstage";
+    if (itemKind === "service" || itemKind === "database" || itemKind === "queue") {
+      return "Backstage";
+    }
+    if (itemKind === "metric" || itemKind === "risk") return "Management";
+  }
+
+  if (diagramType === "logistics_system") {
+    if (itemKind === "resource" || itemKind === "queue") return "Flow";
+    if (itemKind === "dependency" || itemKind === "risk") return "Constraints";
+    if (itemKind === "metric") return "Control";
+  }
+
+  if (diagramType === "ui_flow") {
+    if (itemKind === "persona" || itemKind === "actor") return "Actors";
+    if (itemKind === "screen" || itemKind === "decision") return "Screens";
+  }
+
+  return getDefaultLane(diagramType);
+}
+
+function getPreferredLaneOrder(diagramType: CanvasLayoutDiagramType): string[] {
+  if (diagramType === "distributed_system") {
+    return [
+      "Clients & Edge",
+      "Compute & Services",
+      "Messaging",
+      "Data & State",
+      "Operations & Governance",
+      "External Systems",
+    ];
+  }
+  if (diagramType === "business_process") {
+    return ["Participants", "Process Flow", "Systems & Records", "Controls & Outcomes"];
+  }
+  if (diagramType === "manufacturing_process") {
+    return [
+      "Inputs & Suppliers",
+      "Material Flow",
+      "Production",
+      "Quality & Control",
+      "Systems & Automation",
+      "Outputs & Distribution",
+    ];
+  }
+  return [];
 }
 
 function getDefaultLane(diagramType: CanvasLayoutDiagramType): string {
@@ -312,6 +485,18 @@ function getDefaultLane(diagramType: CanvasLayoutDiagramType): string {
 
   if (diagramType === "logistics_system") {
     return "Operations";
+  }
+
+  if (diagramType === "distributed_system") {
+    return "Compute & Services";
+  }
+
+  if (diagramType === "business_process") {
+    return "Process Flow";
+  }
+
+  if (diagramType === "manufacturing_process") {
+    return "Production";
   }
 
   return "Flow";
@@ -365,7 +550,12 @@ function getDefaultCanvasColor(
   item: CanvasLayoutItem,
   diagramType: CanvasLayoutDiagramType,
 ): string | undefined {
-  if (item.kind === "decision" || item.kind === "risk") {
+  if (
+    item.kind === "decision" ||
+    item.kind === "risk" ||
+    item.kind === "inspection" ||
+    item.kind === "control"
+  ) {
     return "3";
   }
 
@@ -374,20 +564,43 @@ function getDefaultCanvasColor(
     item.kind === "database" ||
     item.kind === "queue" ||
     item.kind === "resource" ||
-    item.kind === "metric"
+    item.kind === "metric" ||
+    item.kind === "broker" ||
+    item.kind === "cache" ||
+    item.kind === "inventory" ||
+    item.kind === "material" ||
+    item.kind === "document"
   ) {
     return "5";
   }
 
-  if (item.kind === "external" || item.kind === "dependency") {
+  if (
+    item.kind === "external" ||
+    item.kind === "external_system" ||
+    item.kind === "dependency" ||
+    item.kind === "supplier" ||
+    item.kind === "output"
+  ) {
     return "6";
   }
 
-  if (item.kind === "milestone") {
+  if (
+    item.kind === "milestone" ||
+    item.kind === "event" ||
+    item.kind === "client" ||
+    item.kind === "actor" ||
+    item.kind === "persona"
+  ) {
     return "2";
   }
 
-  if (diagramType === "architecture" || diagramType === "service_blueprint") {
+  if (
+    diagramType === "architecture" ||
+    diagramType === "service_blueprint" ||
+    diagramType === "distributed_system" ||
+    diagramType === "business_process" ||
+    diagramType === "manufacturing_process"
+  ) {
     return "4";
   }
 

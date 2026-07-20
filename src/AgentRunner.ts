@@ -15394,7 +15394,7 @@ function getAllowedToolDefinitions(
     }
 
     if (name === "create_svg_design") {
-      return allowDesignTools && allowSvgDesign;
+      return allowDesignTools && allowSvgDesign && !allowDesignPackage;
     }
 
     if (name === "read_svg_design") {
@@ -16369,7 +16369,11 @@ function getRequiredWriteToolNames(
       requiredToolNames.push("create_design_canvas");
     }
 
-    if (hasSvgDesignIntent(prompt) && !hasReviseDesignIntent(prompt)) {
+    if (
+      hasSvgDesignIntent(prompt) &&
+      !hasReviseDesignIntent(prompt) &&
+      !hasDesignPackageIntent(prompt)
+    ) {
       requiredToolNames.push("create_svg_design");
     }
   }
@@ -18430,7 +18434,7 @@ function hasDesignIntent(prompt: string): boolean {
 }
 
 function hasDesignPackageIntent(prompt: string): boolean {
-  return /\b(design\s*package|service\s*blueprint|logistics\s*system|project\s*ideation|canvas\s+plus\s+(brief|markdown)|brief\s+plus\s+canvas|ui\s*flow|mind\s*map)\b/i.test(
+  return /\b(design\s*package|service\s*blueprint|logistics\s*system|project\s*ideation|canvas\s+plus\s+(brief|markdown)|canvas[\s\S]{0,80}(?:brief|svg\s+image|image)|brief\s+plus\s+canvas|ui\s*flow|mind\s*map|distributed(?:\s+\w+){0,3}\s+systems?|cloud\s+architecture|microservices?(?:\s+architecture)?|event[-\s]?driven\s+architecture|c4\s+(?:model|diagram)|business\s+process(?:es)?|manufacturing(?:\s+\w+){0,2}\s+process(?:es)?|production\s+lines?|plant\s+workflows?|value\s+streams?|bpmn|sipoc)\b/i.test(
     prompt,
   );
 }
@@ -18443,7 +18447,7 @@ function hasCanvasDesignIntent(prompt: string): boolean {
     return false;
   }
   return (
-    /\b(canvas|mind\s*map|concept\s*map|flowchart|workflow|user\s*flows?|ui\s*flows?|process\s*map|research\s*map|architecture\s*diagram|software\s+architecture|system\s+design|dependency\s*map|visual\s*map|diagram)\b/i.test(
+    /\b(canvas|mind\s*map|concept\s*map|flowchart|workflow|user\s*flows?|ui\s*flows?|process\s*map|research\s*map|architecture\s*diagram|software\s+architecture|system\s+design|systems?\s+charts?|distributed(?:\s+\w+){0,3}\s+systems?|cloud\s+architecture|microservices?(?:\s+architecture)?|event[-\s]?driven\s+architecture|c4\s+(?:model|diagram)|network\s+topology|data\s+architecture|business\s+process(?:es)?|manufacturing(?:\s+\w+){0,2}\s+process(?:es)?|production\s+lines?|plant\s+workflows?|value\s+streams?|bpmn|sipoc|dependency\s*map|visual\s*map|diagram)\b/i.test(
       prompt,
     ) ||
     (hasDesignIntent(prompt) && !hasSvgDesignIntent(prompt))

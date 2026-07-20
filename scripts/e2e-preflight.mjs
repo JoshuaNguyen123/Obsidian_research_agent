@@ -88,6 +88,7 @@ async function resolveExpectedPluginIds() {
     "release-vertical": [],
     "disposable-live-external": [],
     "configured-linear-live": [],
+    "systems-diagrams": [],
   };
   for (const lane of playwrightLanes) {
     const lanePlugins = requiredByLane[lane];

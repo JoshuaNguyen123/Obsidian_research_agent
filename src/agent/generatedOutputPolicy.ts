@@ -1,3 +1,5 @@
+import { hasDesignIntent } from "./codeDesignIntent";
+
 export type GeneratedOutputKind =
   | "essay"
   | "how_to"
@@ -130,9 +132,10 @@ function getGeneratedOutputTarget(
 }
 
 function hasDiagramIntent(prompt: string): boolean {
-  return /\b(draw|diagram|flowchart|canvas|blocks?|nodes?|map|wireframe|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map|design\s*package)\b/i.test(
-    prompt,
-  );
+  return hasDesignIntent(prompt) ||
+    /\b(draw|diagram|flowchart|canvas|blocks?|nodes?|map|wireframe|user\s*flows?|ui\s*flows?|architecture|system\s+design|software\s+architecture|service\s*blueprint|logistics\s*system|project\s*ideation|mind\s*map|design\s*package)\b/i.test(
+      prompt,
+    );
 }
 
 function hasTextQuoteIntent(prompt: string): boolean {

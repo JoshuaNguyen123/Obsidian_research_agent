@@ -670,7 +670,10 @@ test("workspace reconciliation resumes durable state and proves committed or not
       workspaceId: "reconcile-space", path: "pending.txt", content: "pending\n",
     }, context);
 
-    const restartedManager = new WorkspaceManagerV2({ applicationDataRoot: path.join(fixture.root, "app-data") });
+    const restartedManager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(fixture.root, "app-data"),
+      now: () => new Date("2026-07-12T21:00:01.000Z"),
+    });
     const restarted = toolMap(createCodeWorkspaceToolContributionsV2({ manager: restartedManager, repositoryProvisioner: fixture.repositories }));
     const committed = await restarted.get("code_workspace_create_file")!.reconcile!(committedAction, context);
     assert.equal(committed.outcome, "committed");

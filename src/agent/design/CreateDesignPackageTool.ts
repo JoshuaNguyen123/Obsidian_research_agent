@@ -13,7 +13,7 @@ import {
 } from "../../tools/validation";
 
 const DESIGN_PACKAGE_INTENT_PATTERN =
-  /\b(create|make|draw|generate|build|draft|map|design|package)\b[\s\S]{0,160}\b(ui\s*flow|logistics|service\s*blueprint|architecture|project\s*ideation|mind\s*map|canvas|design\s*package|workflow|system)\b|\b(ui\s*flow|logistics|service\s*blueprint|architecture|project\s*ideation|mind\s*map|canvas|design\s*package|workflow|system)\b[\s\S]{0,160}\b(create|make|draw|generate|build|draft|map|design|package)\b/i;
+  /\b(create|make|draw|generate|build|draft|map|model|architect|design|package)\b[\s\S]{0,160}\b(ui\s*flow|logistics|service\s*blueprint|architecture|project\s*ideation|mind\s*map|canvas|design\s*package|workflow|system|distributed(?:\s+\w+){0,3}\s+system|business\s+process|manufacturing(?:\s+\w+){0,2}\s+process|production\s+line|value\s+stream|bpmn|sipoc)\b|\b(ui\s*flow|logistics|service\s*blueprint|architecture|project\s*ideation|mind\s*map|canvas|design\s*package|workflow|system|distributed(?:\s+\w+){0,3}\s+system|business\s+process|manufacturing(?:\s+\w+){0,2}\s+process|production\s+line|value\s+stream|bpmn|sipoc)\b[\s\S]{0,160}\b(create|make|draw|generate|build|draft|map|model|architect|design|package)\b/i;
 
 export const createDesignPackageTool: AgentTool = {
   name: "create_design_package",
@@ -43,7 +43,7 @@ export const createDesignPackageTool: AgentTool = {
     receiptKind: "artifact",
   },
   description:
-    "Create a paired Obsidian Canvas plus markdown brief for UI flows, logistics systems, service blueprints, architecture maps, project ideation, or mind maps.",
+    "Create an editable Obsidian Canvas plus evidence-oriented markdown brief, and optionally a passive SVG image, for distributed systems, business/manufacturing processes, UI flows, logistics, service blueprints, architecture, ideation, or mind maps.",
   parameters: {
     type: "object",
     required: ["title", "kind", "items", "edges"],
@@ -58,18 +58,71 @@ export const createDesignPackageTool: AgentTool = {
           "project_ideation",
           "architecture",
           "mind_map",
+          "distributed_system",
+          "business_process",
+          "manufacturing_process",
         ],
       },
       targetFolder: { type: "string" },
       items: {
         type: "array",
-        items: { type: "object" },
+        minItems: 1,
+        maxItems: 80,
+        description: "Architecture or process nodes. Use details/metadata for scale, resilience, security, observability, safety, traceability, capacity, and KPI evidence; use lane for trust zones, tiers, owners, or process stages.",
+        items: {
+          type: "object",
+          required: ["id", "kind", "title", "summary"],
+          properties: {
+            id: { type: "string" },
+            kind: {
+              type: "string",
+              enum: [
+                "persona", "screen", "actor", "service", "resource",
+                "queue", "database", "milestone", "risk", "metric",
+                "dependency", "decision", "note", "client", "gateway",
+                "worker", "broker", "cache", "external_system", "event",
+                "process", "subprocess", "document", "supplier", "material",
+                "inventory", "operation", "workcell", "facility", "inspection",
+                "control", "output",
+              ],
+            },
+            title: { type: "string" },
+            summary: { type: "string" },
+            lane: {
+              type: "string",
+              description: "Optional explicit swimlane, trust boundary, system tier, owner, or manufacturing stage.",
+            },
+            details: {
+              type: "array",
+              items: { type: "string" },
+              description: "Concrete design assumptions, constraints, failure modes, controls, and evidence.",
+            },
+            metadata: {
+              type: "object",
+              description: "Primitive architecture/process facts such as replicas, throughput, SLO, recovery, security, OEE, takt, yield, or traceability.",
+            },
+          },
+          additionalProperties: false,
+        },
       },
       edges: {
         type: "array",
-        items: { type: "object" },
+        maxItems: 160,
+        description: "Directed data, control, material, handoff, exception, or dependency flows. Label each relationship precisely.",
+        items: {
+          type: "object",
+          required: ["id", "from", "to"],
+          properties: {
+            id: { type: "string" },
+            from: { type: "string" },
+            to: { type: "string" },
+            label: { type: "string" },
+          },
+          additionalProperties: false,
+        },
       },
       briefMarkdown: { type: "string" },
+      includeSvg: { type: "boolean", description: "Also create a passive SVG image. Defaults to true for distributed-system and business/manufacturing-process packages." },
       overwrite: { type: "boolean" },
     },
     additionalProperties: false,
@@ -80,7 +133,7 @@ export const createDesignPackageTool: AgentTool = {
     context.reportProgress?.(`Planning design package ${input.title}...`);
     const result = await new CanvasWriter(context.app.vault).createPackage(input);
     context.reportProgress?.(
-      `Design package written: ${result.canvasPath} and ${result.briefPath}.`,
+      `Design package written: ${[result.canvasPath, result.svgPath, result.briefPath].filter(Boolean).join(", ")}.`,
     );
 
     return {
@@ -89,6 +142,7 @@ export const createDesignPackageTool: AgentTool = {
       operation: "create",
       artifacts: [
         { kind: "canvas", path: result.canvasPath, title: input.title },
+        ...(result.svgPath ? [{ kind: "image", path: result.svgPath, title: input.title }] : []),
         { kind: "note", path: result.briefPath, title: input.title },
       ],
       summary: `Created design package with ${result.itemCount} items and ${result.edgeCount} edges.`,
@@ -116,6 +170,7 @@ function parseInput(args: Record<string, unknown>): CreateDesignPackageInput {
     edges,
     briefMarkdown: getOptionalString(args, "briefMarkdown"),
     overwrite: false,
+    includeSvg: getOptionalBoolean(args.includeSvg, "includeSvg"),
   };
 }
 
@@ -137,6 +192,7 @@ function parseItems(value: unknown): CreateDesignPackageInput["items"] {
       title: getFieldString(item, "title", index),
       summary: getFieldString(item, "summary", index),
       details: getOptionalStringArray(item.details, index, "details"),
+      lane: getOptionalFieldString(item.lane, index, "lane"),
       metadata: getOptionalMetadata(item.metadata, index),
     };
   });
@@ -164,7 +220,7 @@ function assertDesignPackageIntent(context: ToolExecutionContext) {
   if (!DESIGN_PACKAGE_INTENT_PATTERN.test(context.originalPrompt)) {
     throw new ToolExecutionError(
       "intent_required",
-      "create_design_package requires explicit design package, UI flow, logistics, service blueprint, architecture, project ideation, mind map, or Canvas intent.",
+      "create_design_package requires explicit diagram, distributed-system, business/manufacturing-process, design-package, UI-flow, logistics, service-blueprint, architecture, project-ideation, mind-map, or Canvas intent.",
     );
   }
 }
@@ -176,7 +232,10 @@ function getDesignPackageKind(value: unknown): DesignPackageKind {
     value === "service_blueprint" ||
     value === "project_ideation" ||
     value === "architecture" ||
-    value === "mind_map"
+    value === "mind_map" ||
+    value === "distributed_system" ||
+    value === "business_process" ||
+    value === "manufacturing_process"
   ) {
     return value;
   }
@@ -198,7 +257,26 @@ function getDesignItemKind(value: unknown, index: number): DesignItemKind {
     value === "metric" ||
     value === "dependency" ||
     value === "decision" ||
-    value === "note"
+    value === "note" ||
+    value === "client" ||
+    value === "gateway" ||
+    value === "worker" ||
+    value === "broker" ||
+    value === "cache" ||
+    value === "external_system" ||
+    value === "event" ||
+    value === "process" ||
+    value === "subprocess" ||
+    value === "document" ||
+    value === "supplier" ||
+    value === "material" ||
+    value === "inventory" ||
+    value === "operation" ||
+    value === "workcell" ||
+    value === "facility" ||
+    value === "inspection" ||
+    value === "control" ||
+    value === "output"
   ) {
     return value;
   }
@@ -239,6 +317,32 @@ function getOptionalStringArray(
     );
   }
   return value.map((item) => item.trim()).filter(Boolean);
+}
+
+function getOptionalFieldString(
+  value: unknown,
+  index: number,
+  key: string,
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      `items[${index}].${key} must be a non-empty string when provided.`,
+    );
+  }
+  return value.trim();
+}
+
+function getOptionalBoolean(value: unknown, key: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new ToolExecutionError(
+      "invalid_arguments",
+      `${key} must be a boolean when provided.`,
+    );
+  }
+  return value;
 }
 
 function getOptionalMetadata(

@@ -146,6 +146,25 @@ export const createDesignCanvasTool: AgentTool = {
                 "dependency",
                 "note",
                 "external",
+                "client",
+                "gateway",
+                "worker",
+                "broker",
+                "cache",
+                "external_system",
+                "event",
+                "process",
+                "subprocess",
+                "document",
+                "supplier",
+                "material",
+                "inventory",
+                "operation",
+                "workcell",
+                "facility",
+                "inspection",
+                "control",
+                "output",
               ],
             },
             title: { type: "string" },
@@ -171,6 +190,9 @@ export const createDesignCanvasTool: AgentTool = {
           "project_ideation",
           "architecture",
           "mind_map",
+          "distributed_system",
+          "business_process",
+          "manufacturing_process",
         ],
         description: "Generated diagram style for layout items.",
       },
@@ -1350,14 +1372,17 @@ function getDiagramType(value: unknown): CanvasLayoutDiagramType {
     value === "service_blueprint" ||
     value === "project_ideation" ||
     value === "architecture" ||
-    value === "mind_map"
+    value === "mind_map" ||
+    value === "distributed_system" ||
+    value === "business_process" ||
+    value === "manufacturing_process"
   ) {
     return value;
   }
 
   throw new ToolExecutionError(
     "invalid_arguments",
-    "diagramType must be sequence, user_flow, ui_flow, logistics_system, service_blueprint, project_ideation, architecture, or mind_map.",
+    "diagramType must be sequence, user_flow, ui_flow, logistics_system, service_blueprint, project_ideation, architecture, mind_map, distributed_system, business_process, or manufacturing_process.",
   );
 }
 
@@ -1455,7 +1480,26 @@ function getItemKind(value: unknown, index: number): CanvasLayoutItemKind | unde
     normalized === "metric" ||
     normalized === "dependency" ||
     normalized === "note" ||
-    normalized === "external"
+    normalized === "external" ||
+    normalized === "client" ||
+    normalized === "gateway" ||
+    normalized === "worker" ||
+    normalized === "broker" ||
+    normalized === "cache" ||
+    normalized === "external_system" ||
+    normalized === "event" ||
+    normalized === "process" ||
+    normalized === "subprocess" ||
+    normalized === "document" ||
+    normalized === "supplier" ||
+    normalized === "material" ||
+    normalized === "inventory" ||
+    normalized === "operation" ||
+    normalized === "workcell" ||
+    normalized === "facility" ||
+    normalized === "inspection" ||
+    normalized === "control" ||
+    normalized === "output"
   ) {
     return normalized;
   }

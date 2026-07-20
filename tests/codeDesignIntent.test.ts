@@ -27,8 +27,18 @@ test("codeDesignIntent classifies code and design prompts", () => {
     ),
     true,
   );
+  assert.equal(hasDesignIntent("How are my notes connected in the graph?"), false);
+  for (const prompt of [
+    "Architect a globally distributed system with failover and observability.",
+    "Create a C4 diagram for this event-driven microservices architecture.",
+    "Map the business process with BPMN lanes and exception paths.",
+    "Model a manufacturing process from supplier through the production line.",
+    "Generate a value stream chart with quality controls and OEE metrics.",
+  ]) {
+    assert.equal(hasDesignIntent(prompt), true, prompt);
+  }
   assert.equal(
-    hasDesignIntent("How are my notes connected in the graph?"),
+    hasDesignIntent("Explain how distributed systems reach consensus."),
     false,
   );
   assert.equal(hasReviseDesignIntent("revise the canvas layout"), true);

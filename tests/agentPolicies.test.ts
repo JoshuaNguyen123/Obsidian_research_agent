@@ -125,6 +125,16 @@ test("generated output policy classifies prompt matrix targets", () => {
   );
   assert.equal(architecture.kind, "diagram");
   assert.equal(architecture.target, "design_canvas");
+
+  for (const prompt of [
+    "Architect a distributed system at scale with regional failover.",
+    "Map a manufacturing process with quality-control swimlanes.",
+    "Create a BPMN business process with exception flows.",
+  ]) {
+    const policy = analyzeGeneratedOutputPrompt(prompt);
+    assert.equal(policy.kind, "diagram", prompt);
+    assert.equal(policy.target, "design_canvas", prompt);
+  }
 });
 
 test("generated output policy detects grounded quote prompts", () => {

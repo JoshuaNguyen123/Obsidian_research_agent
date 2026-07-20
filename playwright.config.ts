@@ -29,6 +29,8 @@ const dailyUseNoteTitles =
   /DU-01 automatic mode creates one collision-free note when no markdown note is active/iu;
 const dailyUseMemoryReflexTitles =
   /(?:agentic reflex routes ambiguous semantic prompt|small context budget compacts loop messages mid-run|research memory save clear reload recall|vault-scoped research memory isolation|canonical continuation handoff|reflex safety and unchanged-loop control)/iu;
+const systemsDiagramTitles =
+  /(?:distributed-system architecture creates editable Canvas, SVG image, and scale brief|manufacturing business process creates swimlanes, quality controls, and visual artifacts)/iu;
 const protectedDailyUseCodeTitles =
   /DU-03 protected real-model TypeScript project creation, validation, README, commit, and readback/iu;
 // These historical core-host execution scenarios use the removed inline/native
@@ -43,6 +45,7 @@ const nonCoreTitles = new RegExp(
     companionRestartTitles,
     realAiTitles,
     supersededCoreCodeTitles,
+    systemsDiagramTitles,
   ]
     .map((pattern) => pattern.source)
     .join("|"),
@@ -76,6 +79,13 @@ export default defineConfig({
       grepInvert: nonCoreTitles,
       timeout: 180_000,
       expect: { timeout: 15_000 },
+    },
+    {
+      name: "systems-diagrams",
+      testMatch: /obsidian-agent\.spec\.ts/u,
+      grep: systemsDiagramTitles,
+      timeout: 300_000,
+      expect: { timeout: 30_000 },
     },
     {
       name: "integration-mock",

@@ -7,13 +7,13 @@ const CODE_INTENT =
   /\b(run|execute|code|script|python|javascript|typescript|node|pip|npm|workspace|program|snippet)\b/i;
 
 const DESIGN_ACTION =
-  "create|make|draw|generate|build|draft|render|save|write|map|package|update|revise|edit|change|modify|improve|tweak|fix|adjust|turn|convert|transform";
+  "create|make|draw|generate|build|draft|render|save|write|map|model|architect|package|update|revise|edit|change|modify|improve|tweak|fix|adjust|turn|convert|transform";
 
 // Keep bare `graph` out of the general noun list so questions about the
 // Obsidian note graph remain read-only. A graph becomes a design artifact when
 // it is explicitly visual/design-qualified or content is converted into one.
 const DESIGN_ARTIFACT =
-  "canvas|design(?:\\s*package)?|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|user\\s*flows?|ui\\s*flows?|architecture|system\\s+design|software\\s+architecture|service\\s*blueprint|logistics\\s*system|project\\s*ideation|mind\\s*map|(?:design|visual|concept|relationship|knowledge|idea|dependency|process)\\s+graph|graph\\s+(?:design|diagram|visualization|artifact)";
+  "canvas|design(?:\\s*package)?|wireframe|diagram|flowchart|layout|svg|mermaid|mockup|map|sketch|systems?\\s+charts?|user\\s*flows?|ui\\s*flows?|architecture|system\\s+design|software\\s+architecture|distributed(?:\\s+\\w+){0,3}\\s+systems?|cloud\\s+architecture|microservices?(?:\\s+architecture)?|event[-\\s]?driven\\s+architecture|c4\\s+(?:model|diagram)|network\\s+topology|data\\s+architecture|service\\s*blueprint|logistics\\s*system|business\\s+process(?:es)?|manufacturing(?:\\s+\\w+){0,2}\\s+process(?:es)?|production\\s+lines?|plant\\s+workflows?|value\\s+streams?|bpmn|sipoc|project\\s*ideation|mind\\s*map|(?:design|visual|concept|relationship|knowledge|idea|dependency|process)\\s+graph|graph\\s+(?:design|diagram|visualization|artifact)";
 
 const DESIGN_INTENT = new RegExp(
   `\\b(?:${DESIGN_ACTION})\\b[\\s\\S]{0,160}\\b(?:${DESIGN_ARTIFACT})\\b|` +

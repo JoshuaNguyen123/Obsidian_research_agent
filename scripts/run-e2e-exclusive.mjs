@@ -36,6 +36,7 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "release-vertical",
   "disposable-live-external",
   "configured-linear-live",
+  "systems-diagrams",
 ]);
 const SIGNAL_EXIT_CODES = {
   SIGHUP: 129,
