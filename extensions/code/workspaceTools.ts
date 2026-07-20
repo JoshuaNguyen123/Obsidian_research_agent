@@ -32,6 +32,10 @@ import {
   CODE_CREATION_LANGUAGE_SUMMARY_V1,
   detectCodeCreationLanguageV1,
 } from "./CodeCreationLanguagesV1";
+import {
+  buildJupyterNotebookV1,
+  validateJupyterNotebookContentV1,
+} from "./JupyterNotebookV1";
 
 export const CODE_WORKSPACE_TOOL_NAMES_V2 = [
   "code_workspace_create",
@@ -242,7 +246,8 @@ class WorkspaceToolRuntimeV2 {
           action = "create";
         } else if (name === "code_workspace_create_file") {
           await assertMissing(this.manager, workspaceId, targetPath);
-          const content = requiredString(args.content, "content", true);
+          const resolvedContent = resolveCreateFileContentV1(args, targetPath);
+          const content = resolvedContent.content;
           const sourceLanguage = detectCodeCreationLanguageV1(targetPath);
           outboundBytes = byteLength(content);
           expected = absentFingerprint(workspaceId, targetPath);
@@ -250,6 +255,8 @@ class WorkspaceToolRuntimeV2 {
           normalizedArgs.expectedSha256 = null;
           normalizedArgs.content = content;
           if (sourceLanguage) normalizedArgs.creationLanguage = sourceLanguage.id;
+          if (resolvedContent.notebookMetadata)
+            normalizedArgs.notebookMetadata = resolvedContent.notebookMetadata;
           normalizedArgs.expectedAfterSha256 = sha256Text(content);
           normalizedArgs.payloadBytes = outboundBytes;
           summary = `Create ${sourceLanguage ? `${sourceLanguage.displayName} source file ` : ""}${targetPath} without overwrite while the target remains absent.`;
@@ -1441,7 +1448,15 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
   if (name === "code_workspace_list" || name === "list_workspace_files") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() });
   if (name === "code_workspace_read" || name === "read_workspace_file" || name === "code_workspace_stat") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
   if (name === "code_workspace_mkdir") return objectSchema({ workspaceId: stringSchema(), path: stringSchema() }, ["path"]);
-  if (name === "code_workspace_create_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema() }, ["path", "content"]);
+  if (name === "code_workspace_create_file") return {
+    ...objectSchema({
+      workspaceId: stringSchema(),
+      path: stringSchema(),
+      content: stringSchema(),
+      notebook: jupyterNotebookInputSchema(),
+    }, ["path"]),
+    oneOf: [{ required: ["content"] }, { required: ["notebook"] }],
+  };
   if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content", "expectedSha256"]);
   if (name === "code_workspace_write_expected" || name === "write_workspace_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content"]);
   if (name === "code_workspace_patch") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: stringSchema(), replacements: { type: "array", items: objectSchema({ oldText: stringSchema(), newText: stringSchema(), expectedOccurrences: { type: "integer", enum: [1] } }, ["oldText", "newText"]) } }, ["path", "replacements"]);
@@ -1455,13 +1470,30 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
 
 function objectSchema(properties: Record<string, JsonSchemaObjectV1>, required: string[] = []): JsonSchemaObjectV1 { return { type: "object", properties, required, additionalProperties: false }; }
 function stringSchema(): JsonSchemaObjectV1 { return { type: "string" }; }
+function jupyterNotebookInputSchema(): JsonSchemaObjectV1 {
+  return objectSchema({
+    cells: {
+      type: "array",
+      minItems: 1,
+      maxItems: 200,
+      items: objectSchema({
+        type: { type: "string", enum: ["markdown", "code"] },
+        source: stringSchema(),
+      }, ["type", "source"]),
+    },
+    kernelName: stringSchema(),
+    kernelDisplayName: stringSchema(),
+    language: stringSchema(),
+  }, ["cells"]);
+}
+
 function description(name: string): string {
   const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace.`;
   if (name === "code_workspace_create") {
     return `${base} Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
   }
   if (name === "code_workspace_create_file") {
-    return `${base} Use this only for an absent path and provide the complete new-file content; it never overwrites an existing path. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+    return `${base} Use this only for an absent path; it never overwrites. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
   }
   if (name === "code_workspace_patch") {
     return `${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
@@ -1473,6 +1505,61 @@ function description(name: string): string {
     ? `${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`
     : base;
 }
+function resolveCreateFileContentV1(
+  args: Record<string, unknown>,
+  targetPath: string,
+): {
+  content: string;
+  notebookMetadata?: Record<string, JsonValueV1>;
+} {
+  const notebookPath = /\.ipynb$/iu.test(targetPath);
+  if (args.notebook !== undefined) {
+    if (!notebookPath) {
+      throw new WorkspaceManagerErrorV2(
+        "invalid_arguments",
+        "Structured notebook cells require an .ipynb destination.",
+      );
+    }
+    if (args.content !== undefined) {
+      throw new WorkspaceManagerErrorV2(
+        "invalid_arguments",
+        "Provide notebook or content, not both.",
+      );
+    }
+    try {
+      const built = buildJupyterNotebookV1(args.notebook);
+      return {
+        content: built.content,
+        notebookMetadata: {
+          cellCount: built.cellCount,
+          codeCellCount: built.codeCellCount,
+          markdownCellCount: built.markdownCellCount,
+          kernelName: built.kernelName,
+          language: built.language,
+          executionState: built.executionState,
+        },
+      };
+    } catch (error) {
+      throw new WorkspaceManagerErrorV2(
+        "invalid_arguments",
+        error instanceof Error ? error.message : "Notebook input is invalid.",
+      );
+    }
+  }
+  const content = requiredString(args.content, "content", true);
+  if (notebookPath) {
+    try {
+      validateJupyterNotebookContentV1(content);
+    } catch (error) {
+      throw new WorkspaceManagerErrorV2(
+        "invalid_arguments",
+        error instanceof Error ? error.message : "Notebook content is invalid.",
+      );
+    }
+  }
+  return { content };
+}
+
 function workspaceIdFrom(args: Record<string, unknown>, context: ScopedExtensionContextV1): string { return (optionalString(args.workspaceId) ?? context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc").toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 128) || "adhoc"; }
 function runId(context: ScopedExtensionContextV1): string { return context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc"; }
 function actionRunId(context: ScopedExtensionContextV1): string { return context.missionId ?? context.rootMissionId ?? context.operationId ?? "adhoc"; }

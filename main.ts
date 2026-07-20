@@ -1689,14 +1689,14 @@ export default class AgenticResearcherPlugin extends Plugin {
     settings.orchestratorWorkerMaxSteps = clampIntegerSetting(
       settings.orchestratorWorkerMaxSteps,
       4,
-      30,
-      DEFAULT_SETTINGS.orchestratorWorkerMaxSteps ?? 20,
+      60,
+      DEFAULT_SETTINGS.orchestratorWorkerMaxSteps ?? 40,
     );
     settings.orchestratorWorkerMaxToolCalls = clampIntegerSetting(
       settings.orchestratorWorkerMaxToolCalls,
       4,
-      40,
-      DEFAULT_SETTINGS.orchestratorWorkerMaxToolCalls ?? 24,
+      80,
+      DEFAULT_SETTINGS.orchestratorWorkerMaxToolCalls ?? 40,
     );
     settings.orchestratorWorkerMaxMinutes = clampIntegerSetting(
       settings.orchestratorWorkerMaxMinutes,
@@ -7265,8 +7265,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       !detectChatOnlyIntent(prompt);
     const autoContinueLongRun =
       !durableManifest &&
-      this.settings.autoContinueLongRuns !== false &&
-      (completionDrivenLoops || isExplicitLongRunningResearchPrompt(prompt));
+      (completionDrivenLoops ||
+        (this.settings.autoContinueLongRuns !== false &&
+          isExplicitLongRunningResearchPrompt(prompt)));
     const maxSegments = autoContinueLongRun
       ? completionDrivenLoops
         ? Math.min(
@@ -7793,9 +7794,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     try {
     const runId = input.runId ?? createAgentRunId();
-    const workerMaxSteps = this.settings.orchestratorWorkerMaxSteps ?? 20;
+    const workerMaxSteps = this.settings.orchestratorWorkerMaxSteps ?? 40;
     const workerMaxToolCalls =
-      this.settings.orchestratorWorkerMaxToolCalls ?? 24;
+      this.settings.orchestratorWorkerMaxToolCalls ?? 40;
     const workerMaxMinutes = this.settings.orchestratorWorkerMaxMinutes ?? 15;
     const leadMaxSteps = Math.max(4, MAX_AGENT_STEPS - workerMaxSteps);
     const leadMaxToolCalls = Math.max(
@@ -8329,7 +8330,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       emitOrchestratorAssistantResult(input.events, blocker, "error");
       input.events.onRunComplete?.({
         step: 0,
-        maxSteps: this.settings.orchestratorWorkerMaxSteps ?? 20,
+        maxSteps: this.settings.orchestratorWorkerMaxSteps ?? 40,
         stopReason: "final",
       });
       return null;
@@ -8343,9 +8344,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     try {
     const runId = input.runId ?? createAgentRunId();
-    const workerMaxSteps = this.settings.orchestratorWorkerMaxSteps ?? 20;
+    const workerMaxSteps = this.settings.orchestratorWorkerMaxSteps ?? 40;
     const workerMaxToolCalls =
-      this.settings.orchestratorWorkerMaxToolCalls ?? 24;
+      this.settings.orchestratorWorkerMaxToolCalls ?? 40;
     const workerMaxMinutes = this.settings.orchestratorWorkerMaxMinutes ?? 15;
     let operationalSnapshot: OrchestratorSnapshotV1 | null = null;
     const runtime = new OrchestratorRuntime({

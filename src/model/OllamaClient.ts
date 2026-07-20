@@ -14,6 +14,7 @@ import {
   StreamingHttpTransport,
 } from "./types";
 import { parseRetryAfterMs } from "./retry";
+import { parseProviderToolArguments } from "./toolArgumentNormalization";
 
 interface OllamaClientOptions {
   baseUrl: string;
@@ -449,29 +450,8 @@ function parseOllamaToolCalls(toolCalls: unknown): ModelToolCall[] {
 }
 
 function parseToolArguments(args: unknown): Record<string, unknown> {
-  if (args === undefined || args === null) {
-    return {};
-  }
-
-  if (isRecord(args)) {
-    return args;
-  }
-
-  if (typeof args === "string") {
-    if (!args.trim()) {
-      return {};
-    }
-
-    try {
-      const parsed = JSON.parse(args);
-      if (isRecord(parsed)) {
-        return parsed;
-      }
-    } catch {
-      // Handled by the error below.
-    }
-  }
-
+  const parsed = parseProviderToolArguments(args);
+  if (parsed) return parsed;
   throw new ModelClientError(
     "invalid_response",
     "Ollama returned tool arguments in an unexpected format.",

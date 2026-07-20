@@ -1010,15 +1010,15 @@ test("long-run event flood stays bounded across pane detach and replay", async (
   });
 });
 
-test("long-running research auto-continues one budgeted segment", async () => {
+test("completion-driven mission auto-continues when explicit long-research continuation is off", async () => {
   test.setTimeout(180_000);
   await withE2EHarness("long-run-auto-segment", async ({ page, notePath }) => {
     await setStreamingMode(page, false);
     await setAgenticReflexMode(page, false);
     await setPluginSettingOverrides(page, {
-      autoContinueLongRuns: true,
-      completionDrivenLoops: false,
-      maxLongRunSegments: 2,
+      autoContinueLongRuns: false,
+      completionDrivenLoops: true,
+      maxCompletionSegments: 4,
       // The dedicated wall-clock test below proves the tight stop. This lane
       // needs enough per-segment time for three source readbacks plus write
       // verification after the durable continuation starts.
@@ -1108,16 +1108,13 @@ test("long-running research auto-continues one budgeted segment", async () => {
     }, { pluginId: PLUGIN_ID, missionStartedAt });
 
     await page.getByRole("tab", { name: "Run Details" }).click();
-    await expect(
-      page.locator(".agentic-researcher-details-panel", {
-        hasText: "Long research segment 1/2",
-      }),
-    ).toBeVisible({ timeout: 30_000 });
-    await expect(
-      page.locator(".agentic-researcher-details-panel", {
-        hasText: `Continuing long research from segment ${firstRunId}.`,
-      }),
-    ).toBeVisible();
+    const detailsPanel = page.locator(".agentic-researcher-details-panel");
+    await expect(detailsPanel).toContainText("mission not complete yet", {
+      timeout: 30_000,
+    });
+    await expect(detailsPanel).toContainText(
+      `mission not complete yet (segment ${firstRunId}).`,
+    );
     await expect(page.locator("button.agentic-researcher-run")).toHaveText(
       "Stop Mission",
     );

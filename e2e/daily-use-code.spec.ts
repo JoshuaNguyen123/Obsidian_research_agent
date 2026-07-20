@@ -318,6 +318,66 @@ test.describe("Daily-use Code capability production boundaries", () => {
       ).toBe(file.content);
     }
   });
+  test("NOTEBOOK-01 creates a structured Jupyter notebook with durable readback", async () => {
+    test.skip(
+      LIVE_CODE_LANE,
+      "The deterministic notebook contract runs in the targeted daily-use-code lane.",
+    );
+    const active = requireHarness(harness);
+    const workspaceId = `phase4-notebook-${active.marker.toLowerCase()}`;
+    const notebookPath = "analysis/checkers.ipynb";
+    await active.configureScenario("notebook-create", {
+      workspaceId,
+      notebookPath,
+    });
+    await active.submitMissionWithApprovals(
+      [
+        `NOTEBOOK-01 create isolated scratch workspace ${workspaceId}, then create ${notebookPath}.`,
+        "Use exactly code_workspace_create and code_workspace_create_file through the prepared approval path.",
+        "Pass structured markdown and code cells in the notebook field. Do not hand-write raw notebook JSON.",
+        "Stop only after the notebook creation receipt is committed.",
+      ].join(" "),
+      { timeoutMs: MISSION_TIMEOUT_MS },
+    );
+
+    const result = await active.executeTool(
+      "code_workspace_read",
+      { workspaceId, path: notebookPath },
+      `Read back NOTEBOOK-01 notebook ${notebookPath}.`,
+    );
+    const content = requireString(
+      requireRecord(toolOutput(result), "notebook readback").content,
+      "notebook content",
+    );
+    const notebook = JSON.parse(content) as {
+      nbformat: number;
+      nbformat_minor: number;
+      metadata: { kernelspec?: { name?: string } };
+      cells: Array<{
+        cell_type: string;
+        execution_count?: number | null;
+        outputs?: unknown[];
+        source: string[];
+      }>;
+    };
+    expect(notebook.nbformat).toBe(4);
+    expect(notebook.nbformat_minor).toBe(5);
+    expect(notebook.metadata.kernelspec?.name).toBe("python3");
+    expect(notebook.cells.map((cell) => cell.cell_type)).toEqual([
+      "markdown",
+      "code",
+    ]);
+    expect(notebook.cells[1].execution_count).toBeNull();
+    expect(notebook.cells[1].outputs).toEqual([]);
+    expect(notebook.cells.flatMap((cell) => cell.source).join("")).toContain(
+      active.marker,
+    );
+    await active.page.getByRole("tab", { name: "Run Details" }).click();
+    await expect(active.page.locator(".agentic-researcher-details-panel")).toContainText(
+      "code_workspace_create_file",
+    );
+  });
+
 
   test("managed metadata boundary supports durable CRUD and restart with hashes and trash/restore receipts", async () => {
     test.setTimeout(SUITE_TIMEOUT_MS);

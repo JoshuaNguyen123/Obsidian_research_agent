@@ -6,16 +6,18 @@ import type {
   ModelClient,
   ModelToolCall,
   ModelToolDefinition,
+  JsonSchemaObject,
 } from "../model/types";
 import type { ToolExecutionResult } from "../tools/types";
 import type { WorkerHandoff } from "./types";
+import { buildJupyterNotebookV1 } from "../../extensions/code/JupyterNotebookV1";
 
 const MAX_CODE_FILE_BYTES = 1_000_000;
 const MAX_LISTED_FILES = 500;
 const ALLOWED_EXTENSIONS = new Set([
   ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css",
   ".scss", ".html", ".md", ".yaml", ".yml", ".toml", ".txt", ".py",
-  ".ps1", ".sh", ".sql", ".svg",
+  ".ps1", ".sh", ".sql", ".svg", ".ipynb",
 ]);
 const IGNORED_DIRECTORIES = new Set([
   ".git", "node_modules", "dist", "build", "coverage", ".agent-backups",
@@ -108,8 +110,8 @@ export async function runCodeWorker(input: {
   events?: CodeWorkerEvents;
   now?: () => Date;
 }): Promise<CodeWorkerResult> {
-  const maxSteps = clamp(input.maxSteps ?? 20, 1, 30);
-  const maxToolCalls = clamp(input.maxToolCalls ?? 30, 1, 50);
+  const maxSteps = clamp(input.maxSteps ?? 40, 1, 60);
+  const maxToolCalls = clamp(input.maxToolCalls ?? 40, 1, 80);
   const changed = new Set<string>();
   const messages: ModelChatMessage[] = [
     {
@@ -119,6 +121,7 @@ export async function runCodeWorker(input: {
         "Use only the code file tools provided. You have no shell, Git, network, vault, or approval capability.",
         "Inspect relevant files before editing. Keep changes scoped to the assigned task.",
         "When finished, return a concise summary and tests the Lead should run.",
+        "Create .ipynb files only with code_write_notebook so notebook JSON is structured and validated.",
       ].join(" "),
     },
     { role: "user", content: input.assignment },
@@ -250,7 +253,44 @@ export async function executeCodeWorkerTool(input: {
         output: { path: normalizeRelative(input.root, path, runtime), content },
       };
     }
+    if (input.call.name === "code_write_notebook") {
+      if (!/\.ipynb$/iu.test(relativePath)) {
+        throw new Error("code_write_notebook requires an .ipynb path.");
+      }
+      assertWorkerMutationPath(input.root, path, runtime);
+      await assertNoLinkTraversal(runtime, input.root, path, {
+        allowMissingLeaf: true,
+      });
+      const built = buildJupyterNotebookV1({
+        cells: input.call.arguments.cells,
+        kernelName: input.call.arguments.kernelName,
+        kernelDisplayName: input.call.arguments.kernelDisplayName,
+        language: input.call.arguments.language,
+      });
+      assertFileSize(built.content);
+      await runtime.fs.mkdir(runtime.path.dirname(path), { recursive: true });
+      await runtime.fs.writeFile(path, built.content, "utf8");
+      const normalized = normalizeRelative(input.root, path, runtime);
+      input.changed?.add(normalized);
+      return {
+        ok: true,
+        toolName: input.call.name,
+        output: {
+          path: normalized,
+          bytesWritten: Buffer.byteLength(built.content, "utf8"),
+          notebook: {
+            cellCount: built.cellCount,
+            codeCellCount: built.codeCellCount,
+            markdownCellCount: built.markdownCellCount,
+            kernelName: built.kernelName,
+            language: built.language,
+            executionState: built.executionState,
+          },
+        },
+      };
+    }
     if (input.call.name === "code_write_file") {
+      if (/\.ipynb$/iu.test(relativePath)) throw new Error("Use code_write_notebook for .ipynb files.");
       assertWorkerMutationPath(input.root, path, runtime);
       await assertNoLinkTraversal(runtime, input.root, path, {
         allowMissingLeaf: true,
@@ -340,6 +380,26 @@ export const CODE_WORKER_TOOL_DEFINITIONS: ModelToolDefinition[] = [
     path: { type: "string" },
     content: { type: "string" },
   }, ["path", "content"]),
+  definition("code_write_notebook", "Create or replace one structured nbformat 4 Jupyter notebook. Creation validates structure but does not execute cells.", {
+    path: { type: "string", description: "Worktree-relative .ipynb path." },
+    cells: {
+      type: "array",
+      minItems: 1,
+      maxItems: 200,
+      items: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["markdown", "code"] },
+          source: { type: "string" },
+        },
+        required: ["type", "source"],
+        additionalProperties: false,
+      },
+    },
+    kernelName: { type: "string" },
+    kernelDisplayName: { type: "string" },
+    language: { type: "string" },
+  }, ["path", "cells"]),
   definition("code_replace_text", "Replace one exact unique text occurrence in a worktree file.", {
     path: { type: "string" },
     oldText: { type: "string" },
@@ -350,7 +410,7 @@ export const CODE_WORKER_TOOL_DEFINITIONS: ModelToolDefinition[] = [
 function definition(
   name: string,
   description: string,
-  properties: Record<string, { type: string; description?: string }>,
+  properties: Record<string, JsonSchemaObject>,
   required: string[] = [],
 ): ModelToolDefinition {
   return {
@@ -500,7 +560,7 @@ function getOutputPath(result: ToolExecutionResult): string | null {
 }
 
 function isMutationTool(name: string): boolean {
-  return name === "code_write_file" || name === "code_replace_text";
+  return name === "code_write_file" || name === "code_write_notebook" || name === "code_replace_text";
 }
 
 function failure(toolName: string, code: string, message: string): ToolExecutionResult {

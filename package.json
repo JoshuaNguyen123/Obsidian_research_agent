@@ -30,6 +30,8 @@
     "test:e2e:daily-use:live-model": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-research --grep=DU-02",
     "test:e2e:daily-use:code": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=daily-use-code --grep=DU-03",
     "test:e2e:daily-use:languages": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=daily-use-code --grep=LANG-01",
+    "test:e2e:daily-use:notebooks": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=daily-use-code --grep=NOTEBOOK-01",
+    "test:e2e:continuation": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=deterministic-core-mock --grep=completion-driven",
     "test:e2e:systems-diagrams": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=systems-diagrams",
     "test:e2e:daily-use:code:live": "node scripts/run-e2e-exclusive.mjs --real-ai --project=daily-use-code-live",
     "test:e2e:daily-use:linear": "node scripts/run-e2e-exclusive.mjs --mock-ai --project=daily-use-linear --grep=DU-04",

@@ -17,6 +17,7 @@ import type {
 } from "./types";
 import { ModelClientError } from "./types";
 import { parseRetryAfterMs } from "./retry";
+import { parseProviderToolArguments } from "./toolArgumentNormalization";
 
 interface OpenAICompatibleClientOptions {
   baseUrl: string;
@@ -516,22 +517,8 @@ function parseJsonEvent(event: string, message: string): unknown {
 }
 
 function parseToolArguments(args: unknown): Record<string, unknown> {
-  if (args === undefined || args === null || args === "") {
-    return {};
-  }
-  if (isRecord(args)) {
-    return args;
-  }
-  if (typeof args === "string") {
-    try {
-      const parsed = JSON.parse(args);
-      if (isRecord(parsed)) {
-        return parsed;
-      }
-    } catch {
-      // Report below.
-    }
-  }
+  const parsed = parseProviderToolArguments(args);
+  if (parsed) return parsed;
   throw new ModelClientError(
     "invalid_response",
     "OpenAI-compatible API returned tool arguments in an unexpected format.",

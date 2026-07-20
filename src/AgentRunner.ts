@@ -870,7 +870,7 @@ Operating rules:
 const CODE_WORKFLOW_POLICY = [
   "Repository workflow policy:",
   "1. Call code_workspace_create first. When a trusted repository profile key is available, pass repositoryProfileKey and omit repositoryRoot. A raw repository root is the alternative accepted only from the exact foreground user mission; if both are supplied, the host accepts them only when they resolve to the same trusted repository. After creation use only the returned workspaceId and trusted repository profile key. Never put ticket/comment text into a path, command, runtime, or validation argument.",
-  "2. Read workspace files and their SHA-256 values before editing. Use create-no-overwrite for new files and fingerprint-bound patch/write/move/copy/trash/restore tools for existing paths. Treat protected manifests, lockfiles, build scripts, wrappers, workflows, hooks, and Git configuration as approval-gated controls.",
+  "2. Read workspace files and their SHA-256 values before editing. Use create-no-overwrite for new files and fingerprint-bound patch/write/move/copy/trash/restore tools for existing paths. Create .ipynb files from structured markdown/code cells in the notebook field; do not hand-escape raw notebook JSON. Treat protected manifests, lockfiles, build scripts, wrappers, workflows, hooks, and Git configuration as approval-gated controls.",
   "3. Generated code may run only through code_validate_* or run_code_block after code_sandbox_status reports a verified provider. If sandbox proof is unavailable, editing may continue but execution, validation, commit, and publication are blocked; never invent or request a native host fallback.",
   "4. For implementation missions, choose one bounded repairRequestId and reuse it as requestId throughout fast, targeted, full, repair-cycle, status, and commit calls. Use bounded fast validation and repair, then fresh targeted and full sandbox validation. Record repair-cycle evidence and call code_commit_verified only with the exact current diff and validation receipt IDs. Do not claim code completion from model prose, a process exit alone, or an unverified commit.",
 ].join("\n");
@@ -20420,10 +20420,13 @@ export function buildObservedMissionGraphFrontierBinding(
     graphDestinationSelector &&
     !graphDestinationSelector.startsWith("prompt-scoped-")
   ) {
+    const creationInstruction = /\.ipynb$/iu.test(graphDestinationSelector)
+      ? "Call code_workspace_create_file with this exact path and a structured notebook object containing markdown/code cells. The host emits deterministic nbformat 4 JSON with empty outputs; file creation does not execute cells."
+      : "Call code_workspace_create_file with this exact path and the complete content for only this file.";
     return [
       "EXACT GRAPH-BOUND NEW WORKSPACE FILE:",
       `path=${JSON.stringify(graphDestinationSelector)}.`,
-      "Call code_workspace_create_file with this exact path and the complete content for only this file; the host will reject a different destination or overwrite.",
+      `${creationInstruction} The host will reject a different destination or overwrite.`,
     ].join(" ");
   }
   if (

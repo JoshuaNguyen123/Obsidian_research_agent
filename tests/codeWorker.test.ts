@@ -167,3 +167,49 @@ test("code worker observes cancellation between batched mutation calls", async (
     await rm(root, { recursive: true, force: true });
   }
 });
+test("code worker creates structured notebooks and blocks raw ipynb writes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "code-worker-notebook-"));
+  try {
+    const changed = new Set<string>();
+    const created = await executeCodeWorkerTool({
+      root,
+      changed,
+      call: {
+        name: "code_write_notebook",
+        arguments: {
+          path: "analysis/checkers.ipynb",
+          cells: [
+            { type: "markdown", source: "# Checkers analysis\n" },
+            { type: "code", source: "BOARD_SIZE = 8\nprint(BOARD_SIZE)\n" },
+          ],
+        },
+      },
+    });
+    assert.equal(created.ok, true);
+    assert.deepEqual([...changed], ["analysis/checkers.ipynb"]);
+    const notebook = JSON.parse(
+      await readFile(join(root, "analysis", "checkers.ipynb"), "utf8"),
+    ) as {
+      nbformat: number;
+      cells: Array<{ cell_type: string; execution_count?: null; outputs?: unknown[] }>;
+    };
+    assert.equal(notebook.nbformat, 4);
+    assert.equal(notebook.cells[1].execution_count, null);
+    assert.deepEqual(notebook.cells[1].outputs, []);
+
+    const raw = await executeCodeWorkerTool({
+      root,
+      call: {
+        name: "code_write_file",
+        arguments: {
+          path: "raw.ipynb",
+          content: '{"nbformat":4,"nbformat_minor":5,"cells":[]}',
+        },
+      },
+    });
+    assert.equal(raw.ok, false);
+    assert.match(raw.error?.message ?? "", /code_write_notebook/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

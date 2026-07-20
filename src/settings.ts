@@ -185,8 +185,8 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,
   orchestratorAutoMergeGreen: true,
-  orchestratorWorkerMaxSteps: 20,
-  orchestratorWorkerMaxToolCalls: 24,
+  orchestratorWorkerMaxSteps: 40,
+  orchestratorWorkerMaxToolCalls: 40,
   orchestratorWorkerMaxMinutes: 15,
   autoTitleOnWrite: true,
   maxCodeRunsPerMission: undefined,
@@ -1039,9 +1039,9 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(section)
-      .setName("Auto-continue long research")
+      .setName("Auto-continue explicit long research")
       .setDesc(
-        "When a prompt explicitly asks for deep or long-running research, continue from the durable run snapshot after a segment reaches its step budget.",
+        "Fallback used only when completion-driven missions are off. Explicit deep or long-running research resumes automatically from its durable snapshot after a segment budget.",
       )
       .addToggle((toggle) =>
         toggle
@@ -1076,9 +1076,9 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(section)
-      .setName("Completion-driven long loops")
+      .setName("Completion-driven missions")
       .setDesc(
-        "When on (default), explicit long research continues soft 100-step segments until acceptance passes and proof debt is clear, up to the completion segment cap.",
+        "When on (default), non-chat missions automatically continue saved 100-step segments until acceptance passes and proof debt is clear. Correctable tool errors retry inside a segment; blockers and approvals still stop safely.",
       )
       .addToggle((toggle) =>
         toggle

@@ -1,5 +1,6 @@
 export const CODE_CREATION_LANGUAGE_CATALOG_V1 = [
   { id: "python", displayName: "Python", extensions: [".py"] },
+  { id: "jupyter", displayName: "Jupyter Notebook", extensions: [".ipynb"] },
   { id: "typescript", displayName: "TypeScript", extensions: [".ts", ".tsx", ".mts", ".cts"] },
   { id: "javascript", displayName: "JavaScript", extensions: [".js", ".jsx", ".mjs", ".cjs"] },
   { id: "c", displayName: "C", extensions: [".c", ".h"] },
@@ -22,7 +23,7 @@ export interface CodeCreationLanguageMatchV1 {
 }
 
 export const CODE_CREATION_LANGUAGE_SUMMARY_V1 =
-  "Python, TypeScript, JavaScript, C, C++, HTML, CSS, Rust, Go, Java, and C#";
+  "Python, Jupyter notebooks, TypeScript, JavaScript, C, C++, HTML, CSS, Rust, Go, Java, and C#";
 
 /** Classify only the target filename; content remains untrusted text until its prepared write. */
 export function detectCodeCreationLanguageV1(

@@ -21,6 +21,7 @@ import {
 import { WorkspaceManagerV2 } from "../extensions/code/workspaces";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories";
 import { CODE_CREATION_LANGUAGE_CATALOG_V1 } from "../extensions/code/CodeCreationLanguagesV1";
+import { buildJupyterNotebookV1 } from "../extensions/code/JupyterNotebookV1";
 
 test("workspace contribution factory replaces every new and legacy tool name", async () => {
   const fixture = await createFixture("names");
@@ -99,7 +100,7 @@ test("workspace contribution factory replaces every new and legacy tool name", a
   }
 });
 
-test("prepared workspace creation supports eleven explicit source languages", async () => {
+test("prepared workspace creation supports twelve explicit source and notebook formats", async () => {
   const fixture = await createFixture("languages");
   try {
     const tools = toolMap(createCodeWorkspaceToolContributionsV2({
@@ -113,8 +114,15 @@ test("prepared workspace creation supports eleven explicit source languages", as
       { workspaceId: "language-space", kind: "scratch" },
       context,
     );
+    const notebookContent = buildJupyterNotebookV1({
+      cells: [
+        { type: "markdown", source: "# Analysis\n" },
+        { type: "code", source: "print('ok')\n" },
+      ],
+    }).content;
     const files = [
       { language: "python", path: "app.py", content: "print('ok')\n" },
+      { language: "jupyter", path: "analysis.ipynb", content: notebookContent },
       { language: "typescript", path: "app.ts", content: "export const ok: boolean = true;\n" },
       { language: "javascript", path: "app.js", content: "export const ok = true;\n" },
       { language: "c", path: "app.c", content: "int main(void) { return 0; }\n" },
@@ -131,15 +139,33 @@ test("prepared workspace creation supports eleven explicit source languages", as
       files.map((file) => file.language),
     );
     const createTool = tools.get("code_workspace_create_file")!;
-    assert.match(createTool.description, /Python, TypeScript, JavaScript, C, C\+\+/u);
+    assert.match(createTool.description, /Python, Jupyter notebooks, TypeScript, JavaScript, C, C\+\+/u);
     assert.match(createTool.description, /HTML, CSS, Rust, Go, Java, and C#/u);
     for (const file of files) {
       const prepared = await requirePrepared(
         createTool,
-        { workspaceId: "language-space", path: file.path, content: file.content },
+        file.language === "jupyter"
+          ? {
+              workspaceId: "language-space",
+              path: file.path,
+              notebook: {
+                cells: [
+                  { type: "markdown", source: "# Analysis\n" },
+                  { type: "code", source: "print('ok')\n" },
+                ],
+              },
+            }
+          : { workspaceId: "language-space", path: file.path, content: file.content },
         context,
       );
       assert.equal(prepared.normalizedArgs.creationLanguage, file.language);
+      if (file.language === "jupyter") {
+        assert.deepEqual(prepared.normalizedArgs.notebookMetadata, {
+          cellCount: 2, codeCellCount: 1, markdownCellCount: 1,
+          kernelName: "python3", language: "python",
+          executionState: "not_executed",
+        });
+      }
       await createTool.executePrepared!(prepared, authorize(context, prepared));
       const readback = await tools.get("code_workspace_read")!.execute(
         { workspaceId: "language-space", path: file.path },
@@ -147,6 +173,16 @@ test("prepared workspace creation supports eleven explicit source languages", as
       ) as { content: string };
       assert.equal(readback.content, file.content);
     }
+    const malformedNotebook = await createTool.prepare!(
+      {
+        workspaceId: "language-space",
+        path: "invalid.ipynb",
+        content: "{\"cells\":[]}",
+      },
+      context,
+    );
+    assert.equal(malformedNotebook.ok, false);
+    if (!malformedNotebook.ok) assert.equal(malformedNotebook.error.code, "invalid_arguments");
   } finally {
     await fixture.cleanup();
   }

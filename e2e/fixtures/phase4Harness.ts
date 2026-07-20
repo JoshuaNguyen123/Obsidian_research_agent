@@ -76,7 +76,8 @@ export interface Phase4Harness {
       | "crud-stage-1"
       | "crud-stage-2"
       | "repository-create"
-      | "language-create",
+      | "language-create"
+      | "notebook-create",
     data?: Record<string, unknown>,
   ): Promise<void>;
   readToolCatalog(): Promise<Phase4ToolCatalogEntry[]>;
@@ -567,6 +568,35 @@ async function installPhase4PageHarness(
           }
           return final(
             `Created ${file?.path ?? "the requested source file"} in ${workspaceId} with a prepared receipt. PHASE4_LANGUAGE_FILE_DONE ${marker}`,
+          );
+        }
+        if (scenarioState.name === "notebook-create") {
+          const notebookPath = String(
+            scenarioState.data.notebookPath ?? "analysis/checkers.ipynb",
+          );
+          if (scenarioState.step === 0) {
+            return toolCall(required("code_workspace_create"), {
+              workspaceId,
+              kind: "scratch",
+            });
+          }
+          if (scenarioState.step === 1) {
+            return toolCall(required("code_workspace_create_file"), {
+              workspaceId,
+              path: notebookPath,
+              notebook: {
+                cells: [
+                  { type: "markdown", source: `# Checkers analysis ${marker}\n` },
+                  {
+                    type: "code",
+                    source: `BOARD_SIZE = 8\nMARKER = "${marker}"\nprint(BOARD_SIZE)\n`,
+                  },
+                ],
+              },
+            });
+          }
+          return final(
+            `Created structured Jupyter notebook ${notebookPath} in ${workspaceId} with nbformat readback. PHASE4_NOTEBOOK_DONE ${marker}`,
           );
         }
         if (scenarioState.name === "crud-stage-1") {
