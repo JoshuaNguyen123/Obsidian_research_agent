@@ -1514,19 +1514,26 @@ function resolveCreateFileContentV1(
   notebookMetadata?: Record<string, JsonValueV1>;
 } {
   const notebookPath = /\.ipynb$/iu.test(targetPath);
-  if (args.notebook !== undefined) {
-    if (args.content !== undefined) {
-      throw new WorkspaceManagerErrorV2(
-        "invalid_arguments",
-        "Provide notebook or content, not both.",
-      );
-    }
-    if (!notebookPath) {
-      // Missions often say "notebook" for Obsidian notes. When the graph binds a
-      // source path, flatten mistaken Jupyter cells into ordinary file content.
+  const hasNotebook = args.notebook !== undefined;
+  const contentArg = typeof args.content === "string" ? args.content : undefined;
+  const hasUsableContent = contentArg !== undefined && contentArg.length > 0;
+
+  if (notebookPath) {
+    // Prefer structured notebook cells when the destination is .ipynb. Models
+    // sometimes also echo a content string; ignore that duplicate payload.
+    if (hasNotebook) {
       try {
+        const built = buildJupyterNotebookV1(args.notebook);
         return {
-          content: flattenNotebookCellsToPlainContentV1(args.notebook),
+          content: built.content,
+          notebookMetadata: {
+            cellCount: built.cellCount,
+            codeCellCount: built.codeCellCount,
+            markdownCellCount: built.markdownCellCount,
+            kernelName: built.kernelName,
+            language: built.language,
+            executionState: built.executionState,
+          },
         };
       } catch (error) {
         throw new WorkspaceManagerErrorV2(
@@ -1535,28 +1542,7 @@ function resolveCreateFileContentV1(
         );
       }
     }
-    try {
-      const built = buildJupyterNotebookV1(args.notebook);
-      return {
-        content: built.content,
-        notebookMetadata: {
-          cellCount: built.cellCount,
-          codeCellCount: built.codeCellCount,
-          markdownCellCount: built.markdownCellCount,
-          kernelName: built.kernelName,
-          language: built.language,
-          executionState: built.executionState,
-        },
-      };
-    } catch (error) {
-      throw new WorkspaceManagerErrorV2(
-        "invalid_arguments",
-        error instanceof Error ? error.message : "Notebook input is invalid.",
-      );
-    }
-  }
-  const content = requiredString(args.content, "content", true);
-  if (notebookPath) {
+    const content = requiredString(args.content, "content", true);
     try {
       validateJupyterNotebookContentV1(content);
     } catch (error) {
@@ -1565,8 +1551,27 @@ function resolveCreateFileContentV1(
         error instanceof Error ? error.message : "Notebook content is invalid.",
       );
     }
+    return { content };
   }
-  return { content };
+
+  // Non-.ipynb destinations: prefer plain content when present. If the model
+  // also (or only) sent Jupyter cells for a .py/.md/etc. path, flatten cells.
+  if (hasUsableContent) {
+    return { content: contentArg };
+  }
+  if (hasNotebook) {
+    try {
+      return {
+        content: flattenNotebookCellsToPlainContentV1(args.notebook),
+      };
+    } catch (error) {
+      throw new WorkspaceManagerErrorV2(
+        "invalid_arguments",
+        error instanceof Error ? error.message : "Notebook input is invalid.",
+      );
+    }
+  }
+  return { content: requiredString(args.content, "content", true) };
 }
 
 function workspaceIdFrom(args: Record<string, unknown>, context: ScopedExtensionContextV1): string { return (optionalString(args.workspaceId) ?? context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc").toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 128) || "adhoc"; }

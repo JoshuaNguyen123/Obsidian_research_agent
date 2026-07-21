@@ -205,6 +205,28 @@ test("prepared workspace creation supports twelve explicit source and notebook f
       "# helper\n\ndef ok():\n    return True\n",
     );
     await createTool.executePrepared!(flattened, authorize(context, flattened));
+
+    // Models often send both notebook cells and a content string for .py paths.
+    // Prefer the explicit content payload instead of failing closed.
+    const bothFields = await requirePrepared(
+      createTool,
+      {
+        workspaceId: "language-space",
+        path: "both_fields.py",
+        content: "def preferred():\n    return 1\n",
+        notebook: {
+          cells: [
+            { type: "code", source: "def ignored():\n    return 0\n" },
+          ],
+        },
+      },
+      context,
+    );
+    assert.equal(
+      bothFields.normalizedArgs.content,
+      "def preferred():\n    return 1\n",
+    );
+    await createTool.executePrepared!(bothFields, authorize(context, bothFields));
   } finally {
     await fixture.cleanup();
   }
