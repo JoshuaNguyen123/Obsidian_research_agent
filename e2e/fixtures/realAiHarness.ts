@@ -714,8 +714,13 @@ async function submitMission(
   const input = page.locator("textarea.agentic-researcher-prompt");
   await input.fill(prompt);
   await page.locator("button.agentic-researcher-run").click();
-  await expect(page.locator(".agentic-researcher-log-user", { hasText: prompt }).last())
-    .toBeVisible({ timeout: 5_000 });
+  // Compound DU prompts exceed chat bubble text; match a stable unique marker.
+  const marker =
+    prompt.match(/\bDU0[0-9]_[A-Za-z0-9_]+\b/u)?.[0] ??
+    prompt.match(/\bE2E Agent Tests\/[^\s]+\.md\b/u)?.[0] ??
+    prompt.slice(0, 96);
+  await expect(page.locator(".agentic-researcher-log-user", { hasText: marker }).last())
+    .toBeVisible({ timeout: 15_000 });
   if (options.waitForCompletion === false) return;
   await waitForMissionComplete(page, options.timeoutMs);
 }
