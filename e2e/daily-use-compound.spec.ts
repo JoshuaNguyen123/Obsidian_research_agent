@@ -1665,10 +1665,14 @@ async function configureProtectedConnections(
   requestedLinearTeamId: string | null,
   requestedLinearProjectId: string | null,
 ) {
+  // Generate outside page.evaluate — node:crypto cannot be closed over into the
+  // Obsidian renderer (Playwright would serialize it as an undefined binding).
+  const evidenceProjectId = randomUUID();
   return page.evaluate(async ({
     pluginId,
     requestedLinearTeamId,
     requestedLinearProjectId,
+    evidenceProjectId,
   }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
     const environment = (globalThis as any).process?.env ?? {};
@@ -1742,9 +1746,8 @@ async function configureProtectedConnections(
           );
         }
         // projects.create only acknowledges success; the catalog mutation does
-        // not return the provider id. Pin a client-generated UUID in input.id
+        // not return the provider id. Pin a host-provided UUID in input.id
         // (supported by ProjectCreateInput) so the evidence destination is known.
-        const evidenceProjectId = randomUUID();
         const created = await plugin.createSecretBackedLinearClient().execute(
           "projects.create",
           {
@@ -1853,6 +1856,7 @@ async function configureProtectedConnections(
     pluginId: NATIVE_CORE_PLUGIN_ID,
     requestedLinearTeamId,
     requestedLinearProjectId,
+    evidenceProjectId,
   });
 }
 
