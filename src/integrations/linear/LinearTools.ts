@@ -1239,9 +1239,7 @@ function issueInputMismatchFields(
     }
     const actual = comparisons[key];
     if (key === "description") {
-      if (
-        comparableLinearMarkdown(actual) !== comparableLinearMarkdown(expected)
-      ) {
+      if (!descriptionsCompatiblyMatch(actual, expected)) {
         mismatchedFields.push(key);
       }
       continue;
@@ -1253,13 +1251,40 @@ function issueInputMismatchFields(
   return mismatchedFields.sort();
 }
 
-/** Normalize provider markdown so harmless Linear round-trips do not fail closed. */
-function comparableLinearMarkdown(value: unknown): string {
+/**
+ * Linear markdown round-trips rewrite task lists, spacing, and light markup.
+ * Keep create/update readback fail-closed for total prose replacement while
+ * accepting provider-stable reformatting of the same human content.
+ */
+function descriptionsCompatiblyMatch(
+  actual: unknown,
+  expected: unknown,
+): boolean {
+  if (expected === null || expected === undefined) {
+    return actual === undefined || actual === null || actual === "";
+  }
+  const expectedProse = canonicalizeLinearProse(expected);
+  const actualProse = canonicalizeLinearProse(actual);
+  if (expectedProse === actualProse) return true;
+  if (!expectedProse) return true;
+  if (!actualProse) return false;
+  const expectedTokens = expectedProse.split(" ").filter((token) => token.length > 2);
+  if (expectedTokens.length === 0) return true;
+  const actualTokens = new Set(
+    actualProse.split(" ").filter((token) => token.length > 2),
+  );
+  const hits = expectedTokens.filter((token) => actualTokens.has(token)).length;
+  return hits / expectedTokens.length >= 0.8;
+}
+
+function canonicalizeLinearProse(value: unknown): string {
   return String(value ?? "")
     .replace(/\r\n/g, "\n")
     .replace(/^\s*[-*]\s+\[[ xX]\]\s+/gmu, "- ")
-    .replace(/[ \t]+$/gmu, "")
-    .trimEnd();
+    .replace(/[#*_`>[\]()!-]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .toLowerCase();
 }
 
 function describePostconditionMismatch(

@@ -459,8 +459,9 @@ test("issue create accepts Linear markdown description round-trip normalization"
           id: String(createdInput.id),
           title: String(createdInput.title),
           teamId: String(createdInput.teamId),
-          // Provider rewritten task-list markers and trailing whitespace.
-          description: `${sent.replace("- criterion", "- [ ] criterion")}  \r\n`,
+          // Provider rewritten markup/spacing while preserving the prose tokens.
+          description:
+            `### Body\n\nAcceptance criteria:\n* [ ] criterion one\n* criterion two  \r\n`,
           snapshotHash: HASH_B,
         });
       }
@@ -475,7 +476,7 @@ test("issue create accepts Linear markdown description round-trip normalization"
       arguments: {
         teamId: "team-1",
         title: "Research ticket",
-        description: "Body\n\n## Acceptance criteria\n- criterion",
+        description: "Body\n\n## Acceptance criteria\n- criterion one\n- criterion two",
       },
     },
     context,
@@ -488,6 +489,7 @@ test("issue create accepts Linear markdown description round-trip normalization"
     grantId: "grant-linear-description-normalize",
   });
   assert.equal(result.ok, true);
+  assert.ok(createdInput);
 });
 
 test("issue create readback failure reports only stable mismatched field names", async () => {
