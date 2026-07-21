@@ -336,24 +336,29 @@ export class ResearchTicketPublisher {
       context: request.context,
     });
     if (!prepared.ok) {
-      const adopted = await this.tryAdoptDeterministicIssue(
+      const adoption = await this.tryAdoptDeterministicIssue(
         ticket,
         request.context,
         prepared.error,
       );
-      if (adopted) {
+      if (adoption.issue) {
         return {
           ok: true,
           status: "deduplicated",
           ticket,
-          issue: adopted,
+          issue: adoption.issue,
           candidatesExamined: preview.candidatesExamined,
         };
       }
       return {
         ok: false,
         status: "rejected",
-        error: prepared.error,
+        error: adoption.failureMessage
+          ? {
+              code: prepared.error.code,
+              message: `${prepared.error.message} (${adoption.failureMessage})`,
+            }
+          : prepared.error,
         ticket,
         candidatesExamined: preview.candidatesExamined,
       };
@@ -430,14 +435,9 @@ export class ResearchTicketPublisher {
     // id even when search indexing or an earlier ack path missed it.
     try {
       const byId = await this.readIssue(ticket.deterministicIssueId, context);
-      if (
-        !ticketReadbackMismatch(
-          byId,
-          ticket,
-          this.queueTeamId,
-          this.queueProjectId,
-        )
-      ) {
+      // The client UUID is host-owned. Team+title match is enough to reuse it on
+      // retry even when Linear project/description readback still lags or drifts.
+      if (!ownedDeterministicIssueMismatch(byId, ticket, this.queueTeamId)) {
         return { issue: byId, candidatesExamined: 1 };
       }
     } catch (error) {
@@ -521,25 +521,26 @@ export class ResearchTicketPublisher {
     ticket: BuiltResearchTicket,
     context: ToolExecutionContext,
     error: { code: string; message: string },
-  ): Promise<LinearIssueRecord | null> {
+  ): Promise<{ issue: LinearIssueRecord | null; failureMessage?: string }> {
     if (error.code !== "linear_duplicate_target") {
-      return null;
+      return { issue: null };
     }
     try {
       const issue = await this.readIssue(ticket.deterministicIssueId, context);
-      if (
-        ticketReadbackMismatch(
-          issue,
-          ticket,
-          this.queueTeamId,
-          this.queueProjectId,
-        )
-      ) {
-        return null;
+      const mismatch = ownedDeterministicIssueMismatch(
+        issue,
+        ticket,
+        this.queueTeamId,
+      );
+      if (mismatch) {
+        return { issue: null, failureMessage: mismatch };
       }
-      return issue;
-    } catch {
-      return null;
+      return { issue };
+    } catch (adoptError) {
+      return {
+        issue: null,
+        failureMessage: publisherError(adoptError, "research_ticket_invalid_readback").message,
+      };
     }
   }
 }
@@ -852,17 +853,43 @@ function ticketReadbackMismatch(
   if (issue.title !== expected.title) {
     return "Linear issue readback contains a different title.";
   }
-  if (issue.description !== expected.description) {
+  if (
+    normalizeComparableTicketText(issue.description) !==
+      normalizeComparableTicketText(expected.description)
+  ) {
     return "Linear issue readback contains a different clean description.";
   }
   return null;
+}
+
+function ownedDeterministicIssueMismatch(
+  issue: LinearIssueRecord,
+  expected: BuiltResearchTicket,
+  queueTeamId: string,
+): string | null {
+  if (issue.id !== expected.deterministicIssueId) {
+    return "Linear issue id does not match the deterministic research ticket id.";
+  }
+  if (issue.team.id !== queueTeamId) {
+    return "Linear issue readback is outside the pinned queue team.";
+  }
+  if (issue.title !== expected.title) {
+    return "Linear issue readback contains a different title.";
+  }
+  return null;
+}
+
+function normalizeComparableTicketText(value: string | undefined): string {
+  return (value ?? "").replace(/\r\n/g, "\n").trimEnd();
 }
 
 function hasExactHumanTicketContent(
   issue: LinearIssueRecord,
   expected: BuiltResearchTicket,
 ): boolean {
-  return issue.title === expected.title && issue.description === expected.description;
+  return issue.title === expected.title &&
+    normalizeComparableTicketText(issue.description) ===
+      normalizeComparableTicketText(expected.description);
 }
 
 function expectIssuePage(

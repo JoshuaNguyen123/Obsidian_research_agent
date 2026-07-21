@@ -330,6 +330,48 @@ test("publisher adopts deterministic issue after prepare reports duplicate targe
   assert.equal(getCount, 2);
 });
 
+test("publisher adopts owned deterministic issue even when project or description drift", async () => {
+  let prepareCount = 0;
+  let deterministicId = "";
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") return page([]);
+      if (operationKey === "issues.get") {
+        assert.equal(variables.id, deterministicId);
+        const drifted = issue(deterministicId, "Drifted provider description.", null);
+        return drifted;
+      }
+      throw new Error(`Unexpected operation ${operationKey}`);
+    },
+  };
+  const publisher = publisherFixture(
+    readClient,
+    fakeExecutor({
+      onPrepare: () => {
+        prepareCount += 1;
+      },
+    }),
+  );
+  const built = publisher.build(SECTIONS, DRAFT);
+  deterministicId = built.deterministicIssueId;
+
+  const result = await publisher.publish(
+    requestFixture({
+      approvedPreview: {
+        status: "create",
+        workItemFingerprint: built.spec.fingerprint,
+        duplicateId: null,
+        duplicateSnapshotHash: null,
+      },
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  if (!result.ok || result.status !== "deduplicated") return;
+  assert.equal(result.issue.id, deterministicId);
+  assert.equal(prepareCount, 0);
+});
+
 test("publisher prepares one deterministic pinned create and verifies independent readback", async () => {
   const searches: Array<Record<string, unknown>> = [];
   let preparedArguments: Record<string, unknown> | undefined;

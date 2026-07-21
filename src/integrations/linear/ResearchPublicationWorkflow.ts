@@ -875,10 +875,17 @@ function issueDestinationMismatch(
   if (issue.team.id !== destination.teamId) {
     return "Linear issue readback is outside the approved team.";
   }
-  if ((issue.project?.id ?? null) !== (destination.projectId ?? null)) {
-    return "Linear issue readback is outside the approved project.";
+  const issueProjectId = issue.project?.id ?? null;
+  const destinationProjectId = destination.projectId ?? null;
+  if (issueProjectId === destinationProjectId) {
+    return null;
   }
-  return null;
+  // A just-created or retry-adopted issue can omit project on readback while the
+  // approved destination still pins the queue project the create targeted.
+  if (issueProjectId === null && destinationProjectId !== null) {
+    return null;
+  }
+  return "Linear issue readback is outside the approved project.";
 }
 
 function publicationDrift(
