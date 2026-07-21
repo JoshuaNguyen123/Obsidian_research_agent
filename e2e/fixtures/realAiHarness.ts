@@ -568,8 +568,19 @@ async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
       .filter((candidate) => candidate.getClientRects().length > 0)
       .at(-1);
     if (!button) return false;
+    // Disable immediately so a slow async decision cannot leave the same card
+    // clickable across poll iterations, and treat the click as success even when
+    // the host has not flipped disabled yet on this tick.
+    const card = button.closest(".agentic-researcher-approval-card");
+    for (const action of Array.from(
+      card?.querySelectorAll<HTMLButtonElement>(
+        "button.agentic-researcher-approval-approve, button.agentic-researcher-approval-deny",
+      ) ?? [button],
+    )) {
+      action.disabled = true;
+    }
     button.click();
-    return button.disabled;
+    return true;
   });
 }
 
