@@ -20798,7 +20798,7 @@ export function buildObservedMissionGraphFrontierBinding(
   ) {
     const creationInstruction = /\.ipynb$/iu.test(graphDestinationSelector)
       ? "Call code_workspace_create_file with this exact path and a structured notebook object containing markdown/code cells. The host emits deterministic nbformat 4 JSON with empty outputs; file creation does not execute cells."
-      : "Call code_workspace_create_file with this exact path and the complete content for only this file.";
+      : "Call code_workspace_create_file with this exact path and the complete content string for only this file. Do not pass a notebook cells object unless the path ends in .ipynb; an Obsidian research notebook is not a Jupyter .ipynb workspace file.";
     return [
       "EXACT GRAPH-BOUND NEW WORKSPACE FILE:",
       `path=${JSON.stringify(graphDestinationSelector)}.`,

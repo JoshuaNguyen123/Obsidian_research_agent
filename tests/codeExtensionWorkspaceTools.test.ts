@@ -183,6 +183,28 @@ test("prepared workspace creation supports twelve explicit source and notebook f
     );
     assert.equal(malformedNotebook.ok, false);
     if (!malformedNotebook.ok) assert.equal(malformedNotebook.error.code, "invalid_arguments");
+
+    // Mistaken Jupyter cells for a .py path flatten into ordinary source text.
+    const flattened = await requirePrepared(
+      createTool,
+      {
+        workspaceId: "language-space",
+        path: "from_cells.py",
+        notebook: {
+          cells: [
+            { type: "markdown", source: "# helper\n" },
+            { type: "code", source: "def ok():\n    return True\n" },
+          ],
+        },
+      },
+      context,
+    );
+    assert.equal(flattened.normalizedArgs.creationLanguage, "python");
+    assert.equal(
+      flattened.normalizedArgs.content,
+      "# helper\n\ndef ok():\n    return True\n",
+    );
+    await createTool.executePrepared!(flattened, authorize(context, flattened));
   } finally {
     await fixture.cleanup();
   }

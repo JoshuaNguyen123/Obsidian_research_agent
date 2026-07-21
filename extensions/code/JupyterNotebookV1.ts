@@ -106,6 +106,41 @@ export function buildJupyterNotebookV1(
   };
 }
 
+/**
+ * Flatten structured notebook cells into ordinary file text. Used when a model
+ * supplies a notebook object for a non-.ipynb path (common when a mission says
+ * "notebook" meaning an Obsidian note while Code work expects source files).
+ */
+export function flattenNotebookCellsToPlainContentV1(value: unknown): string {
+  const input = parseNotebookInput(value);
+  let totalSourceChars = 0;
+  const parts: string[] = [];
+  for (const [index, cell] of input.cells.entries()) {
+    if (!cell || typeof cell !== "object" || Array.isArray(cell)) {
+      throw new Error(`Notebook cell ${index + 1} must be an object.`);
+    }
+    const source = (cell as unknown as Record<string, unknown>).source;
+    const type = (cell as unknown as Record<string, unknown>).type;
+    if (type !== "markdown" && type !== "code") {
+      throw new Error(
+        `Notebook cell ${index + 1} type must be markdown or code.`,
+      );
+    }
+    if (typeof source !== "string") {
+      throw new Error(`Notebook cell ${index + 1} source must be a string.`);
+    }
+    totalSourceChars += source.length;
+    if (totalSourceChars > MAX_NOTEBOOK_SOURCE_CHARS_V1) {
+      throw new Error(
+        `Notebook source exceeds ${MAX_NOTEBOOK_SOURCE_CHARS_V1} characters.`,
+      );
+    }
+    const normalized = source.replace(/\r\n?/gu, "\n").replace(/\n+$/u, "");
+    if (normalized.length > 0) parts.push(normalized);
+  }
+  return parts.length === 0 ? "" : `${parts.join("\n\n")}\n`;
+}
+
 /** Validate a compatibility raw notebook payload without executing it. */
 export function validateJupyterNotebookContentV1(content: string): void {
   let parsed: unknown;

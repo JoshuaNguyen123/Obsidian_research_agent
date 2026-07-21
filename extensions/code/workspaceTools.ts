@@ -34,6 +34,7 @@ import {
 } from "./CodeCreationLanguagesV1";
 import {
   buildJupyterNotebookV1,
+  flattenNotebookCellsToPlainContentV1,
   validateJupyterNotebookContentV1,
 } from "./JupyterNotebookV1";
 
@@ -1514,17 +1515,25 @@ function resolveCreateFileContentV1(
 } {
   const notebookPath = /\.ipynb$/iu.test(targetPath);
   if (args.notebook !== undefined) {
-    if (!notebookPath) {
-      throw new WorkspaceManagerErrorV2(
-        "invalid_arguments",
-        "Structured notebook cells require an .ipynb destination.",
-      );
-    }
     if (args.content !== undefined) {
       throw new WorkspaceManagerErrorV2(
         "invalid_arguments",
         "Provide notebook or content, not both.",
       );
+    }
+    if (!notebookPath) {
+      // Missions often say "notebook" for Obsidian notes. When the graph binds a
+      // source path, flatten mistaken Jupyter cells into ordinary file content.
+      try {
+        return {
+          content: flattenNotebookCellsToPlainContentV1(args.notebook),
+        };
+      } catch (error) {
+        throw new WorkspaceManagerErrorV2(
+          "invalid_arguments",
+          error instanceof Error ? error.message : "Notebook input is invalid.",
+        );
+      }
     }
     try {
       const built = buildJupyterNotebookV1(args.notebook);
