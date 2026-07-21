@@ -444,6 +444,52 @@ test("uncertain creation reconciles only after matching independent readback", a
   assert.equal(reconciled.receipt?.readback.observedRevision, HASH_B);
 });
 
+test("issue create accepts Linear markdown description round-trip normalization", async () => {
+  let createdInput: Record<string, unknown> | null = null;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        const sent = String(createdInput.description ?? "");
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          // Provider rewritten task-list markers and trailing whitespace.
+          description: `${sent.replace("- criterion", "- [ ] criterion")}  \r\n`,
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: {
+        teamId: "team-1",
+        title: "Research ticket",
+        description: "Body\n\n## Acceptance criteria\n- criterion",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-description-normalize",
+  });
+  assert.equal(result.ok, true);
+});
+
 test("issue create readback failure reports only stable mismatched field names", async () => {
   let createdInput: Record<string, unknown> | null = null;
   const client: LinearToolClient = {

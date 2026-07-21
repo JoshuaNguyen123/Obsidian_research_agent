@@ -914,8 +914,10 @@ function stableToolCallId(planFingerprint: string, key: string): string {
 function renderHierarchyIssueDescriptionV1(
   issue: ResearchProjectPlanV1["issues"][number],
 ): string {
+  // Use plain bullets. Linear markdown round-trips often rewrite task-list
+  // checkboxes (`- [ ]`), which breaks exact create readback.
   const description = `${issue.description}\n\n## Acceptance criteria\n${issue.acceptanceCriteria
-    .map((criterion) => `- [ ] ${criterion}`)
+    .map((criterion) => `- ${criterion}`)
     .join("\n")}`;
   assertCleanLinearHumanOutputV1(description, `Linear issue ${issue.title}`);
   return description;

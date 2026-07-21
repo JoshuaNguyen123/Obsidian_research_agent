@@ -1238,11 +1238,28 @@ function issueInputMismatchFields(
       continue;
     }
     const actual = comparisons[key];
+    if (key === "description") {
+      if (
+        comparableLinearMarkdown(actual) !== comparableLinearMarkdown(expected)
+      ) {
+        mismatchedFields.push(key);
+      }
+      continue;
+    }
     if (expected === null ? actual !== undefined : actual !== expected) {
       mismatchedFields.push(key);
     }
   }
   return mismatchedFields.sort();
+}
+
+/** Normalize provider markdown so harmless Linear round-trips do not fail closed. */
+function comparableLinearMarkdown(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/^\s*[-*]\s+\[[ xX]\]\s+/gmu, "- ")
+    .replace(/[ \t]+$/gmu, "")
+    .trimEnd();
 }
 
 function describePostconditionMismatch(

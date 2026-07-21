@@ -880,7 +880,11 @@ function ownedDeterministicIssueMismatch(
 }
 
 function normalizeComparableTicketText(value: string | undefined): string {
-  return (value ?? "").replace(/\r\n/g, "\n").trimEnd();
+  return (value ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/^\s*[-*]\s+\[[ xX]\]\s+/gmu, "- ")
+    .replace(/[ \t]+$/gmu, "")
+    .trimEnd();
 }
 
 function hasExactHumanTicketContent(

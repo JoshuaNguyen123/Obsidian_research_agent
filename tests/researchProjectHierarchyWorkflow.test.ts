@@ -710,7 +710,7 @@ function cleanHierarchyIssueDescription(
   issue: ReturnType<typeof planFixture>["issues"][number],
 ): string {
   return `${issue.description}\n\n## Acceptance criteria\n${issue.acceptanceCriteria
-    .map((criterion) => `- [ ] ${criterion}`)
+    .map((criterion) => `- ${criterion}`)
     .join("\n")}`;
 }
 
