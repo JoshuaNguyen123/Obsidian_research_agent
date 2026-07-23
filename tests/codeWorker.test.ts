@@ -6,9 +6,11 @@ import { tmpdir } from "node:os";
 
 import {
   executeCodeWorkerTool,
+  OLLAMA_CLOUD_CODE_WORKER_MODEL,
   resolveCodeWorkerPath,
   runCodeWorker,
 } from "../src/orchestrator/codeWorker";
+import type { ModelChatRequest, ModelClient } from "../src/model/types";
 
 test("code worker rejects worktree escapes and non-text extensions", () => {
   const root = join(tmpdir(), "code-worker-root");
@@ -167,6 +169,92 @@ test("code worker observes cancellation between batched mutation calls", async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("code worker uses the direct Ollama Cloud code model with thinking", async () => {
+  const root = await mkdtemp(join(tmpdir(), "code-worker-cloud-model-"));
+  const requests: ModelChatRequest[] = [];
+  try {
+    const modelClient: ModelClient = {
+      descriptor: {
+        provider: "ollama",
+        model: "configured-default",
+        endpointCategory: "ollama_cloud",
+        transportKind: "test_mock",
+      },
+      async chat(request) {
+        requests.push(request);
+        return {
+          message: { role: "assistant", content: "No changes required." },
+          toolCalls: [],
+        };
+      },
+      async streamChat() {
+        throw new Error("unused");
+      },
+    };
+
+    await runCodeWorker({
+      runId: "run-cloud-code",
+      participantId: "code_worker",
+      leadParticipantId: "lead",
+      taskId: "task",
+      assignment: "Inspect the implementation.",
+      worktreePath: root,
+      modelClient,
+      maxSteps: 1,
+    });
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].model, OLLAMA_CLOUD_CODE_WORKER_MODEL);
+    assert.equal(requests[0].think, true);
+    assert.equal(modelClient.descriptor?.model, "configured-default");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("code worker does not apply cloud routing to a non-Ollama provider", async () => {
+  const root = await mkdtemp(join(tmpdir(), "code-worker-provider-safety-"));
+  const requests: ModelChatRequest[] = [];
+  try {
+    const modelClient: ModelClient = {
+      descriptor: {
+        provider: "openai_compatible",
+        model: "custom-model",
+        endpointCategory: "ollama_cloud",
+        transportKind: "test_mock",
+      },
+      async chat(request) {
+        requests.push(request);
+        return {
+          message: { role: "assistant", content: "No changes required." },
+          toolCalls: [],
+        };
+      },
+      async streamChat() {
+        throw new Error("unused");
+      },
+    };
+
+    await runCodeWorker({
+      runId: "run-provider-safety",
+      participantId: "code_worker",
+      leadParticipantId: "lead",
+      taskId: "task",
+      assignment: "Inspect the implementation.",
+      worktreePath: root,
+      modelClient,
+      maxSteps: 1,
+    });
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].model, undefined);
+    assert.equal(requests[0].think, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("code worker creates structured notebooks and blocks raw ipynb writes", async () => {
   const root = await mkdtemp(join(tmpdir(), "code-worker-notebook-"));
   try {

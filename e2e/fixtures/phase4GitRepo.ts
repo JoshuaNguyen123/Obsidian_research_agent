@@ -45,6 +45,7 @@ export interface Phase4PythonCheckersProjectFixture {
   status(): Promise<string>;
   inspectWorktree(worktreeRoot: string): Promise<{
     head: string;
+    commitSubject: string;
     status: string;
     changedPaths: string[];
     files: Record<string, string>;
@@ -157,6 +158,251 @@ export async function createPhase4TypeScriptProjectFixture(
         "src/math.ts",
         "test/math.test.mjs",
       ];
+      return {
+        head: await git(verified, ["rev-parse", "HEAD"]),
+        status: await git(verified, ["status", "--short"]),
+        changedPaths: changed.split(/\r?\n/gu).filter(Boolean).sort(),
+        files: Object.fromEntries(
+          await Promise.all(
+            expected.map(async (relativePath) => [
+              relativePath,
+              await readFile(path.join(verified, ...relativePath.split("/")), "utf8"),
+            ]),
+          ),
+        ),
+      };
+    },
+    async removeOwnedWorktree(worktreeRoot, branch) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      await git(root, ["worktree", "remove", "--force", verified]);
+      if (branch.startsWith("codex/workspace-")) {
+        await git(root, ["branch", "-D", branch]).catch(() => "");
+      }
+    },
+    cleanup: () => cleanupTypeScriptGitFixture(root),
+  };
+}
+
+/**
+ * Minimal Node repository for COMPOUND-REAL / Flow-real. Validation only
+ * requires `src/flow_real.ts` to export the mission marker — not the full
+ * DU-03 math package — so Linear → Code → GitHub → reflection stays tractable.
+ */
+export async function createFlowRealTypeScriptFixture(
+  marker: string,
+): Promise<Phase4TypeScriptProjectFixture> {
+  const root = await realpath(
+    await mkdtemp(path.join(tmpdir(), "agentic-flow-real-typescript-")),
+  );
+  const safeMarker = marker.replace(/[^A-Za-z0-9_]/gu, "_");
+  const packageJson = {
+    name: `flow-real-typescript-${safeMarker.toLowerCase()}`,
+    private: true,
+    type: "module",
+    scripts: {
+      test: "python3 scripts/verify_project.py",
+      build: "python3 scripts/verify_project.py",
+    },
+  };
+  await mkdir(path.join(root, "scripts"), { recursive: true });
+  await writeFile(
+    path.join(root, "package.json"),
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(root, "scripts", "verify_project.py"),
+    [
+      "from pathlib import Path",
+      "import re",
+      "import sys",
+      "source = Path('src/flow_real.ts').read_text(encoding='utf-8')",
+      "if not re.search(r'export\\s+const\\s+marker\\s*=', source):",
+      "    print('missing export const marker', file=sys.stderr)",
+      "    raise SystemExit(1)",
+      `if ${JSON.stringify(safeMarker)} not in source:`,
+      `    print('missing marker ${safeMarker}', file=sys.stderr)`,
+      "    raise SystemExit(1)",
+      "print('flow-real verify ok')",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  // Commit a wrong-marker stub so the worktree has src/, and the agent must
+  // write_expected the exact marker before validation can go green.
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await writeFile(
+    path.join(root, "src", "flow_real.ts"),
+    `export const marker = "PLACEHOLDER_REPLACE_ME";\n`,
+    "utf8",
+  );
+  await git(root, ["init", "--initial-branch=main"]);
+  await git(root, ["config", "user.name", "Flow Real E2E"]);
+  await git(root, ["config", "user.email", "flow-real-e2e@example.invalid"]);
+  await git(root, [
+    "add",
+    "--",
+    "package.json",
+    "scripts/verify_project.py",
+    "src/flow_real.ts",
+  ]);
+  await git(root, ["commit", "-m", "flow-real TypeScript fixture baseline"]);
+  const baseSha = await git(root, ["rev-parse", "HEAD"]);
+  if (!/^[a-f0-9]{40}$/u.test(baseSha)) {
+    await cleanupTypeScriptGitFixture(root);
+    throw new Error("Flow-real TypeScript fixture did not produce a full Git SHA.");
+  }
+  return {
+    root,
+    baseSha,
+    head: () => git(root, ["rev-parse", "HEAD"]),
+    status: () => git(root, ["status", "--short"]),
+    async inspectWorktree(worktreeRoot) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      const changed = await git(verified, [
+        "diff",
+        "--name-only",
+        baseSha,
+        "HEAD",
+        "--",
+      ]);
+      const expected = ["src/flow_real.ts"];
+      return {
+        head: await git(verified, ["rev-parse", "HEAD"]),
+        status: await git(verified, ["status", "--short"]),
+        changedPaths: changed.split(/\r?\n/gu).filter(Boolean).sort(),
+        files: Object.fromEntries(
+          await Promise.all(
+            expected.map(async (relativePath) => [
+              relativePath,
+              await readFile(
+                path.join(verified, ...relativePath.split("/")),
+                "utf8",
+              ).catch(() => ""),
+            ]),
+          ),
+        ),
+      };
+    },
+    async removeOwnedWorktree(worktreeRoot, branch) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      await git(root, ["worktree", "remove", "--force", verified]);
+      if (branch.startsWith("codex/workspace-")) {
+        await git(root, ["branch", "-D", branch]).catch(() => "");
+      }
+    },
+    cleanup: () => cleanupTypeScriptGitFixture(root),
+  };
+}
+
+/**
+ * Empty dependency-free JavaScript repository for the bounded number-guess
+ * live-external journey. The agent must create the game engine, its Node test,
+ * and README while the committed verifier retains the behavioral contract.
+ */
+export async function createNumberGuessJavaScriptFixture(
+  marker: string,
+): Promise<Phase4TypeScriptProjectFixture> {
+  const root = await realpath(
+    await mkdtemp(path.join(tmpdir(), "agentic-number-guess-javascript-")),
+  );
+  const safeMarker = marker.replace(/[^A-Za-z0-9_]/gu, "_");
+  const packageJson = {
+    name: `number-guess-${safeMarker.toLowerCase()}`,
+    private: true,
+    type: "module",
+    scripts: {
+      test: "node --test test/number_guess.test.mjs && node scripts/verify-project.mjs",
+      build: "node scripts/verify-project.mjs",
+    },
+  };
+  await mkdir(path.join(root, "scripts"), { recursive: true });
+  await writeFile(
+    path.join(root, "package.json"),
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(root, "scripts", "verify-project.mjs"),
+    [
+      "import assert from 'node:assert/strict';",
+      "import { readFile } from 'node:fs/promises';",
+      "const [source, testSource, readme, packageSource] = await Promise.all([",
+      "  readFile('src/number_guess.js', 'utf8'),",
+      "  readFile('test/number_guess.test.mjs', 'utf8'),",
+      "  readFile('README.md', 'utf8'),",
+      "  readFile('package.json', 'utf8'),",
+      "]);",
+      "const packageJson = JSON.parse(packageSource);",
+      "assert.equal(packageJson.dependencies, undefined, 'runtime dependencies are not allowed');",
+      "assert.equal(packageJson.devDependencies, undefined, 'development dependencies are not allowed');",
+      "assert.doesNotMatch(source, /^\\s*import(?:\\s|\\()/mu, 'the game engine must be dependency-free');",
+      "const game = await import(new URL('../src/number_guess.js', import.meta.url));",
+      "assert.equal(typeof game.checkGuess, 'function');",
+      "assert.equal(game.checkGuess(10, 42), 'too-low');",
+      "assert.equal(game.checkGuess(75, 42), 'too-high');",
+      "assert.equal(game.checkGuess(42, 42), 'correct');",
+      "assert.equal(game.checkGuess(0, 42), 'invalid');",
+      "assert.equal(game.checkGuess(101, 42), 'invalid');",
+      "assert.equal(game.checkGuess(4.5, 42), 'invalid');",
+      "function assertInvalidTarget(target) {",
+      "  let result;",
+      "  try {",
+      "    result = game.checkGuess(42, target);",
+      "  } catch (error) {",
+      "    assert.ok(error instanceof Error);",
+      "    return;",
+      "  }",
+      "  assert.equal(result, 'invalid');",
+      "}",
+      "assertInvalidTarget(0);",
+      "assertInvalidTarget(101);",
+      "assertInvalidTarget(42.5);",
+      "assert.match(testSource, /node:test/);",
+      "assert.match(testSource, /node:assert\\/strict/);",
+      "assert.match(testSource, /number_guess\\.js/);",
+      "assert.match(testSource, /checkGuess/);",
+      "assert.match(readme, /number[ -]guess/i);",
+      "assert.match(readme, /npm\\s+test/i);",
+      `assert.match(readme, /${safeMarker}/);`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await git(root, ["init", "--initial-branch=main"]);
+  await git(root, ["config", "user.name", "Number Guess E2E"]);
+  await git(root, ["config", "user.email", "number-guess-e2e@example.invalid"]);
+  await git(root, [
+    "add",
+    "--",
+    "package.json",
+    "scripts/verify-project.mjs",
+  ]);
+  await git(root, ["commit", "-m", "number-guess JavaScript fixture baseline"]);
+  const baseSha = await git(root, ["rev-parse", "HEAD"]);
+  if (!/^[a-f0-9]{40}$/u.test(baseSha)) {
+    await cleanupTypeScriptGitFixture(root);
+    throw new Error("Number-guess JavaScript fixture did not produce a full Git SHA.");
+  }
+  const expected = [
+    "README.md",
+    "src/number_guess.js",
+    "test/number_guess.test.mjs",
+  ];
+  return {
+    root,
+    baseSha,
+    head: () => git(root, ["rev-parse", "HEAD"]),
+    status: () => git(root, ["status", "--short"]),
+    async inspectWorktree(worktreeRoot) {
+      const verified = await requireOwnedWorktree(root, worktreeRoot);
+      const changed = await git(verified, [
+        "diff",
+        "--name-only",
+        baseSha,
+        "HEAD",
+        "--",
+      ]);
       return {
         head: await git(verified, ["rev-parse", "HEAD"]),
         status: await git(verified, ["status", "--short"]),
@@ -339,6 +585,7 @@ export async function createPhase4PythonCheckersProjectFixture(
       ]);
       return {
         head: await git(verified, ["rev-parse", "HEAD"]),
+        commitSubject: await git(verified, ["show", "-s", "--format=%s", "HEAD"]),
         status: await git(verified, ["status", "--short"]),
         changedPaths: changed.split(/\r?\n/gu).filter(Boolean).sort(),
         files: Object.fromEntries(
@@ -519,12 +766,17 @@ async function cleanupTypeScriptGitFixture(root: string): Promise<void> {
   const verifiedRoot = await realpath(root).catch(() => null);
   if (!verifiedRoot) return;
   const verifiedTemp = await realpath(tmpdir());
+  const ownedPrefixes = [
+    "agentic-phase4-typescript-",
+    "agentic-flow-real-typescript-",
+    "agentic-number-guess-javascript-",
+  ];
   if (
     path.dirname(verifiedRoot) !== verifiedTemp ||
-    !path.basename(verifiedRoot).startsWith("agentic-phase4-typescript-")
+    !ownedPrefixes.some((prefix) => path.basename(verifiedRoot).startsWith(prefix))
   ) {
     throw new Error(
-      `Refusing to remove unowned Phase 4 TypeScript fixture: ${verifiedRoot}`,
+      `Refusing to remove unowned Node project fixture: ${verifiedRoot}`,
     );
   }
   await rm(verifiedRoot, { recursive: true, force: true });

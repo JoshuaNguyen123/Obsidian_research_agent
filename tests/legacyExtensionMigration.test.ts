@@ -76,6 +76,10 @@ test("legacy migration creates three immutable independently hashed secret-free 
     "project_queue",
   );
   assert.equal(
+    plan.namespaces.integrations.snapshot.linearSettings.readyStateId,
+    "state_ready",
+  );
+  assert.equal(
     plan.namespaces.companion.snapshot.baseUrl,
     "http://127.0.0.1:9876",
   );
@@ -393,6 +397,7 @@ function legacySource() {
     linearDefaultTeamId: "team_default",
     linearQueueEnabled: true,
     linearQueueProjectId: "project_queue",
+    linearReadyStateId: "state_ready",
     linearStartedStateId: "state_started",
     linearCompletedStateId: "state_completed",
     linearBlockedStateId: "state_blocked",

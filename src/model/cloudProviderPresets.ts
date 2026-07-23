@@ -46,8 +46,9 @@ export const CLOUD_PROVIDER_PRESETS: readonly CloudProviderPreset[] = [
     id: "ollama_cloud",
     label: "Ollama Cloud",
     provider: "ollama",
-    baseUrl: "https://ollama.com",
-    suggestedModel: "gpt-oss:120b-cloud",
+    // Must include /api — chat hits `${baseUrl}/chat` → https://ollama.com/api/chat.
+    baseUrl: "https://ollama.com/api",
+    suggestedModel: "glm-5.2",
     description: "Ollama Cloud BYOK (ollama.com).",
   },
 ];
@@ -63,6 +64,44 @@ export interface CloudPresetSettingsSlice {
   model: string;
   ollamaBaseUrl: string;
   openAiCompatibleBaseUrl: string;
+}
+
+function normalizePresetBaseUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, "");
+}
+
+/**
+ * Heal the broken bare-host preset URL (`https://ollama.com`) that omitted `/api`.
+ * Local and custom endpoints are left alone.
+ */
+export function repairOllamaCloudBaseUrl(baseUrl: string): string {
+  const normalized = normalizePresetBaseUrl(baseUrl);
+  if (normalized === "https://ollama.com" || normalized === "http://ollama.com") {
+    return "https://ollama.com/api";
+  }
+  return baseUrl.trim() || baseUrl;
+}
+
+/**
+ * Return the preset that matches the current provider + base URL, if any.
+ * Used so the Endpoint preset dropdown stays selected after apply/redisplay.
+ */
+export function matchCloudProviderPreset(
+  settings: CloudPresetSettingsSlice,
+): CloudProviderPreset | undefined {
+  const currentBase =
+    settings.modelProvider === "openai_compatible"
+      ? settings.openAiCompatibleBaseUrl
+      : settings.ollamaBaseUrl;
+  const normalizedCurrent = normalizePresetBaseUrl(currentBase);
+  if (!normalizedCurrent) {
+    return undefined;
+  }
+  return CLOUD_PROVIDER_PRESETS.find(
+    (preset) =>
+      preset.provider === settings.modelProvider &&
+      normalizePresetBaseUrl(preset.baseUrl) === normalizedCurrent,
+  );
 }
 
 /**

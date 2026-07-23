@@ -1,5 +1,6 @@
 import type { MissionEvidence } from "./missionLedger";
 import { getEvidencePassageIdentifiers } from "./missionPlan";
+import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 
 export const MAX_RESEARCH_CLAIMS = 40;
 
@@ -131,6 +132,17 @@ export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
   ) {
     return false;
   }
+  // Literary close-reading ("quotes/citations from the text") is not
+  // passage-id claim-ledger work unless the user also asked for public-web
+  // research / fact-check grounding.
+  if (
+    hasPrimaryTextCitationIntent(value) &&
+    !/\b(?:web|online|internet|https?:\/\/|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?)|deep\s+research|passage[-\s]?level|source:<)\b/iu.test(
+      value,
+    )
+  ) {
+    return false;
+  }
   // "current online dating market" alone is not claim-ledger work.
   return /\b(?:cite|cited|citation|citations|passage|passages|quote|quoted|quotations|text[-\s]?level\s+quotation|verify|fact[-\s]?check|deep\s+research|long[-\s]?running\s+(?:research|co-?research)|long\s+research|exhaustive\s+(?:research|investigation))\b/i.test(
     value,
@@ -155,7 +167,8 @@ export function extractClaimsFromDraft(
   );
   const sentences = splitClaimSentences(draft);
   const claims: ResearchClaim[] = [];
-  for (const text of sentences) {
+  for (const sentence of sentences) {
+    const { text } = sentence;
     if (claims.length >= maxClaims) {
       break;
     }
@@ -165,7 +178,10 @@ export function extractClaimsFromDraft(
     claims.push({
       id: `claim:${claims.length + 1}`,
       text,
-      status: isExemptLimitationSentence(text) ? "exempt" : "ungrounded",
+      status:
+        sentence.epistemicSection || isExemptLimitationSentence(text)
+          ? "exempt"
+          : "ungrounded",
       passageIds: [],
       conflictIds: [],
     });
@@ -541,22 +557,36 @@ function resolvePassageRefs(
   });
 }
 
-function splitClaimSentences(draft: string): string[] {
+function splitClaimSentences(
+  draft: string,
+): Array<{ text: string; epistemicSection: boolean }> {
   const normalized = draft.replace(/\r\n/g, "\n").trim();
   if (!normalized) {
     return [];
   }
-  const chunks = normalized
-    .split(/\n+/)
-    .flatMap((line) => {
-      const cleaned = line.replace(/^\s*[-*•]\s+/, "").trim();
-      if (!cleaned) {
-        return [];
+  const chunks: Array<{ text: string; epistemicSection: boolean }> = [];
+  let epistemicSection = false;
+  for (const line of normalized.split(/\n+/)) {
+    const cleaned = line.replace(/^\s*[-*•]\s+/, "").trim();
+    if (!cleaned) {
+      continue;
+    }
+    const heading = /^#{1,6}\s+(.+)$/u.exec(cleaned);
+    if (heading?.[1]) {
+      epistemicSection =
+        /^(?:limitations?|confidence|uncertainty|unanswered questions?|open questions?)\b/iu.test(
+          heading[1].trim(),
+        );
+      chunks.push({ text: cleaned, epistemicSection: false });
+      continue;
+    }
+    for (const part of cleaned.split(/(?<=[.!?])\s+(?=[A-Z0-9“"([])/)) {
+      const text = part.replace(/\s+/g, " ").trim();
+      if (text) {
+        chunks.push({ text, epistemicSection });
       }
-      return cleaned.split(/(?<=[.!?])\s+(?=[A-Z0-9“"([])/);
-    })
-    .map((part) => part.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
+    }
+  }
   return chunks;
 }
 

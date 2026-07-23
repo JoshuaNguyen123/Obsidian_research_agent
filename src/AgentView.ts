@@ -22,6 +22,8 @@ import {
   approvalDeniedFailureCopy,
   claimGroundingFailureCopy,
   cloudProviderBlockerFromError,
+  conversationalBlockerCopy,
+  conversationalStatusLine,
   formatFailureCopy,
   formatModelFailureCopy,
 } from "./agent/failureCopy";
@@ -53,10 +55,10 @@ import {
 } from "./agent/capabilitySetup";
 import {
   compoundLifecycleStageLabel,
-  evaluateCompoundLifecycleReadinessV1,
   formatCompoundLifecycleStageStrip,
-  type CompoundLifecycleBlockerV1,
 } from "./agent/compoundLifecycleReadiness";
+import { evaluateMissionReadinessPreflightV1 } from "./agent/missionReadinessPreflight";
+import { githubCleanupAuthorityFromScopesV1 } from "./agent/capabilityReadiness";
 import {
   extractReceiptArtifactUrl,
   inferArtifactSystem,
@@ -73,21 +75,34 @@ import {
   formatStopReasonLabel,
 } from "./agent/missionStopReason";
 import {
-  artifactLinkChatLine,
   clearChatConfirmCopy,
   clearChatDoneCopy,
   chatApprovalAttentionTitle,
   chatModelConnectionGateTitle,
+  chatMissionGraphBlockerTitle,
   chatProviderBlockerTitle,
-  compoundLifecycleReadinessChatLine,
-  compoundLifecycleReadinessTitle,
+  chatWriteInterruptedNextCopy,
+  chatWriteInterruptedTitle,
   continueLatestRunSafeCopy,
-  endToEndStarterMissionLabel,
-  endToEndStarterMissionPrompt,
+  isPartialWritebackStopDetail,
+  inferTeamRolePhaseFromStatus,
   missionReceiptWrittenChatLine,
   noteStreamingActiveChatLine,
+  receiptUrlWorkstreamLine,
+  teamRoleStripCopy,
   toolStepChatLine,
+  isToolIntentGateFailure,
+  type TeamRoleStripPhase,
 } from "./ui/agentViewCopy";
+import {
+  formatAutonomyStatsLine,
+  formatTeamStatsLine,
+} from "./ui/autonomyStatsCopy";
+import {
+  buildMissionReadinessCardModelV1,
+  renderMissionReadinessCard,
+} from "./ui/MissionReadinessCard";
+import type { AutonomyRunStatsV1 } from "./agent/autonomyRunStats";
 import {
   projectMissionGraphRunDetails,
   type MissionGraphRunDetailsProjectionV1,
@@ -136,11 +151,16 @@ export class AgentView extends ItemView {
   private resumeBannerEl: HTMLElement | null = null;
   private chatAttentionEl: HTMLElement | null = null;
   private firstRunEl: HTMLElement | null = null;
-  private starterMissionEl: HTMLElement | null = null;
   private liveWorkstreamEl: HTMLElement | null = null;
   private lifecycleStageStripEl: HTMLElement | null = null;
+  private chatTeamStripEl: HTMLElement | null = null;
   private thinkingStreamEl: HTMLElement | null = null;
   private liveThinkingMessageEl: HTMLElement | null = null;
+  private teamPhase: TeamRoleStripPhase = "idle";
+  private teamHandoffReady: boolean | undefined = undefined;
+  private lifecycleStripActive = false;
+  private autonomyRunStats: AutonomyRunStatsV1 | null = null;
+  private chatStatsStepLabel = "step —";
   private phaseValueEl: HTMLElement | null = null;
   private stepValueEl: HTMLElement | null = null;
   private activeToolValueEl: HTMLElement | null = null;
@@ -161,7 +181,6 @@ export class AgentView extends ItemView {
   private milestonesDetailsEl: HTMLElement | null = null;
   private memoryDetailsEl: HTMLElement | null = null;
   private evidenceDetailsEl: HTMLElement | null = null;
-  private artifactsDetailsEl: HTMLElement | null = null;
   private verificationEl: HTMLElement | null = null;
   private previewEl: HTMLElement | null = null;
   private runLogEl: HTMLElement | null = null;
@@ -171,6 +190,7 @@ export class AgentView extends ItemView {
   private livePlanningMessageEl: HTMLElement | null = null;
   private liveFinalMessageEl: HTMLElement | null = null;
   private readonly toolTimelineItems = new Map<string, HTMLElement>();
+  private toolTimelineOrdinal = 0;
   private readonly chatMessageEls = new Map<string, HTMLElement>();
   private readonly traceRowEls = new Map<string, HTMLElement>();
   private readonly approvalCardEls = new Map<string, HTMLElement>();
@@ -239,9 +259,9 @@ export class AgentView extends ItemView {
     this.unsubscribeRunEvents = this.plugin.subscribeMissionEvents(
       this.createRunEventHandlers(),
       {
-        replay:
-          missionRunningAtOpen ||
-          coordinatorSnapshot.lastMissionGraph !== null,
+        // Only replay an in-flight mission. Hydrated unfinished graphs must not
+        // re-fire Chat blockers / attention banners on every panel open.
+        replay: missionRunningAtOpen,
       },
     );
     if (this.plugin.isMissionRunning()) {
@@ -433,6 +453,7 @@ export class AgentView extends ItemView {
 
   private resetDomBackedState() {
     this.toolTimelineItems.clear();
+    this.toolTimelineOrdinal = 0;
     this.chatMessageEls.clear();
     this.traceRowEls.clear();
     this.approvalCardEls.clear();
@@ -506,7 +527,6 @@ export class AgentView extends ItemView {
     if (this.plugin.hasVerifiedModelConnection()) {
       emptyState.hide();
       emptyState.addClass("is-hidden");
-      this.renderStarterMissionChip();
       return;
     }
     emptyState.show();
@@ -529,39 +549,6 @@ export class AgentView extends ItemView {
       event.stopPropagation();
       void this.plugin.openFirstRunModelSetup();
     });
-    this.renderStarterMissionChip();
-  }
-
-  private renderStarterMissionChip(): void {
-    const host = this.starterMissionEl;
-    if (!host) return;
-    host.empty();
-    if (!this.plugin.hasVerifiedModelConnection()) {
-      host.addClass("is-hidden");
-      host.hide();
-      return;
-    }
-    host.removeClass("is-hidden");
-    host.show();
-    host.createSpan({
-      text: "STARTER",
-      cls: "agentic-researcher-starter-mission-kicker",
-    });
-    const button = host.createEl("button", {
-      text: endToEndStarterMissionLabel(),
-      cls: "agentic-researcher-starter-mission-action",
-      attr: {
-        type: "button",
-        "data-testid": "end-to-end-starter-mission-button",
-      },
-    });
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (!this.promptEl) return;
-      this.promptEl.value = endToEndStarterMissionPrompt();
-      this.focusPrompt({ moveCaretToEnd: true });
-    });
   }
 
   private renderChat(container: HTMLElement) {
@@ -573,12 +560,6 @@ export class AgentView extends ItemView {
     });
     this.renderFirstRunEmptyState();
 
-    this.starterMissionEl = container.createDiv({
-      cls: "agentic-researcher-starter-mission",
-      attr: { "data-testid": "end-to-end-starter-mission" },
-    });
-    this.renderStarterMissionChip();
-
     this.lifecycleStageStripEl = container.createDiv({
       cls: "agentic-researcher-lifecycle-strip is-hidden",
       attr: {
@@ -588,20 +569,36 @@ export class AgentView extends ItemView {
     });
     this.lifecycleStageStripEl.hide();
 
+    // Primary Chat surface: message thread + terminal-style mission prompt.
+    this.logEl = container.createDiv({
+      cls: "agentic-researcher-log",
+      attr: {
+        "aria-live": "polite",
+        "data-testid": "chat-stream-box",
+      },
+    });
+    this.renderConversationLog();
+
+    this.chatTeamStripEl = container.createDiv({
+      cls: "agentic-researcher-chat-team is-hidden",
+      attr: {
+        "data-testid": "chat-team-strip",
+        "aria-live": "polite",
+      },
+    });
+    this.chatTeamStripEl.hide();
+    this.renderChatTeamStrip();
+
+    // Compact mission telemetry under the log; hidden until the run emits lines.
     this.liveWorkstreamEl = container.createDiv({
-      cls: "agentic-researcher-live-workstream",
+      cls: "agentic-researcher-live-workstream is-hidden",
       attr: {
         "data-testid": "live-workstream",
         "aria-live": "polite",
       },
     });
-    this.setSectionPlaceholder(this.liveWorkstreamEl, "Live workstream idle.");
+    this.liveWorkstreamEl.hide();
 
-    this.logEl = container.createDiv({
-      cls: "agentic-researcher-log",
-      attr: { "aria-live": "polite" },
-    });
-    this.renderConversationLog();
     this.chatAttentionEl = container.createDiv({
       cls: "agentic-researcher-chat-attention is-hidden",
       attr: {
@@ -617,17 +614,49 @@ export class AgentView extends ItemView {
     void this.renderStartupResumeBanner();
 
     const formEl = container.createEl("form", {
-      cls: "agentic-researcher-form",
+      cls: "agentic-researcher-form agentic-researcher-composer",
+      attr: {
+        "aria-label": "Agent terminal prompt",
+        "data-testid": "terminal-prompt",
+      },
     });
 
-    this.promptEl = formEl.createEl("textarea", {
+    const promptHeaderEl = formEl.createDiv({
+      cls: "agentic-researcher-prompt-header",
+    });
+    promptHeaderEl.createSpan({
+      text: "MISSION PROMPT",
+      cls: "agentic-researcher-prompt-title",
+    });
+    promptHeaderEl.createSpan({
+      text: "ENTER: RUN · SHIFT+ENTER: NEW LINE",
+      cls: "agentic-researcher-prompt-shortcut",
+    });
+
+    const promptShellEl = formEl.createDiv({
+      cls: "agentic-researcher-prompt-shell",
+      attr: { "data-testid": "terminal-prompt-shell" },
+    });
+    promptShellEl.createSpan({
+      text: "agent@vault:~$",
+      cls: "agentic-researcher-prompt-prefix",
+      attr: { "aria-hidden": "true" },
+    });
+
+    this.promptEl = promptShellEl.createEl("textarea", {
       cls: "agentic-researcher-prompt",
       attr: {
-        placeholder: "Ask a research question...",
-        rows: "5",
-        "aria-label": "Ask a research question",
+        placeholder: "Type a mission, question, or command…",
+        rows: "3",
+        "aria-label": "Message the agent",
         tabindex: "0",
       },
+    });
+    promptShellEl.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (event.target !== this.promptEl) {
+        this.promptEl?.focus();
+      }
     });
 
     const actionsEl = formEl.createDiv({ cls: "agentic-researcher-actions" });
@@ -775,6 +804,10 @@ export class AgentView extends ItemView {
       event.stopPropagation();
       void this.clearChat();
     });
+
+    // Button is created with a default label; sync Connect model / Run Mission
+    // after the element exists (first-run empty state runs earlier).
+    this.updateRunButtonState();
   }
 
   private renderConversationLog() {
@@ -803,6 +836,11 @@ export class AgentView extends ItemView {
     const requestId = ++this.resumeBannerRequestId;
     this.resumeBannerEl.addClass("is-hidden");
     this.resumeBannerEl.hide();
+
+    // Default off: do not nag on every Obsidian / panel open.
+    if (this.plugin.settings.showUnfinishedRunBannerOnOpen !== true) {
+      return;
+    }
 
     if (this.isRunning || this.missionSubmittedSinceOpen) {
       return;
@@ -1050,12 +1088,6 @@ export class AgentView extends ItemView {
       "evidence",
       { collapseUntilPopulated: true },
     );
-    this.artifactsDetailsEl = this.createDashboardSection(
-      dashboardEl,
-      "Artifacts",
-      "artifacts",
-      { collapseUntilPopulated: true },
-    );
     this.verificationEl = this.createDashboardSection(
       dashboardEl,
       "Verification",
@@ -1073,7 +1105,6 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.modelConfigEl, "No run yet.");
     this.setSectionPlaceholder(this.missionGraphEl, "No mission graph yet.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
-    this.setSectionPlaceholder(this.thinkingStreamEl, "No model thinking yet.");
     this.setSectionPlaceholder(this.planningStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
@@ -1088,8 +1119,7 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.milestonesDetailsEl, "No milestones yet.");
     this.setSectionPlaceholder(this.memoryDetailsEl, "No memory activity yet.");
     this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
-    this.setSectionPlaceholder(this.artifactsDetailsEl, "No artifacts yet.");
-    this.setSectionPlaceholder(this.verificationEl, "No artifacts verified yet.");
+    this.setSectionPlaceholder(this.verificationEl, "No verification yet.");
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
   }
@@ -1182,20 +1212,28 @@ export class AgentView extends ItemView {
       return null;
     }
 
-    const lifecycleReadiness = evaluateCompoundLifecycleReadinessV1({
+    const activeFile = this.app.workspace.getActiveFile();
+    const missionReadiness = evaluateMissionReadinessPreflightV1({
       prompt,
       readiness: this.plugin.getCapabilityReadiness(),
+      activeNote: {
+        hasActiveMarkdown: activeFile?.extension === "md",
+        path: activeFile?.path ?? null,
+      },
+      cleanupAuthority: {
+        deleteRepoAuthorized: this.readGitHubCleanupAuthority(),
+      },
     });
-    if (!lifecycleReadiness.ok) {
-      const summaries = lifecycleReadiness.blockers.map(
-        (blocker) =>
-          `${compoundLifecycleStageLabel(blocker.stage)}: ${blocker.nextAction}`,
-      );
-      this.appendLog("error", compoundLifecycleReadinessChatLine(summaries));
-      this.renderCompoundLifecycleReadinessBlocker(lifecycleReadiness.blockers);
+    if (!missionReadiness.ok) {
+      const card = buildMissionReadinessCardModelV1(missionReadiness);
+      if (card) {
+        this.appendLog("error", card.chatLine);
+        this.renderMissionReadinessBlocker(card);
+      }
       this.promptEl?.focus();
       return null;
     }
+    const lifecycleReadiness = missionReadiness;
 
     const conversationHistory = [...this.plugin.conversationHistory];
     this.missionSubmittedSinceOpen = true;
@@ -1215,11 +1253,12 @@ export class AgentView extends ItemView {
         `Lifecycle: ${formatCompoundLifecycleStageStrip(lifecycleReadiness.stages)}`,
       );
     }
-    this.appendStatus("Starting mission...");
     const userLogItem = this.appendLog("user", prompt);
     this.currentRunChatId = userLogItem?.dataset.chatId ?? null;
-    this.setRunning(true, "SYS> mission accepted");
-    this.updateChatLoader("SYS> mission accepted");
+    // Quiet start: user bubble + subtle agent working indicator (no "Starting
+    // mission..." status box or CRT LOAD chrome).
+    this.setRunning(true, "working...");
+    this.updateChatLoader("working...");
 
     let outcome: RunOutcome | null = null;
     try {
@@ -1426,6 +1465,7 @@ export class AgentView extends ItemView {
     options: { preserveOrchestrator?: boolean } = {},
   ) {
     this.toolTimelineItems.clear();
+    this.toolTimelineOrdinal = 0;
     this.traceRowEls.clear();
     this.approvalCardEls.clear();
     this.receiptKeys.clear();
@@ -1438,6 +1478,10 @@ export class AgentView extends ItemView {
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
     this.liveThinkingMessageEl = null;
+    this.autonomyRunStats = null;
+    this.chatStatsStepLabel = "step —";
+    this.teamPhase = "idle";
+    this.teamHandoffReady = undefined;
     this.runConfig = null;
     this.missionGraphProjection = null;
     this.usageTotals = this.createEmptyUsageTotals();
@@ -1448,7 +1492,10 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.modelConfigEl, "Starting run.");
     this.setSectionPlaceholder(this.missionGraphEl, "Building mission graph.");
     this.setSectionPlaceholder(this.statusStreamEl, "Waiting.");
-    this.setSectionPlaceholder(this.thinkingStreamEl, "No model thinking yet.");
+    if (this.thinkingStreamEl) {
+      this.thinkingStreamEl.empty();
+      this.setSectionPlaceholder(this.thinkingStreamEl, "No model thinking yet.");
+    }
     this.setSectionPlaceholder(this.planningStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.finalStreamEl, "Waiting.");
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
@@ -1463,11 +1510,17 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.milestonesDetailsEl, "No milestones yet.");
     this.setSectionPlaceholder(this.memoryDetailsEl, "No memory activity yet.");
     this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
-    this.setSectionPlaceholder(this.artifactsDetailsEl, "No artifacts yet.");
-    this.setSectionPlaceholder(this.verificationEl, "No artifacts verified yet.");
+    this.setSectionPlaceholder(this.verificationEl, "No verification yet.");
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
-    this.setSectionPlaceholder(this.liveWorkstreamEl, "Live workstream starting…");
+    if (this.liveWorkstreamEl) {
+      this.liveWorkstreamEl.empty();
+      this.liveWorkstreamEl.removeClass("is-hidden");
+      this.liveWorkstreamEl.show();
+      this.setSectionPlaceholder(this.liveWorkstreamEl, "Live workstream starting…");
+    }
+    this.renderChatTeamStrip();
+    this.renderChatStatsStrip();
     this.hideLifecycleStageStrip();
     if (!options.preserveOrchestrator) {
       this.resetOrchestratorPanelForNewRun();
@@ -1522,9 +1575,12 @@ export class AgentView extends ItemView {
       return;
     }
 
+    const display =
+      kind === "status" ? conversationalStatusLine(message) : message;
+
     this.clearPlaceholder(this.statusStreamEl);
     this.statusStreamEl.createDiv({
-      text: message,
+      text: display,
       cls: "agentic-researcher-status-line",
     });
     this.trimRows(
@@ -1534,10 +1590,27 @@ export class AgentView extends ItemView {
     );
     this.statusStreamEl.scrollTop = this.statusStreamEl.scrollHeight;
     if (kind === "status") {
-      this.updateChatLoader(message);
-      this.appendWorkstreamLine(message);
+      this.updateChatLoader(display);
+      this.appendWorkstreamLine(display);
+      if (display !== message.replace(/\s+/g, " ").trim()) {
+        this.appendLog("system", display);
+      }
+      this.updateTeamStripFromStatus(display);
     }
-    this.appendTrace(kind, message);
+    this.appendTrace(kind, display);
+  }
+
+  private updateTeamStripFromStatus(message: string): void {
+    const inferred = inferTeamRolePhaseFromStatus(message);
+    if (!inferred) return;
+    this.teamPhase = inferred.phase;
+    if (inferred.handoffReady !== undefined) {
+      this.teamHandoffReady = inferred.handoffReady;
+    }
+    this.renderChatTeamStrip();
+    if (this.teamPhase !== "idle" && !this.orchestratorTabButtonEl) {
+      this.refreshOrchestratorAvailability();
+    }
   }
 
   private startPlanningStream(step: number) {
@@ -1587,9 +1660,16 @@ export class AgentView extends ItemView {
   private handleToolDone(event: AgentToolRunEvent) {
     const itemEl = this.ensureToolTimelineItem(event);
     const ok = event.ok !== false;
+    const skipped = !ok && isToolIntentGateFailure(event);
 
-    itemEl.addClass(ok ? "is-complete" : "is-error");
-    this.setTimelineStatus(itemEl, ok ? "Complete" : "Error");
+    itemEl.removeClass("is-complete");
+    itemEl.removeClass("is-error");
+    itemEl.removeClass("is-skipped");
+    itemEl.addClass(ok ? "is-complete" : skipped ? "is-skipped" : "is-error");
+    this.setTimelineStatus(
+      itemEl,
+      ok ? "Complete" : skipped ? "Skipped" : "Error",
+    );
     this.setTimelineDetail(itemEl, event.message ?? event.name);
     this.setExpandablePayload(itemEl, event.output ?? event.error);
     this.renderToolVerification(event);
@@ -1597,11 +1677,14 @@ export class AgentView extends ItemView {
     this.setMetric(this.activeToolValueEl, "None");
     this.updateChatLoader(event.message ?? `${event.name} complete`);
     this.appendTrace(
-      ok ? "tool" : "error",
-      event.message ?? `${event.name} ${ok ? "complete" : "error"}`,
+      ok || skipped ? "tool" : "error",
+      event.message ?? `${event.name} ${ok ? "complete" : skipped ? "skipped" : "error"}`,
     );
-    const toolLine = toolStepChatLine(event.name, ok, event.message);
-    this.appendLog("system", toolLine);
+    const toolLine = toolStepChatLine(event.name, ok, event.message, {
+      skipped,
+    });
+    // Keep Chat prompt-first: tool steps live in the workstream + Run Details
+    // timeline, not as a stack of system bubbles in the main stream.
     this.appendWorkstreamLine(toolLine);
   }
 
@@ -1814,6 +1897,9 @@ export class AgentView extends ItemView {
   }
 
   private async handleRunComplete(event: AgentRunCompleteEvent) {
+    if (event.autonomyStats) {
+      this.setAutonomyRunStats(event.autonomyStats);
+    }
     this.appendSilentTurnFallbackIfNeeded(event);
     this.clearChatAttention();
     this.setRunDetailsNeedsAttention(false);
@@ -1835,18 +1921,61 @@ export class AgentView extends ItemView {
       missionStop === "approval_denied" ||
       missionStop === "required_tools_failed"
     ) {
-      this.renderChatProviderBlocker({
-        what: formatStopReasonLabel(missionStop),
-        why: event.stopDetail?.trim() || stopLine,
-        next: "Open Run Details for the blocker, then Continue Latest Run or send the next message.",
-      });
+      const writeInterrupted = isPartialWritebackStopDetail(event.stopDetail);
+      const detail = event.stopDetail?.trim() || stopLine;
+      const blockerCopy = writeInterrupted
+        ? {
+            what: "Streaming writeback stopped after partial note apply.",
+            why: detail,
+            next: chatWriteInterruptedNextCopy(),
+          }
+        : conversationalBlockerCopy({
+            kind:
+              missionStop === "approval_denied"
+                ? "approval"
+                : missionStop === "provider_error"
+                  ? /api key|credential|auth|missing_api_key/i.test(detail)
+                    ? "credential"
+                    : "provider"
+                  : missionStop === "graph_blocked" ||
+                      missionStop === "required_tools_failed"
+                    ? "external"
+                    : "generic",
+            why: detail,
+            approvalDecision:
+              missionStop === "approval_denied" ? "denied" : undefined,
+          });
+        this.stopRequested = false;
+      this.setRunning(false);
+      this.currentRunChatId = null;
+      this.renderChatBlockedContinueAttention(
+        blockerCopy,
+        missionStop === "graph_blocked"
+          ? chatMissionGraphBlockerTitle()
+          : writeInterrupted
+            ? chatWriteInterruptedTitle()
+            : missionStop === "approval_denied"
+              ? "Approval blocked"
+              : chatProviderBlockerTitle(),
+        {
+          allowOpenSettings:
+            missionStop === "provider_error" &&
+            /api key|credential|auth|missing_api_key/i.test(detail),
+        },
+      );
       this.setRunDetailsNeedsAttention(true);
+      await this.maybeWriteMissionReceiptNote(event);
+      this.renderModelConfig();
+      return;
     }
     await this.maybeWriteMissionReceiptNote(event);
     this.renderModelConfig();
     this.stopRequested = false;
     this.setRunning(false);
     this.currentRunChatId = null;
+    // Budget/resumable Idle must expose Chat Continue after the running flag
+    // clears (setRunning → renderModelConfig refreshes the control).
+    this.refreshChatContinuationAction();
   }
 
   private async maybeWriteMissionReceiptNote(
@@ -2176,6 +2305,7 @@ export class AgentView extends ItemView {
     }
 
     this.clearPlaceholder(this.toolTimelineEl);
+    this.toolTimelineOrdinal += 1;
     const itemEl = this.toolTimelineEl.createDiv({
       cls: "agentic-researcher-tool-item",
       attr: {
@@ -2187,8 +2317,11 @@ export class AgentView extends ItemView {
     const headerEl = itemEl.createDiv({
       cls: "agentic-researcher-tool-header",
     });
+    // Number tools by appearance order. Agent-loop step indexes repeat when a
+    // single planning step emits several tool calls (1,1,1,2), which looked
+    // like a broken counter in Run Details.
     headerEl.createSpan({
-      text: `${event.step}. ${event.name}`,
+      text: `${this.toolTimelineOrdinal}. ${event.name}`,
       cls: "agentic-researcher-tool-name",
     });
     headerEl.createSpan({
@@ -2388,8 +2521,8 @@ export class AgentView extends ItemView {
     const artifact: MissionReceiptArtifactLinkV1 = { system, label, url };
     if (!this.runArtifactLinks.some((item) => item.url === url)) {
       this.runArtifactLinks.push(artifact);
-      this.appendLog("system", artifactLinkChatLine(system, url));
-      this.appendWorkstreamLine(artifactLinkChatLine(system, url));
+      // Receipt row keeps the URL; workstream gets a short ping (no Artifacts panel).
+      this.appendWorkstreamLine(receiptUrlWorkstreamLine(system, url));
     }
     this.trackReceiptMetadata(receipt);
   }
@@ -2397,13 +2530,21 @@ export class AgentView extends ItemView {
   private trackReceiptMetadata(receipt: AgentRunReceipt): void {
     if (receipt.path?.trim() && !this.runResearchNotePath) {
       const tool = (receipt.toolName ?? "").toLowerCase();
+      const path = receipt.path.trim();
+      const looksLikeVaultMarkdown =
+        /\.md$/iu.test(path) &&
+        !path.includes("\\") &&
+        !/^[a-zA-Z]:/u.test(path) &&
+        !tool.startsWith("code_workspace_");
       if (
-        tool.includes("research") ||
-        tool.includes("append") ||
-        tool.includes("replace") ||
-        tool.includes("write")
+        looksLikeVaultMarkdown &&
+        (tool.includes("research") ||
+          tool.includes("append") ||
+          tool.includes("replace") ||
+          tool.includes("write") ||
+          tool.includes("seed"))
       ) {
-        this.runResearchNotePath = receipt.path.trim();
+        this.runResearchNotePath = path;
       }
     }
     const resourceId = receipt.resource?.id?.trim();
@@ -2627,6 +2768,7 @@ export class AgentView extends ItemView {
       `num_ctx=${this.formatOptionalNumber(this.runConfig.numCtx)}`,
       `estimated_prompt_chars=${this.formatOptionalNumber(this.runConfig.estimatedPromptChars)}`,
       `context_budget_chars=${this.formatOptionalNumber(this.runConfig.contextBudgetChars)}`,
+      `context_budget_source=${this.runConfig.contextBudgetSource ?? "unknown"}`,
       `write_autonomy=${this.runConfig.writeAutonomy ? "on" : "off"}`,
       `autonomy_read=current_note ${scope.read.currentNote ? "on" : "off"}, vault ${scope.read.vault ? "on" : "off"}, web ${scope.read.web ? "on" : "off"}, files ${this.formatScopeList(scope.read.files)}, folders ${this.formatScopeList(scope.read.folders)}`,
       `autonomy_write=current_note ${scope.write.currentNote ? "on" : "off"}, files ${this.formatScopeList(scope.write.files)}, folders ${this.formatScopeList(scope.write.folders)}, artifacts ${scope.write.artifacts ? "on" : "off"}, research_memory ${scope.write.researchMemory ? "on" : "off"}`,
@@ -2700,6 +2842,16 @@ export class AgentView extends ItemView {
     | undefined {
     const snapshotLedger = this.plugin.getMissionRunSnapshot().lastMissionLedger;
     const configLedger = this.runConfig?.missionLedger;
+    // Prefer a resumable snapshot ledger even when runIds diverge. Continue
+    // segments mint a new runId while runConfig can lag one event behind, and
+    // Chat Continue must track the durable snapshot the harness reads.
+    if (
+      snapshotLedger?.canResume &&
+      typeof snapshotLedger.continuationCommand === "string" &&
+      snapshotLedger.continuationCommand.trim()
+    ) {
+      return snapshotLedger;
+    }
     if (
       snapshotLedger &&
       (!configLedger || snapshotLedger.runId === this.runConfig?.runId)
@@ -2712,11 +2864,24 @@ export class AgentView extends ItemView {
   private refreshChatContinuationAction(): void {
     if (!this.continueButtonEl) return;
     const ledger = this.getLatestContinuationLedger();
+    const bannerOwnsContinue = Boolean(
+      this.chatAttentionEl &&
+        !this.chatAttentionEl.hasClass("is-hidden") &&
+        this.chatAttentionEl.querySelector(
+          '[data-testid="chat-blocked-continue"]',
+        ),
+    );
     const available = Boolean(
-      !this.isRunning &&
+      !bannerOwnsContinue &&
+        !this.isRunning &&
         ledger?.canResume &&
         ledger.continuationCommand.trim(),
     );
+    // Continue lives on the Chat composer. If Orchestrator/Details hid the
+    // panel, surface Chat so the control is actually clickable.
+    if (available && this.activeTab !== "chat") {
+      this.setActiveTab("chat");
+    }
     this.continueButtonEl.hidden = !available;
     this.continueButtonEl.disabled = !available;
     this.continueButtonEl.setAttribute(
@@ -2876,19 +3041,12 @@ export class AgentView extends ItemView {
       }),
       cls: "agentic-researcher-config-line agentic-researcher-proof-debt-next",
     });
-    const buttonEl = actionEl.createEl("button", {
-      text: "Continue Latest Run",
-      cls: "agentic-researcher-secondary-action",
-      attr: {
-        type: "button",
-        "aria-label": `Continue latest run ${ledger.runId} without replaying completed writes`,
-      },
-    });
-    buttonEl.disabled = this.isRunning;
-    buttonEl.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      void this.submitMissionContinuation(ledger.continuationCommand);
+    // Singular Continue path lives on the Chat Continue Latest Run control
+    // (and the blocked-run attention CTA). Avoid a second Details button.
+    actionEl.createDiv({
+      text: "Use Continue Latest Run in Chat to resume without replaying completed writes.",
+      cls: "agentic-researcher-config-line",
+      attr: { "data-testid": "details-continue-pointer" },
     });
   }
 
@@ -3076,6 +3234,7 @@ export class AgentView extends ItemView {
 
     if (!this.liveAssistantMessageEl) {
       const itemEl = this.createLogItem("assistant");
+      itemEl?.addClass("is-streaming");
       this.liveAssistantMessageEl = itemEl?.querySelector(
         ".agentic-researcher-log-message",
       ) as HTMLElement | null;
@@ -3100,6 +3259,7 @@ export class AgentView extends ItemView {
 
     if (!this.liveAssistantMessageEl) {
       const itemEl = this.createLogItem("assistant");
+      itemEl?.addClass("is-streaming");
       this.liveAssistantMessageEl = itemEl?.querySelector(
         ".agentic-researcher-log-message",
       ) as HTMLElement | null;
@@ -3114,13 +3274,16 @@ export class AgentView extends ItemView {
   }
 
   private finishLiveAssistantMessage() {
+    this.liveAssistantMessageEl
+      ?.closest(".agentic-researcher-log-item")
+      ?.removeClass("is-streaming");
     this.liveAssistantMessageEl = null;
   }
 
   private startLiveThinkingMessage() {
     this.appendStatus("Thinking...");
     if (!this.thinkingStreamEl) return;
-    this.revealDashboardSection(this.thinkingStreamEl);
+    // Thinking stays in Run Details — never chat history or note writeback.
     this.clearPlaceholder(this.thinkingStreamEl);
     this.liveThinkingMessageEl = this.thinkingStreamEl.createDiv({
       cls: "agentic-researcher-thinking-stream",
@@ -3130,8 +3293,7 @@ export class AgentView extends ItemView {
 
   private appendThinkingDelta(delta: string) {
     if (!delta || !this.thinkingStreamEl) return;
-    // Thinking is Run Details only — never chat history or note writeback.
-    this.revealDashboardSection(this.thinkingStreamEl);
+    // Thinking stays in Run Details — never chat history or note writeback.
     if (!this.liveThinkingMessageEl) {
       this.clearPlaceholder(this.thinkingStreamEl);
       this.liveThinkingMessageEl = this.thinkingStreamEl.createDiv({
@@ -3151,9 +3313,9 @@ export class AgentView extends ItemView {
   private getLogLabel(kind: LogKind) {
     switch (kind) {
       case "user":
-        return "User";
+        return "You";
       case "assistant":
-        return "Assistant";
+        return "Agent";
       case "error":
         return "Error";
       case "system":
@@ -3241,17 +3403,20 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-chat-loader-header",
     });
     headerEl.createSpan({
-      text: "CRT LOAD",
+      text: "Agent",
       cls: "agentic-researcher-chat-loader-label",
     });
     this.chatLoaderTextEl = headerEl.createSpan({
       text: "",
       cls: "agentic-researcher-chat-loader-text",
     });
-    this.chatLoaderEl.createDiv({
-      cls: "agentic-researcher-chat-loader-bar",
+    const dotsEl = this.chatLoaderEl.createDiv({
+      cls: "agentic-researcher-chat-loader-dots",
       attr: { "aria-hidden": "true" },
     });
+    for (let i = 0; i < 3; i += 1) {
+      dotsEl.createSpan({ cls: "agentic-researcher-chat-loader-dot" });
+    }
     this.moveChatLoaderToEnd();
 
     return this.chatLoaderEl;
@@ -3431,7 +3596,12 @@ export class AgentView extends ItemView {
   }
 
   private shouldShowOrchestrator(): boolean {
-    return true;
+    return Boolean(
+      this.orchestratorSnapshot ||
+        this.lifecycleStripActive ||
+        this.teamPhase !== "idle" ||
+        this.missionGraphProjection,
+    );
   }
 
   private shouldAcceptOrchestratorSnapshot(
@@ -3625,6 +3795,51 @@ export class AgentView extends ItemView {
 
   private setMetric(element: HTMLElement | null, value: string) {
     element?.setText(value);
+    if (element === this.stepValueEl) {
+      this.chatStatsStepLabel = `step ${value}`;
+      this.renderChatStatsStrip();
+    }
+  }
+
+  private renderChatTeamStrip(): void {
+    const el = this.chatTeamStripEl;
+    if (!el) return;
+    const copy = teamRoleStripCopy({
+      phase: this.teamPhase,
+      handoffReady: this.teamHandoffReady,
+    });
+    el.empty();
+    if (this.teamPhase === "idle") {
+      el.addClass("is-hidden");
+      el.hide();
+      return;
+    }
+    el.removeClass("is-hidden");
+    el.show();
+    el.createDiv({
+      text: copy,
+      cls: "agentic-researcher-chat-team-line",
+    });
+  }
+
+  private renderChatStatsStrip(): void {
+    // Autonomy/team stats stay out of the Chat stream box; surface via status.
+    if (!this.autonomyRunStats || !this.runStatusTextEl) return;
+    if (this.isRunning) return;
+    const autonomy = formatAutonomyStatsLine(this.autonomyRunStats);
+    const team = formatTeamStatsLine(this.autonomyRunStats);
+    const parts = [autonomy, team].filter(Boolean);
+    if (parts.length === 0) return;
+    // Keep Idle/running label primary; append a short stats hint when idle.
+    if (this.runStatusTextEl.textContent?.trim() === "Idle") {
+      this.runStatusTextEl.setText(`Idle · ${parts.join(" · ")}`);
+    }
+  }
+
+  /** Integrator / finish path: bind finalized autonomy stats into Chat. */
+  setAutonomyRunStats(stats: AutonomyRunStatsV1 | null): void {
+    this.autonomyRunStats = stats;
+    this.renderChatStatsStrip();
   }
 
   private setSectionPlaceholder(element: HTMLElement | null, text: string) {
@@ -3807,16 +4022,6 @@ export class AgentView extends ItemView {
       toolName === "browser_extract_markdown"
     ) {
       this.appendDetailLine(this.evidenceDetailsEl, event);
-    }
-
-    if (
-      toolName === "create_design_canvas" ||
-      toolName === "create_svg_design" ||
-      toolName === "create_design_package" ||
-      toolName === "open_web_source" ||
-      event.kind === "receipt"
-    ) {
-      this.appendDetailLine(this.artifactsDetailsEl, event);
     }
   }
 
@@ -4106,6 +4311,8 @@ export class AgentView extends ItemView {
 
   private appendWorkstreamLine(message: string): void {
     if (!message.trim() || !this.liveWorkstreamEl) return;
+    this.liveWorkstreamEl.removeClass("is-hidden");
+    this.liveWorkstreamEl.show();
     this.clearPlaceholder(this.liveWorkstreamEl);
     this.liveWorkstreamEl.createDiv({
       text: message.trim(),
@@ -4125,9 +4332,13 @@ export class AgentView extends ItemView {
   ): void {
     const strip = this.lifecycleStageStripEl;
     if (!strip || stages.length === 0) return;
+    this.lifecycleStripActive = stages.length > 1;
     strip.empty();
     strip.removeClass("is-hidden");
     strip.show();
+    if (this.lifecycleStripActive && !this.orchestratorTabButtonEl) {
+      this.refreshOrchestratorAvailability();
+    }
     strip.createSpan({
       text: formatCompoundLifecycleStageStrip(stages, activeStage),
       cls: "agentic-researcher-lifecycle-strip-text",
@@ -4135,6 +4346,7 @@ export class AgentView extends ItemView {
   }
 
   private hideLifecycleStageStrip(): void {
+    this.lifecycleStripActive = false;
     this.lifecycleStageStripEl?.empty();
     this.lifecycleStageStripEl?.addClass("is-hidden");
     this.lifecycleStageStripEl?.hide();
@@ -4151,50 +4363,27 @@ export class AgentView extends ItemView {
     this.showLifecycleStageStrip(stages, activeStage);
   }
 
-  private renderCompoundLifecycleReadinessBlocker(
-    blockers: readonly CompoundLifecycleBlockerV1[],
+  private renderMissionReadinessBlocker(
+    card: NonNullable<ReturnType<typeof buildMissionReadinessCardModelV1>>,
   ): void {
     const banner = this.chatAttentionEl;
     if (!banner) return;
-    const primary = blockers[0];
-    const setupTarget: CapabilitySetupTarget = primary?.setupTarget ?? "model";
-    banner.empty();
-    banner.removeClass("is-hidden");
-    banner.show();
-    banner.createDiv({
-      text: compoundLifecycleReadinessTitle(),
-      cls: "agentic-researcher-chat-attention-title",
-    });
-    banner.createDiv({
-      text: `What: End-to-end workflow needs ${blockers
-        .map((b) => compoundLifecycleStageLabel(b.stage))
-        .join(", ")} setup.`,
-      cls: "agentic-researcher-chat-attention-body",
-    });
-    banner.createDiv({
-      text: `Why: ${primary?.reason ?? "Required capabilities are not ready."}`,
-      cls: "agentic-researcher-chat-attention-body",
-    });
-    banner.createDiv({
-      text: `Next: ${primary?.nextAction ?? "Open settings and finish connection setup."}`,
-      cls: "agentic-researcher-chat-attention-body",
-    });
-    const controls = banner.createDiv({
-      cls: "agentic-researcher-chat-attention-controls",
-    });
-    const openSettings = controls.createEl("button", {
-      text: "Open settings",
-      cls: "agentic-researcher-secondary-action",
-      attr: {
-        type: "button",
-        "data-testid": "chat-compound-readiness-open-settings",
+    renderMissionReadinessCard(banner, card, {
+      onSetupAndResume: (setupTarget) => {
+        void this.plugin.openCapabilitySetup(setupTarget);
       },
     });
-    openSettings.addEventListener("click", (event) => {
-      event.preventDefault();
-      void this.plugin.openCapabilitySetup(setupTarget);
-    });
     this.setRunDetailsNeedsAttention(true);
+  }
+
+  /** Best-effort scope read for cleanup preflight without expanding plugin API. */
+  private readGitHubCleanupAuthority(): boolean | null {
+    const credential = (
+      this.plugin as unknown as {
+        githubCredential?: { scopes?: string[] } | null;
+      }
+    ).githubCredential;
+    return githubCleanupAuthorityFromScopesV1(credential?.scopes);
   }
 
   private renderChatProviderBlocker(
@@ -4204,6 +4393,29 @@ export class AgentView extends ItemView {
       next: string;
     },
     title: string = chatProviderBlockerTitle(),
+  ) {
+    // Connection gates need settings first; blocked runs use the Continue CTA.
+    this.renderChatBlockedContinueAttention(copy, title, {
+      allowOpenSettings: true,
+      forceSettingsOnly: true,
+    });
+  }
+
+  /**
+   * Blocked-run attention: conversational What/Why/Next and exactly one
+   * primary action (Continue when resumable, otherwise Open settings).
+   */
+  private renderChatBlockedContinueAttention(
+    copy: {
+      what: string;
+      why: string;
+      next: string;
+    },
+    title: string,
+    options: {
+      allowOpenSettings?: boolean;
+      forceSettingsOnly?: boolean;
+    } = {},
   ) {
     const banner = this.chatAttentionEl;
     if (!banner) {
@@ -4231,24 +4443,55 @@ export class AgentView extends ItemView {
     const controls = banner.createDiv({
       cls: "agentic-researcher-chat-attention-controls",
     });
-    const openSettings = controls.createEl("button", {
-      text: "Open settings",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button", "data-testid": "chat-provider-open-settings" },
-    });
-    const openDetails = controls.createEl("button", {
-      text: "Open Run Details",
-      cls: "agentic-researcher-secondary-action",
-      attr: { type: "button" },
-    });
-    openSettings.addEventListener("click", (event) => {
-      event.preventDefault();
-      void this.plugin.openFirstRunModelSetup();
-    });
-    openDetails.addEventListener("click", (event) => {
-      event.preventDefault();
-      this.setActiveTab("details");
-    });
+
+    const ledger = this.getLatestContinuationLedger();
+    const canContinue = Boolean(
+      !options.forceSettingsOnly &&
+        !this.isRunning &&
+        ledger?.canResume &&
+        ledger.continuationCommand.trim(),
+    );
+
+    if (canContinue && ledger) {
+      const continueButton = controls.createEl("button", {
+        text: "Continue Latest Run",
+        cls: "agentic-researcher-secondary-action agentic-researcher-chat-continuation",
+        attr: {
+          type: "button",
+          "data-testid": "chat-blocked-continue",
+          "aria-label": `Continue latest run ${ledger.runId}`,
+        },
+      });
+      continueButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        this.clearChatAttention();
+        void this.submitMissionContinuation(ledger.continuationCommand);
+      });
+    } else if (options.allowOpenSettings || options.forceSettingsOnly) {
+      const openSettings = controls.createEl("button", {
+        text: "Open settings",
+        cls: "agentic-researcher-secondary-action",
+        attr: { type: "button", "data-testid": "chat-provider-open-settings" },
+      });
+      openSettings.addEventListener("click", (event) => {
+        event.preventDefault();
+        void this.plugin.openFirstRunModelSetup();
+      });
+    } else {
+      const continueButton = controls.createEl("button", {
+        text: "Continue Latest Run",
+        cls: "agentic-researcher-secondary-action agentic-researcher-chat-continuation",
+        attr: {
+          type: "button",
+          "data-testid": "chat-blocked-continue",
+          "aria-label": "Continue latest run",
+        },
+      });
+      continueButton.disabled = true;
+      continueButton.title = "Continue becomes available when the ledger is resumable.";
+    }
+
+    this.refreshChatContinuationAction();
     this.setRunDetailsNeedsAttention(true);
   }
 
@@ -4315,6 +4558,7 @@ export class AgentView extends ItemView {
     this.chatAttentionEl.empty();
     this.chatAttentionEl.addClass("is-hidden");
     this.chatAttentionEl.hide();
+    this.refreshChatContinuationAction();
   }
 
   private setRunDetailsNeedsAttention(on: boolean) {

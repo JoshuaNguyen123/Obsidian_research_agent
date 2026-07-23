@@ -45,6 +45,8 @@ if (playwrightLanes.some((lane) => [
   "daily-use-research",
   "daily-use-code-live",
   "daily-use-compound",
+  "obsidian-hello-github-live",
+  "compound-flow-real-live",
 ].includes(lane))) {
   await assertLiveObsidianExecutable();
   await assertLiveProviderConfiguration();
@@ -78,6 +80,7 @@ async function resolveExpectedPluginIds() {
     "daily-use-linear": [],
     "daily-use-github": [],
     "daily-use-compound": [],
+    "obsidian-hello-github-live": [],
     "integration-mock": [],
     "integration-mock-legacy": [],
     sandbox: [],
@@ -88,6 +91,8 @@ async function resolveExpectedPluginIds() {
     "release-vertical": [],
     "disposable-live-external": [],
     "configured-linear-live": [],
+    "compound-flow-smoke-live": [],
+    "compound-flow-real-live": [],
     "systems-diagrams": [],
   };
   for (const lane of playwrightLanes) {
@@ -135,7 +140,7 @@ async function assertLiveProviderConfiguration() {
     : settings.modelProvider === "openai_compatible"
       ? "openai_compatible"
       : "ollama";
-  const model = process.env.E2E_AI_MODEL?.trim() || settings.model || "gpt-oss:120b-cloud";
+  const model = process.env.E2E_AI_MODEL?.trim() || settings.model || "glm-5.2";
   const baseUrl = provider === "openai_compatible"
     ? process.env.E2E_OPENAI_COMPATIBLE_BASE_URL?.trim() || settings.openAiCompatibleBaseUrl
     : process.env.E2E_OLLAMA_BASE_URL?.trim() || settings.ollamaBaseUrl || "https://ollama.com/api";

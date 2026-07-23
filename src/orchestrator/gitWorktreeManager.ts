@@ -1,3 +1,4 @@
+import { agentGitCommitIdentityEnvironmentV1 } from "../../packages/core-api/src/agentGitCommitIdentityV1";
 import { requireNodeModule } from "../platform/nodeRequire";
 import {
   buildOrchestratorBranchName,
@@ -411,6 +412,7 @@ function createGitCommandExecutor(): GitCommandExecutor {
       "child_process",
       "git_worktree_manager",
     );
+    const nullConfig = process.platform === "win32" ? "NUL" : "/dev/null";
     return new Promise<GitCommandResult>((resolve, reject) => {
       const child = spawn("git", args, {
         cwd,
@@ -422,6 +424,9 @@ function createGitCommandExecutor(): GitCommandExecutor {
           GIT_EDITOR: "true",
           GIT_MERGE_AUTOEDIT: "no",
           GIT_TERMINAL_PROMPT: "0",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: nullConfig,
+          ...agentGitCommitIdentityEnvironmentV1(),
         },
       });
       let stdout = "";

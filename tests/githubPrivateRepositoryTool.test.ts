@@ -164,6 +164,18 @@ test("private repository intent honors explicit negation", () => {
   );
   assert.equal(
     hasExplicitPrivateGitHubRepositoryCreationIntent(
+      "Call github_create_private_repository for the exact private repository owner/repo.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasExplicitPrivateGitHubRepositoryCreationIntent(
+      "Create the exact private GitHub repository owner/repo. Do not stop before Linear, code, GitHub proofs exist.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasExplicitPrivateGitHubRepositoryCreationIntent(
       "Do not create a GitHub repository; only describe the setup.",
     ),
     false,

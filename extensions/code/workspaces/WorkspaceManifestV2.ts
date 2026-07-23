@@ -191,6 +191,36 @@ export function assertWorkspaceRelativePathV2(value: unknown, label = "workspace
   return relativePath(value, label);
 }
 
+/**
+ * Models often pass host-absolute paths for workspace reads/writes. When the
+ * absolute path clearly ends in a safe relative suffix (src/…, test/…, README),
+ * coerce to that workspace-relative form before validation.
+ */
+export function coerceAbsoluteToWorkspaceRelativePathV2(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  // Only rewrite host-absolute paths. Relative paths that still contain
+  // backslashes must keep failing closed as workspace-relative violations.
+  const looksAbsolute =
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("\\") ||
+    /^[a-z]:[\\/]/iu.test(trimmed);
+  if (!looksAbsolute) return value;
+  const normalized = trimmed.replace(/\\/gu, "/");
+  const lower = normalized.toLowerCase();
+  const markers = ["/src/", "/test/", "/readme.md"] as const;
+  for (const marker of markers) {
+    const idx = lower.lastIndexOf(marker);
+    if (idx < 0) continue;
+    if (marker === "/readme.md") {
+      return "README.md";
+    }
+    return normalized.slice(idx + 1);
+  }
+  return value;
+}
+
 export function isSha256FingerprintV2(value: unknown): value is string {
   return typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value);
 }
@@ -269,7 +299,8 @@ function parseLease(value: unknown): WorkspaceLeaseV2 {
 }
 
 function relativePath(value: unknown, label: string): string {
-  const input = boundedString(value, label, 1, 1_024);
+  const coerced = coerceAbsoluteToWorkspaceRelativePathV2(value);
+  const input = boundedString(coerced, label, 1, 1_024);
   if (
     input.startsWith("/") || input.includes("\\") || /^[a-z]:/iu.test(input) ||
     /[\0\r\n]/u.test(input)

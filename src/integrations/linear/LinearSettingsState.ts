@@ -8,6 +8,8 @@ import type {
 export interface LinearQueueSelectionV1 {
   teamId: string;
   projectId: string;
+  /** Only issues in this unstarted state are eligible to enter the queue. */
+  readyStateId: string;
   startedStateId: string;
   completedStateId: string;
   blockedStateId?: string;
@@ -64,6 +66,10 @@ export function evaluateLinearQueueConfiguration(
   if (project.teamIds.length > 0 && !project.teamIds.includes(team.id)) {
     return blocked("The selected Linear project is not associated with the selected team.");
   }
+  const ready = findTeamState(snapshot, selection.readyStateId, team.id);
+  if (!ready || ready.type !== "unstarted") {
+    return blocked("Select an unstarted Ready workflow state for the chosen team.");
+  }
   const started = findTeamState(snapshot, selection.startedStateId, team.id);
   if (!started) return blocked("Select a started workflow state for the chosen team.");
   const completed = findTeamState(snapshot, selection.completedStateId, team.id);
@@ -99,6 +105,10 @@ export function reconcileLinearSelections(
   const states = snapshot.workflowStates.filter(
     (item) => !teamId || item.teamId === null || item.teamId === teamId,
   );
+  const readyStateId = selectKnownOrOnly(
+    selection.readyStateId,
+    states.filter((item) => item.type === "unstarted").map((item) => item.id),
+  );
   const startedStateId = selectKnownOrOnly(
     selection.startedStateId,
     states.filter((item) => item.type === "started").map((item) => item.id),
@@ -113,6 +123,7 @@ export function reconcileLinearSelections(
   const next = {
     teamId,
     projectId,
+    readyStateId,
     startedStateId,
     completedStateId,
     blockedStateId,
@@ -122,6 +133,7 @@ export function reconcileLinearSelections(
     changed:
       next.teamId !== selection.teamId ||
       next.projectId !== selection.projectId ||
+      next.readyStateId !== selection.readyStateId ||
       next.startedStateId !== selection.startedStateId ||
       next.completedStateId !== selection.completedStateId ||
       next.blockedStateId !== (selection.blockedStateId ?? ""),

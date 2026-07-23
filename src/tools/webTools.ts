@@ -9,6 +9,7 @@ import {
   MAX_WEB_RESULTS,
   MAX_WEB_SEARCH_SNIPPET_CHARS,
 } from "./constants";
+import { withDiscriminativeDescription } from "./discriminativeToolDescriptions";
 import {
   ToolExecutionError,
   type AgentTool,
@@ -47,7 +48,10 @@ export function createWebTools(): AgentTool[] {
 
 export const webSearchTool: AgentTool = {
   name: "web_search",
-  description: "Search the web through the configured Ollama-compatible endpoint.",
+  description: withDiscriminativeDescription(
+    "web_search",
+    "Search the web through the configured Ollama-compatible endpoint.",
+  ),
   parameters: {
     type: "object",
     required: ["query"],

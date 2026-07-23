@@ -519,6 +519,42 @@ test("production repair preparation derives checkpoint sequence and latest scope
   );
 });
 
+test("explicit user commit subject is host-bound into the durable repair request", async (t) => {
+  const harness = await createHarness(t, "src/index.ts");
+  const passingFast = await validation(
+    "fast",
+    "fast-sandbox",
+    true,
+    "fast-explicit-commit-subject",
+    0,
+    true,
+    null,
+    harness.validationBinding,
+  );
+  harness.validations.set(passingFast.id, passingFast);
+  const originalPrompt = [
+    "Implement the fixture.",
+    "Create one local commit with message feat: add protected Python checkers game",
+    "and independently read its exact SHA back.",
+  ].join(" ");
+  const prepared = await harness.handlers.prepareCycleRecord(
+    cycleArgs(passingFast, 1, 0),
+    context(originalPrompt),
+  );
+  assert.equal(prepared.ok, true);
+
+  const checkpoints = new CallbackCodeRepairCheckpointStoreV1(
+    harness.checkpointPersistence,
+  );
+  const checkpoint = await checkpoints.load(
+    "code-repair:mission-1:workspace-1:request-1",
+  );
+  assert.equal(
+    checkpoint?.request.commitMessage,
+    "feat: add protected Python checkers game",
+  );
+});
+
 test("denial means execute is not called, and missing authorization cannot reach Git", async (t) => {
   const harness = await createHarness(t, "src/index.ts");
   await recordPassingFast(harness);
@@ -859,13 +895,15 @@ async function validation(
   };
 }
 
-function context(): ScopedExtensionContextV1 {
+function context(
+  originalPrompt = "Repair the fixture and create a verified local commit.",
+): ScopedExtensionContextV1 {
   return {
     version: 1,
     extensionId: "agentic-researcher-code",
     missionId: SCOPE.runId,
     operationId: "repair-tool-operation",
-    originalPrompt: "Repair the fixture and create a verified local commit.",
+    originalPrompt,
     abortSignal: new AbortController().signal,
     now: () => new Date(NOW),
     reportProgress() {},

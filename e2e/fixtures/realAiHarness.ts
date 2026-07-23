@@ -11,10 +11,27 @@ import {
   startNativeObsidianHarness,
   type NativeObsidianHarness,
 } from "./nativeObsidianHarness";
+import { clearChatInline } from "./chatCleanup";
+import {
+  assertRealAiLaneNonMock,
+  RealAiConnectionAttestationRegistry,
+  verifyWithWorkerConnectionAttestation,
+} from "./realAiConnectionAttestation";
+
+export { clearChatInline } from "./chatCleanup";
 
 export interface RealAiHarness extends NativeObsidianHarness {
   config: E2EAiConfig;
-  submitMission(prompt: string, options?: { waitForCompletion?: boolean; timeoutMs?: number }): Promise<void>;
+  submitMission(
+    prompt: string,
+    options?: {
+      waitForCompletion?: boolean;
+      timeoutMs?: number;
+      /** Clear Chat memory before submit (default true). Set false only for dependent Continues. */
+      clearChatFirst?: boolean;
+    },
+  ): Promise<void>;
+  clearChat(): Promise<void>;
   waitForMissionComplete(timeoutMs?: number): Promise<void>;
   seedNote(path: string, content: string, activate?: boolean): Promise<void>;
   indexSemanticNotes(paths: string[]): Promise<void>;
@@ -32,6 +49,11 @@ export interface RealAiHarness extends NativeObsidianHarness {
     timeoutMs?: number,
     options?: CompoundMissionApprovalOptions,
   ): Promise<number>;
+  /**
+   * Set-loose compound: wait for Idle/complete without clicking Bound approvals.
+   * Fails if chat-approval-approve appears (set-loose Bound should auto-run).
+   */
+  waitUntilIdleOrComplete(timeoutMs?: number): Promise<void>;
   readProgressCounters(): { approvals: number; continuations: number };
   activePreparedApproval(toolName: string): Locator;
   approve(approval: Locator): Promise<void>;
@@ -81,6 +103,14 @@ const PROJECT_STAGE_COMPLETION_TOOL: Readonly<
   reconciliation_cleanup: "github_delete_private_repository",
 });
 
+/**
+ * One real provider health check is enough for the exact provider/model/base
+ * tuple during a single serial Playwright worker. Each mission still uses the
+ * production client; this only avoids rate-limiting the redundant preflight.
+ */
+const VERIFIED_REAL_AI_CONNECTIONS =
+  new RealAiConnectionAttestationRegistry();
+
 export async function startRealAiHarness(
   label: string,
   overrides: Partial<E2EAiConfig> = {},
@@ -97,9 +127,15 @@ export async function startRealAiHarness(
   const corePluginDataOverrides: Record<string, unknown> = {
     modelProvider: provider,
     model: config.model,
+    // Live-contract scenarios prove one explicitly selected provider model.
+    // Never inherit a stale utility model from the developer's test vault.
+    utilityModel: "",
     enableStreaming: false,
     thinkingMode: "off",
-    requestTimeoutMs: config.missionTimeoutMs,
+    // Cap per-request HTTP timeout below the mission wall clock. Coupling them
+    // lets one stalled chat() burn the full completion wait (seen as
+    // Running mission... with empty progress after Continue on error).
+    requestTimeoutMs: Math.min(config.missionTimeoutMs, 10 * 60_000),
     maxRunMinutes: 14,
     maxAgentSteps: 24,
     modelRouterEnabled: true,
@@ -156,7 +192,9 @@ export async function startRealAiHarness(
     submitMission: (prompt, options = {}) => submitMission(native.page, prompt, {
       timeoutMs: options.timeoutMs ?? config.missionTimeoutMs,
       waitForCompletion: options.waitForCompletion,
+      clearChatFirst: options.clearChatFirst,
     }),
+    clearChat: () => clearChatInline(native.page),
     waitForMissionComplete: (timeoutMs = config.completionTimeoutMs) =>
       waitForMissionComplete(native.page, timeoutMs),
     seedNote: (path, content, activate = false) =>
@@ -197,6 +235,8 @@ export async function startRealAiHarness(
         recordedContinuations += callContinuations;
       }
     },
+    waitUntilIdleOrComplete: (timeoutMs = config.completionTimeoutMs) =>
+      waitUntilIdleOrComplete(native.page, timeoutMs),
     readProgressCounters: () => ({
       approvals: recordedApprovals,
       continuations: recordedContinuations,
@@ -254,6 +294,468 @@ async function restartCorePlugin(
   await assertProductionClientReady(page, config, provider);
 }
 
+async function waitUntilIdleOrComplete(
+  page: Page,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let continuations = 0;
+  let missingContinuationPolls = 0;
+  const maximumContinuations = 12;
+  // Progress stall: must exceed the capped per-request timeout (10m). Model-call
+  // evidence is only recorded on completion, so a healthy long chat() looks
+  // unchanged until it returns.
+  const stallTimeoutMs = Math.min(timeoutMs, 12 * 60_000);
+  let lastProgressKey = "";
+  let lastProgressAt = Date.now();
+  while (Date.now() < deadline) {
+    const state = await page.evaluate(({ pluginId }) => {
+      const approveVisible = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(
+          "button[data-testid='chat-approval-approve']:not(:disabled), button.agentic-researcher-approval-approve:not(:disabled)",
+        ),
+      ).some((button) => button.getClientRects().length > 0);
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      const snapshot = plugin?.getMissionRunSnapshot?.();
+      const ledger = snapshot?.lastMissionLedger;
+      const nextAction =
+        typeof ledger?.nextAction === "string" ? ledger.nextAction : "";
+      return {
+        runText:
+          document
+            .querySelector("button.agentic-researcher-run")
+            ?.textContent?.trim() ?? "",
+        statusText:
+          document
+            .querySelector(".agentic-researcher-run-status-text")
+            ?.textContent?.trim() ?? "",
+        approveVisible,
+        stopReason: snapshot?.lastComplete?.stopReason ?? null,
+        canResume: ledger?.canResume === true,
+        continuationCommand:
+          typeof ledger?.continuationCommand === "string"
+            ? ledger.continuationCommand
+            : null,
+        acceptanceStatus: ledger?.acceptance?.status ?? null,
+        ledgerStatus: ledger?.status ?? null,
+        nextAction,
+        evidenceCount: ledger?.evidenceCount ?? null,
+        receiptCount: ledger?.receiptCount ?? null,
+        providerUsage: snapshot?.providerUsage ?? null,
+        modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
+          ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
+              phase: item?.phase ?? null,
+              outcome: item?.outcome ?? null,
+            }))
+          : [],
+        autoContinueRecommended:
+          snapshot?.lastComplete?.autoContinueRecommended === true,
+      };
+    }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    if (state.approveVisible) {
+      const approveDiagnostics = await collectIdleWaitDiagnostics(page);
+      console.error(
+        "waitUntilIdleOrComplete Bound Approve appearance diagnostics:",
+        JSON.stringify(approveDiagnostics),
+      );
+      throw new Error(
+        [
+          "Set-loose compound waitUntilIdleOrComplete saw a Bound Chat approval control; expected Bound tools to auto-run without approve.",
+          `approvalTitle=${JSON.stringify(approveDiagnostics.approvalTitle ?? "")}`,
+          `approvalReason=${JSON.stringify(approveDiagnostics.approvalReason ?? "")}`,
+          `diagnostics=${JSON.stringify(approveDiagnostics)}`,
+        ].join(" "),
+      );
+    }
+    const running =
+      state.runText === "Stop Mission" ||
+      /running mission/iu.test(state.statusText);
+    if (running) {
+      const progressKey = JSON.stringify({
+        statusText: state.statusText,
+        ledgerStatus: state.ledgerStatus,
+        evidenceCount: state.evidenceCount,
+        receiptCount: state.receiptCount,
+        nextAction: state.nextAction,
+        modelCallPhases: state.modelCallPhases,
+        providerUsage: state.providerUsage,
+      });
+      if (progressKey !== lastProgressKey) {
+        lastProgressKey = progressKey;
+        lastProgressAt = Date.now();
+      } else if (Date.now() - lastProgressAt > stallTimeoutMs) {
+        const stallDiagnostics = await collectIdleWaitDiagnostics(page);
+        throw new Error(
+          [
+            `waitUntilIdleOrComplete stalled for ${stallTimeoutMs}ms with no progress while Running.`,
+            `progressKey=${progressKey}`,
+            `diagnostics=${JSON.stringify(stallDiagnostics)}`,
+          ].join(" "),
+        );
+      }
+    } else {
+      lastProgressKey = "";
+      lastProgressAt = Date.now();
+    }
+    if (
+      state.runText === "Run Mission" &&
+      /^Idle$/i.test(state.statusText)
+    ) {
+      if (
+        state.acceptanceStatus === "pass" ||
+        state.ledgerStatus === "complete"
+      ) {
+        const idleDiagnostics = await collectIdleWaitDiagnostics(page);
+        console.log(
+          "waitUntilIdleOrComplete Idle:",
+          JSON.stringify(idleDiagnostics),
+        );
+        return;
+      }
+      const latestModelCall = state.modelCallPhases.at(-1);
+      const modelStepFailed = state.nextAction.startsWith("Model step failed:");
+      // Align with approveUntilMissionComplete: only auto-Continue budget /
+      // recommended / retryable provider stops — never generic stopReason=error.
+      const retryableProviderStop =
+        state.canResume &&
+        Boolean(state.continuationCommand) &&
+        modelStepFailed &&
+        (state.stopReason === "error" ||
+          state.stopReason === "user_stopped" ||
+          (latestModelCall?.phase === "retry" &&
+            latestModelCall.outcome === "error"));
+      // write_completed + needs_more_work is a set-loose Soft-union pause when
+      // GitHub/reflection proofs remain unpaid — Continue rather than accept Idle.
+      const unfinishedWriteCompleted =
+        state.stopReason === "write_completed" &&
+        state.acceptanceStatus === "needs_more_work";
+      const shouldAutoContinue =
+        state.canResume &&
+        Boolean(state.continuationCommand) &&
+        (state.stopReason === "budget" ||
+          state.autoContinueRecommended === true ||
+          retryableProviderStop ||
+          unfinishedWriteCompleted ||
+          state.stopReason === null);
+      if (shouldAutoContinue) {
+        const preContinueDiagnostics = await collectIdleWaitDiagnostics(page);
+        const nextAction = String(preContinueDiagnostics.nextAction ?? "");
+        const diagnosticBlob = [
+          nextAction,
+          preContinueDiagnostics.blockerCategory,
+          preContinueDiagnostics.lastError,
+          preContinueDiagnostics.lastStatusLog,
+          ...(Array.isArray(preContinueDiagnostics.recentLogs)
+            ? preContinueDiagnostics.recentLogs
+            : []),
+          ...(Array.isArray(preContinueDiagnostics.diagnostics)
+            ? preContinueDiagnostics.diagnostics.map(
+                (item) =>
+                  `${String((item as { errorCode?: unknown }).errorCode ?? "")} ${String((item as { message?: unknown }).message ?? "")}`,
+              )
+            : []),
+        ]
+          .map((value) => String(value ?? ""))
+          .join("\n");
+        // Terminal validation / MissionGraph blockers cannot be healed by
+        // burning more Continue budget loops — fail immediately.
+        if (
+          /Mission graph stopped|Validation completed red|Fast validation remained red|passing cycle is still required|tool_failure_terminal|tool_failure_repeated|same fast-validation failure fingerprint|third bounded repair cycle|host envelope is exhausted|lacks enough reserved budget|cannot be added within the graph budget/iu.test(
+            diagnosticBlob,
+          )
+        ) {
+          throw new Error(
+            [
+              "Set-loose compound hit a terminal validation/MissionGraph blocker; refusing further Continue loops.",
+              `diagnostics=${JSON.stringify(preContinueDiagnostics)}`,
+            ].join(" "),
+          );
+        }
+        // Fail closed when Continue keeps retrying the same unpaid graph node
+        // without healing (seen as dozens of "alternate path" budget stops).
+        if (
+          continuations >= 6 &&
+          /already tried \d+ alternate path|set_loose_delivery_unpaid=|mission_graph_incomplete/iu.test(
+            diagnosticBlob,
+          )
+        ) {
+          throw new Error(
+            [
+              "Set-loose compound is spinning on unpaid/incomplete graph work across Continues; refusing further Continue loops.",
+              `diagnostics=${JSON.stringify(preContinueDiagnostics)}`,
+            ].join(" "),
+          );
+        }
+        // Hard cap: any set-loose budget Continue storm without Idle completion.
+        if (continuations >= 6 && state.stopReason === "budget") {
+          throw new Error(
+            [
+              "Set-loose compound exceeded 6 budget Continues without completion; refusing further Continue loops.",
+              `diagnostics=${JSON.stringify(preContinueDiagnostics)}`,
+            ].join(" "),
+          );
+        }
+        // Fail fast on durable code-commit blockers that Continue cannot heal
+        // (missing repair checkpoint). Avoids 45m budget loops.
+        if (
+          continuations >= 2 &&
+          /durable code repair checkpoint is missing|repair_checkpoint_missing|sandbox_project_binding_mismatch|exactly one project covering|Required tool execution failed without producing usable proof|verified passing fast cycle is required|passing_fast_validation_missing/iu.test(
+            nextAction,
+          )
+        ) {
+          throw new Error(
+            [
+              "Set-loose compound stuck on a non-healable tool/validation blocker; Continue cannot create it.",
+              `diagnostics=${JSON.stringify(preContinueDiagnostics)}`,
+            ].join(" "),
+          );
+        }
+        // Continue lives on the Chat composer; Orchestrator/Details can hide it.
+        await page
+          .getByRole("tab", { name: "Chat" })
+          .click({ timeout: 5_000 })
+          .catch(() => undefined);
+        const continuation = page.getByRole("button", {
+          name: /Continue Latest Run/iu,
+        });
+        const visible = await continuation.isVisible().catch(() => false);
+        const enabled = visible
+          ? await continuation.isEnabled().catch(() => false)
+          : false;
+        let continueViaView = false;
+        if (!visible || !enabled) {
+          missingContinuationPolls += 1;
+          // After a few Chat-tab polls, drive Continue through the view API so a
+          // hidden/disabled composer control cannot stall a resumable budget Idle.
+          if (missingContinuationPolls >= 4 && state.continuationCommand) {
+            continueViaView = await page.evaluate(
+              async ({ command }) => {
+                const app = (window as typeof window & { app?: any }).app;
+                const view = app?.workspace?.getLeavesOfType?.(
+                  "agentic-researcher-view",
+                )?.[0]?.view;
+                if (
+                  !view ||
+                  typeof view.submitMissionContinuation !== "function"
+                ) {
+                  return false;
+                }
+                await view.submitMissionContinuation(command);
+                return true;
+              },
+              { command: state.continuationCommand },
+            );
+          }
+          if (!continueViaView) {
+            if (missingContinuationPolls >= 40) {
+              throw new Error(
+                [
+                  "Set-loose compound Idle is resumable but Continue Latest Run stayed unavailable.",
+                  `diagnostics=${JSON.stringify(preContinueDiagnostics)}`,
+                ].join(" "),
+              );
+            }
+            await page.waitForTimeout(250);
+            continue;
+          }
+        }
+        missingContinuationPolls = 0;
+        continuations += 1;
+        if (continuations > maximumContinuations) {
+          throw new Error(
+            [
+              `Set-loose compound exceeded ${maximumContinuations} Continue clicks without Idle completion.`,
+              `diagnostics=${JSON.stringify(preContinueDiagnostics)}`,
+            ].join(" "),
+          );
+        }
+        const rateLimited =
+          /rate limit|usage limit|Retry-After|upgrade for higher limits|429\b/iu.test(
+            nextAction,
+          );
+        console.log(
+          `waitUntilIdleOrComplete ${continueViaView ? "view-submitting" : "clicking"} Continue Latest Run continuation=${continuations} stopReason=${state.stopReason} retryableProviderStop=${retryableProviderStop}${rateLimited ? " rateLimited=true" : ""}`,
+        );
+        if (rateLimited) {
+          // Cloud session limits need a real cooldown; 1s Continues just burn the cap.
+          console.log(
+            "waitUntilIdleOrComplete rate-limit backoff 90s before Continue",
+          );
+          await page.waitForTimeout(90_000);
+        } else if (retryableProviderStop) {
+          await page.waitForTimeout(1_000);
+        }
+        if (!continueViaView) {
+          await continuation.click();
+        }
+        lastProgressKey = "";
+        lastProgressAt = Date.now();
+        await page.waitForTimeout(500);
+        continue;
+      }
+      const idleDiagnostics = await collectIdleWaitDiagnostics(page);
+      console.log(
+        "waitUntilIdleOrComplete Idle:",
+        JSON.stringify(idleDiagnostics),
+      );
+      if (
+        state.stopReason === "error" &&
+        !retryableProviderStop
+      ) {
+        throw new Error(
+          [
+            "Set-loose compound reached Idle with non-retryable stopReason=error; refusing to auto-Continue.",
+            `nextAction=${JSON.stringify(state.nextAction)}`,
+            `diagnostics=${JSON.stringify(idleDiagnostics)}`,
+          ].join(" "),
+        );
+      }
+      return;
+    }
+    await page.waitForTimeout(500);
+  }
+  const timeoutDiagnostics = await collectIdleWaitDiagnostics(page);
+  console.error(
+    "waitUntilIdleOrComplete timeout diagnostics:",
+    JSON.stringify(timeoutDiagnostics),
+  );
+  throw new Error(
+    [
+      `waitUntilIdleOrComplete timed out after ${timeoutMs}ms without Idle.`,
+      `diagnostics=${JSON.stringify(timeoutDiagnostics)}`,
+    ].join(" "),
+  );
+}
+
+/** Additive healing aid: last UI status + ledger snippet (secrets redacted). */
+async function collectIdleWaitDiagnostics(
+  page: Page,
+): Promise<Record<string, unknown>> {
+  return page.evaluate(({ pluginId }) => {
+    const redact = (value: unknown): string =>
+      String(value ?? "")
+        .replace(
+          /(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu,
+          "[REDACTED]",
+        )
+        .slice(0, 500);
+    const plugin = (window as typeof window & { app?: any }).app?.plugins
+      ?.plugins?.[pluginId];
+    const snapshot = plugin?.getMissionRunSnapshot?.();
+    const ledger = snapshot?.lastMissionLedger;
+    const lastError =
+      Array.from(
+        document.querySelectorAll<HTMLElement>(
+          ".agentic-researcher-log-error .agentic-researcher-log-message",
+        ),
+      )
+        .at(-1)
+        ?.textContent ?? "";
+    const recentLogs = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        ".agentic-researcher-log-error .agentic-researcher-log-message, .agentic-researcher-log-status .agentic-researcher-log-message, .agentic-researcher-log-tool .agentic-researcher-log-message",
+      ),
+    )
+      .slice(-8)
+      .map((el) => el.textContent?.trim() ?? "")
+      .filter(Boolean);
+    const lastStatusLog =
+      Array.from(
+        document.querySelectorAll<HTMLElement>(
+          ".agentic-researcher-log-status .agentic-researcher-log-message, .agentic-researcher-run-status-text",
+        ),
+      )
+        .at(-1)
+        ?.textContent ?? "";
+    return {
+      runText:
+        document
+          .querySelector("button.agentic-researcher-run")
+          ?.textContent?.trim() ?? "",
+      statusText:
+        document
+          .querySelector(".agentic-researcher-run-status-text")
+          ?.textContent?.trim() ?? "",
+      approveVisible: Array.from(
+        document.querySelectorAll<HTMLButtonElement>(
+          "button[data-testid='chat-approval-approve']:not(:disabled), button.agentic-researcher-approval-approve:not(:disabled)",
+        ),
+      ).some((button) => button.getClientRects().length > 0),
+      approvalTitle:
+        document
+          .querySelector(
+            ".agentic-researcher-approval-title, .agentic-researcher-chat-approval-title",
+          )
+          ?.textContent?.trim()
+          ?.slice(0, 240) ?? "",
+      approvalReason:
+        document
+          .querySelector(
+            ".agentic-researcher-approval-reason, .agentic-researcher-chat-approval-reason",
+          )
+          ?.textContent?.trim()
+          ?.slice(0, 240) ?? "",
+      stopReason: snapshot?.lastComplete?.stopReason ?? null,
+      autoContinueRecommended:
+        snapshot?.lastComplete?.autoContinueRecommended === true,
+      phase: snapshot?.phase ?? null,
+      ledgerStatus: ledger?.status ?? null,
+      acceptanceStatus: ledger?.acceptance?.status ?? null,
+      canResume: ledger?.canResume === true,
+      continuationCommand:
+        typeof ledger?.continuationCommand === "string"
+          ? ledger.continuationCommand
+          : null,
+      nextAction: redact(ledger?.nextAction),
+      blockerCategory: ledger?.blockerCategory ?? null,
+      lastError: redact(lastError),
+      lastStatusLog: redact(lastStatusLog),
+      recentLogs: recentLogs.map((line) => redact(line)),
+      evidenceCount: ledger?.evidenceCount ?? null,
+      receiptCount: ledger?.receiptCount ?? null,
+      providerUsage: snapshot?.providerUsage ?? null,
+      modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
+        ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
+            phase: item?.phase ?? null,
+            outcome: item?.outcome ?? null,
+            durationMs: item?.durationMs ?? null,
+          }))
+        : [],
+      diagnostics: Array.isArray(snapshot?.diagnosticAttestations)
+        ? snapshot.diagnosticAttestations.slice(-8).map((item: any) => ({
+            id: item?.id ?? null,
+            errorCode: item?.errorCode ?? null,
+            message: redact(item?.message),
+          }))
+        : [],
+    };
+  }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+}
+
+async function safePageWait(
+  page: Page,
+  ms: number,
+  context: string,
+): Promise<void> {
+  if (page.isClosed()) {
+    throw new Error(
+      `Obsidian page closed during ${context}; reopen Obsidian and Continue the durable run if the mission is still resumable.`,
+    );
+  }
+  try {
+    await page.waitForTimeout(ms);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (page.isClosed() || /has been closed/iu.test(message)) {
+      throw new Error(
+        `Obsidian page/context closed during ${context}; reopen Obsidian and Continue the durable run if the mission is still resumable. Cause: ${message}`,
+      );
+    }
+    throw error;
+  }
+}
+
 async function approveUntilMissionComplete(
   page: Page,
   timeoutMs: number,
@@ -266,120 +768,168 @@ async function approveUntilMissionComplete(
   let continuations = 0;
   let missingContinuationPolls = 0;
   let lastDurableState: Record<string, unknown> | null = null;
+  // Long code-stage repair ladders (read → write_expected × N → revalidate)
+  // need more durable Continues than short vault missions.
   const maximumContinuations = Math.max(
     1,
-    Math.min(12, Math.floor(options.maxContinuations ?? 3)),
+    Math.min(24, Math.floor(options.maxContinuations ?? 3)),
   );
   const restartStages = new Set(options.restartAfterProjectStages ?? []);
   const restartedStages = new Set<ProjectLifecycleStageName>();
-  await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
   while (Date.now() < deadline) {
-    // Approval is the time-sensitive foreground action. Never await durable
-    // vault/ledger projection work before looking for the already-rendered
-    // exact approval card, because an active lifecycle write may hold the same
-    // persistence boundary until the approval resolves.
+    // Stay on Chat — do not flip Chat ↔ Run Details every poll (UI flicker).
+    // Soft→Bound Chat Approve and Run Details cards are both clickable via DOM
+    // even when the Details panel is not the active tab.
+    if (page.isClosed()) {
+      throw new Error(
+        `Obsidian page closed while waiting for mission completion; approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
+      );
+    }
     if (await approveFirstVisiblePreparedAction(page)) {
       approvals += 1;
       options.onProgress?.({ approvals, continuations });
-      await page.waitForTimeout(100);
+      await safePageWait(page, 100, "post-approval settle");
       continue;
     }
-    const ui = await page.evaluate(async ({ pluginId }) => {
-      const app = (window as typeof window & { app?: any }).app;
-      const plugin = app?.plugins?.plugins?.[pluginId];
-      const snapshot = plugin?.getMissionRunSnapshot?.();
-      // A lifecycle stage can commit and render the next exact approval after
-      // the outer pre-poll but before this durable read acquires its storage
-      // boundary. Never let that read starve the 120-second approval broker:
-      // return to the approval poll quickly and try durability again later.
-      const durableRestart = await Promise.race([
-        Promise.resolve(plugin?.getDurableMissionRestartReadiness?.())
-          .catch(() => null),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
-      ]) ?? null;
-      const lastError = Array.from(document.querySelectorAll<HTMLElement>(
-        ".agentic-researcher-log-error .agentic-researcher-log-message",
-      )).at(-1)?.textContent ?? "";
-      return {
-        runText: document.querySelector("button.agentic-researcher-run")?.textContent?.trim() ?? "",
-        statusText: document.querySelector(".agentic-researcher-run-status-text")?.textContent?.trim() ?? "",
-        hasEnabledApproval: Array.from(document.querySelectorAll<HTMLButtonElement>(
-          "button.agentic-researcher-approval-approve:not(:disabled)",
-        )).some((button) => button.getClientRects().length > 0),
-        stopReason: snapshot?.lastComplete?.stopReason ?? null,
-        canResume: snapshot?.lastMissionLedger?.canResume === true,
-        continuationCommand:
-          snapshot?.lastMissionLedger?.continuationCommand ?? "",
-        acceptanceStatus:
-          snapshot?.lastMissionLedger?.acceptance?.status ?? null,
-        ledgerStatus: snapshot?.lastMissionLedger?.status ?? null,
-        ledger: snapshot?.lastMissionLedger
-          ? {
-              status: snapshot.lastMissionLedger.status,
-              acceptance: snapshot.lastMissionLedger.acceptance,
-              evidenceCount: snapshot.lastMissionLedger.evidenceCount,
-              receiptCount: snapshot.lastMissionLedger.receiptCount,
-              nextAction: snapshot.lastMissionLedger.nextAction,
-            }
-          : null,
-        graph: snapshot?.lastMissionGraph
-          ? Object.values(snapshot.lastMissionGraph.nodes ?? {}).map((node: any) => ({
-              id: node.id,
-              status: node.status,
-              allowedTools: node.allowedTools,
-              attempts: node.retries?.attempts ?? 0,
-              blockerCode: node.blocker?.code ?? null,
-              blockerMessage:
-                typeof node.blocker?.message === "string"
-                  ? node.blocker.message.slice(0, 500)
-                  : null,
-            }))
-          : [],
-        providerUsage: snapshot?.providerUsage ?? null,
-        lastComplete: snapshot?.lastComplete ?? null,
-        modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
-          ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
-              phase: item?.phase ?? null,
-              outcome: item?.outcome ?? null,
-            }))
-          : [],
-        lastError: lastError
-          .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
-          .slice(0, 500),
-        diagnostics: Array.isArray(snapshot?.diagnosticAttestations)
-          ? snapshot.diagnosticAttestations.slice(-12).map((item: any) => ({
-              id: item.id ?? null,
-              errorCode: item.errorCode ?? null,
-              message: typeof item.message === "string"
-                ? item.message
-                    .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
-                    .slice(0, 500)
-                : "",
-            }))
-          : [],
-        hasGraphBlocker: Object.values(snapshot?.lastMissionGraph?.nodes ?? {}).some(
-          (node: any) => node?.status === "blocked" || Boolean(node?.blocker),
-        ),
-        projectStages: Array.from(new Set(
-          (app?.plugins?.plugins?.[pluginId]?.getProjectLineages?.() ?? [])
-            .flatMap((lineage: any) =>
-              Array.isArray(lineage?.commits)
-                ? lineage.commits.map((commit: any) => commit?.stage)
-                : [],
-            )
-            .filter((stage: unknown) => typeof stage === "string"),
-        )),
-        durablyCompletedLifecycleTools: Array.isArray(
-          durableRestart?.completedLifecycleTools,
-        )
-          ? durableRestart.completedLifecycleTools.filter(
-              (toolName: unknown) => typeof toolName === "string",
-            )
-          : [],
-      };
-    }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    let ui: {
+      runText: string;
+      statusText: string;
+      hasEnabledApproval: boolean;
+      stopReason: string | null;
+      canResume: boolean;
+      continuationCommand: string;
+      acceptanceStatus: string | null;
+      ledgerStatus: string | null;
+      ledger: {
+        status?: string;
+        acceptance?: unknown;
+        evidenceCount?: unknown;
+        receiptCount?: unknown;
+        nextAction?: unknown;
+      } | null;
+      graph: Array<{
+        id: string;
+        status: string;
+        allowedTools: string[];
+        attempts: number;
+        blockerCode: string | null;
+        blockerMessage: string | null;
+      }>;
+      providerUsage: unknown;
+      lastComplete: unknown;
+      modelCallPhases: Array<{ phase: string | null; outcome: string | null }>;
+      lastError: string;
+      diagnostics: Array<{ id: string | null; errorCode: string | null; message: string }>;
+      hasGraphBlocker: boolean;
+      projectStages: string[];
+      durablyCompletedLifecycleTools: string[];
+    };
+    try {
+      ui = await page.evaluate(async ({ pluginId }) => {
+        const app = (window as typeof window & { app?: any }).app;
+        const plugin = app?.plugins?.plugins?.[pluginId];
+        const snapshot = plugin?.getMissionRunSnapshot?.();
+        // A lifecycle stage can commit and render the next exact approval after
+        // the outer pre-poll but before this durable read acquires its storage
+        // boundary. Never let that read starve the 120-second approval broker:
+        // return to the approval poll quickly and try durability again later.
+        const durableRestart = await Promise.race([
+          Promise.resolve(plugin?.getDurableMissionRestartReadiness?.())
+            .catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+        ]) ?? null;
+        const lastError = Array.from(document.querySelectorAll<HTMLElement>(
+          ".agentic-researcher-log-error .agentic-researcher-log-message",
+        )).at(-1)?.textContent ?? "";
+        return {
+          runText: document.querySelector("button.agentic-researcher-run")?.textContent?.trim() ?? "",
+          statusText: document.querySelector(".agentic-researcher-run-status-text")?.textContent?.trim() ?? "",
+          hasEnabledApproval: Array.from(document.querySelectorAll<HTMLButtonElement>(
+            "button.agentic-researcher-approval-approve:not(:disabled), button[data-testid='chat-approval-approve']:not(:disabled)",
+          )).some((button) => button.getClientRects().length > 0),
+          stopReason: snapshot?.lastComplete?.stopReason ?? null,
+          canResume: snapshot?.lastMissionLedger?.canResume === true,
+          continuationCommand:
+            snapshot?.lastMissionLedger?.continuationCommand ?? "",
+          acceptanceStatus:
+            snapshot?.lastMissionLedger?.acceptance?.status ?? null,
+          ledgerStatus: snapshot?.lastMissionLedger?.status ?? null,
+          ledger: snapshot?.lastMissionLedger
+            ? {
+                status: snapshot.lastMissionLedger.status,
+                acceptance: snapshot.lastMissionLedger.acceptance,
+                evidenceCount: snapshot.lastMissionLedger.evidenceCount,
+                receiptCount: snapshot.lastMissionLedger.receiptCount,
+                nextAction: snapshot.lastMissionLedger.nextAction,
+              }
+            : null,
+          graph: snapshot?.lastMissionGraph
+            ? Object.values(snapshot.lastMissionGraph.nodes ?? {}).map((node: any) => ({
+                id: node.id,
+                status: node.status,
+                allowedTools: node.allowedTools,
+                attempts: node.retries?.attempts ?? 0,
+                blockerCode: node.blocker?.code ?? null,
+                blockerMessage:
+                  typeof node.blocker?.message === "string"
+                    ? node.blocker.message.slice(0, 500)
+                    : null,
+              }))
+            : [],
+          providerUsage: snapshot?.providerUsage ?? null,
+          lastComplete: snapshot?.lastComplete ?? null,
+          modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
+            ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
+                phase: item?.phase ?? null,
+                outcome: item?.outcome ?? null,
+              }))
+            : [],
+          lastError: lastError
+            .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
+            .slice(0, 500),
+          diagnostics: Array.isArray(snapshot?.diagnosticAttestations)
+            ? snapshot.diagnosticAttestations.slice(-12).map((item: any) => ({
+                id: item.id ?? null,
+                errorCode: item.errorCode ?? null,
+                message: typeof item.message === "string"
+                  ? item.message
+                      .replace(/(?:Bearer\s+)?(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|lin_api_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]{48,})/giu, "[REDACTED]")
+                      .slice(0, 500)
+                  : "",
+              }))
+            : [],
+          hasGraphBlocker: Object.values(snapshot?.lastMissionGraph?.nodes ?? {}).some(
+            (node: any) => node?.status === "blocked" || Boolean(node?.blocker),
+          ),
+          projectStages: Array.from(new Set(
+            (app?.plugins?.plugins?.[pluginId]?.getProjectLineages?.() ?? [])
+              .flatMap((lineage: any) =>
+                Array.isArray(lineage?.commits)
+                  ? lineage.commits.map((commit: any) => commit?.stage)
+                  : [],
+              )
+              .filter((stage: unknown) => typeof stage === "string"),
+          )),
+          durablyCompletedLifecycleTools: Array.isArray(
+            durableRestart?.completedLifecycleTools,
+          )
+            ? durableRestart.completedLifecycleTools.filter(
+                (toolName: unknown) => typeof toolName === "string",
+              )
+            : [],
+        };
+      }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (page.isClosed() || /has been closed/iu.test(message)) {
+        throw new Error(
+          `Obsidian page closed while reading mission state; approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}. Cause: ${message}`,
+        );
+      }
+      throw error;
+    }
     const preAuthorityReconciliationBlock = ui.diagnostics.some(
-      (diagnostic: { id: string; errorCode: string }) =>
+      (diagnostic) =>
         diagnostic.id === "resume-mutation-reconciliation-required" ||
         diagnostic.errorCode === "mutation_reconciliation_required",
     );
@@ -427,7 +977,7 @@ async function approveUntilMissionComplete(
         approvals += 1;
         options.onProgress?.({ approvals, continuations });
       }
-      await page.waitForTimeout(100);
+      await safePageWait(page, 100, "post-approval settle");
       continue;
     }
     if (ui.runText === "Run Mission" && ui.statusText === "Idle") {
@@ -435,14 +985,24 @@ async function approveUntilMissionComplete(
         return approvals;
       }
       const latestModelCall = ui.modelCallPhases.at(-1);
-      const retryableProviderStop =
-        ui.stopReason === "error" &&
-        ui.canResume &&
-        Boolean(ui.continuationCommand) &&
-        latestModelCall?.phase === "retry" &&
-        latestModelCall.outcome === "error" &&
+      const modelStepFailed =
         typeof ui.ledger?.nextAction === "string" &&
         ui.ledger.nextAction.startsWith("Model step failed:");
+      // Provider 5xx / abort races can finish as stopReason=error or user_stopped
+      // while the ledger still exposes a durable Continue. Treat both as
+      // retryable when the next action is clearly a model-step failure.
+      const retryableProviderStop =
+        ui.canResume &&
+        Boolean(ui.continuationCommand) &&
+        modelStepFailed &&
+        (
+          ui.stopReason === "error" ||
+          ui.stopReason === "user_stopped" ||
+          (
+            latestModelCall?.phase === "retry" &&
+            latestModelCall.outcome === "error"
+          )
+        );
       if (
         !ui.hasGraphBlocker &&
         (
@@ -474,7 +1034,7 @@ async function approveUntilMissionComplete(
               `Mission is resumable but its continuation action stayed unavailable; approved=${approvals}; state=${JSON.stringify(ui)}.`,
             );
           }
-          await page.waitForTimeout(250);
+          await safePageWait(page, 250, "missing-continuation poll");
           continue;
         }
         missingContinuationPolls = 0;
@@ -490,10 +1050,10 @@ async function approveUntilMissionComplete(
         // durable continuation so a transient upstream outage is not retried
         // in a tight loop by the harness.
         if (retryableProviderStop) {
-          await page.waitForTimeout(1_000);
+          await safePageWait(page, 1_000, "provider-retry backoff");
         }
         await continuation.click();
-        await page.waitForTimeout(250);
+        await safePageWait(page, 250, "post-continue settle");
         continue;
       }
       const failureSummary = {
@@ -515,7 +1075,7 @@ async function approveUntilMissionComplete(
       );
     }
     missingContinuationPolls = 0;
-    await page.waitForTimeout(250);
+    await safePageWait(page, 250, "mission-running poll");
   }
   const safeState = await page.evaluate(({ pluginId }) => {
     const app = (window as typeof window & { app?: any }).app;
@@ -561,27 +1121,53 @@ async function approveUntilMissionComplete(
 }
 
 async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
-  return page.evaluate(() => {
-    const button = Array.from(document.querySelectorAll<HTMLButtonElement>(
-      "button.agentic-researcher-approval-approve:not(:disabled)",
-    ))
-      .filter((candidate) => candidate.getClientRects().length > 0)
-      .at(-1);
-    if (!button) return false;
-    // Click first so host handlers still see an enabled control, then disable
-    // both actions so a slow async decision cannot be double-clicked on the
-    // next poll tick. Treat the click as success even before host disable.
-    button.click();
-    const card = button.closest(".agentic-researcher-approval-card");
-    for (const action of Array.from(
-      card?.querySelectorAll<HTMLButtonElement>(
-        "button.agentic-researcher-approval-approve, button.agentic-researcher-approval-deny",
-      ) ?? [button],
-    )) {
-      action.disabled = true;
+  // Click Approve in-place via DOM — no tab switching. Prefer Chat Soft→Bound
+  // Approve, then any Run Details approve card (including when Details is hidden).
+  if (page.isClosed()) {
+    throw new Error(
+      "Obsidian page closed while looking for prepared approvals; reopen Obsidian and Continue the durable run if the mission is still resumable.",
+    );
+  }
+  try {
+    return await page.evaluate(() => {
+      const buttons = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(
+          "button[data-testid='chat-approval-approve']:not(:disabled), button.agentic-researcher-approval-approve:not(:disabled)",
+        ),
+      );
+      const chat = buttons.find(
+        (candidate) => candidate.getAttribute("data-testid") === "chat-approval-approve",
+      );
+      const button =
+        chat ??
+        buttons.find((candidate) => candidate.getClientRects().length > 0) ??
+        buttons.at(-1);
+      if (!button) return false;
+      // Click first so host handlers still see an enabled control, then disable
+      // both actions so a slow async decision cannot be double-clicked on the
+      // next poll tick. Treat the click as success even before host disable.
+      button.click();
+      const card = button.closest(
+        ".agentic-researcher-approval-card, .agentic-researcher-chat-attention-controls, .agentic-researcher-chat-attention",
+      );
+      for (const action of Array.from(
+        card?.querySelectorAll<HTMLButtonElement>(
+          "button.agentic-researcher-approval-approve, button.agentic-researcher-approval-deny, button[data-testid='chat-approval-approve'], button[data-testid='chat-approval-deny']",
+        ) ?? [button],
+      )) {
+        action.disabled = true;
+      }
+      return true;
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (page.isClosed() || /has been closed/iu.test(message)) {
+      throw new Error(
+        `Obsidian page/context closed while clicking prepared approval. Cause: ${message}`,
+      );
     }
-    return true;
-  });
+    throw error;
+  }
 }
 
 async function continueLatestRunAfterStageRestart(page: Page): Promise<boolean> {
@@ -695,43 +1281,107 @@ async function assertProductionClientReady(
   config: E2EAiConfig,
   provider: "ollama" | "openai_compatible",
 ): Promise<void> {
-  const state = await page.evaluate(({ pluginId }) => {
-    const app = (window as typeof window & { app?: any }).app;
-    const plugin = app?.plugins?.plugins?.[pluginId];
-    const views = app?.workspace?.getLeavesOfType?.("agentic-researcher-view") ?? [];
-    return {
-      settingsModel: plugin?.settings?.model ?? "",
-      descriptor: plugin?.createModelClient?.()?.descriptor ?? null,
-      mockInstalled: Boolean(plugin?.__playwrightE2EMockInstalled),
-      viewMocks: views.map((leaf: any) => Boolean(leaf.view?.plugin?.__playwrightE2EMockInstalled)),
-    };
-  }, { pluginId: NATIVE_CORE_PLUGIN_ID });
-  expect(state.settingsModel).toBe(config.model);
-  expect(state.descriptor).toMatchObject({
-    provider,
-    model: config.model,
-    transportKind: "production",
+  await verifyWithWorkerConnectionAttestation({
+    registry: VERIFIED_REAL_AI_CONNECTIONS,
+    target: { provider, baseUrl: config.baseUrl, model: config.model },
+    verify: async ({ reuseWorkerAttestation }) =>
+      page.evaluate(async ({ pluginId, reuseWorkerAttestation }) => {
+        const app = (window as typeof window & { app?: any }).app;
+        const plugin = app?.plugins?.plugins?.[pluginId];
+        const views =
+          app?.workspace?.getLeavesOfType?.("agentic-researcher-view") ?? [];
+        if (reuseWorkerAttestation) {
+          if (!plugin?.hasVerifiedModelConnection?.()) {
+            if (typeof plugin?.markModelConnectionVerifiedForHarness !== "function") {
+              throw new Error("Harness connection-reuse marker is unavailable.");
+            }
+            plugin.markModelConnectionVerifiedForHarness({
+              message:
+                "Reused the exact live connection attestation from this serial Playwright worker.",
+            });
+          }
+        } else {
+          if (typeof plugin?.testModelConnection !== "function") {
+            throw new Error("Production model connection test is unavailable.");
+          }
+          // The first proof for this exact tuple is always fresh, even when
+          // the disposable vault happens to contain matching persisted state.
+          await plugin.testModelConnection();
+        }
+        return {
+          settingsModel: plugin?.settings?.model ?? "",
+          descriptor: plugin?.createModelClient?.()?.descriptor ?? null,
+          connection: plugin?.getModelConnectionStatus?.() ?? null,
+          verified: Boolean(plugin?.hasVerifiedModelConnection?.()),
+          mockInstalled: Boolean(plugin?.__playwrightE2EMockInstalled),
+          viewMocks: views.map((leaf: any) =>
+            Boolean(leaf.view?.plugin?.__playwrightE2EMockInstalled),
+          ),
+        };
+      }, { pluginId: NATIVE_CORE_PLUGIN_ID, reuseWorkerAttestation }),
+    validate: async (state) => {
+      assertRealAiLaneNonMock({
+        mockInstalled: state.mockInstalled,
+        viewMocks: state.viewMocks,
+        descriptorTransportKind: state.descriptor?.transportKind ?? null,
+        settingsModel: state.settingsModel,
+        expectedModel: config.model,
+      });
+      expect(state.settingsModel).toBe(config.model);
+      expect(state.descriptor).toMatchObject({
+        provider,
+        model: config.model,
+        transportKind: "production",
+      });
+      expect(state.connection, JSON.stringify(state.connection)).toMatchObject({
+        status: "ready",
+        provider,
+        model: config.model,
+      });
+      expect(state.verified).toBe(true);
+      expect(state.mockInstalled).toBe(false);
+      expect(state.viewMocks.every((value: boolean) => value === false)).toBe(
+        true,
+      );
+      await expect(page.locator("button.agentic-researcher-run")).toBeEnabled({
+        timeout: 30_000,
+      });
+    },
   });
-  expect(state.mockInstalled).toBe(false);
-  expect(state.viewMocks.every((value: boolean) => value === false)).toBe(true);
 }
 
 async function submitMission(
   page: Page,
   prompt: string,
-  options: { waitForCompletion?: boolean; timeoutMs: number },
+  options: {
+    waitForCompletion?: boolean;
+    timeoutMs: number;
+    clearChatFirst?: boolean;
+  },
 ): Promise<void> {
   await page.getByRole("tab", { name: "Chat" }).click();
+  if (options.clearChatFirst !== false) {
+    await clearChatInline(page);
+  }
   const input = page.locator("textarea.agentic-researcher-prompt");
-  await input.fill(prompt);
-  await page.locator("button.agentic-researcher-run").click();
+  const runButton = page.locator("button.agentic-researcher-run");
   // Compound DU prompts exceed chat bubble text; match a stable unique marker.
   const marker =
     prompt.match(/\bDU0[0-9]_[A-Za-z0-9_]+\b/u)?.[0] ??
+    prompt.match(/\bFLOW_REAL_[A-Za-z0-9_]+\b/u)?.[0] ??
+    prompt.match(/\bCOMPOUND_REAL_[A-Za-z0-9_]+\b/u)?.[0] ??
+    prompt.match(/\bCOMPOUND_SMOKE_[A-Za-z0-9_]+\b/u)?.[0] ??
+    prompt.match(/\bOBS_HELLO_[A-Za-z0-9_]+\b/u)?.[0] ??
     prompt.match(/\bE2E Agent Tests\/[^\s]+\.md\b/u)?.[0] ??
     prompt.slice(0, 96);
-  await expect(page.locator(".agentic-researcher-log-user", { hasText: marker }).last())
-    .toBeVisible({ timeout: 15_000 });
+  await expect(runButton).toBeEnabled({ timeout: 30_000 });
+  await input.fill(prompt);
+  await runButton.click();
+  await expect(
+    page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
+      hasText: marker,
+    }).last(),
+  ).toBeVisible({ timeout: 30_000 });
   if (options.waitForCompletion === false) return;
   await waitForMissionComplete(page, options.timeoutMs);
 }
@@ -935,15 +1585,186 @@ async function attestProductionRun(
   const snapshot = await page.evaluate(async ({ pluginId }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
     const current = plugin?.getMissionRunSnapshot?.() ?? null;
-    const ledgerPath = current?.persistedProjection?.missionLedgerPath;
-    const ledgerFile = ledgerPath
-      ? (window as typeof window & { app?: any }).app?.vault?.getFileByPath?.(ledgerPath)
-      : null;
-    if (!current || !ledgerFile) return current;
+    if (!current) return current;
+    const runId = typeof current.runId === "string" ? current.runId.trim() : "";
+    if (!runId) throw new Error("Current production run has no run id for ledger attestation.");
+    const configRootRunId =
+      typeof current.lastConfig?.runId === "string"
+        ? current.lastConfig.runId.trim()
+        : "";
+    if (!configRootRunId || configRootRunId !== runId) {
+      throw new Error(
+        "Current production run does not match its exact config root identity.",
+      );
+    }
+    const summaryRunId =
+      typeof current.lastMissionLedger?.runId === "string"
+        ? current.lastMissionLedger.runId.trim()
+        : "";
+    const configLedgerRunId =
+      typeof current.lastConfig?.missionLedger?.runId === "string"
+        ? current.lastConfig.missionLedger.runId.trim()
+        : "";
+    if (!summaryRunId || !configLedgerRunId || summaryRunId !== configLedgerRunId) {
+      throw new Error(
+        "Current production run does not have one exact config/summary ledger identity.",
+      );
+    }
+    const ledgerRunId = summaryRunId;
+    // persistedProjection describes startup hydration and is intentionally
+    // cleared once a fresh run publishes authority. Resolve the current run's
+    // exact canonical ledger path from its identity instead of silently
+    // treating a null/stale projection as an empty persisted proof set.
+    const safeRunId =
+      ledgerRunId
+        .replace(/[^A-Za-z0-9._-]+/gu, "-")
+        .replace(/^-+|-+$/gu, "")
+        .slice(0, 120) || "run";
+    const ledgerPath = `Agent Runs/${safeRunId}.md`;
+    const app = (window as typeof window & { app?: any }).app;
+    const ledgerFile = app?.vault?.getFileByPath?.(ledgerPath);
     try {
-      const markdown = await (window as typeof window & { app?: any }).app.vault.read(ledgerFile);
+      const markdown = ledgerFile
+        ? await app.vault.read(ledgerFile)
+        : await app?.vault?.adapter?.read?.(ledgerPath);
+      if (typeof markdown !== "string" || markdown.length === 0) {
+        throw new Error(`Current production ledger is missing at ${ledgerPath}.`);
+      }
       const match = /## Mission Ledger\r?\n```json\r?\n([\s\S]*?)\r?\n```/u.exec(markdown);
       const ledger = match ? JSON.parse(match[1]) : null;
+      const runtimeMatch = /## Runtime Snapshot\r?\n```json\r?\n([\s\S]*?)\r?\n```/u.exec(markdown);
+      const runtime = runtimeMatch ? JSON.parse(runtimeMatch[1]) : null;
+      if (!ledger || ledger.runId !== ledgerRunId) {
+        throw new Error(`Persisted ledger identity mismatch at ${ledgerPath}.`);
+      }
+      if (
+        !runtime ||
+        runtime.runId !== ledgerRunId ||
+        runtime.lineage?.segmentId !== ledgerRunId
+      ) {
+        throw new Error(`Persisted runtime identity mismatch at ${ledgerPath}.`);
+      }
+      if (ledgerRunId !== runId) {
+        const graph = current.lastMissionGraph;
+        const orchestratorRootBound =
+          graph?.missionId === runId &&
+          graph?.nodes?.dispatch?.executorId === "research-team";
+        if (!orchestratorRootBound) {
+          throw new Error(
+            `Persisted child ledger ${ledgerRunId} is not bound to research-team root ${runId}.`,
+          );
+        }
+
+        const leadRootRunId = `${runId}-lead`;
+        const lineage = runtime.lineage;
+        const segmentIndex = lineage?.segmentIndex;
+        const priorSegmentIds = Array.isArray(lineage?.priorSegmentIds)
+          ? lineage.priorSegmentIds
+          : [];
+        const parentSegmentId =
+          typeof lineage?.parentSegmentId === "string"
+            ? lineage.parentSegmentId
+            : "";
+        if (lineage?.rootRunId !== leadRootRunId) {
+          throw new Error("Research-team lead lineage has the wrong root identity.");
+        }
+        if (segmentIndex === 0) {
+          if (
+            ledgerRunId !== leadRootRunId ||
+            parentSegmentId ||
+            priorSegmentIds.length !== 0
+          ) {
+            throw new Error("Initial research-team lead lineage is invalid.");
+          }
+        } else {
+          const uniquePriorSegmentIds = new Set(priorSegmentIds);
+          if (
+            !Number.isInteger(segmentIndex) ||
+            segmentIndex < 1 ||
+            priorSegmentIds.length !== segmentIndex ||
+            priorSegmentIds[0] !== leadRootRunId ||
+            priorSegmentIds.at(-1) !== parentSegmentId ||
+            uniquePriorSegmentIds.size !== priorSegmentIds.length ||
+            uniquePriorSegmentIds.has(ledgerRunId)
+          ) {
+            throw new Error("Continued research-team lead lineage is invalid.");
+          }
+        }
+      }
+      const nonNegativeNumber = (value: unknown): number | null =>
+        typeof value === "number" && Number.isFinite(value) && value >= 0
+          ? value
+          : null;
+      const nonNegativeInteger = (value: unknown): number | null => {
+        const numeric = nonNegativeNumber(value);
+        return numeric !== null && Number.isInteger(numeric) ? numeric : null;
+      };
+      const effort = ledger?.researchPlan?.effort;
+      const effortUsage = ledger?.researchPlan?.effortUsage;
+      const effortClosure = ledger?.researchPlan?.effortClosure;
+      const tier = ["quick", "standard", "deep", "extended"].includes(
+        effort?.tier,
+      )
+        ? effort.tier
+        : null;
+      const closureReason = [
+        "duration_cap_reached",
+        "model_step_cap_reached",
+        "tool_call_cap_reached",
+        "research_budget_reached",
+      ].includes(effortClosure?.reason)
+        ? effortClosure.reason
+        : null;
+      // Explicit projection only: never expose planner reasons, prompt text,
+      // evidence content, source URLs, credentials, or provider payloads.
+      current.redactedResearchEffort = tier
+        ? {
+            tier,
+            budget: {
+              maxModelStepsPerSegment: nonNegativeInteger(
+                effort?.budget?.maxModelStepsPerSegment,
+              ),
+              maxToolCallsPerSegment: nonNegativeInteger(
+                effort?.budget?.maxToolCallsPerSegment,
+              ),
+              maxSegments: nonNegativeInteger(effort?.budget?.maxSegments),
+              maxTotalModelSteps: nonNegativeInteger(
+                effort?.budget?.maxTotalModelSteps,
+              ),
+              maxTotalToolCalls: nonNegativeInteger(
+                effort?.budget?.maxTotalToolCalls,
+              ),
+              maxDurationMs:
+                effort?.budget?.maxDurationMs === null
+                  ? null
+                  : nonNegativeNumber(effort?.budget?.maxDurationMs),
+            },
+            usage: {
+              modelSteps: nonNegativeInteger(effortUsage?.modelSteps),
+              toolCalls: nonNegativeInteger(effortUsage?.toolCalls),
+              segmentsStarted: nonNegativeInteger(
+                effortUsage?.segmentsStarted,
+              ),
+              modelStepsInCurrentSegment: nonNegativeInteger(
+                effortUsage?.modelStepsInCurrentSegment,
+              ),
+              toolCallsInCurrentSegment: nonNegativeInteger(
+                effortUsage?.toolCallsInCurrentSegment,
+              ),
+              completionSegmentsStarted: nonNegativeInteger(
+                effortUsage?.completionSegmentsStarted,
+              ),
+              elapsedMs: nonNegativeNumber(effortUsage?.elapsedMs),
+            },
+            closure: effortClosure
+              ? {
+                  requested: effortClosure.requested === true,
+                  attempts: nonNegativeInteger(effortClosure.attempts),
+                  reason: closureReason,
+                }
+              : null,
+          }
+        : null;
       current.redactedEvidenceConflicts = Array.isArray(ledger?.evidenceConflicts)
         ? ledger.evidenceConflicts.map((conflict: any) => ({
             id: conflict?.id ?? null,
@@ -963,9 +1784,11 @@ async function attestProductionRun(
             )
             .slice(0, 24)
         : [];
-    } catch {
-      current.redactedEvidenceConflicts = [];
-      current.redactedClaimPassageIds = [];
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Unable to attest the current production ledger at ${ledgerPath}: ${detail}`,
+      );
     }
     return current;
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });

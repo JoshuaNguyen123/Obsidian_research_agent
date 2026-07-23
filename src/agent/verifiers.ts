@@ -29,6 +29,7 @@ import {
   type MissionPlanProofKind,
   type MissionPlanTask,
 } from "./missionPlan";
+import { isOptionalMissionGraphNodeId } from "./missionGraphAuthority";
 
 export type VerifierKind =
   | "proof_contract"
@@ -101,6 +102,9 @@ export function runMissionVerifiers({
   const checks: VerificationCheck[] = [];
   if (plan) {
     for (const task of plan.tasks) {
+      if (isOptionalMissionGraphNodeId(task.id)) {
+        continue;
+      }
       checks.push(
         verifyTaskProofContract(
           task,
@@ -121,7 +125,11 @@ export function runMissionVerifiers({
     checks.push(verifyWordCount(plan, evidenceList, verifierNow));
   }
   if (plan) {
-    for (const task of plan.tasks.filter(taskRequiresSourceCoverageCheck)) {
+    for (const task of plan.tasks.filter(
+      (candidate) =>
+        !isOptionalMissionGraphNodeId(candidate.id) &&
+        taskRequiresSourceCoverageCheck(candidate),
+    )) {
       checks.push(
         verifySourceCoverage(task, plan.tasks.length === 1, evidenceList, verifierNow),
       );

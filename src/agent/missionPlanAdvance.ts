@@ -49,7 +49,9 @@ export function advanceMissionPlanFromToolResult({
             ? CODE_RUN_SUCCESS_EVIDENCE_ID
             : CODE_RUN_FAILURE_EVIDENCE_ID,
         ]
-      : [];
+      : toolName === "code_commit_verified" && result.ok
+        ? [CODE_RUN_SUCCESS_EVIDENCE_ID, "tool:code_commit_verified"]
+        : [];
   const nextTask: MissionPlanTask = {
     ...active,
     status: active.status,

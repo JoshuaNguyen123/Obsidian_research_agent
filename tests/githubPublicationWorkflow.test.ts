@@ -84,15 +84,17 @@ test("draft PR becomes ready, receives fresh double approval, merges, and finali
     "receipt-ready",
     "receipt-merge",
     "receipt-linear-link",
-    "receipt-linear",
     "receipt-obsidian",
+    "receipt-linear",
   ]);
 
-  const waitingObsidian = harness.checkpoints.find(
-    (checkpoint) => checkpoint.status === "linear_completed",
+  const waitingLinearCompletion = harness.checkpoints.find(
+    (checkpoint) =>
+      checkpoint.status === "waiting_linear_completion" &&
+      checkpoint.obsidianReceiptId === "receipt-obsidian",
   );
-  assert.ok(waitingObsidian);
-  const resumed = await workflow.resumeFinalization(waitingObsidian);
+  assert.ok(waitingLinearCompletion);
+  const resumed = await workflow.resumeFinalization(waitingLinearCompletion);
   assert.equal(resumed.status, "finalized");
   assert.equal(resumed.mergeSha, SHA_C);
   assert.equal(harness.pushes, 1);
@@ -147,7 +149,7 @@ test("non-explicit publication and non-agent branch fail before push", async () 
   assert.equal(harness.pushes, 0);
 });
 
-test("draft-pr completion proof durably links Linear, completes it, backlinks Obsidian, and never merges", async () => {
+test("draft-pr completion proof links Linear, reflects in Obsidian, then completes Linear without merging", async () => {
   const harness = createHarness();
   const workflow = new GitHubPublicationWorkflowV1(harness.options);
 

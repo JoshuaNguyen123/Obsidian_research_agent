@@ -66,6 +66,56 @@ test("callback checkpoint store provides serialized create/update CAS without al
   assert.equal((await store.load(created.id))?.sequence, 1);
 });
 
+test("checkpoint store preserves UTF-8 canonical diff order across mixed-case paths", async () => {
+  let namespace: CodeRepairCheckpointNamespaceV1 | null = null;
+  const store = new CallbackCodeRepairCheckpointStoreV1({
+    async readNamespace() {
+      return namespace ? structuredClone(namespace) : null;
+    },
+    async writeNamespace(next, expectedRevision) {
+      assert.equal(expectedRevision, namespace?.revision ?? 0);
+      namespace = structuredClone(next);
+      return true;
+    },
+  });
+  const mixed = await checkpoint(0, "committing");
+  const files = [
+    {
+      path: "README.md",
+      status: "modified" as const,
+      previousPath: null,
+      beforeSha256: BEFORE_HASH,
+      afterSha256: AFTER_HASH,
+    },
+    {
+      path: "package.json",
+      status: "modified" as const,
+      previousPath: null,
+      beforeSha256: BEFORE_HASH,
+      afterSha256: AFTER_HASH,
+    },
+  ];
+  const patch = "diff --git a/README.md b/README.md\n+fixed\n";
+  mixed.finalDiff = {
+    version: 1,
+    kindName: "code_diff_readback",
+    id: "mixed-case-diff",
+    operationId: "mixed-case-diff-readback",
+    baseSha: BASE_SHA,
+    patch,
+    files,
+    changedPaths: files.map((file) => file.path),
+    readAt: NOW,
+    fingerprint: await sha256Fingerprint({ baseSha: BASE_SHA, patch, files }),
+  };
+
+  await store.save(mixed, null);
+  assert.deepEqual(
+    (await store.load(mixed.id))?.finalDiff?.changedPaths,
+    ["README.md", "package.json"],
+  );
+});
+
 test("checkpoint store rejects corrupt namespaces and terminal rewrites", async () => {
   let namespace: CodeRepairCheckpointNamespaceV1 | null = null;
   const store = new CallbackCodeRepairCheckpointStoreV1({

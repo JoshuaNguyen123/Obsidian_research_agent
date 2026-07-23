@@ -28,6 +28,7 @@ const snapshot = {
     },
   ],
   workflowStates: [
+    { id: "ready-1", name: "Ready", type: "unstarted", teamId: "team-1" },
     { id: "started-1", name: "In Progress", type: "started", teamId: "team-1" },
     { id: "completed-1", name: "Done", type: "completed", teamId: "team-1" },
     { id: "blocked-1", name: "Blocked", type: "canceled", teamId: "team-1" },
@@ -36,7 +37,7 @@ const snapshot = {
     { operation: "connection.context", enabled: true, itemCount: 1, truncated: false, errorCode: null },
     { operation: "teams.list", enabled: true, itemCount: 1, truncated: false, errorCode: null },
     { operation: "projects.list", enabled: true, itemCount: 1, truncated: false, errorCode: null },
-    { operation: "workflow_states.list", enabled: true, itemCount: 3, truncated: false, errorCode: null },
+    { operation: "workflow_states.list", enabled: true, itemCount: 4, truncated: false, errorCode: null },
   ],
   capabilities: [
     { id: "authenticated_connection", enabled: true, summary: "Connected." },
@@ -79,6 +80,7 @@ test("Linear queue and hierarchy readiness are derived from discovered bindings,
     evaluateLinearQueueConfiguration(snapshot, {
       teamId: "team-1",
       projectId: "project-1",
+      readyStateId: "ready-1",
       startedStateId: "started-1",
       completedStateId: "completed-1",
       blockedStateId: "blocked-1",
@@ -92,6 +94,7 @@ test("Linear queue and hierarchy readiness are derived from discovered bindings,
     evaluateLinearQueueConfiguration(snapshot, {
       teamId: "team-injected",
       projectId: "project-1",
+      readyStateId: "ready-1",
       startedStateId: "started-1",
       completedStateId: "completed-1",
     }).reason,
@@ -105,6 +108,7 @@ test("Linear selection migration preserves known IDs and only auto-selects unamb
     reconcileLinearSelections(snapshot, {
       teamId: "legacy-team",
       projectId: "legacy-project",
+      readyStateId: "legacy-ready",
       startedStateId: "legacy-started",
       completedStateId: "legacy-completed",
       blockedStateId: "legacy-blocked",
@@ -112,6 +116,7 @@ test("Linear selection migration preserves known IDs and only auto-selects unamb
     {
       teamId: "team-1",
       projectId: "project-1",
+      readyStateId: "ready-1",
       startedStateId: "started-1",
       completedStateId: "completed-1",
       blockedStateId: "",

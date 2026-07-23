@@ -6,6 +6,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import { sha256Fingerprint } from "../packages/headless-runtime/src/canonicalize";
 import type { PreparedActionV1, ScopedExtensionContextV1 } from "../packages/core-api/src";
 import {
@@ -165,7 +169,7 @@ test("durable validation registry captures only exact request-scoped sandbox evi
   );
 });
 
-test("fixed-argv ephemeral index commits mixed modified and WorkspaceManager-authorized added files", async (t) => {
+test("fixed-argv commit preserves canonical mixed-case path order through checkpoint and Git readback", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "repair-live-adapters-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const repository = path.join(root, "repository");
@@ -176,9 +180,9 @@ test("fixed-argv ephemeral index commits mixed modified and WorkspaceManager-aut
   await git(repository, "config", "user.name", "Fixture");
   await git(repository, "config", "user.email", "fixture@example.invalid");
   await git(repository, "config", "core.autocrlf", "false");
-  await fs.mkdir(path.join(repository, "src"), { recursive: true });
+  await fs.mkdir(path.join(repository, "checkers"), { recursive: true });
+  await fs.writeFile(path.join(repository, "README.md"), "broken\n");
   await fs.writeFile(path.join(repository, "package.json"), "{\"scripts\":{\"test\":\"node --test\"}}\n");
-  await fs.writeFile(path.join(repository, "src", "index.ts"), "export const value = 'broken';\n");
   await git(repository, "add", "--all");
   await git(repository, "commit", "-m", "base");
   const baseSha = await gitText(repository, "rev-parse", "HEAD");
@@ -199,18 +203,18 @@ test("fixed-argv ephemeral index commits mixed modified and WorkspaceManager-aut
     trusted: true,
   });
   const lease = await manager.acquireLease("workspace-1", "mission-1");
-  const before = await manager.read("workspace-1", "src/index.ts");
+  const before = await manager.read("workspace-1", "README.md");
   await manager.writeExpected(
     "workspace-1",
     lease.lease!.id,
-    "src/index.ts",
-    "export const value = 'fixed';\n",
+    "README.md",
+    "fixed\n",
     before.sha256,
   );
   await manager.createFile(
     "workspace-1",
     lease.lease!.id,
-    "src/added.ts",
+    "checkers/added.ts",
     "export const added = true;\n",
   );
   await manager.releaseLease("workspace-1", lease.lease!.id);
@@ -220,10 +224,10 @@ test("fixed-argv ephemeral index commits mixed modified and WorkspaceManager-aut
     displayName: "Fixture",
     repositoryRoot: canonicalRepository,
     defaultBranch: "main",
-    files: ["package.json", "src/added.ts", "src/index.ts"],
+    files: ["README.md", "checkers/added.ts", "package.json"],
     fileContents: { "package.json": "{\"scripts\":{\"test\":\"node --test\"}}\n" },
     runtimeDigests: { node: SHA("5") },
-    allowedPaths: ["package.json", "src/added.ts", "src/index.ts"],
+    allowedPaths: ["README.md", "checkers/added.ts", "package.json"],
   });
   const runner = new SpawnFixedArgvGitRunnerV1();
   const artifacts = new FixedArgvArtifactHashReaderV1(runner);
@@ -259,8 +263,8 @@ test("fixed-argv ephemeral index commits mixed modified and WorkspaceManager-aut
     maxCycles: 3,
   });
   const rawDiff = await proof.readDiff({ operationId: "proof-1", request });
-  assert.deepEqual(rawDiff.files.map((file) => file.path), ["src/added.ts", "src/index.ts"]);
-  assert.deepEqual(rawDiff.files.map((file) => file.status), ["added", "modified"]);
+  assert.deepEqual(rawDiff.files.map((file) => file.path), ["README.md", "checkers/added.ts"]);
+  assert.deepEqual(rawDiff.files.map((file) => file.status), ["modified", "added"]);
   assert.equal(await gitText(canonicalWorktree, "diff", "--cached", "--name-only"), "");
   const diff: CodeDiffReceiptV1 = {
     version: 1,
@@ -372,6 +376,21 @@ test("fixed-argv ephemeral index commits mixed modified and WorkspaceManager-aut
   );
   const committedHead = await gitText(canonicalWorktree, "rev-parse", "HEAD");
   assert.notEqual(committedHead, baseSha);
+  assert.equal(
+    await gitText(
+      canonicalWorktree,
+      "show",
+      "--no-patch",
+      "--format=%an%x00%ae%x00%cn%x00%ce",
+      committedHead,
+    ),
+    [
+      AGENT_GIT_COMMIT_NAME_V1,
+      AGENT_GIT_COMMIT_EMAIL_V1,
+      AGENT_GIT_COMMIT_NAME_V1,
+      AGENT_GIT_COMMIT_EMAIL_V1,
+    ].join("\0"),
+  );
   const reconciled = await handlers.executePreparedVerifiedCommit(
     commitPrepared.action,
     repairContext(commitPrepared.action),
@@ -613,14 +632,18 @@ async function validationBindingFor(input: {
 }): Promise<NonNullable<CodeValidationReceiptV1["binding"]>> {
   const stagedFiles = input.files
     .map(({ path, sha256, bytes }) => ({ path, sha256, bytes }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+    .sort((left, right) =>
+      Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8")),
+    );
   return {
     requestId: input.requestId,
     workspaceId: input.workspaceId,
     profileKey: input.profileKey,
     inputWorkspaceManifestFingerprint: input.manifestFingerprint,
     validatedWorkspaceManifestFingerprint: input.manifestFingerprint,
-    workspaceChangedPaths: [...input.changedPaths].sort(),
+    workspaceChangedPaths: [...input.changedPaths].sort((left, right) =>
+      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")),
+    ),
     stagingManifestFingerprint: await sha256Fingerprint(stagedFiles),
     stagedFiles,
     importedArtifacts: [],

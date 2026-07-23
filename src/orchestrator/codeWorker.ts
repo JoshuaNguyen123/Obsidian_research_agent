@@ -3,6 +3,7 @@ import { appendToolTranscript } from "../model/toolTranscript";
 import { serializeToolResultForModel } from "../model/toolResultPayload";
 import type {
   ModelChatMessage,
+  ModelChatRequest,
   ModelClient,
   ModelToolCall,
   ModelToolDefinition,
@@ -73,6 +74,9 @@ const BLOCKED_MUTATION_EXTENSIONS = new Set([
   ".sh",
 ]);
 
+/** Canonical model name for direct requests to https://ollama.com/api. */
+export const OLLAMA_CLOUD_CODE_WORKER_MODEL = "kimi-k2.7-code";
+
 export interface CodeWorkerResult {
   handoff: WorkerHandoff;
   summary: string;
@@ -129,15 +133,18 @@ export async function runCodeWorker(input: {
   let toolCalls = 0;
   let modelSteps = 0;
   let summary = "";
+  const modelRequestProfile = resolveCodeWorkerModelRequestProfile(
+    input.modelClient,
+  );
 
   for (let step = 1; step <= maxSteps; step += 1) {
     throwIfAborted(input.abortSignal);
     modelSteps = step;
     await input.events?.onStatus?.(`Code worker step ${step}/${maxSteps}`);
     const response = await input.modelClient.chat({
+      ...modelRequestProfile,
       messages,
       tools: CODE_WORKER_TOOL_DEFINITIONS,
-      think: false,
       abortSignal: input.abortSignal,
       evidencePhase: "worker",
     });
@@ -217,6 +224,27 @@ export async function runCodeWorker(input: {
     modelSteps,
     toolCalls,
   };
+}
+
+/**
+ * Route only a verified direct Ollama Cloud client to the cloud code model.
+ * Local Ollama, custom endpoints, and descriptor-less test/legacy clients keep
+ * the previous request shape and non-thinking behavior.
+ */
+export function resolveCodeWorkerModelRequestProfile(
+  modelClient: ModelClient,
+): Pick<ModelChatRequest, "model" | "think"> {
+  const descriptor = modelClient.descriptor;
+  if (
+    descriptor?.provider === "ollama" &&
+    descriptor.endpointCategory === "ollama_cloud"
+  ) {
+    return {
+      model: OLLAMA_CLOUD_CODE_WORKER_MODEL,
+      think: true,
+    };
+  }
+  return { think: false };
 }
 
 export async function executeCodeWorkerTool(input: {

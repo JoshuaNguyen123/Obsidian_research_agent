@@ -207,6 +207,7 @@ function validState(): DailyUseDu06SafeLifecycleState {
               targetedValidationFingerprint,
               fullValidationFingerprint,
             ],
+            diffFingerprint: fp("f"),
             targetedValidationPassed: true,
             freshFullValidationPassed: true,
             commitSha,

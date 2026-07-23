@@ -11,6 +11,16 @@ import {
   isVaultReadEvidence,
 } from "./missionPlan";
 import { hasExplicitNoWebIntent } from "./evidenceIntent";
+import {
+  RESEARCH_EFFORT_TIER_ORDER,
+  resolveResearchEffortBudget,
+  selectInitialResearchEffort,
+  type ResearchEffortBudget,
+  type ResearchEffortSelection,
+  type ResearchEffortUsage,
+  type ResearchFreshnessRequirement,
+  type ResearchRisk,
+} from "./researchEffortPolicy";
 
 export type ResearchMode = "none" | "deep_web" | "deep_vault" | "deep_hybrid";
 export type ResearchEvidenceType = "web_source" | "vault_note" | "either";
@@ -57,6 +67,16 @@ export interface ResearchPlan {
   subquestions: ResearchSubquestion[];
   evidenceIds: string[];
   status: "pending" | "in_progress" | "complete" | "blocked";
+  /** Host-selected bounded effort. Optional only for legacy persisted plans. */
+  effort?: ResearchEffortSelection;
+  /** Durable, cumulative usage for the accepted-research lifecycle stage. */
+  effortUsage?: ResearchEffortUsage;
+  /** A spent research budget gets exactly one model turn to publish its package. */
+  effortClosure?: {
+    requested: boolean;
+    attempts: number;
+    reason?: string;
+  };
   nextAction?: ResearchNextAction;
 }
 
@@ -115,6 +135,7 @@ export function createResearchPlan({
     evidenceIds: [],
     status: "in_progress",
   };
+  plan.effort = selectResearchEffort(prompt, missionIntent, runPlan, plan);
   plan.nextAction = getNextResearchAction(plan);
   return plan;
 }
@@ -140,6 +161,14 @@ export async function createResearchPlanWithAssist(
   if (!plan) {
     return null;
   }
+  // An explicit source cardinality is a closed evidence-set contract. Do not
+  // let the optional utility planner expand a bounded two-source writeback
+  // into more evidence-bearing subquestions than the user authorized. The
+  // deterministic plan already distributes the exact source floor across the
+  // requested comparison and limitations work.
+  if (parseExplicitResearchSourceCount(input.prompt) !== null) {
+    return plan;
+  }
   const deterministicQuestions = plan.subquestions.map((item) => item.question);
   const assisted = await maybeAssistResearchSubquestions({
     prompt: input.prompt,
@@ -151,18 +180,44 @@ export async function createResearchPlanWithAssist(
   if (assisted.source !== "utility_assist") {
     return plan;
   }
-  const rebuilt = assisted.questions.map((question, index) =>
-    makeSubquestion(
-      `rq-${index + 1}`,
-      question,
-      evidenceTypeForSubquestion(plan.mode, index, assisted.questions.length),
-      minEvidenceForSubquestion(plan.mode, index, assisted.questions.length),
-    ),
+  const deterministicEnvelope = new Map(
+    plan.subquestions.map((item) => [
+      normalizeQuestionText(item.question).toLowerCase(),
+      item,
+    ]),
   );
-  if (rebuilt[0]) {
-    rebuilt[0] = { ...rebuilt[0], status: "in_progress" };
-  }
+  const rebuilt = assisted.questions.map((question, index) => {
+    const deterministic = deterministicEnvelope.get(
+      normalizeQuestionText(question).toLowerCase(),
+    );
+    if (deterministic) {
+      return {
+        ...deterministic,
+        id: `rq-${index + 1}`,
+        question,
+      };
+    }
+    // Utility questions improve the synthesis outline, but they must not
+    // silently expand the deterministic proof/source budget. Keep additions
+    // advisory and already non-blocking; only the host-built envelope can add
+    // required evidence work.
+    return {
+      ...makeSubquestion(
+        `rq-${index + 1}`,
+        question,
+        evidenceTypeForSubquestion(plan.mode, index, assisted.questions.length),
+        0,
+      ),
+      status: "complete" as const,
+    };
+  });
   plan.subquestions = rebuilt;
+  plan.effort = selectResearchEffort(
+    input.prompt,
+    input.missionIntent,
+    input.runPlan,
+    plan,
+  );
   plan.nextAction = getNextResearchAction(plan);
   return plan;
 }
@@ -173,7 +228,7 @@ export function parseExplicitResearchSourceCount(prompt: string): number | null 
   if (/\bboth\s+(?:returned\s+|fetched\s+|owned\s+)*(?:sources?|passages?)\b/u.test(normalized)) {
     return 2;
   }
-  const match = /\b(?:exactly\s+|use\s+|fetch\s+|from\s+)?(one|two|three|four|five|six|seven|eight|\d{1,2})\s+(?:returned\s+|fetched\s+|owned\s+|web\s+)*(?:sources?|passages?)\b/u.exec(
+  const match = /\b(?:exactly\s+|use\s+|fetch\s+|from\s+)?(one|two|three|four|five|six|seven|eight|\d{1,2})\s+(?:returned\s+|fetched\s+|owned\s+|focused\s+|web\s+)*(?:sources?|passages?)\b/u.exec(
     normalized,
   );
   if (!match?.[1]) return null;
@@ -406,11 +461,22 @@ export function evaluateResearchAcceptance({
   if (finalOutput !== undefined) {
     const output = finalOutput.trim();
     if (plan.sourceRequirements.minFetchedSources > 0) {
-      const citedFetchedUrls = stats.fetchedUrls.filter((url) => output.includes(url));
+      const fetchedEvidence = evidence.filter(isFetchedWebEvidence);
+      const citedFetchedSources = fetchedEvidence.filter((item) => {
+        const citationIdentifiers = dedupe([
+          ...(item.url ? [item.url] : []),
+          ...getEvidenceCitationIdentifiers(item),
+        ]);
+        return citationIdentifiers.some((identifier) => output.includes(identifier));
+      });
       if (
-        citedFetchedUrls.length <
-        Math.min(stats.fetchedUrls.length, plan.sourceRequirements.minFetchedSources)
+        citedFetchedSources.length <
+        Math.min(fetchedEvidence.length, plan.sourceRequirements.minFetchedSources)
       ) {
+        // Retain the legacy proof key for persisted-ledger compatibility. A
+        // fetched source is covered by either its visible URL or an exact
+        // source-scoped passage id; passage-grounded missions intentionally
+        // require the latter and must not be blocked for omitting a bare URL.
         missing.add("citation_url_coverage");
       }
     }
@@ -429,7 +495,20 @@ export function evaluateResearchAcceptance({
       .filter((item) => {
         const identifiers = item.evidenceIds.flatMap((id) => {
           const itemEvidence = evidence.find((candidate) => candidate.id === id);
-          return itemEvidence ? getEvidenceCitationIdentifiers(itemEvidence) : [];
+          if (!itemEvidence) {
+            return [];
+          }
+          // In hybrid work, vault reads can provide private context without
+          // granting their opaque internal passage ids public citation
+          // authority. Fetched-web coverage remains exact and mandatory. Pure
+          // vault research retains its existing passage-citation contract.
+          if (
+            plan.sourceRequirements.minFetchedSources > 0 &&
+            !isFetchedWebEvidence(itemEvidence)
+          ) {
+            return [];
+          }
+          return getEvidenceCitationIdentifiers(itemEvidence);
         });
         return identifiers.length > 0 && !identifiers.some((identifier) => output.includes(identifier));
       });
@@ -471,6 +550,11 @@ export function formatResearchPlanForPrompt(plan: ResearchPlan | null): string {
     `Mode: ${plan.mode}`,
     `Fetched web source requirement: ${plan.sourceRequirements.minFetchedSources}`,
     `Distinct domain requirement: ${plan.sourceRequirements.minDistinctDomains}`,
+    ...(plan.effort
+      ? [
+          `Adaptive research effort: ${plan.effort.tier}; model steps ${plan.effort.budget.maxModelStepsPerSegment} per segment; tool calls ${plan.effort.budget.maxToolCallsPerSegment} per segment; segments ${plan.effort.budget.maxSegments}.`,
+        ]
+      : []),
     `Vault coverage requirement: confidence ${plan.coverageRequirements.minVaultCoverageConfidence}; expand sampled/truncated retrieval: ${plan.coverageRequirements.expandWhenSampledOrTruncated}`,
     "Subquestions:",
     ...plan.subquestions.map(
@@ -523,11 +607,212 @@ export function normalizeResearchPlan(value: unknown): ResearchPlan | undefined 
     evidenceIds: getStringArray(value.evidenceIds),
     status,
   };
+  const effort = normalizeResearchEffort(value.effort);
+  if (effort) {
+    plan.effort = effort;
+  }
+  const effortUsage = normalizeResearchEffortUsage(value.effortUsage);
+  if (effortUsage) {
+    plan.effortUsage = effortUsage;
+  }
+  const effortClosure = normalizeResearchEffortClosure(value.effortClosure);
+  if (effortClosure) {
+    plan.effortClosure = effortClosure;
+  }
   const nextAction = normalizeNextAction(value.nextAction);
   if (nextAction) {
     plan.nextAction = nextAction;
   }
   return plan;
+}
+
+function selectResearchEffort(
+  prompt: string,
+  missionIntent: MissionIntent,
+  runPlan: Pick<RunPlan, "route" | "slowPathReason">,
+  plan: Pick<ResearchPlan, "subquestions" | "sourceRequirements">,
+): ResearchEffortSelection {
+  const freshness: ResearchFreshnessRequirement =
+    /\b(?:latest|current|recent|today|as of)\b/iu.test(prompt)
+      ? "required"
+      : "helpful";
+  const risk: ResearchRisk =
+    /\b(?:medical|legal|financial|security|safety[- ]critical)\b/iu.test(prompt)
+      ? "high"
+      : missionIntent.explicitMutation || missionIntent.requireWriteCompletion
+        ? "medium"
+        : "low";
+  return selectInitialResearchEffort({
+    prompt,
+    route: `${runPlan.route} ${runPlan.slowPathReason}`,
+    subquestions: plan.subquestions,
+    requiredSources: plan.sourceRequirements.minFetchedSources,
+    freshness,
+    risk,
+  });
+}
+
+function normalizeResearchEffort(value: unknown): ResearchEffortSelection | undefined {
+  if (!isRecord(value) || typeof value.tier !== "string") return undefined;
+  const tier = RESEARCH_EFFORT_TIER_ORDER.find((candidate) => candidate === value.tier);
+  if (!tier) return undefined;
+  const constrained = value.constrained === true;
+  return {
+    tier,
+    budget: normalizePersistedResearchEffortBudget(
+      value.budget,
+      tier,
+      constrained,
+    ),
+    reasons: getStringArray(value.reasons).slice(0, 12),
+    constrained,
+  };
+}
+
+/**
+ * A persisted ceiling may become narrower, but normalization must never make
+ * it wider. Constrained records with a missing field fail closed at zero;
+ * unconstrained legacy records retain the tier default for missing fields.
+ */
+function normalizePersistedResearchEffortBudget(
+  value: unknown,
+  tier: ResearchEffortSelection["tier"],
+  constrained: boolean,
+): ResearchEffortBudget {
+  const base = resolveResearchEffortBudget(tier);
+  const record = isRecord(value) ? value : null;
+  const maxSegments = boundedPersistedInteger(
+    record?.maxSegments,
+    base.maxSegments,
+    constrained,
+  );
+  const persistedModelPerSegment = boundedPersistedInteger(
+    record?.maxModelStepsPerSegment,
+    base.maxModelStepsPerSegment,
+    constrained,
+  );
+  const persistedToolPerSegment = boundedPersistedInteger(
+    record?.maxToolCallsPerSegment,
+    base.maxToolCallsPerSegment,
+    constrained,
+  );
+  const maxTotalModelSteps = Math.min(
+    boundedPersistedInteger(
+      record?.maxTotalModelSteps,
+      base.maxTotalModelSteps,
+      constrained,
+    ),
+    persistedModelPerSegment * maxSegments,
+  );
+  const maxTotalToolCalls = Math.min(
+    boundedPersistedInteger(
+      record?.maxTotalToolCalls,
+      base.maxTotalToolCalls,
+      constrained,
+    ),
+    persistedToolPerSegment * maxSegments,
+  );
+  return {
+    maxModelStepsPerSegment: Math.min(
+      persistedModelPerSegment,
+      maxTotalModelSteps,
+    ),
+    maxToolCallsPerSegment: Math.min(
+      persistedToolPerSegment,
+      maxTotalToolCalls,
+    ),
+    maxSegments,
+    maxTotalModelSteps,
+    maxTotalToolCalls,
+    maxDurationMs: boundedPersistedDuration(
+      record?.maxDurationMs,
+      base.maxDurationMs,
+      constrained,
+    ),
+  };
+}
+
+function boundedPersistedInteger(
+  value: unknown,
+  base: number,
+  failClosed: boolean,
+): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(base, nonNegativeInteger(value))
+    : failClosed
+      ? 0
+      : base;
+}
+
+function boundedPersistedDuration(
+  value: unknown,
+  base: number | null,
+  failClosed: boolean,
+): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const persisted = nonNegativeNumber(value);
+    return base === null ? persisted : Math.min(base, persisted);
+  }
+  if (value === null) {
+    return base;
+  }
+  return failClosed ? 0 : base;
+}
+
+function normalizeResearchEffortUsage(value: unknown): ResearchEffortUsage | undefined {
+  if (!isRecord(value)) return undefined;
+  return {
+    modelSteps: nonNegativeInteger(value.modelSteps),
+    toolCalls: nonNegativeInteger(value.toolCalls),
+    segmentsStarted: nonNegativeInteger(value.segmentsStarted),
+    ...(typeof value.modelStepsInCurrentSegment === "number"
+      ? {
+          modelStepsInCurrentSegment: nonNegativeInteger(
+            value.modelStepsInCurrentSegment,
+          ),
+        }
+      : {}),
+    ...(typeof value.toolCallsInCurrentSegment === "number"
+      ? {
+          toolCallsInCurrentSegment: nonNegativeInteger(
+            value.toolCallsInCurrentSegment,
+          ),
+        }
+      : {}),
+    ...(typeof value.completionSegmentsStarted === "number"
+      ? {
+          completionSegmentsStarted: nonNegativeInteger(
+            value.completionSegmentsStarted,
+          ),
+        }
+      : {}),
+    elapsedMs: nonNegativeNumber(value.elapsedMs),
+  };
+}
+
+function normalizeResearchEffortClosure(
+  value: unknown,
+): ResearchPlan["effortClosure"] | undefined {
+  if (!isRecord(value) || value.requested !== true) return undefined;
+  return {
+    requested: true,
+    attempts: nonNegativeInteger(value.attempts),
+    ...(typeof value.reason === "string" && value.reason.trim()
+      ? { reason: value.reason.trim().slice(0, 120) }
+      : {}),
+  };
+}
+
+function nonNegativeInteger(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : 0;
+}
+
+function nonNegativeNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, value)
+    : 0;
 }
 
 export function researchPlanToTaskStatus(
@@ -577,16 +862,16 @@ function classifyResearchMode(
 function createSubquestions(
   prompt: string,
   mode: ResearchMode,
-  _sourceRequirements: ResearchSourceRequirements,
+  sourceRequirements: ResearchSourceRequirements,
 ): ResearchSubquestion[] {
   const decomposed = decomposePromptIntoResearchQuestions(prompt);
   const questions =
     decomposed.length > 0
       ? decomposed
-      : defaultResearchQuestions(prompt, mode);
+      : defaultResearchQuestions(prompt, mode, sourceRequirements);
   const withLimitations = ensureLimitationsConfidenceQuestion(questions, mode);
   const capped = capAndMergeSubquestionTexts(withLimitations, 2, 8);
-  return capped.map((question, index) =>
+  const subquestions = capped.map((question, index) =>
     makeSubquestion(
       `rq-${index + 1}`,
       question,
@@ -594,6 +879,25 @@ function createSubquestions(
       minEvidenceForSubquestion(mode, index, capped.length),
     ),
   );
+  const webQuestionIndexes = subquestions
+    .map((item, index) => ({ item, index }))
+    .filter(
+      ({ item }) =>
+        item.requiredEvidenceType === "web_source" && item.minEvidence > 0,
+    )
+    .map(({ index }) => index);
+  let remainingSources = sourceRequirements.minFetchedSources;
+  for (let position = 0; position < webQuestionIndexes.length; position += 1) {
+    const index = webQuestionIndexes[position]!;
+    const remainingQuestions = webQuestionIndexes.length - position - 1;
+    const allocated = Math.max(1, remainingSources - remainingQuestions);
+    subquestions[index] = {
+      ...subquestions[index]!,
+      minEvidence: allocated,
+    };
+    remainingSources = Math.max(0, remainingSources - allocated);
+  }
+  return subquestions;
 }
 
 /**
@@ -693,7 +997,11 @@ export function decomposePromptIntoResearchQuestions(prompt: string): string[] {
   );
 }
 
-function defaultResearchQuestions(prompt: string, mode: ResearchMode): string[] {
+function defaultResearchQuestions(
+  prompt: string,
+  mode: ResearchMode,
+  sourceRequirements: ResearchSourceRequirements,
+): string[] {
   const topic = summarizePromptTopic(prompt);
   if (mode === "deep_vault") {
     return [
@@ -706,6 +1014,9 @@ function defaultResearchQuestions(prompt: string, mode: ResearchMode): string[] 
       `Gather external source evidence for: ${topic}`,
       `Retrieve relevant local vault context about ${topic} and compare it to external evidence.`,
     ];
+  }
+  if (sourceRequirements.minFetchedSources === 1) {
+    return [`Find fetched source evidence for: ${topic}`];
   }
   return [
     `Find fetched source evidence for: ${topic}`,
@@ -1101,7 +1412,7 @@ function getResearchAcceptanceNextAction(missing: string[]): string | undefined 
     return "Gather and cite evidence bound to each incomplete research subquestion.";
   }
   if (missing.includes("citation_url_coverage")) {
-    return "Revise the answer to include fetched source URLs.";
+    return "Revise the answer to cite each fetched source by URL or exact persisted passage identifier.";
   }
   if (missing.includes("limitations_section") || missing.includes("confidence_section")) {
     return "Revise the answer with limitations and confidence.";

@@ -46,6 +46,14 @@ export interface Phase6LinearHarness extends NativeObsidianHarness {
     Array<{ prompt: string; toolNames: string[] }>
   >;
   restoreLinearIntentSentinel(): Promise<void>;
+  readGenericCreateModelRequests(): Promise<
+    Array<{
+      prompt: string;
+      step: number;
+      tools: string[];
+      canonicalTemplateSeen: boolean;
+    }>
+  >;
   installResearchPublicationClient(): Promise<void>;
   readResearchPublicationState(notePath: string): Promise<{
     createCalls: number;
@@ -126,6 +134,8 @@ export async function startPhase6LinearHarness(): Promise<Phase6LinearHarness> {
     readLinearIntentExposures: () => readLinearIntentExposures(native.page),
     restoreLinearIntentSentinel: () =>
       restoreLinearIntentSentinel(native.page),
+    readGenericCreateModelRequests: () =>
+      readGenericCreateModelRequests(native.page),
     installResearchPublicationClient: () =>
       installFixedLinearPublicationClient(native.page),
     readResearchPublicationState: (notePath) =>
@@ -160,6 +170,12 @@ async function installPhase6LinearPageHarness(context: {
         __e2eLinearIntentToolExposure?: Array<{
           prompt: string;
           toolNames: string[];
+        }>;
+        __e2eLinearGenericCreateModelRequests?: Array<{
+          prompt: string;
+          step: number;
+          tools: string[];
+          canonicalTemplateSeen: boolean;
         }>;
         __e2eLinearQueueModelCreateCalls?: number;
         __e2eLinearQueueModelPrompts?: string[];
@@ -233,6 +249,124 @@ async function installPhase6LinearPageHarness(context: {
           const tools = (request.tools ?? [])
             .map((tool) => tool.function?.name)
             .filter((name): name is string => typeof name === "string");
+
+          const genericMissionText = [...(request.messages ?? [])]
+            .reverse()
+            .find(
+              (message) =>
+                message.role === "user" &&
+                (message.content ?? "").includes("E2E_LINEAR_GENERIC_CREATE"),
+            )?.content ?? "";
+          if (genericMissionText) {
+            if (request.format !== undefined) {
+              return {
+                message: { role: "assistant", content: "{}" },
+                toolCalls: [],
+                raw: { playwrightPhase6Linear: true },
+              };
+            }
+            const activeRunId =
+              plugin.getMissionRunSnapshot?.()?.lastConfig?.runId ?? "unknown-run";
+            const unsafe = genericMissionText.includes(
+              "E2E_LINEAR_GENERIC_CREATE_UNSAFE",
+            );
+            const genericKey = `${unsafe ? "unsafe" : "valid"}:${activeRunId}`;
+            const genericStep = stepCounts.get(genericKey) ?? 0;
+            phase6Window.__e2eLinearGenericCreateModelRequests = [
+              ...(phase6Window.__e2eLinearGenericCreateModelRequests ?? []),
+              {
+                prompt: unsafe
+                  ? "E2E_LINEAR_GENERIC_CREATE_UNSAFE"
+                  : "E2E_LINEAR_GENERIC_CREATE_VALID",
+                step: genericStep,
+                tools,
+                canonicalTemplateSeen:
+                  requestText.includes("Agent Work/templates/Linear issue.md") &&
+                  requestText.includes("{{problem_impact}}"),
+              },
+            ];
+            if (genericStep === 0) {
+              if (
+                !tools.includes("read_template") ||
+                tools.includes("linear_create_issue")
+              ) {
+                throw new Error(
+                  `The generic Linear create must read its template first. Tools: ${tools.join(", ")}`,
+                );
+              }
+              stepCounts.set(genericKey, 1);
+              const toolCall = {
+                id: `playwright-e2e-linear-generic-template-${unsafe ? "unsafe" : "valid"}`,
+                index: 0,
+                name: "read_template",
+                arguments: {
+                  // The host must discard this invented path because neither
+                  // mission names an explicit custom .md template path.
+                  path: "Templates/Invented Linear.md",
+                  maxChars: 12_000,
+                },
+              };
+              return {
+                message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                toolCalls: [toolCall],
+                raw: { playwrightPhase6Linear: true },
+              };
+            }
+            if (genericStep === 1) {
+              if (
+                !requestText.includes("Agent Work/templates/Linear issue.md") ||
+                !requestText.includes("{{problem_impact}}")
+              ) {
+                throw new Error(
+                  "The generic Linear create did not receive the canonical template readback.",
+                );
+              }
+              if (!tools.includes("linear_create_issue")) {
+                throw new Error(
+                  `The generic Linear create tool was not exposed after the template read. Tools: ${tools.join(", ")}`,
+                );
+              }
+              stepCounts.set(genericKey, 2);
+              const toolCall = {
+                id: `playwright-e2e-linear-generic-create-${unsafe ? "unsafe" : "valid"}`,
+                index: 0,
+                name: "linear_create_issue",
+                arguments: {
+                  teamId: "e2e-team",
+                  title: unsafe
+                    ? "{{title}}"
+                    : `Template-first generic issue ${marker}`,
+                  description: unsafe
+                    ? "## Problem / impact\n{{problem_impact}}"
+                    : [
+                        "## Problem / impact",
+                        `The deterministic ${marker} generic Linear flow needs a verified template-first handoff.`,
+                        "",
+                        "## Acceptance criteria",
+                        "- The provider receives one clean issue after explicit approval.",
+                        "",
+                        "## Validation",
+                        "- Provider readback matches the approved issue.",
+                      ].join("\n"),
+                },
+              };
+              return {
+                message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                toolCalls: [toolCall],
+                raw: { playwrightPhase6Linear: true },
+              };
+            }
+            return {
+              message: {
+                role: "assistant",
+                content: unsafe
+                  ? `E2E_LINEAR_GENERIC_CREATE_UNSAFE_DONE ${marker}`
+                  : `E2E_LINEAR_GENERIC_CREATE_VALID_DONE ${marker}`,
+              },
+              toolCalls: [],
+              raw: { playwrightPhase6Linear: true },
+            };
+          }
 
           if (requestText.includes("E2E_LINEAR_PROJECT_HIERARCHY")) {
             if (request.format !== undefined) {
@@ -625,6 +759,7 @@ async function installPhase6LinearPageHarness(context: {
       phase6Window.__e2eLinearQueueModelCreateCalls = 0;
       phase6Window.__e2eLinearQueueModelPrompts = [];
       phase6Window.__e2eLinearQueueModelRequests = [];
+      phase6Window.__e2eLinearGenericCreateModelRequests = [];
       install(plugin);
       for (const leaf of app.workspace.getLeavesOfType?.(
         "agentic-researcher-view",
@@ -637,6 +772,15 @@ async function installPhase6LinearPageHarness(context: {
         "agentic-researcher-view",
       ) ?? []) {
         install(leaf.view?.plugin);
+      }
+      if (typeof plugin.markModelConnectionVerifiedForHarness !== "function") {
+        throw new Error("Phase 6 model connection attestation is unavailable.");
+      }
+      plugin.markModelConnectionVerifiedForHarness({
+        message: "Verified the deterministic Phase 6 Linear model harness.",
+      });
+      if (!plugin.hasVerifiedModelConnection?.()) {
+        throw new Error("Phase 6 model connection attestation did not bind.");
       }
     },
     {
@@ -657,6 +801,8 @@ async function submitMission(
   const runButton = page.locator("button.agentic-researcher-run");
   await promptInput.fill(prompt);
   await expect(promptInput).toHaveValue(prompt);
+  await expect(runButton).toBeEnabled({ timeout: 10_000 });
+  await expect(runButton).toHaveText("Run Mission");
   await runButton.click();
   await expect(
     page.locator(
@@ -779,6 +925,29 @@ async function readLinearIntentExposures(
       }>;
     };
     return obsidianWindow.__e2eLinearIntentToolExposure ?? [];
+  });
+}
+
+async function readGenericCreateModelRequests(
+  page: Page,
+): Promise<
+  Array<{
+    prompt: string;
+    step: number;
+    tools: string[];
+    canonicalTemplateSeen: boolean;
+  }>
+> {
+  return page.evaluate(() => {
+    const obsidianWindow = window as typeof window & {
+      __e2eLinearGenericCreateModelRequests?: Array<{
+        prompt: string;
+        step: number;
+        tools: string[];
+        canonicalTemplateSeen: boolean;
+      }>;
+    };
+    return obsidianWindow.__e2eLinearGenericCreateModelRequests ?? [];
   });
 }
 

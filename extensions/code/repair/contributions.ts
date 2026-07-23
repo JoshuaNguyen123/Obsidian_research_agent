@@ -135,6 +135,7 @@ export function createCodeRepairToolContributionsV1(
       tool: {
         name: CODE_REPAIR_RECORD_CYCLE_TOOL,
         description:
+          "Purpose: Open the next repair cycle after red validation. Use when: validate_fast failed. Do not use when: re-validating or writing before the cycle opens. Required: request/workspace ids. Next: hash-bound write then re-validate. Side effects: bound. " +
           "Persist one fingerprint-bound code repair cycle and return a code_repair_cycle domain receipt.",
         parameters: {
           ...scopeSchema(),
@@ -214,7 +215,7 @@ export function createCodeRepairToolContributionsV1(
       tool: {
         name: CODE_COMMIT_VERIFIED_TOOL,
         description:
-          "Execute an exact prepared local commit only after protected approvals, artifact readback, and fresh targeted/full sandbox validation.",
+          "Purpose: Host git add of changed paths + verified commit + handoff SHA. Use when: fast (+ ladder) validation passed. Do not use when: before passed fast; do not invent git_commit/git_add. Required: commit message + validation receipt ids. Next: GitHub publish_draft. Side effects: bound. Execute an exact prepared local commit only after protected approvals, artifact readback, and fresh targeted/full sandbox validation.",
         parameters: {
           ...scopeSchema(),
           properties: {

@@ -8,8 +8,17 @@ import {
   type GitHubCatalogRepositoryContextV1,
 } from "../src/tools/githubCatalogTools";
 import type { ActionReceipt } from "../src/agent/actions";
+import {
+  createOneShotGrant,
+  evaluateAuthorityGrant,
+} from "../src/agent/authority";
 import type { ToolExecutionContext } from "../src/tools/types";
 import type { TrustedGitHubRepositoryBindingV1 } from "../src/integrations/github/TrustedGitHubRepositoryBindingV1";
+import {
+  GitHubApiError,
+  type GitHubCommentRecord,
+  type GitHubIssueRecord,
+} from "../src/integrations/github/GitHubRestClient";
 import { withPreparedActionFingerprint } from "../src/agent/actions/canonicalize";
 import type { GitHubPublicationCheckpointV1 } from "../src/integrations/github/GitHubPublicationWorkflow";
 import { createGitHubPublicationTool } from "../src/tools/githubPublicationTool";
@@ -29,6 +38,11 @@ const PHASE7_TIMEOUT_MS = 120_000;
 
 test.describe("Daily-use verified code publication", () => {
   test.describe.configure({ timeout: PHASE7_TIMEOUT_MS });
+
+  // Agent-loop AI authoring of project code → github_create_private_repository is
+  // covered in tests/AgentRunner.test.ts ("mock AI generates project code then
+  // creates the private GitHub repository"). Live BYOK end-to-end is DU-06.
+  // DU-05 below remains the deterministic direct-tool receipt/restart proof.
 
   test("DU-05 private repository creation, verified publication, restart recovery, and cleanup retain exact receipts", async ({}, testInfo) => {
     const harness = await createPhase7GitHubHarness(`PW-${Date.now()}`);
@@ -292,15 +306,15 @@ test.describe("Daily-use verified code publication", () => {
       }
       expect(harness.finalizerReceiptIds).toEqual([
         "phase7-linear-link-1",
-        "phase7-linear-complete-2",
-        "phase7-obsidian-3",
+        "phase7-obsidian-2",
+        "phase7-linear-complete-3",
       ]);
       expect(finalized.receiptIds).toEqual(
         expect.arrayContaining([
           ...updated.receiptIds,
           "phase7-linear-link-1",
-          "phase7-linear-complete-2",
-          "phase7-obsidian-3",
+          "phase7-obsidian-2",
+          "phase7-linear-complete-3",
         ]),
       );
       expect(
@@ -316,7 +330,7 @@ test.describe("Daily-use verified code publication", () => {
           "blocked",
           "merged_verified",
           "linear_linked",
-          "linear_completed",
+          "waiting_linear_completion",
           "finalized",
         ]),
       );
@@ -359,12 +373,16 @@ test.describe("Daily-use verified code publication", () => {
           requestNestedApproval: async (request) => {
             privateRepositoryCleanupApprovals += 1;
             expect(request.toolName).toBe("github_delete_private_repository");
+            expect(request.confirmationIndex).toBe(
+              privateRepositoryCleanupApprovals,
+            );
+            expect(request.requiredConfirmations).toBe(2);
             expect(request.preparedAction?.payloadFingerprint).toMatch(
               /^sha256:[a-f0-9]{64}$/u,
             );
             return {
               approved: true,
-              approvalId: "du05-private-repository-cleanup-approval",
+              approvalId: `du05-private-repository-cleanup-approval-${privateRepositoryCleanupApprovals}`,
               approvalFingerprint:
                 request.preparedAction!.payloadFingerprint,
             };
@@ -373,7 +391,7 @@ test.describe("Daily-use verified code publication", () => {
       );
       expect(cleanupResult.ok).toBe(true);
       expect(privateRepositoryDeletes).toBe(1);
-      expect(privateRepositoryCleanupApprovals).toBe(1);
+      expect(privateRepositoryCleanupApprovals).toBe(2);
       expect(cleanupReceipts).toHaveLength(1);
       expect(cleanupReceipts[0]?.readback?.status).toBe("verified");
       expect(privateRepositoryExists).toBe(false);
@@ -535,6 +553,24 @@ test.describe("Daily-use verified code publication", () => {
       client,
       binding: catalogBinding(),
       profile: {} as never,
+      repositoryReadback: {
+        id: 99,
+        fullName: "acme/research-agent",
+        htmlUrl: "https://github.com/acme/research-agent",
+        defaultBranch: "main",
+        private: true,
+        archived: false,
+        visibility: "private",
+        topics: [],
+        hasIssues: true,
+        permissions: {
+          admin: true,
+          maintain: true,
+          push: true,
+          triage: true,
+          pull: true,
+        },
+      },
     };
     const registry = new DefaultToolRegistry(createGitHubCatalogTools({
       async withRepository(profileKey, _signal, use) {
@@ -588,6 +624,417 @@ test.describe("Daily-use verified code publication", () => {
     expect(persisted).toHaveLength(1);
   });
 
+  test("DU-05 bounded GitHub CRUD lifecycle proves prepared grants, receipts, and final readback", async () => {
+    const timestamp = "2026-07-13T12:05:00.000Z";
+    let issue: GitHubIssueRecord | null = null;
+    let comment: GitHubCommentRecord | null = null;
+    let commentIssueNumber: number | null = null;
+    const providerMutations: string[] = [];
+    const persistedReceipts: ActionReceipt[] = [];
+
+    const readIssue = (number: number): GitHubIssueRecord => {
+      if (!issue || issue.number !== number) {
+        throw new GitHubApiError("github_not_found", "Issue not found.", 404);
+      }
+      return structuredClone(issue);
+    };
+    const readComment = (commentId: number): GitHubCommentRecord => {
+      if (!comment || comment.id !== commentId) {
+        throw new GitHubApiError("github_not_found", "Comment not found.", 404);
+      }
+      return structuredClone(comment);
+    };
+
+    const client = {
+      async listIssues() {
+        return issue ? [structuredClone(issue)] : [];
+      },
+      async getIssue(_owner: string, _repository: string, number: number) {
+        return readIssue(number);
+      },
+      async createIssue(input: {
+        owner: string;
+        repository: string;
+        title: string;
+        body: string;
+      }) {
+        expect(input).toMatchObject({ owner: "acme", repository: "research-agent" });
+        providerMutations.push("issue.create");
+        issue = {
+          number: 101,
+          htmlUrl: "https://github.com/acme/research-agent/issues/101",
+          state: "open",
+          title: input.title,
+          body: input.body,
+          author: { id: 42, login: "agent-user" },
+          pullRequest: false,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        return structuredClone(issue);
+      },
+      async updateIssue(input: {
+        number: number;
+        title?: string;
+        body?: string;
+      }) {
+        const current = readIssue(input.number);
+        providerMutations.push("issue.update");
+        issue = {
+          ...current,
+          ...(input.title === undefined ? {} : { title: input.title }),
+          ...(input.body === undefined ? {} : { body: input.body }),
+          updatedAt: timestamp,
+        };
+        return structuredClone(issue);
+      },
+      async closeIssue(input: { number: number }) {
+        const current = readIssue(input.number);
+        providerMutations.push("issue.close");
+        issue = { ...current, state: "closed", updatedAt: timestamp };
+        return structuredClone(issue);
+      },
+      async listIssueComments(
+        _owner: string,
+        _repository: string,
+        number: number,
+      ) {
+        return comment && commentIssueNumber === number
+          ? [structuredClone(comment)]
+          : [];
+      },
+      async getIssueComment(
+        _owner: string,
+        _repository: string,
+        commentId: number,
+      ) {
+        return readComment(commentId);
+      },
+      async createIssueComment(input: { number: number; body: string }) {
+        readIssue(input.number);
+        providerMutations.push("issue_comment.create");
+        commentIssueNumber = input.number;
+        comment = {
+          id: 501,
+          htmlUrl:
+            "https://github.com/acme/research-agent/issues/101#issuecomment-501",
+          body: input.body,
+          author: { id: 42, login: "agent-user" },
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        return structuredClone(comment);
+      },
+      async updateIssueComment(input: {
+        commentId: number;
+        body: string;
+        expectedAuthorLogin: string;
+      }) {
+        const current = readComment(input.commentId);
+        expect(input.expectedAuthorLogin).toBe("agent-user");
+        providerMutations.push("issue_comment.update");
+        comment = { ...current, body: input.body, updatedAt: timestamp };
+        return structuredClone(comment);
+      },
+      async deleteOwnedComment(input: {
+        commentId: number;
+        kind: "issue" | "review";
+        expectedAuthorLogin: string;
+      }) {
+        const current = readComment(input.commentId);
+        expect(input).toMatchObject({
+          kind: "issue",
+          expectedAuthorLogin: current.author.login,
+        });
+        providerMutations.push("issue_comment.delete");
+        comment = null;
+        commentIssueNumber = null;
+      },
+    } as unknown as GitHubCatalogRepositoryContextV1["client"];
+
+    const repository: GitHubCatalogRepositoryContextV1 = {
+      client,
+      binding: catalogBinding(),
+      profile: {} as never,
+      repositoryReadback: {
+        id: 99,
+        fullName: "acme/research-agent",
+        htmlUrl: "https://github.com/acme/research-agent",
+        defaultBranch: "main",
+        private: true,
+        archived: false,
+        visibility: "private",
+        topics: ["agentic-proof"],
+        hasIssues: true,
+        permissions: {
+          admin: true,
+          maintain: true,
+          push: true,
+          triage: true,
+          pull: true,
+        },
+      },
+    };
+    const registry = new DefaultToolRegistry(createGitHubCatalogTools({
+      async withRepository(profileKey, _signal, use) {
+        expect(profileKey).toBe("fixture");
+        return use(repository);
+      },
+      async persistExternalReceipt(receipt) {
+        persistedReceipts.push(structuredClone(receipt));
+      },
+      isAvailable: () => true,
+    }));
+    const baseContext: ToolExecutionContext = {
+      app: {} as never,
+      settings: { githubEnabled: true } as never,
+      originalPrompt:
+        "Read, create, edit, close, and clean up exact GitHub resources in profile fixture.",
+      runId: "du05-github-crud-run",
+      operationId: "du05-github-crud-read",
+      httpTransport: async () => ({ status: 500, headers: {} }),
+      now: () => new Date(timestamp),
+    };
+
+    const initialRead = await registry.execute(
+      {
+        name: "github_get_repository",
+        arguments: { profileKey: "fixture" },
+      },
+      baseContext,
+    );
+    expect(initialRead).toMatchObject({
+      ok: true,
+      output: {
+        authority: false,
+        repository: {
+          profileKey: "fixture",
+          fullName: "acme/research-agent",
+          repositoryId: 99,
+        },
+        result: { fullName: "acme/research-agent", private: true },
+      },
+    });
+
+    let grantOrdinal = 0;
+    const executeMutation = async (
+      name: string,
+      args: Record<string, unknown>,
+      expected: {
+        operation: ActionReceipt["operation"];
+        resourceType: string;
+        resourceId: string;
+        confirmations?: 1 | 2;
+      },
+    ) => {
+      grantOrdinal += 1;
+      const context = {
+        ...baseContext,
+        operationId: `du05-github-crud-${grantOrdinal}`,
+      };
+      const prepared = await registry.prepare!({ name, arguments: args }, context);
+      expect(prepared.ok).toBe(true);
+      if (!prepared.ok) {
+        throw new Error(`Failed to prepare ${name}: ${prepared.error.message}`);
+      }
+      const descriptor = registry.getDescriptor(name);
+      expect(descriptor).not.toBeNull();
+      if (!descriptor) throw new Error(`Missing descriptor for ${name}.`);
+      expect(prepared.action.target).toMatchObject({
+        system: "github",
+        resourceType: expected.resourceType,
+        accountId: "42",
+        containerId: "acme/research-agent",
+        repositoryId: "99",
+        repositoryProfileId: "fixture",
+      });
+      expect(prepared.action.relatedResources).toEqual([
+        {
+          system: "github",
+          resourceType: "repository",
+          id: "acme/research-agent",
+          identifier: "github-fixture",
+          accountId: "42",
+          repositoryId: "99",
+          repositoryProfileId: "fixture",
+          revision: catalogBinding().fingerprint,
+        },
+      ]);
+      expect(prepared.action.requiredConfirmations ?? 1).toBe(
+        expected.confirmations ?? 1,
+      );
+
+      const grant = await createOneShotGrant({
+        id: `grant:du05-github-crud:${grantOrdinal}`,
+        action: prepared.action,
+        descriptor,
+        issuedAt: new Date(timestamp),
+      });
+      const authority = await evaluateAuthorityGrant({
+        grant,
+        action: prepared.action,
+        descriptor,
+        now: new Date(timestamp),
+      });
+      expect(authority.allowed).toBe(true);
+      if (!authority.allowed) {
+        throw new Error(`Authority denied for ${name}: ${authority.reason}`);
+      }
+      expect(authority.grant.kind).toBe("one_shot");
+      expect(authority.grant.actionFingerprint).toBe(
+        prepared.action.payloadFingerprint,
+      );
+      expect(authority.grant.id).not.toBe("policy:scoped-read");
+
+      const result = await registry.executePrepared!(prepared.action, context, {
+        preparedActionId: prepared.action.id,
+        payloadFingerprint: prepared.action.payloadFingerprint,
+        grantId: authority.grant.id,
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok || !result.receipt) {
+        throw new Error(`Prepared execution failed for ${name}.`);
+      }
+      expect(result.receipt).toMatchObject({
+        runId: baseContext.runId,
+        actionId: prepared.action.id,
+        toolName: name,
+        operation: expected.operation,
+        payloadFingerprint: prepared.action.payloadFingerprint,
+        grantId: authority.grant.id,
+        resource: {
+          system: "github",
+          resourceType: expected.resourceType,
+          id: expected.resourceId,
+          accountId: "42",
+          containerId: "acme/research-agent",
+          repositoryId: "99",
+          repositoryProfileId: "fixture",
+        },
+        readback: { status: "verified" },
+      });
+      expect(result.receipt.idempotencyKey).toBe(
+        prepared.action.idempotencyKey,
+      );
+      return result;
+    };
+
+    await executeMutation(
+      "github_create_issue",
+      {
+        profileKey: "fixture",
+        title: "CRUD lifecycle proof",
+        body: "Created through a fingerprint-bound prepared action.",
+      },
+      { operation: "create", resourceType: "issue", resourceId: "101" },
+    );
+    await executeMutation(
+      "github_update_issue",
+      {
+        profileKey: "fixture",
+        number: 101,
+        title: "CRUD lifecycle proof updated",
+        body: "Edited through a second exact prepared action.",
+      },
+      { operation: "update", resourceType: "issue", resourceId: "101" },
+    );
+    await executeMutation(
+      "github_create_issue_comment",
+      {
+        profileKey: "fixture",
+        number: 101,
+        body: "Initial lifecycle comment.",
+      },
+      {
+        operation: "create",
+        resourceType: "issue_comment",
+        resourceId: "501",
+      },
+    );
+    await executeMutation(
+      "github_update_issue_comment",
+      {
+        profileKey: "fixture",
+        commentId: 501,
+        body: "Edited lifecycle comment.",
+      },
+      {
+        operation: "update",
+        resourceType: "issue_comment",
+        resourceId: "501",
+      },
+    );
+    await executeMutation(
+      "github_delete_owned_comment",
+      { profileKey: "fixture", commentId: 501, kind: "issue" },
+      {
+        operation: "delete",
+        resourceType: "comment",
+        resourceId: "501",
+        confirmations: 2,
+      },
+    );
+    await executeMutation(
+      "github_close_issue",
+      { profileKey: "fixture", number: 101 },
+      { operation: "archive", resourceType: "issue", resourceId: "101" },
+    );
+
+    const finalIssueRead = await registry.execute(
+      {
+        name: "github_get_issue",
+        arguments: { profileKey: "fixture", number: 101 },
+      },
+      { ...baseContext, operationId: "du05-github-crud-final-issue-read" },
+    );
+    const finalCommentRead = await registry.execute(
+      {
+        name: "github_list_issue_comments",
+        arguments: { profileKey: "fixture", number: 101, limit: 10 },
+      },
+      { ...baseContext, operationId: "du05-github-crud-final-comment-read" },
+    );
+    expect(finalIssueRead).toMatchObject({
+      ok: true,
+      output: {
+        authority: false,
+        result: {
+          number: 101,
+          state: "closed",
+          title: "CRUD lifecycle proof updated",
+          body: "Edited through a second exact prepared action.",
+        },
+      },
+    });
+    expect(finalCommentRead).toMatchObject({
+      ok: true,
+      output: {
+        authority: false,
+        result: { records: [], returned: 0, modelTruncated: false },
+      },
+    });
+    const finalProviderIssue = issue as unknown as GitHubIssueRecord | null;
+    expect(finalProviderIssue?.state).toBe("closed");
+    expect(comment).toBeNull();
+    expect(providerMutations).toEqual([
+      "issue.create",
+      "issue.update",
+      "issue_comment.create",
+      "issue_comment.update",
+      "issue_comment.delete",
+      "issue.close",
+    ]);
+    expect(persistedReceipts).toHaveLength(6);
+    expect(new Set(persistedReceipts.map((receipt) => receipt.id)).size).toBe(6);
+    expect(
+      persistedReceipts.every(
+        (receipt) =>
+          receipt.grantId.startsWith("grant:du05-github-crud:") &&
+          receipt.readback.status === "verified",
+      ),
+    ).toBe(true);
+  });
+
   test("draft-pr completion policy finalizes Linear and Obsidian substates without merge", async () => {
     const harness = await createPhase7GitHubHarness(`PW-DRAFT-${Date.now()}`);
     try {
@@ -613,14 +1060,14 @@ test.describe("Daily-use verified code publication", () => {
       expect(harness.provider.mergeCount).toBe(0);
       expect(harness.finalizerReceiptIds).toEqual([
         "phase7-linear-link-1",
-        "phase7-linear-complete-2",
-        "phase7-obsidian-3",
+        "phase7-obsidian-2",
+        "phase7-linear-complete-3",
       ]);
       expect(harness.checkpoints.map(({ status }) => status)).toEqual(
         expect.arrayContaining([
           "draft_pr_verified",
           "linear_linked",
-          "linear_completed",
+          "waiting_linear_completion",
           "finalized",
         ]),
       );

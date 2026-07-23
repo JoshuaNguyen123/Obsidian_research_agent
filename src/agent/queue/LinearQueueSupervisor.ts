@@ -72,6 +72,8 @@ export interface LinearQueueSupervisorOptions {
   client: LinearQueueReadClient;
   /** Trusted Linear project that exclusively owns executable queue issues. */
   queueProjectId: string;
+  /** Unstarted workflow state that constitutes explicit execution readiness. */
+  readyStateId: string;
   clock?: LinearQueueClock;
   timer?: LinearQueueTimer;
   reduceQueueState: DurableLinearQueueReducer;
@@ -115,6 +117,7 @@ export class LinearQueueSupervisor {
 
   constructor(options: LinearQueueSupervisorOptions) {
     assertTrustedId(options.queueProjectId, "Linear queue project id");
+    assertTrustedId(options.readyStateId, "Linear ready state id");
     this.options = options;
     this.clock = options.clock ?? SYSTEM_CLOCK;
     this.timer = options.timer ?? SYSTEM_TIMER;
@@ -211,6 +214,7 @@ export class LinearQueueSupervisor {
     if (
       result.id !== candidate.issueId ||
       result.project?.id !== this.options.queueProjectId ||
+      result.state?.id !== this.options.readyStateId ||
       result.state?.id !== candidate.remoteStateId ||
       result.updatedAt !== candidate.remoteUpdatedAt ||
       result.trashed ||
@@ -245,12 +249,17 @@ export class LinearQueueSupervisor {
     const initialCursor = state.cursor;
     const result = await this.options.client.execute(
       "issues.list",
-      buildIssueListVariables(initialCursor, this.options.queueProjectId),
+      buildIssueListVariables(
+        initialCursor,
+        this.options.queueProjectId,
+        this.options.readyStateId,
+      ),
       { abortSignal: signal },
     );
     assertNotAborted(signal);
     const fetchedIssues = readIssuePage(result)
       .filter((issue) => issue.project?.id === this.options.queueProjectId)
+      .filter((issue) => issue.state?.id === this.options.readyStateId)
       .filter((issue) => isAfterCursor(issue, initialCursor))
       .sort(compareIssuesByCursor)
       .slice(0, LINEAR_QUEUE_SCAN_LIMIT);
@@ -355,12 +364,14 @@ export class LinearQueueSupervisor {
 function buildIssueListVariables(
   cursor: LinearQueueCursorV1 | null,
   queueProjectId: string,
+  readyStateId: string,
 ): Record<string, unknown> {
   return {
     first: LINEAR_QUEUE_SCAN_LIMIT,
     includeArchived: false,
     filter: {
       project: { id: { eq: queueProjectId } },
+      state: { id: { eq: readyStateId } },
       ...(cursor
         ? {
             updatedAt: { gte: cursor.updatedAt },

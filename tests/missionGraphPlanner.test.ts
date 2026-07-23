@@ -6,6 +6,8 @@ import {
 } from "../src/agent/missionGraphV3";
 import {
   buildDeterministicMissionGraphV3,
+  createMissionGraphPlannerSchema,
+  normalizeStructuredMissionGraphProposalV1,
   planMissionGraphV3,
   resolveAuthoritativeMissionGraphV3,
   type DeterministicMissionGraphProposalV1,
@@ -13,12 +15,42 @@ import {
   type StructuredMissionGraphProposalV1,
 } from "../src/agent/missionGraphPlanner";
 import type {
+  JsonSchemaObject,
   ModelChatRequest,
   ModelChatResponse,
   ModelClient,
 } from "../src/model/types";
 
 const NOW = "2026-07-11T15:00:00.000Z";
+
+test("structured planner capacity covers long host graphs up to the MissionGraph ceiling", () => {
+  const ids = Array.from({ length: 39 }, (_, index) =>
+    `tool-${String(index + 1).padStart(2, "0")}`,
+  );
+  const schema = createMissionGraphPlannerSchema(ids);
+  const nodesSchema = schema.properties?.nodes as JsonSchemaObject | undefined;
+  assert.equal(nodesSchema?.maxItems, 39);
+  const proposal = normalizeStructuredMissionGraphProposalV1({
+    confidence: 0.98,
+    nodes: ids.map((id, index) => ({
+      id,
+      objective: `Execute host node ${index + 1}.`,
+      dependencyIds: index === 0 ? [] : [ids[index - 1]],
+    })),
+  });
+  assert.equal(proposal?.nodes.length, 39);
+  assert.equal(
+    normalizeStructuredMissionGraphProposalV1({
+      confidence: 0.98,
+      nodes: Array.from({ length: 65 }, (_, index) => ({
+        id: `overflow-${index + 1}`,
+        objective: "Overflow node.",
+        dependencyIds: [],
+      })),
+    }),
+    null,
+  );
+});
 
 test("automatic planning accepts a high-confidence semantic DAG without trusting executable fields", async () => {
   const fixture = await createFixture();
@@ -75,6 +107,43 @@ test("automatic planning accepts a high-confidence semantic DAG without trusting
   assert.equal(requests[0].format?.additionalProperties, false);
   assert.match(requests[0].messages[0].content, /Do not invent paths, commands, bindings/);
   assert.match(requests[0].messages[0].content, /hostDependencyIds/);
+});
+
+test("Ollama Cloud graph planning omits provider format but keeps host DAG validation", async () => {
+  const fixture = await createFixture();
+  const requests: ModelChatRequest[] = [];
+  const client: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "glm-5.2",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+    },
+    chat: async (request) => {
+      requests.push(request);
+      return response(
+        requests.length === 1
+          ? "not-json"
+          : structuredJson([
+              semanticNode("context", "Read context."),
+              semanticNode("write", "Append verified output.", ["context"]),
+            ]),
+      );
+    },
+    streamChat: async (request) => client.chat(request),
+  };
+
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: client,
+  });
+
+  assert.equal(result.source, "structured_model");
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => !("format" in request)));
+  assert.match(requests[0].messages[0].content, /return exactly one JSON object/);
+  assert.match(requests[1].messages.at(-1)?.content ?? "", /Schema repair/);
 });
 
 test("conservative mode never calls the model and records the intentional fallback", async () => {
@@ -257,6 +326,46 @@ test("structured planner accepts one complete fenced JSON object", async () => {
     ),
   });
   assert.equal(result.source, "structured_model");
+});
+
+test("structured planner recovers one bounded proposal from provider prose", async () => {
+  const fixture = await createFixture();
+  const proposal = structuredJson([
+    semanticNode("context", "Read context."),
+    semanticNode("write", "Append verified output.", ["context"]),
+  ]);
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: clientFrom(async () =>
+      response(
+        `Planner note {"ignored":true}: the bounded proposal follows.\n${proposal}\nEnd of response.`,
+      ),
+    ),
+  });
+
+  assert.equal(result.source, "structured_model");
+  assert.equal(result.fallbackReason, null);
+});
+
+test("structured planner rejects ambiguous wrapped proposals", async () => {
+  const fixture = await createFixture();
+  const first = structuredJson([
+    semanticNode("context", "Read context."),
+    semanticNode("write", "Append verified output.", ["context"]),
+  ]);
+  const second = structuredJson([
+    semanticNode("context", "Read different context."),
+    semanticNode("write", "Append a different output.", ["context"]),
+  ]);
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: clientFrom(async () => response(`${first}\n${second}`)),
+  });
+
+  assert.equal(result.source, "deterministic");
+  assert.equal(result.fallbackReason, "structured_model_invalid_json");
 });
 
 test("unknown delete or mutation selection is rejected as authority widening", async () => {

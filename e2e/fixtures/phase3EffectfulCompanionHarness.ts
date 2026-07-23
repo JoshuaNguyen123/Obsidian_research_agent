@@ -37,7 +37,10 @@ export interface Phase3EffectfulSnapshot {
     lastObservedEventSequence: number;
     lastAppliedEventSequence: number;
     reconcileStatus: string;
+    chatResumeSummary: string | null;
+    chatResumeDeliveredAt: string | null;
   } | null;
+  chatResumeLines: string[];
 }
 
 export interface Phase3EffectfulCompanionHarness extends NativeObsidianHarness {
@@ -930,8 +933,28 @@ async function readSnapshot(page: Page): Promise<Phase3EffectfulSnapshot> {
               lineage.lastAppliedEventSequence ?? 0,
             ),
             reconcileStatus: String(lineage.reconcileStatus),
+            chatResumeSummary:
+              typeof lineage.chatResumeSummary === "string"
+                ? lineage.chatResumeSummary
+                : null,
+            chatResumeDeliveredAt:
+              typeof lineage.chatResumeDeliveredAt === "string"
+                ? lineage.chatResumeDeliveredAt
+                : null,
           }
         : null,
+      chatResumeLines: Array.isArray(
+        app?.plugins?.plugins?.[corePluginId]?.conversationHistory,
+      )
+        ? app.plugins.plugins[corePluginId].conversationHistory
+            .filter(
+              (message: any) =>
+                message?.role === "assistant" &&
+                typeof message?.content === "string" &&
+                /Background Linear update verified/i.test(message.content),
+            )
+            .map((message: any) => String(message.content))
+        : [],
     };
   }, {
     corePluginId: NATIVE_CORE_PLUGIN_ID,

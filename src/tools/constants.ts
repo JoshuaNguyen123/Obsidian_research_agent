@@ -6,8 +6,15 @@ export const CHECKPOINT_EVERY_STEPS = 5;
 export const PROGRESS_REVIEW_EVERY_STEPS = 10;
 export const MISSION_MILESTONE_STEPS = [25, 50, 75, 100] as const;
 export const LONG_RUN_STEP_WARN_AT = 15;
-export const MAX_FILE_READ_CHARS = 12000;
-export const MAX_INITIAL_CURRENT_NOTE_CHARS = 6000;
+/** Path/file reads. ~100k chars covers ~15–20k word essays without paging. */
+export const MAX_FILE_READ_CHARS = 100_000;
+/**
+ * Host prefetch for "Reading current note...". Keep below the model tool
+ * default so casual missions stay lean; edit/replace raises this at the call.
+ */
+export const MAX_INITIAL_CURRENT_NOTE_CHARS = 12_000;
+/** Host/model budget when the active note must be edited or expanded in place. */
+export const MAX_EDIT_CURRENT_NOTE_CHARS = 100_000;
 export const MAX_TOOL_RESULT_CHARS = 8000;
 export const MAX_LISTED_FILES = 300;
 export const MAX_BATCH_READ_FILES = 20;

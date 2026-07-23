@@ -1,3 +1,4 @@
+import { isLiteraryPrimaryTextWriteMission } from "../agent/evidenceIntent";
 import { OrchestratorStore, type OrchestratorSnapshotRepository } from "./orchestratorStore";
 import { SharedBudget, type BudgetResource } from "./sharedBudget";
 import type {
@@ -341,6 +342,7 @@ export function createResearchTeamScaffold(input: {
  * Opt into Lead + Researcher orchestration only for source/verify-style
  * missions. Bare "research" / "research this topic" must stay false so ordinary
  * note writebacks do not open a research_team runtime.
+ * Literary "citations from the text" essays are single-agent write missions.
  */
 export function shouldUseResearchTeam(
   prompt: string,
@@ -348,6 +350,9 @@ export function shouldUseResearchTeam(
   forceChatOnly = false,
 ): boolean {
   if (!previewEnabled || forceChatOnly) return false;
+  if (isLiteraryPrimaryTextWriteMission(prompt)) {
+    return false;
+  }
   // Require deep/sources/verify-style language — bare "research" alone is not enough.
   return /\b(deep\s+research|investigate|sources?|citations?|verify|fact[-\s]?check|evidence|compare\s+(?:sources?|evidence)|current\s+(?:events?|sources?)|latest\s+(?:sources?|research)|web\s+research|vault\s+research)\b/i.test(
     prompt,

@@ -9,6 +9,11 @@ const AGENT_BRANCH_PREFIX = "codex/";
 const MAX_LIST_RECORDS = 100;
 const MAX_TREE_RECORDS = 5_000;
 const MAX_BLOB_CONTENT_CHARS = 3_000_000;
+const MAX_RELEASE_BODY_CHARS = 65_536;
+const MAX_PULL_REQUEST_PATCH_CHARS = 20_000;
+const MAX_PROVIDER_NAME_CHARS = 1_024;
+const MAX_PROVIDER_PATH_CHARS = 4_096;
+const MAX_PROVIDER_URL_CHARS = 4_096;
 
 export type GitHubApiErrorCode =
   | "github_not_configured"
@@ -45,6 +50,18 @@ export interface GitHubRepositoryRecord {
   defaultBranch: string;
   private: boolean;
   archived: boolean;
+  visibility?: "private" | "public" | "internal";
+  description?: string;
+  language?: string;
+  topics?: string[];
+  hasIssues?: boolean;
+  permissions?: {
+    admin: boolean;
+    maintain: boolean;
+    push: boolean;
+    triage: boolean;
+    pull: boolean;
+  };
 }
 
 export interface CreatePrivateGitHubRepositoryInput {
@@ -58,6 +75,33 @@ export interface GitHubReferenceRecord {
   ref: string;
   sha: string;
   objectType: string;
+}
+
+export interface GitHubBranchRecord {
+  name: string;
+  sha: string;
+  protected: boolean;
+}
+
+export interface GitHubTagRecord {
+  name: string;
+  sha: string;
+}
+
+export interface GitHubReleaseRecord {
+  id: number;
+  tagName: string;
+  targetCommitish: string;
+  name: string;
+  body: string;
+  bodyTruncated: boolean;
+  draft: boolean;
+  prerelease: boolean;
+  immutable: boolean;
+  htmlUrl: string;
+  author: GitHubActorRecord;
+  createdAt: string;
+  publishedAt?: string;
 }
 
 export interface GitHubCommitRecord {
@@ -130,6 +174,27 @@ export interface GitHubPullRequestRecord {
   mergeSha?: string | null;
 }
 
+export type GitHubPullRequestFileStatus =
+  | "added"
+  | "removed"
+  | "modified"
+  | "renamed"
+  | "copied"
+  | "changed"
+  | "unchanged";
+
+export interface GitHubPullRequestFileRecord {
+  sha: string;
+  filename: string;
+  status: GitHubPullRequestFileStatus;
+  additions: number;
+  deletions: number;
+  changes: number;
+  previousFilename?: string;
+  patch?: string;
+  patchTruncated: boolean;
+}
+
 export interface GitHubReviewRecord {
   id: number;
   htmlUrl: string;
@@ -188,6 +253,21 @@ export interface GitHubWorkflowRunRecord {
   event: string;
   runAttempt: number;
   updatedAt: string;
+}
+
+export interface GitHubWorkflowJobRecord {
+  id: number;
+  runId: number;
+  name: string;
+  htmlUrl: string;
+  status: string;
+  conclusion?: string;
+  headSha: string;
+  startedAt?: string;
+  completedAt?: string;
+  workflowName?: string;
+  headBranch?: string;
+  runnerName?: string;
 }
 
 export interface GitHubMergeRecord {
@@ -287,6 +367,73 @@ export class GitHubRestClient {
       await this.request(
         "GET",
         `${repoPath(owner, repository)}/git/ref/heads/${refPath(branch)}`,
+        undefined,
+        signal,
+      ),
+    );
+  }
+
+  async listBranches(
+    owner: string,
+    repository: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubBranchRecord[]> {
+    return normalizeList(
+      await this.request(
+        "GET",
+        `${repoPath(owner, repository)}/branches?per_page=100`,
+        undefined,
+        signal,
+      ),
+      "branches",
+      normalizeBranch,
+    );
+  }
+
+  async listTags(
+    owner: string,
+    repository: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubTagRecord[]> {
+    return normalizeList(
+      await this.request(
+        "GET",
+        `${repoPath(owner, repository)}/tags?per_page=100`,
+        undefined,
+        signal,
+      ),
+      "tags",
+      normalizeTag,
+    );
+  }
+
+  async listReleases(
+    owner: string,
+    repository: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubReleaseRecord[]> {
+    return normalizeList(
+      await this.request(
+        "GET",
+        `${repoPath(owner, repository)}/releases?per_page=100`,
+        undefined,
+        signal,
+      ),
+      "releases",
+      normalizeRelease,
+    );
+  }
+
+  async getRelease(
+    owner: string,
+    repository: string,
+    releaseId: number,
+    signal?: AbortSignal,
+  ): Promise<GitHubReleaseRecord> {
+    return normalizeRelease(
+      await this.request(
+        "GET",
+        `${repoPath(owner, repository)}/releases/${positiveInteger(releaseId, "releaseId")}`,
         undefined,
         signal,
       ),
@@ -423,6 +570,24 @@ export class GitHubRestClient {
         undefined,
         signal,
       ),
+    );
+  }
+
+  async listPullRequestFiles(
+    owner: string,
+    repository: string,
+    number: number,
+    signal?: AbortSignal,
+  ): Promise<GitHubPullRequestFileRecord[]> {
+    return normalizeList(
+      await this.request(
+        "GET",
+        `${repoPath(owner, repository)}/pulls/${positiveInteger(number, "number")}/files?per_page=100`,
+        undefined,
+        signal,
+      ),
+      "pull request files",
+      normalizePullRequestFile,
     );
   }
 
@@ -589,6 +754,40 @@ export class GitHubRestClient {
       throw invalidResponse("Expected workflow_runs in the GitHub response.");
     }
     return normalizeList(payload.workflow_runs, "workflow runs", normalizeWorkflowRun);
+  }
+
+  async getWorkflowRun(
+    owner: string,
+    repository: string,
+    runId: number,
+    signal?: AbortSignal,
+  ): Promise<GitHubWorkflowRunRecord> {
+    return normalizeWorkflowRun(
+      await this.request(
+        "GET",
+        `${repoPath(owner, repository)}/actions/runs/${positiveInteger(runId, "runId")}`,
+        undefined,
+        signal,
+      ),
+    );
+  }
+
+  async listWorkflowJobs(
+    owner: string,
+    repository: string,
+    runId: number,
+    signal?: AbortSignal,
+  ): Promise<GitHubWorkflowJobRecord[]> {
+    const payload = await this.request(
+      "GET",
+      `${repoPath(owner, repository)}/actions/runs/${positiveInteger(runId, "runId")}/jobs?filter=latest&per_page=100`,
+      undefined,
+      signal,
+    );
+    if (!isRecord(payload)) {
+      throw invalidResponse("Expected jobs in the GitHub response.");
+    }
+    return normalizeList(payload.jobs, "workflow jobs", normalizeWorkflowJob);
   }
 
   async createAgentBranch(
@@ -1117,6 +1316,8 @@ function normalizeAuthenticatedUser(value: unknown): GitHubAuthenticatedUserReco
 
 function normalizeRepository(value: unknown): GitHubRepositoryRecord {
   if (!isRecord(value)) throw invalidResponse("Invalid repository response.");
+  const visibility = normalizeRepositoryVisibility(value);
+  const permissions = normalizeRepositoryPermissions(value.permissions);
   return {
     id: requiredNumber(value.id, "repository.id"),
     fullName: requiredString(value.full_name, "repository.full_name"),
@@ -1124,6 +1325,52 @@ function normalizeRepository(value: unknown): GitHubRepositoryRecord {
     defaultBranch: requiredString(value.default_branch, "repository.default_branch"),
     private: value.private === true,
     archived: value.archived === true,
+    visibility,
+    ...(typeof value.description === "string" && value.description.trim()
+      ? { description: value.description.trim().slice(0, 1_024) }
+      : {}),
+    ...(typeof value.language === "string" && value.language.trim()
+      ? { language: value.language.trim().slice(0, 128) }
+      : {}),
+    topics: Array.isArray(value.topics)
+      ? value.topics
+          .filter((topic): topic is string => typeof topic === "string")
+          .map((topic) => topic.trim())
+          .filter(Boolean)
+          .slice(0, 20)
+      : [],
+    hasIssues: value.has_issues !== false,
+    ...(permissions ? { permissions } : {}),
+  };
+}
+
+function normalizeRepositoryVisibility(
+  value: Record<string, unknown>,
+): GitHubRepositoryRecord["visibility"] {
+  if (
+    value.visibility === "private" ||
+    value.visibility === "public" ||
+    value.visibility === "internal"
+  ) {
+    return value.visibility;
+  }
+  return value.private === true ? "private" : "public";
+}
+
+function normalizeRepositoryPermissions(
+  value: unknown,
+): GitHubRepositoryRecord["permissions"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const fields = ["admin", "maintain", "push", "triage", "pull"] as const;
+  if (fields.some((field) => typeof value[field] !== "boolean")) {
+    throw invalidResponse("Invalid repository permissions response.");
+  }
+  return {
+    admin: value.admin as boolean,
+    maintain: value.maintain as boolean,
+    push: value.push as boolean,
+    triage: value.triage as boolean,
+    pull: value.pull as boolean,
   };
 }
 
@@ -1135,6 +1382,72 @@ function normalizeReference(value: unknown): GitHubReferenceRecord {
     ref: requiredString(value.ref, "reference.ref"),
     sha: requiredString(value.object.sha, "reference.object.sha"),
     objectType: requiredString(value.object.type, "reference.object.type"),
+  };
+}
+
+function normalizeBranch(value: unknown): GitHubBranchRecord {
+  if (!isRecord(value) || !isRecord(value.commit)) {
+    throw invalidResponse("Invalid branch response.");
+  }
+  if (typeof value.protected !== "boolean") {
+    throw invalidResponse("Invalid branch.protected response.");
+  }
+  return {
+    name: validateRef(
+      boundedProviderString(value.name, "branch.name", 255),
+    ),
+    sha: validateSha(requiredString(value.commit.sha, "branch.commit.sha")),
+    protected: value.protected,
+  };
+}
+
+function normalizeTag(value: unknown): GitHubTagRecord {
+  if (!isRecord(value) || !isRecord(value.commit)) {
+    throw invalidResponse("Invalid tag response.");
+  }
+  return {
+    name: validateRef(boundedProviderString(value.name, "tag.name", 255)),
+    sha: validateSha(requiredString(value.commit.sha, "tag.commit.sha")),
+  };
+}
+
+function normalizeRelease(value: unknown): GitHubReleaseRecord {
+  if (!isRecord(value)) throw invalidResponse("Invalid release response.");
+  if (typeof value.draft !== "boolean" || typeof value.prerelease !== "boolean") {
+    throw invalidResponse("Invalid release state response.");
+  }
+  const body = boundedProviderContent(
+    value.body,
+    "release.body",
+    MAX_RELEASE_BODY_CHARS,
+  );
+  const name = value.name === null || value.name === undefined
+    ? ""
+    : boundedProviderString(value.name, "release.name", MAX_PROVIDER_NAME_CHARS);
+  return {
+    id: positiveInteger(requiredNumber(value.id, "release.id"), "release.id"),
+    tagName: validateRef(
+      boundedProviderString(value.tag_name, "release.tag_name", 255),
+    ),
+    targetCommitish: validateRef(
+      boundedProviderString(value.target_commitish, "release.target_commitish", 255),
+    ),
+    name,
+    body: body.text,
+    bodyTruncated: body.truncated,
+    draft: value.draft,
+    prerelease: value.prerelease,
+    immutable: value.immutable === true,
+    htmlUrl: boundedProviderString(
+      value.html_url,
+      "release.html_url",
+      MAX_PROVIDER_URL_CHARS,
+    ),
+    author: normalizeActor(value.author, "release.author"),
+    createdAt: canonicalTimestamp(value.created_at, "release.created_at"),
+    ...(typeof value.published_at === "string"
+      ? { publishedAt: canonicalTimestamp(value.published_at, "release.published_at") }
+      : {}),
   };
 }
 
@@ -1266,6 +1579,52 @@ function normalizePullRequest(value: unknown): GitHubPullRequestRecord {
       typeof value.merge_commit_sha === "string"
         ? validateSha(value.merge_commit_sha)
         : null,
+  };
+}
+
+function normalizePullRequestFile(value: unknown): GitHubPullRequestFileRecord {
+  if (!isRecord(value)) throw invalidResponse("Invalid pull request file response.");
+  const status = value.status;
+  if (
+    status !== "added" &&
+    status !== "removed" &&
+    status !== "modified" &&
+    status !== "renamed" &&
+    status !== "copied" &&
+    status !== "changed" &&
+    status !== "unchanged"
+  ) {
+    throw invalidResponse("Invalid pull request file status.");
+  }
+  const patch = value.patch === undefined || value.patch === null
+    ? undefined
+    : boundedProviderContent(
+        value.patch,
+        "pull_request_file.patch",
+        MAX_PULL_REQUEST_PATCH_CHARS,
+      );
+  return {
+    sha: validateSha(requiredString(value.sha, "pull_request_file.sha")),
+    filename: boundedProviderString(
+      value.filename,
+      "pull_request_file.filename",
+      MAX_PROVIDER_PATH_CHARS,
+    ),
+    status,
+    additions: nonNegativeInteger(value.additions, "pull_request_file.additions"),
+    deletions: nonNegativeInteger(value.deletions, "pull_request_file.deletions"),
+    changes: nonNegativeInteger(value.changes, "pull_request_file.changes"),
+    ...(typeof value.previous_filename === "string"
+      ? {
+          previousFilename: boundedProviderString(
+            value.previous_filename,
+            "pull_request_file.previous_filename",
+            MAX_PROVIDER_PATH_CHARS,
+          ),
+        }
+      : {}),
+    ...(patch ? { patch: patch.text } : {}),
+    patchTruncated: patch?.truncated ?? false,
   };
 }
 
@@ -1426,15 +1785,77 @@ function normalizeCombinedStatus(value: unknown): GitHubCombinedStatusRecord {
 function normalizeWorkflowRun(value: unknown): GitHubWorkflowRunRecord {
   if (!isRecord(value)) throw invalidResponse("Invalid workflow run response.");
   return {
-    id: requiredNumber(value.id, "workflow_run.id"),
-    name: requiredString(value.name, "workflow_run.name"),
-    htmlUrl: requiredString(value.html_url, "workflow_run.html_url"),
-    status: requiredString(value.status, "workflow_run.status"),
-    ...(typeof value.conclusion === "string" ? { conclusion: value.conclusion } : {}),
-    headSha: requiredString(value.head_sha, "workflow_run.head_sha"),
-    event: requiredString(value.event, "workflow_run.event"),
-    runAttempt: requiredNumber(value.run_attempt, "workflow_run.run_attempt"),
+    id: positiveInteger(requiredNumber(value.id, "workflow_run.id"), "workflow_run.id"),
+    name: boundedProviderString(value.name, "workflow_run.name", MAX_PROVIDER_NAME_CHARS),
+    htmlUrl: boundedProviderString(
+      value.html_url,
+      "workflow_run.html_url",
+      MAX_PROVIDER_URL_CHARS,
+    ),
+    status: boundedProviderString(value.status, "workflow_run.status", 64),
+    ...(typeof value.conclusion === "string"
+      ? { conclusion: boundedProviderString(value.conclusion, "workflow_run.conclusion", 64) }
+      : {}),
+    headSha: validateSha(requiredString(value.head_sha, "workflow_run.head_sha")),
+    event: boundedProviderString(value.event, "workflow_run.event", 128),
+    runAttempt: positiveInteger(
+      requiredNumber(value.run_attempt, "workflow_run.run_attempt"),
+      "workflow_run.run_attempt",
+    ),
     updatedAt: canonicalTimestamp(value.updated_at, "workflow_run.updated_at"),
+  };
+}
+
+function normalizeWorkflowJob(value: unknown): GitHubWorkflowJobRecord {
+  if (!isRecord(value)) throw invalidResponse("Invalid workflow job response.");
+  return {
+    id: positiveInteger(requiredNumber(value.id, "workflow_job.id"), "workflow_job.id"),
+    runId: positiveInteger(
+      requiredNumber(value.run_id, "workflow_job.run_id"),
+      "workflow_job.run_id",
+    ),
+    name: boundedProviderString(value.name, "workflow_job.name", MAX_PROVIDER_NAME_CHARS),
+    htmlUrl: boundedProviderString(
+      value.html_url,
+      "workflow_job.html_url",
+      MAX_PROVIDER_URL_CHARS,
+    ),
+    status: boundedProviderString(value.status, "workflow_job.status", 64),
+    ...(typeof value.conclusion === "string"
+      ? { conclusion: boundedProviderString(value.conclusion, "workflow_job.conclusion", 64) }
+      : {}),
+    headSha: validateSha(requiredString(value.head_sha, "workflow_job.head_sha")),
+    ...(typeof value.started_at === "string"
+      ? { startedAt: canonicalTimestamp(value.started_at, "workflow_job.started_at") }
+      : {}),
+    ...(typeof value.completed_at === "string"
+      ? { completedAt: canonicalTimestamp(value.completed_at, "workflow_job.completed_at") }
+      : {}),
+    ...(typeof value.workflow_name === "string" && value.workflow_name.trim()
+      ? {
+          workflowName: boundedProviderString(
+            value.workflow_name,
+            "workflow_job.workflow_name",
+            MAX_PROVIDER_NAME_CHARS,
+          ),
+        }
+      : {}),
+    ...(typeof value.head_branch === "string" && value.head_branch.trim()
+      ? {
+          headBranch: validateRef(
+            boundedProviderString(value.head_branch, "workflow_job.head_branch", 255),
+          ),
+        }
+      : {}),
+    ...(typeof value.runner_name === "string" && value.runner_name.trim()
+      ? {
+          runnerName: boundedProviderString(
+            value.runner_name,
+            "workflow_job.runner_name",
+            MAX_PROVIDER_NAME_CHARS,
+          ),
+        }
+      : {}),
   };
 }
 
@@ -1463,13 +1884,18 @@ function repoPath(owner: string, repository: string): string {
 }
 
 function segment(value: string): string {
-  if (!OWNER_REPO_PATTERN.test(value)) {
+  const normalized = value.trim();
+  if (
+    !OWNER_REPO_PATTERN.test(normalized) ||
+    normalized === "." ||
+    normalized === ".."
+  ) {
     throw new GitHubApiError(
       "github_invalid_response",
       "GitHub owner or repository identifier is invalid.",
     );
   }
-  return encodeURIComponent(value);
+  return encodeURIComponent(normalized);
 }
 
 function validateOwnerRepoSegment(value: string, field: string): string {
@@ -1555,6 +1981,35 @@ function boundedText(
   return normalized;
 }
 
+function boundedProviderString(
+  value: unknown,
+  field: string,
+  maximum: number,
+): string {
+  const text = requiredString(value, field);
+  if (text.length > maximum) {
+    throw invalidResponse(`${field} exceeds the bounded response limit.`);
+  }
+  return text;
+}
+
+function boundedProviderContent(
+  value: unknown,
+  field: string,
+  maximum: number,
+): { text: string; truncated: boolean } {
+  if (value === null || value === undefined) {
+    return { text: "", truncated: false };
+  }
+  if (typeof value !== "string") {
+    throw invalidResponse(`Invalid ${field}.`);
+  }
+  return {
+    text: value.slice(0, maximum),
+    truncated: value.length > maximum,
+  };
+}
+
 function optionalBoundedText(
   value: string | undefined,
   field: string,
@@ -1574,6 +2029,13 @@ function definedBody(body: Record<string, unknown>): Record<string, unknown> {
 function positiveInteger(value: number, field: string): number {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new GitHubApiError("github_invalid_response", `${field} must be a positive integer.`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw invalidResponse(`${field} must be a non-negative integer.`);
   }
   return value;
 }

@@ -1,3 +1,7 @@
+import {
+  agentGitCommitIdentityEnvironmentV1,
+  isAgentGitCommitIdentityV1,
+} from "../../packages/core-api/src/agentGitCommitIdentityV1";
 import type { CapabilitySetupTarget } from "./capabilitySetup";
 
 export type CapabilityReadinessStatusV2 =
@@ -7,6 +11,38 @@ export type CapabilityReadinessStatusV2 =
   | "Approval needed"
   | "Degraded"
   | "Blocked";
+
+/**
+ * True when the host-pinned agent commit identity contract is loadable and
+ * matches the attribution-integrity constants used for agent commits.
+ */
+export function evaluatePinnedGitIdentityReadinessV1(): boolean {
+  const env = agentGitCommitIdentityEnvironmentV1();
+  return isAgentGitCommitIdentityV1({
+    authorName: env.GIT_AUTHOR_NAME ?? "",
+    authorEmail: env.GIT_AUTHOR_EMAIL ?? "",
+    committerName: env.GIT_COMMITTER_NAME ?? "",
+    committerEmail: env.GIT_COMMITTER_EMAIL ?? "",
+  });
+}
+
+/**
+ * Classic OAuth `repo` includes delete for owned repositories; fine-grained
+ * tokens need an explicit `delete_repo` grant. Returns null when scopes were
+ * not observed so callers can fail closed for cleanup-required missions.
+ */
+export function githubCleanupAuthorityFromScopesV1(
+  scopes: readonly string[] | null | undefined,
+): boolean | null {
+  if (!scopes) return null;
+  const normalized = scopes
+    .map((scope) => scope.trim().toLowerCase())
+    .filter((scope) => scope.length > 0);
+  if (normalized.length === 0) return null;
+  return normalized.some(
+    (scope) => scope === "delete_repo" || scope === "repo",
+  );
+}
 
 export interface CapabilityReadinessV2 {
   version: 2;

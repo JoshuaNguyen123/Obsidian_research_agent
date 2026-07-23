@@ -435,6 +435,12 @@ function parseModelRole(role: unknown): ModelRole {
   );
 }
 
+/**
+ * Accumulate streamed Ollama tool_calls. Ollama emits complete tool-call
+ * objects per chunk (docs.ollama.com/capabilities/tool-calling); prefer
+ * extend/replace-by-index and dedupe identical unordered calls rather than
+ * OpenAI-style progressive argument merges.
+ */
 function mergeOllamaToolCallDeltas(
   byIndex: Map<number, ModelToolCall>,
   unordered: ModelToolCall[],
@@ -442,29 +448,30 @@ function mergeOllamaToolCallDeltas(
 ): void {
   for (const delta of deltas) {
     if (typeof delta.index === "number") {
-      const existing = byIndex.get(delta.index);
-      if (!existing) {
-        byIndex.set(delta.index, { ...delta });
-        continue;
-      }
-      byIndex.set(delta.index, {
-        ...existing,
-        name: delta.name || existing.name,
-        arguments: mergeToolArgumentRecords(existing.arguments, delta.arguments),
-        id: delta.id ?? existing.id,
-        raw: delta.raw ?? existing.raw,
-      });
+      // Complete-call replace: later chunk for the same index wins wholesale.
+      byIndex.set(delta.index, { ...delta });
+      continue;
+    }
+    if (
+      unordered.some(
+        (existing) =>
+          existing.name === delta.name &&
+          stableToolArgumentsKey(existing.arguments) ===
+            stableToolArgumentsKey(delta.arguments),
+      )
+    ) {
       continue;
     }
     unordered.push(delta);
   }
 }
 
-function mergeToolArgumentRecords(
-  left: Record<string, unknown>,
-  right: Record<string, unknown>,
-): Record<string, unknown> {
-  return { ...left, ...right };
+function stableToolArgumentsKey(args: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(args, Object.keys(args).sort());
+  } catch {
+    return JSON.stringify(args);
+  }
 }
 
 function parseOllamaToolCalls(toolCalls: unknown): ModelToolCall[] {

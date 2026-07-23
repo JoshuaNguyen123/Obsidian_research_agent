@@ -18,6 +18,7 @@ import {
   type MissionPlanTask,
 } from "./missionPlan";
 import type { MissionAcceptanceReceiptLike } from "./missionAcceptance";
+import { isOptionalMissionGraphNodeId } from "./missionGraphAuthority";
 
 export interface MissionPlanAcceptanceInput extends MissionAcceptanceInput {
   plan?: MissionPlan | null;
@@ -50,6 +51,10 @@ function evaluatePlanProof(
   const missing = new Set<string>();
   const reasons: string[] = [];
   for (const task of plan.tasks) {
+    // Optional MissionGraph enrichment nodes must never gate acceptance.
+    if (isOptionalMissionGraphNodeId(task.id)) {
+      continue;
+    }
     for (const proof of task.completionContract.requiredProof) {
       if (!hasProof(proof, task, plan, evidence, receipts, finalOutput)) {
         missing.add(`plan:${task.id}:${proof}`);
@@ -115,9 +120,17 @@ function hasProof(
     case "code_execution":
       return (
         task.evidenceIds.includes(CODE_RUN_SUCCESS_EVIDENCE_ID) ||
+        task.evidenceIds.includes("tool:code_commit_verified") ||
+        receipts.some(
+          (receipt) =>
+            receipt.toolName === "code_commit_verified" &&
+            (receipt.operation === "commit" ||
+              receipt.resource?.system === "git" ||
+              Boolean(receipt.resource?.id)),
+        ) ||
         (allowUnboundFallback &&
           evidence.some((item) =>
-            /run_code_block[\s\S]{0,120}exit\s*code\s*0|exit\s*code\s*0[\s\S]{0,120}run_code_block/i.test(
+            /run_code_block[\s\S]{0,120}exit\s*code\s*0|exit\s*code\s*0[\s\S]{0,120}run_code_block|code_commit_verified/i.test(
               `${item.title} ${item.summary}`,
             ),
           ))

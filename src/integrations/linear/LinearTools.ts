@@ -1946,6 +1946,12 @@ function copyOptionalStringArg(
     target[key] = null;
     return;
   }
+  // Models often emit "" for unused optional IDs. Treat blank as omitted so
+  // Linear can apply team defaults (e.g. workflow state) instead of failing
+  // validation before the network call.
+  if (typeof source[key] === "string" && source[key].trim() === "") {
+    return;
+  }
   target[key] = boundedString(source[key], key, maxChars);
 }
 

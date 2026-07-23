@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { withPreparedActionFingerprint } from "../src/agent/actions";
 import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
+import { DefaultToolRegistry } from "../src/tools/ToolRegistry";
 import { DEFAULT_TEMPLATE_SEEDS } from "../src/tools/vaultTools";
 import {
   AGENT_TEMPLATE_FOLDER,
@@ -17,7 +19,7 @@ import {
   MAX_WEB_FETCH_CHARS,
   MAX_WEB_SEARCH_SNIPPET_CHARS,
 } from "../src/tools/constants";
-import type { ResearchMemoryIndexEntry, ToolExecutionContext, ToolExecutionResult, ToolRegistry } from "../src/tools/types";
+import type { AgentTool, ResearchMemoryIndexEntry, ToolExecutionContext, ToolExecutionResult, ToolRegistry } from "../src/tools/types";
 
 async function executeAuthorizedPrepared(
   registry: ToolRegistry,
@@ -90,6 +92,119 @@ test("registry exposes tool definitions and rejects unknown tools", async () => 
   assert.equal(result.error?.code, "unknown_tool");
 });
 
+test("registry rejects scoped-read authority for mutations and accepts a real one-shot grant", async () => {
+  let executionCount = 0;
+  const tool: AgentTool = {
+    name: "github_update_issue_fixture",
+    description: "Test-only prepared GitHub mutation.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    descriptor: {
+      version: 1,
+      name: "github_update_issue_fixture",
+      capability: { system: "github", resourceType: "issue", action: "update" },
+      effect: "reversible_mutation",
+      risk: "medium",
+      approval: {
+        allowPromptGrant: true,
+        allowPersistentGrant: false,
+        fallback: "exact",
+      },
+      execution: {
+        preparation: "required",
+        cacheable: false,
+        parallelSafe: false,
+      },
+      durability: {
+        journal: true,
+        receipt: true,
+        readback: "required",
+        reconciliation: "required",
+      },
+      allowedPrincipals: ["single_agent"],
+    },
+    async execute() {
+      throw new Error("Prepared execution required.");
+    },
+    async executePrepared(action, context) {
+      executionCount += 1;
+      const grantId = context.authorizedAction?.grantId ?? "";
+      return {
+        output: { updated: true },
+        mutationState: "applied",
+        receipt: {
+          version: 1,
+          id: "receipt-github-update-issue",
+          runId: action.runId,
+          actionId: action.id,
+          toolName: action.toolName,
+          operation: "update",
+          resource: action.target,
+          message: "Updated issue with verified readback.",
+          payloadFingerprint: action.payloadFingerprint,
+          grantId,
+          startedAt: "1970-01-01T00:00:01.000Z",
+          committedAt: "1970-01-01T00:00:02.000Z",
+          commitKind: "committed",
+          readback: {
+            status: "verified",
+            checkedAt: "1970-01-01T00:00:02.000Z",
+          },
+        },
+      };
+    },
+  };
+  const action = await withPreparedActionFingerprint({
+    version: 1,
+    id: "action-github-update-issue",
+    runId: "run-github-update-issue",
+    toolCallId: "call-github-update-issue",
+    toolName: tool.name,
+    target: {
+      system: "github",
+      resourceType: "issue",
+      id: "issue:12",
+      repositoryProfileId: "trusted-repository",
+    },
+    relatedResources: [],
+    normalizedArgs: { number: 12, title: "Updated title" },
+    preview: {
+      summary: "Update GitHub issue 12",
+      destination: "trusted-repository",
+      outboundPayload: { title: "Updated title" },
+      warnings: [],
+      outboundBytes: 13,
+    },
+    preparedAt: "1970-01-01T00:00:00.000Z",
+    expiresAt: "1970-01-01T00:01:00.000Z",
+  });
+  const registry = new DefaultToolRegistry([tool]);
+  const context = createMockContext({ now: new Date(1_000) }).context;
+  context.runId = action.runId;
+
+  const rejected = await registry.executePrepared!(action, context, {
+    preparedActionId: action.id,
+    payloadFingerprint: action.payloadFingerprint,
+    grantId: "policy:scoped-read",
+  });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error?.code, "authorization_scope_mismatch");
+  assert.equal(rejected.mutationState, "not_applied");
+  assert.equal(executionCount, 0);
+
+  const allowed = await registry.executePrepared!(action, context, {
+    preparedActionId: action.id,
+    payloadFingerprint: action.payloadFingerprint,
+    grantId: "grant:one-shot:approved",
+  });
+  assert.equal(allowed.ok, true);
+  assert.equal(allowed.receipt?.grantId, "grant:one-shot:approved");
+  assert.equal(executionCount, 1);
+});
+
 test("registry marks invalid mutation arguments as definitely not applied", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({
@@ -110,7 +225,48 @@ test("registry marks invalid mutation arguments as definitely not applied", asyn
   assert.equal(result.ok, false);
   assert.equal(result.error?.code, "invalid_arguments");
   assert.equal(result.mutationState, "not_applied");
+  assert.ok(Array.isArray(result.error?.details?.violations));
   assert.equal(mock.content.has("Designs/invalid.canvas"), false);
+});
+
+test("registry returns structured not-applied violations for invalid raw Canvas geometry", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({ prompt: "Create a canvas diagram." });
+
+  const result = await registry.execute(
+    {
+      name: "create_design_canvas",
+      arguments: {
+        path: "Designs/raw-invalid.canvas",
+        canvas: {
+          nodes: [
+            {
+              id: "bad-node",
+              type: "text",
+              x: 1.5,
+              y: 0,
+              width: 0,
+              height: 100,
+              color: "purple",
+              text: "Invalid geometry",
+            },
+          ],
+          edges: [],
+        },
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "invalid_arguments");
+  assert.equal(result.mutationState, "not_applied");
+  assert.deepEqual(result.error?.details?.violations, [
+    "nodes[0].x must be an integer.",
+    "nodes[0].width must be a positive integer.",
+    "nodes[0].color must be a preset color 1-6 or a hex color.",
+  ]);
+  assert.equal(mock.content.has("Designs/raw-invalid.canvas"), false);
 });
 
 test("companion browser tool stays blocked when browser setting is disabled", async () => {
@@ -203,6 +359,42 @@ test("read_current_file honors optional maxChars cap", async () => {
   assert.deepEqual(result.output, {
     path: "Current.md",
     content: `${"x".repeat(10)}\n\n[truncated]`,
+    totalChars: 20,
+    returnedChars: 10,
+    offset: 0,
+    truncated: true,
+    nextOffset: 10,
+  });
+});
+
+test("read_current_file pages with offset after truncation", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext();
+  mock.content.set("Current.md", "abcdefghij");
+
+  const first = await registry.execute(
+    { name: "read_current_file", arguments: { maxChars: 4 } },
+    mock.context,
+  );
+  assert.equal(first.ok, true);
+  assert.equal((first.output as { nextOffset: number }).nextOffset, 4);
+
+  const second = await registry.execute(
+    {
+      name: "read_current_file",
+      arguments: { maxChars: 4, offset: 4 },
+    },
+    mock.context,
+  );
+  assert.equal(second.ok, true);
+  assert.deepEqual(second.output, {
+    path: "Current.md",
+    content: "efgh\n\n[truncated]",
+    totalChars: 10,
+    returnedChars: 4,
+    offset: 4,
+    truncated: true,
+    nextOffset: 8,
   });
 });
 
@@ -223,6 +415,11 @@ test("read_current_file uses plugin current page resolver and live editor text",
   assert.deepEqual(result.output, {
     path: "Current.md",
     content: "Unsaved prompt from the open editor",
+    totalChars: 35,
+    returnedChars: 35,
+    offset: 0,
+    truncated: false,
+    nextOffset: null,
   });
 });
 
@@ -1639,6 +1836,14 @@ test("read_template narrowly permits the managed Linear issue template for expli
   );
   assert.equal(blockedOtherTemplate.ok, false);
   assert.match(blockedOtherTemplate.error?.message ?? "", /ask about templates/i);
+
+  // Wrong relative path on a Linear mutation mission redirects to the managed template.
+  const redirected = await registry.execute(
+    { name: "read_template", arguments: { path: "Linear ticket.md" } },
+    allowed.context,
+  );
+  assert.equal(redirected.ok, true);
+  assert.equal((redirected.output as { path: string }).path, managedPath);
 });
 
 test("seed_default_templates creates starter templates without overwriting existing files", async () => {
@@ -2002,6 +2207,11 @@ test("reads, appends, and replaces the active markdown file with backup", async 
   assert.deepEqual(read.output, {
     path: "Current.md",
     content: "Initial note",
+    totalChars: 12,
+    returnedChars: 12,
+    offset: 0,
+    truncated: false,
+    nextOffset: null,
   });
 
   const append = await registry.execute(
@@ -2097,6 +2307,24 @@ test("replace_current_file is blocked without explicit replace intent", async ()
   assert.match(result.error?.message ?? "", /explicitly ask/);
 });
 
+test("replace_current_file allows edit existing note trim wording", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt:
+      "It is slightly over 3000 words. Could you edit some sections of the existing note to get it closer to 3000 words?",
+    now: new Date(456),
+  });
+
+  const result = await executeAuthorizedPrepared(
+    registry,
+    { name: "replace_current_file", arguments: { text: "Trimmed essay" } },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(mock.content.get("Current.md"), "Trimmed essay");
+});
+
 test("append_to_current_file is blocked without explicit append intent", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({ prompt: "Summarize this note." });
@@ -2108,6 +2336,58 @@ test("append_to_current_file is blocked without explicit append intent", async (
 
   assert.equal(result.ok, false);
   assert.match(result.error?.message ?? "", /explicitly ask/);
+});
+
+test("append_to_current_file rejects process narration about missing replace", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: "Append a short status line to this note.",
+    writeAutonomy: true,
+  });
+  mock.content.set(
+    "Current.md",
+    `${"Existing draft body. ".repeat(40)}\n`,
+  );
+
+  const result = await registry.execute(
+    {
+      name: "append_to_current_file",
+      arguments: {
+        text: [
+          "I need to replace the current note content entirely with the revised essay, but I only have `append_to_current_file` available — I don't have access to `replace_current_file` in this session.",
+          "",
+          "Let me write the revised 2000-2200 word version and append it:",
+        ].join("\n"),
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error?.message ?? "", /process narration/i);
+  assert.match(mock.content.get("Current.md") ?? "", /Existing draft body/);
+});
+
+test("append_to_current_file is blocked on revise missions with existing body", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt:
+      "Revise this essay into a clearer 2000 word version and write the result to the note.",
+    writeAutonomy: true,
+  });
+  mock.content.set("Current.md", `${"Draft paragraph. ".repeat(50)}\n`);
+
+  const result = await registry.execute(
+    {
+      name: "append_to_current_file",
+      arguments: { text: "## Extra section\n\nMore prose for the note." },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error?.message ?? "", /blocked for this revise\/replace/i);
+  assert.match(mock.content.get("Current.md") ?? "", /Draft paragraph/);
 });
 
 test("append_to_current_section inserts below a heading with backup", async () => {
@@ -3329,6 +3609,7 @@ function createMockContext(options: {
   activePath?: string | null;
   currentMarkdownPath?: string;
   liveContent?: string;
+  writeAutonomy?: boolean;
   fileStats?: Record<string, { ctime?: number; mtime?: number; size?: number }>;
   settings?: Partial<ToolExecutionContext["settings"]>;
   cachedReadTransform?: (path: string, value: string) => string;
@@ -3585,6 +3866,7 @@ function createMockContext(options: {
       ...options.settings,
     },
     originalPrompt: options.prompt ?? "Research this note.",
+    writeAutonomy: options.writeAutonomy === true,
     httpTransport: async () => ({
       status: 500,
       headers: {},

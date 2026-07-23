@@ -338,6 +338,10 @@ function expectUniquePaths(value: unknown, label: string): string[] {
 
 function normalizeRelativePath(value: string, label: string): string {
   const normalized = value.replace(/\/$/, "");
+  // Repository-root scope (sandbox project covering + mutation fence).
+  if (normalized === ".") {
+    return normalized;
+  }
   if (
     !normalized ||
     normalized.startsWith("/") ||

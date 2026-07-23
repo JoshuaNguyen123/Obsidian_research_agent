@@ -4,6 +4,9 @@ import {
   approvalDeniedFailureCopy,
   blockedDomainFailureCopy,
   claimGroundingFailureCopy,
+  conversationalBlockerCopy,
+  conversationalStatusLine,
+  credentialBlockFailureCopy,
   formatAcceptanceFailureCopy,
   formatFailureCopy,
   formatModelFailureCopy,
@@ -19,6 +22,7 @@ import {
   policyBlockFailureCopy,
   providerAuthFailureCopy,
   semanticCoverageSecondPassCopy,
+  validationRepairProgressCopy,
   walReconcileFailureCopy,
   webFetchFailureCopy,
   writeReceiptMissingFailureCopy,
@@ -135,4 +139,47 @@ test("formatAcceptanceFailureCopy maps claim conflict and phase gates", () => {
     formatAcceptanceFailureCopy(["web_evidence"]),
     /Mission acceptance missing: web_evidence/,
   );
+});
+
+test("validation repair and conversational blockers stay plain-language", () => {
+  assert.equal(
+    validationRepairProgressCopy({ failedFileCount: 2 }),
+    "Validation failed; I'm fixing two files.",
+  );
+  assert.match(
+    validationRepairProgressCopy({ files: ["src/a.ts"] }),
+    /I'm fixing src\/a\.ts/,
+  );
+  assert.match(
+    conversationalStatusLine(
+      "Mission plan appears stalled; asking model to choose a different next action...",
+    ),
+    /stalled; I'm choosing a different next action/i,
+  );
+  assert.match(
+    conversationalStatusLine("Recovery planned: web_search instead"),
+    /^web_search instead$/,
+  );
+
+  const credential = credentialBlockFailureCopy("missing key");
+  assert.match(credential.next, /Continue/i);
+  assert.match(
+    formatFailureCopy(conversationalBlockerCopy({ kind: "external", why: "PR draft missing" })),
+    /Next: .*Continue/i,
+  );
+  assert.match(
+    formatFailureCopy(
+      conversationalBlockerCopy({
+        kind: "approval",
+        toolName: "code_commit_verified",
+        approvalDecision: "denied",
+      }),
+    ),
+    /Click Continue/i,
+  );
+});
+
+test("provider auth copy points at settings then Continue", () => {
+  assert.match(providerAuthFailureCopy("401").next, /Continue/i);
+  assert.match(approvalDeniedFailureCopy("replace_current_file", "denied").next, /Continue/i);
 });

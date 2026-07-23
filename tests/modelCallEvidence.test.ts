@@ -52,6 +52,7 @@ test("emits redacted production evidence and enforces the call budget", async ()
   });
 
   await observed.client.chat({
+    model: " glm-5.2 ",
     messages: [{ role: "user", content: "secret prompt" }],
     evidencePhase: "router",
   });
@@ -63,11 +64,13 @@ test("emits redacted production evidence and enforces the call budget", async ()
   );
 
   assert.equal(evidence[0].outcome, "success");
+  assert.equal(evidence[0].model, "glm-5.2");
   assert.equal(evidence[0].phase, "router");
   assert.equal(evidence[0].transportKind, "production");
   assert.equal(evidence[0].responseChars, "provider text".length);
   assert.equal(evidence[0].totalTokens, 12);
   assert.equal(evidence[1].outcome, "budget_exhausted");
+  assert.equal(evidence[1].model, "gpt-oss:120b-cloud");
   assert.doesNotMatch(JSON.stringify(evidence), /secret prompt|provider text|ollama\.com/);
   assert.equal(observed.getUsage().modelCallCount, 1);
 });

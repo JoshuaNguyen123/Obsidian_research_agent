@@ -3,7 +3,19 @@ import {
   advanceMissionPlanFromBlocker,
   type MissionPlanAdvanceResult,
 } from "./missionPlanAdvance";
-import { formatFailureCopy, phaseGateFailureCopy, policyBlockFailureCopy } from "./failureCopy";
+import {
+  formatFailureCopy,
+  noAlternateToolFailureCopy,
+  phaseGateFailureCopy,
+  policyBlockFailureCopy,
+  recoveryExhaustedFailureCopy,
+  toolFallbackProgressCopy,
+} from "./failureCopy";
+import {
+  decideSafeFailureRetry,
+  shouldAutoRetrySafeFailure,
+  type SafeFailureRetryState,
+} from "./safeFailureRetry";
 
 export interface RecoveryInput {
   plan: MissionPlan;
@@ -60,11 +72,7 @@ export function planRecovery(input: RecoveryInput): RecoveryDecision {
                     "The active safety policy does not allow this action without a safer scope or approval.",
                   ),
             )
-          : formatFailureCopy({
-              what: "Recovery attempts were exhausted for the active mission task.",
-              why: `The runner already tried ${attemptsForNode} alternate path(s) for this node.`,
-              next: "Inspect Run Details, adjust the mission scope, then continue from the saved ledger.",
-            }),
+          : formatFailureCopy(recoveryExhaustedFailureCopy(attemptsForNode)),
     };
   }
   const alternative = chooseAlternativeTool(input.allowedToolNames, input.failedAction);
@@ -72,18 +80,15 @@ export function planRecovery(input: RecoveryInput): RecoveryDecision {
     return {
       status: "block",
       attempts: [],
-      blocker: formatFailureCopy({
-        what: "No alternate allowed tool is available for recovery.",
-        why: "The remaining tool set cannot replace the failed or stalled action.",
-        next: "Broaden allowed tools or change the mission approach, then continue from the saved ledger.",
-      }),
+      blocker: formatFailureCopy(noAlternateToolFailureCopy(input.failedAction)),
     };
   }
+  const progress = toolFallbackProgressCopy(input.failedAction, alternative);
   const action: MissionPlanAction = {
     kind: "tool",
     taskId: active.id,
     toolName: alternative,
-    summary: `Recover by using ${alternative} instead of repeating ${input.failedAction ?? "the stalled action"}.`,
+    summary: progress,
   };
   return {
     status: "recover",
@@ -96,7 +101,7 @@ export function planRecovery(input: RecoveryInput): RecoveryDecision {
         failedAction: input.failedAction,
         selectedAction: action,
         status: "planned",
-        message: action.summary,
+        message: progress,
       },
     ],
   };
@@ -168,8 +173,12 @@ export interface BoundedRecoveryInput {
     message: string;
     retryable?: boolean;
     requiresReplan?: boolean;
+    code?: string;
+    category?: string;
   };
   state?: RecoveryState;
+  /** Optional safe schema/model retry ledger (auto-retry without Continue). */
+  safeFailureState?: SafeFailureRetryState;
   maxAttempts?: number;
   maxStoredAttempts?: number;
   now?: Date;
@@ -181,7 +190,12 @@ export interface BoundedRecoveryDecision {
   attemptsUsed: number;
   attemptsRemaining: number;
   reason: string;
+  /** Plain Chat/status progress line (preferred over raw reason). */
+  progressLine: string;
   state: RecoveryState;
+  safeFailureState?: SafeFailureRetryState;
+  /** True when schema/model failure was auto-retried without user Continue. */
+  safeAutoRetry?: boolean;
   planAdvance?: MissionPlanAdvanceResult;
 }
 
@@ -189,10 +203,65 @@ export function decideRecoveryAction({
   plan,
   failure,
   state,
+  safeFailureState,
   maxAttempts,
   maxStoredAttempts,
   now = new Date(),
 }: BoundedRecoveryInput): BoundedRecoveryDecision {
+  const safeDecision = decideSafeFailureRetry({
+    failure: {
+      source: failure.source,
+      message: failure.message,
+      code: failure.code,
+      category: failure.category,
+    },
+    state: safeFailureState,
+    maxAttempts: Math.min(2, maxAttempts ?? 2),
+    now,
+  });
+  if (shouldAutoRetrySafeFailure(safeDecision)) {
+    const previousState = normalizeRecoveryState(state, {
+      maxAttempts: maxAttempts ?? state?.maxAttempts ?? 2,
+      maxStoredAttempts:
+        maxStoredAttempts ?? state?.maxStoredAttempts ?? DEFAULT_MAX_STORED_ATTEMPTS,
+      now,
+    });
+    return {
+      action: "retry",
+      signature: safeDecision.signature,
+      attemptsUsed: safeDecision.attemptsUsed,
+      attemptsRemaining: safeDecision.attemptsRemaining,
+      reason: safeDecision.progressLine,
+      progressLine: safeDecision.progressLine,
+      state: previousState,
+      safeFailureState: safeDecision.state,
+      safeAutoRetry: true,
+    };
+  }
+  if (safeDecision.action === "block") {
+    const previousState = normalizeRecoveryState(state, {
+      maxAttempts: maxAttempts ?? state?.maxAttempts ?? 2,
+      maxStoredAttempts:
+        maxStoredAttempts ?? state?.maxStoredAttempts ?? DEFAULT_MAX_STORED_ATTEMPTS,
+      now,
+    });
+    const reason =
+      safeDecision.progressLine ||
+      formatFailureCopy(recoveryExhaustedFailureCopy(safeDecision.attemptsUsed));
+    return {
+      action: "block",
+      signature: safeDecision.signature,
+      attemptsUsed: safeDecision.attemptsUsed,
+      attemptsRemaining: 0,
+      reason,
+      progressLine: reason,
+      state: previousState,
+      safeFailureState: safeDecision.state,
+      safeAutoRetry: false,
+      planAdvance: advanceMissionPlanFromBlocker({ plan, blocker: reason, now }),
+    };
+  }
+
   const signature = getFailureSignature(failure.source, failure.message);
   const previousState = normalizeRecoveryState(state, {
     maxAttempts: maxAttempts ?? state?.maxAttempts ?? 2,
@@ -217,10 +286,10 @@ export function decideRecoveryAction({
   });
   const reason =
     action === "block"
-      ? `Recovery attempts exhausted for ${failure.source}.`
+      ? formatFailureCopy(recoveryExhaustedFailureCopy(attemptsUsed + 1))
       : action === "replan"
-        ? `Replan around ${failure.source}: ${failure.message}`
-        : `Retry ${failure.source}: ${failure.message}`;
+        ? `Replanning around ${failure.source} (${failure.message}).`
+        : `Retrying ${failure.source} (${failure.message}).`;
   const attempt: BoundedRecoveryAttempt = {
     signature,
     action,
@@ -253,7 +322,10 @@ export function decideRecoveryAction({
     attemptsUsed: attemptsUsed + 1,
     attemptsRemaining: Math.max(0, boundedMaxAttempts - attemptsUsed - 1),
     reason,
+    progressLine: reason,
     state: nextState,
+    safeFailureState: safeDecision.state,
+    safeAutoRetry: false,
     planAdvance:
       action === "block"
         ? advanceMissionPlanFromBlocker({ plan, blocker: reason, now })

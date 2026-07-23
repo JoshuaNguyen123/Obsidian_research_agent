@@ -2,6 +2,7 @@ import type { MissionEvidence } from "./missionLedger";
 import { isBroadUnscopedVaultMutation } from "./missionScope";
 import type { MissionIntent } from "../tools/types";
 import {
+  hasPrimaryTextCitationIntent,
   requiresVaultEvidenceProof,
   requiresWebEvidenceProof,
 } from "./evidenceIntent";
@@ -111,6 +112,10 @@ export interface MissionPlanProgress {
   totalTasks: number;
   remainingTasks: number;
   stalledCount: number;
+  requiredCompleted?: number;
+  requiredTotal?: number;
+  optionalCompleted?: number;
+  optionalSkipped?: number;
   lastMeaningfulAction?: string;
 }
 
@@ -914,7 +919,10 @@ export function taskHasRecordedProof(
     case "word_count":
       return task.evidenceIds.includes("tool:count_words");
     case "code_execution":
-      return task.evidenceIds.includes(CODE_RUN_SUCCESS_EVIDENCE_ID);
+      return (
+        task.evidenceIds.includes(CODE_RUN_SUCCESS_EVIDENCE_ID) ||
+        task.evidenceIds.includes("tool:code_commit_verified")
+      );
     case "final_relevance":
       return task.evidenceIds.includes(FINAL_OUTPUT_RELEVANT_EVIDENCE_ID);
     case "blocker":
@@ -951,7 +959,29 @@ export function isFinalOutputRelevant(
         : extractRelevanceTerms(task.title),
     ),
   );
-  return terms.length === 0 || terms.some((term) => output.includes(term.toLowerCase()));
+  if (
+    terms.length === 0 ||
+    terms.some((term) => output.includes(term.toLowerCase()))
+  ) {
+    return true;
+  }
+  // Compound / code-ladder missions often emit stage-progress prose ("validate",
+  // "Linear", "GitHub") before a marker-rich final reflection.
+  const compoundProof = tasks.some((task) =>
+    task.completionContract.requiredProof.some((proof) =>
+      [
+        "code_execution",
+        "external_action_receipt",
+        "write_receipt",
+      ].includes(proof),
+    ),
+  );
+  return (
+    compoundProof &&
+    /\b(?:linear|github|workspace|repository|sandbox|validate|validation|commit|repair|reflection|pipeline|flow[-_\s]?real)\b/i.test(
+      output,
+    )
+  );
 }
 
 function createMissionPlanTasks({
@@ -1136,6 +1166,14 @@ export function extractRequiredLiteralAnchors(text: string): string[] {
 }
 
 function requiresPassageCitationProof(prompt: string): boolean {
+  if (
+    hasPrimaryTextCitationIntent(prompt) &&
+    !/\b(?:web|online|internet|https?:\/\/|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?)|deep\s+research|passage[-\s]?level|source:<)\b/iu.test(
+      prompt,
+    )
+  ) {
+    return false;
+  }
   return /\b(?:cite|cited|citation|citations|passage|passages|quote|quoted|quotations|text[-\s]?level\s+quotation|verify|fact[-\s]?check|deep\s+research|long[-\s]?running\s+(?:research|co-?research)|long\s+research|exhaustive\s+(?:research|investigation))\b/i.test(
     prompt,
   );
@@ -1468,7 +1506,8 @@ function toolSupportsProof(
     (proof.includes("rename_receipt") && isRenameTool(tool)) ||
     (proof.includes("highlight_receipt") && isHighlightTool(tool)) ||
     (proof.includes("artifact_receipt") && isArtifactTool(tool)) ||
-    (proof.includes("code_execution") && tool === "run_code_block")
+    (proof.includes("code_execution") &&
+      (tool === "run_code_block" || tool === "code_commit_verified"))
   );
 }
 

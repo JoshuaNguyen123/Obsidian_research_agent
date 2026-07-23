@@ -12,6 +12,28 @@ export interface ApprovalRequest {
   payloadFingerprint?: string;
   confirmationIndex?: number;
   requiredConfirmations?: 1 | 2;
+  /**
+   * When set, this request is the one early compound Bound bundle preview.
+   * Matches `BundledApprovalPreviewV1.bundleFingerprint`. Hard tools are never
+   * authorized by approving this request alone.
+   */
+  bundleFingerprint?: string;
+}
+
+/** Synthetic tool name used for the one early compound Bound preview. */
+export const BUNDLED_COMPOUND_BOUND_PREVIEW_TOOL_NAME =
+  "bundled_compound_bound_preview";
+
+export function isBundledApprovalRequest(
+  request: Pick<ApprovalRequest, "toolName" | "bundleFingerprint" | "policyTags">,
+): boolean {
+  if (request.toolName === BUNDLED_COMPOUND_BOUND_PREVIEW_TOOL_NAME) {
+    return true;
+  }
+  if (request.bundleFingerprint?.trim()) {
+    return true;
+  }
+  return request.policyTags.includes("bundled_approval_preview");
 }
 
 export type ApprovalDecision = "approved" | "denied" | "expired" | "aborted";

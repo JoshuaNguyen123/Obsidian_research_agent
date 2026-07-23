@@ -1190,7 +1190,9 @@ export class CodeRepairToolRuntimeV1 implements CodeRepairToolHandlersV1 {
       ? boundedString(originalPrompt, "repair objective", 1, 20_000)
       : `Complete verified code repair ${scope.requestId}`;
     const commitMessage = boundedString(
-      resolution.commitMessage ?? `Agent repair: ${scope.requestId}`,
+      extractExplicitCommitMessage(originalPrompt) ??
+        resolution.commitMessage ??
+        `Agent repair: ${scope.requestId}`,
       "commit message",
       1,
       4_000,
@@ -2418,6 +2420,45 @@ function boundedString(
   }
   if (value.includes("\u0000")) throw new Error(`${label} contains NUL.`);
   return value;
+}
+
+/**
+ * Bind an explicitly requested one-line Git subject from the user mission.
+ * Unquoted subjects stop only at a following execution clause, so conventional
+ * commit prefixes such as `feat:` remain intact. Ambiguous or unsafe prose
+ * falls back to the host resolver's deterministic subject.
+ */
+function extractExplicitCommitMessage(prompt: string | undefined): string | null {
+  if (!prompt) return null;
+  const instruction =
+    /\b(?:create|make|produce)\s+(?:(?:one|a|the)\s+)?(?:local\s+)?commit\s+with\s+(?:(?:the\s+)?exact\s+)?message\s*/iu.exec(
+      prompt,
+    );
+  if (!instruction) return null;
+  const remainder = prompt.slice(instruction.index + instruction[0].length).trimStart();
+  if (!remainder) return null;
+
+  let candidate: string;
+  const quote = remainder[0];
+  if (quote === '"' || quote === "'" || quote === "`") {
+    const closing = remainder.indexOf(quote, 1);
+    if (closing < 2) return null;
+    candidate = remainder.slice(1, closing);
+  } else {
+    candidate = remainder.split(
+      /(?=\s+(?:and\s+(?:independently|then|read|verify|push|publish|open|stop)|then|before|after)\b|[.;](?:\s|$))/iu,
+      1,
+    )[0] ?? "";
+  }
+  candidate = candidate.trim();
+  if (
+    candidate.length < 1 ||
+    candidate.length > 200 ||
+    /[\u0000-\u001f\u007f]/u.test(candidate)
+  ) {
+    return null;
+  }
+  return candidate;
 }
 
 function plainRecord(value: unknown, label: string): Record<string, unknown> {

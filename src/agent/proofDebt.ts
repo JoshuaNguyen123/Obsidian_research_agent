@@ -489,6 +489,20 @@ function nextActionFromAcceptanceMissing(
       summary: "Verify word count.",
     };
   }
+  // Explicit tool:X missing entries win over generic write_receipt→append so
+  // Bound writes (replace_current_file, publish_*, …) surface for Soft→Bound
+  // auto-continue grant gating.
+  const explicitToolMissing = missing
+    .map((item) => /^tool:([A-Za-z0-9_]+)$/i.exec(item)?.[1])
+    .find((name): name is string => Boolean(name));
+  if (explicitToolMissing) {
+    return {
+      kind: "tool",
+      toolName: explicitToolMissing,
+      reason: `Complete required tool ${explicitToolMissing}.`,
+      summary: `Complete required tool ${explicitToolMissing}.`,
+    };
+  }
   if (missing.includes("write_receipt") || missing.some((item) => item.startsWith("pending_goal:"))) {
     return {
       kind: "tool",

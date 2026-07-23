@@ -8,10 +8,38 @@ import {
   WORKSPACE_MAX_SEARCH_RESULTS_V2,
   WorkspaceManagerErrorV2,
   WorkspaceManagerV2,
+  assertWorkspaceRelativePathV2,
+  coerceAbsoluteToWorkspaceRelativePathV2,
   createVerifiedWorkspaceBaseReadbackV2,
   parseWorkspaceManifestV2,
   serializeWorkspaceManifestV2,
 } from "../extensions/code/workspaces";
+
+test("absolute host paths coerce to workspace-relative src/test/README suffixes", () => {
+  assert.equal(
+    coerceAbsoluteToWorkspaceRelativePathV2(
+      "C:\\Users\\me\\proj\\src\\flow_real.ts",
+    ),
+    "src/flow_real.ts",
+  );
+  assert.equal(
+    assertWorkspaceRelativePathV2("/tmp/repo/src/flow_real.ts"),
+    "src/flow_real.ts",
+  );
+  assert.equal(
+    assertWorkspaceRelativePathV2("D:/work/test/math.test.mjs"),
+    "test/math.test.mjs",
+  );
+  assert.equal(
+    assertWorkspaceRelativePathV2("C:/work/README.md"),
+    "README.md",
+  );
+  assert.equal(assertWorkspaceRelativePathV2("src/ok.ts"), "src/ok.ts");
+  assert.throws(
+    () => assertWorkspaceRelativePathV2("C:/work/secrets/token.txt"),
+    /workspace-relative/u,
+  );
+});
 
 test("WorkspaceManifestV2 exact parser round-trips and rejects contract drift", async () => {
   const fixture = await fixtureManager("manifest");

@@ -14,6 +14,7 @@ import {
   createResearchPlan,
   parseExplicitResearchSourceCount,
   decomposePromptIntoResearchQuestions,
+  normalizeResearchPlan,
 } from "../src/agent/researchPlan";
 import {
   SOURCE_CACHE_SECTION_CHARS,
@@ -577,6 +578,8 @@ test("mission-specific decomposition splits compare and risks with limitations",
 
   assert.ok(plan);
   assert.equal(plan.mode, "deep_web");
+  assert.equal(plan.effort?.tier, "deep");
+  assert.equal(plan.effort?.budget.maxModelStepsPerSegment, 60);
   const questions = plan.subquestions.map((item) => item.question.toLowerCase());
   assert.ok(
     questions.some((item) => item.includes("compare") && item.includes("a") && item.includes("b")),
@@ -609,6 +612,7 @@ test("plain deep research topic still produces bounded useful defaults", () => {
 
   assert.ok(plan);
   assert.equal(plan.mode, "deep_web");
+  assert.equal(plan.effort?.tier, "deep");
   assert.ok(plan.subquestions.length >= 2 && plan.subquestions.length <= 8);
   assert.ok(
     plan.subquestions.some((item) =>
@@ -624,6 +628,161 @@ test("plain deep research topic still produces bounded useful defaults", () => {
     "deep research topic solid-state batteries",
   );
   assert.equal(decomposed.length, 0);
+});
+
+test("research plan normalization preserves cumulative effort usage and closure state", () => {
+  const plan = createResearchPlan({
+    prompt: "Research a focused implementation question with current sources.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+  assert.ok(plan);
+  const restored = normalizeResearchPlan({
+    ...plan,
+    effortUsage: {
+      modelSteps: 8,
+      toolCalls: 4,
+      segmentsStarted: 1,
+      modelStepsInCurrentSegment: 8,
+      toolCallsInCurrentSegment: 4,
+      completionSegmentsStarted: 2,
+      elapsedMs: 12_345,
+    },
+    effortClosure: {
+      requested: true,
+      attempts: 1,
+      reason: "model_step_cap_reached",
+    },
+  });
+
+  assert.deepEqual(restored?.effortUsage, {
+    modelSteps: 8,
+    toolCalls: 4,
+    segmentsStarted: 1,
+    modelStepsInCurrentSegment: 8,
+    toolCallsInCurrentSegment: 4,
+    completionSegmentsStarted: 2,
+    elapsedMs: 12_345,
+  });
+  assert.deepEqual(restored?.effortClosure, {
+    requested: true,
+    attempts: 1,
+    reason: "model_step_cap_reached",
+  });
+});
+
+test("research plan normalization never expands persisted constrained ceilings", () => {
+  const plan = createResearchPlan({
+    prompt: "Compare solid-state battery evidence and list risks.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+  assert.ok(plan);
+  const restored = normalizeResearchPlan({
+    ...plan,
+    effort: {
+      tier: "extended",
+      constrained: true,
+      reasons: ["Explicit bounded test."],
+      budget: {
+        maxModelStepsPerSegment: 12,
+        maxToolCallsPerSegment: 6,
+        maxSegments: 2,
+        maxTotalModelSteps: 24,
+        maxTotalToolCalls: 12,
+        maxDurationMs: 5_000,
+      },
+    },
+  });
+
+  assert.deepEqual(restored?.effort?.budget, {
+    maxModelStepsPerSegment: 12,
+    maxToolCallsPerSegment: 6,
+    maxSegments: 2,
+    maxTotalModelSteps: 24,
+    maxTotalToolCalls: 12,
+    maxDurationMs: 5_000,
+  });
+
+  const malformed = normalizeResearchPlan({
+    ...plan,
+    effort: {
+      tier: "extended",
+      constrained: true,
+      reasons: [],
+      budget: {
+        maxModelStepsPerSegment: 999,
+        maxSegments: 2,
+        maxTotalModelSteps: 999,
+        maxTotalToolCalls: 999,
+        maxDurationMs: null,
+      },
+    },
+  });
+  assert.deepEqual(malformed?.effort?.budget, {
+    maxModelStepsPerSegment: 100,
+    maxToolCallsPerSegment: 0,
+    maxSegments: 2,
+    maxTotalModelSteps: 200,
+    maxTotalToolCalls: 0,
+    maxDurationMs: 8 * 60 * 60_000,
+  });
+});
+
+test("one focused source selects quick effort without a contradictory comparison", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "Find the current stable Obsidian version using one focused web source.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+
+  assert.ok(plan);
+  assert.equal(plan.mode, "deep_web");
+  assert.deepEqual(plan.sourceRequirements, {
+    minFetchedSources: 1,
+    minDistinctDomains: 1,
+  });
+  assert.equal(plan.effort?.tier, "quick");
+  assert.equal(
+    plan.subquestions.filter((item) => item.minEvidence > 0).length,
+    1,
+  );
+  assert.equal(
+    plan.subquestions.some((item) => /compare evidence across/i.test(item.question)),
+    false,
+  );
+});
+
+test("default three-source research distributes all source proof across questions", () => {
+  const plan = createResearchPlan({
+    prompt: "Research current solid-state battery progress with web sources.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+
+  assert.ok(plan);
+  const webMinima = plan.subquestions
+    .filter((item) => item.requiredEvidenceType === "web_source")
+    .map((item) => item.minEvidence)
+    .filter((value) => value > 0);
+  assert.deepEqual(webMinima, [2, 1]);
+  assert.equal(
+    webMinima.reduce((sum, value) => sum + value, 0),
+    plan.sourceRequirements.minFetchedSources,
+  );
 });
 
 test("deep research explicitly scoped across the vault stays vault-only", () => {

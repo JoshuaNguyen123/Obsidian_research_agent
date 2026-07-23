@@ -94,3 +94,42 @@ test("a PID-tree dispatch race is accepted only when every shutdown readback is 
     },
   );
 });
+
+test("controlled teardown reconciles an owned-PID boundary race after app drain", async () => {
+  let ownedExitChecks = 0;
+  await terminateControlledObsidian(
+    { pid: 3456, exitCode: null },
+    {
+      terminateOwnedTree: async () => undefined,
+      waitForOwnedExit: async () => {
+        ownedExitChecks += 1;
+        return ownedExitChecks === 2;
+      },
+      waitForNoRunningProcess: async () => true,
+      waitForCdpClose: async () => true,
+    },
+  );
+
+  assert.equal(ownedExitChecks, 2);
+});
+
+test("controlled teardown still rejects a live owned PID after terminal recheck", async () => {
+  let ownedExitChecks = 0;
+  await assert.rejects(
+    terminateControlledObsidian(
+      { pid: 7890, exitCode: null },
+      {
+        terminateOwnedTree: async () => undefined,
+        waitForOwnedExit: async () => {
+          ownedExitChecks += 1;
+          return false;
+        },
+        waitForNoRunningProcess: async () => true,
+        waitForCdpClose: async () => true,
+      },
+    ),
+    /Controlled Obsidian teardown did not drain cleanly \(owned process exit\)/u,
+  );
+
+  assert.equal(ownedExitChecks, 2);
+});

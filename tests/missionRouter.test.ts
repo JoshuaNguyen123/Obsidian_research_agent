@@ -161,6 +161,39 @@ test("classifyMissionWithModel sends schema-constrained request and parses reply
   );
 });
 
+test("Ollama Cloud router omits provider format but keeps host schema repair", async () => {
+  const requests: ModelChatRequest[] = [];
+  const client: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "glm-5.2",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+    },
+    chat: async (request) => {
+      requests.push(request);
+      return {
+        message: {
+          role: "assistant",
+          content: requests.length === 1 ? "not json" : routedJson(),
+        },
+        toolCalls: [],
+      };
+    },
+    streamChat: async () => {
+      throw new Error("streamChat is not used by the router");
+    },
+  };
+
+  const intent = await classifyMissionWithModel({ client, prompt: "research this" });
+
+  assert.equal(intent?.mode, "web_research");
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => !("format" in request)));
+  assert.equal(requests[0].messages[0].content, MISSION_ROUTER_SYSTEM_PROMPT);
+  assert.match(requests[1].messages.at(-1)?.content ?? "", /Schema repair/);
+});
+
 test("classifyMissionWithModel returns null on model errors", async () => {
   const client = clientFromResponse(async () => {
     throw new Error("boom");

@@ -1,5 +1,6 @@
 export * from "./contracts";
 export * from "./discovery";
+export * from "./agentGitCommitIdentityV1";
 export * from "./secretStoreV1";
 export * from "./verifiedCodePublicationHandoffV1";
 export * from "./preparedExternalActionHandoffV1";

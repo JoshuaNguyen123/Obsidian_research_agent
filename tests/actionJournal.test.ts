@@ -10,10 +10,110 @@ import {
   createOperationJournalRecord,
   buildOperationReconciliationInputs,
   normalizeMissionRuntimeSnapshot,
+  reconcileHistoricalCanvasPreflightJournalRecord,
   reconcilePersistedExactLifecycleJournalRecords,
   reconcilePriorExactLifecycleJournalRecords,
   transitionOperationJournalRecord,
 } from "../src/agent/runStore";
+
+test("historical Canvas preflight WAL recovery is fail-closed", async () => {
+  const descriptor: ToolDescriptor = {
+    ...descriptorFixture(),
+    name: "create_design_canvas",
+    capability: {
+      system: "vault",
+      resourceType: "canvas",
+      action: "create",
+    },
+    effect: "reversible_mutation",
+  };
+  const action = await withPreparedActionFingerprint({
+    version: 1,
+    id: "canvas-action",
+    runId: "run-canvas",
+    toolCallId: "canvas-call",
+    toolName: descriptor.name,
+    target: {
+      system: "vault",
+      resourceType: "canvas",
+      id: "Story.canvas",
+      path: "Story.canvas",
+    },
+    relatedResources: [],
+    normalizedArgs: { path: "Story.canvas" },
+    preview: {
+      summary: "Create Story.canvas",
+      destination: "Story.canvas",
+      warnings: [],
+      outboundBytes: 0,
+    },
+    preparedAt: "2026-07-22T10:00:00.000Z",
+    expiresAt: "2026-07-22T10:05:00.000Z",
+  });
+  let record = createOperationJournalRecord({
+    operationId: "canvas-op",
+    rootRunId: "run-canvas",
+    segmentId: "run-canvas",
+    toolName: descriptor.name,
+    operation: descriptor.capability.action,
+    targetPath: "Story.canvas",
+    expectedPostWriteHash: `sha256:${"a".repeat(64)}`,
+    preparedAction: action,
+    descriptor,
+    authorization: {
+      preparedActionId: action.id,
+      payloadFingerprint: action.payloadFingerprint,
+      grantId: "canvas-grant",
+    },
+    now: new Date("2026-07-22T10:00:00.000Z"),
+  });
+  record = transitionOperationJournalRecord(record, "applying", {
+    message: "Canvas preflight started.",
+    now: new Date("2026-07-22T10:00:01.000Z"),
+  });
+  record = transitionOperationJournalRecord(record, "reconcile_required", {
+    message:
+      "Invalid JSON Canvas: nodes[0].x must be an integer; mutation may have applied.",
+    error: "invalid_arguments: nodes[0].x must be an integer",
+    mutationMayHaveApplied: true,
+    now: new Date("2026-07-22T10:00:02.000Z"),
+  });
+
+  const absent = reconcileHistoricalCanvasPreflightJournalRecord(
+    record,
+    { status: "absent" },
+    new Date("2026-07-22T10:00:03.000Z"),
+  );
+  assert.equal(absent.state, "failed");
+  assert.equal(absent.mutationMayHaveApplied, false);
+  assert.equal(
+    buildOperationReconciliationInputs([absent])[0].recommendedAction,
+    "safe_to_retry",
+  );
+
+  const conflicting = reconcileHistoricalCanvasPreflightJournalRecord(record, {
+    status: "conflicting",
+    observedFingerprint: `sha256:${"b".repeat(64)}`,
+  });
+  assert.equal(conflicting.state, "reconcile_required");
+  assert.equal(conflicting.receipt, undefined);
+
+  const matching = reconcileHistoricalCanvasPreflightJournalRecord(
+    record,
+    {
+      status: "fingerprint_match",
+      observedFingerprint: `sha256:${"a".repeat(64)}`,
+    },
+    new Date("2026-07-22T10:00:04.000Z"),
+  );
+  assert.equal(matching.state, "committed");
+  assert.equal(matching.receipt?.commitKind, "reconciled");
+  assert.equal(matching.receipt?.readback?.status, "verified");
+  assert.equal(
+    matching.receipt?.readback?.observedFingerprint,
+    `sha256:${"a".repeat(64)}`,
+  );
+});
 
 test("verified exact lifecycle retry closes an older ambiguous WAL row for the same graph node", () => {
   const make = (operationId: string) =>

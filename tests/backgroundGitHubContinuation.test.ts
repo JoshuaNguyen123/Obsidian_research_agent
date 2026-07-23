@@ -6,6 +6,10 @@ import * as path from "node:path";
 import test from "node:test";
 
 import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
+import {
   GITHUB_DRAFT_PULL_REQUEST_OPERATION_V1,
   GITHUB_PULL_REQUEST_AUTO_MERGE_OPERATION_V1,
   GITHUB_PULL_REQUEST_MERGE_OPERATION_V1,
@@ -1711,6 +1715,14 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
       if (subject === "HEAD^") return ok(BASE);
     }
     if (operation === "branch") return ok("codex/repair-1");
+    if (operation === "show") {
+      return ok([
+        AGENT_GIT_COMMIT_NAME_V1,
+        AGENT_GIT_COMMIT_EMAIL_V1,
+        AGENT_GIT_COMMIT_NAME_V1,
+        AGENT_GIT_COMMIT_EMAIL_V1,
+      ].join("\0"));
+    }
     if (operation === "ls-remote") {
       const ref = input.args.at(-1);
       if (ref === "refs/heads/main") return ok(`${BASE}\t${ref}`);
@@ -2127,7 +2139,7 @@ function withoutEnvelope(action: PreparedBackgroundGitHubActionV1) {
 }
 
 function gitOperation(args: readonly string[]) {
-  return args.find((argument) => ["rev-parse", "branch", "ls-remote", "fetch", "merge-base", "push"].includes(argument)) ?? "unknown";
+  return args.find((argument) => ["rev-parse", "branch", "show", "ls-remote", "fetch", "merge-base", "push"].includes(argument)) ?? "unknown";
 }
 
 function ok(stdout: string) {

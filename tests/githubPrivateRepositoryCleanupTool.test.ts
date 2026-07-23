@@ -17,6 +17,7 @@ const NOW = new Date("2026-07-16T18:00:00.000Z");
 test("private repository cleanup checkpoints, deletes once, and verifies absence", async () => {
   const checkpoints: GitHubPrivateRepositoryCleanupCheckpointV1[] = [];
   const receipts: ActionReceipt[] = [];
+  const approvalRequests: Array<{ index: number | undefined; required: number | undefined }> = [];
   let present = true;
   let deleteCount = 0;
   const tool = createGitHubPrivateRepositoryCleanupTool({
@@ -40,11 +41,17 @@ test("private repository cleanup checkpoints, deletes once, and verifies absence
 
   const result = await tool.executeResult!(
     { profileKey: "fixture" },
-    context(async (request) => ({
-      approved: true,
-      approvalId: "approval-private-delete",
-      approvalFingerprint: request.preparedAction!.payloadFingerprint,
-    })),
+    context(async (request) => {
+      approvalRequests.push({
+        index: request.confirmationIndex,
+        required: request.requiredConfirmations,
+      });
+      return {
+        approved: true,
+        approvalId: `approval-private-delete-${request.confirmationIndex}`,
+        approvalFingerprint: request.preparedAction!.payloadFingerprint,
+      };
+    }),
   );
 
   assert.equal(result.ok, true);
@@ -56,6 +63,53 @@ test("private repository cleanup checkpoints, deletes once, and verifies absence
   assert.equal(receipts[0]?.operation, "delete");
   assert.equal(receipts[0]?.readback.status, "verified");
   assert.equal(receipts[0]?.commitKind, "committed");
+  assert.deepEqual(approvalRequests, [
+    { index: 1, required: 2 },
+    { index: 2, required: 2 },
+  ]);
+  assert.match(receipts[0]?.grantId ?? "", /^double-exact:/u);
+});
+
+test("private repository cleanup requires two distinct exact confirmations before delete", async () => {
+  let deleteCount = 0;
+  let approvalCount = 0;
+  const checkpoints: GitHubPrivateRepositoryCleanupCheckpointV1[] = [];
+  const tool = createGitHubPrivateRepositoryCleanupTool({
+    resolveBinding: async () => binding(),
+    readRepository: async () => repository(),
+    deleteRepository: async () => {
+      deleteCount += 1;
+    },
+    getCheckpoint: async () => null,
+    persistCheckpoint: async (checkpoint) => {
+      checkpoints.push(structuredClone(checkpoint));
+    },
+    persistExternalReceipt: async () => undefined,
+    now: () => NOW,
+  });
+
+  await assert.rejects(
+    tool.executeResult!(
+      { profileKey: "fixture" },
+      context(async (request) => {
+        approvalCount += 1;
+        return {
+          approved: true,
+          approvalId: "duplicate-approval-id",
+          approvalFingerprint: request.preparedAction!.payloadFingerprint,
+        };
+      }),
+    ),
+    /two distinct confirmations/iu,
+  );
+
+  assert.equal(approvalCount, 2);
+  assert.equal(deleteCount, 0);
+  assert.equal(checkpoints.at(-1)?.status, "not_applied");
+  assert.equal(
+    checkpoints.at(-1)?.preparedAction.requiredConfirmations,
+    2,
+  );
 });
 
 test("private repository cleanup reconciles prior absence without approval or delete", async () => {

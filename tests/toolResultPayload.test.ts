@@ -80,3 +80,25 @@ test("code repair cycle payload preserves the host-verified outcome", () => {
   assert.equal(payload.output.cycle, 1);
   assert.doesNotMatch(serialized, /must-not-cross/iu);
 });
+
+test("read_current_file model payload keeps full note content for edit missions", () => {
+  const body = `${"Paragraph about Holden. ".repeat(400)}TAIL_MARKER_END`;
+  const serialized = serializeToolResultForModel({
+    ok: true,
+    toolName: "read_current_file",
+    output: {
+      path: "Essays/catcher.md",
+      content: body,
+      totalChars: body.length,
+      returnedChars: body.length,
+      offset: 0,
+      truncated: false,
+      nextOffset: null,
+    },
+  });
+  const payload = JSON.parse(serialized) as Record<string, any>;
+  assert.equal(payload.output.path, "Essays/catcher.md");
+  assert.equal(payload.output.content, body);
+  assert.equal(payload.output.contentEvidence, undefined);
+  assert.match(payload.output.content, /TAIL_MARKER_END/);
+});

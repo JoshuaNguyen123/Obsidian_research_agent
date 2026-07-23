@@ -202,6 +202,7 @@ export interface MissionCompositeLifecycleActionV1 {
   requiredEvidenceKinds: string[];
   minimumReceipts: number;
   requiredReceiptKinds: string[];
+  condition?: "fast_validation_failed";
 }
 
 export interface MissionCompositeLifecycleSpecV1 {
@@ -215,6 +216,7 @@ export interface MissionCompositeLifecycleSpecV1 {
 export interface MissionCompositeLifecycleStateV1 {
   actionCursor: number;
   completedActionIds: string[];
+  skippedActionIds: string[];
   actionAttemptCounts: Record<string, number>;
 }
 
@@ -1395,22 +1397,32 @@ function normalizeMissionCompositeLifecycleSpecV1(
   const actions = actionValues.map((value, index) => {
     const actionPath = `${path}.actions[${index}]`;
     const action = record(value, actionPath);
+    const requiredActionKeys = [
+      "id",
+      "toolName",
+      "effect",
+      "bindingId",
+      "selector",
+      "objective",
+      "minimumEvidence",
+      "requiredEvidenceKinds",
+      "minimumReceipts",
+      "requiredReceiptKinds",
+    ] as const;
     exactKeys(
       action,
       [
-        "id",
-        "toolName",
-        "effect",
-        "bindingId",
-        "selector",
-        "objective",
-        "minimumEvidence",
-        "requiredEvidenceKinds",
-        "minimumReceipts",
-        "requiredReceiptKinds",
+        ...requiredActionKeys,
+        "condition",
       ],
       actionPath,
+      true,
     );
+    for (const key of requiredActionKeys) {
+      if (!Object.prototype.hasOwnProperty.call(action, key)) {
+        fail("invalid_shape", `${actionPath} is missing required field ${key}.`);
+      }
+    }
     const id = stableId(action.id, `${actionPath}.id`);
     if (actionIds.has(id)) {
       fail("invalid_id", `${path}.actions cannot contain duplicate action IDs.`);
@@ -1453,6 +1465,14 @@ function normalizeMissionCompositeLifecycleSpecV1(
         0,
         32,
       ),
+      ...(action.condition === undefined
+        ? {}
+        : action.condition === "fast_validation_failed"
+          ? { condition: "fast_validation_failed" as const }
+          : fail(
+              "invalid_shape",
+              `${actionPath}.condition is not supported.`,
+            )),
     };
   });
   return {
@@ -1476,6 +1496,7 @@ function normalizeMissionCompositeLifecycleStateV1(
     return {
       actionCursor: 0,
       completedActionIds: [],
+      skippedActionIds: [],
       actionAttemptCounts: {},
     };
   }
@@ -1485,10 +1506,21 @@ function normalizeMissionCompositeLifecycleStateV1(
     [
       "lifecycleActionCursor",
       "lifecycleCompletedActionIds",
+      "lifecycleSkippedActionIds",
       "lifecycleActionAttemptCounts",
     ],
     path,
+    true,
   );
+  for (const key of [
+    "lifecycleActionCursor",
+    "lifecycleCompletedActionIds",
+    "lifecycleActionAttemptCounts",
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) {
+      fail("invalid_shape", `${path} is missing required field ${key}.`);
+    }
+  }
   const actionCursor = integer(
     source.lifecycleActionCursor,
     `${path}.lifecycleActionCursor`,
@@ -1499,22 +1531,55 @@ function normalizeMissionCompositeLifecycleStateV1(
     source.lifecycleCompletedActionIds,
     `${path}.lifecycleCompletedActionIds`,
   );
-  if (completedValues.length !== actionCursor) {
+  const skippedValues =
+    source.lifecycleSkippedActionIds === undefined
+      ? []
+      : array(
+          source.lifecycleSkippedActionIds,
+          `${path}.lifecycleSkippedActionIds`,
+        );
+  if (completedValues.length + skippedValues.length !== actionCursor) {
     fail(
       "invalid_shape",
-      `${path} completed actions must match the lifecycle cursor.`,
+      `${path} settled actions must match the lifecycle cursor.`,
     );
   }
   const completedActionIds = completedValues.map((value, index) =>
     stableId(value, `${path}.lifecycleCompletedActionIds[${index}]`),
   );
+  const skippedActionIds = skippedValues.map((value, index) =>
+    stableId(value, `${path}.lifecycleSkippedActionIds[${index}]`),
+  );
+  const skippedSet = new Set(skippedActionIds);
+  if (
+    skippedSet.size !== skippedActionIds.length ||
+    completedActionIds.some((id) => skippedSet.has(id))
+  ) {
+    fail("invalid_shape", `${path} settled action IDs must be unique.`);
+  }
   const expectedCompleted = spec.actions
     .slice(0, actionCursor)
-    .map((action) => action.id);
+    .map((action) => action.id)
+    .filter((id) => !skippedSet.has(id));
   if (!sameJson(completedActionIds, expectedCompleted)) {
     fail(
       "invalid_shape",
       `${path} completed actions must be the exact ordered lifecycle prefix.`,
+    );
+  }
+  const expectedSkipped = spec.actions
+    .slice(0, actionCursor)
+    .filter((action) => skippedSet.has(action.id))
+    .map((action) => action.id);
+  if (
+    !sameJson(skippedActionIds, expectedSkipped) ||
+    spec.actions
+      .filter((action) => skippedSet.has(action.id))
+      .some((action) => action.condition !== "fast_validation_failed")
+  ) {
+    fail(
+      "invalid_shape",
+      `${path} may skip only ordered conditional lifecycle actions.`,
     );
   }
   const countSource = record(
@@ -1543,7 +1608,12 @@ function normalizeMissionCompositeLifecycleStateV1(
       fail("invalid_shape", `${path} lacks a completed action attempt count.`);
     }
   }
-  return { actionCursor, completedActionIds, actionAttemptCounts };
+  return {
+    actionCursor,
+    completedActionIds,
+    skippedActionIds,
+    actionAttemptCounts,
+  };
 }
 
 function validateNodeAuthority(
@@ -1830,19 +1900,26 @@ function validateMissionCompositeLifecycleAuthorityV1(
     );
   }
 
-  const expectedMinimumEvidence = lifecycle.actions.reduce(
+  const unconditionallyRequiredActions = lifecycle.actions.filter(
+    (action) => action.condition === undefined,
+  );
+  const expectedMinimumEvidence = unconditionallyRequiredActions.reduce(
     (total, action) => total + action.minimumEvidence,
     0,
   );
-  const expectedMinimumReceipts = lifecycle.actions.reduce(
+  const expectedMinimumReceipts = unconditionallyRequiredActions.reduce(
     (total, action) => total + action.minimumReceipts,
     0,
   );
   const expectedEvidenceKinds = [...new Set(
-    lifecycle.actions.flatMap((action) => action.requiredEvidenceKinds),
+    unconditionallyRequiredActions.flatMap(
+      (action) => action.requiredEvidenceKinds,
+    ),
   )].sort();
   const expectedReceiptKinds = [...new Set(
-    lifecycle.actions.flatMap((action) => action.requiredReceiptKinds),
+    unconditionallyRequiredActions.flatMap(
+      (action) => action.requiredReceiptKinds,
+    ),
   )].sort();
   const contract = node.completionContract;
   if (
@@ -1863,7 +1940,10 @@ function validateMissionCompositeLifecycleAuthorityV1(
     lifecycle,
     `node ${node.id} lifecycle outputs`,
   );
-  const completedActions = lifecycle.actions.slice(0, state.actionCursor);
+  const skippedActionIds = new Set(state.skippedActionIds);
+  const completedActions = lifecycle.actions
+    .slice(0, state.actionCursor)
+    .filter((action) => !skippedActionIds.has(action.id));
   const completedMinimumEvidence = completedActions.reduce(
     (total, action) => total + action.minimumEvidence,
     0,

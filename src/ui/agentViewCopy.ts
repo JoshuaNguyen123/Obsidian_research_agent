@@ -18,6 +18,26 @@ export function chatProviderBlockerTitle(): string {
   return "Cloud model blocked";
 }
 
+/** Mid-stream writeback kept a partial note; not an auth/settings block. */
+export function chatWriteInterruptedTitle(): string {
+  return "Write interrupted";
+}
+
+export function isPartialWritebackStopDetail(detail?: string | null): boolean {
+  return /partial_write_no_safe_retry|cannot safely retry after partial note apply|interrupted after note content may have changed/i.test(
+    detail ?? "",
+  );
+}
+
+export function chatWriteInterruptedNextCopy(): string {
+  return "Partial draft was kept in the note. Click Continue Latest Run to expand it to the word target (do not start a fresh append).";
+}
+
+/** Title for mission-graph / plan blockers (not a cloud provider outage). */
+export function chatMissionGraphBlockerTitle(): string {
+  return "Mission blocked";
+}
+
 /** Inline Chat gate when model connection is unverified before Run Mission. */
 export function chatModelConnectionGateTitle(): string {
   return "Model connection required";
@@ -31,12 +51,24 @@ export function toolStepChatLine(
   toolName: string,
   ok: boolean,
   message?: string,
+  options: { skipped?: boolean } = {},
 ): string {
-  const shortSummary = (message ?? (ok ? "ok" : "failed"))
+  const skipped = Boolean(options.skipped);
+  const shortSummary = (message ?? (ok ? "ok" : skipped ? "skipped" : "failed"))
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 120);
-  return `Used ${toolName}: ${ok ? "ok" : "failed"} — ${shortSummary}`;
+  const outcome = ok ? "ok" : skipped ? "skipped" : "failed";
+  return `Used ${toolName}: ${outcome} — ${shortSummary}`;
+}
+
+/** Policy/intent gates are not model or vault failures; surface them as skips. */
+export function isToolIntentGateFailure(event: {
+  message?: string;
+  error?: { message?: string } | null;
+}): boolean {
+  const text = `${event.message ?? ""} ${event.error?.message ?? ""}`;
+  return /requires the user to (?:ask|explicitly ask)/i.test(text);
 }
 
 /**
@@ -68,19 +100,6 @@ export function continueLatestRunSafeCopy(input: {
     : `Safe resume for ${input.runId}.${writeNote}`;
 }
 
-/** Demo starter for the compound research → Linear → code → GitHub lifecycle. */
-export function endToEndStarterMissionPrompt(): string {
-  return (
-    "I want to create the game of checkers in Python end to end following the full workflow: " +
-    "research into Obsidian, turn findings into Linear tasks, implement and test the code, " +
-    "publish a verified draft pull request to GitHub, and document results back into Obsidian."
-  );
-}
-
-export function endToEndStarterMissionLabel(): string {
-  return "End-to-end checkers workflow";
-}
-
 export function compoundLifecycleReadinessTitle(): string {
   return "End-to-end workflow setup required";
 }
@@ -99,11 +118,72 @@ export function noteStreamingActiveChatLine(): string {
   return "Streaming into the active note…";
 }
 
-export function artifactLinkChatLine(system: string, url: string): string {
-  const label = system.trim() || "artifact";
-  return `Artifact (${label}): ${url}`;
+/** Short workstream ping for Linear/GitHub/etc. receipt URLs (no Artifacts panel). */
+export function receiptUrlWorkstreamLine(system: string, url: string): string {
+  const label = system.trim() || "link";
+  return `${label}: ${url}`;
 }
 
 export function missionReceiptWrittenChatLine(path: string): string {
   return `Mission receipt written to ${path}`;
+}
+
+export type TeamRoleStripPhase = "researcher" | "handoff" | "lead" | "idle";
+
+/** Compact Chat strip for Lead + Researcher missions. */
+export function teamRoleStripCopy(input: {
+  phase: TeamRoleStripPhase;
+  handoffReady?: boolean;
+}): string {
+  switch (input.phase) {
+    case "researcher":
+      return "Team: Researcher";
+    case "handoff":
+      return input.handoffReady === false
+        ? "Team: Researcher > Handoff rejected"
+        : "Team: Researcher > Handoff OK";
+    case "lead":
+      return "Team: Researcher > Handoff OK > Lead";
+    case "idle":
+    default:
+      return "Team: idle";
+  }
+}
+
+/** Infer team phase from status / workstream lines (Wave 0; Integrator may pass structured phases). */
+export function inferTeamRolePhaseFromStatus(
+  message: string,
+): { phase: TeamRoleStripPhase; handoffReady?: boolean } | null {
+  const text = message.trim();
+  if (!text) return null;
+  if (/handoff\s+rejected/i.test(text)) {
+    return { phase: "handoff", handoffReady: false };
+  }
+  if (/handoff\s+accepted|handoff\s+ready|handoff\s+ok\b/i.test(text)) {
+    return { phase: "handoff", handoffReady: true };
+  }
+  if (/\blead\b/i.test(text) && !/researcher/i.test(text)) {
+    return { phase: "lead" };
+  }
+  if (/researcher\s+step|researcher\b/i.test(text)) {
+    return { phase: "researcher" };
+  }
+  return null;
+}
+
+export function chatThinkingSectionLabel(): string {
+  return "Thinking";
+}
+
+export function chatStatsSectionLabel(): string {
+  return "Run stats";
+}
+
+export function chatStatsPlaceholderCopy(input: {
+  stepLabel?: string;
+  elapsedLabel?: string;
+}): string {
+  const step = input.stepLabel?.trim() || "step —";
+  const elapsed = input.elapsedLabel?.trim() || "elapsed —";
+  return `${step} · ${elapsed}`;
 }

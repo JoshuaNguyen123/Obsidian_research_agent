@@ -15,6 +15,7 @@ import type {
   ModelToolCall,
   ModelToolDefinition,
 } from "../model/types";
+import { MAX_AGENT_STEPS } from "../tools/constants";
 import type {
   ToolExecutionContext,
   ToolExecutionResult,
@@ -22,7 +23,19 @@ import type {
 } from "../tools/types";
 import type { WorkerHandoff } from "./types";
 import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
+import {
+  selectInitialResearchEffort,
+  type ResearchEffortTier,
+} from "../agent/researchEffortPolicy";
 import { resolveThinkForCall } from "../agent/thinkPolicy";
+import { filterResearcherToolNames } from "./researcherSoftCatalog";
+
+/** Align with settings default (40) and MAX_AGENT_STEPS hard ceiling. */
+const RESEARCH_WORKER_MAX_STEPS = MAX_AGENT_STEPS;
+/** Match orchestrator worker tool-call normalize / code worker ceiling. */
+const RESEARCH_WORKER_MAX_TOOL_CALLS = 80;
+/** Canonical model name for direct requests to https://ollama.com/api. */
+export const OLLAMA_CLOUD_DEEP_RESEARCH_MODEL = "nemotron-3-ultra";
 import {
   addSourceCandidate,
   claimNextSourceCandidate,
@@ -116,12 +129,29 @@ export async function runResearchWorker(input: {
   abortSignal?: AbortSignal;
   maxSteps?: number;
   maxToolCalls?: number;
+  /** Optional host-selected tier; otherwise the worker classifies its mission. */
+  researchEffortTier?: ResearchEffortTier;
   events?: ResearchWorkerEvents;
   now?: () => Date;
 }): Promise<ResearchWorkerResult> {
-  const maxSteps = clamp(input.maxSteps ?? 20, 1, 30);
-  const maxToolCalls = clamp(input.maxToolCalls ?? 24, 1, 40);
+  const maxSteps = clamp(
+    input.maxSteps ?? 40,
+    1,
+    RESEARCH_WORKER_MAX_STEPS,
+  );
+  const maxToolCalls = clamp(
+    input.maxToolCalls ?? 40,
+    1,
+    RESEARCH_WORKER_MAX_TOOL_CALLS,
+  );
   const registry = createReadOnlyWorkerRegistry(input.toolRegistry);
+  const researchEffortTier = input.researchEffortTier ??
+    classifyResearchWorkerEffort(input.originalMission, input.assignment);
+  const modelRequestProfile = resolveResearchWorkerModelRequestProfile({
+    modelClient: input.modelClient,
+    toolContext: input.toolContext,
+    researchEffortTier,
+  });
   const evidence: MissionEvidence[] = [];
   const claimPassages: ClaimPassageRef[] = [];
   const minimumUsableSources = clamp(
@@ -175,11 +205,10 @@ export async function runResearchWorker(input: {
     throwIfAborted(input.abortSignal);
     modelSteps = step;
     await input.events?.onStatus?.(`Researcher step ${step}/${maxSteps}`);
-    const think = resolveResearcherThink(input);
     const request: ModelChatRequest = {
+      ...modelRequestProfile,
       messages,
       tools: registry.getDefinitions(),
-      think,
       abortSignal: input.abortSignal,
       evidencePhase: "worker",
     };
@@ -540,8 +569,11 @@ export async function runResearchWorker(input: {
 }
 
 export function createReadOnlyWorkerRegistry(registry: ToolRegistry): ToolRegistry {
+  const allowedNames = new Set(
+    filterResearcherToolNames([...RESEARCH_WORKER_ALLOWED_TOOLS]),
+  );
   const allowedDefinitions = registry.getDefinitions().filter((definition) =>
-    RESEARCH_WORKER_ALLOWED_TOOLS.has(definition.function.name),
+    allowedNames.has(definition.function.name),
   );
   return {
     getDefinitions(): ModelToolDefinition[] {
@@ -581,6 +613,67 @@ function resolveResearcherThink(input: {
     settings,
     model,
   });
+}
+
+/**
+ * Apply stage-specific overrides only to the direct Ollama Cloud transport.
+ * Deep and extended research use the stronger research model. Quick and
+ * standard passes retain the configured model and resolve thinking from the
+ * configured policy instead of unconditionally forcing the researcher low.
+ */
+export function resolveResearchWorkerModelRequestProfile(input: {
+  modelClient: ModelClient;
+  toolContext: ToolExecutionContext;
+  researchEffortTier: ResearchEffortTier;
+}): Pick<ModelChatRequest, "model" | "think"> {
+  const descriptor = input.modelClient.descriptor;
+  const directOllamaCloud =
+    descriptor?.provider === "ollama" &&
+    descriptor.endpointCategory === "ollama_cloud";
+  if (!directOllamaCloud) {
+    return { think: resolveResearcherThink(input) };
+  }
+
+  const deepResearch =
+    input.researchEffortTier === "deep" ||
+    input.researchEffortTier === "extended";
+  if (deepResearch) {
+    return {
+      model: OLLAMA_CLOUD_DEEP_RESEARCH_MODEL,
+      // Nemotron's direct Ollama thinking contract is safely enabled as a
+      // boolean. Preserve an explicit user opt-out when one is configured.
+      think: input.toolContext.settings?.thinkingMode === "off" ? false : true,
+    };
+  }
+
+  const model =
+    descriptor.model ?? input.toolContext.settings?.model ?? undefined;
+  return {
+    think: resolveThinkForCall({
+      role: "lead",
+      expectedTimeClass:
+        input.researchEffortTier === "quick" ? "quick" : "normal",
+      settings: input.toolContext.settings,
+      model,
+    }),
+  };
+}
+
+function classifyResearchWorkerEffort(
+  originalMission: string,
+  assignment: string,
+): ResearchEffortTier {
+  const prompt = `${originalMission}\n${assignment}`;
+  const route = /\b(?:extended|overnight|exhaustive|systematic review)\b/iu.test(
+    prompt,
+  )
+    ? "extended research"
+    : /\b(?:deep research|in[- ]depth research|deep dive|long research)\b/iu.test(
+          prompt,
+        )
+      ? "deep research"
+      : "research";
+  return selectInitialResearchEffort({ prompt, route }).tier;
 }
 
 async function chatResearcherTurn(

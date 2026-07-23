@@ -19,6 +19,8 @@ import {
 } from "../src/agent/queue";
 import {
   ResearchTicketPublisher,
+  WORK_ITEM_CONTRACT_V2_END,
+  WORK_ITEM_CONTRACT_V2_START,
   createWorkItemSpecV1,
   createWorkItemSpecV2,
   parseRenderedCompatibleWorkItemSpec,
@@ -34,6 +36,7 @@ import type { ToolExecutionContext } from "../src/tools/types";
 const T0 = "2026-07-12T12:00:00.000Z";
 const T1 = "2026-07-12T12:01:00.000Z";
 const PROJECT_ID = "project-queue";
+const READY_STATE_ID = "state-todo";
 const ARTIFACT_FINGERPRINT = `sha256:${"a".repeat(64)}`;
 
 const SECTIONS: SynthesizedResearchTicketSectionsV1 = {
@@ -62,7 +65,7 @@ const V2_DRAFT: ResearchTicketWorkItemDraftV2 = {
   generation: 0,
 };
 
-test("v2 publisher keeps identity host-side and deduplicates exact clean human content", async () => {
+test("v2 publisher appends one canonical signed contract and deduplicates the full description", async () => {
   let duplicateDescription = "";
   const duplicate = issue("issue-v2", T0, duplicateDescription);
   const publisher = new ResearchTicketPublisher({
@@ -92,11 +95,20 @@ test("v2 publisher keeps identity host-side and deduplicates exact clean human c
   assert.deepEqual(built.spec.validationRequirementKeys, ["tests.unit", "build.production"]);
   assert.match(built.description, /## Validation/u);
   assert.match(built.description, /tests\.unit/u);
+  const parsedDescription = parseRenderedCompatibleWorkItemSpec(built.description);
+  assert.deepEqual(parsedDescription.spec, built.spec);
+  assert.equal(countOccurrences(built.description, WORK_ITEM_CONTRACT_V2_START), 1);
+  assert.equal(countOccurrences(built.description, WORK_ITEM_CONTRACT_V2_END), 1);
+  assert.ok(built.description.endsWith(WORK_ITEM_CONTRACT_V2_END));
+  const humanDescription = built.description.slice(0, parsedDescription.contractStart).trimEnd();
   assert.doesNotMatch(
-    built.description,
+    humanDescription,
 
     /sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract|\bWork item:\s*sha256:/iu,
   );
+  duplicateDescription = built.description
+    .replace(/\n/g, "\r\n")
+    .replace("- [ ] **AC-1**", "- **AC-1**");
   const preview = await publisher.preview({
     context: {} as ToolExecutionContext,
     sections: SECTIONS,
@@ -106,6 +118,29 @@ test("v2 publisher keeps identity host-side and deduplicates exact clean human c
   if (!preview.ok) return;
   assert.equal(preview.status, "deduplicated");
   assert.equal(preview.duplicate?.id, "issue-v2");
+
+  duplicateDescription = duplicateDescription.replace(
+    built.spec.fingerprint,
+    `sha256:${"f".repeat(64)}`,
+  );
+  const contractDrift = await publisher.preview({
+    context: {} as ToolExecutionContext,
+    sections: SECTIONS,
+    draft: V2_DRAFT,
+  });
+  assert.equal(contractDrift.ok, true);
+  if (!contractDrift.ok) return;
+  assert.equal(contractDrift.status, "create");
+
+  duplicateDescription = `${built.description}\n`;
+  const trailingWhitespaceDrift = await publisher.preview({
+    context: {} as ToolExecutionContext,
+    sections: SECTIONS,
+    draft: V2_DRAFT,
+  });
+  assert.equal(trailingWhitespaceDrift.ok, true);
+  if (!trailingWhitespaceDrift.ok) return;
+  assert.equal(trailingWhitespaceDrift.status, "create");
 });
 
 test("compatible rendering and parsing preserve the existing v1 contract", () => {
@@ -219,6 +254,7 @@ test("stale preclaim timestamp blocks a v2 claim before any mutation", async () 
   );
   const supervisor = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async (operation) => {
         if (operation === "issues.get") return changed;
@@ -319,6 +355,7 @@ function verifierFor(readback: LinearIssueRecord): LinearQueueSupervisor {
   let queue = createLinearQueueState({ workspaceId: "workspace-verifier", at: T0 });
   return new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async (operation) => {
         if (operation === "issues.get") return readback;
@@ -347,6 +384,10 @@ function page(items: LinearIssueRecord[]): LinearOperationResult {
     pageInfo: { hasNextPage: false },
     fetchedAt: T0,
   };
+}
+
+function countOccurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
 }
 
 function unusedExecutor(): ConstructorParameters<typeof ResearchTicketPublisher>[0]["actionExecutor"] {

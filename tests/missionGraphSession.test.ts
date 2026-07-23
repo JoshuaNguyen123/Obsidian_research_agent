@@ -28,6 +28,88 @@ import type { ToolExecutionContext, ToolRegistry } from "../src/tools/types";
 
 const GRAPH_TIME = new Date("2026-07-11T18:00:00.000Z");
 
+test("beginToolExecution recovers an orphaned running node back to ready", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-orphan-running-recover",
+    allowedTools: ["replace_current_file"],
+    plannedTools: ["replace_current_file"],
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const first = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  assert.equal(session.graph.nodes[first.nodeId]?.status, "running");
+  // Simulate a host early-return that forgot finishToolExecution: node stays
+  // running with no in-flight lease. The next begin must heal and restart.
+  const recovered = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  assert.equal(recovered.nodeId, first.nodeId);
+  assert.equal(session.graph.nodes[recovered.nodeId]?.status, "running");
+  await session.finishToolExecution(recovered, {
+    ok: false,
+    failureFingerprint: fp("f"),
+    failureMessage: "path mismatch",
+  });
+  assert.equal(session.graph.nodes[recovered.nodeId]?.status, "ready");
+});
+
+test("parallel same-name reads never recover an intentionally running node", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-parallel-same-name-reads",
+    allowedTools: ["web_fetch"],
+    // Only one planned slot: the other deliberately concurrent reads must
+    // receive distinct bounded retry nodes instead of recovering each other.
+    plannedTools: ["web_fetch"],
+    maxToolCalls: 6,
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+
+  const executions: MissionGraphToolExecution[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    executions.push(
+      requireExecution(
+        await session.beginToolExecution("web_fetch", {
+          recoverOrphanedRunning: false,
+        }),
+      ),
+    );
+  }
+
+  assert.equal(new Set(executions.map((item) => item.nodeId)).size, 3);
+  assert.equal(
+    executions.filter((item) => /^retry-/u.test(item.nodeId)).length,
+    2,
+  );
+  for (const execution of executions) {
+    assert.equal(session.graph.nodes[execution.nodeId]?.status, "running");
+  }
+
+  for (let index = 0; index < executions.length; index += 1) {
+    const execution = executions[index]!;
+    const node = session.graph.nodes[execution.nodeId]!;
+    await session.finishToolExecution(execution, {
+      ok: true,
+      evidence: evidenceFor(
+        node,
+        String(index + 1),
+        harness.nextTimestamp(),
+      ),
+    });
+  }
+  for (const execution of executions) {
+    assert.equal(session.graph.nodes[execution.nodeId]?.status, "complete");
+  }
+});
+
 test("canonical evidence kinds satisfy the exact graph contract without weakening generic nodes", () => {
   assert.equal(
     resolveMissionGraphEvidenceKind("vault_note", ["vault-note"]),
@@ -200,6 +282,7 @@ test("composite lifecycle advances one durable action at a time and rejects wron
     {
       actionCursor: 1,
       completedActionIds: ["action-001-web_search"],
+      skippedActionIds: [],
       actionAttemptCounts: { "action-001-web_search": 1 },
     },
   );
@@ -291,6 +374,75 @@ test("composite lifecycle rejects a persisted cursor without completed-prefix pr
   assert.throws(
     () => validateMissionGraphV3(tampered),
     /cursor exceeds its durable action proof/u,
+  );
+});
+
+test("green fast validation skips the conditional repair checkpoint", async () => {
+  const harness = createVaultHarness();
+  const graph = await conditionalCodeLifecycleGraphFor(
+    "session-conditional-code-repair",
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const research = requireExecution(
+    await session.beginToolExecution("web_search"),
+  );
+  await session.finishToolExecution(research, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[research.nodeId],
+      "1",
+      harness.nextTimestamp(),
+    ),
+  });
+  const create = requireExecution(
+    await session.beginToolExecution("code_workspace_create"),
+  );
+  await session.finishToolExecution(create, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[create.nodeId],
+      "2",
+      harness.nextTimestamp(),
+    ),
+  });
+  const fast = requireExecution(
+    await session.beginToolExecution("code_validate_fast"),
+  );
+  const afterFast = await session.finishToolExecution(fast, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[fast.nodeId],
+      "3",
+      harness.nextTimestamp(),
+    ),
+    skipNextToolNames: ["code_repair_record_cycle"],
+  });
+  assert.deepEqual(
+    getMissionCompositeLifecycleStateV1(afterFast.nodes[fast.nodeId]),
+    {
+      actionCursor: 3,
+      completedActionIds: [
+        "action-001-code_workspace_create",
+        "action-002-code_validate_fast",
+      ],
+      skippedActionIds: ["action-003-code_repair_record_cycle"],
+      actionAttemptCounts: {
+        "action-001-code_workspace_create": 1,
+        "action-002-code_validate_fast": 1,
+      },
+    },
+  );
+  const repair = await session.beginToolExecution(
+    "code_repair_record_cycle",
+  );
+  assert.equal(repair.ok, false);
+  if (!repair.ok) assert.match(repair.reason, /expected code_validate_targeted/u);
+  assert.equal(
+    (await session.beginToolExecution("code_validate_targeted")).ok,
+    true,
   );
 });
 
@@ -975,6 +1127,61 @@ async function compositeLifecycleGraphFor(
       "linear_get_issue",
     ],
     maxToolCalls: options.maxToolCalls ?? 4,
+    maxWallClockMs: 120_000,
+    now: GRAPH_TIME,
+  });
+  assert.ok(host.projectLifecycleIntent);
+  return (
+    await planMissionGraphV3({
+      mission: { missionId, objective },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+}
+
+async function conditionalCodeLifecycleGraphFor(
+  missionId: string,
+): Promise<MissionGraphV3> {
+  const names = [
+    "web_search",
+    "code_workspace_create",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+  ];
+  const descriptors = names.map((name) =>
+    sessionLifecycleDescriptor(
+      name,
+      name === "web_search" ? "browser" : "workspace",
+      "read",
+    ),
+  );
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const objective =
+    "Research the requirements, then implement and validate the code workspace.";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective,
+    toolRegistry: registry,
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: names.length,
     maxWallClockMs: 120_000,
     now: GRAPH_TIME,
   });

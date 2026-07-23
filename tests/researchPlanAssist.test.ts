@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyResearchEvidence,
   createResearchPlan,
   createResearchPlanWithAssist,
   estimateDeterministicResearchConfidence,
@@ -88,6 +89,15 @@ test("createResearchPlanWithAssist merges utility questions when confidence is l
       /retention|validation gates/i.test(item.question),
     ),
   );
+  assert.equal(
+    assisted!.subquestions.reduce((sum, item) => sum + item.minEvidence, 0),
+    base.subquestions.reduce((sum, item) => sum + item.minEvidence, 0),
+  );
+  assert.ok(
+    assisted!.subquestions
+      .filter((item) => /retention|validation gates/i.test(item.question))
+      .every((item) => item.minEvidence === 0 && item.status === "complete"),
+  );
 });
 
 test("createResearchPlanWithAssist ignores assist when utility model is not configured", async () => {
@@ -107,4 +117,69 @@ test("createResearchPlanWithAssist ignores assist when utility model is not conf
   });
   assert.equal(called, false);
   assert.ok(assisted);
+});
+
+test("createResearchPlanWithAssist preserves an explicit closed source set", async () => {
+  let called = false;
+  const assisted = await createResearchPlanWithAssist({
+    prompt:
+      "Search the web, fetch both returned sources, compare their conflicting conclusions, and append exactly two cited findings.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+    utilityModelConfigured: true,
+    assist: async () => {
+      called = true;
+      return [
+        "Invent an extra research question that would require another source.",
+        "Invent another research question beyond the closed evidence set.",
+      ];
+    },
+  });
+
+  assert.equal(called, false);
+  assert.ok(assisted);
+  assert.equal(assisted!.sourceRequirements.minFetchedSources, 2);
+  assert.equal(
+    assisted!.subquestions
+      .filter((item) => item.requiredEvidenceType === "web_source")
+      .reduce((sum, item) => sum + item.minEvidence, 0),
+    2,
+  );
+  const completed = applyResearchEvidence(assisted!, [
+    {
+      id: "vault:du02",
+      kind: "vault_note",
+      title: "Current note",
+      summary: "Owned current-note context.",
+      confidence: "high",
+      path: "Current.md",
+      passageIds: ["source:vault:passage:0-20"],
+    },
+    {
+      id: "web:du02-alpha",
+      kind: "web_source",
+      title: "Alpha evidence",
+      summary: "Alpha supports the controlled validation conclusion.",
+      confidence: "high",
+      url: "https://alpha.example/evidence",
+      usableSource: true,
+      parserStatus: "parsed",
+      passageIds: ["source:alpha:passage:0-20"],
+    },
+    {
+      id: "web:du02-beta",
+      kind: "web_source",
+      title: "Beta evidence",
+      summary: "Beta conflicts with the controlled validation conclusion.",
+      confidence: "high",
+      url: "https://beta.example/evidence",
+      usableSource: true,
+      parserStatus: "parsed",
+      passageIds: ["source:beta:passage:0-20"],
+    },
+  ]);
+  assert.equal(completed.status, "complete");
 });

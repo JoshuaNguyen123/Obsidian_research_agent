@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   analyzeGeneratedOutputPrompt,
+  buildWordTargetExpansionResumePrompt,
+  hasWordCountShortfallFollowUp,
+  resolveWordCountBounds,
+  shouldResumeWordTargetAsExpansion,
 } from "../src/agent/generatedOutputPolicy";
 import {
   analyzeCurrentNoteResetPrompt,
@@ -15,10 +19,89 @@ import {
 import {
   deriveAutonomyScope,
   extractExplicitNewWorkspaceFilePaths,
+  extractExplicitVaultReadFilePaths,
   extractExplicitWorkspaceReadFilePaths,
+  extractExplicitWorkspaceWriteExpectedFilePaths,
   extractMarkdownPathMentions,
   hasExplicitCurrentNoteMutationIntent,
 } from "../src/agent/missionScope";
+
+test("explicit vault read paths stay inside affirmative read clauses", () => {
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths(
+      "Read the two named vault notes Sources/Alpha.md and Sources/Beta.md. Append the synthesis into Reports/Result.md.",
+    ),
+    ["Sources/Alpha.md", "Sources/Beta.md"],
+  );
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths(
+      "Do not read Sources/Private.md. Append a marker to Reports/Result.md.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths(
+      "Read the two named vault notes E2E Agent Tests/source-a-marker.md and E2E Agent Tests/source-b-marker.md. Synthesize them.",
+    ),
+    [
+      "E2E Agent Tests/source-a-marker.md",
+      "E2E Agent Tests/source-b-marker.md",
+    ],
+  );
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths("Read Plan.md, then summarize it."),
+    ["Plan.md"],
+  );
+});
+
+test("explicit vault read paths do not inherit later mutation destinations", () => {
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths(
+      "Read Sources/One.md and write Reports/Out.md, then delete Trash/Old.md.",
+    ),
+    ["Sources/One.md"],
+  );
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths(
+      "Review the proposal to create Reports/New.md.",
+    ),
+    [],
+  );
+});
+
+test("explicit vault read negation is scoped to its local action", () => {
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths(
+      "Without reading Sources/Private.md, open Sources/Public.md.",
+    ),
+    ["Sources/Public.md"],
+  );
+  assert.deepEqual(
+    extractExplicitVaultReadFilePaths(
+      "Do not read Sources/Private.md but read Sources/Public.md.",
+    ),
+    ["Sources/Public.md"],
+  );
+});
+
+test("explicit vault read paths reject unsafe and system targets without coercion", () => {
+  for (const unsafe of [
+    "../../Secrets.md",
+    "/Absolute/Thing.md",
+    "Folder\\Thing.md",
+    "C:/Private/Thing.md",
+    ".obsidian/Secret.md",
+    ".agent-backups/Secret.md",
+    ".trash/Secret.md",
+    "trash/Secret.md",
+  ]) {
+    assert.deepEqual(
+      extractExplicitVaultReadFilePaths(`Read ${unsafe}.`),
+      [],
+      unsafe,
+    );
+  }
+});
 
 test("explicit repository file sets are extracted without adjacent mission paths", () => {
   const prompt = [
@@ -38,6 +121,21 @@ test("explicit repository file sets are extracted without adjacent mission paths
       "Do not create exactly safe.py, ../escape.py, or C:/private.py.",
     ),
     [],
+  );
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      [
+        "Never weaken or edit scripts/.",
+        "Create exactly README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py; do not change any other path.",
+      ].join(" "),
+    ),
+    [
+      "README.md",
+      "checkers/__init__.py",
+      "checkers/cli.py",
+      "checkers/game.py",
+      "tests/test_checkers.py",
+    ],
   );
 });
 
@@ -75,10 +173,33 @@ test("explicit workspace reads recognize affirmative protected contracts only", 
     ),
     [],
   );
+  assert.deepEqual(
+    extractExplicitWorkspaceReadFilePaths(
+      "Call code_workspace_read for path src/flow_real.ts, then code_workspace_write_expected path src/flow_real.ts with exact content.",
+    ),
+    ["src/flow_real.ts"],
+  );
+});
+
+test("explicit workspace write_expected paths recognize tool-token form", () => {
+  assert.deepEqual(
+    extractExplicitWorkspaceWriteExpectedFilePaths(
+      "code_workspace_write_expected path src/flow_real.ts with the exact one-line content",
+    ),
+    ["src/flow_real.ts"],
+  );
+  assert.deepEqual(
+    extractExplicitWorkspaceWriteExpectedFilePaths(
+      "Do not code_workspace_write_expected path secrets.env. Leave scripts alone.",
+    ),
+    [],
+  );
 });
 import {
   hasExplicitNoWebIntent,
   hasExplicitPublicWebSignal,
+  hasPrimaryTextCitationIntent,
+  isLiteraryPrimaryTextWriteMission,
   requiresWebEvidenceProof,
 } from "../src/agent/evidenceIntent";
 import type { MissionIntent } from "../src/tools/types";
@@ -113,6 +234,7 @@ test("generated output policy classifies prompt matrix targets", () => {
     target: 100,
     exact: false,
     tolerancePct: 10,
+    floorAtTarget: true,
   });
 
   const wholePageCorrection = analyzeGeneratedOutputPrompt(
@@ -124,6 +246,7 @@ test("generated output policy classifies prompt matrix targets", () => {
     target: 1000,
     exact: false,
     tolerancePct: 10,
+    floorAtTarget: true,
   });
 
   const freshEssay = analyzeGeneratedOutputPrompt(
@@ -134,6 +257,7 @@ test("generated output policy classifies prompt matrix targets", () => {
     target: 1000,
     exact: false,
     tolerancePct: 10,
+    floorAtTarget: true,
   });
 
   const steak = analyzeGeneratedOutputPrompt(
@@ -190,7 +314,64 @@ test("generated output policy detects grounded quote prompts", () => {
     target: 300,
     exact: false,
     tolerancePct: 10,
+    floorAtTarget: true,
   });
+});
+
+test("bare N-word essays floor at the stated count; about keeps ±10%", () => {
+  const bare = analyzeGeneratedOutputPrompt(
+    "Write a 5000 word essay on the catcher in the rye and the meaning of the book.",
+  );
+  assert.equal(bare.wordTarget?.floorAtTarget, true);
+  assert.deepEqual(resolveWordCountBounds(bare.wordTarget!), {
+    min: 5000,
+    max: 5500,
+  });
+
+  const approx = analyzeGeneratedOutputPrompt(
+    "Write about 5000 words on the catcher in the rye.",
+  );
+  assert.equal(approx.wordTarget?.floorAtTarget, false);
+  assert.deepEqual(resolveWordCountBounds(approx.wordTarget!), {
+    min: 4500,
+    max: 5500,
+  });
+});
+
+test("word-count shortfall follow-ups replace instead of append", () => {
+  const prompt = "The essay still isn't 5000 words.";
+  assert.equal(hasWordCountShortfallFollowUp(prompt), true);
+  const policy = analyzeGeneratedOutputPrompt(prompt);
+  assert.equal(policy.target, "current_note_replace");
+  assert.equal(policy.wordTarget?.target, 5000);
+  assert.equal(policy.wordTarget?.floorAtTarget, true);
+});
+
+test("partial writeback resume expands under-target drafts instead of appending", () => {
+  const mission = "Can you write me a 5000 word essay on the catcher in the rye?";
+  assert.equal(
+    shouldResumeWordTargetAsExpansion({
+      missionPrompt: mission,
+      noteWordCount: 1256,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldResumeWordTargetAsExpansion({
+      missionPrompt: mission,
+      noteWordCount: 5200,
+    }),
+    false,
+  );
+  const resumePrompt = buildWordTargetExpansionResumePrompt(mission, 5000);
+  assert.equal(hasWordCountShortfallFollowUp(resumePrompt), true);
+  assert.match(resumePrompt, /expand that draft in place by editing/i);
+  assert.match(resumePrompt, /soft ±5% band \(4750–5250 words; target 5000\)/i);
+  assert.match(resumePrompt, /Prefer deepening thin sections/i);
+  assert.equal(
+    analyzeGeneratedOutputPrompt(resumePrompt).target,
+    "current_note_replace",
+  );
 });
 
 test("current note reset policy separates delete-only from delete-then-write", () => {
@@ -244,6 +425,19 @@ test("loop planner reserves finalization for grounded generated writing", () => 
   assert.equal(budget.finalizationReserve, 4);
   assert.equal(budget.toolStepBudget, 1);
   assert.deepEqual(budget.expectedTools, ["web_search", "web_fetch"]);
+});
+
+test("loop planner does not expect web tools for primary-text literary citations", () => {
+  const prompt =
+    "Write a 3000 college level essay on the Catcher in the rye. Use supporting details and quotes, and citations directly from the text to support your essay.";
+  const budget = planLoopBudget({
+    prompt,
+    route: "direct_writeback",
+    generated: analyzeGeneratedOutputPrompt(prompt),
+    configuredMaxSteps: 12,
+  });
+
+  assert.deepEqual(budget.expectedTools, []);
 });
 
 test("loop planner keeps vault-only evidence research off the web", () => {
@@ -350,6 +544,32 @@ test("vault paths containing source do not manufacture public-web intent", () =>
   assert.equal(
     hasExplicitPublicWebSignal(`${prompt} Then verify claims on the web.`),
     true,
+  );
+});
+
+test("literary citations from the text are not public-web proof debt", () => {
+  const prompt =
+    "Write a 3000 college level essay on the Catcher in the rye. Use supporting details and quotes, and citations directly from the text to support your essay.";
+  const intent = {
+    explicitMutation: false,
+    requireWriteCompletion: true,
+    noteOutput: true,
+  } as MissionIntent;
+  assert.equal(hasPrimaryTextCitationIntent(prompt), true);
+  assert.equal(isLiteraryPrimaryTextWriteMission(prompt), true);
+  assert.equal(hasExplicitPublicWebSignal(prompt), false);
+  assert.equal(requiresWebEvidenceProof(prompt, intent), false);
+  assert.equal(deriveAutonomyScope(prompt, { noteOutput: true }).read.web, false);
+  const policy = analyzeGeneratedOutputPrompt(prompt);
+  assert.equal(policy.requiresGrounding, false);
+  assert.equal(policy.requiresTextQuotes, true);
+  // Grapes-of-Wrath-style "text level quotation and citations" without
+  // "from the text" still wants Soft / public grounding.
+  assert.equal(
+    isLiteraryPrimaryTextWriteMission(
+      "Write an essay with text level quotation and citations.",
+    ),
+    false,
   );
 });
 

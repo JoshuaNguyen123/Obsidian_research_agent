@@ -842,7 +842,16 @@ export class CodeExtensionRuntimeV2 {
     if (projects.length !== 1) {
       throw new CodeSandboxContributionErrorV2(
         "sandbox_project_binding_mismatch",
-        "Sandbox preparation requires exactly one project covering the trusted workspace changes.",
+        [
+          "Sandbox preparation requires exactly one project covering the trusted workspace changes.",
+          `changedPaths=${JSON.stringify(changedPaths)}`,
+          `projectAllowed=${JSON.stringify(
+            profile.projects.map((project) => ({
+              id: project.id,
+              allowedPaths: project.allowedPaths,
+            })),
+          )}`,
+        ].join(" "),
       );
     }
     const project = projects[0];

@@ -22,8 +22,10 @@ import {
   type BackgroundExecutionDomainV1,
 } from "../../packages/headless-runtime/src";
 import {
+  analyzeExplicitVaultReadFilePaths,
   extractExplicitNewWorkspaceFilePaths,
   extractExplicitWorkspaceReadFilePaths,
+  extractExplicitWorkspaceWriteExpectedFilePaths,
   extractMarkdownPathMentions,
 } from "./missionScope";
 import {
@@ -111,6 +113,36 @@ export async function buildHostMissionGraphPlanV1(
     extractExplicitNewWorkspaceFilePaths(input.objective);
   const explicitWorkspaceReadFilePaths =
     extractExplicitWorkspaceReadFilePaths(input.objective);
+  const explicitWorkspaceWriteExpectedFilePaths = (() => {
+    const named = extractExplicitWorkspaceWriteExpectedFilePaths(
+      input.objective,
+    );
+    if (named.length > 0) return named;
+    // Seeded-file repair missions name the read path and say "write_expected
+    // for that same path" without repeating the path token. Reuse read paths
+    // only when no create_file destinations were named.
+    if (explicitNewWorkspaceFilePaths.length > 0) return [];
+    return explicitWorkspaceReadFilePaths;
+  })();
+  const plannedToolNames = [...input.plannedToolNames];
+  const explicitVaultReadFilePathAnalysis =
+    analyzeExplicitVaultReadFilePaths(input.objective);
+  const explicitVaultReadFilePaths = explicitVaultReadFilePathAnalysis.paths;
+  const plannedVaultReadFileCount = plannedToolNames.filter(
+    (name) => name === "read_file",
+  ).length;
+  if (
+    plannedVaultReadFileCount > 0 &&
+    explicitVaultReadFilePathAnalysis.referencedPathCount > 0 &&
+    (explicitVaultReadFilePathAnalysis.invalidPathCount > 0 ||
+      explicitVaultReadFilePaths.length !== plannedVaultReadFileCount ||
+      explicitVaultReadFilePathAnalysis.referencedPathCount !==
+        explicitVaultReadFilePaths.length)
+  ) {
+    throw new Error(
+      "Named vault read authority is invalid or does not match the planned read_file node count.",
+    );
+  }
   // Preserve deliberate read multiplicity: two bounded source fetches are two
   // separately budgeted graph nodes even though they use the same descriptor.
   // Effectful tools remain deduplicated except for the explicit Mermaid
@@ -119,10 +151,48 @@ export async function buildHostMissionGraphPlanV1(
   // accidental duplicate introduced by overlapping host/router requirements.
   const seenEffectfulPlannedNames = new Set<string>();
   const basePlannedSteps: PlannedToolStepV1[] = [];
-  for (const name of input.plannedToolNames) {
+  let explicitVaultReadFileIndex = 0;
+  let explicitWorkspaceReadFileIndex = 0;
+  for (const name of plannedToolNames) {
     const descriptor = descriptorByName.get(name);
     if (!descriptor) continue;
     if (descriptor.effect === "read") {
+      if (name === "read_file") {
+        const exactVaultPath =
+          explicitVaultReadFilePaths[explicitVaultReadFileIndex++];
+        basePlannedSteps.push(
+          exactVaultPath
+            ? {
+                name,
+                selector: exactVaultPath,
+                objective: `Read the exact named vault note ${exactVaultPath}.`,
+              }
+            : { name },
+        );
+        continue;
+      }
+      if (name === "code_workspace_read") {
+        let boundPath: string | undefined;
+        if (explicitWorkspaceReadFileIndex < explicitWorkspaceReadFilePaths.length) {
+          boundPath =
+            explicitWorkspaceReadFilePaths[explicitWorkspaceReadFileIndex++];
+        } else if (
+          explicitWorkspaceReadFilePaths.length === 0 &&
+          explicitWorkspaceWriteExpectedFilePaths.length === 1
+        ) {
+          boundPath = explicitWorkspaceWriteExpectedFilePaths[0];
+        }
+        basePlannedSteps.push(
+          boundPath
+            ? {
+                name,
+                selector: boundPath,
+                objective: `Read the exact workspace file ${boundPath}.`,
+              }
+            : { name },
+        );
+        continue;
+      }
       basePlannedSteps.push({ name });
       continue;
     }
@@ -140,6 +210,21 @@ export async function buildHostMissionGraphPlanV1(
           name,
           selector: path,
           objective: `Create the exact new workspace file ${path} without overwrite.`,
+        })),
+      );
+      continue;
+    }
+    if (
+      name === "code_workspace_write_expected" &&
+      explicitWorkspaceWriteExpectedFilePaths.length > 0 &&
+      !seenEffectfulPlannedNames.has(name)
+    ) {
+      seenEffectfulPlannedNames.add(name);
+      basePlannedSteps.push(
+        ...explicitWorkspaceWriteExpectedFilePaths.map((path) => ({
+          name,
+          selector: path,
+          objective: `Hash-bound rewrite the exact workspace file ${path}.`,
         })),
       );
       continue;
@@ -710,6 +795,9 @@ function buildCompositeLifecycleNodeProposalsV1(input: {
           requiredReceiptKinds: [
             ...proposal.completionContract.requiredReceiptKinds,
           ],
+          ...(step.name === "code_repair_record_cycle"
+            ? { condition: "fast_validation_failed" as const }
+            : {}),
         };
       },
     );
@@ -746,6 +834,9 @@ function buildCompositeLifecycleNodeProposalsV1(input: {
                 requiredEvidenceKinds: [...action.requiredEvidenceKinds],
                 minimumReceipts: action.minimumReceipts,
                 requiredReceiptKinds: [...action.requiredReceiptKinds],
+                ...(action.condition
+                  ? { condition: action.condition }
+                  : {}),
               }),
             ),
           },
@@ -777,21 +868,29 @@ function buildCompositeLifecycleNodeProposalsV1(input: {
       maxAttempts: input.maxAttempts,
       completionContract: {
         criteria: [
-          `Every ordered ${stageTemplate.stage} lifecycle action produced its required durable proof.`,
+          `Every required or executed ${stageTemplate.stage} lifecycle action produced its required durable proof; conditionally skipped actions were host-proven unnecessary.`,
         ],
-        minimumEvidence: actions.reduce(
+        minimumEvidence: actions
+          .filter((action) => action.condition === undefined)
+          .reduce(
           (total, action) => total + action.minimumEvidence,
           0,
         ),
         requiredEvidenceKinds: sortedUnique(
-          actions.flatMap((action) => action.requiredEvidenceKinds),
+          actions
+            .filter((action) => action.condition === undefined)
+            .flatMap((action) => action.requiredEvidenceKinds),
         ),
-        minimumReceipts: actions.reduce(
+        minimumReceipts: actions
+          .filter((action) => action.condition === undefined)
+          .reduce(
           (total, action) => total + action.minimumReceipts,
           0,
         ),
         requiredReceiptKinds: sortedUnique(
-          actions.flatMap((action) => action.requiredReceiptKinds),
+          actions
+            .filter((action) => action.condition === undefined)
+            .flatMap((action) => action.requiredReceiptKinds),
         ),
         verifierId: null,
       },
@@ -900,7 +999,9 @@ function plannedReadPrerequisiteIds(
   // Repeated exact workspace reads must be serialized so a same-name frontier
   // always resolves to one graph selector. Other read lifecycles retain their
   // established parallelism and explicit prerequisite rules above.
-  if (toolName === "code_workspace_read") prerequisiteNames.add(toolName);
+  if (toolName === "code_workspace_read" || toolName === "read_file") {
+    prerequisiteNames.add(toolName);
+  }
   return priorReads
     .filter((candidate) => prerequisiteNames.has(candidate.name))
     .map((candidate) => candidate.id);
@@ -1069,12 +1170,14 @@ function explicitVaultSelector(input: {
   objective: string;
   currentNotePath: string | null;
 }): string | null {
+  if (input.toolName === "read_file") {
+    return analyzeExplicitVaultReadFilePaths(input.objective).paths[0] ?? null;
+  }
   const paths = extractMarkdownPathMentions(input.objective);
   if (paths.length === 0) return input.currentNotePath;
   if (input.toolName === "delete_path") return paths.at(-1)!;
   if (
     input.toolName === "create_file" ||
-    input.toolName === "read_file" ||
     input.toolName === "append_file" ||
     input.toolName === "replace_file" ||
     input.toolName === "move_path"

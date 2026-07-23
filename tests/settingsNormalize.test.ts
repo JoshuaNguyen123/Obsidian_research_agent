@@ -30,6 +30,8 @@ describe("settingsNormalize", () => {
     assert.equal(settings.agenticReflexEnabled, true);
     assert.equal(settings.modelRouterMode, "authority");
     assert.equal(settings.modelRouterEnabled, true);
+    assert.equal(settings.model, "glm-5.2");
+    assert.equal(settings.showUnfinishedRunBannerOnOpen, false);
     assert.equal(settings.settingsSchemaVersion, SETTINGS_SCHEMA_VERSION);
   });
 
@@ -48,6 +50,14 @@ describe("settingsNormalize", () => {
     assert.equal(settings.streamWritebackMode, "off");
     assert.equal(settings.autoTitleOnWrite, false);
     assert.equal(settings.ollamaApiKey, "secret-key");
+  });
+
+  it("preserves an existing explicit Ollama model tag", () => {
+    const settings = normalizeAgentSettings(
+      { model: "qwen3.5:cloud" },
+      "existing_install",
+    );
+    assert.equal(settings.model, "qwen3.5:cloud");
   });
 
   it("malformed streaming flags normalize without losing credentials", () => {
@@ -288,6 +298,19 @@ describe("settingsNormalize", () => {
     assert.equal(settings.memoryMode, "research_and_experience");
     assert.equal(settings.researchMemoryEnabled, true);
     assert.equal(settings.experienceMemoryEnabled, true);
+  });
+
+  it("heals bare Ollama Cloud host missing /api", () => {
+    const settings = normalizeAgentSettings(
+      {
+        settingsSchemaVersion: 4,
+        workingMode: "automatic",
+        memoryMode: "research",
+        ollamaBaseUrl: "https://ollama.com",
+      },
+      "existing_install",
+    );
+    assert.equal(settings.ollamaBaseUrl, "https://ollama.com/api");
   });
 });
 

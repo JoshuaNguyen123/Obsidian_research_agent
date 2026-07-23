@@ -609,6 +609,12 @@ test("resumed sourced writeback uses durable read proof and commits exactly once
     },
     async streamChat(request, events = {}) {
       streamRequests.push(cloneRequest(request));
+      // Stream+tools planning turns must not emit note writeback deltas.
+      if (request.tools?.length) {
+        return responseWithContent(
+          "The durable source proof is ready for writeback.",
+        );
+      }
       events.onContentDelta?.(candidate);
       return responseWithContent(candidate);
     },
@@ -629,17 +635,24 @@ test("resumed sourced writeback uses durable read proof and commits exactly once
     },
   });
 
+  const planningStreamTurns = streamRequests.filter(
+    (request) => Boolean(request.tools?.length),
+  );
+  const writebackStreams = streamRequests.filter(
+    (request) => !request.tools?.length,
+  );
+  const planningTurns = chatRequests.length + planningStreamTurns.length;
   assert.ok(
-    chatRequests.length >= 1 && chatRequests.length <= 2,
-    "the resumed writeback may perform bounded planning but must not replay completed tools",
+    planningTurns >= 1 && planningTurns <= 3,
+    `the resumed writeback may perform bounded planning but must not replay completed tools (planningTurns=${planningTurns}, chat=${chatRequests.length}, streamTools=${planningStreamTurns.length})`,
   );
   assert.equal(
-    streamRequests.length,
+    writebackStreams.length,
     1,
-    JSON.stringify({ statuses, completions, receipts, toolStarts }),
+    JSON.stringify({ statuses, completions, receipts, toolStarts, streamRequests: streamRequests.length }),
   );
   assert.ok(
-    streamRequests[0].messages.some((message) =>
+    writebackStreams[0].messages.some((message) =>
       message.content.includes(passageId),
     ),
     "the resumed draft must retain the durable passage proof",

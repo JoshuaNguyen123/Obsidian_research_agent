@@ -93,3 +93,23 @@ test("withModelRetry does not retry auth failures", async () => {
   );
   assert.equal(attempts, 1);
 });
+
+test("withModelRetry respects shouldRetry=false after partial apply", async () => {
+  let attempts = 0;
+  await assert.rejects(
+    withModelRetry(
+      async () => {
+        attempts += 1;
+        throw new ModelClientError("api", "Internal Server Error", {
+          status: 500,
+        });
+      },
+      {
+        policy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
+        shouldRetry: () => false,
+      },
+    ),
+    /Internal Server Error/,
+  );
+  assert.equal(attempts, 1);
+});

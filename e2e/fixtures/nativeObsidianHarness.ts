@@ -389,6 +389,7 @@ async function seedCorePluginData(
         enableStreaming: false,
         thinkingMode: "off",
         model: "playwright-phase6-linear-mock",
+        e2eHarnessAttestationEnabled: true,
         maxAgentSteps: 100,
         streamWritebackMode: "off",
         scheduledMissions: [],

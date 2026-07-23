@@ -7,6 +7,7 @@ import {
   type CompanionHostApprovalSignerDescriptionV1,
   type CompanionHostApprovalVerificationResultV1,
   type CompanionJobV1,
+  type CompanionReceiptV1,
   type CompanionLinearQueueConfigurationV1,
   type CompanionLinearQueueEventV1,
   type CompanionLinearQueueStatusV1,
@@ -16,6 +17,8 @@ import {
   companionReceiptFingerprintV1,
   clearCompanionBootstrapSessionV1,
   installCompanionBootstrapSessionV1,
+  buildCompanionChatResumeSummaryV1,
+  isTerminalCompanionJobState,
   prepareCompanionJobV1,
   remoteJobToCompanionJob,
   type MissionGraphV3,
@@ -98,6 +101,10 @@ export interface PersistedCompanionLineageV1 {
     | "terminal_blocked"
     | "reconcile_required";
   reconcileError: string | null;
+  /** Concise Chat outcome for terminal background jobs; vault work stays null. */
+  chatResumeSummary: string | null;
+  /** ISO timestamp once Chat has been offered the resume summary once. */
+  chatResumeDeliveredAt: string | null;
   updatedAt: string;
 }
 
@@ -120,6 +127,15 @@ export interface CompanionReconciledLineageV1 {
   job: CompanionRemoteJobV1;
   events: CompanionEventV1[];
   receipts: Awaited<ReturnType<CompanionCoordinatorClientV1["listReceipts"]>>;
+}
+
+/** One Chat-ready outcome drained after companion reconciliation. */
+export interface CompanionChatResumeDeliveryV1 {
+  jobId: string;
+  missionId: string;
+  nodeId: string;
+  state: string;
+  line: string;
 }
 
 export interface CompanionLinearQueueReconciliationV1 {
@@ -832,6 +848,41 @@ export class CompanionExtensionCoordinatorV1 {
     );
   }
 
+  /**
+   * Returns undelivered terminal Chat resume lines once, then marks them
+   * delivered so Obsidian reopen does not spam duplicate outcomes.
+   */
+  async drainPendingChatResumeSummaries(
+    now = new Date(),
+  ): Promise<CompanionChatResumeDeliveryV1[]> {
+    return this.withCoordinationLock(async () => {
+      const deliveries: CompanionChatResumeDeliveryV1[] = [];
+      const deliveredAt = now.toISOString();
+      for (const lineage of Object.values(this.runtimeState.jobs)) {
+        if (
+          !lineage.chatResumeSummary ||
+          lineage.chatResumeDeliveredAt ||
+          !isTerminalCompanionJobState(lineage.state)
+        ) {
+          continue;
+        }
+        deliveries.push({
+          jobId: lineage.jobId,
+          missionId: lineage.missionId,
+          nodeId: lineage.nodeId,
+          state: lineage.state,
+          line: lineage.chatResumeSummary,
+        });
+        lineage.chatResumeDeliveredAt = deliveredAt;
+        lineage.updatedAt = deliveredAt;
+      }
+      if (deliveries.length > 0) {
+        await this.persistRuntimeState();
+      }
+      return deliveries;
+    });
+  }
+
   private async reconcilePersistedJobsUnlocked(
     signal?: AbortSignal,
   ): Promise<CompanionReconciledLineageV1[]> {
@@ -880,6 +931,7 @@ export class CompanionExtensionCoordinatorV1 {
               : "pending";
         lineage.reconcileError = null;
         lineage.updatedAt = job.updatedAt;
+        refreshChatResumeSummary(lineage, projected, job, receipts);
         results.push({ lineage: { ...lineage }, job, events, receipts });
       } catch (error) {
         lineage.reconcileStatus = "reconcile_required";
@@ -959,8 +1011,57 @@ function lineageFromPreparedJob(
     resultFingerprint: null,
     reconcileStatus: "pending",
     reconcileError: null,
+    chatResumeSummary: null,
+    chatResumeDeliveredAt: null,
     updatedAt: job.updatedAt,
   };
+}
+
+function refreshChatResumeSummary(
+  lineage: PersistedCompanionLineageV1,
+  projected: CompanionJobV1,
+  job: CompanionRemoteJobV1,
+  receipts: CompanionReceiptV1[],
+): void {
+  if (lineage.chatResumeDeliveredAt) {
+    return;
+  }
+  if (!isTerminalCompanionJobState(job.state)) {
+    lineage.chatResumeSummary = null;
+    return;
+  }
+  const output = openRecord(job.output ?? {}, "companion job output");
+  const completionOutputs =
+    output.outputs && typeof output.outputs === "object" && !Array.isArray(output.outputs)
+      ? (output.outputs as Record<string, unknown>)
+      : {};
+  const blocker = output.blocker === null || output.blocker === undefined
+    ? null
+    : openRecord(output.blocker, "companion job blocker");
+  const outputsForSummary: Record<string, MissionJsonValueV1> =
+    (Object.keys(completionOutputs).length > 0
+      ? completionOutputs
+      : output) as Record<string, MissionJsonValueV1>;
+  lineage.chatResumeSummary = buildCompanionChatResumeSummaryV1({
+    jobId: job.id,
+    missionId: job.missionId,
+    nodeId: job.nodeId,
+    domain: projected.domain,
+    state: job.state,
+    objective: projected.objective,
+    outputs: outputsForSummary,
+    blocker: blocker
+      ? {
+          code: typeof blocker.code === "string" ? blocker.code : null,
+          message: typeof blocker.message === "string" ? blocker.message : null,
+          requiredAction:
+            typeof blocker.requiredAction === "string"
+              ? blocker.requiredAction
+              : null,
+        }
+      : null,
+    receipts,
+  });
 }
 
 function adoptRemoteLineage(
@@ -1066,14 +1167,20 @@ function parseRuntimeState(value: unknown): CompanionRuntimeStateV1 {
         "reconcileError",
         "updatedAt",
       ];
-      const currentLineageKeys = [
+      const hostRuntimeLineageKeys = [
         ...legacyLineageKeys,
         "hostRuntimeRunId",
+      ];
+      const chatResumeLineageKeys = [
+        ...hostRuntimeLineageKeys,
+        "chatResumeSummary",
+        "chatResumeDeliveredAt",
       ];
       const rawLineage = item as unknown as Record<string, unknown>;
       if (
         !hasExactKeys(rawLineage, legacyLineageKeys) &&
-        !hasExactKeys(rawLineage, currentLineageKeys)
+        !hasExactKeys(rawLineage, hostRuntimeLineageKeys) &&
+        !hasExactKeys(rawLineage, chatResumeLineageKeys)
       ) {
         throw new Error(
           `Persisted companion lineage ${jobId} has unknown or missing fields.`,
@@ -1083,6 +1190,18 @@ function parseRuntimeState(value: unknown): CompanionRuntimeStateV1 {
         "hostRuntimeRunId" in rawLineage
           ? rawLineage.hostRuntimeRunId
           : null,
+      );
+      const chatResumeSummary = normalizeOptionalChatText(
+        "chatResumeSummary" in rawLineage
+          ? rawLineage.chatResumeSummary
+          : null,
+        "chat resume summary",
+      );
+      const chatResumeDeliveredAt = normalizeOptionalIsoTimestamp(
+        "chatResumeDeliveredAt" in rawLineage
+          ? rawLineage.chatResumeDeliveredAt
+          : null,
+        "chat resume deliveredAt",
       );
       if (
         item.version === 1 &&
@@ -1109,6 +1228,8 @@ function parseRuntimeState(value: unknown): CompanionRuntimeStateV1 {
         state.jobs[jobId] = {
           ...item,
           hostRuntimeRunId,
+          chatResumeSummary,
+          chatResumeDeliveredAt,
           receiptFingerprints: Array.isArray(item.receiptFingerprints)
             ? item.receiptFingerprints.filter((entry) => /^sha256:[a-f0-9]{64}$/.test(entry))
             : [],
@@ -1205,6 +1326,31 @@ function normalizeHostRuntimeRunId(value: unknown): string | null {
     !/^[A-Za-z0-9](?:[A-Za-z0-9._:-]*[A-Za-z0-9])?$/u.test(value)
   ) {
     throw new Error("Persisted companion host runtime run id is malformed.");
+  }
+  return value;
+}
+
+function normalizeOptionalChatText(
+  value: unknown,
+  label: string,
+): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0) {
+    throw new Error(`Persisted companion ${label} is malformed.`);
+  }
+  if (value.length > 280) {
+    throw new Error(`Persisted companion ${label} exceeds the Chat resume limit.`);
+  }
+  return value;
+}
+
+function normalizeOptionalIsoTimestamp(
+  value: unknown,
+  label: string,
+): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+    throw new Error(`Persisted companion ${label} is malformed.`);
   }
   return value;
 }

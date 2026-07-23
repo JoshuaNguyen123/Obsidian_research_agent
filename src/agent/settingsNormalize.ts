@@ -7,6 +7,7 @@ import { normalizeModelRouterMode } from "./missionRouter";
 import { normalizeScheduledMissions } from "./missionScheduler";
 import type { AutonomyProfile, OutputProfile } from "./noteOutputPolicy";
 import { deriveOutputProfileFromLegacy } from "./noteOutputPolicy";
+import { repairOllamaCloudBaseUrl } from "../model/cloudProviderPresets";
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 
@@ -80,6 +81,7 @@ export interface NormalizableAgentSettings {
   overnightRunHours?: number;
   overnightMaxSegments?: number;
   autoResumeOvernightRuns?: boolean;
+  showUnfinishedRunBannerOnOpen?: boolean;
   keepAwakeDuringOvernightRuns?: boolean;
   orchestratorPreviewEnabled?: boolean;
   orchestratorEnabled?: boolean;
@@ -124,6 +126,7 @@ export interface NormalizableAgentSettings {
   linearDefaultTeamId?: string;
   linearQueueEnabled?: boolean;
   linearQueueProjectId?: string;
+  linearReadyStateId?: string;
   linearStartedStateId?: string;
   linearCompletedStateId?: string;
   linearBlockedStateId?: string;
@@ -145,7 +148,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   ollamaBaseUrl: "https://ollama.com/api",
   openAiCompatibleApiKey: "",
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
-  model: "gpt-oss:120b-cloud",
+  model: "glm-5.2",
   utilityModel: "",
   utilityModelProvider: "ollama",
   modelRouterEnabled: true,
@@ -162,6 +165,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   overnightRunHours: 10,
   overnightMaxSegments: 24,
   autoResumeOvernightRuns: true,
+  showUnfinishedRunBannerOnOpen: false,
   keepAwakeDuringOvernightRuns: false,
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,
@@ -205,6 +209,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   linearDefaultTeamId: "",
   linearQueueEnabled: false,
   linearQueueProjectId: "",
+  linearReadyStateId: "",
   linearStartedStateId: "",
   linearCompletedStateId: "",
   linearBlockedStateId: "",
@@ -371,6 +376,13 @@ export function normalizeAgentSettings(
       experienceMemoryEnabled: merged.experienceMemoryEnabled,
     });
   applyMemoryModeDefaults(merged, memoryMode);
+
+  // Heal the broken Ollama Cloud preset that wrote https://ollama.com (no /api).
+  merged.ollamaBaseUrl = repairOllamaCloudBaseUrl(
+    typeof merged.ollamaBaseUrl === "string"
+      ? merged.ollamaBaseUrl
+      : BASE_DEFAULTS.ollamaBaseUrl,
+  );
 
   return {
     ...merged,

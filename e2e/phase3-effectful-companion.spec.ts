@@ -95,6 +95,36 @@ test.describe("phase-3 authenticated companion continuation", () => {
         .poll(async () => {
           const snapshot = await harness.readSnapshot();
           return {
+            chatResumeSummary: snapshot.lineage?.chatResumeSummary ?? null,
+            chatResumeDeliveredAt:
+              snapshot.lineage?.chatResumeDeliveredAt ?? null,
+            chatResumeLines: snapshot.chatResumeLines,
+          };
+        }, {
+          timeout: 30_000,
+          message:
+            "reconnect should surface one concise Chat resume summary for the verified Linear background job",
+        })
+        .toEqual({
+          chatResumeSummary: expect.stringMatching(
+            /Background Linear update verified for issue-42/i,
+          ),
+          chatResumeDeliveredAt: expect.any(String),
+          chatResumeLines: [
+            expect.stringMatching(
+              /Background Linear update verified for issue-42/i,
+            ),
+          ],
+        });
+
+      await expect(
+        harness.page.getByText(/Background Linear update verified for issue-42/i),
+      ).toBeVisible({ timeout: 15_000 });
+
+      await expect
+        .poll(async () => {
+          const snapshot = await harness.readSnapshot();
+          return {
             posts: snapshot.postCount,
             providerMutations: snapshot.providerMutationCount,
             foregroundMutations: snapshot.foregroundMutationCount,

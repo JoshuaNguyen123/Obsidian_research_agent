@@ -201,6 +201,17 @@ export class DefaultToolRegistry implements ToolRegistry {
         "not_applied",
       );
     }
+    if (
+      descriptor.effect !== "read" &&
+      authorized.grantId.trim() === "policy:scoped-read"
+    ) {
+      return failed(
+        tool.name,
+        "authorization_scope_mismatch",
+        "Read-only policy authority cannot authorize a prepared mutation.",
+        "not_applied",
+      );
+    }
 
     try {
       const execution = await tool.executePrepared(action, {

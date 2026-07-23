@@ -234,7 +234,11 @@ export class MissionGraphSession {
 
   async beginToolExecution(
     toolName: string,
-    options: { allowDynamicReadContinuation?: boolean } = {},
+    options: {
+      allowDynamicReadContinuation?: boolean;
+      /** Disable only when the host intentionally prestarts parallel calls. */
+      recoverOrphanedRunning?: boolean;
+    } = {},
   ): Promise<MissionGraphToolStartResult> {
     return this.enqueueMutation(async () => {
       let node = Object.values(this.record.graph.nodes).find(
@@ -242,6 +246,31 @@ export class MissionGraphSession {
           candidate.status === "ready" &&
           missionNodeExpectsToolV1(candidate, toolName),
       );
+      // Host early-returns that forget finishToolExecution can leave a node
+      // stuck in running with an empty ready frontier. Heal before begin.
+      if (!node && options.recoverOrphanedRunning !== false) {
+        const orphanedRunning = Object.values(this.record.graph.nodes).find(
+          (candidate) =>
+            candidate.status === "running" &&
+            missionNodeExpectsToolV1(candidate, toolName),
+        );
+        if (orphanedRunning) {
+          await this.releaseOrphanedNodeLocksUnlocked(orphanedRunning.id);
+          await this.applyUnlocked(
+            `Recover orphaned running mission node ${orphanedRunning.id}.`,
+            [
+              {
+                op: "set_status",
+                nodeId: orphanedRunning.id,
+                expectedStatus: "running",
+                status: "ready",
+                blocker: null,
+              },
+            ],
+          );
+          node = this.record.graph.nodes[orphanedRunning.id];
+        }
+      }
       if (!node) {
         const terminalFailure = Object.values(this.record.graph.nodes).find(
           (candidate) =>
@@ -264,9 +293,15 @@ export class MissionGraphSession {
         if (lifecycleNode) {
           const expected = getCurrentMissionCompositeLifecycleActionV1(lifecycleNode);
           const state = getMissionCompositeLifecycleStateV1(lifecycleNode);
-          const replayed = state && getMissionCompositeLifecycleSpecV1(lifecycleNode)
-            ?.actions.slice(0, state.actionCursor)
-            .some((action) => action.toolName === toolName);
+          const lifecycleSpec =
+            getMissionCompositeLifecycleSpecV1(lifecycleNode);
+          const replayed =
+            state &&
+            lifecycleSpec?.actions
+              .filter((action) =>
+                state.completedActionIds.includes(action.id),
+              )
+              .some((action) => action.toolName === toolName);
           return {
             ok: false as const,
             reason: replayed
@@ -613,6 +648,8 @@ export class MissionGraphSession {
       failureMessage?: string;
       /** Host-verified domain outcome that must not be retried. */
       terminalFailure?: boolean;
+      /** Conditional actions proved unnecessary by the just-finished result. */
+      skipNextToolNames?: string[];
     },
   ): Promise<MissionGraphV3> {
     return this.enqueueMutation(async () => {
@@ -671,6 +708,7 @@ export class MissionGraphSession {
             lifecycleOutputsOperationV1(
               node.id,
               lifecycleState,
+              lifecycle!,
               lifecycleAction.id,
               false,
             ),
@@ -691,14 +729,20 @@ export class MissionGraphSession {
           lifecycle &&
           lifecycleState &&
           lifecycleAction &&
-          lifecycleState.actionCursor + 1 < lifecycle.actions.length
+          nextLifecycleCursor(
+            lifecycle,
+            lifecycleState.actionCursor,
+            result.skipNextToolNames,
+          ) < lifecycle.actions.length
         ) {
           operations.push(
             lifecycleOutputsOperationV1(
               node.id,
               lifecycleState,
+              lifecycle,
               lifecycleAction.id,
               true,
+              result.skipNextToolNames,
             ),
             {
               op: "update_node",
@@ -727,8 +771,10 @@ export class MissionGraphSession {
               lifecycleOutputsOperationV1(
                 node.id,
                 lifecycleState,
+                lifecycle!,
                 lifecycleAction.id,
                 true,
+                result.skipNextToolNames,
               ),
             );
           }
@@ -806,6 +852,7 @@ export class MissionGraphSession {
             lifecycleOutputsOperationV1(
               node.id,
               lifecycleState,
+              lifecycle!,
               lifecycleAction.id,
               false,
             ),
@@ -1309,6 +1356,23 @@ export class MissionGraphSession {
     this.record = persisted.record;
   }
 
+  /** Drop locks left behind when a host forgot finishToolExecution. */
+  private async releaseOrphanedNodeLocksUnlocked(
+    nodeId: string,
+  ): Promise<void> {
+    const ownerId = `${this.record.missionId}/${nodeId}`;
+    const held = Object.values(this.record.resourceLocks.locks).filter(
+      (lock) => lock.ownerId === ownerId,
+    );
+    if (held.length === 0) return;
+    await this.releaseNodeLocksUnlocked({
+      nodeId,
+      ownerId,
+      token: held[0]!.token,
+      resourceKeys: held.map((lock) => lock.resourceKey),
+    });
+  }
+
   private requireNode(nodeId: string) {
     const node = this.record.graph.nodes[nodeId];
     if (!node) throw new Error(`Unknown mission graph node ${nodeId}.`);
@@ -1403,24 +1467,56 @@ function actionProofMissingV1(
 function lifecycleOutputsOperationV1(
   nodeId: string,
   state: NonNullable<ReturnType<typeof getMissionCompositeLifecycleStateV1>>,
+  lifecycle: NonNullable<ReturnType<typeof getMissionCompositeLifecycleSpecV1>>,
   actionId: string,
   completed: boolean,
+  skipNextToolNames: readonly string[] = [],
 ): MissionGraphPatchOperationV1 {
   const completedActionIds = completed
     ? [...state.completedActionIds, actionId]
     : [...state.completedActionIds];
+  const skipSet = new Set(skipNextToolNames);
+  const skippedActionIds = [...state.skippedActionIds];
+  let actionCursor = state.actionCursor + (completed ? 1 : 0);
+  while (
+    completed &&
+    actionCursor < lifecycle.actions.length &&
+    skipSet.has(lifecycle.actions[actionCursor].toolName) &&
+    lifecycle.actions[actionCursor].condition === "fast_validation_failed"
+  ) {
+    skippedActionIds.push(lifecycle.actions[actionCursor].id);
+    actionCursor += 1;
+  }
   return {
     op: "set_outputs",
     nodeId,
     outputs: {
-      lifecycleActionCursor: state.actionCursor + (completed ? 1 : 0),
+      lifecycleActionCursor: actionCursor,
       lifecycleCompletedActionIds: completedActionIds,
+      lifecycleSkippedActionIds: skippedActionIds,
       lifecycleActionAttemptCounts: {
         ...state.actionAttemptCounts,
         [actionId]: (state.actionAttemptCounts[actionId] ?? 0) + 1,
       },
     },
   };
+}
+
+function nextLifecycleCursor(
+  lifecycle: NonNullable<ReturnType<typeof getMissionCompositeLifecycleSpecV1>>,
+  currentCursor: number,
+  skipNextToolNames: readonly string[] | undefined,
+): number {
+  const skipSet = new Set(skipNextToolNames ?? []);
+  let cursor = currentCursor + 1;
+  while (
+    cursor < lifecycle.actions.length &&
+    skipSet.has(lifecycle.actions[cursor].toolName) &&
+    lifecycle.actions[cursor].condition === "fast_validation_failed"
+  ) {
+    cursor += 1;
+  }
+  return cursor;
 }
 
 function clone<T>(value: T): T {

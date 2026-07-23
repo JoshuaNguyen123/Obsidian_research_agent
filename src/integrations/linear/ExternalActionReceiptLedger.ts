@@ -111,7 +111,9 @@ export function normalizeExternalActionReceiptLedgerState(
 
 /**
  * Appends an already host-validated external receipt. Duplicate ids are
- * idempotent only when the canonical receipt is identical; collisions fail.
+ * idempotent only when the canonical receipt is identical; collisions fail
+ * unless an incomplete GitHub publication receipt is being superseded by a
+ * retry or completed draft-PR receipt for the same logical publication.
  * The oldest entry rolls off after the fixed 256-receipt bound.
  */
 export function appendVerifiedExternalActionReceipt(
@@ -125,12 +127,37 @@ export function appendVerifiedExternalActionReceipt(
   const current = parseExternalActionReceiptLedgerState(state);
   assertExpectedRevision(current.revision, input.expectedRevision);
   const receipt = parseVerifiedExternalReceipt(input.receipt);
-  const existing = current.entries.find((entry) => entry.receipt.id === receipt.id);
-  if (existing) {
-    if (canonicalJson(existing.receipt) !== canonicalJson(receipt)) {
-      throw new Error("External action receipt id collided with different receipt data.");
+  const existingIndex = current.entries.findIndex(
+    (entry) => entry.receipt.id === receipt.id,
+  );
+  if (existingIndex >= 0) {
+    const existing = current.entries[existingIndex]!;
+    if (canonicalJson(existing.receipt) === canonicalJson(receipt)) {
+      return cloneSerializable(current);
     }
-    return cloneSerializable(current);
+    if (
+      canSupersedeIncompleteGithubPublicationReceipt(existing.receipt, receipt)
+    ) {
+      const recordedAt = expectIsoTimestamp(input.recordedAt, "Receipt recording time");
+      assertMonotonicTimestamp(recordedAt, current.updatedAt, "Receipt recording time");
+      assertMonotonicTimestamp(recordedAt, receipt.committedAt, "Receipt recording time");
+      const entries = current.entries.map((entry, index) =>
+        index === existingIndex
+          ? {
+              proofKind: EXTERNAL_ACTION_PROOF_KIND,
+              receipt,
+              recordedAt,
+            }
+          : entry,
+      );
+      return parseExternalActionReceiptLedgerState({
+        ...current,
+        revision: current.revision + 1,
+        entries,
+        updatedAt: recordedAt,
+      });
+    }
+    throw new Error("External action receipt id collided with different receipt data.");
   }
   const recordedAt = expectIsoTimestamp(input.recordedAt, "Receipt recording time");
   assertMonotonicTimestamp(recordedAt, current.updatedAt, "Receipt recording time");
@@ -211,7 +238,7 @@ function parseVerifiedExternalReceipt(value: unknown): ActionReceipt {
     throw new Error("Only Linear or GitHub receipts may enter the external proof ledger.");
   }
   const toolName = expectIdentifier(record.toolName, "Receipt tool name");
-  if (!toolName.startsWith(`${resource.system}_`)) {
+  if (!externalReceiptToolMatchesResourceSystem(toolName, resource.system)) {
     throw new Error("External receipt tool domain does not match its resource system.");
   }
   if (
@@ -395,6 +422,55 @@ function assertSerializedBound(value: unknown): void {
       `External action receipt ledger exceeds ${MAX_EXTERNAL_ACTION_LEDGER_BYTES} bytes.`,
     );
   }
+}
+
+/** Prefix tools (`github_*`) and publish bridges (`publish_*_to_github`). */
+export function externalReceiptToolMatchesResourceSystem(
+  toolName: string,
+  resourceSystem: string,
+): boolean {
+  if (toolName.startsWith(`${resourceSystem}_`)) return true;
+  return toolName.endsWith(`_to_${resourceSystem}`);
+}
+
+/**
+ * Incomplete publish receipts (branch-only / no draft PR URL) may be replaced
+ * by a later retry or a completed draft-PR receipt for the same logical work.
+ */
+export function canSupersedeIncompleteGithubPublicationReceipt(
+  existing: ActionReceipt,
+  next: ActionReceipt,
+): boolean {
+  if (
+    existing.resource.system !== "github" ||
+    next.resource.system !== "github" ||
+    existing.toolName !== next.toolName
+  ) {
+    return false;
+  }
+  if (!isIncompleteGithubPublicationReceipt(existing)) {
+    return false;
+  }
+  if (
+    existing.idempotencyKey &&
+    next.idempotencyKey &&
+    existing.idempotencyKey !== next.idempotencyKey
+  ) {
+    return false;
+  }
+  if (existing.actionId !== next.actionId && !existing.idempotencyKey) {
+    return false;
+  }
+  return true;
+}
+
+export function isIncompleteGithubPublicationReceipt(
+  receipt: ActionReceipt,
+): boolean {
+  if (receipt.resource.system !== "github") return false;
+  if (receipt.resource.resourceType === "repository_branch") return true;
+  const url = typeof receipt.resource.url === "string" ? receipt.resource.url : "";
+  return !/\/pull\/\d+/u.test(url);
 }
 
 export function cloneExternalActionReceiptLedgerState(

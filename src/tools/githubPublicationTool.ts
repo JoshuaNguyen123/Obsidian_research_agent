@@ -49,7 +49,7 @@ export function createGitHubPublicationTool(
   const tool: AgentTool = {
     name: PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
     description:
-      "Publish the latest host-verified local commit for a trusted repository profile to its agent-owned GitHub branch and draft pull request, or refresh proof and request a separate double-exact merge. The model supplies only a logical profile key and PR prose; local paths, SHAs, credentials, repository destinations, checks, and merge policy are host-resolved.",
+      "Purpose: Push verified branch and create draft PR (or Bound merge when mission asks). Use when: after code_commit_verified + private repo. Do not use when: before commit; do not invent git_push. Required: action publish_draft|merge + bindings. Next: note reflection. Side effects: bound/hard for merge. Publish the latest host-verified local commit for a trusted repository profile to its agent-owned GitHub branch and draft pull request, or refresh proof and request a separate double-exact merge. The model supplies only a logical profile key and PR prose; local paths, SHAs, credentials, repository destinations, checks, and merge policy are host-resolved.",
     parameters: {
       type: "object",
       properties: {
@@ -86,6 +86,23 @@ export function createGitHubPublicationTool(
         "github_publication_reconcile_required",
         checkpoint.blocker?.message ??
           "GitHub publication requires remote readback reconciliation.",
+        { mutationState: "may_have_applied" },
+      );
+    }
+    // Soft draft_pr proof must not treat push_prepared / branch-only
+    // checkpoints as success. Returning those as ok previously caused the
+    // model to loop, then ExternalActionReceiptLedger collisions on retry.
+    const requiresDraftPr =
+      (checkpoint.completionProof ?? "draft_pr") === "draft_pr";
+    const draftPrUrl =
+      typeof checkpoint.pullRequest?.htmlUrl === "string"
+        ? checkpoint.pullRequest.htmlUrl.trim()
+        : "";
+    if (requiresDraftPr && !/^https:\/\/github\.com\//iu.test(draftPrUrl)) {
+      throw new ToolExecutionError(
+        "github_publication_draft_pr_missing",
+        checkpoint.blocker?.message ??
+          "publish_verified_code_to_github did not produce a draft pull request URL. Retry after fixing Git push credentials (create-capable REST token is not enough when Contents write is missing on the new repo).",
         { mutationState: "may_have_applied" },
       );
     }
@@ -253,6 +270,29 @@ async function executeGitHubPublication(
         signal: context.abortSignal,
       });
     }
+    // Incomplete push_prepared / blocked checkpoints must NOT be returned as
+    // success. A prior auth-failed push leaves push_prepared durable; the old
+    // catch-all `if (existing) return existing` made retries look successful
+    // with pullRequest=null and then collided external receipt ids.
+    const incompleteWithoutDraftPr =
+      existing &&
+      !(
+        typeof existing.pullRequest?.htmlUrl === "string" &&
+        /^https:\/\/github\.com\//iu.test(existing.pullRequest.htmlUrl)
+      ) &&
+      (existing.status === "push_prepared" || existing.status === "blocked");
+    if (incompleteWithoutDraftPr) {
+      return workflow.publishDraft({
+        explicitUserMission: true,
+        publicationId,
+        title,
+        body,
+        handoff: adaptHandoff(handoff),
+        binding: binding.workflowBinding,
+        completionProof: binding.completionProof ?? "draft_pr",
+        signal: context.abortSignal,
+      });
+    }
     if (existing) return existing;
     return workflow.publishDraft({
       explicitUserMission: true,
@@ -261,7 +301,10 @@ async function executeGitHubPublication(
       body,
       handoff: adaptHandoff(handoff),
       binding: binding.workflowBinding,
-      completionProof: binding.completionProof ?? "merged_pr",
+      // Soft-auto / set-loose draft publication must stop at draft PR proof.
+      // Defaulting to merged_pr left Soft runs waiting for merge and often
+      // returned checkpoints without a pullRequest URL for delivery proofs.
+      completionProof: binding.completionProof ?? "draft_pr",
       signal: context.abortSignal,
     });
   }

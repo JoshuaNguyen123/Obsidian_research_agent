@@ -24,7 +24,7 @@ export function getE2EAiConfig(): E2EAiConfig {
 
   return {
     mode,
-    model: process.env.E2E_AI_MODEL?.trim() || "gpt-oss:120b-cloud",
+    model: process.env.E2E_AI_MODEL?.trim() || "glm-5.2",
     baseUrl: process.env.E2E_OLLAMA_BASE_URL?.trim() || "https://ollama.com/api",
     missionTimeoutMs: readTimeout("E2E_MISSION_TIMEOUT_MS", 600_000),
     firstChunkTimeoutMs: readTimeout("E2E_FIRST_CHUNK_TIMEOUT_MS", 180_000),

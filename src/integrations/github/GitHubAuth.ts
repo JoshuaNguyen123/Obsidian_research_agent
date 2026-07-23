@@ -28,6 +28,7 @@ const CREDENTIAL_ID_PATTERN = /^github_credential_[A-Za-z0-9_-]{20,128}$/;
 const SECRET_REFERENCE_PATTERN = /^(?:(?:secret|credential)_[A-Za-z0-9-]{8,128}|secret-obsidian-[a-z0-9-]{16,48})$/;
 const SCOPE_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
 const FINE_GRAINED_PAT_PATTERN = /^github_pat_[A-Za-z0-9_-]{20,500}$/;
+const CLASSIC_OR_OAUTH_TOKEN_PATTERN = /^gh[pousr]_[A-Za-z0-9]{20,500}$/;
 
 export type GitHubCredentialKindV1 = "oauth_device" | "fine_grained_pat";
 
@@ -369,6 +370,35 @@ export class GitHubAuthV1 {
     return this.commitCredential(token, "fine_grained_pat", [], signal);
   }
 
+  /**
+   * E2E / harness only: accept fine-grained PATs or classic/OAuth bearer
+   * tokens (ghp_/gho_/…) so live compound lanes can install a create-capable
+   * credential when the vault fine-grained PAT lacks Administration:write.
+   */
+  async importHarnessAccessToken(
+    token: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubCredentialV1> {
+    assertNotAborted(signal);
+    if (typeof token !== "string") {
+      throw new GitHubAuthErrorV1(
+        "github_auth_invalid_input",
+        "A valid GitHub access token is required.",
+      );
+    }
+    const trimmed = token.trim();
+    if (FINE_GRAINED_PAT_PATTERN.test(trimmed)) {
+      return this.commitCredential(trimmed, "fine_grained_pat", [], signal);
+    }
+    if (CLASSIC_OR_OAUTH_TOKEN_PATTERN.test(trimmed)) {
+      return this.commitCredential(trimmed, "oauth_device", ["repo"], signal);
+    }
+    throw new GitHubAuthErrorV1(
+      "github_auth_invalid_input",
+      "Harness GitHub credentials must be a github_pat_ fine-grained token or a gh[pousr]_ classic/OAuth token.",
+    );
+  }
+
   async withCredentialToken<TResult>(
     credential: GitHubCredentialV1,
     use: (token: string) => Promise<TResult>,
@@ -388,11 +418,24 @@ export class GitHubAuthV1 {
     }
     try {
       return await lease.withSecret(use);
-    } catch {
-      throw new GitHubAuthErrorV1(
-        "github_auth_secret_store_failed",
-        "The leased GitHub credential operation failed.",
-      );
+    } catch (error) {
+      if (error instanceof GitHubAuthErrorV1) throw error;
+      const raw = error instanceof Error ? error.message : String(error);
+      // Never surface leased secret material. Opaque-wrap only when the
+      // callback error embeds credential-like bytes; otherwise preserve the
+      // operational failure so Soft-union can heal (push auth, 404, etc.).
+      if (containsOpaqueGitHubSecretMaterial(raw)) {
+        throw new GitHubAuthErrorV1(
+          "github_auth_secret_store_failed",
+          "The leased GitHub credential operation failed.",
+        );
+      }
+      throw error instanceof Error
+        ? new Error(redactLeasedCredentialDiagnostic(raw))
+        : new GitHubAuthErrorV1(
+            "github_auth_secret_store_failed",
+            "The leased GitHub credential operation failed.",
+          );
     } finally {
       lease.dispose();
     }
@@ -700,6 +743,24 @@ export class GitHubAuthV1 {
   private nowIso(): string {
     return this.nowDate().toISOString();
   }
+}
+
+function containsOpaqueGitHubSecretMaterial(value: string): boolean {
+  return (
+    FINE_GRAINED_PAT_PATTERN.test(value) ||
+    CLASSIC_OR_OAUTH_TOKEN_PATTERN.test(value) ||
+    /Bearer\s+\S+/iu.test(value) ||
+    /https:\/\/[^/\s]+@github\.com/iu.test(value)
+  );
+}
+
+function redactLeasedCredentialDiagnostic(value: string): string {
+  return value
+    .replace(FINE_GRAINED_PAT_PATTERN, "github_pat_[REDACTED]")
+    .replace(CLASSIC_OR_OAUTH_TOKEN_PATTERN, "gh_[REDACTED]")
+    .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
+    .replace(/https:\/\/[^/\s]+@github\.com/giu, "https://[REDACTED]@github.com")
+    .slice(0, 1_000);
 }
 
 export function parseGitHubCredentialV1(value: unknown): GitHubCredentialV1 {

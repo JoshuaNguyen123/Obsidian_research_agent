@@ -116,6 +116,26 @@ test("final relevance requires an explicitly requested high-entropy literal anch
   );
 });
 
+test("compound code-ladder plans accept stage-progress prose as final relevance", () => {
+  const plan = createTestPlan(
+    "Run the full pipeline: Linear issue, repository workspace validate and commit, private GitHub, note reflection.",
+    [
+      "linear_create_issue",
+      "code_validate_fast",
+      "code_commit_verified",
+      "github_create_private_repository",
+      "append_to_current_file",
+    ],
+  );
+  assert.equal(
+    isFinalOutputRelevant(
+      plan,
+      "Continuing with code_validate_fast on the workspace after Linear create.",
+    ),
+    true,
+  );
+});
+
 test("named vault source paths do not create a public-web proof obligation", () => {
   const plan = createTestPlan(
     "Read the named vault notes Sources/Alpha.md and Sources/Beta.md, synthesize two findings, and append them to the current note.",

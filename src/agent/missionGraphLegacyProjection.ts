@@ -37,6 +37,7 @@ import { sha256Fingerprint } from "../../packages/headless-runtime/src/canonical
 import {
   normalizeOrchestratorSnapshot,
 } from "../orchestrator/orchestratorStore";
+import { partitionGraphNodes } from "./missionGraphAuthority";
 import {
   ORCHESTRATOR_SNAPSHOT_VERSION,
   type AgentParticipantStatus,
@@ -65,6 +66,7 @@ export function projectMissionGraphToLegacyPlan(
       projectedCitationMode !== undefined &&
       !citationContractProjected &&
       !node.id.startsWith("retry-") &&
+      !node.id.startsWith("optional-") &&
       task.completionContract.requiredProof.includes("web_evidence") &&
       node.allowedTools.some((toolName) =>
         /web_fetch|read_source_section|browser_extract_markdown/i.test(toolName),
@@ -81,26 +83,49 @@ export function projectMissionGraphToLegacyPlan(
     }
     return task;
   });
-  const activeNode = selectActiveGraphNode(ordered);
-  const completedTasks = tasks.filter((task) => task.status === "complete").length;
-  const remainingTasks = tasks.filter(
+  const { required, optional } = partitionGraphNodes(graph);
+  const requiredIds = new Set(required.map(({ id }) => id));
+  const requiredNodes = ordered.filter((node) => requiredIds.has(node.id));
+  const requiredTasks = tasks.filter((task) => requiredIds.has(task.id));
+  const activeNode = selectActiveGraphNode(requiredNodes);
+  const completedTasks = requiredTasks.filter(
+    (task) => task.status === "complete",
+  ).length;
+  const remainingTasks = requiredTasks.filter(
     (task) => task.status !== "complete" && task.status !== "blocked",
   ).length;
-  const nextAction = projectLegacyNextAction(activeNode, ordered);
+  const nextAction = projectLegacyNextAction(activeNode, requiredNodes);
+  const optionalCompleted = optional.filter(
+    ({ node }) => node.status === "complete",
+  ).length;
+  const optionalSkipped = optional.filter(({ node }) =>
+    ["blocked", "cancelled"].includes(node.status),
+  ).length;
 
   return {
     version: 1,
     runId: graph.missionId,
-    status: projectLegacyRunStatus(ordered),
+    status: projectLegacyRunStatus(requiredNodes),
     activeTaskId: activeNode?.id ?? null,
     tasks,
     progress: {
-      score: tasks.length === 0 ? 1 : roundScore(completedTasks / tasks.length),
+      score:
+        requiredTasks.length === 0
+          ? 1
+          : roundScore(completedTasks / requiredTasks.length),
       completedTasks,
-      totalTasks: tasks.length,
+      totalTasks: requiredTasks.length,
       remainingTasks,
-      stalledCount: ordered.filter((node) => node.status === "blocked").length,
+      stalledCount: requiredNodes.filter((node) => node.status === "blocked").length,
       lastMeaningfulAction: nextAction?.summary,
+      ...(optional.length > 0
+        ? {
+            requiredCompleted: completedTasks,
+            requiredTotal: requiredTasks.length,
+            optionalCompleted,
+            optionalSkipped,
+          }
+        : {}),
     },
     ...(nextAction ? { nextAction } : {}),
     createdAt: graph.createdAt,
@@ -118,6 +143,18 @@ export function projectMissionGraphToLegacyPlan(
 function resolveProjectedCitationMode(
   objective: string,
 ): "source" | "passage" | undefined {
+  // Literary "citations from the text" is not web citationMode debt.
+  if (
+    /\bfrom the (?:text|novel|book|work|poem|play|story)\b/i.test(objective) &&
+    /\b(?:quote|quotes|quoted|quotation|quotations|cite|cited|citation|citations)\b/i.test(
+      objective,
+    ) &&
+    !/\b(?:web|online|internet|https?:\/\/|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?)|deep\s+research|passage[-\s]?level|source:<)\b/iu.test(
+      objective,
+    )
+  ) {
+    return undefined;
+  }
   if (/\b(?:passage|passages|passage[-\s]?level|claim[-\s]?(?:grounding|verification)|ground(?:ed|ing)?|fact[-\s]?check|verify|verified|verification|quote|quoted|quotation|quotations)\b/iu.test(
     objective,
   )) {
@@ -134,7 +171,10 @@ export function projectMissionGraphToOrchestratorSnapshot(
   graph: MissionGraphV3,
 ): OrchestratorSnapshotV1 {
   const ordered = topologicallyOrderGraphNodes(graph);
-  const activeNode = selectActiveGraphNode(ordered);
+  const { required } = partitionGraphNodes(graph);
+  const requiredIds = new Set(required.map(({ id }) => id));
+  const requiredNodes = ordered.filter((node) => requiredIds.has(node.id));
+  const activeNode = selectActiveGraphNode(requiredNodes);
   const childIdsByDependency = new Map<string, string[]>();
   for (const node of ordered) {
     for (const dependencyId of node.dependencyIds) {
@@ -180,7 +220,7 @@ export function projectMissionGraphToOrchestratorSnapshot(
       return [node.id, projected];
     }),
   );
-  const status = projectOrchestratorRunStatus(ordered);
+  const status = projectOrchestratorRunStatus(requiredNodes);
   const totalToolCalls = ordered.reduce(
     (total, node) => total + node.budget.toolCalls,
     0,
@@ -753,7 +793,7 @@ function projectLegacyNodeStatus(status: MissionNodeStatusV3): MissionPlanStatus
 }
 
 function projectLegacyRunStatus(nodes: MissionNodeV3[]): MissionPlanStatus {
-  if (nodes.length > 0 && nodes.every((node) => node.status === "complete")) {
+  if (nodes.every((node) => node.status === "complete")) {
     return "complete";
   }
   if (nodes.some((node) => node.status === "verifying")) {
@@ -817,7 +857,7 @@ function projectOrchestratorNodeStatus(status: MissionNodeStatusV3): WorkNodeSta
 function projectOrchestratorRunStatus(
   nodes: MissionNodeV3[],
 ): OrchestratorRunStatus {
-  if (nodes.length > 0 && nodes.every((node) => node.status === "complete")) {
+  if (nodes.every((node) => node.status === "complete")) {
     return "complete";
   }
   if (nodes.length > 0 && nodes.every((node) => node.status === "cancelled")) {

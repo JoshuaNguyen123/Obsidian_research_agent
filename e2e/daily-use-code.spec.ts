@@ -1,11 +1,17 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import { expect, test, type Page } from "@playwright/test";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import {
   createPhase4GitFixture,
   createPhase4TypeScriptProjectFixture,
@@ -31,6 +37,7 @@ const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 const LIVE_CODE_LANE = (process.env.E2E_PLAYWRIGHT_LANE ?? "")
   .split(",")
   .includes("daily-use-code-live");
+const execFileAsync = promisify(execFile);
 
 test.describe("Daily-use Code capability production boundaries", () => {
   test.describe.configure({ timeout: SUITE_TIMEOUT_MS });
@@ -200,6 +207,12 @@ test.describe("Daily-use Code capability production boundaries", () => {
       };
       const worktree = await fixture.inspectWorktree(handoff.canonicalWorktreeRoot);
       expect(worktree.head).toBe(handoff.commitSha);
+      expect(
+        await readAgentCommitIdentity(
+          handoff.canonicalWorktreeRoot,
+          handoff.commitSha,
+        ),
+      ).toEqual(expectedAgentCommitIdentity());
       expect(worktree.status).toBe("");
       expect(worktree.changedPaths).toEqual([...handoff.changedPaths].sort());
       expect(worktree.files["src/math.ts"]).toMatch(/export\s+function\s+add/iu);
@@ -740,6 +753,12 @@ test.describe("Daily-use Code capability production boundaries", () => {
 
       const worktree = await fixture.inspectWorktree(worktreeRoot);
       expect(worktree.head).toBe(verifiedCommit.commitSha);
+      expect(
+        await readAgentCommitIdentity(
+          worktreeRoot,
+          String(verifiedCommit.commitSha),
+        ),
+      ).toEqual(expectedAgentCommitIdentity());
       expect(worktree.status).toBe("");
       expect(worktree.source).toContain("return left + right");
       expect(await fixture.head()).toBe(fixture.baseSha);
@@ -1124,6 +1143,46 @@ async function readDailyUseRunCounters(
       approvals,
     };
   }, { approvals });
+}
+
+async function readAgentCommitIdentity(
+  cwd: string,
+  commitSha: string,
+): Promise<{
+  authorName: string;
+  authorEmail: string;
+  committerName: string;
+  committerEmail: string;
+}> {
+  const { stdout } = await execFileAsync(
+    "git",
+    [
+      "show",
+      "--no-patch",
+      "--format=%an%x00%ae%x00%cn%x00%ce",
+      commitSha,
+    ],
+    { cwd, windowsHide: true, encoding: "utf8" },
+  );
+  const fields = stdout.replace(/(?:\r?\n)+$/u, "").split("\0");
+  if (fields.length !== 4 || fields.some((field) => !field)) {
+    throw new Error("Git commit identity readback was invalid.");
+  }
+  return {
+    authorName: fields[0],
+    authorEmail: fields[1],
+    committerName: fields[2],
+    committerEmail: fields[3],
+  };
+}
+
+function expectedAgentCommitIdentity() {
+  return {
+    authorName: AGENT_GIT_COMMIT_NAME_V1,
+    authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+    committerName: AGENT_GIT_COMMIT_NAME_V1,
+    committerEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+  };
 }
 
 async function readOwnedRepositoryWorktreeFromCodeStatus(

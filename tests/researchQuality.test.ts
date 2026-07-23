@@ -500,6 +500,62 @@ test("candidate conflict acknowledgement requires an explicit disagreement secti
   assert.equal(open[0]?.status, "open", "projection must not mutate durable state");
 });
 
+test("hybrid web citation coverage does not expose opaque vault-context passage ids", () => {
+  const plan = hybridResearchPlan();
+  const evidence = hybridEvidence().map((item) =>
+    item.kind === "vault_note"
+      ? {
+          ...item,
+          passageIds: ["source:vault-context:passage:0-80"],
+        }
+      : {
+          ...item,
+          passageIds: ["source:web-evidence:passage:0-80"],
+        },
+  );
+  const hybrid = evaluateResearchAcceptance({
+    plan,
+    evidence,
+    conflicts: [],
+    finalOutput: [
+      "External evidence supports the finding [source:web-evidence:passage:0-80].",
+      "Limitations: local context informed comparison but is not a public citation.",
+      "Confidence: medium.",
+    ].join("\n\n"),
+  });
+  assert.ok(
+    !hybrid.missing.some((item) =>
+      item.startsWith("subquestion_citation_coverage:"),
+    ),
+    JSON.stringify(hybrid),
+  );
+
+  const vaultOnly: ResearchPlan = {
+    ...plan,
+    mode: "deep_vault",
+    sourceRequirements: { minFetchedSources: 0, minDistinctDomains: 0 },
+    subquestions: [
+      {
+        ...plan.subquestions[1]!,
+        evidenceIds: ["vault:1"],
+      },
+    ],
+    evidenceIds: ["vault:1"],
+  };
+  const vaultOnlyResult = evaluateResearchAcceptance({
+    plan: vaultOnly,
+    evidence: evidence.filter((item) => item.kind === "vault_note"),
+    conflicts: [],
+    finalOutput: "Local finding without its passage marker.\n\nLimitations: bounded.\n\nConfidence: medium.",
+  });
+  assert.ok(
+    vaultOnlyResult.missing.some((item) =>
+      item.startsWith("subquestion_citation_coverage:"),
+    ),
+    JSON.stringify(vaultOnlyResult),
+  );
+});
+
 function hybridResearchPlan(): ResearchPlan {
   return {
     version: 1,

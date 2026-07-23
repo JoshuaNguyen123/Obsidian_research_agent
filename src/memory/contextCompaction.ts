@@ -4,6 +4,21 @@ import { toConversationModelMessages } from "../conversationHistory";
 
 export const DEFAULT_CONVERSATION_PROMPT_CHAR_BUDGET = 48_000;
 export const DEFAULT_CONVERSATION_SUMMARY_CHAR_BUDGET = 4_000;
+export const MAX_CONVERSATION_PROMPT_CHAR_BUDGET = 120_000;
+
+/** Scale chat prompt budget with the run context window (capped). */
+export function resolveConversationPromptCharBudget(
+  maxPromptChars: number,
+): number {
+  const windowChars = Math.max(0, Math.floor(maxPromptChars));
+  return Math.min(
+    MAX_CONVERSATION_PROMPT_CHAR_BUDGET,
+    Math.max(
+      DEFAULT_CONVERSATION_PROMPT_CHAR_BUDGET,
+      Math.floor(windowChars * 0.2),
+    ),
+  );
+}
 
 export interface ConversationCompactionOptions {
   promptCharBudget?: number;

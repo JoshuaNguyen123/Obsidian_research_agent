@@ -6,6 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import { InMemorySecretStoreV1 } from "../packages/headless-runtime/src/secretStoreV1";
 import { LinearGraphqlClient } from "../src/integrations/linear/client";
 import { createLinearTools } from "../src/integrations/linear/LinearTools";
@@ -302,9 +306,9 @@ async function runGitHubSmoke(input: { merge: boolean }): Promise<void> {
         await requireGitSuccess(runner, repoRoot, ["add", "--", markerRelativePath]);
         await requireGitSuccess(runner, repoRoot, [
           "-c",
-          "user.name=Agentic Researcher Live E2E",
+          `user.name=${AGENT_GIT_COMMIT_NAME_V1}`,
           "-c",
-          "user.email=agentic-live-e2e@users.noreply.github.com",
+          `user.email=${AGENT_GIT_COMMIT_EMAIL_V1}`,
           "commit",
           "-m",
           `test: disposable live smoke ${suffix}`,
@@ -319,6 +323,10 @@ async function runGitHubSmoke(input: { merge: boolean }): Promise<void> {
           );
         });
         expect((await client.getReference(owner, repository, branch)).sha).toBe(branchSha);
+        expect(await client.getCommit(owner, repository, branchSha)).toMatchObject({
+          authorName: AGENT_GIT_COMMIT_NAME_V1,
+          authorEmail: AGENT_GIT_COMMIT_EMAIL_V1,
+        });
 
         const existing = await client.listPullRequestsForHead(owner, repository, branch, base);
         expect(existing).toHaveLength(0);
@@ -390,9 +398,9 @@ async function runGitHubSmoke(input: { merge: boolean }): Promise<void> {
         await requireGitSuccess(runner, repoRoot, ["add", "--", markerRelativePath]);
         await requireGitSuccess(runner, repoRoot, [
           "-c",
-          "user.name=Agentic Researcher Live E2E",
+          `user.name=${AGENT_GIT_COMMIT_NAME_V1}`,
           "-c",
-          "user.email=agentic-live-e2e@users.noreply.github.com",
+          `user.email=${AGENT_GIT_COMMIT_EMAIL_V1}`,
           "commit",
           "-m",
           `test: clean disposable live smoke ${suffix}`,

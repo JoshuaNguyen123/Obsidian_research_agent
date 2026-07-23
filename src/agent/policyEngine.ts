@@ -77,6 +77,10 @@ const RESEARCH_SETUP_MUTATION_TOOLS = new Set([
   "rename_current_file",
   "retitle_current_file",
 ]);
+/** External provider mutations always require a matching authority grant. */
+const EXTERNAL_WRITE_AUTONOMY_SYSTEMS = new Set<
+  ToolDescriptor["capability"]["system"]
+>(["github", "linear", "browser"]);
 
 export function evaluateToolPolicy(ctx: ToolPolicyContext): PolicyDecision {
   if (Object.prototype.hasOwnProperty.call(ctx, "descriptor")) {
@@ -293,6 +297,7 @@ export function evaluateActionPolicy(ctx: ActionPolicyContext): PolicyDecision {
   if (
     action &&
     ctx.writeAutonomy &&
+    !EXTERNAL_WRITE_AUTONOMY_SYSTEMS.has(descriptor.capability.system) &&
     descriptor.effect === "reversible_mutation" &&
     descriptor.risk !== "high" &&
     descriptor.risk !== "critical" &&

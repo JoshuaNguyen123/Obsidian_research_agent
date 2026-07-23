@@ -81,6 +81,10 @@ authorization is already present and the secure persistent backend is healthy.
 Vault nodes must remain `waiting_obsidian` in the core; the companion cannot
 execute them.
 
+When Obsidian reconnects, the companion extension derives a short Chat resume
+line from each terminal non-vault job (validation/CI/PR/Linear/research) and
+the core delivers it once into Chat history. Full receipts stay in Run Details.
+
 ## Tests
 
 From the repository root:

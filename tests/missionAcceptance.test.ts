@@ -451,3 +451,84 @@ test("deep research acceptance passes with source coverage, limitations, and con
   assert.equal(result.status, "pass");
   assert.deepEqual(result.missing, []);
 });
+
+test("deep research accepts exact persisted passage coverage without redundant bare URLs", () => {
+  const passageIds = [
+    "source:alpha:passage:0-100",
+    "source:beta:passage:0-100",
+  ];
+  const researchPlan: ResearchPlan = {
+    version: 1,
+    mode: "deep_web",
+    sourceRequirements: { minFetchedSources: 2, minDistinctDomains: 2 },
+    coverageRequirements: {
+      minVaultCoverageConfidence: "medium",
+      expandWhenSampledOrTruncated: true,
+    },
+    subquestions: [
+      {
+        id: "rq-1",
+        question: "Compare the two fetched sources.",
+        requiredEvidenceType: "web_source",
+        minEvidence: 2,
+        status: "complete",
+        evidenceIds: ["web:1", "web:2"],
+      },
+    ],
+    evidenceIds: ["web:1", "web:2"],
+    status: "complete",
+  };
+
+  const evidence = [
+    {
+      id: "web:1",
+      kind: "web_source" as const,
+      title: "Alpha",
+      url: "https://alpha.example.com/source",
+      passageId: passageIds[0],
+      passageIds: [passageIds[0]],
+      usableSource: true,
+      summary: "alpha",
+      confidence: "high" as const,
+    },
+    {
+      id: "web:2",
+      kind: "web_source" as const,
+      title: "Beta",
+      url: "https://beta.example.org/source",
+      passageId: passageIds[1],
+      passageIds: [passageIds[1]],
+      usableSource: true,
+      summary: "beta",
+      confidence: "high" as const,
+    },
+  ];
+  const accepted = evaluateMissionAcceptance({
+    prompt: "Compare two sources and cite each exact passage.",
+    missionIntent: baseIntent,
+    requiredTools: [],
+    successfulTools: ["web_fetch"],
+    failedTools: [],
+    evidence,
+    receipts: [],
+    operationGoals: {},
+    researchPlan,
+    finalOutput: `Alpha finding ${passageIds[0]}. Beta finding ${passageIds[1]}.\n\nLimitations: the sources conflict.\n\nConfidence: medium.`,
+  });
+  const missingOneSource = evaluateMissionAcceptance({
+    prompt: "Compare two sources and cite each exact passage.",
+    missionIntent: baseIntent,
+    requiredTools: [],
+    successfulTools: ["web_fetch"],
+    failedTools: [],
+    evidence,
+    receipts: [],
+    operationGoals: {},
+    researchPlan,
+    finalOutput: `Alpha finding ${passageIds[0]}.\n\nLimitations: one source is omitted.\n\nConfidence: low.`,
+  });
+
+  assert.equal(accepted.status, "pass");
+  assert.deepEqual(accepted.missing, []);
+  assert.ok(missingOneSource.missing.includes("citation_url_coverage"));
+});

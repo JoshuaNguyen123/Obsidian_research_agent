@@ -157,6 +157,14 @@ test("real AI and live external flags cannot widen into other projects", () => {
     () => normalizeExclusiveArgs(["--project=unknown-lane"]),
     /Unknown E2E project/u,
   );
+  assert.throws(
+    () => normalizeExclusiveArgs(["--mock-ai", "--project=daily-use-compound"]),
+    /cannot target Tier A journey projects/u,
+  );
+  assert.throws(
+    () => normalizeExclusiveArgs(["--mock-ai", "--project=compound-flow-real-live"]),
+    /cannot target Tier A journey projects/u,
+  );
 });
 
 test("live external routing is single-project and explicitly exported", () => {
@@ -226,7 +234,7 @@ test("runner mode exports explicit child-process environment without secrets", (
   assert.deepEqual(env, {
     E2E_AI_MODE: "real",
     E2E_REAL_AI: "1",
-    E2E_AI_MODEL: "gpt-oss:120b-cloud",
+    E2E_AI_MODEL: "glm-5.2",
     E2E_MODEL_PROVIDER: "ollama",
     E2E_PLAYWRIGHT_LANE: "real-ai-contract",
     E2E_LIVE_EXTERNAL: "0",
@@ -336,6 +344,35 @@ test("daily-use commands route to focused specs and live projects disable reruns
   assert.match(packageJson.scripts["test:e2e:daily-use:linear"], /DU-04/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:github"], /DU-05/u);
   assert.match(packageJson.scripts["test:e2e:daily-use:compound"], /DU-06/u);
+  assert.match(
+    packageJson.scripts["test:e2e:daily-use:compound"],
+    /--real-ai --project=daily-use-compound/u,
+  );
+  assert.match(
+    packageJson.scripts["test:e2e:daily-use:code:live"],
+    /--real-ai --project=daily-use-code-live/u,
+  );
+  assert.match(
+    packageJson.scripts["test:e2e:hello-github"],
+    /--real-ai --project=obsidian-hello-github-live/u,
+  );
+  assert.match(
+    packageJson.scripts["test:e2e:compound-real"],
+    /--real-ai --project=compound-flow-real-live/u,
+  );
+  assert.match(
+    packageJson.scripts["test:e2e:journeys"],
+    /--real-ai --project=daily-use-research/u,
+  );
+  assert.match(
+    packageJson.scripts["cleanup:e2e-github-residue"],
+    /cleanup-e2e-github-residue\.mjs/u,
+  );
+  // Tier B policy/boundary lanes intentionally remain mock.
+  assert.match(packageJson.scripts["test:e2e:deterministic-matrix"], /--mock-ai/u);
+  assert.match(packageJson.scripts["test:e2e:compound-smoke"], /--mock-ai/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:linear"], /--mock-ai/u);
+  assert.match(packageJson.scripts["test:e2e:daily-use:github"], /--mock-ai/u);
   assert.match(
     packageJson.scripts["test:e2e:daily-use:checkers"],
     /--project=daily-use-compound --grep="DU-06 checkers"/u,
@@ -457,6 +494,49 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
     new URL("../e2e/fixtures/realAiHarness.ts", import.meta.url),
     "utf8",
   );
+  const connectionAttestation = readFileSync(
+    new URL(
+      "../e2e/fixtures/realAiConnectionAttestation.ts",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.match(realHarness, /hasVerifiedModelConnection/u);
+  assert.match(realHarness, /testModelConnection/u);
+  assert.match(realHarness, /VERIFIED_REAL_AI_CONNECTIONS/u);
+  assert.match(realHarness, /markModelConnectionVerifiedForHarness/u);
+  assert.match(realHarness, /utilityModel:\s*""/u);
+  assert.match(realHarness, /if \(reuseWorkerAttestation\)/u);
+  assert.match(
+    realHarness,
+    /Validation completed red\|passing cycle is still required\|tool_failure_terminal\|tool_failure_repeated\|same fast-validation failure fingerprint/u,
+  );
+  assert.match(
+    realHarness,
+    /terminal validation\/MissionGraph blocker; refusing further Continue loops/u,
+  );
+  assert.match(
+    connectionAttestation,
+    /await validate\(state\);[\s\S]*registry\.record\(target\)/u,
+  );
+  assert.match(realHarness, /const runId = typeof current\.runId/u);
+  assert.match(
+    realHarness,
+    /const ledgerPath = `Agent Runs\/\$\{safeRunId\}\.md`/u,
+  );
+  assert.match(realHarness, /configRootRunId !== runId/u);
+  assert.match(realHarness, /summaryRunId !== configLedgerRunId/u);
+  assert.match(realHarness, /ledger\.runId !== ledgerRunId/u);
+  assert.match(realHarness, /ledgerRunId !== runId/u);
+  assert.match(
+    realHarness,
+    /graph\?\.missionId === runId[\s\S]*graph\?\.nodes\?\.dispatch\?\.executorId === "research-team"/u,
+  );
+  assert.match(realHarness, /lineage\?\.rootRunId !== leadRootRunId/u);
+  assert.doesNotMatch(
+    realHarness,
+    /current\?\.persistedProjection\?\.missionLedgerPath/u,
+  );
   const phase4GitRepo = readFileSync(
     new URL("../e2e/fixtures/phase4GitRepo.ts", import.meta.url),
     "utf8",
@@ -468,6 +548,10 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   const mainSource = readFileSync(
     new URL("../main.ts", import.meta.url),
     "utf8",
+  );
+  assert.match(
+    mainSource,
+    /e2eHarnessAttestationEnabled !== true[\s\S]*Harness connection attestation is disabled/u,
   );
   assert.match(compound, /restartAfterProjectStages: MAIN_STAGES/u);
   assert.match(compound, /restartAfterProjectStages: \["reconciliation_cleanup"\]/u);
@@ -508,6 +592,21 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   assert.match(compound, /expectGitHubRepositoryAbsent/u);
   assert.match(compound, /independentlyVerifyLinearCleanup/u);
   assert.match(compound, /createPhase4PythonCheckersProjectFixture/u);
+  assert.match(
+    compound,
+    /readCreatedRepositoryWorktreeOnce[\s\S]*waitForWorktreeCapture\(worktreeCapturePromise\)\.catch\(\(\) => undefined\)[\s\S]*readCreatedRepositoryWorktreeOnce/u,
+    "DU-03 must fall back to an exact manifest readback when its concurrent worktree observer is late",
+  );
+  assert.equal(
+    (compound.match(/code\?\.workspaceManager \?\? code\?\.runtime\?\.workspaceManager/gu) ?? []).length,
+    2,
+    "both DU-03 worktree readers must resolve the public bundled Code runtime manager",
+  );
+  assert.match(
+    compound,
+    /worktreeCaptureController\?\.abort\(\);[\s\S]*waitForWorktreeCapture\(worktreeCapturePromise, 1_000\)\.catch/u,
+    "DU-03 must not await an in-flight Playwright worktree observer without a bound",
+  );
   assert.match(compound, /topic: "checkers"/u);
   assert.match(
     compound,
@@ -545,6 +644,44 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   assert.match(compound, /https:\/\/ollama\.com\/api/u);
   assert.match(compound, /getE2EAiConfig/u);
   assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);
+});
+
+test("quick number-guess live lane creates, publishes, reads back, and cleans exact disposable projects", () => {
+  const source = readFileSync(
+    new URL("../e2e/compound-flow-smoke-live.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const fixture = readFileSync(
+    new URL("../e2e/fixtures/phase4GitRepo.ts", import.meta.url),
+    "utf8",
+  );
+  const packageJson = readFileSync(
+    new URL("../package.json", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /NUMBER-GUESS-LIVE creates a real Linear project and GitHub repository/u);
+  assert.match(source, /"linear_create_project"/u);
+  assert.match(source, /"linear_get_project"/u);
+  assert.match(source, /teamId,\s*projectId,/u);
+  assert.match(source, /runNumberGuessValidation\(proof\.workspaceRoot\)/u);
+  assert.match(source, /--untracked-files=all/u);
+  assert.match(source, /AGENT_GIT_NAME = "Agentic Researcher"/u);
+  assert.match(source, /AGENT_GIT_EMAIL = "agentic-researcher@example\.invalid"/u);
+  assert.match(source, /HEAD:refs\/heads\/main/u);
+  assert.match(source, /remoteSha !== input\.expectedSha/u);
+  assert.match(source, /cleanupLinearNumberGuessResources/u);
+  assert.match(source, /deleteDisposableRepositoryAndVerify/u);
+  assert.match(source, /assertGhDeleteScopeForRepositoryFallback/u);
+  assert.match(source, /active token lacks delete_repo cleanup authority/u);
+  assert.match(source, /mandatory cleanup failed/u);
+  assert.match(fixture, /createNumberGuessJavaScriptFixture/u);
+  assert.match(fixture, /agentic-number-guess-javascript-/u);
+  assert.match(fixture, /game\.checkGuess\(42, 42\), 'correct'/u);
+  assert.match(
+    packageJson,
+    /"test:e2e:compound-smoke":\s*"[^"]*compound-flow-smoke-live"/u,
+  );
 });
 
 test("public workflows use only the free trusted self-hosted runner and SHA-pinned actions", () => {

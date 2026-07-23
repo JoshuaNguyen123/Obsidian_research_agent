@@ -8,6 +8,7 @@ import type {
 import { ModelClientError } from "../model/types";
 import { withModelRetry } from "../model/retry";
 import {
+  MISSION_GRAPH_MAX_NODES,
   MissionGraphValidationError,
   parseMissionCapabilityEnvelopeV1,
   parseMissionGraphV3,
@@ -371,6 +372,7 @@ export function createMissionGraphPlannerSchema(
   catalogNodeIds: readonly string[],
 ): JsonSchemaObject {
   const ids = sortedUnique([...catalogNodeIds]);
+  const maxProposalNodes = Math.min(ids.length, MISSION_GRAPH_MAX_NODES);
   return {
     type: "object",
     required: ["confidence", "nodes"],
@@ -380,7 +382,7 @@ export function createMissionGraphPlannerSchema(
       nodes: {
         type: "array",
         minItems: 1,
-        maxItems: 16,
+        maxItems: maxProposalNodes,
         items: {
           type: "object",
           required: ["id", "objective", "dependencyIds"],
@@ -390,7 +392,7 @@ export function createMissionGraphPlannerSchema(
             objective: { type: "string", minLength: 1, maxLength: 4_000 },
             dependencyIds: {
               type: "array",
-              maxItems: 15,
+              maxItems: Math.max(0, maxProposalNodes - 1),
               uniqueItems: true,
               items: { type: "string", enum: ids },
             },
@@ -412,7 +414,7 @@ export function normalizeStructuredMissionGraphProposalV1(
     value.confidence > 1 ||
     !Array.isArray(value.nodes) ||
     value.nodes.length < 1 ||
-    value.nodes.length > 16
+    value.nodes.length > MISSION_GRAPH_MAX_NODES
   ) {
     return null;
   }
@@ -430,7 +432,7 @@ export function normalizeStructuredMissionGraphProposalV1(
       entry.objective.trim().length < 1 ||
       entry.objective.length > 4_000 ||
       !Array.isArray(entry.dependencyIds) ||
-      entry.dependencyIds.length > 15
+      entry.dependencyIds.length > MISSION_GRAPH_MAX_NODES - 1
     ) {
       return null;
     }
@@ -562,7 +564,9 @@ async function requestStructuredMissionGraph({
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const request: ModelChatRequest = {
         messages,
-        format: createMissionGraphPlannerSchema(context.catalogNodeIds),
+        ...(client.descriptor?.endpointCategory === "ollama_cloud"
+          ? {}
+          : { format: createMissionGraphPlannerSchema(context.catalogNodeIds) }),
         abortSignal: controller.signal,
         evidencePhase: attempt === 1 ? "graph_planner" : "retry",
         think: false,
@@ -616,13 +620,91 @@ function parseStructuredJson(value: string): unknown | null {
     return JSON.parse(trimmed) as unknown;
   } catch {
     const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/iu.exec(trimmed);
-    if (!fenced) return null;
-    try {
-      return JSON.parse(fenced[1].trim()) as unknown;
-    } catch {
-      return null;
+    if (fenced) {
+      try {
+        return JSON.parse(fenced[1].trim()) as unknown;
+      } catch {
+        // Continue into bounded object recovery below. Some providers include
+        // a short analysis prefix inside an otherwise valid fenced response.
+      }
     }
   }
+
+  const recovered = extractBalancedJsonObjects(trimmed)
+    .map((candidate) => {
+      try {
+        return JSON.parse(candidate) as unknown;
+      } catch {
+        return null;
+      }
+    })
+    .filter((candidate): candidate is unknown => candidate !== null);
+  const structured = recovered.filter(isStructuredProposalObject);
+  // Multiple proposal-shaped objects are ambiguous. Never guess which graph
+  // the provider intended; the deterministic host fallback remains safer.
+  return structured.length === 1 ? structured[0] : null;
+}
+
+function extractBalancedJsonObjects(value: string): string[] {
+  const bounded = value.slice(0, 64_000);
+  const candidates: string[] = [];
+  let searchStart = 0;
+  let inspectedStarts = 0;
+  while (
+    candidates.length < 64 &&
+    inspectedStarts < 64 &&
+    searchStart < bounded.length
+  ) {
+    const start = bounded.indexOf("{", searchStart);
+    if (start < 0) break;
+    inspectedStarts += 1;
+    const end = findBalancedJsonObjectEnd(bounded, start);
+    if (end < 0) {
+      searchStart = start + 1;
+      continue;
+    }
+    candidates.push(bounded.slice(start, end + 1));
+    searchStart = end + 1;
+  }
+  return candidates;
+}
+
+function findBalancedJsonObjectEnd(value: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+    } else if (character === "{") {
+      depth += 1;
+    } else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function isStructuredProposalObject(value: unknown): boolean {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Object.prototype.hasOwnProperty.call(value, "confidence") &&
+      Object.prototype.hasOwnProperty.call(value, "nodes"),
+  );
 }
 
 async function buildGraphFromProposalNodes({

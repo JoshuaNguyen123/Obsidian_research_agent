@@ -3,15 +3,44 @@ import assert from "node:assert/strict";
 import type { ModelChatMessage } from "../src/model/types";
 import { createMissionLedger } from "../src/agent/missionLedger";
 import {
+  COMPACTION_THRESHOLD_RATIO,
+  DEFAULT_ASSUMED_NUM_CTX,
   compactLoopMessages,
   createRunContextBudget,
   estimatePromptChars,
+  resolveKeepRecentLoopSteps,
   shouldCompactLoopMessages,
 } from "../src/agent/runContext";
+import { resolveConversationPromptCharBudget } from "../src/memory/contextCompaction";
 import {
   buildContinuationHandoffV1,
   validateContinuationHandoffV1,
 } from "../src/agent/continuationMemory";
+
+test("blank numCtx budgets as 48k tokens with assumed_48k source", () => {
+  const budget = createRunContextBudget(null);
+  assert.equal(DEFAULT_ASSUMED_NUM_CTX, 49_152);
+  assert.equal(budget.budgetSource, "assumed_48k");
+  assert.equal(budget.numCtx, null);
+  assert.equal(
+    budget.maxPromptChars,
+    (DEFAULT_ASSUMED_NUM_CTX - 1500) * 4,
+  );
+  assert.ok(budget.maxPromptChars > 180_000);
+
+  const explicit = createRunContextBudget(131_072);
+  assert.equal(explicit.budgetSource, "setting");
+  assert.equal(explicit.numCtx, 131_072);
+  assert.ok(explicit.maxPromptChars > budget.maxPromptChars);
+
+  assert.equal(resolveKeepRecentLoopSteps(40_000), 6);
+  assert.equal(resolveKeepRecentLoopSteps(190_000), 10);
+  assert.equal(resolveKeepRecentLoopSteps(320_000), 16);
+  assert.equal(
+    resolveConversationPromptCharBudget(budget.maxPromptChars),
+    Math.min(120_000, Math.max(48_000, Math.floor(budget.maxPromptChars * 0.2))),
+  );
+});
 
 test("run context estimates prompt chars and compacts through ledger state", () => {
   const messages: ModelChatMessage[] = [
@@ -32,11 +61,30 @@ test("run context estimates prompt chars and compacts through ledger state", () 
     });
   }
 
-  const budget = createRunContextBudget(1600);
-  assert.ok(estimatePromptChars(messages) > 0);
-  assert.equal(shouldCompactLoopMessages(messages, budget), false);
-  const tinyBudget = { ...budget, maxPromptChars: 900 };
+  const estimated = estimatePromptChars(messages);
+  assert.ok(estimated > 0);
+  // Comfortably under 85% → do not compact.
+  const underBudget = {
+    numCtx: 1600,
+    maxPromptChars: Math.ceil(estimated / 0.5),
+    budgetSource: "setting" as const,
+  };
+  assert.equal(shouldCompactLoopMessages(messages, underBudget), false);
+  const tinyBudget = { ...underBudget, maxPromptChars: 900 };
   assert.equal(shouldCompactLoopMessages(messages, tinyBudget), true);
+
+  // Over 85% but under 100% → compact (AGENTS.md).
+  const eightyFiveBudget = {
+    numCtx: 1600,
+    maxPromptChars: Math.floor(estimated / 0.9),
+    budgetSource: "setting" as const,
+  };
+  assert.ok(estimated < eightyFiveBudget.maxPromptChars);
+  assert.ok(
+    estimated > eightyFiveBudget.maxPromptChars * COMPACTION_THRESHOLD_RATIO,
+  );
+  assert.equal(shouldCompactLoopMessages(messages, eightyFiveBudget), true);
+  assert.equal(COMPACTION_THRESHOLD_RATIO, 0.85);
 
   const ledger = createMissionLedger({
     runId: "run-ctx",
@@ -125,6 +173,7 @@ test("fingerprinted continuation handoff survives compaction and rejects tamperi
   assert.equal(compacted.applied, true);
   assert.match(compacted.missionStateMessage ?? "", /Canonical continuation handoff/);
   assert.match(compacted.missionStateMessage ?? "", new RegExp(handoff.fingerprint));
+  assert.match(compacted.missionStateMessage ?? "", /Authority counts:/);
 
   const tampered = { ...handoff, proofDebt: { ...handoff.proofDebt, blocked: !handoff.proofDebt.blocked } };
   assert.equal(validateContinuationHandoffV1(tampered).ok, false);
@@ -164,6 +213,257 @@ test("fingerprinted continuation handoff survives compaction and rejects tamperi
     assert.ok(authorityValidation.errors.includes("authority_approval_mismatch"));
     assert.ok(authorityValidation.errors.includes("authority_lineage_mismatch"));
   }
+});
+
+test("compaction preserves red validation diagnostics and receipt fingerprints", () => {
+  const messages: ModelChatMessage[] = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "repair the failing validators" },
+  ];
+  for (let index = 0; index < 8; index += 1) {
+    messages.push({
+      role: "assistant",
+      content: "",
+      toolCalls: [{ name: "read_file", arguments: { path: `${index}.md` } }],
+    });
+    messages.push({
+      role: "tool",
+      toolName: "read_file",
+      content: "x".repeat(200),
+    });
+  }
+  const ledger = createMissionLedger({
+    runId: "run-proof-compact",
+    mission: "Preserve assertion text",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["code_validate_fast"],
+      stopWhenSatisfied: true,
+    },
+  });
+  ledger.receipts = ["receipt:validate:sha256:abc", "receipt:write:sha256:def"];
+
+  const compacted = compactLoopMessages({
+    messages,
+    ledger,
+    keepRecentSteps: 1,
+    proofExcerpts: {
+      validationDiagnostic: {
+        stdout: "AssertionError: king backward movement must fail",
+        stderr: "FAILED tests/test_checkers.py::test_king",
+        truncated: false,
+        redactedLines: 2,
+      },
+      receiptFingerprints: ["sha256:" + "f".repeat(64)],
+    },
+  });
+
+  assert.equal(compacted.applied, true);
+  assert.match(
+    compacted.missionStateMessage ?? "",
+    /Proof-critical excerpts retained across compaction/,
+  );
+  assert.match(
+    compacted.missionStateMessage ?? "",
+    /AssertionError: king backward movement must fail/,
+  );
+  assert.match(
+    compacted.missionStateMessage ?? "",
+    /FAILED tests\/test_checkers\.py::test_king/,
+  );
+  assert.match(
+    compacted.missionStateMessage ?? "",
+    new RegExp(`sha256:${"f".repeat(64)}`),
+  );
+  assert.match(compacted.missionStateMessage ?? "", /diagnostic_redacted_lines=2/);
+});
+
+test("payload-first compaction shrinks oversized tool JSON while keeping chaining fields", () => {
+  const bulky = JSON.stringify({
+    toolName: "read_file",
+    status: "success",
+    summary: "read note",
+    path: "Notes/Keep.md",
+    output: {
+      path: "Notes/Keep.md",
+      content: "y".repeat(4_000),
+      baseHash: "sha256:abc",
+    },
+  });
+  const messages: ModelChatMessage[] = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "read then continue" },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ name: "read_file", arguments: { path: "Notes/Keep.md" } }],
+    },
+    { role: "tool", toolName: "read_file", content: bulky },
+  ];
+  const ledger = createMissionLedger({
+    runId: "run-payload-shrink",
+    mission: "Shrink oversized tool bodies",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["read_file"],
+      stopWhenSatisfied: true,
+    },
+  });
+
+  const compacted = compactLoopMessages({
+    messages,
+    ledger,
+    keepRecentSteps: 6,
+    maxPromptChars: estimatePromptChars(messages) - 100,
+  });
+  assert.equal(compacted.applied, true);
+  assert.ok(compacted.estimatedCharsAfter < compacted.estimatedCharsBefore);
+  const toolMessage = compacted.messages.find((message) => message.role === "tool");
+  assert.ok(toolMessage);
+  assert.match(toolMessage.content, /Notes\/Keep\.md/);
+  assert.match(toolMessage.content, /sha256:abc/);
+  assert.ok(!toolMessage.content.includes("y".repeat(100)));
+  assert.ok(
+    compacted.messages.some((message) =>
+      message.role === "assistant" && (message.toolCalls?.length ?? 0) > 0,
+    ),
+  );
+});
+
+test("turn-drop compaction preserves the one-shot passage writeback contract", () => {
+  const passageId = "source:compact-web:passage:0-120";
+  const messages: ModelChatMessage[] = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "research then append with citations" },
+    {
+      role: "system",
+      content:
+        `Passage-grounded writeback contract:\nAccepted passage identifiers: ${passageId}.`,
+    },
+  ];
+  for (let index = 0; index < 8; index += 1) {
+    messages.push({
+      role: "assistant",
+      content: "",
+      toolCalls: [{ name: "read_file", arguments: { path: `${index}.md` } }],
+    });
+    messages.push({
+      role: "tool",
+      toolName: "read_file",
+      content: "x".repeat(240),
+    });
+  }
+  const ledger = createMissionLedger({
+    runId: "run-passage-contract-compact",
+    mission: "Preserve passage citation authority",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["web_fetch", "append_to_current_file"],
+      stopWhenSatisfied: true,
+    },
+  });
+  ledger.evidence = [{
+    id: "web:compact",
+    kind: "web_source",
+    title: "Compacted fetched source",
+    url: "https://example.com/compact",
+    passageId,
+    passageIds: [passageId],
+    summary: "The cited passage must remain authorized after compaction.",
+    confidence: "high",
+  }];
+
+  const compacted = compactLoopMessages({
+    messages,
+    ledger,
+    keepRecentSteps: 1,
+  });
+  assert.equal(compacted.applied, true);
+  const retainedContract = compacted.messages.find(
+    (message) =>
+      message.role === "system" &&
+      message.content.includes("Passage-grounded writeback contract"),
+  );
+  assert.ok(retainedContract);
+  assert.match(retainedContract.content, new RegExp(passageId, "u"));
+});
+
+test("payload-first compaction retains bounded nested content evidence", () => {
+  const passageId = "source:oversized-fetch:passage:20-520";
+  const bulky = JSON.stringify({
+    toolName: "web_fetch",
+    status: "success",
+    output: {
+      url: "https://example.com/oversized",
+      contentEvidence: {
+        passages: [{
+          id: passageId,
+          start: 20,
+          end: 520,
+          text:
+            "The fetched source provides exact passage text for grounded citation. " +
+            "e".repeat(900),
+        }],
+      },
+      ignoredBody: "z".repeat(4_000),
+    },
+  });
+  const messages: ModelChatMessage[] = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "fetch and cite the source" },
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        name: "web_fetch",
+        arguments: { url: "https://example.com/oversized" },
+      }],
+    },
+    { role: "tool", toolName: "web_fetch", content: bulky },
+  ];
+  const ledger = createMissionLedger({
+    runId: "run-content-evidence-compact",
+    mission: "Preserve fetched passage proof",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["web_fetch"],
+      stopWhenSatisfied: true,
+    },
+  });
+
+  const compacted = compactLoopMessages({
+    messages,
+    ledger,
+    keepRecentSteps: 6,
+    maxPromptChars: estimatePromptChars(messages) - 100,
+  });
+  assert.equal(compacted.applied, true);
+  const toolMessage = compacted.messages.find(
+    (message) => message.role === "tool",
+  );
+  assert.ok(toolMessage);
+  const parsed = JSON.parse(toolMessage.content) as {
+    contentEvidence?: { passages?: Array<{ id?: string; text?: string }> };
+  };
+  assert.equal(parsed.contentEvidence?.passages?.[0]?.id, passageId);
+  assert.match(
+    parsed.contentEvidence?.passages?.[0]?.text ?? "",
+    /exact passage text for grounded citation/,
+  );
+  assert.ok((parsed.contentEvidence?.passages?.[0]?.text?.length ?? 0) <= 300);
+  assert.doesNotMatch(toolMessage.content, /ignoredBody/);
 });
 
 test("run context rejects a compaction candidate that would increase the estimate", () => {

@@ -600,6 +600,51 @@ class WorkspaceToolRuntimeV2 {
   ): Promise<PreparedActionV1> {
     const workspaceId = workspaceIdFrom(args, context);
     const ownerRunId = runId(context);
+    const existing = await this.manager.loadManifest(workspaceId).then(
+      (manifest) => manifest,
+      (error) =>
+        error instanceof WorkspaceManagerErrorV2 &&
+        error.code === "workspace_not_found"
+          ? null
+          : Promise.reject(error),
+    );
+    if (existing) {
+      const rebound = await this.manager.rebindWorkspaceOwnerForContinuation(
+        workspaceId,
+        ownerRunId,
+      );
+      const leaseOwnerId = `extension:${ownerRunId}`;
+      const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
+      const leaseId = leased.lease?.id ?? null;
+      if (leaseId) {
+        this.leases.set(leaseCacheKey(workspaceId, ownerRunId), leaseId);
+      }
+      return preparedAction({
+        name: "code_workspace_create",
+        context,
+        workspaceId,
+        targetPath: workspaceId,
+        normalizedArgs: {
+          workspaceId,
+          kind: "scratch",
+          ownerRunId,
+          leaseId,
+          leaseOwnerId,
+          expectedWorkspaceState: "existing",
+          payloadBytes: 0,
+        },
+        expected: sha256Json({
+          workspaceId,
+          ownerRunId,
+          canonicalRoot: rebound.canonicalRoot,
+          leaseId,
+        }),
+        summary: `Reuse durable scratch workspace ${workspaceId} for continue segment ${ownerRunId}.`,
+        action: "create",
+        outboundBytes: 0,
+        targetType: "code_workspace",
+      });
+    }
     await assertWorkspaceAbsent(this.manager, workspaceId);
     const expected = absentFingerprint(workspaceId, "");
     const normalizedArgs: Record<string, JsonValueV1> = {
@@ -633,15 +678,47 @@ class WorkspaceToolRuntimeV2 {
     const workspaceId = requiredString(args.workspaceId, "workspaceId");
     const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
     const leaseOwnerId = requiredString(args.leaseOwnerId, "leaseOwnerId");
+    const expectedState = optionalString(args.expectedWorkspaceState);
     if (
       ownerRunId !== runId(context) ||
       action.target.workspaceId !== workspaceId ||
       action.target.path !== workspaceId ||
-      args.expectedWorkspaceState !== "absent"
+      (expectedState !== "absent" && expectedState !== "existing")
     ) {
       throw new WorkspaceManagerErrorV2("prepared_binding_drift", "Prepared scratch workspace binding changed.");
     }
     assertPayloadBytes(args, 0);
+    if (expectedState === "existing") {
+      const readback = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
+      const leaseId =
+        optionalString(args.leaseId) ??
+        (await this.manager.acquireLease(workspaceId, leaseOwnerId)).lease?.id;
+      if (!leaseId) {
+        throw new WorkspaceManagerErrorV2(
+          "workspace_lease_missing",
+          "Existing scratch workspace did not acquire its bound lease.",
+        );
+      }
+      this.leases.set(leaseCacheKey(workspaceId, ownerRunId), leaseId);
+      await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+      return {
+        output: readback,
+        receipt: workspaceCreationReceipt(
+          action,
+          context,
+          readback,
+          sha256Json({
+            workspaceId,
+            ownerRunId,
+            canonicalRoot: readback.canonicalRoot,
+            leaseId,
+          }),
+          `Reused durable scratch workspace ${workspaceId} for continue segment.`,
+        ),
+        // Segment ownership/lease was applied even though the worktree already existed.
+        mutationState: "applied" as const,
+      };
+    }
     await assertWorkspaceAbsent(this.manager, workspaceId);
     await this.manager.createScratchWorkspace({ workspaceId, ownerRunId });
     const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
@@ -674,6 +751,63 @@ class WorkspaceToolRuntimeV2 {
   ): Promise<PreparedActionV1> {
     const workspaceId = workspaceIdFrom(args, context);
     const ownerRunId = runId(context);
+    const existing = await this.manager.loadManifest(workspaceId).then(
+      (manifest) => manifest,
+      (error) =>
+        error instanceof WorkspaceManagerErrorV2 &&
+        error.code === "workspace_not_found"
+          ? null
+          : Promise.reject(error),
+    );
+    if (existing?.kind === "repository" && existing.repositoryBinding) {
+      const rebound = await this.manager.rebindWorkspaceOwnerForContinuation(
+        workspaceId,
+        ownerRunId,
+      );
+      const leaseOwnerId = `extension:${ownerRunId}`;
+      const leased = await this.manager.acquireLease(workspaceId, leaseOwnerId);
+      const leaseId = leased.lease?.id ?? null;
+      if (leaseId) {
+        this.leases.set(leaseCacheKey(workspaceId, ownerRunId), leaseId);
+      }
+      const binding = rebound.repositoryBinding!;
+      return preparedAction({
+        name: "code_workspace_create",
+        context,
+        workspaceId,
+        targetPath: workspaceId,
+        normalizedArgs: {
+          workspaceId,
+          kind: "repository",
+          ownerRunId,
+          leaseId,
+          leaseOwnerId,
+          expectedWorkspaceState: "existing",
+          payloadBytes: 0,
+          profileKey: binding.profileKey,
+          repositoryRoot: binding.repositoryRoot,
+          baseSha: rebound.baseSha,
+          branch: binding.branch,
+          clean: true,
+          worktreeBranch: binding.branch,
+          bindingFingerprint: binding.bindingFingerprint,
+        },
+        expected: rebound.baseSha ?? binding.bindingFingerprint,
+        summary: `Reuse durable repository workspace ${workspaceId} for continue segment ${ownerRunId}.`,
+        action: "create",
+        outboundBytes: 0,
+        targetType: "code_workspace",
+        previewDestination: binding.repositoryRoot,
+        relatedResources: [{
+          system: "git",
+          resourceType: "repository",
+          id: `repository:${binding.repositoryRoot}`,
+          path: binding.repositoryRoot,
+          revision: rebound.baseSha ?? undefined,
+        }],
+        repositoryProfileId: binding.profileKey,
+      });
+    }
     await assertWorkspaceAbsent(this.manager, workspaceId);
     const profileKeyInput = optionalString(args.repositoryProfileKey);
     const rawRoot = optionalString(args.repositoryRoot);
@@ -779,14 +913,41 @@ class WorkspaceToolRuntimeV2 {
     const workspaceId = requiredString(args.workspaceId, "workspaceId");
     const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
     const leaseOwnerId = requiredString(args.leaseOwnerId, "leaseOwnerId");
+    const expectedState = optionalString(args.expectedWorkspaceState);
     if (
       ownerRunId !== runId(context) ||
       action.target.workspaceId !== workspaceId ||
-      args.expectedWorkspaceState !== "absent"
+      (expectedState !== "absent" && expectedState !== "existing")
     ) {
       throw new WorkspaceManagerErrorV2("prepared_binding_drift", "Prepared repository workspace binding changed.");
     }
     assertPayloadBytes(args, 0);
+    if (expectedState === "existing") {
+      const readback = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
+      const leaseId =
+        optionalString(args.leaseId) ??
+        (await this.manager.acquireLease(workspaceId, leaseOwnerId)).lease?.id;
+      if (!leaseId) {
+        throw new WorkspaceManagerErrorV2(
+          "workspace_lease_missing",
+          "Existing repository workspace did not acquire its bound lease.",
+        );
+      }
+      this.leases.set(leaseCacheKey(workspaceId, ownerRunId), leaseId);
+      await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+      return {
+        output: readback,
+        receipt: workspaceCreationReceipt(
+          action,
+          context,
+          readback,
+          requiredFingerprint(args.bindingFingerprint),
+          `Reused durable repository workspace ${workspaceId} for continue segment.`,
+        ),
+        // Segment ownership/lease was applied even though the worktree already existed.
+        mutationState: "applied" as const,
+      };
+    }
     await assertWorkspaceAbsent(this.manager, workspaceId);
     const inspection: RepositoryInspectionV2 = {
       repositoryRoot: requiredString(args.repositoryRoot, "repositoryRoot"),
@@ -1490,21 +1651,20 @@ function jupyterNotebookInputSchema(): JsonSchemaObjectV1 {
 
 function description(name: string): string {
   const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace.`;
+  let text = base;
   if (name === "code_workspace_create") {
-    return `${base} Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
+    text = `${base} Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
+  } else if (name === "code_workspace_create_file") {
+    text = `Purpose: Create a new file in the sandbox code workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast. Side effects: bound write. ${base} Use this only for an absent path; it never overwrites. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+  } else if (name === "code_workspace_patch") {
+    text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
+  } else if (
+    name === "code_workspace_write_expected" ||
+    name === "write_workspace_file"
+  ) {
+    text = `Purpose: Hash-bound full-file correction in the workspace. Use when: repairing after code_workspace_read with expectedSha256. Do not use when: first create (use code_workspace_create_file) or inventing a patch tool. Required: path, content, expectedSha256. Next: validate/repair. Side effects: bound write. ${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
   }
-  if (name === "code_workspace_create_file") {
-    return `${base} Use this only for an absent path; it never overwrites. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
-  }
-  if (name === "code_workspace_patch") {
-    return `${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
-  }
-  return [
-    "code_workspace_write_expected",
-    "write_workspace_file",
-  ].includes(name)
-    ? `${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`
-    : base;
+  return text;
 }
 function resolveCreateFileContentV1(
   args: Record<string, unknown>,

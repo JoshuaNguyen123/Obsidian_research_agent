@@ -18,6 +18,7 @@ import {
   MAX_SEARCH_RESULTS,
   MAX_SEARCH_SNIPPET_CHARS,
 } from "./constants";
+import { withDiscriminativeDescription } from "./discriminativeToolDescriptions";
 import {
   ToolExecutionError,
   type AgentTool,
@@ -25,6 +26,8 @@ import {
   type ResearchMemoryIndexEntry,
   type ToolExecutionContext,
 } from "./types";
+import { hasAuthorizedCurrentNoteReplaceIntent } from "../agent/replaceIntent";
+import { assertSafeCurrentNoteWritePayload } from "../agent/vaultWriteContentGuard";
 import {
   getFirstH1,
   getFrontmatterTitle,
@@ -78,8 +81,6 @@ import {
 const PREPARED_VAULT_ACTION_TTL_MS = 5 * 60 * 1_000;
 
 const CREATE_INTENT_PATTERN = /\b(create|creating|new|make)\b/i;
-const REPLACE_INTENT_PATTERN =
-  /\b(rewrite|replace|reset|overwrite)\b|\bclean\s+up\b|\bstart\s+(?:fresh|cleanly)\b|\bedit\s+over\s+(?:it|this|the\s+(?:note|page|document|file|contents?))\b|\b(edit(?:ing)?|revise|revising|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b[\s\S]{0,120}\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown))\b|\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire|current|this|active)\s+(?:note|page|file|markdown))\b[\s\S]{0,120}\b(edit(?:ing)?|revise|revising|rewrite|rewriting|improve|improving|expand|expanding|iterate|iterating|flesh\s+out|develop|add(?:ing)?\s+(?:more\s+)?detail|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b|\b(correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b[\s\S]{0,80}\b(?:entire|whole)\s+(?:page|note|file|document|essay|draft|article|content|body)\b|\b(update|updating)\b[\s\S]{0,120}\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire)\s+(?:note|page|file|markdown))\b|\b(essay|draft|article|paragraphs?|body|content|document|(?:whole|entire)\s+(?:note|page|file|markdown))\b[\s\S]{0,120}\b(update|updating)\b|\b(clear|delete|remove|empty)\s+all\s+(?:of\s+)?(?:the\s+)?(?:notes?|contents?|content|text|writing)\s+(?:on|from|in)\s+(?:this|the|current|active)?\s*(?:page|note|document|file)?\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\b(clear|delete|remove|empty)\b[\s\S]{0,80}\b(?:current|this|active|whole|entire)\s+(?:note|page|document|file)\b[\s\S]{0,180}\b(write|draft|compose|generate|create)\b|\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i;
 const APPEND_INTENT_PATTERN =
   /\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,80}\b(note|file|markdown|vault|page|document)\b|\b(note|file|markdown|vault|page|document)\b[\s\S]{0,80}\b(append|save|write|update|add|insert|copy|paste|put)\b|\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,120}\.md\b/i;
 const SECTION_APPEND_INTENT_PATTERN =
@@ -97,7 +98,7 @@ const DELETE_INTENT_PATTERN =
   /\b(delete|remove|trash)\b[\s\S]{0,80}\b(?:current|this|active|whole|entire)\s+(?:note|file)\b|\b(?:current|this|active|whole|entire)\s+(?:note|file)\b[\s\S]{0,80}\b(delete|remove|trash)\b/i;
 const DELETE_PATH_INTENT_PATTERN = /\b(delete|remove|trash)\b/i;
 const TEMPLATE_INTENT_PATTERN =
-  /\b(template|templates|templated|form|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i;
+  /\b(template|templates|templated|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i;
 const TEMPLATE_CREATE_INTENT_PATTERN =
   /\b(create|new|make|save)\b[\s\S]{0,100}\b(template|boilerplate|reusable\s+(?:note|markdown|outline|format|structure))\b|\b(template|boilerplate|reusable\s+(?:note|markdown|outline|format|structure))\b[\s\S]{0,100}\b(create|new|make|save)\b/i;
 const TEMPLATE_OUTPUT_CREATE_INTENT_PATTERN =
@@ -182,13 +183,21 @@ export function createVaultTools(): AgentTool[] {
 
 export const readCurrentFileTool: AgentTool = {
   name: "read_current_file",
-  description: "Read the active markdown note.",
+  description: withDiscriminativeDescription(
+    "read_current_file",
+    "Read the active markdown note. Use offset to continue after a truncated window.",
+  ),
   parameters: {
     type: "object",
     properties: {
       maxChars: {
         type: "integer",
-        description: "Optional maximum characters to return.",
+        description: "Optional maximum characters to return from the offset.",
+      },
+      offset: {
+        type: "integer",
+        description:
+          "Optional 0-based character offset into the note. Use nextOffset from a truncated read to continue.",
       },
     },
     additionalProperties: false,
@@ -199,14 +208,27 @@ export const readCurrentFileTool: AgentTool = {
       1,
       MAX_FILE_READ_CHARS,
     );
+    const offset = clampPositiveInteger(
+      getOptionalInteger(args, "offset") ?? 0,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
     const file = getActiveMarkdownFile(context);
     const content =
       context.getCurrentMarkdownContent?.(file) ??
       (await context.app.vault.cachedRead(file));
+    const safeOffset = Math.min(offset, content.length);
+    const window = content.slice(safeOffset, safeOffset + maxChars);
+    const truncated = safeOffset + window.length < content.length;
 
     return {
       path: file.path,
-      content: truncateText(content, maxChars),
+      content: truncated ? `${window}\n\n[truncated]` : window,
+      totalChars: content.length,
+      returnedChars: window.length,
+      offset: safeOffset,
+      truncated,
+      nextOffset: truncated ? safeOffset + window.length : null,
     };
   },
 };
@@ -505,7 +527,10 @@ export const readMarkdownFilesTool: AgentTool = {
 
 export const readFileTool: AgentTool = {
   name: "read_file",
-  description: "Read a markdown file by vault-relative path.",
+  description: withDiscriminativeDescription(
+    "read_file",
+    "Read a markdown file by vault-relative path.",
+  ),
   parameters: {
     type: "object",
     required: ["path"],
@@ -1375,7 +1400,7 @@ export const listTemplatesTool: AgentTool = {
 export const readTemplateTool: AgentTool = {
   name: "read_template",
   description:
-    "Read a reusable markdown template from the configured template folder or the managed Agent Work/templates library.",
+    "Read a reusable markdown template from the configured template folder or the managed Agent Work/templates library. Use only when the user asks about templates, or for the managed Linear issue template during explicit Linear issue/publication/hierarchy work. Do not call this for ordinary research, web search, or note writing.",
   parameters: {
     type: "object",
     required: ["path"],
@@ -1383,7 +1408,7 @@ export const readTemplateTool: AgentTool = {
       path: {
         type: "string",
         description:
-          "Template path. Bare filenames prefer the configured template folder and fall back to Agent Work/templates.",
+          "Template path. Bare filenames prefer the configured template folder and fall back to Agent Work/templates. For Linear issue shaping, use the managed Linear issue.md path.",
       },
       maxChars: {
         type: "integer",
@@ -1393,11 +1418,24 @@ export const readTemplateTool: AgentTool = {
     additionalProperties: false,
   },
   async execute(args, context) {
-    const path = resolveReadableTemplatePath(
-      context,
-      getRequiredString(args, "path"),
-    );
-    assertReadTemplateIntent(context, path);
+    const requestedPath = getRequiredString(args, "path");
+    let path = resolveReadableTemplatePath(context, requestedPath);
+    try {
+      assertReadTemplateIntent(context, path);
+    } catch (error) {
+      // Linear mutation missions often receive a wrong Linear-* relative path.
+      // Redirect only those attempts to the managed issue template.
+      if (
+        path !== LINEAR_ISSUE_TEMPLATE_PATH &&
+        canReadManagedLinearIssueTemplate(context) &&
+        looksLikeLinearTemplatePath(requestedPath)
+      ) {
+        path = LINEAR_ISSUE_TEMPLATE_PATH;
+        assertReadTemplateIntent(context, path);
+      } else {
+        throw error;
+      }
+    }
     const maxChars = clampPositiveInteger(
       getOptionalInteger(args, "maxChars") ?? MAX_FILE_READ_CHARS,
       1,
@@ -2145,7 +2183,10 @@ export const deletePathTool: AgentTool = {
 
 export const appendToCurrentFileTool: AgentTool = {
   name: "append_to_current_file",
-  description: "Append markdown text to the active markdown note.",
+  description: withDiscriminativeDescription(
+    "append_to_current_file",
+    "Append markdown text to the active markdown note.",
+  ),
   parameters: {
     type: "object",
     required: ["text"],
@@ -2167,6 +2208,26 @@ export const appendToCurrentFileTool: AgentTool = {
 
     const file = getActiveMarkdownFile(context);
     const current = await context.app.vault.read(file);
+    assertSafeCurrentNoteWritePayload({
+      kind: "append",
+      text,
+      currentContent: current,
+      allowDestructiveShortReplace:
+        /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
+          context.originalPrompt,
+        ),
+    });
+    // Revision missions must not "append" process talk or a second draft when
+    // whole-note replace is the authorized path — fail closed instead of
+    // polluting / appearing to wipe the page.
+    if (
+      hasAuthorizedCurrentNoteReplaceIntent(context.originalPrompt) &&
+      current.trim().length >= 400
+    ) {
+      throw new Error(
+        "append_to_current_file is blocked for this revise/replace mission. Use replace_current_file with the full revised note body.",
+      );
+    }
     const prefix = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
     const appendedText = `${prefix}${text}`;
 
@@ -2706,17 +2767,31 @@ function assertReadTemplateIntent(
   context: ToolExecutionContext,
   resolvedPath: string,
 ) {
-  if (
+  if (canReadManagedLinearIssueTemplate(context, resolvedPath)) {
+    return;
+  }
+
+  assertTemplateIntent(context, "read_template");
+}
+
+function canReadManagedLinearIssueTemplate(
+  context: ToolExecutionContext,
+  resolvedPath: string = LINEAR_ISSUE_TEMPLATE_PATH,
+): boolean {
+  return (
     resolvedPath === LINEAR_ISSUE_TEMPLATE_PATH &&
     !hasNegatedLinearIssueMutationIntent(context.originalPrompt) &&
     (hasExplicitResearchPublicationIntent(context.originalPrompt) ||
       hasExplicitResearchProjectHierarchyIntent(context.originalPrompt) ||
       hasExplicitLinearIssueMutationIntent(context.originalPrompt))
-  ) {
-    return;
-  }
+  );
+}
 
-  assertTemplateIntent(context, "read_template");
+function looksLikeLinearTemplatePath(rawPath: string): boolean {
+  return (
+    /\blinear\b/i.test(rawPath) &&
+    /\b(issue|ticket|work[\s_-]*item)s?\b/i.test(rawPath)
+  );
 }
 
 function hasExplicitLinearIssueMutationIntent(prompt: string): boolean {
@@ -2781,8 +2856,8 @@ function assertAppendIntent(context: ToolExecutionContext, toolName: string) {
 }
 
 function assertReplaceIntent(context: ToolExecutionContext, toolName: string) {
-  if (!REPLACE_INTENT_PATTERN.test(context.originalPrompt)) {
-    throw new Error(`${toolName} requires the user to explicitly ask to rewrite, replace, reset, clean up, start fresh, or overwrite a file.`);
+  if (!hasAuthorizedCurrentNoteReplaceIntent(context.originalPrompt)) {
+    throw new Error(`${toolName} requires the user to explicitly ask to rewrite, replace, reset, clean up, start fresh, overwrite, expand an under-target draft, or edit/revise the existing note.`);
   }
 }
 
@@ -4889,13 +4964,22 @@ async function prepareReplaceCurrentFile(
 ): Promise<PreparedActionResult> {
   try {
     const text = getString(args, "text");
-    if (!REPLACE_INTENT_PATTERN.test(context.originalPrompt)) {
+    if (!hasAuthorizedCurrentNoteReplaceIntent(context.originalPrompt)) {
       throw new Error(
-        "replace_current_file requires the user to explicitly ask for rewrite, replace, clean up, reset, start fresh, overwrite, or clear/delete current note content and then write new content.",
+        "replace_current_file requires the user to explicitly ask for rewrite, replace, clean up, reset, start fresh, overwrite, expand an under-target draft, edit/revise the existing note, or clear/delete current note content and then write new content.",
       );
     }
     const file = getActiveMarkdownFile(context);
     const current = await context.app.vault.read(file);
+    assertSafeCurrentNoteWritePayload({
+      kind: "replace",
+      text,
+      currentContent: current,
+      allowDestructiveShortReplace:
+        /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
+          context.originalPrompt,
+        ),
+    });
     const contentRevision = await sha256Fingerprint(current);
     const outboundBytes = getByteLength(text);
     const action = await buildPreparedVaultAction({
@@ -4953,6 +5037,15 @@ async function executePreparedReplaceCurrentFile(
   }
   const current = await context.app.vault.read(file);
   await assertVaultContentRevision(current, action, contentRevision);
+  assertSafeCurrentNoteWritePayload({
+    kind: "replace",
+    text,
+    currentContent: current,
+    allowDestructiveShortReplace:
+      /\b(clear|delete|remove|empty|reset|start\s+fresh)\b/i.test(
+        context.originalPrompt,
+      ),
+  });
   const startedAt = vaultNow(context).toISOString();
   const backupPath = await backupCurrentFile(context, file, current);
   await context.app.vault.modify(file, text);

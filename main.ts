@@ -21,6 +21,10 @@ import {
   createConfiguredModelClient,
   requestUrlTransport,
 } from "./src/model/createModelClient";
+import {
+  isDirectOllamaCloudApiBaseUrl,
+  preflightOllamaCloudAgentCapabilities,
+} from "./src/model/ollamaCloudCapabilityPreflight";
 import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
 import {
   createSemanticIndexService,
@@ -274,6 +278,21 @@ import { runResearchWorker } from "./src/orchestrator/researchWorker";
 import { mergeResearchWorkerResult } from "./src/orchestrator/teamEvidenceMerge";
 import type { ResearchWorkerResult } from "./src/orchestrator/researchWorker";
 import { summarizeSourceLedger } from "./src/orchestrator/sourceLedgerSummary";
+import { buildResearcherAssignment } from "./src/orchestrator/researcherSoftCatalog";
+import {
+  buildAcceptedResearchArtifactFromWorkerHandoff,
+  buildResearcherHandoffV1FromWorker,
+  formatBridgedHandoffAttachContext,
+} from "./src/orchestrator/researchTeamHandoffBridge";
+import {
+  createAutonomyRunStats,
+  finalizeAutonomyRunStats,
+  recordHandoffAccepted,
+  recordLeadStep,
+  recordResearcherStep,
+  recordUsableSources,
+} from "./src/agent/autonomyRunStats";
+import { parseExplicitResearchSourceCount } from "./src/agent/researchPlan";
 import { runCodeWorker } from "./src/orchestrator/codeWorker";
 import {
   CODE_TEAM_CLARIFY_TEMPLATE,
@@ -1261,7 +1280,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.settings.modelConnectionVerifiedProvider === this.settings.modelProvider &&
       this.settings.modelConnectionVerifiedModel === this.settings.model &&
       this.settings.modelConnectionVerifiedBaseUrl ===
-        getConfiguredModelBaseUrl(this.settings)
+        getConfiguredModelBaseUrl(this.settings) &&
+      hasRequiredPersistedModelCapabilityProof(this.settings)
     );
   }
 
@@ -1270,6 +1290,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     latencyMs?: number;
     message?: string;
   }): void {
+    if (this.settings.e2eHarnessAttestationEnabled !== true) {
+      throw new Error(
+        "Harness connection attestation is disabled outside a seeded disposable E2E vault.",
+      );
+    }
     const provider = this.settings.modelProvider;
     const model = this.settings.model;
     const checkedAt = new Date().toISOString();
@@ -1279,6 +1304,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.settings.modelConnectionVerifiedBaseUrl = getConfiguredModelBaseUrl(
       this.settings,
     );
+    this.settings.modelConnectionVerifiedAgenticCapabilities =
+      this.settings.modelProvider === "ollama" &&
+      isDirectOllamaCloudApiBaseUrl(this.settings.ollamaBaseUrl)
+        ? true
+        : undefined;
     this.modelConnectionStatus = {
       status: "ready",
       message:
@@ -1297,6 +1327,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.settings.modelConnectionVerifiedProvider = undefined;
     this.settings.modelConnectionVerifiedModel = undefined;
     this.settings.modelConnectionVerifiedBaseUrl = undefined;
+    this.settings.modelConnectionVerifiedAgenticCapabilities = undefined;
     this.modelConnectionStatus = {
       status: "untested",
       message: "Connection changed; test it before starting important work.",
@@ -1321,7 +1352,18 @@ export default class AgenticResearcherPlugin extends Plugin {
     };
     const startedAt = Date.now();
     try {
-      const response = await this.createModelClient().chat({
+      const client = this.createModelClient();
+      const cloudCapabilityProof = client.descriptor
+        ? await preflightOllamaCloudAgentCapabilities({
+            descriptor: client.descriptor,
+            baseUrl: this.settings.ollamaBaseUrl,
+            apiKey: this.settings.ollamaApiKey,
+            model,
+            transport: requestUrlTransport,
+            requestTimeoutMs: this.settings.requestTimeoutMs,
+          })
+        : null;
+      const response = await client.chat({
         model,
         messages: [
           {
@@ -1338,9 +1380,16 @@ export default class AgenticResearcherPlugin extends Plugin {
         throw new Error("Provider returned an invalid health-check role.");
       }
       const latencyMs = Math.max(0, Date.now() - startedAt);
+      const cloudCapabilityMessage = cloudCapabilityProof
+        ? ` Tools + Thinking verified by Ollama /api/show${
+            cloudCapabilityProof.contextLength
+              ? `; context window ${cloudCapabilityProof.contextLength.toLocaleString("en-US")} tokens`
+              : ""
+          }.`
+        : "";
       this.modelConnectionStatus = {
         status: "ready",
-        message: `Connected to ${provider} model ${model} in ${latencyMs}ms.`,
+        message: `Connected to ${provider} model ${model} in ${latencyMs}ms.${cloudCapabilityMessage}`,
         checkedAt: new Date().toISOString(),
         latencyMs,
         provider,
@@ -1352,6 +1401,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.settings.modelConnectionVerifiedBaseUrl = getConfiguredModelBaseUrl(
         this.settings,
       );
+      this.settings.modelConnectionVerifiedAgenticCapabilities =
+        cloudCapabilityProof ? true : undefined;
       await this.savePluginData();
       await this.returnToChatAfterFirstRunSetup();
     } catch (error) {
@@ -1359,6 +1410,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.settings.modelConnectionVerifiedProvider = undefined;
       this.settings.modelConnectionVerifiedModel = undefined;
       this.settings.modelConnectionVerifiedBaseUrl = undefined;
+      this.settings.modelConnectionVerifiedAgenticCapabilities = undefined;
       this.modelConnectionStatus = {
         status: "error",
         message: `Connection failed: ${formatModelClientError(error)}`,
@@ -1744,6 +1796,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     settings.autoResumeOvernightRuns =
       settings.autoResumeOvernightRuns !== false;
+    // Default off: unfinished-run Chat banner must not nag on every Obsidian open.
+    settings.showUnfinishedRunBannerOnOpen =
+      settings.showUnfinishedRunBannerOnOpen === true;
     settings.keepAwakeDuringOvernightRuns =
       settings.keepAwakeDuringOvernightRuns === true;
     settings.orchestratorEnabled =
@@ -1791,6 +1846,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       settings.linearEnabled === true && settings.linearQueueEnabled === true;
     settings.linearQueueProjectId = normalizeOpaqueIdSetting(
       settings.linearQueueProjectId,
+    );
+    settings.linearReadyStateId = normalizeOpaqueIdSetting(
+      settings.linearReadyStateId,
     );
     settings.linearStartedStateId = normalizeOpaqueIdSetting(
       settings.linearStartedStateId,
@@ -1854,7 +1912,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       Number.isFinite(Date.parse(settings.modelConnectionVerifiedAt)) &&
       settings.modelConnectionVerifiedProvider === settings.modelProvider &&
       settings.modelConnectionVerifiedModel === settings.model &&
-      settings.modelConnectionVerifiedBaseUrl === getConfiguredModelBaseUrl(settings);
+      settings.modelConnectionVerifiedBaseUrl === getConfiguredModelBaseUrl(settings) &&
+      hasRequiredPersistedModelCapabilityProof(settings);
     if (verifiedConnectionMatches) {
       this.modelConnectionStatus = {
         status: "ready",
@@ -1869,6 +1928,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       settings.modelConnectionVerifiedProvider = undefined;
       settings.modelConnectionVerifiedModel = undefined;
       settings.modelConnectionVerifiedBaseUrl = undefined;
+      settings.modelConnectionVerifiedAgenticCapabilities = undefined;
       this.modelConnectionStatus = {
         status: "untested",
         message: "Connection has not passed testing for this provider configuration.",
@@ -2442,6 +2502,48 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
   }
 
+  /**
+   * E2E harness only (requires e2eHarnessAttestationEnabled). Installs a
+   * create-capable GitHub credential: github_pat_ or classic/OAuth gh[pousr]_.
+   */
+  async setGitHubHarnessAccessToken(
+    token: string,
+  ): Promise<{ ok: boolean; message: string }> {
+    if (this.settings.e2eHarnessAttestationEnabled !== true) {
+      return {
+        ok: false,
+        message:
+          "Harness GitHub credential install requires e2eHarnessAttestationEnabled.",
+      };
+    }
+    if (!this.getOptionalExtensionCapabilities().integrations) {
+      this.githubAuthStatusMessage =
+        "The built-in Integrations capability is not ready. Reload Agentic Researcher, then connect GitHub again.";
+      return {
+        ok: false,
+        message: this.githubAuthStatusMessage,
+      };
+    }
+    try {
+      const store = this.createGitHubForegroundSecretStore();
+      await this.requirePersistentForegroundSecretStore(store);
+      const auth = this.createGitHubAuthClient(
+        store,
+        normalizeGitHubOAuthClientIdSetting(this.settings.githubOAuthClientId) ||
+          "harness-token-import",
+      );
+      const credential = await auth.importHarnessAccessToken(token.trim());
+      await this.acceptGitHubCredential(auth, store, credential);
+      return { ok: true, message: this.githubAuthStatusMessage };
+    } catch (error) {
+      this.githubAuthStatusMessage =
+        error instanceof Error
+          ? error.message
+          : "The harness GitHub access token could not be verified.";
+      return { ok: false, message: this.githubAuthStatusMessage };
+    }
+  }
+
   async disconnectGitHub(): Promise<{ ok: boolean; message: string }> {
     this.cancelActiveGitHubDeviceFlow(false);
     const credential = this.githubCredential;
@@ -2603,7 +2705,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         [profile.key]: privateBinding,
       };
       await this.savePluginData();
-      return use({ client, binding, profile });
+      return use({ client, binding, profile, repositoryReadback: remote });
     });
   }
 
@@ -2664,6 +2766,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     return evaluateLinearQueueConfiguration(this.linearCapabilitySnapshot, {
       teamId: this.settings.linearDefaultTeamId ?? "",
       projectId: this.settings.linearQueueProjectId ?? "",
+      readyStateId: this.settings.linearReadyStateId ?? "",
       startedStateId: this.settings.linearStartedStateId ?? "",
       completedStateId: this.settings.linearCompletedStateId ?? "",
       blockedStateId: this.settings.linearBlockedStateId ?? "",
@@ -2788,6 +2891,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       !this.getLinearQueueConfigurationStatus().ready ||
       !projectId ||
       !this.settings.linearDefaultTeamId ||
+      !this.settings.linearReadyStateId ||
       !this.settings.linearStartedStateId ||
       !this.settings.linearCompletedStateId ||
       !this.linearQueueState ||
@@ -2906,12 +3010,14 @@ export default class AgenticResearcherPlugin extends Plugin {
       const selections = reconcileLinearSelections(snapshot, {
         teamId: this.settings.linearDefaultTeamId ?? "",
         projectId: this.settings.linearQueueProjectId ?? "",
+        readyStateId: this.settings.linearReadyStateId ?? "",
         startedStateId: this.settings.linearStartedStateId ?? "",
         completedStateId: this.settings.linearCompletedStateId ?? "",
         blockedStateId: this.settings.linearBlockedStateId ?? "",
       });
       this.settings.linearDefaultTeamId = selections.teamId;
       this.settings.linearQueueProjectId = selections.projectId;
+      this.settings.linearReadyStateId = selections.readyStateId;
       this.settings.linearStartedStateId = selections.startedStateId;
       this.settings.linearCompletedStateId = selections.completedStateId;
       this.settings.linearBlockedStateId = selections.blockedStateId;
@@ -3099,6 +3205,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       ),
       defaultTeamId: this.settings.linearDefaultTeamId ?? "",
       queueProjectId: this.settings.linearQueueProjectId ?? "",
+      readyStateId: this.settings.linearReadyStateId ?? "",
       startedStateId: this.settings.linearStartedStateId ?? "",
       completedStateId: this.settings.linearCompletedStateId ?? "",
       blockedStateId: this.settings.linearBlockedStateId ?? "",
@@ -3132,6 +3239,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           !this.linearQueueState ||
           !this.settings.linearQueueProjectId ||
           !this.settings.linearDefaultTeamId ||
+          !this.settings.linearReadyStateId ||
           !this.settings.linearStartedStateId ||
           !this.settings.linearCompletedStateId
         ) {
@@ -3227,6 +3335,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         supervisor = new LinearQueueSupervisor({
           client,
           queueProjectId: this.settings.linearQueueProjectId,
+          readyStateId: this.settings.linearReadyStateId,
           reduceQueueState: (reduce) =>
             this.reduceLinearQueueStateDurably(reduce),
           isConnectionEligible: async () => {
@@ -3321,6 +3430,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       !this.linearQueueState ||
       !this.settings.linearQueueProjectId ||
       !this.settings.linearDefaultTeamId ||
+      !this.settings.linearReadyStateId ||
       !this.settings.linearStartedStateId ||
       !this.settings.linearCompletedStateId
     ) {
@@ -3337,6 +3447,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       integrationUpdatedAt: this.linearIntegrationState.updatedAt,
       queueProjectId: this.settings.linearQueueProjectId,
       defaultTeamId: this.settings.linearDefaultTeamId,
+      readyStateId: this.settings.linearReadyStateId,
       startedStateId: this.settings.linearStartedStateId,
       completedStateId: this.settings.linearCompletedStateId,
       blockedStateId: this.settings.linearBlockedStateId ?? "",
@@ -4345,20 +4456,29 @@ export default class AgenticResearcherPlugin extends Plugin {
       .filter((item) => item.teamIds.length === 0 || item.teamIds.includes(team.id))
       .sort((a, b) => projectSetupRank(a.name ?? a.id) - projectSetupRank(b.name ?? b.id) || (a.name ?? a.id).localeCompare(b.name ?? b.id))[0];
     const states = snapshot.workflowStates.filter((item) => item.teamId === null || item.teamId === team.id);
+    const ready = [...states]
+      .filter((item) => item.type === "unstarted")
+      .sort(
+        (left, right) =>
+          readyStateSetupRank(left.name ?? left.id) -
+            readyStateSetupRank(right.name ?? right.id) ||
+          (left.name ?? left.id).localeCompare(right.name ?? right.id),
+      )[0];
     const started = states.find((item) => item.type === "started");
     const completed = states.find((item) => item.type === "completed");
     const blocked = states.find((item) => item.type === "canceled");
-    if (!project || !started || !completed) {
-      return { ok: false, message: "Linear did not return a usable project plus started and completed workflow states. Create or connect a project, then test the connection again." };
+    if (!project || !ready || !started || !completed) {
+      return { ok: false, message: "Linear did not return a usable project plus Ready, started, and completed workflow states. Create or connect those states, then test the connection again." };
     }
     this.settings.linearDefaultTeamId = team.id;
     this.settings.linearQueueProjectId = project.id;
+    this.settings.linearReadyStateId = ready.id;
     this.settings.linearStartedStateId = started.id;
     this.settings.linearCompletedStateId = completed.id;
     this.settings.linearBlockedStateId = blocked?.id ?? "";
     await this.savePluginData();
     await this.restartLinearQueueRuntime(false);
-    return { ok: true, message: `Queue setup selected ${project.name ?? project.id} for ${team.name ?? team.id}. Review the recommendations below, then activate authority.` };
+    return { ok: true, message: `Queue setup selected ${project.name ?? project.id} for ${team.name ?? team.id}. Move an issue to ${ready.name ?? ready.id} to authorize pickup; then review the recommendations and activate authority.` };
   }
 
   private createObsidianSecretStore(): ObsidianSecretStoreV1 {
@@ -5030,6 +5150,43 @@ export default class AgenticResearcherPlugin extends Plugin {
     return this.getCapabilityRuntime<CompanionRuntimePluginV1>(
       "agentic-researcher-companion",
     );
+  }
+
+  /**
+   * Surfaces one concise Chat line per terminal companion job after Obsidian
+   * reconnects. Vault nodes never produce these lines (waiting_obsidian).
+   */
+  private async deliverCompanionChatResumeSummaries(
+    coordinator: CompanionRuntimePluginV1["companionCoordinator"],
+  ): Promise<void> {
+    if (!coordinator.drainPendingChatResumeSummaries) {
+      return;
+    }
+    let deliveries: Array<{ line: string }> = [];
+    try {
+      deliveries = await coordinator.drainPendingChatResumeSummaries();
+    } catch (error) {
+      console.warn(
+        "Unable to drain companion Chat resume summaries.",
+        sanitizeExtensionRuntimeError(error),
+      );
+      return;
+    }
+    for (const delivery of deliveries) {
+      const line = delivery.line?.trim();
+      if (!line) continue;
+      try {
+        await this.appendConversationMessage({
+          role: "assistant",
+          content: line,
+        });
+      } catch (error) {
+        console.warn(
+          "Unable to append a companion Chat resume summary.",
+          sanitizeExtensionRuntimeError(error),
+        );
+      }
+    }
   }
 
   private async buildDesiredCompanionLinearQueueConfiguration(): Promise<
@@ -5879,6 +6036,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         reconciledProjectionRunId ?? undefined,
       );
     }
+    await this.deliverCompanionChatResumeSummaries(
+      companion.companionCoordinator,
+    );
     const runtime = companion.companionCoordinator.getRuntimeState?.();
     if (
       runtime &&
@@ -7596,6 +7756,12 @@ export default class AgenticResearcherPlugin extends Plugin {
               approvalBroker: this.approvalBroker,
               backgroundContinuation: this.createBackgroundMissionDispatchPort(),
               forceChatOnly: options.forceChatOnly === true,
+              ...(autoContinueLongRun
+                ? {
+                    completionSegmentIndex: segmentIndex,
+                    maxCompletionSegments: maxSegments,
+                  }
+                : {}),
               events: segmentEvents,
             });
 
@@ -7901,9 +8067,25 @@ export default class AgenticResearcherPlugin extends Plugin {
     toolRegistry?: ToolRegistry;
     forceChatOnly?: boolean;
   }): Promise<OrchestratorSnapshotV1 | null> {
+    const workerMaxMinutes = this.settings.orchestratorWorkerMaxMinutes ?? 15;
+    const configuredMaxRunMinutes =
+      typeof this.settings.maxRunMinutes === "number" &&
+      Number.isFinite(this.settings.maxRunMinutes) &&
+      this.settings.maxRunMinutes > 0
+        ? Math.trunc(this.settings.maxRunMinutes)
+        : null;
+    // Lead needs a real synthesis window after the Researcher. Derive from
+    // worker minutes + maxRunMinutes (when set); never hard-cap root at 30m
+    // while settings allow a longer worker budget.
+    const leadMaxMinutes = Math.max(
+      workerMaxMinutes,
+      configuredMaxRunMinutes ?? workerMaxMinutes,
+    );
+    const rootWallClockMs = (workerMaxMinutes + leadMaxMinutes) * 60_000;
+    const leadWallClockMs = leadMaxMinutes * 60_000;
     const rootDeadline = createLinkedDeadlineSignal(
       input.abortSignal,
-      30 * 60_000,
+      rootWallClockMs,
       "Orchestrator root wall-clock budget exhausted.",
     );
     try {
@@ -7911,7 +8093,6 @@ export default class AgenticResearcherPlugin extends Plugin {
     const workerMaxSteps = this.settings.orchestratorWorkerMaxSteps ?? 40;
     const workerMaxToolCalls =
       this.settings.orchestratorWorkerMaxToolCalls ?? 40;
-    const workerMaxMinutes = this.settings.orchestratorWorkerMaxMinutes ?? 15;
     const leadMaxSteps = Math.max(4, MAX_AGENT_STEPS - workerMaxSteps);
     const leadMaxToolCalls = Math.max(
       16,
@@ -7955,7 +8136,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       // the only state projected to the primary UI and durable plugin state.
       rootModelSteps: MAX_AGENT_STEPS,
       rootToolCalls: MAX_AGENT_STEPS * 2,
-      rootWallClockMs: 30 * 60_000,
+      rootWallClockMs,
       finalizationReserveSteps: 4,
     });
     const scaffold = createResearchTeamScaffold({
@@ -7969,7 +8150,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       participantId: "lead",
       modelSteps: leadMaxSteps,
       toolCalls: leadMaxToolCalls,
-      wallClockMs: 30 * 60_000,
+      wallClockMs: leadWallClockMs,
       lead: true,
     });
     runtime.registerParticipantBudget({
@@ -7985,6 +8166,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     const verifyNodeId = `${runId}:verify`;
     const rootNodeId = `${runId}:mission`;
     await runtime.start(scaffold);
+    const teamAutonomyStats = createAutonomyRunStats();
+    const teamStartedAt = Date.now();
+    input.events.onStatus?.("Researcher gathering Soft evidence...");
     await runtime.progress(researchNodeId, {
       status: "running",
       lastAction: "Researcher accepted a read-only assignment.",
@@ -8008,8 +8192,13 @@ export default class AgenticResearcherPlugin extends Plugin {
         participantId: "researcher",
         leadParticipantId: "lead",
         taskId: researchNodeId,
-        assignment:
-          "Independently gather and verify the strongest web or vault evidence needed for the mission. Fetch underlying pages; report conflicts and unresolved questions.",
+        assignment: buildResearcherAssignment({
+          prompt: input.prompt,
+          explicitSourceCount: parseExplicitResearchSourceCount(input.prompt),
+          deep: /\b(deep|thorough|comprehensive|verify|citation|sources?)\b/i.test(
+            input.prompt,
+          ),
+        }),
         originalMission: input.prompt,
         modelClient: this.createModelClient(),
         toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
@@ -8019,7 +8208,8 @@ export default class AgenticResearcherPlugin extends Plugin {
         maxToolCalls: workerMaxToolCalls,
         events: {
           onStatus: async (status) => {
-            input.events.onStatus?.(`ORCH> ${status}`);
+            recordResearcherStep(teamAutonomyStats);
+            input.events.onStatus?.(`Researcher step: ${status}`);
             await runtime.progress(researchNodeId, {
               status: "running",
               lastAction: status,
@@ -8030,7 +8220,10 @@ export default class AgenticResearcherPlugin extends Plugin {
             });
           },
           onToolStart: async (event) => {
-            input.events.onStatus?.(`ORCH> Researcher using ${event.name}...`);
+            recordResearcherStep(teamAutonomyStats);
+            input.events.onStatus?.(
+              `Researcher step: using ${event.name}...`,
+            );
             await runtime.progress(researchNodeId, {
               lastAction: `Using ${event.name}`,
             });
@@ -8111,6 +8304,74 @@ export default class AgenticResearcherPlugin extends Plugin {
       seedEvidence = merged.evidence;
       seedClaimPassages = merged.claimPassages;
       handoffContext = merged.promptContext;
+      const activeNotePath =
+        this.app.workspace.getActiveFile()?.path?.trim() ||
+        "Research/Team handoff.md";
+      const bridgedArtifact = buildAcceptedResearchArtifactFromWorkerHandoff({
+        handoff: merged.handoff,
+        notePath: activeNotePath.endsWith(".md")
+          ? activeNotePath
+          : `${activeNotePath}.md`,
+        runId,
+        evidence: merged.evidence,
+      });
+      if (!("ok" in bridgedArtifact)) {
+        const durableHandoff = buildResearcherHandoffV1FromWorker({
+          handoff: merged.handoff,
+          runId,
+          taskId: researchNodeId,
+          notePath: bridgedArtifact.notePath,
+          noteSha256: bridgedArtifact.noteSha256,
+          acceptedArtifactFingerprint: bridgedArtifact.artifactFingerprint,
+          artifact: bridgedArtifact,
+          evidence: merged.evidence,
+        });
+        if (!("ok" in durableHandoff)) {
+          // Keep merged MissionEvidence as Lead seedMissionEvidence; also
+          // attach durable AcceptedResearch lineage for publish_research_*.
+          try {
+            await this.projectLineageStore.upsert(
+              createProjectLineageV1({
+                lineageId: `project-${bridgedArtifact.artifactFingerprint.slice(7, 31)}`,
+                runId,
+                vaultBindingKey: bridgedArtifact.vaultBindingKey,
+                handoff: durableHandoff,
+                updatedAt: bridgedArtifact.acceptedAt,
+              }),
+            );
+          } catch (attachError) {
+            input.events.onStatus?.(
+              `ORCH> Could not attach accepted research lineage (${
+                attachError instanceof Error
+                  ? attachError.message
+                  : "attach_failed"
+              }).`,
+            );
+          }
+          handoffContext = [
+            handoffContext,
+            "",
+            formatBridgedHandoffAttachContext({
+              artifact: bridgedArtifact,
+              durableHandoff,
+            }),
+          ].join("\n");
+        }
+      }
+      const handoffAccepted = merged.handoff.status === "accepted";
+      recordHandoffAccepted(teamAutonomyStats, handoffAccepted);
+      recordUsableSources(
+        teamAutonomyStats,
+        merged.evidence.filter((item) => item.usableSource !== false).length,
+      );
+      input.events.onStatus?.(
+        handoffAccepted
+          ? "Handoff accepted."
+          : merged.handoff.status === "ready"
+            ? "Handoff ready."
+            : "Handoff rejected.",
+      );
+      input.events.onStatus?.("Lead synthesizing from Researcher evidence.");
       await runtime.setSourceLedgerSummary(
         summarizeSourceLedger(workerResult.sourceLedger),
       );
@@ -8190,12 +8451,22 @@ export default class AgenticResearcherPlugin extends Plugin {
         if (property === "onRunComplete") {
           return (event: AgentRunCompleteEvent) => {
             leadCompletion.current = event;
-            target.onRunComplete?.(event);
+            const finalizedTeam = finalizeAutonomyRunStats(teamAutonomyStats, {
+              elapsedMs: Date.now() - teamStartedAt,
+            });
+            target.onRunComplete?.({
+              ...event,
+              autonomyStats: {
+                ...(event.autonomyStats ?? finalizedTeam),
+                team: finalizedTeam.team,
+              },
+            });
           };
         }
         if (property === "onToolStart") {
           return (event: AgentToolRunEvent) => {
             leadToolCalls += 1;
+            recordLeadStep(teamAutonomyStats);
             target.onToolStart?.(event);
             enqueueLeadEvent(() =>
               runtime.progress(leadNodeId, {
@@ -10696,6 +10967,18 @@ export default class AgenticResearcherPlugin extends Plugin {
         resolution.privateRepositoryBinding.repository,
         signal,
       );
+      if (remote.permissions && remote.permissions.push !== true) {
+        throw new Error(
+          [
+            "GitHub credential can see the private repository but lacks Contents push permission.",
+            "REST Administration (create) can succeed while git push fails for fine-grained PATs",
+            "without Contents:write on the new repository.",
+            "Heal: install a github_pat_ with Contents:write (All repositories) or a classic/gh",
+            "OAuth token with repo scope via setGitHubHarnessAccessToken / vault credential,",
+            "then retry publish_draft.",
+          ].join(" "),
+        );
+      }
       const refreshed = createTrustedGitHubRepositoryBindingV2({
         key: resolution.privateRepositoryBinding.key,
         profile: resolution.profile,
@@ -11195,7 +11478,8 @@ export default class AgenticResearcherPlugin extends Plugin {
         }
         if (result.status === "not_applied") {
           throw new Error(
-            "Remote readback proved that the prepared Git push was not applied.",
+            result.message ||
+              "Remote readback proved that the prepared Git push was not applied.",
           );
         }
         const now = new Date().toISOString();
@@ -11341,7 +11625,8 @@ export default class AgenticResearcherPlugin extends Plugin {
             }
             if (result.status === "not_applied") {
               throw new Error(
-                "Remote readback proved that the prepared Git push was not applied.",
+                result.message ||
+                  "Remote readback proved that the prepared Git push was not applied.",
               );
             }
             const now = new Date().toISOString();
@@ -11557,6 +11842,10 @@ export default class AgenticResearcherPlugin extends Plugin {
           approvalReason:
             `Approve moving the exact originating Linear issue to its configured completed state after verified GitHub ${proof.completionProof === "draft_pr" ? "draft" : "merge"} proof.`,
         });
+        await this.completeQueueCandidateAfterPublication(
+          origin.issue.id,
+          nextMonotonicIso(origin.updatedAt),
+        );
         return { receiptId: completed.id };
       },
       finalizeObsidian: async (proof: GitHubPublicationFinalizationInputV1) => {
@@ -11564,6 +11853,9 @@ export default class AgenticResearcherPlugin extends Plugin {
           input.profileKey,
           input.handoff,
         );
+        if (!origin.issue) {
+          throw new Error("No exact Linear issue lineage matches this verified code handoff.");
+        }
         const file = this.app.vault.getFileByPath(origin.artifact.notePath);
         if (!file || file.extension !== "md") {
           throw new Error("The originating Obsidian research note is unavailable.");
@@ -11584,10 +11876,10 @@ export default class AgenticResearcherPlugin extends Plugin {
         const now = new Date();
         const preparedAction = await withPreparedActionFingerprint({
           version: 1,
-          id: `github-obsidian-links-${proof.publicationId}`,
+          id: `github-obsidian-reflection-${proof.publicationId}`,
           runId: input.handoff.runId,
-          toolCallId: `github-obsidian-links-${proof.publicationId}`,
-          toolName: "finalize_github_links_in_obsidian",
+          toolCallId: `github-obsidian-reflection-${proof.publicationId}`,
+          toolName: "finalize_project_reflection_in_obsidian",
           target: {
             system: "vault",
             resourceType: "markdown_file",
@@ -11608,26 +11900,35 @@ export default class AgenticResearcherPlugin extends Plugin {
             pullRequestUrl: proof.pullRequest.htmlUrl,
             completionProof: proof.completionProof,
             proofRevision: proof.proofRevision,
+            publicationId: proof.publicationId,
+            issueIdentifier: origin.issue.identifier,
+            issueUrl: origin.issue.url,
+            changedPaths: input.handoff.changedPaths,
+            targetedValidationReceiptId: input.handoff.targetedValidationReceiptId,
+            fullValidationReceiptId: input.handoff.fullValidationReceiptId,
+            localCommitReceiptId: input.handoff.localCommitReceiptId,
             ...(mergeCommitUrl ? { mergeCommitUrl } : {}),
             ...(proof.mergeSha ? { mergeSha: proof.mergeSha } : {}),
           },
           preview: {
-            summary: `Append verified GitHub publication links to ${origin.artifact.notePath}.`,
+            summary: `Append the verified project completion reflection to ${origin.artifact.notePath}.`,
             destination: origin.artifact.notePath,
             outboundPayload: {
               pullRequestUrl: proof.pullRequest.htmlUrl,
               completionProof: proof.completionProof,
               proofRevision: proof.proofRevision,
+              linearIssueUrl: origin.issue.url,
+              changedPaths: input.handoff.changedPaths,
               ...(mergeCommitUrl ? { mergeCommitUrl } : {}),
               ...(proof.mergeSha ? { mergeSha: proof.mergeSha } : {}),
             },
             warnings: [],
             outboundBytes: new TextEncoder().encode(
-              `${proof.pullRequest.htmlUrl}\n${mergeCommitUrl ?? ""}\n${proof.proofRevision}`,
+              `${origin.issue.url}\n${proof.pullRequest.htmlUrl}\n${mergeCommitUrl ?? ""}\n${proof.proofRevision}\n${input.handoff.changedPaths.join("\n")}`,
             ).length,
           },
           expectedTargetRevision: beforeSha256,
-          idempotencyKey: `github-note-links:${proof.publicationId}:${proof.proofRevision}`,
+          idempotencyKey: `github-note-reflection:${proof.publicationId}:${proof.proofRevision}`,
           preparedAt: now.toISOString(),
           expiresAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
         } satisfies PreparedActionInput);
@@ -11639,8 +11940,8 @@ export default class AgenticResearcherPlugin extends Plugin {
           toolName: preparedAction.toolName,
           action: preparedAction.preview.summary,
           reason:
-            "Approve the exact note hash and verified GitHub links. Note drift invalidates this approval.",
-          policyTags: ["github_publication", "obsidian_backlink", "exact"],
+            "Approve the exact note hash and evidence-backed project reflection. Note drift invalidates this approval.",
+          policyTags: ["github_publication", "obsidian_reflection", "exact"],
           preparedAction,
           timeoutMs: 120_000,
           confirmationIndex: 1,
@@ -11654,28 +11955,31 @@ export default class AgenticResearcherPlugin extends Plugin {
         }
         const result = await new AcceptedResearchNoteWriter(
           this.app.vault,
-        ).appendGitHubCompletionLinks({
+        ).appendProjectCompletionReflection({
           artifact: origin.artifact,
           expectedNoteSha256: beforeSha256,
+          publicationId: proof.publicationId,
+          issueIdentifier: origin.issue.identifier,
+          issueUrl: origin.issue.url,
           pullRequestNumber: proof.pullRequest.number,
           pullRequestUrl: proof.pullRequest.htmlUrl,
+          completionProof: proof.completionProof,
+          proofRevision: proof.proofRevision,
+          changedPaths: input.handoff.changedPaths,
+          targetedValidationReceiptId: input.handoff.targetedValidationReceiptId,
+          fullValidationReceiptId: input.handoff.fullValidationReceiptId,
+          localCommitReceiptId: input.handoff.localCommitReceiptId,
           ...(mergeCommitUrl && proof.mergeSha
             ? { mergeCommitUrl, mergeSha: proof.mergeSha }
             : {}),
         });
         const finalizedReceiptId =
-          `github-note-links-${result.afterSha256.slice(7, 39)}`;
+          `github-note-reflection-${result.afterSha256.slice(7, 39)}`;
         await this.persistFinalizedGitHubPublicationLineage({
           origin,
           receiptId: finalizedReceiptId,
           noteSha256: result.afterSha256,
         });
-        if (origin.issue) {
-          await this.completeQueueCandidateAfterPublication(
-            origin.issue.id,
-            nextMonotonicIso(origin.updatedAt),
-          );
-        }
         return {
           receiptId: finalizedReceiptId,
         };
@@ -11776,6 +12080,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             handoff.targetedValidationFingerprint,
             handoff.fullValidationFingerprint,
           ],
+          diffFingerprint: handoff.diffFingerprint,
           targetedValidationPassed: true,
           freshFullValidationPassed: true,
           commitSha: handoff.commitSha,
@@ -12289,6 +12594,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       getResearchMemoryIndex: () => [...this.researchMemoryIndex],
       setResearchMemoryIndex: (entries) => this.setResearchMemoryIndex(entries),
       getProjectLineages: () => this.getProjectLineages(),
+      getRepositoryProfileKeys: () =>
+        Object.keys(this.repositoryProfileRegistry.profiles),
       semanticEmbeddingProvider: this.getSemanticEmbeddingProvider(),
       semanticIndexService: this.getSemanticIndexService(),
     };
@@ -12376,6 +12683,18 @@ export default class AgenticResearcherPlugin extends Plugin {
     return this.semanticEmbeddingProvider;
   }
 
+  /**
+   * Test/harness hook: replace the embed provider and rebuild the index service
+   * so e2e can prove rebuild→search without relying on a seeded fake index JSON.
+   */
+  setSemanticEmbeddingProviderForTests(
+    provider: SemanticEmbeddingProvider | null,
+  ): void {
+    this.semanticEmbeddingProvider = provider;
+    this.semanticIndexService = this.createSemanticIndexService();
+    this.semanticIndexNeedsBootstrap = true;
+  }
+
   private createSemanticIndexService(): SemanticIndexService {
     return createSemanticIndexService({
       app: this.app,
@@ -12384,7 +12703,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
   }
 
-  private getSemanticIndexService(): SemanticIndexService {
+  getSemanticIndexService(): SemanticIndexService {
     if (!this.semanticIndexService) {
       this.semanticIndexService = this.createSemanticIndexService();
     }
@@ -12682,6 +13001,15 @@ interface CompanionRuntimePluginV1 {
       }>;
     }>;
     acknowledgeAppliedLinearQueueEvents(throughSequence: number): Promise<void>;
+    drainPendingChatResumeSummaries?(now?: Date): Promise<
+      Array<{
+        jobId: string;
+        missionId: string;
+        nodeId: string;
+        state: string;
+        line: string;
+      }>
+    >;
     getRuntimeState?(): {
       linearQueueLastObservedEventSequence: number;
       linearQueueLastAppliedEventSequence: number;
@@ -12696,6 +13024,8 @@ interface CompanionRuntimePluginV1 {
             | "reconciled"
             | "reconcile_required"
             | "terminal_blocked";
+          chatResumeSummary?: string | null;
+          chatResumeDeliveredAt?: string | null;
         }
       >;
     };
@@ -12992,6 +13322,13 @@ function projectSetupRank(name: string): number {
   return 2;
 }
 
+function readyStateSetupRank(name: string): number {
+  const normalized = name.trim().toLowerCase();
+  if (normalized === "ready") return 0;
+  if (/^(?:to[ -]?do|queued?|approved)$/u.test(normalized)) return 1;
+  return 2;
+}
+
 function normalizeLinearQueueStateOrNull(
   value: unknown,
 ): LinearQueueStateV1 | null {
@@ -13126,6 +13463,15 @@ function getConfiguredModelBaseUrl(settings: AgentSettings): string {
   return settings.modelProvider === "openai_compatible"
     ? settings.openAiCompatibleBaseUrl.trim().replace(/\/+$/u, "")
     : settings.ollamaBaseUrl.trim().replace(/\/+$/u, "");
+}
+
+function hasRequiredPersistedModelCapabilityProof(
+  settings: AgentSettings,
+): boolean {
+  return !(
+    settings.modelProvider === "ollama" &&
+    isDirectOllamaCloudApiBaseUrl(settings.ollamaBaseUrl)
+  ) || settings.modelConnectionVerifiedAgenticCapabilities === true;
 }
 
 function normalizeResearchMemoryIndex(

@@ -219,6 +219,11 @@ export function missingIncludesWriteReceipt(missing: string[]): boolean {
 
 /** Prefer streamed replace for current-note edit/organize and whole-note edits. */
 export function prefersStreamedReplaceForEditOrganize(prompt: string): boolean {
+  // Named section edits stay on edit_current_section / prepare_edit — not
+  // whole-note streamed replace — even when the prompt also says "this note".
+  if (isNamedSectionEditIntent(prompt)) {
+    return false;
+  }
   return (
     isCurrentNoteEditOrganizeIntent(prompt) ||
     isWholeNoteEditIntent(prompt)

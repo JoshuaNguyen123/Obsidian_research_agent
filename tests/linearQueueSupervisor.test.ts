@@ -39,6 +39,7 @@ import { createWorkItemSpecV1 } from "../src/integrations/linear/WorkItemSpecV1"
 import { renderWorkItemSpecV1 } from "../src/integrations/linear/WorkItemRenderer";
 
 const PROJECT_ID = "project-queue";
+const READY_STATE_ID = "state-todo";
 const T0 = "2026-07-11T10:00:00.000Z";
 
 test("supervisor polls every 15 minutes, scopes the trusted project, and caps scans at 10", async () => {
@@ -58,6 +59,7 @@ test("supervisor polls every 15 minutes, scopes the trusted project, and caps sc
   ].reverse();
   const supervisor = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async (operation, variables = {}) => {
         calls.push({ operation, variables });
@@ -100,10 +102,48 @@ test("supervisor polls every 15 minutes, scopes the trusted project, and caps sc
   assert.deepEqual(calls[0].variables, {
     first: 10,
     includeArchived: false,
-    filter: { project: { id: { eq: PROJECT_ID } } },
+    filter: {
+      project: { id: { eq: PROJECT_ID } },
+      state: { id: { eq: READY_STATE_ID } },
+    },
   });
   await supervisor.stop();
   assert.equal(timer.cleared, true);
+});
+
+test("supervisor ignores trusted-project issues until they enter the configured Ready state", async () => {
+  let queue = createLinearQueueState({ workspaceId: "workspace-ready", at: T0 });
+  const notReady = {
+    ...makeIssue(1, PROJECT_ID, "2026-07-11T11:00:00.000Z"),
+    state: { id: "state-backlog", name: "Backlog", type: "backlog" },
+  } satisfies LinearIssueRecord;
+  const ready = makeIssue(2, PROJECT_ID, "2026-07-11T11:01:00.000Z");
+  const supervisor = new LinearQueueSupervisor({
+    queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
+    client: { execute: async () => issuePage([notReady, ready]) },
+    timer: new FakeTimer(),
+    reduceQueueState: async (reduce) => {
+      queue = reduce(queue);
+      return queue;
+    },
+    isConnectionEligible: () => true,
+    isConfigurationEligible: () => true,
+    isExecutionGrantEligible: () => true,
+    evaluateCandidate: ({ workItem, at }) =>
+      evaluateCandidateEligibility(workItem, {
+        policy: createCandidateEligibilityPolicy(),
+        repositories: createRepositoryProfileRegistry(),
+        at,
+      }),
+  });
+
+  const result = await supervisor.start();
+  assert.equal(result?.status, "completed");
+  if (result?.status === "completed") assert.equal(result.fetched, 1);
+  assert.equal(queue.candidates[notReady.id], undefined);
+  assert.ok(queue.candidates[ready.id]);
+  await supervisor.stop();
 });
 
 test("supervisor preserves its cursor when the final durable cursor commit fails", async () => {
@@ -118,6 +158,7 @@ test("supervisor preserves its cursor when the final durable cursor commit fails
   const variables: Record<string, unknown>[] = [];
   const supervisor = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async (_operation, input = {}) => {
         variables.push(input);
@@ -156,6 +197,7 @@ test("supervisor preserves its cursor when the final durable cursor commit fails
   assert.equal(queue.candidates["issue-2"].status, "eligible");
   assert.deepEqual(variables[0].filter, {
     project: { id: { eq: PROJECT_ID } },
+    state: { id: { eq: READY_STATE_ID } },
     updatedAt: { gte: originalCursor!.updatedAt },
   });
 
@@ -171,6 +213,7 @@ test("grant-ineligible candidates remain pending and can be evaluated on a later
   let grant = false;
   const supervisor = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async () =>
         issuePage([makeIssue(1, PROJECT_ID, "2026-07-11T11:00:00.000Z")]),
@@ -212,6 +255,7 @@ test("connection and configuration gates prevent Linear reads", async () => {
   let configurationCalls = 0;
   const connectionBlocked = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async () => {
         clientCalls += 1;
@@ -243,6 +287,7 @@ test("connection and configuration gates prevent Linear reads", async () => {
 
   const configurationBlocked = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async () => {
         clientCalls += 1;
@@ -275,6 +320,7 @@ test("supervisor prevents overlapping scans and aborts the active scan on stop",
   let aborted = false;
   const supervisor = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,
+    readyStateId: READY_STATE_ID,
     client: {
       execute: async (_operation, _variables, options) =>
         new Promise<LinearOperationResult>((_resolve, reject) => {

@@ -1,5 +1,6 @@
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import { FINALIZATION_RESERVE_STEPS } from "./AgentBudget";
+import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
 import type { RunBudgetProfile, RunBudgetRoute } from "./runBudget";
 import { getRunBudgetProfile, resolveConfiguredMaxAgentSteps } from "./runBudget";
 import type { GeneratedOutputPolicy } from "./generatedOutputPolicy";
@@ -117,7 +118,11 @@ function getExpectedTools(
       : ["inspect_semantic_index", "semantic_search_notes"];
   }
 
-  if (generated.requiresGrounding || /\b(sources?)\b/i.test(prompt)) {
+  if (
+    (generated.requiresGrounding || /\b(sources?)\b/i.test(prompt)) &&
+    // Literary primary-text citations are not a fetched-web expectation.
+    !hasPrimaryTextCitationIntent(prompt)
+  ) {
     return ["web_search", "web_fetch"];
   }
 
@@ -271,6 +276,10 @@ function getExplicitMarkdownReadTargets(prompt: string): string[] {
 }
 
 function hasExplicitWebGroundingIntent(prompt: string): boolean {
+  // "citations from the text" is close reading, not public-web grounding.
+  if (hasPrimaryTextCitationIntent(prompt)) {
+    return false;
+  }
   return /\bweb\b|\bonline\b|\bexternal\s+sources?\b|\bsource\s+urls?\b|\bcitations?\b|\blatest\b|\bcurrent\s+(?:events?|news|information|data)\b|https?:\/\//iu.test(
     prompt,
   );

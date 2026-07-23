@@ -26,6 +26,7 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "daily-use-linear",
   "daily-use-github",
   "daily-use-compound",
+  "obsidian-hello-github-live",
   "integration-mock",
   "integration-mock-legacy",
   "sandbox",
@@ -36,6 +37,8 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "release-vertical",
   "disposable-live-external",
   "configured-linear-live",
+  "compound-flow-smoke-live",
+  "compound-flow-real-live",
   "systems-diagrams",
 ]);
 const SIGNAL_EXIT_CODES = {
@@ -53,6 +56,9 @@ const WINDOWS_USER_SANDBOX_ENV_NAMES = Object.freeze([
 const SANDBOX_E2E_PROJECTS = new Set([
   "daily-use-code-live",
   "daily-use-compound",
+  "obsidian-hello-github-live",
+  "compound-flow-smoke-live",
+  "compound-flow-real-live",
   "release-vertical",
 ]);
 
@@ -502,6 +508,10 @@ export function normalizeExclusiveArgs(rawArgs) {
       );
     }
   }
+  // Tier A journey lanes (real LLM via startRealAiHarness). Tier B policy /
+  // boundary / fingerprint projects stay on --mock-ai (deterministic-matrix,
+  // connections, memory-reflex, code/linear/github mock packs, compound-smoke,
+  // configured-linear, companion-restart, integration-mock*).
   const realAiProjects = new Set([
     "real-ai-contract",
     "real-ai-soak",
@@ -510,9 +520,19 @@ export function normalizeExclusiveArgs(rawArgs) {
     "daily-use-research",
     "daily-use-code-live",
     "daily-use-compound",
+    "obsidian-hello-github-live",
+    "compound-flow-real-live",
   ]);
   if (aiMode === "real" && projects.some((project) => !realAiProjects.has(project))) {
     throw new Error("--real-ai is restricted to attested live-provider Playwright projects.");
+  }
+  if (
+    aiMode === "mock" &&
+    projects.some((project) => realAiProjects.has(project))
+  ) {
+    throw new Error(
+      "--mock-ai cannot target Tier A journey projects (use --real-ai + startRealAiHarness). Keep mock for policy/boundary projects only.",
+    );
   }
   if (
     liveExternal &&
@@ -531,14 +551,14 @@ export function normalizeExclusiveArgs(rawArgs) {
 /**
  * Apply AI mode for the Playwright child. Explicit CLI flags win; otherwise
  * leave any caller-provided E2E_AI_* env vars alone. Default package scripts
- * pass --real-ai (gpt-oss:120b-cloud) or --mock-ai for deterministic runs.
+ * pass --real-ai (glm-5.2) or --mock-ai for deterministic runs.
  */
 export function applyE2eAiMode(aiMode, env = process.env) {
   if (aiMode === "real") {
     env.E2E_AI_MODE = "real";
     env.E2E_REAL_AI = "1";
     if (!env.E2E_AI_MODEL?.trim()) {
-      env.E2E_AI_MODEL = "gpt-oss:120b-cloud";
+      env.E2E_AI_MODEL = "glm-5.2";
     }
     return;
   }

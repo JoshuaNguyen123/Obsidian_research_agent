@@ -13,14 +13,274 @@ export function formatFailureCopy(copy: FailureCopy): string {
   return `What: ${copy.what} Why: ${copy.why} Next: ${copy.next}`;
 }
 
-export function providerAuthFailureCopy(detail?: string): FailureCopy {
+/** Single-line progress for Chat/status (no state-machine jargon). */
+export function formatRecoveryProgressLine(message: string): string {
+  return message.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Plain progress while validation/repair is in flight.
+ * Example: "Validation failed; I'm fixing two files."
+ */
+export function validationRepairProgressCopy(input: {
+  failedFileCount?: number;
+  files?: readonly string[];
+  detail?: string;
+} = {}): string {
+  const named = (input.files ?? [])
+    .map((file) => file.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  const count =
+    typeof input.failedFileCount === "number" &&
+    Number.isFinite(input.failedFileCount) &&
+    input.failedFileCount > 0
+      ? Math.floor(input.failedFileCount)
+      : named.length;
+  if (count <= 0) {
+    return formatRecoveryProgressLine(
+      input.detail?.trim() ||
+        "Validation failed; I'm repairing the workspace and will retry.",
+    );
+  }
+  if (named.length === 1 && count === 1) {
+    return formatRecoveryProgressLine(
+      `Validation failed; I'm fixing ${named[0]}.`,
+    );
+  }
+  if (named.length > 0 && named.length === count) {
+    return formatRecoveryProgressLine(
+      `Validation failed; I'm fixing ${named.join(", ")}.`,
+    );
+  }
+  const countLabel =
+    count === 1
+      ? "one file"
+      : count === 2
+        ? "two files"
+        : count === 3
+          ? "three files"
+          : `${count} files`;
+  return formatRecoveryProgressLine(
+    `Validation failed; I'm fixing ${countLabel}.`,
+  );
+}
+
+export function schemaRetryProgressCopy(attempt: number, maxAttempts: number): string {
+  return formatRecoveryProgressLine(
+    `The model call looked malformed; retrying automatically (${Math.max(1, attempt)}/${Math.max(1, maxAttempts)}).`,
+  );
+}
+
+export function modelRetryProgressCopy(attempt: number, maxAttempts: number): string {
+  return formatRecoveryProgressLine(
+    `The model hiccuped; retrying automatically (${Math.max(1, attempt)}/${Math.max(1, maxAttempts)}).`,
+  );
+}
+
+export function toolFallbackProgressCopy(
+  fromTool?: string,
+  toTool?: string,
+): string {
+  if (fromTool?.trim() && toTool?.trim()) {
+    return formatRecoveryProgressLine(
+      `${fromTool.trim()} stalled; trying ${toTool.trim()} instead.`,
+    );
+  }
+  if (toTool?.trim()) {
+    return formatRecoveryProgressLine(
+      `Trying ${toTool.trim()} to keep the mission moving.`,
+    );
+  }
+  return formatRecoveryProgressLine(
+    "Trying a safer alternate tool to keep the mission moving.",
+  );
+}
+
+/** Credential / provider blocks that need settings then Continue. */
+export function credentialBlockFailureCopy(detail?: string): FailureCopy {
   return {
-    what: "Model provider authentication failed.",
+    what: "I can't reach the model provider yet.",
     why:
       detail?.trim() ||
-      "The configured provider is missing a required API key or rejected credentials.",
-    next: "Add or refresh the provider API key in plugin settings, then retry the mission.",
+      "Credentials are missing or were rejected by the provider.",
+    next: "Add or refresh the API key in settings, then click Continue.",
   };
+}
+
+/** Approval/external pauses that expose one Continue path after the user acts. */
+export function approvalBlockContinueCopy(
+  toolName: string,
+  decision: "denied" | "expired" | "aborted" | "needed" | string = "needed",
+): FailureCopy {
+  if (decision === "needed") {
+    return {
+      what: `I need your approval before ${toolName}.`,
+      why: "This action is gated so it does not run without an explicit go-ahead.",
+      next: "Approve or Deny in Chat, then click Continue if the run is still waiting.",
+    };
+  }
+  if (decision === "expired") {
+    return {
+      what: `Approval timed out for ${toolName}.`,
+      why: "The approval card expired before a decision was recorded.",
+      next: "Click Continue and approve promptly when the card appears again.",
+    };
+  }
+  if (decision === "aborted") {
+    return {
+      what: `Approval was interrupted for ${toolName}.`,
+      why: "The run stopped while waiting for Approve or Deny.",
+      next: "Click Continue when you are ready to decide on that gated action.",
+    };
+  }
+  return {
+    what: `Approval was denied for ${toolName}.`,
+    why: "You denied the gated tool, so it was not executed.",
+    next: "Click Continue to resume with a different approach, or Approve next time if that tool is required.",
+  };
+}
+
+export function externalStateBlockFailureCopy(detail?: string): FailureCopy {
+  return {
+    what: "I'm paused on external state.",
+    why:
+      detail?.trim() ||
+      "A Linear, GitHub, or workspace check is not ready to proceed yet.",
+    next: "Fix the external blocker if needed, then click Continue.",
+  };
+}
+
+export function recoveryExhaustedFailureCopy(attemptsUsed?: number): FailureCopy {
+  const count =
+    typeof attemptsUsed === "number" && Number.isFinite(attemptsUsed)
+      ? Math.max(0, Math.floor(attemptsUsed))
+      : undefined;
+  return {
+    what: "I couldn't recover from this step automatically.",
+    why:
+      count !== undefined
+        ? `I already tried ${count} alternate path(s) for the active task.`
+        : "Automatic recovery hit its bounded retry limit for this task.",
+    next: "Inspect Run Details if you want detail, then click Continue.",
+  };
+}
+
+export function noAlternateToolFailureCopy(failedAction?: string): FailureCopy {
+  return {
+    what: "I don't have a safe alternate tool for this step.",
+    why: failedAction?.trim()
+      ? `${failedAction.trim()} failed and no allowed fallback is available.`
+      : "The remaining tool set cannot replace the failed or stalled action.",
+    next: "Broaden allowed tools or adjust the mission, then click Continue.",
+  };
+}
+
+/**
+ * Map a user-visible stop/blocker into conversational What/Why/Next with a
+ * single Continue-oriented next step (credentials / approval / external).
+ */
+export function conversationalBlockerCopy(input: {
+  kind?:
+    | "credential"
+    | "approval"
+    | "external"
+    | "validation"
+    | "provider"
+    | "generic";
+  what?: string;
+  why?: string;
+  toolName?: string;
+  approvalDecision?: string;
+  failedFileCount?: number;
+}): FailureCopy {
+  const kind = input.kind ?? "generic";
+  if (kind === "credential") {
+    return credentialBlockFailureCopy(input.why);
+  }
+  if (kind === "approval") {
+    return approvalBlockContinueCopy(
+      input.toolName?.trim() || "the gated tool",
+      input.approvalDecision ?? "needed",
+    );
+  }
+  if (kind === "external") {
+    return externalStateBlockFailureCopy(input.why);
+  }
+  if (kind === "validation") {
+    const progress = validationRepairProgressCopy({
+      failedFileCount: input.failedFileCount,
+      detail: input.why,
+    });
+    return {
+      what: progress,
+      why: input.why?.trim() || "Sandbox validation reported failures.",
+      next: "I'll keep repairing automatically when it's safe; otherwise click Continue.",
+    };
+  }
+  if (kind === "provider") {
+    return cloudProviderBlockerFromError({ message: input.why });
+  }
+  return {
+    what: input.what?.trim() || "The mission paused.",
+    why: input.why?.trim() || "A required step could not finish yet.",
+    next: "Click Continue to resume from the saved ledger.",
+  };
+}
+
+/**
+ * Rewrite recovery/status jargon into a plain Chat system line when recognized.
+ * Unknown messages pass through unchanged.
+ */
+export function conversationalStatusLine(message: string): string {
+  const text = message.replace(/\s+/g, " ").trim();
+  if (!text) return text;
+
+  const validationFiles =
+    /validation (?:failed|completed red)|passing[_ ]fast|code_validate/i.test(
+      text,
+    );
+  const fileCountMatch = /(\d+)\s+files?/i.exec(text);
+  if (validationFiles && fileCountMatch) {
+    return validationRepairProgressCopy({
+      failedFileCount: Number(fileCountMatch[1]),
+      detail: text,
+    });
+  }
+  if (validationFiles && /repair|fixing|patch/i.test(text)) {
+    return validationRepairProgressCopy({ detail: text });
+  }
+
+  const recoveryPlanned = /recovery planned:\s*(.+)$/i.exec(text);
+  if (recoveryPlanned?.[1]) {
+    return formatRecoveryProgressLine(recoveryPlanned[1]);
+  }
+  if (/mission plan appears stalled/i.test(text)) {
+    return "That step stalled; I'm choosing a different next action.";
+  }
+  if (/recovery attempts exhausted/i.test(text)) {
+    return formatFailureCopy(recoveryExhaustedFailureCopy());
+  }
+  const retryMatch = /^retry\s+([^:]+):\s*(.+)$/i.exec(text);
+  if (retryMatch) {
+    return formatRecoveryProgressLine(
+      `Retrying ${retryMatch[1]!.trim()} (${retryMatch[2]!.trim()}).`,
+    );
+  }
+  const replanMatch = /^replan around\s+([^:]+):\s*(.+)$/i.exec(text);
+  if (replanMatch) {
+    return formatRecoveryProgressLine(
+      `Replanning around ${replanMatch[1]!.trim()} (${replanMatch[2]!.trim()}).`,
+    );
+  }
+  return text;
+}
+
+export function providerAuthFailureCopy(detail?: string): FailureCopy {
+  return credentialBlockFailureCopy(
+    detail?.trim() ||
+      "The configured provider is missing a required API key or rejected credentials.",
+  );
 }
 
 export function modelTimeoutFailureCopy(detail?: string): FailureCopy {
@@ -34,11 +294,19 @@ export function modelTimeoutFailureCopy(detail?: string): FailureCopy {
 }
 
 export function modelRetryExhaustedFailureCopy(detail?: string): FailureCopy {
+  const why =
+    detail?.trim() ||
+    "Transient provider errors kept failing after the bounded retry budget.";
+  if (/partial_write_no_safe_retry|cannot safely retry after partial note apply/i.test(why)) {
+    return {
+      what: "Streaming writeback stopped after partial note apply.",
+      why,
+      next: "Partial draft was kept. Continue Latest Run to expand it in place to the word target — do not start a fresh append.",
+    };
+  }
   return {
     what: "Model retries were exhausted.",
-    why:
-      detail?.trim() ||
-      "Transient provider errors kept failing after the bounded retry budget.",
+    why,
     next: "Wait briefly, verify provider health and timeout settings, then retry or continue the saved ledger.",
   };
 }
@@ -59,7 +327,7 @@ export function modelMissingApiKeyFailureCopy(detail?: string): FailureCopy {
     why:
       detail?.trim() ||
       "The configured cloud endpoint requires a BYOK API key before chat or tool calls.",
-    next: "Open settings, add the provider API key, then Test connection before Run Mission.",
+    next: "Open settings, add the provider API key, Test connection, then click Continue.",
   };
 }
 
@@ -107,25 +375,7 @@ export function approvalDeniedFailureCopy(
   toolName: string,
   decision: "denied" | "expired" | "aborted" | string,
 ): FailureCopy {
-  if (decision === "expired") {
-    return {
-      what: `Approval expired for ${toolName}.`,
-      why: "The approval card timed out before Approve or Deny was chosen.",
-      next: "Re-run the mission and approve promptly when the card appears, or deny to skip that tool.",
-    };
-  }
-  if (decision === "aborted") {
-    return {
-      what: `Approval aborted for ${toolName}.`,
-      why: "The run stopped while waiting for an approval decision.",
-      next: "Start the mission again when ready to approve or deny the gated tool.",
-    };
-  }
-  return {
-    what: `Approval denied for ${toolName}.`,
-    why: "You denied the gated tool, so it was not executed.",
-    next: "Re-run and choose Approve if that tool is required, or continue with a different approach.",
-  };
+  return approvalBlockContinueCopy(toolName, decision);
 }
 
 /**

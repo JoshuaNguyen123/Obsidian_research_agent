@@ -302,6 +302,41 @@ export class WorkspaceManagerV2 {
   }
 
   /**
+   * Continue segments mint a new runId. Adopt an existing mission workspace so
+   * code_workspace_create is idempotent instead of failing with workspace_exists
+   * / workspace_owner_mismatch and burning Soft-union budget Continues.
+   */
+  async rebindWorkspaceOwnerForContinuation(
+    workspaceId: string,
+    nextOwnerRunId: string,
+  ): Promise<WorkspaceManifestV2> {
+    return this.serializeWrite(async () => {
+      const id = workspaceIdentifier(workspaceId);
+      const ownerRunId = boundedText(nextOwnerRunId, "owner run id", 256);
+      let manifest = await this.loadManifest(id);
+      manifest = await this.applyExpiry(manifest);
+      if (["expired", "closed", "blocked"].includes(manifest.status)) {
+        throw new WorkspaceManagerErrorV2(
+          `workspace_${manifest.status}`,
+          `Workspace is ${manifest.status}.`,
+        );
+      }
+      await this.assertWorkspaceRoot(manifest);
+      if (manifest.ownerRunId === ownerRunId) {
+        return manifest;
+      }
+      const rebound: WorkspaceManifestV2 = {
+        ...manifest,
+        ownerRunId,
+        lease: null,
+        updatedAt: this.isoNow(),
+      };
+      await this.persistManifest(rebound);
+      return rebound;
+    });
+  }
+
+  /**
    * Advance a repository workspace epoch only after a fixed-argv Git reader has
    * proven that the exact agent branch is clean at the verified prior commit.
    * This resets only the per-mission change budget; hashes remain as drift

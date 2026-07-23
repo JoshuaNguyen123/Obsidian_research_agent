@@ -3,9 +3,15 @@ import { truncateText } from "../tools/validation";
 import { extractEvidencePassages } from "../agent/researchDossier";
 
 const MAX_SUMMARY_CHARS = 8000;
+/** Active-note reads must keep body text for edit/expand, not passage snippets. */
+const MAX_CURRENT_NOTE_SUMMARY_CHARS = 120_000;
 const MAX_SNIPPET_CHARS = 600;
 const MAX_RESULT_ITEMS = 8;
 const MAX_REF_COUNT = 20;
+
+const FULL_CONTENT_NOTE_READ_TOOLS = new Set([
+  "read_current_file",
+]);
 
 export interface ToolPayloadSummary {
   toolName: string;
@@ -20,20 +26,52 @@ export interface ToolPayloadSummary {
 
 export function serializeToolResultForModel(result: ToolExecutionResult): string {
   const summary = summarizeToolOutput(result.toolName, result);
+  const budget = FULL_CONTENT_NOTE_READ_TOOLS.has(result.toolName)
+    ? MAX_CURRENT_NOTE_SUMMARY_CHARS
+    : MAX_SUMMARY_CHARS;
   const serialized = JSON.stringify(summary, null, 2);
-  if (serialized.length <= MAX_SUMMARY_CHARS) {
+  if (serialized.length <= budget) {
     return serialized;
   }
 
   const compact = compactOversizedSummary(summary);
   const compactSerialized = JSON.stringify(compact, null, 2);
-  if (compactSerialized.length <= MAX_SUMMARY_CHARS) {
+  if (compactSerialized.length <= budget) {
     return compactSerialized;
   }
 
   // Preserve valid JSON even when an unusual tool result still exceeds the
   // model payload budget. Invalid, character-truncated JSON is harder for the
   // model to recover from than an explicit metadata-only summary.
+  // Current-note reads keep a hard-capped content window so edit missions
+  // still see the note body instead of passage metadata only.
+  if (
+    FULL_CONTENT_NOTE_READ_TOOLS.has(result.toolName) &&
+    isRecord(summary.output) &&
+    typeof summary.output.content === "string"
+  ) {
+    const contentBudget = Math.max(4_000, budget - 1_500);
+    return JSON.stringify(
+      {
+        toolName: summary.toolName,
+        status: summary.status,
+        summary: summary.summary,
+        truncated: true,
+        output: {
+          path: summary.output.path,
+          totalChars: summary.output.totalChars,
+          returnedChars: summary.output.returnedChars,
+          offset: summary.output.offset,
+          nextOffset: summary.output.nextOffset,
+          truncated: true,
+          content: truncateText(summary.output.content, contentBudget),
+        },
+      },
+      null,
+      2,
+    );
+  }
+
   return JSON.stringify({
     toolName: summary.toolName,
     status: summary.status,
@@ -249,11 +287,30 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
     }
   }
   if (typeof output.content === "string" && toolName !== "count_words") {
-    keep.contentEvidence = extractEvidencePassages(output.content, {
-      query: getEvidenceQuery(output),
-      sourceLocator: getEvidenceSourceLocator(output),
-      baseOffset: getEvidenceBaseOffset(output),
-    });
+    if (FULL_CONTENT_NOTE_READ_TOOLS.has(toolName)) {
+      // Edit/expand missions need the note body, not research passage snippets.
+      keep.content = output.content;
+      for (const key of [
+        "totalChars",
+        "returnedChars",
+        "offset",
+        "nextOffset",
+        "truncated",
+      ]) {
+        if (output[key] !== undefined) {
+          keep[key] = output[key];
+        }
+      }
+      if (keep.truncated === undefined) {
+        keep.truncated = /\n\n\[truncated\]$/u.test(output.content);
+      }
+    } else {
+      keep.contentEvidence = extractEvidencePassages(output.content, {
+        query: getEvidenceQuery(output),
+        sourceLocator: getEvidenceSourceLocator(output),
+        baseOffset: getEvidenceBaseOffset(output),
+      });
+    }
   }
   return Object.keys(keep).length > 0 ? keep : undefined;
 }

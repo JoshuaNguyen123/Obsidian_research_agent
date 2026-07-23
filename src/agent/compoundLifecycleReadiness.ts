@@ -29,6 +29,9 @@ const STAGE_CAPABILITY: Partial<
   linear_hierarchy: "linear",
   code_execution: "code",
   private_github_publication: "github",
+  // Cleanup still needs a connected GitHub capability; delete_repo authority
+  // is enforced separately by missionReadinessPreflight.
+  reconciliation_cleanup: "github",
 };
 
 /**

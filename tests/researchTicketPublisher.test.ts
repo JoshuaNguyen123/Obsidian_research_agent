@@ -90,6 +90,31 @@ test("publisher rebuilds, fingerprints, renders, and bounds synthesized ticket i
   );
 });
 
+test("publisher rejects secrets, raw authority, and unresolved template placeholders", () => {
+  const publisher = publisherFixture(emptyReadClient(), unusedExecutor());
+  const cases: Array<[string, SynthesizedResearchTicketSectionsV1, RegExp]> = [
+    [
+      "secret",
+      { ...SECTIONS, problemImpact: "api_key=super-secret-provider-value" },
+      /credentials|secrets/i,
+    ],
+    [
+      "raw authority",
+      { ...SECTIONS, proposedWork: ["Run npm test before publication."] },
+      /raw filesystem paths|shell commands|executable authority/i,
+    ],
+    [
+      "placeholder",
+      { ...SECTIONS, title: "{{issue_title}}" },
+      /unresolved template placeholder/i,
+    ],
+  ];
+
+  for (const [label, sections, expected] of cases) {
+    assert.throws(() => publisher.build(sections, DRAFT), expected, label);
+  }
+});
+
 test("publisher preview builds and deduplicates without preparing or dispatching a mutation", async () => {
   let prepareCount = 0;
   let executeCount = 0;
@@ -305,6 +330,7 @@ test("publisher adopts deterministic issue after prepare reports duplicate targe
         prepareCount += 1;
         return {
           ok: false as const,
+          status: "rejected" as const,
           error: {
             code: "linear_duplicate_target",
             message: `Linear issue ${deterministicId} already exists.`,
@@ -330,7 +356,7 @@ test("publisher adopts deterministic issue after prepare reports duplicate targe
   assert.equal(getCount, 2);
 });
 
-test("publisher adopts owned deterministic issue even when project or description drift", async () => {
+test("publisher refuses deterministic issue adoption when project or description drift", async () => {
   let prepareCount = 0;
   let deterministicId = "";
   const readClient: LinearToolClient = {
@@ -349,6 +375,14 @@ test("publisher adopts owned deterministic issue even when project or descriptio
     fakeExecutor({
       onPrepare: () => {
         prepareCount += 1;
+        return {
+          ok: false as const,
+          status: "rejected" as const,
+          error: {
+            code: "linear_duplicate_target",
+            message: `Linear issue ${deterministicId} already exists.`,
+          },
+        };
       },
     }),
   );
@@ -366,10 +400,12 @@ test("publisher adopts owned deterministic issue even when project or descriptio
     }),
   );
 
-  assert.equal(result.ok, true);
-  if (!result.ok || result.status !== "deduplicated") return;
-  assert.equal(result.issue.id, deterministicId);
-  assert.equal(prepareCount, 0);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.status, "rejected");
+  assert.equal(result.error.code, "linear_duplicate_target");
+  assert.match(result.error.message, /project|description/i);
+  assert.equal(prepareCount, 1);
 });
 
 test("publisher prepares one deterministic pinned create and verifies independent readback", async () => {
@@ -629,14 +665,17 @@ function requestFixture(overrides: Partial<{
 }
 
 function fakeExecutor(options: {
-  onPrepare?: (arguments_: Record<string, unknown>) => void;
+  onPrepare?: (
+    arguments_: Record<string, unknown>,
+  ) => HostLinearActionPreparation | void;
   onExecute?: (action: PreparedAction) => void;
   executionResult?: (action: PreparedAction) => HostLinearActionExecution;
 }): ResearchTicketPublisherOptions["actionExecutor"] {
   let action: PreparedAction | undefined;
   return {
     prepare: async (request): Promise<HostLinearActionPreparation> => {
-      options.onPrepare?.(request.arguments);
+      const preparation = options.onPrepare?.(request.arguments);
+      if (preparation) return preparation;
       action = preparedAction(
         request.runId,
         request.toolCallId,

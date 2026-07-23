@@ -1117,8 +1117,7 @@ export async function parseCodeRepairCheckpointV1(
     if (new TextEncoder().encode(patch).byteLength > MAX_DIFF_PATCH_BYTES) {
       throw new Error(`${label} patch exceeds the mission byte limit.`);
     }
-    const files = diff.files.map(normalizeDiffFile).sort((left, right) =>
-      left.path.localeCompare(right.path));
+    const files = diff.files.map(normalizeDiffFile).sort(comparePath);
     const changedPaths = files.map((file) => file.path);
     if (
       new Set(changedPaths).size !== changedPaths.length ||
@@ -1457,7 +1456,7 @@ async function createDiffReceipt(
   if (input.files.length > MAX_CHANGED_FILES) {
     throw new Error(`Diff exceeds the ${MAX_CHANGED_FILES}-file mission limit.`);
   }
-  const files = input.files.map(normalizeDiffFile).sort((left, right) => left.path.localeCompare(right.path));
+  const files = input.files.map(normalizeDiffFile).sort(comparePath);
   if (new Set(files.map((file) => file.path)).size !== files.length) {
     throw new Error("Diff readback contains duplicate changed paths.");
   }
@@ -1630,7 +1629,7 @@ function normalizeExpectedArtifacts(input: ExpectedArtifactV1[]): ExpectedArtifa
   }
   return [...byPath.entries()]
     .map(([path, sha256]) => ({ path, sha256 }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+    .sort(comparePath);
 }
 
 function normalizeArtifactReadback(
@@ -1655,7 +1654,7 @@ function normalizeArtifactReadback(
       bytes: artifact.bytes,
     };
   });
-  normalized.sort((left, right) => left.path.localeCompare(right.path));
+  normalized.sort(comparePath);
   if (new Set(normalized.map((artifact) => artifact.path)).size !== normalized.length) {
     throw new Error("Artifact readback contains duplicate paths.");
   }
@@ -1707,7 +1706,7 @@ function collectExpectedArtifacts(
   return {
     artifacts: [...explicit.entries()]
       .map(([path, sha256]) => ({ path, sha256 }))
-      .sort((left, right) => left.path.localeCompare(right.path)),
+      .sort(comparePath),
     mismatch: null,
   };
 }
@@ -2060,7 +2059,18 @@ function assertExactVerifiedCommitReceipt(receipt: VerifiedLocalCommitReceiptV1)
 
 function sameStrings(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false;
-  return [...left].sort().every((value, index) => value === [...right].sort()[index]);
+  const expected = [...right].sort(compareCanonicalText);
+  return [...left]
+    .sort(compareCanonicalText)
+    .every((value, index) => value === expected[index]);
+}
+
+function comparePath<T extends { path: string }>(left: T, right: T): number {
+  return compareCanonicalText(left.path, right.path);
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function cloneJson<T>(value: T): T {

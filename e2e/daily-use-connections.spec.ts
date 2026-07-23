@@ -122,12 +122,87 @@ test.describe("daily-use connections and setup", () => {
       }, NATIVE_CORE_PLUGIN_ID);
       const settings = harness.page.locator(".agentic-researcher-settings");
       await expect(settings.locator("#agentic-settings-essentials")).toBeVisible();
+      // Prefer labeled controls — cloud preset dropdowns shifted nth() indexes.
+      const essentials = settings.locator("#agentic-settings-essentials");
       await expect(
-        settings.locator(".agentic-settings-basic select").nth(1),
+        essentials
+          .locator(".setting-item")
+          .filter({ hasText: "Working mode" })
+          .locator("select"),
       ).toHaveValue("custom");
       await expect(
-        settings.locator(".agentic-settings-basic select").nth(2),
+        essentials
+          .locator(".setting-item")
+          .filter({ hasText: "Optional durable research notes" })
+          .locator("select"),
       ).toHaveValue("off");
+    } finally {
+      if (harness) {
+        await closeObsidianSettings(harness.page).catch(() => undefined);
+      }
+      await harness?.close();
+    }
+  });
+
+  test("Ollama Cloud endpoint preset applies /api base URL and stays selected", async () => {
+    let harness: NativeObsidianHarness | null = null;
+    try {
+      harness = await startNativeObsidianHarness({
+        label: "daily-use-ollama-cloud-preset",
+        corePluginDataOverrides: {
+          modelProvider: "ollama",
+          ollamaBaseUrl: "http://127.0.0.1:11434",
+          model: "qwen3.5:cloud",
+          modelConnectionVerifiedAt: undefined,
+          modelConnectionVerifiedProvider: undefined,
+          modelConnectionVerifiedModel: undefined,
+          modelConnectionVerifiedBaseUrl: undefined,
+        },
+        setup: setupDailyUsePage,
+      });
+      const page = harness.page;
+      await page.evaluate(async (pluginId) => {
+        const app = (window as typeof window & { app?: any }).app;
+        app.setting.open();
+        await app.setting.openTabById(pluginId);
+      }, NATIVE_CORE_PLUGIN_ID);
+
+      const settings = page.locator(".agentic-researcher-settings");
+      const essentials = settings.locator("#agentic-settings-essentials");
+      await expect(essentials).toBeVisible();
+
+      const presetSelect = essentials
+        .locator(".setting-item")
+        .filter({ hasText: "Endpoint preset" })
+        .locator("select");
+      await expect(presetSelect).toHaveValue("");
+      await presetSelect.selectOption({ label: "Ollama Cloud" });
+
+      await expect(presetSelect).toHaveValue("ollama_cloud", { timeout: 10_000 });
+      await expect
+        .poll(async () =>
+          page.evaluate((pluginId) => {
+            const plugin = (window as typeof window & { app?: any }).app?.plugins
+              ?.plugins?.[pluginId];
+            return {
+              baseUrl: plugin?.settings?.ollamaBaseUrl ?? null,
+              model: plugin?.settings?.model ?? null,
+            };
+          }, NATIVE_CORE_PLUGIN_ID),
+        )
+        .toEqual({
+          baseUrl: "https://ollama.com/api",
+          model: "qwen3.5:cloud",
+        });
+
+      const customEndpoint = essentials.locator("details.agentic-settings-disclosure");
+      await customEndpoint.locator("summary").click();
+      await expect(
+        customEndpoint
+          .locator(".setting-item")
+          .filter({ hasText: "Base URL" })
+          .locator("input"),
+      ).toHaveValue("https://ollama.com/api");
     } finally {
       if (harness) {
         await closeObsidianSettings(harness.page).catch(() => undefined);
@@ -212,10 +287,16 @@ test.describe("daily-use connections and setup", () => {
       );
       await expect(modelHelp).toContainText("no model is selected automatically");
       await expect(
-        modelHelp.getByRole("link", { name: "Ollama Cloud + Thinking catalog" }),
-      ).toHaveAttribute("href", "https://ollama.com/search?c=cloud&c=thinking");
+        modelHelp.getByRole("link", {
+          name: "Ollama Tools + Cloud + Thinking catalog",
+        }),
+      ).toHaveAttribute(
+        "href",
+        "https://ollama.com/search?c=tools&c=cloud&c=thinking",
+      );
 
       // Model tag must stay editable on cloud (no snap-back to the default tag).
+      // Prefer a tools+cloud+thinking tag from the Ollama catalog.
       await modelInput.fill("qwen3.5:cloud");
       await expect(modelInput).toHaveValue("qwen3.5:cloud");
       await expect
@@ -427,7 +508,7 @@ test.describe("daily-use connections and setup", () => {
     }
   });
 
-  test("end-to-end starter mission and compound readiness gate surface before a long run", async () => {
+  test("compound readiness gate surfaces for agentic end-to-end prompts before a long run", async () => {
     let harness: NativeObsidianHarness | null = null;
     try {
       harness = await startNativeObsidianHarness({
@@ -444,15 +525,15 @@ test.describe("daily-use connections and setup", () => {
         setup: setupDailyUsePage,
       });
       const page = harness.page;
-      const starter = page.getByTestId("end-to-end-starter-mission");
-      await expect(starter).toBeVisible({ timeout: 15_000 });
-      await expect(
-        page.getByTestId("end-to-end-starter-mission-button"),
-      ).toContainText("End-to-end checkers workflow");
+      await expect(page.getByTestId("end-to-end-starter-mission")).toHaveCount(0);
       await expect(page.getByTestId("live-workstream")).toBeVisible();
 
-      await page.getByTestId("end-to-end-starter-mission-button").click();
       const prompt = page.locator("textarea.agentic-researcher-prompt");
+      await prompt.fill(
+        "I want to create the game of checkers in Python end to end following the full workflow: " +
+          "research into Obsidian, turn findings into Linear tasks, implement and test the code, " +
+          "publish a verified draft pull request to GitHub, and document results back into Obsidian.",
+      );
       await expect(prompt).toHaveValue(/end to end/i);
 
       await page.evaluate((pluginId) => {
@@ -539,8 +620,9 @@ test.describe("daily-use connections and setup", () => {
       await expect(attention).toBeVisible({ timeout: 10_000 });
       await expect(attention).toContainText("End-to-end workflow setup required");
       await expect(attention).toContainText("Connect Linear");
+      await expect(attention).toContainText("Set up & resume");
       await expect(
-        page.getByTestId("chat-compound-readiness-open-settings"),
+        page.getByTestId("chat-mission-readiness-setup-resume"),
       ).toBeVisible();
       await expect(page.getByTestId("lifecycle-stage-strip")).toBeHidden();
     } finally {

@@ -74,6 +74,43 @@ test("MissionGraphV3 projects status, progress, next action, evidence, and recei
   assert.deepEqual(orchestrator.nodes.research.evidenceIds, ["evidence-web"]);
 });
 
+test("optional cancellation does not reduce required progress or block completion", async () => {
+  const envelope = await createEnvelope();
+  const completeGraph = await migrateLegacyMissionPlanToMissionGraphV3(
+    completePlan(),
+    migrationOptions(envelope),
+  );
+  const graph = await parseMissionGraphV3({
+    ...completeGraph,
+    nodes: {
+      ...completeGraph.nodes,
+      "optional-enrichment": {
+        ...completeGraph.nodes.research,
+        id: "optional-enrichment",
+        objective: "Optional enrichment",
+        dependencyIds: [],
+        status: "cancelled",
+        evidence: [],
+        receipts: [],
+        verification: null,
+      },
+    },
+  });
+
+  const legacy = projectMissionGraphToLegacyPlan(graph);
+  assert.equal(legacy.status, "complete");
+  assert.equal(legacy.progress.score, 1);
+  assert.equal(legacy.progress.requiredCompleted, 2);
+  assert.equal(legacy.progress.requiredTotal, 2);
+  assert.equal(legacy.progress.optionalCompleted, 0);
+  assert.equal(legacy.progress.optionalSkipped, 1);
+  assert.equal(legacy.activeTaskId, null);
+
+  const orchestrator = projectMissionGraphToOrchestratorSnapshot(graph);
+  assert.equal(orchestrator.status, "complete");
+  assert.equal(orchestrator.participants.lead.currentNodeId, null);
+});
+
 test("host-added read retry nodes do not become semantic citation obligations", async () => {
   const envelope = await createEnvelope();
   const migrated = await migrateLegacyMissionPlanToMissionGraphV3(

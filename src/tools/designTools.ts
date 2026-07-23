@@ -27,6 +27,7 @@ import {
 import {
   assertValidJsonCanvas,
   stringifyJsonCanvas,
+  validateJsonCanvas,
   type JsonCanvas,
 } from "../design/jsonCanvas";
 import {
@@ -102,20 +103,6 @@ export const createDesignCanvasTool: AgentTool = {
       title: {
         type: "string",
         description: "Optional title used when generating layout nodes.",
-      },
-      canvas: {
-        type: "object",
-        description: "Optional complete JSON Canvas object with nodes and edges arrays.",
-      },
-      nodes: {
-        type: "array",
-        items: { type: "object" },
-        description: "Optional JSON Canvas nodes.",
-      },
-      edges: {
-        type: "array",
-        items: { type: "object" },
-        description: "Optional JSON Canvas edges.",
       },
       items: {
         type: "array",
@@ -209,7 +196,24 @@ export const createDesignCanvasTool: AgentTool = {
       connections: {
         type: "array",
         items: { type: "object" },
-        description: "Optional explicit edges with from/to ids, labels, colors, and sides.",
+        description: "Optional explicit high-level edges with from/to item ids, labels, colors, and sides.",
+      },
+      canvas: {
+        type: "object",
+        description:
+          "Advanced backward-compatible escape hatch: a complete raw JSON Canvas object with nodes and edges. Prefer items, connections, direction, and diagramType.",
+      },
+      nodes: {
+        type: "array",
+        items: { type: "object" },
+        description:
+          "Advanced backward-compatible raw JSON Canvas nodes. Prefer high-level items unless preserving an existing Canvas structure.",
+      },
+      edges: {
+        type: "array",
+        items: { type: "object" },
+        description:
+          "Advanced backward-compatible raw JSON Canvas edges. Prefer high-level connections unless preserving an existing Canvas structure.",
       },
       createFolders: {
         type: "boolean",
@@ -232,12 +236,20 @@ export const createDesignCanvasTool: AgentTool = {
     // This keeps invalid arguments provably retryable instead of leaving a
     // failed mutation intent that continuation must conservatively reconcile.
     const canvas = getCanvasFromArgs(args);
-    const diagramType = getDiagramType(args.diagramType);
+    const diagramType = getCanvasDiagramType(args.diagramType);
     const canvasSummary = summarizeCanvas(canvas, diagramType);
-    const content = stringifyJsonCanvas(canvas);
+    let content: string;
+    try {
+      content = stringifyJsonCanvas(canvas);
+    } catch (error) {
+      throw invalidCanvasArguments([getErrorMessage(error)]);
+    }
     const preflight = verifyCanvasArtifact(content);
     if (!preflight.ok) {
-      throw new Error(`Canvas preflight verification failed: ${preflight.errors.join(" ")}`);
+      throw invalidCanvasArguments(
+        preflight.errors,
+        "Canvas preflight validation failed.",
+      );
     }
 
     assertPathDoesNotExist(context, path);
@@ -1285,28 +1297,87 @@ function normalizeArtifactPath(path: string, extension: ".canvas" | ".svg"): str
 }
 
 function getCanvasFromArgs(args: Record<string, unknown>): JsonCanvas {
-  if (args.canvas !== undefined) {
-    assertValidJsonCanvas(args.canvas);
-    return args.canvas;
-  }
+  try {
+    if (args.canvas !== undefined) {
+      return validateCanvasArgument(args.canvas);
+    }
 
-  if (args.nodes !== undefined || args.edges !== undefined) {
-    const canvas = {
-      nodes: Array.isArray(args.nodes) ? args.nodes : [],
-      edges: Array.isArray(args.edges) ? args.edges : [],
-    };
-    assertValidJsonCanvas(canvas);
-    return canvas;
-  }
+    if (args.nodes !== undefined || args.edges !== undefined) {
+      return validateCanvasArgument({
+        nodes: Array.isArray(args.nodes) ? args.nodes : [],
+        edges: Array.isArray(args.edges) ? args.edges : [],
+      });
+    }
 
-  return buildLayoutCanvas({
-    title: getOptionalString(args, "title"),
-    items: getLayoutItems(args),
-    direction: getDirection(args.direction),
-    connect: getConnect(args.connect),
-    diagramType: getDiagramType(args.diagramType),
-    connections: getConnections(args.connections),
-  });
+    const canvas = buildLayoutCanvas({
+      title: getOptionalString(args, "title"),
+      items: getLayoutItems(args),
+      direction: getDirection(args.direction),
+      connect: getConnect(args.connect),
+      diagramType: getDiagramType(args.diagramType),
+      connections: getConnections(args.connections),
+    });
+    return validateCanvasArgument(canvas);
+  } catch (error) {
+    if (error instanceof ToolExecutionError && error.code === "invalid_arguments") {
+      const violations = Array.isArray(error.details?.violations)
+        ? error.details.violations.map(String)
+        : [error.message];
+      throw invalidCanvasArguments(violations);
+    }
+    throw invalidCanvasArguments([getErrorMessage(error)]);
+  }
+}
+
+/**
+ * Canvas creation parses all model-owned structure before folder creation or
+ * vault writes. Keep the machine-readable violations on the retryable,
+ * definitely-not-applied path so the run/WAL can safely accept a corrected
+ * tool call without reconciliation.
+ */
+function validateCanvasArgument(value: unknown): JsonCanvas {
+  const validation = validateJsonCanvas(value);
+  if (!validation.ok) {
+    throw invalidCanvasArguments(validation.errors);
+  }
+  return value as JsonCanvas;
+}
+
+function invalidCanvasArguments(
+  violations: readonly unknown[],
+  message = "Canvas arguments are invalid.",
+): ToolExecutionError {
+  const normalized = violations
+    .map((violation) => String(violation).trim())
+    .filter(Boolean)
+    .slice(0, 32);
+  return new ToolExecutionError(
+    "invalid_arguments",
+    normalized.length > 0 ? `${message} ${normalized.join(" ")}` : message,
+    {
+      mutationState: "not_applied",
+      details: { violations: normalized },
+    },
+  );
+}
+
+function getCanvasDiagramType(value: unknown): CanvasLayoutDiagramType {
+  try {
+    return getDiagramType(value);
+  } catch (error) {
+    if (error instanceof ToolExecutionError && error.code === "invalid_arguments") {
+      throw invalidCanvasArguments(
+        Array.isArray(error.details?.violations)
+          ? error.details.violations
+          : [error.message],
+      );
+    }
+    throw invalidCanvasArguments([getErrorMessage(error)]);
+  }
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function getLayoutItems(args: Record<string, unknown>): CanvasLayoutItem[] {

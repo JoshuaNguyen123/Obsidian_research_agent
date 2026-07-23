@@ -142,6 +142,57 @@ test("high-risk reversible mutations still require exact approval under write au
   assert.equal(decision.payloadFingerprint, action.payloadFingerprint);
 });
 
+test("write autonomy cannot authorize external provider mutations", async () => {
+  for (const system of ["github", "linear", "browser"] as const) {
+    const descriptor: ToolDescriptor = {
+      ...descriptorFixture(),
+      name: `${system}_create_external_resource`,
+      capability: { system, resourceType: "external_resource", action: "create" },
+      approval: {
+        allowPromptGrant: true,
+        allowPersistentGrant: false,
+        fallback: "exact",
+      },
+    };
+    const action = await actionForDescriptor(descriptor);
+    const decision = evaluateActionPolicy({
+      toolName: descriptor.name,
+      descriptor,
+      preparedAction: action,
+      principal: "single_agent",
+      scopeAllowed: true,
+      writeAutonomy: true,
+      isDesktop: true,
+      now: new Date("2026-07-11T12:01:00.000Z"),
+    });
+
+    assert.equal(decision.action, "require_approval", system);
+    assert.equal(decision.requiredConfirmations, 1, system);
+  }
+});
+
+test("write autonomy still permits a scoped local reversible mutation", async () => {
+  const descriptor: ToolDescriptor = {
+    ...descriptorFixture(),
+    name: "vault_create_note",
+    capability: { system: "vault", resourceType: "markdown", action: "create" },
+  };
+  const action = await actionForDescriptor(descriptor);
+  const decision = evaluateActionPolicy({
+    toolName: descriptor.name,
+    descriptor,
+    preparedAction: action,
+    principal: "single_agent",
+    scopeAllowed: true,
+    writeAutonomy: true,
+    isDesktop: true,
+    now: new Date("2026-07-11T12:01:00.000Z"),
+  });
+
+  assert.equal(decision.action, "allow");
+  assert.ok(decision.tags.includes("write_autonomy"));
+});
+
 test("in-scope descriptor reads do not require a mutation grant", () => {
   const descriptor: ToolDescriptor = {
     ...descriptorFixture(),
@@ -201,6 +252,34 @@ async function actionFixture(
       outboundBytes: 6,
     },
     ...(requiredConfirmations ? { requiredConfirmations } : {}),
+    preparedAt: "2026-07-11T12:00:00.000Z",
+    expiresAt: "2026-07-11T12:05:00.000Z",
+  });
+}
+
+async function actionForDescriptor(
+  descriptor: ToolDescriptor,
+): Promise<PreparedAction> {
+  return withPreparedActionFingerprint({
+    version: 1,
+    id: `action-${descriptor.capability.system}`,
+    runId: "run-1",
+    toolCallId: `call-${descriptor.capability.system}`,
+    toolName: descriptor.name,
+    target: {
+      system: descriptor.capability.system,
+      resourceType: descriptor.capability.resourceType,
+      id: `new:${descriptor.capability.system}`,
+    },
+    relatedResources: [],
+    normalizedArgs: { title: "Resource" },
+    preview: {
+      summary: "Create resource",
+      destination: descriptor.capability.system,
+      outboundPayload: { title: "Resource" },
+      warnings: [],
+      outboundBytes: 8,
+    },
     preparedAt: "2026-07-11T12:00:00.000Z",
     expiresAt: "2026-07-11T12:05:00.000Z",
   });

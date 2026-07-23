@@ -6,6 +6,7 @@ import {
   applyCloudProviderPreset,
   CLOUD_PROVIDER_PRESETS,
   getCloudProviderPreset,
+  matchCloudProviderPreset,
   type CloudProviderPresetId,
 } from "./model/cloudProviderPresets";
 import { MAX_AGENT_STEPS, MAX_CODE_RUNS_PER_MISSION } from "./tools/constants";
@@ -56,6 +57,10 @@ export interface AgentSettings {
   modelConnectionVerifiedProvider?: ModelProvider;
   modelConnectionVerifiedModel?: string;
   modelConnectionVerifiedBaseUrl?: string;
+  /** True only after Ollama Cloud /api/show proved Tools + Thinking. */
+  modelConnectionVerifiedAgenticCapabilities?: boolean;
+  /** Hidden disposable-vault capability for Playwright connection attestations. */
+  e2eHarnessAttestationEnabled?: boolean;
   /** Canonical normal-user behavior profile. Legacy autonomy/output fields are derived. */
   workingMode?: WorkingModeSetting;
   /** Canonical memory consent profile. Legacy memory booleans are derived. */
@@ -90,6 +95,11 @@ export interface AgentSettings {
   overnightRunHours?: number;
   overnightMaxSegments?: number;
   autoResumeOvernightRuns?: boolean;
+  /**
+   * When true, Chat shows an unfinished-run banner on panel open.
+   * Default off — Continue Latest Run remains available without nagging on every Obsidian launch.
+   */
+  showUnfinishedRunBannerOnOpen?: boolean;
   keepAwakeDuringOvernightRuns?: boolean;
   /** Opt-in Lead + Worker orchestration and Orchestrator tab. */
   orchestratorPreviewEnabled?: boolean;
@@ -147,6 +157,8 @@ export interface AgentSettings {
   linearDefaultTeamId?: string;
   linearQueueEnabled?: boolean;
   linearQueueProjectId?: string;
+  /** Unstarted state that explicitly authorizes queue pickup. */
+  linearReadyStateId?: string;
   linearStartedStateId?: string;
   linearCompletedStateId?: string;
   linearBlockedStateId?: string;
@@ -170,7 +182,8 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   ollamaBaseUrl: "https://ollama.com/api",
   openAiCompatibleApiKey: "",
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
-  model: "gpt-oss:120b-cloud",
+  model: "glm-5.2",
+  e2eHarnessAttestationEnabled: false,
   utilityModel: "",
   utilityModelProvider: "ollama",
   modelRouterEnabled: true,
@@ -187,6 +200,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   overnightRunHours: 10,
   overnightMaxSegments: 24,
   autoResumeOvernightRuns: true,
+  showUnfinishedRunBannerOnOpen: false,
   keepAwakeDuringOvernightRuns: false,
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,
@@ -234,6 +248,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   linearDefaultTeamId: "",
   linearQueueEnabled: false,
   linearQueueProjectId: "",
+  linearReadyStateId: "",
   linearStartedStateId: "",
   linearCompletedStateId: "",
   linearBlockedStateId: "",
@@ -404,15 +419,15 @@ export class AgentSettingTab extends PluginSettingTab {
         text: "Catalog and account availability are authoritative; no model is selected automatically. Browse the ",
       });
       modelSetting.descEl.createEl("a", {
-        text: "Ollama Cloud + Thinking catalog",
+        text: "Ollama Tools + Cloud + Thinking catalog",
         attr: {
-          href: "https://ollama.com/search?c=cloud&c=thinking",
+          href: "https://ollama.com/search?c=tools&c=cloud&c=thinking",
           rel: "noopener noreferrer",
           target: "_blank",
         },
       });
       modelSetting.descEl.createSpan({
-        text: ", paste the exact model tag, then Test connection.",
+        text: ". The current pipeline recommendation is glm-5.2; paste another exact tag or apply the recommendation, then Test connection.",
       });
     } else {
       modelSetting.setDesc("Exact model name, then Test connection.");
@@ -427,7 +442,7 @@ export class AgentSettingTab extends PluginSettingTab {
       // cloud model on every keystroke — that blocks changing models in Obsidian.
       return text
         .setPlaceholder(
-          provider === "ollama" ? "e.g. qwen3.5:cloud" : "e.g. gpt-4o-mini",
+          provider === "ollama" ? "e.g. glm-5.2" : "e.g. gpt-4o-mini",
         )
         .setValue(this.plugin.settings.model)
         .onChange(async (value) => {
@@ -440,6 +455,21 @@ export class AgentSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
     });
+    if (provider === "ollama") {
+      modelSetting.addButton((button) =>
+        button
+          .setButtonText("Use glm-5.2")
+          .setTooltip("Apply the current Tools + Thinking + Cloud lead model")
+          .onClick(async () => {
+            this.plugin.settings.model = "glm-5.2";
+            this.plugin.settings.ollamaBaseUrl = "https://ollama.com/api";
+            this.plugin.invalidateModelConnectionStatus();
+            await this.plugin.saveSettings();
+            new Notice("Ollama Cloud lead model glm-5.2 applied. Add your API key, then Test connection.");
+            this.display();
+          }),
+      );
+    }
 
     this.renderCloudProviderPresets(basicEl, provider);
 
@@ -560,7 +590,8 @@ export class AgentSettingTab extends PluginSettingTab {
       for (const preset of presets) {
         dropdown.addOption(preset.id, preset.label);
       }
-      dropdown.setValue("");
+      const matched = matchCloudProviderPreset(this.plugin.settings);
+      dropdown.setValue(matched?.id ?? "");
       dropdown.onChange(async (value) => {
         if (!value) {
           return;
@@ -574,7 +605,7 @@ export class AgentSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
         new Notice(
           preset.provider === "ollama"
-            ? `${preset.label} endpoint applied. Set your model tag from the catalog, add your API key, then Test connection.`
+            ? `${preset.label} endpoint applied. The current model tag is preserved; use glm-5.2 above for the recommended lead model, then Test connection.`
             : `${preset.label} preset applied. Add your API key, then Test connection.`,
         );
         this.display();
@@ -899,10 +930,12 @@ export class AgentSettingTab extends PluginSettingTab {
 
     new Setting(section)
       .setName("Context window")
-      .setDesc("Optional num_ctx value. Leave blank for provider default.")
+      .setDesc(
+        "Optional num_ctx sent to the provider. Leave blank for the provider default on the API request; the plugin still budgets compaction as 48k tokens unless you set a value (including 100k+).",
+      )
       .addText((text) =>
         text
-          .setPlaceholder("default")
+          .setPlaceholder("default (budget 48k)")
           .setValue(formatOptionalNumber(this.plugin.settings.numCtx))
           .onChange(async (value) => {
             this.plugin.settings.numCtx = parseOptionalInteger(value, {
@@ -1251,6 +1284,20 @@ export class AgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.autoResumeOvernightRuns !== false)
           .onChange(async (value) => {
             this.plugin.settings.autoResumeOvernightRuns = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Show unfinished-run banner on open")
+      .setDesc(
+        "Off by default. When on, Chat shows an unfinished-run reminder when you open the panel. Continue Latest Run stays available either way.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.showUnfinishedRunBannerOnOpen === true)
+          .onChange(async (value) => {
+            this.plugin.settings.showUnfinishedRunBannerOnOpen = value;
             await this.plugin.saveSettings();
           }),
       );
@@ -1993,6 +2040,13 @@ export class AgentSettingTab extends PluginSettingTab {
 
       for (const state of [
         {
+          name: "Ready workflow state",
+          key: "linearReadyStateId" as const,
+          description:
+            "Only issues deliberately moved into this state can enter automatic execution.",
+          allowedTypes: ["unstarted"],
+        },
+        {
           name: "Started workflow state",
           key: "linearStartedStateId" as const,
           description: "State applied only after a claim comment is verified.",
@@ -2187,13 +2241,19 @@ export class AgentSettingTab extends PluginSettingTab {
     }
 
     let pendingGitHubPat = "";
+    let githubPatInput: HTMLInputElement | null = null;
     const githubPatSetting = new Setting(section)
       .setName("GitHub fine-grained personal access token")
       .setDesc(
-        "Fallback for an account or repository where OAuth device authorization is unavailable. The field is never persisted.",
+        githubStatus.connected && githubStatus.credentialKind === "fine_grained_pat"
+          ? `Saved for ${githubStatus.account?.login ?? "GitHub"}. Paste a new github_pat_… token only to replace it.`
+          : "Must start with github_pat_ (not gho_/ghp_ from gh auth). The field is never persisted in settings.",
       );
     githubPatSetting.addText((text) => {
       text.inputEl.type = "password";
+      text.inputEl.autocomplete = "off";
+      text.inputEl.spellcheck = false;
+      githubPatInput = text.inputEl;
       text
         .setPlaceholder(githubStatus.connected ? "Credential configured" : "github_pat_...")
         .setValue("")
@@ -2205,15 +2265,40 @@ export class AgentSettingTab extends PluginSettingTab {
       button
         .setButtonText("Verify and save")
         .onClick(async () => {
+          const candidate = pendingGitHubPat.trim();
+          if (!candidate) {
+            const message = "Paste a fine-grained token that starts with github_pat_ first.";
+            githubPatSetting.setDesc(message);
+            new Notice(message);
+            return;
+          }
+          if (!/^github_pat_[A-Za-z0-9_-]{20,500}$/u.test(candidate)) {
+            const message =
+              candidate.startsWith("gho_") || candidate.startsWith("ghp_")
+                ? "That looks like a classic/OAuth token. Create a fine-grained PAT (github_pat_…) on GitHub and paste that instead."
+                : "Token must match github_pat_… with no spaces or line breaks.";
+            githubPatSetting.setDesc(message);
+            new Notice(message);
+            return;
+          }
           button.setDisabled(true).setButtonText("Verifying...");
-          const result = await this.plugin.setGitHubFineGrainedPat(
-            pendingGitHubPat,
-          );
-          pendingGitHubPat = "";
-          githubPatSetting.setDesc(result.message);
-          if (result.ok) {
-            this.refreshConnectionStatus();
-          } else {
+          try {
+            const result = await this.plugin.setGitHubFineGrainedPat(candidate);
+            pendingGitHubPat = "";
+            if (githubPatInput) githubPatInput.value = "";
+            githubPatSetting.setDesc(result.message);
+            new Notice(result.message);
+            if (result.ok) {
+              this.refreshConnectionStatus();
+            }
+          } catch (error) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : "GitHub fine-grained token verification failed.";
+            githubPatSetting.setDesc(message);
+            new Notice(message);
+          } finally {
             button.setDisabled(false).setButtonText("Verify and save");
           }
         }),
@@ -2651,11 +2736,13 @@ function capabilitySetupTargetId(target: CapabilitySetupTarget): string {
   if (
     target === "browser_web" ||
     target === "linear" ||
-    target === "github"
+    target === "github" ||
+    // Companion service URL / background continuation live under Connections.
+    target === "background"
   ) {
     return "agentic-settings-connections";
   }
-  // code + background land on Diagnostics & health (Companion/Code metadata).
+  // code lands on Diagnostics & health (bundled Code metadata).
   return "agentic-settings-system-health";
 }
 

@@ -20,6 +20,9 @@ export interface DailyUseRunMetricsV1 {
   acceptanceStatus: "pass" | "needs_more_work";
   observedAt: string;
   fingerprint: string;
+  /** Optional autonomy rollup (Soft path attestation). */
+  autonomySoftOnly?: boolean;
+  autonomyToolsOfferedMax?: number;
 }
 
 export function createDailyUseRunMetricsV1(input: {

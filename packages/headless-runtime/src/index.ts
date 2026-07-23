@@ -9,6 +9,7 @@ export * from "./missionGraphV3";
 export * from "./missionGraphProjection";
 export * from "./missionScheduler";
 export * from "./backgroundContinuation";
+export * from "./companionChatResumeSummaryV1";
 export * from "./companionCredentialSession";
 export * from "./companionCoordinatorClient";
 export * from "./companionWorkerCoordinator";

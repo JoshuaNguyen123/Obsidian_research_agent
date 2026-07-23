@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { decideAutoContinuation } from "../src/agent/autoContinuation";
+import {
+  decideAutoContinuation,
+  resolvePendingToolsForAutoContinuation,
+} from "../src/agent/autoContinuation";
 import { computeProofDebt } from "../src/agent/proofDebt";
 import { reflectMissionCompletion } from "../src/agent/completionReflection";
 
@@ -12,6 +15,60 @@ test("auto continuation recommends only an unfinished productive budget outcome"
         status: "needs_more_work",
         reasons: ["required_evidence_or_tool_missing"],
       },
+    }),
+    { recommended: true, reason: "budget_exhausted" },
+  );
+});
+
+test("set-loose compound budget continues past stale narrative blockerCategory", () => {
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance: {
+        status: "needs_more_work",
+        reasons: ["set_loose_delivery_unpaid=github_private_repo_or_pr_url"],
+        missing: ["set_loose_delivery:github_private_repo_or_pr_url"],
+      },
+      blockerCategory: "safety_policy",
+      blockerCount: 1,
+      compoundLifecycleDetected: true,
+      completionDriven: true,
+      reflection: {
+        done: false,
+        confidence: 0,
+        reason: "note_reflection_unpaid",
+        remainingActions: ["append_to_current_file"],
+      },
+    }),
+    { recommended: true, reason: "budget_exhausted" },
+  );
+});
+
+test("set-loose unpaid delivery continues past failed_tools=workspace_exists noise", () => {
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance: {
+        status: "needs_more_work",
+        reasons: ["failed_tools=code_workspace_create"],
+        missing: ["set_loose_delivery:private_github_publication"],
+      },
+      blockerCategory: "safety_policy",
+      blockerCount: 1,
+      compoundLifecycleDetected: true,
+      completionDriven: true,
+      reflection: {
+        done: false,
+        confidence: 0,
+        reason: "github_unpaid",
+        remainingActions: ["github_create_private_repository"],
+      },
+      pendingToolNames: [
+        "github_create_private_repository",
+        "publish_verified_code_to_github",
+      ],
+      autonomyProfile: "automatic",
+      hasMatchingGrant: false,
     }),
     { recommended: true, reason: "budget_exhausted" },
   );
@@ -303,5 +360,113 @@ test("completion-driven null debt stops when acceptance already passed", () => {
       maxSegments: 8,
     }),
     { recommended: false, reason: "proof_satisfied" },
+  );
+});
+
+test("resolvePendingToolsForAutoContinuation prefers Bound required writes", () => {
+  assert.deepEqual(
+    resolvePendingToolsForAutoContinuation({
+      debtPendingToolNames: ["append_to_current_file"],
+      pendingRequiredWrites: ["replace_current_file"],
+    }),
+    ["replace_current_file"],
+  );
+  assert.deepEqual(
+    resolvePendingToolsForAutoContinuation({
+      debtPendingToolNames: ["web_search"],
+      pendingRequiredWrites: ["append_to_current_file"],
+    }),
+    ["web_search"],
+  );
+  assert.deepEqual(
+    resolvePendingToolsForAutoContinuation({
+      debtPendingToolNames: ["web_fetch"],
+      pendingRequiredWrites: [],
+    }),
+    ["web_fetch"],
+  );
+});
+
+test("Bound pending tool without grant is effect_class_blocked", () => {
+  const acceptance = {
+    status: "needs_more_work" as const,
+    missing: ["tool:replace_current_file"],
+  };
+  const debt = computeProofDebt({ status: "budget", acceptance });
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance,
+      proofDebt: debt,
+      completionDriven: true,
+      reflection: {
+        done: false,
+        confidence: 0.4,
+        reason: "bound_write_pending",
+        remainingActions: ["replace_current_file"],
+      },
+      segmentsUsed: 1,
+      maxSegments: 8,
+      pendingToolNames: ["replace_current_file"],
+      autonomyProfile: "automatic",
+      hasMatchingGrant: false,
+    }),
+    { recommended: false, reason: "effect_class_blocked" },
+  );
+});
+
+test("Bound pending tool with matching grant continues under automatic", () => {
+  const acceptance = {
+    status: "needs_more_work" as const,
+    missing: ["tool:replace_current_file"],
+  };
+  const debt = computeProofDebt({ status: "budget", acceptance });
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance,
+      proofDebt: debt,
+      completionDriven: true,
+      reflection: {
+        done: false,
+        confidence: 0.4,
+        reason: "bound_write_pending",
+        remainingActions: ["replace_current_file"],
+      },
+      segmentsUsed: 1,
+      maxSegments: 8,
+      pendingToolNames: ["replace_current_file"],
+      autonomyProfile: "automatic",
+      hasMatchingGrant: true,
+    }),
+    { recommended: true, reason: "budget_exhausted" },
+  );
+});
+
+test("Soft pending tool continues without grant under automatic", () => {
+  const acceptance = {
+    status: "needs_more_work" as const,
+    missing: ["web_evidence", "fetched_sources"],
+  };
+  const debt = computeProofDebt({ status: "budget", acceptance });
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance,
+      proofDebt: debt,
+      completionDriven: true,
+      reflection: {
+        done: false,
+        confidence: 0.4,
+        reason: "soft_research_pending",
+        remainingActions: ["web_search"],
+      },
+      segmentsUsed: 1,
+      maxSegments: 8,
+      pendingToolNames: ["web_search"],
+      autonomyProfile: "automatic",
+      hasMatchingGrant: false,
+    }),
+    { recommended: true, reason: "budget_exhausted" },
   );
 });

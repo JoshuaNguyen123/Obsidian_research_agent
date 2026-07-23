@@ -228,6 +228,12 @@ test("current-note edit/organize prefers streamed replace; vault-wide does not",
   assert.equal(prefersStreamedReplaceForEditOrganize("Organize my vault"), false);
   assert.equal(prefersStreamedReplaceForEditOrganize("Edit the essay"), true);
   assert.equal(
+    prefersStreamedReplaceForEditOrganize(
+      "Edit the Goals section in this note.",
+    ),
+    false,
+  );
+  assert.equal(
     prefersStreamedReplaceForEditOrganize("Please correct the entire page."),
     true,
   );

@@ -164,7 +164,9 @@ export async function classifyMissionWithModelDetailed({
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const request = {
         messages,
-        format: MISSION_ROUTER_SCHEMA,
+        ...(client.descriptor?.endpointCategory === "ollama_cloud"
+          ? {}
+          : { format: MISSION_ROUTER_SCHEMA }),
         abortSignal: controller.signal,
         evidencePhase: attempt === 1 ? "router" : "retry",
         think: false,
@@ -335,12 +337,13 @@ export function intersectAuthoritativeIntent(
   model: RoutedMissionIntent,
   regex: RoutedMissionIntent,
 ): RoutedMissionIntent {
+  const resolvedNeedsWeb = model.needsWebEvidence || regex.needsWebEvidence;
   return {
     ...model,
     // Read authority is additive: either planner may identify grounding that
     // is useful, while the installed tool catalog and budgets remain the host
     // boundary. Execution stays intersected so model output cannot grant it.
-    needsWebEvidence: model.needsWebEvidence || regex.needsWebEvidence,
+    needsWebEvidence: resolvedNeedsWeb,
     needsVaultContext: model.needsVaultContext || regex.needsVaultContext,
     needsCodeExecution:
       model.needsCodeExecution && regex.needsCodeExecution,

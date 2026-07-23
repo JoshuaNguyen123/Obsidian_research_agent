@@ -91,6 +91,19 @@ test("generate-with-title is visible title intent but not explicit rename", () =
   );
 });
 
+test("numeric word targets do not manufacture a visible-note rename", () => {
+  const prompt =
+    "Expand the current draft into the soft band (95–105 words; target 100). Replace the note with one full essay.";
+  assert.equal(isExplicitVisibleFileRenameIntent(prompt), false);
+  assert.equal(isVisibleTitleRenameIntent(prompt), false);
+  assert.equal(
+    isExplicitVisibleFileRenameIntent(
+      "No, target Untitled and then change that to Catcher Notes.",
+    ),
+    true,
+  );
+});
+
 test("artifact title revisions do not require a visible note rename", () => {
   assert.equal(
     isExplicitVisibleFileRenameIntent(

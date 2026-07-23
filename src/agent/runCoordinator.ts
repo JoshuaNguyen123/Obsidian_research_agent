@@ -393,7 +393,10 @@ export class RunCoordinator {
       const graph = args[0] as MissionGraphV3 | undefined;
       if (graph) {
         this.acceptActiveRunAuthority();
-        this.runId = graph.missionId || this.runId;
+        // The run config owns the durable Agent Runs ledger identity. A graph
+        // may use a canonicalized mission id, so it can seed an otherwise
+        // unknown coordinator but must never replace an established root run.
+        this.runId = this.runId ?? graph.missionId ?? null;
         this.lastMissionGraph = structuredCloneValue(graph);
       }
     } else if (key === "onModelCallEvidence") {
@@ -467,7 +470,9 @@ export class RunCoordinator {
       }
     } else if (key === "onOrchestratorEvent") {
       const snapshot = args[1] as { runId?: string } | undefined;
-      this.runId = snapshot?.runId ?? this.runId;
+      // Team/orchestrator snapshots may identify a child or canonical mission.
+      // Preserve the root ledger id already published by onRunConfig.
+      this.runId = this.runId ?? snapshot?.runId ?? null;
     } else if (key === "onReceipt") {
       const receipt = args[0] as AgentRunReceipt | undefined;
       if (

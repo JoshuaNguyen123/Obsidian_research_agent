@@ -279,7 +279,7 @@ export function formatMissionAcceptanceCorrection(
       ? "Complete the next incomplete research plan item before answering."
       : "",
     result.missing.includes("citation_url_coverage")
-      ? "Revise the final answer so fetched source URLs are visible."
+      ? "Revise the final answer so each fetched source is cited by URL or exact persisted passage identifier."
       : "",
     result.missing.includes("limitations_section") ||
     result.missing.includes("confidence_section")

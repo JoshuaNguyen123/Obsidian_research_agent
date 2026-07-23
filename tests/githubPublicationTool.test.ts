@@ -192,6 +192,98 @@ test("GitHub publication tool rejects model-supplied paths or SHAs before resolu
   assert.equal(resolved, 0);
 });
 
+test("publish_draft retries incomplete push_prepared instead of returning no-PR success", async () => {
+  const stale = {
+    ...checkpoint("push_prepared"),
+    completionProof: "draft_pr" as const,
+    pullRequest: null,
+    remoteSha: null,
+  };
+  let published = 0;
+  const tool = createGitHubPublicationTool({
+    async resolveHandoff() {
+      return verifiedHandoff();
+    },
+    async resolveBinding() {
+      return { ...bindingResolution(), completionProof: "draft_pr" as const };
+    },
+    async getCheckpoint() {
+      return stale;
+    },
+    createWorkflow() {
+      return {
+        async publishDraft() {
+          published += 1;
+          return {
+            ...checkpoint("draft_pr_verified"),
+            completionProof: "draft_pr" as const,
+          };
+        },
+      } as never;
+    },
+    async persistExternalReceipt() {},
+  });
+
+  const result = await tool.executeResult!(
+    {
+      action: "publish_draft",
+      profileKey: "fixture",
+      title: "Retry after auth-failed push",
+      body: "Must not return stale push_prepared.",
+    },
+    context(),
+  );
+  assert.equal(published, 1);
+  assert.equal(result.ok, true);
+  assert.equal(
+    (result.output as GitHubPublicationCheckpointV1).status,
+    "draft_pr_verified",
+  );
+});
+
+test("publish_draft fails closed when Soft draft_pr proof has no pull request URL", async () => {
+  const tool = createGitHubPublicationTool({
+    async resolveHandoff() {
+      return verifiedHandoff();
+    },
+    async resolveBinding() {
+      return { ...bindingResolution(), completionProof: "draft_pr" as const };
+    },
+    async getCheckpoint() {
+      return null;
+    },
+    createWorkflow() {
+      return {
+        async publishDraft() {
+          return {
+            ...checkpoint("push_prepared"),
+            completionProof: "draft_pr" as const,
+            pullRequest: null,
+            remoteSha: null,
+          };
+        },
+      } as never;
+    },
+    async persistExternalReceipt() {
+      assert.fail("must not persist external receipt without a draft PR URL");
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      tool.executeResult!(
+        {
+          action: "publish_draft",
+          profileKey: "fixture",
+          title: "No false success",
+          body: "push_prepared without PR must error.",
+        },
+        context(),
+      ),
+    /draft pull request URL|Git push credentials/i,
+  );
+});
+
 test("publish_draft resumes draft-proof finalization from durable draft_pr_verified checkpoint", async () => {
   const durable = {
     ...checkpoint("draft_pr_verified"),

@@ -142,6 +142,7 @@ export function createObservableModelClient({
   ): Promise<ModelChatResponse> => {
     const callStartedAt = now();
     const callId = `model-call-${++sequence}`;
+    const requestModel = request.model?.trim() || descriptor.model;
     const attempt = (requestAttempts.get(request) ?? 0) + 1;
     requestAttempts.set(request, attempt);
     const phase = attempt > 1
@@ -158,6 +159,7 @@ export function createObservableModelClient({
         callId,
         phase,
         descriptor,
+        model: requestModel,
         durationMs: 0,
         outcome: "budget_exhausted",
         attempt,
@@ -189,6 +191,7 @@ export function createObservableModelClient({
           callId,
           phase,
           descriptor,
+          model: requestModel,
           durationMs: Math.max(0, now() - callStartedAt),
           outcome: "success",
           attempt,
@@ -205,6 +208,7 @@ export function createObservableModelClient({
           callId,
           phase,
           descriptor,
+          model: requestModel,
           durationMs: Math.max(0, now() - callStartedAt),
           outcome:
             error instanceof ModelClientError &&
@@ -240,6 +244,7 @@ function buildEvidence({
   callId,
   phase,
   descriptor,
+  model,
   durationMs,
   outcome,
   responseChars = 0,
@@ -253,6 +258,7 @@ function buildEvidence({
   callId: string;
   phase: ModelCallPhase;
   descriptor: ModelClientDescriptor;
+  model: string;
   durationMs: number;
   outcome: ModelCallEvidenceV1["outcome"];
   responseChars?: number;
@@ -268,7 +274,7 @@ function buildEvidence({
     callId,
     phase,
     provider: descriptor.provider,
-    model: descriptor.model,
+    model,
     endpointCategory: descriptor.endpointCategory,
     transportKind: descriptor.transportKind,
     attempt,

@@ -142,6 +142,35 @@ test("accepted research append and backlink reject stale hashes before changing 
   assert.equal(vault.files.get("Research/Existing.md"), before);
 });
 
+test("accepted research append retry is marker-bound and does not duplicate the initiating note", async () => {
+  const path = "Projects/Checkers idea.md";
+  const initial = "# Checkers idea\n\nCreate a playable checkers application.\n";
+  const vault = new ResearchVault({ [path]: initial });
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const request = {
+    path,
+    mode: "append" as const,
+    baseHash: await sha256DiagramContent(initial),
+    artifactId: "accepted-research-run-initiating-note",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  };
+
+  const first = await writer.writeAcceptedPackage(request);
+  const firstBytes = vault.files.get(path) ?? "";
+  const retry = await writer.writeAcceptedPackage(request);
+
+  assert.equal(first.operation, "append");
+  assert.equal(retry.operation, "no_op");
+  assert.equal(retry.afterSha256, first.afterSha256);
+  assert.equal(vault.files.get(path), firstBytes);
+  assert.equal(
+    firstBytes.match(/agentic-accepted-research:accepted-research-run-initiating-note/gu)?.length,
+    1,
+  );
+  assert.equal(firstBytes.match(/## Problem and impact/gu)?.length, 1);
+});
+
 test("GitHub completion backlink rejects stale hashes and non-GitHub destinations", async () => {
   const vault = new ResearchVault();
   const writer = new AcceptedResearchNoteWriter(vault);
@@ -202,6 +231,76 @@ test("verified draft-PR backlink is append-once and does not require fabricated 
   });
   assert.equal(second.operation, "no_op");
   assert.equal(second.afterSha256, first.afterSha256);
+});
+
+test("project completion reflection appends substantive proof once", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const written = await writer.writeAcceptedPackage({
+    path: "Research/Checkers delivery.md",
+    mode: "create",
+    artifactId: "accepted-research-checkers",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  });
+  const reflected = await writer.appendProjectCompletionReflection({
+    artifact: written.artifact,
+    expectedNoteSha256: written.afterSha256,
+    publicationId: "publication-checkers-17",
+    issueIdentifier: "GAME-17",
+    issueUrl: "https://linear.app/acme/issue/GAME-17",
+    pullRequestNumber: 17,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/17",
+    completionProof: "draft_pr",
+    proofRevision: "b".repeat(40),
+    changedPaths: ["src/checkers.ts", "tests/checkers.test.ts"],
+    targetedValidationReceiptId: "receipt-checkers-targeted",
+    fullValidationReceiptId: "receipt-checkers-full",
+    localCommitReceiptId: "receipt-checkers-commit",
+  });
+  const note = vault.files.get(written.path) ?? "";
+  assert.equal(reflected.operation, "append");
+  assert.match(note, /## Agent project reflection/u);
+  assert.match(note, /agentic-project-reflection:publication-checkers-17/u);
+  assert.match(note, /src\/checkers\.ts/u);
+  assert.match(note, /receipt-checkers-full/u);
+  assert.match(note, /Human review and merge remain/u);
+
+  const retry = await writer.appendProjectCompletionReflection({
+    artifact: written.artifact,
+    expectedNoteSha256: reflected.afterSha256,
+    publicationId: "publication-checkers-17",
+    issueIdentifier: "GAME-17",
+    issueUrl: "https://linear.app/acme/issue/GAME-17",
+    pullRequestNumber: 17,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/17",
+    completionProof: "draft_pr",
+    proofRevision: "b".repeat(40),
+    changedPaths: ["src/checkers.ts", "tests/checkers.test.ts"],
+    targetedValidationReceiptId: "receipt-checkers-targeted",
+    fullValidationReceiptId: "receipt-checkers-full",
+    localCommitReceiptId: "receipt-checkers-commit",
+  });
+  assert.equal(retry.operation, "no_op");
+  assert.equal(vault.files.get(written.path), note);
+  await assert.rejects(
+    writer.appendProjectCompletionReflection({
+      artifact: written.artifact,
+      expectedNoteSha256: retry.afterSha256,
+      publicationId: "publication-checkers-17",
+      issueIdentifier: "GAME-17",
+      issueUrl: "https://linear.app/acme/issue/GAME-17",
+      pullRequestNumber: 17,
+      pullRequestUrl: "https://github.com/acme/checkers/pull/17",
+      completionProof: "draft_pr",
+      proofRevision: "b".repeat(40),
+      changedPaths: ["src/different.ts"],
+      targetedValidationReceiptId: "receipt-checkers-targeted",
+      fullValidationReceiptId: "receipt-checkers-full",
+      localCommitReceiptId: "receipt-checkers-commit",
+    }),
+    /collides with different or incomplete proof/u,
+  );
 });
 
 function packageFixture(): AcceptedResearchNotePackageV1 {

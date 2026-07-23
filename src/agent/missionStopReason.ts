@@ -44,7 +44,7 @@ export function fromAgentRunStopReason(
     case "user_stopped":
       return "user_aborted";
     case "error":
-      return "provider_error";
+      return classifyErrorDetail(detail);
     case "budget":
       return classifyBudgetDetail(detail);
     default:
@@ -140,6 +140,18 @@ export function formatStopReasonLabel(reason: MissionStopReason): string {
   }
 }
 
+function classifyErrorDetail(detail?: string | null): MissionStopReason {
+  const text = (detail ?? "").toLowerCase();
+  if (
+    /authoritative mission graph|not ready in the (?:exact )?authoritative|off-frontier|mission_graph_authority|mission graph/i.test(
+      text,
+    )
+  ) {
+    return "graph_blocked";
+  }
+  return "provider_error";
+}
+
 function classifyBudgetDetail(detail?: string | null): MissionStopReason {
   const text = (detail ?? "").toLowerCase();
   if (/wall.?clock/.test(text)) return "wall_clock";
@@ -147,6 +159,19 @@ function classifyBudgetDetail(detail?: string | null): MissionStopReason {
   if (/required_tools_failed/.test(text)) return "required_tools_failed";
   if (/model|token/.test(text)) return "model_budget";
   if (/approval/.test(text)) return "approval_denied";
+  // Unpaid compound delivery / graph blockers outrank verifier:final_relevance so
+  // Chat does not say "relevance check" when Continue should keep running tools.
+  if (
+    /set_loose_delivery|missing_delivery_proofs|mission_graph_incomplete|graph_incomplete|passing fast|validation completed red|recovery attempts exhausted/i.test(
+      text,
+    )
+  ) {
+    return /mission_graph|graph_incomplete|passing fast|validation completed red|recovery attempts/i.test(
+      text,
+    )
+      ? "graph_blocked"
+      : "step_budget";
+  }
   if (/relevance/.test(text)) return "relevance_rejected";
   if (/block|mission_graph_incomplete|graph_incomplete/.test(text)) {
     return "graph_blocked";

@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
+import {
+  AGENT_GIT_COMMIT_EMAIL_V1,
+  AGENT_GIT_COMMIT_NAME_V1,
+  LEGACY_AGENT_GIT_COMMIT_EMAIL_V1,
+} from "../packages/core-api/src/agentGitCommitIdentityV1";
 import { createVerifiedCodePublicationHandoffV1 } from "../packages/core-api/src/verifiedCodePublicationHandoffV1";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
 import type { VerifiedLocalCommitReceiptV1 } from "../extensions/code/repair/types";
@@ -13,6 +18,7 @@ import {
 import {
   VerifiedGitPushErrorV1,
   VerifiedGitPushGatewayV1,
+  isDefinitiveGitPushAuthFailureV1,
   type EphemeralGitAskpassBrokerV1,
   type GitPushAttemptRecordV1,
   type GitPushAttemptStoreV1,
@@ -113,6 +119,28 @@ test("failed remote readback remains reconcile-required without a second dispatc
   assert.equal(fixture.runner.pushes, 1);
 });
 
+test("auth-failed push is not_applied and may retry after a Contents-capable credential", async () => {
+  assert.equal(
+    isDefinitiveGitPushAuthFailureV1(
+      "remote: Repository not found.\nfatal: Authentication failed for 'https://github.com/acme/research-agent.git/'",
+    ),
+    true,
+  );
+  const fixture = createFixture({ pushMode: "auth_failure" });
+  const first = await fixture.gateway.push(fixture.input);
+  assert.equal(first.status, "not_applied");
+  assert.equal(fixture.runner.pushes, 1);
+  if (first.status === "not_applied") {
+    assert.match(first.message, /Contents:write|Git push authentication failed/iu);
+  }
+
+  // Same handoff may redispatch after the host installs a push-capable token.
+  fixture.runner.pushMode = "success";
+  const second = await fixture.gateway.push(fixture.input);
+  assert.equal(second.status, "pushed_verified");
+  assert.equal(fixture.runner.pushes, 2);
+});
+
 test("local commit identity drift blocks before remote access", async () => {
   const fixture = createFixture({ localTreeSha: "e".repeat(40) });
   await assert.rejects(
@@ -121,6 +149,43 @@ test("local commit identity drift blocks before remote access", async () => {
   );
   assert.equal(fixture.runner.remoteReads, 0);
   assert.equal(fixture.broker.calls, 0);
+});
+
+test("a GitHub-linked author or committer is blocked before credential or remote access", async () => {
+  const attempts = [
+    createFixture({
+      authorName: "JoshuaNguyen123",
+      authorEmail: "joshua@users.noreply.github.com",
+      committerName: "JoshuaNguyen123",
+      committerEmail: "joshua@users.noreply.github.com",
+    }),
+    createFixture({
+      committerName: "JoshuaNguyen123",
+      committerEmail: "joshua@users.noreply.github.com",
+    }),
+  ];
+  for (const fixture of attempts) {
+    await assert.rejects(
+      fixture.gateway.push(fixture.input),
+      (error: unknown) =>
+        error instanceof VerifiedGitPushErrorV1 &&
+        error.code === "commit_identity_mismatch" &&
+        /misattribution/iu.test(error.message),
+    );
+    assert.equal(fixture.runner.remoteReads, 0);
+    assert.equal(fixture.runner.pushes, 0);
+    assert.equal(fixture.broker.calls, 0);
+  }
+});
+
+test("the earlier local-only agent identity remains publication compatible", async () => {
+  const fixture = createFixture({
+    authorEmail: LEGACY_AGENT_GIT_COMMIT_EMAIL_V1,
+    committerEmail: LEGACY_AGENT_GIT_COMMIT_EMAIL_V1,
+  });
+  const result = await fixture.gateway.push(fixture.input);
+  assert.equal(result.status, "pushed_verified");
+  assert.equal(fixture.runner.pushes, 1);
 });
 
 test("an already-present exact remote commit is verified without push", async () => {
@@ -158,8 +223,12 @@ function createFixture(options: {
   remoteSha?: string | null;
   remoteBaseSha?: string | null;
   fastForward?: boolean;
-  pushMode?: "success" | "applied_throw" | "readback_mismatch";
+  pushMode?: "success" | "applied_throw" | "readback_mismatch" | "auth_failure";
   localTreeSha?: string;
+  authorName?: string;
+  authorEmail?: string;
+  committerName?: string;
+  committerEmail?: string;
 } = {}) {
   const profile = detectRepositoryProfileV2({
     key: "fixture",
@@ -194,6 +263,10 @@ function createFixture(options: {
     fastForward: options.fastForward ?? true,
     pushMode: options.pushMode ?? "success",
     localTreeSha: options.localTreeSha ?? TREE,
+    authorName: options.authorName ?? AGENT_GIT_COMMIT_NAME_V1,
+    authorEmail: options.authorEmail ?? AGENT_GIT_COMMIT_EMAIL_V1,
+    committerName: options.committerName ?? AGENT_GIT_COMMIT_NAME_V1,
+    committerEmail: options.committerEmail ?? AGENT_GIT_COMMIT_EMAIL_V1,
   });
   const broker = new FakeAskpassBroker();
   const store = new MemoryAttemptStore();
@@ -264,16 +337,22 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
   remoteReads = 0;
   private remoteSha: string | null;
   private remoteBaseSha: string | null;
+  pushMode: "success" | "applied_throw" | "readback_mismatch" | "auth_failure";
 
   constructor(private readonly options: {
     remoteSha: string | null;
     remoteBaseSha: string | null;
     fastForward: boolean;
-    pushMode: "success" | "applied_throw" | "readback_mismatch";
+    pushMode: "success" | "applied_throw" | "readback_mismatch" | "auth_failure";
     localTreeSha: string;
+    authorName: string;
+    authorEmail: string;
+    committerName: string;
+    committerEmail: string;
   }) {
     this.remoteSha = options.remoteSha;
     this.remoteBaseSha = options.remoteBaseSha;
+    this.pushMode = options.pushMode;
   }
 
   async run(input: Parameters<VerifiedGitCommandRunnerV1["run"]>[0]) {
@@ -287,6 +366,14 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
       if (subject === "HEAD^") return ok(BASE);
     }
     if (op === "branch") return ok("codex/repair-1");
+    if (op === "show") {
+      return ok([
+        this.options.authorName,
+        this.options.authorEmail,
+        this.options.committerName,
+        this.options.committerEmail,
+      ].join("\0"));
+    }
     if (op === "ls-remote") {
       this.remoteReads += 1;
       const ref = input.args.at(-1);
@@ -308,12 +395,20 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
     }
     if (op === "push") {
       this.pushes += 1;
-      if (this.options.pushMode === "applied_throw") {
+      if (this.pushMode === "applied_throw") {
         this.remoteBaseSha = BASE;
         this.remoteSha = COMMIT;
         throw new Error("transport closed after dispatch");
       }
-      if (this.options.pushMode === "readback_mismatch") {
+      if (this.pushMode === "auth_failure") {
+        return {
+          exitCode: 128,
+          stdout: "",
+          stderr:
+            "remote: Repository not found.\nfatal: Authentication failed for 'https://github.com/acme/research-agent.git/'",
+        };
+      }
+      if (this.pushMode === "readback_mismatch") {
         this.remoteBaseSha = BASE;
         this.remoteSha = "e".repeat(40);
         return ok("push dispatched");
@@ -327,7 +422,7 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
 }
 
 function operation(args: readonly string[]): string {
-  return args.find((arg) => ["rev-parse", "branch", "ls-remote", "fetch", "merge-base", "push"].includes(arg)) ?? "unknown";
+  return args.find((arg) => ["rev-parse", "branch", "show", "ls-remote", "fetch", "merge-base", "push"].includes(arg)) ?? "unknown";
 }
 
 function ok(stdout: string) {

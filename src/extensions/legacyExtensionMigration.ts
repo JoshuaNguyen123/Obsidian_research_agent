@@ -86,6 +86,7 @@ export interface IntegrationsExtensionSnapshotV1 {
     defaultTeamId: string;
     queueEnabled: boolean;
     queueProjectId: string;
+    readyStateId: string;
     startedStateId: string;
     completedStateId: string;
     blockedStateId: string;
@@ -601,6 +602,7 @@ async function buildSnapshots(
       defaultTeamId: optionalOpaqueId(source, "linearDefaultTeamId"),
       queueEnabled: optionalBoolean(source, "linearQueueEnabled", false),
       queueProjectId: optionalOpaqueId(source, "linearQueueProjectId"),
+      readyStateId: optionalOpaqueId(source, "linearReadyStateId"),
       startedStateId: optionalOpaqueId(source, "linearStartedStateId"),
       completedStateId: optionalOpaqueId(source, "linearCompletedStateId"),
       blockedStateId: optionalOpaqueId(source, "linearBlockedStateId"),

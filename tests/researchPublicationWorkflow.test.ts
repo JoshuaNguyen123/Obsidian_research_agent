@@ -52,6 +52,10 @@ test("explicit research publication writes note, previews, exactly approves, pub
   ]);
   assert.equal(fixture.publisher.publishCount, 1);
   assert.equal(fixture.publisher.mutationCount, 1);
+  assert.match(
+    fixture.publisher.lastPreviewSections?.scope[0] ?? "",
+    /\[Open accepted research in Obsidian\]\(obsidian:\/\/open\?file=Research%2FAgent%20platform\.md\)/u,
+  );
   assertOrdered(fixture.trace, [
     "note_verified",
     "linear_preview_verified",
@@ -157,6 +161,112 @@ test("a retry adopts the exact pending issue through fresh duplicate readback wi
   );
 });
 
+test("resume reuses the checkpoint-bound initiating note even when a different note is requested", async () => {
+  const fixture = workflowFixture("reconcile_required");
+  const initiatingPath = "Projects/Checkers idea.md";
+  const initiatingContent = "# Checkers idea\n\nBuild a playable checkers application.\n";
+  fixture.vault.files.set(initiatingPath, initiatingContent);
+  const initialRequest: ResearchPublicationRequestV1 = {
+    ...requestFixture(),
+    note: {
+      ...requestFixture().note,
+      path: initiatingPath,
+      mode: "append",
+      baseHash: await sha256DiagramContent(initiatingContent),
+    },
+  };
+  const first = await fixture.workflow.execute(initialRequest);
+  assert.equal(first.status, "reconcile_required");
+  assert.equal(fixture.checkpoints.at(-1)?.artifact.notePath, initiatingPath);
+  const acceptedBytes = fixture.vault.files.get(initiatingPath) ?? "";
+
+  fixture.publisher.mode = "deduplicated";
+  const resumed = await fixture.workflow.execute({
+    ...initialRequest,
+    note: {
+      ...initialRequest.note,
+      path: "Research/Model redirected.md",
+      mode: "create",
+      baseHash: undefined,
+    },
+  });
+
+  assert.equal(resumed.ok, true);
+  if (!resumed.ok) return;
+  assert.equal(resumed.artifact.notePath, initiatingPath);
+  assert.equal(resumed.backlink.path, initiatingPath);
+  assert.equal(fixture.vault.files.has("Research/Model redirected.md"), false);
+  const completedBytes = fixture.vault.files.get(initiatingPath) ?? "";
+  assert.equal(completedBytes.match(/## Problem and impact/gu)?.length, 1);
+  assert.equal(completedBytes.match(/agentic-accepted-research:/gu)?.length, 1);
+  assert.ok(completedBytes.length > acceptedBytes.length);
+  assert.match(completedBytes, /https:\/\/linear\.app\/acme\/issue\/ENG-42/u);
+
+  const reflection = await new AcceptedResearchNoteWriter(
+    fixture.vault,
+  ).appendProjectCompletionReflection({
+    artifact: resumed.artifact,
+    expectedNoteSha256: resumed.backlink.afterSha256,
+    publicationId: "github-publication-checkers-42",
+    issueIdentifier: resumed.issue.identifier,
+    issueUrl: resumed.issue.url,
+    pullRequestNumber: 42,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/42",
+    completionProof: "draft_pr",
+    proofRevision: "b".repeat(40),
+    changedPaths: ["src/checkers.ts", "tests/checkers.test.ts"],
+    targetedValidationReceiptId: "checkers-targeted-validation",
+    fullValidationReceiptId: "checkers-full-validation",
+    localCommitReceiptId: "checkers-local-commit",
+  });
+  assert.equal(reflection.path, initiatingPath);
+  assert.match(
+    fixture.vault.files.get(initiatingPath) ?? "",
+    /agentic-project-reflection:github-publication-checkers-42/u,
+  );
+  assert.equal(fixture.vault.files.has("Research/Model redirected.md"), false);
+});
+
+test("resume blocks on initiating-note drift before writing a redirected path", async () => {
+  const fixture = workflowFixture("reconcile_required");
+  const initiatingPath = "Projects/Checkers source.md";
+  const initiatingContent = "# Checkers source\n";
+  fixture.vault.files.set(initiatingPath, initiatingContent);
+  const initialRequest: ResearchPublicationRequestV1 = {
+    ...requestFixture(),
+    note: {
+      ...requestFixture().note,
+      path: initiatingPath,
+      mode: "append",
+      baseHash: await sha256DiagramContent(initiatingContent),
+    },
+  };
+  const first = await fixture.workflow.execute(initialRequest);
+  assert.equal(first.status, "reconcile_required");
+  fixture.vault.files.set(
+    initiatingPath,
+    `${fixture.vault.files.get(initiatingPath) ?? ""}\nUser edit after checkpoint.\n`,
+  );
+  const driftedBytes = fixture.vault.files.get(initiatingPath);
+
+  fixture.publisher.mode = "deduplicated";
+  await assert.rejects(
+    fixture.workflow.execute({
+      ...initialRequest,
+      note: {
+        ...initialRequest.note,
+        path: "Research/Redirected after drift.md",
+        mode: "create",
+        baseHash: undefined,
+      },
+    }),
+    /changed before publication resume readback/iu,
+  );
+  assert.equal(fixture.vault.files.get(initiatingPath), driftedBytes);
+  assert.equal(fixture.vault.files.has("Research/Redirected after drift.md"), false);
+  assert.equal(fixture.publisher.publishCount, 1);
+});
+
 test("backlink failure persists waiting_obsidian after verified Linear lineage without recreating the issue", async () => {
   const fixture = workflowFixture("created");
   fixture.vault.failLinearBacklinkWrites = true;
@@ -245,6 +355,7 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
   publishCount = 0;
   mutationCount = 0;
   private ticket: ReturnType<typeof ticketFromRequest> | null = null;
+  lastPreviewSections: ResearchTicketPreviewRequest["sections"] | null = null;
 
   constructor(
     public mode: "created" | "deduplicated" | "reconcile_required",
@@ -252,6 +363,7 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
 
   async preview(request: ResearchTicketPreviewRequest) {
     this.previewCount += 1;
+    this.lastPreviewSections = structuredClone(request.sections);
     const ticket = ticketFromRequest(request);
     this.ticket = ticket;
     const duplicate = this.mode === "deduplicated" ? issue(ticket.description) : null;

@@ -23,7 +23,20 @@ import {
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
 import { hasDesignIntent as hasSharedDesignIntent } from "./codeDesignIntent";
-import { hasExplicitNoWebIntent } from "./evidenceIntent";
+import {
+  hasExplicitNoWebIntent,
+  hasPrimaryTextCitationIntent,
+} from "./evidenceIntent";
+import type { AutonomyEffectClass } from "./autonomyEffectClass";
+import { detectLinearIntent } from "./linearIntent";
+import {
+  detectProjectLifecycleStagesV1,
+} from "./projectLifecycle";
+import {
+  classifyMissionSpeechAct,
+  type ExecutionTier,
+  type MissionSpeechAct,
+} from "./missionSpeechAct";
 
 export type RunRoute =
   | "instant_local"
@@ -49,12 +62,19 @@ export type StreamingWritebackKind = "append" | "replace" | "edit";
 
 export interface RunPlan {
   route: RunRoute;
+  speechAct: MissionSpeechAct;
+  executionTier: ExecutionTier;
   maxStepsForRun: number;
   thinking: ModelThink | undefined;
   allowedTools: ModelToolDefinition[];
   slowPathReason: SlowPathReason;
   expectedTimeClass: "quick" | "normal" | "long";
   requiresEnglishGuard: boolean;
+  /**
+   * Max effect class the host will offer without a matching grant.
+   * Non-compound note/research routes default to soft.
+   */
+  maxEffectClassWithoutGrant: AutonomyEffectClass;
 }
 
 export interface CreateRunPlanInput {
@@ -82,6 +102,7 @@ export function createRunPlan({
   directCurrentNoteWritebackKind,
   reflex,
 }: CreateRunPlanInput): RunPlanDecision {
+  const speechAct = classifyMissionSpeechAct(prompt);
   const requiresEnglishGuard = isLikelyEnglishPrompt(prompt);
   const configuredMaxSteps = resolveConfiguredMaxAgentSteps(settings?.maxAgentSteps);
   const explicitModelStepTarget = parseExplicitModelStepTarget(prompt);
@@ -108,7 +129,15 @@ export function createRunPlan({
     slowPathReason,
     expectedTimeClass,
     traceReasons,
-  }: Omit<RunPlanDecision, "requiresEnglishGuard" | "allowedToolNames" | "budgetProfile">): RunPlanDecision => {
+  }: Omit<
+    RunPlanDecision,
+    | "requiresEnglishGuard"
+    | "allowedToolNames"
+    | "budgetProfile"
+    | "maxEffectClassWithoutGrant"
+    | "speechAct"
+    | "executionTier"
+  >): RunPlanDecision => {
     const allowedToolNames = allowedTools.map((tool) => tool.function.name);
     const generated = analyzeGeneratedOutputPrompt(prompt);
     const budgetProfile = buildRouteBudgetProfile({
@@ -134,6 +163,8 @@ export function createRunPlan({
     });
     return {
       route,
+      speechAct: speechAct.speechAct,
+      executionTier: speechAct.executionTier,
       maxStepsForRun,
       thinking,
       allowedTools,
@@ -141,6 +172,7 @@ export function createRunPlan({
       slowPathReason,
       expectedTimeClass,
       requiresEnglishGuard,
+      maxEffectClassWithoutGrant: maxEffectClassWithoutGrantForRoute(route),
       traceReasons,
       budgetProfile: {
         ...budgetProfile,
@@ -191,6 +223,43 @@ export function createRunPlan({
       slowPathReason: "none",
       expectedTimeClass: "quick",
       traceReasons: ["simple_date_time_prompt"],
+    });
+  }
+
+  if (speechAct.executionTier === "direct_chat") {
+    return plan({
+      route: "single_model_answer",
+      maxStepsForRun: 1,
+      thinking: undefined,
+      allowedTools: [],
+      slowPathReason: "none",
+      expectedTimeClass: "quick",
+      traceReasons: [
+        "speech_act_direct_chat",
+        ...speechAct.reasons,
+      ],
+    });
+  }
+
+  // Named Linear/GitHub Bound tools must not collapse into single-step note
+  // writeback (maxSteps=1 / softOnly) — create + get + append need a tool loop.
+  // Compound Linear→code→GitHub (or any code-shaped mission) must NOT take the
+  // short 24-step Bound-mutation default; fall through to grounded_workflow so
+  // configuredMaxSteps / the code ladder budget apply.
+  if (
+    hasExplicitExternalMutationToolMission(prompt) &&
+    !hasCodeExecutionIntent(prompt) &&
+    !hasDesignIntent(prompt) &&
+    detectProjectLifecycleStagesV1(prompt).length <= 1
+  ) {
+    return plan({
+      route: "tool_required",
+      maxStepsForRun: capSteps(24),
+      thinking: resolveThinkingMode(settings),
+      allowedTools: tools,
+      slowPathReason: "needs_model_planning",
+      expectedTimeClass: "normal",
+      traceReasons: ["explicit_external_mutation_tool_mission"],
     });
   }
 
@@ -254,21 +323,8 @@ export function createRunPlan({
     ]);
   }
 
-  if (
-    explicitWebSearchIntent ||
-    hasReflexReadLabel(["web_research"])
-  ) {
-    return grounded("needs_web_sources", "long", [
-      hasWebSearchIntent(prompt) ? "web_search_intent" : "reflex_web_research",
-    ]);
-  }
-
-  if (hasLongResearchIntent(prompt) || hasBrowserAutomationIntent(prompt)) {
-    return grounded("needs_model_planning", "long", [
-      hasLongResearchIntent(prompt) ? "long_research_intent" : "browser_automation_intent",
-    ]);
-  }
-
+  // Research→code (and other code-shaped) missions must take this path before
+  // the pure web-search route so the step budget includes the code ladder.
   if (
     hasDesignIntent(prompt) ||
     hasCodeExecutionIntent(prompt) ||
@@ -287,15 +343,19 @@ export function createRunPlan({
       loopBudget.toolStepBudget,
       explicitCodeToolCount,
     );
+    // Multi-stage compound (Linear→code→GitHub) burns steps on Soft reads,
+    // rejected off-frontier attempts, and Continue segments — use the hard cap
+    // rather than a tight named-tool count.
+    const compoundLifecycle = detectProjectLifecycleStagesV1(prompt).length > 1;
+    const requestedSteps = compoundLifecycle
+      ? loopBudget.hardCap
+      : codeToolStepBudget + loopBudget.finalizationReserve;
     return plan({
       route: "grounded_workflow",
       maxStepsForRun: applyExplicitModelStepTarget(
         Math.max(
           1,
-          Math.min(
-            loopBudget.hardCap,
-            codeToolStepBudget + loopBudget.finalizationReserve,
-          ),
+          Math.min(loopBudget.hardCap, requestedSteps),
         ),
       ),
       thinking: resolveThinkingMode(settings),
@@ -306,12 +366,30 @@ export function createRunPlan({
         hasDesignIntent(prompt)
           ? "design_intent"
           : hasCodeExecutionIntent(prompt)
-            ? "code_execution_intent"
+            ? hasWebSearchIntent(prompt)
+              ? "research_then_code_intent"
+              : "code_execution_intent"
             : hasHtmlPreviewIntent(prompt)
               ? "html_preview_intent"
               : "open_web_source_intent",
+        ...(compoundLifecycle ? ["compound_lifecycle_step_budget"] : []),
       ],
     });
+  }
+
+  if (
+    explicitWebSearchIntent ||
+    hasReflexReadLabel(["web_research"])
+  ) {
+    return grounded("needs_web_sources", "long", [
+      hasWebSearchIntent(prompt) ? "web_search_intent" : "reflex_web_research",
+    ]);
+  }
+
+  if (hasLongResearchIntent(prompt) || hasBrowserAutomationIntent(prompt)) {
+    return grounded("needs_model_planning", "long", [
+      hasLongResearchIntent(prompt) ? "long_research_intent" : "browser_automation_intent",
+    ]);
   }
 
   if (hasWordCountIntent(prompt) || hasReflexReadLabel(["word_count"])) {
@@ -343,6 +421,7 @@ export function createRunPlan({
   // Title + content needs a tool step for rename_current_file before streamed
   // writeback. Do not take the single-step writeback route or the rename never
   // runs (or the run ends after rename with maxSteps=1 and no stream).
+  // External Bound mutations already returned above; keep this note-only.
   if (
     streamingWritebackKind !== null &&
     !hasTitleIntent(prompt) &&
@@ -618,6 +697,53 @@ function hasCodeExecutionIntent(prompt: string): boolean {
     ) ||
     /\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b[\s\S]{0,180}\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b|\b(implement|fix|repair|patch|refactor|edit|change|create|add|remove|rename|move|copy|validate|test|build|commit)\b[\s\S]{0,180}\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b/i.test(
       prompt,
+    ) ||
+    // Keep runPlan routing aligned with AgentRunner code-deliverable intent so
+    // "build a checkers game in Python" takes grounded_workflow, not a chat-only path.
+    // Exclude current-note sample writes ("Write … in TypeScript on this page").
+    (!(
+      /\b(?:on|to|into|in)\s+(?:this|the|current|active)\s+(?:page|note|file)\b/i.test(
+        prompt,
+      ) || /\bstream(?:\s+it)?\s+to\s+(?:the\s+)?note\b/i.test(prompt)
+    ) &&
+      (/\.(?:py|ts|tsx|js|jsx|rs|go|java|cs)\b/i.test(prompt) ||
+        /\b(build|implement|create|write)\b[\s\S]{0,100}\b(game|app|script|module|library|package|checkers|chess|solver)\b/i.test(
+          prompt,
+        ) ||
+        /\b(build|implement|create|write|code)\b[\s\S]{0,120}\b(python|javascript|typescript|rust|golang|java)\b/i.test(
+          prompt,
+        )))
+  );
+}
+
+/** Bound Linear/GitHub mutations named in the mission (tool-token e2e prompts). */
+function hasExplicitExternalMutationToolMission(prompt: string): boolean {
+  const normalized = prompt.toLowerCase();
+  if (
+    /\bgithub_(?:create_private_repository|create_issue|create_pull_request)\b/u.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\blinear_(?:create|update|archive|unarchive|delete|comment)_[a-z0-9_]+\b/u.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  // Prose Linear create / turn-into-issues must not collapse to single-step
+  // note writeback (append before linear_create_issue needs a tool loop).
+  if (!detectLinearIntent(prompt).explicit) {
+    return false;
+  }
+  return (
+    /\b(?:create|publish|send|turn)\b[\s\S]{0,120}\blinear\b[\s\S]{0,80}\b(?:issues?|tickets?|hierarchy|project)\b/iu.test(
+      prompt,
+    ) ||
+    /\b(?:create|draft|write|prepare)\b[\s\S]{0,80}\b(?:issues?|tickets?)\b[\s\S]{0,40}\bin\s+linear\b/iu.test(
+      prompt,
     )
   );
 }
@@ -653,7 +779,8 @@ function hasLongResearchIntent(prompt: string): boolean {
 }
 
 function hasTemplateIntent(prompt: string): boolean {
-  return /\b(template|templates|templated|form|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i.test(
+  // Do not match bare "form" ("in the form of", "form a plan").
+  return /\b(template|templates|templated|boilerplate|reusable\s+(?:note|markdown|outline|format|structure)|fill\s+(?:this|the)?\s*(?:out\s+)?(?:form|template)|populate\s+(?:this|the)?\s*(?:form|template))\b/i.test(
     prompt,
   );
 }
@@ -665,6 +792,9 @@ function hasResearchMemoryReadIntent(prompt: string): boolean {
 }
 
 function hasVaultBrowseIntent(prompt: string): boolean {
+  if (/\btemplates?\b/i.test(prompt)) {
+    return false;
+  }
   return /\b(vault|files|file names|filenames|markdown files|md files|folders|folder|directory|directories|path|paths|list|browse|inspect|where\s+this\s+note\s+belongs|placement|organize\s+(?:the\s+)?vault|across\s+files)\b/i.test(
     prompt,
   );
@@ -722,6 +852,9 @@ function hasSectionAppendIntent(prompt: string): boolean {
 }
 
 function hasAppendIntent(prompt: string): boolean {
+  if (/\bappend_to_current_file\b/i.test(prompt)) {
+    return true;
+  }
   return /\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,80}\b(note|file|markdown|vault|page|document)\b|\b(note|file|markdown|vault|page|document)\b[\s\S]{0,80}\b(append|save|write|update|add|insert|copy|paste|put)\b|\b(append|save|write|update|add|insert|copy|paste|put)\b[\s\S]{0,120}\.md\b/i.test(
     prompt,
   );
@@ -874,6 +1007,14 @@ function isRecentAssistantWritebackFollowup(prompt: string): boolean {
 }
 
 function hasFetchedWebSourceIntent(prompt: string): boolean {
+  if (
+    hasPrimaryTextCitationIntent(prompt) &&
+    !/\b(?:web|online|internet|https?:\/\/|bibliography|reference\s+list|source\s+urls?|verified\s+sources?|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
+      prompt,
+    )
+  ) {
+    return false;
+  }
   return /\b(cited\s+sources?|cite\s+sources?|citations?|source\s+urls?|bibliography|reference\s+list|verified\s+sources?|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?))\b/i.test(
     prompt,
   );
@@ -892,6 +1033,14 @@ function hasDeepResearchIntent(prompt: string): boolean {
 }
 
 function hasExplicitWebSearchIntent(prompt: string): boolean {
+  if (
+    hasPrimaryTextCitationIntent(prompt) &&
+    !/\b(?:web|internet|online|search|look\s+up|browse|news|up[-\s]?to[-\s]?date|verify|fact[-\s]?check|https?:\/\/)\b/iu.test(
+      prompt,
+    )
+  ) {
+    return false;
+  }
   return /\b(web|internet|online|search|look\s+up|browse|sources?|citations?|cited|cite|news|up[-\s]?to[-\s]?date|verify|fact[-\s]?check)\b|\b(?:latest|recent|current)\b[\s\S]{0,60}\b(events?|news|information|info|version|versions?|prices?|rates?|status|facts?|research|reports?|papers?|studies?)\b/i.test(
     prompt,
   );
@@ -946,4 +1095,29 @@ function hasNamedFolderTraversalIntent(prompt: string): boolean {
     ) &&
     /\bfolders?\b[\s\S]{0,100}\b(?:named|called)\b/i.test(prompt)
   );
+}
+
+/**
+ * Soft for pure chat/answer routes (Soft-path SLA).
+ * Bound for current-note writeback so replace/append stay offerable.
+ * Hard for tool/grounded routes so delete/install remain *offerable*;
+ * Hard still never auto-executes (mayAutoExecute / approval broker).
+ */
+function maxEffectClassWithoutGrantForRoute(
+  route: RunRoute,
+): AutonomyEffectClass {
+  switch (route) {
+    case "instant_local":
+    case "single_model_answer":
+    case "prefetched_vault_answer":
+      return "soft";
+    case "direct_writeback":
+    case "single_model_writeback":
+    case "prefetched_vault_writeback":
+      return "bound";
+    case "tool_required":
+    case "grounded_workflow":
+    default:
+      return "hard";
+  }
 }

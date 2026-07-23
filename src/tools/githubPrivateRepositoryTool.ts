@@ -109,12 +109,35 @@ export function hasExplicitPrivateGitHubRepositoryCreationIntent(
   prompt: string,
 ): boolean {
   const value = typeof prompt === "string" ? prompt : "";
-  if (
-    /\b(?:do not|don't|never|without|skip|exclude|no)\b[^.\n]{0,100}\b(?:create|github|repository|repo)\b/iu.test(
+  const normalized = value.toLowerCase();
+  // Ignore continue-meta "do not stop/ask … before GitHub"; still honor
+  // "do not create a GitHub repository" / without/skip/exclude.
+  const createTarget =
+    /\b(?:create|github|repository|repo)\b/iu;
+  let createNegated =
+    /\b(?:without|skip|exclude)\b[^.\n]{0,100}\b(?:create|github|repository|repo)\b/iu.test(
       value,
-    )
-  ) {
+    ) || /\bno\b\s+(?:github|repository|repo)\b/iu.test(value);
+  if (!createNegated) {
+    for (const match of normalized.matchAll(
+      /\b(?:do not|don't|never)\b([^.\n]{0,120})/gu,
+    )) {
+      const rest = match[1] ?? "";
+      if (/^\s*(?:stop|ask|wait|continue|idle|halt|pause)\b/u.test(rest)) {
+        continue;
+      }
+      if (createTarget.test(rest)) {
+        createNegated = true;
+        break;
+      }
+    }
+  }
+  if (createNegated) {
     return false;
+  }
+  // Snake_case tool tokens are one word for \bcreate\b; accept the named tool.
+  if (/\bgithub_create_private_repository\b/iu.test(value)) {
+    return true;
   }
   return (
     /\b(?:create|make|provision)\b[\s\S]{0,100}\bprivate\b[\s\S]{0,80}\b(?:github\s+)?(?:repository|repo)\b/iu.test(
@@ -282,21 +305,30 @@ async function executePrivateRepositoryCreation(
   };
   await options.persistCheckpoint(checkpoint);
 
+  let createFailureCode: string | null = null;
   try {
     await options.createPrivateRepository(
       destination,
       description,
       context.abortSignal,
     );
-  } catch {
+  } catch (error) {
     // Creation conflicts and transport ambiguity are intentionally handled by
     // the same independent readback below. Provider error bodies are not
-    // persisted or returned to the model.
+    // persisted or returned to the model; only a stable error code is kept.
+    createFailureCode =
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      typeof (error as { code?: unknown }).code === "string"
+        ? String((error as { code: string }).code).slice(0, 80)
+        : "github_create_failed";
   }
   const readback = await options.readRepository(destination, context.abortSignal);
   if (!readback) {
-    const blockerMessage =
-      "Independent GitHub readback proves the private repository does not exist; a new explicit approval is required to try again.";
+    const blockerMessage = createFailureCode
+      ? `Independent GitHub readback proves the private repository does not exist after create (${createFailureCode}) for ${destination.owner}/${destination.repository}; a new explicit approval is required to try again.`
+      : `Independent GitHub readback proves the private repository does not exist for ${destination.owner}/${destination.repository}; a new explicit approval is required to try again.`;
     checkpoint = {
       ...checkpoint,
       status: "not_applied",

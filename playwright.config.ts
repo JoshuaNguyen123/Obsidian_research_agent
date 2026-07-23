@@ -11,7 +11,8 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
     activeLanes.has("daily-use-compound")
   ? 120 * 60_000
   : activeLanes.has("daily-use-code-live") ||
-      activeLanes.has("real-ai-soak")
+      activeLanes.has("real-ai-soak") ||
+      activeLanes.has("obsidian-hello-github-live")
     ? 60 * 60_000
     : activeLanes.has("real-ai-contract") ||
         activeLanes.has("daily-use-research")
@@ -194,6 +195,14 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
+      name: "obsidian-hello-github-live",
+      testMatch: /obsidian-hello-github-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 3_600_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
       name: "real-ai-soak",
       testMatch: /real-ai-soak\.spec\.ts/u,
       retries: 0,
@@ -231,6 +240,22 @@ export default defineConfig({
       retries: 0,
       timeout: 600_000,
       expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "compound-flow-smoke-live",
+      testMatch: /compound-flow-smoke-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 900_000,
+      expect: { timeout: 60_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "compound-flow-real-live",
+      testMatch: /compound-flow-real-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 3_600_000,
+      expect: { timeout: 180_000 },
       use: { trace: "off", screenshot: "off", video: "off" },
     },
   ],

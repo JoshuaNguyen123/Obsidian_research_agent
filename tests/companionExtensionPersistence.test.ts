@@ -394,6 +394,8 @@ function stateFixture(): CompanionRuntimeStateV1 {
         resultFingerprint: null,
         reconcileStatus: "pending",
         reconcileError: null,
+        chatResumeSummary: null,
+        chatResumeDeliveredAt: null,
         updatedAt: NOW,
       },
     },

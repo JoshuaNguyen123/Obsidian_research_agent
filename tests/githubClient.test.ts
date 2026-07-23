@@ -44,6 +44,15 @@ test("GitHubRestClient reads a repository through fixed headers", async () => {
 
   const repository = await client.getRepository("acme", "research-agent");
   assert.equal(repository.fullName, "acme/research-agent");
+  assert.equal(repository.visibility, "private");
+  assert.deepEqual(repository.permissions, {
+    admin: false,
+    maintain: true,
+    push: true,
+    triage: true,
+    pull: true,
+  });
+  assert.deepEqual(repository.topics, ["agent", "obsidian"]);
   assert.equal(request?.url, "https://api.github.com/repos/acme/research-agent");
   assert.equal(request?.headers?.Authorization, "Bearer secret-token");
   assert.equal(request?.method, "GET");
@@ -211,6 +220,147 @@ test("GitHubRestClient exposes bounded issue, review, check, status, and workflo
     `/repos/acme/research-agent/commits/${SHA_A}/status?per_page=100`,
     `/repos/acme/research-agent/actions/runs?head_sha=${SHA_A}&per_page=100`,
   ]);
+});
+
+test("GitHubRestClient reads branches, tags, releases, and pull request files through fixed bounded endpoints", async () => {
+  const requests: HttpRequest[] = [];
+  const oversizedReleaseBody = "r".repeat(65_540);
+  const oversizedPatch = "p".repeat(20_010);
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    const path = new URL(request.url).pathname;
+    if (path.endsWith("/branches")) {
+      return response(200, [{ name: "main", commit: { sha: SHA_A }, protected: true }]);
+    }
+    if (path.endsWith("/tags")) {
+      return response(200, [{ name: "v1.2.3", commit: { sha: SHA_B } }]);
+    }
+    if (path.endsWith("/pulls/12/files")) {
+      return response(200, [{
+        sha: SHA_A,
+        filename: "src/new-name.ts",
+        status: "renamed",
+        additions: 8,
+        deletions: 3,
+        changes: 11,
+        previous_filename: "src/old-name.ts",
+        patch: oversizedPatch,
+      }]);
+    }
+    return response(200, path.endsWith("/releases/7")
+      ? releasePayload({ body: oversizedReleaseBody })
+      : [releasePayload({ body: oversizedReleaseBody })]);
+  });
+
+  const branches = await client.listBranches("acme", "research-agent");
+  const tags = await client.listTags("acme", "research-agent");
+  const releases = await client.listReleases("acme", "research-agent");
+  const release = await client.getRelease("acme", "research-agent", 7);
+  const files = await client.listPullRequestFiles("acme", "research-agent", 12);
+
+  assert.deepEqual(branches, [{ name: "main", sha: SHA_A, protected: true }]);
+  assert.deepEqual(tags, [{ name: "v1.2.3", sha: SHA_B }]);
+  assert.equal(releases[0]?.body.length, 65_536);
+  assert.equal(releases[0]?.bodyTruncated, true);
+  assert.equal(release.id, 7);
+  assert.equal(release.tagName, "v1.2.3");
+  assert.equal(files[0]?.patch?.length, 20_000);
+  assert.equal(files[0]?.patchTruncated, true);
+  assert.equal(files[0]?.previousFilename, "src/old-name.ts");
+  assert.deepEqual(
+    requests.map((request) => [request.method, new URL(request.url).pathname + new URL(request.url).search]),
+    [
+      ["GET", "/repos/acme/research-agent/branches?per_page=100"],
+      ["GET", "/repos/acme/research-agent/tags?per_page=100"],
+      ["GET", "/repos/acme/research-agent/releases?per_page=100"],
+      ["GET", "/repos/acme/research-agent/releases/7"],
+      ["GET", "/repos/acme/research-agent/pulls/12/files?per_page=100"],
+    ],
+  );
+  assert.ok(requests.every((request) => request.body === undefined));
+});
+
+test("GitHubRestClient reads one workflow run and its latest jobs through fixed endpoints", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    const path = new URL(request.url).pathname;
+    if (path.endsWith("/jobs")) {
+      return response(200, {
+        total_count: 1,
+        jobs: [workflowJobPayload()],
+      });
+    }
+    return response(200, workflowRunPayload());
+  });
+
+  const run = await client.getWorkflowRun("acme", "research-agent", 6);
+  const jobs = await client.listWorkflowJobs("acme", "research-agent", 6);
+
+  assert.equal(run.id, 6);
+  assert.equal(run.headSha, SHA_A);
+  assert.deepEqual(jobs, [{
+    id: 61,
+    runId: 6,
+    name: "test",
+    htmlUrl: "https://github.com/acme/research-agent/actions/runs/6/job/61",
+    status: "completed",
+    conclusion: "success",
+    headSha: SHA_A,
+    startedAt: "2026-07-12T00:00:00.000Z",
+    completedAt: "2026-07-12T00:02:00.000Z",
+    workflowName: "CI",
+    headBranch: "main",
+    runnerName: "GitHub Actions 1",
+  }]);
+  assert.deepEqual(
+    requests.map((request) => [request.method, new URL(request.url).pathname + new URL(request.url).search]),
+    [
+      ["GET", "/repos/acme/research-agent/actions/runs/6"],
+      ["GET", "/repos/acme/research-agent/actions/runs/6/jobs?filter=latest&per_page=100"],
+    ],
+  );
+});
+
+test("GitHubRestClient rejects unsafe read selectors, invalid refs, and oversized provider lists", async () => {
+  let requests = 0;
+  const noRequestClient = clientWith(async () => {
+    requests += 1;
+    return response(200, {});
+  });
+  for (const operation of [
+    () => noRequestClient.listBranches("../acme", "research-agent"),
+    () => noRequestClient.listTags("acme", "."),
+    () => noRequestClient.getRelease("acme", "research-agent", 0),
+    () => noRequestClient.listPullRequestFiles("acme", "research-agent", -1),
+    () => noRequestClient.getWorkflowRun("acme", "research-agent", Number.NaN),
+    () => noRequestClient.listWorkflowJobs("acme", "research-agent", 0),
+  ]) {
+    await assert.rejects(
+      operation,
+      (error: unknown) =>
+        error instanceof GitHubApiError && error.code === "github_invalid_response",
+    );
+  }
+  assert.equal(requests, 0);
+
+  const invalidRefClient = clientWith(async () => response(200, [
+    { name: "../unsafe", commit: { sha: SHA_A }, protected: false },
+  ]));
+  await assert.rejects(
+    invalidRefClient.listBranches("acme", "research-agent"),
+    (error: unknown) =>
+      error instanceof GitHubApiError && error.code === "github_invalid_response",
+  );
+
+  const oversizedClient = clientWith(async () => response(200, Array.from(
+    { length: 101 },
+    (_, index) => ({ name: `branch-${index}`, commit: { sha: SHA_A }, protected: false }),
+  )));
+  await assert.rejects(
+    oversizedClient.listBranches("acme", "research-agent"),
+    /bounded result limit/iu,
+  );
 });
 
 test("GitHubRestClient reads only bounded unresolved review prose through its fixed GraphQL query", async () => {
@@ -594,6 +744,18 @@ function repositoryPayload(): Record<string, unknown> {
     default_branch: "main",
     private: true,
     archived: false,
+    visibility: "private",
+    description: "Agentic research plugin",
+    language: "TypeScript",
+    topics: ["agent", "obsidian"],
+    has_issues: true,
+    permissions: {
+      admin: false,
+      maintain: true,
+      push: true,
+      triage: true,
+      pull: true,
+    },
   };
 }
 
@@ -665,6 +827,57 @@ function reviewCommentPayload(): Record<string, unknown> {
     path: "src/index.ts",
     line: 12,
     pull_request_review_id: 50,
+  };
+}
+
+function releasePayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id: 7,
+    tag_name: "v1.2.3",
+    target_commitish: "main",
+    name: "Version 1.2.3",
+    body: "Release notes",
+    draft: false,
+    prerelease: false,
+    immutable: false,
+    html_url: "https://github.com/acme/research-agent/releases/tag/v1.2.3",
+    author: actorPayload(),
+    created_at: "2026-07-12T00:00:00Z",
+    published_at: "2026-07-12T01:00:00Z",
+    ...overrides,
+  };
+}
+
+function workflowRunPayload(): Record<string, unknown> {
+  return {
+    id: 6,
+    name: "CI",
+    html_url: "https://github.com/acme/research-agent/actions/runs/6",
+    status: "completed",
+    conclusion: "success",
+    head_sha: SHA_A,
+    event: "pull_request",
+    run_attempt: 1,
+    updated_at: "2026-07-12T00:02:00Z",
+  };
+}
+
+function workflowJobPayload(): Record<string, unknown> {
+  return {
+    id: 61,
+    run_id: 6,
+    name: "test",
+    html_url: "https://github.com/acme/research-agent/actions/runs/6/job/61",
+    status: "completed",
+    conclusion: "success",
+    head_sha: SHA_A,
+    started_at: "2026-07-12T00:00:00Z",
+    completed_at: "2026-07-12T00:02:00Z",
+    workflow_name: "CI",
+    head_branch: "main",
+    runner_name: "GitHub Actions 1",
   };
 }
 

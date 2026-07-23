@@ -537,8 +537,8 @@ export class CommitOnlyVerifiedCommitGatewayV1
       });
       if (after) artifacts.push(after);
     }
-    files.sort((left, right) => left.path.localeCompare(right.path));
-    artifacts.sort((left, right) => left.path.localeCompare(right.path));
+    files.sort(comparePath);
+    artifacts.sort(comparePath);
     const fingerprint = await diffFingerprint({ baseSha: parentSha, patch, files });
     return {
       operationId,
@@ -1437,13 +1437,17 @@ function isHostPathWithin(candidate: string, root: string): boolean {
 }
 
 function comparePath<T extends { path: string }>(left: T, right: T): number {
-  return left.path.localeCompare(right.path);
+  return compareCanonicalText(left.path, right.path);
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   if (left.length !== right.length) return false;
-  const a = [...left].sort();
-  const b = [...right].sort();
+  const a = [...left].sort(compareCanonicalText);
+  const b = [...right].sort(compareCanonicalText);
   return a.every((value, index) => value === b[index]);
 }
 

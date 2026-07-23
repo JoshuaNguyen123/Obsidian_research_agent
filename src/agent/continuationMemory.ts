@@ -235,6 +235,25 @@ export function formatContinuationHandoffForPrompt(
   ].join("\n");
 }
 
+/**
+ * Model-facing handoff projection for loop compaction. Keeps fingerprint and
+ * recovery/proof state without dumping every identity list into the prompt.
+ * Full fingerprinted handoff remains the validation/persistence authority.
+ */
+export function formatContinuationHandoffCompactForPrompt(
+  handoff: ContinuationHandoffV1,
+): string {
+  return [
+    "Canonical continuation handoff (fingerprint validated).",
+    `Fingerprint: ${handoff.fingerprint}`,
+    `Graph frontier: ${handoff.graphFrontier ? `${handoff.graphFrontier.missionId}@${handoff.graphFrontier.revision}; active=${handoff.graphFrontier.activeNodeIds.join(",") || "none"}; ready=${handoff.graphFrontier.readyNodeIds.join(",") || "none"}` : "none"}`,
+    `Authority counts: evidence=${handoff.evidence.length}; readbacks=${handoff.readbackFingerprints.length}; receipts=${handoff.receiptFingerprints.length}; approvals=${handoff.approvals.length}; bindings=${handoff.bindingFingerprints.length}; lineage=${handoff.lineageFingerprints.length}`,
+    `Receipts (recent): ${handoff.receiptFingerprints.slice(-6).join(", ") || "none"}`,
+    `Recovery: stalled=${handoff.recovery.stalledCount}; last=${handoff.recovery.lastMeaningfulAction ?? "none"}; remaining=${handoff.recovery.remainingActions.join("; ") || "none"}`,
+    `Proof debt: blocked=${handoff.proofDebt.blocked}; resumeBlocked=${handoff.proofDebt.resumeBlocked}; missing=${handoff.proofDebt.missing.join(", ") || "none"}`,
+  ].join("\n");
+}
+
 function fingerprint(value: unknown): string {
   return `sha256:${portableSha256Text(canonicalJson(value))}`;
 }

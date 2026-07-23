@@ -166,6 +166,8 @@ export interface CodeExecutionLineageProofV1 {
   repositoryProfileFingerprint: string;
   workspaceId: string;
   validationReceiptFingerprints: string[];
+  /** Exact verified workspace diff bound into the commit handoff. */
+  diffFingerprint?: string;
   targetedValidationPassed: true;
   freshFullValidationPassed: true;
   commitSha: string;
@@ -403,14 +405,52 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
     secretFree: true,
   });
   const normalized = text.toLowerCase();
-  const isNegated = (targetPattern: string) =>
-    new RegExp(
-      `\\b(?:do not|don't|without|skip|exclude|no)\\b[^.\\n]{0,100}\\b(?:${targetPattern})\\b`,
-      "u",
-    ).test(normalized);
-  if (
-    /\b(?:end[- ]to[- ]end|complete\s+(?:the\s+)?(?:project|lifecycle)|create\s+(?:the\s+)?project\s+from\s+research)\b/u.test(normalized)
-  ) {
+  // Stage skip when the user forbids that stage. Ignore continue-meta clauses
+  // ("do not stop/ask/wait … before Linear/code/GitHub") so they do not strip
+  // delivery stages, while still honoring "do not clean up/publish/create …".
+  const isNegated = (targetPattern: string) => {
+    if (
+      new RegExp(
+        `\\b(?:without|skip|exclude)\\b[^.\\n]{0,100}\\b(?:${targetPattern})\\b`,
+        "u",
+      ).test(normalized)
+    ) {
+      return true;
+    }
+    if (new RegExp(`\\bno\\b\\s+(?:${targetPattern})\\b`, "u").test(normalized)) {
+      return true;
+    }
+    const target = new RegExp(`\\b(?:${targetPattern})\\b`, "u");
+    for (const match of normalized.matchAll(
+      /\b(?:do not|don't|never)\b([^.\n]{0,120})/gu,
+    )) {
+      const rest = match[1] ?? "";
+      if (/^\s*(?:stop|ask|wait|continue|idle|halt|pause)\b/u.test(rest)) {
+        continue;
+      }
+      if (target.test(rest)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // Classic end-to-end unlock (cleanup included unless negated).
+  const isEndToEndUnlock =
+    /\b(?:end[- ]to[- ]end|complete\s+(?:the\s+)?(?:project|lifecycle)|create\s+(?:the\s+)?project\s+from\s+research)\b/u.test(
+      normalized,
+    );
+  // Compound / Flow-real / full-pipeline unlock (same multi-stage set; cleanup
+  // omitted unless cleanup words are present). Matches COMPOUND-REAL mission
+  // wording without requiring the literal phrase "end-to-end".
+  const isCompoundPipelineUnlock =
+    /\bfull\s+pipeline\b/u.test(normalized) ||
+    /\bflow[-_\s]?real(?:\b|[-_])/u.test(normalized) ||
+    /\blinear\b[\s\S]{0,900}\b(?:repository|repo|workspace)\b[\s\S]{0,900}\bgithub\b[\s\S]{0,900}\breflection\b/u.test(
+      normalized,
+    );
+  if (isEndToEndUnlock || isCompoundPipelineUnlock) {
+    const cleanupAsked =
+      /\b(?:cleanup|clean\s*up|reconcil(?:e|iation)|backlinks?|close)\b/u.test(normalized);
     return PROJECT_LIFECYCLE_STAGES.filter((stage) => {
       switch (stage) {
         case "accepted_research":
@@ -422,7 +462,15 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
         case "private_github_publication":
           return !isNegated("github|publish(?:ing|ation)?|push|pull request|draft pr|private repository");
         case "reconciliation_cleanup":
-          return !isNegated("cleanup|clean\\s*up|reconcil(?:e|iation)|backlinks?|close");
+          // End-to-end keeps cleanup unless negated; compound unlocks omit it
+          // unless cleanup was explicitly asked for.
+          if (isEndToEndUnlock) {
+            return !isNegated("cleanup|clean\\s*up|reconcil(?:e|iation)|backlinks?|close");
+          }
+          return (
+            cleanupAsked &&
+            !isNegated("cleanup|clean\\s*up|reconcil(?:e|iation)|backlinks?|close")
+          );
       }
     });
   }
@@ -430,13 +478,41 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   const positive = (pattern: RegExp, targetPattern: string) =>
     pattern.test(normalized) &&
     !isNegated(targetPattern);
-  if (positive(/\b(?:research|investigate|study|analy[sz]e)\b[^.\n]{0,120}\b(?:topic|product|problem|idea|market|vault|web|sources?)\b/u, "research|investigat(?:e|ion)")) {
+  // Include "research on/about X" and research→code sequencing so ordinary
+  // "research then implement" missions become a two-stage compound without
+  // requiring the full end-to-end Linear/GitHub vocabulary.
+  if (
+    positive(
+      /\b(?:research|investigate|study|analy[sz]e)\b[^.\n]{0,120}\b(?:topic|product|problem|idea|market|vault|web|sources?|rules?|online)\b/u,
+      "research|investigat(?:e|ion)",
+    ) ||
+    positive(
+      /\b(?:research|investigate|study|analy[sz]e)\b\s+(?:on|about|into)\s+\w/u,
+      "research|investigat(?:e|ion)",
+    ) ||
+    positive(
+      /\b(?:research|investigate|study)\b[\s\S]{0,160}\b(?:then|afterwards|and\s+then|next)\b[\s\S]{0,120}\b(?:implement|build|code|write|create)\b/u,
+      "research|investigat(?:e|ion)",
+    )
+  ) {
     stages.push("accepted_research");
   }
   if (positive(/\b(?:prepare|format|shape|turn|send|publish|create|build)\b[^.\n]{0,140}\blinear\b[^.\n]{0,100}\b(?:initiative|project|issues?|hierarchy|plan)\b/u, "linear|initiative|hierarchy")) {
     stages.push("linear_hierarchy");
   }
-  if (positive(/\b(?:implement|code|execute|work|build|fix)\b[^.\n]{0,140}\b(?:code|repository|repo|workspace|linear\s+issues?)\b/u, "code|implement(?:ation)?|repository|repo|workspace")) {
+  // Do not treat "write … Linear issue URL" (note reflection) as code_execution.
+  // Prefer repository/workspace/language nouns; "implement Linear issues in the
+  // workspace" still matches via workspace/repository.
+  if (
+    positive(
+      /\b(?:implement|code|execute|work|build|fix|write)\b[^.\n]{0,140}\b(?:code|repository|repo|workspace|game|app|script|module|library|package|python|javascript|typescript|rust|golang)\b/u,
+      "code|implement(?:ation)?|repository|repo|workspace",
+    ) ||
+    positive(
+      /\b(?:then|afterwards|and\s+then|next)\b[^.\n]{0,120}\b(?:implement|build|code|write)\b[^.\n]{0,120}\b(?:code|game|app|script|module|python|javascript|typescript|workspace|repository|repo)\b/u,
+      "code|implement(?:ation)?|repository|repo|workspace",
+    )
+  ) {
     stages.push("code_execution");
   }
   if (positive(/\b(?:publish|push|open|create)\b[^.\n]{0,140}\b(?:github|draft\s+(?:pr|pull request)|pull request|private\s+repository)\b/u, "github|publish(?:ing|ation)?|push|pull request|draft pr|private repository")) {
@@ -458,7 +534,60 @@ export function estimateProjectLifecycleV1(
 ): ProjectLifecycleEstimateV1 | null {
   const stages = detectProjectLifecycleStagesV1(command);
   if (stages.length === 0) return null;
+  return estimateProjectLifecycleForStagesV1(stages);
+}
+
+/** Stage estimates from an explicit stage list (set-loose budget planning). */
+export function estimateProjectLifecycleForStagesV1(
+  stages: readonly ProjectLifecycleStageV1[],
+): ProjectLifecycleEstimateV1 {
   const estimates = stages.map(projectLifecycleStageEstimate);
+  return {
+    version: 1,
+    stages: estimates,
+    activeMinutesMin: estimates.reduce(
+      (total, estimate) => total + estimate.activeMinutesMin,
+      0,
+    ),
+    activeMinutesMax: estimates.reduce(
+      (total, estimate) => total + estimate.activeMinutesMax,
+      0,
+    ),
+    excludesProviderAndApprovalWaits: true,
+  };
+}
+
+/**
+ * Set-loose estimates: Linear/code/GitHub do not expect mid-run Chat approval pauses.
+ * Cleanup still may pause (Hard).
+ */
+export function projectLifecycleStageEstimateForSetLoose(
+  stage: ProjectLifecycleStageV1,
+): ProjectLifecycleStageEstimateV1 {
+  const base = projectLifecycleStageEstimate(stage);
+  if (
+    stage === "linear_hierarchy" ||
+    stage === "code_execution" ||
+    stage === "private_github_publication"
+  ) {
+    return {
+      ...base,
+      approvalMayPause: false,
+      label:
+        stage === "linear_hierarchy"
+          ? "Linear prepare, create, and readback"
+          : stage === "code_execution"
+            ? "Code implementation, validation, and commit"
+            : "Private GitHub publication and readback",
+    };
+  }
+  return base;
+}
+
+export function estimateProjectLifecycleForSetLooseV1(
+  stages: readonly ProjectLifecycleStageV1[],
+): ProjectLifecycleEstimateV1 {
+  const estimates = stages.map(projectLifecycleStageEstimateForSetLoose);
   return {
     version: 1,
     stages: estimates,
@@ -1116,7 +1245,7 @@ function parseStageProof(value: unknown): ProjectLifecycleStageProofV1 {
         providerReadbackFingerprints: parseUniqueStrings(record.providerReadbackFingerprints, "Linear readback fingerprint", 3, 22, 72, expectSha256),
       };
     case "code_execution":
-      assertExactKeys(record, ["stage", "repositoryProfileKey", "repositoryProfileFingerprint", "workspaceId", "validationReceiptFingerprints", "targetedValidationPassed", "freshFullValidationPassed", "commitSha", "commitReadbackFingerprint"], [], "code execution lineage proof");
+      assertExactKeys(record, ["stage", "repositoryProfileKey", "repositoryProfileFingerprint", "workspaceId", "validationReceiptFingerprints", "targetedValidationPassed", "freshFullValidationPassed", "commitSha", "commitReadbackFingerprint"], ["diffFingerprint"], "code execution lineage proof");
       if (record.targetedValidationPassed !== true || record.freshFullValidationPassed !== true) {
         throw new DurableLinearContractError("Code lineage requires targeted and fresh-full validation proof.");
       }
@@ -1126,6 +1255,14 @@ function parseStageProof(value: unknown): ProjectLifecycleStageProofV1 {
         repositoryProfileFingerprint: expectSha256(record.repositoryProfileFingerprint, "repository profile fingerprint"),
         workspaceId: expectOpaqueId(record.workspaceId, "code workspace id"),
         validationReceiptFingerprints: parseUniqueStrings(record.validationReceiptFingerprints, "validation receipt fingerprint", 2, 20, 72, expectSha256),
+        ...(record.diffFingerprint === undefined
+          ? {}
+          : {
+              diffFingerprint: expectSha256(
+                record.diffFingerprint,
+                "code diff fingerprint",
+              ),
+            }),
         targetedValidationPassed: true,
         freshFullValidationPassed: true,
         commitSha: gitSha(record.commitSha, "local commit SHA"),

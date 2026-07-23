@@ -94,12 +94,9 @@ export function isMissionGraphAcceptablyComplete(
   const final = findFinalMissionGraphNode(graph);
   if (!final) {
     const { required } = partitionGraphNodes(graph);
-    return required.every(
-      ({ node }) =>
-        node.status === "complete" || node.status === "cancelled",
-    );
+    return required.every(({ node }) => node.status === "complete");
   }
-  if (final.node.status !== "complete" && final.node.status !== "cancelled") {
+  if (final.node.status !== "complete") {
     return false;
   }
   const requiredIds = collectRequiredDependencyIds(graph, final.id);
@@ -109,10 +106,7 @@ export function isMissionGraphAcceptablyComplete(
       return true;
     }
     const node = graph.nodes[id];
-    return (
-      node !== undefined &&
-      (node.status === "complete" || node.status === "cancelled")
-    );
+    return node !== undefined && node.status === "complete";
   });
 }
 

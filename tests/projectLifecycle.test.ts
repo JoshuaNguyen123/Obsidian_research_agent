@@ -121,6 +121,122 @@ test("research project plan is one destination, one initiative/project, and at m
   }), /1-20 issues/u);
 });
 
+test("note reflection of a Linear ticket URL is not code_execution", () => {
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      [
+        "On the current Obsidian note, complete this Linear writeback mission.",
+        "Create exactly one Linear issue on team TEAM.",
+        "The append_to_current_file call is mandatory: write a markdown section that includes the exact Linear issue URL from linear_get_issue.",
+      ].join(" "),
+    ),
+    ["linear_hierarchy"],
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "After linear_get_issue, call append_to_current_file once and put the returned ticket URL into the note.",
+    ),
+    [],
+  );
+});
+
+test("research then code prompts detect accepted research and code execution without Linear", () => {
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Research American checkers rules with two web sources, then implement the game in Python.",
+    ),
+    ["accepted_research", "code_execution"],
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Do research on checkers and then write code for a Python checkers game.",
+    ),
+    ["accepted_research", "code_execution"],
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Research this topic online, then build a simple checkers app in Python.",
+    ),
+    ["accepted_research", "code_execution"],
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Research the rules, then code a Python implementation in the workspace.",
+    ),
+    ["accepted_research", "code_execution"],
+  );
+});
+
+test("full pipeline and Flow-real compound wording unlock multi-stage set without cleanup", () => {
+  const multiStageWithoutCleanup = [
+    "accepted_research",
+    "linear_hierarchy",
+    "code_execution",
+    "private_github_publication",
+  ] as const;
+
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1("Run the full pipeline on this tracking note."),
+    [...multiStageWithoutCleanup],
+  );
+  // Durable Continue command text alone must not look like a compound mission;
+  // AgentRunner re-detects from restored originalMission after resume.
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "continue run run-2026-07-21T12-00-00.000Z-abcd",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "FLOW_REAL_abc123 mission: create Linear issue, use the repository workspace, publish GitHub, append Flow real reflection.",
+    ),
+    [...multiStageWithoutCleanup],
+  );
+  // COMPOUND-REAL-style continuous mission (no literal "end-to-end").
+  const compoundRealLike = [
+    "Run the full pipeline on this tracking note for marker FLOW_REAL_xyz.",
+    "Create one Linear issue for team TEAM titled Flow real FLOW_REAL_xyz, then read it back.",
+    "Use the trusted local repository profile: create workspace ws, write code, validate, and commit.",
+    "Create the exact private GitHub repository owner/repo.",
+    "Append a Flow real reflection section to the current note with the Linear issue URL and GitHub repo URL.",
+    "Decide tool order yourself. Do not ask for approval. Do not trash or delete. Do not merge.",
+    // Continue-instruction wording must not strip Linear/code/GitHub stages.
+    "Do not stop with a chat-only final answer before Linear, code, GitHub, and reflection proofs exist.",
+  ].join(" ");
+  assert.deepEqual(detectProjectLifecycleStagesV1(compoundRealLike), [
+    ...multiStageWithoutCleanup,
+  ]);
+  // Compound Linear → repository → GitHub → reflection without "full pipeline".
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Create a Linear issue, implement in the repository workspace, publish to GitHub, then append a note reflection.",
+    ),
+    [...multiStageWithoutCleanup],
+  );
+  // Negation still filters stages on compound unlock.
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1(
+      "Run the full pipeline, but do not publish to GitHub or open a pull request.",
+    ),
+    ["accepted_research", "linear_hierarchy", "code_execution"],
+  );
+  // Cleanup omitted unless explicitly asked on compound unlock.
+  assert.deepEqual(
+    detectProjectLifecycleStagesV1("Run the full pipeline and then reconcile the project links."),
+    [
+      "accepted_research",
+      "linear_hierarchy",
+      "code_execution",
+      "private_github_publication",
+      "reconciliation_cleanup",
+    ],
+  );
+  assert.ok(
+    !detectProjectLifecycleStagesV1("Run the full pipeline.").includes("reconciliation_cleanup"),
+  );
+});
+
 test("explicit lifecycle classification is ordered, negation-authoritative, and produces composite stage nodes", () => {
   assert.deepEqual(
     detectProjectLifecycleStagesV1(
@@ -247,6 +363,7 @@ test("project lineage advances once per verified stage and binds exact local and
       repositoryProfileFingerprint: SHA("a"),
       workspaceId: "workspace-code-1",
       validationReceiptFingerprints: [SHA("b"), SHA("c")],
+      diffFingerprint: SHA("f"),
       targetedValidationPassed: true,
       freshFullValidationPassed: true,
       commitSha,

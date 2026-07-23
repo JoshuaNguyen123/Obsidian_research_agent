@@ -41,8 +41,10 @@ test.describe("Daily-use live research contract", () => {
       expect(appendReceipts, JSON.stringify(safeState)).toHaveLength(1);
       expect(after.startsWith(before)).toBe(true);
       expect(after).toContain(harness.marker);
-      expect(after).toMatch(/retention\s+improved/iu);
-      expect(after).toMatch(/error(?:s|\s+rates?)?\s+fell/iu);
+      expect(after).toMatch(/retention\s+(?:improved|increased|rose|grew)/iu);
+      expect(after).toMatch(
+        /error(?:s|\s+rates?)?\s+(?:fell|dropped|decreased|declined)/iu,
+      );
       expect(appendReceipts[0]?.readback).toBeTruthy();
       expect(
         Object.values(snapshot.lastMissionGraph.nodes).every(

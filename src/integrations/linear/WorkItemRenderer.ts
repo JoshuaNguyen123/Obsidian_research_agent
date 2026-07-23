@@ -128,13 +128,7 @@ export function renderCompatibleWorkItemSpec(
   const spec = parseWorkItemSpecV2(value);
   const details = normalizeRenderDetails(renderDetails);
   assertNoReservedMarkersV2(spec, details);
-  const contract = [
-    WORK_ITEM_CONTRACT_V2_START,
-    "```json",
-    JSON.stringify(spec, null, 2),
-    "```",
-    WORK_ITEM_CONTRACT_V2_END,
-  ].join("\n");
+  const contract = renderWorkItemSpecV2Contract(spec);
   const acceptanceCriteria = spec.acceptanceCriteria
     .map((criterion) => `- [ ] **${escapeInline(criterion.id)}** - ${criterion.text}`)
     .join("\n");
@@ -201,6 +195,20 @@ export function renderCompatibleWorkItemSpec(
   ].join("\n\n");
 }
 
+/**
+ * Render clean provider-facing issue prose followed by exactly one signed v2
+ * contract. Keeping the contract last lets queue ingestion bind the complete
+ * approved Linear description without putting host authority in human fields.
+ */
+export function renderQueueExecutableHumanWorkItemSpecV2(
+  value: WorkItemSpecV2,
+  renderDetails: WorkItemRenderDetailsV1 = {},
+): string {
+  const spec = parseWorkItemSpecV2(value);
+  const humanDescription = renderHumanCompatibleWorkItemSpec(spec, renderDetails);
+  return [humanDescription, renderWorkItemSpecV2Contract(spec)].join("\n\n");
+}
+
 /** Render provider-visible issue prose without host fingerprints or machine metadata. */
 export function renderHumanCompatibleWorkItemSpec(
   value: ParsedCompatibleWorkItemSpec,
@@ -249,6 +257,19 @@ export function assertCleanLinearHumanOutputV1(value: string, label: string): vo
   ) {
     throw new Error(`${label} contains internal agent metadata.`);
   }
+  if (/\{\{[^{}\r\n]{1,200}\}\}/u.test(value)) {
+    throw new Error(`${label} contains an unresolved template placeholder.`);
+  }
+}
+
+function renderWorkItemSpecV2Contract(spec: WorkItemSpecV2): string {
+  return [
+    WORK_ITEM_CONTRACT_V2_START,
+    "```json",
+    JSON.stringify(spec, null, 2),
+    "```",
+    WORK_ITEM_CONTRACT_V2_END,
+  ].join("\n");
 }
 
 function renderStringList(values: readonly string[], emptyText: string): string {

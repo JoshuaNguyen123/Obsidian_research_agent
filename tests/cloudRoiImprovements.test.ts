@@ -17,6 +17,8 @@ import {
   applyCloudProviderPreset,
   CLOUD_PROVIDER_PRESETS,
   getCloudProviderPreset,
+  matchCloudProviderPreset,
+  repairOllamaCloudBaseUrl,
 } from "../src/model/cloudProviderPresets";
 import {
   accumulateOpenAIStreamToolCalls,
@@ -172,6 +174,25 @@ test("runRoute maps to schema policy and drops Linear on current-note", () => {
   assert.ok(researchNames.includes("web_fetch"));
   assert.ok(researchNames.includes("read_current_file"));
   assert.ok(!researchNames.includes("linear_create_issue"));
+
+  const compoundSchemas = schemasForStep({
+    route: "grounded_workflow",
+    frontier: ["code_workspace_create_file"],
+    graphRequired: [],
+    allSchemas: [
+      { type: "function", function: { name: "code_workspace_create_file" } },
+      { type: "function", function: { name: "code_sandbox_status" } },
+      { type: "function", function: { name: "publish_research_to_linear" } },
+      { type: "function", function: { name: "linear_create_issue" } },
+      { type: "function", function: { name: "web_search" } },
+    ],
+  });
+  const compoundNames = compoundSchemas.map((s) => s.function.name);
+  assert.ok(compoundNames.includes("code_workspace_create_file"));
+  assert.ok(compoundNames.includes("code_sandbox_status"));
+  assert.ok(compoundNames.includes("publish_research_to_linear"));
+  assert.ok(compoundNames.includes("web_search"));
+  assert.ok(!compoundNames.includes("linear_create_issue"));
 });
 
 test("constrainToolsToMissionGraphFrontier shrinks note route without graph", () => {
@@ -241,9 +262,11 @@ test("constrainToolsToMissionGraphFrontier shrinks research and vault routes wit
   const vault = constrainToolsToMissionGraphFrontier(tools, null, {
     route: "prefetched_vault_answer",
   });
+  // Without a graph, vault/research routes only strip linear_*/github_* noise
+  // (not an empty-frontier whitelist), so Soft research tools stay available.
   assert.deepEqual(
-    vault.map((t) => t.function.name),
-    ["read_file"],
+    vault.map((t) => t.function.name).sort(),
+    ["read_file", "web_search"],
   );
 });
 
@@ -279,6 +302,11 @@ test("cloud provider presets include OpenAI OpenRouter Azure and Ollama Cloud", 
   );
   assert.match(getCloudProviderPreset("azure_openai")?.baseUrl ?? "", /azure/i);
   assert.equal(getCloudProviderPreset("ollama_cloud")?.provider, "ollama");
+  assert.equal(getCloudProviderPreset("ollama_cloud")?.suggestedModel, "glm-5.2");
+  assert.equal(
+    getCloudProviderPreset("ollama_cloud")?.baseUrl,
+    "https://ollama.com/api",
+  );
 });
 
 test("Ollama Cloud preset sets base URL only and leaves the model tag alone", () => {
@@ -291,8 +319,33 @@ test("Ollama Cloud preset sets base URL only and leaves the model tag alone", ()
   const preset = getCloudProviderPreset("ollama_cloud");
   assert.ok(preset);
   applyCloudProviderPreset(settings, preset);
-  assert.equal(settings.ollamaBaseUrl, "https://ollama.com");
+  assert.equal(settings.ollamaBaseUrl, "https://ollama.com/api");
   assert.equal(settings.model, "qwen3.5:cloud");
+});
+
+test("matchCloudProviderPreset recognizes applied Ollama Cloud endpoint", () => {
+  const settings = {
+    modelProvider: "ollama" as const,
+    model: "glm-5.2",
+    ollamaBaseUrl: "https://ollama.com/api/",
+    openAiCompatibleBaseUrl: "https://api.openai.com/v1",
+  };
+  assert.equal(matchCloudProviderPreset(settings)?.id, "ollama_cloud");
+  settings.ollamaBaseUrl = "http://127.0.0.1:11434";
+  assert.equal(matchCloudProviderPreset(settings), undefined);
+});
+
+test("repairOllamaCloudBaseUrl heals bare ollama.com host", () => {
+  assert.equal(repairOllamaCloudBaseUrl("https://ollama.com"), "https://ollama.com/api");
+  assert.equal(repairOllamaCloudBaseUrl("https://ollama.com/"), "https://ollama.com/api");
+  assert.equal(
+    repairOllamaCloudBaseUrl("https://ollama.com/api"),
+    "https://ollama.com/api",
+  );
+  assert.equal(
+    repairOllamaCloudBaseUrl("http://127.0.0.1:11434"),
+    "http://127.0.0.1:11434",
+  );
 });
 
 test("OpenAI-compatible presets still apply a suggested model", () => {

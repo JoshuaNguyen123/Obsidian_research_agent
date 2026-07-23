@@ -7,9 +7,11 @@ import {
   type ActionReceipt,
 } from "../src/agent/actions";
 import type { AuthorityGrantV1 } from "../src/agent/authority";
+import { sha256DiagramContent } from "../src/design/diagramArtifactStore";
 import {
   createAcceptedResearchArtifactV1,
   createWorkItemSpecV2,
+  type AcceptedResearchNoteReadRequestV1,
   type AcceptedResearchNoteWriteRequestV1,
   type LinearIssueRecord,
   type ResearchPublicationCheckpointV1,
@@ -70,6 +72,179 @@ test("host keeps the deterministic path fallback for a pathless create mission",
     }),
     "Accepted research run-42.md",
   );
+});
+
+test("host binds a pathless publication to the trusted initiating note", () => {
+  assert.equal(
+    resolveResearchPublicationNotePathV1({
+      initiatingNotePath: "Projects/Checkers.md",
+      originalPrompt: "Publish the accepted research report from this note to Linear.",
+      runId: "run:42",
+    }),
+    "Projects/Checkers.md",
+  );
+  assert.throws(
+    () => resolveResearchPublicationNotePathV1({
+      initiatingNotePath: "Projects/Checkers.md",
+      requestedPath: "Accepted research elsewhere.md",
+      originalPrompt: "Publish the accepted research report to Linear.",
+      runId: "run:42",
+    }),
+    /differs from the trusted initiating Obsidian note/iu,
+  );
+});
+
+test("composite publication captures the active note and host hash as an append binding", async () => {
+  const fixture = createFixture("created");
+  const context = contextFixture(
+    "Publish the accepted research report from this note to Linear.",
+    "run-active-note",
+    "call-active-note",
+  );
+  const initiatingContent = "# Checkers idea\n\nBuild a complete playable game.\n";
+  const initiatingFile = { path: "Projects/Checkers.md", extension: "md" };
+  context.getCurrentMarkdownFile = () => initiatingFile as never;
+  context.app = {
+    vault: {
+      read: async () => initiatingContent,
+    },
+  } as never;
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-active-note",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: argsFixture({ notePath: undefined }) },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites[0]?.path, "Projects/Checkers.md");
+  assert.equal(fixture.noteWrites[0]?.mode, "append");
+  assert.equal(
+    fixture.noteWrites[0]?.baseHash,
+    await sha256DiagramContent(initiatingContent),
+  );
+  assert.equal(
+    fixture.checkpoints.at(-1)?.artifact.notePath,
+    "Projects/Checkers.md",
+  );
+});
+
+test("checkpoint resume ignores newly active note and keeps the original note binding", async () => {
+  const fixture = createFixture("reconcile_required", { resumeCheckpoints: true });
+  const firstContext = contextFixture(
+    "Publish the accepted research report from this note to Linear.",
+    "run-checkpoint-resume",
+    "call-checkpoint-first",
+  );
+  const noteA = { path: "Projects/Checkers A.md", extension: "md" };
+  firstContext.getCurrentMarkdownFile = () => noteA as never;
+  firstContext.app = {
+    vault: { read: async () => "# Checkers A\n\nOriginal mission note.\n" },
+  } as never;
+  firstContext.requestNestedApproval = approveNested;
+
+  await assert.rejects(
+    fixture.tool.execute(argsFixture({ notePath: undefined }), firstContext),
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "linear_mutation_uncertain",
+  );
+  assert.equal(fixture.noteWrites[0]?.path, noteA.path);
+  assert.equal(fixture.checkpoints.at(-1)?.status, "reconcile_required");
+
+  fixture.publisher.mode = "deduplicated";
+  let noteBReads = 0;
+  const secondContext = contextFixture(
+    "Publish the accepted research report to Linear; resume the prior attempt.",
+    "run-checkpoint-resume",
+    "call-checkpoint-second",
+  );
+  const noteB = { path: "Projects/Unrelated B.md", extension: "md" };
+  secondContext.getCurrentMarkdownFile = () => noteB as never;
+  secondContext.app = {
+    vault: {
+      read: async () => {
+        noteBReads += 1;
+        throw new Error("The active editor must not be consulted during resume.");
+      },
+    },
+  } as never;
+  secondContext.requestNestedApproval = approveNested;
+
+  const resumed = await fixture.tool.execute(
+    argsFixture({ notePath: "Projects/Unrelated B.md" }),
+    secondContext,
+  ) as { ok: boolean; artifact: { notePath: string } };
+
+  assert.equal(resumed.ok, true);
+  assert.equal(resumed.artifact.notePath, noteA.path);
+  assert.equal(noteBReads, 0);
+  assert.equal(fixture.noteWrites.length, 1);
+  assert.equal(fixture.resumeReads.length, 1);
+  assert.equal(fixture.resumeReads[0]?.artifact.notePath, noteA.path);
+  assert.equal(
+    fixture.resumeReads[0]?.expectedNoteSha256,
+    fixture.checkpoints[0]?.artifact.noteSha256,
+  );
+  assert.equal(
+    fixture.noteWrites.some((request) => request.path === noteB.path),
+    false,
+  );
+});
+
+test("checkpoint identity mismatch fails before consulting a newly active note", async () => {
+  const fixture = createFixture("reconcile_required", { resumeCheckpoints: true });
+  const firstContext = contextFixture(
+    "Publish the accepted research report from this note to Linear.",
+    "run-checkpoint-identity",
+    "call-checkpoint-identity-first",
+  );
+  const noteA = { path: "Projects/Identity A.md", extension: "md" };
+  firstContext.getCurrentMarkdownFile = () => noteA as never;
+  firstContext.app = {
+    vault: { read: async () => "# Identity A\n" },
+  } as never;
+  firstContext.requestNestedApproval = approveNested;
+  await assert.rejects(
+    fixture.tool.execute(argsFixture({ notePath: undefined }), firstContext),
+  );
+  const checkpoint = fixture.checkpoints.at(-1);
+  assert.ok(checkpoint);
+  checkpoint.artifact.originRunId = "different-run";
+
+  let noteBReads = 0;
+  const secondContext = contextFixture(
+    "Publish the accepted research report to Linear; resume the prior attempt.",
+    "run-checkpoint-identity",
+    "call-checkpoint-identity-second",
+  );
+  secondContext.getCurrentMarkdownFile = () => ({
+    path: "Projects/Identity B.md",
+    extension: "md",
+  }) as never;
+  secondContext.app = {
+    vault: {
+      read: async () => {
+        noteBReads += 1;
+        return "# Identity B\n";
+      },
+    },
+  } as never;
+
+  await assert.rejects(
+    fixture.tool.execute(argsFixture({ notePath: undefined }), secondContext),
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "research_publication_checkpoint_identity_invalid",
+  );
+  assert.equal(noteBReads, 0);
+  assert.equal(fixture.noteWrites.length, 1);
 });
 
 test("composite publication uses host lineage/bindings, exact UI approval, one grant, and canonical receipt", async () => {
@@ -716,15 +891,17 @@ test("external bindings, origin ids, and unscoped paths fail before note mutatio
 });
 
 function createFixture(
-  mode: "created" | "deduplicated",
+  mode: "created" | "deduplicated" | "reconcile_required",
   options: {
     trustRepository?: boolean;
+    resumeCheckpoints?: boolean;
     loadDurableWebEvidence?: Parameters<
       typeof createResearchPublicationTool
     >[0]["loadDurableWebEvidence"];
   } = {},
 ) {
   const noteWrites: AcceptedResearchNoteWriteRequestV1[] = [];
+  const resumeReads: AcceptedResearchNoteReadRequestV1[] = [];
   const checkpoints: ResearchPublicationCheckpointV1[] = [];
   const grants: AuthorityGrantV1[] = [];
   const persistedReceipts: ActionReceipt[] = [];
@@ -758,6 +935,18 @@ function createFixture(
         transaction: { status: "committed" },
       } as never;
     },
+    readAcceptedPackage: async (request: AcceptedResearchNoteReadRequestV1) => {
+      resumeReads.push(structuredClone(request));
+      return {
+        path: request.artifact.notePath,
+        operation: "no_op",
+        beforeSha256: request.expectedNoteSha256,
+        afterSha256: request.expectedNoteSha256,
+        noteReceiptId: request.artifact.noteReceiptId,
+        artifact: request.artifact,
+        transaction: null,
+      } as never;
+    },
     appendLinearBacklink: async () => ({
       path: noteWrites[0].path,
       operation: "append",
@@ -771,13 +960,29 @@ function createFixture(
     noteWriter: noteWriter as never,
     publisher,
     lineage: {
+      ...(options.resumeCheckpoints
+        ? {
+            get: async (publicationId: string) =>
+              structuredClone(
+                [...checkpoints]
+                  .reverse()
+                  .find((checkpoint) => checkpoint.publicationId === publicationId) ?? null,
+              ),
+          }
+        : {}),
       persist: async (checkpoint) => {
         checkpoints.push(structuredClone(checkpoint));
       },
     },
     destination: DESTINATION,
     vaultBindingKey: "current-vault",
-    resolveNotePath: ({ requestedPath, originalPrompt, runId }) => {
+    resolveNotePath: ({ requestedPath, initiatingNotePath, originalPrompt, runId }) => {
+      if (initiatingNotePath) {
+        if (requestedPath && requestedPath !== initiatingNotePath) {
+          throw new Error("Requested path differs from initiating note.");
+        }
+        return initiatingNotePath;
+      }
       if (!requestedPath) return `Accepted research ${runId}.md`;
       if (!originalPrompt.includes(requestedPath)) throw new Error("Path is not explicit in mission.");
       return requestedPath;
@@ -803,18 +1008,26 @@ function createFixture(
       : {}),
     now: () => new Date(NOW),
   });
-  return { tool, noteWrites, checkpoints, grants, persistedReceipts, publisher };
+  return {
+    tool,
+    noteWrites,
+    resumeReads,
+    checkpoints,
+    grants,
+    persistedReceipts,
+    publisher,
+  };
 }
 
 class FakePublisher implements ResearchPublicationPublisherPortV1 {
   lastActiveGrantCount = 0;
   private ticket: ReturnType<typeof ticket> | null = null;
-  constructor(private readonly mode: "created" | "deduplicated") {}
+  constructor(public mode: "created" | "deduplicated" | "reconcile_required") {}
   async preview(request: ResearchTicketPreviewRequest) {
     this.ticket = ticket(request);
     return {
       ok: true as const,
-      status: this.mode === "created" ? "create" as const : "deduplicated" as const,
+      status: this.mode === "deduplicated" ? "deduplicated" as const : "create" as const,
       ticket: this.ticket,
       duplicate: this.mode === "deduplicated" ? issue(this.ticket.description) : null,
       candidatesExamined: this.mode === "deduplicated" ? 1 : 0,
@@ -828,6 +1041,20 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
       return { ok: true as const, status: "deduplicated" as const, ticket: built, issue: issue_, candidatesExamined: 1 };
     }
     const action = preparedAction(built.spec.fingerprint);
+    if (this.mode === "reconcile_required") {
+      return {
+        ok: false as const,
+        status: "reconcile_required" as const,
+        error: {
+          code: "linear_mutation_uncertain",
+          message: "The Linear response was ambiguous.",
+        },
+        ticket: built,
+        action,
+        grantId: request.preferredGrantId!,
+        candidatesExamined: 0,
+      };
+    }
     return {
       ok: true as const,
       status: "created" as const,
@@ -877,6 +1104,16 @@ function contextFixture(
     now: () => new Date(NOW),
     httpTransport: async () => ({ status: 500, headers: {} }),
   } as unknown as ToolExecutionContext;
+}
+
+async function approveNested(
+  request: Parameters<NonNullable<ToolExecutionContext["requestNestedApproval"]>>[0],
+) {
+  return {
+    approved: true as const,
+    approvalId: "approval-checkpoint-resume",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  };
 }
 
 function ticket(request: ResearchTicketPreviewRequest | ResearchTicketPublishRequest) {

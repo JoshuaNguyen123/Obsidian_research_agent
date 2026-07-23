@@ -30,6 +30,11 @@ export async function withModelRetry<T>(
     policy?: Partial<RetryPolicy>;
     abortSignal?: AbortSignal;
     onRetry?: (attempt: number, error: unknown, delayMs: number) => void;
+    /**
+     * When false, do not retry even for transient errors. Used after streamed
+     * writeback has already applied note bytes (re-stream would duplicate).
+     */
+    shouldRetry?: (error: unknown, attempt: number) => boolean;
   } = {},
 ): Promise<T> {
   const policy = normalizeRetryPolicy(options.policy);
@@ -40,7 +45,11 @@ export async function withModelRetry<T>(
     try {
       return await run();
     } catch (error) {
-      if (attempt >= policy.maxAttempts || !isTransientModelError(error)) {
+      if (
+        attempt >= policy.maxAttempts ||
+        !isTransientModelError(error) ||
+        options.shouldRetry?.(error, attempt) === false
+      ) {
         throw error;
       }
 

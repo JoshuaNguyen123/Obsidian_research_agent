@@ -21,6 +21,7 @@ import {
   type GitHubIssueRecord,
   type GitHubPullRequestRecord,
   type GitHubReferenceRecord,
+  type GitHubRepositoryRecord,
   type GitHubRestClient,
   type GitHubReviewCommentRecord,
   type GitHubReviewRecord,
@@ -50,13 +51,19 @@ const SHA_PATTERN = /^[a-f0-9]{40}$/iu;
 export const GITHUB_CATALOG_TOOL_OPERATION_MAP = Object.freeze({
   github_get_repository: "repository.get",
   github_get_reference: "reference.get",
+  github_list_branches: "branch.list",
+  github_list_tags: "tag.list",
+  github_list_releases: "release.list",
+  github_get_release: "release.get",
   github_get_commit: "commit.get",
   github_get_tree: "tree.get",
   github_get_blob: "blob.get",
   github_get_issue: "issue.get",
+  github_list_issues: "issue.list",
   github_get_issue_comment: "issue_comment.get",
   github_list_issue_comments: "issue_comment.list",
   github_get_pull_request: "pull_request.get",
+  github_list_pull_request_files: "pull_request_file.list",
   github_list_pull_requests_for_head: "pull_request.list_for_head",
   github_list_pull_request_reviews: "pull_request_review.list",
   github_get_review_comment: "review_comment.get",
@@ -64,6 +71,8 @@ export const GITHUB_CATALOG_TOOL_OPERATION_MAP = Object.freeze({
   github_list_check_runs: "check_run.list",
   github_get_combined_status: "commit_status.get",
   github_list_workflow_runs: "workflow_run.list",
+  github_get_workflow_run: "workflow_run.get",
+  github_list_workflow_jobs: "workflow_job.list",
   github_create_issue: "issue.create",
   github_update_issue: "issue.update",
   github_close_issue: "issue.close",
@@ -78,6 +87,11 @@ export const GITHUB_CATALOG_TOOL_OPERATION_MAP = Object.freeze({
   github_close_pull_request: "pull_request.close",
   github_reopen_pull_request: "pull_request.reopen",
   github_rerun_failed_workflow_jobs: "workflow_run.rerun_failed_jobs",
+  github_create_agent_branch: "agent_branch.create",
+  github_update_agent_branch_fast_forward: "agent_branch.fast_forward",
+  github_create_draft_pull_request: "pull_request.create_draft",
+  github_mark_pull_request_ready: "pull_request.mark_ready",
+  github_merge_pull_request: "pull_request.merge",
   github_delete_owned_branch: "owned_branch.delete",
 } as const);
 
@@ -86,13 +100,19 @@ export type GitHubCatalogToolName = keyof typeof GITHUB_CATALOG_TOOL_OPERATION_M
 export const GITHUB_CATALOG_READ_TOOL_NAMES = Object.freeze([
   "github_get_repository",
   "github_get_reference",
+  "github_list_branches",
+  "github_list_tags",
+  "github_list_releases",
+  "github_get_release",
   "github_get_commit",
   "github_get_tree",
   "github_get_blob",
   "github_get_issue",
+  "github_list_issues",
   "github_get_issue_comment",
   "github_list_issue_comments",
   "github_get_pull_request",
+  "github_list_pull_request_files",
   "github_list_pull_requests_for_head",
   "github_list_pull_request_reviews",
   "github_get_review_comment",
@@ -100,6 +120,8 @@ export const GITHUB_CATALOG_READ_TOOL_NAMES = Object.freeze([
   "github_list_check_runs",
   "github_get_combined_status",
   "github_list_workflow_runs",
+  "github_get_workflow_run",
+  "github_list_workflow_jobs",
 ] as const satisfies readonly GitHubCatalogToolName[]);
 
 export const GITHUB_CATALOG_MUTATION_TOOL_NAMES = Object.freeze([
@@ -117,6 +139,11 @@ export const GITHUB_CATALOG_MUTATION_TOOL_NAMES = Object.freeze([
   "github_close_pull_request",
   "github_reopen_pull_request",
   "github_rerun_failed_workflow_jobs",
+  "github_create_agent_branch",
+  "github_update_agent_branch_fast_forward",
+  "github_create_draft_pull_request",
+  "github_mark_pull_request_ready",
+  "github_merge_pull_request",
   "github_delete_owned_branch",
 ] as const satisfies readonly GitHubCatalogToolName[]);
 
@@ -134,6 +161,10 @@ type GitHubCatalogClientV1 = Pick<
   GitHubRestClient,
   | "getRepository"
   | "getReference"
+  | "listBranches"
+  | "listTags"
+  | "listReleases"
+  | "getRelease"
   | "getCommit"
   | "getTree"
   | "getBlob"
@@ -142,6 +173,7 @@ type GitHubCatalogClientV1 = Pick<
   | "getIssueComment"
   | "listIssueComments"
   | "getPullRequest"
+  | "listPullRequestFiles"
   | "listPullRequestsForHead"
   | "listPullRequestReviews"
   | "getReviewComment"
@@ -149,6 +181,8 @@ type GitHubCatalogClientV1 = Pick<
   | "listCheckRuns"
   | "getCombinedStatus"
   | "listWorkflowRunsForCommit"
+  | "getWorkflowRun"
+  | "listWorkflowJobs"
   | "createIssue"
   | "updateIssue"
   | "closeIssue"
@@ -159,10 +193,15 @@ type GitHubCatalogClientV1 = Pick<
   | "deleteOwnedComment"
   | "createPullRequestReview"
   | "replyToReviewComment"
+  | "createAgentBranch"
+  | "updateAgentBranchFastForward"
+  | "createDraftPullRequest"
+  | "markPullRequestReadyForReview"
   | "updatePullRequest"
   | "closePullRequest"
   | "reopenPullRequest"
   | "rerunFailedWorkflowJobs"
+  | "mergePullRequest"
   | "deleteAgentBranch"
 >;
 
@@ -170,6 +209,8 @@ export interface GitHubCatalogRepositoryContextV1 {
   client: GitHubCatalogClientV1;
   binding: TrustedGitHubRepositoryBindingV1;
   profile: RepositoryProfileV2;
+  /** Fresh host-read repository metadata; never accepted from model input. */
+  repositoryReadback: GitHubRepositoryRecord;
 }
 
 export interface CreateGitHubCatalogToolsOptionsV1 {
@@ -185,20 +226,28 @@ export interface CreateGitHubCatalogToolsOptionsV1 {
 type ReadKind =
   | "repository"
   | "reference"
+  | "branches"
+  | "tags"
+  | "releases"
+  | "release"
   | "commit"
   | "tree"
   | "blob"
   | "issue"
+  | "issues"
   | "issue_comment"
   | "issue_comments"
   | "pull_request"
+  | "pull_request_files"
   | "pull_requests_for_head"
   | "pull_request_reviews"
   | "review_comment"
   | "review_comments"
   | "check_runs"
   | "combined_status"
-  | "workflow_runs";
+  | "workflow_runs"
+  | "workflow_run"
+  | "workflow_jobs";
 
 interface ReadToolConfig {
   name: (typeof GITHUB_CATALOG_READ_TOOL_NAMES)[number];
@@ -224,7 +273,15 @@ type MutationKind =
   | "pull_request_close"
   | "pull_request_reopen"
   | "workflow_rerun_failed"
+  | "agent_branch_create"
+  | "agent_branch_fast_forward"
+  | "draft_pull_request_create"
+  | "pull_request_mark_ready"
+  | "pull_request_merge"
   | "owned_branch_delete";
+
+type MutationImpact = "standard" | "high" | "destructive" | "critical";
+type RepositoryMutationPermission = "triage" | "push" | "maintain" | "admin";
 
 interface MutationToolConfig {
   name: (typeof GITHUB_CATALOG_MUTATION_TOOL_NAMES)[number];
@@ -232,7 +289,9 @@ interface MutationToolConfig {
   kind: MutationKind;
   resourceType: string;
   action: ResourceAction;
-  destructive?: boolean;
+  impact: MutationImpact;
+  requiredPermission: RepositoryMutationPermission;
+  warning?: string;
   parameters: JsonSchemaObject;
 }
 
@@ -276,13 +335,19 @@ const BODY_SCHEMA: JsonSchemaObject = {
 const READ_CONFIGS: readonly ReadToolConfig[] = [
   readConfig("github_get_repository", "Read the trusted GitHub repository metadata resolved from a repository profile.", "repository", "repository"),
   readConfig("github_get_reference", "Read one branch reference from the trusted GitHub repository.", "reference", "reference", { branch: stringSchema(MAX_BRANCH_CHARS) }, ["branch"]),
+  readConfig("github_list_branches", "List a bounded set of repository branches and their exact head SHAs.", "branches", "branch", { limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, [], "list"),
+  readConfig("github_list_tags", "List a bounded set of repository tags and their exact target SHAs.", "tags", "tag", { limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, [], "list"),
+  readConfig("github_list_releases", "List a bounded set of GitHub releases from the trusted repository.", "releases", "release", { limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, [], "list"),
+  readConfig("github_get_release", "Read one GitHub release by exact numeric id.", "release", "release", { releaseId: POSITIVE_INTEGER_SCHEMA }, ["releaseId"]),
   readConfig("github_get_commit", "Read one Git commit object by exact SHA from the trusted GitHub repository.", "commit", "commit", { sha: SHA_SCHEMA }, ["sha"]),
   readConfig("github_get_tree", "Read a bounded Git tree by exact SHA. At most 200 entries are returned to the model.", "tree", "tree", { sha: SHA_SCHEMA, recursive: { type: "boolean" }, maxEntries: integerSchema(1, MAX_MODEL_TREE_RECORDS) }, ["sha"]),
   readConfig("github_get_blob", "Read a bounded Git blob by exact SHA. At most 100000 content characters are returned.", "blob", "blob", { sha: SHA_SCHEMA, maxContentChars: integerSchema(1, MAX_MODEL_BLOB_CHARS) }, ["sha"]),
   readConfig("github_get_issue", "Read one GitHub issue by number from the trusted repository.", "issue", "issue", { number: POSITIVE_INTEGER_SCHEMA }, ["number"]),
+  readConfig("github_list_issues", "List a bounded set of GitHub issues, excluding pull requests returned by GitHub's shared issues endpoint.", "issues", "issue", { limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, [], "list"),
   readConfig("github_get_issue_comment", "Read one GitHub issue or pull-request conversation comment by id.", "issue_comment", "issue_comment", { commentId: POSITIVE_INTEGER_SCHEMA }, ["commentId"]),
   readConfig("github_list_issue_comments", "List a bounded set of conversation comments for one issue or pull request.", "issue_comments", "issue_comment", { number: POSITIVE_INTEGER_SCHEMA, limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["number"], "list"),
   readConfig("github_get_pull_request", "Read one GitHub pull request by number.", "pull_request", "pull_request", { number: POSITIVE_INTEGER_SCHEMA }, ["number"]),
+  readConfig("github_list_pull_request_files", "List a bounded set of changed files and bounded patches for one pull request.", "pull_request_files", "pull_request_file", { number: POSITIVE_INTEGER_SCHEMA, limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["number"], "list"),
   readConfig("github_list_pull_requests_for_head", "List pull requests for an exact head and base branch pair.", "pull_requests_for_head", "pull_request", { head: stringSchema(MAX_BRANCH_CHARS), base: stringSchema(MAX_BRANCH_CHARS), limit: integerSchema(1, 10) }, ["head", "base"], "list"),
   readConfig("github_list_pull_request_reviews", "List a bounded set of reviews for one pull request.", "pull_request_reviews", "pull_request_review", { number: POSITIVE_INTEGER_SCHEMA, limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["number"], "list"),
   readConfig("github_get_review_comment", "Read one pull-request review comment by id.", "review_comment", "review_comment", { commentId: POSITIVE_INTEGER_SCHEMA }, ["commentId"]),
@@ -290,24 +355,31 @@ const READ_CONFIGS: readonly ReadToolConfig[] = [
   readConfig("github_list_check_runs", "List a bounded set of check runs for an exact commit SHA or trusted ref.", "check_runs", "check_run", { reference: stringSchema(MAX_REFERENCE_CHARS), limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["reference"], "list"),
   readConfig("github_get_combined_status", "Read the combined commit status and a bounded set of status contexts.", "combined_status", "commit_status", { reference: stringSchema(MAX_REFERENCE_CHARS), limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["reference"]),
   readConfig("github_list_workflow_runs", "List a bounded set of workflow runs for an exact commit SHA.", "workflow_runs", "workflow_run", { headSha: SHA_SCHEMA, limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["headSha"], "list"),
+  readConfig("github_get_workflow_run", "Read one workflow run by exact numeric id.", "workflow_run", "workflow_run", { runId: POSITIVE_INTEGER_SCHEMA }, ["runId"]),
+  readConfig("github_list_workflow_jobs", "List a bounded set of jobs for one exact workflow run id.", "workflow_jobs", "workflow_job", { runId: POSITIVE_INTEGER_SCHEMA, limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["runId"], "list"),
 ];
 
 const MUTATION_CONFIGS: readonly MutationToolConfig[] = [
-  mutationConfig("github_create_issue", "Prepare creation of an issue in the trusted GitHub repository.", "issue_create", "issue", "create", { title: stringSchema(MAX_TITLE_CHARS, 1), body: BODY_SCHEMA }, ["title", "body"]),
-  mutationConfig("github_update_issue", "Prepare a bounded title/body update to one GitHub issue.", "issue_update", "issue", "update", { number: POSITIVE_INTEGER_SCHEMA, title: stringSchema(MAX_TITLE_CHARS, 1), body: BODY_SCHEMA }, ["number"]),
-  mutationConfig("github_close_issue", "Prepare closing one GitHub issue.", "issue_close", "issue", "archive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"]),
-  mutationConfig("github_reopen_issue", "Prepare reopening one GitHub issue.", "issue_reopen", "issue", "unarchive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"]),
-  mutationConfig("github_create_issue_comment", "Prepare a conversation comment on one GitHub issue or pull request.", "issue_comment_create", "issue_comment", "create", { number: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["number", "body"]),
-  mutationConfig("github_update_issue_comment", "Prepare an update to a conversation comment owned by the pinned GitHub account.", "issue_comment_update", "issue_comment", "update", { commentId: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["commentId", "body"]),
-  mutationConfig("github_update_review_comment", "Prepare an update to an inline review comment owned by the pinned GitHub account.", "review_comment_update", "review_comment", "update", { commentId: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["commentId", "body"]),
-  mutationConfig("github_delete_owned_comment", "Prepare exact deletion of a comment owned by the pinned GitHub account.", "owned_comment_delete", "comment", "delete", { commentId: POSITIVE_INTEGER_SCHEMA, kind: { type: "string", enum: ["issue", "review"] } }, ["commentId", "kind"], true),
-  mutationConfig("github_create_pull_request_review", "Prepare a review against the current exact pull-request head SHA.", "pull_request_review_create", "pull_request_review", "create", { number: POSITIVE_INTEGER_SCHEMA, body: BODY_SCHEMA, commitId: SHA_SCHEMA, event: { type: "string", enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"] } }, ["number", "body", "commitId", "event"]),
-  mutationConfig("github_reply_to_review_comment", "Prepare a reply to one inline pull-request review comment.", "review_comment_reply", "review_comment", "create", { pullNumber: POSITIVE_INTEGER_SCHEMA, commentId: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["pullNumber", "commentId", "body"]),
-  mutationConfig("github_update_pull_request", "Prepare a title/body update to one pull request. Base, head, and source content cannot be changed.", "pull_request_update", "pull_request", "update", { number: POSITIVE_INTEGER_SCHEMA, title: stringSchema(MAX_TITLE_CHARS, 1), body: BODY_SCHEMA }, ["number"]),
-  mutationConfig("github_close_pull_request", "Prepare closing one pull request without merging it.", "pull_request_close", "pull_request", "archive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"]),
-  mutationConfig("github_reopen_pull_request", "Prepare reopening one pull request.", "pull_request_reopen", "pull_request", "unarchive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"]),
-  mutationConfig("github_rerun_failed_workflow_jobs", "Prepare rerunning failed jobs for one workflow run tied to an exact commit SHA.", "workflow_rerun_failed", "workflow_run", "execute", { runId: POSITIVE_INTEGER_SCHEMA, headSha: SHA_SCHEMA }, ["runId", "headSha"]),
-  mutationConfig("github_delete_owned_branch", "Prepare exact deletion of an agent-owned codex/ branch at an expected SHA.", "owned_branch_delete", "branch", "delete", { branch: stringSchema(MAX_BRANCH_CHARS, 1), expectedSha: SHA_SCHEMA }, ["branch", "expectedSha"], true),
+  mutationConfig("github_create_issue", "Prepare creation of an issue in the trusted GitHub repository.", "issue_create", "issue", "create", { title: stringSchema(MAX_TITLE_CHARS, 1), body: BODY_SCHEMA }, ["title", "body"], { requiredPermission: "triage" }),
+  mutationConfig("github_update_issue", "Prepare a bounded title/body update to one GitHub issue.", "issue_update", "issue", "update", { number: POSITIVE_INTEGER_SCHEMA, title: stringSchema(MAX_TITLE_CHARS, 1), body: BODY_SCHEMA }, ["number"], { requiredPermission: "triage" }),
+  mutationConfig("github_close_issue", "Prepare closing one GitHub issue.", "issue_close", "issue", "archive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"], { requiredPermission: "triage" }),
+  mutationConfig("github_reopen_issue", "Prepare reopening one GitHub issue.", "issue_reopen", "issue", "unarchive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"], { requiredPermission: "triage" }),
+  mutationConfig("github_create_issue_comment", "Prepare a conversation comment on one GitHub issue or pull request.", "issue_comment_create", "issue_comment", "create", { number: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["number", "body"], { requiredPermission: "triage" }),
+  mutationConfig("github_update_issue_comment", "Prepare an update to a conversation comment owned by the pinned GitHub account.", "issue_comment_update", "issue_comment", "update", { commentId: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["commentId", "body"], { requiredPermission: "triage" }),
+  mutationConfig("github_update_review_comment", "Prepare an update to an inline review comment owned by the pinned GitHub account.", "review_comment_update", "review_comment", "update", { commentId: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["commentId", "body"], { requiredPermission: "triage" }),
+  mutationConfig("github_delete_owned_comment", "Prepare exact deletion of a comment owned by the pinned GitHub account.", "owned_comment_delete", "comment", "delete", { commentId: POSITIVE_INTEGER_SCHEMA, kind: { type: "string", enum: ["issue", "review"] } }, ["commentId", "kind"], { impact: "destructive", requiredPermission: "triage", warning: "This permanently deletes only a comment owned by the pinned GitHub account." }),
+  mutationConfig("github_create_pull_request_review", "Prepare a review against the current exact pull-request head SHA.", "pull_request_review_create", "pull_request_review", "create", { number: POSITIVE_INTEGER_SCHEMA, body: BODY_SCHEMA, commitId: SHA_SCHEMA, event: { type: "string", enum: ["COMMENT", "APPROVE", "REQUEST_CHANGES"] } }, ["number", "body", "commitId", "event"], { requiredPermission: "push" }),
+  mutationConfig("github_reply_to_review_comment", "Prepare a reply to one inline pull-request review comment.", "review_comment_reply", "review_comment", "create", { pullNumber: POSITIVE_INTEGER_SCHEMA, commentId: POSITIVE_INTEGER_SCHEMA, body: stringSchema(MAX_BODY_CHARS, 1) }, ["pullNumber", "commentId", "body"], { requiredPermission: "push" }),
+  mutationConfig("github_update_pull_request", "Prepare a title/body update to one pull request. Base, head, and source content cannot be changed.", "pull_request_update", "pull_request", "update", { number: POSITIVE_INTEGER_SCHEMA, title: stringSchema(MAX_TITLE_CHARS, 1), body: BODY_SCHEMA }, ["number"], { requiredPermission: "push" }),
+  mutationConfig("github_close_pull_request", "Prepare closing one pull request without merging it.", "pull_request_close", "pull_request", "archive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"], { requiredPermission: "push" }),
+  mutationConfig("github_reopen_pull_request", "Prepare reopening one pull request.", "pull_request_reopen", "pull_request", "unarchive", { number: POSITIVE_INTEGER_SCHEMA }, ["number"], { requiredPermission: "push" }),
+  mutationConfig("github_rerun_failed_workflow_jobs", "Prepare rerunning failed jobs for one workflow run tied to an exact commit SHA.", "workflow_rerun_failed", "workflow_run", "execute", { runId: POSITIVE_INTEGER_SCHEMA, headSha: SHA_SCHEMA }, ["runId", "headSha"], { impact: "high", requiredPermission: "push", warning: "This reruns failed jobs for the exact approved workflow run and commit SHA." }),
+  mutationConfig("github_create_agent_branch", "Prepare creation of an agent-owned codex/ branch at one exact commit SHA.", "agent_branch_create", "branch", "create", { branch: stringSchema(MAX_BRANCH_CHARS, 1), sha: SHA_SCHEMA }, ["branch", "sha"], { impact: "high", requiredPermission: "push", warning: "This publishes a new agent-owned branch reference; raw source edits remain excluded." }),
+  mutationConfig("github_update_agent_branch_fast_forward", "Prepare a non-force fast-forward of an agent-owned codex/ branch from one exact SHA to another.", "agent_branch_fast_forward", "branch", "update", { branch: stringSchema(MAX_BRANCH_CHARS, 1), expectedSha: SHA_SCHEMA, newSha: SHA_SCHEMA }, ["branch", "expectedSha", "newSha"], { impact: "high", requiredPermission: "push", warning: "This moves only an agent-owned branch by a provider-enforced non-force update." }),
+  mutationConfig("github_create_draft_pull_request", "Prepare a draft pull request from an existing agent-owned codex/ branch. The host binds the current head and base references before approval.", "draft_pull_request_create", "pull_request", "create", { title: stringSchema(MAX_TITLE_CHARS, 1), body: BODY_SCHEMA, head: stringSchema(MAX_BRANCH_CHARS, 1), base: stringSchema(MAX_BRANCH_CHARS, 1) }, ["title", "body", "head", "base"], { impact: "high", requiredPermission: "push", warning: "This creates a draft pull request from an already-published agent-owned branch." }),
+  mutationConfig("github_mark_pull_request_ready", "Prepare transition of one open draft pull request to ready-for-review after exact head readback.", "pull_request_mark_ready", "pull_request", "update", { number: POSITIVE_INTEGER_SCHEMA }, ["number"], { impact: "high", requiredPermission: "push", warning: "This makes an existing draft pull request ready for reviewer attention." }),
+  mutationConfig("github_merge_pull_request", "Prepare merge of one ready pull request at an exact head SHA using an explicit merge method.", "pull_request_merge", "pull_request", "merge", { number: POSITIVE_INTEGER_SCHEMA, expectedHeadSha: SHA_SCHEMA, mergeMethod: { type: "string", enum: ["squash", "merge", "rebase"] }, commitTitle: stringSchema(MAX_TITLE_CHARS, 1), commitMessage: BODY_SCHEMA }, ["number", "expectedHeadSha", "mergeMethod"], { impact: "critical", requiredPermission: "push", warning: "This merges the exact approved pull-request head and requires two independent exact confirmations." }),
+  mutationConfig("github_delete_owned_branch", "Prepare exact deletion of an agent-owned codex/ branch at an expected SHA.", "owned_branch_delete", "branch", "delete", { branch: stringSchema(MAX_BRANCH_CHARS, 1), expectedSha: SHA_SCHEMA }, ["branch", "expectedSha"], { impact: "destructive", requiredPermission: "push", warning: "This permanently deletes only an agent-owned codex/ branch at the approved SHA." }),
 ];
 
 export function isGitHubCatalogToolName(name: string): name is GitHubCatalogToolName {
@@ -315,28 +387,47 @@ export function isGitHubCatalogToolName(name: string): name is GitHubCatalogTool
 }
 
 export function hasExplicitGitHubCatalogIntent(prompt: string): boolean {
-  return /\bgithub\b/iu.test(prompt) && /\b(repository|repo|branch|ref(?:erence)?|commit|tree|blob|file|issue|comment|pull request|pr|review|check|status|workflow|action|run)\b/iu.test(prompt);
+  return /\bgithub\b/iu.test(prompt) && /\b(repositor(?:y|ies)|repos?|branch(?:es)?|tags?|releases?|ref(?:erence)?s?|commits?|trees?|blobs?|files?|issues?|comments?|pull requests?|prs?|reviews?|checks?|statuses|status|workflows?|actions?|runs?|jobs?)\b/iu.test(prompt);
 }
 
 export function getGitHubCatalogReadToolNames(prompt: string): GitHubCatalogToolName[] {
   if (!hasExplicitGitHubCatalogIntent(prompt)) return [];
   const names = new Set<GitHubCatalogToolName>();
-  if (/\b(repository|repo)\b/iu.test(prompt)) names.add("github_get_repository");
-  if (/\b(branch|ref(?:erence)?)\b/iu.test(prompt)) names.add("github_get_reference");
+  const pullRequest = /\b(pull request|pr)\b/iu.test(prompt);
+  const reviewComment = /\breview comments?\b/iu.test(prompt);
+  const listIntent = /\b(list|all|browse|show|summari[sz]e|inspect)\b/iu.test(prompt);
+  const issueList = /\bissues\b/iu.test(prompt) && listIntent;
+  const branchList = /\bbranches\b/iu.test(prompt) || (/\bbranch\b/iu.test(prompt) && listIntent && !/\b(?:branch|ref(?:erence)?)\s*(?:named\s+)?[A-Za-z0-9._/-]+\b/iu.test(prompt));
+  const releaseId = /\brelease(?:\s+id)?\s*#?\d+\b/iu.test(prompt);
+  const pullRequestFiles = pullRequest && /\b(files?|diff|patch|changes?)\b/iu.test(prompt);
+  const workflowJobs = /\b(?:workflow\s+)?jobs?\b/iu.test(prompt);
+  const workflowRun = /\b(?:workflow\s+)?run(?:\s+id)?\s*#?\d+\b/iu.test(prompt);
+  const reviewCommentId = reviewComment && !listIntent && /\breview comment(?:\s+id)?\s*#?\d+\b/iu.test(prompt);
+  const blobRead = !pullRequest && /\b(blob|file contents?|read (?:the )?file)\b/iu.test(prompt);
+  if (branchList && !pullRequest) names.add("github_list_branches");
+  else if (/\b(branch|ref(?:erence)?)\b/iu.test(prompt) && !pullRequest) names.add("github_get_reference");
+  if (/\btags?\b/iu.test(prompt)) names.add("github_list_tags");
+  if (releaseId) names.add("github_get_release");
+  else if (/\breleases?\b/iu.test(prompt)) names.add("github_list_releases");
   if (/\bcommit\b/iu.test(prompt)) names.add("github_get_commit");
-  if (/\b(tree|directory|contents?|traverse|files?)\b/iu.test(prompt)) names.add("github_get_tree");
-  if (/\b(blob|file contents?|read file)\b/iu.test(prompt)) names.add("github_get_blob");
-  if (/\bissue\b/iu.test(prompt)) names.add("github_get_issue");
-  if (/\bcomments?\b/iu.test(prompt) && /\b(list|all|summari[sz]e|read|show|inspect)\b/iu.test(prompt)) names.add("github_list_issue_comments");
-  if (/\bcomment\s*(?:id\s*)?#?\d+\b/iu.test(prompt)) names.add("github_get_issue_comment");
-  if (/\b(pull request|pr)\b/iu.test(prompt)) names.add("github_get_pull_request");
+  if (/\b(tree|directory|traverse|list files?)\b/iu.test(prompt) && !blobRead) names.add("github_get_tree");
+  if (blobRead) names.add("github_get_blob");
+  if (issueList) names.add("github_list_issues");
+  else if (/\bissue\b/iu.test(prompt)) names.add("github_get_issue");
+  if (!reviewComment && /\bcomments?\b/iu.test(prompt) && listIntent) names.add("github_list_issue_comments");
+  if (!reviewComment && /\bcomment\s*(?:id\s*)?#?\d+\b/iu.test(prompt)) names.add("github_get_issue_comment");
+  if (pullRequestFiles) names.add("github_list_pull_request_files");
+  else if (pullRequest && !reviewComment && !/\breviews?\b/iu.test(prompt)) names.add("github_get_pull_request");
   if (/\b(head|head branch)\b/iu.test(prompt) && /\b(pull request|pr)s?\b/iu.test(prompt)) names.add("github_list_pull_requests_for_head");
-  if (/\breviews?\b/iu.test(prompt)) names.add("github_list_pull_request_reviews");
-  if (/\breview comments?\b/iu.test(prompt)) names.add("github_list_pull_request_review_comments");
-  if (/\breview comment\s*(?:id\s*)?#?\d+\b/iu.test(prompt)) names.add("github_get_review_comment");
+  if (/\breviews?\b/iu.test(prompt) && !reviewComment) names.add("github_list_pull_request_reviews");
+  if (reviewComment && !reviewCommentId && listIntent) names.add("github_list_pull_request_review_comments");
+  if (reviewCommentId) names.add("github_get_review_comment");
   if (/\bchecks?\b/iu.test(prompt)) names.add("github_list_check_runs");
   if (/\bstatus(?:es)?\b/iu.test(prompt)) names.add("github_get_combined_status");
-  if (/\b(workflow|actions?|runs?)\b/iu.test(prompt)) names.add("github_list_workflow_runs");
+  if (workflowJobs) names.add("github_list_workflow_jobs");
+  else if (workflowRun) names.add("github_get_workflow_run");
+  else if (/\b(workflow|actions?|runs?)\b/iu.test(prompt)) names.add("github_list_workflow_runs");
+  if (names.size === 0 && /\b(repository|repo)\b/iu.test(prompt)) names.add("github_get_repository");
   if (names.size === 0) names.add("github_get_repository");
   return [...names].filter((name) => READ_NAMES.has(name));
 }
@@ -354,6 +445,28 @@ export function getExplicitGitHubCatalogMutationToolNames(prompt: string): GitHu
   const issue = /\bissue\b/iu.test(prompt);
   const pullRequest = /\b(pull request|pr)\b/iu.test(prompt);
   const reviewComment = /\breview comment\b/iu.test(prompt);
+  const createDraftPullRequest =
+    pullRequest &&
+    /\b(?:create|open)\b[\s\S]{0,60}\bdraft\b|\bdraft\b[\s\S]{0,60}\b(?:pull request|pr)\b[\s\S]{0,40}\b(?:create|open)\b/iu.test(prompt);
+  const markPullRequestReady =
+    pullRequest &&
+    /\b(?:mark|make|transition|convert)\b[\s\S]{0,50}\bready(?:\s+for\s+review)?\b|\bready\s+for\s+review\b/iu.test(prompt);
+  const mergePullRequest =
+    pullRequest &&
+    /\b(?:merge|squash|rebase)\b/iu.test(prompt);
+  const deleteBranch = hasAffirmativeActionClause(prompt, /\bdelete\b/iu, /\bbranch\b/iu);
+  const createBranch =
+    !deleteBranch &&
+    /\b(?:create|make|provision)\b[\s\S]{0,60}\b(?:github\s+)?branch\b|\b(?:github\s+)?branch\b[\s\S]{0,60}\b(?:create|make|provision)\b/iu.test(prompt);
+  const updateBranch =
+    !deleteBranch &&
+    !createBranch &&
+    /\b(?:fast[- ]?forward|update|advance|move)\b[\s\S]{0,70}\b(?:github\s+)?branch\b|\b(?:github\s+)?branch\b[\s\S]{0,70}\b(?:fast[- ]?forward|update|advance|move)\b/iu.test(prompt);
+  if (createBranch) names.add("github_create_agent_branch");
+  if (updateBranch) names.add("github_update_agent_branch_fast_forward");
+  if (createDraftPullRequest) names.add("github_create_draft_pull_request");
+  if (markPullRequestReady) names.add("github_mark_pull_request_ready");
+  if (mergePullRequest) names.add("github_merge_pull_request");
   if (
     issue &&
     (/\b(create|file)\s+(?:a\s+|an\s+|new\s+)?(?:github\s+)?issue\b/iu.test(prompt) ||
@@ -363,7 +476,7 @@ export function getExplicitGitHubCatalogMutationToolNames(prompt: string): GitHu
   if (issue && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_issue");
   if (issue && /\bclose\b/iu.test(prompt)) names.add("github_close_issue");
   if (issue && /\breopen\b/iu.test(prompt)) names.add("github_reopen_issue");
-  if (/\b(comment on|add (?:a )?comment|post (?:a )?comment|create (?:a )?comment)\b/iu.test(prompt)) names.add("github_create_issue_comment");
+  if (!reviewComment && /\b(comment on|add (?:a )?comment|post (?:a )?comment|create (?:a )?comment)\b/iu.test(prompt)) names.add("github_create_issue_comment");
   if (reviewComment && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_review_comment");
   if (!reviewComment && /\bcomment\b/iu.test(prompt) && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_issue_comment");
   if (hasAffirmativeActionClause(prompt, /\bdelete\b/iu, /\bcomment\b/iu)) {
@@ -371,11 +484,11 @@ export function getExplicitGitHubCatalogMutationToolNames(prompt: string): GitHu
   }
   if (/\b(reply|respond)\b/iu.test(prompt) && reviewComment) names.add("github_reply_to_review_comment");
   if (/\b(submit|create|leave|approve|request changes?)\b/iu.test(prompt) && /\breview\b/iu.test(prompt) && !reviewComment) names.add("github_create_pull_request_review");
-  if (pullRequest && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_pull_request");
-  if (pullRequest && /\bclose\b/iu.test(prompt) && !/\bmerge\b/iu.test(prompt)) names.add("github_close_pull_request");
-  if (pullRequest && /\breopen\b/iu.test(prompt)) names.add("github_reopen_pull_request");
+  if (pullRequest && !createDraftPullRequest && !markPullRequestReady && !mergePullRequest && /\b(update|edit|change|revise)\b/iu.test(prompt)) names.add("github_update_pull_request");
+  if (pullRequest && !mergePullRequest && /\bclose\b/iu.test(prompt)) names.add("github_close_pull_request");
+  if (pullRequest && !mergePullRequest && /\breopen\b/iu.test(prompt)) names.add("github_reopen_pull_request");
   if (/\brerun\b/iu.test(prompt) && /\b(failed|workflow|job|check|action)\b/iu.test(prompt)) names.add("github_rerun_failed_workflow_jobs");
-  if (hasAffirmativeActionClause(prompt, /\bdelete\b/iu, /\bbranch\b/iu)) {
+  if (deleteBranch) {
     names.add("github_delete_owned_branch");
   }
   return [...names].filter((name) => MUTATION_NAMES.has(name));
@@ -428,7 +541,7 @@ function createReadTool(
         return {
           source: "github_provider_untrusted",
           authority: false,
-          repository: repositorySummary(repository.binding),
+          repository: repositorySummary(repository),
           result,
         };
       });
@@ -466,14 +579,24 @@ async function executeRead(
   repository: GitHubCatalogRepositoryContextV1,
   signal: AbortSignal | undefined,
 ): Promise<unknown> {
+  assertRepositoryContext(repository);
+  assertReadPermission(repository);
   const { client, binding } = repository;
   const owner = binding.owner;
   const repo = binding.repository;
   switch (config.kind) {
     case "repository":
-      return client.getRepository(owner, repo, signal);
+      return repository.repositoryReadback;
     case "reference":
       return client.getReference(owner, repo, boundedString(args.branch, "branch", 1, MAX_BRANCH_CHARS), signal);
+    case "branches":
+      return boundedList(await client.listBranches(owner, repo, signal), args.limit);
+    case "tags":
+      return boundedList(await client.listTags(owner, repo, signal), args.limit);
+    case "releases":
+      return boundedList(await client.listReleases(owner, repo, signal), args.limit);
+    case "release":
+      return client.getRelease(owner, repo, positiveInteger(args.releaseId, "releaseId"), signal);
     case "commit":
       return client.getCommit(owner, repo, exactSha(args.sha, "sha"), signal);
     case "tree": {
@@ -488,12 +611,19 @@ async function executeRead(
     }
     case "issue":
       return client.getIssue(owner, repo, positiveInteger(args.number, "number"), signal);
+    case "issues":
+      return boundedList(
+        (await client.listIssues(owner, repo, signal)).filter((issue) => !issue.pullRequest),
+        args.limit,
+      );
     case "issue_comment":
       return client.getIssueComment(owner, repo, positiveInteger(args.commentId, "commentId"), signal);
     case "issue_comments":
       return boundedList(await client.listIssueComments(owner, repo, positiveInteger(args.number, "number"), signal), args.limit);
     case "pull_request":
       return client.getPullRequest(owner, repo, positiveInteger(args.number, "number"), signal);
+    case "pull_request_files":
+      return boundedList(await client.listPullRequestFiles(owner, repo, positiveInteger(args.number, "number"), signal), args.limit);
     case "pull_requests_for_head":
       return boundedList(await client.listPullRequestsForHead(owner, repo, boundedString(args.head, "head", 1, MAX_BRANCH_CHARS), boundedString(args.base, "base", 1, MAX_BRANCH_CHARS), signal), args.limit, 10);
     case "pull_request_reviews":
@@ -511,6 +641,10 @@ async function executeRead(
     }
     case "workflow_runs":
       return boundedList(await client.listWorkflowRunsForCommit(owner, repo, exactSha(args.headSha, "headSha"), signal), args.limit);
+    case "workflow_run":
+      return client.getWorkflowRun(owner, repo, positiveInteger(args.runId, "runId"), signal);
+    case "workflow_jobs":
+      return boundedList(await client.listWorkflowJobs(owner, repo, positiveInteger(args.runId, "runId"), signal), args.limit);
   }
 }
 
@@ -526,6 +660,9 @@ async function prepareMutation(
     const profileKey = normalized.profileKey as string;
     return await options.withRepository(profileKey, context.abortSignal, async (repository) => {
       assertAvailable(options);
+      assertRepositoryContext(repository);
+      assertReadPermission(repository);
+      assertMutationPermission(config, repository);
       const precondition = await readMutationObservation(config, normalized, repository, context.abortSignal);
       assertPreparationState(config, normalized, precondition, repository.binding);
       const now = context.now?.() ?? new Date();
@@ -558,15 +695,16 @@ async function prepareMutation(
           ...(precondition?.found && precondition.value ? { before: safeJsonRecord(precondition.value) } : {}),
           after: safeJsonRecord(normalized),
           outboundPayload: safeJsonRecord(normalized),
-          warnings: config.destructive
-            ? ["This deletes only a pinned-account-owned comment or codex/ branch and requires a fresh exact approval."]
-            : ["GitHub titles, bodies, comments, reviews, and status text are untrusted provider data."],
+          warnings: [
+            "GitHub titles, bodies, comments, reviews, and status text are untrusted provider data.",
+            ...(config.warning ? [config.warning] : []),
+          ],
           outboundBytes: new TextEncoder().encode(JSON.stringify(normalized)).length,
         },
         ...(precondition ? { expectedTargetRevision: precondition.fingerprint } : {}),
         idempotencyKey: `github:${GITHUB_CATALOG_TOOL_OPERATION_MAP[config.name]}:${actionSeed}`,
         reconciliationKey: `github:${GITHUB_CATALOG_TOOL_OPERATION_MAP[config.name]}:${actionSeed}`,
-        ...(config.destructive ? { requiredConfirmations: 1 as const } : {}),
+        ...(requiresDoubleExact(config) ? { requiredConfirmations: 2 as const } : {}),
         preparedAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + PREPARED_ACTION_TTL_MS).toISOString(),
       });
@@ -593,6 +731,9 @@ async function executePreparedMutation(
   await assertPreparedBinding(config, action, context);
   const payload = parsePreparedPayload(config, action);
   return options.withRepository(payload.profileKey, context.abortSignal, async (repository) => {
+    assertRepositoryContext(repository);
+    assertReadPermission(repository);
+    assertMutationPermission(config, repository);
     assertRepositoryBinding(payload, repository.binding);
     const before = await readMutationObservation(config, payload.arguments, repository, context.abortSignal);
     assertExactPrecondition(config, action, payload, before, repository.binding);
@@ -625,7 +766,7 @@ async function executePreparedMutation(
         output: {
           source: "github_provider_untrusted",
           authority: false,
-          repository: repositorySummary(repository.binding),
+          repository: repositorySummary(repository),
           result: observation.found ? observation.value : { deleted: true },
         },
         receipt,
@@ -651,6 +792,8 @@ async function reconcileMutation(
     assertAvailable(options);
     const payload = parsePreparedPayload(config, action);
     return await options.withRepository(payload.profileKey, context.abortSignal, async (repository) => {
+      assertRepositoryContext(repository);
+      assertReadPermission(repository);
       assertRepositoryBinding(payload, repository.binding);
       const observation = isCreateMutation(config.kind)
         ? await discoverCreatedObservation(config, payload.arguments, repository, action, context.abortSignal)
@@ -703,6 +846,31 @@ async function discoverCreatedObservation(
   };
   let candidates: unknown[];
   switch (config.kind) {
+    case "agent_branch_create": {
+      const reference = await readReferenceOrNull(client, owner, repo, args.branch as string, signal);
+      return reference ? observationFor(reference) : null;
+    }
+    case "draft_pull_request_create": {
+      const expectedHeadSha = nestedPreparedString(action.preview.before, "headReference", "sha");
+      candidates = (await client.listPullRequestsForHead(
+        owner,
+        repo,
+        args.head as string,
+        args.base as string,
+        signal,
+      )).filter((pull) =>
+        pull.title === args.title &&
+        pull.body === args.body &&
+        pull.draft &&
+        pull.state === "open" &&
+        !pull.merged &&
+        pull.head.ref === args.head &&
+        pull.base.ref === args.base &&
+        pull.head.sha.toLowerCase() === expectedHeadSha.toLowerCase() &&
+        inPreparedWindow(pull.updatedAt),
+      );
+      break;
+    }
     case "issue_create":
       candidates = (await client.listIssues(owner, repo, signal)).filter((issue) =>
         !issue.pullRequest &&
@@ -842,11 +1010,70 @@ function normalizeMutationArguments(
         runId: positiveInteger(args.runId, "runId"),
         headSha: exactSha(args.headSha, "headSha"),
       };
+    case "agent_branch_create":
+      allowedFor("branch", "sha");
+      return {
+        ...base,
+        branch: agentBranch(args.branch, "branch"),
+        sha: exactSha(args.sha, "sha"),
+      };
+    case "agent_branch_fast_forward": {
+      allowedFor("branch", "expectedSha", "newSha");
+      const expectedSha = exactSha(args.expectedSha, "expectedSha");
+      const newSha = exactSha(args.newSha, "newSha");
+      if (expectedSha === newSha) {
+        throw invalidArguments("newSha must differ from expectedSha for a branch fast-forward.");
+      }
+      return {
+        ...base,
+        branch: agentBranch(args.branch, "branch"),
+        expectedSha,
+        newSha,
+      };
+    }
+    case "draft_pull_request_create": {
+      allowedFor("title", "body", "head", "base");
+      const head = agentBranch(args.head, "head");
+      const targetBase = boundedString(args.base, "base", 1, MAX_BRANCH_CHARS);
+      if (head === targetBase) throw invalidArguments("Draft pull-request head and base branches must differ.");
+      return {
+        ...base,
+        title: boundedString(args.title, "title", 1, MAX_TITLE_CHARS),
+        body: boundedString(args.body, "body", 0, MAX_BODY_CHARS, true),
+        head,
+        base: targetBase,
+      };
+    }
+    case "pull_request_mark_ready":
+      allowedFor("number");
+      return { ...base, number: positiveInteger(args.number, "number") };
+    case "pull_request_merge": {
+      allowedFor("number", "expectedHeadSha", "mergeMethod", "commitTitle", "commitMessage");
+      const mergeMethod = args.mergeMethod;
+      if (mergeMethod !== "squash" && mergeMethod !== "merge" && mergeMethod !== "rebase") {
+        throw invalidArguments("mergeMethod must be squash, merge, or rebase.");
+      }
+      const result: Record<string, JsonValue> = {
+        ...base,
+        number: positiveInteger(args.number, "number"),
+        expectedHeadSha: exactSha(args.expectedHeadSha, "expectedHeadSha"),
+        mergeMethod,
+      };
+      if (args.commitTitle !== undefined) {
+        result.commitTitle = boundedString(args.commitTitle, "commitTitle", 1, MAX_TITLE_CHARS);
+      }
+      if (args.commitMessage !== undefined) {
+        result.commitMessage = boundedString(args.commitMessage, "commitMessage", 0, MAX_BODY_CHARS, true);
+      }
+      return result;
+    }
     case "owned_branch_delete": {
       allowedFor("branch", "expectedSha");
-      const branch = boundedString(args.branch, "branch", 1, MAX_BRANCH_CHARS);
-      if (!branch.startsWith("codex/")) throw invalidArguments("Only an agent-owned codex/ branch can be deleted.");
-      return { ...base, branch, expectedSha: exactSha(args.expectedSha, "expectedSha") };
+      return {
+        ...base,
+        branch: agentBranch(args.branch, "branch"),
+        expectedSha: exactSha(args.expectedSha, "expectedSha"),
+      };
     }
   }
 }
@@ -866,6 +1093,26 @@ async function readMutationObservation(
     switch (config.kind) {
       case "issue_create":
         return null;
+      case "agent_branch_create": {
+        const [targetCommit, existingReference] = await Promise.all([
+          client.getCommit(owner, repo, args.sha as string, signal),
+          readReferenceOrNull(client, owner, repo, args.branch as string, signal),
+        ]);
+        value = { targetCommit, existingReference };
+        break;
+      }
+      case "agent_branch_fast_forward":
+        value = await client.getReference(owner, repo, args.branch as string, signal);
+        break;
+      case "draft_pull_request_create": {
+        const [headReference, baseReference, existingPullRequests] = await Promise.all([
+          client.getReference(owner, repo, args.head as string, signal),
+          client.getReference(owner, repo, args.base as string, signal),
+          client.listPullRequestsForHead(owner, repo, args.head as string, args.base as string, signal),
+        ]);
+        value = { headReference, baseReference, existingPullRequests };
+        break;
+      }
       case "issue_update":
       case "issue_close":
       case "issue_reopen":
@@ -899,6 +1146,8 @@ async function readMutationObservation(
       case "pull_request_update":
       case "pull_request_close":
       case "pull_request_reopen":
+      case "pull_request_mark_ready":
+      case "pull_request_merge":
         value = await client.getPullRequest(owner, repo, args.number as number, signal);
         break;
       case "workflow_rerun_failed": {
@@ -954,6 +1203,16 @@ async function readPostMutationObservation(
       if (!record) throw new Error("GitHub review reply returned no record.");
       return observationFor(await client.getReviewComment(owner, repo, record.id, signal));
     }
+    case "agent_branch_create": {
+      const record = dispatchResult as GitHubReferenceRecord | undefined;
+      if (!record) throw new Error("GitHub branch create returned no record.");
+      return observationFor(await client.getReference(owner, repo, args.branch as string, signal));
+    }
+    case "draft_pull_request_create": {
+      const record = dispatchResult as GitHubPullRequestRecord | undefined;
+      if (!record) throw new Error("GitHub draft pull-request create returned no record.");
+      return observationFor(await client.getPullRequest(owner, repo, record.number, signal));
+    }
     default:
       return (await readMutationObservation(config, args, repository, signal, true)) ?? absentObservation();
   }
@@ -966,23 +1225,74 @@ function assertPreparationState(
   binding: TrustedGitHubRepositoryBindingV1,
 ): void {
   if (config.kind === "issue_create") return;
+  if (config.kind === "agent_branch_create") {
+    if (!observation?.found || !observation.value) {
+      throw notApplied("github_readback_incomplete", "GitHub did not return the target commit and branch-absence proof.");
+    }
+    const before = observation.value as {
+      targetCommit?: { sha?: string };
+      existingReference?: GitHubReferenceRecord | null;
+    };
+    if (before.existingReference) {
+      throw notApplied("github_target_exists", "The approved agent branch already exists.");
+    }
+    if (before.targetCommit?.sha?.toLowerCase() !== String(args.sha).toLowerCase()) {
+      throw notApplied("github_precondition_changed", "The exact target commit was not verified before branch creation.");
+    }
+    if (!String(args.branch).startsWith(binding.agentBranchPrefix)) {
+      throw notApplied("github_precondition_changed", "The branch is outside the trusted agent branch prefix.");
+    }
+    return;
+  }
+  if (config.kind === "draft_pull_request_create") {
+    if (!observation?.found || !observation.value) {
+      throw notApplied("github_readback_incomplete", "GitHub did not return exact head/base references for draft pull-request creation.");
+    }
+    const before = observation.value as {
+      headReference?: GitHubReferenceRecord;
+      baseReference?: GitHubReferenceRecord;
+      existingPullRequests?: GitHubPullRequestRecord[];
+    };
+    if (
+      !before.headReference ||
+      !before.baseReference ||
+      !refMatchesBranch(before.headReference.ref, String(args.head)) ||
+      !refMatchesBranch(before.baseReference.ref, String(args.base))
+    ) {
+      throw notApplied("github_precondition_changed", "Draft pull-request branch readback did not match the requested head/base pair.");
+    }
+    if (!String(args.head).startsWith(binding.agentBranchPrefix)) {
+      throw notApplied("github_precondition_changed", "Draft pull requests require a trusted agent-owned head branch.");
+    }
+    if ((before.existingPullRequests ?? []).some((pull) => pull.state === "open" && !pull.merged)) {
+      throw notApplied("github_target_exists", "An open pull request already exists for the exact head/base pair.");
+    }
+    return;
+  }
   if (!observation?.found || !observation.value) {
     throw notApplied("github_target_not_found", "The GitHub target does not exist.");
   }
   switch (config.kind) {
     case "issue_update": {
       const issue = observation.value as GitHubIssueRecord;
+      assertIssueNotPullRequest(issue);
       if ((args.title === undefined || args.title === issue.title) && (args.body === undefined || args.body === issue.body)) {
         throw notApplied("github_no_state_change", "The approved issue update would not change GitHub state.");
       }
       break;
     }
-    case "issue_close":
-      if ((observation.value as GitHubIssueRecord).state === "closed") throw notApplied("github_no_state_change", "The GitHub issue is already closed.");
+    case "issue_close": {
+      const issue = observation.value as GitHubIssueRecord;
+      assertIssueNotPullRequest(issue);
+      if (issue.state === "closed") throw notApplied("github_no_state_change", "The GitHub issue is already closed.");
       break;
-    case "issue_reopen":
-      if ((observation.value as GitHubIssueRecord).state === "open") throw notApplied("github_no_state_change", "The GitHub issue is already open.");
+    }
+    case "issue_reopen": {
+      const issue = observation.value as GitHubIssueRecord;
+      assertIssueNotPullRequest(issue);
+      if (issue.state === "open") throw notApplied("github_no_state_change", "The GitHub issue is already open.");
       break;
+    }
     case "issue_comment_update":
     case "review_comment_update": {
       const comment = observation.value as GitHubCommentRecord;
@@ -1022,6 +1332,30 @@ function assertPreparationState(
       }
       if (!Number.isSafeInteger(run.runAttempt) || run.runAttempt < 1) {
         throw notApplied("github_readback_incomplete", "GitHub workflow readback did not include a valid run_attempt.");
+      }
+      break;
+    }
+    case "agent_branch_fast_forward": {
+      const ref = observation.value as GitHubReferenceRecord;
+      if (!String(args.branch).startsWith(binding.agentBranchPrefix) || ref.sha.toLowerCase() !== String(args.expectedSha).toLowerCase()) {
+        throw notApplied("github_precondition_changed", "The agent branch or exact current SHA does not match provider readback.");
+      }
+      break;
+    }
+    case "pull_request_mark_ready": {
+      const pull = observation.value as GitHubPullRequestRecord;
+      if (pull.state !== "open" || pull.merged || !pull.draft) {
+        throw notApplied("github_target_state_invalid", "Only an open, unmerged draft pull request can be marked ready.");
+      }
+      break;
+    }
+    case "pull_request_merge": {
+      const pull = observation.value as GitHubPullRequestRecord;
+      if (pull.head.sha.toLowerCase() !== String(args.expectedHeadSha).toLowerCase()) {
+        throw notApplied("github_precondition_changed", "The merge expectedHeadSha does not match the current pull-request head.");
+      }
+      if (pull.state !== "open" || pull.merged || pull.draft) {
+        throw notApplied("github_target_state_invalid", "Only an open, unmerged, ready pull request can be merged.");
       }
       break;
     }
@@ -1094,6 +1428,34 @@ async function dispatchMutation(
       return client.reopenPullRequest({ ...common, number: args.number as number }, signal);
     case "workflow_rerun_failed":
       return client.rerunFailedWorkflowJobs({ ...common, runId: args.runId as number }, signal);
+    case "agent_branch_create":
+      return client.createAgentBranch({ ...common, branch: args.branch as string, sha: args.sha as string }, signal);
+    case "agent_branch_fast_forward":
+      return client.updateAgentBranchFastForward({ ...common, branch: args.branch as string, sha: args.newSha as string }, signal);
+    case "draft_pull_request_create":
+      return client.createDraftPullRequest({
+        ...common,
+        title: args.title as string,
+        body: args.body as string,
+        head: args.head as string,
+        base: args.base as string,
+      }, signal);
+    case "pull_request_mark_ready":
+      return client.markPullRequestReadyForReview({ ...common, number: args.number as number }, signal);
+    case "pull_request_merge": {
+      const result = await client.mergePullRequest({
+        ...common,
+        number: args.number as number,
+        expectedHeadSha: args.expectedHeadSha as string,
+        mergeMethod: args.mergeMethod as "squash" | "merge" | "rebase",
+        ...(args.commitTitle === undefined ? {} : { commitTitle: args.commitTitle as string }),
+        ...(args.commitMessage === undefined ? {} : { commitMessage: args.commitMessage as string }),
+      }, signal);
+      if (!result.merged) {
+        throw new GitHubApiError("github_conflict", `GitHub did not merge the approved pull request: ${result.message}`);
+      }
+      return result;
+    }
     case "owned_branch_delete":
       return client.deleteAgentBranch({ ...common, branch: args.branch as string, expectedSha: args.expectedSha as string }, signal);
   }
@@ -1115,17 +1477,17 @@ function verifyPostcondition(
   switch (config.kind) {
     case "issue_create": {
       const issue = observation.value as GitHubIssueRecord;
-      return { ok: issue.title === args.title && issue.body === args.body && issue.state === "open", changedFields: ["title", "body", "state"], resource };
+      return { ok: !issue.pullRequest && issue.title === args.title && issue.body === args.body && issue.state === "open", changedFields: ["title", "body", "state"], resource };
     }
     case "issue_update": {
       const issue = observation.value as GitHubIssueRecord;
       const fields = [args.title !== undefined ? "title" : "", args.body !== undefined ? "body" : ""].filter(Boolean);
-      return { ok: (args.title === undefined || issue.title === args.title) && (args.body === undefined || issue.body === args.body), changedFields: fields, resource };
+      return { ok: !issue.pullRequest && (args.title === undefined || issue.title === args.title) && (args.body === undefined || issue.body === args.body), changedFields: fields, resource };
     }
     case "issue_close":
-      return { ok: (observation.value as GitHubIssueRecord).state === "closed", changedFields: ["state"], resource };
+      return { ok: !(observation.value as GitHubIssueRecord).pullRequest && (observation.value as GitHubIssueRecord).state === "closed", changedFields: ["state"], resource };
     case "issue_reopen":
-      return { ok: (observation.value as GitHubIssueRecord).state === "open", changedFields: ["state"], resource };
+      return { ok: !(observation.value as GitHubIssueRecord).pullRequest && (observation.value as GitHubIssueRecord).state === "open", changedFields: ["state"], resource };
     case "issue_comment_create":
     case "issue_comment_update":
     case "review_comment_update":
@@ -1161,6 +1523,64 @@ function verifyPostcondition(
         resource,
       };
     }
+    case "agent_branch_create": {
+      const ref = observation.value as GitHubReferenceRecord;
+      return {
+        ok: refMatchesBranch(ref.ref, String(args.branch)) && ref.sha.toLowerCase() === String(args.sha).toLowerCase(),
+        changedFields: ["ref", "sha"],
+        resource,
+      };
+    }
+    case "agent_branch_fast_forward": {
+      const ref = observation.value as GitHubReferenceRecord;
+      return {
+        ok: refMatchesBranch(ref.ref, String(args.branch)) && ref.sha.toLowerCase() === String(args.newSha).toLowerCase(),
+        changedFields: ["sha"],
+        resource,
+      };
+    }
+    case "draft_pull_request_create": {
+      const pull = observation.value as GitHubPullRequestRecord;
+      const expectedHeadSha = nestedPreparedString(preparedBefore, "headReference", "sha");
+      return {
+        ok:
+          pull.title === args.title &&
+          pull.body === args.body &&
+          pull.state === "open" &&
+          pull.draft &&
+          !pull.merged &&
+          pull.head.ref === args.head &&
+          pull.base.ref === args.base &&
+          pull.head.sha.toLowerCase() === expectedHeadSha.toLowerCase(),
+        changedFields: ["title", "body", "draft", "head", "base"],
+        resource,
+      };
+    }
+    case "pull_request_mark_ready": {
+      const pull = observation.value as GitHubPullRequestRecord;
+      const expectedHeadSha = nestedPreparedString(preparedBefore, "head", "sha");
+      return {
+        ok: pull.state === "open" && !pull.merged && !pull.draft && pull.head.sha.toLowerCase() === expectedHeadSha.toLowerCase(),
+        changedFields: ["draft"],
+        resource,
+      };
+    }
+    case "pull_request_merge": {
+      const pull = observation.value as GitHubPullRequestRecord;
+      const merge = dispatchResult as { sha?: unknown; merged?: unknown } | undefined;
+      const mergeSha = typeof pull.mergeSha === "string" ? pull.mergeSha.toLowerCase() : "";
+      return {
+        ok:
+          pull.merged &&
+          pull.state === "closed" &&
+          !pull.draft &&
+          pull.head.sha.toLowerCase() === String(args.expectedHeadSha).toLowerCase() &&
+          mergeSha.length > 0 &&
+          (merge === undefined || (merge.merged === true && typeof merge.sha === "string" && merge.sha.toLowerCase() === mergeSha)),
+        changedFields: ["merged", "state", "mergeSha"],
+        resource,
+      };
+    }
   }
 }
 
@@ -1184,12 +1604,17 @@ function targetResource(
     case "review_comment_reply":
       id = `pending:review-comment:${args.commentId}:reply`;
       break;
+    case "draft_pull_request_create":
+      id = `pending:pull:${args.head}->${args.base}`;
+      break;
     case "issue_update":
     case "issue_close":
     case "issue_reopen":
     case "pull_request_update":
     case "pull_request_close":
     case "pull_request_reopen":
+    case "pull_request_mark_ready":
+    case "pull_request_merge":
       id = String(args.number);
       break;
     case "issue_comment_update":
@@ -1200,6 +1625,8 @@ function targetResource(
     case "workflow_rerun_failed":
       id = String(args.runId);
       break;
+    case "agent_branch_create":
+    case "agent_branch_fast_forward":
     case "owned_branch_delete":
       id = String(args.branch);
       break;
@@ -1321,7 +1748,8 @@ async function assertPreparedBinding(
     !authorized ||
     authorized.preparedActionId !== action.id ||
     authorized.payloadFingerprint !== action.payloadFingerprint ||
-    !authorized.grantId.trim()
+    !authorized.grantId.trim() ||
+    authorized.grantId.trim() === "policy:scoped-read"
   ) {
     throw notApplied("authorization_mismatch", "Prepared GitHub action lacks its exact authority binding.");
   }
@@ -1395,16 +1823,27 @@ function readDescriptor(config: ReadToolConfig): ToolDescriptor {
 }
 
 function mutationDescriptor(config: MutationToolConfig): ToolDescriptor {
+  const elevated = config.impact !== "standard" || config.action === "execute" || config.action === "merge";
   return {
     version: 1,
     name: config.name,
     capability: { system: "github", resourceType: config.resourceType, action: config.action },
-    effect: config.destructive ? "destructive_mutation" : config.action === "execute" ? "execution" : "reversible_mutation",
-    risk: config.destructive ? "high" : config.action === "execute" ? "high" : "medium",
+    effect: config.impact === "critical"
+      ? "publish"
+      : config.impact === "destructive"
+        ? "destructive_mutation"
+        : config.action === "execute"
+          ? "execution"
+          : "reversible_mutation",
+    risk: config.impact === "critical"
+      ? "critical"
+      : elevated
+        ? "high"
+        : "medium",
     approval: {
-      allowPromptGrant: false,
+      allowPromptGrant: true,
       allowPersistentGrant: false,
-      fallback: "exact",
+      fallback: elevated ? "double_exact" : "exact",
     },
     execution: { preparation: "required", desktopOnly: true, cacheable: false, parallelSafe: false },
     durability: { journal: true, receipt: true, readback: "required", reconciliation: "required" },
@@ -1441,7 +1880,11 @@ function mutationConfig(
   action: ResourceAction,
   properties: Record<string, JsonSchemaObject>,
   required: string[],
-  destructive = false,
+  options: {
+    impact?: MutationImpact;
+    requiredPermission: RepositoryMutationPermission;
+    warning?: string;
+  },
 ): MutationToolConfig {
   return {
     name,
@@ -1449,7 +1892,9 @@ function mutationConfig(
     kind,
     resourceType,
     action,
-    destructive,
+    impact: options.impact ?? "standard",
+    requiredPermission: options.requiredPermission,
+    ...(options.warning ? { warning: options.warning } : {}),
     parameters: closedSchema(properties, required),
   };
 }
@@ -1508,15 +1953,75 @@ function boundedList<T>(
   };
 }
 
-function repositorySummary(binding: TrustedGitHubRepositoryBindingV1) {
+function repositorySummary(repository: GitHubCatalogRepositoryContextV1) {
+  const { binding, repositoryReadback } = repository;
+  const permissions = repositoryReadback.permissions;
   return {
     profileKey: binding.repositoryProfileKey,
     fullName: `${binding.owner}/${binding.repository}`,
     repositoryId: binding.repositoryId,
     defaultBranch: binding.defaultBranch,
+    verifiedAccountId: binding.verifiedAccountId,
     verifiedAccountLogin: binding.verifiedAccountLogin,
     bindingFingerprint: binding.fingerprint,
+    capabilities: {
+      archived: repositoryReadback.archived,
+      hasIssues: repositoryReadback.hasIssues ?? null,
+      permissionsVerified: permissions !== undefined,
+      permissions: permissions
+        ? {
+          pull: permissions.pull,
+          triage: permissions.triage,
+          push: permissions.push,
+          maintain: permissions.maintain,
+          admin: permissions.admin,
+        }
+        : null,
+      agentBranchPrefix: binding.agentBranchPrefix,
+      sourceMutationMode: "verified_commit_only",
+      rawSourceEditTools: false,
+    },
   };
+}
+
+function assertRepositoryContext(repository: GitHubCatalogRepositoryContextV1): void {
+  const { binding, repositoryReadback } = repository;
+  if (
+    repositoryReadback.id !== binding.repositoryId ||
+    repositoryReadback.fullName.toLowerCase() !== `${binding.owner}/${binding.repository}`.toLowerCase() ||
+    repositoryReadback.defaultBranch !== binding.defaultBranch
+  ) {
+    throw notApplied("github_repository_readback_changed", "Fresh GitHub repository readback does not match the trusted repository binding.");
+  }
+}
+
+function assertReadPermission(repository: GitHubCatalogRepositoryContextV1): void {
+  if (repository.repositoryReadback.permissions?.pull === false) {
+    throw notApplied("github_permission_denied", "The pinned GitHub account does not have repository read permission.");
+  }
+}
+
+function assertMutationPermission(
+  config: MutationToolConfig,
+  repository: GitHubCatalogRepositoryContextV1,
+): void {
+  if (repository.repositoryReadback.archived) {
+    throw notApplied("github_repository_archived", "GitHub mutations are blocked because the trusted repository is archived.");
+  }
+  const permissions = repository.repositoryReadback.permissions;
+  if (!permissions) {
+    throw notApplied("github_permissions_unavailable", "GitHub did not return authenticated repository permissions; mutation preparation is blocked.");
+  }
+  const allowed = config.requiredPermission === "triage"
+    ? permissions.triage || permissions.push || permissions.maintain || permissions.admin
+    : config.requiredPermission === "push"
+      ? permissions.push || permissions.maintain || permissions.admin
+      : config.requiredPermission === "maintain"
+        ? permissions.maintain || permissions.admin
+        : permissions.admin;
+  if (!allowed) {
+    throw notApplied("github_permission_denied", `The pinned GitHub account lacks required ${config.requiredPermission} repository permission.`);
+  }
 }
 
 function assertOwnedByPinnedAccount(
@@ -1572,6 +2077,20 @@ function boundedString(
 function exactSha(value: unknown, label: string): string {
   if (typeof value !== "string" || !SHA_PATTERN.test(value)) throw invalidArguments(`${label} must be an exact 40-character Git SHA.`);
   return value.toLowerCase();
+}
+
+function agentBranch(value: unknown, label: string): string {
+  const branch = boundedString(value, label, "codex/".length + 1, MAX_BRANCH_CHARS).trim();
+  if (
+    !branch.startsWith("codex/") ||
+    branch.endsWith("/") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    /[\s~^:?*[\\\]]/u.test(branch)
+  ) {
+    throw invalidArguments(`${label} must be a valid agent-owned codex/ branch.`);
+  }
+  return branch;
 }
 
 function positiveInteger(value: unknown, label: string): number {
@@ -1631,7 +2150,59 @@ function previewSummary(config: MutationToolConfig, target: ResourceRef): string
 }
 
 function isCreateMutation(kind: MutationKind): boolean {
-  return ["issue_create", "issue_comment_create", "pull_request_review_create", "review_comment_reply"].includes(kind);
+  return [
+    "issue_create",
+    "issue_comment_create",
+    "pull_request_review_create",
+    "review_comment_reply",
+    "agent_branch_create",
+    "draft_pull_request_create",
+  ].includes(kind);
+}
+
+function requiresDoubleExact(config: MutationToolConfig): boolean {
+  return config.impact !== "standard" || config.action === "execute" || config.action === "merge";
+}
+
+async function readReferenceOrNull(
+  client: GitHubCatalogClientV1,
+  owner: string,
+  repository: string,
+  branch: string,
+  signal: AbortSignal | undefined,
+): Promise<GitHubReferenceRecord | null> {
+  try {
+    return await client.getReference(owner, repository, branch, signal);
+  } catch (error) {
+    if (error instanceof GitHubApiError && error.code === "github_not_found") return null;
+    throw error;
+  }
+}
+
+function nestedPreparedString(
+  source: Record<string, JsonValue> | undefined,
+  parent: string,
+  child: string,
+): string {
+  const nested = source?.[parent];
+  if (!nested || typeof nested !== "object" || Array.isArray(nested)) {
+    throw new Error(`Prepared GitHub readback is missing ${parent}.${child}.`);
+  }
+  const value = nested[child];
+  if (typeof value !== "string" || !value) {
+    throw new Error(`Prepared GitHub readback is missing ${parent}.${child}.`);
+  }
+  return value;
+}
+
+function refMatchesBranch(ref: string, branch: string): boolean {
+  return ref === branch || ref === `refs/heads/${branch}`;
+}
+
+function assertIssueNotPullRequest(issue: GitHubIssueRecord): void {
+  if (issue.pullRequest) {
+    throw notApplied("github_issue_is_pull_request", "Issue update, close, and reopen operations reject pull-request records from GitHub's shared issues endpoint.");
+  }
 }
 
 function isDefinitelyNotApplied(error: unknown): boolean {

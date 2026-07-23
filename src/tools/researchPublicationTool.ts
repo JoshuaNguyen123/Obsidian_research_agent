@@ -10,11 +10,14 @@ import {
 import type { JsonSchemaObject } from "../model/types";
 import type { AuthorityGrantV1 } from "../agent/authority";
 import { extractMarkdownPathMentions } from "../agent/missionScope";
+import { sha256DiagramContent } from "../design/diagramArtifactStore";
 import {
   ResearchPublicationWorkflow,
   type AcceptedResearchArtifactV1,
   type AcceptedResearchNotePackageV1,
   type AcceptedResearchNoteWriteRequestV1,
+  parseResearchPublicationCheckpointV1,
+  type ResearchPublicationCheckpointV1,
   type ResearchPublicationDestinationV1,
   type ResearchPublicationExactApprovalRequestV1,
   type ResearchPublicationLineagePortV1,
@@ -28,9 +31,25 @@ export const PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME = "publish_research_to_linear"
 
 export function resolveResearchPublicationNotePathV1(input: {
   requestedPath?: string;
+  initiatingNotePath?: string;
   originalPrompt: string;
   runId: string;
 }): string {
+  const initiatingNotePath = input.initiatingNotePath === undefined
+    ? undefined
+    : requireSafeVaultMarkdownPath(input.initiatingNotePath);
+  if (initiatingNotePath) {
+    if (
+      input.requestedPath &&
+      requireSafeVaultMarkdownPath(input.requestedPath).toLowerCase() !==
+        initiatingNotePath.toLowerCase()
+    ) {
+      throw new Error(
+        "The requested research note differs from the trusted initiating Obsidian note.",
+      );
+    }
+    return initiatingNotePath;
+  }
   const explicitPaths = dedupeVaultPaths(
     extractMarkdownPathMentions(input.originalPrompt).flatMap((candidate) => {
       try {
@@ -107,6 +126,122 @@ function dedupeVaultPaths(paths: readonly string[]): string[] {
   });
 }
 
+interface InitiatingNoteBindingV1 {
+  path: string;
+  sha256: string;
+  source: "active_note" | "checkpoint";
+}
+
+async function captureInitiatingNoteBinding(
+  context: ToolExecutionContext,
+): Promise<InitiatingNoteBindingV1 | null> {
+  const file = context.getCurrentMarkdownFile?.() ?? null;
+  if (!file) return null;
+  let path: string;
+  try {
+    path = requireSafeVaultMarkdownPath(file.path);
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_initiating_note_invalid",
+      cause instanceof Error ? cause.message : "The initiating Obsidian note path is unsafe.",
+      { mutationState: "not_applied" },
+    );
+  }
+  let content: string | null = null;
+  const vault = context.app?.vault;
+  if (vault && typeof vault.read === "function") {
+    try {
+      content = await vault.read(file);
+    } catch (cause) {
+      throw new ToolExecutionError(
+        "research_publication_initiating_note_unreadable",
+        cause instanceof Error
+          ? `The initiating Obsidian note could not be read: ${cause.message}`
+          : "The initiating Obsidian note could not be read.",
+        { mutationState: "not_applied" },
+      );
+    }
+  } else {
+    content = context.getCurrentMarkdownContent?.(file) ?? null;
+  }
+  if (content === null) {
+    throw new ToolExecutionError(
+      "research_publication_initiating_note_unreadable",
+      "The initiating Obsidian note could not be read.",
+      { mutationState: "not_applied" },
+    );
+  }
+  return {
+    path,
+    sha256: await sha256DiagramContent(content),
+    source: "active_note",
+  };
+}
+
+async function createResearchPublicationArtifactId(
+  runId: string,
+  vaultBindingKey: string,
+): Promise<string> {
+  const artifactIdentity = await sha256Fingerprint({
+    schemaVersion: 2,
+    kind: "accepted_research_publication",
+    runId,
+    vaultBindingKey,
+  });
+  return `accepted-${artifactIdentity.slice("sha256:".length, 39)}`;
+}
+
+function initiatingNoteFromCheckpoint(input: {
+  checkpoint: ResearchPublicationCheckpointV1;
+  publicationId: string;
+  artifactId: string;
+  runId: string;
+  vaultBindingKey: string;
+}): InitiatingNoteBindingV1 {
+  let checkpoint: ResearchPublicationCheckpointV1;
+  try {
+    checkpoint = parseResearchPublicationCheckpointV1(input.checkpoint);
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_identity_invalid",
+      cause instanceof Error
+        ? `The research publication checkpoint is invalid: ${cause.message}`
+        : "The research publication checkpoint is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+  if (
+    checkpoint.publicationId !== input.publicationId ||
+    checkpoint.artifact.artifactId !== input.artifactId ||
+    checkpoint.artifact.originRunId !== input.runId ||
+    checkpoint.artifact.vaultBindingKey !== input.vaultBindingKey
+  ) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_identity_invalid",
+      "The research publication checkpoint belongs to a different run or vault binding.",
+      { mutationState: "not_applied" },
+    );
+  }
+  try {
+    return {
+      path: requireSafeVaultMarkdownPath(checkpoint.artifact.notePath),
+      sha256: requireSha256(
+        checkpoint.backlink?.afterSha256 ?? checkpoint.artifact.noteSha256,
+        "checkpoint note hash",
+      ),
+      source: "checkpoint",
+    };
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_identity_invalid",
+      cause instanceof Error
+        ? `The research publication checkpoint note binding is invalid: ${cause.message}`
+        : "The research publication checkpoint note binding is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+}
+
 export interface ResearchPublicationGrantInputV1 {
   runId: string;
   approvalId: string;
@@ -114,13 +249,17 @@ export interface ResearchPublicationGrantInputV1 {
 }
 
 export interface CreateResearchPublicationToolOptionsV1 {
-  noteWriter: Pick<AcceptedResearchNoteWriter, "writeAcceptedPackage" | "appendLinearBacklink">;
+  noteWriter: Pick<
+    AcceptedResearchNoteWriter,
+    "writeAcceptedPackage" | "readAcceptedPackage" | "appendLinearBacklink"
+  >;
   publisher: ResearchPublicationPublisherPortV1;
   lineage: ResearchPublicationLineagePortV1;
   destination: ResearchPublicationDestinationV1;
   vaultBindingKey: string;
   resolveNotePath(input: {
     requestedPath?: string;
+    initiatingNotePath?: string;
     originalPrompt: string;
     runId: string;
   }): string;
@@ -169,6 +308,25 @@ export function createResearchPublicationTool(
       }
       const runId = requireIdentity(context.runId, "run id");
       const toolCallId = requireIdentity(context.operationId, "tool call id");
+      const vaultBindingKey = requireLogicalKey(
+        options.vaultBindingKey,
+        "host vault binding key",
+      );
+      const artifactId = await createResearchPublicationArtifactId(
+        runId,
+        vaultBindingKey,
+      );
+      const publicationId = `publication-${artifactId}`;
+      const priorCheckpoint = await options.lineage.get?.(publicationId) ?? null;
+      const initiatingNote = priorCheckpoint
+        ? initiatingNoteFromCheckpoint({
+            checkpoint: priorCheckpoint,
+            publicationId,
+            artifactId,
+            runId,
+            vaultBindingKey,
+          })
+        : await captureInitiatingNoteBinding(context);
       const proofCache = context.runtimeCache ?? { toolResults: new Map() };
       if (options.loadDurableWebEvidence) {
         const evidenceRunId = requireIdentity(
@@ -185,16 +343,19 @@ export function createResearchPublicationTool(
         runId,
         toolCallId,
         originalPrompt: context.originalPrompt,
-        vaultBindingKey: options.vaultBindingKey,
+        vaultBindingKey,
+        artifactId,
         runtimeCache: proofCache,
         resolveNotePath: options.resolveNotePath,
         validateTrustedBindings: options.validateTrustedBindings,
+        initiatingNote,
         nowProvider: options.now ?? context.now,
       });
       const note = stabilizeAcceptedResearchRequest(
         parsedNote,
         proofCache,
         runId,
+        priorCheckpoint !== null,
       );
       if (!context.requestNestedApproval) {
         throw new ToolExecutionError(
@@ -312,9 +473,23 @@ export function createResearchPublicationTool(
 
 export function hasExplicitResearchPublicationIntent(prompt: string): boolean {
   const normalized = typeof prompt === "string" ? prompt : "";
+  // "Obsidian note … create … Linear issue" is ordinary ticket writeback, not
+  // publish_research_to_linear. Require research/findings/report language or an
+  // explicit publish/send/sync verb before Linear.
+  if (
+    /\b(?:publish|send|sync|post)\b[\s\S]{0,120}\b(?:research|findings|report|accepted\s+research)\b[\s\S]{0,120}\b(?:to|in|on)\s+linear\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:research|findings|report|accepted\s+research)\b[\s\S]{0,120}\b(?:publish|send|sync|post)\b[\s\S]{0,120}\blinear\b/iu.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
   return (
-    /\b(?:publish|send|create|post|sync|file|open)\b[\s\S]{0,120}\b(?:research|findings|report|note|ticket|issue)\b[\s\S]{0,120}\b(?:to|in|on)\s+linear\b/iu.test(normalized) ||
-    /\b(?:research|findings|report|note)\b[\s\S]{0,120}\b(?:publish|send|create|post|sync)\b[\s\S]{0,120}\blinear\b/iu.test(normalized)
+    /\b(?:publish|send|sync|post|file)\b[\s\S]{0,120}\b(?:research|findings|report)\b[\s\S]{0,80}\b(?:ticket|issue)\b[\s\S]{0,80}\b(?:to|in|on)\s+linear\b/iu.test(
+      normalized,
+    )
   );
 }
 
@@ -324,9 +499,11 @@ async function parseToolArguments(input: {
   toolCallId: string;
   originalPrompt: string;
   vaultBindingKey: string;
+  artifactId: string;
   runtimeCache: ToolExecutionContext["runtimeCache"];
   resolveNotePath: CreateResearchPublicationToolOptionsV1["resolveNotePath"];
   validateTrustedBindings: CreateResearchPublicationToolOptionsV1["validateTrustedBindings"];
+  initiatingNote: InitiatingNoteBindingV1 | null;
   nowProvider?: () => Date;
 }) {
   const { value, runId } = input;
@@ -401,24 +578,17 @@ async function parseToolArguments(input: {
       { mutationState: "not_applied" },
     );
   }
-  const mode: "create" | "append" = value.mode;
-  const baseHash =
+  const requestedMode: "create" | "append" = value.mode;
+  const requestedBaseHash =
     typeof value.baseHash === "string" &&
     value.baseHash.trim() === ""
       ? undefined
       : value.baseHash;
-  if (mode === "append" && typeof baseHash !== "string") {
-    throw new ToolExecutionError(
-      "research_publication_base_hash_required",
-      "Appending an accepted research package requires the current note SHA-256 hash.",
-      { mutationState: "not_applied" },
-    );
-  }
   const acceptedAt = canonicalNow(input.nowProvider);
   const requestedPath = value.notePath === undefined
     ? undefined
     : requireText(value.notePath, "note path", 1_000);
-  if (mode === "append" && !requestedPath) {
+  if (!input.initiatingNote && requestedMode === "append" && !requestedPath) {
     throw new ToolExecutionError(
       "research_publication_note_path_required",
       "Appending requires a vault-safe Markdown path explicitly present in the user mission.",
@@ -431,24 +601,53 @@ async function parseToolArguments(input: {
     originRunId: runId,
   } as unknown as AcceptedResearchNotePackageV1;
   input.validateTrustedBindings(package_);
-  const path = input.resolveNotePath({
-    ...(requestedPath ? { requestedPath } : {}),
-    originalPrompt: input.originalPrompt,
-    runId,
-  });
-  const artifactIdentity = await sha256Fingerprint({
-    schemaVersion: 1,
-    kind: "accepted_research_publication",
-    runId,
-    path,
-  });
+  const path = input.initiatingNote?.source === "checkpoint"
+    ? input.initiatingNote.path
+    : requireSafeVaultMarkdownPath(
+        input.resolveNotePath({
+          ...(requestedPath ? { requestedPath } : {}),
+          ...(input.initiatingNote
+            ? { initiatingNotePath: input.initiatingNote.path }
+            : {}),
+          originalPrompt: input.originalPrompt,
+          runId,
+        }),
+      );
+  if (
+    input.initiatingNote &&
+    path.toLowerCase() !== input.initiatingNote.path.toLowerCase()
+  ) {
+    throw new ToolExecutionError(
+      "research_publication_initiating_note_mismatch",
+      "Research publication cannot redirect the trusted initiating Obsidian note.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const mode: "create" | "append" = input.initiatingNote
+    ? "append"
+    : requestedMode;
+  const baseHash = input.initiatingNote?.sha256 ?? requestedBaseHash;
+  if (mode === "append" && typeof baseHash !== "string") {
+    throw new ToolExecutionError(
+      "research_publication_base_hash_required",
+      "Appending an accepted research package requires the current note SHA-256 hash.",
+      { mutationState: "not_applied" },
+    );
+  }
+  if (mode === "append" && !path) {
+    throw new ToolExecutionError(
+      "research_publication_note_path_required",
+      "Appending requires a vault-safe Markdown path.",
+      { mutationState: "not_applied" },
+    );
+  }
   return {
     path,
     mode,
     ...(typeof baseHash === "string"
       ? { baseHash: requireSha256(baseHash, "base hash") }
       : {}),
-    artifactId: `accepted-${artifactIdentity.slice("sha256:".length, 39)}`,
+    artifactId: input.artifactId,
     acceptedAt,
     package: package_,
   };
@@ -478,10 +677,21 @@ function stabilizeAcceptedResearchRequest(
   candidate: AcceptedResearchNoteWriteRequestV1,
   runtimeCache: ToolExecutionContext["runtimeCache"],
   runId: string,
+  checkpointBound: boolean,
 ): AcceptedResearchNoteWriteRequestV1 {
   if (!runtimeCache) return cloneAcceptedResearchRequest(candidate);
   runtimeCache.acceptedResearchPublicationRequests ??= new Map<string, unknown>();
-  const key = `${runId}:${candidate.path}`;
+  // One run has one immutable initiating-note binding. A changed active tab or
+  // model-supplied path on retry must not fork the durable publication.
+  const key = runId;
+  if (checkpointBound) {
+    const canonical = cloneAcceptedResearchRequest(candidate);
+    runtimeCache.acceptedResearchPublicationRequests.set(
+      key,
+      cloneAcceptedResearchRequest(canonical),
+    );
+    return canonical;
+  }
   const stored = runtimeCache.acceptedResearchPublicationRequests.get(key);
   if (stored) {
     return cloneAcceptedResearchRequest(

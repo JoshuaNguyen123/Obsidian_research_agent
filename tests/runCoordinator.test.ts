@@ -180,6 +180,34 @@ test("run coordinator retains and replays the latest canonical mission graph", a
   assert.deepEqual(seen, ["Inspect and update the active note"]);
 });
 
+test("graph and orchestrator events cannot replace the configured root run id", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onRunConfig?.({
+      runId: "run-root-ledger",
+      missionLedger: { runId: "run-root-ledger-lead" },
+    } as never);
+    events.onMissionGraphUpdate?.({
+      schemaVersion: 3,
+      missionId: "run-root-ledger-canonicalized",
+      objective: "Coordinate a research team",
+      revision: 1,
+      nodes: {},
+    } as never);
+    events.onOrchestratorEvent?.(
+      { kind: "status" } as never,
+      { runId: "run-researcher-child" } as never,
+    );
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.runId, "run-root-ledger");
+  assert.equal(snapshot.lastConfig?.runId, "run-root-ledger");
+  assert.equal(snapshot.lastConfig?.missionLedger?.runId, "run-root-ledger-lead");
+  assert.equal(snapshot.lastMissionLedger?.runId, "run-root-ledger-lead");
+});
+
 test("run coordinator hydrates and replays an idle persisted mission projection", () => {
   const coordinator = new RunCoordinator();
   const graph = {

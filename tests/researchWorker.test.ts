@@ -9,6 +9,7 @@ import type {
 import {
   createReadOnlyWorkerRegistry,
   isResearchWorkerParallelSafe,
+  OLLAMA_CLOUD_DEEP_RESEARCH_MODEL,
   runResearchWorker,
 } from "../src/orchestrator/researchWorker";
 import type {
@@ -344,6 +345,137 @@ test("researcher tool turns pass graded think and prefer streamChat", async () =
   assert.equal(requests[0].think, "low");
 });
 
+test("deep and extended direct Ollama Cloud research use Nemotron with thinking", async () => {
+  for (const researchEffortTier of ["deep", "extended"] as const) {
+    const requests: ModelChatRequest[] = [];
+    const model: ModelClient = {
+      descriptor: {
+        provider: "ollama",
+        model: "configured-default",
+        endpointCategory: "ollama_cloud",
+        transportKind: "test_mock",
+      },
+      async chat(request) {
+        requests.push(request);
+        return finalResponse("Research handoff complete.");
+      },
+      async streamChat() {
+        throw new Error("unused");
+      },
+    };
+
+    await runResearchWorker({
+      runId: `run-cloud-${researchEffortTier}`,
+      participantId: "researcher",
+      leadParticipantId: "lead",
+      taskId: "research",
+      assignment: "Gather bounded evidence.",
+      originalMission: "Research the claim.",
+      researchEffortTier,
+      modelClient: model,
+      toolRegistry: emptyRegistry(),
+      toolContext: {
+        settings: {
+          model: "configured-default",
+          thinkingMode: "auto",
+          enableStreaming: false,
+        },
+      } as ToolExecutionContext,
+      maxSteps: 1,
+    });
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].model, OLLAMA_CLOUD_DEEP_RESEARCH_MODEL);
+    assert.equal(requests[0].think, true);
+    assert.equal(model.descriptor?.model, "configured-default");
+  }
+});
+
+test("standard Ollama Cloud research retains the configured model and is not forced low", async () => {
+  const requests: ModelChatRequest[] = [];
+  const model: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "qwen3.5:cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "test_mock",
+    },
+    async chat(request) {
+      requests.push(request);
+      return finalResponse("Research handoff complete.");
+    },
+    async streamChat() {
+      throw new Error("unused");
+    },
+  };
+
+  await runResearchWorker({
+    runId: "run-cloud-standard",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Gather bounded evidence.",
+    originalMission: "Research the claim.",
+    researchEffortTier: "standard",
+    modelClient: model,
+    toolRegistry: emptyRegistry(),
+    toolContext: {
+      settings: {
+        model: "qwen3.5:cloud",
+        thinkingMode: "auto",
+        enableStreaming: false,
+      },
+    } as ToolExecutionContext,
+    maxSteps: 1,
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].model, undefined);
+  assert.equal(requests[0].think, true);
+});
+
+test("deep Ollama Cloud research preserves an explicit thinking opt-out", async () => {
+  const requests: ModelChatRequest[] = [];
+  const model: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "configured-default",
+      endpointCategory: "ollama_cloud",
+      transportKind: "test_mock",
+    },
+    async chat(request) {
+      requests.push(request);
+      return finalResponse("Research handoff complete.");
+    },
+    async streamChat() {
+      throw new Error("unused");
+    },
+  };
+
+  await runResearchWorker({
+    runId: "run-cloud-thinking-off",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Gather bounded evidence.",
+    originalMission: "Run deep research on the claim.",
+    modelClient: model,
+    toolRegistry: emptyRegistry(),
+    toolContext: {
+      settings: {
+        model: "configured-default",
+        thinkingMode: "off",
+        enableStreaming: false,
+      },
+    } as ToolExecutionContext,
+    maxSteps: 1,
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].model, OLLAMA_CLOUD_DEEP_RESEARCH_MODEL);
+  assert.equal(requests[0].think, false);
+});
+
 test("researcher falls back to chat when streaming is disabled", async () => {
   let chatCalls = 0;
   let streamCalls = 0;
@@ -460,6 +592,15 @@ function sequenceModel(responses: ModelChatResponse[]): ModelClient {
     },
     async streamChat(_request: ModelChatRequest) {
       return responses[Math.min(index++, responses.length - 1)];
+    },
+  };
+}
+
+function emptyRegistry(): ToolRegistry {
+  return {
+    getDefinitions: () => [],
+    async execute(call) {
+      return { ok: true, toolName: call.name, output: {} };
     },
   };
 }

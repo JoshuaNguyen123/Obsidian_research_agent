@@ -190,7 +190,9 @@ function preparedSandboxContribution(
     name,
     description: install
       ? "Restore only profile-declared lockfiles in a verified sandbox after exact prepared approval; arbitrary package installation is not supported."
-      : "Run the selected immutable RepositoryProfileV2 command only inside a verified sandbox.",
+      : name === "code_validate_fast"
+        ? "Purpose: Sandbox smoke validation. Use when: after workspace edits. Do not use when: calling verify_all or repo scripts as tools. Required: workspace scope. Next: code_repair_record_cycle if red, else targeted/full. Side effects: read/execute sandbox. Run the selected immutable RepositoryProfileV2 command only inside a verified sandbox."
+        : "Run the selected immutable RepositoryProfileV2 command only inside a verified sandbox.",
     parameters: sandboxParameters(Boolean(options.resolvePreparationInput)),
     descriptor: descriptor(
       name,

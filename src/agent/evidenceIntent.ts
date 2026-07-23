@@ -1,5 +1,38 @@
 import type { MissionIntent } from "../tools/types";
 
+/**
+ * Literary / primary-text citation: "quotes/citations from the text|novel|book".
+ * This is close-reading support, not a request for public-web sources.
+ */
+export function hasPrimaryTextCitationIntent(prompt: string): boolean {
+  return (
+    /\bfrom the (?:text|novel|book|work|poem|play|story)\b/i.test(prompt) &&
+    /\b(?:quote|quotes|quoted|quotation|quotations|cite|cited|citation|citations)\b/i.test(
+      prompt,
+    )
+  );
+}
+
+function hasPublicNetworkResearchCue(prompt: string): boolean {
+  return /https?:\/\/|\b(?:web|online|internet|latest|current\s+(?:events?|information|data|news)|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?)|deep\s+research)\b/iu.test(
+    prompt,
+  );
+}
+
+/**
+ * Close-reading write missions that must not open Soft research_team, force
+ * public-web tools, or gate note writeback on Soft-seeded passage conflicts.
+ */
+export function isLiteraryPrimaryTextWriteMission(prompt: string): boolean {
+  return (
+    hasPrimaryTextCitationIntent(prompt) &&
+    !hasPublicNetworkResearchCue(prompt) &&
+    /\b(?:write|draft|compose|generate|essay|analysis|critique|paper)\b/i.test(
+      prompt,
+    )
+  );
+}
+
 export function requiresVaultEvidenceProof(
   prompt: string,
   intent: MissionIntent,
@@ -22,6 +55,12 @@ export function requiresWebEvidenceProof(
   intent: MissionIntent,
 ): boolean {
   if (hasExplicitNoWebIntent(prompt)) {
+    return false;
+  }
+  if (
+    hasPrimaryTextCitationIntent(prompt) &&
+    !hasPublicNetworkResearchCue(prompt)
+  ) {
     return false;
   }
   if (
@@ -73,6 +112,13 @@ export function requiresWebEvidenceProof(
  */
 export function hasExplicitPublicWebSignal(prompt: string): boolean {
   if (hasExplicitNoWebIntent(prompt)) {
+    return false;
+  }
+  // "citations from the text" is literary quotation, not public-web research.
+  if (
+    hasPrimaryTextCitationIntent(prompt) &&
+    !hasPublicNetworkResearchCue(prompt)
+  ) {
     return false;
   }
   return /https?:\/\/|\b(?:web|online|internet|citations?|cited|latest|current\s+(?:events?|information|data|news)|fact[-\s]?check(?:ed)?|verify\s+(?:sources?|facts?|claims?))\b/iu.test(

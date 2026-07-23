@@ -80,6 +80,27 @@ test("compound readiness blocks missing Linear and Code", () => {
   assert.equal(isLinearStartableForCompound("Setup needed"), false);
 });
 
+test("end-to-end cleanup stage maps to GitHub capability readiness", () => {
+  const readiness = readyBundle().map((item) =>
+    item.id === "github" ? row("github", "Setup needed", "github") : item,
+  );
+  const result = evaluateCompoundLifecycleReadinessV1({
+    prompt:
+      "I want to create the game of checkers in Python end to end following the full workflow",
+    readiness,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.stages.includes("reconciliation_cleanup"));
+  assert.ok(
+    result.blockers.some(
+      (b) =>
+        b.capabilityId === "github" &&
+        (b.stage === "private_github_publication" ||
+          b.stage === "reconciliation_cleanup"),
+    ),
+  );
+});
+
 test("stage strip marks the active stage", () => {
   assert.equal(
     formatCompoundLifecycleStageStrip(

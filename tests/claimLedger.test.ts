@@ -141,6 +141,30 @@ test("limitation sentences are exempt from material claim grounding", () => {
   assert.ok(ledger.claims.some((claim) => claim.status === "exempt"));
 });
 
+test("epistemic section bodies remain exempt when the heading carries the label", () => {
+  const source = fetchedSource();
+  const ledger = buildClaimLedger({
+    draft: [
+      "## Findings",
+      `Quantum battery evidence compares independent laboratory sources [${source.passageId}].`,
+      "## Confidence",
+      "High because both bounded checks point in the same direction.",
+      "## Unanswered Questions",
+      "None remain within this deliberately narrow comparison.",
+    ].join("\n\n"),
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Deep research with citations.",
+  });
+
+  assert.equal(ledger.status, "pass", ledger.missing.join(", "));
+  assert.ok(
+    ledger.claims
+      .filter((claim) => /High because|None remain/u.test(claim.text))
+      .every((claim) => claim.status === "exempt"),
+  );
+});
+
 test("quote/verify missions require quote spans inside passage text", () => {
   const source = fetchedSource();
   const missingQuote = buildClaimLedger({

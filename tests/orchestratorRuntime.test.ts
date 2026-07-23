@@ -60,6 +60,8 @@ test("research_team trigger matrix stays prompt-first (bare research false)", ()
     "Write a poem",
     "Append a short note",
     "Correct the entire page",
+    // Literary "citations from the text" is close-reading writeback, not Soft.
+    "Write a 3000 college level essay on the Catcher in the rye. Use supporting details and quotes, and citations directly from the text to support your essay.",
   ];
 
   for (const prompt of shouldTrigger) {
@@ -80,6 +82,11 @@ test("research_team trigger matrix stays prompt-first (bare research false)", ()
   assert.equal(shouldUseResearchTeam("Research sources", false), false);
   assert.equal(shouldUseResearchTeam("Verify sources", true, true), false);
   assert.equal(shouldUseResearchTeam("Deep research", false), false);
+  // Bare citation requests still open Soft; only primary-text literary writes skip.
+  assert.equal(
+    shouldUseResearchTeam("Add citations for every claim", true),
+    true,
+  );
 });
 
 test("budget rejection is terminal to callers instead of silently observational", async () => {

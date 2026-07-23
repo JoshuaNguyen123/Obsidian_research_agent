@@ -181,7 +181,10 @@ export interface ResearchPublicationPublisherPortV1 {
 }
 
 export interface ResearchPublicationWorkflowOptionsV1 {
-  noteWriter: Pick<AcceptedResearchNoteWriter, "writeAcceptedPackage" | "appendLinearBacklink">;
+  noteWriter: Pick<
+    AcceptedResearchNoteWriter,
+    "writeAcceptedPackage" | "readAcceptedPackage" | "appendLinearBacklink"
+  >;
   publisher: ResearchPublicationPublisherPortV1;
   approval: ResearchPublicationApprovalPortV1;
   lineage: ResearchPublicationLineagePortV1;
@@ -253,10 +256,18 @@ export class ResearchPublicationWorkflow {
     const publicationId = `publication-${request.note.artifactId}`;
     const priorCheckpoint = await this.options.lineage.get?.(publicationId) ?? null;
     const resumesReconciliation = priorCheckpoint?.status === "reconcile_required";
+    const boundRequest = bindRequestToCheckpoint(request, priorCheckpoint);
     this.trace("explicit_intent_verified", publicationId);
 
     this.trace("note_write_started", publicationId);
-    const note = await this.options.noteWriter.writeAcceptedPackage(request.note);
+    const note = priorCheckpoint
+      ? await this.options.noteWriter.readAcceptedPackage({
+          artifact: priorCheckpoint.artifact,
+          package: boundRequest.note.package,
+          expectedNoteSha256:
+            priorCheckpoint.backlink?.afterSha256 ?? priorCheckpoint.artifact.noteSha256,
+        })
+      : await this.options.noteWriter.writeAcceptedPackage(boundRequest.note);
     const artifact = note.artifact;
     if (
       priorCheckpoint &&
@@ -269,9 +280,13 @@ export class ResearchPublicationWorkflow {
       noteReceiptId: note.noteReceiptId,
     });
 
-    const sections = sectionsFromAcceptedNote(request.note);
-    const draft = draftFromAcceptedArtifact(request, artifact);
-    const previewRequest = { context: request.context, sections, draft } as ResearchTicketPreviewRequest;
+    const sections = sectionsFromAcceptedNote(boundRequest.note);
+    const draft = draftFromAcceptedArtifact(boundRequest, artifact);
+    const previewRequest = {
+      context: boundRequest.context,
+      sections,
+      draft,
+    } as ResearchTicketPreviewRequest;
     this.trace("linear_preview_started", publicationId);
     const preview = await this.options.publisher.preview(previewRequest);
     if (!preview.ok) {
@@ -313,7 +328,7 @@ export class ResearchPublicationWorkflow {
     }
 
     let lineage = priorCheckpoint?.lineage ??
-      createNoteVerifiedLineage(request, artifact, preview.ticket);
+      createNoteVerifiedLineage(boundRequest, artifact, preview.ticket);
     if (!resumesReconciliation) {
       await this.persist({
         publicationId,
@@ -331,7 +346,7 @@ export class ResearchPublicationWorkflow {
     }
     this.trace("note_lineage_persisted", publicationId);
 
-    const approvalRequest = await buildExactApprovalRequest(request, artifact, preview);
+    const approvalRequest = await buildExactApprovalRequest(boundRequest, artifact, preview);
     this.trace("approval_requested", publicationId, {
       approvalFingerprint: approvalRequest.approvalFingerprint,
     });
@@ -405,10 +420,10 @@ export class ResearchPublicationWorkflow {
 
     this.trace("linear_publish_started", publicationId);
     const published = await this.options.publisher.publish({
-      runId: request.runId,
-      toolCallId: request.toolCallId,
-      subject: request.subject,
-      context: request.context,
+      runId: boundRequest.runId,
+      toolCallId: boundRequest.toolCallId,
+      subject: boundRequest.subject,
+      context: boundRequest.context,
       sections,
       draft,
       approvedPreview: {
@@ -474,7 +489,10 @@ export class ResearchPublicationWorkflow {
     }
 
     const drift = publicationDrift(preview.ticket, published.ticket);
-    const destinationMismatch = issueDestinationMismatch(published.issue, request.destination);
+    const destinationMismatch = issueDestinationMismatch(
+      published.issue,
+      boundRequest.destination,
+    );
     const reconciliationIssueMismatch =
       priorCheckpoint?.pendingAction?.issueId &&
       priorCheckpoint.pendingAction.issueId !== published.issue.id
@@ -534,7 +552,7 @@ export class ResearchPublicationWorkflow {
         bindingId: `linear-${artifact.artifactId}`,
         provider: "linear",
         originRunId: artifact.originRunId,
-        workspaceId: request.destination.workspaceId,
+        workspaceId: boundRequest.destination.workspaceId,
         teamId: published.issue.team.id,
         issueId: published.issue.id,
         issueIdentifier: published.issue.identifier,
@@ -710,6 +728,35 @@ export class ResearchPublicationWorkflow {
   }
 }
 
+function bindRequestToCheckpoint(
+  request: ResearchPublicationRequestV1,
+  checkpoint: ResearchPublicationCheckpointV1 | null,
+): ResearchPublicationRequestV1 {
+  if (!checkpoint) return request;
+  if (
+    checkpoint.publicationId !== `publication-${request.note.artifactId}` ||
+    checkpoint.artifact.artifactId !== request.note.artifactId ||
+    checkpoint.artifact.originRunId !== request.runId ||
+    checkpoint.artifact.vaultBindingKey !== request.note.package.vaultBindingKey
+  ) {
+    throw new Error(
+      "The persisted initiating-note binding belongs to a different research publication.",
+    );
+  }
+  return {
+    ...request,
+    note: {
+      ...request.note,
+      // Checkpoint identity wins over whichever note happens to be active when
+      // a continuation resumes. This path is the accepted artifact path used
+      // later by GitHub finalization and the append-once reflection writer.
+      path: checkpoint.artifact.notePath,
+      artifactId: checkpoint.artifact.artifactId,
+      acceptedAt: checkpoint.artifact.acceptedAt,
+    },
+  };
+}
+
 function validateHostIntent(request: ResearchPublicationRequestV1): void {
   if (request.explicitUserMission !== true) {
     throw new ResearchPublicationWorkflowError(
@@ -759,6 +806,18 @@ function sectionsFromAcceptedNote(
   note: AcceptedResearchNoteWriteRequestV1,
 ): SynthesizedResearchTicketSectionsV1 {
   const value = note.package;
+  const sourceNotePath = note.path.trim();
+  if (
+    !sourceNotePath ||
+    sourceNotePath.includes("\\") ||
+    sourceNotePath.startsWith("/") ||
+    /^[A-Za-z]:/u.test(sourceNotePath) ||
+    sourceNotePath.split("/").some((segment) => segment === "..")
+  ) {
+    throw new Error("Accepted research source note path is unsafe.");
+  }
+  const sourceNoteLink =
+    `[Open accepted research in Obsidian](obsidian://open?file=${encodeURIComponent(sourceNotePath)})`;
   return {
     contentKind: "synthesized",
     title: value.title,
@@ -766,7 +825,7 @@ function sectionsFromAcceptedNote(
     confidenceLimitations: value.confidenceLimitations,
     proposedWork: [...value.proposedWork],
     nonGoals: [...value.nonGoals],
-    scope: [...value.scope],
+    scope: [sourceNoteLink, ...value.scope],
     dependencies: [...value.dependencies],
   };
 }

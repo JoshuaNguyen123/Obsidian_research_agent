@@ -1,4 +1,6 @@
 import { hasDesignIntent } from "./codeDesignIntent";
+import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { normalizeVaultPath } from "../tools/validation";
 
 export interface AutonomyScope {
   read: {
@@ -77,6 +79,16 @@ export function deriveAutonomyScope(
     /\b(web|online|source|sources|citation|citations|latest|current|verify|verified|fact[-\s]?check|research|browser|page|url|click|scroll|navigate|open\s+page)\b/i.test(
       prompt,
     );
+  // Literary "citations from the text" is not a public-web read scope.
+  if (
+    scope.read.web &&
+    hasPrimaryTextCitationIntent(prompt) &&
+    !/\b(?:web|online|internet|research|browser|url|https?:\/\/|latest|current\s+(?:events?|information|data|news)|fact[-\s]?check|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
+      prompt,
+    )
+  ) {
+    scope.read.web = false;
+  }
   scope.read.vault =
     input.vaultContext === true ||
     /\b(vault|folders|graph|backlinks?|related notes?|markdown files?|md files?|my notes|across notes|notes in|note graph)\b/i.test(
@@ -244,6 +256,211 @@ export function extractMarkdownPathMentions(prompt: string): string[] {
     .filter(Boolean));
 }
 
+export interface ExplicitVaultReadFilePathAnalysis {
+  /** Safe, exact, vault-relative Markdown paths in user-stated order. */
+  paths: string[];
+  /** Markdown-looking targets attached to affirmative read actions. */
+  referencedPathCount: number;
+  /** Referenced targets rejected by the vault path safety contract. */
+  invalidPathCount: number;
+}
+
+const VAULT_READ_ACTION_SOURCE =
+  String.raw`(?:read(?:ing)?|inspect(?:ing)?|open(?:ing)?|review(?:ing)?)`;
+const VAULT_MUTATION_ACTION_SOURCE =
+  String.raw`(?:writ(?:e|ing)|append(?:ing)?|replac(?:e|ing)|edit(?:ing)?|creat(?:e|ing)|delet(?:e|ing)|trash(?:ing)?|remov(?:e|ing)|mov(?:e|ing)|renam(?:e|ing)|sav(?:e|ing)|publish(?:ing)?|copy(?:ing)?|put(?:ting)?|insert(?:ing)?|updat(?:e|ing))`;
+const VAULT_ANY_FOLLOWUP_ACTION_SOURCE =
+  String.raw`(?:${VAULT_READ_ACTION_SOURCE}|${VAULT_MUTATION_ACTION_SOURCE})`;
+const BLOCKED_EXPLICIT_VAULT_ROOTS = new Set([
+  ".agent-backups",
+  ".obsidian",
+  ".trash",
+  "trash",
+]);
+
+/**
+ * Returns only Markdown paths attached to an affirmative read/inspect/open
+ * action. Parsing stops before a later write/delete action, and candidates are
+ * rejected before normalization so an absolute or traversal path can never be
+ * converted into vault-relative read authority.
+ */
+export function extractExplicitVaultReadFilePaths(prompt: string): string[] {
+  return analyzeExplicitVaultReadFilePaths(prompt).paths;
+}
+
+/**
+ * Exposes bounded parser evidence to the host graph so it can fail closed when
+ * planned read_file node cardinality disagrees with the exact named sources.
+ */
+export function analyzeExplicitVaultReadFilePaths(
+  prompt: string,
+): ExplicitVaultReadFilePathAnalysis {
+  if (prompt.length > 100_000) {
+    return { paths: [], referencedPathCount: 0, invalidPathCount: 0 };
+  }
+
+  const readAction = new RegExp(`\\b${VAULT_READ_ACTION_SOURCE}\\b`, "giu");
+  const safePaths: string[] = [];
+  let referencedPathCount = 0;
+  let invalidPathCount = 0;
+
+  for (const action of prompt.matchAll(readAction)) {
+    const actionIndex = action.index ?? 0;
+    if (isLocallyNegatedVaultReadAction(prompt, actionIndex)) continue;
+
+    const remainderStart = actionIndex + action[0].length;
+    const remainder = prompt.slice(
+      remainderStart,
+      Math.min(prompt.length, remainderStart + 4_000),
+    );
+    const span = remainder.slice(0, findVaultReadActionBoundary(remainder));
+    for (const rawTarget of extractRawVaultReadTargets(span)) {
+      referencedPathCount += 1;
+      const safePath = safeExplicitVaultReadPath(rawTarget);
+      if (safePath === null) {
+        invalidPathCount += 1;
+        continue;
+      }
+      safePaths.push(safePath);
+    }
+  }
+
+  return {
+    paths: dedupeStrings(safePaths).slice(0, 16),
+    referencedPathCount,
+    invalidPathCount,
+  };
+}
+
+function isLocallyNegatedVaultReadAction(
+  prompt: string,
+  actionIndex: number,
+): boolean {
+  const prefixStart = Math.max(0, actionIndex - 160);
+  const prefix = prompt.slice(prefixStart, actionIndex);
+  const localBoundary =
+    /[,;.!?\r\n]|\b(?:but|then|and\s+then|after\s+that)\b/giu;
+  let localStart = 0;
+  for (const boundary of prefix.matchAll(localBoundary)) {
+    localStart = (boundary.index ?? 0) + boundary[0].length;
+  }
+  const localPrefix = prefix.slice(localStart);
+  return /\b(?:do\s+not|don't|never|without|avoid)\b[^,;.!?\r\n]{0,100}$/iu.test(
+    localPrefix,
+  );
+}
+
+function findVaultReadActionBoundary(remainder: string): number {
+  const boundary = new RegExp(
+    [
+      String.raw`[;!?\r\n]`,
+      String.raw`\.(?=\s|$)`,
+      String.raw`,\s*(?=${VAULT_ANY_FOLLOWUP_ACTION_SOURCE}\b)`,
+      String.raw`\b(?:and\s+then|then|after\s+that|but)\b`,
+      String.raw`\band\s+(?=${VAULT_ANY_FOLLOWUP_ACTION_SOURCE}\b)`,
+      String.raw`\bto\s+(?=${VAULT_MUTATION_ACTION_SOURCE}\b)`,
+      String.raw`\b(?:before|while)\s+(?=${VAULT_MUTATION_ACTION_SOURCE}\b)`,
+    ].join("|"),
+    "iu",
+  ).exec(remainder);
+  return boundary?.index ?? remainder.length;
+}
+
+function extractRawVaultReadTargets(span: string): string[] {
+  const targets: string[] = [];
+  for (const part of splitVaultReadTargetList(span)) {
+    const withoutLead = stripVaultReadTargetLead(part);
+    if (!withoutLead) continue;
+    const quoted = /^(?:["'`])([^"'`\r\n]{1,1000}?\.md)(?:["'`])(?=$|\s|[,;.!?])/iu.exec(
+      withoutLead,
+    );
+    const unquoted = /^(.{1,1000}?\.md)(?=$|\s|[,;.!?])/iu.exec(withoutLead);
+    const raw = (quoted?.[1] ?? unquoted?.[1] ?? "").trim();
+    if (raw) targets.push(raw);
+  }
+  return targets;
+}
+
+function splitVaultReadTargetList(span: string): string[] {
+  const result: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | "`" | null = null;
+  let index = 0;
+  while (index < span.length) {
+    const character = span[index]!;
+    if (quote !== null) {
+      current += character;
+      if (character === quote) quote = null;
+      index += 1;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+      current += character;
+      index += 1;
+      continue;
+    }
+    const andMatch = /^\s+and\s+/iu.exec(span.slice(index));
+    const completedTarget = /\.md(?:["'`])?\s*$/iu.test(current);
+    if ((character === "," || andMatch) && completedTarget) {
+      result.push(current);
+      current = "";
+      index += andMatch?.[0].length ?? 1;
+      continue;
+    }
+    current += character;
+    index += 1;
+  }
+  result.push(current);
+  return result;
+}
+
+function stripVaultReadTargetLead(value: string): string {
+  let remaining = value.trim().replace(/^(?::|[-–—])\s*/u, "");
+  remaining = remaining.replace(
+    /^(?:(?:and\s+)?count\s+(?:the\s+)?words?\s+(?:in|of)\s+)/iu,
+    "",
+  );
+  const qualifier =
+    /^(?:the|these|those|both|one|two|three|four|five|six|seven|eight|nine|ten|\d+|named|exact|vault(?:-relative)?|markdown|notes?|files?|paths?|at|called|from|in)\b\s*:?[ \t]*/iu;
+  while (qualifier.test(remaining)) {
+    remaining = remaining.replace(qualifier, "");
+  }
+  return remaining.trim();
+}
+
+function safeExplicitVaultReadPath(rawPath: string): string | null {
+  const path = rawPath.trim();
+  if (
+    !path ||
+    path.length > 1_000 ||
+    /[\u0000-\u001f\u007f]/u.test(path) ||
+    path.startsWith("/") ||
+    path.startsWith("\\") ||
+    /^[a-zA-Z]:/u.test(path) ||
+    path.includes("\\") ||
+    path.includes("//") ||
+    path.includes("..") ||
+    /[<>:"|?*]/u.test(path) ||
+    !path.toLowerCase().endsWith(".md")
+  ) {
+    return null;
+  }
+  const parts = path.split("/");
+  if (
+    parts.some((part) => !part || part === "." || part === "..") ||
+    BLOCKED_EXPLICIT_VAULT_ROOTS.has(parts[0]!.toLowerCase())
+  ) {
+    return null;
+  }
+  try {
+    const normalized = normalizeVaultPath(path, { requireMarkdown: true });
+    return normalized === path ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Extracts a bounded, explicit new-file set from phrases such as
  * "Add only README.md, src/app.ts, and tests/app.test.ts", plus singular
@@ -262,7 +479,13 @@ export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
   for (const introduction of introductions) {
     const introductionIndex = introduction.index ?? 0;
     const prefix = prompt.slice(Math.max(0, introductionIndex - 100), introductionIndex);
-    if (/(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(prefix)) {
+    // Negation must stay inside the same sentence. "Never edit scripts/. Create
+    // exactly README.md" must not suppress the later create clause.
+    if (
+      /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[^.!?\r\n]{0,80}$/iu.test(
+        prefix,
+      )
+    ) {
       continue;
     }
     const start = introductionIndex + introduction[0].length;
@@ -284,7 +507,28 @@ export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
   )) {
     const actionIndex = match.index ?? 0;
     const prefix = prompt.slice(Math.max(0, actionIndex - 100), actionIndex);
-    if (/(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(prefix)) {
+    if (
+      /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[^.!?\r\n]{0,80}$/iu.test(
+        prefix,
+      )
+    ) {
+      continue;
+    }
+    const candidate = match[1] ?? "";
+    if (isSafeExplicitWorkspaceFilePath(candidate)) paths.push(candidate);
+  }
+  // Tool-token form used by e2e/set-loose compound prompts:
+  // code_workspace_create_file … path src/foo.ts
+  for (const match of prompt.matchAll(
+    /\bcode_workspace_create_file\b[\s\S]{0,120}?\bpath\b[ \t:=]+["'\x60]?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})/giu,
+  )) {
+    const actionIndex = match.index ?? 0;
+    const prefix = prompt.slice(Math.max(0, actionIndex - 100), actionIndex);
+    if (
+      /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[^.!?\r\n]{0,80}$/iu.test(
+        prefix,
+      )
+    ) {
       continue;
     }
     const candidate = match[1] ?? "";
@@ -310,7 +554,7 @@ export function extractExplicitWorkspaceReadFilePaths(prompt: string): string[] 
       const actionIndex = match.index ?? 0;
       const prefix = clause.slice(Math.max(0, actionIndex - 100), actionIndex);
       if (
-        /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(
+        /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[^.!?\r\n]{0,80}$/iu.test(
           prefix,
         )
       ) {
@@ -319,6 +563,61 @@ export function extractExplicitWorkspaceReadFilePaths(prompt: string): string[] 
       const candidate = match[1] ?? "";
       if (isSafeExplicitWorkspaceFilePath(candidate)) paths.push(candidate);
     }
+  }
+  // Tool-token form used by e2e/set-loose compound prompts:
+  // code_workspace_read … path src/foo.ts
+  // Call code_workspace_read for path src/foo.ts
+  for (const match of prompt.matchAll(
+    /\bcode_workspace_read\b[\s\S]{0,120}?\bpath\b[ \t:=]+["'\x60]?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})/giu,
+  )) {
+    const actionIndex = match.index ?? 0;
+    const prefix = prompt.slice(Math.max(0, actionIndex - 100), actionIndex);
+    if (
+      /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[^.!?\r\n]{0,80}$/iu.test(
+        prefix,
+      )
+    ) {
+      continue;
+    }
+    const candidate = match[1] ?? "";
+    if (isSafeExplicitWorkspaceFilePath(candidate)) paths.push(candidate);
+  }
+  return dedupeStrings(paths);
+}
+
+/**
+ * Repository-relative files an affirmative clause asks to hash-bound rewrite via
+ * code_workspace_write_expected. Used to attach MissionGraph selectors so Soft
+ * models cannot retarget write_expected onto vault note paths.
+ */
+export function extractExplicitWorkspaceWriteExpectedFilePaths(
+  prompt: string,
+): string[] {
+  if (prompt.length > 100_000 || prompt.includes("\0")) return [];
+  const paths: string[] = [];
+  for (const match of prompt.matchAll(
+    /\bcode_workspace_write_expected\b[\s\S]{0,160}?\bpath\b[ \t:=]+["'\x60]?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})/giu,
+  )) {
+    const actionIndex = match.index ?? 0;
+    const prefix = prompt.slice(Math.max(0, actionIndex - 100), actionIndex);
+    if (
+      /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[^.!?\r\n]{0,80}$/iu.test(
+        prefix,
+      )
+    ) {
+      continue;
+    }
+    const candidate = match[1] ?? "";
+    if (isSafeExplicitWorkspaceFilePath(candidate)) paths.push(candidate);
+  }
+  // "write_expected for that same path src/foo.ts" / "for that same path with"
+  // still needs the earlier read tool-token path; also accept an explicit path
+  // after "same path" when the model-facing prompt restates it.
+  for (const match of prompt.matchAll(
+    /\bsame\s+path\b[ \t]+["'\x60]?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})/giu,
+  )) {
+    const candidate = match[1] ?? "";
+    if (isSafeExplicitWorkspaceFilePath(candidate)) paths.push(candidate);
   }
   return dedupeStrings(paths);
 }

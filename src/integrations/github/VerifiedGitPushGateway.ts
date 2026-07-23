@@ -1,4 +1,8 @@
 import {
+  isAgentGitCommitIdentityV1,
+  type AgentGitCommitIdentityV1,
+} from "../../../packages/core-api/src/agentGitCommitIdentityV1";
+import {
   parseVerifiedCodePublicationHandoffV1,
   type VerifiedCodePublicationHandoffV1,
 } from "../../../packages/core-api/src/verifiedCodePublicationHandoffV1";
@@ -153,6 +157,7 @@ export class VerifiedGitPushErrorV1 extends Error {
     readonly code:
       | "invalid_publication_handoff"
       | "local_commit_drift"
+      | "commit_identity_mismatch"
       | "remote_non_fast_forward"
       | "git_command_failed"
       | "attempt_store_conflict",
@@ -176,7 +181,10 @@ export class VerifiedGitPushGatewayV1 {
     const prepared = this.prepare(input);
     const attemptId = attemptIdFor(prepared.handoff, prepared.binding);
     const prior = await this.options.attemptStore.load(attemptId);
-    if (prior) return resultFromPrior(prior);
+    // Definitive not_applied (auth/permission) may be retried after the host
+    // installs a Contents-capable credential. Ambiguous reconcile_required must
+    // never redispatch.
+    if (prior && prior.status !== "not_applied") return resultFromPrior(prior);
 
     await this.verifyLocalIdentity(prepared.handoff, input.signal);
     return this.options.askpassBroker.withHandle({
@@ -185,19 +193,34 @@ export class VerifiedGitPushGatewayV1 {
       signal: input.signal,
       use: async (handle) => {
         const environment = askpassEnvironment(handle);
-        const beforeRemoteSha = await this.readRemoteSha(
-          prepared.handoff,
-          prepared.remoteUrl,
-          environment,
-          input.signal,
-        );
-        const beforeBaseSha = await this.readRemoteRefSha(
-          prepared.handoff,
-          prepared.remoteUrl,
-          prepared.handoff.baseBranch,
-          environment,
-          input.signal,
-        );
+        let beforeRemoteSha: string | null;
+        let beforeBaseSha: string | null;
+        try {
+          beforeRemoteSha = await this.readRemoteSha(
+            prepared.handoff,
+            prepared.remoteUrl,
+            environment,
+            input.signal,
+          );
+          beforeBaseSha = await this.readRemoteRefSha(
+            prepared.handoff,
+            prepared.remoteUrl,
+            prepared.handoff.baseBranch,
+            environment,
+            input.signal,
+          );
+        } catch (error) {
+          const diagnostic = safeDiagnostic(error);
+          if (isDefinitiveGitPushAuthFailureV1(diagnostic)) {
+            // Fail closed before claiming a durable ambiguous attempt so a
+            // Contents-capable credential can retry the same handoff.
+            throw new VerifiedGitPushErrorV1(
+              "git_command_failed",
+              healableGitPushAuthFailureMessage(diagnostic),
+            );
+          }
+          throw error;
+        }
         if (beforeBaseSha && beforeBaseSha !== prepared.handoff.baseSha) {
           throw new VerifiedGitPushErrorV1(
             "remote_non_fast_forward",
@@ -217,7 +240,7 @@ export class VerifiedGitPushGatewayV1 {
         const attempt: GitPushAttemptRecordV1 = {
           version: 1,
           id: attemptId,
-          revision: 0,
+          revision: prior ? prior.revision + 1 : 0,
           handoffFingerprint: prepared.handoff.fingerprint,
           bindingFingerprint: prepared.binding.fingerprint,
           branch: prepared.handoff.branch,
@@ -235,7 +258,8 @@ export class VerifiedGitPushGatewayV1 {
           receipt: null,
           diagnostic: null,
         };
-        if (!(await this.options.attemptStore.save(attempt, null))) {
+        const expectedRevision = prior ? prior.revision : null;
+        if (!(await this.options.attemptStore.save(attempt, expectedRevision))) {
           const concurrent = await this.options.attemptStore.load(attemptId);
           if (concurrent) return resultFromPrior(concurrent);
           throw new VerifiedGitPushErrorV1("attempt_store_conflict", "Git push attempt could not be claimed durably.");
@@ -279,10 +303,24 @@ export class VerifiedGitPushGatewayV1 {
             input.signal,
           );
         } catch (error) {
-          return this.markReconcileRequired(attempt, safeDiagnostic(error));
+          const diagnostic = safeDiagnostic(error);
+          if (isDefinitiveGitPushAuthFailureV1(diagnostic)) {
+            return this.markNotApplied(
+              attempt,
+              healableGitPushAuthFailureMessage(diagnostic),
+            );
+          }
+          return this.markReconcileRequired(attempt, diagnostic);
         }
         if (pushResult.exitCode !== 0) {
-          return this.markReconcileRequired(attempt, safeGitDiagnostic(pushResult));
+          const diagnostic = safeGitDiagnostic(pushResult);
+          if (isDefinitiveGitPushAuthFailureV1(diagnostic)) {
+            return this.markNotApplied(
+              attempt,
+              healableGitPushAuthFailureMessage(diagnostic),
+            );
+          }
+          return this.markReconcileRequired(attempt, diagnostic);
         }
         let observed: string | null;
         try {
@@ -445,6 +483,67 @@ export class VerifiedGitPushGatewayV1 {
         "Canonical worktree, branch, commit, tree, or parent drifted after local verification.",
       );
     }
+    const identity = await this.readLocalCommitIdentity(
+      cwd,
+      handoff.commitSha,
+      environment,
+      signal,
+    );
+    if (
+      !isAgentGitCommitIdentityV1(identity, {
+        allowLegacyLocalhost: true,
+      })
+    ) {
+      throw new VerifiedGitPushErrorV1(
+        "commit_identity_mismatch",
+        "Verified commit author or committer is not the host-pinned Agentic Researcher identity; publication is blocked to prevent GitHub account misattribution.",
+      );
+    }
+  }
+
+  private async readLocalCommitIdentity(
+    cwd: string,
+    commitSha: string,
+    environment: Readonly<Record<string, string>>,
+    signal?: AbortSignal,
+  ): Promise<AgentGitCommitIdentityV1> {
+    const result = await this.runGit(
+      cwd,
+      [
+        "show",
+        "--no-patch",
+        "--no-show-signature",
+        "--format=%an%x00%ae%x00%cn%x00%ce",
+        commitSha,
+      ],
+      environment,
+      signal,
+    );
+    if (result.exitCode !== 0) {
+      throw new VerifiedGitPushErrorV1(
+        "git_command_failed",
+        safeGitDiagnostic(result),
+      );
+    }
+    const output = result.stdout.replace(/(?:\r?\n)+$/u, "");
+    const fields = output.split("\0");
+    if (
+      output.length < 1 ||
+      output.length > 4_096 ||
+      fields.length !== 4 ||
+      fields.some((field) => !field || /[\0\r\n]/u.test(field))
+    ) {
+      throw new VerifiedGitPushErrorV1(
+        "git_command_failed",
+        "Git commit author and committer readback was invalid.",
+      );
+    }
+    return {
+      authorName: fields[0],
+      authorEmail: fields[1],
+      committerName: fields[2],
+      committerEmail: fields[3],
+    };
   }
 
   private async assertFastForward(
@@ -627,6 +726,21 @@ export class VerifiedGitPushGatewayV1 {
     return resultFromPrior(next);
   }
 
+  private async markNotApplied(
+    attempt: GitPushAttemptRecordV1,
+    diagnostic: string,
+  ): Promise<VerifiedGitPushResultV1> {
+    const next: GitPushAttemptRecordV1 = {
+      ...attempt,
+      revision: attempt.revision + 1,
+      status: "not_applied",
+      updatedAt: this.now().toISOString(),
+      diagnostic,
+    };
+    await this.saveReplacement(attempt, next);
+    return resultFromPrior(next);
+  }
+
   private async saveReplacement(
     prior: GitPushAttemptRecordV1,
     next: GitPushAttemptRecordV1,
@@ -726,6 +840,42 @@ function safeDiagnostic(value: unknown): string {
     .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
     .replace(/(?:token|password|secret|authorization|credential)\s*[=:]\s*\S+/giu, "credential=[REDACTED]")
     .slice(0, 1000);
+}
+
+/**
+ * GitHub returns "Repository not found" for private repos when the token lacks
+ * Contents access. Treat that, and explicit auth failures, as definitive
+ * non-application so Soft publish can retry after installing a push-capable
+ * credential (create-only Administration is not enough).
+ */
+export function isDefinitiveGitPushAuthFailureV1(diagnostic: string): boolean {
+  const text = diagnostic.toLowerCase();
+  return (
+    /authentication failed/u.test(text) ||
+    /could not read username/u.test(text) ||
+    /invalid username or token/u.test(text) ||
+    /support for password authentication was removed/u.test(text) ||
+    (/repository not found/u.test(text) &&
+      (/authentication failed/u.test(text) ||
+        /fatal:/u.test(text) ||
+        /remote:/u.test(text))) ||
+    /http(s)?\s*401/u.test(text) ||
+    /http(s)?\s*403/u.test(text)
+  );
+}
+
+export function healableGitPushAuthFailureMessage(diagnostic: string): string {
+  return [
+    "Git push authentication failed for the trusted private repository.",
+    "REST create (Administration) can succeed while git push fails when the",
+    "leased credential lacks Contents:write on the new repo.",
+    "Heal: install a github_pat_ with Contents:write (All repositories) or a",
+    "classic/gh OAuth token with repo scope via the harness/vault credential,",
+    "then retry publish_draft.",
+    diagnostic ? `Detail: ${diagnostic.slice(0, 400)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function sha256(value: unknown): string {

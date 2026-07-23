@@ -65,6 +65,13 @@ export interface AcceptedResearchNoteWriteResultV1 {
   transaction: DiagramArtifactCreateTransactionReceipt | DiagramArtifactUpdateReceipt | null;
 }
 
+export interface AcceptedResearchNoteReadRequestV1 {
+  artifact: AcceptedResearchArtifactV1;
+  package: AcceptedResearchNotePackageV1;
+  /** Exact checkpoint-bound note revision expected before a resume proceeds. */
+  expectedNoteSha256: string;
+}
+
 export interface ResearchNoteBacklinkResultV1 {
   path: string;
   operation: "append" | "no_op";
@@ -82,6 +89,12 @@ export interface ResearchNoteGitHubCompletionResultV1 {
   pullRequestUrl: string;
   mergeCommitUrl: string | null;
   transaction: DiagramArtifactUpdateReceipt | null;
+}
+
+export interface ResearchNoteProjectReflectionResultV1
+  extends ResearchNoteGitHubCompletionResultV1 {
+  issueUrl: string;
+  publicationId: string;
 }
 
 /** Host-owned note writer. External integration code never receives the vault. */
@@ -122,7 +135,9 @@ export class AcceptedResearchNoteWriter {
       acceptedAt: request.acceptedAt,
       acceptedBy: "host",
     });
-    const rendered = renderAcceptedResearchNotePackageV1(normalized);
+    const renderedPackage = renderAcceptedResearchNotePackageV1(normalized);
+    const marker = acceptedResearchMarker(request.artifactId);
+    const rendered = `${marker}\n${renderedPackage}`;
     let beforeSha256: string | null = null;
     let afterSha256: string;
     let operation: "create" | "append" | "no_op";
@@ -171,26 +186,37 @@ export class AcceptedResearchNoteWriter {
     } else {
       const current = await this.store.read(request.path);
       beforeSha256 = current.sha256;
-      if (!request.baseHash || request.baseHash !== current.sha256) {
+      if (current.content.includes(marker)) {
+        if (!current.content.includes(rendered.replace(/\s*$/u, ""))) {
+          throw new DiagramArtifactStoreError(
+            "validation_failed",
+            "Accepted research marker collides with different or incomplete content.",
+          );
+        }
+        operation = "no_op";
+        afterSha256 = current.sha256;
+        transaction = null;
+      } else if (!request.baseHash || request.baseHash !== current.sha256) {
         throw new DiagramArtifactStoreError(
           "expected_hash_mismatch",
           "Accepted research note changed before append.",
         );
+      } else {
+        const content = appendSection(current.content, rendered);
+        const updated = await this.store.update({
+          path: request.path,
+          expectedSha256: current.sha256,
+          content,
+          validator: ({ content: persisted }) =>
+            validateRenderedResearchNote(persisted, normalized.title),
+        });
+        if (updated.status !== "committed" || !updated.afterSha256) {
+          throw new Error(updated.error?.message ?? "Accepted research note append rolled back.");
+        }
+        operation = "append";
+        afterSha256 = updated.afterSha256;
+        transaction = updated;
       }
-      const content = appendSection(current.content, rendered);
-      const updated = await this.store.update({
-        path: request.path,
-        expectedSha256: current.sha256,
-        content,
-        validator: ({ content: persisted }) =>
-          validateRenderedResearchNote(persisted, normalized.title),
-      });
-      if (updated.status !== "committed" || !updated.afterSha256) {
-        throw new Error(updated.error?.message ?? "Accepted research note append rolled back.");
-      }
-      operation = "append";
-      afterSha256 = updated.afterSha256;
-      transaction = updated;
     }
 
     const noteReceiptId = `research-note-${afterSha256.slice(7, 39)}`;
@@ -216,6 +242,50 @@ export class AcceptedResearchNoteWriter {
       noteReceiptId,
       artifact,
       transaction,
+    };
+  }
+
+  /**
+   * Re-read a checkpoint-bound accepted package without repeating its write.
+   * The exact note revision and persisted package bytes must still match before
+   * Linear reconciliation or any later resume step is allowed to continue.
+   */
+  async readAcceptedPackage(
+    request: AcceptedResearchNoteReadRequestV1,
+  ): Promise<AcceptedResearchNoteWriteResultV1> {
+    const current = await this.store.read(request.artifact.notePath);
+    if (current.sha256 !== request.expectedNoteSha256) {
+      throw new DiagramArtifactStoreError(
+        "expected_hash_mismatch",
+        "Initiating research note changed before publication resume readback.",
+      );
+    }
+    const normalized = normalizePackage(request.package);
+    const rendered = renderAcceptedResearchNotePackageV1(normalized);
+    const marker = acceptedResearchMarker(request.artifact.artifactId);
+    if (!current.content.includes(rendered.replace(/\s*$/u, ""))) {
+      throw new DiagramArtifactStoreError(
+        "validation_failed",
+        "The checkpoint-bound initiating note no longer contains the accepted research package.",
+      );
+    }
+    // Older accepted notes did not carry the marker. Exact package-byte
+    // readback keeps those checkpoints resumable; all new writes carry it.
+    if (current.content.includes("<!-- agentic-accepted-research:") &&
+        !current.content.includes(marker)) {
+      throw new DiagramArtifactStoreError(
+        "validation_failed",
+        "The initiating note is bound to a different accepted research artifact.",
+      );
+    }
+    return {
+      path: current.path,
+      operation: "no_op",
+      beforeSha256: current.sha256,
+      afterSha256: current.sha256,
+      noteReceiptId: request.artifact.noteReceiptId,
+      artifact: request.artifact,
+      transaction: null,
     };
   }
 
@@ -343,6 +413,178 @@ export class AcceptedResearchNoteWriter {
       operation: "append",
       beforeSha256: current.sha256,
       afterSha256: update.afterSha256,
+      pullRequestUrl,
+      mergeCommitUrl,
+      transaction: update,
+    };
+  }
+
+  /**
+   * Final, append-once project reflection. It records verified handoff evidence
+   * in the accepted research note instead of treating links alone as closure.
+   */
+  async appendProjectCompletionReflection(input: {
+    artifact: AcceptedResearchArtifactV1;
+    expectedNoteSha256: string;
+    publicationId: string;
+    issueIdentifier: string;
+    issueUrl: string;
+    pullRequestNumber: number;
+    pullRequestUrl: string;
+    completionProof: "draft_pr" | "merged_pr";
+    proofRevision: string;
+    changedPaths: string[];
+    targetedValidationReceiptId: string;
+    fullValidationReceiptId: string;
+    localCommitReceiptId: string;
+    mergeCommitUrl?: string;
+    mergeSha?: string;
+  }): Promise<ResearchNoteProjectReflectionResultV1> {
+    const current = await this.store.read(input.artifact.notePath);
+    if (current.sha256 !== input.expectedNoteSha256) {
+      throw new DiagramArtifactStoreError(
+        "expected_hash_mismatch",
+        "Research note changed before project completion reflection append.",
+      );
+    }
+    const publicationId = markerId(input.publicationId);
+    const marker = `<!-- agentic-project-reflection:${publicationId} -->`;
+    const issueUrl = normalizeHttpsUrl(input.issueUrl);
+    const issueIdentifier = boundedText(input.issueIdentifier, "issue identifier", 100);
+    const pullRequestUrl = normalizeGitHubUrl(
+      input.pullRequestUrl,
+      "GitHub pull request URL",
+    );
+    const pullRequestNumber = positiveInteger(
+      input.pullRequestNumber,
+      "GitHub pull request number",
+    );
+    if ((input.mergeCommitUrl === undefined) !== (input.mergeSha === undefined)) {
+      throw new Error("Project reflection requires both merge URL and merge SHA, or neither.");
+    }
+    if (input.completionProof === "merged_pr" && !input.mergeSha) {
+      throw new Error("Merged project reflection requires verified merge proof.");
+    }
+    const mergeCommitUrl = input.mergeCommitUrl === undefined
+      ? null
+      : normalizeGitHubUrl(input.mergeCommitUrl, "GitHub merge commit URL");
+    const mergeSha = input.mergeSha === undefined ? null : gitSha(input.mergeSha);
+    const proofRevision = gitSha(input.proofRevision);
+    const changedPaths = boundedRepositoryPaths(input.changedPaths);
+    const targetedReceipt = boundedText(
+      input.targetedValidationReceiptId,
+      "targeted validation receipt ID",
+      240,
+    );
+    const fullReceipt = boundedText(
+      input.fullValidationReceiptId,
+      "full validation receipt ID",
+      240,
+    );
+    const commitReceipt = boundedText(
+      input.localCommitReceiptId,
+      "local commit receipt ID",
+      240,
+    );
+    if (current.content.includes(marker)) {
+      const expectedProof = [
+        issueUrl,
+        pullRequestUrl,
+        proofRevision,
+        targetedReceipt,
+        fullReceipt,
+        commitReceipt,
+        ...changedPaths,
+        ...(mergeCommitUrl ? [mergeCommitUrl] : []),
+        ...(mergeSha ? [mergeSha] : []),
+      ];
+      if (!expectedProof.every((value) => current.content.includes(value))) {
+        throw new DiagramArtifactStoreError(
+          "validation_failed",
+          "Project reflection marker collides with different or incomplete proof.",
+        );
+      }
+      return {
+        path: current.path,
+        operation: "no_op",
+        beforeSha256: current.sha256,
+        afterSha256: current.sha256,
+        issueUrl,
+        publicationId,
+        pullRequestUrl,
+        mergeCommitUrl,
+        transaction: null,
+      };
+    }
+    const deliveryState = input.completionProof === "merged_pr"
+      ? "Merged after verified checks and provider readback."
+      : "Published as a verified draft pull request for human review.";
+    const remaining = input.completionProof === "merged_pr"
+      ? "No publication blocker remains in this pipeline run. Follow-up product learning is separate work."
+      : "Human review and merge remain outside this completed draft-publication proof.";
+    const acceptanceCriteria = input.artifact.acceptanceCriteria.map(
+      (criterion) => `- **${escapeMarkdown(criterion.id)}:** ${criterion.text}`,
+    );
+    const reflection = [
+      "## Agent project reflection",
+      marker,
+      "",
+      "### Outcome",
+      "",
+      `- ${deliveryState}`,
+      `- Linear source: [${escapeMarkdown(issueIdentifier)}](${issueUrl})`,
+      `- GitHub proof: [pull request #${pullRequestNumber}](${pullRequestUrl})`,
+      `- Verified revision: \`${proofRevision}\``,
+      ...(mergeSha && mergeCommitUrl
+        ? [`- Verified merge: [\`${mergeSha}\`](${mergeCommitUrl})`]
+        : []),
+      "",
+      "### Delivered scope",
+      "",
+      ...changedPaths.map((path) => `- \`${escapeInline(path)}\``),
+      "",
+      "### Acceptance criteria carried through the execution contract",
+      "",
+      ...acceptanceCriteria,
+      "",
+      "### Verification receipts",
+      "",
+      `- Targeted validation: \`${escapeInline(targetedReceipt)}\``,
+      `- Full validation: \`${escapeInline(fullReceipt)}\``,
+      `- Verified local commit: \`${escapeInline(commitReceipt)}\``,
+      "",
+      "### Reflection",
+      "",
+      "- What worked: the accepted research artifact, Linear work item, repository changes, validations, and GitHub proof stayed linked by durable identifiers and readbacks.",
+      `- Remaining limitation: ${remaining}`,
+    ].join("\n");
+    const candidate = appendSection(current.content, reflection);
+    const update = await this.store.update({
+      path: current.path,
+      expectedSha256: current.sha256,
+      content: candidate,
+      validator: ({ content }) => ({
+        ok:
+          content.includes(marker) &&
+          content.includes(issueUrl) &&
+          content.includes(pullRequestUrl) &&
+          content.includes(proofRevision) &&
+          content.includes(targetedReceipt) &&
+          content.includes(fullReceipt) &&
+          content.includes(commitReceipt),
+        errors: ["Project completion reflection was not persisted with its proof."],
+      }),
+    });
+    if (update.status !== "committed" || !update.afterSha256) {
+      throw new Error(update.error?.message ?? "Project completion reflection append rolled back.");
+    }
+    return {
+      path: current.path,
+      operation: "append",
+      beforeSha256: current.sha256,
+      afterSha256: update.afterSha256,
+      issueUrl,
+      publicationId,
       pullRequestUrl,
       mergeCommitUrl,
       transaction: update,
@@ -486,6 +728,40 @@ function boundedText(value: unknown, label: string, maximum: number): string {
   const normalized = typeof value === "string" ? value.trim() : "";
   if (!normalized || normalized.length > maximum || /[\0\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(normalized)) {
     throw new Error(`${label} must contain safe bounded text.`);
+  }
+  return normalized;
+}
+
+function markerId(value: unknown): string {
+  const normalized = boundedText(value, "publication ID", 200);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(normalized) || normalized.includes("--")) {
+    throw new Error("publication ID is not safe for a reflection marker.");
+  }
+  return normalized;
+}
+
+function acceptedResearchMarker(artifactId: unknown): string {
+  return `<!-- agentic-accepted-research:${markerId(artifactId)} -->`;
+}
+
+function boundedRepositoryPaths(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_LIST_ENTRIES) {
+    throw new Error(`changed paths require 1-${MAX_LIST_ENTRIES} entries.`);
+  }
+  const normalized = value.map((entry, index) => {
+    const path = boundedText(entry, `changed path ${index + 1}`, 500);
+    if (
+      path.includes("\\") ||
+      path.startsWith("/") ||
+      /^[A-Za-z]:/u.test(path) ||
+      path.split("/").some((segment) => !segment || segment === "." || segment === "..")
+    ) {
+      throw new Error("changed paths must be safe repository-relative paths.");
+    }
+    return path;
+  });
+  if (new Set(normalized).size !== normalized.length) {
+    throw new Error("changed paths must be unique.");
   }
   return normalized;
 }

@@ -23,6 +23,130 @@ const allTools = [
   "get_note_graph_context",
 ].map((name) => tool(name));
 
+test("named linear_create_issue stays tool_required even with append writeback", () => {
+  const plan = createRunPlan({
+    prompt:
+      "Call linear_create_issue exactly once, then call append_to_current_file. Append markdown with the issue URL.",
+    missionIntent: missionIntent({
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: [
+      ...allTools,
+      tool("linear_create_issue"),
+      tool("linear_get_issue"),
+    ],
+    streamingWritebackKind: "append",
+    directCurrentNoteWritebackKind: null,
+  });
+  assert.equal(plan.route, "tool_required");
+  assert.ok(plan.maxStepsForRun >= 8);
+  assert.ok(plan.traceReasons.includes("explicit_external_mutation_tool_mission"));
+  assert.equal(plan.maxEffectClassWithoutGrant, "hard");
+  assert.equal(plan.executionTier, "durable_mission");
+});
+
+test("compound Linear+code+GitHub uses grounded workflow step budget not the Bound-mutation 24 cap", () => {
+  const plan = createRunPlan({
+    prompt: [
+      "Run the full pipeline for Flow real: Linear issue, repository workspace, private GitHub, and note reflection.",
+      "Call linear_create_issue then linear_get_issue.",
+      "Call code_sandbox_status, code_workspace_create, code_workspace_create_file, code_validate_fast, code_repair_record_cycle, code_validate_targeted, code_validate_full, and code_commit_verified.",
+      "Create the exact private GitHub repository via github_create_private_repository.",
+      "Append a Flow real reflection via append_to_current_file.",
+    ].join(" "),
+    missionIntent: missionIntent({
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: [
+      ...allTools,
+      tool("linear_create_issue"),
+      tool("linear_get_issue"),
+      tool("code_sandbox_status"),
+      tool("code_workspace_create"),
+      tool("code_workspace_create_file"),
+      tool("code_validate_fast"),
+      tool("code_repair_record_cycle"),
+      tool("code_validate_targeted"),
+      tool("code_validate_full"),
+      tool("code_commit_verified"),
+      tool("github_create_private_repository"),
+    ],
+    settings: { maxAgentSteps: 128 } as AgentSettings,
+    streamingWritebackKind: null,
+    directCurrentNoteWritebackKind: null,
+  });
+  assert.equal(plan.route, "grounded_workflow");
+  assert.ok(
+    plan.maxStepsForRun > 24,
+    `expected compound step budget > 24, got ${plan.maxStepsForRun}`,
+  );
+  assert.ok(
+    !plan.traceReasons.includes("explicit_external_mutation_tool_mission"),
+  );
+});
+
+test("run plan carries direct-chat classification for analytical prompt", () => {
+  const plan = createRunPlan({
+    prompt: "Is the red list the complete current set of fully-agentic gaps?",
+    missionIntent: missionIntent(),
+    tools: [],
+    streamingWritebackKind: null,
+    directCurrentNoteWritebackKind: null,
+  });
+  assert.ok(["explain", "evaluate"].includes(plan.speechAct));
+  assert.equal(plan.executionTier, "direct_chat");
+  assert.equal(plan.route, "single_model_answer");
+  assert.equal(plan.maxStepsForRun, 1);
+  assert.deepEqual(plan.allowedToolNames, []);
+  assert.ok(plan.traceReasons.includes("speech_act_direct_chat"));
+});
+
+test("exact pipeline-difficulty question cannot fabricate a durable workflow", () => {
+  const plan = createRunPlan({
+    prompt:
+      "From your perspective, what is hard about doing research in obsidian, agentically, converting the notebook into Linear issues, Linear issues to real code project code files, github and fianlly a reflection ?",
+    missionIntent: missionIntent({
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: allTools,
+    streamingWritebackKind: "append",
+    directCurrentNoteWritebackKind: "append",
+  });
+  assert.equal(plan.speechAct, "explain");
+  assert.equal(plan.executionTier, "direct_chat");
+  assert.equal(plan.route, "single_model_answer");
+  assert.equal(plan.maxStepsForRun, 1);
+  assert.deepEqual(plan.allowedToolNames, []);
+});
+
+test("essay then turn into linear issues stays tool_required (not single-step writeback)", () => {
+  const plan = createRunPlan({
+    prompt:
+      "Could you write me a 1000 word essay on china's government? Then turn the essay into linear issues?",
+    missionIntent: missionIntent({
+      mode: "note_output",
+      noteOutput: true,
+      allowAutonomousWrite: true,
+      requireWriteCompletion: true,
+    }),
+    tools: [...allTools, tool("linear_create_issue"), tool("read_template")],
+    streamingWritebackKind: "append",
+    directCurrentNoteWritebackKind: null,
+  });
+  assert.equal(plan.route, "tool_required");
+  assert.ok(plan.maxStepsForRun >= 8);
+  assert.ok(plan.traceReasons.includes("explicit_external_mutation_tool_mission"));
+});
+
 test("run planner exposes route decisions, allowed tool names, and trace reasons", () => {
   const cases: Array<{
     prompt: string;

@@ -49,6 +49,21 @@ test("detectLinearIntent rejects ordinary linear terminology", () => {
   });
 });
 
+test("detectLinearIntent recognizes named linear_* tool tokens", () => {
+  assert.deepEqual(
+    detectLinearIntent(
+      "Call linear_create_issue exactly once, then append_to_current_file.",
+    ),
+    { explicit: true, reason: "linear_tool_token" },
+  );
+  assert.equal(
+    detectLinearIntent(
+      "Required tools: linear_get_issue, append_to_current_file.",
+    ).explicit,
+    true,
+  );
+});
+
 test("permanent Linear deletion requires explicit irreversible wording", () => {
   assert.equal(
     hasExplicitPermanentLinearDeleteIntent("Delete Linear issue ENG-42."),

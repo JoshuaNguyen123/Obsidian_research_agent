@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   buildCapabilityReadinessV2,
+  evaluatePinnedGitIdentityReadinessV1,
+  githubCleanupAuthorityFromScopesV1,
   type CapabilityReadinessInputsV2,
 } from "../src/agent/capabilityReadiness";
 
@@ -147,5 +149,11 @@ describe("CapabilityReadinessV2", () => {
     assert.match(browser?.reason ?? "", /Public web search and fetch are available/u);
     assert.match(browser?.reason ?? "", /Companion passes a healthy runtime probe/u);
     assert.equal(browser?.nextAction, "Use web research");
+  });
+
+  it("exposes pinned git identity and cleanup-scope helpers for mission preflight", () => {
+    assert.equal(evaluatePinnedGitIdentityReadinessV1(), true);
+    assert.equal(githubCleanupAuthorityFromScopesV1(["repo"]), true);
+    assert.equal(githubCleanupAuthorityFromScopesV1(["public_repo"]), false);
   });
 });

@@ -1433,12 +1433,47 @@ export class GitHubPublicationWorkflowV1 {
         return current;
       }
     }
+    // The originating notebook reflection is part of completion, not an
+    // optional backlink after the ticket has already been closed.
+    if (!current.obsidianReceiptId) {
+      try {
+        const obsidian = await this.options.finalizers.finalizeObsidian(input);
+        current = {
+          ...current,
+          status: current.linearCompletionReceiptId
+            ? "finalized"
+            : "waiting_linear_completion",
+          updatedAt: this.isoNow(),
+          obsidianReceiptId: obsidian.receiptId,
+          receiptIds: appendUnique(current.receiptIds, obsidian.receiptId),
+          blocker: null,
+        };
+        await this.options.checkpoints.persist(current);
+      } catch {
+        const obsidianCommitted = Boolean(current.obsidianReceiptId);
+        current = {
+          ...current,
+          status: obsidianCommitted
+            ? (current.linearCompletionReceiptId ? "finalized" : "waiting_linear_completion")
+            : "waiting_obsidian",
+          updatedAt: this.isoNow(),
+          blocker: obsidianCommitted
+            ? null
+            : {
+                code: "github_obsidian_finalization_waiting",
+                message: "GitHub proof and the exact Linear link are verified; the originating notebook reflection remains pending.",
+              },
+        };
+        await this.options.checkpoints.persist(current);
+        return current;
+      }
+    }
     if (!current.linearCompletionReceiptId) {
       try {
         const completed = await this.options.finalizers.finalizeLinearCompletion(input);
         current = {
           ...current,
-          status: "linear_completed",
+          status: "finalized",
           updatedAt: this.isoNow(),
           linearCompletionReceiptId: completed.receiptId,
           receiptIds: appendUnique(current.receiptIds, completed.receiptId),
@@ -1449,48 +1484,20 @@ export class GitHubPublicationWorkflowV1 {
         const completionCommitted = Boolean(current.linearCompletionReceiptId);
         current = {
           ...current,
-          status: completionCommitted ? "linear_completed" : "waiting_linear_completion",
+          status: completionCommitted ? "finalized" : "waiting_linear_completion",
           updatedAt: this.isoNow(),
           blocker: completionCommitted
             ? null
             : {
                 code: "github_linear_completion_waiting",
-                message: "The GitHub link is durable; Linear completion remains pending.",
+                message: "GitHub proof, Linear linkage, and the notebook reflection are durable; Linear completion remains pending.",
               },
         };
         await this.options.checkpoints.persist(current);
         return current;
       }
     }
-    if (current.obsidianReceiptId) return current;
-    try {
-      const obsidian = await this.options.finalizers.finalizeObsidian(input);
-      current = {
-        ...current,
-        status: "finalized",
-        updatedAt: this.isoNow(),
-        obsidianReceiptId: obsidian.receiptId,
-        receiptIds: appendUnique(current.receiptIds, obsidian.receiptId),
-        blocker: null,
-      };
-      await this.options.checkpoints.persist(current);
-      return current;
-    } catch {
-      const obsidianCommitted = Boolean(current.obsidianReceiptId);
-      current = {
-        ...current,
-        status: obsidianCommitted ? "finalized" : "waiting_obsidian",
-        updatedAt: this.isoNow(),
-        blocker: obsidianCommitted
-          ? null
-          : {
-              code: "github_obsidian_finalization_waiting",
-              message: "GitHub proof and Linear completion are verified; the Obsidian backlink waits for the core.",
-            },
-      };
-      await this.options.checkpoints.persist(current);
-      return current;
-    }
+    return current;
   }
 
   private async continueDraftPublication(

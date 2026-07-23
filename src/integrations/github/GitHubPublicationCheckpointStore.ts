@@ -440,10 +440,15 @@ function validateConsistency(value: GitHubPublicationCheckpointV1): void {
   if (value.linearCompletionReceiptId && !value.linearLinkReceiptId) {
     throw new Error("Linear completion cannot precede durable Linear linkage.");
   }
-  if (value.obsidianReceiptId && !value.linearCompletionReceiptId) {
-    throw new Error("Obsidian finalization cannot precede durable Linear completion.");
+  if (value.obsidianReceiptId && !value.linearLinkReceiptId) {
+    throw new Error("Obsidian reflection cannot precede durable Linear linkage.");
   }
-  if (value.status === "finalized" && !value.obsidianReceiptId) {
+  if (
+    value.status === "finalized" &&
+    (!value.linearLinkReceiptId ||
+      !value.obsidianReceiptId ||
+      !value.linearCompletionReceiptId)
+  ) {
     throw new Error("Finalized GitHub publication requires all durable finalization receipts.");
   }
 }

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
+import { agentGitCommitIdentityEnvironmentV1 } from "../../../packages/core-api/src/agentGitCommitIdentityV1";
 import type { RepositoryProfileV2 } from "../repositories/RepositoryProfileV2";
 import type { WorkspaceManagerV2 } from "../workspaces/WorkspaceManagerV2";
 import type { WorkspaceManifestV2 } from "../workspaces/WorkspaceManifestV2";
@@ -70,8 +71,6 @@ export interface FixedArgvGitBytesRunnerV1 extends FixedArgvGitRunnerV1 {
 
 export interface SpawnFixedArgvGitRunnerOptionsV1 {
   executable?: string;
-  authorName?: string;
-  authorEmail?: string;
   maxOutputBytes?: number;
 }
 
@@ -114,10 +113,7 @@ export class SpawnFixedArgvGitRunnerV1 implements FixedArgvGitBytesRunnerV1 {
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_CONFIG_GLOBAL: nullConfig,
       GIT_OPTIONAL_LOCKS: "0",
-      GIT_AUTHOR_NAME: options.authorName ?? "Agentic Researcher",
-      GIT_AUTHOR_EMAIL: options.authorEmail ?? "agentic-researcher@localhost",
-      GIT_COMMITTER_NAME: options.authorName ?? "Agentic Researcher",
-      GIT_COMMITTER_EMAIL: options.authorEmail ?? "agentic-researcher@localhost",
+      ...agentGitCommitIdentityEnvironmentV1(),
     };
   }
 
@@ -788,7 +784,7 @@ function sha256Bytes(value: Uint8Array): string {
 }
 
 function comparePath<T extends { path: string }>(left: T, right: T): number {
-  return left.path.localeCompare(right.path);
+  return Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8"));
 }
 
 function sameHostPath(left: string, right: string): boolean {

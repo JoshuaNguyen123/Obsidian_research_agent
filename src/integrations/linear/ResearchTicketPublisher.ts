@@ -9,8 +9,13 @@ import type {
 import type { LinearToolClient } from "./LinearTools";
 import {
   renderHumanCompatibleWorkItemSpec,
+  renderQueueExecutableHumanWorkItemSpecV2,
   type WorkItemRenderDetailsV1,
 } from "./WorkItemRenderer";
+import {
+  assertNoRawAuthority,
+  assertSecretFree,
+} from "./LinearContractSupport";
 import {
   createWorkItemSpecV1,
   parseWorkItemSpecV1,
@@ -223,7 +228,9 @@ export class ResearchTicketPublisher {
       scope: normalizedSections.scope,
       dependencies: normalizedSections.dependencies,
     };
-    const description = renderHumanCompatibleWorkItemSpec(spec, renderDetails);
+    const description = spec.schemaVersion === 2
+      ? renderQueueExecutableHumanWorkItemSpecV2(spec, renderDetails)
+      : renderHumanCompatibleWorkItemSpec(spec, renderDetails);
     if (description.length > MAX_RENDERED_DESCRIPTION_CHARS) {
       throw new ResearchTicketPublisherError(
         "research_ticket_description_too_large",
@@ -378,8 +385,8 @@ export class ResearchTicketPublisher {
     }
 
     // The adapter's mutation readback proves its field-level postcondition. A
-    // separate fixed read then proves the exact clean human payload and pinned
-    // queue project before publication is reported as successful.
+    // separate fixed read then proves the complete signed description and
+    // pinned queue project before publication is reported as successful.
     let readback: LinearIssueRecord;
     try {
       readback = await this.readIssue(execution.action.target.id, request.context);
@@ -435,9 +442,12 @@ export class ResearchTicketPublisher {
     // id even when search indexing or an earlier ack path missed it.
     try {
       const byId = await this.readIssue(ticket.deterministicIssueId, context);
-      // The client UUID is host-owned. Team+title match is enough to reuse it on
-      // retry even when Linear project/description readback still lags or drifts.
-      if (!ownedDeterministicIssueMismatch(byId, ticket, this.queueTeamId)) {
+      if (!ownedDeterministicIssueMismatch(
+        byId,
+        ticket,
+        this.queueTeamId,
+        this.queueProjectId,
+      )) {
         return { issue: byId, candidatesExamined: 1 };
       }
     } catch (error) {
@@ -448,7 +458,7 @@ export class ResearchTicketPublisher {
 
     const candidates = new Map<string, LinearIssueRecord>();
     // Search with human-facing text only. Exact deduplication still requires
-    // an independent readback of the complete title and clean description.
+    // an independent readback of the complete title and signed description.
     for (const query of uniqueStrings([ticket.title, ticket.spec.objective])) {
       const remaining = this.duplicateCandidateLimit - candidates.size;
       if (remaining <= 0) break;
@@ -477,7 +487,7 @@ export class ResearchTicketPublisher {
     }
 
     for (const candidate of candidates.values()) {
-      if (!hasExactHumanTicketContent(candidate, ticket)) continue;
+      if (!hasExactTicketContent(candidate, ticket)) continue;
       let readback: LinearIssueRecord;
       try {
         readback = await this.readIssue(candidate.id, context);
@@ -531,6 +541,7 @@ export class ResearchTicketPublisher {
         issue,
         ticket,
         this.queueTeamId,
+        this.queueProjectId,
       );
       if (mismatch) {
         return { issue: null, failureMessage: mismatch };
@@ -767,6 +778,21 @@ function boundedText(value: unknown, label: string, maximum: number): string {
       `${label} contains unsupported control characters.`,
     );
   }
+  try {
+    assertSecretFree(normalized, label);
+    assertNoRawAuthority(normalized, label);
+  } catch (error) {
+    throw new ResearchTicketPublisherError(
+      "research_ticket_unsafe_sections",
+      error instanceof Error ? error.message : `${label} contains unsafe content.`,
+    );
+  }
+  if (/\{\{[^{}\r\n]{1,200}\}\}/u.test(normalized)) {
+    throw new ResearchTicketPublisherError(
+      "research_ticket_unresolved_placeholder",
+      `${label} contains an unresolved template placeholder.`,
+    );
+  }
   return normalized;
 }
 
@@ -866,28 +892,26 @@ function ownedDeterministicIssueMismatch(
   issue: LinearIssueRecord,
   expected: BuiltResearchTicket,
   queueTeamId: string,
+  queueProjectId: string | null,
 ): string | null {
   if (issue.id !== expected.deterministicIssueId) {
     return "Linear issue id does not match the deterministic research ticket id.";
   }
-  if (issue.team.id !== queueTeamId) {
-    return "Linear issue readback is outside the pinned queue team.";
-  }
-  if (issue.title !== expected.title) {
-    return "Linear issue readback contains a different title.";
-  }
-  return null;
+  return ticketReadbackMismatch(
+    issue,
+    expected,
+    queueTeamId,
+    queueProjectId,
+  );
 }
 
 function normalizeComparableTicketText(value: string | undefined): string {
   return (value ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/^\s*[-*]\s+\[[ xX]\]\s+/gmu, "- ")
-    .replace(/[ \t]+$/gmu, "")
-    .trimEnd();
+    .replace(/\r\n?/g, "\n")
+    .replace(/^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+/gmu, "- ");
 }
 
-function hasExactHumanTicketContent(
+function hasExactTicketContent(
   issue: LinearIssueRecord,
   expected: BuiltResearchTicket,
 ): boolean {

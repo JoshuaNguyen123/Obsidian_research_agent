@@ -5,6 +5,7 @@ export interface LinearIntentDetection {
     | "linear_issue_identifier"
     | "linear_resource_phrase"
     | "linear_action_phrase"
+    | "linear_tool_token"
     | "none";
   issueIdentifier?: string;
   url?: string;
@@ -58,6 +59,12 @@ export function detectLinearIntent(prompt: string): LinearIntentDetection {
 
   if (LINEAR_ACTION_PATTERN.test(withoutNonProductPhrases)) {
     return { explicit: true, reason: "linear_action_phrase" };
+  }
+
+  // Missions that name Bound tools (`linear_create_issue`) are explicit even
+  // when they omit prose like "Linear issue" / "create in Linear".
+  if (/\blinear_[a-z][a-z0-9_]*\b/iu.test(withoutNonProductPhrases)) {
+    return { explicit: true, reason: "linear_tool_token" };
   }
 
   return { explicit: false, reason: "none" };

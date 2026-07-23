@@ -298,6 +298,12 @@ export interface OperationReconciliationInput {
   recommendedAction: OperationReconciliationAction;
 }
 
+export type HistoricalCanvasArtifactObservation =
+  | { status: "absent" }
+  | { status: "fingerprint_match"; observedFingerprint: string }
+  | { status: "conflicting"; observedFingerprint?: string }
+  | { status: "unverifiable" };
+
 export interface MissionRuntimeSnapshotV2 {
   version: typeof MISSION_RUNTIME_SNAPSHOT_VERSION;
   revision: number;
@@ -1245,6 +1251,102 @@ export function reconcilePersistedExactLifecycleJournalRecords(
     );
   }
   return reconciled;
+}
+
+/**
+ * Repairs only the historical Canvas WAL bug where model arguments were
+ * rejected during host preflight but the outer runner nevertheless persisted
+ * `reconcile_required`. The caller must independently inspect the exact target.
+ *
+ * An absent target proves the rejected call was not applied and makes the row
+ * retry-safe. An existing target is adopted only when its current fingerprint
+ * exactly matches the fingerprint the WAL expected. Conflicting or
+ * unverifiable artifacts remain blocked; this helper never replays or
+ * overwrites them.
+ */
+export function reconcileHistoricalCanvasPreflightJournalRecord(
+  record: OperationJournalRecord,
+  observation: HistoricalCanvasArtifactObservation,
+  now = new Date(),
+): OperationJournalRecord {
+  if (!isHistoricalCanvasPreflightRejection(record)) {
+    return { ...record };
+  }
+
+  if (observation.status === "absent") {
+    return transitionOperationJournalRecord(record, "failed", {
+      message:
+        "Historical Canvas preflight rejection reconciled as not applied after confirming the exact target is absent.",
+      error: record.error,
+      mutationMayHaveApplied: false,
+      now,
+    });
+  }
+
+  if (
+    observation.status !== "fingerprint_match" ||
+    !record.expectedPostWriteHash ||
+    observation.observedFingerprint !== record.expectedPostWriteHash ||
+    !record.preparedAction ||
+    !record.descriptor ||
+    !record.authorization
+  ) {
+    return { ...record };
+  }
+
+  const checkedAt = now.toISOString();
+  const receipt: ActionReceipt = {
+    version: 1,
+    id: `canvas-reconcile:${record.operationId}`,
+    runId: record.preparedAction.runId,
+    actionId: record.preparedAction.id,
+    toolName: record.toolName,
+    operation: record.descriptor.capability.action,
+    resource: { ...record.preparedAction.target },
+    relatedResources: record.preparedAction.relatedResources.map((item) => ({
+      ...item,
+    })),
+    message:
+      "Adopted the existing Canvas only after exact fingerprint readback matched the historical prepared action.",
+    payloadFingerprint: record.preparedAction.payloadFingerprint,
+    grantId: record.authorization.grantId,
+    idempotencyKey: record.preparedAction.idempotencyKey,
+    startedAt: record.createdAt,
+    committedAt: checkedAt,
+    commitKind: "reconciled",
+    readback: {
+      status: "verified",
+      checkedAt,
+      observedFingerprint: observation.observedFingerprint,
+    },
+  };
+  return transitionOperationJournalRecord(record, "committed", {
+    message:
+      "Historical Canvas artifact matched the exact expected fingerprint and was committed with verified readback.",
+    receipt,
+    observedPostWriteHash: observation.observedFingerprint,
+    mutationMayHaveApplied: true,
+    now,
+  });
+}
+
+export function isHistoricalCanvasPreflightRejection(
+  record: OperationJournalRecord,
+): boolean {
+  if (
+    record.toolName !== "create_design_canvas" ||
+    record.state !== "reconcile_required" ||
+    !record.targetPath?.toLowerCase().endsWith(".canvas")
+  ) {
+    return false;
+  }
+  const evidence = [
+    record.error ?? "",
+    ...record.transitions.map((transition) => transition.message),
+  ].join("\n");
+  return /\b(?:invalid_arguments|invalid json canvas|pre[- ]?write|preflight|geometry)\b|nodes?\[\d+\]\.(?:x|y|width|height)/iu.test(
+    evidence,
+  );
 }
 
 function exactLifecycleReceiptMatches(
@@ -3561,7 +3663,10 @@ function isAllowedJournalTransition(
 function getReconciliationAction(
   record: OperationJournalRecord,
 ): OperationReconciliationAction {
-  if (record.state === "intent_recorded" && !record.mutationMayHaveApplied) {
+  if (
+    (record.state === "intent_recorded" || record.state === "failed") &&
+    !record.mutationMayHaveApplied
+  ) {
     return "safe_to_retry";
   }
   if (isExactLifecycleCompositeRetry(record)) {

@@ -130,8 +130,17 @@ export interface ToolExecutionContext {
   ) => Promise<void> | void;
   /** Host-validated project lineage used to bind downstream provider reads. */
   getProjectLineages?: () => ProjectLineageV1[];
+  /**
+   * Trusted repository profile keys from the plugin registry. Used to host-bind
+   * `code_workspace_create` when the mission names exactly one of them.
+   */
+  getRepositoryProfileKeys?: () => readonly string[];
   semanticEmbeddingProvider?: SemanticEmbeddingProvider;
   semanticIndexService?: SemanticIndexService;
+  /** Optional run-scoped flags for set-loose compound autonomy. */
+  runFlags?: {
+    compoundLifecycleDetected?: boolean;
+  };
 }
 
 export interface ToolExecutionResult {
@@ -194,6 +203,12 @@ export interface AgentRuntimeCache {
    * restart cannot remove the evidence needed by the next bounded repair turn.
    */
   latestFastValidationDiagnostic?: CodeValidationDiagnosticObservation;
+  /**
+   * Set when code_repair_record_cycle records outcome "passed" for a fast
+   * validation. Set-loose Soft-union uses this to withhold code_commit_verified
+   * until a durable passing fast cycle exists.
+   */
+  passedFastRepairCycle?: boolean;
   /** First validated accepted-research request for a run/path; retries cannot rewrite it. */
   acceptedResearchPublicationRequests?: Map<string, unknown>;
   semanticProfiles?: Map<string, unknown>;

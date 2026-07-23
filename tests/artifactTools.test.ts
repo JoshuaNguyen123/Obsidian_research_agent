@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateJsonCanvas } from "../src/design/jsonCanvas";
+import {
+  validateJsonCanvas,
+  type JsonCanvas,
+} from "../src/design/jsonCanvas";
 import {
   createDesignCanvasTool,
   createSvgDesignTool,
@@ -153,6 +156,46 @@ test("create_design_canvas creates lane-based architecture diagrams", async () =
       "Canvas architecture planned: 8 nodes, 3 edges across 3 lanes.",
     ),
   );
+});
+
+test("high-level Canvas inputs emit validated integer geometry, bounded colors, and resolved edges", async () => {
+  const mock = createMockContext({
+    prompt: "Create a distributed system diagram on a canvas.",
+  });
+
+  await createDesignCanvasTool.execute(
+    {
+      path: "Designs/high-level.canvas",
+      title: "Checkout platform",
+      diagramType: "distributed_system",
+      direction: "row",
+      items: [
+        { id: "client", title: "Web client", kind: "client" },
+        { id: "api", title: "API gateway", kind: "gateway" },
+        { id: "orders", title: "Orders", kind: "database" },
+      ],
+      connections: [
+        { from: "client", to: "api", color: "2" },
+        { from: "api", to: "orders", color: "#2f6feb" },
+      ],
+    },
+    mock.context,
+  );
+
+  const canvas = JSON.parse(mock.content.get("Designs/high-level.canvas") ?? "null") as JsonCanvas;
+  const validation = validateJsonCanvas(canvas);
+  assert.equal(validation.ok, true);
+  assert.ok(canvas.nodes.every((node) =>
+    Number.isInteger(node.x) &&
+    Number.isInteger(node.y) &&
+    Number.isInteger(node.width) &&
+    Number.isInteger(node.height),
+  ));
+  assert.ok(canvas.edges.every((edge) =>
+    canvas.nodes.some((node) => node.id === edge.fromNode) &&
+    canvas.nodes.some((node) => node.id === edge.toNode),
+  ));
+  assert.deepEqual(canvas.edges.map((edge) => edge.color), ["2", "#2f6feb"]);
 });
 
 test("create_svg_design creates an escaped SVG artifact", async () => {

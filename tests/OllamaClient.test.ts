@@ -192,6 +192,9 @@ test("round-trips assistant thinking on tool turns for follow-up chat requests",
   const body = JSON.parse(String(capturedRequest.body));
   assert.equal(body.messages[1].thinking, "need web_search first");
   assert.equal(body.messages[1].tool_calls[0].function.name, "web_search");
+  assert.equal(body.messages[2].role, "tool");
+  assert.equal(body.messages[2].tool_name, "web_search");
+  assert.equal(body.messages[2].content, '{"results":[]}');
 });
 
 test("passes request timeout to chat transport and maps timeout errors", async () => {
@@ -297,6 +300,29 @@ test("parses streamed NDJSON content, thinking, and tool calls", async () => {
   assert.equal(response.doneReason, "stop");
   assert.deepEqual(contentDeltas, ["Hello", " world"]);
   assert.deepEqual(thinkingDeltas, ["checking "]);
+});
+
+test("streamed tool_calls accumulate by index and dedupe identical unordered re-emits", async () => {
+  const response = await parseOllamaChatStream(
+    chunks([
+      '{"message":{"role":"assistant","thinking":"parallel tools"},"done":false}\n',
+      '{"message":{"role":"assistant","tool_calls":[{"function":{"index":0,"name":"get_temperature","arguments":{"city":"New York"}}}]},"done":false}\n',
+      '{"message":{"role":"assistant","tool_calls":[{"function":{"index":1,"name":"get_conditions","arguments":{"city":"London"}}}]},"done":false}\n',
+      // Re-emit index 0 as a complete object (replace, do not shallow-merge args).
+      '{"message":{"role":"assistant","tool_calls":[{"function":{"index":0,"name":"get_temperature","arguments":{"city":"NYC"}}}]},"done":false}\n',
+      // Duplicate unordered complete call should not double-count.
+      '{"message":{"role":"assistant","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"A.md"}}},{"function":{"name":"read_file","arguments":{"path":"A.md"}}}]},"done":true,"done_reason":"stop"}\n',
+    ]),
+  );
+
+  assert.equal(response.message.thinking, "parallel tools");
+  assert.equal(response.toolCalls.length, 3);
+  assert.equal(response.toolCalls[0].name, "get_temperature");
+  assert.deepEqual(response.toolCalls[0].arguments, { city: "NYC" });
+  assert.equal(response.toolCalls[1].name, "get_conditions");
+  assert.deepEqual(response.toolCalls[1].arguments, { city: "London" });
+  assert.equal(response.toolCalls[2].name, "read_file");
+  assert.deepEqual(response.toolCalls[2].arguments, { path: "A.md" });
 });
 
 test("streams chat through streaming transport with stream true", async () => {

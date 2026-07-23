@@ -112,6 +112,123 @@ test.describe("Daily-use Linear integration", () => {
     }
   });
 
+  test("DU-04 generic Linear create is template-first and rejects unsafe provider prose", async () => {
+    let harness: Phase6LinearHarness | null = null;
+    try {
+      harness = await startPhase6LinearHarness();
+      await harness.installResearchPublicationClient();
+
+      await harness.submitMission(
+        [
+          `E2E_LINEAR_GENERIC_CREATE_UNSAFE ${harness.marker}:`,
+          "Create one Linear issue in team E2E using a template, but no custom template path.",
+          "Attempt the create once and stop if the host rejects unsafe provider-visible prose.",
+        ].join(" "),
+        { timeoutMs: 90_000 },
+      );
+
+      const afterUnsafe = await harness.readResearchPublicationState(
+        harness.notePath,
+      );
+      const unsafeRequests = (await harness.readGenericCreateModelRequests())
+        .filter((request) =>
+          request.prompt.includes("E2E_LINEAR_GENERIC_CREATE_UNSAFE"),
+        );
+      expect(afterUnsafe.createCalls).toBe(0);
+      expect(afterUnsafe.issue).toBeNull();
+      expect(
+        afterUnsafe.toolFailures,
+        JSON.stringify({
+          modelRequests: unsafeRequests,
+          runErrors: afterUnsafe.runErrors,
+          missionSnapshot: afterUnsafe.missionSnapshot,
+        }),
+      ).toContainEqual(
+        expect.objectContaining({
+          name: "linear_create_issue",
+          code: "linear_issue_provider_output_rejected",
+        }),
+      );
+
+      expect(unsafeRequests[0]?.tools).toContain("read_template");
+      expect(unsafeRequests[0]?.tools).not.toContain("linear_create_issue");
+      expect(unsafeRequests[1]).toMatchObject({
+        step: 1,
+        canonicalTemplateSeen: true,
+      });
+      expect(unsafeRequests[1]?.tools).toContain("linear_create_issue");
+      const unsafeGraphNodes = Object.values(
+        afterUnsafe.missionSnapshot?.lastMissionGraph?.nodes ?? {},
+      ) as Array<{ id?: string; allowedTools?: string[] }>;
+      expect(
+        unsafeGraphNodes.some((node) =>
+          node.allowedTools?.includes("append_to_current_file"),
+        ),
+      ).toBe(false);
+      expect(
+        unsafeGraphNodes.some((node) => String(node.id ?? "").startsWith("retry-")),
+      ).toBe(false);
+
+      await harness.submitMission(
+        [
+          `E2E_LINEAR_GENERIC_CREATE_VALID ${harness.marker}:`,
+          "Call linear_create_issue for team e2e-team titled Template-first generic issue.",
+          "Use clean Markdown from the required issue template and stop after provider readback.",
+        ].join(" "),
+        { waitForCompletion: false },
+      );
+      await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      const approval = harness.activePreparedApproval("linear_create_issue");
+      await expect(approval).toBeVisible({ timeout: 60_000 });
+      await expect(approval).toContainText("policy=exact_payload_approval");
+      await expect(approval).toContainText("confirmation=1/1");
+      expect(
+        (await harness.readResearchPublicationState(harness.notePath)).createCalls,
+      ).toBe(0);
+
+      await harness.approvePreparedApproval(approval);
+      await harness.waitForMissionComplete(90_000);
+
+      const completed = await harness.readResearchPublicationState(
+        harness.notePath,
+      );
+      expect(completed.createCalls).toBe(1);
+      expect(completed.issue).toMatchObject({
+        title: `Template-first generic issue ${harness.marker}`,
+        team: { id: "e2e-team" },
+      });
+      expect(String(completed.issue?.description ?? "")).not.toMatch(
+        /\{\{[^}]+\}\}|sha256:[a-f0-9]{64}|<!--\s*agentic-|##\s*Machine contract/iu,
+      );
+
+      const validRequests = (await harness.readGenericCreateModelRequests())
+        .filter((request) =>
+          request.prompt.includes("E2E_LINEAR_GENERIC_CREATE_VALID"),
+        );
+      expect(validRequests[0]?.tools).toContain("read_template");
+      expect(validRequests[0]?.tools).not.toContain("linear_create_issue");
+      expect(validRequests[1]).toMatchObject({
+        step: 1,
+        canonicalTemplateSeen: true,
+      });
+      expect(validRequests[1]?.tools).toContain("linear_create_issue");
+
+      const visibleTools = await harness.page
+        .locator(".agentic-researcher-tool-item")
+        .allTextContents();
+      const templateIndex = visibleTools.findIndex((text) =>
+        text.includes("read_template"),
+      );
+      const createIndex = visibleTools.findIndex((text) =>
+        text.includes("linear_create_issue"),
+      );
+      expect(templateIndex).toBeGreaterThanOrEqual(0);
+      expect(createIndex).toBeGreaterThan(templateIndex);
+    } finally {
+      await harness?.close();
+    }
+  });
+
   test("DU-04 accepted research creates a verified Linear hierarchy, backlink, and restart-safe dedupe", async ({}, testInfo) => {
     let harness: Phase6LinearHarness | null = null;
     let acceptedNotePath = "";

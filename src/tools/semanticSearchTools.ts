@@ -16,6 +16,8 @@ import type {
 import { getSemanticIndexFreshness } from "../embeddings/semanticIndex";
 import { buildRetrievalCoverage } from "../agent/retrievalCoverage";
 import { isVaultPathExcluded } from "./vaultExclusions";
+import { resolveSemanticSearchCapsForCompoundRun } from "../agent/setLooseCompoundAutonomy";
+import type { AutonomyProfile } from "../agent/autonomyEffectClass";
 
 const DEFAULT_SEMANTIC_LIMIT = 8;
 const MAX_SEMANTIC_LIMIT = 20;
@@ -156,21 +158,39 @@ export const semanticSearchNotesTool: AgentTool = {
       );
     }
 
+    const caps = resolveSemanticSearchCapsForCompoundRun({
+      autonomyProfile:
+        context.settings.autonomyProfile === "conservative" ||
+        context.settings.autonomyProfile === "custom"
+          ? (context.settings.autonomyProfile as AutonomyProfile)
+          : "automatic",
+      compoundLifecycleDetected:
+        context.runFlags?.compoundLifecycleDetected === true,
+      semanticSearchEnabled: context.settings.semanticSearchEnabled,
+    });
     const limit = clampInteger(
-      getOptionalInteger(args, "limit") ?? DEFAULT_SEMANTIC_LIMIT,
+      getOptionalInteger(args, "limit") ?? caps.defaultLimit,
       1,
-      MAX_SEMANTIC_LIMIT,
+      caps.maxLimit,
     );
     const maxSnippetChars = clampInteger(
-      getOptionalInteger(args, "maxSnippetChars") ?? DEFAULT_MAX_SNIPPET_CHARS,
+      getOptionalInteger(args, "maxSnippetChars") ?? caps.defaultSnippetChars,
       80,
-      MAX_SNIPPET_CHARS,
+      caps.maxSnippetChars,
     );
     const folder = normalizeOptionalFolder(getOptionalString(args, "folder"));
-    const mode = getOptionalString(args, "mode") === "deep" ? "deep" : "standard";
+    const modeArg = getOptionalString(args, "mode");
+    const mode =
+      modeArg === "deep" || modeArg === "standard"
+        ? modeArg
+        : caps.preferDeepMode
+          ? "deep"
+          : "standard";
     const candidateLimit = clampInteger(
       getOptionalInteger(args, "candidateLimit") ??
-        (mode === "deep" ? Math.max(64, limit * 8) : limit * 4),
+        (mode === "deep"
+          ? Math.max(caps.deepCandidateFloor, limit * 8)
+          : limit * 4),
       limit,
       500,
     );

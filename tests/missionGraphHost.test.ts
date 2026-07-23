@@ -388,6 +388,71 @@ test("host graph keeps an explicit workspace CRUD lifecycle within the bounded D
   );
 });
 
+test("repeated named vault reads bind each exact path in order before append", async () => {
+  const sourceA = "E2E Agent Tests/Source A.md";
+  const sourceB = "E2E Agent Tests/Source B.md";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-named-vault-reads",
+    objective:
+      `Read the two named vault notes ${sourceA} and ${sourceB}. ` +
+      "Append exactly two findings to the current note.",
+    toolRegistry: registryFor(["read_file", "append_to_current_file"]),
+    allowedToolNames: ["read_file", "append_to_current_file"],
+    modelVisibleToolNames: ["read_file", "append_to_current_file"],
+    plannedToolNames: ["read_file", "read_file", "append_to_current_file"],
+    currentNotePath: "E2E Agent Tests/Current.md",
+    maxToolCalls: 4,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const nodes = Object.values(host.deterministicProposal.nodes);
+  const reads = nodes.filter((node) => node.allowedTools.includes("read_file"));
+  const append = nodes.find((node) =>
+    node.allowedTools.includes("append_to_current_file"),
+  );
+  assert.equal(reads.length, 2);
+  assert.equal((reads[0]?.inputs.resource as any)?.selector, sourceA);
+  assert.equal((reads[1]?.inputs.resource as any)?.selector, sourceB);
+  assert.deepEqual(reads[1]?.dependencyIds, [reads[0]?.id]);
+  assert.ok(append);
+  assert.ok(append.dependencyIds.includes(reads[1]!.id));
+});
+
+test("named vault read graph fails closed on path/node cardinality mismatch", async () => {
+  await assert.rejects(
+    buildHostMissionGraphPlanV1({
+      missionId: "run-named-vault-read-cardinality",
+      objective: "Read Sources/A.md and Sources/B.md.",
+      toolRegistry: registryFor(["read_file"]),
+      allowedToolNames: ["read_file"],
+      modelVisibleToolNames: ["read_file"],
+      plannedToolNames: ["read_file"],
+      maxToolCalls: 2,
+      maxWallClockMs: 60_000,
+      now: NOW,
+    }),
+    /Named vault read authority is invalid or does not match the planned read_file node count/u,
+  );
+});
+
+test("named vault read graph fails closed when a named path is unsafe", async () => {
+  await assert.rejects(
+    buildHostMissionGraphPlanV1({
+      missionId: "run-unsafe-named-vault-read",
+      objective: "Read ../../Secrets.md.",
+      toolRegistry: registryFor(["read_file"]),
+      allowedToolNames: ["read_file"],
+      modelVisibleToolNames: ["read_file"],
+      plannedToolNames: ["read_file"],
+      maxToolCalls: 2,
+      maxWallClockMs: 60_000,
+      now: NOW,
+    }),
+    /Named vault read authority is invalid or does not match the planned read_file node count/u,
+  );
+});
+
 test("host graph binds every explicit new repository file to its own ordered node", async () => {
   const name = "code_workspace_create_file";
   const paths = [

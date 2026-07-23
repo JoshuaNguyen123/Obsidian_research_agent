@@ -5,6 +5,39 @@ import {
 } from "./proofDebt";
 import type { CompletionReflectionResult } from "./completionReflection";
 
+import {
+  effectClassForTool,
+  effectClassForTools,
+  mayAutoExecute,
+  type AutonomyEffectClass,
+  type AutonomyProfile,
+} from "./autonomyEffectClass";
+import { pendingToolsAllowSetLooseWithoutGrant } from "./setLooseCompoundAutonomy";
+
+/**
+ * Prefer Bound required writes over Soft proof-debt next tools.
+ * Soft research often leaves write_receipt debt mapped to append; when the
+ * mission still owes replace_current_file (or another Bound write), auto-
+ * continue must gate on that Bound tool + grant instead.
+ */
+export function resolvePendingToolsForAutoContinuation(input: {
+  debtPendingToolNames?: readonly string[] | null;
+  pendingRequiredWrites?: readonly string[] | null;
+}): string[] {
+  const required = (input.pendingRequiredWrites ?? [])
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const boundRequired = required.filter(
+    (toolName) => effectClassForTool(toolName) === "bound",
+  );
+  if (boundRequired.length > 0) {
+    return boundRequired;
+  }
+  return (input.debtPendingToolNames ?? [])
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
 export type AutoContinuationReason =
   | "not_budget"
   | "budget_exhausted"
@@ -12,7 +45,8 @@ export type AutoContinuationReason =
   | "blocked"
   | "acceptance_failed"
   | "required_tool_failure"
-  | "segment_cap";
+  | "segment_cap"
+  | "effect_class_blocked";
 
 export interface AutoContinuationDecision {
   recommended: boolean;
@@ -40,8 +74,24 @@ export interface AutoContinuationDecisionInput {
   /** Soft multi-segment loops driven by unpaid completion reflection. */
   completionDriven?: boolean;
   reflection?: CompletionReflectionResult | null;
+  /** Host segment index (0-based); required with maxSegments for segment_cap. */
   segmentsUsed?: number;
+  /** Host soft segment budget from main.ts multi-segment loops. */
   maxSegments?: number;
+  /** Soft/Bound/Hard gate for unpaid pending tools (Integrator wires). */
+  pendingToolNames?: readonly string[];
+  pendingEffectClass?: AutonomyEffectClass;
+  autonomyProfile?: AutonomyProfile;
+  /**
+   * True when Bound pending tools have an unused exact prepared grant/approval.
+   * Soft under automatic does not require this; Hard never auto-continues.
+   */
+  hasMatchingGrant?: boolean;
+  /**
+   * When true with automatic profile, Bound set-loose tools continue without a
+   * Chat grant (compound lifecycle detected by the host).
+   */
+  compoundLifecycleDetected?: boolean;
 }
 
 /**
@@ -67,15 +117,28 @@ export function decideAutoContinuation({
   reflection = null,
   segmentsUsed,
   maxSegments,
+  pendingToolNames,
+  pendingEffectClass,
+  autonomyProfile = "automatic",
+  hasMatchingGrant = false,
+  compoundLifecycleDetected = false,
 }: AutoContinuationDecisionInput): AutoContinuationDecision {
   if (stopReason !== "budget") {
     return { recommended: false, reason: "not_budget" };
   }
 
+  // Set-loose compound budget segments must stay Continue-able while acceptance
+  // still needs work. Stale narrative blockerCategory values (often misclassified
+  // "blocked" tool deferrals → safety_policy) and soft idempotent failures
+  // (e.g. code_workspace_create workspace_exists) must not suppress auto-continue.
+  const setLooseUnfinished =
+    compoundLifecycleDetected === true &&
+    acceptance?.status === "needs_more_work";
+
   const failedRequiredTool =
     acceptance?.status !== "pass" &&
     acceptance?.reasons?.some((reason) => /^failed_tools=/i.test(reason)) === true;
-  if (failedRequiredTool) {
+  if (failedRequiredTool && !setLooseUnfinished) {
     return { recommended: false, reason: "required_tool_failure" };
   }
 
@@ -93,14 +156,15 @@ export function decideAutoContinuation({
         })
       : null);
 
-  if (debt?.blocked) {
+  if (debt?.blocked && !setLooseUnfinished) {
     return { recommended: false, reason: "blocked" };
   }
 
   if (
-    Boolean(blockerCategory) ||
-    blockerCount > 0 ||
-    missionPlanStatus === "blocked"
+    !setLooseUnfinished &&
+    (Boolean(blockerCategory) ||
+      blockerCount > 0 ||
+      missionPlanStatus === "blocked")
   ) {
     return { recommended: false, reason: "blocked" };
   }
@@ -125,6 +189,27 @@ export function decideAutoContinuation({
     return { recommended: false, reason: "proof_satisfied" };
   }
 
+  const pendingClass: AutonomyEffectClass | null =
+    pendingEffectClass ??
+    (pendingToolNames && pendingToolNames.length > 0
+      ? effectClassForTools(pendingToolNames)
+      : null);
+  const setLooseBoundWithoutGrant =
+    compoundLifecycleDetected === true &&
+    pendingToolsAllowSetLooseWithoutGrant({
+      pendingToolNames: pendingToolNames ?? [],
+      autonomyProfile,
+      compoundLifecycleDetected,
+    });
+  const allowEffectContinue =
+    pendingClass === null ||
+    mayAutoExecute({
+      effectClass: pendingClass,
+      autonomyProfile,
+      hasMatchingGrant,
+      setLooseBoundWithoutGrant,
+    });
+
   if (completionDriven) {
     const withinSegmentBudget =
       typeof segmentsUsed !== "number" ||
@@ -135,6 +220,9 @@ export function decideAutoContinuation({
     }
     // Keep looping while proof debt remains or reflection is incomplete.
     if (unpaidProofDebt || !reflectionDone) {
+      if (!allowEffectContinue) {
+        return { recommended: false, reason: "effect_class_blocked" };
+      }
       return { recommended: true, reason: "budget_exhausted" };
     }
     return { recommended: false, reason: "proof_satisfied" };
@@ -146,6 +234,10 @@ export function decideAutoContinuation({
 
   if (acceptancePass) {
     return { recommended: false, reason: "proof_satisfied" };
+  }
+
+  if (!allowEffectContinue) {
+    return { recommended: false, reason: "effect_class_blocked" };
   }
 
   return { recommended: true, reason: "budget_exhausted" };

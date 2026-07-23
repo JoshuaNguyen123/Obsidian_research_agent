@@ -87,7 +87,7 @@ export function createGitHubPrivateRepositoryCleanupTool(
   return {
     name: DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
     description:
-      "Permanently delete only the exact host-bound private GitHub repository after a separate fingerprint-bound approval. The host checkpoints before deletion and requires independent absence readback; it cannot delete public, unbound, or model-selected repositories.",
+      "Permanently delete only the exact host-bound private GitHub repository after two separate fingerprint-bound confirmations. The host checkpoints before deletion and requires independent absence readback; it cannot delete public, unbound, or model-selected repositories.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -200,47 +200,60 @@ async function executeCleanup(
     now(options, context),
   );
   await options.persistCheckpoint(checkpoint);
-  const approval = await context.requestNestedApproval({
-    toolName: DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
-    action: checkpoint.preparedAction.preview.summary,
-    reason:
-      "Approve permanent deletion of only this exact read-back-verified private repository. This does not authorize any other GitHub or local cleanup.",
-    policyTags: [
-      "github_private_repository_cleanup",
-      "destructive",
-      "exact",
-      "checkpoint_before_mutation",
-    ],
-    preparedAction: checkpoint.preparedAction,
-    timeoutMs: 120_000,
-    confirmationIndex: 1,
-    requiredConfirmations: 1,
-  });
-  if (
-    !approval.approved ||
-    approval.approvalFingerprint !==
-      checkpoint.preparedAction.payloadFingerprint
-  ) {
-    const deniedMessage = "Private repository cleanup was denied or stale.";
-    checkpoint = {
-      ...checkpoint,
-      status: "not_applied",
-      blocker: {
-        code: "github_private_repository_cleanup_approval_denied",
-        message: deniedMessage,
-      },
-      updatedAt: now(options, context).toISOString(),
-    };
-    await options.persistCheckpoint(checkpoint);
-    throw notApplied(
-      "github_private_repository_cleanup_approval_denied",
-      deniedMessage,
-    );
+  const approvalIds: string[] = [];
+  for (const confirmationIndex of [1, 2] as const) {
+    const approval = await context.requestNestedApproval({
+      toolName: DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+      action: checkpoint.preparedAction.preview.summary,
+      reason:
+        confirmationIndex === 1
+          ? "First confirmation: approve permanent deletion of only this exact read-back-verified private repository. This does not authorize any other GitHub or local cleanup."
+          : "Second independent confirmation: permanently delete the same exact private repository now.",
+      policyTags: [
+        "github_private_repository_cleanup",
+        "destructive",
+        "double_exact",
+        "checkpoint_before_mutation",
+        `confirmation_${confirmationIndex}_of_2`,
+      ],
+      preparedAction: checkpoint.preparedAction,
+      timeoutMs: 120_000,
+      confirmationIndex,
+      requiredConfirmations: 2,
+    });
+    const duplicateApproval =
+      approval.approved && approvalIds.includes(approval.approvalId);
+    if (
+      !approval.approved ||
+      approval.approvalFingerprint !==
+        checkpoint.preparedAction.payloadFingerprint ||
+      duplicateApproval
+    ) {
+      const deniedMessage = duplicateApproval
+        ? "Private repository cleanup requires two distinct confirmations."
+        : "Private repository cleanup was denied or stale.";
+      checkpoint = {
+        ...checkpoint,
+        status: "not_applied",
+        blocker: {
+          code: "github_private_repository_cleanup_approval_denied",
+          message: deniedMessage,
+        },
+        updatedAt: now(options, context).toISOString(),
+      };
+      await options.persistCheckpoint(checkpoint);
+      throw notApplied(
+        "github_private_repository_cleanup_approval_denied",
+        deniedMessage,
+      );
+    }
+    approvalIds.push(approval.approvalId);
   }
+  const approvalId = `double-exact:${approvalIds.join(":")}`;
   checkpoint = {
     ...checkpoint,
     status: "reconcile_required",
-    approvalId: approval.approvalId,
+    approvalId,
     blocker: {
       code: "github_private_repository_cleanup_readback_required",
       message:
@@ -268,7 +281,7 @@ async function executeCleanup(
     context,
     checkpoint,
     commitKind: "committed",
-    approvalId: approval.approvalId,
+    approvalId,
   });
 }
 
@@ -317,7 +330,7 @@ async function initialCheckpoint(
     expectedTargetRevision: binding.repositoryReadbackFingerprint,
     idempotencyKey: `github-private-repository-cleanup:${binding.repositoryId}`,
     reconciliationKey: `github-private-repository-cleanup:${binding.repositoryId}`,
-    requiredConfirmations: 1,
+    requiredConfirmations: 2,
     preparedAt,
     expiresAt: new Date(observedAt.getTime() + 120_000).toISOString(),
   });
@@ -534,7 +547,7 @@ const PRIVATE_REPOSITORY_CLEANUP_DESCRIPTOR: ToolDescriptor = {
   approval: {
     allowPromptGrant: false,
     allowPersistentGrant: false,
-    fallback: "exact",
+    fallback: "double_exact",
   },
   execution: {
     preparation: "none",

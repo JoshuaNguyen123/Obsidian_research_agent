@@ -310,6 +310,108 @@ test("day-1 chat answer without tools", async () => {
   });
 });
 
+test("exact analytical regressions stay one-call chat-only with zero mutations", async () => {
+  await withE2EHarness(
+    "exact-analytical-direct-chat",
+    async ({ page, noteFilePath }) => {
+      const prompts = [
+        "The current platform that I created to give you tools, NO specific document, I want you to rate actual usefulness.",
+        "From your perspective, what is hard about doing research in Obsidian, agentically, converting the notebook into Linear issues, Linear issues to real code project code files, GitHub and finally a reflection?",
+      ];
+      const before = (await readOptionalFile(noteFilePath)) ?? "";
+      const agentRunsPath = path.join(vaultRoot, "Agent Runs");
+      const agentRunsBefore = existsSync(agentRunsPath)
+        ? (await readdir(agentRunsPath)).sort()
+        : [];
+      await setStreamingMode(page, false);
+
+      for (const prompt of prompts) {
+        await submitMission(page, prompt);
+        const run = await page.evaluate((pluginId) => {
+          const plugin = (window as typeof window & { app?: any }).app?.plugins
+            ?.plugins?.[pluginId];
+          const snapshot = plugin?.getMissionRunSnapshot?.() ?? null;
+          return {
+            modelCalls: snapshot?.modelCallEvidence?.length ?? -1,
+            stopReason: snapshot?.lastComplete?.stopReason ?? null,
+            config: snapshot?.lastConfig
+              ? {
+                  route: snapshot.lastConfig.route,
+                  maxStepsForRun: snapshot.lastConfig.maxStepsForRun,
+                  chatOnlyOverride: snapshot.lastConfig.chatOnlyOverride,
+                  allowedToolNames: snapshot.lastConfig.allowedToolNames,
+                  routeTraceReasons: snapshot.lastConfig.routeTraceReasons,
+                }
+              : null,
+            evidence: (snapshot?.modelCallEvidence ?? []).map(
+              (item: { phase?: string; metricName?: string; outcome?: string }) => ({
+                phase: item.phase ?? null,
+                metricName: item.metricName ?? null,
+                outcome: item.outcome ?? null,
+              }),
+            ),
+            ledger: snapshot?.lastMissionLedger
+              ? {
+                  status: snapshot.lastMissionLedger.status,
+                  blocker: snapshot.lastMissionLedger.blocker ?? null,
+                  nextAction: snapshot.lastMissionLedger.nextAction ?? null,
+                }
+              : null,
+            diagnostics: snapshot?.diagnosticAttestations ?? [],
+          };
+        }, PLUGIN_ID);
+        const detailsText = await readRunDetailsText(page);
+        expect(run.modelCalls, `${prompt}\n${JSON.stringify(run)}`).toBe(1);
+        expect(
+          run.stopReason,
+          `${prompt}\n${JSON.stringify(run)}\n${detailsText}`,
+        ).toBe("final");
+        await page.getByRole("tab", { name: "Run Details" }).click();
+        await expect(page.locator(".agentic-researcher-tool-item")).toHaveCount(0);
+        await expectNoReceipts(page);
+        await expect
+          .poll(async () => (await readOptionalFile(noteFilePath)) ?? "", {
+            message: "analytical direct chat must not mutate the active note",
+            timeout: 5_000,
+          })
+          .toBe(before);
+      }
+      const agentRunsAfter = existsSync(agentRunsPath)
+        ? (await readdir(agentRunsPath)).sort()
+        : [];
+      expect(
+        agentRunsAfter,
+        "direct chat must not create a durable Agent Runs ledger or runtime snapshot",
+      ).toEqual(agentRunsBefore);
+    },
+  );
+});
+
+test("exact design-tools prompt creates an auto-laid-out native Canvas", async () => {
+  await withE2EHarness(
+    "exact-design-tools-canvas",
+    async ({ page, input }) => {
+      const canvasFilePath = path.join(
+        vaultRoot,
+        ...input.designCanvasPath.split("/"),
+      );
+      await setStreamingMode(page, false);
+      await submitMission(page, "Using design tools can you make a diagram?");
+
+      await expectFileToContain(
+        canvasFilePath,
+        "Research Pipeline",
+        "exact design-tools prompt should create a Canvas from high-level items",
+        30_000,
+      );
+      await expectCanvasContentNodeCount(canvasFilePath, 4, 30_000);
+      await expectToolRun(page, "create_design_canvas");
+      await expectReceipt(page, input.designCanvasPath);
+      await expectDetailsText(page, "Canvas verified");
+    },
+  );
+});
+
 test("explicit GitHub review repair uses the native exact approval surface and denial performs zero pushes", async () => {
   test.setTimeout(240_000);
 
@@ -497,6 +599,9 @@ test("day-1 stop mission mid-run leaves resumable ledger", async () => {
 
 test("chat action buttons keep terminal layout and readable contrast", async () => {
   await withE2EHarness("chat-action-button-layout", async ({ page }) => {
+    const terminalPrompt = page.getByTestId("terminal-prompt");
+    const promptShell = page.getByTestId("terminal-prompt-shell");
+    const promptInput = page.locator("textarea.agentic-researcher-prompt");
     const runButton = page.locator("button.agentic-researcher-run");
     const clearButton = page.locator("button.agentic-researcher-clear");
     const chatOnlyToggle = page.locator(".agentic-researcher-chat-only-toggle");
@@ -504,12 +609,35 @@ test("chat action buttons keep terminal layout and readable contrast", async () 
       "button.agentic-researcher-chat-continuation",
     );
 
+    await expect(terminalPrompt).toBeVisible();
+    await expect(promptShell).toBeVisible();
+    await expect(terminalPrompt).toContainText("MISSION PROMPT");
+    await expect(terminalPrompt).toContainText("ENTER: RUN");
+    await expect(promptShell).toContainText("agent@vault:~$");
+    await expect(promptInput).toHaveAttribute(
+      "placeholder",
+      "Type a mission, question, or command…",
+    );
+    await page.locator(".agentic-researcher-prompt-prefix").click();
+    await expect(promptInput).toBeFocused();
     await expect(runButton).toBeVisible();
     await expect(clearButton).toBeVisible();
     await expect(chatOnlyToggle).toBeVisible();
 
     const geometry = await page.evaluate(() => {
       const root = document.querySelector<HTMLElement>(".agentic-researcher-view");
+      const composer = root?.querySelector<HTMLElement>(
+        ".agentic-researcher-composer",
+      );
+      const promptShell = root?.querySelector<HTMLElement>(
+        ".agentic-researcher-prompt-shell",
+      );
+      const prompt = root?.querySelector<HTMLTextAreaElement>(
+        "textarea.agentic-researcher-prompt",
+      );
+      const promptPrefix = root?.querySelector<HTMLElement>(
+        ".agentic-researcher-prompt-prefix",
+      );
       const actions = root?.querySelector<HTMLElement>(".agentic-researcher-actions");
       const run = root?.querySelector<HTMLButtonElement>("button.agentic-researcher-run");
       const clear = root?.querySelector<HTMLButtonElement>(
@@ -521,10 +649,24 @@ test("chat action buttons keep terminal layout and readable contrast", async () 
       const continuation = root?.querySelector<HTMLButtonElement>(
         "button.agentic-researcher-chat-continuation",
       );
-      if (!root || !actions || !run || !clear || !chatOnly || !continuation) {
+      if (
+        !root ||
+        !composer ||
+        !promptShell ||
+        !prompt ||
+        !promptPrefix ||
+        !actions ||
+        !run ||
+        !clear ||
+        !chatOnly ||
+        !continuation
+      ) {
         throw new Error("Chat action controls were not mounted.");
       }
 
+      const composerStyle = window.getComputedStyle(composer);
+      const promptShellStyle = window.getComputedStyle(promptShell);
+      const promptStyle = window.getComputedStyle(prompt);
       const actionsRect = actions.getBoundingClientRect();
       const runRect = run.getBoundingClientRect();
       const clearRect = clear.getBoundingClientRect();
@@ -565,6 +707,12 @@ test("chat action buttons keep terminal layout and readable contrast", async () 
       };
 
       return {
+        composerCornerRadius: Number.parseFloat(
+          composerStyle.borderTopLeftRadius,
+        ),
+        promptShellDisplay: promptShellStyle.display,
+        promptBorderWidth: Number.parseFloat(promptStyle.borderTopWidth),
+        prefixPrecedesInput: promptPrefix.nextElementSibling === prompt,
         runWidthRatio: runRect.width / Math.max(actionsRect.width, 1),
         sameRow: Math.abs(clearRect.top - chatOnlyRect.top) <= 2,
         clearRightOfChatOnly: clearRect.left >= chatOnlyRect.right - 1,
@@ -602,6 +750,10 @@ test("chat action buttons keep terminal layout and readable contrast", async () 
       };
     });
 
+    expect(geometry.composerCornerRadius).toBeLessThanOrEqual(2);
+    expect(geometry.promptShellDisplay).toBe("grid");
+    expect(geometry.promptBorderWidth).toBe(0);
+    expect(geometry.prefixPrecedesInput).toBe(true);
     expect(geometry.runWidthRatio).toBeGreaterThan(0.92);
     expect(geometry.sameRow).toBe(true);
     expect(geometry.clearRightOfChatOnly).toBe(true);
@@ -1823,6 +1975,51 @@ test("long research does not auto-continue a required tool failure", async () =>
         hasText: "Long research segment",
       }),
     ).toHaveCount(0);
+  });
+});
+
+test("Soft→Bound replace does not auto-continue without a Bound grant", async () => {
+  test.setTimeout(120_000);
+  await withE2EHarness("soft-bound-no-grant", async ({ page, notePath }) => {
+    await setStreamingMode(page, false);
+    await setAgenticReflexMode(page, false);
+    await setPluginSettingOverrides(page, {
+      autoContinueLongRuns: true,
+      completionDrivenLoops: true,
+      maxCompletionSegments: 4,
+      maxAgentSteps: 1,
+      streamWritebackMode: "off",
+    });
+    const before = await page.evaluate(async ({ path }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const file = app?.vault?.getFileByPath?.(path);
+      return file ? await app.vault.read(file) : "";
+    }, { path: notePath });
+
+    await submitMission(
+      page,
+      "E2E_SOFT_BOUND_NO_GRANT: Read the current note first. Then replace the entire current note with exactly this markdown:\n# Soft Bound Blocked\n\nE2E_SOFT_BOUND_NO_GRANT_DONE",
+      { timeout: 120_000 },
+    );
+
+    const state = await page.evaluate(async ({ pluginId, notePath }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const plugin = app?.plugins?.plugins?.[pluginId];
+      const file = app?.vault?.getFileByPath?.(notePath);
+      const note = file ? await app.vault.read(file) : "";
+      return {
+        snapshot: plugin?.getMissionRunSnapshot?.(),
+        note,
+      };
+    }, { pluginId: PLUGIN_ID, notePath });
+
+    expect(state.snapshot?.lastComplete).toMatchObject({
+      stopReason: "budget",
+      autoContinueRecommended: false,
+      autoContinueReason: "effect_class_blocked",
+    });
+    expect(state.note).toBe(before);
+    expect(state.note).not.toContain("E2E_SOFT_BOUND_NO_GRANT_DONE");
   });
 });
 
@@ -3144,6 +3341,20 @@ test("streaming writeback writes early and final chunks", async () => {
   });
 });
 
+test("streaming writeback soft word near-miss skips correction pass", async () => {
+  await withE2EHarness("streaming-soft-word-near-miss", async ({ page, noteFilePath }) => {
+    const marker = "E2E_SOFT_WORD_NEAR_MISS";
+    const prompt = `In this note, write a 100 word essay about rain containing ${marker}.`;
+    await setStreamingMode(page, true);
+    await submitMission(page, prompt, { waitForCompletion: true, timeout: 90_000 });
+    await assertMockModelUsed(page);
+    await expectNoteToContain(noteFilePath, marker, "near-miss draft should remain", 10_000);
+    const details = await readRunDetailsText(page);
+    expect(details).toMatch(/Word count:\s*95\/100\s*\(within target; correction=not used\)/i);
+    expect(details).not.toMatch(/requesting one correction pass/i);
+  });
+});
+
 test("streaming writeback scrolls the active editor to follow new output", async () => {
   await withE2EHarness("streaming-follow-end", async ({ page, noteFilePath, input }) => {
     await page.evaluate(() => {
@@ -3418,6 +3629,149 @@ test("semantic vault search uses semantic_search_notes", async () => {
     await expectToolRun(page, "inspect_semantic_index");
     await expectToolRun(page, "semantic_search_notes");
     await expectNoReceipts(page);
+  });
+});
+
+test("semantic index rebuild then search finds owned note without seeded fake index", async () => {
+  test.setTimeout(180_000);
+  await withE2EHarness("semantic-index-rebuild", async ({ page, input }) => {
+    await setStreamingMode(page, false);
+    const rebuildProof = await page.evaluate(async ({ pluginId, marker }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const plugin = app?.plugins?.plugins?.[pluginId];
+      if (!plugin?.getSemanticIndexService || !plugin?.setSemanticEmbeddingProviderForTests) {
+        throw new Error("Semantic index test hooks are unavailable on the plugin.");
+      }
+
+      // Remove harness-seeded fake index so rebuild must write a real v2 index.
+      for (const path of [
+        "Agent Memory/semantic-vault-index.json",
+        "Agent Memory/Semantic Vault Index.md",
+      ]) {
+        const file = app.vault.getAbstractFileByPath(path);
+        if (file) {
+          await app.vault.delete(file);
+        }
+      }
+      const shardFiles = (app.vault.getFiles?.() ?? []).filter((file: { path?: string }) =>
+        /^Agent Memory\/semantic-vault-index-shard-/u.test(file.path ?? ""),
+      );
+      for (const file of shardFiles) {
+        await app.vault.delete(file);
+      }
+
+      const dim = 512;
+      plugin.setSemanticEmbeddingProviderForTests({
+        async embed(request: {
+          model: string;
+          dim: number;
+          documents: string[];
+          queries: string[];
+        }) {
+          const unit = Array.from({ length: request.dim }, (_, index) =>
+            index === 0 ? 1 : 0,
+          );
+          return {
+            ok: true,
+            model: request.model,
+            dim: request.dim,
+            documents: request.documents.map(() => unit),
+            queries: request.queries.map(() => unit),
+          };
+        },
+      });
+
+      plugin.settings.semanticSearchEnabled = true;
+      plugin.settings.semanticIndexEnabled = true;
+      plugin.settings.semanticIndexPersistVectors = true;
+      plugin.settings.semanticIndexFolder = "Agent Memory";
+      plugin.settings.semanticEmbeddingDim = dim;
+      plugin.settings.semanticIndexMaxFiles = 10_000;
+      await plugin.saveSettings?.();
+
+      const ownedNote = (app.vault.getMarkdownFiles?.() ?? []).find(
+        (file: { path?: string }) =>
+          String(file.path ?? "").includes("E2E Agent Tests/Other Folder/"),
+      );
+      if (!ownedNote?.path) {
+        throw new Error("Owned Other Folder note was missing before rebuild.");
+      }
+
+      const service = plugin.getSemanticIndexService();
+      plugin.settings.semanticIndexMaxFiles = 10_000;
+      await plugin.saveSettings?.();
+      const rebuild = await service.rebuild();
+      if (!rebuild?.ok) {
+        throw new Error(
+          `semantic rebuild failed: ${rebuild?.code ?? rebuild?.message ?? "unknown"}`,
+        );
+      }
+      const update = await service.updatePaths([ownedNote.path]);
+      if (!update?.ok) {
+        throw new Error(
+          `semantic updatePaths failed: ${update?.code ?? update?.message ?? "unknown"}`,
+        );
+      }
+      const loaded = await service.load();
+      if (!loaded) {
+        throw new Error("semantic index load returned null after rebuild.");
+      }
+      const owned = (loaded.notes ?? []).find(
+        (note: { path?: string }) => note.path === ownedNote.path,
+      );
+      if (!owned) {
+        throw new Error(`owned note ${ownedNote.path} missing from rebuilt index.`);
+      }
+      const manifestFile = app.vault.getAbstractFileByPath(
+        "Agent Memory/semantic-vault-index.json",
+      );
+      if (!manifestFile) {
+        throw new Error("v2 semantic-vault-index.json was not written.");
+      }
+      const manifest = JSON.parse(await app.vault.read(manifestFile));
+      const shardPath = manifest.shards?.[0]?.path as string | undefined;
+      const shardFile = shardPath
+        ? app.vault.getAbstractFileByPath(shardPath)
+        : null;
+      const shard = shardFile
+        ? JSON.parse(await app.vault.read(shardFile))
+        : null;
+      return {
+        rebuildOk: rebuild.ok === true,
+        noteCount: rebuild.noteCount ?? 0,
+        manifestVersion: manifest.version,
+        hasShards: Array.isArray(manifest.shards) && manifest.shards.length > 0,
+        ownedIndexed: true,
+        ownedChunkCount: Number(owned.chunkCount ?? 0),
+        shardHasVectors:
+          typeof shard?.vectorsBase64 === "string" &&
+          shard.vectorsBase64.length > 0,
+        indexUsedForMission: true,
+      };
+    }, {
+      pluginId: PLUGIN_ID,
+      marker: input.folderAnswerMarker,
+    });
+
+    expect(rebuildProof.rebuildOk).toBe(true);
+    expect(rebuildProof.noteCount).toBeGreaterThan(0);
+    expect(rebuildProof.manifestVersion).toBe(2);
+    expect(rebuildProof.hasShards).toBe(true);
+    expect(rebuildProof.ownedIndexed).toBe(true);
+    expect(rebuildProof.ownedChunkCount).toBeGreaterThan(0);
+    expect(rebuildProof.shardHasVectors).toBe(true);
+
+    await submitMission(
+      page,
+      `What do my notes say about E2E_SEMANTIC_SEARCH ${input.folderAnswerMarker} themes?`,
+    );
+    await expect(
+      page.locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
+        hasText: input.folderAnswerMarker,
+      }),
+    ).toBeVisible({ timeout: 60_000 });
+    await expectToolRun(page, "inspect_semantic_index");
+    await expectToolRun(page, "semantic_search_notes");
   });
 });
 
@@ -5026,10 +5380,20 @@ test("budget-stopped run exposes Continue Latest Run action", async () => {
         detailsText,
       )?.[1] ?? "";
     expect(runId, "Run Details should expose a concrete continuation command").not.toBe("");
+    await expectDetailsText(
+      page,
+      "Use Continue Latest Run in Chat to resume without replaying completed writes.",
+    );
+    // Singular Continue path is Chat-only (no duplicate Details button).
+    await expect(
+      page.locator(".agentic-researcher-details-panel").getByRole("button", {
+        name: /Continue Latest Run/iu,
+      }),
+    ).toHaveCount(0);
 
-    await page.getByRole("button", { name: "Continue Latest Run" }).click();
-    await waitForMissionComplete(page, 120_000);
     await page.getByRole("tab", { name: "Chat" }).click();
+    await chatContinuation.click();
+    await waitForMissionComplete(page, 120_000);
     await expect(
       page.locator(".agentic-researcher-log-user .agentic-researcher-log-message", {
         hasText: `continue run ${runId}`,
@@ -8915,6 +9279,14 @@ async function setupVaultNoteAndMockModel(
               ?.content ?? "";
           const requestText =
             request.messages?.map((message) => message.content ?? "").join("\n") ?? "";
+          if (
+            requestText.includes("E2E_SOFT_WORD_NEAR_MISS") &&
+            /word[- ]count|correction|exactly \d+ words/i.test(requestText)
+          ) {
+            throw new Error(
+              "soft word near-miss must not request a word-count correction chat pass",
+            );
+          }
           const missionGraphE2eRequest =
             requestText.includes("E2E_MGV3_VISIBLE_BEFORE_TOOL") ||
             requestText.includes("E2E_MGV3_MALICIOUS_EXTRA") ||
@@ -9167,6 +9539,91 @@ async function setupVaultNoteAndMockModel(
                 raw: { playwrightE2E: true },
               };
             }
+          }
+          if (
+            latestUserText.trim() ===
+            "The current platform that I created to give you tools, NO specific document, I want you to rate actual usefulness."
+          ) {
+            return {
+              message: {
+                role: "assistant",
+                content:
+                  "The platform is useful, but intent routing, durable lineage, cleanup authority, and live proof determine whether it is genuinely agentic.",
+              },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
+          if (
+            latestUserText.trim() ===
+            "From your perspective, what is hard about doing research in Obsidian, agentically, converting the notebook into Linear issues, Linear issues to real code project code files, GitHub and finally a reflection?"
+          ) {
+            return {
+              message: {
+                role: "assistant",
+                content:
+                  "The hard parts are preserving source provenance, binding the canonical Linear contract, proving workspace validation and commit identity, matching the draft PR head, and grounding reflection in the durable ledger.",
+              },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
+          if (
+            latestUserText.trim() ===
+            "Using design tools can you make a diagram?"
+          ) {
+            if (toolNames.includes("create_design_canvas")) {
+              const toolCall = {
+                id: "playwright-e2e-exact-design-tools-canvas",
+                index: 0,
+                name: "create_design_canvas",
+                arguments: {
+                  path: designCanvasPath,
+                  title: "Research Pipeline",
+                  diagramType: "user_flow",
+                  direction: "row",
+                  items: [
+                    {
+                      id: "note",
+                      title: "Obsidian Note",
+                      text: "Source context and research.",
+                    },
+                    {
+                      id: "issue",
+                      title: "Linear Issue",
+                      text: "Canonical accepted work item.",
+                    },
+                    {
+                      id: "code",
+                      title: "Verified Code",
+                      text: "Validated commit and draft PR.",
+                    },
+                  ],
+                  connections: [
+                    { from: "note", to: "issue", label: "specifies" },
+                    { from: "issue", to: "code", label: "implements" },
+                  ],
+                },
+              };
+              return {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  toolCalls: [toolCall],
+                },
+                toolCalls: [toolCall],
+                raw: { playwrightE2E: true },
+              };
+            }
+            return {
+              message: {
+                role: "assistant",
+                content:
+                  "Created and verified the editable Research Pipeline Canvas.",
+              },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
           }
           if (latestUserText.includes("E2E_DAY1_CHAT_ANSWER_NO_TOOLS")) {
             return {
@@ -10131,6 +10588,37 @@ async function setupVaultNoteAndMockModel(
             };
           }
 
+          if (latestUserText.includes("E2E_SOFT_BOUND_NO_GRANT")) {
+            // Soft→Bound canary: Soft read first; Bound replace remains unpaid
+            // without a grant so host auto-continue must stay blocked.
+            if (!toolNames.includes("read_current_file")) {
+              return {
+                message: {
+                  role: "assistant",
+                  content:
+                    "E2E_SOFT_BOUND_NO_GRANT awaiting read_current_file on the Soft→Bound frontier.",
+                },
+                toolCalls: [],
+                raw: { playwrightE2E: true },
+              };
+            }
+            const toolCall = {
+              id: "playwright-e2e-soft-bound-no-grant-read",
+              index: 0,
+              name: "read_current_file",
+              arguments: {},
+            };
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                toolCalls: [toolCall],
+              },
+              toolCalls: [toolCall],
+              raw: { playwrightE2E: true },
+            };
+          }
+
           if (latestUserText.includes("E2E_LONG_RUN_REQUIRED_TOOL_FAILURE")) {
             const key = "E2E_LONG_RUN_REQUIRED_TOOL_FAILURE";
             const step = longRunRequiredToolFailureStepCounts.get(key) ?? 0;
@@ -10794,7 +11282,7 @@ async function setupVaultNoteAndMockModel(
             if (webStep === 1) {
               if (
                 requestText.includes("https://example.com/e2e-ledger-source") &&
-                !toolNames.includes("web_fetch")
+                ledgerPassageId
               ) {
                 webLedgerStepCounts.set(key, 2);
                 return {
@@ -10911,7 +11399,7 @@ async function setupVaultNoteAndMockModel(
               const alreadyFetchedUrls = urls.filter((url) =>
                 requestText.includes(url),
               );
-              if (alreadyFetchedUrls.length >= urls.length && !toolNames.includes("web_fetch")) {
+              if (alreadyFetchedUrls.length >= urls.length) {
                 deepWebStepCounts.set(key, 2);
                 return {
                   message: {
@@ -10994,7 +11482,7 @@ async function setupVaultNoteAndMockModel(
               const alreadyFetchedUrls = urls.filter((url) =>
                 requestText.includes(url),
               );
-              if (alreadyFetchedUrls.length >= urls.length && !toolNames.includes("web_fetch")) {
+              if (alreadyFetchedUrls.length >= urls.length) {
                 quoteVerifyStepCounts.set(key, 2);
               } else {
                 if (!toolNames.includes("web_fetch")) {
@@ -12840,6 +13328,8 @@ async function setupVaultNoteAndMockModel(
         async streamChat(
           request: {
             messages?: Array<{ role?: string; content?: string }>;
+            tools?: Array<{ function?: { name?: string } }>;
+            evidencePhase?: string;
           },
           events?: { onContentDelta?: (delta: string) => void },
         ) {
@@ -12850,6 +13340,10 @@ async function setupVaultNoteAndMockModel(
               ?.content ?? "";
           const requestText =
             request.messages?.map((message) => message.content ?? "").join("\n") ?? "";
+          const toolNames =
+            request.tools
+              ?.map((tool) => tool.function?.name ?? "")
+              .filter(Boolean) ?? [];
           if (requestText.includes("E2E_AUTO_SEGMENT_CONTINUATION")) {
             const passageIds = [
               ...new Set(
@@ -12911,6 +13405,21 @@ async function setupVaultNoteAndMockModel(
                 requestText,
               )?.[0] ?? "E2E_DIRECT_USER_ROLE_WRITEBACK_MISSING";
             const content = `# Direct Writeback Status\n\n${marker}\n\nThe project remains on track.`;
+            events?.onContentDelta?.(content);
+            return {
+              message: { role: "assistant", content },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
+          if (requestText.includes("E2E_SOFT_WORD_NEAR_MISS")) {
+            // 95 visible words is inside the soft ±5% band for a 100-word target.
+            const content = [
+              "# Rain Near Miss",
+              "",
+              Array.from({ length: 94 }, (_, i) => `rain${i + 1}`).join(" "),
+              "E2E_SOFT_WORD_NEAR_MISS",
+            ].join("\n");
             events?.onContentDelta?.(content);
             return {
               message: { role: "assistant", content },
@@ -12983,6 +13492,53 @@ async function setupVaultNoteAndMockModel(
                 toolCalls: [],
                 raw: { playwrightE2E: true },
               };
+            }
+            if (request.evidencePhase === "agent_step") {
+              const key = "E2E_SELECTION_RESEARCH_STREAM";
+              const step = selectionResearchStepCounts.get(key) ?? 0;
+              if (step === 0) {
+                if (!toolNames.includes("web_search")) {
+                  throw new Error(
+                    `selection research was missing web_search. Tools: ${toolNames.join(", ")}`,
+                  );
+                }
+                selectionResearchStepCounts.set(key, 1);
+                const toolCall = {
+                  id: "playwright-e2e-selection-research-stream-search",
+                  index: 0,
+                  name: "web_search",
+                  arguments: {
+                    query: "E2E selection research quantum battery density",
+                    max_results: 3,
+                  },
+                };
+                return {
+                  message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                  toolCalls: [toolCall],
+                  raw: { playwrightE2E: true },
+                };
+              }
+              if (step === 1) {
+                if (!toolNames.includes("web_fetch")) {
+                  throw new Error(
+                    `selection research was missing web_fetch. Tools: ${toolNames.join(", ")}`,
+                  );
+                }
+                selectionResearchStepCounts.set(key, 2);
+                const toolCall = {
+                  id: "playwright-e2e-selection-research-stream-fetch",
+                  index: 0,
+                  name: "web_fetch",
+                  arguments: {
+                    url: "https://example.com/e2e-ledger-source",
+                  },
+                };
+                return {
+                  message: { role: "assistant", content: "", toolCalls: [toolCall] },
+                  toolCalls: [toolCall],
+                  raw: { playwrightE2E: true },
+                };
+              }
             }
             const passageId =
               /source:[A-Za-z0-9]+:passage:\d+-\d+/.exec(requestText)?.[0] ?? "";
@@ -14150,6 +14706,7 @@ Confidence: high for deterministic workflow coverage.
         model: "playwright-e2e-mock",
         ollamaBaseUrl: "http://127.0.0.1:11434",
         ollamaApiKey: "",
+        e2eHarnessAttestationEnabled: true,
         // Keep single-agent mock paths stable; research-team e2e opts in explicitly.
         orchestratorEnabled: false,
         orchestratorPreviewEnabled: false,

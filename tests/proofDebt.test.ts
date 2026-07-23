@@ -38,6 +38,19 @@ function researchPlanNeedingFetch(): ResearchPlan {
   };
 }
 
+test("computeProofDebt maps explicit tool:replace_current_file over write_receipt append", () => {
+  const debt = computeProofDebt({
+    status: "budget",
+    acceptance: {
+      status: "needs_more_work",
+      missing: ["write_receipt", "tool:replace_current_file"],
+    },
+  });
+  assert.equal(debt.empty, false);
+  assert.equal(debt.nextAction.kind, "tool");
+  assert.equal(debt.nextAction.toolName, "replace_current_file");
+});
+
 test("computeProofDebt maps missing fetch to web_fetch nextAction", () => {
   const snapshot: ProofDebtSnapshot = {
     status: "budget",
