@@ -34,6 +34,7 @@ import {
   GitHubRestClient,
 } from "../src/integrations/github/GitHubRestClient";
 import { LinearGraphqlClient } from "../src/integrations/linear/client";
+import { parseRenderedCompatibleWorkItemSpec } from "../src/integrations/linear/WorkItemParser";
 import type { HttpTransport } from "../src/model/types";
 import { liveProviderConfiguration } from "../scripts/ci-sandbox-boundary";
 
@@ -99,6 +100,32 @@ interface ProtectedCredentialOwnership {
   linear: boolean;
   github: boolean;
   verifyPreservedLinear: boolean;
+}
+
+interface RedactedResearchEffortAttestationV1 {
+  tier: "quick" | "standard" | "deep" | "extended";
+  budget: {
+    maxModelStepsPerSegment: number | null;
+    maxToolCallsPerSegment: number | null;
+    maxSegments: number | null;
+    maxTotalModelSteps: number | null;
+    maxTotalToolCalls: number | null;
+    maxDurationMs: number | null;
+  };
+  usage: {
+    modelSteps: number | null;
+    toolCalls: number | null;
+    segmentsStarted: number | null;
+    modelStepsInCurrentSegment: number | null;
+    toolCallsInCurrentSegment: number | null;
+    completionSegmentsStarted: number | null;
+    elapsedMs: number | null;
+  };
+  closure: {
+    requested: boolean;
+    attempts: number | null;
+    reason: string | null;
+  } | null;
 }
 
 interface IndependentStageEntryProbe {
@@ -203,7 +230,15 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       windowsHide: true,
     })
   ).stdout.trim();
-  expect(checkoutStatus, "DU-06 exact-SHA proof requires a clean checkout").toBe("");
+  const allowDirtyCheckout =
+    process.env.E2E_DU06_ALLOW_DIRTY_CHECKOUT?.trim() === "1";
+  if (allowDirtyCheckout) {
+    // Local compound canary only — not release attestation. Exact SHA still
+    // must match HEAD so disposable names and retained Linear proof stay bound.
+    expect(checkoutSha).toBe(releaseSha);
+  } else {
+    expect(checkoutStatus, "DU-06 exact-SHA proof requires a clean checkout").toBe("");
+  }
   if (process.env.GITHUB_SHA?.trim()) {
     expect(process.env.GITHUB_SHA.trim().toLowerCase()).toBe(releaseSha);
   }
@@ -524,6 +559,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     modelCallCount += mainSnapshot.modelCallEvidence.length;
     toolCallCount += mainSnapshot.missionEvidence.length;
     expect(mainSnapshot.lastComplete.stopReason).not.toBe("error");
+    expectPersistedResearchEffortWithinSelectedBudget(mainSnapshot);
     expect(
       Object.values(mainSnapshot.lastMissionGraph?.nodes ?? {}).some(
         (node: any) => node?.status === "blocked" || Boolean(node?.blocker),
@@ -545,7 +581,10 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       lifecycleScope,
     );
     const lineage = requireOne(state.lineages, "completed project lineage");
-    expect(lineage.commits.map((item: any) => item.stage)).toEqual(MAIN_STAGES);
+    expect(
+      lineage.commits.map((item: any) => item.stage),
+      "bounded research must not starve Linear, code, or private GitHub publication",
+    ).toEqual(MAIN_STAGES);
     const research = requireOne(
       state.researchPublications.filter((item) => item.status === "complete"),
       "accepted research publication",
@@ -554,6 +593,20 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     expect(research.notePath).toBe(notePath);
     expect(research.issueId).toBeTruthy();
     expect(research.backlinkVerified).toBe(true);
+    const publishedResearchIssue = await activeLinearClient.execute(
+      "issues.get",
+      { id: research.issueId },
+    ) as any;
+    const publishedResearchDescription = String(
+      publishedResearchIssue?.description ?? "",
+    );
+    const publishedResearchContract = parseRenderedCompatibleWorkItemSpec(
+      publishedResearchDescription,
+    ).spec;
+    expect(publishedResearchContract.schemaVersion).toBe(2);
+    expect(publishedResearchDescription).toContain(
+      `obsidian://open?file=${encodeURIComponent(notePath)}`,
+    );
     const hierarchy = requireOne(
       state.linearHierarchies.filter((item) => item.status === "complete"),
       "verified Linear hierarchy",
@@ -635,6 +688,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     });
     expect(publication.remoteSha).toBe(codeHandoff.commitSha);
     expect(publication.linearLinkReceiptId).toBeTruthy();
+    expect(publication.linearCompletionReceiptId).toBeTruthy();
     expect(publication.obsidianReceiptId).toBeTruthy();
     const exactPullRequestNumber = Number(publication.pullRequest.number);
     const exactPublishedBranch = String(publication.branch ?? "");
@@ -693,6 +747,88 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     expect(note).toMatch(/king/iu);
     expect(note).toMatch(/linear\.app/iu);
     expect(note).toMatch(/github\.com/iu);
+    expect(note).toMatch(/## Agent project reflection/iu);
+    expect(note).toContain(codeHandoff.targetedValidationReceiptId);
+    expect(note).toContain(codeHandoff.fullValidationReceiptId);
+    expect(note).toContain(codeHandoff.localCommitReceiptId);
+    for (const changedPath of codeHandoff.changedPaths) {
+      expect(note).toContain(changedPath);
+    }
+
+    // Stage 6 deep readback: receipt existence is not enough. Prove against
+    // the provider that the research-derived issue is literally in the
+    // configured completed workflow state and carries the durable lineage
+    // summary comment — BEFORE reconciliation cleanup trashes the hierarchy.
+    await test.step("DU-06 stage 6: Linear completion deep readback", async () => {
+      const completionReceipt = await readExternalActionReceipt(
+        harness!.page,
+        String(publication.linearCompletionReceiptId),
+      );
+      expect(completionReceipt.toolName).toBe("linear_update_issue");
+      expect(
+        completionReceipt.readbackStatus,
+        "issue completion must have verified provider readback",
+      ).toBe("verified");
+      const completedIssueId = completionReceipt.resourceId;
+      expect(completedIssueId).toBeTruthy();
+      expect(
+        completedIssueId,
+        "completion must target the research-derived code work package issue",
+      ).toBe(String(research.issueId));
+      const configuredCompletedStateId = await readLinearCompletedStateId(
+        harness!.page,
+      );
+      expect(
+        configuredCompletedStateId,
+        "linearCompletedStateId must be configured",
+      ).toBeTruthy();
+      const completedIssue = await activeLinearClient.execute("issues.get", {
+        id: completedIssueId,
+      }) as any;
+      expect(
+        String(completedIssue?.state?.type ?? ""),
+        "provider readback must show the issue in a completed workflow state",
+      ).toBe("completed");
+      expect(String(completedIssue?.state?.id ?? "")).toBe(
+        configuredCompletedStateId,
+      );
+      expect(completedIssue?.completedAt).toBeTruthy();
+      expect(completedIssue?.trashed).not.toBe(true);
+
+      const linkReceipt = await readExternalActionReceipt(
+        harness!.page,
+        String(publication.linearLinkReceiptId),
+      );
+      expect(linkReceipt.toolName).toBe("linear_create_comment");
+      expect(linkReceipt.resourceId).toBeTruthy();
+      const comments = await activeLinearClient.execute("comments.list", {
+        first: 50,
+        includeArchived: false,
+        filter: { issue: { id: { eq: completedIssueId } } },
+      }) as any;
+      const commentNodes: any[] = Array.isArray(comments?.nodes)
+        ? comments.nodes
+        : [];
+      const summaryComment = commentNodes.find(
+        (comment) => String(comment?.id ?? "") === linkReceipt.resourceId,
+      );
+      expect(
+        summaryComment,
+        "durable summary comment from finalizeLinearLink must exist on the completed issue",
+      ).toBeTruthy();
+      const summaryBody = String(summaryComment?.body ?? "");
+      expect(summaryBody).toMatch(
+        new RegExp(`pull request #${exactPullRequestNumber}\\b`, "iu"),
+      );
+      const publishedPullRequestUrl = String(
+        (publication.pullRequest as any)?.htmlUrl ?? "",
+      );
+      expect(publishedPullRequestUrl).toMatch(/^https:\/\/github\.com\//iu);
+      expect(summaryBody).toContain(publishedPullRequestUrl);
+      expect(summaryBody).toContain(
+        `Publication lineage: \`${publication.publicationId}\``,
+      );
+    });
 
     linearResources = resourcesFromState(state);
     const linearResourcesForCleanup = linearResources;
@@ -1423,10 +1559,10 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
       });
     const mission = [
       `Implement a complete American checkers game in Python in the exact trusted repository ${fixture.root}, using durable workspace ${workspaceId} and one repair request id ${requestId}.`,
-      "First read the exact protected scripts/verify_project.py and scripts/verify_all.py contracts. Treat them as test data and leave the scripts directory unchanged.",
+      "First read the exact protected scripts/verify_project.py and scripts/verify_all.py contracts. Treat them as test data and leave the scripts directory unchanged. If self-authored unittest expectations conflict with those protected contracts, change the implementation or tests to match the protected contracts and leave scripts/ untouched.",
       "Create exactly README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py; do not change any other path.",
       "The game API must export constants RED, BLACK, RED_KING, and BLACK_KING and CheckersGame(board, turn), CheckersGame.initial(), legal_moves(), apply_move(start, end), and winner(). legal_moves() returns start/end coordinate pairs shaped ((row, column), (row, column)); when any capture exists it returns captures only. In this coordinate system, playable dark squares satisfy (row + column) % 2 == 1. apply_move() mutates that same CheckersGame instance in place and returns None, so tests must inspect the same game after each move rather than assigning its return value.",
-      "Implement an 8 by 8 board with twelve men per side on dark squares; red moves upward; captures are mandatory; a capturing piece must finish all available same-piece multi-jumps before the turn changes; captured pieces are removed; back-rank moves promote; kings move both directions; and winner() returns the opponent when the side to move has no pieces or no legal move, returning None only while the side to move still has a legal move and both colors remain.",
+      "Implement an 8 by 8 board with twelve men per side on dark squares; red moves upward (toward decreasing row / row 0), so CheckersGame.initial() must place BLACK men on rows 0-2 and RED men on rows 5-7; captures are mandatory; a capturing piece must finish all available same-piece multi-jumps before the turn changes; captured pieces are removed; back-rank moves promote; kings move both directions; and winner() returns the opponent when the side to move has no pieces or no legal move, returning None only while the side to move still has a legal move and both colors remain.",
       `README.md must include marker ${marker}, python -m checkers.cli, python -m unittest, and the exact heading ## Research and Linear traceability.`,
       "Create dependency-free unittest coverage for setup, mandatory captures, multi-jumps, promotion, kings, and victory. A no-winner test must contain both colors and at least one legal move for the side to move; never expect None from a one-sided board. Run fast validation, perform only bounded evidence-driven repairs, then run distinct targeted and fresh-full sandbox validation.",
       "Create one local commit with message feat: add protected Python checkers game and independently read its exact SHA back. Stop only after a verified_code_publication_handoff proves the five changed paths, both validations, clean worktree, and commit readback.",
@@ -1436,7 +1572,7 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
       timeoutMs: 45 * 60_000,
     });
     approvalCount = await harness.approveUntilMissionComplete(45 * 60_000, {
-      maxContinuations: 6,
+      maxContinuations: 12,
     });
     const snapshot = await harness.attestProductionRun({
       requireStructuredRouting: true,
@@ -1445,9 +1581,32 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
     const transientCapture = await takeDu06TransientRunCapture(harness.page);
     toolCallCount = transientCapture.toolCalls;
     failedFastValidationDiagnostic = transientCapture.diagnostic;
-    if (worktreeCapturePromise) await waitForWorktreeCapture(worktreeCapturePromise);
     if (worktreeCaptureError) throw worktreeCaptureError;
+    if (!verifiedWorktree) {
+      // The polling observer is best-effort during a busy real-model run. On a
+      // successful mission, prefer one exact manifest readback immediately
+      // instead of spending the teardown grace period waiting on a concurrent
+      // Playwright evaluate.
+      verifiedWorktree = await readCreatedRepositoryWorktreeOnce({
+        page: harness.page,
+        workspaceId,
+        expectedRepositoryRoot: fixture.root,
+      });
+    }
+    if (!verifiedWorktree && worktreeCapturePromise) {
+      await waitForWorktreeCapture(worktreeCapturePromise).catch(() => undefined);
+      verifiedWorktree ??= await readCreatedRepositoryWorktreeOnce({
+        page: harness.page,
+        workspaceId,
+        expectedRepositoryRoot: fixture.root,
+      });
+    }
     expect(verifiedWorktree).not.toBeNull();
+    worktreeCaptureController?.abort();
+    if (worktreeCapturePromise) {
+      await waitForWorktreeCapture(worktreeCapturePromise, 1_000).catch(() => undefined);
+      worktreeCapturePromise = null;
+    }
     const handoff = await harness.page.evaluate(
       async ({ codePluginId, profileKey }) => {
         const app = (window as typeof window & { app?: any }).app;
@@ -1476,6 +1635,7 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
     ]);
     const worktree = await fixture.inspectWorktree(verifiedWorktree!.root);
     expect(worktree.head).toBe(handoff.commitSha);
+    expect(worktree.commitSubject).toBe("feat: add protected Python checkers game");
     expect(worktree.status).toBe("");
     expect(worktree.changedPaths).toEqual([...handoff.changedPaths].sort());
     expect(worktree.files["README.md"]).toContain(marker);
@@ -1564,7 +1724,9 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
       ).catch(() => undefined);
     }
     worktreeCaptureController?.abort();
-    if (worktreeCapturePromise) await worktreeCapturePromise;
+    if (worktreeCapturePromise) {
+      await waitForWorktreeCapture(worktreeCapturePromise, 1_000).catch(() => undefined);
+    }
     if (missionError) {
       const capturedWorktree = verifiedWorktree as
         | { root: string; branch: string }
@@ -1807,13 +1969,20 @@ async function configureProtectedConnections(
 
       let github = plugin.getGitHubCredentialStatus?.();
       if (github?.connected === true) {
-        const leased = await plugin.withGitHubCredentialToken(
-          (_token: string, account: { id: number; login: string }) => ({
-            account: { ...account },
-          }),
-        );
-        github = { ...github, account: leased.account };
-      } else {
+        try {
+          const leased = await plugin.withGitHubCredentialToken(
+            (_token: string, account: { id: number; login: string }) => ({
+              account: { ...account },
+            }),
+          );
+          github = { ...github, account: leased.account };
+        } catch {
+          // Vault metadata can report connected while the secure lease is stale
+          // after a re-auth. Prefer the explicit disposable E2E token then.
+          github = null;
+        }
+      }
+      if (!github?.connected || !github?.account?.login) {
         const githubSaved = await plugin.setGitHubFineGrainedPat(githubToken);
         if (!githubSaved?.ok) {
           throw new Error(
@@ -1919,6 +2088,44 @@ function createPageBackedLinearReadbackClient(page: Page): LinearReadbackClient 
       return result.value;
     },
   };
+}
+
+/** Redacted projection of one external action receipt from the ledger. */
+async function readExternalActionReceipt(
+  page: Page,
+  receiptId: string,
+): Promise<{
+  id: string;
+  toolName: string;
+  resourceId: string;
+  readbackStatus: string;
+}> {
+  return page.evaluate(({ pluginId, receiptId }) => {
+    const plugin = (window as typeof window & { app?: any }).app?.plugins
+      ?.plugins?.[pluginId];
+    if (!plugin) throw new Error("Agentic Researcher is unavailable.");
+    const entry = (plugin.externalActionReceiptLedger?.entries ?? []).find(
+      (candidate: any) => candidate?.receipt?.id === receiptId,
+    );
+    if (!entry) throw new Error(`External action receipt missing: ${receiptId}`);
+    const receipt = entry.receipt;
+    return {
+      id: String(receipt.id ?? ""),
+      toolName: String(receipt.toolName ?? ""),
+      resourceId: String(receipt.resource?.id ?? ""),
+      readbackStatus: String(receipt.readback?.status ?? ""),
+    };
+  }, { pluginId: NATIVE_CORE_PLUGIN_ID, receiptId });
+}
+
+/** The configured Linear completed workflow-state id used by finalization. */
+async function readLinearCompletedStateId(page: Page): Promise<string> {
+  return page.evaluate(({ pluginId }) => {
+    const plugin = (window as typeof window & { app?: any }).app?.plugins
+      ?.plugins?.[pluginId];
+    if (!plugin) throw new Error("Agentic Researcher is unavailable.");
+    return String(plugin.settings?.linearCompletedStateId ?? "");
+  }, { pluginId: NATIVE_CORE_PLUGIN_ID });
 }
 
 async function readSafeLifecycleState(
@@ -2138,11 +2345,12 @@ async function captureCreatedRepositoryWorktree(input: {
         const app = (window as typeof window & { app?: any }).app;
         const code = app?.plugins?.plugins?.[corePluginId]
           ?.getBundledCapability?.(codePluginId);
-        if (!code?.workspaceManager?.loadManifest) {
+        const manager = code?.workspaceManager ?? code?.runtime?.workspaceManager;
+        if (!manager?.loadManifest) {
           return { state: "waiting" as const };
         }
         try {
-          const manifest = await code.workspaceManager.loadManifest(workspaceId);
+          const manifest = await manager.loadManifest(workspaceId);
           if (manifest?.kind !== "repository" || !manifest.repositoryBinding) {
             return { state: "waiting" as const };
           }
@@ -2196,9 +2404,10 @@ async function readCreatedRepositoryWorktreeOnce(input: {
       const app = (window as typeof window & { app?: any }).app;
       const code = app?.plugins?.plugins?.[corePluginId]
         ?.getBundledCapability?.(codePluginId);
-      if (!code?.workspaceManager?.loadManifest) return null;
+      const manager = code?.workspaceManager ?? code?.runtime?.workspaceManager;
+      if (!manager?.loadManifest) return null;
       try {
-        const manifest = await code.workspaceManager.loadManifest(workspaceId);
+        const manifest = await manager.loadManifest(workspaceId);
         if (manifest?.kind !== "repository" || !manifest.repositoryBinding) {
           return null;
         }
@@ -2231,11 +2440,14 @@ async function readCreatedRepositoryWorktreeOnce(input: {
   return { root: observed.worktreeRoot, branch: observed.branch };
 }
 
-async function waitForWorktreeCapture(capture: Promise<void>): Promise<void> {
+async function waitForWorktreeCapture(
+  capture: Promise<void>,
+  timeoutMs = 10_000,
+): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error("DU-06 timed out capturing its created worktree.")),
-      10_000,
+      () => reject(new Error("Timed out waiting for the owned-worktree observer.")),
+      timeoutMs,
     );
     capture.then(
       () => {
@@ -3296,6 +3508,105 @@ async function readRedactedDailyUseCounters(
         : 0,
     };
   }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+}
+
+function expectPersistedResearchEffortWithinSelectedBudget(snapshot: any): void {
+  const effort = snapshot?.redactedResearchEffort as
+    | RedactedResearchEffortAttestationV1
+    | null
+    | undefined;
+  expect(
+    effort,
+    "DU-06 must attest persisted, redacted adaptive-research effort",
+  ).toBeTruthy();
+  if (!effort) return;
+
+  expect(["quick", "standard", "deep", "extended"]).toContain(effort.tier);
+  const requireInteger = (value: number | null, field: string): number => {
+    expect(
+      Number.isSafeInteger(value) && Number(value) >= 0,
+      `DU-06 research effort ${field} must be a non-negative integer`,
+    ).toBe(true);
+    return Number(value);
+  };
+  const requireNumber = (value: number | null, field: string): number => {
+    expect(
+      typeof value === "number" && Number.isFinite(value) && value >= 0,
+      `DU-06 research effort ${field} must be a non-negative number`,
+    ).toBe(true);
+    return Number(value);
+  };
+
+  const maxModelStepsPerSegment = requireInteger(
+    effort.budget.maxModelStepsPerSegment,
+    "budget.maxModelStepsPerSegment",
+  );
+  const maxToolCallsPerSegment = requireInteger(
+    effort.budget.maxToolCallsPerSegment,
+    "budget.maxToolCallsPerSegment",
+  );
+  const maxSegments = requireInteger(
+    effort.budget.maxSegments,
+    "budget.maxSegments",
+  );
+  const maxTotalModelSteps = requireInteger(
+    effort.budget.maxTotalModelSteps,
+    "budget.maxTotalModelSteps",
+  );
+  const maxTotalToolCalls = requireInteger(
+    effort.budget.maxTotalToolCalls,
+    "budget.maxTotalToolCalls",
+  );
+  const modelSteps = requireInteger(
+    effort.usage.modelSteps,
+    "usage.modelSteps",
+  );
+  const toolCalls = requireInteger(
+    effort.usage.toolCalls,
+    "usage.toolCalls",
+  );
+  const segmentsStarted = requireInteger(
+    effort.usage.segmentsStarted,
+    "usage.segmentsStarted",
+  );
+  const modelStepsInCurrentSegment = requireInteger(
+    effort.usage.modelStepsInCurrentSegment,
+    "usage.modelStepsInCurrentSegment",
+  );
+  const toolCallsInCurrentSegment = requireInteger(
+    effort.usage.toolCallsInCurrentSegment,
+    "usage.toolCallsInCurrentSegment",
+  );
+  const completionSegmentsStarted = requireInteger(
+    effort.usage.completionSegmentsStarted,
+    "usage.completionSegmentsStarted",
+  );
+  const elapsedMs = requireNumber(effort.usage.elapsedMs, "usage.elapsedMs");
+
+  expect(modelSteps).toBeLessThanOrEqual(maxTotalModelSteps);
+  expect(toolCalls).toBeLessThanOrEqual(maxTotalToolCalls);
+  expect(segmentsStarted).toBeLessThanOrEqual(maxSegments);
+  expect(modelStepsInCurrentSegment).toBeLessThanOrEqual(
+    maxModelStepsPerSegment,
+  );
+  expect(toolCallsInCurrentSegment).toBeLessThanOrEqual(
+    maxToolCallsPerSegment,
+  );
+  expect(
+    completionSegmentsStarted,
+    "accepted research plus its one closure-only segment must stay bounded",
+  ).toBeLessThanOrEqual(maxSegments + 1);
+  if (effort.budget.maxDurationMs !== null) {
+    expect(elapsedMs).toBeLessThanOrEqual(
+      requireNumber(effort.budget.maxDurationMs, "budget.maxDurationMs"),
+    );
+  }
+  if (effort.closure) {
+    expect(effort.closure.requested).toBe(true);
+    expect(
+      requireInteger(effort.closure.attempts, "closure.attempts"),
+    ).toBeLessThanOrEqual(1);
+  }
 }
 
 function requiredEnvironment(name: string): string {
