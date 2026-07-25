@@ -1,4 +1,5 @@
 import { isLiteraryPrimaryTextWriteMission } from "../agent/evidenceIntent";
+import { RESEARCH_TEAM_KEYWORD_FLOOR } from "../agent/researchTeamDispatch";
 import { OrchestratorStore, type OrchestratorSnapshotRepository } from "./orchestratorStore";
 import { SharedBudget, type BudgetResource } from "./sharedBudget";
 import type {
@@ -343,6 +344,10 @@ export function createResearchTeamScaffold(input: {
  * missions. Bare "research" / "research this topic" must stay false so ordinary
  * note writebacks do not open a research_team runtime.
  * Literary "citations from the text" essays are single-agent write missions.
+ *
+ * @deprecated Synchronous layers 1–2 only. Production dispatch goes through
+ * resolveResearchTeamDispatchV1 (src/agent/researchTeamDispatch.ts), which
+ * adds deterministic structural signals and a fail-closed embedding widener.
  */
 export function shouldUseResearchTeam(
   prompt: string,
@@ -354,11 +359,16 @@ export function shouldUseResearchTeam(
     return false;
   }
   // Require deep/sources/verify-style language — bare "research" alone is not enough.
-  return /\b(deep\s+research|investigate|sources?|citations?|verify|fact[-\s]?check|evidence|compare\s+(?:sources?|evidence)|current\s+(?:events?|sources?)|latest\s+(?:sources?|research)|web\s+research|vault\s+research)\b/i.test(
-    prompt,
-  );
+  return RESEARCH_TEAM_KEYWORD_FLOOR.test(prompt);
 }
 
+/**
+ * @deprecated Unreachable from production dispatch: resolveTopLevelMissionDispatchV1
+ * hard-routes code intent to single_agent because this legacy code-team
+ * executor predates the extension-registry prepared-action approval boundary.
+ * Kept for tests only; do not wire it back without routing worker authority
+ * through the extension registry.
+ */
 export function createCodeTeamScaffold(input: {
   runId: string;
   mission: string;

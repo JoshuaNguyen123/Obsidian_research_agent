@@ -4,6 +4,8 @@ import { createCodeTools } from "./codeTools";
 import { createCodeWorkspaceTools } from "./codeWorkspaceTools";
 import { createDesignTools } from "./designTools";
 import { createMermaidTools } from "./mermaidTools";
+import { createDatasetTools } from "./datasetTools";
+import { createCitationTools } from "./citationTools";
 import { createCompanionTools } from "./companionTools";
 import { createVaultIndexTools } from "./vaultIndexTools";
 import { createVaultTools } from "./vaultTools";
@@ -73,6 +75,7 @@ export const CODE_EXTENSION_V2_TOOL_NAMES = Object.freeze([
   "code_workspace_search",
   "code_workspace_mkdir",
   "code_workspace_create_file",
+  "code_workspace_export_directory",
   "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
@@ -292,6 +295,8 @@ function createCoreOwnedTools(): AgentTool[] {
     ...createWebViewerTools(),
     ...createDesignTools(),
     ...createMermaidTools(),
+    ...createDatasetTools(),
+    ...createCitationTools(),
   ].map(withExplicitToolDescriptor);
 }
 

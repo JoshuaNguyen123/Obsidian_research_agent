@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -35,7 +35,7 @@ test("workspace contribution factory replaces every new and legacy tool name", a
       contributions.map((item) => item.tool.name),
       [...CODE_WORKSPACE_TOOL_NAMES_V2],
     );
-    assert.equal(new Set(contributions.map((item) => item.tool.name)).size, 21);
+    assert.equal(new Set(contributions.map((item) => item.tool.name)).size, 22);
     for (const contribution of contributions) {
       assert.equal(contribution.descriptor.kind, "tool");
       assert.equal(contribution.tool.descriptor.capability.system === "workspace" || contribution.tool.descriptor.capability.system === "git", true);
@@ -263,6 +263,150 @@ test("prepared new-file creation safely materializes missing parent folders", as
     assert.equal(
       (await fixture.manager.read("nested-space", "src/checkers/game.py")).content,
       "class CheckersGame:\n    pass\n",
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("prepared directory export preserves a nested workspace tree in an explicitly requested Desktop path without overwrite", async () => {
+  const fixture = await createFixture("directory-export");
+  try {
+    const desktopRoot = path.join(fixture.root, "desktop");
+    await mkdir(desktopRoot);
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+      resolveKnownHostDirectory: async (directory) => {
+        assert.equal(directory, "desktop");
+        return realpath(desktopRoot);
+      },
+    }));
+    const context = fixture.context(
+      "Create a Python checkers project and put it on my Desktop.",
+    );
+    await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "export-space", kind: "scratch" },
+      context,
+    );
+    await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      {
+        workspaceId: "export-space",
+        path: "src/checkers/ui/game.py",
+        content: "class CheckersGame:\n    pass\n",
+      },
+      context,
+    );
+    await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      {
+        workspaceId: "export-space",
+        path: "README.md",
+        content: "# Checkers\n",
+      },
+      context,
+    );
+    await prepareAndExecute(
+      tools.get("code_workspace_mkdir")!,
+      {
+        workspaceId: "export-space",
+        path: "assets/sprites/red",
+      },
+      context,
+    );
+
+    const exportTool = tools.get("code_workspace_export_directory")!;
+    assert.match(exportTool.description, /never overwrites/u);
+    assert.equal(
+      exportTool.descriptor.capability.resourceType,
+      "host_directory",
+    );
+    const prepared = await requirePrepared(
+      exportTool,
+      {
+        workspaceId: "export-space",
+        destinationRoot: "desktop",
+        destinationPath: "Games/Python/Checkers",
+      },
+      context,
+    );
+    assert.equal(
+      prepared.preview.destination,
+      path.join(desktopRoot, "Games", "Python", "Checkers"),
+    );
+    assert.equal(prepared.target.resourceType, "host_directory");
+    const committed = await exportTool.executePrepared!(
+      prepared,
+      authorize(context, prepared),
+    );
+    assert.equal(committed.receipt.readback.status, "verified");
+    assert.equal(
+      committed.receipt.effects?.bytesWritten,
+      Buffer.byteLength("class CheckersGame:\n    pass\n# Checkers\n", "utf8"),
+    );
+    assert.equal(
+      await readFile(
+        path.join(
+          desktopRoot,
+          "Games",
+          "Python",
+          "Checkers",
+          "src",
+          "checkers",
+          "ui",
+          "game.py",
+        ),
+        "utf8",
+      ),
+      "class CheckersGame:\n    pass\n",
+    );
+    assert.equal(
+      await readFile(
+        path.join(
+          desktopRoot,
+          "Games",
+          "Python",
+          "Checkers",
+          "README.md",
+        ),
+        "utf8",
+      ),
+      "# Checkers\n",
+    );
+    const reconciled = await exportTool.reconcile!(prepared, context);
+    assert.equal(reconciled.outcome, "committed");
+    assert.equal(reconciled.receipt?.commitKind, "reconciled");
+
+    const duplicate = await exportTool.prepare!(
+      {
+        workspaceId: "export-space",
+        destinationRoot: "desktop",
+        destinationPath: "Games/Python/Checkers",
+      },
+      context,
+    );
+    assert.equal(duplicate.ok, false);
+    if (duplicate.ok) throw new Error("Existing export unexpectedly prepared.");
+    assert.equal(duplicate.error.code, "host_export_destination_exists");
+
+    const unauthorized = await exportTool.prepare!(
+      {
+        workspaceId: "export-space",
+        destinationRoot: "desktop",
+        destinationPath: "Another/Project",
+      },
+      fixture.context("Create another project in the workspace."),
+    );
+    assert.equal(unauthorized.ok, false);
+    if (unauthorized.ok) {
+      throw new Error("Unrequested host directory export unexpectedly prepared.");
+    }
+    assert.equal(
+      unauthorized.error.code,
+      "host_directory_authority_missing",
     );
   } finally {
     await fixture.cleanup();

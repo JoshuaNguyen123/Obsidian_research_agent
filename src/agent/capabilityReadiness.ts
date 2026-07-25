@@ -166,7 +166,9 @@ export function buildCapabilityReadinessV2(
   const codeStatus: CapabilityReadinessStatusV2 = !input.code.registered
     ? "Blocked"
     : input.code.repositoryProfileCount === 0
-      ? "Available"
+      ? input.code.executionAvailable && probeFresh
+        ? "Ready"
+        : "Available"
       : input.code.runtimeUnresolvedProfileCount > 0
         ? "Degraded"
       : input.code.executionAvailable && probeFresh
@@ -181,7 +183,9 @@ export function buildCapabilityReadinessV2(
     reason: !input.code.registered
       ? "The Code runtime is not registered."
       : input.code.repositoryProfileCount === 0
-        ? "Durable editing is available; bind a trusted repository before repository work."
+        ? input.code.executionAvailable && probeFresh
+          ? "Scratch workspace editing, sandbox validation, and known-folder export are ready without a repository binding. A trusted binding is required only for repository work."
+          : "Scratch workspace editing and known-folder export are available without a repository binding. Sandbox validation requires a fresh attested runtime probe."
         : input.code.runtimeUnresolvedProfileCount > 0
           ? `${input.code.runtimeUnresolvedProfileCount} trusted repository profile(s) still require a fresh immutable runtime binding.`
         : input.code.executionAvailable && probeFresh
@@ -192,7 +196,9 @@ export function buildCapabilityReadinessV2(
     nextAction: !input.code.registered
       ? "Reload Code capability"
       : input.code.repositoryProfileCount === 0
-        ? "Bind a repository"
+        ? codeStatus === "Ready"
+          ? "Review Code setup"
+          : "Run sandbox boundary probe"
         : input.code.runtimeUnresolvedProfileCount > 0
           ? "Refresh repository runtime binding"
         : codeStatus === "Ready"

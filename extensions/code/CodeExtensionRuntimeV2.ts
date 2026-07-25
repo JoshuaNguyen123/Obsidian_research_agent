@@ -43,6 +43,8 @@ import {
   type SandboxStagedFileBytesV2,
 } from "./sandbox";
 import {
+  createRepositoryProfileV2,
+  defaultRepositoryMergePolicyV2,
   detectRepositoryProfileV2,
   migrateRepositoryProfileV1,
   parseRepositoryProfileV2,
@@ -111,6 +113,7 @@ const MAX_SANDBOX_STAGING_TOTAL_BYTES = 10_000_000;
 const MAX_SANDBOX_STAGING_DIRECTORIES = 256;
 const MAX_SANDBOX_STAGING_METADATA_ENTRIES = 2_000;
 const MAX_SANDBOX_STAGING_DEPTH = 32;
+const SCRATCH_SANDBOX_PROJECT_ID = "scratch";
 const IGNORED_INVENTORY_DIRECTORIES = new Set([
   ".git",
   ".agent-backups",
@@ -602,23 +605,58 @@ export class CodeExtensionRuntimeV2 {
     artifactImporter?: SandboxArtifactImporterV2;
   }> {
     this.assertInitialized();
-    const profile = await this.getRepositoryProfile(sandboxAction.profileKey);
-    if (!profile) {
-      throw new CodeSandboxContributionErrorV2(
-        "repository_profile_missing",
-        "Sandbox staging requires a trusted RepositoryProfileV2.",
-      );
-    }
     const manifest = await this.workspaceManager.loadManifest(sandboxAction.workspaceId);
-    if (
-      manifest.kind !== "repository" ||
-      manifest.repositoryBinding?.profileKey !== profile.key ||
-      !samePath(manifest.repositoryBinding.repositoryRoot, profile.repositoryRoot)
-    ) {
-      throw new CodeSandboxContributionErrorV2(
-        "sandbox_workspace_binding_mismatch",
-        "Sandbox staging requires the exact trusted repository-worktree binding.",
+    let profile: RepositoryProfileV2;
+    if (manifest.kind === "scratch") {
+      const runtimeDigest = this.verifiedSandboxRuntimeDigests(["python"]).python;
+      if (!runtimeDigest) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_runtime_digest_required",
+          "Scratch validation requires a freshly verified sandbox runtime containing Python.",
+        );
+      }
+      profile = createScratchPythonSandboxProfileV2({
+        workspaceId: manifest.workspaceId,
+        canonicalRoot: manifest.canonicalRoot,
+        stagingManifest: sandboxAction.stagingManifest,
+        runtimeDigest,
+      });
+      const expectedCommand = selectForegroundValidationCommand(
+        profile,
+        SCRATCH_SANDBOX_PROJECT_ID,
+        sandboxAction.purpose,
       );
+      if (
+        sandboxAction.profileKey !== profile.key ||
+        sandboxAction.projectId !== SCRATCH_SANDBOX_PROJECT_ID ||
+        sandboxAction.commandId !== expectedCommand.id
+      ) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_workspace_binding_mismatch",
+          "Scratch sandbox staging does not match its host-generated workspace validation profile.",
+        );
+      }
+    } else {
+      const repositoryProfile = await this.getRepositoryProfile(sandboxAction.profileKey);
+      if (!repositoryProfile) {
+        throw new CodeSandboxContributionErrorV2(
+          "repository_profile_missing",
+          "Repository sandbox staging requires a trusted RepositoryProfileV2.",
+        );
+      }
+      if (
+        manifest.repositoryBinding?.profileKey !== repositoryProfile.key ||
+        !samePath(
+          manifest.repositoryBinding.repositoryRoot,
+          repositoryProfile.repositoryRoot,
+        )
+      ) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_workspace_binding_mismatch",
+          "Repository sandbox staging requires the exact trusted repository-worktree binding.",
+        );
+      }
+      profile = repositoryProfile;
     }
     if (manifest.hashes.indexFingerprint !== sandboxAction.workspaceManifestFingerprint) {
       throw new CodeSandboxContributionErrorV2(
@@ -821,48 +859,91 @@ export class CodeExtensionRuntimeV2 {
       : null;
     const resolvedWorkspaceId = foregroundScope?.workspaceId ?? workspaceId;
     const manifest = await this.workspaceManager.loadManifest(resolvedWorkspaceId);
-    const profileKey = manifest.repositoryBinding?.profileKey;
-    const profile = profileKey ? await this.getRepositoryProfile(profileKey) : null;
-    if (
-      !profile ||
-      manifest.kind !== "repository" ||
-      !samePath(manifest.repositoryBinding!.repositoryRoot, profile.repositoryRoot)
-    ) {
-      throw new CodeSandboxContributionErrorV2(
-        "sandbox_workspace_binding_mismatch",
-        "Sandbox preparation requires the exact trusted repository-worktree profile binding.",
+    let profile: RepositoryProfileV2;
+    let projectId: string;
+    let stagingRoots: string[];
+    if (manifest.kind === "scratch") {
+      const stagingManifest = await collectSandboxStagingManifest(
+        this.workspaceManager,
+        manifest.workspaceId,
+        ["."],
       );
-    }
-    const changedPaths = manifest.budget.changedPaths;
-    const projects = profile.projects.filter((candidate) =>
-      changedPaths.length === 0 || changedPaths.every((relativePath) =>
-        candidate.allowedPaths.some((allowed) => pathAtOrBelow(allowed, relativePath)),
-      ),
-    );
-    if (projects.length !== 1) {
-      throw new CodeSandboxContributionErrorV2(
-        "sandbox_project_binding_mismatch",
-        [
-          "Sandbox preparation requires exactly one project covering the trusted workspace changes.",
-          `changedPaths=${JSON.stringify(changedPaths)}`,
-          `projectAllowed=${JSON.stringify(
-            profile.projects.map((project) => ({
-              id: project.id,
-              allowedPaths: project.allowedPaths,
-            })),
-          )}`,
-        ].join(" "),
+      const sandboxStatus = await this.probeConfiguredSandboxProviders();
+      if (!sandboxStatus.executionAvailable) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_provider_unavailable",
+          sandboxStatus.blocker?.message ??
+            "No sandbox provider passed the fresh preparation boundary probe.",
+        );
+      }
+      const runtimeDigest = this.verifiedSandboxRuntimeDigests(["python"]).python;
+      if (!runtimeDigest) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_runtime_digest_required",
+          "Scratch validation requires a verified sandbox runtime containing Python.",
+        );
+      }
+      profile = createScratchPythonSandboxProfileV2({
+        workspaceId: manifest.workspaceId,
+        canonicalRoot: manifest.canonicalRoot,
+        stagingManifest,
+        runtimeDigest,
+      });
+      projectId = SCRATCH_SANDBOX_PROJECT_ID;
+      stagingRoots = ["."];
+    } else {
+      const profileKey = manifest.repositoryBinding?.profileKey;
+      const repositoryProfile = profileKey
+        ? await this.getRepositoryProfile(profileKey)
+        : null;
+      if (
+        !repositoryProfile ||
+        !samePath(
+          manifest.repositoryBinding!.repositoryRoot,
+          repositoryProfile.repositoryRoot,
+        )
+      ) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_workspace_binding_mismatch",
+          "Sandbox preparation requires the exact trusted repository-worktree profile binding.",
+        );
+      }
+      const changedPaths = manifest.budget.changedPaths;
+      const projects = repositoryProfile.projects.filter((candidate) =>
+        changedPaths.length === 0 || changedPaths.every((relativePath) =>
+          candidate.allowedPaths.some((allowed) =>
+            pathAtOrBelow(allowed, relativePath)
+          ),
+        ),
       );
+      if (projects.length !== 1) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_project_binding_mismatch",
+          [
+            "Sandbox preparation requires exactly one project covering the trusted workspace changes.",
+            `changedPaths=${JSON.stringify(changedPaths)}`,
+            `projectAllowed=${JSON.stringify(
+              repositoryProfile.projects.map((project) => ({
+                id: project.id,
+                allowedPaths: project.allowedPaths,
+              })),
+            )}`,
+          ].join(" "),
+        );
+      }
+      profile = repositoryProfile;
+      projectId = projects[0].id;
+      stagingRoots = [
+        ...projects[0].allowedPaths,
+        ...profile.protectedControls.map((control) => control.path),
+      ];
     }
-    const project = projects[0];
+    const project = profile.projects.find((candidate) => candidate.id === projectId)!;
     const command = selectForegroundValidationCommand(profile, project.id, purpose);
     const stagingManifest = await collectSandboxStagingManifest(
       this.workspaceManager,
       manifest.workspaceId,
-      [
-        ...project.allowedPaths,
-        ...profile.protectedControls.map((control) => control.path),
-      ],
+      stagingRoots,
     );
     for (const entry of stagingManifest) {
       const tracked = manifest.hashes.files[entry.path];
@@ -882,13 +963,15 @@ export class CodeExtensionRuntimeV2 {
         "The trusted workspace has no hash-bound files in the selected project scope.",
       );
     }
-    const sandboxStatus = await this.probeConfiguredSandboxProviders();
-    if (!sandboxStatus.executionAvailable) {
-      throw new CodeSandboxContributionErrorV2(
-        "sandbox_provider_unavailable",
-        sandboxStatus.blocker?.message ??
-          "No sandbox provider passed the fresh preparation boundary probe.",
-      );
+    if (manifest.kind === "repository") {
+      const sandboxStatus = await this.probeConfiguredSandboxProviders();
+      if (!sandboxStatus.executionAvailable) {
+        throw new CodeSandboxContributionErrorV2(
+          "sandbox_provider_unavailable",
+          sandboxStatus.blocker?.message ??
+            "No sandbox provider passed the fresh preparation boundary probe.",
+        );
+      }
     }
     return {
       profile,
@@ -2611,6 +2694,74 @@ function selectForegroundValidationCommand(
     "sandbox_validation_command_unavailable",
     `The trusted repository profile has no unambiguous ${exactPhase} command for project ${projectId}.`,
   );
+}
+
+/**
+ * Scratch workspaces intentionally carry no repository or Git authority.
+ * Their validation contract is generated entirely by the host from a
+ * hash-bound staging inventory and a freshly verified sandbox runtime.
+ */
+function createScratchPythonSandboxProfileV2(input: {
+  workspaceId: string;
+  canonicalRoot: string;
+  stagingManifest: readonly { path: string; sha256: string; bytes: number }[];
+  runtimeDigest: string;
+}): RepositoryProfileV2 {
+  const pythonPaths = input.stagingManifest
+    .map((entry) => assertWorkspaceRelativePathV2(entry.path))
+    .filter((entryPath) => entryPath.toLowerCase().endsWith(".py"));
+  if (pythonPaths.length === 0) {
+    throw new CodeSandboxContributionErrorV2(
+      "scratch_validation_unsupported",
+      "Scratch validation currently requires at least one Python .py file. The workspace remains editable and exportable.",
+    );
+  }
+  const profileKey = `scratch-${sha256Canonical({
+    version: 1,
+    workspaceId: input.workspaceId,
+  }).slice("sha256:".length, "sha256:".length + 32)}`;
+  const validationCatalog: RepositoryValidationCommandV2[] = (
+    ["fast", "targeted", "full"] as const
+  ).map((phase) => ({
+    id: `scratch-python-${phase}`,
+    phase,
+    projectId: SCRATCH_SANDBOX_PROJECT_ID,
+    executable: "python",
+    args: ["-m", "compileall", "-q", "."],
+    cwd: ".",
+    timeoutMs: 60_000,
+    network: "disabled",
+    credentialPolicy: "none",
+    lockfile: null,
+  }));
+  return createRepositoryProfileV2({
+    key: profileKey,
+    displayName: `Scratch workspace ${input.workspaceId}`,
+    repositoryRoot: input.canonicalRoot,
+    defaultBranch: "scratch",
+    projects: [{
+      id: SCRATCH_SANDBOX_PROJECT_ID,
+      root: ".",
+      ecosystems: ["python"],
+      allowedPaths: ["."],
+    }],
+    ecosystems: ["python"],
+    allowedPaths: ["."],
+    protectedControls: [],
+    pinnedRuntimes: [{
+      projectId: SCRATCH_SANDBOX_PROJECT_ID,
+      ecosystem: "python",
+      executable: "python",
+      version: "sandbox-bundled",
+      source: "immutable_digest",
+      digest: input.runtimeDigest,
+      approval: "one_time_exact_digest",
+    }],
+    validationCatalog,
+    generatedOutputs: [],
+    requiredGitHubChecks: [],
+    mergePolicy: defaultRepositoryMergePolicyV2(),
+  });
 }
 
 function contextRunId(context: ScopedExtensionContextV1): string {

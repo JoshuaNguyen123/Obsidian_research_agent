@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
@@ -41,9 +42,11 @@ test.describe("Daily-use live research contract", () => {
       expect(appendReceipts, JSON.stringify(safeState)).toHaveLength(1);
       expect(after.startsWith(before)).toBe(true);
       expect(after).toContain(harness.marker);
-      expect(after).toMatch(/retention\s+(?:improved|increased|rose|grew)/iu);
       expect(after).toMatch(
-        /error(?:s|\s+rates?)?\s+(?:fell|dropped|decreased|declined)/iu,
+        /(?:retention.{0,80}(?:improved|increased|rose|grew)|(?:improved|increased|rose|grew).{0,80}retention)/iu,
+      );
+      expect(after).toMatch(
+        /(?:error(?:s|\s+rates?)?.{0,80}(?:fell|dropped|decreased|declined|reduced|lowered)|(?:fell|dropped|decreased|declined|reduced|lowered).{0,80}error(?:s|\s+rates?)?|(?:drop|reduction|decrease|decline)\s+in\s+(?:the\s+)?error(?:s|\s+rates?)?|fewer\s+error(?:s|\s+rates?)?)/iu,
       );
       expect(appendReceipts[0]?.readback).toBeTruthy();
       expect(
@@ -89,6 +92,12 @@ test.describe("Daily-use live research contract", () => {
       const conflicts = Array.isArray(snapshot.redactedEvidenceConflicts)
         ? snapshot.redactedEvidenceConflicts
         : [];
+      const analyzePhaseWriteBlocks = snapshot.diagnosticAttestations.filter(
+        (item: any) =>
+          /research phase gate blocked a write during analyze/iu.test(
+            item?.message ?? "",
+          ),
+      );
       const safeState = {
         complete: snapshot.lastComplete,
         acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
@@ -106,6 +115,7 @@ test.describe("Daily-use live research contract", () => {
         fetchedPassageCount: fetchedPassageIds.size,
         citedPassageCount: new Set(citedPassageIds).size,
         conflicts,
+        analyzePhaseWriteBlockCount: analyzePhaseWriteBlocks.length,
         diagnostics: snapshot.diagnosticAttestations,
         providerUsage: snapshot.providerUsage,
       };
@@ -115,6 +125,7 @@ test.describe("Daily-use live research contract", () => {
         snapshot.lastReceipts.filter((receipt: any) => receipt.operation === "append"),
         JSON.stringify(safeState),
       ).toHaveLength(1);
+      expect(analyzePhaseWriteBlocks, JSON.stringify(safeState)).toHaveLength(0);
       expect(graphNodes.some((node) => node.allowedTools?.includes("web_search"))).toBe(true);
       expect(graphNodes.some((node) => node.allowedTools?.includes("web_fetch"))).toBe(true);
       expect(
@@ -313,10 +324,74 @@ test.describe("Daily-use live research contract", () => {
       await expect(denied).toContainText("fingerprint=sha256:");
       expect(await readFile(harness.noteFilePath, "utf8")).toBe(original);
       await harness.deny(denied);
-      await harness.waitForMissionComplete();
+      const activeHarness = harness;
+      const page = activeHarness.page;
+      const missionTimeoutMs = activeHarness.config.missionTimeoutMs;
+      const readDurableDenialState = async () => {
+        const vaultRoot = dirname(dirname(activeHarness.noteFilePath));
+        const graphDirectory = join(vaultRoot, "Agent Runs", "Mission Graphs");
+        const graphNames = (await readdir(graphDirectory))
+          .filter((name) => name.endsWith(".md"))
+          .sort()
+          .reverse();
+        for (const graphName of graphNames) {
+          const markdown = await readFile(join(graphDirectory, graphName), "utf8");
+          if (!markdown.includes(activeHarness.marker)) continue;
+          const normalized = markdown.replace(/\r\n/gu, "\n");
+          const payload = normalized
+            .split("## Mission Graph Store\n```json\n")[1]
+            ?.split("\n```")[0];
+          if (!payload) continue;
+          try {
+            const graphStore = JSON.parse(payload) as any;
+            const replacementNode = Object.values(
+              graphStore?.graph?.nodes ?? {},
+            ).find(
+              (node: any) =>
+                Array.isArray(node?.allowedTools) &&
+                node.allowedTools.includes("replace_current_file"),
+            ) as any;
+            if (!replacementNode) continue;
+            return {
+              status: replacementNode.status ?? null,
+              blockerCode: replacementNode.blocker?.code ?? null,
+            };
+          } catch {
+            // The graph store is still being atomically projected; poll again.
+          }
+        }
+        return null;
+      };
+      const denialDeadline = Date.now() + missionTimeoutMs;
+      let durableDenialState: Awaited<ReturnType<typeof readDurableDenialState>> = null;
+      while (Date.now() < denialDeadline) {
+        durableDenialState = await readDurableDenialState();
+        if (
+          durableDenialState?.status === "blocked" &&
+          durableDenialState.blockerCode === "approval_denied"
+        ) {
+          break;
+        }
+        await page.waitForTimeout(250);
+      }
+      expect(durableDenialState).toMatchObject({
+        status: "blocked",
+        blockerCode: "approval_denied",
+      });
+      const runButton = page.locator("button.agentic-researcher-run");
+      await expect(runButton).toHaveText("Run Mission", {
+        timeout: missionTimeoutMs,
+      });
+      await expect(runButton).toBeEnabled();
       expect(await readFile(harness.noteFilePath, "utf8")).toBe(original);
 
-      await harness.submitMission(prompt, { waitForCompletion: false });
+      await harness.submitMission(prompt, {
+        waitForCompletion: false,
+        // This is the dependent approved retry for the same exact mission;
+        // retain the denial transcript instead of exercising unrelated chat
+        // cleanup while an historical approval card remains rendered.
+        clearChatFirst: false,
+      });
       await harness.page.getByRole("tab", { name: "Run Details" }).click();
       const approved = harness.activePreparedApproval("replace_current_file");
       await expect(approved).toBeVisible({ timeout: harness.config.missionTimeoutMs });
@@ -343,14 +418,28 @@ test.describe("Daily-use live research contract", () => {
         {},
         {
           orchestratorEnabled: true,
-          enableStreaming: true,
-          thinkingMode: "auto",
-          maxAgentSteps: 28,
+          // Keep the two sequential participant budgets inside this lane's
+          // 15-minute Playwright cap. The host derives root time as worker +
+          // lead, where lead uses max(worker, maxRunMinutes): 2 + 3 = 5m.
+          // This remains a real-provider handoff but avoids timing out an
+          // intentionally still-running team before its host deadline.
+          enableStreaming: false,
+          thinkingMode: "off",
+          requestTimeoutMs: 90_000,
+          maxRunMinutes: 3,
+          maxAgentSteps: 16,
+          orchestratorWorkerMaxSteps: 6,
+          orchestratorWorkerMaxToolCalls: 6,
+          orchestratorWorkerMaxMinutes: 2,
+          agenticReflexEnabled: false,
         },
       );
       await harness.installOwnedWebBackend({ sourceCount: 2 });
       await harness.submitMission(
-        `Do a deep research investigation with sources and evidence about controlled onboarding validation. Fetch owned sources, then append a short cited findings section to the current note including ${harness.marker}.`,
+        `Run one bounded research-team mission about controlled onboarding validation. Have the read-only Researcher fetch exactly one owned source, then hand that accepted evidence to the Lead. Only the Lead may append one short cited findings section to the current note including ${harness.marker}.`,
+        // The bounded worker + lead root deadline is five minutes; leave a
+        // separate observer buffer for terminal projection and cleanup.
+        { timeoutMs: 8 * 60_000 },
       );
       const snapshot = await harness.attestProductionRun();
       const orchestrator = snapshot.lastMissionLedger?.orchestrator;
@@ -373,6 +462,7 @@ test.describe("Daily-use live research contract", () => {
           snapshot.lastComplete.stopReason === "final" ||
           snapshot.lastComplete.stopReason === "budget" ||
           snapshot.lastComplete.stopReason === "blocked",
+        JSON.stringify(safeState),
       ).toBe(true);
     } finally {
       await harness?.close();

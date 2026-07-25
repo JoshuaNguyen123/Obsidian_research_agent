@@ -36,6 +36,10 @@ const SOFT_FORCE = new Set([
   "research_memory_get",
   "open_web_source",
   "read_source_cache",
+  "analyze_dataset",
+  "resolve_citation",
+  "verify_citation",
+  "export_bibtex",
 ]);
 
 /**

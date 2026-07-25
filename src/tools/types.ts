@@ -18,6 +18,8 @@ import type {
   ToolDescriptor,
 } from "../agent/actions";
 import type { ProjectLineageV1 } from "../agent/projectLifecycle";
+import type { ToolOutcomeMemoryV1 } from "../agent/outcomeMemory";
+import type { CapabilityReadinessV2 } from "../agent/capabilityReadiness";
 
 export type AgentMissionMode =
   | "chat_only"
@@ -128,6 +130,15 @@ export interface ToolExecutionContext {
   setResearchMemoryIndex?: (
     entries: ResearchMemoryIndexEntry[],
   ) => Promise<void> | void;
+  /**
+   * Cross-run tool outcome ledger. Absent on hosts that do not persist it, in
+   * which case the runner keeps a run-local ledger and simply learns nothing
+   * across runs — the pre-existing behavior.
+   */
+  getToolOutcomeMemory?: () => ToolOutcomeMemoryV1 | null;
+  setToolOutcomeMemory?: (
+    memory: ToolOutcomeMemoryV1,
+  ) => Promise<void> | void;
   /** Host-validated project lineage used to bind downstream provider reads. */
   getProjectLineages?: () => ProjectLineageV1[];
   /**
@@ -135,6 +146,8 @@ export interface ToolExecutionContext {
    * `code_workspace_create` when the mission names exactly one of them.
    */
   getRepositoryProfileKeys?: () => readonly string[];
+  /** Fresh host-owned readiness evidence for pre-model capability blockers. */
+  getCapabilityReadiness?: () => readonly CapabilityReadinessV2[];
   semanticEmbeddingProvider?: SemanticEmbeddingProvider;
   semanticIndexService?: SemanticIndexService;
   /** Optional run-scoped flags for set-loose compound autonomy. */
@@ -191,6 +204,12 @@ export interface AgentRuntimeCache {
   /** Successful strong-hash web reads retained for proof-bound downstream tools. */
   trustedWebFetchResults?: Map<string, ToolExecutionResult>;
   /**
+   * Latest exact Mermaid block read retained for the immediately dependent
+   * hash-bound upsert. The observation survives transcript compaction and is
+   * cleared after a successful mutation.
+   */
+  verifiedMermaidRead?: VerifiedMermaidReadObservation;
+  /**
    * Bounded, run-local workspace reads used to bind a later exact-path write to
    * the host-observed SHA even when model-visible tool messages are compacted.
    * These observations are never used to skip a fresh tool execution.
@@ -220,6 +239,12 @@ export interface VerifiedWorkspaceReadObservation {
   path: string;
   sha256: string;
   content: string;
+}
+
+export interface VerifiedMermaidReadObservation {
+  path: string;
+  sha256: string;
+  selector: Record<string, unknown>;
 }
 
 export interface CodeValidationDiagnosticObservation {

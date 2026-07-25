@@ -49,7 +49,7 @@ export function createGitHubPublicationTool(
   const tool: AgentTool = {
     name: PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
     description:
-      "Purpose: Push verified branch and create draft PR (or Bound merge when mission asks). Use when: after code_commit_verified + private repo. Do not use when: before commit; do not invent git_push. Required: action publish_draft|merge + bindings. Next: note reflection. Side effects: bound/hard for merge. Publish the latest host-verified local commit for a trusted repository profile to its agent-owned GitHub branch and draft pull request, or refresh proof and request a separate double-exact merge. The model supplies only a logical profile key and PR prose; local paths, SHAs, credentials, repository destinations, checks, and merge policy are host-resolved.",
+      "Purpose: Push verified branch and create draft PR (or Bound merge when mission asks). Use when: after code_commit_verified + private repo. Do not use when: before commit; do not invent git_push. Required: action publish_draft|merge + bindings. Next: note reflection. Side effects: bound/hard for merge. Publish the latest host-verified local commit for a trusted repository profile to its agent-owned GitHub branch and draft pull request, or refresh proof and request a separate double-exact merge. The model supplies only a logical profile key and optional PR prose; when title or body is omitted for publish_draft, the host emits a bounded verified-publication summary. Local paths, SHAs, credentials, repository destinations, checks, and merge policy are host-resolved.",
     parameters: {
       type: "object",
       properties: {
@@ -64,11 +64,11 @@ export function createGitHubPublicationTool(
         },
         title: {
           type: "string",
-          description: "Draft pull request title for publish_draft.",
+          description: "Optional draft pull request title for publish_draft. When omitted, the host derives a bounded title from the trusted verified handoff.",
         },
         body: {
           type: "string",
-          description: "Draft pull request body for publish_draft.",
+          description: "Optional draft pull request body for publish_draft. When omitted, the host emits a bounded summary of the verified handoff. A supplied value must be nonblank safe prose.",
         },
       },
       required: ["action", "profileKey"],
@@ -235,8 +235,7 @@ async function executeGitHubPublication(
   });
   const publicationId = `github-${profileKey}-${handoff.fingerprint.slice(7, 31)}`;
   if (action === "publish_draft") {
-    const title = boundedText(args.title, "pull request title", 1, 256);
-    const body = boundedText(args.body, "pull request body", 1, 65_536, true);
+    const { title, body } = resolveDraftPublicationDocument(args, handoff);
     const existing = await options.getCheckpoint(publicationId);
     if (existing?.status === "finalized") return existing;
     if (existing?.status === "reconcile_required") {
@@ -262,26 +261,53 @@ async function executeGitHubPublication(
         context.abortSignal,
       );
     }
+    const hasVerifiedDraftPr = Boolean(
+      typeof existing?.pullRequest?.htmlUrl === "string" &&
+        /^https:\/\/github\.com\//iu.test(existing.pullRequest.htmlUrl),
+    );
+    const retryAfterVerifiedPush =
+      existing &&
+      !hasVerifiedDraftPr &&
+      (
+        (existing.status === "blocked" &&
+          existing.blocker?.code === "github_draft_pr_not_applied") ||
+        ((existing.status === "push_prepared" ||
+          existing.status === "pushed_verified") &&
+          existing.blocker === null &&
+          existing.pendingAction === null &&
+          existing.remoteSha === existing.headSha &&
+          existing.receiptIds.length > 0)
+      );
+    if (retryAfterVerifiedPush && existing) {
+      return workflow.retryDraftPublicationAfterNotApplied(existing, {
+        title,
+        body,
+        binding: binding.workflowBinding,
+        handoff: adaptHandoff(handoff),
+        signal: context.abortSignal,
+      });
+    }
     if (existing?.status === "pushed_verified") {
       return workflow.resumeDraftPublication(existing, {
         title,
         body,
         binding: binding.workflowBinding,
+        handoff: adaptHandoff(handoff),
         signal: context.abortSignal,
       });
     }
-    // Incomplete push_prepared / blocked checkpoints must NOT be returned as
-    // success. A prior auth-failed push leaves push_prepared durable; the old
-    // catch-all `if (existing) return existing` made retries look successful
-    // with pullRequest=null and then collided external receipt ids.
-    const incompleteWithoutDraftPr =
+    // A prior auth-failed push has no verified remote or receipt, so it may
+    // restart the full publication flow. In contrast, any durable push proof
+    // is routed above through a fresh PR-only approval and retains its receipt
+    // lineage.
+    const incompleteInitialPush =
       existing &&
-      !(
-        typeof existing.pullRequest?.htmlUrl === "string" &&
-        /^https:\/\/github\.com\//iu.test(existing.pullRequest.htmlUrl)
-      ) &&
-      (existing.status === "push_prepared" || existing.status === "blocked");
-    if (incompleteWithoutDraftPr) {
+      !hasVerifiedDraftPr &&
+      existing.status === "push_prepared" &&
+      existing.remoteSha === null &&
+      existing.receiptIds.length === 0 &&
+      existing.pendingAction === null;
+    if (incompleteInitialPush) {
       return workflow.publishDraft({
         explicitUserMission: true,
         publicationId,
@@ -463,6 +489,39 @@ function boundedText(
     );
   }
   return text;
+}
+
+/**
+ * A draft PR is an externally visible proof artifact, not an invitation for
+ * the model to invent repository authority.  It is nevertheless useful when
+ * a model focuses on the durable publication action and omits prose entirely.
+ * In that narrow case derive a factual, bounded document from the already
+ * verified handoff.  Explicit prose remains subject to the same strict
+ * validation: an empty string is not silently replaced.
+ */
+function resolveDraftPublicationDocument(
+  args: Record<string, unknown>,
+  handoff: VerifiedCodePublicationHandoffV1,
+): { title: string; body: string } {
+  const title =
+    args.title === undefined
+      ? `Verified change for ${handoff.repositoryProfileKey}`
+      : boundedText(args.title, "pull request title", 1, 256);
+  const body =
+    args.body === undefined
+      ? [
+        "## Verified publication",
+        "",
+        "This draft was generated by the host from an already verified local commit.",
+        "",
+        `- Repository profile: \`${handoff.repositoryProfileKey}\``,
+        `- Workspace: \`${handoff.workspaceId}\``,
+        `- Branch: \`${handoff.branch}\``,
+        `- Commit: \`${handoff.commitSha}\``,
+        "- Validation: targeted and full checks were verified before publication.",
+      ].join("\n")
+      : boundedText(args.body, "pull request body", 1, 65_536, true);
+  return { title, body };
 }
 
 function optionsTimestamp(now: (() => Date) | undefined): string {

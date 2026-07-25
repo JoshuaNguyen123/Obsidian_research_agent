@@ -19,6 +19,21 @@ const PROCESS_NARRATION_PATTERNS: RegExp[] = [
 const TOOL_NAME_LEAK =
   /\b(?:append_to_current_file|replace_current_file|edit_current_section|read_current_file)\b/;
 
+const LEADING_WRITE_TOOL_ARTIFACT =
+  /^(?:[ \t]*\r?\n)*(?:`{1,3})?(?:append_to_current_file|replace_current_file|edit_current_section)(?:`{1,3})?[ \t]*(?:\r?\n)+(?:[ \t]*\r?\n)*(?=(?: {0,3})#(?:[ \t]|$)|---(?:\r?\n|$))/;
+
+/**
+ * Some providers occasionally prefix a buffered correction with the bare tool
+ * name before the real markdown body. That token is transport/process markup,
+ * not user content. Strip only the narrow, leading tool-line + markdown-title
+ * shape so legitimate documentation that mentions a tool remains untouched.
+ */
+export function stripLeadingVaultWriteToolArtifact(text: string): string {
+  const value = String(text ?? "");
+  const match = LEADING_WRITE_TOOL_ARTIFACT.exec(value);
+  return match ? value.slice(match[0].length) : value;
+}
+
 /** First-person lead-ins that must not live-flush into a replace stream. */
 export function looksLikeProcessNarrationLead(text: string): boolean {
   const trimmed = String(text ?? "").trimStart();
@@ -32,6 +47,9 @@ export function isVaultWriteProcessNarration(text: string): boolean {
   const trimmed = String(text ?? "").trim();
   if (!trimmed) {
     return false;
+  }
+  if (stripLeadingVaultWriteToolArtifact(trimmed) !== trimmed) {
+    return true;
   }
   if (PROCESS_NARRATION_PATTERNS.some((pattern) => pattern.test(trimmed))) {
     return true;

@@ -5,11 +5,25 @@ import {
   cleanupLinearResourceIfPresent,
   DisposableExternalCleanupManifest,
   KNOWN_E2E_GITHUB_RESIDUE_REPOSITORY_NAMES,
+  orderGitHubHarnessTokensForPush,
   preflightDisposableRepositoryDeleteAuthority,
   proveRestRepositoryAdministration,
   safeExternalCleanupError,
 } from "../e2e/fixtures/externalCleanup";
 import { GitHubApiError } from "../src/integrations/github/GitHubRestClient";
+
+test("GitHub harness tokens prefer repo-scoped classic/OAuth credentials for push", () => {
+  const fineGrained = `github_pat_${"a".repeat(24)}`;
+  const oauth = `gho_${"b".repeat(24)}`;
+  assert.deepEqual(
+    orderGitHubHarnessTokensForPush([
+      fineGrained,
+      oauth,
+      fineGrained,
+    ]),
+    [oauth, fineGrained],
+  );
+});
 
 test("external cleanup runs every registered resource in reverse order and aggregates failures", async () => {
   const observed: string[] = [];

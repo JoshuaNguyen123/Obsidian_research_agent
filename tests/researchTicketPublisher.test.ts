@@ -464,6 +464,57 @@ test("publisher prepares one deterministic pinned create and verifies independen
   assert.equal(searches.length, 2);
 });
 
+test("publisher accepts Linear markdown round-trip formatting normalization", async () => {
+  let preparedArguments: Record<string, unknown> | undefined;
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") return page([]);
+      if (operationKey === "issues.get") {
+        if (!preparedArguments) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
+        const description = String(preparedArguments.description)
+          .replace(
+            /(<!-- agentic-researcher:work-item:v2:start -->)\n```/u,
+            "$1\n\n```",
+          )
+          .replace(
+            /```\n(<!-- agentic-researcher:work-item:v2:end -->)/u,
+            "```\n\n$1",
+          )
+          .replace(
+            /^- (https:\/\/\S+)$/gmu,
+            "* [$1](<$1>)",
+          )
+          .replace(/^- /gmu, "* ")
+          .split("\n")
+          .map((line) => `${line}  `)
+          .join("\r\n");
+        return issue(String(variables.id), `\n${description}\n`, QUEUE_PROJECT_ID);
+      }
+      throw new Error(`Unexpected operation ${operationKey}`);
+    },
+  };
+  const publisher = publisherFixture(
+    readClient,
+    fakeExecutor({
+      onPrepare: (arguments_) => {
+        preparedArguments = arguments_;
+      },
+    }),
+  );
+
+  const result = await publisher.publish(requestFixture());
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.status, "created");
+});
+
 test("publisher supports an exact team-scoped destination when Linear has no project", async () => {
   const searches: Array<Record<string, unknown>> = [];
   let preparedArguments: Record<string, unknown> | undefined;
@@ -567,6 +618,10 @@ test("publisher fails closed when created issue readback changes project or desc
       assert.equal(result.status, "reconcile_required");
       assert.equal(result.error.code, "research_ticket_readback_mismatch");
       assert.match(result.error.message, mismatch === "project" ? /project/i : /description/i);
+      if (mismatch === "description") {
+        assert.match(result.error.message, /First normalized difference is line \d+/u);
+        assert.doesNotMatch(result.error.message, /https?:\/\/|sha256:/iu);
+      }
     });
   }
 });

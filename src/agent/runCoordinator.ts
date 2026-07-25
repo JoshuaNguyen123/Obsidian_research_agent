@@ -10,7 +10,16 @@ import type {
 } from "../AgentRunner";
 import type { MissionGraphV3 } from "../../packages/headless-runtime/src/missionGraphV3";
 import type { MissionLedgerSummary } from "./missionLedger";
+import type { MissionScorecardV1 } from "./missionScorecard";
 import type { MissionGraphStoreReferenceV1 } from "./runStore";
+import {
+  createRunSteeringQueue,
+  drainSteeringDirectives,
+  enqueueSteeringDirective,
+  type RunSteeringQueueV1,
+  type SteeringDirectiveV1,
+  type SteeringEnqueueResult,
+} from "./runSteering";
 
 const MAX_BUFFERED_RUN_EVENTS = 800;
 const MAX_BUFFERED_RUN_EVENT_CHARS = 2_000_000;
@@ -38,6 +47,7 @@ export interface RunCoordinatorSnapshot {
   lastConfig: AgentRunConfigEvent | null;
   modelCallEvidence: ModelCallEvidenceV1[];
   missionEvidence: MissionEvidenceAttestationV1[];
+  lastMissionScorecard: MissionScorecardV1 | null;
   diagnosticAttestations: RunDiagnosticAttestationV1[];
   providerUsage: ModelUsageAggregateV1;
   lastMissionGraph: MissionGraphV3 | null;
@@ -111,12 +121,14 @@ export class RunCoordinator {
   private readonly bufferedEvents: BufferedRunEvent[] = [];
   private activePromise: Promise<RunOutcome> | null = null;
   private activeController: AbortController | null = null;
+  private steeringQueue: RunSteeringQueueV1 = createRunSteeringQueue();
   private activeEventTap: AgentRunEvents | null = null;
   private state: RunCoordinatorState = "idle";
   private runId: string | null = null;
   private lastConfig: AgentRunConfigEvent | null = null;
   private readonly modelCallEvidence: ModelCallEvidenceV1[] = [];
   private readonly missionEvidence: MissionEvidenceAttestationV1[] = [];
+  private lastMissionScorecard: MissionScorecardV1 | null = null;
   private readonly diagnosticAttestations: RunDiagnosticAttestationV1[] = [];
   private providerUsage: ModelUsageAggregateV1 = emptyProviderUsage();
   private lastMissionGraph: MissionGraphV3 | null = null;
@@ -154,6 +166,9 @@ export class RunCoordinator {
         ...item,
         passageIds: [...item.passageIds],
       })),
+      lastMissionScorecard: this.lastMissionScorecard
+        ? structuredCloneValue(this.lastMissionScorecard)
+        : null,
       diagnosticAttestations: this.diagnosticAttestations.map((item) => ({
         ...item,
         missing: [...item.missing],
@@ -222,6 +237,7 @@ export class RunCoordinator {
     this.lastConfig = null;
     this.modelCallEvidence.splice(0, this.modelCallEvidence.length);
     this.missionEvidence.splice(0, this.missionEvidence.length);
+    this.lastMissionScorecard = null;
     this.diagnosticAttestations.splice(0, this.diagnosticAttestations.length);
     this.providerUsage = emptyProviderUsage();
     // Keep an integrity-checked restart projection visible until the accepted
@@ -235,6 +251,9 @@ export class RunCoordinator {
     this.lastReceipts.splice(0, this.lastReceipts.length);
     this.lastComplete = null;
     this.activeController = new AbortController();
+    // Steering never carries across runs: a directive narrows the mission the
+    // user was watching, not the next one.
+    this.steeringQueue = createRunSteeringQueue();
     this.state = "running";
     this.startedAtMs = Date.now();
     this.lastActivityAtMs = this.startedAtMs;
@@ -331,12 +350,53 @@ export class RunCoordinator {
     });
     this.lastReceipts.splice(0, this.lastReceipts.length);
     this.missionEvidence.splice(0, this.missionEvidence.length);
+    this.lastMissionScorecard = null;
     this.diagnosticAttestations.splice(0, this.diagnosticAttestations.length);
     this.lastComplete = null;
     this.state = "idle";
     this.startedAtMs = null;
     this.lastActivityAtMs = Date.now();
     return true;
+  }
+
+  /**
+   * Queue a narrowing steering directive for the active run. Rejects anything
+   * that would widen authority, so a directive can never reach a tool the host
+   * did not already authorize. Returns the typed result so callers can surface
+   * the exact rejection reason.
+   */
+  steerActiveRun(input: {
+    kind: string;
+    text: string;
+    toolName?: string;
+  }): SteeringEnqueueResult {
+    if (this.state !== "running") {
+      return {
+        ok: false,
+        code: "no_active_run",
+        message: "There is no active run to steer.",
+      };
+    }
+    const result = enqueueSteeringDirective(this.steeringQueue, {
+      ...input,
+      enqueuedAt: new Date().toISOString(),
+    });
+    if (result.ok) {
+      this.steeringQueue = result.queue;
+      this.lastActivityAtMs = Date.now();
+    }
+    return result;
+  }
+
+  /** Runner-facing port: drains pending directives at a step boundary. */
+  getRunSteeringPort(): { drain(): SteeringDirectiveV1[] } {
+    return {
+      drain: () => {
+        const { queue, drained } = drainSteeringDirectives(this.steeringQueue);
+        this.steeringQueue = queue;
+        return drained;
+      },
+    };
   }
 
   requestStop(reason = "user_requested"): boolean {
@@ -428,6 +488,11 @@ export class RunCoordinator {
         } else {
           this.missionEvidence.push(copied);
         }
+      }
+    } else if (key === "onMissionScorecard") {
+      const scorecard = args[0] as MissionScorecardV1 | undefined;
+      if (scorecard) {
+        this.lastMissionScorecard = structuredCloneValue(scorecard);
       }
     } else if (key === "onTrace") {
       const trace = args[0] as

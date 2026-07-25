@@ -6,6 +6,7 @@ import type {
 import type { AgentTool } from "./types";
 
 const VAULT_READS = new Set([
+  "analyze_dataset",
   "count_words",
   "find_related_notes",
   "get_note_graph_context",
@@ -33,7 +34,10 @@ const VAULT_READS = new Set([
   "suggest_note_links",
 ]);
 const WEB_READS = new Set([
+  "export_bibtex",
   "read_source_section",
+  "resolve_citation",
+  "verify_citation",
   "web_fetch",
   "web_search",
 ]);

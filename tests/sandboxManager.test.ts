@@ -66,6 +66,10 @@ test("SandboxManager stays editing-only until a provider passes its explicit bou
     probed.blocker?.message ?? "",
     /docker unavailable: Probe exited 1\./u,
   );
+  assert.match(
+    probed.providers[0]?.diagnostic ?? "",
+    /Probe exited 1\. provider unavailable/u,
+  );
   assert.ok(probed.providers[0]?.checkedAt, "failed probes retain an evidence timestamp");
   const prepared = await manager.prepareExecution(prepareInput());
   assert.equal(prepared.status, "blocked");
@@ -171,6 +175,51 @@ test("SandboxManager verifies staging, re-probes, executes with fixed argv, and 
   assert.equal(execute.args.includes("--volume"), false);
 });
 
+test("a prepared action naming an unconfigured provider fails closed with a non-null blocker", async () => {
+  const runner: SandboxCommandRunnerV2 = {
+    async run(spec) {
+      return spec.purpose === "boundary_probe"
+        ? { exitCode: 0, stdout: PROBE, stderr: "" }
+        : { exitCode: 0, stdout: "ok", stderr: "" };
+    },
+  };
+  const source = new TextEncoder().encode("export const value = 1;\n");
+  const staging = [{ path: "src/index.ts", bytes: source }];
+
+  // The action is prepared and sealed against a podman host...
+  const podmanProvider: SandboxProviderConfigV2 = {
+    ...dockerProvider(),
+    kind: "podman",
+    executable: "podman",
+    priority: 2,
+  };
+  const preparer = new SandboxManagerV2({ runner, providers: [podmanProvider] });
+  await preparer.probeProviders();
+  const prepared = await preparer.prepareExecution(prepareInput());
+  assert.equal(prepared.status, "prepared");
+  if (prepared.status !== "prepared") return;
+  assert.equal(prepared.action.provider, "podman");
+
+  // ...but executes on a host that only has docker configured and verified
+  // (a settings change, or a checkpoint restored across a config edit).
+  // readStatus().blocker is null because docker is healthy, so the old
+  // `readStatus().blocker!` produced { status: "blocked", blocker: null } here
+  // and crashed every consumer on blocker.code.
+  const executor = new SandboxManagerV2({ runner, providers: [dockerProvider()] });
+  await executor.probeProviders();
+  const result = await executor.executePrepared(prepared.action, {
+    authorization: authorization(prepared.action),
+    stagedFiles: staging,
+  });
+  assert.equal(result.status, "blocked");
+  if (result.status === "blocked") {
+    assert.equal(result.blocker.code, "sandbox_provider_unavailable");
+    assert.equal(typeof result.blocker.message, "string");
+    assert.ok(result.blocker.message.length > 0, "fail-closed blocker must carry a message");
+    assert.match(result.blocker.message, /podman/u);
+  }
+});
+
 test("lockfile restoration is exact-approved, credential-free, and cannot become arbitrary install", async () => {
   const specs: SandboxHostCommandSpecV2[] = [];
   const runner: SandboxCommandRunnerV2 = {
@@ -273,7 +322,7 @@ test("all provider command specs are shell-free, bounded, and omit host/root/soc
     const execute = buildSandboxExecutionCommandV2(provider, prepared.action);
     assert.equal(
       probe.timeoutMs,
-      provider.kind === "wsl2" ? 60_000 : 30_000,
+      provider.kind === "wsl2" ? 90_000 : 30_000,
       "WSL2 cold-start attestation has a bounded provider-specific budget",
     );
     assert.deepEqual(execute.env, {}, "action environment must not be inherited by the host provider process");

@@ -46,8 +46,8 @@ const TOOL_CHAINING_KEYS = [
 export interface RunContextBudget {
   numCtx: number | null;
   maxPromptChars: number;
-  /** Whether maxPromptChars came from settings.numCtx or the 48k assumption. */
-  budgetSource: "setting" | "assumed_48k";
+  /** Whether maxPromptChars came from settings.numCtx, the model-reported context window, or the 48k assumption. */
+  budgetSource: "setting" | "model_reported" | "assumed_48k";
 }
 
 /** Proof-critical excerpts retained across compaction for repair loops. */
@@ -71,7 +71,10 @@ export interface LoopCompactionResult {
   rejectionReason?: "invalid_handoff" | "non_reducing";
 }
 
-export function createRunContextBudget(numCtx: number | null): RunContextBudget {
+export function createRunContextBudget(
+  numCtx: number | null,
+  budgetSource?: RunContextBudget["budgetSource"],
+): RunContextBudget {
   const resolvedNumCtx = numCtx ?? DEFAULT_ASSUMED_NUM_CTX;
   const usableTokens = Math.max(
     1024,
@@ -80,8 +83,35 @@ export function createRunContextBudget(numCtx: number | null): RunContextBudget 
   return {
     numCtx,
     maxPromptChars: usableTokens * CHARS_PER_TOKEN_ESTIMATE,
-    budgetSource: numCtx === null ? "assumed_48k" : "setting",
+    budgetSource:
+      budgetSource ?? (numCtx === null ? "assumed_48k" : "setting"),
   };
+}
+
+/**
+ * Where the run's context budget came from: an explicit Settings value wins,
+ * then the model-reported context window, then the 48k assumption. A non-null
+ * resolved numCtx without either source (the set-loose floor) reports as
+ * "setting" to match the pre-existing display behavior.
+ */
+export function resolveRunContextBudgetSource(input: {
+  settingsNumCtx: number | null | undefined;
+  modelReportedContextLength: number | null;
+  resolvedNumCtx: number | null;
+}): RunContextBudget["budgetSource"] {
+  if (
+    typeof input.settingsNumCtx === "number" &&
+    Number.isFinite(input.settingsNumCtx) &&
+    input.settingsNumCtx > 0
+  ) {
+    return "setting";
+  }
+  if (input.resolvedNumCtx === null) {
+    return "assumed_48k";
+  }
+  return input.modelReportedContextLength !== null
+    ? "model_reported"
+    : "setting";
 }
 
 /** Recent tool-loop turns retained before falling back to 3 → 1 → 0. */

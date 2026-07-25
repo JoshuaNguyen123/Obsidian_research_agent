@@ -16,6 +16,8 @@ import type { ToolExecutionContext } from "../src/tools/types";
 function createCacheContext(now: Date) {
   const content = new Map<string, string>();
   const folders = new Set<string>();
+  const revisions = new Map<string, number>();
+  const readCounts = new Map<string, number>();
 
   const getFile = (path: string) =>
     content.has(path)
@@ -23,6 +25,10 @@ function createCacheContext(now: Date) {
           path,
           basename: path.split("/").pop()?.replace(/\.[^.]+$/i, "") ?? path,
           extension: path.split(".").pop()?.toLowerCase() ?? "",
+          stat: {
+            mtime: revisions.get(path) ?? 0,
+            size: content.get(path)?.length ?? 0,
+          },
         }
       : null;
 
@@ -36,12 +42,15 @@ function createCacheContext(now: Date) {
       },
       create: async (path: string, data: string) => {
         content.set(path, data);
+        revisions.set(path, (revisions.get(path) ?? 0) + 1);
         return getFile(path);
       },
       modify: async (file: { path: string }, data: string) => {
         content.set(file.path, data);
+        revisions.set(file.path, (revisions.get(file.path) ?? 0) + 1);
       },
       read: async (file: { path: string }) => {
+        readCounts.set(file.path, (readCounts.get(file.path) ?? 0) + 1);
         const value = content.get(file.path);
         if (value === undefined) {
           throw new Error(`File not found: ${file.path}`);
@@ -65,7 +74,7 @@ function createCacheContext(now: Date) {
     now: () => now,
   } as unknown as ToolExecutionContext;
 
-  return { context, content, folders };
+  return { context, content, folders, readCounts };
 }
 
 test("writeSourceCacheNote writes a sectioned frontmatter note under Agent Sources", async () => {
@@ -324,6 +333,68 @@ test("readSourceSection returns 1-based clamped sections without frontmatter", a
 
   await assert.rejects(
     () => readSourceSection(context, { url: "https://missing.example.com" }, 1),
+    /Cached source was not found/,
+  );
+});
+
+test("URL section reads use the manifest directly and reuse parsed source content", async () => {
+  const now = new Date("2026-07-07T12:00:00.000Z");
+  const { context, readCounts } = createCacheContext(now);
+  const distractor = await writeSourceCacheNote(context, {
+    url: "https://example.com/distractor",
+    title: "Distractor",
+    content: "This note must not be scanned for the target URL.",
+  });
+  const target = await writeSourceCacheNote(context, {
+    url: "https://example.com/target",
+    title: "Target",
+    content: "T".repeat(SOURCE_CACHE_SECTION_CHARS + 50),
+  });
+  readCounts.clear();
+
+  const first = await readSourceSection(
+    context,
+    { url: "https://example.com/target" },
+    1,
+  );
+  const second = await readSourceSection(
+    context,
+    { url: "https://example.com/target" },
+    2,
+  );
+
+  assert.equal(first.content.length, SOURCE_CACHE_SECTION_CHARS);
+  assert.equal(second.content.length, 50);
+  assert.equal(readCounts.get(distractor.vaultPath) ?? 0, 0);
+  assert.equal(readCounts.get(target.vaultPath), 1);
+  assert.equal(readCounts.get(SOURCE_CACHE_MANIFEST_PATH), 2);
+});
+
+test("manifest-directed section reads reject a cached note whose URL drifted", async () => {
+  const now = new Date("2026-07-07T12:00:00.000Z");
+  const { context, content } = createCacheContext(now);
+  const cached = await writeSourceCacheNote(context, {
+    url: "https://example.com/expected",
+    title: "Expected",
+    content: "Expected source body.",
+  });
+  const file = context.app.vault.getFileByPath(cached.vaultPath);
+  assert.ok(file);
+  await context.app.vault.modify(
+    file,
+    String(content.get(cached.vaultPath)).replace(
+      /https:\/\/example\.com\/expected/g,
+      "https://example.com/drifted",
+    ),
+  );
+
+  await assert.rejects(
+    () =>
+      readSourceSection(
+        context,
+        { url: "https://example.com/expected" },
+        1,
+      ),
     /Cached source was not found/,
   );
 });

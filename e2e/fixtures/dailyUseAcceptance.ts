@@ -7,9 +7,11 @@ import {
   type DailyUseScenarioId,
 } from "../../src/agent/dailyUseAcceptance";
 import { createDailyUseRunMetricsV1 } from "../../src/agent/dailyUseRunMetrics";
+import type { MissionScorecardV1 } from "../../src/agent/missionScorecard";
 
 export const DAILY_USE_OBSERVED_ANNOTATION = "daily-use-observed-v1";
 export const DAILY_USE_METRICS_ANNOTATION = "daily-use-metrics-v1";
+export const DAILY_USE_SCORECARD_ANNOTATION = "daily-use-scorecard-v1";
 
 export async function recordDailyUseAcceptance(
   testInfo: TestInfo,
@@ -20,6 +22,7 @@ export async function recordDailyUseAcceptance(
     toolCalls?: number;
     continuations?: number;
     approvals?: number;
+    missionScorecard?: MissionScorecardV1 | null;
   } = {},
   options: { requireComplete?: boolean } = {},
 ) {
@@ -29,11 +32,12 @@ export async function recordDailyUseAcceptance(
     normalized,
   );
   const releaseSha = process.env.E2E_RELEASE_COMMIT_SHA?.trim() || null;
+  const { missionScorecard = null, ...metricCounters } = counters;
   const metrics = createDailyUseRunMetricsV1({
     scenarioId,
     releaseSha,
     observed: normalized,
-    ...counters,
+    ...metricCounters,
     observedAt: new Date().toISOString(),
   });
   testInfo.annotations.push({
@@ -44,10 +48,28 @@ export async function recordDailyUseAcceptance(
     type: DAILY_USE_METRICS_ANNOTATION,
     description: JSON.stringify(metrics),
   });
+  if (missionScorecard) {
+    testInfo.annotations.push({
+      type: DAILY_USE_SCORECARD_ANNOTATION,
+      description: JSON.stringify(missionScorecard),
+    });
+  }
   await testInfo.attach(`daily-use-${scenarioId.toLowerCase()}-metrics`, {
     body: Buffer.from(`${JSON.stringify(metrics, null, 2)}\n`, "utf8"),
     contentType: "application/json",
   });
+  if (missionScorecard) {
+    await testInfo.attach(
+      `daily-use-${scenarioId.toLowerCase()}-mission-scorecard`,
+      {
+        body: Buffer.from(
+          `${JSON.stringify(missionScorecard, null, 2)}\n`,
+          "utf8",
+        ),
+        contentType: "application/json",
+      },
+    );
+  }
   if (options.requireComplete && evaluation.status !== "pass") {
     throw new Error(
       `${scenarioId} acceptance is incomplete: ${evaluation.missing.join(", ")}`,

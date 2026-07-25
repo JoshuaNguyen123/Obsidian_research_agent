@@ -111,6 +111,16 @@ export async function buildHostMissionGraphPlanV1(
   );
   const explicitNewWorkspaceFilePaths =
     extractExplicitNewWorkspaceFilePaths(input.objective);
+  const inferredCodeDeliverableEntryPath =
+    explicitNewWorkspaceFilePaths.length === 0
+      ? inferCodeDeliverableEntryPath(input.objective)
+      : null;
+  const boundNewWorkspaceFilePaths =
+    explicitNewWorkspaceFilePaths.length > 0
+      ? explicitNewWorkspaceFilePaths
+      : inferredCodeDeliverableEntryPath
+        ? [inferredCodeDeliverableEntryPath]
+        : [];
   const explicitWorkspaceReadFilePaths =
     extractExplicitWorkspaceReadFilePaths(input.objective);
   const explicitWorkspaceWriteExpectedFilePaths = (() => {
@@ -201,12 +211,12 @@ export async function buildHostMissionGraphPlanV1(
       basePlannedSteps.at(-1)?.name === "read_mermaid_block";
     if (
       name === "code_workspace_create_file" &&
-      explicitNewWorkspaceFilePaths.length > 0 &&
+      boundNewWorkspaceFilePaths.length > 0 &&
       !seenEffectfulPlannedNames.has(name)
     ) {
       seenEffectfulPlannedNames.add(name);
       basePlannedSteps.push(
-        ...explicitNewWorkspaceFilePaths.map((path) => ({
+        ...boundNewWorkspaceFilePaths.map((path) => ({
           name,
           selector: path,
           objective: `Create the exact new workspace file ${path} without overwrite.`,
@@ -523,6 +533,27 @@ export async function buildHostMissionGraphPlanV1(
   };
 }
 
+function inferCodeDeliverableEntryPath(objective: string): string | null {
+  if (
+    !/\b(?:build|implement|create|write|code)\b/iu.test(objective) ||
+    !/\b(?:game|app|script|program|module|library|package|solver|code)\b/iu.test(
+      objective,
+    )
+  ) {
+    return null;
+  }
+  if (/\bpython\b|\.py\b/iu.test(objective)) return "main.py";
+  if (/\btypescript\b|\.tsx?\b/iu.test(objective)) return "main.ts";
+  if (/\bjavascript\b|\bnode(?:\.js)?\b|\.jsx?\b/iu.test(objective)) {
+    return "main.js";
+  }
+  if (/\brust\b|\.rs\b/iu.test(objective)) return "main.rs";
+  if (/\b(?:golang|go)\b|\.go\b/iu.test(objective)) return "main.go";
+  if (/\bjava\b|\.java\b/iu.test(objective)) return "Main.java";
+  if (/\b(?:c#|csharp)\b|\.cs\b/iu.test(objective)) return "Program.cs";
+  return null;
+}
+
 function addPostAcceptanceNodes(input: {
   nodes: Record<string, MissionGraphNodeProposalV1>;
   names: string[];
@@ -650,7 +681,20 @@ function buildCompositeLifecyclePlanV1(input: {
   descriptorByName: ReadonlyMap<string, ToolDescriptor>;
 }): CompositeLifecyclePlanV1 | null {
   const stages = detectProjectLifecycleStagesV1(input.exactUserCommand);
-  if (stages.length < 2 || input.steps.length === 0) return null;
+  const conditionalStandaloneCodeDelivery =
+    stages.length === 1 &&
+    stages[0] === "code_execution" &&
+    input.steps.some((step) => step.name === "code_validate_fast") &&
+    input.steps.some((step) => step.name === "code_repair_record_cycle") &&
+    input.steps.some(
+      (step) => step.name === "code_workspace_export_directory",
+    );
+  if (
+    (stages.length < 2 && !conditionalStandaloneCodeDelivery) ||
+    input.steps.length === 0
+  ) {
+    return null;
+  }
   const stepsByStage = new Map<ProjectLifecycleStageV1, PlannedToolStepV1[]>(
     stages.map((stage) => [stage, []]),
   );

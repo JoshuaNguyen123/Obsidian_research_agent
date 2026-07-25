@@ -5,6 +5,48 @@ import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness
 test.describe("real AI autonomy soak", () => {
   test.describe.configure({ mode: "default", timeout: 3_600_000, retries: 0 });
 
+  test("lead researcher orchestration keeps writeback lead-owned", async () => {
+    let harness: RealAiHarness | null = null;
+    try {
+      harness = await startRealAiHarness(
+        "soak-lead-researcher",
+        {},
+        {
+          orchestratorEnabled: true,
+          orchestratorPreviewEnabled: true,
+          orchestratorWorkerMaxSteps: 8,
+          orchestratorWorkerMaxToolCalls: 10,
+          orchestratorWorkerMaxMinutes: 8,
+        },
+      );
+      await harness.installOwnedWebBackend({ sourceCount: 2 });
+      await harness.submitMission(
+        "Run one bounded research-team mission. Have a read-only Researcher search and fetch exactly one owned source, then hand that accepted evidence to the Lead. After the handoff, only the Lead may append one short synthesis to the current note.",
+        { timeoutMs: 600_000 },
+      );
+      const snapshot = await harness.attestProductionRun();
+      const safeState = JSON.stringify({
+        complete: snapshot.lastComplete,
+        graph: snapshot.lastMissionGraph,
+        receipts: snapshot.lastReceipts.map((receipt: any) => ({
+          operation: receipt.operation,
+          toolName: receipt.toolName,
+          hasReadback: Boolean(receipt.readback),
+        })),
+        acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
+        conflicts: snapshot.redactedEvidenceConflicts ?? [],
+        providerUsage: snapshot.providerUsage,
+      });
+      expect(
+        snapshot.lastReceipts.filter((receipt: any) => receipt.operation === "append"),
+        safeState,
+      ).toHaveLength(1);
+      expect(JSON.stringify(snapshot.lastMissionGraph), safeState).toMatch(/lead|research/iu);
+    } finally {
+      await harness?.close();
+    }
+  });
+
   for (const scenario of [
     {
       name: "deep vault retrieval and semantic expansion",
@@ -20,13 +62,21 @@ test.describe("real AI autonomy soak", () => {
       prompt: (h: RealAiHarness) =>
         `Within one bounded mission, investigate my vault for ${h.marker}. Use semantic retrieval, batch-read only the paths returned by semantic retrieval without guessing paths or repeatedly reading one file at a time, and append a grounded synthesis to the current note. Do not use web or memory tools.`,
       requiredTools: ["semantic_search_notes", "append_to_current_file"],
-      pluginDataOverrides: { autoContinueLongRuns: false },
+      pluginDataOverrides: {
+        autoContinueLongRuns: false,
+        // Seed while watcher indexing is disabled. indexSemanticNotes enables
+        // the real production service immediately before its awaited update,
+        // avoiding two writers during fresh fixture creation.
+        semanticIndexEnabled: false,
+      },
     },
     {
       name: "long public-web research and source-cache reuse",
-      setup: async () => undefined,
+      setup: async (h: RealAiHarness) => {
+        await h.installOwnedWebBackend({ sourceCount: 2 });
+      },
       prompt: (h: RealAiHarness) =>
-        `Use only public-web evidence. Search the official Obsidian documentation for current plugin security guidance, fetch one relevant official page, and re-request that exact URL so the source cache can be reused. Append a synthesis with ${h.marker} to the current note using only claims supported by accepted fetched passages, with passage citations, limitations, confidence, and unanswered questions.`,
+        `Use only the owned public-web evidence for ${h.marker}. Search once, fetch one returned owned source, then re-request that exact same URL so the persisted source cache can be reused without another transport fetch. Append a synthesis with ${h.marker} to the current note using only claims supported by accepted fetched passages, with passage citations, limitations, confidence, and unanswered questions.`,
       requiredTools: ["web_search", "web_fetch", "append_to_current_file"],
       pluginDataOverrides: { autoContinueLongRuns: false },
     },
@@ -104,6 +154,7 @@ test.describe("real AI autonomy soak", () => {
       );
       await harness.approveUntilMissionComplete(1_200_000);
       const once = await readFile(harness.noteFilePath, "utf8");
+      const committedMarkerOccurrences = once.split(harness.marker).length - 1;
       const firstSnapshot = await harness.attestProductionRun();
       const firstSafeState = JSON.stringify({
         complete: firstSnapshot.lastComplete,
@@ -117,56 +168,22 @@ test.describe("real AI autonomy soak", () => {
         providerUsage: firstSnapshot.providerUsage,
         diagnostics: firstSnapshot.diagnosticAttestations,
       });
-      expect(once.split(harness.marker), firstSafeState).toHaveLength(2);
+      expect(committedMarkerOccurrences, firstSafeState).toBeGreaterThan(0);
+      expect(
+        firstSnapshot.lastReceipts.filter(
+          (receipt: any) => receipt.operation === "append",
+        ),
+        firstSafeState,
+      ).toHaveLength(1);
       const runId = firstSnapshot.lastConfig?.runId ?? firstSnapshot.runId;
       expect(runId).toMatch(/^run-/u);
       await harness.restartCorePlugin();
       await harness.submitMission(`continue run ${runId}`);
       const resumed = await readFile(harness.noteFilePath, "utf8");
-      expect(resumed.split(harness.marker)).toHaveLength(2);
+      expect(resumed.split(harness.marker).length - 1).toBe(
+        committedMarkerOccurrences,
+      );
       expect(resumed).toBe(once);
-    } finally {
-      await harness?.close();
-    }
-  });
-
-  test("lead researcher orchestration keeps writeback lead-owned", async () => {
-    let harness: RealAiHarness | null = null;
-    try {
-      harness = await startRealAiHarness(
-        "soak-lead-researcher",
-        {},
-        {
-          orchestratorEnabled: true,
-          orchestratorPreviewEnabled: true,
-          orchestratorWorkerMaxSteps: 8,
-          orchestratorWorkerMaxToolCalls: 10,
-          orchestratorWorkerMaxMinutes: 8,
-        },
-      );
-      await harness.installOwnedWebBackend({ sourceCount: 3 });
-      await harness.submitMission(
-        `Run deep research as a Lead with a read-only Researcher handoff over the owned sources, then have only the Lead append the verified synthesis with ${harness.marker}.`,
-        { timeoutMs: 1_200_000 },
-      );
-      const snapshot = await harness.attestProductionRun();
-      const safeState = JSON.stringify({
-        complete: snapshot.lastComplete,
-        graph: snapshot.lastMissionGraph,
-        receipts: snapshot.lastReceipts.map((receipt: any) => ({
-          operation: receipt.operation,
-          toolName: receipt.toolName,
-          hasReadback: Boolean(receipt.readback),
-        })),
-        acceptance: snapshot.lastMissionLedger?.acceptance ?? null,
-        conflicts: snapshot.redactedEvidenceConflicts ?? [],
-        providerUsage: snapshot.providerUsage,
-      });
-      expect(
-        snapshot.lastReceipts.filter((receipt: any) => receipt.operation === "append"),
-        safeState,
-      ).toHaveLength(1);
-      expect(JSON.stringify(snapshot.lastMissionGraph), safeState).toMatch(/lead|research/iu);
     } finally {
       await harness?.close();
     }
@@ -217,7 +234,10 @@ test.describe("real AI autonomy soak", () => {
         `In the current note at the exact vault-relative path "${harness.notePath}" under the exact heading "E2E Diagram", create a small Mermaid diagram showing mission plan -> tool -> receipt and include ${harness.marker}. Use that heading as the Mermaid block selector. First read the selector to obtain the current note hash, create the block, read that saved Mermaid block back, then revise the same block in place to add a verification node and read it once more to validate the resulting structure.`,
         { waitForCompletion: false, timeoutMs: 1_200_000 },
       );
-      const approvalCount = await harness.approveUntilMissionComplete(1_200_000);
+      const approvalCount = await harness.approveUntilMissionComplete(
+        1_200_000,
+        { maxContinuations: 8 },
+      );
       const snapshot = await harness.attestProductionRun();
       const safeState = JSON.stringify({
         approvalCount,

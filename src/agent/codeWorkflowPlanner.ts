@@ -20,7 +20,7 @@ export function selectCodeWorkspaceEditToolName(
   const text = String(prompt ?? "");
 
   if (
-    /\b(create|add|new)\b[\s\S]{0,80}\b(folder|directory)\b/i.test(text) &&
+    /\b(create|add|new)\b[\s\S]{0,80}\b(folder|folders|directory|directories)\b/i.test(text) &&
     allowlist.has("code_workspace_mkdir")
   ) {
     return "code_workspace_mkdir";

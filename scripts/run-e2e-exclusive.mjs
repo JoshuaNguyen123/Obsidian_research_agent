@@ -9,6 +9,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertMissionScorecardSummaryFile } from "./mission-scorecard-regression.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_WAIT_MS = 30_000;
@@ -23,6 +24,7 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "daily-use-research",
   "daily-use-code",
   "daily-use-code-live",
+  "desktop-code-delivery-real-live",
   "daily-use-linear",
   "daily-use-github",
   "daily-use-compound",
@@ -40,7 +42,18 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "compound-flow-smoke-live",
   "compound-flow-real-live",
   "systems-diagrams",
+  "agentic-capability-wireups",
+  "github-askpass-runtime-live",
 ]);
+// Lanes that talk to a real external service with a real credential but make
+// no model calls. They run under --mock-ai and gate on their credential being
+// present before Obsidian boots, so a missing token fails in seconds.
+const EXTERNAL_CREDENTIAL_PROJECTS = Object.freeze({
+  "github-askpass-runtime-live": {
+    requiredEnv: ["E2E_GITHUB_TOKEN"],
+    platforms: ["win32"],
+  },
+});
 const SIGNAL_EXIT_CODES = {
   SIGHUP: 129,
   SIGINT: 130,
@@ -55,6 +68,7 @@ const WINDOWS_USER_SANDBOX_ENV_NAMES = Object.freeze([
 ]);
 const SANDBOX_E2E_PROJECTS = new Set([
   "daily-use-code-live",
+  "desktop-code-delivery-real-live",
   "daily-use-compound",
   "obsidian-hello-github-live",
   "compound-flow-smoke-live",
@@ -211,6 +225,7 @@ export function isProcessAlive(pid) {
 async function main() {
   const normalized = normalizeExclusiveArgs(process.argv.slice(2));
   const { playwrightArgs, aiMode, liveExternal, projects } = normalized;
+  assertExternalCredentialProjectPreconditions({ projects });
   applyE2eAiMode(aiMode);
   applyE2eProviderDefaults({ aiMode, projects });
   applyE2eLane({ liveExternal, projects });
@@ -234,6 +249,9 @@ async function main() {
       `E2E lane=${process.env.E2E_PLAYWRIGHT_LANE} live_external=${process.env.E2E_LIVE_EXTERNAL === "1" ? "enabled" : "disabled"}`,
     );
     const exitCode = await runE2ePipeline(playwrightArgs);
+    if (exitCode === 0) {
+      await assertMissionScorecardSummaryFile({ selectedProjects: projects });
+    }
     process.exitCode = interruptedSignal
       ? SIGNAL_EXIT_CODES[interruptedSignal] ?? 1
       : exitCode;
@@ -519,6 +537,7 @@ export function normalizeExclusiveArgs(rawArgs) {
     "release-vertical",
     "daily-use-research",
     "daily-use-code-live",
+    "desktop-code-delivery-real-live",
     "daily-use-compound",
     "obsidian-hello-github-live",
     "compound-flow-real-live",
@@ -598,6 +617,40 @@ export function applyE2eLane(
 ) {
   env.E2E_PLAYWRIGHT_LANE = projects.join(",");
   env.E2E_LIVE_EXTERNAL = liveExternal ? "1" : "0";
+}
+
+/**
+ * Fail fast — before the lock, build, vault sync, or Obsidian boot — when an
+ * external-credential lane is requested without its credential or on an
+ * unsupported platform. These lanes must also run alone: their specs
+ * self-skip unless E2E_PLAYWRIGHT_LANE equals the single project name.
+ */
+export function assertExternalCredentialProjectPreconditions(
+  { projects },
+  env = process.env,
+  platform = process.platform,
+) {
+  for (const project of projects) {
+    const requirements = EXTERNAL_CREDENTIAL_PROJECTS[project];
+    if (!requirements) continue;
+    if (projects.length !== 1) {
+      throw new Error(
+        `${project} must run as the only selected project so its lane gate matches.`,
+      );
+    }
+    if (!requirements.platforms.includes(platform)) {
+      throw new Error(
+        `${project} supports only ${requirements.platforms.join(", ")}; current platform is ${platform}.`,
+      );
+    }
+    for (const name of requirements.requiredEnv) {
+      if (!env[name]?.trim()) {
+        throw new Error(
+          `${project} requires ${name} to be set (a disposable-scope credential) before the run starts.`,
+        );
+      }
+    }
+  }
 }
 
 /**

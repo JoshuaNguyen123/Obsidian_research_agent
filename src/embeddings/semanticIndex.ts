@@ -6,6 +6,7 @@ import {
 } from "../tools/semanticSearchTools";
 import { normalizeVaultPath } from "../tools/validation";
 import { isPathUnderVaultFolder, isVaultPathExcluded } from "../tools/vaultExclusions";
+import { mapWithBoundedConcurrency } from "../utils/boundedConcurrency";
 import type { SemanticEmbeddingProvider } from "./types";
 import type {
   SemanticIndexBuildResult,
@@ -32,6 +33,7 @@ const LEGACY_INDEX_VERSION = 1;
 const INDEX_SHARD_ROW_LIMIT = 2048;
 const INDEX_SHARD_NAME_PREFIX = "semantic-vault-index-shard-";
 const MAX_INDEX_SNIPPET_CHARS = 360;
+export const SEMANTIC_INDEX_READ_CONCURRENCY = 8;
 const STOP_TERMS = new Set([
   "the",
   "and",
@@ -506,8 +508,12 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     const pending: PendingNoteBuild[] = [];
     const documents: string[] = [];
 
-    for (const file of files) {
-      const note = await buildPendingNote(this.app, file, chunking);
+    const builtNotes = await mapWithBoundedConcurrency(
+      files,
+      SEMANTIC_INDEX_READ_CONCURRENCY,
+      (file) => buildPendingNote(this.app, file, chunking),
+    );
+    for (const note of builtNotes) {
       if (!note) {
         continue;
       }
@@ -1443,18 +1449,37 @@ async function ensureFolderPath(app: App, folder: string) {
     return;
   }
 
+  const resolveExistingFolder = (path: string) => {
+    const direct = app.vault.getFolderByPath(path);
+    if (direct) {
+      return direct;
+    }
+    const abstract = app.vault.getAbstractFileByPath(path);
+    return abstract &&
+      typeof abstract === "object" &&
+      "children" in abstract
+      ? abstract
+      : null;
+  };
   const parts = folder.split("/").filter(Boolean);
   let current = "";
   for (const part of parts) {
     current = current ? `${current}/${part}` : part;
-    if (!app.vault.getFolderByPath(current)) {
+    if (!resolveExistingFolder(current)) {
       try {
         await app.vault.createFolder(current);
       } catch (error) {
         // File watchers and an explicit updatePaths() call may race while
-        // creating a fresh per-run index folder. Treat only the confirmed
-        // postcondition as success; all other create failures remain fatal.
-        if (!app.vault.getFolderByPath(current)) {
+        // creating a fresh per-run index folder. Obsidian's metadata view can
+        // briefly lag the adapter after the competing create resolves, so
+        // allow a short bounded postcondition check. All other failures remain
+        // fatal and a file at the folder path is never accepted.
+        let confirmed = Boolean(resolveExistingFolder(current));
+        for (let attempt = 0; !confirmed && attempt < 20; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          confirmed = Boolean(resolveExistingFolder(current));
+        }
+        if (!confirmed) {
           throw error;
         }
       }

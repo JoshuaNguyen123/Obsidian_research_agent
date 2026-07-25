@@ -33,6 +33,7 @@ export const PHASE4_REQUIRED_CRUD_TOOLS = [
   "code_workspace_read",
   "code_workspace_mkdir",
   "code_workspace_create_file",
+  "code_workspace_export_directory",
   "code_workspace_write_expected",
   "code_workspace_move",
   "code_workspace_trash",
@@ -524,6 +525,9 @@ async function installPhase4PageHarness(
         const originalPath = String(
           scenarioState.data.originalPath ?? "src/phase4-value.txt",
         );
+        const directoryPath = String(
+          scenarioState.data.directoryPath ?? "src",
+        );
         const movedPath = String(
           scenarioState.data.movedPath ?? "src/phase4-value-restored.txt",
         );
@@ -609,7 +613,7 @@ async function installPhase4PageHarness(
             case 1:
               return toolCall(required("code_workspace_mkdir"), {
                 workspaceId,
-                path: "src",
+                path: directoryPath,
               });
             case 2:
               return toolCall(required("code_workspace_create_file"), {
@@ -727,12 +731,19 @@ async function installPhase4PageHarness(
         completionDrivenLoops: false,
         maxAgentSteps: 40,
         model: "playwright-phase4-mock",
+        e2eHarnessAttestationEnabled: true,
       };
       target.saveSettings = async () => undefined;
       target.appendConversationMessage = async function (message: unknown) {
         this.conversationHistory = [...(this.conversationHistory ?? []), message];
       };
       target.createModelClient = createModelClient;
+      // Cloud BYOK gate: mock installs must satisfy verified connection.
+      if (typeof target.markModelConnectionVerifiedForHarness === "function") {
+        target.markModelConnectionVerifiedForHarness({
+          message: "Phase 4 mock model connection verified.",
+        });
+      }
       target.__playwrightPhase4MockInstalled = true;
       const prototype = Object.getPrototypeOf(target);
       if (prototype) prototype.createModelClient = createModelClient;

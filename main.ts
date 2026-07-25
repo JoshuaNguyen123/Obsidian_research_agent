@@ -100,6 +100,11 @@ import {
   getProjectMemoryLocation,
 } from "./src/agent/projectMemory";
 import {
+  createToolOutcomeMemory,
+  isValidToolOutcomeMemory,
+  type ToolOutcomeMemoryV1,
+} from "./src/agent/outcomeMemory";
+import {
   MissionScheduler,
   normalizeScheduledMissions,
   type ScheduledMission,
@@ -133,6 +138,10 @@ import {
   type RunCoordinatorSnapshot,
   type RunOutcome,
 } from "./src/agent/runCoordinator";
+import type {
+  SteeringDirectiveKind,
+  SteeringEnqueueResult,
+} from "./src/agent/runSteering";
 import {
   getDurablyCompletedLifecycleToolNames,
   loadLatestPersistedMissionRunProjection,
@@ -272,11 +281,16 @@ import {
   OrchestratorRuntime,
   createCodeTeamScaffold,
   createResearchTeamScaffold,
-  shouldUseResearchTeam,
 } from "./src/orchestrator/orchestratorRuntime";
+import { resolveResearchTeamDispatchV1 } from "./src/agent/researchTeamDispatch";
+import { runExtensionVerifiers } from "./src/agent/extensionVerifiers";
+import { runCriticWorker } from "./src/orchestrator/criticWorker";
+import type { VerificationCheck } from "./src/agent/verifiers";
 import { runResearchWorker } from "./src/orchestrator/researchWorker";
 import { mergeResearchWorkerResult } from "./src/orchestrator/teamEvidenceMerge";
 import type { ResearchWorkerResult } from "./src/orchestrator/researchWorker";
+import { shouldContinueResearchLead } from "./src/orchestrator/leadContinuation";
+import { resolveResearchTeamBudget } from "./src/orchestrator/researchTeamBudget";
 import { summarizeSourceLedger } from "./src/orchestrator/sourceLedgerSummary";
 import { buildResearcherAssignment } from "./src/orchestrator/researcherSoftCatalog";
 import {
@@ -409,6 +423,13 @@ import {
   GitHubRestClient,
 } from "./src/integrations/github/GitHubRestClient";
 import {
+  projectGitHubPublicationPullRequestV1,
+} from "./src/integrations/github/GitHubPublicationPullRequestProjectionV1";
+import {
+  ensureGitHubPublicationDefaultBranchV1,
+  type GitHubPublicationDefaultBranchProofV1,
+} from "./src/integrations/github/GitHubPublicationDefaultBranchV1";
+import {
   fingerprintBackgroundGitHubValueV1,
   type PreparedBackgroundGitHubActionV1,
   type PreparedBackgroundGitHubToolNameV1,
@@ -428,6 +449,7 @@ import {
   type GitHubPublicationProviderPortV1,
   type GitHubPublicationPullRequestV1,
 } from "./src/integrations/github/GitHubPublicationWorkflow";
+import { FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME } from "./src/agent/nestedApprovalPolicy";
 import {
   GitHubPublicationCheckpointStoreV1,
   parseGitHubPublicationCheckpointNamespaceV1,
@@ -662,6 +684,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   settings: AgentSettings = { ...DEFAULT_SETTINGS };
   conversationHistory: AgentConversationMessage[] = [];
   researchMemoryIndex: ResearchMemoryIndexEntry[] = [];
+  toolOutcomeMemory: ToolOutcomeMemoryV1 = createToolOutcomeMemory();
   private projectMemoryLoadGeneration = 0;
   private lastActiveMarkdownFile: TFile | null = null;
   private semanticEmbeddingProvider: SemanticEmbeddingProvider | null = null;
@@ -1328,6 +1351,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.settings.modelConnectionVerifiedModel = undefined;
     this.settings.modelConnectionVerifiedBaseUrl = undefined;
     this.settings.modelConnectionVerifiedAgenticCapabilities = undefined;
+    this.settings.modelConnectionVerifiedContextLength = undefined;
     this.modelConnectionStatus = {
       status: "untested",
       message: "Connection changed; test it before starting important work.",
@@ -1403,6 +1427,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       );
       this.settings.modelConnectionVerifiedAgenticCapabilities =
         cloudCapabilityProof ? true : undefined;
+      this.settings.modelConnectionVerifiedContextLength =
+        cloudCapabilityProof?.contextLength ?? undefined;
       await this.savePluginData();
       await this.returnToChatAfterFirstRunSetup();
     } catch (error) {
@@ -1411,6 +1437,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.settings.modelConnectionVerifiedModel = undefined;
       this.settings.modelConnectionVerifiedBaseUrl = undefined;
       this.settings.modelConnectionVerifiedAgenticCapabilities = undefined;
+      this.settings.modelConnectionVerifiedContextLength = undefined;
       this.modelConnectionStatus = {
         status: "error",
         message: `Connection failed: ${formatModelClientError(error)}`,
@@ -1750,6 +1777,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     settings.agenticReflexEnabled = settings.agenticReflexEnabled === true;
     settings.agenticReflexDiagnosticsEnabled =
       settings.agenticReflexDiagnosticsEnabled !== false;
+    settings.runDetailsDiagnosticsExpanded =
+      settings.runDetailsDiagnosticsExpanded === true;
     settings.utilityModel =
       typeof settings.utilityModel === "string" ? settings.utilityModel.trim() : "";
     settings.utilityModelProvider =
@@ -4577,7 +4606,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           transport: requestUrlTransport,
           token,
           timeoutMs: Math.min(this.settings.requestTimeoutMs, 30_000),
-        }).getAuthenticatedUser(signal),
+        }).getAuthenticatedUserWithOAuthScopes(signal),
     });
   }
 
@@ -6953,6 +6982,16 @@ export default class AgenticResearcherPlugin extends Plugin {
     await this.saveProjectMemoryData();
   }
 
+  async setToolOutcomeMemory(memory: ToolOutcomeMemoryV1) {
+    this.invalidateProjectMemoryLoads();
+    // Reject a record set whose fingerprints do not verify rather than letting
+    // a corrupt or hand-edited file bias future tool ranking.
+    this.toolOutcomeMemory = isValidToolOutcomeMemory(memory)
+      ? memory
+      : createToolOutcomeMemory();
+    await this.saveProjectMemoryData();
+  }
+
   async setResearchMemoryIndex(entries: ResearchMemoryIndexEntry[]) {
     this.invalidateProjectMemoryLoads();
     this.researchMemoryIndex = migrateResearchMemoryIndexV2(
@@ -7219,6 +7258,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     const researchMemoryIndex = await this.readProjectMemoryJson(
       location.researchIndexPath,
     );
+    const toolOutcomeMemory = await this.readProjectMemoryJson(
+      location.toolOutcomePath,
+    );
 
     const currentLocation = getProjectMemoryLocation(
       this.getCurrentMarkdownFile()?.path ?? null,
@@ -7243,6 +7285,14 @@ export default class AgenticResearcherPlugin extends Plugin {
         this.settings.vaultScopeId!,
       );
     }
+
+    // Fail closed to an empty ledger: a corrupt or tampered file must not be
+    // able to steer tool ranking in a later run.
+    this.toolOutcomeMemory =
+      toolOutcomeMemory !== null &&
+      isValidToolOutcomeMemory(toolOutcomeMemory as ToolOutcomeMemoryV1)
+        ? (toolOutcomeMemory as ToolOutcomeMemoryV1)
+        : createToolOutcomeMemory();
   }
 
   private invalidateProjectMemoryLoads(): void {
@@ -7258,6 +7308,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     await this.writeProjectMemoryJson(
       location.researchIndexPath,
       this.researchMemoryIndex,
+    );
+    await this.writeProjectMemoryJson(
+      location.toolOutcomePath,
+      this.toolOutcomeMemory,
     );
   }
 
@@ -7437,6 +7491,14 @@ export default class AgenticResearcherPlugin extends Plugin {
     return requested;
   }
 
+  requestMissionSteering(input: {
+    kind: SteeringDirectiveKind;
+    text: string;
+    toolName?: string;
+  }): SteeringEnqueueResult {
+    return this.runCoordinator.steerActiveRun(input);
+  }
+
   getActiveDurableMissionId(): string | null {
     return this.activeDurableMissionId;
   }
@@ -7586,14 +7648,20 @@ export default class AgenticResearcherPlugin extends Plugin {
           }
 
           const codeTeamRequest = parseExplicitCodeTeamRequest(prompt);
+          const researchTeamDispatch = await resolveResearchTeamDispatchV1({
+            prompt,
+            orchestratorEnabled: this.settings.orchestratorEnabled !== false,
+            forceChatOnly: options.forceChatOnly === true,
+            settings: this.settings,
+            embeddingProvider: this.getSemanticEmbeddingProvider(),
+          });
+          events.onStatus?.(
+            `Research-team routing: ${researchTeamDispatch.useTeam ? "team" : "single"} [${researchTeamDispatch.signals.join(", ")}]`,
+          );
           const directDispatch = resolveTopLevelMissionDispatchV1({
             codeTeamRequest,
             codeTeamBridgeIntent: hasCodeTeamBridgeIntent(prompt),
-            researchTeamRequested: shouldUseResearchTeam(
-              prompt,
-              this.settings.orchestratorEnabled !== false,
-              options.forceChatOnly === true,
-            ),
+            researchTeamRequested: researchTeamDispatch.useTeam,
             orchestratorEnabled: this.settings.orchestratorEnabled !== false,
             forceChatOnly: options.forceChatOnly === true,
             codeExtensionAvailable: this.getOptionalExtensionCapabilities().code,
@@ -7756,6 +7824,7 @@ export default class AgenticResearcherPlugin extends Plugin {
               approvalBroker: this.approvalBroker,
               backgroundContinuation: this.createBackgroundMissionDispatchPort(),
               forceChatOnly: options.forceChatOnly === true,
+              runSteering: this.runCoordinator.getRunSteeringPort(),
               ...(autoContinueLongRun
                 ? {
                     completionSegmentIndex: segmentIndex,
@@ -8058,6 +8127,41 @@ export default class AgenticResearcherPlugin extends Plugin {
     });
   }
 
+  /**
+   * Run every registered mission_verifier extension contribution for the
+   * mission's verify gate. Empty when the extension host is not ready or no
+   * verifier is registered; individual verifier failures surface as blocked
+   * checks (fail-closed) rather than exceptions.
+   */
+  private async runMissionExtensionVerifiers(input: {
+    missionId: string;
+    nodeId: string;
+    objective: string;
+  }): Promise<VerificationCheck[]> {
+    if (this.coreApiHost.state !== "ready") return [];
+    let snapshot;
+    try {
+      snapshot = this.coreApiHost.createMissionSnapshot(
+        `mission-verify-${++this.extensionSnapshotSequence}`,
+      );
+    } catch {
+      return [];
+    }
+    if (snapshot.verifiers.length === 0) return [];
+    return runExtensionVerifiers(
+      snapshot,
+      {
+        missionId: input.missionId,
+        nodeId: input.nodeId,
+        objective: input.objective,
+        outputs: {},
+        evidence: [],
+        receiptIds: [],
+      },
+      { isTokenActive: (token) => this.coreApiHost.isTokenActive(token) },
+    );
+  }
+
   private async runResearchTeamMission(input: {
     runId?: string;
     prompt: string;
@@ -8090,14 +8194,16 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     try {
     const runId = input.runId ?? createAgentRunId();
-    const workerMaxSteps = this.settings.orchestratorWorkerMaxSteps ?? 40;
-    const workerMaxToolCalls =
-      this.settings.orchestratorWorkerMaxToolCalls ?? 40;
-    const leadMaxSteps = Math.max(4, MAX_AGENT_STEPS - workerMaxSteps);
-    const leadMaxToolCalls = Math.max(
-      16,
-      MAX_AGENT_STEPS * 2 - workerMaxToolCalls,
-    );
+    const teamBudget = resolveResearchTeamBudget({
+      configuredMaxAgentSteps: this.settings.maxAgentSteps,
+      requestedWorkerMaxSteps: this.settings.orchestratorWorkerMaxSteps,
+      requestedWorkerMaxToolCalls:
+        this.settings.orchestratorWorkerMaxToolCalls,
+    });
+    const workerMaxSteps = teamBudget.researcherModelSteps;
+    const workerMaxToolCalls = teamBudget.researcherToolCalls;
+    const leadMaxSteps = teamBudget.leadModelSteps;
+    const leadMaxToolCalls = teamBudget.leadToolCalls;
     // Keep bounded continuation slices inside the existing Lead budget.
     // A monolithic segment can spend its final turn establishing that more
     // work is required but cannot consume the durable continuation it just
@@ -8134,8 +8240,8 @@ export default class AgenticResearcherPlugin extends Plugin {
       },
       // Legacy runtime events are executor-local telemetry. MissionGraphV3 is
       // the only state projected to the primary UI and durable plugin state.
-      rootModelSteps: MAX_AGENT_STEPS,
-      rootToolCalls: MAX_AGENT_STEPS * 2,
+      rootModelSteps: teamBudget.rootModelSteps,
+      rootToolCalls: teamBudget.rootToolCalls,
       rootWallClockMs,
       finalizationReserveSteps: 4,
     });
@@ -8429,6 +8535,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     };
     let leadModelSteps = 0;
     let leadToolCalls = 0;
+    // Captured for the independent critic: only the objective, final output,
+    // evidence, and receipt ids ever reach it — never the Lead's transcript.
+    let leadFinalOutput = "";
+    const leadReceiptIds: string[] = [];
     let leadEventQueue = Promise.resolve();
     const enqueueLeadEvent = (operation: () => Promise<unknown>) => {
       leadEventQueue = leadEventQueue.then(operation, operation).then(() => undefined);
@@ -8475,6 +8585,18 @@ export default class AgenticResearcherPlugin extends Plugin {
             );
           };
         }
+        if (property === "onFinalDelta") {
+          return (delta: string) => {
+            leadFinalOutput += delta;
+            target.onFinalDelta?.(delta);
+          };
+        }
+        if (property === "onFinalReplace") {
+          return (content: string) => {
+            leadFinalOutput = content;
+            target.onFinalReplace?.(content);
+          };
+        }
         if (property === "onReceipt") {
           return (receipt: Parameters<NonNullable<AgentRunEvents["onReceipt"]>>[0]) => {
             target.onReceipt?.(receipt);
@@ -8483,6 +8605,7 @@ export default class AgenticResearcherPlugin extends Plugin {
               receipt.operation,
               receipt.path ?? receipt.toPath ?? "vault",
             ].join(":");
+            if (leadReceiptIds.length < 64) leadReceiptIds.push(receiptId);
             enqueueLeadEvent(() =>
               runtime.progress(leadNodeId, {
                 receiptIds: [receiptId],
@@ -8528,13 +8651,18 @@ export default class AgenticResearcherPlugin extends Plugin {
           onRunComplete: (event) => {
             leadCompletion.current = event;
             leadModelSteps += Math.max(1, event.step);
-            continueLead =
-              event.stopReason === "budget" &&
-              event.autoContinueRecommended === true &&
-              leadModelSteps < leadMaxSteps &&
-              leadToolCalls < leadMaxToolCalls &&
-              segmentIndex + 1 < leadMaxSegments &&
-              !rootDeadline.signal.aborted;
+            continueLead = shouldContinueResearchLead({
+              stopReason: event.stopReason,
+              autoContinueRecommended: event.autoContinueRecommended,
+              autoContinueReason: event.autoContinueReason,
+              usedModelSteps: leadModelSteps,
+              maxModelSteps: leadMaxSteps,
+              usedToolCalls: leadToolCalls,
+              maxToolCalls: leadMaxToolCalls,
+              segmentIndex,
+              maxSegments: leadMaxSegments,
+              aborted: rootDeadline.signal.aborted,
+            });
             return continueLead;
           },
         });
@@ -8637,9 +8765,124 @@ export default class AgenticResearcherPlugin extends Plugin {
         status: "running",
         lastAction: "Checking the Lead terminal proof contract.",
       });
+      // Independent critic review. Advisory-first: missionAcceptance remains
+      // the sole terminal gate, and the critic may trigger AT MOST ONE bounded
+      // Lead continuation (no retry loop of its own), so it cannot livelock
+      // against acceptance or proof-debt.
+      if (this.settings.agenticReflexEnabled !== false && leadFinalOutput.trim()) {
+        try {
+          input.events.onStatus?.("ORCH> Independent critic reviewing the Lead result.");
+          const criticResult = await runCriticWorker({
+            runId,
+            objective: input.prompt,
+            finalOutput: leadFinalOutput,
+            evidence: seedEvidence,
+            receiptIds: leadReceiptIds,
+            modelClient: this.createModelClient(),
+            toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
+            toolContext: this.createToolExecutionContext(input.prompt),
+            abortSignal: rootDeadline.signal,
+            now: () => new Date(),
+          });
+          input.events.onTrace?.({
+            id: `critic-review-${runId}`,
+            kind: "status",
+            message: `Critic ${criticResult.status}: ${criticResult.check.message}`,
+            outputPreview: {
+              status: criticResult.status,
+              missing: criticResult.check.missing,
+              modelSteps: criticResult.modelSteps,
+              toolCalls: criticResult.toolCalls,
+            },
+          });
+          if (
+            criticResult.status === "needs_more_work" &&
+            criticResult.check.missing.length > 0 &&
+            leadModelSteps < leadMaxSteps &&
+            leadToolCalls < leadMaxToolCalls &&
+            !rootDeadline.signal.aborted
+          ) {
+            // The single permitted escalation: one more bounded Lead segment
+            // addressing the critic's missing items, then verification
+            // proceeds regardless of outcome.
+            input.events.onStatus?.(
+              "ORCH> Critic requested one bounded revision pass; continuing the Lead.",
+            );
+            const escalationEvents = createSegmentEventProxy(leadEvents, {
+              bufferAssistantUntilComplete: false,
+              onRunConfig: (event) => {
+                leadSegmentRunId = event.runId;
+                leadEvents.onRunConfig?.(event);
+              },
+              onRunComplete: (event) => {
+                leadCompletion.current = event;
+                leadModelSteps += Math.max(1, event.step);
+                return false;
+              },
+            });
+            await runAgentMission({
+              prompt: [
+                `continue run ${leadSegmentRunId}`,
+                "An independent critic reviewed the result and found gaps to address before finishing:",
+                ...criticResult.check.missing.map((item) => `- ${item}`),
+              ].join("\n"),
+              conversationHistory: [],
+              modelClient: this.createModelClient(),
+              toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
+              toolContext: this.createToolExecutionContext(input.prompt),
+              enableStreaming: this.settings.enableStreaming,
+              abortSignal: rootDeadline.signal,
+              approvalBroker: this.approvalBroker,
+              forceChatOnly: input.forceChatOnly === true,
+              events: escalationEvents,
+              maxSteps: Math.min(8, Math.max(1, leadMaxSteps - leadModelSteps)),
+              maxToolCalls: Math.min(8, Math.max(1, leadMaxToolCalls - leadToolCalls)),
+              orchestratorContext: handoffContext,
+              orchestratorSnapshot: runtime.getSnapshot() ?? undefined,
+              getOrchestratorSnapshot: () => runtime.getSnapshot(),
+            });
+            await leadEventQueue;
+          }
+        } catch (criticError) {
+          // The critic is advisory; its own failure never blocks the mission.
+          input.events.onTrace?.({
+            id: `critic-review-error-${runId}`,
+            kind: "status",
+            message: `Critic review failed and was skipped: ${
+              criticError instanceof Error ? criticError.message : String(criticError)
+            }`,
+          });
+        }
+      }
+      // Registered mission_verifier extension contributions run at the verify
+      // node and fail closed: any fail/needs_more_work/blocked check blocks the
+      // node instead of the previous unconditional success.
+      const extensionVerifierChecks = await this.runMissionExtensionVerifiers({
+        missionId: runId,
+        nodeId: verifyNodeId,
+        objective: input.prompt,
+      });
+      const failedExtensionCheck = extensionVerifierChecks.find(
+        (check) => check.status !== "pass",
+      );
+      if (failedExtensionCheck) {
+        const blocker =
+          `Extension verifier ${failedExtensionCheck.id} reported ` +
+          `${failedExtensionCheck.status}: ${failedExtensionCheck.message}`;
+        await runtime.blockNode(verifyNodeId, blocker);
+        await runtime.updateParticipant("lead", {
+          status: "blocked",
+          blocker,
+          lastAction: blocker,
+        });
+        await runtime.finish("blocked", blocker);
+        return runtime.getSnapshot();
+      }
       await runtime.completeNode(
         verifyNodeId,
-        "Lead completion and proof gates passed.",
+        extensionVerifierChecks.length > 0
+          ? `Lead completion, proof gates, and ${extensionVerifierChecks.length} extension verifier check(s) passed.`
+          : "Lead completion and proof gates passed.",
       );
       await runtime.progress(rootNodeId, {
         status: "complete",
@@ -8693,6 +8936,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
   }
 
+  /**
+   * @deprecated Unreachable from production dispatch: resolveTopLevelMissionDispatchV1
+   * hard-routes code intent to single_agent. Kept for tests only; do not wire
+   * back without extension-registry prepared-action authority for the worker.
+   */
   private async runCodeTeamMission(input: {
     runId?: string;
     prompt: string;
@@ -10887,6 +11135,20 @@ export default class AgenticResearcherPlugin extends Plugin {
       ) {
         return null;
       }
+      // Publication preflight: GitHub's repository readback includes the
+      // authenticated credential's effective permissions. push=false is a
+      // definitive "cannot push" — fail here with the remediation instead of
+      // minting a binding whose push will fail later. A missing permissions
+      // object stays permissive: the VerifiedGitPushGateway heal/retry loop
+      // remains the authority on push capability.
+      if (remote.permissions && remote.permissions.push === false) {
+        throw new Error(
+          `The GitHub credential cannot push to ${owner}/${repository} ` +
+            "(GitHub reports permissions.push=false). Install a github_pat_ " +
+            "fine-grained token with Contents:write on this repository, or a " +
+            "classic/gh OAuth token with repo scope, then retry.",
+        );
+      }
       const publicationBinding = createTrustedGitHubRepositoryBindingV1({
         key: `github-${profile.key}`,
         profile,
@@ -11294,19 +11556,47 @@ export default class AgenticResearcherPlugin extends Plugin {
       return readback;
     };
     return {
-      listPullRequestsForHead: (owner, repository, head, base, signal) =>
-        withClient((client) =>
-          client.listPullRequestsForHead(owner, repository, head, base, signal)),
+      listPullRequestsForHead: async (owner, repository, head, base, signal) =>
+        (await withClient((client) =>
+          client.listPullRequestsForHead(owner, repository, head, base, signal)))
+          .map(projectGitHubPublicationPullRequestV1),
       createDraftPullRequest: async (input, signal) => {
-        const pullRequest = await withClient(async (client) => {
-          await requirePrivateRepository(
-            client,
-            input.owner,
-            input.repository,
-            signal,
-          );
-          return client.createDraftPullRequest(input, signal);
-        });
+        const { expectedBaseSha, expectedHeadSha, ...request } = input;
+        const pullRequest = projectGitHubPublicationPullRequestV1(
+          await withClient(async (client) => {
+            const defaultBranchProof =
+              await ensureGitHubPublicationDefaultBranchV1(
+                client,
+                {
+                  owner: input.owner,
+                  repository: input.repository,
+                  baseBranch: input.base,
+                  baseSha: expectedBaseSha,
+                  headBranch: input.head,
+                  headSha: expectedHeadSha,
+                },
+                signal,
+              );
+            if (defaultBranchProof.status === "updated_verified") {
+              await this.appendExternalActionReceipt(
+                await this.createGitHubDefaultBranchActionReceipt({
+                  runId,
+                  owner: input.owner,
+                  repository: input.repository,
+                  baseBranch: input.base,
+                  baseSha: expectedBaseSha,
+                  headBranch: input.head,
+                  headSha: expectedHeadSha,
+                  proof: defaultBranchProof,
+                }),
+              );
+            }
+            return client.createDraftPullRequest(
+              request,
+              signal,
+            );
+          }),
+        );
         const receipt = await this.createGitHubProviderActionReceipt({
           runId,
           operation: "publish",
@@ -11316,9 +11606,11 @@ export default class AgenticResearcherPlugin extends Plugin {
         await this.appendExternalActionReceipt(receipt);
         return { pullRequest, receipt };
       },
-      getPullRequest: (owner, repository, number, signal) =>
-        withClient((client) =>
-          client.getPullRequest(owner, repository, number, signal)),
+      getPullRequest: async (owner, repository, number, signal) =>
+        projectGitHubPublicationPullRequestV1(
+          await withClient((client) =>
+            client.getPullRequest(owner, repository, number, signal)),
+        ),
       listCheckRuns: (owner, repository, reference, signal) =>
         withClient((client) =>
           client.listCheckRuns(owner, repository, reference, signal)),
@@ -11342,13 +11634,15 @@ export default class AgenticResearcherPlugin extends Plugin {
         }));
       },
       markPullRequestReady: async (owner, repository, number, signal) => {
-        const pullRequest = await withClient(async (client) => {
-          await requirePrivateRepository(client, owner, repository, signal);
-          return client.markPullRequestReadyForReview(
-            { owner, repository, number },
-            signal,
-          );
-        });
+        const pullRequest = projectGitHubPublicationPullRequestV1(
+          await withClient(async (client) => {
+            await requirePrivateRepository(client, owner, repository, signal);
+            return client.markPullRequestReadyForReview(
+              { owner, repository, number },
+              signal,
+            );
+          }),
+        );
         const receipt = await this.createGitHubProviderActionReceipt({
           runId,
           operation: "update",
@@ -11374,13 +11668,15 @@ export default class AgenticResearcherPlugin extends Plugin {
             mergeMethod: input.mergeMethod,
           }, signal);
         });
-        const pullRequest = await withClient((client) =>
-          client.getPullRequest(
-            input.owner,
-            input.repository,
-            input.number,
-            signal,
-          ));
+        const pullRequest = projectGitHubPublicationPullRequestV1(
+          await withClient((client) =>
+            client.getPullRequest(
+              input.owner,
+              input.repository,
+              input.number,
+              signal,
+            )),
+        );
         const receipt = await this.createGitHubProviderActionReceipt({
           runId,
           operation: "merge",
@@ -11395,6 +11691,81 @@ export default class AgenticResearcherPlugin extends Plugin {
         await this.appendExternalActionReceipt(receipt);
         return { merged: merged.merged, sha: merged.sha, receipt };
       },
+    };
+  }
+
+  private async createGitHubDefaultBranchActionReceipt(input: {
+    runId: string;
+    owner: string;
+    repository: string;
+    baseBranch: string;
+    baseSha: string;
+    headBranch: string;
+    headSha: string;
+    proof: GitHubPublicationDefaultBranchProofV1;
+  }): Promise<ActionReceipt> {
+    const committedAt = new Date().toISOString();
+    const fingerprint = await sha256Fingerprint({
+      repositoryId: input.proof.repository.id,
+      owner: input.owner,
+      repository: input.repository,
+      previousDefaultBranch: input.proof.previousDefaultBranch,
+      defaultBranch: input.proof.repository.defaultBranch,
+      baseBranch: input.baseBranch,
+      baseSha: input.baseSha,
+      headBranch: input.headBranch,
+      headSha: input.headSha,
+    });
+    return {
+      version: 1,
+      id:
+        `github-default-branch-${input.runId}-` +
+        `${input.proof.repository.id}`,
+      runId: input.runId,
+      actionId: `github-default-branch-${input.proof.repository.id}`,
+      toolName: "github_update_default_branch",
+      operation: "update",
+      resource: {
+        system: "github",
+        resourceType: "private_repository",
+        id: String(input.proof.repository.id),
+        identifier: `${input.owner}/${input.repository}`,
+        url: input.proof.repository.htmlUrl,
+        revision: input.baseSha,
+      },
+      relatedResources: [
+        {
+          system: "github",
+          resourceType: "repository_branch",
+          id: input.baseBranch,
+          revision: input.baseSha,
+        },
+        {
+          system: "github",
+          resourceType: "repository_branch",
+          id: input.headBranch,
+          revision: input.headSha,
+        },
+      ],
+      message:
+        `Changed the new private repository default branch from ` +
+        `${input.proof.previousDefaultBranch} to the verified base ` +
+        `${input.baseBranch}, then independently read back both exact refs.`,
+      payloadFingerprint: fingerprint,
+      grantId: "github-nested-exact-approval",
+      idempotencyKey:
+        `github-default-branch:${input.owner.toLowerCase()}/` +
+        `${input.repository.toLowerCase()}:${input.baseBranch}:${input.baseSha}`,
+      startedAt: committedAt,
+      committedAt,
+      commitKind: "committed",
+      readback: {
+        status: "verified",
+        checkedAt: committedAt,
+        observedRevision: input.baseSha,
+        observedFingerprint: fingerprint,
+      },
+      effects: { affectedCount: 1 },
     };
   }
 
@@ -11735,6 +12106,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       askpassBroker: new LoopbackEphemeralGitAskpassBrokerV1({
         secretStore: store,
         tempRoot: runtime.tempRoot,
+        nodeExecutable: runtime.nodeExecutable,
       }),
       attemptStore: this.gitPushAttemptStore,
       disabledHooksPath: runtime.disabledHooksPath,
@@ -11879,7 +12251,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           id: `github-obsidian-reflection-${proof.publicationId}`,
           runId: input.handoff.runId,
           toolCallId: `github-obsidian-reflection-${proof.publicationId}`,
-          toolName: "finalize_project_reflection_in_obsidian",
+          toolName: FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME,
           target: {
             system: "vault",
             resourceType: "markdown_file",
@@ -12593,9 +12965,12 @@ export default class AgenticResearcherPlugin extends Plugin {
         this.setCurrentMarkdownContent(file, content, options),
       getResearchMemoryIndex: () => [...this.researchMemoryIndex],
       setResearchMemoryIndex: (entries) => this.setResearchMemoryIndex(entries),
+      getToolOutcomeMemory: () => this.toolOutcomeMemory,
+      setToolOutcomeMemory: (memory) => this.setToolOutcomeMemory(memory),
       getProjectLineages: () => this.getProjectLineages(),
       getRepositoryProfileKeys: () =>
         Object.keys(this.repositoryProfileRegistry.profiles),
+      getCapabilityReadiness: () => this.getCapabilityReadiness(),
       semanticEmbeddingProvider: this.getSemanticEmbeddingProvider(),
       semanticIndexService: this.getSemanticIndexService(),
     };
@@ -13906,6 +14281,7 @@ function normalizeGitHubReviewState(
 
 async function prepareGitHubPublicationRuntimePaths(): Promise<{
   gitExecutable: string;
+  nodeExecutable: string;
   tempRoot: string;
   disabledHooksPath: string;
 }> {
@@ -13946,6 +14322,7 @@ async function prepareGitHubPublicationRuntimePaths(): Promise<{
   }
   return {
     gitExecutable: resolveGitExecutablePath(),
+    nodeExecutable: resolveNodeExecutablePath(),
     tempRoot,
     disabledHooksPath,
   };
@@ -13983,6 +14360,52 @@ function resolveGitExecutablePath(): string {
   }
   throw new Error(
     "Git is unavailable in the host PATH; verified GitHub publication is blocked.",
+  );
+}
+
+function resolveNodeExecutablePath(): string {
+  const fs = requireNodeModule<typeof import("node:fs")>(
+    "node:fs",
+    "verified GitHub publication",
+  );
+  const path = requireNodeModule<typeof import("node:path")>(
+    "node:path",
+    "verified GitHub publication",
+  );
+  const executableName = process.platform === "win32" ? "node.exe" : "node";
+  const candidates: string[] = [];
+  if (/^node(?:\.exe)?$/iu.test(path.basename(process.execPath))) {
+    candidates.push(process.execPath);
+  }
+  const pathValue = process.env.PATH ?? process.env.Path ?? "";
+  candidates.push(
+    ...pathValue
+      .split(path.delimiter)
+      .map((directory) => directory.trim())
+      .filter(Boolean)
+      .map((directory) => path.join(directory, executableName)),
+  );
+  if (process.platform === "win32") {
+    for (const root of [process.env.ProgramFiles, process.env.LOCALAPPDATA]) {
+      if (!root) continue;
+      candidates.push(path.join(root, "nodejs", "node.exe"));
+      candidates.push(path.join(root, "Programs", "nodejs", "node.exe"));
+    }
+  }
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      if (
+        fs.statSync(candidate).isFile() &&
+        /^node(?:\.exe)?$/iu.test(path.basename(candidate))
+      ) {
+        return fs.realpathSync(candidate);
+      }
+    } catch {
+      // Continue through the fixed host path catalog.
+    }
+  }
+  throw new Error(
+    "Node.js is unavailable in the host PATH; the secure Git credential helper cannot run. Install Node.js, reload Obsidian, and retry verified GitHub publication.",
   );
 }
 

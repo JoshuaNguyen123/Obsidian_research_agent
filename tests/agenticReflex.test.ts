@@ -14,6 +14,10 @@ import {
 import type { SemanticEmbeddingProvider } from "../src/embeddings/types";
 import type { MissionIntent } from "../src/tools/types";
 import type { AgentSettings } from "../src/settings";
+import {
+  createToolOutcomeMemory,
+  recordToolOutcome,
+} from "../src/agent/outcomeMemory";
 
 const missionIntent: MissionIntent = {
   mode: "chat_only",
@@ -116,6 +120,136 @@ test("reflex controller classifies semantic vault intent and scores semantic act
   assert.equal(output.intent.version, 2);
   assert.ok(output.intent.winningMargin >= 0.08);
   assert.equal(output.actionScores[0].action.toolName, "semantic_search_notes");
+});
+
+test("reflex action scoring preserves the pre-memory scores when history is absent", async () => {
+  const output = await new AgenticReflexController().evaluate(input());
+  const semantic = output.actionScores.find(
+    (item) => item.action.toolName === "semantic_search_notes",
+  );
+  assert.ok(semantic);
+  assert.equal(semantic.baseScore, semantic.score);
+  assert.equal(semantic.outcomePenalty, 0);
+});
+
+test("repeated matching failures down-rank a tool without removing it", async () => {
+  let memory = createToolOutcomeMemory();
+  for (let index = 0; index < 5; index += 1) {
+    memory = recordToolOutcome(memory, {
+      toolName: "semantic_search_notes",
+      ok: false,
+      errorCode: "semantic_helper_unavailable",
+      targetKind: "vault_note",
+      observedAt: `2026-07-24T00:00:0${index}.000Z`,
+    });
+  }
+
+  const output = await new AgenticReflexController().evaluate(
+    input({ toolOutcomeMemory: memory }),
+  );
+  const semantic = output.actionScores.find(
+    (item) => item.action.toolName === "semantic_search_notes",
+  );
+  assert.ok(semantic);
+  assert.ok(semantic.outcomePenalty > 0);
+  assert.ok(semantic.score < semantic.baseScore);
+  assert.match(semantic.reason, /Learned outcome penalty=/u);
+  assert.notEqual(
+    output.actionScores[0]?.action.toolName,
+    "semantic_search_notes",
+  );
+  assert.ok(
+    output.actionScores.some(
+      (item) => item.action.toolName === "semantic_search_notes",
+    ),
+    "learned history must never remove an authorized tool",
+  );
+});
+
+test("generic graph candidates use their tool-derived target kind for learned ranking", async () => {
+  let memory = createToolOutcomeMemory();
+  for (let index = 0; index < 3; index += 1) {
+    memory = recordToolOutcome(memory, {
+      toolName: "get_note_graph_context",
+      ok: false,
+      errorCode: "mission_graph_authority_blocked",
+      targetKind: "vault_note",
+      observedAt: `2026-07-24T00:01:0${index}.000Z`,
+    });
+  }
+
+  const output = await new AgenticReflexController().evaluate(
+    input({
+      allowedToolNames: new Set([
+        "get_note_graph_context",
+        "list_markdown_files",
+      ]),
+      toolOutcomeMemory: memory,
+    }),
+  );
+  const graph = output.actionScores.find(
+    (item) => item.action.toolName === "get_note_graph_context",
+  );
+  assert.ok(graph);
+  assert.equal(graph.action.kind, "use_tool");
+  assert.ok(graph.outcomePenalty > 0);
+  assert.ok(graph.score < graph.baseScore);
+});
+
+test("one failure is noise and a different target kind does not affect ranking", async () => {
+  const once = recordToolOutcome(createToolOutcomeMemory(), {
+    toolName: "semantic_search_notes",
+    ok: false,
+    errorCode: "temporary",
+    targetKind: "vault_note",
+    observedAt: "2026-07-24T00:00:00.000Z",
+  });
+  let differentTarget = createToolOutcomeMemory();
+  for (let index = 0; index < 5; index += 1) {
+    differentTarget = recordToolOutcome(differentTarget, {
+      toolName: "semantic_search_notes",
+      ok: false,
+      errorCode: "workspace_only",
+      targetKind: "code_workspace",
+      observedAt: `2026-07-24T00:00:1${index}.000Z`,
+    });
+  }
+
+  for (const memory of [once, differentTarget]) {
+    const output = await new AgenticReflexController().evaluate(
+      input({ toolOutcomeMemory: memory }),
+    );
+    const semantic = output.actionScores.find(
+      (item) => item.action.toolName === "semantic_search_notes",
+    );
+    assert.ok(semantic);
+    assert.equal(semantic.outcomePenalty, 0);
+    assert.equal(semantic.score, semantic.baseScore);
+  }
+});
+
+test("every allowed tool receives exactly one score including compound tools", async () => {
+  const allowedToolNames = new Set([
+    "semantic_search_notes",
+    "code_workspace_create",
+    "github_create_private_repository",
+  ]);
+  const output = await new AgenticReflexController().evaluate(
+    input({ allowedToolNames }),
+  );
+  for (const toolName of allowedToolNames) {
+    assert.equal(
+      output.actionScores.filter((item) => item.action.toolName === toolName)
+        .length,
+      1,
+    );
+  }
+  assert.equal(
+    output.actionScores.find(
+      (item) => item.action.toolName === "code_workspace_create",
+    )?.action.kind,
+    "use_tool",
+  );
 });
 
 test("reflex controller falls back when disabled", async () => {

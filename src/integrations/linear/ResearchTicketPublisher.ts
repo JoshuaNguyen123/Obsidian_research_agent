@@ -413,7 +413,10 @@ export class ResearchTicketPublisher {
         status: "reconcile_required",
         error: {
           code: "research_ticket_readback_mismatch",
-          message: mismatch,
+          message: `${mismatch}${comparableTicketDifferenceDiagnostic(
+            readback.description,
+            ticket.description,
+          )}`,
         },
         ticket,
         action: execution.action,
@@ -908,7 +911,43 @@ function ownedDeterministicIssueMismatch(
 function normalizeComparableTicketText(value: string | undefined): string {
   return (value ?? "")
     .replace(/\r\n?/g, "\n")
-    .replace(/^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+/gmu, "- ");
+    .replace(
+      /\[([^\]\r\n]+)\]\(<(https?:\/\/[^>\r\n]+)>\)/gu,
+      (match, label: string, target: string) => label === target ? target : match,
+    )
+    .replace(/(<!--[^>\r\n]+-->)[ \t]*\n(?:[ \t]*\n)+(?=```)/gu, "$1\n")
+    .replace(/(```)[ \t]*\n(?:[ \t]*\n)+(?=<!--)/gu, "$1\n")
+    .replace(/^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+/gmu, "- ")
+    .replace(/^[ \t]*[-*][ \t]+/gmu, "- ")
+    .replace(/[ \t]+$/gmu, "")
+    .trim();
+}
+
+function comparableTicketDifferenceDiagnostic(
+  actual: string | undefined,
+  expected: string | undefined,
+): string {
+  const actualLines = normalizeComparableTicketText(actual).split("\n");
+  const expectedLines = normalizeComparableTicketText(expected).split("\n");
+  const lineCount = Math.max(actualLines.length, expectedLines.length);
+  for (let index = 0; index < lineCount; index += 1) {
+    if (actualLines[index] === expectedLines[index]) continue;
+    return [
+      ` First normalized difference is line ${index + 1}`,
+      `expected=${boundedComparableLine(expectedLines[index])}`,
+      `actual=${boundedComparableLine(actualLines[index])}.`,
+    ].join("; ");
+  }
+  return ` Normalized line counts differ: expected=${expectedLines.length}; actual=${actualLines.length}.`;
+}
+
+function boundedComparableLine(value: string | undefined): string {
+  const normalized = (value ?? "<missing>")
+    .replace(/https?:\/\/[^\s)\]>"']+/giu, "<url>")
+    .replace(/sha256:[a-f0-9]{64}/giu, "<sha256>");
+  return JSON.stringify(
+    normalized.length > 180 ? `${normalized.slice(0, 177)}...` : normalized,
+  );
 }
 
 function hasExactTicketContent(

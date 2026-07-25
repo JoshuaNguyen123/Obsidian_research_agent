@@ -141,6 +141,32 @@ test("limitation sentences are exempt from material claim grounding", () => {
   assert.ok(ledger.claims.some((claim) => claim.status === "exempt"));
 });
 
+test("standalone required literal markers are metadata rather than material claims", () => {
+  const source = fetchedSource();
+  const ledger = buildClaimLedger({
+    draft: [
+      "E2E_MARKER_CONFLICT_REPAIR_01",
+      `Quantum battery evidence compares independent laboratory sources [${source.passageId}].`,
+    ].join("\n\n"),
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Deep research with citations. Include E2E_MARKER_CONFLICT_REPAIR_01.",
+  });
+
+  assert.equal(ledger.status, "pass", ledger.missing.join(", "));
+  assert.equal(ledger.claims.length, 1);
+  assert.doesNotMatch(ledger.claims[0]?.text ?? "", /E2E_MARKER/iu);
+});
+
+test("word-count verification does not manufacture passage grounding debt", () => {
+  assert.equal(
+    shouldRequireClaimGrounding(
+      "Write approximately 180 words about local-first workflows, then use count_words to verify the generated note length.",
+    ),
+    false,
+  );
+});
+
 test("epistemic section bodies remain exempt when the heading carries the label", () => {
   const source = fetchedSource();
   const ledger = buildClaimLedger({

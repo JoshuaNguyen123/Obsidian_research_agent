@@ -2,6 +2,7 @@ import type { AgentSettings } from "../../settings";
 import type { MissionIntent } from "../../tools/types";
 import type { SemanticEmbeddingProvider } from "../../embeddings/types";
 import type { MissionEvidence } from "../missionLedger";
+import type { ToolOutcomeMemoryV1 } from "../outcomeMemory";
 
 export type ReflexLabel =
   | "chat_answer"
@@ -123,6 +124,7 @@ export interface CandidateAgentAction {
     | "count_words"
     | "write_current_note"
     | "create_artifact"
+    | "use_tool"
     | "ask_clarifying_question"
     | "stop_with_blocker";
   toolName?: string;
@@ -132,6 +134,10 @@ export interface CandidateAgentAction {
 
 export interface ActionScore {
   action: CandidateAgentAction;
+  /** Intent/state score before learned outcome history is applied. */
+  baseScore: number;
+  /** Normalized 0..1 downward adjustment from cross-run outcome memory. */
+  outcomePenalty: number;
   score: number;
   reason: string;
 }
@@ -170,6 +176,8 @@ export interface AgenticReflexInput {
   receipts: ReflexReceiptLike[];
   settings?: AgentSettings;
   embeddingProvider?: SemanticEmbeddingProvider;
+  /** Optional cross-run tool history. Absent preserves pre-memory scoring. */
+  toolOutcomeMemory?: ToolOutcomeMemoryV1;
   checkpoint?: ReflexCheckpointKind;
   frontierFingerprint?: string | null;
 }

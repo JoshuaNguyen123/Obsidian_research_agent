@@ -407,12 +407,15 @@ test.describe("Daily-use Code capability production boundaries", () => {
     ).toEqual([]);
 
     const workspaceId = `phase4-crud-${active.marker.toLowerCase()}`;
-    const originalPath = "src/durable-value.txt";
-    const movedPath = "src/durable-value-restored.txt";
+    const directoryPath = "projects/checkers/src/engine/state";
+    const originalPath = `${directoryPath}/durable-value.txt`;
+    const movedPath =
+      "projects/checkers/archive/snapshots/durable-value-restored.txt";
     let cleanupStatus: Record<string, unknown> | null = null;
     try {
       await active.configureScenario("crud-stage-1", {
         workspaceId,
+        directoryPath,
         originalPath,
         movedPath,
       });
@@ -420,7 +423,7 @@ test.describe("Daily-use Code capability production boundaries", () => {
         [
           `Create the isolated scratch workspace ${workspaceId}.`,
           "Use exactly code_workspace_create, code_workspace_mkdir, code_workspace_create_file, code_workspace_read, code_workspace_write_expected, code_workspace_move, code_workspace_trash, and code_workspace_restore.",
-          `Create ${originalPath} containing before:${active.marker}, read its hash, replace it with after:${active.marker}, move it to ${movedPath}, trash it, and restore the exact trashId.`,
+          `Create the nested directory ${directoryPath}, then create ${originalPath} containing before:${active.marker}. Read its hash, replace it with after:${active.marker}, move it to the different nested path ${movedPath}, trash it, and restore the exact trashId.`,
           "Use the actual approval UI for every prepared action and surface the before/after hashes and trash/restore receipts in Run Details.",
         ].join(" "),
         { timeoutMs: MISSION_TIMEOUT_MS },

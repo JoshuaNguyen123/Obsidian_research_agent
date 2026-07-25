@@ -815,6 +815,12 @@ test("explicit source cardinality overrides the deep-research default without re
     ),
     null,
   );
+  assert.equal(
+    parseExplicitResearchSourceCount(
+      "Use exactly two distinct owned source domains for the handoff.",
+    ),
+    2,
+  );
   const plan = createResearchPlan({
     prompt:
       "Do deep research using exactly two owned sources and cite their passages.",

@@ -71,6 +71,14 @@ export interface GitPushAttemptRecordV1 {
   beforeRemoteSha: string | null;
   expectedCommitSha: string;
   status: GitPushAttemptStatusV1;
+  /**
+   * Advisory only: 1 when this attempt intends a `git push` dispatch, 0 when
+   * the remote already held the exact verified refs at claim time. It is
+   * computed BEFORE dispatch and is never read back — the at-most-one-dispatch
+   * invariant rests solely on `status` (only `not_applied` may redispatch,
+   * enforced at push() entry). Kept in the persisted schema for forensic
+   * value; do not wire it into control flow.
+   */
   dispatchCount: 0 | 1;
   reconciliationKey: string;
   startedAt: string;
@@ -304,20 +312,34 @@ export class VerifiedGitPushGatewayV1 {
           );
         } catch (error) {
           const diagnostic = safeDiagnostic(error);
-          if (isDefinitiveGitPushAuthFailureV1(diagnostic)) {
+          const failureClass = classifyGitPushFailureV1(diagnostic);
+          if (failureClass === "auth") {
             return this.markNotApplied(
               attempt,
               healableGitPushAuthFailureMessage(diagnostic),
+            );
+          }
+          if (failureClass === "policy") {
+            return this.markReconcileRequired(
+              attempt,
+              policyDeclinedGitPushMessage(diagnostic),
             );
           }
           return this.markReconcileRequired(attempt, diagnostic);
         }
         if (pushResult.exitCode !== 0) {
           const diagnostic = safeGitDiagnostic(pushResult);
-          if (isDefinitiveGitPushAuthFailureV1(diagnostic)) {
+          const failureClass = classifyGitPushFailureV1(diagnostic);
+          if (failureClass === "auth") {
             return this.markNotApplied(
               attempt,
               healableGitPushAuthFailureMessage(diagnostic),
+            );
+          }
+          if (failureClass === "policy") {
+            return this.markReconcileRequired(
+              attempt,
+              policyDeclinedGitPushMessage(diagnostic),
             );
           }
           return this.markReconcileRequired(attempt, diagnostic);
@@ -720,7 +742,7 @@ export class VerifiedGitPushGatewayV1 {
       revision: attempt.revision + 1,
       status: "reconcile_required",
       updatedAt: this.now().toISOString(),
-      diagnostic,
+      diagnostic: truncateDiagnosticForStore(diagnostic),
     };
     await this.saveReplacement(attempt, next);
     return resultFromPrior(next);
@@ -735,7 +757,7 @@ export class VerifiedGitPushGatewayV1 {
       revision: attempt.revision + 1,
       status: "not_applied",
       updatedAt: this.now().toISOString(),
-      diagnostic,
+      diagnostic: truncateDiagnosticForStore(diagnostic),
     };
     await this.saveReplacement(attempt, next);
     return resultFromPrior(next);
@@ -830,27 +852,84 @@ function bounded(value: unknown, label: string, min: number, max: number): strin
   return value;
 }
 
+// Git prints remote: progress banners first and its definitive failure line
+// (fatal:, HTTP 4xx) last. Classification must see that tail, so we redact the
+// full string and bound to the last MAX_CLASSIFY bytes rather than the head —
+// the previous head-only .slice(0, 1000) misread a real "fatal: Authentication
+// failed" that landed past byte 1000 as ambiguous, which permanently bricked the
+// handoff (reconcile_required cannot redispatch). Storage truncation happens
+// separately, at the persistence boundary in mark*, keeping head + tail.
+const MAX_CLASSIFY_DIAGNOSTIC_BYTES = 4000;
+const STORE_DIAGNOSTIC_HEAD_BYTES = 400;
+const STORE_DIAGNOSTIC_TAIL_BYTES = 600;
+
 function safeGitDiagnostic(result: VerifiedGitCommandResultV1): string {
   return safeDiagnostic(result.stderr || `Git exited with code ${result.exitCode}.`);
 }
 
-function safeDiagnostic(value: unknown): string {
+/** Scrub credential material. Runs on the whole string so a secret is redacted
+ * regardless of position; bounding is the caller's concern. */
+function redactGitDiagnostic(value: unknown): string {
   return (value instanceof Error ? value.message : String(value))
     .replace(/https:\/\/[^\s/@]+@github\.com/giu, "https://[REDACTED]@github.com")
     .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
-    .replace(/(?:token|password|secret|authorization|credential)\s*[=:]\s*\S+/giu, "credential=[REDACTED]")
-    .slice(0, 1000);
+    .replace(/(?:token|password|secret|authorization|credential)\s*[=:]\s*\S+/giu, "credential=[REDACTED]");
+}
+
+/** Redacted diagnostic bounded for classification (keeps the tail, where the
+ * definitive git failure line lives). Passed to mark*, which store-truncates. */
+function safeDiagnostic(value: unknown): string {
+  const redacted = redactGitDiagnostic(value);
+  return redacted.length > MAX_CLASSIFY_DIAGNOSTIC_BYTES
+    ? redacted.slice(redacted.length - MAX_CLASSIFY_DIAGNOSTIC_BYTES)
+    : redacted;
+}
+
+/** Bound a redacted diagnostic for durable storage, preserving both the head
+ * (context) and the tail (the fatal line). Only truncates past head + tail. */
+function truncateDiagnosticForStore(diagnostic: string): string {
+  if (diagnostic.length <= STORE_DIAGNOSTIC_HEAD_BYTES + STORE_DIAGNOSTIC_TAIL_BYTES) {
+    return diagnostic;
+  }
+  return (
+    `${diagnostic.slice(0, STORE_DIAGNOSTIC_HEAD_BYTES)}` +
+    `…` +
+    `${diagnostic.slice(diagnostic.length - STORE_DIAGNOSTIC_TAIL_BYTES)}`
+  );
 }
 
 /**
- * GitHub returns "Repository not found" for private repos when the token lacks
- * Contents access. Treat that, and explicit auth failures, as definitive
- * non-application so Soft publish can retry after installing a push-capable
- * credential (create-only Administration is not enough).
+ * Classify a redacted git-push failure diagnostic.
+ *
+ * - "auth": the credential definitively lacks access (401, bad token,
+ *   "Repository not found" on a private repo). Safe to mark not_applied and
+ *   heal by installing a Contents-capable token.
+ * - "policy": the push was declined by repository policy — GitHub push
+ *   protection (GH013 secret scanning), protected branches (GH006), or
+ *   repository rulesets. These also surface HTTP 403, but re-credentialing
+ *   can never fix them, so they must NOT get the auth remediation; the
+ *   content or target itself has to change.
+ * - "ambiguous": everything else; requires remote readback reconciliation.
+ *
+ * Policy patterns are checked before the generic 403 rule because GitHub
+ * reports policy declines with 403 status lines too.
  */
-export function isDefinitiveGitPushAuthFailureV1(diagnostic: string): boolean {
+export function classifyGitPushFailureV1(
+  diagnostic: string,
+): "auth" | "policy" | "ambiguous" {
   const text = diagnostic.toLowerCase();
-  return (
+  if (
+    /\bgh0(06|13)\b/u.test(text) ||
+    /push declined due to repository rule violations/u.test(text) ||
+    /protected branch hook declined/u.test(text) ||
+    /cannot be pushed to a protected branch/u.test(text) ||
+    /push cannot contain secrets/u.test(text) ||
+    /secret scanning/u.test(text) ||
+    /push protection/u.test(text)
+  ) {
+    return "policy";
+  }
+  if (
     /authentication failed/u.test(text) ||
     /could not read username/u.test(text) ||
     /invalid username or token/u.test(text) ||
@@ -861,7 +940,37 @@ export function isDefinitiveGitPushAuthFailureV1(diagnostic: string): boolean {
         /remote:/u.test(text))) ||
     /http(s)?\s*401/u.test(text) ||
     /http(s)?\s*403/u.test(text)
-  );
+  ) {
+    return "auth";
+  }
+  return "ambiguous";
+}
+
+/**
+ * GitHub returns "Repository not found" for private repos when the token lacks
+ * Contents access. Treat that, and explicit auth failures, as definitive
+ * non-application so Soft publish can retry after installing a push-capable
+ * credential (create-only Administration is not enough).
+ */
+export function isDefinitiveGitPushAuthFailureV1(diagnostic: string): boolean {
+  return classifyGitPushFailureV1(diagnostic) === "auth";
+}
+
+/**
+ * Remediation for a policy-declined push (push protection, protected branch,
+ * rulesets). Distinct from the auth message: installing a wider token will
+ * never help here.
+ */
+export function policyDeclinedGitPushMessage(diagnostic: string): string {
+  return [
+    "GitHub declined the push by repository policy (push protection,",
+    "protected branch, or repository rules) — not by authentication.",
+    "Installing a different token will not help. Remove flagged secrets or",
+    "adjust the target branch/rules, produce a new verified commit, and retry.",
+    diagnostic ? `Detail: ${diagnostic.slice(-400)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 export function healableGitPushAuthFailureMessage(diagnostic: string): string {
@@ -872,7 +981,7 @@ export function healableGitPushAuthFailureMessage(diagnostic: string): string {
     "Heal: install a github_pat_ with Contents:write (All repositories) or a",
     "classic/gh OAuth token with repo scope via the harness/vault credential,",
     "then retry publish_draft.",
-    diagnostic ? `Detail: ${diagnostic.slice(0, 400)}` : "",
+    diagnostic ? `Detail: ${diagnostic.slice(-400)}` : "",
   ]
     .filter(Boolean)
     .join(" ");

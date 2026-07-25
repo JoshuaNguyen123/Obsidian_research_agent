@@ -9,6 +9,8 @@ test("covers confused pairs with Purpose / Do not use when", () => {
   for (const name of [
     "append_to_current_file",
     "code_workspace_create_file",
+    "code_workspace_export_directory",
+    "code_workspace_write_expected",
     "code_commit_verified",
     "publish_verified_code_to_github",
     "read_file",
@@ -17,6 +19,22 @@ test("covers confused pairs with Purpose / Do not use when", () => {
     const text = DISCRIMINATIVE_TOOL_DESCRIPTIONS[name];
     assert.match(String(text), /Purpose:/);
     assert.match(String(text), /Do not use when:/);
+  }
+});
+
+test("code delivery descriptions identify the real local filesystem and export route", () => {
+  for (const name of [
+    "code_workspace_create_file",
+    "code_workspace_write_expected",
+    "code_workspace_export_directory",
+  ] as const) {
+    const text = DISCRIMINATIVE_TOOL_DESCRIPTIONS[name];
+    assert.match(text, /real (?:directory|local filesystem)/iu);
+    assert.match(text, /Desktop/iu);
+    assert.match(
+      text,
+      /code_workspace_export_directory|absolute verified export path/iu,
+    );
   }
 });
 

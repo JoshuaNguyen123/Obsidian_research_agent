@@ -18,6 +18,7 @@ import {
 import {
   VerifiedGitPushErrorV1,
   VerifiedGitPushGatewayV1,
+  classifyGitPushFailureV1,
   isDefinitiveGitPushAuthFailureV1,
   type EphemeralGitAskpassBrokerV1,
   type GitPushAttemptRecordV1,
@@ -141,6 +142,107 @@ test("auth-failed push is not_applied and may retry after a Contents-capable cre
   assert.equal(fixture.runner.pushes, 2);
 });
 
+test("verbose auth failure with the fatal line past 1000 bytes is still not_applied", async () => {
+  const fixture = createFixture({ pushMode: "auth_failure_verbose" });
+  const first = await fixture.gateway.push(fixture.input);
+  // Previously the head-only .slice(0, 1000) hid the fatal line, misclassifying
+  // this as reconcile_required and permanently bricking the handoff.
+  assert.equal(first.status, "not_applied");
+  assert.equal(fixture.runner.pushes, 1);
+  if (first.status === "not_applied") {
+    assert.match(first.message, /Contents:write|Git push authentication failed/iu);
+  }
+  const stored = fixture.store.all();
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0]?.status, "not_applied");
+
+  // And it can still heal: install a capable token and redispatch.
+  fixture.runner.pushMode = "success";
+  const second = await fixture.gateway.push(fixture.input);
+  assert.equal(second.status, "pushed_verified");
+});
+
+test("policy-declined pushes are reconcile_required with policy remediation, not auth healing", async () => {
+  // GH013 push protection and GH006 protected branch both surface HTTP 403,
+  // but installing a wider token can never fix them. Previously they were
+  // classified as auth failures and got the "install Contents:write" message.
+  const policyCases = [
+    {
+      name: "GH013 secret scanning push protection",
+      stderr: [
+        "remote: error: GH013: Repository rule violations found for refs/heads/codex/repair-1.",
+        "remote: - GITHUB PUSH PROTECTION",
+        "remote:   Push cannot contain secrets",
+        "remote: (403)",
+        "error: failed to push some refs",
+      ].join("\n"),
+    },
+    {
+      name: "GH006 protected branch",
+      stderr: [
+        "remote: error: GH006: Protected branch update failed for refs/heads/codex/repair-1.",
+        "remote: error: Cannot change this locked branch (403)",
+        "error: failed to push some refs",
+      ].join("\n"),
+    },
+  ];
+  for (const policyCase of policyCases) {
+    assert.equal(
+      classifyGitPushFailureV1(policyCase.stderr),
+      "policy",
+      policyCase.name,
+    );
+    assert.equal(
+      isDefinitiveGitPushAuthFailureV1(policyCase.stderr),
+      false,
+      policyCase.name,
+    );
+  }
+  // A plain 403 auth failure without policy markers stays an auth failure.
+  assert.equal(
+    classifyGitPushFailureV1(
+      "error: RPC failed; HTTP 403 curl 22 The requested URL returned error: 403",
+    ),
+    "auth",
+  );
+
+  // End to end: a policy decline persists reconcile_required with the policy
+  // remediation, and the same handoff is NOT redispatchable.
+  const fixture = createFixture({ pushMode: "policy_decline" });
+  const first = await fixture.gateway.push(fixture.input);
+  assert.equal(first.status, "reconcile_required");
+  if (first.status === "reconcile_required") {
+    assert.match(first.message, /repository policy|push protection|protected branch/iu);
+    assert.doesNotMatch(first.message, /Contents:write/u);
+  }
+  assert.equal(fixture.runner.pushes, 1);
+  const second = await fixture.gateway.push(fixture.input);
+  assert.equal(second.status, "reconcile_required");
+  assert.equal(fixture.runner.pushes, 1, "policy declines must not auto-redispatch");
+});
+
+test("a credential past the classification cut is redacted in the stored diagnostic", async () => {
+  const fixture = createFixture({ pushMode: "auth_failure_with_token" });
+  const result = await fixture.gateway.push(fixture.input);
+  assert.equal(result.status, "not_applied");
+  const stored = fixture.store.all();
+  const diagnostic = stored[0]?.diagnostic ?? "";
+  assert.doesNotMatch(diagnostic, /ghp_LEAKEDSECRETVALUE/u);
+  assert.match(diagnostic, /credential=\[REDACTED\]/u);
+});
+
+test("dispatchCount is advisory: 1 exactly when git push ran, 0 for already-present", async () => {
+  const pushed = createFixture();
+  await pushed.gateway.push(pushed.input);
+  assert.equal(pushed.runner.pushes, 1);
+  assert.equal(pushed.store.all()[0]?.dispatchCount, 1);
+
+  const present = createFixture({ remoteSha: COMMIT, remoteBaseSha: BASE });
+  await present.gateway.push(present.input);
+  assert.equal(present.runner.pushes, 0);
+  assert.equal(present.store.all()[0]?.dispatchCount, 0);
+});
+
 test("local commit identity drift blocks before remote access", async () => {
   const fixture = createFixture({ localTreeSha: "e".repeat(40) });
   await assert.rejects(
@@ -223,7 +325,14 @@ function createFixture(options: {
   remoteSha?: string | null;
   remoteBaseSha?: string | null;
   fastForward?: boolean;
-  pushMode?: "success" | "applied_throw" | "readback_mismatch" | "auth_failure";
+  pushMode?:
+    | "success"
+    | "applied_throw"
+    | "readback_mismatch"
+    | "auth_failure"
+    | "auth_failure_verbose"
+    | "auth_failure_with_token"
+    | "policy_decline";
   localTreeSha?: string;
   authorName?: string;
   authorEmail?: string;
@@ -327,6 +436,10 @@ class MemoryAttemptStore implements GitPushAttemptStoreV1 {
     this.records.set(record.id, clone(record));
     return true;
   }
+
+  all(): GitPushAttemptRecordV1[] {
+    return [...this.records.values()].map((record) => clone(record));
+  }
 }
 
 class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
@@ -337,13 +450,27 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
   remoteReads = 0;
   private remoteSha: string | null;
   private remoteBaseSha: string | null;
-  pushMode: "success" | "applied_throw" | "readback_mismatch" | "auth_failure";
+  pushMode:
+    | "success"
+    | "applied_throw"
+    | "readback_mismatch"
+    | "auth_failure"
+    | "auth_failure_verbose"
+    | "auth_failure_with_token"
+    | "policy_decline";
 
   constructor(private readonly options: {
     remoteSha: string | null;
     remoteBaseSha: string | null;
     fastForward: boolean;
-    pushMode: "success" | "applied_throw" | "readback_mismatch" | "auth_failure";
+    pushMode:
+      | "success"
+      | "applied_throw"
+      | "readback_mismatch"
+      | "auth_failure"
+      | "auth_failure_verbose"
+      | "auth_failure_with_token"
+      | "policy_decline";
     localTreeSha: string;
     authorName: string;
     authorEmail: string;
@@ -406,6 +533,48 @@ class FakeGitRunner implements VerifiedGitCommandRunnerV1 {
           stdout: "",
           stderr:
             "remote: Repository not found.\nfatal: Authentication failed for 'https://github.com/acme/research-agent.git/'",
+        };
+      }
+      if (this.pushMode === "auth_failure_verbose") {
+        // Real git emits kilobytes of remote: progress before the fatal line.
+        // The definitive marker lands well past the old 1000-char classification
+        // cut, so this is the case that previously misclassified to
+        // reconcile_required and bricked the handoff.
+        const banner = Array.from(
+          { length: 60 },
+          (_unused, index) =>
+            `remote: Enumerating objects: ${index}, done. Counting objects, compressing deltas, writing objects across the wire`,
+        ).join("\n");
+        return {
+          exitCode: 128,
+          stdout: "",
+          stderr: `${banner}\nfatal: Authentication failed for 'https://github.com/acme/research-agent.git/'`,
+        };
+      }
+      if (this.pushMode === "auth_failure_with_token") {
+        // A leaked credential sits past byte 1000, after the banner, before the
+        // fatal line — it must still be redacted in the stored diagnostic.
+        const banner = Array.from(
+          { length: 60 },
+          (_unused, index) => `remote: Counting objects ${index} across the wire`,
+        ).join("\n");
+        return {
+          exitCode: 128,
+          stdout: "",
+          stderr: `${banner}\nfatal: could not read Password: token=ghp_LEAKEDSECRETVALUE0123456789ABCDE\nfatal: Authentication failed`,
+        };
+      }
+      if (this.pushMode === "policy_decline") {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: [
+            "remote: error: GH013: Repository rule violations found for refs/heads/codex/repair-1.",
+            "remote: - GITHUB PUSH PROTECTION",
+            "remote:   Push cannot contain secrets",
+            "remote: (403)",
+            "error: failed to push some refs to 'https://github.com/acme/research-agent.git'",
+          ].join("\n"),
         };
       }
       if (this.pushMode === "readback_mismatch") {

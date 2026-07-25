@@ -38,3 +38,12 @@ test("plain write essay does not authorize replace", () => {
     false,
   );
 });
+
+test("negative non-note rewrite clause does not authorize current-note replacement", () => {
+  const prompt = [
+    "Create a repository workspace and append the verified reflection to the current note.",
+    "Do not rewrite package.json or scripts.",
+  ].join(" ");
+
+  assert.equal(hasAuthorizedCurrentNoteReplaceIntent(prompt), false);
+});

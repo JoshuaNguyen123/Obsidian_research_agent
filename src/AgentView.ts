@@ -48,6 +48,7 @@ import {
 } from "./agent/proofDebt";
 import { readMissionRuntimeSnapshotByRunId } from "./agent/runStore";
 import type { RunOutcome } from "./agent/runCoordinator";
+import type { SteeringDirectiveKind } from "./agent/runSteering";
 import type { OrchestratorSnapshotV1 } from "./orchestrator/types";
 import {
   inferCapabilitySetupTarget,
@@ -99,6 +100,15 @@ import {
   formatTeamStatsLine,
 } from "./ui/autonomyStatsCopy";
 import {
+  formatAgentMetric,
+  formatChars,
+  formatOptionalNumber,
+  formatReceiptOperationLabel,
+  formatScopeList,
+  formatStepMetric,
+  formatStreamLifecycleLabel,
+} from "./ui/agentViewFormatters";
+import {
   buildMissionReadinessCardModelV1,
   renderMissionReadinessCard,
 } from "./ui/MissionReadinessCard";
@@ -107,6 +117,10 @@ import {
   projectMissionGraphRunDetails,
   type MissionGraphRunDetailsProjectionV1,
 } from "../packages/headless-runtime/src/missionGraphProjection";
+import {
+  createBrowserFrameScheduler,
+  KeyedFrameBatcher,
+} from "./ui/frameBatcher";
 
 export const AGENT_VIEW_TYPE = "agentic-researcher-view";
 
@@ -117,6 +131,16 @@ const MAX_RECEIPT_ROWS = 256;
 const MAX_CODE_OUTPUT_ROWS = 100;
 const MAX_VERIFICATION_ROWS = 100;
 const MAX_DETAIL_ROWS = 100;
+const MAX_CHAT_ROWS = 80;
+const STEERING_KIND_OPTIONS: readonly {
+  value: SteeringDirectiveKind;
+  label: string;
+}[] = [
+  { value: "add_constraint", label: "Add constraint" },
+  { value: "narrow_scope", label: "Narrow scope" },
+  { value: "drop_tool", label: "Drop tool" },
+  { value: "prioritize_target", label: "Prioritize target" },
+] as const;
 
 type LogKind = "system" | "user" | "assistant" | "error";
 type AgentViewTab = "chat" | "orchestrator" | "details";
@@ -135,6 +159,13 @@ export class AgentView extends ItemView {
   private logEl: HTMLElement | null = null;
   private promptEl: HTMLTextAreaElement | null = null;
   private runButtonEl: HTMLButtonElement | null = null;
+  private steeringEl: HTMLElement | null = null;
+  private steeringKindEl: HTMLSelectElement | null = null;
+  private steeringTextEl: HTMLInputElement | null = null;
+  private steeringToolLabelEl: HTMLElement | null = null;
+  private steeringToolEl: HTMLSelectElement | null = null;
+  private steeringButtonEl: HTMLButtonElement | null = null;
+  private steeringStatusEl: HTMLElement | null = null;
   private continueButtonEl: HTMLButtonElement | null = null;
   private chatOnlyToggleEl: HTMLInputElement | null = null;
   private clearButtonEl: HTMLButtonElement | null = null;
@@ -184,6 +215,8 @@ export class AgentView extends ItemView {
   private verificationEl: HTMLElement | null = null;
   private previewEl: HTMLElement | null = null;
   private runLogEl: HTMLElement | null = null;
+  private diagnosticsDetailsEl: HTMLDetailsElement | null = null;
+  private diagnosticsBadgeEl: HTMLElement | null = null;
   private chatLoaderEl: HTMLElement | null = null;
   private chatLoaderTextEl: HTMLElement | null = null;
   private liveAssistantMessageEl: HTMLElement | null = null;
@@ -218,10 +251,22 @@ export class AgentView extends ItemView {
   private runConfig: AgentRunConfigEvent | null = null;
   private missionGraphProjection: MissionGraphRunDetailsProjectionV1 | null = null;
   private usageTotals = this.createEmptyUsageTotals();
+  private readonly textFrameBatcher: KeyedFrameBatcher<HTMLElement>;
+  private readonly scrollFrameBatcher: KeyedFrameBatcher<HTMLElement>;
+  private readonly pendingTextDeltas = new Map<HTMLElement, string>();
+  private readonly pendingScrollTargets = new Map<
+    HTMLElement,
+    { tab: AgentViewTab; preserveUserPosition: boolean }
+  >();
+  private lastStatusRowKey: string | null = null;
+  private lastWorkstreamLine: string | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: AgenticResearcherPlugin) {
     super(leaf);
     this.plugin = plugin;
+    const frameScheduler = createBrowserFrameScheduler(window);
+    this.textFrameBatcher = new KeyedFrameBatcher(frameScheduler);
+    this.scrollFrameBatcher = new KeyedFrameBatcher(frameScheduler);
   }
 
   getViewType() {
@@ -275,6 +320,10 @@ export class AgentView extends ItemView {
 
   async onClose() {
     this.clearRunningStateSyncTimers();
+    this.textFrameBatcher.cancelAll();
+    this.scrollFrameBatcher.cancelAll();
+    this.pendingTextDeltas.clear();
+    this.pendingScrollTargets.clear();
     this.unsubscribeRunEvents?.();
     this.unsubscribeRunEvents = null;
     this.plugin.unregisterAgentView(this);
@@ -452,6 +501,10 @@ export class AgentView extends ItemView {
   }
 
   private resetDomBackedState() {
+    this.textFrameBatcher.cancelAll();
+    this.scrollFrameBatcher.cancelAll();
+    this.pendingTextDeltas.clear();
+    this.pendingScrollTargets.clear();
     this.toolTimelineItems.clear();
     this.toolTimelineOrdinal = 0;
     this.chatMessageEls.clear();
@@ -460,14 +513,24 @@ export class AgentView extends ItemView {
     this.receiptKeys.clear();
     this.chatLoaderEl = null;
     this.chatLoaderTextEl = null;
+    this.liveWorkstreamEl = null;
     this.liveAssistantMessageEl = null;
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
     this.firstRunEl = null;
     this.continueButtonEl = null;
+    this.steeringEl = null;
+    this.steeringKindEl = null;
+    this.steeringTextEl = null;
+    this.steeringToolLabelEl = null;
+    this.steeringToolEl = null;
+    this.steeringButtonEl = null;
+    this.steeringStatusEl = null;
     this.orchestratorTab?.destroy();
     this.orchestratorTab = null;
     this.orchestratorReferenceRunId = null;
+    this.lastStatusRowKey = null;
+    this.lastWorkstreamLine = null;
     this.tabsEl = null;
     this.orchestratorTabButtonEl = null;
     this.orchestratorPanelEl = null;
@@ -589,16 +652,6 @@ export class AgentView extends ItemView {
     this.chatTeamStripEl.hide();
     this.renderChatTeamStrip();
 
-    // Compact mission telemetry under the log; hidden until the run emits lines.
-    this.liveWorkstreamEl = container.createDiv({
-      cls: "agentic-researcher-live-workstream is-hidden",
-      attr: {
-        "data-testid": "live-workstream",
-        "aria-live": "polite",
-      },
-    });
-    this.liveWorkstreamEl.hide();
-
     this.chatAttentionEl = container.createDiv({
       cls: "agentic-researcher-chat-attention is-hidden",
       attr: {
@@ -669,6 +722,81 @@ export class AgentView extends ItemView {
       },
     });
 
+    this.steeringEl = actionsEl.createDiv({
+      cls: "agentic-researcher-steering",
+      attr: {
+        role: "group",
+        "aria-label": "Steer current mission",
+        "data-testid": "run-steering",
+      },
+    });
+    this.steeringEl.hidden = true;
+    this.steeringEl.createDiv({
+      text: "STEER CURRENT RUN",
+      cls: "agentic-researcher-steering-title",
+    });
+    const steeringFieldsEl = this.steeringEl.createDiv({
+      cls: "agentic-researcher-steering-fields",
+    });
+    const steeringKindLabelEl = steeringFieldsEl.createEl("label", {
+      cls: "agentic-researcher-steering-field",
+    });
+    steeringKindLabelEl.createSpan({ text: "Directive" });
+    this.steeringKindEl = steeringKindLabelEl.createEl("select", {
+      cls: "agentic-researcher-steering-kind",
+      attr: {
+        "aria-label": "Steering directive type",
+        "data-testid": "run-steering-kind",
+      },
+    });
+    for (const option of STEERING_KIND_OPTIONS) {
+      this.steeringKindEl.createEl("option", {
+        text: option.label,
+        attr: { value: option.value },
+      });
+    }
+    const steeringTextLabelEl = steeringFieldsEl.createEl("label", {
+      cls: "agentic-researcher-steering-field agentic-researcher-steering-text-field",
+    });
+    steeringTextLabelEl.createSpan({ text: "Instruction" });
+    this.steeringTextEl = steeringTextLabelEl.createEl("input", {
+      cls: "agentic-researcher-steering-text",
+      attr: {
+        type: "text",
+        maxlength: "500",
+        placeholder: "Add a constraint for the next step...",
+        "aria-label": "Steering instruction",
+        "data-testid": "run-steering-text",
+      },
+    });
+    this.steeringToolLabelEl = steeringFieldsEl.createEl("label", {
+      cls: "agentic-researcher-steering-field agentic-researcher-steering-tool-field",
+    });
+    this.steeringToolLabelEl.createSpan({ text: "Tool to drop" });
+    this.steeringToolEl = this.steeringToolLabelEl.createEl("select", {
+      cls: "agentic-researcher-steering-tool",
+      attr: {
+        "aria-label": "Tool to drop",
+        "data-testid": "run-steering-tool",
+      },
+    });
+    this.steeringToolLabelEl.hidden = true;
+    this.steeringButtonEl = this.steeringEl.createEl("button", {
+      text: "Apply next step",
+      cls: "agentic-researcher-secondary-action agentic-researcher-steering-submit",
+      attr: {
+        type: "button",
+        "data-testid": "run-steering-submit",
+      },
+    });
+    this.steeringStatusEl = this.steeringEl.createDiv({
+      cls: "agentic-researcher-steering-status",
+      attr: {
+        "aria-live": "polite",
+        "data-testid": "run-steering-status",
+      },
+    });
+
     this.continueButtonEl = actionsEl.createEl("button", {
       text: "Continue Latest Run",
       cls: "agentic-researcher-secondary-action agentic-researcher-chat-continuation",
@@ -714,6 +842,7 @@ export class AgentView extends ItemView {
       text: "Idle",
       cls: "agentic-researcher-run-status-text",
     });
+    this.runStatusEl.hidden = true;
 
     formEl.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -763,6 +892,20 @@ export class AgentView extends ItemView {
         return;
       }
       void this.capturePrompt();
+    });
+    this.steeringKindEl.addEventListener("change", () => {
+      this.updateSteeringControls();
+    });
+    this.steeringTextEl.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      this.submitSteering();
+    });
+    this.steeringButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.submitSteering();
     });
     this.continueButtonEl.addEventListener("click", (event) => {
       event.preventDefault();
@@ -826,6 +969,18 @@ export class AgentView extends ItemView {
     for (const message of this.plugin.conversationHistory) {
       this.createLogItem(message.role, message.content);
     }
+
+    // Keep live tool/progress activity in the transcript, immediately after
+    // the latest message, instead of occupying a separate strip above the
+    // composer.
+    this.liveWorkstreamEl = this.logEl.createDiv({
+      cls: "agentic-researcher-live-workstream is-hidden",
+      attr: {
+        "data-testid": "live-workstream",
+        "aria-live": "polite",
+      },
+    });
+    this.liveWorkstreamEl.hide();
   }
 
   private async renderStartupResumeBanner() {
@@ -998,50 +1153,26 @@ export class AgentView extends ItemView {
     });
 
     this.phaseValueEl = this.createMetric(metricsEl, "Phase", "Idle");
-    this.stepValueEl = this.createMetric(metricsEl, "Step", this.formatStepMetric(0));
+    this.stepValueEl = this.createMetric(
+      metricsEl,
+      "Step",
+      formatStepMetric(0, this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS),
+    );
     this.activeToolValueEl = this.createMetric(metricsEl, "Active tool", "None");
     this.activityValueEl = this.createMetric(metricsEl, "Activity", "Idle");
 
-    this.modelConfigEl = this.createDashboardSection(
-      dashboardEl,
-      "Model config",
-      "model-config",
-    );
-    this.missionGraphEl = this.createDashboardSection(
-      dashboardEl,
-      "Mission",
-      "mission-graph",
-    );
+    // Primary surface: what the mission produced and what proves it. Process
+    // detail lives behind one Diagnostics expander below so the default view
+    // stays quiet.
     this.statusStreamEl = this.createDashboardSection(
       dashboardEl,
       "Status",
       "status",
     );
-    this.thinkingStreamEl = this.createDashboardSection(
-      dashboardEl,
-      "Thinking",
-      "thinking",
-      { collapseUntilPopulated: true },
-    );
-
-    const streamsEl = dashboardEl.createDiv({
-      cls: "agentic-researcher-stream-grid",
-    });
-
-    this.planningStreamEl = this.createDashboardSection(
-      streamsEl,
-      "Planning",
-      "planning",
-    );
     this.finalStreamEl = this.createDashboardSection(
-      streamsEl,
+      dashboardEl,
       "Final answer",
       "final-answer",
-    );
-    this.toolTimelineEl = this.createDashboardSection(
-      dashboardEl,
-      "Tool timeline",
-      "tool-timeline",
     );
     this.receiptsEl = this.createDashboardSection(
       dashboardEl,
@@ -1053,45 +1184,10 @@ export class AgentView extends ItemView {
       "Mission acceptance",
       "acceptance",
     );
-    this.browserDetailsEl = this.createDashboardSection(
-      dashboardEl,
-      "Browser",
-      "browser",
-      { collapseUntilPopulated: true },
-    );
-    this.actionsDetailsEl = this.createDashboardSection(
-      dashboardEl,
-      "Actions",
-      "actions",
-    );
-    this.codeOutputEl = this.createDashboardSection(
-      dashboardEl,
-      "Code output",
-      "code-output",
-      { collapseUntilPopulated: true },
-    );
-    this.milestonesDetailsEl = this.createDashboardSection(
-      dashboardEl,
-      "Milestones",
-      "milestones",
-      { collapseUntilPopulated: true },
-    );
-    this.memoryDetailsEl = this.createDashboardSection(
-      dashboardEl,
-      "Memory",
-      "memory",
-      { collapseUntilPopulated: true },
-    );
     this.evidenceDetailsEl = this.createDashboardSection(
       dashboardEl,
       "Evidence",
       "evidence",
-      { collapseUntilPopulated: true },
-    );
-    this.verificationEl = this.createDashboardSection(
-      dashboardEl,
-      "Verification",
-      "verification",
       { collapseUntilPopulated: true },
     );
     this.previewEl = this.createDashboardSection(
@@ -1100,7 +1196,110 @@ export class AgentView extends ItemView {
       "preview",
       { collapseUntilPopulated: true },
     );
-    this.runLogEl = this.createDashboardSection(dashboardEl, "Run log", "run-log");
+
+    // Diagnostics: every process/system section, one expander. Section
+    // reveal semantics (collapseUntilPopulated / revealDashboardSection) are
+    // unchanged — the expander only controls whether the group is unfolded.
+    const diagnosticsEl = dashboardEl.createEl("details", {
+      cls: "agentic-researcher-dashboard-diagnostics",
+    });
+    this.diagnosticsDetailsEl = diagnosticsEl;
+    diagnosticsEl.open =
+      this.plugin.settings.runDetailsDiagnosticsExpanded === true;
+    const summaryEl = diagnosticsEl.createEl("summary", {
+      cls: "agentic-researcher-dashboard-diagnostics-summary",
+    });
+    summaryEl.createSpan({
+      text: "Diagnostics",
+      cls: "agentic-researcher-dashboard-diagnostics-title",
+    });
+    this.diagnosticsBadgeEl = summaryEl.createSpan({
+      cls: "agentic-researcher-dashboard-diagnostics-badge",
+    });
+    diagnosticsEl.addEventListener("toggle", () => {
+      if (
+        this.plugin.settings.runDetailsDiagnosticsExpanded !== diagnosticsEl.open
+      ) {
+        this.plugin.settings.runDetailsDiagnosticsExpanded = diagnosticsEl.open;
+        void this.plugin.saveSettings();
+      }
+    });
+    const diagnosticsBodyEl = diagnosticsEl.createDiv({
+      cls: "agentic-researcher-dashboard-diagnostics-body",
+    });
+
+    this.modelConfigEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Model config",
+      "model-config",
+    );
+    this.missionGraphEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Mission",
+      "mission-graph",
+    );
+
+    const streamsEl = diagnosticsBodyEl.createDiv({
+      cls: "agentic-researcher-stream-grid",
+    });
+    this.thinkingStreamEl = this.createDashboardSection(
+      streamsEl,
+      "Thinking",
+      "thinking",
+      { collapseUntilPopulated: true },
+    );
+    this.planningStreamEl = this.createDashboardSection(
+      streamsEl,
+      "Planning",
+      "planning",
+    );
+
+    this.toolTimelineEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Tool timeline",
+      "tool-timeline",
+    );
+    this.browserDetailsEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Browser",
+      "browser",
+      { collapseUntilPopulated: true },
+    );
+    this.actionsDetailsEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Actions",
+      "actions",
+    );
+    this.codeOutputEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Code output",
+      "code-output",
+      { collapseUntilPopulated: true },
+    );
+    this.milestonesDetailsEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Milestones",
+      "milestones",
+      { collapseUntilPopulated: true },
+    );
+    this.memoryDetailsEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Memory",
+      "memory",
+      { collapseUntilPopulated: true },
+    );
+    this.verificationEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Verification",
+      "verification",
+      { collapseUntilPopulated: true },
+    );
+    this.runLogEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Run log",
+      "run-log",
+    );
+    this.updateDiagnosticsBadge();
 
     this.setSectionPlaceholder(this.modelConfigEl, "No run yet.");
     this.setSectionPlaceholder(this.missionGraphEl, "No mission graph yet.");
@@ -1183,6 +1382,20 @@ export class AgentView extends ItemView {
     }
     sectionEl.removeAttribute("hidden");
     sectionEl.removeClass("agentic-researcher-dashboard-section-collapsed");
+    this.updateDiagnosticsBadge();
+  }
+
+  /**
+   * "Diagnostics · N active" — N is the number of visible sections inside the
+   * expander, so a collapsed Diagnostics group still signals that process
+   * detail is accumulating behind it.
+   */
+  private updateDiagnosticsBadge() {
+    if (!this.diagnosticsDetailsEl || !this.diagnosticsBadgeEl) return;
+    const active = this.diagnosticsDetailsEl.querySelectorAll(
+      ".agentic-researcher-dashboard-section:not([hidden])",
+    ).length;
+    this.diagnosticsBadgeEl.setText(`· ${active} active`);
   }
 
   private async capturePrompt(): Promise<RunOutcome | null> {
@@ -1362,9 +1575,116 @@ export class AgentView extends ItemView {
     this.updateChatLoader("SYS> stop requested");
     this.updatePhase("stopped", "Stop requested");
     this.updateRunButtonState();
+    this.updateSteeringControls();
 
     if (this.runStatusTextEl) {
       this.runStatusTextEl.setText("Stopping mission...");
+    }
+  }
+
+  private submitSteering(): void {
+    const kind =
+      STEERING_KIND_OPTIONS.find(
+        (option) => option.value === this.steeringKindEl?.value,
+      )?.value ?? "add_constraint";
+    const text = this.steeringTextEl?.value.trim() ?? "";
+    const toolName =
+      kind === "drop_tool"
+        ? this.steeringToolEl?.value.trim() || undefined
+        : undefined;
+    const result = this.plugin.requestMissionSteering({
+      kind,
+      text,
+      ...(toolName ? { toolName } : {}),
+    });
+    if (!result.ok) {
+      const message = `Steering was not queued: ${result.message}`;
+      this.steeringStatusEl?.setText(message);
+      this.steeringStatusEl?.addClass("is-error");
+      this.appendLog("error", message);
+      this.appendStatus(message);
+      return;
+    }
+
+    const message = `Steering queued for the next step: ${STEERING_KIND_OPTIONS.find(
+      (option) => option.value === result.directive.kind,
+    )?.label ?? result.directive.kind}.`;
+    this.steeringStatusEl?.removeClass("is-error");
+    this.steeringStatusEl?.setText(message);
+    this.appendLog("system", message);
+    this.appendStatus(message);
+    this.appendTrace("status", message);
+    if (this.steeringTextEl) {
+      this.steeringTextEl.value = "";
+      this.steeringTextEl.focus();
+    }
+  }
+
+  private resetSteeringComposer(): void {
+    if (this.steeringKindEl) {
+      this.steeringKindEl.value = "add_constraint";
+    }
+    if (this.steeringTextEl) {
+      this.steeringTextEl.value = "";
+    }
+    this.steeringStatusEl?.removeClass("is-error");
+    this.steeringStatusEl?.setText("");
+    this.refreshSteeringToolOptions([]);
+    this.updateSteeringControls();
+  }
+
+  private refreshSteeringToolOptions(toolNames: readonly string[]): void {
+    if (!this.steeringToolEl) return;
+    const previous = this.steeringToolEl.value;
+    this.steeringToolEl.empty();
+    const names = [...new Set(toolNames.filter(Boolean))].sort();
+    if (names.length === 0) {
+      const option = this.steeringToolEl.createEl("option", {
+        text: "No tools available",
+        attr: { value: "" },
+      });
+      option.disabled = true;
+      this.steeringToolEl.disabled = true;
+      return;
+    }
+    for (const toolName of names) {
+      this.steeringToolEl.createEl("option", {
+        text: toolName,
+        attr: { value: toolName },
+      });
+    }
+    this.steeringToolEl.disabled = false;
+    this.steeringToolEl.value = names.includes(previous)
+      ? previous
+      : names[0] ?? "";
+  }
+
+  private updateSteeringControls(): void {
+    const visible = this.isRunning;
+    const active =
+      visible && this.plugin.isMissionRunning() && !this.stopRequested;
+    if (this.steeringEl) {
+      this.steeringEl.hidden = !visible;
+    }
+    if (this.steeringKindEl) {
+      this.steeringKindEl.disabled = !active;
+    }
+    if (this.steeringTextEl) {
+      this.steeringTextEl.disabled = !active;
+    }
+    const dropsTool = this.steeringKindEl?.value === "drop_tool";
+    if (this.steeringToolLabelEl) {
+      this.steeringToolLabelEl.hidden = !dropsTool;
+    }
+    if (this.steeringToolEl) {
+      this.steeringToolEl.disabled =
+        !active ||
+        !dropsTool ||
+        this.steeringToolEl.options.length === 0 ||
+        this.steeringToolEl.options[0]?.disabled === true;
+    }
+    if (this.steeringButtonEl) {
+      this.steeringButtonEl.disabled = !active;
     }
   }
 
@@ -1464,6 +1784,12 @@ export class AgentView extends ItemView {
   private resetDashboardForRun(
     options: { preserveOrchestrator?: boolean } = {},
   ) {
+    this.textFrameBatcher.cancelAll();
+    this.scrollFrameBatcher.cancelAll();
+    this.pendingTextDeltas.clear();
+    this.pendingScrollTargets.clear();
+    this.lastStatusRowKey = null;
+    this.lastWorkstreamLine = null;
     this.toolTimelineItems.clear();
     this.toolTimelineOrdinal = 0;
     this.traceRowEls.clear();
@@ -1483,10 +1809,14 @@ export class AgentView extends ItemView {
     this.teamPhase = "idle";
     this.teamHandoffReady = undefined;
     this.runConfig = null;
+    this.resetSteeringComposer();
     this.missionGraphProjection = null;
     this.usageTotals = this.createEmptyUsageTotals();
     this.updatePhase("idle", "Queued");
-    this.setMetric(this.stepValueEl, this.formatStepMetric(0));
+    this.setMetric(
+      this.stepValueEl,
+      formatStepMetric(0, MAX_AGENT_STEPS),
+    );
     this.setMetric(this.activeToolValueEl, "None");
     this.setMetric(this.activityValueEl, "Queued");
     this.setSectionPlaceholder(this.modelConfigEl, "Starting run.");
@@ -1577,27 +1907,29 @@ export class AgentView extends ItemView {
 
     const display =
       kind === "status" ? conversationalStatusLine(message) : message;
+    const rowKey = `${kind}:${display}`;
+    const duplicate = rowKey === this.lastStatusRowKey;
 
-    this.clearPlaceholder(this.statusStreamEl);
-    this.statusStreamEl.createDiv({
-      text: display,
-      cls: "agentic-researcher-status-line",
-    });
-    this.trimRows(
-      this.statusStreamEl,
-      ".agentic-researcher-status-line",
-      MAX_STATUS_ROWS,
-    );
-    this.statusStreamEl.scrollTop = this.statusStreamEl.scrollHeight;
+    if (!duplicate) {
+      this.lastStatusRowKey = rowKey;
+      this.clearPlaceholder(this.statusStreamEl);
+      this.statusStreamEl.createDiv({
+        text: display,
+        cls: "agentic-researcher-status-line",
+      });
+      this.trimRows(
+        this.statusStreamEl,
+        ".agentic-researcher-status-line",
+        MAX_STATUS_ROWS,
+      );
+      this.scheduleScrollToEnd(this.statusStreamEl, "details");
+    }
     if (kind === "status") {
       this.updateChatLoader(display);
-      this.appendWorkstreamLine(display);
-      if (display !== message.replace(/\s+/g, " ").trim()) {
-        this.appendLog("system", display);
-      }
+      if (!duplicate) this.appendWorkstreamLine(display);
       this.updateTeamStripFromStatus(display);
     }
-    this.appendTrace(kind, display);
+    if (!duplicate) this.appendTrace(kind, display);
   }
 
   private updateTeamStripFromStatus(message: string): void {
@@ -1614,7 +1946,10 @@ export class AgentView extends ItemView {
   }
 
   private startPlanningStream(step: number) {
-    this.setMetric(this.stepValueEl, this.formatStepMetric(step));
+    this.setMetric(
+      this.stepValueEl,
+      formatStepMetric(step, this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS),
+    );
 
     if (!this.planningStreamEl) {
       return;
@@ -1640,11 +1975,18 @@ export class AgentView extends ItemView {
   }
 
   private finishPlanningStream() {
+    this.flushText(this.livePlanningMessageEl);
     this.livePlanningMessageEl = null;
   }
 
   private handleToolStart(event: AgentToolRunEvent) {
-    this.setMetric(this.stepValueEl, this.formatStepMetric(event.step));
+    this.setMetric(
+      this.stepValueEl,
+      formatStepMetric(
+        event.step,
+        this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS,
+      ),
+    );
     this.setMetric(this.activeToolValueEl, event.name);
     this.updateChatLoader(`RUN> ${event.name}`);
     this.appendWorkstreamLine(`Tool start: ${event.name}`);
@@ -1907,7 +2249,7 @@ export class AgentView extends ItemView {
       event.stopReason,
       event.stopDetail ?? event.autoContinueReason,
     );
-    this.setMetric(this.stepValueEl, this.formatStepMetric(event.step, event.maxSteps));
+    this.setMetric(this.stepValueEl, formatStepMetric(event.step, event.maxSteps));
     this.setMetric(this.phaseValueEl, formatStopReasonLabel(missionStop));
     this.setMetric(this.activityValueEl, formatStopReasonLabel(missionStop));
     this.setMetric(this.activeToolValueEl, "None");
@@ -1974,8 +2316,14 @@ export class AgentView extends ItemView {
     this.setRunning(false);
     this.currentRunChatId = null;
     // Budget/resumable Idle must expose Chat Continue after the running flag
-    // clears (setRunning → renderModelConfig refreshes the control).
+    // clears (setRunning → renderModelConfig refreshes the control). Event
+    // fan-out order between the coordinator tap, config events, and this
+    // completion handler is not guaranteed, so re-check on deferred ticks —
+    // the refresh is idempotent and the reveal must converge regardless of
+    // which event carried the final resumable ledger.
     this.refreshChatContinuationAction();
+    window.setTimeout(() => this.refreshChatContinuationAction(), 50);
+    window.setTimeout(() => this.refreshChatContinuationAction(), 500);
   }
 
   private async maybeWriteMissionReceiptNote(
@@ -2239,14 +2587,14 @@ export class AgentView extends ItemView {
   }
 
   private handleStreamLifecycle(event: AgentStreamLifecycleEvent) {
-    const streamLabel = this.formatStreamLifecycleLabel(event.kind);
+    const streamLabel = formatStreamLifecycleLabel(event.kind);
     const parts = [
       `${streamLabel}: ${event.message}`,
       event.bufferedChars !== undefined
-        ? `buffered ${this.formatChars(event.bufferedChars)}`
+        ? `buffered ${formatChars(event.bufferedChars)}`
         : null,
       event.releasedChars !== undefined
-        ? `released ${this.formatChars(event.releasedChars)}`
+        ? `released ${formatChars(event.releasedChars)}`
         : null,
       `${event.elapsedMs}ms`,
     ].filter((part): part is string => Boolean(part));
@@ -2261,37 +2609,6 @@ export class AgentView extends ItemView {
       this.appendLog("system", noteStreamingActiveChatLine());
       this.appendWorkstreamLine(noteStreamingActiveChatLine());
     }
-  }
-
-  private formatStreamLifecycleLabel(
-    kind: AgentStreamLifecycleEvent["kind"],
-  ): string {
-    if (kind === "first_visible_content") {
-      return "chat_stream";
-    }
-    if (kind === "first_note_write") {
-      return "note_stream";
-    }
-    return kind;
-  }
-
-  private formatReceiptOperationLabel(
-    operation: AgentRunReceipt["operation"],
-  ): string {
-    if (operation === "append") {
-      return "note_append";
-    }
-    if (
-      operation === "replace" ||
-      operation === "edit" ||
-      operation === "retitle"
-    ) {
-      return "note_replace";
-    }
-    if (operation === "trash" || operation === "delete") {
-      return "note_delete";
-    }
-    return `note_${operation}`;
   }
 
   private ensureToolTimelineItem(event: AgentToolRunEvent): HTMLElement {
@@ -2395,11 +2712,11 @@ export class AgentView extends ItemView {
       this.startFinalStream();
     }
 
-    this.liveFinalMessageEl?.empty();
-    this.appendText(this.liveFinalMessageEl, content);
+    this.replaceText(this.liveFinalMessageEl, content);
   }
 
   private finishFinalStream() {
+    this.flushText(this.liveFinalMessageEl);
     this.liveFinalMessageEl = null;
   }
 
@@ -2459,7 +2776,7 @@ export class AgentView extends ItemView {
     this.createCopyButton(headerEl, () => receiptEl.textContent ?? "", "Copy receipt");
 
     const metaParts = [
-      `receipt=${this.formatReceiptOperationLabel(receipt.operation)}`,
+      `receipt=${formatReceiptOperationLabel(receipt.operation)}`,
       receipt.bytesWritten !== undefined
         ? `${receipt.bytesWritten} bytes written`
         : null,
@@ -2597,7 +2914,7 @@ export class AgentView extends ItemView {
   private appendMetric(event: AgentRunMetricEvent) {
     this.updateUsageTotals(event);
     this.renderModelConfig();
-    this.appendStatus(this.formatMetric(event), "metric");
+    this.appendStatus(formatAgentMetric(event), "metric");
   }
 
   private handleRunConfig(event: AgentRunConfigEvent) {
@@ -2611,8 +2928,15 @@ export class AgentView extends ItemView {
     if (lifecycleStages && lifecycleStages.length > 1) {
       this.showLifecycleStageStrip(lifecycleStages);
     }
+    this.refreshSteeringToolOptions(event.allowedToolNames);
+    this.updateSteeringControls();
     this.renderModelConfig();
     this.renderMissionAcceptance(event.missionLedger?.acceptance ?? null, "ledger");
+    // The final resumable ledger can arrive on a trailing config event AFTER
+    // onRunComplete. Without this refresh, Chat Continue stayed hidden until
+    // an unrelated re-render — the user saw a stopped run with no resume path.
+    // Always refresh: the gate itself accounts for isRunning.
+    this.refreshChatContinuationAction();
     this.appendTrace(
       "config",
       `Model ${event.model}, mission ${event.missionMode}, streaming ${event.streaming ? "on" : "off"}, write autonomy ${event.writeAutonomy ? "on" : "off"}, note writeback ${event.writebackMode}, chat-only override ${event.chatOnlyOverride ? "on" : "off"}`,
@@ -2625,57 +2949,6 @@ export class AgentView extends ItemView {
     }
 
     return this.createLogItem(kind, message);
-  }
-
-  private formatMetric(event: AgentRunMetricEvent): string {
-    if (event.kind === "model_chat") {
-      return [
-        `Timing: model step ${event.step ?? "?"}`,
-        this.formatDuration(event.durationMs),
-        event.requestChars !== undefined
-          ? `request ${this.formatChars(event.requestChars)}`
-          : null,
-        event.responseChars !== undefined
-          ? `response ${this.formatChars(event.responseChars)}`
-          : null,
-        this.formatTokenParts(event),
-      ]
-        .filter((part): part is string => Boolean(part))
-        .join(", ");
-    }
-
-    if (event.kind === "model_stream") {
-      return [
-        "Timing: final stream",
-        this.formatDuration(event.durationMs),
-        event.requestChars !== undefined
-          ? `request ${this.formatChars(event.requestChars)}`
-          : null,
-        event.responseChars !== undefined
-          ? `response ${this.formatChars(event.responseChars)}`
-          : null,
-        this.formatTokenParts(event),
-      ]
-        .filter((part): part is string => Boolean(part))
-        .join(", ");
-    }
-
-    if (event.kind === "tool") {
-      return [
-        event.cached ? `Cache hit: ${event.name}` : `Timing: ${event.name}`,
-        this.formatDuration(event.durationMs),
-        event.inputChars !== undefined
-          ? `input ${this.formatChars(event.inputChars)}`
-          : null,
-        event.outputChars !== undefined
-          ? `output ${this.formatChars(event.outputChars)}`
-          : null,
-      ]
-        .filter((part): part is string => Boolean(part))
-        .join(", ");
-    }
-
-    return `Timing: run ${this.formatDuration(event.durationMs)}`;
   }
 
   private renderModelConfig() {
@@ -2758,20 +3031,20 @@ export class AgentView extends ItemView {
           ]
         : []),
       `slow_path=${this.runConfig.slowPathReason}`,
-      `route_reasons=${this.formatScopeList(this.runConfig.routeTraceReasons)}`,
-      `allowed_tools=${this.formatScopeList(this.runConfig.allowedToolNames)}`,
+      `route_reasons=${formatScopeList(this.runConfig.routeTraceReasons)}`,
+      `allowed_tools=${formatScopeList(this.runConfig.allowedToolNames)}`,
       `english_guard=${this.runConfig.englishGuard ? "on" : "off"}`,
       `thinking=${this.runConfig.thinkingMode} (resolved ${this.runConfig.resolvedThink})`,
-      `temperature=${this.formatOptionalNumber(this.runConfig.temperature)}`,
-      `top_k=${this.formatOptionalNumber(this.runConfig.topK)}`,
-      `top_p=${this.formatOptionalNumber(this.runConfig.topP)}`,
-      `num_ctx=${this.formatOptionalNumber(this.runConfig.numCtx)}`,
-      `estimated_prompt_chars=${this.formatOptionalNumber(this.runConfig.estimatedPromptChars)}`,
-      `context_budget_chars=${this.formatOptionalNumber(this.runConfig.contextBudgetChars)}`,
+      `temperature=${formatOptionalNumber(this.runConfig.temperature)}`,
+      `top_k=${formatOptionalNumber(this.runConfig.topK)}`,
+      `top_p=${formatOptionalNumber(this.runConfig.topP)}`,
+      `num_ctx=${formatOptionalNumber(this.runConfig.numCtx)}`,
+      `estimated_prompt_chars=${formatOptionalNumber(this.runConfig.estimatedPromptChars)}`,
+      `context_budget_chars=${formatOptionalNumber(this.runConfig.contextBudgetChars)}`,
       `context_budget_source=${this.runConfig.contextBudgetSource ?? "unknown"}`,
       `write_autonomy=${this.runConfig.writeAutonomy ? "on" : "off"}`,
-      `autonomy_read=current_note ${scope.read.currentNote ? "on" : "off"}, vault ${scope.read.vault ? "on" : "off"}, web ${scope.read.web ? "on" : "off"}, files ${this.formatScopeList(scope.read.files)}, folders ${this.formatScopeList(scope.read.folders)}`,
-      `autonomy_write=current_note ${scope.write.currentNote ? "on" : "off"}, files ${this.formatScopeList(scope.write.files)}, folders ${this.formatScopeList(scope.write.folders)}, artifacts ${scope.write.artifacts ? "on" : "off"}, research_memory ${scope.write.researchMemory ? "on" : "off"}`,
+      `autonomy_read=current_note ${scope.read.currentNote ? "on" : "off"}, vault ${scope.read.vault ? "on" : "off"}, web ${scope.read.web ? "on" : "off"}, files ${formatScopeList(scope.read.files)}, folders ${formatScopeList(scope.read.folders)}`,
+      `autonomy_write=current_note ${scope.write.currentNote ? "on" : "off"}, files ${formatScopeList(scope.write.files)}, folders ${formatScopeList(scope.write.folders)}, artifacts ${scope.write.artifacts ? "on" : "off"}, research_memory ${scope.write.researchMemory ? "on" : "off"}`,
       `autonomy_destructive=replace_current_note ${scope.destructive.replaceCurrentNote ? "on" : "off"}, delete_current_note ${scope.destructive.deleteCurrentNote ? "on" : "off"}, delete_paths ${scope.destructive.deletePaths ? "on" : "off"}`,
       ...this.runConfig.dependencyStatus.map((dependency) =>
         this.formatDependencyStatusLine(dependency),
@@ -2783,11 +3056,11 @@ export class AgentView extends ItemView {
       ...(this.runConfig.reflexLabel
         ? [
             `reflex_intent=${this.runConfig.reflexLabel}`,
-            `reflex_confidence=${this.formatOptionalNumber(this.runConfig.reflexConfidence)}`,
+            `reflex_confidence=${formatOptionalNumber(this.runConfig.reflexConfidence)}`,
             `reflex_top_action=${this.runConfig.reflexTopAction ?? "none"}`,
-            `reflex_progress=${this.formatOptionalNumber(this.runConfig.reflexProgressScore)}`,
-            `reflex_loop_risk=${this.formatOptionalNumber(this.runConfig.reflexLoopRisk)}`,
-            `reflex_missing=${this.formatScopeList(this.runConfig.reflexCompletionMissing ?? [])}`,
+            `reflex_progress=${formatOptionalNumber(this.runConfig.reflexProgressScore)}`,
+            `reflex_loop_risk=${formatOptionalNumber(this.runConfig.reflexLoopRisk)}`,
+            `reflex_missing=${formatScopeList(this.runConfig.reflexCompletionMissing ?? [])}`,
             `reflex_reason=${this.runConfig.reflexAppliedReason ?? "none"}`,
           ]
         : []),
@@ -2795,22 +3068,22 @@ export class AgentView extends ItemView {
         ? [
             `ledger_status=${ledger.status}`,
             `ledger_acceptance_status=${ledger.acceptance?.status ?? "unchecked"}`,
-            `ledger_acceptance_missing=${this.formatScopeList(ledger.acceptance?.missing ?? [])}`,
+            `ledger_acceptance_missing=${formatScopeList(ledger.acceptance?.missing ?? [])}`,
             `ledger_acceptance_next_action=${ledger.acceptance?.nextAction ?? "none"}`,
             `ledger_evidence=${ledger.evidenceCount}`,
             `ledger_receipts=${ledger.receiptCount}`,
-            `ledger_expected_tools=${this.formatScopeList(ledger.expectedTools)}`,
+            `ledger_expected_tools=${formatScopeList(ledger.expectedTools)}`,
             `ledger_iterations=${ledger.iterationCount}`,
-            `ledger_progress=${this.formatOptionalNumber(ledger.progressScore)}`,
+            `ledger_progress=${formatOptionalNumber(ledger.progressScore)}`,
             `ledger_stalled_count=${ledger.stalledCount}`,
             `ledger_last_action=${ledger.lastMeaningfulAction ?? "none"}`,
             `ledger_next_action=${ledger.nextAction}`,
-            `ledger_remaining_actions=${this.formatScopeList(ledger.remainingActions)}`,
+            `ledger_remaining_actions=${formatScopeList(ledger.remainingActions)}`,
             ...(ledger.missionPlan
               ? [
                   `ledger_mission_plan=${ledger.missionPlan.status}`,
                   `ledger_plan_active_task=${ledger.missionPlan.activeTaskId ?? "none"}`,
-                  `ledger_plan_progress=${this.formatOptionalNumber(ledger.missionPlan.progressScore)}`,
+                  `ledger_plan_progress=${formatOptionalNumber(ledger.missionPlan.progressScore)}`,
                   `ledger_plan_remaining_tasks=${ledger.missionPlan.remainingTasks}`,
                   `ledger_plan_stalled_count=${ledger.missionPlan.stalledCount}`,
                   `ledger_plan_next_action=${ledger.missionPlan.nextAction}`,
@@ -2821,8 +3094,8 @@ export class AgentView extends ItemView {
             `ledger_blocker=${ledger.blockerCategory ?? "none"}`,
           ]
         : []),
-      `usage_chars=request ${this.formatChars(this.usageTotals.requestChars)}, response ${this.formatChars(this.usageTotals.responseChars)}`,
-      `usage_tokens=prompt ${this.formatOptionalNumber(this.usageTotals.promptTokens)}, completion ${this.formatOptionalNumber(this.usageTotals.completionTokens)}, total ${this.formatOptionalNumber(this.usageTotals.totalTokens)}`,
+      `usage_chars=request ${formatChars(this.usageTotals.requestChars)}, response ${formatChars(this.usageTotals.responseChars)}`,
+      `usage_tokens=prompt ${formatOptionalNumber(this.usageTotals.promptTokens)}, completion ${formatOptionalNumber(this.usageTotals.completionTokens)}, total ${formatOptionalNumber(this.usageTotals.totalTokens)}`,
     ];
 
     for (const line of lines) {
@@ -2852,6 +3125,18 @@ export class AgentView extends ItemView {
     ) {
       return snapshotLedger;
     }
+    // A resumable config ledger must never be shadowed by a stale
+    // non-resumable coordinator snapshot: the view's runConfig carries the
+    // final post-stop ledger while the snapshot can lag one event behind,
+    // which previously hid Chat Continue exactly when a budget stop made it
+    // matter most.
+    if (
+      configLedger?.canResume &&
+      typeof configLedger.continuationCommand === "string" &&
+      configLedger.continuationCommand.trim()
+    ) {
+      return configLedger;
+    }
     if (
       snapshotLedger &&
       (!configLedger || snapshotLedger.runId === this.runConfig?.runId)
@@ -2877,6 +3162,15 @@ export class AgentView extends ItemView {
         ledger?.canResume &&
         ledger.continuationCommand.trim(),
     );
+    // Self-diagnosing gate: this dataset surfaces in DOM snapshots (and e2e
+    // failure contexts), so a hidden Continue button explains itself.
+    this.continueButtonEl.dataset.continueGate = [
+      `available:${available}`,
+      `running:${this.isRunning}`,
+      `banner:${bannerOwnsContinue}`,
+      `canResume:${ledger?.canResume === true}`,
+      `command:${Boolean(ledger?.continuationCommand?.trim())}`,
+    ].join(" ");
     // Continue lives on the Chat composer. If Orchestrator/Details hid the
     // panel, surface Chat so the control is actually clickable.
     if (available && this.activeTab !== "chat") {
@@ -2884,12 +3178,13 @@ export class AgentView extends ItemView {
     }
     this.continueButtonEl.hidden = !available;
     this.continueButtonEl.disabled = !available;
-    this.continueButtonEl.setAttribute(
-      "aria-label",
-      available && ledger
-        ? `Continue latest run ${ledger.runId}`
-        : "Continue latest run",
-    );
+    // The accessible name must stay exactly the visible label — appending the
+    // runId to aria-label changed the name and broke every role-based lookup
+    // ("Continue Latest Run" is a whole-string accessible-name match). The
+    // runId detail belongs in the tooltip.
+    this.continueButtonEl.setAttribute("aria-label", "Continue Latest Run");
+    this.continueButtonEl.title =
+      available && ledger ? `Continue latest run ${ledger.runId}` : "";
   }
 
   private renderPersistedMissionConfig(ledger: MissionLedgerSummary): void {
@@ -2902,15 +3197,15 @@ export class AgentView extends ItemView {
       "run_config=restored_from_durable_state",
       `ledger_status=${ledger.status}`,
       `ledger_acceptance_status=${ledger.acceptance?.status ?? "unchecked"}`,
-      `ledger_acceptance_missing=${this.formatScopeList(ledger.acceptance?.missing ?? [])}`,
+      `ledger_acceptance_missing=${formatScopeList(ledger.acceptance?.missing ?? [])}`,
       `ledger_evidence=${ledger.evidenceCount}`,
       `ledger_receipts=${ledger.receiptCount}`,
-      `ledger_expected_tools=${this.formatScopeList(ledger.expectedTools)}`,
+      `ledger_expected_tools=${formatScopeList(ledger.expectedTools)}`,
       `ledger_iterations=${ledger.iterationCount}`,
-      `ledger_progress=${this.formatOptionalNumber(ledger.progressScore)}`,
+      `ledger_progress=${formatOptionalNumber(ledger.progressScore)}`,
       `ledger_last_action=${ledger.lastMeaningfulAction ?? "none"}`,
       `ledger_next_action=${ledger.nextAction}`,
-      `ledger_remaining_actions=${this.formatScopeList(ledger.remainingActions)}`,
+      `ledger_remaining_actions=${formatScopeList(ledger.remainingActions)}`,
       `ledger_continuation=${ledger.continuationCommand}`,
       `ledger_can_resume=${ledger.canResume ? "on" : "off"}`,
       `ledger_blocker=${ledger.blockerCategory ?? "none"}`,
@@ -3054,6 +3349,24 @@ export class AgentView extends ItemView {
     if (this.isRunning || !this.promptEl) {
       return;
     }
+    // Run-complete projection reaches the UI before RunCoordinator finishes
+    // terminal persistence. A user may click the visible Continue during that
+    // gap; wait for ownership release instead of turning the click into a
+    // silent no-op or treating it as Stop.
+    for (
+      let attempt = 0;
+      this.plugin.isMissionRunning() && attempt < 240;
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (this.plugin.isMissionRunning()) {
+      this.appendLog(
+        "error",
+        "The previous run is still finishing durable persistence. Try Continue Latest Run again shortly.",
+      );
+      return;
+    }
     this.promptEl.value = command;
     this.focusPrompt({ moveCaretToEnd: true });
     await this.capturePrompt();
@@ -3087,7 +3400,7 @@ export class AgentView extends ItemView {
       text: [
         acceptance.status,
         acceptance.confidence !== undefined
-          ? `confidence=${this.formatOptionalNumber(acceptance.confidence)}`
+          ? `confidence=${formatOptionalNumber(acceptance.confidence)}`
           : null,
         `source=${source}`,
       ]
@@ -3096,12 +3409,12 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-acceptance-value",
     });
 
-    this.createAcceptanceRow("missing", this.formatScopeList(acceptance.missing));
+    this.createAcceptanceRow("missing", formatScopeList(acceptance.missing));
     this.createAcceptanceRow(
       "next_action",
       acceptance.nextAction?.trim() || "none",
     );
-    this.createAcceptanceRow("reasons", this.formatScopeList(acceptance.reasons));
+    this.createAcceptanceRow("reasons", formatScopeList(acceptance.reasons));
     if (acceptance.checkedAt) {
       this.createAcceptanceRow("checked_at", acceptance.checkedAt);
     }
@@ -3124,10 +3437,6 @@ export class AgentView extends ItemView {
     });
   }
 
-  private formatScopeList(values: string[]) {
-    return values.length > 0 ? values.join(",") : "none";
-  }
-
   private updateUsageTotals(event: AgentRunMetricEvent) {
     this.usageTotals.requestChars += event.requestChars ?? 0;
     this.usageTotals.responseChars += event.responseChars ?? 0;
@@ -3144,36 +3453,6 @@ export class AgentView extends ItemView {
       completionTokens: 0,
       totalTokens: 0,
     };
-  }
-
-  private formatTokenParts(event: AgentRunMetricEvent): string | null {
-    const parts = [
-      event.promptTokens !== undefined ? `prompt tokens ${event.promptTokens}` : null,
-      event.completionTokens !== undefined
-        ? `completion tokens ${event.completionTokens}`
-        : null,
-      event.totalTokens !== undefined ? `total tokens ${event.totalTokens}` : null,
-    ].filter((part): part is string => Boolean(part));
-
-    return parts.length > 0 ? parts.join(", ") : null;
-  }
-
-  private formatOptionalNumber(value: number | undefined): string {
-    return typeof value === "number" && Number.isFinite(value)
-      ? String(value)
-      : "default";
-  }
-
-  private formatDuration(durationMs: number): string {
-    return `${Math.max(0, Math.round(durationMs))}ms`;
-  }
-
-  private formatChars(chars: number): string {
-    if (chars >= 1024) {
-      return `${(chars / 1024).toFixed(1)} KB`;
-    }
-
-    return `${chars} B`;
   }
 
   private compactLoaderMessage(message: string): string {
@@ -3218,8 +3497,17 @@ export class AgentView extends ItemView {
       `Copy ${this.getLogLabel(kind)} message`,
     );
 
-    this.moveChatLoaderToEnd();
-    this.logEl.scrollTop = this.logEl.scrollHeight;
+    this.moveChatActivityToEnd();
+    while (this.chatMessageEls.size > MAX_CHAT_ROWS) {
+      const oldest = this.chatMessageEls.entries().next().value as
+        | [string, HTMLElement]
+        | undefined;
+      if (!oldest) break;
+      oldest[1].remove();
+      this.chatMessageEls.delete(oldest[0]);
+      this.ensureCompactionMarker(this.logEl);
+    }
+    this.scheduleScrollToEnd(this.logEl, "chat");
     return itemEl;
   }
 
@@ -3244,13 +3532,7 @@ export class AgentView extends ItemView {
     this.appendText(this.liveAssistantMessageEl, delta);
 
     if (this.logEl) {
-      // Stay pinned to new tokens while the user is already near the bottom;
-      // do not yank them if they scrolled up to re-read earlier chat.
-      const distanceFromBottom =
-        this.logEl.scrollHeight - this.logEl.scrollTop - this.logEl.clientHeight;
-      if (distanceFromBottom < 96) {
-        this.logEl.scrollTop = this.logEl.scrollHeight;
-      }
+      this.scheduleScrollToEnd(this.logEl, "chat", true);
     }
   }
 
@@ -3265,15 +3547,15 @@ export class AgentView extends ItemView {
       ) as HTMLElement | null;
     }
 
-    this.liveAssistantMessageEl?.empty();
-    this.appendText(this.liveAssistantMessageEl, content);
+    this.replaceText(this.liveAssistantMessageEl, content);
 
     if (this.logEl) {
-      this.logEl.scrollTop = this.logEl.scrollHeight;
+      this.scheduleScrollToEnd(this.logEl, "chat");
     }
   }
 
   private finishLiveAssistantMessage() {
+    this.flushText(this.liveAssistantMessageEl);
     this.liveAssistantMessageEl
       ?.closest(".agentic-researcher-log-item")
       ?.removeClass("is-streaming");
@@ -3302,10 +3584,11 @@ export class AgentView extends ItemView {
       });
     }
     this.appendText(this.liveThinkingMessageEl, delta);
-    this.thinkingStreamEl.scrollTop = this.thinkingStreamEl.scrollHeight;
+    this.scheduleScrollToEnd(this.thinkingStreamEl, "details");
   }
 
   private finishLiveThinkingMessage() {
+    this.flushText(this.liveThinkingMessageEl);
     this.appendStatus("Thinking complete.");
     this.liveThinkingMessageEl = null;
   }
@@ -3333,6 +3616,11 @@ export class AgentView extends ItemView {
     this.contentEl.setAttribute("aria-busy", String(isRunning));
 
     this.updateRunButtonState();
+    if (this.promptEl) {
+      this.promptEl.disabled = isRunning;
+      this.promptEl.setAttribute("aria-disabled", String(isRunning));
+    }
+    this.updateSteeringControls();
 
     if (this.chatOnlyToggleEl) {
       this.chatOnlyToggleEl.disabled = isRunning;
@@ -3344,6 +3632,7 @@ export class AgentView extends ItemView {
 
     if (this.runStatusEl) {
       this.runStatusEl.classList.toggle("is-running", isRunning);
+      this.runStatusEl.hidden = !isRunning;
     }
 
     if (this.runStatusTextEl) {
@@ -3402,10 +3691,6 @@ export class AgentView extends ItemView {
     const headerEl = this.chatLoaderEl.createDiv({
       cls: "agentic-researcher-chat-loader-header",
     });
-    headerEl.createSpan({
-      text: "Agent",
-      cls: "agentic-researcher-chat-loader-label",
-    });
     this.chatLoaderTextEl = headerEl.createSpan({
       text: "",
       cls: "agentic-researcher-chat-loader-text",
@@ -3417,7 +3702,7 @@ export class AgentView extends ItemView {
     for (let i = 0; i < 3; i += 1) {
       dotsEl.createSpan({ cls: "agentic-researcher-chat-loader-dot" });
     }
-    this.moveChatLoaderToEnd();
+    this.moveChatActivityToEnd();
 
     return this.chatLoaderEl;
   }
@@ -3441,7 +3726,7 @@ export class AgentView extends ItemView {
         this.chatLoaderTextEl.setText("");
       }
     }
-    this.moveChatLoaderToEnd();
+    this.moveChatActivityToEnd();
   }
 
   private updateChatLoader(message: string) {
@@ -3457,15 +3742,20 @@ export class AgentView extends ItemView {
     this.chatLoaderTextEl.setText(this.compactLoaderMessage(message));
     loaderEl.classList.add("is-active");
     loaderEl.setAttribute("aria-hidden", "false");
-    this.moveChatLoaderToEnd();
+    this.moveChatActivityToEnd();
   }
 
-  private moveChatLoaderToEnd() {
-    if (!this.logEl || !this.chatLoaderEl?.isConnected) {
+  private moveChatActivityToEnd() {
+    if (!this.logEl) {
       return;
     }
 
-    this.logEl.appendChild(this.chatLoaderEl);
+    if (this.liveWorkstreamEl?.isConnected) {
+      this.logEl.appendChild(this.liveWorkstreamEl);
+    }
+    if (this.chatLoaderEl?.isConnected) {
+      this.logEl.appendChild(this.chatLoaderEl);
+    }
   }
 
   private updateRunButtonState() {
@@ -3593,6 +3883,7 @@ export class AgentView extends ItemView {
       this.orchestratorPanelEl.hidden = !isOrchestrator;
       this.orchestratorPanelEl.classList.toggle("is-active", isOrchestrator);
     }
+    this.flushVisibleScrollTargets(tab);
   }
 
   private shouldShowOrchestrator(): boolean {
@@ -3937,7 +4228,7 @@ export class AgentView extends ItemView {
       this.ensureCompactionMarker(this.runLogEl);
     }
     this.enforceTraceRowLimit();
-    this.runLogEl.scrollTop = this.runLogEl.scrollHeight;
+    this.scheduleScrollToEnd(this.runLogEl, "details");
     return rowEl;
   }
 
@@ -4275,11 +4566,70 @@ export class AgentView extends ItemView {
   }
 
   private appendText(element: HTMLElement | null, text: string) {
-    if (!element) {
-      return;
-    }
+    if (!element || !text) return;
+    this.pendingTextDeltas.set(
+      element,
+      `${this.pendingTextDeltas.get(element) ?? ""}${text}`,
+    );
+    this.textFrameBatcher.schedule(element, () => this.flushText(element));
+  }
 
-    element.textContent = `${element.textContent ?? ""}${text}`;
+  private replaceText(element: HTMLElement | null, text: string): void {
+    if (!element) return;
+    this.textFrameBatcher.cancel(element);
+    this.pendingTextDeltas.delete(element);
+    element.textContent = text;
+  }
+
+  private flushText(element: HTMLElement | null): void {
+    if (!element) return;
+    const pending = this.pendingTextDeltas.get(element);
+    if (!pending) return;
+    this.pendingTextDeltas.delete(element);
+    this.textFrameBatcher.cancel(element);
+    const last = element.lastChild;
+    if (last?.nodeType === 3 && typeof (last as Text).appendData === "function") {
+      (last as Text).appendData(pending);
+    } else {
+      element.appendChild(element.ownerDocument.createTextNode(pending));
+    }
+  }
+
+  private scheduleScrollToEnd(
+    element: HTMLElement,
+    tab: AgentViewTab,
+    preserveUserPosition = false,
+  ): void {
+    this.pendingScrollTargets.set(element, {
+      tab,
+      preserveUserPosition,
+    });
+    if (this.activeTab !== tab) return;
+    this.scrollFrameBatcher.schedule(element, () =>
+      this.flushScrollTarget(element),
+    );
+  }
+
+  private flushScrollTarget(element: HTMLElement): void {
+    const target = this.pendingScrollTargets.get(element);
+    if (!target || this.activeTab !== target.tab) return;
+    this.pendingScrollTargets.delete(element);
+    if (!element.isConnected) return;
+    if (target.preserveUserPosition) {
+      const distanceFromBottom =
+        element.scrollHeight - element.scrollTop - element.clientHeight;
+      if (distanceFromBottom >= 96) return;
+    }
+    element.scrollTop = element.scrollHeight;
+  }
+
+  private flushVisibleScrollTargets(tab: AgentViewTab): void {
+    for (const [element, target] of this.pendingScrollTargets) {
+      if (target.tab !== tab) continue;
+      this.scrollFrameBatcher.schedule(element, () =>
+        this.flushScrollTarget(element),
+      );
+    }
   }
 
   private nextChatMessageId(): string {
@@ -4298,24 +4648,25 @@ export class AgentView extends ItemView {
     return Number.isFinite(step) && step > 0 ? step : 1;
   }
 
-  private formatStepMetric(
-    step: number,
-    maxSteps = this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS,
-  ): string {
-    return `${step} used (max ${maxSteps})`;
-  }
-
   private formatStopReason(stopReason: AgentRunCompleteEvent["stopReason"]) {
     return formatStopReasonLabel(fromAgentRunStopReason(stopReason));
   }
 
   private appendWorkstreamLine(message: string): void {
-    if (!message.trim() || !this.liveWorkstreamEl) return;
+    const normalized = message.trim();
+    if (
+      !normalized ||
+      normalized === this.lastWorkstreamLine ||
+      !this.liveWorkstreamEl
+    ) {
+      return;
+    }
+    this.lastWorkstreamLine = normalized;
     this.liveWorkstreamEl.removeClass("is-hidden");
     this.liveWorkstreamEl.show();
     this.clearPlaceholder(this.liveWorkstreamEl);
     this.liveWorkstreamEl.createDiv({
-      text: message.trim(),
+      text: normalized,
       cls: "agentic-researcher-live-workstream-line",
     });
     this.trimRows(
@@ -4323,7 +4674,8 @@ export class AgentView extends ItemView {
       ".agentic-researcher-live-workstream-line",
       MAX_STATUS_ROWS,
     );
-    this.liveWorkstreamEl.scrollTop = this.liveWorkstreamEl.scrollHeight;
+    this.moveChatActivityToEnd();
+    this.scheduleScrollToEnd(this.liveWorkstreamEl, "chat");
   }
 
   private showLifecycleStageStrip(
@@ -4459,7 +4811,10 @@ export class AgentView extends ItemView {
         attr: {
           type: "button",
           "data-testid": "chat-blocked-continue",
-          "aria-label": `Continue latest run ${ledger.runId}`,
+          // Accessible name = visible label; runId detail goes in the tooltip
+          // so role-based lookups keep a stable whole-string name.
+          "aria-label": "Continue Latest Run",
+          title: `Continue latest run ${ledger.runId}`,
         },
       });
       continueButton.addEventListener("click", (event) => {

@@ -675,18 +675,33 @@ test("chat action buttons keep terminal layout and readable contrast", async () 
       const clearStyle = window.getComputedStyle(clear);
       const continuationStyle = window.getComputedStyle(continuation);
 
+      // Theme-adaptive palette: colors may compute as rgba(...) or, for
+      // color-mix() tokens, as color(srgb r g b / a). Parse both. Hue is the
+      // theme's business now — assertions below check structure and alpha
+      // (transparency / readability), never a specific palette hue.
       const parseRgba = (value: string) => {
-        const match = value.match(
+        const rgba = value.match(
           /rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i,
         );
-        if (!match) {
+        if (rgba) {
+          return {
+            r: Number(rgba[1]),
+            g: Number(rgba[2]),
+            b: Number(rgba[3]),
+            a: rgba[4] === undefined ? 1 : Number(rgba[4]),
+          };
+        }
+        const srgb = value.match(
+          /color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\)/i,
+        );
+        if (!srgb) {
           return null;
         }
         return {
-          r: Number(match[1]),
-          g: Number(match[2]),
-          b: Number(match[3]),
-          a: match[4] === undefined ? 1 : Number(match[4]),
+          r: Number(srgb[1]) * 255,
+          g: Number(srgb[2]) * 255,
+          b: Number(srgb[3]) * 255,
+          a: srgb[4] === undefined ? 1 : Number(srgb[4]),
         };
       };
 
@@ -698,12 +713,9 @@ test("chat action buttons keep terminal layout and readable contrast", async () 
         return parsed.a <= 0.08;
       };
 
-      const isReadableTerminalGreen = (value: string) => {
+      const isReadableInk = (value: string) => {
         const parsed = parseRgba(value);
-        if (!parsed || parsed.a < 0.5) {
-          return false;
-        }
-        return parsed.g >= 140 && parsed.g > parsed.r && parsed.g > parsed.b;
+        return Boolean(parsed && parsed.a >= 0.5);
       };
 
       return {
@@ -732,20 +744,14 @@ test("chat action buttons keep terminal layout and readable contrast", async () 
         continuationTransparent: isNearTransparent(
           continuationStyle.backgroundColor,
         ),
-        clearReadable: isReadableTerminalGreen(clearStyle.color),
+        clearReadable: isReadableInk(clearStyle.color),
         continuationReadableWhenShown:
           continuation.hidden ||
           continuation.disabled ||
-          isReadableTerminalGreen(continuationStyle.color),
+          isReadableInk(continuationStyle.color),
         runFilledSoft: (() => {
           const parsed = parseRgba(runStyle.backgroundColor);
-          return Boolean(
-            parsed &&
-              parsed.a > 0.05 &&
-              parsed.a < 0.35 &&
-              parsed.g > parsed.r &&
-              parsed.g > parsed.b,
-          );
+          return Boolean(parsed && parsed.a > 0.05 && parsed.a < 0.35);
         })(),
       };
     });
@@ -790,17 +796,28 @@ test("prompt textarea click edits at clicked position", async () => {
   });
 });
 
-test("chat loader stays hidden without stale idle text until active", async () => {
+test("chat activity stays under the latest text and the idle footer stays hidden", async () => {
   await withE2EHarness("chat-loader-active-state", async ({ page }) => {
+    const chatBox = page.getByTestId("chat-stream-box");
     const loader = page.locator(".agentic-researcher-chat-loader");
     const loaderText = page.locator(".agentic-researcher-chat-loader-text");
+    const workstream = page.getByTestId("live-workstream");
+    const runStatus = page.locator(".agentic-researcher-run-status");
     const staleIdleLoader = loader.filter({ hasText: /\bidle\b/i });
 
+    await expect(
+      chatBox.locator(":scope > [data-testid='live-workstream']"),
+    ).toHaveCount(1);
+    await expect(
+      page.locator(".agentic-researcher-chat-panel > [data-testid='live-workstream']"),
+    ).toHaveCount(0);
     await expect(loader).toBeHidden();
+    await expect(runStatus).toBeHidden();
     await expect(staleIdleLoader).toHaveCount(0);
 
     await reloadAssistantPanel(page);
     await expect(loader).toBeHidden();
+    await expect(runStatus).toBeHidden();
     await expect(staleIdleLoader).toHaveCount(0);
 
     const prompt =
@@ -808,11 +825,70 @@ test("chat loader stays hidden without stale idle text until active", async () =
     await submitMission(page, prompt, { waitForCompletion: false });
 
     await expect(loader).toBeVisible({ timeout: 5_000 });
+    await expect(workstream).toBeVisible();
+    await expect(runStatus).toBeVisible();
     await expect(loaderText).not.toHaveText(/\bidle\b/i);
+    const placement = await chatBox.evaluate((element) => {
+      const messages = element.querySelectorAll(".agentic-researcher-log-item");
+      const latestMessage = messages.item(messages.length - 1);
+      const activity = element.querySelector("[data-testid='live-workstream']");
+      const activeLoader = element.querySelector(".agentic-researcher-chat-loader");
+      return {
+        activityIsChild: activity?.parentElement === element,
+        loaderIsChild: activeLoader?.parentElement === element,
+        messageBeforeActivity: Boolean(
+          latestMessage &&
+            activity &&
+            (latestMessage.compareDocumentPosition(activity) &
+              Node.DOCUMENT_POSITION_FOLLOWING),
+        ),
+        activityBeforeLoader: Boolean(
+          activity &&
+            activeLoader &&
+            (activity.compareDocumentPosition(activeLoader) &
+              Node.DOCUMENT_POSITION_FOLLOWING),
+        ),
+      };
+    });
+    expect(placement).toEqual({
+      activityIsChild: true,
+      loaderIsChild: true,
+      messageBeforeActivity: true,
+      activityBeforeLoader: true,
+    });
 
     await waitForMissionComplete(page, 90_000);
     await expect(loader).toBeHidden();
+    await expect(runStatus).toBeHidden();
     await expect(staleIdleLoader).toHaveCount(0);
+    const renderHealth = await chatBox.evaluate((element) => {
+      const rows = Array.from(
+        element.querySelectorAll<HTMLElement>(".agentic-researcher-log-item"),
+      );
+      const workstreamLines = Array.from(
+        element.querySelectorAll<HTMLElement>(
+          ".agentic-researcher-live-workstream-line",
+        ),
+      ).map((line) => line.textContent?.trim() ?? "");
+      return {
+        chatRows: rows.length,
+        assistantTextVisible: rows.some(
+          (row) =>
+            row.classList.contains("agentic-researcher-log-assistant") &&
+            Boolean(
+              row
+                .querySelector(".agentic-researcher-log-message")
+                ?.textContent?.trim(),
+            ),
+        ),
+        consecutiveDuplicateWorkstreamLines: workstreamLines.some(
+          (line, index) => index > 0 && line === workstreamLines[index - 1],
+        ),
+      };
+    });
+    expect(renderHealth.chatRows).toBeLessThanOrEqual(80);
+    expect(renderHealth.assistantTextVisible).toBe(true);
+    expect(renderHealth.consecutiveDuplicateWorkstreamLines).toBe(false);
   });
 });
 
@@ -1158,6 +1234,22 @@ test("long-run event flood stays bounded across pane detach and replay", async (
       expect(replaySnapshot.droppedEventCount).toBeGreaterThan(0);
 
       await page.getByRole("tab", { name: "Run Details" }).click();
+      await openRunDiagnostics(page);
+      // Opening the expander persists the preference through the settings
+      // round-trip (survives a view remount, which this test performs above).
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              ({ pluginId }) =>
+                (window as typeof window & { app?: any }).app?.plugins?.plugins?.[
+                  pluginId
+                ]?.settings?.runDetailsDiagnosticsExpanded === true,
+              { pluginId: PLUGIN_ID },
+            ),
+          { message: "diagnostics expansion should persist to settings" },
+        )
+        .toBe(true);
       await expect(
         page.locator(
           ".agentic-researcher-dashboard-section-status .agentic-researcher-status-line",
@@ -3353,6 +3445,38 @@ test("streaming writeback soft word near-miss skips correction pass", async () =
     expect(details).toMatch(/Word count:\s*95\/100\s*\(within target; correction=not used\)/i);
     expect(details).not.toMatch(/requesting one correction pass/i);
   });
+});
+
+test("under-target correction keeps Chat visible and strips tool marker before title handling", async () => {
+  await withE2EHarness(
+    "streaming-under-target-tool-prefix",
+    async ({ page, noteFilePath }) => {
+      const marker = "E2E_UNDER_TARGET_REPLACEMENT_TOOL_PREFIX";
+      const prompt =
+        `In this note, write a 100 word essay about literary works containing ${marker}.`;
+      await setStreamingMode(page, true);
+      await submitMission(page, prompt, { waitForCompletion: true, timeout: 90_000 });
+      await assertMockModelUsed(page);
+
+      const assistant = page
+        .locator(".agentic-researcher-log-assistant .agentic-researcher-log-message", {
+          hasText: marker,
+        })
+        .last();
+      await expect(assistant).toBeVisible({ timeout: 10_000 });
+      await expect(assistant).not.toContainText("replace_current_file");
+
+      const note = await readFile(noteFilePath, "utf8");
+      expect(note).toContain(marker);
+      expect(note).not.toContain("replace_current_file");
+      expect(note).not.toContain("# Corrected Literary Works Essay");
+      expect(note).not.toContain("E2E_UNDER_TARGET_INITIAL_DRAFT_SHOULD_NOT_REMAIN");
+
+      const details = await readRunDetailsText(page);
+      expect(details).toMatch(/requesting one correction pass/i);
+      expect(details).toMatch(/correction=used/i);
+    },
+  );
 });
 
 test("streaming writeback scrolls the active editor to follow new output", async () => {
@@ -7022,6 +7146,7 @@ test("autonomous loop respects bounded tool budget and checkpoints", async () =>
         }),
       ).toBeVisible({ timeout: 30_000 });
       await page.getByRole("tab", { name: "Run Details" }).click();
+      await openRunDiagnostics(page);
       await expect(
         page.locator(".agentic-researcher-dashboard-section-planning", {
           hasText: `Step ${visibleStep}/${effectiveStepCap}`,
@@ -8097,6 +8222,27 @@ function inferMissionCompletionTimeout(prompt: string): number {
   return DEFAULT_E2E_MISSION_TIMEOUT_MS;
 }
 
+/**
+ * Unfold the Run Details Diagnostics expander when it is collapsed. Sections
+ * inside it (model config, mission graph, thinking/planning, tool timeline,
+ * browser, actions, code output, milestones, memory, verification, run log)
+ * are present in the DOM either way, but visibility assertions and clicks
+ * need the group open — this is the user-reachable path.
+ */
+async function openRunDiagnostics(page: Page) {
+  const details = page.locator(".agentic-researcher-dashboard-diagnostics");
+  await expect(details).toHaveCount(1);
+  const isOpen = await details.evaluate(
+    (element) => (element as HTMLDetailsElement).open,
+  );
+  if (!isOpen) {
+    await details
+      .locator(".agentic-researcher-dashboard-diagnostics-summary")
+      .click();
+  }
+  await expect(details).toHaveJSProperty("open", true);
+}
+
 async function waitForMissionComplete(page: Page, timeout = 60_000) {
   const runButton = page.locator("button.agentic-researcher-run");
   await expect(runButton).toHaveText("Run Mission", { timeout });
@@ -8449,6 +8595,8 @@ async function expectNoReceipts(page: Page) {
 
 async function expectToolRun(page: Page, toolName: string) {
   await page.getByRole("tab", { name: "Run Details" }).click();
+  // The tool timeline lives inside the Diagnostics expander.
+  await openRunDiagnostics(page);
   await expect(
     page.locator(".agentic-researcher-tool-item", { hasText: toolName }).first(),
   ).toBeVisible();
@@ -8456,6 +8604,8 @@ async function expectToolRun(page: Page, toolName: string) {
 
 async function expectVerification(page: Page, text: string) {
   await page.getByRole("tab", { name: "Run Details" }).click();
+  // The verification section lives inside the Diagnostics expander.
+  await openRunDiagnostics(page);
   await expect(
     page.locator(".agentic-researcher-verification-row", { hasText: text }).first(),
   ).toBeVisible();
@@ -9279,6 +9429,24 @@ async function setupVaultNoteAndMockModel(
               ?.content ?? "";
           const requestText =
             request.messages?.map((message) => message.content ?? "").join("\n") ?? "";
+          if (
+            requestText.includes("E2E_UNDER_TARGET_REPLACEMENT_TOOL_PREFIX") &&
+            /Revise the previous draft/i.test(latestUserText)
+          ) {
+            const content = [
+              "replace_current_file",
+              "",
+              "# Corrected Literary Works Essay",
+              "",
+              "E2E_UNDER_TARGET_REPLACEMENT_TOOL_PREFIX",
+              Array.from({ length: 94 }, (_, i) => `corrected${i + 1}`).join(" "),
+            ].join("\n");
+            return {
+              message: { role: "assistant", content },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
           if (
             requestText.includes("E2E_SOFT_WORD_NEAR_MISS") &&
             /word[- ]count|correction|exactly \d+ words/i.test(requestText)
@@ -13419,6 +13587,21 @@ async function setupVaultNoteAndMockModel(
               "",
               Array.from({ length: 94 }, (_, i) => `rain${i + 1}`).join(" "),
               "E2E_SOFT_WORD_NEAR_MISS",
+            ].join("\n");
+            events?.onContentDelta?.(content);
+            return {
+              message: { role: "assistant", content },
+              toolCalls: [],
+              raw: { playwrightE2E: true },
+            };
+          }
+          if (requestText.includes("E2E_UNDER_TARGET_REPLACEMENT_TOOL_PREFIX")) {
+            const content = [
+              "# Short Literary Works Draft",
+              "",
+              "E2E_UNDER_TARGET_REPLACEMENT_TOOL_PREFIX",
+              "E2E_UNDER_TARGET_INITIAL_DRAFT_SHOULD_NOT_REMAIN",
+              Array.from({ length: 38 }, (_, i) => `short${i + 1}`).join(" "),
             ].join("\n");
             events?.onContentDelta?.(content);
             return {

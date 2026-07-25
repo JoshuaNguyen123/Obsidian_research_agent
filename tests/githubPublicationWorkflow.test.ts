@@ -244,6 +244,51 @@ test("ambiguous draft creation reconciles by exact readback and never redispatch
   assert.ok(reconciled.receiptIds.some((id) => id.includes("reconciled-draft-pr")));
 });
 
+test("retries a reconciled unapplied draft PR with fresh approval without pushing again", async () => {
+  const harness = createHarness({
+    ambiguousDraftCreate: true,
+    ambiguousDraftCreateNotApplied: true,
+  });
+  const workflow = new GitHubPublicationWorkflowV1(harness.options);
+  const original = request();
+
+  const uncertain = await workflow.publishDraft(original);
+  assert.equal(uncertain.status, "reconcile_required");
+  assert.equal(uncertain.pendingAction?.operation, "draft_pull_request_create");
+  assert.equal(harness.pushes, 1);
+  assert.equal(harness.createdPullRequests, 1);
+  assert.deepEqual(uncertain.receiptIds, ["receipt-push"]);
+
+  const blocked = await workflow.reconcile(uncertain, original.binding);
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.blocker?.code, "github_draft_pr_not_applied");
+  assert.equal(blocked.pendingAction, null);
+  assert.equal(harness.pushes, 1);
+  assert.equal(harness.createdPullRequests, 1);
+  assert.deepEqual(blocked.receiptIds, ["receipt-push"]);
+
+  const retried = await workflow.retryDraftPublicationAfterNotApplied(blocked, {
+    title: original.title,
+    body: original.body,
+    binding: original.binding,
+    handoff: original.handoff,
+  });
+
+  assert.equal(retried.status, "review_or_merge_ready");
+  assert.equal(retried.pullRequest?.draft, true);
+  assert.equal(harness.pushes, 1);
+  assert.equal(harness.createdPullRequests, 2);
+  assert.deepEqual(harness.approvalKinds, ["publish", "publish"]);
+  assert.equal(harness.approvalFingerprints.length, 2);
+  assert.notEqual(
+    harness.approvalFingerprints[1],
+    harness.approvalFingerprints[0],
+    "the retry must obtain a fresh approval rather than reuse the stale one",
+  );
+  assert.equal(retried.publishApprovalFingerprint, harness.approvalFingerprints[1]);
+  assert.deepEqual(retried.receiptIds, ["receipt-push", "receipt-pr"]);
+});
+
 test("ambiguous Git push uses gateway readback and continues draft publication without redispatch", async () => {
   const harness = createHarness({ ambiguousPush: true });
   const workflow = new GitHubPublicationWorkflowV1(harness.options);
@@ -333,6 +378,7 @@ function createHarness(options: {
   reviewState?: "APPROVED" | "CHANGES_REQUESTED";
   driftAfterMergeApproval?: boolean;
   ambiguousDraftCreate?: boolean;
+  ambiguousDraftCreateNotApplied?: boolean;
   ambiguousPush?: boolean;
   ambiguousReady?: boolean;
   ambiguousMerge?: boolean;
@@ -343,6 +389,7 @@ function createHarness(options: {
 } = {}) {
   const checkpoints: GitHubPublicationCheckpointV1[] = [];
   const approvalKinds: string[] = [];
+  const approvalFingerprints: string[] = [];
   let pushes = 0;
   let pushReconciliations = 0;
   let createdPullRequests = 0;
@@ -355,6 +402,7 @@ function createHarness(options: {
   let obsidianCalls = 0;
   let now = Date.parse("2026-07-12T12:00:00.000Z");
   let pullRequest: GitHubPublicationPullRequestV1 = pr({ draft: true });
+  let draftPullRequestApplied = false;
   let checkpointFailureUsed = false;
 
   const approvals: GitHubPublicationApprovalPortV1 = {
@@ -362,6 +410,7 @@ function createHarness(options: {
       assert.equal(await verifyPreparedActionFingerprint(input.preparedAction), true);
       assert.equal(input.preparedAction.payloadFingerprint, input.approvalFingerprint);
       approvalKinds.push(input.kind);
+      approvalFingerprints.push(input.approvalFingerprint);
       if (input.kind === "merge") {
         mergeApprovalConfirmations = input.requiredConfirmations;
         if (options.driftAfterMergeApproval) {
@@ -382,11 +431,15 @@ function createHarness(options: {
 
   const provider: GitHubPublicationProviderPortV1 = {
     async listPullRequestsForHead() {
-      return createdPullRequests > 0 ? [clone(pullRequest)] : [];
+      return draftPullRequestApplied ? [clone(pullRequest)] : [];
     },
     async createDraftPullRequest() {
       createdPullRequests += 1;
-      if (options.ambiguousDraftCreate) {
+      const firstDispatch = createdPullRequests === 1;
+      if (!(options.ambiguousDraftCreateNotApplied && firstDispatch)) {
+        draftPullRequestApplied = true;
+      }
+      if (options.ambiguousDraftCreate && firstDispatch) {
         throw new Error("simulated connection loss after draft creation");
       }
       return { pullRequest: clone(pullRequest), receipt: receipt("receipt-pr", "publish") };
@@ -454,6 +507,7 @@ function createHarness(options: {
   return {
     checkpoints,
     approvalKinds,
+    approvalFingerprints,
     get pushes() {
       return pushes;
     },

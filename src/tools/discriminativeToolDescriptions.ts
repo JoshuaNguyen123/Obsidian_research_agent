@@ -13,9 +13,11 @@ export const DISCRIMINATIVE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> 
   web_search:
     "Purpose: Search the public web. Use when: external facts or sources are required. Do not use when: pure vault/note organize questions. Required: query. Next: web_fetch or synthesize. Side effects: read.",
   code_workspace_create_file:
-    "Purpose: Create a new file in the sandbox code workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast. Side effects: bound write.",
+    "Purpose: Create a new file in a real directory on the user's local filesystem. Use when: adding a new workspace path for a code deliverable. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write.",
+  code_workspace_export_directory:
+    "Purpose: Deliver a verified workspace directory to Desktop, Documents, or Downloads on the user's real local filesystem. Use when: the foreground mission explicitly requests one of those destinations. Do not use when: no known host folder was requested or the destination already exists. Required: workspaceId, destinationRoot, destinationPath. Next: report the absolute verified export path. Side effects: exact approval-gated host write with no overwrite.",
   code_workspace_write_expected:
-    "Purpose: Hash-bound full-file correction in the workspace. Use when: repairing after code_workspace_read with expectedSha256. Do not use when: first create (use code_workspace_create_file) or inventing a patch tool. Required: path, content, expectedSha256. Next: validate/repair. Side effects: bound write.",
+    "Purpose: Hash-bound full-file correction in a real directory on the user's local filesystem. Use when: repairing after code_workspace_read with expectedSha256. Do not use when: first create (use code_workspace_create_file) or inventing a patch tool. Required: path, content, expectedSha256. Next: validate/repair, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write.",
   code_workspace_patch:
     "Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write.",
   code_validate_fast:

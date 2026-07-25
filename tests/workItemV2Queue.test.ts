@@ -133,14 +133,14 @@ test("v2 publisher appends one canonical signed contract and deduplicates the fu
   assert.equal(contractDrift.status, "create");
 
   duplicateDescription = `${built.description}\n`;
-  const trailingWhitespaceDrift = await publisher.preview({
+  const providerTrailingWhitespace = await publisher.preview({
     context: {} as ToolExecutionContext,
     sections: SECTIONS,
     draft: V2_DRAFT,
   });
-  assert.equal(trailingWhitespaceDrift.ok, true);
-  if (!trailingWhitespaceDrift.ok) return;
-  assert.equal(trailingWhitespaceDrift.status, "create");
+  assert.equal(providerTrailingWhitespace.ok, true);
+  if (!providerTrailingWhitespace.ok) return;
+  assert.equal(providerTrailingWhitespace.status, "deduplicated");
 });
 
 test("compatible rendering and parsing preserve the existing v1 contract", () => {

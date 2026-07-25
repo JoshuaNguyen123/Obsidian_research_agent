@@ -9,8 +9,10 @@ import {
   RECEIPT_PROOF_ID_PREFIX,
   getActiveMissionPlanTask,
   getReceiptProofKinds,
+  isFetchedWebEvidence,
   isFinalOutputRelevant,
   isSuccessfulCodeRunOutput,
+  isVaultReadEvidence,
   refreshMissionPlanProgress,
   taskHasRecordedProof,
   type MissionPlan,
@@ -22,6 +24,72 @@ export interface MissionPlanAdvanceResult {
   plan: MissionPlan;
   changed: boolean;
   meaningfulAction?: string;
+}
+
+export function advanceMissionPlanFromSeedEvidence({
+  plan,
+  evidence,
+  now = new Date(),
+}: {
+  plan: MissionPlan;
+  evidence: readonly MissionEvidence[];
+  now?: Date;
+}): MissionPlanAdvanceResult {
+  const webEvidenceIds = evidence
+    .filter(isFetchedWebEvidence)
+    .map((item) => item.id);
+  const vaultEvidenceIds = evidence
+    .filter(isVaultReadEvidence)
+    .map((item) => item.id);
+  let changed = false;
+  const tasks = plan.tasks.map((task) => {
+    const seededIds = [
+      ...(task.completionContract.requiredProof.includes("web_evidence")
+        ? webEvidenceIds
+        : []),
+      ...(task.completionContract.requiredProof.includes("vault_evidence")
+        ? vaultEvidenceIds
+        : []),
+    ];
+    if (seededIds.length === 0) {
+      return task;
+    }
+    const candidate: MissionPlanTask = {
+      ...task,
+      evidenceIds: dedupe([...task.evidenceIds, ...seededIds]),
+    };
+    const complete =
+      task.status !== "blocked" &&
+      candidate.completionContract.requiredProof.every((proof) =>
+        taskHasRecordedProof(candidate, proof),
+      );
+    const next = complete ? { ...candidate, status: "complete" as const } : candidate;
+    changed =
+      changed ||
+      next.status !== task.status ||
+      next.evidenceIds.length !== task.evidenceIds.length;
+    return next;
+  });
+  if (!changed) {
+    return { plan, changed: false };
+  }
+  const next = refreshMissionPlanProgress({
+    ...plan,
+    tasks,
+    updatedAt: now.toISOString(),
+  });
+  return {
+    plan: {
+      ...next,
+      progress: {
+        ...next.progress,
+        lastMeaningfulAction: "seed_evidence",
+      },
+      updatedAt: now.toISOString(),
+    },
+    changed: true,
+    meaningfulAction: "seed_evidence",
+  };
 }
 
 export function advanceMissionPlanFromToolResult({

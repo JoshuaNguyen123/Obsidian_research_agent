@@ -27,6 +27,7 @@ export { boundMayAutoUnderBundledGrant };
 
 /** Delivery stages gated for set-loose compound completion (not cleanup). */
 export const SET_LOOSE_DELIVERY_STAGES = [
+  "accepted_research",
   "linear_hierarchy",
   "code_execution",
   "private_github_publication",
@@ -186,14 +187,18 @@ export function pendingToolsAllowSetLooseWithoutGrant(input: {
 }
 
 /**
- * Resolve num_ctx for a run. When set-loose compound is on, floor at 100k.
- * Never lower an explicit Settings value that is already higher.
+ * Resolve num_ctx for a run. Explicit Settings win; a blank Settings value
+ * falls back to the model-reported context window from the connection test.
+ * When set-loose compound is on, floor at 100k — capped at the model-reported
+ * window when known. Never lower an explicit Settings value that is already
+ * higher.
  */
 export function resolveNumCtxForCompoundRun(input: {
   settingsNumCtx: number | null | undefined;
   autonomyProfile: AutonomyProfile;
   compoundLifecycleDetected: boolean;
   workingMode?: string | null;
+  modelReportedContextLength?: number | null;
 }): number | null {
   const settings =
     typeof input.settingsNumCtx === "number" &&
@@ -201,9 +206,20 @@ export function resolveNumCtxForCompoundRun(input: {
     input.settingsNumCtx > 0
       ? Math.trunc(input.settingsNumCtx)
       : null;
-  if (!isSetLooseEnabled(input)) return settings;
-  if (settings === null) return COMPOUND_SET_LOOSE_NUM_CTX;
-  return Math.max(settings, COMPOUND_SET_LOOSE_NUM_CTX);
+  const modelReported =
+    typeof input.modelReportedContextLength === "number" &&
+    Number.isSafeInteger(input.modelReportedContextLength) &&
+    input.modelReportedContextLength > 0
+      ? input.modelReportedContextLength
+      : null;
+  const base = settings ?? modelReported;
+  if (!isSetLooseEnabled(input)) return base;
+  const floor =
+    modelReported === null
+      ? COMPOUND_SET_LOOSE_NUM_CTX
+      : Math.min(COMPOUND_SET_LOOSE_NUM_CTX, modelReported);
+  if (base === null) return floor;
+  return Math.max(base, floor);
 }
 
 export interface CompoundStageBudgetV1 {
@@ -579,6 +595,7 @@ export function unpaidSetLooseDeliveryStages(input: {
 }
 
 export type SetLooseDeliveryProofsV1 = {
+  acceptedResearchPublication?: boolean;
   linearIssueUrlOrId?: boolean;
   codeWorkspaceReadback?: boolean;
   githubPrivateRepoOrPrUrl?: boolean;
@@ -618,6 +635,15 @@ function stringField(
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+/** Exact cross-system markers required before final set-loose note reflection pays. */
+export function hasCompleteSetLooseNoteReflectionProof(text: string): boolean {
+  return (
+    /\b(?:FLOW_REAL|COMPOUND)_[A-Za-z0-9_]+\b/u.test(text) &&
+    /https:\/\/linear\.app\/[^\s)\]"'<>]+/iu.test(text) &&
+    /https:\/\/github\.com\/[^\s)\]"'<>]+\/pull\/\d+/iu.test(text)
+  );
+}
+
 /**
  * Apply one successful tool result onto set-loose delivery proofs. Shared by
  * the live tool loop and Continue resume seeding so proofs never reset empty.
@@ -637,6 +663,9 @@ export function applySetLooseDeliveryProofFromSuccessfulTool(input: {
   const outputRecord = isRecordLike(input.output) ? input.output : null;
   const next: SetLooseDeliveryProofsV1 = { ...input.proofs };
 
+  if (toolName === "publish_research_to_linear") {
+    next.acceptedResearchPublication = true;
+  }
   if (
     toolName === "linear_create_issue" ||
     toolName === "linear_get_issue" ||
@@ -680,9 +709,7 @@ export function applySetLooseDeliveryProofFromSuccessfulTool(input: {
   if (
     (toolName === "append_to_current_file" ||
       toolName === "replace_current_file") &&
-    (/https:\/\/linear\.app\//iu.test(combinedText) ||
-      /https:\/\/github\.com\//iu.test(combinedText) ||
-      /FLOW[-_]?REAL|COMPOUND|set-loose|note reflection/iu.test(combinedText))
+    hasCompleteSetLooseNoteReflectionProof(combinedText)
   ) {
     next.noteReflectionWithMarkers = true;
   }
@@ -754,6 +781,12 @@ export function setLooseDeliveryComplete(input: {
   const unpaid: string[] = [];
 
   if (
+    planStages.has("accepted_research") &&
+    input.proofs.acceptedResearchPublication !== true
+  ) {
+    unpaid.push("accepted_research");
+  }
+  if (
     planStages.has("linear_hierarchy") &&
     input.proofs.linearIssueUrlOrId !== true
   ) {
@@ -807,6 +840,14 @@ export function pendingToolsForUnpaidSetLooseDelivery(
   const tools: string[] = [];
   for (const item of unpaid) {
     switch (item) {
+      case "accepted_research":
+        tools.push(
+          ...toolsAllowedForLifecycleStage("accepted_research"),
+          "read_template",
+          "list_templates",
+          "linear_get_connection_context",
+        );
+        break;
       case "linear_hierarchy":
         tools.push(
           "linear_get_connection_context",
@@ -851,31 +892,53 @@ export function toolsOfferedForSetLooseTurn(input: {
   codeDeliveryPaid: boolean;
   unpaidDeliveryKeys?: readonly string[];
 }): string[] {
+  const unpaidKeys = input.unpaidDeliveryKeys ?? [];
+  const earliestUnpaid = [
+    "accepted_research",
+    "linear_hierarchy",
+    "code_execution",
+    "private_github_publication",
+    "note_reflection",
+  ].find((key) => unpaidKeys.includes(key));
+  const unpaidTools = earliestUnpaid
+    ? pendingToolsForUnpaidSetLooseDelivery([earliestUnpaid])
+    : [];
   const base =
-    !input.codeDeliveryPaid && input.currentStage === "code_execution"
+    earliestUnpaid === "code_execution"
       ? toolsOfferedForSetLooseCodeStage({
           stages: input.stages,
-          currentStage: input.currentStage,
+          currentStage: "code_execution",
           passedFastRepairCycle: input.passedFastRepairCycle,
           codeDeliveryPaid: false,
         })
-      : toolsOfferedForSetLoosePipeline({
-          stages: input.stages,
-          currentStage: input.currentStage,
-          passedFastRepairCycle: input.passedFastRepairCycle,
-          codeDeliveryPaid: input.codeDeliveryPaid,
-        });
-
-  const unpaidTools = pendingToolsForUnpaidSetLooseDelivery(
-    input.unpaidDeliveryKeys ?? [],
-  );
+      : earliestUnpaid === undefined
+        ? toolsOfferedForSetLoosePipeline({
+            stages: input.stages,
+            currentStage: input.currentStage,
+            passedFastRepairCycle: input.passedFastRepairCycle,
+            codeDeliveryPaid: input.codeDeliveryPaid,
+          })
+        : [];
   const offered = new Set<string>([
     ...base,
     ...unpaidTools,
     ...(SET_LOOSE_STAGE_SOFT_COMPANIONS as readonly string[]),
   ]);
-  if (!input.codeDeliveryPaid) {
+  if (earliestUnpaid !== "code_execution") {
+    for (const tool of CODE_EXECUTION_TOOL_ALLOW) {
+      offered.delete(tool);
+    }
+  }
+  if (earliestUnpaid !== "private_github_publication") {
     for (const tool of GITHUB_PUBLICATION_TOOLS) {
+      offered.delete(tool);
+    }
+  }
+  if (
+    earliestUnpaid !== "accepted_research" &&
+    earliestUnpaid !== "linear_hierarchy"
+  ) {
+    for (const tool of toolsAllowedForLifecycleStage("linear_hierarchy")) {
       offered.delete(tool);
     }
   }
@@ -925,9 +988,9 @@ export function missionGraphHasIncompleteReadTemplateNode(
 
 /**
  * Soft current-note writes may bypass legacy mission-plan active-task gating
- * during set-loose unpaid note reflection. Soft-union already authorizes these
- * companions; do not strand append behind a stuck MissionGraph
- * `tool-01-read_template` node after Linear/template work already ran.
+ * only after every external delivery proof is paid and note reflection is the
+ * sole remaining obligation. This prevents an early append from bypassing a
+ * still-unpaid research, Linear, code, or GitHub frontier.
  */
 export function setLooseSoftWriteBypassesPlanDependency(input: {
   toolName: string;
@@ -946,7 +1009,10 @@ export function setLooseSoftWriteBypassesPlanDependency(input: {
   ) {
     return false;
   }
-  return input.unpaidDeliveryKeys.includes("note_reflection");
+  return (
+    input.unpaidDeliveryKeys.length === 1 &&
+    input.unpaidDeliveryKeys[0] === "note_reflection"
+  );
 }
 
 /** After this many model turns with GitHub Soft-union tools offered but unused. */

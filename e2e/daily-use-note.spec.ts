@@ -4,6 +4,7 @@ import {
   DAILY_USE_ACCEPTANCE_V1,
   evaluateDailyUseAcceptanceV1,
 } from "../src/agent/dailyUseAcceptance";
+import type { MissionScorecardV1 } from "../src/agent/missionScorecard";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
   NATIVE_CORE_PLUGIN_ID,
@@ -21,6 +22,7 @@ test.describe("daily-use note creation", () => {
     const markerTwo = `DU01_STREAM_TWO_${Date.now()}`;
     let createdPath: string | null = null;
     let seededUntitled = false;
+    let missionScorecard: MissionScorecardV1 | null = null;
 
     try {
       harness = await startNativeObsidianHarness({
@@ -101,6 +103,12 @@ test.describe("daily-use note creation", () => {
       await expectReceipt(harness.page, createdPath);
       await expectDetailsText(harness.page, "receipt=note_append");
       await expectDetailsText(harness.page, "note_output");
+      missionScorecard = await harness.page.evaluate(({ pluginId }) => {
+        const plugin = (window as typeof window & { app?: any }).app?.plugins
+          ?.plugins?.[pluginId];
+        return plugin?.getMissionRunSnapshot?.().lastMissionScorecard ?? null;
+      }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+      expect(missionScorecard).not.toBeNull();
 
       const reloadProof = await harness.page.evaluate(
         async ({ pluginId, targetPath, marker }) => {
@@ -146,7 +154,7 @@ test.describe("daily-use note creation", () => {
         testInfo,
         "DU-01",
         observed,
-        { modelCalls: 1, toolCalls: 1 },
+        { modelCalls: 1, toolCalls: 1, missionScorecard },
         { requireComplete: true },
       );
     } finally {

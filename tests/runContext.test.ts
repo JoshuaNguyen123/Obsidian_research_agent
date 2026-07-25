@@ -9,6 +9,7 @@ import {
   createRunContextBudget,
   estimatePromptChars,
   resolveKeepRecentLoopSteps,
+  resolveRunContextBudgetSource,
   shouldCompactLoopMessages,
 } from "../src/agent/runContext";
 import { resolveConversationPromptCharBudget } from "../src/memory/contextCompaction";
@@ -39,6 +40,46 @@ test("blank numCtx budgets as 48k tokens with assumed_48k source", () => {
   assert.equal(
     resolveConversationPromptCharBudget(budget.maxPromptChars),
     Math.min(120_000, Math.max(48_000, Math.floor(budget.maxPromptChars * 0.2))),
+  );
+});
+
+test("model-reported context length budgets with model_reported source", () => {
+  const reported = createRunContextBudget(196_608, "model_reported");
+  assert.equal(reported.budgetSource, "model_reported");
+  assert.equal(reported.numCtx, 196_608);
+  assert.equal(reported.maxPromptChars, (196_608 - 1500) * 4);
+
+  assert.equal(
+    resolveRunContextBudgetSource({
+      settingsNumCtx: 32_768,
+      modelReportedContextLength: 196_608,
+      resolvedNumCtx: 32_768,
+    }),
+    "setting",
+  );
+  assert.equal(
+    resolveRunContextBudgetSource({
+      settingsNumCtx: null,
+      modelReportedContextLength: 196_608,
+      resolvedNumCtx: 196_608,
+    }),
+    "model_reported",
+  );
+  assert.equal(
+    resolveRunContextBudgetSource({
+      settingsNumCtx: null,
+      modelReportedContextLength: null,
+      resolvedNumCtx: null,
+    }),
+    "assumed_48k",
+  );
+  assert.equal(
+    resolveRunContextBudgetSource({
+      settingsNumCtx: null,
+      modelReportedContextLength: null,
+      resolvedNumCtx: 100_000,
+    }),
+    "setting",
   );
 });
 

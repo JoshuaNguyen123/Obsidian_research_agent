@@ -99,6 +99,11 @@ export interface CodeWorkerEvents {
  * Bounded coding worker. Its only mutation tools are path-confined text edits
  * inside an already approved disposable worktree. It has no shell, Git,
  * network, vault, approval, or base-checkout capability.
+ *
+ * @deprecated Unreachable from production dispatch: resolveTopLevelMissionDispatchV1
+ * hard-routes code intent to single_agent (code work runs in the core loop
+ * with code-extension tools behind the extension-registry approval boundary).
+ * Kept for tests only.
  */
 export async function runCodeWorker(input: {
   runId: string;

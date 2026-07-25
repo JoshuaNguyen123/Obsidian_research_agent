@@ -55,6 +55,47 @@ test("host dispatch preserves force-chat and extension gates before direct execu
   assert.deepEqual(research, { kind: "research_team" });
 });
 
+test("top-level dispatch never resolves the deprecated code_team executor", () => {
+  // The legacy direct code-team executor predates the extension-registry
+  // approval boundary and must stay unreachable: code intent always routes to
+  // single_agent (core loop + code-extension tools). This locks the dead path
+  // shut so it cannot silently return.
+  const codeIntentVariants = [
+    {
+      codeTeamRequest: {
+        repositoryPath: "C:/trusted/repository",
+        assignment: "Repair the repository",
+      },
+      codeTeamBridgeIntent: true,
+    },
+    {
+      codeTeamRequest: {
+        repositoryPath: "C:/trusted/repository",
+        assignment: "Repair the repository",
+      },
+      codeTeamBridgeIntent: false,
+    },
+    { codeTeamRequest: null, codeTeamBridgeIntent: true },
+  ];
+  for (const variant of codeIntentVariants) {
+    for (const researchTeamRequested of [false, true]) {
+      const decision = resolveTopLevelMissionDispatchV1({
+        ...variant,
+        researchTeamRequested,
+        orchestratorEnabled: true,
+        forceChatOnly: false,
+        codeExtensionAvailable: true,
+        codeClarificationMessage: "Provide repository: <path>.",
+      });
+      assert.notEqual(
+        decision.kind,
+        "code_team",
+        `code intent must not open the deprecated code team: ${JSON.stringify(variant)}`,
+      );
+    }
+  }
+});
+
 test("explicit code dispatch persists an exact executor and hashed repository binding", async () => {
   const result = await planTopLevelDirectMissionGraphV1({
     missionId: "run-direct-code",

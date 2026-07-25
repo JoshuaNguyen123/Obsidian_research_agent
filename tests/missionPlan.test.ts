@@ -12,6 +12,7 @@ import {
 import {
   advanceMissionPlanFromFinalOutput,
   advanceMissionPlanFromReceipt,
+  advanceMissionPlanFromSeedEvidence,
   advanceMissionPlanFromToolResult,
 } from "../src/agent/missionPlanAdvance";
 import { evaluateMissionPlanAcceptance } from "../src/agent/missionPlanAcceptance";
@@ -64,6 +65,46 @@ test("mission plan infers proof contract and next action from the mission", () =
   });
 });
 
+test("accepted Researcher evidence pays the Lead read-only research debt", () => {
+  const plan = createTestPlan(
+    "Research two distinct sources and append a cited synthesis to the current note.",
+    ["web_search", "web_fetch", "append_to_current_file"],
+  );
+  const seeded = advanceMissionPlanFromSeedEvidence({
+    plan,
+    evidence: [
+      {
+        id: "web:https://primary.example/source",
+        kind: "web_source",
+        title: "Primary",
+        url: "https://primary.example/source",
+        passageIds: ["source:primary:passage:0-120"],
+        usableSource: true,
+        parserStatus: "parsed",
+        summary: "Primary evidence.",
+        confidence: "high",
+      },
+      {
+        id: "web:https://alternate.example/source",
+        kind: "web_source",
+        title: "Alternate",
+        url: "https://alternate.example/source",
+        passageIds: ["source:alternate:passage:0-120"],
+        usableSource: true,
+        parserStatus: "parsed",
+        summary: "Alternate evidence.",
+        confidence: "high",
+      },
+    ],
+    now: new Date("2026-07-24T00:00:00.000Z"),
+  });
+
+  assert.equal(seeded.changed, true);
+  assert.equal(seeded.plan.tasks[0]?.status, "complete");
+  assert.equal(seeded.plan.nextAction?.toolName, "append_to_current_file");
+  assert.equal(seeded.plan.progress.lastMeaningfulAction, "seed_evidence");
+});
+
 test("mission plan retains required mutation tools when route reads fill the task cap", () => {
   const routeReadTools = Array.from(
     { length: 14 },
@@ -113,6 +154,54 @@ test("final relevance requires an explicitly requested high-entropy literal anch
       `A grounded vault synthesis containing ${marker}.`,
     ),
     true,
+  );
+});
+
+test("ordinary include prose does not become a required literal anchor", () => {
+  const plan = createTestPlan(
+    "Append a sourced synthesis. Include explicit limitations and include confidence.",
+    ["web_fetch", "append_to_current_file"],
+  );
+
+  assert.equal(
+    isFinalOutputRelevant(
+      plan,
+      "The cited result is bounded by the available sources.\n\n## Limitations\n\nCoverage is narrow.\n\n## Confidence\n\nModerate.",
+    ),
+    true,
+  );
+});
+
+test("final relevance prioritizes the research subject over procedural tool words", () => {
+  const marker = "E2E_MARKER_1784882000000_123456";
+  const prompt =
+    `Read the current note as vault context. Search the web for the owned alpha and beta evidence, fetch both returned sources, and compare their deliberately conflicting conclusions about controlled onboarding validation. Append a ## Findings section with exactly two cited finding sentences and a ## Limitations section that explicitly says the two sources conflict. End each finding sentence with the exact source passage identifier returned by the fetch result that supports it, and use both fetched passage identifiers. Include ${marker}. Do not write before fetch, comparison, and verification.`;
+  const plan = createTestPlan(prompt, [
+    "read_current_file",
+    "web_search",
+    "web_fetch",
+    "append_to_current_file",
+  ]);
+  const candidate = [
+    marker,
+    "## Findings",
+    "Controlled onboarding validation improved retention and reduced errors [source:alpha:passage:0-146].",
+    "Controlled onboarding validation showed no reliable benefit in the alternate study [source:beta:passage:0-156].",
+    "## Limitations",
+    "The two sources conflict, so the disagreement remains unresolved.",
+    "## Confidence",
+    "Medium.",
+  ].join("\n\n");
+
+  assert.equal(isFinalOutputRelevant(plan, candidate), true);
+  const verifyTask = plan.tasks.find((task) =>
+    task.completionContract.requiredProof.includes("final_relevance"),
+  );
+  assert.ok(
+    verifyTask?.completionContract.relevanceTerms?.some((term) =>
+      ["controlled", "onboarding", "validation", "conflicting"].includes(term),
+    ),
+    JSON.stringify(verifyTask?.completionContract.relevanceTerms),
   );
 });
 

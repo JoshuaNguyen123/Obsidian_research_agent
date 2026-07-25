@@ -73,6 +73,9 @@ export const GITHUB_CATALOG_TOOL_OPERATION_MAP = Object.freeze({
   github_list_workflow_runs: "workflow_run.list",
   github_get_workflow_run: "workflow_run.get",
   github_list_workflow_jobs: "workflow_job.list",
+  github_search_code: "search.code",
+  github_search_issues: "search.issues",
+  github_search_commits: "search.commits",
   github_create_issue: "issue.create",
   github_update_issue: "issue.update",
   github_close_issue: "issue.close",
@@ -122,6 +125,9 @@ export const GITHUB_CATALOG_READ_TOOL_NAMES = Object.freeze([
   "github_list_workflow_runs",
   "github_get_workflow_run",
   "github_list_workflow_jobs",
+  "github_search_code",
+  "github_search_issues",
+  "github_search_commits",
 ] as const satisfies readonly GitHubCatalogToolName[]);
 
 export const GITHUB_CATALOG_MUTATION_TOOL_NAMES = Object.freeze([
@@ -180,6 +186,9 @@ type GitHubCatalogClientV1 = Pick<
   | "listPullRequestReviewComments"
   | "listCheckRuns"
   | "getCombinedStatus"
+  | "searchCode"
+  | "searchIssues"
+  | "searchCommits"
   | "listWorkflowRunsForCommit"
   | "getWorkflowRun"
   | "listWorkflowJobs"
@@ -247,7 +256,10 @@ type ReadKind =
   | "combined_status"
   | "workflow_runs"
   | "workflow_run"
-  | "workflow_jobs";
+  | "workflow_jobs"
+  | "search_code"
+  | "search_issues"
+  | "search_commits";
 
 interface ReadToolConfig {
   name: (typeof GITHUB_CATALOG_READ_TOOL_NAMES)[number];
@@ -357,6 +369,9 @@ const READ_CONFIGS: readonly ReadToolConfig[] = [
   readConfig("github_list_workflow_runs", "List a bounded set of workflow runs for an exact commit SHA.", "workflow_runs", "workflow_run", { headSha: SHA_SCHEMA, limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["headSha"], "list"),
   readConfig("github_get_workflow_run", "Read one workflow run by exact numeric id.", "workflow_run", "workflow_run", { runId: POSITIVE_INTEGER_SCHEMA }, ["runId"]),
   readConfig("github_list_workflow_jobs", "List a bounded set of jobs for one exact workflow run id.", "workflow_jobs", "workflow_job", { runId: POSITIVE_INTEGER_SCHEMA, limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["runId"], "list"),
+  readConfig("github_search_code", "Search file contents inside the trusted repository only (the repo scope is host-enforced).", "search_code", "search_result", { searchTerms: stringSchema(240, 1), limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["searchTerms"], "list"),
+  readConfig("github_search_issues", "Search issues and pull requests inside the trusted repository only.", "search_issues", "search_result", { searchTerms: stringSchema(240, 1), limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["searchTerms"], "list"),
+  readConfig("github_search_commits", "Search commit messages inside the trusted repository only.", "search_commits", "search_result", { searchTerms: stringSchema(240, 1), limit: integerSchema(1, MAX_MODEL_LIST_RECORDS) }, ["searchTerms"], "list"),
 ];
 
 const MUTATION_CONFIGS: readonly MutationToolConfig[] = [
@@ -387,7 +402,7 @@ export function isGitHubCatalogToolName(name: string): name is GitHubCatalogTool
 }
 
 export function hasExplicitGitHubCatalogIntent(prompt: string): boolean {
-  return /\bgithub\b/iu.test(prompt) && /\b(repositor(?:y|ies)|repos?|branch(?:es)?|tags?|releases?|ref(?:erence)?s?|commits?|trees?|blobs?|files?|issues?|comments?|pull requests?|prs?|reviews?|checks?|statuses|status|workflows?|actions?|runs?|jobs?)\b/iu.test(prompt);
+  return /\bgithub\b/iu.test(prompt) && /\b(repositor(?:y|ies)|repos?|branch(?:es)?|tags?|releases?|ref(?:erence)?s?|commits?|trees?|blobs?|files?|issues?|comments?|pull requests?|prs?|reviews?|checks?|statuses|status|workflows?|actions?|runs?|jobs?|code|search)\b/iu.test(prompt);
 }
 
 export function getGitHubCatalogReadToolNames(prompt: string): GitHubCatalogToolName[] {
@@ -427,6 +442,13 @@ export function getGitHubCatalogReadToolNames(prompt: string): GitHubCatalogTool
   if (workflowJobs) names.add("github_list_workflow_jobs");
   else if (workflowRun) names.add("github_get_workflow_run");
   else if (/\b(workflow|actions?|runs?)\b/iu.test(prompt)) names.add("github_list_workflow_runs");
+  if (/\b(search|find|grep|look\s+for|where\s+is)\b/iu.test(prompt)) {
+    if (/\b(code|file contents?|function|class|implementation|symbol)\b/iu.test(prompt)) {
+      names.add("github_search_code");
+    }
+    if (/\b(issues?|pull requests?|prs?)\b/iu.test(prompt)) names.add("github_search_issues");
+    if (/\bcommits?\b/iu.test(prompt)) names.add("github_search_commits");
+  }
   if (names.size === 0 && /\b(repository|repo)\b/iu.test(prompt)) names.add("github_get_repository");
   if (names.size === 0) names.add("github_get_repository");
   return [...names].filter((name) => READ_NAMES.has(name));
@@ -645,6 +667,12 @@ async function executeRead(
       return client.getWorkflowRun(owner, repo, positiveInteger(args.runId, "runId"), signal);
     case "workflow_jobs":
       return boundedList(await client.listWorkflowJobs(owner, repo, positiveInteger(args.runId, "runId"), signal), args.limit);
+    case "search_code":
+      return boundedList(await client.searchCode(owner, repo, boundedString(args.searchTerms, "searchTerms", 1, 240), signal), args.limit);
+    case "search_issues":
+      return boundedList(await client.searchIssues(owner, repo, boundedString(args.searchTerms, "searchTerms", 1, 240), signal), args.limit);
+    case "search_commits":
+      return boundedList(await client.searchCommits(owner, repo, boundedString(args.searchTerms, "searchTerms", 1, 240), signal), args.limit);
   }
 }
 

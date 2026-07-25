@@ -143,6 +143,20 @@ export function shouldRequireClaimGrounding(promptOrMode: string): boolean {
   ) {
     return false;
   }
+  // Deterministic output checks are not factual-source verification. A request
+  // to count words or verify generated length must not manufacture passage-id
+  // debt for ordinary prose.
+  const verifiesGeneratedLength =
+    /\b(?:count_words|word\s*count|count\s+(?:the\s+)?words?|verify\s+(?:the\s+)?(?:generated\s+|note\s+)?(?:word\s+)?length)\b/iu.test(
+      value,
+    );
+  const hasIndependentGroundingSignal =
+    /\b(?:cite|cited|citation|citations|passage|passages|quote|quoted|quotations|text[-\s]?level\s+quotation|fact[-\s]?check|deep\s+research|long[-\s]?running\s+(?:research|co-?research)|long\s+research|exhaustive\s+(?:research|investigation)|verify\s+(?:sources?|facts?|claims?))\b/iu.test(
+      value,
+    );
+  if (verifiesGeneratedLength && !hasIndependentGroundingSignal) {
+    return false;
+  }
   // "current online dating market" alone is not claim-ledger work.
   return /\b(?:cite|cited|citation|citations|passage|passages|quote|quoted|quotations|text[-\s]?level\s+quotation|verify|fact[-\s]?check|deep\s+research|long[-\s]?running\s+(?:research|co-?research)|long\s+research|exhaustive\s+(?:research|investigation))\b/i.test(
     value,
@@ -592,6 +606,12 @@ function splitClaimSentences(
 
 function isCandidateClaimSentence(text: string): boolean {
   if (text.length < 24) {
+    return false;
+  }
+  // Exact user-required markers and other standalone identifiers are
+  // acceptance metadata, not factual prose that needs passage grounding.
+  // Keep this aligned with missionPlan.extractRequiredLiteralAnchors.
+  if (/^[a-z0-9][a-z0-9_.:-]{7,}[.,;!?]?$/iu.test(text.trim())) {
     return false;
   }
   if (/^#{1,6}\s/.test(text)) {

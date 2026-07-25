@@ -52,9 +52,9 @@ test("explicit research publication writes note, previews, exactly approves, pub
   ]);
   assert.equal(fixture.publisher.publishCount, 1);
   assert.equal(fixture.publisher.mutationCount, 1);
-  assert.match(
-    fixture.publisher.lastPreviewSections?.scope[0] ?? "",
-    /\[Open accepted research in Obsidian\]\(obsidian:\/\/open\?file=Research%2FAgent%20platform\.md\)/u,
+  assert.deepEqual(
+    fixture.publisher.lastPreviewSections?.scope,
+    ["Obsidian to Linear handoff."],
   );
   assertOrdered(fixture.trace, [
     "note_verified",
@@ -130,6 +130,44 @@ test("ambiguous Linear publication persists reconcile_required and never backlin
     /## Linear/u,
   );
   assert.equal(fixture.trace.includes("backlink_started"), false);
+});
+
+test("a checkpoint persist failure after issue creation resolves reconcile_required instead of orphaning the issue", async () => {
+  // The Linear issue is created and readback-verified, then the linear_verified
+  // checkpoint write throws (limit / CAS conflict / invalid transition / stale).
+  // Previously execute() rejected, leaving a real issue with no binding, no
+  // backlink, and no resumable checkpoint. It must now downgrade gracefully.
+  const fixture = workflowFixture("created", { approved: true }, {
+    failPersistOnStatus: "linear_verified",
+  });
+  const result = await fixture.workflow.execute(requestFixture());
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "reconcile_required");
+  if (result.status !== "reconcile_required") return;
+  // The confirmed issue is surfaced for reconciliation rather than orphaned.
+  assert.equal(result.issue?.identifier, "ENG-42");
+  assert.equal(result.pendingAction.issueId, "issue-42");
+  assert.equal(result.error.code, "research_publication_checkpoint_unpersisted");
+  // The publish happened exactly once; the failure did not trigger a retry.
+  assert.equal(fixture.publisher.mutationCount, 1);
+  assert.ok(fixture.trace.includes("checkpoint_persist_failed"));
+});
+
+test("a checkpoint persist failure on the publish-failure path surfaces the publish cause, not the store error", async () => {
+  // The publish itself is ambiguous (reconcile_required), then the checkpoint
+  // persist for that failure also throws. The real cause must survive.
+  const fixture = workflowFixture("reconcile_required", { approved: true }, {
+    failPersistOnStatus: "reconcile_required",
+  });
+  const result = await fixture.workflow.execute(requestFixture());
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "reconcile_required");
+  if (result.status !== "reconcile_required") return;
+  assert.equal(result.error.code, "linear_mutation_uncertain");
+  assert.equal(result.pendingAction.issueId, "issue-42");
+  assert.ok(fixture.trace.includes("checkpoint_persist_failed"));
 });
 
 test("a retry adopts the exact pending issue through fresh duplicate readback without rewriting the accepted note", async () => {
@@ -308,6 +346,7 @@ test("non-explicit research is rejected before note, preview, approval, or Linea
 function workflowFixture(
   mode: "created" | "deduplicated" | "reconcile_required",
   decision: { approved: boolean } = { approved: true },
+  options: { failPersistOnStatus?: ResearchPublicationCheckpointV1["status"] } = {},
 ) {
   const vault = new ResearchVault();
   const noteWriter = new AcceptedResearchNoteWriter(vault, {
@@ -341,6 +380,16 @@ function workflowFixture(
             .find((checkpoint) => checkpoint.publicationId === publicationId) ?? null,
         ),
       persist: async (checkpoint) => {
+        if (
+          options.failPersistOnStatus &&
+          checkpoint.status === options.failPersistOnStatus
+        ) {
+          // Model the real store throwing (limit / CAS conflict / invalid
+          // transition / stale) on this exact transition.
+          throw new Error(
+            `research_publication_checkpoint_conflict at ${checkpoint.status}`,
+          );
+        }
         checkpoints.push(structuredClone(checkpoint));
       },
     },

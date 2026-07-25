@@ -67,6 +67,32 @@ describe("CapabilityReadinessV2", () => {
     assert.ok(rows.every((row) => row.nextAction.length > 0));
   });
 
+  it("treats repository-free scratch validation as ready and never offers a dead repository-binding action", () => {
+    const state = inputs();
+    state.code.repositoryProfileCount = 0;
+    const code = buildCapabilityReadinessV2(state, NOW).find(
+      (row) => row.id === "code",
+    );
+    assert.equal(code?.status, "Ready");
+    assert.match(code?.reason ?? "", /without a repository binding/iu);
+    assert.match(code?.reason ?? "", /known-folder export/iu);
+    assert.equal(code?.nextAction, "Review Code setup");
+    assert.doesNotMatch(code?.nextAction ?? "", /bind a repository/iu);
+  });
+
+  it("keeps scratch editing and export available when sandbox execution needs a probe", () => {
+    const state = inputs();
+    state.code.repositoryProfileCount = 0;
+    state.code.executionAvailable = false;
+    state.code.probeObservedAt = null;
+    const code = buildCapabilityReadinessV2(state, NOW).find(
+      (row) => row.id === "code",
+    );
+    assert.equal(code?.status, "Available");
+    assert.match(code?.reason ?? "", /editing and known-folder export are available/iu);
+    assert.equal(code?.nextAction, "Run sandbox boundary probe");
+  });
+
   it("gives every capability one stable setup target and plain-language next action", () => {
     const rows = buildCapabilityReadinessV2(inputs(), NOW);
     assert.deepEqual(

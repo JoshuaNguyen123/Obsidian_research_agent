@@ -35,6 +35,112 @@ test("GitHubRestClient pins authenticated identity through the fixed /user endpo
   assert.equal(request?.headers?.["X-GitHub-Api-Version"], "2026-03-10");
 });
 
+test("getAuthenticatedUserWithOAuthScopes surfaces the x-oauth-scopes header and nulls its absence", async () => {
+  const withHeader = clientWith(async () => ({
+    status: 200,
+    headers: { "x-oauth-scopes": "repo, read:user" },
+    json: { id: 77, login: "agent-bot", html_url: "https://github.com/agent-bot" },
+  }));
+  const classic = await withHeader.getAuthenticatedUserWithOAuthScopes();
+  assert.deepEqual(classic.oauthScopes, ["repo", "read:user"]);
+  assert.equal(classic.login, "agent-bot");
+
+  // Fine-grained PATs omit the header entirely → unverified (null), never [].
+  const withoutHeader = clientWith(async () => ({
+    status: 200,
+    headers: {},
+    json: { id: 77, login: "agent-bot", html_url: "https://github.com/agent-bot" },
+  }));
+  const fineGrained = await withoutHeader.getAuthenticatedUserWithOAuthScopes();
+  assert.equal(fineGrained.oauthScopes, null);
+});
+
+test("repository-scoped search strips widening qualifiers and pins repo scope", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (input) => {
+    requests.push(input);
+    return response(200, {
+      total_count: 1,
+      items: [
+        {
+          path: "src/index.ts",
+          name: "index.ts",
+          html_url: "https://github.com/acme/research-agent/blob/main/src/index.ts",
+          sha: "a".repeat(40),
+          score: 12.3,
+        },
+      ],
+    });
+  });
+
+  const results = await client.searchCode(
+    "acme",
+    "research-agent",
+    // A widening attempt: repo:/org:/user: qualifiers must be stripped.
+    "tokenizer repo:evil/other org:evil user:evil",
+  );
+  assert.equal(results.length, 1);
+  assert.equal(results[0]!.path, "src/index.ts");
+  const url = new URL(requests[0]!.url);
+  assert.equal(url.pathname, "/search/code");
+  const q = url.searchParams.get("q") ?? "";
+  assert.match(q, /tokenizer/u);
+  assert.match(q, /repo:acme\/research-agent/u);
+  assert.doesNotMatch(q, /evil/u);
+
+  await assert.rejects(
+    () => client.searchCode("acme", "research-agent", "repo:evil/only"),
+    /non-empty search query/u,
+  );
+});
+
+test("issue and commit search normalize bounded records", async () => {
+  const issueClient = clientWith(async () =>
+    response(200, {
+      items: [
+        {
+          number: 7,
+          title: "Fix the tokenizer",
+          state: "open",
+          html_url: "https://github.com/acme/research-agent/issues/7",
+          updated_at: "2026-07-01T00:00:00Z",
+        },
+        {
+          number: 8,
+          title: "A PR",
+          state: "open",
+          html_url: "https://github.com/acme/research-agent/pull/8",
+          pull_request: {},
+          updated_at: "2026-07-02T00:00:00Z",
+        },
+      ],
+    }),
+  );
+  const issues = await issueClient.searchIssues("acme", "research-agent", "tokenizer");
+  assert.equal(issues.length, 2);
+  assert.equal(issues[0]!.pullRequest, false);
+  assert.equal(issues[1]!.pullRequest, true);
+
+  const commitClient = clientWith(async () =>
+    response(200, {
+      items: [
+        {
+          sha: "b".repeat(40),
+          html_url: "https://github.com/acme/research-agent/commit/b",
+          commit: {
+            message: "fix: tokenizer bounds",
+            author: { date: "2026-06-30T00:00:00Z" },
+          },
+        },
+      ],
+    }),
+  );
+  const commits = await commitClient.searchCommits("acme", "research-agent", "tokenizer");
+  assert.equal(commits[0]!.sha, "b".repeat(40));
+  assert.equal(commits[0]!.message, "fix: tokenizer bounds");
+  assert.equal(commits[0]!.authoredAt, "2026-06-30T00:00:00Z");
+});
+
 test("GitHubRestClient reads a repository through fixed headers", async () => {
   let request: HttpRequest | undefined;
   const client = clientWith(async (input) => {
@@ -103,6 +209,34 @@ test("GitHubRestClient deletes only the exact fixed repository endpoint", async 
     "https://api.github.com/repos/acme/disposable-private-proof",
   );
   assert.equal(requests[0]?.body, undefined);
+});
+
+test("GitHubRestClient updates only the exact repository default branch", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    return response(200, {
+      ...repositoryPayload(),
+      default_branch: "main",
+    });
+  });
+
+  const readback = await client.updateRepositoryDefaultBranch(
+    "acme",
+    "research-agent",
+    "main",
+  );
+
+  assert.equal(readback.defaultBranch, "main");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.method, "PATCH");
+  assert.equal(
+    requests[0]?.url,
+    "https://api.github.com/repos/acme/research-agent",
+  );
+  assert.deepEqual(JSON.parse(String(requests[0]?.body)), {
+    default_branch: "main",
+  });
 });
 
 test("GitHubRestClient rejects a create response that is public or identity-drifted", async () => {

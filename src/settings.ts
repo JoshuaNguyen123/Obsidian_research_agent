@@ -59,6 +59,8 @@ export interface AgentSettings {
   modelConnectionVerifiedBaseUrl?: string;
   /** True only after Ollama Cloud /api/show proved Tools + Thinking. */
   modelConnectionVerifiedAgenticCapabilities?: boolean;
+  /** Model-reported max context window (tokens) from the last successful connection test. */
+  modelConnectionVerifiedContextLength?: number | null;
   /** Hidden disposable-vault capability for Playwright connection attestations. */
   e2eHarnessAttestationEnabled?: boolean;
   /** Canonical normal-user behavior profile. Legacy autonomy/output fields are derived. */
@@ -126,6 +128,12 @@ export interface AgentSettings {
   defaultBrowserMissionMode: BrowserMissionMode;
   agenticReflexEnabled: boolean;
   agenticReflexDiagnosticsEnabled: boolean;
+  /**
+   * Whether the Run Details Diagnostics expander is unfolded. UI state,
+   * persisted. Optional so older persisted settings and test fixtures parse;
+   * the load-time normalizer coerces anything non-true to false.
+   */
+  runDetailsDiagnosticsExpanded?: boolean;
   semanticSearchEnabled: boolean;
   semanticEmbeddingModel: string;
   semanticEmbeddingDim: 256 | 512;
@@ -222,6 +230,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   defaultBrowserMissionMode: "supervised",
   agenticReflexEnabled: true,
   agenticReflexDiagnosticsEnabled: true,
+  runDetailsDiagnosticsExpanded: false,
   semanticSearchEnabled: true,
   semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
   semanticEmbeddingDim: 512,
@@ -931,11 +940,11 @@ export class AgentSettingTab extends PluginSettingTab {
     new Setting(section)
       .setName("Context window")
       .setDesc(
-        "Optional num_ctx sent to the provider. Leave blank for the provider default on the API request; the plugin still budgets compaction as 48k tokens unless you set a value (including 100k+).",
+        "Optional num_ctx sent to the provider. Leave blank to auto-match the model's reported context window (verified at Test connection on Ollama Cloud); when no model report is available the plugin budgets compaction as 48k tokens. Set a value to override (including 100k+).",
       )
       .addText((text) =>
         text
-          .setPlaceholder("default (budget 48k)")
+          .setPlaceholder("auto (model max, else 48k)")
           .setValue(formatOptionalNumber(this.plugin.settings.numCtx))
           .onChange(async (value) => {
             this.plugin.settings.numCtx = parseOptionalInteger(value, {

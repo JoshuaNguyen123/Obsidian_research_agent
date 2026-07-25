@@ -4,27 +4,60 @@ import type {
   CandidateAgentAction,
   ReflexDecision,
 } from "./types";
+import {
+  classifyToolTargetKind,
+  MAX_OUTCOME_PENALTY,
+  outcomePenaltyForAction,
+} from "../outcomeMemory";
 
 export function scoreCandidateActions(
   input: AgenticReflexInput,
   intent: ReflexDecision,
 ): ActionScore[] {
   return buildCandidateActions(input.allowedToolNames)
-    .map((action) => ({
-      action,
-      score: scoreByIntentAndState(action, intent, input),
-      reason: explainActionScore(action, intent),
-    }))
-    .sort((left, right) => right.score - left.score);
+    .map((action) => {
+      const baseScore = scoreByIntentAndState(action, intent, input);
+      const rawOutcomePenalty =
+        action.toolName && input.toolOutcomeMemory
+          ? outcomePenaltyForAction(
+              input.toolOutcomeMemory,
+              action.toolName,
+              classifyToolTargetKind(action.toolName),
+            )
+          : 0;
+      const outcomePenalty = round3(
+        Math.min(1, Math.max(0, rawOutcomePenalty / MAX_OUTCOME_PENALTY)),
+      );
+      return {
+        action,
+        baseScore,
+        outcomePenalty,
+        score: round3(Math.max(0, Math.min(1, baseScore - outcomePenalty))),
+        reason: explainActionScore(action, intent, outcomePenalty),
+      };
+    })
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        actionSortKey(left.action).localeCompare(actionSortKey(right.action)),
+    );
 }
 
 export function buildCandidateActions(
   allowedToolNames: Set<string>,
 ): CandidateAgentAction[] {
   const actions: CandidateAgentAction[] = [];
+  const representedToolNames = new Set<string>();
+  const add = (action: CandidateAgentAction): void => {
+    if (action.toolName) {
+      if (representedToolNames.has(action.toolName)) return;
+      representedToolNames.add(action.toolName);
+    }
+    actions.push(action);
+  };
 
   if (allowedToolNames.has("read_current_file")) {
-    actions.push({
+    add({
       kind: "read_current_note",
       toolName: "read_current_file",
       risk: "read",
@@ -32,7 +65,7 @@ export function buildCandidateActions(
     });
   }
   if (allowedToolNames.has("semantic_search_notes")) {
-    actions.push({
+    add({
       kind: "semantic_search",
       toolName: "semantic_search_notes",
       risk: "read",
@@ -40,7 +73,7 @@ export function buildCandidateActions(
     });
   }
   if (allowedToolNames.has("search_markdown_files")) {
-    actions.push({
+    add({
       kind: "search_vault",
       toolName: "search_markdown_files",
       risk: "read",
@@ -48,7 +81,7 @@ export function buildCandidateActions(
     });
   }
   if (allowedToolNames.has("web_search")) {
-    actions.push({
+    add({
       kind: "web_search",
       toolName: "web_search",
       risk: "external",
@@ -56,7 +89,7 @@ export function buildCandidateActions(
     });
   }
   if (allowedToolNames.has("web_fetch")) {
-    actions.push({
+    add({
       kind: "web_fetch",
       toolName: "web_fetch",
       risk: "external",
@@ -64,7 +97,7 @@ export function buildCandidateActions(
     });
   }
   if (allowedToolNames.has("count_words")) {
-    actions.push({
+    add({
       kind: "count_words",
       toolName: "count_words",
       risk: "read",
@@ -76,7 +109,7 @@ export function buildCandidateActions(
     allowedToolNames.has("create_svg_design") ||
     allowedToolNames.has("create_design_package")
   ) {
-    actions.push({
+    add({
       kind: "create_artifact",
       toolName: allowedToolNames.has("create_design_package")
         ? "create_design_package"
@@ -88,11 +121,25 @@ export function buildCandidateActions(
     });
   }
   if (allowedToolNames.has("append_to_current_file")) {
-    actions.push({
+    add({
       kind: "write_current_note",
       toolName: "append_to_current_file",
       risk: "write",
       rationale: "Write required current-note output.",
+    });
+  }
+
+  // The specialized candidates above carry richer intent bonuses, but every
+  // remaining allowed tool still needs a score so learned failures can change
+  // its rank. This is preference only: all authority continues to live in the
+  // scoped registry and prepared-action gates.
+  for (const toolName of [...allowedToolNames].sort()) {
+    if (representedToolNames.has(toolName)) continue;
+    add({
+      kind: "use_tool",
+      toolName,
+      risk: inferDiagnosticRisk(toolName),
+      rationale: "Allowed tool available for the current mission.",
     });
   }
 
@@ -148,9 +195,38 @@ function scoreByIntentAndState(
 function explainActionScore(
   action: CandidateAgentAction,
   intent: ReflexDecision,
+  outcomePenalty: number,
 ): string {
+  const history =
+    outcomePenalty > 0
+      ? ` Learned outcome penalty=${outcomePenalty.toFixed(3)}.`
+      : "";
   if (intent.label !== "unknown" && action.rationale) {
-    return `${action.rationale} Intent=${intent.label}.`;
+    return `${action.rationale} Intent=${intent.label}.${history}`;
   }
-  return action.rationale;
+  return `${action.rationale}${history}`;
+}
+
+function inferDiagnosticRisk(
+  toolName: string,
+): CandidateAgentAction["risk"] {
+  const targetKind = classifyToolTargetKind(toolName);
+  if (targetKind === "web_resource" || targetKind === "external_service") {
+    return "external";
+  }
+  if (/(?:delete|trash|replace)/iu.test(toolName)) {
+    return "destructive";
+  }
+  if (/(?:append|write|create|edit|move|rename|commit|publish)/iu.test(toolName)) {
+    return "write";
+  }
+  return "read";
+}
+
+function actionSortKey(action: CandidateAgentAction): string {
+  return action.toolName ?? action.kind;
+}
+
+function round3(value: number): number {
+  return Math.round(value * 1000) / 1000;
 }

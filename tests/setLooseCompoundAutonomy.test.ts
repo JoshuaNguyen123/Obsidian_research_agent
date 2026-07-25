@@ -189,6 +189,56 @@ test("resolveNumCtxForCompoundRun floors to 100k under set-loose", () => {
   );
 });
 
+test("resolveNumCtxForCompoundRun uses the model-reported window when Settings is blank", () => {
+  assert.equal(
+    resolveNumCtxForCompoundRun({
+      settingsNumCtx: null,
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: false,
+      modelReportedContextLength: 196_608,
+    }),
+    196_608,
+  );
+  assert.equal(
+    resolveNumCtxForCompoundRun({
+      settingsNumCtx: null,
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+      modelReportedContextLength: 196_608,
+    }),
+    196_608,
+  );
+  // The set-loose floor is capped at the model window when the model is smaller.
+  assert.equal(
+    resolveNumCtxForCompoundRun({
+      settingsNumCtx: null,
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+      modelReportedContextLength: 65_536,
+    }),
+    65_536,
+  );
+  assert.equal(
+    resolveNumCtxForCompoundRun({
+      settingsNumCtx: 32_000,
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+      modelReportedContextLength: 65_536,
+    }),
+    65_536,
+  );
+  // Explicit Settings values are never lowered by the model report.
+  assert.equal(
+    resolveNumCtxForCompoundRun({
+      settingsNumCtx: 262_144,
+      autonomyProfile: "automatic",
+      compoundLifecycleDetected: true,
+      modelReportedContextLength: 131_072,
+    }),
+    262_144,
+  );
+});
+
 test("resolveSemanticSearchCapsForCompoundRun raises caps under set-loose", () => {
   const raised = resolveSemanticSearchCapsForCompoundRun({
     autonomyProfile: "automatic",
@@ -303,7 +353,7 @@ test("missionGraphHasIncompleteReadTemplateNode tracks tool-01-read_template pay
   assert.equal(missionGraphHasIncompleteReadTemplateNode(null), false);
 });
 
-test("setLooseSoftWriteBypassesPlanDependency unlocks append when note_reflection unpaid", () => {
+test("setLooseSoftWriteBypassesPlanDependency unlocks append only for reflection-only debt", () => {
   const unpaid = ["linear_hierarchy", "code_execution", "note_reflection"];
   assert.equal(
     setLooseSoftWriteBypassesPlanDependency({
@@ -313,8 +363,8 @@ test("setLooseSoftWriteBypassesPlanDependency unlocks append when note_reflectio
       successfulToolNames: [],
       incompleteReadTemplateNode: true,
     }),
-    true,
-    "Soft-union append must not strand behind stuck tool-01-read_template",
+    false,
+    "append must not bypass unpaid external delivery stages",
   );
   assert.equal(
     setLooseSoftWriteBypassesPlanDependency({
@@ -324,8 +374,8 @@ test("setLooseSoftWriteBypassesPlanDependency unlocks append when note_reflectio
       successfulToolNames: ["read_template"],
       incompleteReadTemplateNode: true,
     }),
-    true,
-    "successful Soft read_template keeps append unlocked for note reflection",
+    false,
+    "read_template success cannot erase unpaid external delivery",
   );
   assert.equal(
     setLooseSoftWriteBypassesPlanDependency({
@@ -335,8 +385,19 @@ test("setLooseSoftWriteBypassesPlanDependency unlocks append when note_reflectio
       successfulToolNames: ["read_template"],
       incompleteReadTemplateNode: false,
     }),
+    false,
+    "MissionGraph read progress cannot erase unpaid external delivery",
+  );
+  assert.equal(
+    setLooseSoftWriteBypassesPlanDependency({
+      toolName: "append_to_current_file",
+      setLooseEnabled: true,
+      unpaidDeliveryKeys: ["note_reflection"],
+      successfulToolNames: ["publish_verified_code_to_github"],
+      incompleteReadTemplateNode: true,
+    }),
     true,
-    "paid MissionGraph read_template node keeps append unlocked",
+    "reflection-only append may bypass a stale legacy plan frontier",
   );
   assert.equal(
     setLooseSoftWriteBypassesPlanDependency({
@@ -520,6 +581,7 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
   const missingLinearGithub = setLooseDeliveryComplete({
     stages,
     proofs: {
+      acceptedResearchPublication: true,
       linearIssueUrlOrId: false,
       codeWorkspaceReadback: true,
       githubPrivateRepoOrPrUrl: false,
@@ -533,6 +595,7 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
   const complete = setLooseDeliveryComplete({
     stages,
     proofs: {
+      acceptedResearchPublication: true,
       linearIssueUrlOrId: true,
       codeWorkspaceReadback: true,
       githubPrivateRepoOrPrUrl: true,
@@ -545,17 +608,23 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
   assert.deepEqual(
     unpaidSetLooseDeliveryStages({
       stages: [...stages, "reconciliation_cleanup"],
-      paidStages: ["linear_hierarchy", "code_execution"],
+      paidStages: [
+        "accepted_research",
+        "linear_hierarchy",
+        "code_execution",
+      ],
     }),
     ["private_github_publication"],
   );
 
   const pending = pendingToolsForUnpaidSetLooseDelivery([
+    "accepted_research",
     "linear_hierarchy",
     "code_execution",
     "private_github_publication",
     "note_reflection",
   ]);
+  assert.ok(pending.includes("publish_research_to_linear"));
   assert.ok(pending.includes("linear_get_connection_context"));
   assert.ok(pending.includes("linear_create_issue"));
   assert.ok(pending.includes("code_sandbox_status"));
@@ -601,6 +670,27 @@ test("toolsOfferedForSetLooseTurn stages Soft-union after Linear / code / reflec
     "code_execution",
     "private_github_publication",
   ];
+
+  const beforeResearchPublication = toolsOfferedForSetLooseTurn({
+    stages,
+    currentStage: "accepted_research",
+    passedFastRepairCycle: false,
+    codeDeliveryPaid: false,
+    unpaidDeliveryKeys: [
+      "accepted_research",
+      "linear_hierarchy",
+      "code_execution",
+      "private_github_publication",
+      "note_reflection",
+    ],
+  });
+  assert.ok(beforeResearchPublication.includes("publish_research_to_linear"));
+  assert.equal(beforeResearchPublication.includes("linear_create_issue"), false);
+  assert.equal(beforeResearchPublication.includes("code_validate_fast"), false);
+  assert.equal(
+    beforeResearchPublication.includes("github_create_private_repository"),
+    false,
+  );
 
   const afterLinear = toolsOfferedForSetLooseTurn({
     stages,
@@ -658,6 +748,13 @@ test("toolsOfferedForSetLooseTurn stages Soft-union after Linear / code / reflec
     unpaidDeliveryKeys: ["note_reflection"],
   });
   assert.ok(reflectionOnly.includes("append_to_current_file"));
+  assert.equal(reflectionOnly.includes("code_validate_fast"), false);
+  assert.equal(reflectionOnly.includes("code_repair_record_cycle"), false);
+  assert.equal(reflectionOnly.includes("code_commit_verified"), false);
+  assert.equal(
+    reflectionOnly.includes("publish_verified_code_to_github"),
+    false,
+  );
 });
 
 test("resolveSetLooseCodeSpecSufficiencyForSoftUnion unlocks writes after Linear pays", () => {
@@ -779,14 +876,53 @@ test("seedSetLooseDeliveryStateFromReceipts restores Linear and commit proofs", 
   );
 });
 
+test("a generic Linear issue does not pay accepted research publication", () => {
+  const genericIssue = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "linear_create_issue",
+    output: {
+      issueUrl: "https://linear.app/team/issue/APP-1",
+      issueId: "issue-1",
+    },
+    proofs: {},
+  });
+  assert.equal(genericIssue.linearIssueUrlOrId, true);
+  assert.equal(genericIssue.acceptedResearchPublication, undefined);
+  assert.deepEqual(
+    setLooseDeliveryComplete({
+      stages: ["accepted_research", "linear_hierarchy"],
+      proofs: genericIssue,
+    }).unpaid,
+    ["accepted_research", "note_reflection"],
+  );
+
+  const published = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "publish_research_to_linear",
+    output: {
+      issueUrl: "https://linear.app/team/issue/APP-2",
+      issueId: "issue-2",
+    },
+    proofs: genericIssue,
+  });
+  assert.equal(published.acceptedResearchPublication, true);
+  assert.equal(published.linearIssueUrlOrId, true);
+});
+
 test("applySetLooseDeliveryProofFromSuccessfulTool pays note reflection markers", () => {
   const proofs = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "append_to_current_file",
+    argumentsText:
+      "Flow real reflection FLOW_REAL_abc https://linear.app/x https://github.com/o/r/pull/3",
+    proofs: {},
+  });
+  assert.equal(proofs.noteReflectionWithMarkers, true);
+
+  const repoOnly = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "append_to_current_file",
     argumentsText:
       "Flow real reflection FLOW_REAL_abc https://linear.app/x https://github.com/o/r",
     proofs: {},
   });
-  assert.equal(proofs.noteReflectionWithMarkers, true);
+  assert.equal(repoOnly.noteReflectionWithMarkers, undefined);
 });
 
 test("applySetLooseDeliveryProofFromSuccessfulTool requires draft PR URL for GitHub delivery", () => {

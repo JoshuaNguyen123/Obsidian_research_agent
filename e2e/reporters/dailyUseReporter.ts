@@ -23,8 +23,13 @@ import {
   type DailyUseRunMetricsV1,
 } from "../../src/agent/dailyUseRunMetrics";
 import {
+  MISSION_SCORE_WEIGHTS,
+  type MissionScorecardV1,
+} from "../../src/agent/missionScorecard";
+import {
   DAILY_USE_METRICS_ANNOTATION,
   DAILY_USE_OBSERVED_ANNOTATION,
+  DAILY_USE_SCORECARD_ANNOTATION,
 } from "../fixtures/dailyUseAcceptance";
 
 interface DailyUseRunRecord extends Pick<
@@ -50,6 +55,7 @@ interface DailyUseRunRecord extends Pick<
   retry: number;
   failureCategory: DailyUseFailureCategory | null;
   observed: DailyUseObservedAcceptanceV1 | null;
+  missionScorecard: MissionScorecardV1 | null;
 }
 
 export interface DailyUseAtomicObservationRecord {
@@ -58,6 +64,7 @@ export interface DailyUseAtomicObservationRecord {
   acceptanceStatus: DailyUseRunMetricsV1["acceptanceStatus"];
   missingAcceptanceCriteria: string[];
   observed: DailyUseObservedAcceptanceV1 | null;
+  missionScorecard?: MissionScorecardV1 | null;
 }
 
 export default class DailyUseReporter implements Reporter {
@@ -91,6 +98,9 @@ export default class DailyUseReporter implements Reporter {
     const annotatedMetrics = typedScenarioId
       ? parseMetricsAnnotation(test, typedScenarioId)
       : null;
+    const missionScorecard = typedScenarioId
+      ? parseScorecardAnnotation(test)
+      : null;
     // The evaluator is invoked for every DU-labelled test. Missing annotations
     // remain explicit proof debt rather than being converted into a pass.
     const metrics = typedScenarioId
@@ -117,6 +127,7 @@ export default class DailyUseReporter implements Reporter {
       retry: result.retry,
       failureCategory: result.status === "passed" ? null : classification.category,
       observed,
+      missionScorecard,
       modelCalls: metrics?.modelCalls ?? 0,
       toolCalls: metrics?.toolCalls ?? 0,
       continuations: metrics?.continuations ?? 0,
@@ -211,6 +222,7 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         acceptanceStatus: atomicPass ? "pass" : "needs_more_work",
         acceptanceRetry: atomicRecord?.retry ?? null,
         missingAcceptanceCriteria,
+        missionScorecard: atomicRecord?.missionScorecard ?? null,
       };
     });
 }
@@ -262,6 +274,42 @@ function parseMetricsAnnotation(
       continuations: safeCounter(value.continuations),
       approvals: safeCounter(value.approvals),
     };
+  } catch {
+    return null;
+  }
+}
+
+function parseScorecardAnnotation(test: TestCase): MissionScorecardV1 | null {
+  const raw = [...test.annotations]
+    .reverse()
+    .find((annotation) => annotation.type === DAILY_USE_SCORECARD_ANNOTATION)
+    ?.description;
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as MissionScorecardV1;
+    if (
+      value?.version !== 1 ||
+      typeof value.acceptancePassed !== "boolean" ||
+      !unitInterval(value.total) ||
+      !Array.isArray(value.dimensions) ||
+      value.dimensions.length !== Object.keys(MISSION_SCORE_WEIGHTS).length
+    ) {
+      return null;
+    }
+    const seen = new Set<string>();
+    for (const dimension of value.dimensions) {
+      if (
+        !(dimension.id in MISSION_SCORE_WEIGHTS) ||
+        seen.has(dimension.id) ||
+        !unitInterval(dimension.score) ||
+        dimension.weight !== MISSION_SCORE_WEIGHTS[dimension.id] ||
+        typeof dimension.detail !== "string"
+      ) {
+        return null;
+      }
+      seen.add(dimension.id);
+    }
+    return value;
   } catch {
     return null;
   }
@@ -332,6 +380,15 @@ function safeCounter(value: unknown): number {
   return Number.isSafeInteger(value) && (value as number) >= 0
     ? value as number
     : 0;
+}
+
+function unitInterval(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= 1
+  );
 }
 
 function sum(

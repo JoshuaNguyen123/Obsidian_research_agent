@@ -37,6 +37,7 @@ function isWriteToolName(toolName: string): boolean {
     toolName === "upsert_mermaid_block" ||
     toolName === "create_design_package" ||
     toolName === "export_workspace_artifact" ||
+    toolName === "code_workspace_export_directory" ||
     toolName === "seed_default_templates" ||
     toolName === "create_template" ||
     toolName === "fill_template" ||
@@ -336,11 +337,18 @@ export function buildMissionGraphFrontierTurnContext(
       budgetLine: options.stageBudgetBlock ?? null,
     }),
   );
+  const codeCapabilityBoundary = names.some((name) => name.startsWith("code_"))
+    ? [
+        "This is one dependency-ready code-workflow frontier, not the full Code capability catalog.",
+        "Code workspaces are real directories on the user's local filesystem. Later dependency-ready frontiers can open file creation, sandbox validation, and user-authorized export to Desktop, Documents, or Downloads.",
+        "Do not claim filesystem access, file creation, validation, or export is unavailable merely because a later Code tool is not callable on this turn. Call only the Code tools listed in the current frontier.",
+      ]
+    : [];
   if (options.setLoose === true) {
     // Durable set-loose turns stay stage-local: objective + evidence + tools.
     // Bulky routing/git/spec cards concatenated by the host are stripped inside
     // projectStagePrompt rather than re-emitted into the model context.
-    return stageProjection;
+    return [stageProjection, ...codeCapabilityBoundary].join("\n");
   }
   const acceptedResearchBoundary =
     names.length === 1 && names[0] === PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME
@@ -387,12 +395,50 @@ export function buildMissionGraphFrontierTurnContext(
           "Correction writes open only after the scheduled reads finish; then call code_workspace_write_expected when it appears.",
         ]
       : [];
+  const sandboxStatusBoundary =
+    names.length === 1 && names[0] === "code_sandbox_status"
+      ? [
+          "This is the first code-workflow checkpoint, not the full capability catalog.",
+          "Call code_sandbox_status now. The next frontier will open code_workspace_create; later frontiers open nested file creation, validation, and any user-authorized directory export.",
+          "Do not answer that file creation is unavailable merely because later tools are not callable on this turn.",
+        ]
+      : [];
+  const workspaceCreateBoundary =
+    names.length === 1 && names[0] === "code_workspace_create"
+      ? [
+          "This is the writable-workspace bootstrap frontier, not the final deliverable.",
+          "Call code_workspace_create now. For a new standalone app or script, use kind=scratch and one stable workspaceId.",
+          "After the creation receipt, code_workspace_mkdir and code_workspace_create_file become callable. create_file accepts a safe path at any depth and automatically creates missing parent directories.",
+          "If the foreground mission requests Desktop, Documents, or Downloads delivery, keep working in the workspace; the approval-gated code_workspace_export_directory frontier opens after the project files and validation steps.",
+          "Do not return code-only chat prose or claim filesystem tools are unavailable while this bootstrap action is ready.",
+        ]
+      : [];
+  const workspaceCreateFileBoundary =
+    names.length === 1 && names[0] === "code_workspace_create_file"
+      ? [
+          "Create the complete bound file now. A safe nested path such as src/game/ui/checkers.py is supported in one call; missing parent directories are created automatically.",
+          "Do not substitute chat-only code for this receipt-backed workspace write.",
+        ]
+      : [];
+  const workspaceExportBoundary =
+    names.length === 1 && names[0] === "code_workspace_export_directory"
+      ? [
+          "This frontier performs the user-requested host delivery after workspace creation.",
+          "Use only the known destinationRoot explicitly named by the foreground user: desktop, documents, or downloads. Choose a safe project-relative destinationPath; the exact destination is shown for approval and must remain absent.",
+          "The export preserves nested directories and never overwrites existing files or folders.",
+        ]
+      : [];
   const toolContractLines = [
+    ...codeCapabilityBoundary,
     ...acceptedResearchBoundary,
     ...researchHierarchyBoundary,
     ...linearIssueReadBoundary,
     ...writeExpectedBoundary,
     ...workspaceReadBoundary,
+    ...sandboxStatusBoundary,
+    ...workspaceCreateBoundary,
+    ...workspaceCreateFileBoundary,
+    ...workspaceExportBoundary,
   ];
   // Exact frontiers keep one-tool contracts, but still use the stage projection
   // frame instead of echoing the full observed binding blob.

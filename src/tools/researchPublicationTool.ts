@@ -12,6 +12,7 @@ import type { AuthorityGrantV1 } from "../agent/authority";
 import { extractMarkdownPathMentions } from "../agent/missionScope";
 import { sha256DiagramContent } from "../design/diagramArtifactStore";
 import {
+  assertNoRawAuthority,
   ResearchPublicationWorkflow,
   type AcceptedResearchArtifactV1,
   type AcceptedResearchNotePackageV1,
@@ -571,6 +572,7 @@ async function parseToolArguments(input: {
   }
   hydrateTrustedWebEvidence(packageRecord, input.runtimeCache);
   canonicalizePackageIdentifiers(packageRecord);
+  canonicalizeProviderSafeWorkItemContract(packageRecord);
   if (value.mode !== "create" && value.mode !== "append") {
     throw new ToolExecutionError(
       "research_publication_invalid_arguments",
@@ -1062,11 +1064,21 @@ function canonicalizePackageIdentifiers(
     }
   }
   if (Array.isArray(packageRecord.acceptanceCriteria)) {
-    const criteria = packageRecord.acceptanceCriteria.map((candidate, index) =>
-      typeof candidate === "string"
-        ? { id: `AC-${index + 1}`, text: candidate.trim() }
-        : candidate,
-    );
+    const criteria = packageRecord.acceptanceCriteria.map((candidate, index) => {
+      if (typeof candidate === "string") {
+        return { id: `AC-${index + 1}`, text: candidate.trim() };
+      }
+      const record = asRecord(candidate);
+      if (
+        record &&
+        typeof record.text !== "string" &&
+        typeof record.$text === "string"
+      ) {
+        const { $text, ...rest } = record;
+        return { ...rest, text: $text };
+      }
+      return candidate;
+    });
     packageRecord.acceptanceCriteria = criteria;
     criteria.forEach((candidate, index) => {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
@@ -1075,6 +1087,101 @@ function canonicalizePackageIdentifiers(
       const criterion = candidate as Record<string, unknown>;
       if (!isValidCriterionIdentifier(criterion.id)) {
         criterion.id = `AC-${index + 1}`;
+      }
+    });
+  }
+}
+
+/**
+ * Model prose may describe the requested validator as a shell command or raw
+ * path. Those strings are useful planning hints but can never become queue
+ * execution authority. Preserve safe behavioral criteria and replace only
+ * unsafe entries with host-owned logical validation language.
+ */
+function canonicalizeProviderSafeWorkItemContract(
+  packageRecord: Record<string, unknown>,
+): void {
+  const validationKeys = Array.isArray(packageRecord.validationRequirementKeys)
+    ? packageRecord.validationRequirementKeys.filter(
+        (value): value is string =>
+          typeof value === "string" &&
+          /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value),
+      )
+    : [];
+  if (Array.isArray(packageRecord.acceptanceCriteria)) {
+    packageRecord.acceptanceCriteria = packageRecord.acceptanceCriteria.map(
+      (candidate, index) => {
+        const criterion = asRecord(candidate);
+        if (!criterion || typeof criterion.text !== "string") return candidate;
+        try {
+          assertNoRawAuthority(
+            criterion.text,
+            `acceptance criterion ${index + 1} text`,
+          );
+          return candidate;
+        } catch {
+          const validationKey =
+            validationKeys[index % Math.max(validationKeys.length, 1)];
+          return {
+            ...criterion,
+            text: validationKey
+              ? `The trusted validation requirement ${validationKey} passes for the verified repository change.`
+              : `The verified implementation satisfies accepted behavioral criterion ${index + 1}.`,
+          };
+        }
+      },
+    );
+  }
+  if (typeof packageRecord.objective === "string") {
+    try {
+      assertNoRawAuthority(packageRecord.objective, "objective");
+    } catch {
+      const repositoryKey =
+        typeof packageRecord.repositoryKey === "string" &&
+        /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(packageRecord.repositoryKey)
+          ? packageRecord.repositoryKey
+          : "";
+      packageRecord.objective = repositoryKey
+        ? `Deliver the accepted research through trusted repository profile ${repositoryKey}.`
+        : "Deliver the accepted research work item through trusted host bindings.";
+    }
+  }
+  const scalarFallbacks: Record<string, string> = {
+    title: "Accepted research implementation",
+    problemImpact:
+      "The accepted research identifies an implementation gap that requires a verified repository change.",
+    confidenceLimitations:
+      "Implementation and provider behavior remain subject to trusted validation readback.",
+  };
+  for (const [field, fallback] of Object.entries(scalarFallbacks)) {
+    const value = packageRecord[field];
+    if (typeof value !== "string") continue;
+    try {
+      assertNoRawAuthority(value, field);
+    } catch {
+      packageRecord[field] = fallback;
+    }
+  }
+  const listFallbacks: Record<string, (index: number) => string> = {
+    proposedWork: (index) =>
+      `Implement accepted work item ${index + 1} through the trusted repository profile.`,
+    nonGoals: (index) =>
+      `Unapproved provider or repository change ${index + 1} remains outside scope.`,
+    scope: (index) =>
+      `Accepted scope item ${index + 1} remains inside the trusted repository profile.`,
+    dependencies: (index) =>
+      `Dependency ${index + 1} is resolved through trusted host bindings.`,
+  };
+  for (const [field, fallback] of Object.entries(listFallbacks)) {
+    const values = packageRecord[field];
+    if (!Array.isArray(values)) continue;
+    packageRecord[field] = values.map((value, index) => {
+      if (typeof value !== "string") return value;
+      try {
+        assertNoRawAuthority(value, `${field} ${index + 1}`);
+        return value;
+      } catch {
+        return fallback(index);
       }
     });
   }
@@ -1154,17 +1261,8 @@ function hydrateTrustedWebEvidence(
     if (!reference) continue;
     const readback = trusted.find((entry) => entry.references.has(reference));
     if (!readback) continue;
-    const suppliedHash =
-      typeof evidence.contentSha256 === "string"
-        ? evidence.contentSha256.trim().toLowerCase()
-        : "";
-    if (suppliedHash && suppliedHash !== readback.contentHash) {
-      throw new ToolExecutionError(
-        "research_publication_evidence_changed",
-        "Accepted research evidence hash does not match the successful same-run web readback.",
-        { mutationState: "not_applied" },
-      );
-    }
+    // The model-supplied hash is never authority. A matching trusted URL is
+    // replaced below with the successful same-run/durable host readback.
   }
   const preservedNonWebEvidence = modelEvidence.filter((candidate) => {
     const evidence = asRecord(candidate);

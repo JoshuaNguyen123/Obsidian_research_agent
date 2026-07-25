@@ -11,6 +11,7 @@ import {
 import { chunkMarkdownForSemanticSearch } from "../src/tools/semanticSearchTools";
 import {
   createSemanticIndexService,
+  SEMANTIC_INDEX_READ_CONCURRENCY,
   shouldSemanticIndexTrackPath,
 } from "../src/embeddings/semanticIndex";
 import {
@@ -1120,6 +1121,55 @@ test("semantic index service rebuild writes v2 sharded vectors and vector-free m
   });
   assert.equal(search.ok, true);
   assert.equal(search.results[0].path, "Research/Semantic.md");
+});
+
+test("semantic index rebuild preprocesses vault notes with bounded concurrency", async () => {
+  let activeReads = 0;
+  let maxActiveReads = 0;
+  const mock = createMockContext({
+    cachedReadOverride: async (_path, value) => {
+      activeReads += 1;
+      maxActiveReads = Math.max(maxActiveReads, activeReads);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      activeReads -= 1;
+      return value;
+    },
+  });
+  mock.content.clear();
+  for (let index = 0; index < 20; index += 1) {
+    mock.content.set(
+      `Research/Concurrent-${index}.md`,
+      `# Concurrent ${index}\n\nBounded semantic evidence ${index}.`,
+    );
+  }
+  mock.folders.add("Research");
+  mock.context.semanticEmbeddingProvider = {
+    async embed(request) {
+      return {
+        ok: true,
+        model: request.model,
+        dim: request.dim,
+        documents: request.documents.map(() =>
+          Array.from({ length: request.dim }, (_value, index) =>
+            index === 0 ? 1 : 0,
+          ),
+        ),
+        queries: [],
+      };
+    },
+  };
+  const service = createSemanticIndexService({
+    app: mock.context.app,
+    getSettings: () => mock.context.settings,
+    getEmbeddingProvider: () => mock.context.semanticEmbeddingProvider!,
+  });
+
+  const result = await service.rebuild();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.noteCount, 20);
+  assert.ok(maxActiveReads > 1);
+  assert.ok(maxActiveReads <= SEMANTIC_INDEX_READ_CONCURRENCY);
 });
 
 test("semantic index v2 updates only changed notes and removes paths without a full re-embed", async () => {
@@ -2390,6 +2440,31 @@ test("append_to_current_file is blocked on revise missions with existing body", 
   assert.match(mock.content.get("Current.md") ?? "", /Draft paragraph/);
 });
 
+test("append_to_current_file permits a reflection when a code rewrite is explicitly forbidden", async () => {
+  const registry = createDefaultToolRegistry();
+  const mock = createMockContext({
+    prompt: [
+      "Append a verified reflection to the current note.",
+      "Do not rewrite package.json or scripts.",
+    ].join(" "),
+    writeAutonomy: true,
+  });
+  mock.content.set("Current.md", `${"Existing research body. ".repeat(40)}\n`);
+
+  const result = await registry.execute(
+    {
+      name: "append_to_current_file",
+      arguments: {
+        text: "## Flow real reflection\n\nThe verified publication is complete.",
+      },
+    },
+    mock.context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.match(mock.content.get("Current.md") ?? "", /## Flow real reflection/);
+});
+
 test("append_to_current_section inserts below a heading with backup", async () => {
   const registry = createDefaultToolRegistry();
   const mock = createMockContext({
@@ -3613,6 +3688,7 @@ function createMockContext(options: {
   fileStats?: Record<string, { ctime?: number; mtime?: number; size?: number }>;
   settings?: Partial<ToolExecutionContext["settings"]>;
   cachedReadTransform?: (path: string, value: string) => string;
+  cachedReadOverride?: (path: string, value: string) => Promise<string>;
 } = {}) {
   const activePath =
     options.activePath === null ? null : (options.activePath ?? "Current.md");
@@ -3739,6 +3815,9 @@ function createMockContext(options: {
       getAllLoadedFiles,
       cachedRead: async (file: { path: string }) => {
         const value = content.get(file.path) ?? "";
+        if (options.cachedReadOverride) {
+          return options.cachedReadOverride(file.path, value);
+        }
         return options.cachedReadTransform?.(file.path, value) ?? value;
       },
       read: async (file: { path: string }) => content.get(file.path) ?? "",

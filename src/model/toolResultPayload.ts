@@ -167,6 +167,8 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
     "operation",
     "path",
     "toPath",
+    "destinationRoot",
+    "destinationPath",
     "backupPath",
     "restoredFromBackupPath",
     "bytesWritten",

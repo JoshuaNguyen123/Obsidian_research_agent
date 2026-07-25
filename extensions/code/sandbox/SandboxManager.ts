@@ -274,7 +274,7 @@ const PROBE_TIMEOUT_MS = 30_000;
 // A dedicated WSL distribution may need to cold-start before bwrap can run the
 // fixed boundary command. Keep the ordinary provider budget tight, but allow
 // WSL2 enough time to produce fresh attestation under normal workstation load.
-const WSL2_PROBE_TIMEOUT_MS = 60_000;
+const WSL2_PROBE_TIMEOUT_MS = 90_000;
 
 /**
  * Sandbox-only execution boundary. A runner must be injected explicitly; this
@@ -307,20 +307,34 @@ export class SandboxManagerV2 {
     }));
   }
 
+  /**
+   * A non-null blocker for "no usable provider." Both the no-provider-selected
+   * path and the named-provider-not-configured path route through here, so the
+   * fail-closed result always carries a blocker consumers can read — a prepared
+   * action naming an unconfigured provider while another is verified must not
+   * yield { status: "blocked", blocker: null } and crash on blocker.code.
+   */
+  private providerUnavailableBlocker(kind?: SandboxProviderKindV2): SandboxDurableBlockerV2 {
+    const providerDiagnostic = summarizeUnavailableProviders(this.statuses);
+    const namePart = kind
+      ? `The prepared action names provider "${kind}", which is not configured on this host. `
+      : "";
+    return blocker(
+      "sandbox_provider_unavailable",
+      `${namePart}${
+        providerDiagnostic
+          ? `No sandbox provider has passed its boundary probe. ${providerDiagnostic}`
+          : "No sandbox provider has passed its boundary probe."
+      }`,
+      "Install or repair Docker, Podman, the dedicated WSL2 sandbox, or bubblewrap, then run the explicit boundary probe.",
+      true,
+    );
+  }
+
   /** Read cached health without starting a process or mutating provider state. */
   readStatus(): SandboxCapabilityStatusV2 {
     const selected = this.selectedProvider();
-    const providerDiagnostic = summarizeUnavailableProviders(this.statuses);
-    const statusBlocker = selected
-      ? null
-      : blocker(
-          "sandbox_provider_unavailable",
-          providerDiagnostic
-            ? `No sandbox provider has passed its boundary probe. ${providerDiagnostic}`
-            : "No sandbox provider has passed its boundary probe.",
-          "Install or repair Docker, Podman, the dedicated WSL2 sandbox, or bubblewrap, then run the explicit boundary probe.",
-          true,
-        );
+    const statusBlocker = selected ? null : this.providerUnavailableBlocker();
     return {
       version: 1,
       mode: selected ? "sandbox_verified" : "editing_only",
@@ -344,7 +358,7 @@ export class SandboxManagerV2 {
 
   async prepareExecution(input: SandboxPrepareInputV2): Promise<SandboxPreparationResultV2> {
     const selected = this.selectedProvider();
-    if (!selected) return { status: "blocked", blocker: this.readStatus().blocker! };
+    if (!selected) return { status: "blocked", blocker: this.providerUnavailableBlocker() };
     const profile = parseRepositoryProfileV2(input.profile);
     const runtimeBlockers = repositoryProfileExecutionBlockersV2(profile);
     if (runtimeBlockers.length > 0) {
@@ -509,7 +523,7 @@ export class SandboxManagerV2 {
       };
     }
     const provider = this.providers.find((candidate) => candidate.kind === action.provider);
-    if (!provider) return { status: "blocked", blocker: this.readStatus().blocker! };
+    if (!provider) return { status: "blocked", blocker: this.providerUnavailableBlocker(action.provider) };
     const freshProbe = await this.probeOne(provider, input.signal);
     this.statuses = this.statuses.map((status) =>
       status.provider === provider.kind ? freshProbe : status,
@@ -656,7 +670,17 @@ export class SandboxManagerV2 {
     try {
       const result = await this.runner.run(spec, { signal });
       if (result.exitCode !== 0) {
-        return { provider: provider.kind, state: "unavailable", diagnostic: `Probe exited ${result.exitCode}.`, probeFingerprint: null, checkedAt };
+        const providerDiagnostic = safeDiagnostic(result.stderr).trim();
+        return {
+          provider: provider.kind,
+          state: "unavailable",
+          diagnostic: [
+            `Probe exited ${result.exitCode}.`,
+            providerDiagnostic,
+          ].filter(Boolean).join(" "),
+          probeFingerprint: null,
+          checkedAt,
+        };
       }
       const proof = parseBoundaryProof(result.stdout, provider.runtimeDigest);
       const probeFingerprint = sha256Canonical({ version: 1, provider, spec, proof });

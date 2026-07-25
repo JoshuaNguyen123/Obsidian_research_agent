@@ -677,6 +677,7 @@ test("project memory paths live under the active note folder", () => {
     memoryFolder: "Projects/Agent Memory",
     conversationPath: "Projects/Agent Memory/conversation-history.json",
     researchIndexPath: "Projects/Agent Memory/research-memory-index.json",
+    toolOutcomePath: "Projects/Agent Memory/tool-outcome-memory.json",
     researchNotesFolder: "Projects/Agent Memory/Research",
   });
 
@@ -684,6 +685,7 @@ test("project memory paths live under the active note folder", () => {
     memoryFolder: "Agent Memory",
     conversationPath: "Agent Memory/conversation-history.json",
     researchIndexPath: "Agent Memory/research-memory-index.json",
+    toolOutcomePath: "Agent Memory/tool-outcome-memory.json",
     researchNotesFolder: "Agent Memory/Research",
   });
 });

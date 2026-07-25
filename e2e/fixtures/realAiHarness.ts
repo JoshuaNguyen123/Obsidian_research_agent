@@ -103,6 +103,15 @@ const PROJECT_STAGE_COMPLETION_TOOL: Readonly<
   reconciliation_cleanup: "github_delete_private_repository",
 });
 
+// `Idle` is the durable primary status. AgentView may append non-semantic
+// autonomy/team stats after it, so lifecycle waits must not confuse that
+// presentation detail with a still-running mission.
+const IDLE_PRIMARY_STATUS_PATTERN = /^Idle(?:\s+\u00b7\s+\S.*)?$/iu;
+
+function hasIdlePrimaryStatus(statusText: string): boolean {
+  return IDLE_PRIMARY_STATUS_PATTERN.test(statusText.trim());
+}
+
 /**
  * One real provider health check is enough for the exact provider/model/base
  * tuple during a single serial Playwright worker. Each mission still uses the
@@ -142,11 +151,11 @@ export async function startRealAiHarness(
     modelRouterMode: "authority",
     streamWritebackMode: "off",
     semanticIndexEnabled: true,
-    // A missing or incompatible index makes updatePaths() rebuild the configured
-    // vault slice. Keep that production fallback real, but bound it to an owned
-    // per-scenario fixture so a developer's shared test-vault size cannot turn a
-    // semantic contract test into an unbounded soak.
-    semanticIndexFolder: `E2E Agent Tests/.semantic-index-${ownedIndexLabel}`,
+    // A missing or incompatible index makes updatePaths() perform a bounded
+    // rebuild. Keep its generated files in a visible, owned per-scenario vault
+    // folder: Obsidian's metadata API intentionally does not expose dot-prefixed
+    // adapter directories, which makes them invalid for a vault-API index.
+    semanticIndexFolder: `E2E Agent Tests/Semantic Index/${ownedIndexLabel}`,
     semanticIndexMaxFiles: 16,
     autoTitleOnWrite: false,
     orchestratorEnabled: false,
@@ -269,6 +278,15 @@ async function restartCorePlugin(
           "The active lifecycle stage did not reach a quiescent durable restart boundary.",
         );
       }
+    }
+    // A plugin-manager disable does not reliably destroy an already-open
+    // ItemView in the shared renderer. Detach the owned leaf first so enable
+    // creates a view bound to the new plugin instance instead of leaving the
+    // old instance's connection gate on screen.
+    for (const leaf of app.workspace.getLeavesOfType?.(
+      "agentic-researcher-view",
+    ) ?? []) {
+      await leaf.detach?.();
     }
     await app.plugins.disablePlugin(pluginId);
     await app.plugins.enablePlugin(pluginId);
@@ -400,7 +418,7 @@ async function waitUntilIdleOrComplete(
     }
     if (
       state.runText === "Run Mission" &&
-      /^Idle$/i.test(state.statusText)
+      hasIdlePrimaryStatus(state.statusText)
     ) {
       if (
         state.acceptanceStatus === "pass" ||
@@ -795,6 +813,7 @@ async function approveUntilMissionComplete(
       runText: string;
       statusText: string;
       hasEnabledApproval: boolean;
+      pluginRunning: boolean;
       stopReason: string | null;
       canResume: boolean;
       continuationCommand: string;
@@ -847,6 +866,7 @@ async function approveUntilMissionComplete(
           hasEnabledApproval: Array.from(document.querySelectorAll<HTMLButtonElement>(
             "button.agentic-researcher-approval-approve:not(:disabled), button[data-testid='chat-approval-approve']:not(:disabled)",
           )).some((button) => button.getClientRects().length > 0),
+          pluginRunning: plugin?.isMissionRunning?.() === true,
           stopReason: snapshot?.lastComplete?.stopReason ?? null,
           canResume: snapshot?.lastMissionLedger?.canResume === true,
           continuationCommand:
@@ -980,7 +1000,17 @@ async function approveUntilMissionComplete(
       await safePageWait(page, 100, "post-approval settle");
       continue;
     }
-    if (ui.runText === "Run Mission" && ui.statusText === "Idle") {
+    if (
+      ui.runText === "Run Mission" &&
+      hasIdlePrimaryStatus(ui.statusText)
+    ) {
+      // Run-complete events update the durable/UI projection before the
+      // coordinator finishes terminal persistence and releases ownership.
+      // Continue is invalid during that gap even though the surface is Idle.
+      if (ui.pluginRunning) {
+        await safePageWait(page, 250, "coordinator terminal settle");
+        continue;
+      }
       if (ui.acceptanceStatus === "pass" || ui.ledgerStatus === "complete") {
         return approvals;
       }
@@ -1052,8 +1082,170 @@ async function approveUntilMissionComplete(
         if (retryableProviderStop) {
           await safePageWait(page, 1_000, "provider-retry backoff");
         }
+        const launchBaseline = JSON.stringify({
+          stopReason: ui.stopReason,
+          canResume: ui.canResume,
+          continuationCommand: ui.continuationCommand,
+          acceptanceStatus: ui.acceptanceStatus,
+          ledgerStatus: ui.ledgerStatus,
+          ledger: ui.ledger,
+          providerUsage: ui.providerUsage,
+          lastComplete: ui.lastComplete,
+          modelCallPhases: ui.modelCallPhases,
+        });
         await continuation.click();
-        await safePageWait(page, 250, "post-continue settle");
+        // `submitMissionContinuation` first copies the durable command into the
+        // Chat composer, then asynchronously enters `capturePrompt`. Do not
+        // read the still-idle snapshot and click Continue again during that
+        // handoff. A short segment can also finish before the next DOM poll, so
+        // accept either the native Stop state or a changed durable
+        // ledger/provider snapshot; the unchanged prior Idle state remains a
+        // hard failure.
+        const launchAcknowledged = await expect
+          .poll(async () => {
+            return page.evaluate(({ pluginId, launchBaseline }) => {
+              const runText =
+                document
+                  .querySelector("button.agentic-researcher-run")
+                  ?.textContent?.trim() ?? "";
+              if (/Stop/iu.test(runText)) {
+                return "acknowledged";
+              }
+              const snapshot = (window as typeof window & { app?: any }).app
+                ?.plugins?.plugins?.[pluginId]?.getMissionRunSnapshot?.();
+              const ledger = snapshot?.lastMissionLedger;
+              const current = JSON.stringify({
+                stopReason: snapshot?.lastComplete?.stopReason ?? null,
+                canResume: ledger?.canResume === true,
+                continuationCommand:
+                  typeof ledger?.continuationCommand === "string"
+                    ? ledger.continuationCommand
+                    : "",
+                acceptanceStatus: ledger?.acceptance?.status ?? null,
+                ledgerStatus: ledger?.status ?? null,
+                ledger: ledger
+                  ? {
+                      status: ledger.status,
+                      acceptance: ledger.acceptance,
+                      evidenceCount: ledger.evidenceCount,
+                      receiptCount: ledger.receiptCount,
+                      nextAction: ledger.nextAction,
+                    }
+                  : null,
+                providerUsage: snapshot?.providerUsage ?? null,
+                lastComplete: snapshot?.lastComplete ?? null,
+                modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
+                  ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
+                      phase: item?.phase ?? null,
+                      outcome: item?.outcome ?? null,
+                    }))
+                  : [],
+              });
+              return current !== launchBaseline
+                ? "acknowledged"
+                : "stale-idle";
+            }, {
+              pluginId: NATIVE_CORE_PLUGIN_ID,
+              launchBaseline,
+            });
+          }, { timeout: 15_000 })
+          .toBe("acknowledged")
+          .then(
+            () => true,
+            () => false,
+          );
+        if (!launchAcknowledged) {
+          // Keep the soak moving through the same public ItemView continuation
+          // seam when a visible button's listener was replaced or otherwise
+          // failed to launch. Invoke it only after 15 seconds of unchanged
+          // durable Idle state, and require independent state change before
+          // accepting the fallback.
+          const fallback = await page.evaluate(
+            async ({ command, launchBaseline, pluginId }) => {
+              const app = (window as typeof window & { app?: any }).app;
+              const plugin = app?.plugins?.plugins?.[pluginId];
+              const view = app?.workspace?.getLeavesOfType?.(
+                "agentic-researcher-view",
+              )?.[0]?.view;
+              const summarize = () => {
+                const snapshot = plugin?.getMissionRunSnapshot?.();
+                const ledger = snapshot?.lastMissionLedger;
+                return JSON.stringify({
+                  stopReason: snapshot?.lastComplete?.stopReason ?? null,
+                  canResume: ledger?.canResume === true,
+                  continuationCommand:
+                    typeof ledger?.continuationCommand === "string"
+                      ? ledger.continuationCommand
+                      : "",
+                  acceptanceStatus: ledger?.acceptance?.status ?? null,
+                  ledgerStatus: ledger?.status ?? null,
+                  ledger: ledger
+                    ? {
+                        status: ledger.status,
+                        acceptance: ledger.acceptance,
+                        evidenceCount: ledger.evidenceCount,
+                        receiptCount: ledger.receiptCount,
+                        nextAction: ledger.nextAction,
+                      }
+                    : null,
+                  providerUsage: snapshot?.providerUsage ?? null,
+                  lastComplete: snapshot?.lastComplete ?? null,
+                  modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
+                    ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
+                        phase: item?.phase ?? null,
+                        outcome: item?.outcome ?? null,
+                      }))
+                    : [],
+                });
+              };
+              const diagnostics = () => ({
+                pluginRunning: plugin?.isMissionRunning?.() === true,
+                viewRunning: view?.isRunning === true,
+                connected: plugin?.hasVerifiedModelConnection?.() === true,
+                prompt:
+                  typeof view?.promptEl?.value === "string"
+                    ? view.promptEl.value.slice(0, 160)
+                    : "",
+                recentErrors: Array.from(
+                  document.querySelectorAll<HTMLElement>(
+                    ".agentic-researcher-log-error .agentic-researcher-log-message",
+                  ),
+                )
+                  .slice(-4)
+                  .map((element) => element.textContent?.trim() ?? ""),
+              });
+              if (
+                !view ||
+                typeof view.submitMissionContinuation !== "function" ||
+                plugin?.isMissionRunning?.() === true ||
+                view.isRunning === true
+              ) {
+                return {
+                  acknowledged: false,
+                  invoked: false,
+                  diagnostics: diagnostics(),
+                };
+              }
+              await view.submitMissionContinuation(command);
+              return {
+                acknowledged: summarize() !== launchBaseline,
+                invoked: true,
+                diagnostics: diagnostics(),
+              };
+            },
+            {
+              command: ui.continuationCommand,
+              launchBaseline,
+              pluginId: NATIVE_CORE_PLUGIN_ID,
+            },
+          );
+          if (!fallback.acknowledged) {
+            throw new Error(
+              `Continue remained on its prior idle snapshot after button and ItemView submission: ${JSON.stringify(fallback)}.`,
+            );
+          }
+        }
+        await safePageWait(page, 100, "post-continue launch");
         continue;
       }
       const failureSummary = {
@@ -1299,6 +1491,15 @@ async function assertProductionClientReady(
               message:
                 "Reused the exact live connection attestation from this serial Playwright worker.",
             });
+            // Plugin restart can finish before the reattached AgentView has
+            // rendered the persisted connection proof. Refresh both the
+            // plugin-owned view reference and every live leaf before asserting
+            // that Run Mission is enabled.
+            plugin.activeAgentView?.refreshFirstRunState?.();
+            plugin.refreshAgentView?.();
+            for (const leaf of views) {
+              leaf.view?.refreshFirstRunState?.();
+            }
           }
         } else {
           if (typeof plugin?.testModelConnection !== "function") {
@@ -1390,7 +1591,22 @@ async function waitForMissionComplete(page: Page, timeoutMs: number): Promise<vo
   const run = page.locator("button.agentic-researcher-run");
   await expect(run).toHaveText("Run Mission", { timeout: timeoutMs });
   await expect(run).toBeEnabled();
-  await expect(page.locator(".agentic-researcher-run-status-text")).toHaveText("Idle");
+  await expect(page.locator(".agentic-researcher-run-status-text")).toHaveText(
+    IDLE_PRIMARY_STATUS_PATTERN,
+  );
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const coordinatorReleased = await page.evaluate((pluginId) => {
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      return plugin?.getMissionRunSnapshot?.()?.isRunning === false;
+    }, NATIVE_CORE_PLUGIN_ID);
+    if (coordinatorReleased) return;
+    await page.waitForTimeout(250);
+  }
+  throw new Error(
+    `Mission UI became idle but the coordinator did not release ownership within ${timeoutMs}ms.`,
+  );
 }
 
 async function seedNote(page: Page, path: string, content: string, activate: boolean): Promise<void> {
@@ -1417,17 +1633,59 @@ async function seedNote(page: Page, path: string, content: string, activate: boo
 async function indexSemanticNotes(page: Page, paths: string[]): Promise<void> {
   await page.evaluate(async ({ pluginId, paths }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
+    if (!plugin?.settings) {
+      throw new Error("Production semantic settings are unavailable.");
+    }
+    // Semantic fixtures are seeded with watcher indexing disabled so setup has
+    // one writer. Re-enable the actual production capability before obtaining
+    // and exercising its service; the subsequent mission sees the same setting.
+    plugin.settings.semanticIndexEnabled = true;
     const service = plugin?.getSemanticIndexService?.() ?? plugin?.semanticIndexService;
     if (!service?.updatePaths) {
       throw new Error("Production semantic index service is unavailable.");
     }
-    const result = await service.updatePaths(paths);
+    const runUpdate = async (phase: string) => {
+      try {
+        return await service.updatePaths(paths);
+      } catch (error) {
+        const folder = String(plugin.settings.semanticIndexFolder ?? "");
+        const abstract = (window as typeof window & { app?: any }).app?.vault
+          ?.getAbstractFileByPath?.(folder);
+        const kind = abstract
+          ? Array.isArray(abstract.children)
+            ? "folder"
+            : "file"
+          : "missing";
+        throw new Error(
+          `Production semantic index ${phase} threw: ` +
+            `${error instanceof Error ? error.message : String(error)}; ` +
+            `indexFolder=${folder}; folderKind=${kind}.`,
+        );
+      }
+    };
+    let result = await runUpdate("initial update");
     if (!result?.ok) {
       throw new Error(
-        `Production semantic index update failed: ${result?.code ?? result?.message ?? "unknown"}`,
+        `Production semantic index update failed: ` +
+          `${result?.code ?? "unknown"}${result?.message ? `: ${result.message}` : ""}`,
       );
     }
-    const updated = new Set(result.updatedPaths ?? []);
+    let updated = new Set(result.updatedPaths ?? []);
+    if (paths.some((path) => !updated.has(path))) {
+      // updatePaths() intentionally falls back to a bounded rebuild when the
+      // per-scenario index does not exist yet. That initial rebuild may omit an
+      // exact fixture outside semanticIndexMaxFiles. Once it has created a
+      // compatible index, a second production update indexes the requested
+      // paths directly instead of weakening the product's bounded rebuild cap.
+      result = await runUpdate("exact-path retry");
+      if (!result?.ok) {
+        throw new Error(
+          `Production semantic index retry failed: ` +
+            `${result?.code ?? "unknown"}${result?.message ? `: ${result.message}` : ""}`,
+        );
+      }
+      updated = new Set(result.updatedPaths ?? []);
+    }
     for (const path of paths) {
       if (!updated.has(path)) {
         throw new Error(`Production semantic index did not attest ${path}.`);

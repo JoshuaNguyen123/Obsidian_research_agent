@@ -33,6 +33,14 @@ export interface GitHubPublicationHandoffV1 {
   handoffFingerprint: string;
 }
 
+export interface GitHubDraftPublicationRefProofV1 {
+  profileKey: string;
+  agentBranch: string;
+  baseSha: string;
+  commitSha: string;
+  handoffFingerprint: string;
+}
+
 export interface TrustedGitHubPublicationBindingV1 {
   bindingFingerprint: string;
   profileKey: string;
@@ -190,6 +198,8 @@ export interface GitHubPublicationProviderPortV1 {
       body: string;
       head: string;
       base: string;
+      expectedHeadSha: string;
+      expectedBaseSha: string;
     },
     signal?: AbortSignal,
   ): Promise<{ pullRequest: GitHubPublicationPullRequestV1; receipt: ActionReceipt }>;
@@ -450,7 +460,10 @@ export class GitHubPublicationWorkflowV1 {
       status: "pushed_verified",
       updatedAt: this.isoNow(),
       remoteSha: push.remoteSha,
-      receiptIds: [push.receipt.id],
+      // A publish retry is only allowed before a verified push. Preserve any
+      // durable prefix defensively so a caller can never truncate receipt
+      // lineage if this flow is reused by a future recovery path.
+      receiptIds: appendUnique(checkpoint.receiptIds, push.receipt.id),
     };
     await this.options.checkpoints.persist(checkpoint);
 
@@ -458,6 +471,7 @@ export class GitHubPublicationWorkflowV1 {
       title: normalized.title,
       body: normalized.body,
       binding: normalized.binding,
+      handoff: normalized.handoff,
       signal: normalized.signal,
     });
   }
@@ -468,6 +482,7 @@ export class GitHubPublicationWorkflowV1 {
       title: string;
       body: string;
       binding: TrustedGitHubPublicationBindingV1;
+      handoff: GitHubDraftPublicationRefProofV1;
       signal?: AbortSignal;
     },
   ): Promise<GitHubPublicationCheckpointV1> {
@@ -487,6 +502,110 @@ export class GitHubPublicationWorkflowV1 {
         allowNewlines: true,
       }),
       binding: validateBinding(input.binding),
+      handoff: validateDraftPublicationRefProof(input.handoff),
+    });
+  }
+
+  /**
+   * Retries only draft-PR creation after provider readback proved that an
+   * earlier create dispatch did not apply. The verified branch push is never
+   * replayed: its remote SHA and append-only receipt prefix remain durable.
+   *
+   * The retry creates a new approval payload from the current title/body.
+   * That is deliberately not `resumeDraftPublication`: an old approval must
+   * not authorize changed PR prose after a recovery or process restart.
+   */
+  async retryDraftPublicationAfterNotApplied(
+    checkpoint: GitHubPublicationCheckpointV1,
+    input: {
+      title: string;
+      body: string;
+      binding: TrustedGitHubPublicationBindingV1;
+      handoff: GitHubDraftPublicationRefProofV1;
+      signal?: AbortSignal;
+    },
+  ): Promise<GitHubPublicationCheckpointV1> {
+    const title = expectString(input.title, "pull request title", 1, 256);
+    const body = expectString(input.body, "pull request body", 1, 65_536, {
+      allowNewlines: true,
+    });
+    const binding = validateBinding(input.binding);
+    const handoff = validateDraftPublicationRefProof(input.handoff);
+    const recoveredNotApplied =
+      checkpoint.status === "blocked" &&
+      checkpoint.blocker?.code === "github_draft_pr_not_applied";
+    // `push_prepared` with a verified remote and receipt prefix is this
+    // method's own durable pre-approval state. Re-entering it deliberately
+    // creates another fresh approval rather than reusing an approval that may
+    // have been interrupted before the PR mutation was prepared.
+    const retryPrepared =
+      checkpoint.status === "push_prepared" &&
+      checkpoint.blocker === null;
+    // A process may also have stopped just after a normal verified push and
+    // before draft creation. Treat that as the same fresh-approval recovery.
+    const verifiedPushWithoutDraft =
+      checkpoint.status === "pushed_verified" &&
+      checkpoint.blocker === null;
+    if (
+      (!recoveredNotApplied && !retryPrepared && !verifiedPushWithoutDraft) ||
+      checkpoint.pullRequest !== null ||
+      checkpoint.pendingAction !== null ||
+      checkpoint.remoteSha !== checkpoint.headSha ||
+      checkpoint.receiptIds.length === 0 ||
+      checkpoint.bindingFingerprint !== binding.bindingFingerprint ||
+      checkpoint.handoffFingerprint !== handoff.handoffFingerprint ||
+      checkpoint.branch !== handoff.agentBranch ||
+      checkpoint.headSha !== handoff.commitSha ||
+      handoff.profileKey !== binding.profileKey ||
+      checkpoint.proofSnapshot !== null ||
+      checkpoint.mergeSha !== null ||
+      checkpoint.readyApprovalFingerprint !== null ||
+      checkpoint.mergeApprovalFingerprint !== null ||
+      checkpoint.linearLinkReceiptId !== null ||
+      checkpoint.linearCompletionReceiptId !== null ||
+      checkpoint.obsidianReceiptId !== null
+    ) {
+      throw new DurableLinearContractError(
+        "Draft-PR retry requires an exact verified push with no durable pull request.",
+      );
+    }
+
+    const publishAction = buildGitHubApprovalPreparedActionV1({
+      kind: "publish",
+      identity: this.options.approvalIdentity,
+      preparedAt: this.isoNow(),
+      publicationId: checkpoint.publicationId,
+      binding,
+      branch: checkpoint.branch,
+      headSha: checkpoint.headSha,
+      title,
+      body,
+    });
+    const publishApprovalFingerprint = publishAction.payloadFingerprint;
+    const prepared: GitHubPublicationCheckpointV1 = {
+      ...checkpoint,
+      status: "push_prepared",
+      updatedAt: this.isoNow(),
+      publishApprovalFingerprint,
+      pendingAction: null,
+      blocker: null,
+    };
+    await this.options.checkpoints.persist(prepared);
+    const approval = await this.options.approvals.request({
+      kind: "publish",
+      approvalFingerprint: publishApprovalFingerprint,
+      preparedAction: publishAction,
+      requiredConfirmations: 1,
+      summary: `Create a draft pull request for already verified ${checkpoint.headSha}.`,
+      destination: `${binding.owner}/${binding.repository}:${checkpoint.branch}`,
+    });
+    requireApproval(approval, publishApprovalFingerprint, 1);
+    return this.continueDraftPublication(prepared, {
+      title,
+      body,
+      binding,
+      handoff,
+      signal: input.signal,
     });
   }
 
@@ -1153,6 +1272,7 @@ export class GitHubPublicationWorkflowV1 {
           allowNewlines: true,
         }),
         binding: trusted,
+        handoff,
         signal,
       });
     }
@@ -1506,14 +1626,20 @@ export class GitHubPublicationWorkflowV1 {
       title: string;
       body: string;
       binding: TrustedGitHubPublicationBindingV1;
+      handoff: GitHubDraftPublicationRefProofV1;
       signal?: AbortSignal;
     },
   ): Promise<GitHubPublicationCheckpointV1> {
+    const handoff = validateDraftPublicationRefProof(input.handoff);
     let checkpoint = initial;
     if (
       checkpoint.bindingFingerprint !== input.binding.bindingFingerprint ||
       checkpoint.remoteSha !== checkpoint.headSha ||
-      !checkpoint.publishApprovalFingerprint
+      !checkpoint.publishApprovalFingerprint ||
+      handoff.handoffFingerprint !== checkpoint.handoffFingerprint ||
+      handoff.profileKey !== input.binding.profileKey ||
+      handoff.agentBranch !== checkpoint.branch ||
+      handoff.commitSha !== checkpoint.headSha
     ) {
       throw new DurableLinearContractError(
         "Draft publication continuation does not match verified push proof.",
@@ -1549,6 +1675,8 @@ export class GitHubPublicationWorkflowV1 {
             body: input.body,
             head: checkpoint.branch,
             base: input.binding.baseBranch,
+            expectedHeadSha: handoff.commitSha,
+            expectedBaseSha: handoff.baseSha,
           },
           input.signal,
         );
@@ -2317,6 +2445,30 @@ function validateHandoff(
       (value, label) => expectSha256(value, label),
     ),
     handoffFingerprint: expectSha256(handoff.handoffFingerprint, "code handoff fingerprint"),
+  };
+}
+
+function validateDraftPublicationRefProof(
+  handoff: GitHubDraftPublicationRefProofV1,
+): GitHubDraftPublicationRefProofV1 {
+  const agentBranch = validateBranch(handoff.agentBranch);
+  if (!agentBranch.startsWith("codex/")) {
+    throw new DurableLinearContractError(
+      "GitHub publication requires an agent-owned codex/ branch.",
+    );
+  }
+  return {
+    profileKey: expectLogicalKey(
+      handoff.profileKey,
+      "publication profile key",
+    ),
+    agentBranch,
+    baseSha: validateGitSha(handoff.baseSha, "publication base SHA"),
+    commitSha: validateGitSha(handoff.commitSha, "publication commit SHA"),
+    handoffFingerprint: expectSha256(
+      handoff.handoffFingerprint,
+      "code handoff fingerprint",
+    ),
   };
 }
 

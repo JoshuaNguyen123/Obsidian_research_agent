@@ -17,6 +17,12 @@ import {
   type GitHubPullRequestRecord,
 } from "../../../src/integrations/github/GitHubRestClient";
 import {
+  ensureGitHubPublicationDefaultBranchV1,
+} from "../../../src/integrations/github/GitHubPublicationDefaultBranchV1";
+import {
+  projectGitHubPublicationPullRequestV1,
+} from "../../../src/integrations/github/GitHubPublicationPullRequestProjectionV1";
+import {
   GitHubPublicationCheckpointStoreV1,
 } from "../../../src/integrations/github/GitHubPublicationCheckpointStore";
 import {
@@ -24,7 +30,6 @@ import {
   GitHubPublicationWorkflowV1,
   type GitHubPublicationCheckpointV1,
   type GitHubPublicationProviderPortV1,
-  type GitHubPublicationPullRequestV1,
   type GitHubPublicationPushPortV1,
   type GitHubPublicationPreapprovedApprovalInputV1,
   type TrustedGitHubPublicationBindingV1,
@@ -221,10 +226,20 @@ class ActionScopedGitHubProviderV1 implements GitHubPublicationProviderPortV1 {
     this.assertRepository(owner, repository);
     this.assertBranchAndBase(head, base);
     return this.withPinnedClient(signal, async (client) =>
-      (await client.listPullRequestsForHead(owner, repository, head, base, signal)).map(projectPullRequest));
+      (await client.listPullRequestsForHead(owner, repository, head, base, signal))
+        .map(projectGitHubPublicationPullRequestV1));
   }
 
-  createDraftPullRequest(input: { owner: string; repository: string; title: string; body: string; head: string; base: string }, signal?: AbortSignal) {
+  createDraftPullRequest(input: {
+    owner: string;
+    repository: string;
+    title: string;
+    body: string;
+    head: string;
+    base: string;
+    expectedHeadSha: string;
+    expectedBaseSha: string;
+  }, signal?: AbortSignal) {
     this.assertRepository(input.owner, input.repository);
     this.assertBranchAndBase(input.head, input.base);
     const action = this.options.action;
@@ -233,9 +248,72 @@ class ActionScopedGitHubProviderV1 implements GitHubPublicationProviderPortV1 {
       fingerprintBackgroundGitHubValueV1(input.title) !== action.payload.titleFingerprint ||
       fingerprintBackgroundGitHubValueV1(input.body) !== action.payload.bodyFingerprint
     ) throw boundary("provider_contract_rejected", "Draft pull-request document drifted from the approved package.");
-    return this.withPinnedClient(signal, async (client) => {
-      const pullRequest = projectPullRequest(await client.createDraftPullRequest(input, signal));
-      return { pullRequest, receipt: this.receipt("create", pullRequest) };
+    return this.withPinnedClient(signal, async (
+      client,
+      _secret,
+      _account,
+      repositoryReadback,
+    ) => {
+      if (
+        input.expectedHeadSha !== action.payload.headSha ||
+        input.expectedBaseSha !== action.payload.baseSha
+      ) {
+        throw boundary(
+          "provider_contract_rejected",
+          "Draft pull-request ref proof drifted from the approved package.",
+        );
+      }
+      const defaultBranchProof =
+        repositoryReadback.defaultBranch === input.base
+          ? {
+              status: "already_verified" as const,
+              previousDefaultBranch: repositoryReadback.defaultBranch,
+              repository: repositoryReadback,
+              baseReference: {
+                ref: `refs/heads/${input.base}`,
+                sha: input.expectedBaseSha,
+                objectType: "commit",
+              },
+              headReference: {
+                ref: `refs/heads/${input.head}`,
+                sha: input.expectedHeadSha,
+                objectType: "commit",
+              },
+            }
+          : await ensureGitHubPublicationDefaultBranchV1(
+              client,
+              {
+                owner: input.owner,
+                repository: input.repository,
+                baseBranch: input.base,
+                baseSha: input.expectedBaseSha,
+                headBranch: input.head,
+                headSha: input.expectedHeadSha,
+              },
+              signal,
+            );
+      const {
+        expectedBaseSha: _expectedBaseSha,
+        expectedHeadSha: _expectedHeadSha,
+        ...request
+      } = input;
+      const pullRequest = projectGitHubPublicationPullRequestV1(
+        await client.createDraftPullRequest(request, signal),
+      );
+      return {
+        pullRequest,
+        receipt: this.receipt("create", {
+          pullRequest,
+          defaultBranch: {
+            status: defaultBranchProof.status,
+            previousDefaultBranch: defaultBranchProof.previousDefaultBranch,
+            currentDefaultBranch:
+              defaultBranchProof.repository.defaultBranch,
+            baseSha: defaultBranchProof.baseReference.sha,
+            headSha: defaultBranchProof.headReference.sha,
+          },
+        }),
+      };
     });
   }
 
@@ -243,7 +321,7 @@ class ActionScopedGitHubProviderV1 implements GitHubPublicationProviderPortV1 {
     this.assertRepository(owner, repository);
     this.assertPullRequestNumber(number);
     return this.withPinnedClient(signal, async (client) =>
-      projectPullRequest(await client.getPullRequest(owner, repository, number, signal)));
+      projectGitHubPublicationPullRequestV1(await client.getPullRequest(owner, repository, number, signal)));
   }
 
   listCheckRuns(owner: string, repository: string, reference: string, signal?: AbortSignal) {
@@ -363,7 +441,7 @@ class ActionScopedGitHubProviderV1 implements GitHubPublicationProviderPortV1 {
           ),
         ]);
         const freshProof = createProofSnapshot(
-          projectPullRequest(pullRequest),
+          projectGitHubPublicationPullRequestV1(pullRequest),
           input.binding.requiredChecks,
           checks.map((check) => ({
             name: check.name,
@@ -415,6 +493,7 @@ class ActionScopedGitHubProviderV1 implements GitHubPublicationProviderPortV1 {
       client: GitHubRestClient,
       secret: string,
       account: { id: number; login: string },
+      repository: Awaited<ReturnType<GitHubRestClient["getRepository"]>>,
     ) => Promise<T>,
   ): Promise<T> {
     const reference = this.options.action.binding.credentialReferenceId;
@@ -450,10 +529,23 @@ class ActionScopedGitHubProviderV1 implements GitHubPublicationProviderPortV1 {
           if (
             repository.id !== this.options.action.binding.repositoryId ||
             repository.fullName !== `${this.options.action.binding.owner}/${this.options.action.binding.repository}` ||
-            repository.defaultBranch !== this.options.action.payload.baseBranch ||
+            (
+              repository.defaultBranch !== this.options.action.payload.baseBranch &&
+              !(
+                this.options.action.operation ===
+                  GITHUB_DRAFT_PULL_REQUEST_OPERATION_V1 &&
+                repository.defaultBranch ===
+                  this.options.action.payload.branch
+              )
+            ) ||
             repository.archived
           ) throw boundary("repository_drift", "GitHub repository readback no longer matches the trusted binding.");
-          const result = await use(client, secret, { id: user.id, login: user.login });
+          const result = await use(
+            client,
+            secret,
+            { id: user.id, login: user.login },
+            repository,
+          );
           if (JSON.stringify(result).includes(secret)) {
             throw boundary("credential_scope_rejected", "Secret material was rejected from GitHub provider output.");
           }
@@ -747,20 +839,6 @@ function pushReceipt(action: PreparedBackgroundGitHubActionV1, receipt: { id: st
       observedRevision: receipt.remoteSha,
       observedFingerprint: receipt.fingerprint,
     },
-  };
-}
-
-function projectPullRequest(value: GitHubPullRequestRecord): GitHubPublicationPullRequestV1 {
-  return {
-    number: value.number,
-    htmlUrl: value.htmlUrl,
-    state: value.state,
-    draft: value.draft,
-    merged: value.merged,
-    head: { ...value.head },
-    base: { ...value.base },
-    updatedAt: value.updatedAt,
-    ...(value.mergeSha === undefined ? {} : { mergeSha: value.mergeSha }),
   };
 }
 

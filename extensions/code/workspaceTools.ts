@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import type {
   ActionReceiptV1,
@@ -47,6 +48,7 @@ export const CODE_WORKSPACE_TOOL_NAMES_V2 = [
   "code_workspace_search",
   "code_workspace_mkdir",
   "code_workspace_create_file",
+  "code_workspace_export_directory",
   "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
@@ -63,6 +65,24 @@ export const CODE_WORKSPACE_TOOL_NAMES_V2 = [
 ] as const;
 
 type CodeWorkspaceToolNameV2 = typeof CODE_WORKSPACE_TOOL_NAMES_V2[number];
+const HOST_EXPORT_MAX_ENTRIES_V2 = 200;
+const HOST_EXPORT_MAX_BYTES_V2 = 10 * 1024 * 1024;
+
+interface WorkspaceDirectoryExportEntryV2 {
+  path: string;
+  kind: "file" | "directory";
+  bytes: number;
+  sha256: string | null;
+}
+
+interface WorkspaceDirectoryExportSnapshotV2 {
+  sourcePath: string;
+  entries: WorkspaceDirectoryExportEntryV2[];
+  files: number;
+  directories: number;
+  bytes: number;
+  fingerprint: string;
+}
 
 export interface RepositoryInspectionV2 {
   repositoryRoot: string;
@@ -98,7 +118,13 @@ export interface CodeWorkspaceToolFactoryOptionsV2 {
     repositoryRoot: string,
     context: ScopedExtensionContextV1,
   ) => boolean;
+  resolveKnownHostDirectory?: (
+    directory: KnownHostDirectoryV2,
+    context: ScopedExtensionContextV1,
+  ) => Promise<string>;
 }
+
+export type KnownHostDirectoryV2 = "desktop" | "documents" | "downloads";
 
 export function createCodeWorkspaceToolContributionsV2(
   options: CodeWorkspaceToolFactoryOptionsV2,
@@ -109,6 +135,8 @@ export function createCodeWorkspaceToolContributionsV2(
     options.isForegroundUserMission ?? ((root, context) => Boolean(
       context.originalPrompt && context.originalPrompt.includes(root),
     )),
+    options.resolveKnownHostDirectory ?? ((directory) =>
+      resolveKnownHostDirectoryV2(directory)),
   );
   return CODE_WORKSPACE_TOOL_NAMES_V2.map((name) => contribution(name, runtime));
 }
@@ -123,6 +151,10 @@ class WorkspaceToolRuntimeV2 {
       repositoryRoot: string,
       context: ScopedExtensionContextV1,
     ) => boolean,
+    private readonly resolveKnownHostDirectory: (
+      directory: KnownHostDirectoryV2,
+      context: ScopedExtensionContextV1,
+    ) => Promise<string>,
   ) {}
 
   async execute(
@@ -198,6 +230,12 @@ class WorkspaceToolRuntimeV2 {
       }
       if (isReadWorkspaceTool(name)) {
         return { ok: false, error: { code: "preparation_not_required", message: `${name} executes directly with readback.` } };
+      }
+      if (name === "code_workspace_export_directory") {
+        return {
+          ok: true,
+          action: await this.prepareDirectoryExport(args, context),
+        };
       }
       const workspaceId = workspaceIdFrom(args, context);
       const leaseId = await this.ensureLease(workspaceId, context);
@@ -450,6 +488,9 @@ class WorkspaceToolRuntimeV2 {
         ? this.executePreparedScratchCreate(action, context)
         : this.executePreparedRepositoryCreate(action, context);
     }
+    if (name === "code_workspace_export_directory") {
+      return this.executePreparedDirectoryExport(action, context);
+    }
     const args = action.normalizedArgs;
     const workspaceId = requiredString(args.workspaceId, "workspaceId");
     const leaseId = requiredString(args.leaseId, "leaseId");
@@ -546,6 +587,9 @@ class WorkspaceToolRuntimeV2 {
       const args = action.normalizedArgs;
       const workspaceId = requiredString(args.workspaceId, "workspaceId");
       const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
+      if (name === "code_workspace_export_directory") {
+        return this.reconcileDirectoryExport(action, context);
+      }
       const manifest = await this.manager.resumeWorkspace(workspaceId, ownerRunId);
       if (name === "code_workspace_create") {
         const fingerprint = args.kind === "repository"
@@ -592,6 +636,290 @@ class WorkspaceToolRuntimeV2 {
       }
     }
     return { outcome: "still_uncertain" as const, message: `Workspace action ${action.id} could not be proven from exact durable readback; keep it pending.` };
+  }
+
+  private async prepareDirectoryExport(
+    args: Record<string, unknown>,
+    context: ScopedExtensionContextV1,
+  ): Promise<PreparedActionV1> {
+    const workspaceId = workspaceIdFrom(args, context);
+    const ownerRunId = runId(context);
+    const leaseId = await this.ensureLease(workspaceId, context);
+    const leaseOwnerId = `extension:${ownerRunId}`;
+    await this.assertBoundWorkspace(
+      workspaceId,
+      ownerRunId,
+      leaseId,
+      leaseOwnerId,
+    );
+    const destinationRoot = requiredKnownHostDirectory(args.destinationRoot);
+    if (!foregroundMissionNamesKnownHostDirectory(destinationRoot, context)) {
+      throw new WorkspaceManagerErrorV2(
+        "host_directory_authority_missing",
+        `Export to ${destinationRoot} requires that exact known directory in the foreground user mission.`,
+      );
+    }
+    const destinationPath = assertWorkspaceRelativePathV2(
+      requiredString(args.destinationPath, "destinationPath"),
+      "destinationPath",
+    );
+    const sourcePathInput = optionalString(args.sourcePath);
+    const sourcePath = sourcePathInput
+      ? assertWorkspaceRelativePathV2(sourcePathInput, "sourcePath")
+      : "";
+    const sourceSnapshot = await snapshotWorkspaceDirectoryV2(
+      this.manager,
+      workspaceId,
+      sourcePath,
+    );
+    const root = await resolveSafeKnownHostRootV2(
+      await this.resolveKnownHostDirectory(destinationRoot, context),
+      destinationRoot,
+    );
+    const destination = await inspectHostExportDestinationV2(
+      root,
+      destinationPath,
+    );
+    if (destination.exists) {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_destination_exists",
+        `${destination.absolutePath} already exists; directory export never overwrites.`,
+      );
+    }
+    const expected = hostExportAbsentFingerprintV2(
+      destinationRoot,
+      destinationPath,
+      root,
+    );
+    return preparedAction({
+      name: "code_workspace_export_directory",
+      context,
+      workspaceId,
+      targetPath: `${destinationRoot}/${destinationPath}`,
+      normalizedArgs: {
+        workspaceId,
+        ownerRunId,
+        leaseId,
+        leaseOwnerId,
+        sourcePath,
+        sourceFingerprint: sourceSnapshot.fingerprint,
+        sourceFiles: sourceSnapshot.files,
+        sourceDirectories: sourceSnapshot.directories,
+        payloadBytes: sourceSnapshot.bytes,
+        destinationRoot,
+        destinationRootCanonical: root,
+        destinationPath,
+        expectedTargetState: "absent",
+      },
+      expected,
+      summary:
+        `Export ${sourceSnapshot.files} file(s) and ${sourceSnapshot.directories} director` +
+        `ies from workspace ${workspaceId} to ${destination.absolutePath} without overwrite.`,
+      action: "create",
+      outboundBytes: sourceSnapshot.bytes,
+      previewDestination: destination.absolutePath,
+      targetOverride: {
+        system: "workspace",
+        resourceType: "host_directory",
+        id: `host-directory:${destinationRoot}:${destinationPath}`,
+        workspaceId,
+        path: destination.absolutePath,
+      },
+      relatedResources: [
+        workspaceResource(
+          workspaceId,
+          sourcePath || ".",
+          "code_workspace",
+        ),
+      ],
+      warnings: [
+        "This creates files outside the Obsidian vault in the exact approved known-directory destination.",
+        "The destination must remain absent; existing files or directories are never overwritten.",
+      ],
+    });
+  }
+
+  private async executePreparedDirectoryExport(
+    action: PreparedActionV1,
+    context: ScopedExtensionContextV1,
+  ): Promise<{
+    output?: unknown;
+    receipt: ActionReceiptV1;
+    mutationState: "applied";
+  }> {
+    const args = action.normalizedArgs;
+    const workspaceId = requiredString(args.workspaceId, "workspaceId");
+    const ownerRunId = requiredString(args.ownerRunId, "ownerRunId");
+    const leaseId = requiredString(args.leaseId, "leaseId");
+    const leaseOwnerId = requiredString(args.leaseOwnerId, "leaseOwnerId");
+    await this.assertBoundWorkspace(
+      workspaceId,
+      ownerRunId,
+      leaseId,
+      leaseOwnerId,
+    );
+    const destinationRoot = requiredKnownHostDirectory(args.destinationRoot);
+    const root = await resolveSafeKnownHostRootV2(
+      await this.resolveKnownHostDirectory(destinationRoot, context),
+      destinationRoot,
+    );
+    const expectedRoot = requiredString(
+      args.destinationRootCanonical,
+      "destinationRootCanonical",
+    );
+    if (!samePath(root, expectedRoot)) {
+      throw new WorkspaceManagerErrorV2(
+        "host_directory_binding_drift",
+        "The known host directory changed after approval.",
+      );
+    }
+    const destinationPath = assertWorkspaceRelativePathV2(
+      requiredString(args.destinationPath, "destinationPath"),
+      "destinationPath",
+    );
+    const destination = await inspectHostExportDestinationV2(
+      root,
+      destinationPath,
+    );
+    if (destination.exists) {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_destination_exists",
+        "The approved host export destination is no longer absent.",
+      );
+    }
+    if (!samePath(action.target.path ?? "", destination.absolutePath)) {
+      throw new WorkspaceManagerErrorV2(
+        "prepared_binding_drift",
+        "Prepared host export destination changed.",
+      );
+    }
+    const sourcePath = optionalString(args.sourcePath) ?? "";
+    const sourceSnapshot = await snapshotWorkspaceDirectoryV2(
+      this.manager,
+      workspaceId,
+      sourcePath,
+    );
+    if (
+      sourceSnapshot.fingerprint !==
+        requiredFingerprint(args.sourceFingerprint) ||
+      sourceSnapshot.bytes !== args.payloadBytes ||
+      sourceSnapshot.files !== args.sourceFiles ||
+      sourceSnapshot.directories !== args.sourceDirectories
+    ) {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_source_drift",
+        "Workspace export source changed after approval.",
+      );
+    }
+    const exported = await exportWorkspaceSnapshotToHostV2({
+      manager: this.manager,
+      workspaceId,
+      snapshot: sourceSnapshot,
+      root,
+      destinationPath,
+    });
+    if (exported.fingerprint !== sourceSnapshot.fingerprint) {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_readback_failed",
+        "Exported directory failed exact tree readback.",
+      );
+    }
+    const receipt = hostDirectoryExportReceiptV2({
+      action,
+      context,
+      destinationPath: exported.absolutePath,
+      snapshot: exported,
+      commitKind: "committed",
+    });
+    return {
+      output: {
+        status: "ok",
+        operation: "export_directory",
+        workspaceId,
+        sourcePath,
+        destinationRoot,
+        destinationPath: exported.absolutePath,
+        files: exported.files,
+        directories: exported.directories,
+        bytesWritten: exported.bytes,
+        fingerprint: exported.fingerprint,
+      },
+      receipt,
+      mutationState: "applied",
+    };
+  }
+
+  private async reconcileDirectoryExport(
+    action: PreparedActionV1,
+    context: ScopedExtensionContextV1,
+  ) {
+    const args = action.normalizedArgs;
+    const destinationRoot = requiredKnownHostDirectory(args.destinationRoot);
+    const root = await resolveSafeKnownHostRootV2(
+      await this.resolveKnownHostDirectory(destinationRoot, context),
+      destinationRoot,
+    );
+    if (
+      !samePath(
+        root,
+        requiredString(
+          args.destinationRootCanonical,
+          "destinationRootCanonical",
+        ),
+      )
+    ) {
+      return {
+        outcome: "still_uncertain" as const,
+        message: "Known host directory binding changed after preparation.",
+      };
+    }
+    const destinationPath = assertWorkspaceRelativePathV2(
+      requiredString(args.destinationPath, "destinationPath"),
+      "destinationPath",
+    );
+    const destination = await inspectHostExportDestinationV2(
+      root,
+      destinationPath,
+    );
+    if (!destination.exists) {
+      return {
+        outcome: "not_applied" as const,
+        message:
+          "The exact approved host export destination remains absent.",
+      };
+    }
+    try {
+      const snapshot = await snapshotAbsoluteHostDirectoryV2(
+        destination.absolutePath,
+      );
+      if (
+        snapshot.fingerprint !== requiredFingerprint(args.sourceFingerprint)
+      ) {
+        return {
+          outcome: "still_uncertain" as const,
+          message:
+            "The host export destination exists but its exact tree differs from the approved source.",
+        };
+      }
+      return {
+        outcome: "committed" as const,
+        message:
+          "The host export was reconciled by exact destination tree readback.",
+        receipt: hostDirectoryExportReceiptV2({
+          action,
+          context: reconcileContext(context, action),
+          destinationPath: destination.absolutePath,
+          snapshot,
+          commitKind: "reconciled",
+        }),
+      };
+    } catch {
+      return {
+        outcome: "still_uncertain" as const,
+        message:
+          "The host export destination exists but could not be verified safely.",
+      };
+    }
   }
 
   private async prepareScratchCreate(
@@ -1194,12 +1522,19 @@ function toolDescriptor(
       : destructive ? "trash"
         : name.includes("move") ? "move"
           : name.includes("append") ? "append"
-            : name.includes("create") || name.includes("mkdir") || name.includes("copy") ? "create"
+            : name.includes("create") || name.includes("mkdir") || name.includes("copy") || name === "code_workspace_export_directory" ? "create"
               : "update";
   return {
     version: 1,
     name,
-    capability: { system: "workspace", resourceType: "code_workspace", action },
+    capability: {
+      system: "workspace",
+      resourceType:
+        name === "code_workspace_export_directory"
+          ? "host_directory"
+          : "code_workspace",
+      action,
+    },
     effect: read ? "read" : destructive ? "destructive_mutation" : "reversible_mutation",
     risk: read ? "low" : destructive ? "high" : "medium",
     approval: {
@@ -1227,19 +1562,22 @@ function preparedAction(input: {
   targetSystem?: "workspace" | "git";
   targetType?: string;
   previewDestination?: string;
+  targetOverride?: PreparedActionV1["target"];
   relatedResources?: PreparedActionV1["relatedResources"];
   requiredConfirmations?: 1 | 2;
   warnings?: string[];
   repositoryProfileId?: string;
 }): PreparedActionV1 {
   const preparedAt = input.context.now();
-  const target = workspaceResource(
-    input.workspaceId,
-    input.targetPath,
-    "code_workspace",
-    "workspace",
-    input.repositoryProfileId,
-  );
+  const target =
+    input.targetOverride ??
+    workspaceResource(
+      input.workspaceId,
+      input.targetPath,
+      "code_workspace",
+      "workspace",
+      input.repositoryProfileId,
+    );
   const preview = {
     summary: input.summary,
     destination: input.previewDestination ?? input.targetPath,
@@ -1619,6 +1957,20 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
     }, ["path"]),
     oneOf: [{ required: ["content"] }, { required: ["notebook"] }],
   };
+  if (name === "code_workspace_export_directory") {
+    return objectSchema(
+      {
+        workspaceId: stringSchema(),
+        sourcePath: stringSchema(),
+        destinationRoot: {
+          type: "string",
+          enum: ["desktop", "documents", "downloads"],
+        },
+        destinationPath: stringSchema(),
+      },
+      ["destinationRoot", "destinationPath"],
+    );
+  }
   if (name === "code_workspace_append") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content", "expectedSha256"]);
   if (name === "code_workspace_write_expected" || name === "write_workspace_file") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), content: stringSchema(), expectedSha256: stringSchema() }, ["path", "content"]);
   if (name === "code_workspace_patch") return objectSchema({ workspaceId: stringSchema(), path: stringSchema(), expectedSha256: stringSchema(), replacements: { type: "array", items: objectSchema({ oldText: stringSchema(), newText: stringSchema(), expectedOccurrences: { type: "integer", enum: [1] } }, ["oldText", "newText"]) } }, ["path", "replacements"]);
@@ -1650,19 +2002,24 @@ function jupyterNotebookInputSchema(): JsonSchemaObjectV1 {
 }
 
 function description(name: string): string {
-  const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace.`;
+  const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace. This workspace is a real directory on the user's local filesystem. Finished workspace trees can be exported to Desktop, Documents, or Downloads with code_workspace_export_directory.`;
   let text = base;
   if (name === "code_workspace_create") {
-    text = `${base} Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
+    text = `${base} This is the bootstrap step, not the final deliverable. After it succeeds, code_workspace_mkdir and code_workspace_create_file become available. Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
+  } else if (name === "code_workspace_mkdir") {
+    text = `Purpose: Create a nested directory path inside the bounded code workspace. Required: path. Side effects: bound write. ${base} Every missing parent directory is created safely; an existing directory is accepted, but a file conflict is rejected.`;
+  } else if (name === "code_workspace_export_directory") {
+    text = `Purpose: Copy a completed workspace directory tree to a user-requested known host folder. Use when: the foreground mission explicitly names Desktop, Documents, or Downloads. Required: destinationRoot plus a safe nested destinationPath; sourcePath is optional and defaults to the workspace root. Side effects: exact approval-gated host write. ${base} The destination must be absent and every parent and file is verified. It never overwrites an existing file or directory.`;
   } else if (name === "code_workspace_create_file") {
-    text = `Purpose: Create a new file in the sandbox code workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast. Side effects: bound write. ${base} Use this only for an absent path; it never overwrites. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+    text = `Purpose: Create a new file in the real local filesystem workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write. ${base} Use this only for an absent path; it never overwrites. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+    text += " Missing parent directories are created automatically, so paths such as src/game/ui/checkers.py are valid in one call.";
   } else if (name === "code_workspace_patch") {
     text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
   } else if (
     name === "code_workspace_write_expected" ||
     name === "write_workspace_file"
   ) {
-    text = `Purpose: Hash-bound full-file correction in the workspace. Use when: repairing after code_workspace_read with expectedSha256. Do not use when: first create (use code_workspace_create_file) or inventing a patch tool. Required: path, content, expectedSha256. Next: validate/repair. Side effects: bound write. ${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+    text = `Purpose: Hash-bound full-file correction in the real local filesystem workspace. Use when: repairing after code_workspace_read with expectedSha256. Do not use when: first create (use code_workspace_create_file) or inventing a patch tool. Required: path, content, expectedSha256. Next: validate/repair, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write. ${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
   }
   return text;
 }
@@ -1732,6 +2089,524 @@ function resolveCreateFileContentV1(
     }
   }
   return { content: requiredString(args.content, "content", true) };
+}
+
+export async function resolveKnownHostDirectoryV2(
+  directory: KnownHostDirectoryV2,
+): Promise<string> {
+  const userHome = homedir();
+  const oneDrive = process.env.OneDrive?.trim();
+  const candidates =
+    directory === "desktop"
+      ? [
+          ...(oneDrive ? [path.join(oneDrive, "Desktop")] : []),
+          path.join(userHome, "Desktop"),
+        ]
+      : directory === "documents"
+        ? [
+            ...(oneDrive ? [path.join(oneDrive, "Documents")] : []),
+            path.join(userHome, "Documents"),
+          ]
+        : [path.join(userHome, "Downloads")];
+  for (const candidate of candidates) {
+    const stat = await fs.lstat(candidate).catch(() => null);
+    if (stat?.isDirectory() && !stat.isSymbolicLink()) {
+      return fs.realpath(candidate);
+    }
+  }
+  throw new WorkspaceManagerErrorV2(
+    "known_host_directory_unavailable",
+    `The local ${directory} directory could not be resolved safely.`,
+  );
+}
+
+function requiredKnownHostDirectory(value: unknown): KnownHostDirectoryV2 {
+  if (
+    value !== "desktop" &&
+    value !== "documents" &&
+    value !== "downloads"
+  ) {
+    throw new WorkspaceManagerErrorV2(
+      "invalid_arguments",
+      "destinationRoot must be desktop, documents, or downloads.",
+    );
+  }
+  return value;
+}
+
+function foregroundMissionNamesKnownHostDirectory(
+  directory: KnownHostDirectoryV2,
+  context: ScopedExtensionContextV1,
+): boolean {
+  const prompt = context.originalPrompt ?? "";
+  const pattern =
+    directory === "desktop"
+      ? /\bdesktop\b/iu
+      : directory === "documents"
+        ? /\bdocuments?(?:\s+folder)?\b/iu
+        : /\bdownloads?(?:\s+folder)?\b/iu;
+  return Boolean(
+    context.missionId &&
+      /^run-/u.test(context.missionId) &&
+      pattern.test(prompt),
+  );
+}
+
+async function resolveSafeKnownHostRootV2(
+  rawRoot: string,
+  directory: KnownHostDirectoryV2,
+): Promise<string> {
+  if (!path.isAbsolute(rawRoot)) {
+    throw new WorkspaceManagerErrorV2(
+      "known_host_directory_invalid",
+      `Resolved ${directory} directory must be absolute.`,
+    );
+  }
+  const resolved = path.resolve(rawRoot);
+  if (samePath(resolved, path.parse(resolved).root)) {
+    throw new WorkspaceManagerErrorV2(
+      "known_host_directory_invalid",
+      `Resolved ${directory} directory cannot be a filesystem root.`,
+    );
+  }
+  const stat = await fs.lstat(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new WorkspaceManagerErrorV2(
+      "known_host_directory_invalid",
+      `Resolved ${directory} path is not a safe directory.`,
+    );
+  }
+  const canonical = await fs.realpath(resolved);
+  if (!samePath(canonical, resolved)) {
+    throw new WorkspaceManagerErrorV2(
+      "known_host_directory_invalid",
+      `Resolved ${directory} directory changed during canonical readback.`,
+    );
+  }
+  return canonical;
+}
+
+async function snapshotWorkspaceDirectoryV2(
+  manager: WorkspaceManagerV2,
+  workspaceId: string,
+  sourcePath: string,
+): Promise<WorkspaceDirectoryExportSnapshotV2> {
+  if (sourcePath) {
+    const stat = await manager.stat(workspaceId, sourcePath);
+    if (stat.kind !== "directory") {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_source_not_directory",
+        "Directory export sourcePath must identify a workspace directory.",
+      );
+    }
+  }
+  const entries: WorkspaceDirectoryExportEntryV2[] = [];
+  const queue = [sourcePath];
+  let bytes = 0;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const children = await manager.list(workspaceId, current);
+    for (const child of children) {
+      const relative = sourcePath
+        ? child.path.slice(sourcePath.length + 1)
+        : child.path;
+      if (!relative) continue;
+      const entry: WorkspaceDirectoryExportEntryV2 = {
+        path: relative,
+        kind: child.kind,
+        bytes: child.bytes,
+        sha256: child.sha256,
+      };
+      entries.push(entry);
+      if (entry.kind === "directory") {
+        queue.push(child.path);
+      } else {
+        bytes += entry.bytes;
+      }
+      assertHostExportBudgetV2(entries.length, bytes);
+    }
+  }
+  entries.sort(compareExportEntriesV2);
+  return buildDirectoryExportSnapshotV2(sourcePath, entries);
+}
+
+function buildDirectoryExportSnapshotV2(
+  sourcePath: string,
+  entries: WorkspaceDirectoryExportEntryV2[],
+): WorkspaceDirectoryExportSnapshotV2 {
+  const files = entries.filter((entry) => entry.kind === "file").length;
+  const directories = entries.length - files;
+  const bytes = entries.reduce(
+    (total, entry) => total + (entry.kind === "file" ? entry.bytes : 0),
+    0,
+  );
+  assertHostExportBudgetV2(entries.length, bytes);
+  return {
+    sourcePath,
+    entries,
+    files,
+    directories,
+    bytes,
+    fingerprint: sha256Json(entries),
+  };
+}
+
+function assertHostExportBudgetV2(entries: number, bytes: number): void {
+  if (entries > HOST_EXPORT_MAX_ENTRIES_V2) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_entry_budget_exceeded",
+      `Directory export exceeds ${HOST_EXPORT_MAX_ENTRIES_V2} entries.`,
+    );
+  }
+  if (bytes > HOST_EXPORT_MAX_BYTES_V2) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_byte_budget_exceeded",
+      "Directory export exceeds 10 MiB.",
+    );
+  }
+}
+
+function compareExportEntriesV2(
+  left: WorkspaceDirectoryExportEntryV2,
+  right: WorkspaceDirectoryExportEntryV2,
+): number {
+  return left.path.localeCompare(right.path);
+}
+
+async function inspectHostExportDestinationV2(
+  root: string,
+  relativePath: string,
+): Promise<{ absolutePath: string; exists: boolean }> {
+  const normalized = assertWorkspaceRelativePathV2(
+    relativePath,
+    "destinationPath",
+  );
+  const absolutePath = path.resolve(root, ...normalized.split("/"));
+  if (!insideHostRootV2(root, absolutePath)) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_path_escape",
+      "Host export destination escaped its known directory root.",
+    );
+  }
+  let cursor = root;
+  let exists = true;
+  const parts = normalized.split("/");
+  for (let index = 0; index < parts.length; index += 1) {
+    cursor = path.join(cursor, parts[index]!);
+    const stat = await fs.lstat(cursor).catch((error) =>
+      isMissingFsErrorV2(error) ? null : Promise.reject(error),
+    );
+    if (!stat) {
+      exists = false;
+      break;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_reparse_path",
+        "Host export paths cannot traverse symlinks, junctions, or reparse points.",
+      );
+    }
+    const canonical = await fs.realpath(cursor);
+    if (!insideHostRootV2(root, canonical)) {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_path_escape",
+        "Host export path resolved outside its known directory root.",
+      );
+    }
+    if (index < parts.length - 1 && !stat.isDirectory()) {
+      throw new WorkspaceManagerErrorV2(
+        "host_export_parent_conflict",
+        "Host export destination has a non-directory parent.",
+      );
+    }
+  }
+  return { absolutePath, exists };
+}
+
+async function exportWorkspaceSnapshotToHostV2(input: {
+  manager: WorkspaceManagerV2;
+  workspaceId: string;
+  snapshot: WorkspaceDirectoryExportSnapshotV2;
+  root: string;
+  destinationPath: string;
+}): Promise<WorkspaceDirectoryExportSnapshotV2 & { absolutePath: string }> {
+  const destination = await inspectHostExportDestinationV2(
+    input.root,
+    input.destinationPath,
+  );
+  if (destination.exists) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_destination_exists",
+      "Host export destination already exists.",
+    );
+  }
+  const createdFiles: string[] = [];
+  const createdDirectories: string[] = [];
+  try {
+    const destinationParts = input.destinationPath.split("/");
+    let cursor = input.root;
+    for (const part of destinationParts.slice(0, -1)) {
+      cursor = path.join(cursor, part);
+      const stat = await fs.lstat(cursor).catch((error) =>
+        isMissingFsErrorV2(error) ? null : Promise.reject(error),
+      );
+      if (stat) {
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+          throw new WorkspaceManagerErrorV2(
+            "host_export_parent_conflict",
+            "Host export parent is not a safe directory.",
+          );
+        }
+        await assertSafeHostExportDirectoryV2(input.root, cursor);
+        continue;
+      }
+      await fs.mkdir(cursor, { recursive: false });
+      createdDirectories.push(cursor);
+      await assertSafeHostExportDirectoryV2(input.root, cursor);
+    }
+    await fs.mkdir(destination.absolutePath, { recursive: false });
+    createdDirectories.push(destination.absolutePath);
+    await assertSafeHostExportDirectoryV2(
+      input.root,
+      destination.absolutePath,
+    );
+
+    for (const entry of input.snapshot.entries.filter(
+      (item) => item.kind === "directory",
+    )) {
+      const absolute = path.join(
+        destination.absolutePath,
+        ...entry.path.split("/"),
+      );
+      await assertSafeHostExportDirectoryV2(input.root, path.dirname(absolute));
+      await fs.mkdir(absolute, { recursive: false });
+      createdDirectories.push(absolute);
+      await assertSafeHostExportDirectoryV2(input.root, absolute);
+    }
+    for (const entry of input.snapshot.entries.filter(
+      (item) => item.kind === "file",
+    )) {
+      const sourceWorkspacePath = input.snapshot.sourcePath
+        ? `${input.snapshot.sourcePath}/${entry.path}`
+        : entry.path;
+      const source = await input.manager.read(
+        input.workspaceId,
+        sourceWorkspacePath,
+      );
+      if (source.sha256 !== entry.sha256 || source.bytes !== entry.bytes) {
+        throw new WorkspaceManagerErrorV2(
+          "host_export_source_drift",
+          `Workspace source ${sourceWorkspacePath} changed during export.`,
+        );
+      }
+      const absolute = path.join(
+        destination.absolutePath,
+        ...entry.path.split("/"),
+      );
+      await assertSafeHostExportDirectoryV2(input.root, path.dirname(absolute));
+      await fs.writeFile(absolute, source.content, {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      createdFiles.push(absolute);
+    }
+    const readback = await snapshotAbsoluteHostDirectoryV2(
+      destination.absolutePath,
+    );
+    return { ...readback, absolutePath: destination.absolutePath };
+  } catch (error) {
+    for (const file of [...createdFiles].reverse()) {
+      await fs.unlink(file).catch(() => undefined);
+    }
+    for (const directory of [...createdDirectories].reverse()) {
+      await fs.rmdir(directory).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+async function snapshotAbsoluteHostDirectoryV2(
+  absoluteRoot: string,
+): Promise<WorkspaceDirectoryExportSnapshotV2> {
+  const rootStat = await fs.lstat(absoluteRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_readback_failed",
+      "Export destination is not a safe directory.",
+    );
+  }
+  const canonicalRoot = await fs.realpath(absoluteRoot);
+  if (!samePath(canonicalRoot, absoluteRoot)) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_readback_failed",
+      "Export destination canonical path changed.",
+    );
+  }
+  const entries: WorkspaceDirectoryExportEntryV2[] = [];
+  const queue: Array<{ absolute: string; relative: string }> = [
+    { absolute: canonicalRoot, relative: "" },
+  ];
+  let bytes = 0;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const children = await fs.readdir(current.absolute, {
+      withFileTypes: true,
+    });
+    for (const child of children.sort((left, right) =>
+      left.name.localeCompare(right.name),
+    )) {
+      const relative = current.relative
+        ? `${current.relative}/${child.name}`
+        : child.name;
+      const absolute = path.join(current.absolute, child.name);
+      const stat = await fs.lstat(absolute);
+      if (stat.isSymbolicLink()) {
+        throw new WorkspaceManagerErrorV2(
+          "host_export_reparse_path",
+          "Export readback rejects symlinks, junctions, and reparse points.",
+        );
+      }
+      if (stat.isDirectory()) {
+        entries.push({
+          path: relative,
+          kind: "directory",
+          bytes: 0,
+          sha256: null,
+        });
+        queue.push({ absolute, relative });
+      } else if (stat.isFile() && stat.nlink === 1) {
+        const content = await fs.readFile(absolute);
+        bytes += content.byteLength;
+        entries.push({
+          path: relative,
+          kind: "file",
+          bytes: content.byteLength,
+          sha256: sha256BufferV2(content),
+        });
+      } else {
+        throw new WorkspaceManagerErrorV2(
+          "host_export_unsupported_entry",
+          `Export readback rejected unsupported entry ${relative}.`,
+        );
+      }
+      assertHostExportBudgetV2(entries.length, bytes);
+    }
+  }
+  entries.sort(compareExportEntriesV2);
+  return buildDirectoryExportSnapshotV2("", entries);
+}
+
+function hostDirectoryExportReceiptV2(input: {
+  action: PreparedActionV1;
+  context: ScopedExtensionContextV1;
+  destinationPath: string;
+  snapshot: WorkspaceDirectoryExportSnapshotV2;
+  commitKind: "committed" | "reconciled";
+}): ActionReceiptV1 {
+  const committedAt = input.context.now().toISOString();
+  return {
+    version: 1,
+    id: `host-directory-export-${input.action.id}`,
+    runId: input.action.runId,
+    actionId: input.action.id,
+    toolName: input.action.toolName,
+    operation: "create",
+    resource: {
+      ...input.action.target,
+      path: input.destinationPath,
+      revision: input.snapshot.fingerprint,
+    },
+    relatedResources: input.action.relatedResources,
+    message:
+      `Exported ${input.snapshot.files} file(s) and ${input.snapshot.directories} ` +
+      `director${input.snapshot.directories === 1 ? "y" : "ies"} to ${input.destinationPath}.`,
+    payloadFingerprint: input.action.payloadFingerprint,
+    grantId: input.context.authorizedAction!.grantId,
+    idempotencyKey: input.action.idempotencyKey,
+    startedAt: input.action.preparedAt,
+    committedAt,
+    commitKind: input.commitKind,
+    readback: {
+      status: "verified",
+      checkedAt: committedAt,
+      observedRevision: input.snapshot.fingerprint,
+      observedFingerprint: input.snapshot.fingerprint,
+    },
+    effects: {
+      bytesWritten: input.snapshot.bytes,
+      affectedCount:
+        input.snapshot.files + input.snapshot.directories + 1,
+      changedFields: input.snapshot.entries
+        .slice(0, 100)
+        .map((entry) => entry.path),
+    },
+  };
+}
+
+function hostExportAbsentFingerprintV2(
+  destinationRoot: KnownHostDirectoryV2,
+  destinationPath: string,
+  canonicalRoot: string,
+): string {
+  return sha256Json({
+    destinationRoot,
+    destinationPath,
+    canonicalRoot,
+    state: "absent",
+  });
+}
+
+function insideHostRootV2(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+async function assertSafeHostExportDirectoryV2(
+  root: string,
+  candidate: string,
+): Promise<void> {
+  const resolved = path.resolve(candidate);
+  if (!samePath(root, resolved) && !insideHostRootV2(root, resolved)) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_path_escape",
+      "Host export directory escaped its known directory root.",
+    );
+  }
+  const stat = await fs.lstat(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_reparse_path",
+      "Host export paths cannot traverse symlinks, junctions, or reparse points.",
+    );
+  }
+  const canonical = await fs.realpath(resolved);
+  if (
+    !samePath(canonical, resolved) ||
+    (!samePath(root, canonical) && !insideHostRootV2(root, canonical))
+  ) {
+    throw new WorkspaceManagerErrorV2(
+      "host_export_path_escape",
+      "Host export directory changed during canonical readback.",
+    );
+  }
+}
+
+function isMissingFsErrorV2(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
+}
+
+function sha256BufferV2(value: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function workspaceIdFrom(args: Record<string, unknown>, context: ScopedExtensionContextV1): string { return (optionalString(args.workspaceId) ?? context.rootMissionId ?? context.missionId ?? context.operationId ?? "adhoc").toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 128) || "adhoc"; }

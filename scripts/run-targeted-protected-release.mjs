@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { acquireE2eLock } from "./run-e2e-exclusive.mjs";
+import { assertMissionScorecardSummaryFile } from "./mission-scorecard-regression.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const playwrightCli = path.join(
@@ -145,6 +146,10 @@ async function main() {
           [playwrightCli, "test", ...buildPlaywrightArgs(definition)],
           buildLaneEnvironment(lane, definition, options.sha),
         );
+        await assertMissionScorecardSummaryFile({
+          summaryPath,
+          selectedProjects: definition.projects,
+        });
       } catch (error) {
         runError = error;
       } finally {
@@ -734,9 +739,48 @@ export function projectDailyUseSummaryForPublicProof(payload) {
         record.status === "passed" && record.scenarioId
           ? "pass"
           : "needs_more_work",
+      missionScorecard: projectPublicMissionScorecard(
+        record.missionScorecard,
+      ),
       fingerprint: requiredPublicFingerprint(record.fingerprint),
     })),
   };
+}
+
+function projectPublicMissionScorecard(value) {
+  if (value === null || value === undefined) return null;
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value.version !== 1 ||
+    typeof value.acceptancePassed !== "boolean" ||
+    !Array.isArray(value.dimensions) ||
+    value.dimensions.length !== 6
+  ) {
+    throw new Error("Daily-use proof contains an invalid mission scorecard.");
+  }
+  return {
+    version: 1,
+    acceptancePassed: value.acceptancePassed,
+    total: boundedPublicScore(value.total),
+    dimensions: value.dimensions.map((dimension) => ({
+      id: boundedPublicToken(dimension.id, 80),
+      score: boundedPublicScore(dimension.score),
+      weight: boundedPublicScore(dimension.weight),
+    })),
+  };
+}
+
+function boundedPublicScore(value) {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < 0 ||
+    value > 1
+  ) {
+    throw new Error("Daily-use proof contains an invalid bounded score.");
+  }
+  return value;
 }
 
 function boundedPublicString(value, maxLength) {

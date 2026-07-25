@@ -108,7 +108,7 @@ test("spawn Git runner bounds runtime and supports cancellation", async () => {
   );
 });
 
-test("ephemeral askpass uses one authenticated loopback request and removes all helper files", async () => {
+test("ephemeral askpass supports the bounded multi-command publication sequence and removes all helper files", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "secure-git-push-test-"));
   try {
     const secretStore = new InMemorySecretStoreV1({
@@ -170,23 +170,27 @@ test("ephemeral askpass uses one authenticated loopback request and removes all 
           AGENTIC_RESEARCHER_ASKPASS_HANDLE: handle.id,
         };
         assert.doesNotMatch(JSON.stringify(environment), new RegExp(TOKEN, "u"));
-        const commandResult = await runner.run({
+        const firstCommandResult = await runner.run({
           cwd: process.cwd(),
           args: ["-e", DIRECT_ASKPASS_CLIENT.replace(/\r?\n/gu, "")],
           environment,
           inheritEnvironment: false,
         });
-        assert.equal(commandResult.exitCode, 0);
-        assert.doesNotMatch(commandResult.stdout, new RegExp(TOKEN, "u"));
-        assert.match(commandResult.stdout, /\[REDACTED\]/u);
-
-        const secondPassword = await invokeHelper(
-          handle.executablePath,
-          "Password for 'https://x-access-token@github.com':",
-        );
-        assert.notEqual(secondPassword.exitCode, 0);
-        assert.doesNotMatch(JSON.stringify(secondPassword), new RegExp(TOKEN, "u"));
-        return { status: "verified", log: commandResult.stdout } as const;
+        const secondCommandResult = await runner.run({
+          cwd: process.cwd(),
+          args: ["-e", DIRECT_ASKPASS_CLIENT.replace(/\r?\n/gu, "")],
+          environment,
+          inheritEnvironment: false,
+        });
+        for (const commandResult of [firstCommandResult, secondCommandResult]) {
+          assert.equal(commandResult.exitCode, 0);
+          assert.doesNotMatch(commandResult.stdout, new RegExp(TOKEN, "u"));
+          assert.match(commandResult.stdout, /\[REDACTED\]/u);
+        }
+        return {
+          status: "verified",
+          log: `${firstCommandResult.stdout}${secondCommandResult.stdout}`,
+        } as const;
       },
     });
     assert.equal(result.status, "verified");
@@ -242,6 +246,80 @@ test("ephemeral askpass rejects token-shaped leakage from arguments and errors",
   }
 });
 
+test("the generated askpass wrapper passes hostile prompt text to the client verbatim", async () => {
+  // git invokes GIT_ASKPASS via the platform shell, so the .cmd/.sh WRAPPER —
+  // not the .cjs client the other tests exercise — is what runs in production.
+  // This is the only coverage of escapeCmdQuoted and the Windows %~1 path.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "secure-git-push-wrapper-test-"));
+  try {
+    const secretStore = new InMemorySecretStoreV1({ randomBytes: deterministicBytes });
+    const credential = await secretStore.put({ value: TOKEN, label: "GitHub token" });
+    const broker = new LoopbackEphemeralGitAskpassBrokerV1({
+      secretStore,
+      tempRoot: root,
+      randomBytes: deterministicBytes,
+      nodeExecutable: process.execPath,
+      lifetimeMs: 10_000,
+    });
+    await broker.withHandle({
+      credentialReferenceId: credential.referenceId,
+      repositoryBindingFingerprint: BINDING_FINGERPRINT,
+      use: async (handle) => {
+        // The canonical git password prompt: spaces, single quotes, '@', ':'.
+        // A wrapper that mangles argument quoting truncates it at the first
+        // space and the server-side prompt validation rejects it.
+        const passwordPrompt = "Password for 'https://x-access-token@github.com':";
+        const password = await invokeWrapper(handle.executablePath, passwordPrompt);
+        assert.equal(password.exitCode, 0, JSON.stringify({ ...password, stdout: "[hidden]" }));
+        assert.equal(password.stdout.trim(), TOKEN);
+
+        const usernamePrompt = "Username for 'https://github.com':";
+        const username = await invokeWrapper(handle.executablePath, usernamePrompt);
+        assert.equal(username.exitCode, 0, JSON.stringify(username));
+        assert.equal(username.stdout.trim(), "x-access-token");
+        return { status: "verified" } as const;
+      },
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the askpass endpoint refuses the ninth password request", async () => {
+  // MAX_ASKPASS_PASSWORD_REQUESTS = 8 bounds one handle's credential reads
+  // across preflight, push, and readback. Only 2 were exercised before.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "secure-git-push-limit-test-"));
+  try {
+    const secretStore = new InMemorySecretStoreV1({ randomBytes: deterministicBytes });
+    const credential = await secretStore.put({ value: TOKEN, label: "GitHub token" });
+    const broker = new LoopbackEphemeralGitAskpassBrokerV1({
+      secretStore,
+      tempRoot: root,
+      randomBytes: deterministicBytes,
+      nodeExecutable: process.execPath,
+      lifetimeMs: 15_000,
+    });
+    await broker.withHandle({
+      credentialReferenceId: credential.referenceId,
+      repositoryBindingFingerprint: BINDING_FINGERPRINT,
+      use: async (handle) => {
+        const passwordPrompt = "Password for 'https://x-access-token@github.com':";
+        for (let request = 1; request <= 8; request += 1) {
+          const result = await invokeHelper(handle.executablePath, passwordPrompt);
+          assert.equal(result.exitCode, 0, `request ${request}: ${result.stderr}`);
+          assert.equal(result.stdout.trim(), TOKEN, `request ${request}`);
+        }
+        const ninth = await invokeHelper(handle.executablePath, passwordPrompt);
+        assert.notEqual(ninth.exitCode, 0, "the ninth password request must be refused");
+        assert.doesNotMatch(ninth.stdout, new RegExp(TOKEN, "u"));
+        return { status: "verified" } as const;
+      },
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("in-memory Git push attempt store provides compare-and-swap semantics and clones records", async () => {
   const store = new InMemoryGitPushAttemptStoreV1();
   const first = attemptRecord(0, "dispatching");
@@ -286,6 +364,40 @@ async function invokeHelper(
       windowsHide: true,
       env: cleanHelperEnvironment(),
     });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
+  });
+}
+
+/**
+ * Execute the generated askpass WRAPPER (.cmd via cmd.exe, .sh via its
+ * shebang) with one prompt argument — the exact contract git uses for
+ * GIT_ASKPASS — instead of shortcutting to the .cjs client.
+ */
+async function invokeWrapper(
+  helperPath: string,
+  prompt: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = process.platform === "win32"
+      ? spawn(
+          process.env.ComSpec ?? "cmd.exe",
+          ["/d", "/s", "/c", `""${helperPath}" "${prompt}""`],
+          {
+            shell: false,
+            windowsHide: true,
+            windowsVerbatimArguments: true,
+            env: cleanHelperEnvironment(),
+          },
+        )
+      : spawn(helperPath, [prompt], {
+          shell: false,
+          env: cleanHelperEnvironment(),
+        });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });

@@ -99,11 +99,13 @@ export async function classifyMissionWithModel({
   prompt,
   recentAssistant,
   timeoutMs = 10_000,
+  abortSignal,
 }: {
   client: ModelClient;
   prompt: string;
   recentAssistant?: string;
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
 }): Promise<RoutedMissionIntent | null> {
   return (
     await classifyMissionWithModelDetailed({
@@ -111,6 +113,7 @@ export async function classifyMissionWithModel({
       prompt,
       recentAssistant,
       timeoutMs,
+      abortSignal,
     })
   ).intent;
 }
@@ -132,13 +135,20 @@ export async function classifyMissionWithModelDetailed({
   prompt,
   recentAssistant,
   timeoutMs = 10_000,
+  abortSignal,
 }: {
   client: ModelClient;
   prompt: string;
   recentAssistant?: string;
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
 }): Promise<RouterModelClassificationResult> {
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(abortSignal?.reason);
+  abortSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (abortSignal?.aborted) {
+    abortFromCaller();
+  }
   let timedOut = false;
   const timeout = setTimeout(() => {
     timedOut = true;
@@ -213,6 +223,7 @@ export async function classifyMissionWithModelDetailed({
     };
   } finally {
     clearTimeout(timeout);
+    abortSignal?.removeEventListener("abort", abortFromCaller);
   }
 }
 

@@ -346,6 +346,75 @@ test("comment preparation inherits issue project scope for bounded authority", a
   }
 });
 
+test("comment creation verifies the exact observed comment and records its resource id", async () => {
+  const calls: string[] = [];
+  const state: { createdInput: Record<string, unknown> | null } = {
+    createdInput: null,
+  };
+  const scopedIssue = issueRecord({
+    id: "issue-finalization-1",
+    teamId: "team-finalization",
+    projectId: "project-finalization",
+  });
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      calls.push(key);
+      if (key === "issues.get") return scopedIssue;
+      if (key === "comments.get" && !state.createdInput) throw notFound(key);
+      if (key === "comments.create") {
+        state.createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "comment");
+      }
+      if (key === "comments.get" && state.createdInput) {
+        return {
+          ...commentRecord(),
+          id: String(state.createdInput.id),
+          body: String(state.createdInput.body),
+          issue: {
+            id: String(state.createdInput.issueId),
+            identifier: scopedIssue.identifier,
+          },
+          snapshotHash: HASH_B,
+        } satisfies LinearCommentRecord;
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_comment",
+      arguments: {
+        issueId: "PLAT-42",
+        body: "Verified GitHub publication lineage.",
+      },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-comment-finalization",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.receipt?.resource.resourceType, "comment");
+  assert.equal(result.receipt?.resource.id, String(state.createdInput?.id));
+  assert.equal((result.output as LinearCommentRecord).id, String(state.createdInput?.id));
+  assert.deepEqual(calls, [
+    "issues.get",
+    "comments.get",
+    "comments.get",
+    "issues.get",
+    "comments.create",
+    "comments.get",
+  ]);
+});
+
 test("prepared update refuses target drift before provider dispatch", async () => {
   let reads = 0;
   let mutations = 0;

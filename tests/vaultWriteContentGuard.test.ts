@@ -4,6 +4,7 @@ import {
   assertSafeCurrentNoteWritePayload,
   isVaultWriteProcessNarration,
   looksLikeProcessNarrationLead,
+  stripLeadingVaultWriteToolArtifact,
 } from "../src/agent/vaultWriteContentGuard";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "../src/agent/replaceIntent";
 
@@ -27,6 +28,29 @@ test("real essay body is not process narration", () => {
   ].join("\n");
   assert.equal(isVaultWriteProcessNarration(essay), false);
   assert.equal(looksLikeProcessNarrationLead(essay), false);
+});
+
+test("leading write-tool artifact is removed only before a real markdown title", () => {
+  const leaked = [
+    "replace_current_file",
+    "",
+    "# Essential Literary Works",
+    "",
+    "The corrected essay begins here.",
+  ].join("\n");
+  assert.equal(
+    stripLeadingVaultWriteToolArtifact(leaked),
+    "# Essential Literary Works\n\nThe corrected essay begins here.",
+  );
+  assert.equal(isVaultWriteProcessNarration(leaked), true);
+
+  const legitimate = [
+    "# Tool Registry Notes",
+    "",
+    "The `replace_current_file` tool requires explicit replacement intent.",
+  ].join("\n");
+  assert.equal(stripLeadingVaultWriteToolArtifact(legitimate), legitimate);
+  assert.equal(isVaultWriteProcessNarration(legitimate), false);
 });
 
 test("assertSafe rejects process narration on append", () => {

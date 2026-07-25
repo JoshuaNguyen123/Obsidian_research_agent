@@ -29,6 +29,8 @@ const SECRET_REFERENCE_PATTERN = /^(?:(?:secret|credential)_[A-Za-z0-9-]{8,128}|
 const SCOPE_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
 const FINE_GRAINED_PAT_PATTERN = /^github_pat_[A-Za-z0-9_-]{20,500}$/;
 const CLASSIC_OR_OAUTH_TOKEN_PATTERN = /^gh[pousr]_[A-Za-z0-9]{20,500}$/;
+const EMBEDDED_FINE_GRAINED_PAT_PATTERN = /github_pat_[A-Za-z0-9_-]{20,500}/u;
+const EMBEDDED_CLASSIC_OR_OAUTH_TOKEN_PATTERN = /gh[pousr]_[A-Za-z0-9]{20,500}/u;
 
 export type GitHubCredentialKindV1 = "oauth_device" | "fine_grained_pat";
 
@@ -43,7 +45,15 @@ export interface GitHubCredentialV1 {
   credentialKind: GitHubCredentialKindV1;
   tokenReferenceId: string;
   account: GitHubAuthenticatedIdentityV1;
-  scopes: string[];
+  /**
+   * Scopes GitHub actually reported for this credential, or `null` when they
+   * could not be verified. Fine-grained and imported classic PATs do not echo
+   * their permissions, so they are `null` — never a fabricated `[]`/`["repo"]`,
+   * which reads as a positive claim the code never checked. Device-flow tokens
+   * carry the scopes GitHub echoes. Push capability is proven at push time by
+   * the VerifiedGitPushGateway heal/retry loop, not asserted here.
+   */
+  scopes: string[] | null;
   issuedAt: string;
 }
 
@@ -185,7 +195,9 @@ export class GitHubAuthV1 {
       );
     }
     assertNotAborted(signal);
-    const normalizedScopes = normalizeScopes(scopes);
+    // Device-flow input is always a concrete array; null can only come from a
+    // null argument, which this signature does not accept.
+    const normalizedScopes = normalizeScopes(scopes) ?? [];
     const form = new URLSearchParams({ client_id: this.clientId });
     if (normalizedScopes.length > 0) {
       form.set("scope", normalizedScopes.join(" "));
@@ -367,7 +379,9 @@ export class GitHubAuthV1 {
         "A valid fine-grained GitHub personal access token is required.",
       );
     }
-    return this.commitCredential(token, "fine_grained_pat", [], signal);
+    // Fine-grained PATs do not expose their permissions through any response
+    // header; scopes are unverified (null) rather than a fabricated [].
+    return this.commitCredential(token, "fine_grained_pat", null, signal);
   }
 
   /**
@@ -388,10 +402,12 @@ export class GitHubAuthV1 {
     }
     const trimmed = token.trim();
     if (FINE_GRAINED_PAT_PATTERN.test(trimmed)) {
-      return this.commitCredential(trimmed, "fine_grained_pat", [], signal);
+      return this.commitCredential(trimmed, "fine_grained_pat", null, signal);
     }
     if (CLASSIC_OR_OAUTH_TOKEN_PATTERN.test(trimmed)) {
-      return this.commitCredential(trimmed, "oauth_device", ["repo"], signal);
+      // An imported classic/OAuth token echoes no scope header here, so its
+      // scopes are unverified (null) rather than a hardcoded ["repo"] claim.
+      return this.commitCredential(trimmed, "oauth_device", null, signal);
     }
     throw new GitHubAuthErrorV1(
       "github_auth_invalid_input",
@@ -514,7 +530,7 @@ export class GitHubAuthV1 {
   private async commitCredential(
     token: string,
     credentialKind: GitHubCredentialKindV1,
-    scopes: readonly string[],
+    scopes: readonly string[] | null,
     signal?: AbortSignal,
   ): Promise<GitHubCredentialV1> {
     let referenceId = "";
@@ -528,7 +544,7 @@ export class GitHubAuthV1 {
         metadata: {
           provider: "github",
           credentialKind,
-          ...(scopes.length > 0 ? { scope: scopes.join(" ") } : {}),
+          ...(scopes && scopes.length > 0 ? { scope: scopes.join(" ") } : {}),
         },
       });
       referenceId = requireSecretReference(description.referenceId);
@@ -545,14 +561,15 @@ export class GitHubAuthV1 {
     }
 
     let identity: GitHubAuthenticatedIdentityV1;
+    let observedScopes: string[] | null = null;
     try {
       assertNotAborted(signal);
       const lease = await this.secretStore.lease(referenceId, { ttlSeconds: 60 });
       try {
-        identity = normalizeIdentity(
-          await lease.withSecret((leasedToken) =>
-            this.validateIdentity(leasedToken, signal)),
-        );
+        const rawIdentity = await lease.withSecret((leasedToken) =>
+          this.validateIdentity(leasedToken, signal));
+        identity = normalizeIdentity(rawIdentity);
+        observedScopes = extractObservedOAuthScopes(rawIdentity);
       } finally {
         lease.dispose();
       }
@@ -570,7 +587,10 @@ export class GitHubAuthV1 {
       credentialKind,
       tokenReferenceId: referenceId,
       account: identity,
-      scopes: normalizeScopes(scopes),
+      // Caller-declared scopes (device flow echoes them from GitHub) win;
+      // otherwise adopt what the identity probe actually observed in the
+      // x-oauth-scopes header; otherwise remain unverified (null).
+      scopes: scopes !== null ? normalizeScopes(scopes) : observedScopes,
       issuedAt: this.nowIso(),
     });
   }
@@ -747,8 +767,8 @@ export class GitHubAuthV1 {
 
 function containsOpaqueGitHubSecretMaterial(value: string): boolean {
   return (
-    FINE_GRAINED_PAT_PATTERN.test(value) ||
-    CLASSIC_OR_OAUTH_TOKEN_PATTERN.test(value) ||
+    EMBEDDED_FINE_GRAINED_PAT_PATTERN.test(value) ||
+    EMBEDDED_CLASSIC_OR_OAUTH_TOKEN_PATTERN.test(value) ||
     /Bearer\s+\S+/iu.test(value) ||
     /https:\/\/[^/\s]+@github\.com/iu.test(value)
   );
@@ -756,8 +776,11 @@ function containsOpaqueGitHubSecretMaterial(value: string): boolean {
 
 function redactLeasedCredentialDiagnostic(value: string): string {
   return value
-    .replace(FINE_GRAINED_PAT_PATTERN, "github_pat_[REDACTED]")
-    .replace(CLASSIC_OR_OAUTH_TOKEN_PATTERN, "gh_[REDACTED]")
+    .replace(
+      /github_pat_[A-Za-z0-9_-]{20,500}/gu,
+      "github_pat_[REDACTED]",
+    )
+    .replace(/gh[pousr]_[A-Za-z0-9]{20,500}/gu, "gh_[REDACTED]")
     .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
     .replace(/https:\/\/[^/\s]+@github\.com/giu, "https://[REDACTED]@github.com")
     .slice(0, 1_000);
@@ -777,7 +800,9 @@ export function parseGitHubCredentialV1(value: unknown): GitHubCredentialV1 {
   }
   const tokenReferenceId = requireSecretReference(record.tokenReferenceId);
   const account = normalizeIdentity(record.account);
-  const scopes = normalizeScopes(Array.isArray(record.scopes) ? record.scopes : []);
+  // Legacy persisted arrays parse verbatim; anything else (null, missing, or
+  // malformed) is treated as unverified rather than fabricated.
+  const scopes = Array.isArray(record.scopes) ? normalizeScopes(record.scopes) : null;
   const issuedAt = requireIso(record.issuedAt, "GitHub credential issuedAt");
   return freezeCredential({
     version: 1,
@@ -810,7 +835,9 @@ function freezeCredential(value: GitHubCredentialV1): GitHubCredentialV1 {
   return Object.freeze({
     ...value,
     account: Object.freeze({ ...value.account }),
-    scopes: Object.freeze([...value.scopes]) as unknown as string[],
+    scopes: value.scopes === null
+      ? null
+      : (Object.freeze([...value.scopes]) as unknown as string[]),
   });
 }
 
@@ -839,7 +866,26 @@ function normalizeIdentity(value: unknown): GitHubAuthenticatedIdentityV1 {
   return Object.freeze({ id: Number(record.id), login: record.login });
 }
 
-function normalizeScopes(value: readonly unknown[]): string[] {
+/**
+ * Scopes the identity probe observed in GitHub's x-oauth-scopes response
+ * header, when the injected validateIdentity implementation surfaces them
+ * (see GitHubRestClient.getAuthenticatedUserWithOAuthScopes). Absent, empty,
+ * or malformed data is unverified (null) — never coerced into a claim.
+ */
+function extractObservedOAuthScopes(value: unknown): string[] | null {
+  if (typeof value !== "object" || value === null) return null;
+  const raw = (value as Record<string, unknown>).oauthScopes;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  try {
+    return normalizeScopes(raw);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeScopes(value: readonly unknown[] | null): string[] | null {
+  // null means "scopes were not verified" and is preserved verbatim.
+  if (value === null) return null;
   if (value.length > MAX_SCOPES) invalidInput("Too many GitHub OAuth scopes were requested.");
   const scopes: string[] = [];
   for (const entry of value) {
@@ -855,11 +901,13 @@ function normalizeScopes(value: readonly unknown[]): string[] {
 }
 
 function normalizeProviderScope(value: unknown, fallback: readonly string[]): string[] {
-  if (value === undefined || value === null || value === "") return normalizeScopes(fallback);
+  // Device-flow scopes are always concrete arrays; normalizeScopes only returns
+  // null for a null input, which cannot happen here.
+  if (value === undefined || value === null || value === "") return normalizeScopes(fallback) ?? [];
   if (typeof value !== "string" || value.length > MAX_SCOPES * MAX_SCOPE_BYTES) {
     invalidResponse("GitHub returned invalid OAuth scope metadata.");
   }
-  return normalizeScopes(value.split(/[\s,]+/).filter(Boolean));
+  return normalizeScopes(value.split(/[\s,]+/).filter(Boolean)) ?? [];
 }
 
 function normalizeVerificationUri(value: unknown): string {

@@ -505,12 +505,15 @@ export function phaseGateFailureCopy(
   detail?: string,
 ): FailureCopy {
   const phaseLabel = phase?.trim() || "gather/analyze";
+  const analyzePhase = phaseLabel.toLowerCase() === "analyze";
   return {
     what: `Research phase gate blocked a write during ${phaseLabel}.`,
     why:
       detail?.trim() ||
       "Write tools stay blocked until gather and analyze proof targets are met.",
-    next: "Finish required search/fetch/read proof first, then retry the write once the phase unlocks.",
+    next: analyzePhase
+      ? "Return the complete cited synthesis as the final answer without a tool call, including explicit limitations for unresolved conflicts; the host will verify it before one write."
+      : "Finish required search/fetch/read proof first, then retry the write once the phase unlocks.",
   };
 }
 
@@ -565,7 +568,12 @@ export function formatAcceptanceFailureCopy(missing: string[]): string {
   ) {
     const phase =
       items
-        .map((item) => /phase[_:]?([a-z_]+)/i.exec(item)?.[1])
+        .map(
+          (item) =>
+            /(?:research_)?phase(?:_(?:gate|acceptance))?[:_]+(gather|analyze|write|verify)\b/iu.exec(
+              item,
+            )?.[1],
+        )
         .find(Boolean) ?? undefined;
     return formatFailureCopy(phaseGateFailureCopy(phase, detail));
   }

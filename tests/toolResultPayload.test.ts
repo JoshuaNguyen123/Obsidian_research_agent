@@ -81,6 +81,31 @@ test("code repair cycle payload preserves the host-verified outcome", () => {
   assert.doesNotMatch(serialized, /must-not-cross/iu);
 });
 
+test("known-folder export payload preserves the verified absolute destination", () => {
+  const destinationPath =
+    "C:\\Users\\joshb\\OneDrive\\Desktop\\number-guessing-game-run123";
+  const serialized = serializeToolResultForModel({
+    ok: true,
+    toolName: "code_workspace_export_directory",
+    output: {
+      status: "ok",
+      operation: "export_directory",
+      workspaceId: "workspace-1",
+      sourcePath: "",
+      destinationRoot: "desktop",
+      destinationPath,
+      files: 1,
+      directories: 0,
+      bytesWritten: 512,
+      fingerprint: `sha256:${"8".repeat(64)}`,
+    },
+  });
+  const payload = JSON.parse(serialized) as Record<string, any>;
+  assert.equal(payload.output.destinationRoot, "desktop");
+  assert.equal(payload.output.destinationPath, destinationPath);
+  assert.doesNotMatch(serialized, /workspace-1/u);
+});
+
 test("read_current_file model payload keeps full note content for edit missions", () => {
   const body = `${"Paragraph about Holden. ".repeat(400)}TAIL_MARKER_END`;
   const serialized = serializeToolResultForModel({

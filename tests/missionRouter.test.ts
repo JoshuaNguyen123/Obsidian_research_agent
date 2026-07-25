@@ -225,6 +225,37 @@ test("classifyMissionWithModel returns null when the router times out", async ()
   assert.ok(Date.now() - startedAt < 5000);
 });
 
+test("classifyMissionWithModel propagates caller abort without retrying", async () => {
+  const outerController = new AbortController();
+  let calls = 0;
+  let innerAbortSignal: AbortSignal | undefined;
+  const client = clientFromResponse(
+    (request) =>
+      new Promise((resolve, reject) => {
+        calls += 1;
+        innerAbortSignal = request.abortSignal;
+        request.abortSignal?.addEventListener(
+          "abort",
+          () => reject(new ModelClientError("network", "caller aborted")),
+          { once: true },
+        );
+      }),
+  );
+
+  const intentPromise = classifyMissionWithModel({
+    client,
+    prompt: "anything",
+    timeoutMs: 10_000,
+    abortSignal: outerController.signal,
+  });
+  assert.ok(innerAbortSignal);
+  outerController.abort();
+
+  assert.equal(await intentPromise, null);
+  assert.equal(innerAbortSignal.aborted, true);
+  assert.equal(calls, 1);
+});
+
 test("classifyMissionWithModel returns null for unparseable router output", async () => {
   const client = clientFromResponse(async () => ({
     message: { role: "assistant", content: "I think this is a web mission." },

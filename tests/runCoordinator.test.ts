@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RunAlreadyActiveError, RunCoordinator } from "../src/agent/runCoordinator";
+import { scoreMissionV1 } from "../src/agent/missionScorecard";
 
 test("run coordinator enforces single flight and returns the runner outcome", async () => {
   const coordinator = new RunCoordinator();
@@ -75,6 +76,50 @@ test("run coordinator aggregates redacted provider evidence", async () => {
   assert.equal(snapshot.providerUsage.modelCallCount, 1);
   assert.equal(snapshot.providerUsage.reportedTokens, 13);
   assert.equal(snapshot.providerUsage.wallClockMs, 42);
+});
+
+test("run coordinator retains, replays, and resets the latest mission scorecard", async () => {
+  const coordinator = new RunCoordinator();
+  const scorecard = scoreMissionV1({
+    acceptanceCriteriaTotal: 1,
+    acceptanceCriteriaMissing: 0,
+    acceptancePassed: true,
+    claimsRequiringEvidence: 0,
+    claimsWithEvidence: 0,
+    mutationsPerformed: 0,
+    mutationsWithReceipts: 0,
+    recoveryAttempts: 0,
+    modelCalls: 1,
+    modelCallBudget: 3,
+    wallClockMs: 10,
+    wallClockBudgetMs: 100,
+  });
+  await coordinator.start(async (_signal, events) => {
+    events.onMissionScorecard?.(scorecard);
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.deepEqual(snapshot.lastMissionScorecard, scorecard);
+  assert.notEqual(snapshot.lastMissionScorecard, scorecard);
+  const replayed: number[] = [];
+  coordinator.subscribe(
+    { onMissionScorecard: (value) => replayed.push(value.total) },
+    { replay: true },
+  );
+  assert.deepEqual(replayed, [scorecard.total]);
+
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const next = coordinator.start(async (_signal, events) => {
+    await gate;
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+  assert.equal(coordinator.getSnapshot().lastMissionScorecard, null);
+  release?.();
+  await next;
 });
 
 test("run coordinator retains only redacted durable source evidence", async () => {
@@ -746,4 +791,118 @@ test("a rejected concurrent start cannot tap or persist the active run's events"
   assert.equal(acceptedCapture, "owned output");
   assert.equal(rejectedCapture, "");
   assert.deepEqual(rejectedPersisted, []);
+});
+
+test("steering is rejected when there is no active run", () => {
+  const coordinator = new RunCoordinator();
+  const result = coordinator.steerActiveRun({
+    kind: "add_constraint",
+    text: "cite every claim",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.ok ? null : result.code, "no_active_run");
+  assert.deepEqual(coordinator.getRunSteeringPort().drain(), []);
+});
+
+test("the coordinator queues narrowing directives and drains them once", async () => {
+  const coordinator = new RunCoordinator();
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const drained: string[][] = [];
+
+  const active = coordinator.start(async (_signal, events) => {
+    const port = coordinator.getRunSteeringPort();
+    // Step boundary 1: nothing queued yet.
+    drained.push(port.drain().map((directive) => directive.kind));
+    await gate;
+    // Step boundary 2: the user's directives arrived mid-run.
+    drained.push(port.drain().map((directive) => directive.kind));
+    // Step boundary 3: draining is idempotent.
+    drained.push(port.drain().map((directive) => directive.kind));
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const accepted = coordinator.steerActiveRun({
+    kind: "narrow_scope",
+    text: "only the 2024 papers",
+  });
+  assert.equal(accepted.ok, true);
+
+  const dropped = coordinator.steerActiveRun({
+    kind: "drop_tool",
+    text: "fetches keep timing out",
+    toolName: "web_fetch",
+  });
+  assert.equal(dropped.ok, true);
+
+  release?.();
+  await active;
+
+  assert.deepEqual(drained, [[], ["narrow_scope", "drop_tool"], []]);
+});
+
+test("the coordinator refuses a directive that would widen authority", async () => {
+  const coordinator = new RunCoordinator();
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let observed: string[] = [];
+
+  const active = coordinator.start(async (_signal, events) => {
+    await gate;
+    observed = coordinator
+      .getRunSteeringPort()
+      .drain()
+      .map((directive) => directive.kind);
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const rejected = coordinator.steerActiveRun({
+    kind: "add_tool",
+    text: "enable the github publication tool",
+    toolName: "publish_research_to_github",
+  });
+
+  assert.equal(rejected.ok, false);
+  assert.equal(
+    rejected.ok === false ? rejected.code : null,
+    "would_widen_authority",
+  );
+
+  release?.();
+  await active;
+
+  // The rejected directive never reached the run.
+  assert.deepEqual(observed, []);
+});
+
+test("steering does not carry across runs", async () => {
+  const coordinator = new RunCoordinator();
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const first = coordinator.start(async (_signal, events) => {
+    await gate;
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+  assert.equal(
+    coordinator.steerActiveRun({ kind: "add_constraint", text: "stay local" }).ok,
+    true,
+  );
+  release?.();
+  await first;
+
+  let leaked: unknown[] = [];
+  await coordinator.start(async (_signal, events) => {
+    leaked = coordinator.getRunSteeringPort().drain();
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  assert.deepEqual(leaked, []);
 });

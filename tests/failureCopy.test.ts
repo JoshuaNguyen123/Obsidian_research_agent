@@ -136,6 +136,10 @@ test("formatAcceptanceFailureCopy maps claim conflict and phase gates", () => {
     /What: Research phase gate blocked a write during/,
   );
   assert.match(
+    formatAcceptanceFailureCopy(["research_phase_gate:analyze"]),
+    /during analyze/i,
+  );
+  assert.match(
     formatAcceptanceFailureCopy(["web_evidence"]),
     /Mission acceptance missing: web_evidence/,
   );

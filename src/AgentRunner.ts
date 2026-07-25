@@ -10,6 +10,7 @@ import type {
   ModelThink,
 } from "./model/types";
 import type { AgentSettings } from "./settings";
+import type { CapabilityReadinessV2 } from "./agent/capabilityReadiness";
 import { ModelClientError } from "./model/types";
 import { appendToolTranscript } from "./model/toolTranscript";
 import { serializeToolResultForModel } from "./model/toolResultPayload";
@@ -21,6 +22,11 @@ import {
   type ModelExecutionBudgetV1,
   type ModelUsageAggregateV1,
 } from "./model/modelCallEvidence";
+import {
+  extractToolCallsFromAssistantText,
+  recoverToolCallsFromAssistantMessage,
+} from "./agent/toolCallRecovery";
+import { getString, getStringArray, isRecord } from "./agent/recordUtils";
 import {
   approvalDeniedFailureCopy,
   formatAcceptanceFailureCopy,
@@ -43,6 +49,7 @@ import type {
   ToolExecutionContext,
   ToolExecutionResult,
   ToolRegistry,
+  VerifiedMermaidReadObservation,
   VerifiedWorkspaceReadObservation,
 } from "./tools/types";
 import { resolveNestedApprovalBindingV1 } from "./agent/nestedApprovalPolicy";
@@ -153,6 +160,7 @@ import {
   assertSafeCurrentNoteWritePayload,
   isVaultWriteProcessNarration,
   looksLikeProcessNarrationLead,
+  stripLeadingVaultWriteToolArtifact,
 } from "./agent/vaultWriteContentGuard";
 import {
   analyzeCurrentNoteResetPrompt,
@@ -269,12 +277,42 @@ import {
 } from "./agent/approvalBroker";
 import {
   createRunContextBudget,
+  resolveRunContextBudgetSource,
   DEFAULT_ASSUMED_NUM_CTX,
   estimatePromptChars,
   shouldCompactLoopMessages,
   compactLoopMessages,
   resolveKeepRecentLoopSteps,
+  type RunContextBudget,
 } from "./agent/runContext";
+import { resolveVerifiedModelContextLength } from "./agent/modelContextWindow";
+import {
+  calibratedMaxPromptChars,
+  createContextCalibration,
+  formatContextCalibrationForRunDetails,
+  observeModelCallEvidence,
+} from "./agent/contextCalibration";
+import {
+  formatMissionScorecard,
+  scoreMissionV1,
+  type MissionScorecardV1,
+} from "./agent/missionScorecard";
+import {
+  classifyToolTargetKind,
+  createToolOutcomeMemory,
+  recordToolOutcome,
+  summarizeOutcomeMemoryForPrompt,
+} from "./agent/outcomeMemory";
+import {
+  buildStructuredDecisionRouting,
+  createModelPhaseRouting,
+  resolveModelForPhase,
+} from "./agent/modelPhaseRouting";
+import {
+  applySteeringToStepPrompt,
+  toolNamesDroppedBySteering,
+  type SteeringDirectiveV1,
+} from "./agent/runSteering";
 import {
   effectClassForTool,
   type AutonomyProfile,
@@ -297,6 +335,7 @@ import {
   formatSetLooseResumeBindingCard,
   formatStageBudgetPromptBlock,
   hasSetLooseGithubCreateReceipt,
+  hasCompleteSetLooseNoteReflectionProof,
   isSetLooseEnabled,
   isSetLooseGithubPublishHealableBlock,
   lifecycleStagePaidBySuccessfulTool,
@@ -423,6 +462,7 @@ import {
   advanceMissionPlanFromBlocker,
   advanceMissionPlanFromFinalOutput,
   advanceMissionPlanFromReceipt,
+  advanceMissionPlanFromSeedEvidence,
   advanceMissionPlanFromToolResult,
 } from "./agent/missionPlanAdvance";
 import {
@@ -453,7 +493,9 @@ import {
   validateContinuationHandoffV1,
 } from "./agent/continuationMemory";
 import { buildReflexCheckpointReceiptV1 } from "./agent/reflex/checkpointReceipt";
-import type { ReflexRecoveryOutcomeV1 } from "./agent/reflex/types";
+import type {
+  ReflexRecoveryOutcomeV1,
+} from "./agent/reflex/types";
 import {
   formatMissionPlanForPrompt,
   formatMissionPlanNextActionPrompt,
@@ -766,7 +808,7 @@ export interface AgentRunConfigEvent {
   numCtx?: number;
   estimatedPromptChars?: number;
   contextBudgetChars?: number;
-  contextBudgetSource?: "setting" | "assumed_48k";
+  contextBudgetSource?: "setting" | "model_reported" | "assumed_48k";
   writeAutonomy: boolean;
   missionMode: AgentMissionMode;
   contextScope: AgentRunContextScope;
@@ -925,6 +967,8 @@ export interface AgentRunEvents {
   onModelCallEvidence?: (event: ModelCallEvidenceV1) => void;
   /** Redacted durable source attestation. Never contains source text, paths, or URLs. */
   onMissionEvidence?: (event: MissionEvidenceAttestationV1) => void;
+  /** Graded run-quality projection; acceptance remains the independent gate. */
+  onMissionScorecard?: (scorecard: MissionScorecardV1) => void;
   onRunConfig?: (event: AgentRunConfigEvent) => void;
   onRunComplete?: (event: AgentRunCompleteEvent) => void;
   onApprovalRequest?: (request: ApprovalRequest) => void | Promise<void>;
@@ -1003,6 +1047,15 @@ interface RunAgentMissionOptions {
   completionSegmentIndex?: number;
   /** Soft segment budget for the current multi-segment host loop. */
   maxCompletionSegments?: number;
+  /**
+   * Host-owned mid-run steering. The runner only *drains* at step boundaries;
+   * the host owns the queue and enforces the narrowing invariant at enqueue
+   * time via `enqueueSteeringDirective`. Directives can therefore only remove
+   * tools or add constraints — never widen authority.
+   */
+  runSteering?: {
+    drain(): SteeringDirectiveV1[];
+  };
 }
 
 interface CheckpointResumeState {
@@ -1067,20 +1120,19 @@ const DIRECT_CHAT_SYSTEM_PROMPT = [
 ].join(" ");
 
 const CODE_WORKFLOW_POLICY = [
-  "Repository workflow policy:",
-  "1. Call code_workspace_create first. When a trusted repository profile key is available, pass repositoryProfileKey and omit repositoryRoot. A raw repository root is the alternative accepted only from the exact foreground user mission; if both are supplied, the host accepts them only when they resolve to the same trusted repository. After creation use only the returned workspaceId and trusted repository profile key. Never put ticket/comment text into a path, command, runtime, or validation argument.",
-  "2. Read workspace files and their SHA-256 values before editing. Use create-no-overwrite for new files and fingerprint-bound patch/write/move/copy/trash/restore tools for existing paths. Create .ipynb files from structured markdown/code cells in the notebook field; do not hand-escape raw notebook JSON. Treat protected manifests, lockfiles, build scripts, wrappers, workflows, hooks, and Git configuration as approval-gated controls.",
+  "Code workspace workflow policy:",
+  "1. Call code_workspace_create first even when it is the only tool on the current frontier. It is a bootstrap step: after its receipt, nested directory and file tools become callable. For a new standalone deliverable use a scratch workspace. When a trusted repository profile key is available, pass repositoryProfileKey and omit repositoryRoot. A raw repository root is the alternative accepted only from the exact foreground user mission; if both are supplied, the host accepts them only when they resolve to the same trusted repository. After creation use only the returned workspaceId and trusted repository profile key. Never put ticket/comment text into a path, command, runtime, or validation argument.",
+  "2. Read existing workspace files and their SHA-256 values before editing. Use code_workspace_mkdir for explicit empty directories and code_workspace_create_file for new files at any safe relative depth; create_file automatically creates every missing parent directory. Use fingerprint-bound patch/write/move/copy/trash/restore tools for existing paths. Create .ipynb files from structured markdown/code cells in the notebook field; do not hand-escape raw notebook JSON. Treat protected manifests, lockfiles, build scripts, wrappers, workflows, hooks, and Git configuration as approval-gated controls.",
   "3. Generated code may run only through code_validate_* or run_code_block after code_sandbox_status reports a verified provider. If sandbox proof is unavailable, editing may continue but execution, validation, commit, and publication are blocked; never invent or request a native host fallback.",
-  "4. For implementation missions, choose one bounded repairRequestId and reuse it as requestId throughout fast, targeted, full, conditional repair-cycle, status, and commit calls. Run fast validation first. If it is red, open and record the bounded repair cycle; if it is green, skip that checkpoint. In both cases require fresh targeted and full sandbox validation before code_commit_verified, using the exact current diff and validation receipt IDs. Do not claim code completion from model prose, a process exit alone, or an unverified commit.",
+  "4. For repository-bound implementation missions, choose one bounded repairRequestId and reuse it as requestId throughout fast, targeted, full, conditional repair-cycle, status, and commit calls. Run fast validation first. If it is red, open and record the bounded repair cycle; if it is green, skip that checkpoint. In both cases require fresh targeted and full sandbox validation before code_commit_verified, using the exact current diff and validation receipt IDs. Standalone scratch deliverables do not require a Git commit. When the foreground mission explicitly requests Desktop, Documents, or Downloads delivery, finish with code_workspace_export_directory after the workspace files are complete; it preserves nested paths and never overwrites an existing destination. Do not claim code completion from model prose, a process exit alone, or an unverified write receipt.",
 ].join("\n");
 
 const ENGLISH_ONLY_POLICY = [
-  "You are an English-only research assistant for an Obsidian vault.",
-  "All visible output must be in English.",
+  "Use English for all user-visible prose in this mission.",
   "Do not write Chinese characters in the final answer.",
-  "Translate and summarize non-English sources into English before using them.",
-  "Use English headings, bullets, source notes, and citation labels.",
-  "Final output must be English-only Markdown suitable for Obsidian.",
+  "Translate and summarize non-English source material into English before using it.",
+  "Keep code, filenames, paths, tool arguments, and requested artifact formats intact.",
+  "This is a language rule only; it does not change the requested output target or limit work to Obsidian notes.",
 ].join("\n");
 
 const FINAL_ENGLISH_ONLY_RULE =
@@ -1343,6 +1395,7 @@ export async function runAgentMission({
   backgroundContinuation,
   completionSegmentIndex,
   maxCompletionSegments,
+  runSteering,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
   const configuredMaxRunMs =
@@ -1415,6 +1468,11 @@ export async function runAgentMission({
       if (property === "onRunComplete") {
         return (event: AgentRunCompleteEvent) => {
           disposeRunDeadline();
+          // Flush learned tool outcomes on every terminal path — including
+          // recovery-blocked and error runs that never reach acceptance — so
+          // the next run starts with what this one learned. Fire-and-forget:
+          // persistence is an optimization and must not delay completion.
+          void persistToolOutcomeMemory();
           const autonomyStats = finalizeAutonomyRunStats(autonomyRunStats, {
             elapsedMs: Date.now() - runStartedMs,
           });
@@ -1443,8 +1501,14 @@ export async function runAgentMission({
   const preliminaryModelCallCap = configuredStepBudget * 3 + 8;
   const configuredContextTokens = Math.max(
     4_096,
-    toolContext.settings?.numCtx ?? DEFAULT_ASSUMED_NUM_CTX,
+    toolContext.settings?.numCtx ??
+      resolveVerifiedModelContextLength(toolContext.settings) ??
+      DEFAULT_ASSUMED_NUM_CTX,
   );
+  // Declared ahead of the observable client so its evidence callback can pair
+  // each provider-reported token count with the prompt size that produced it.
+  let estimatedPromptCharsForRun = 0;
+  let contextCalibration = createContextCalibration();
   let modelExecutionBudget: ModelExecutionBudgetV1 = {
     schemaVersion: 1,
     maxCalls: preliminaryModelCallCap,
@@ -1459,6 +1523,14 @@ export async function runAgentMission({
     budget: modelExecutionBudget,
     onEvidence: (evidence) => {
       events.onModelCallEvidence?.(evidence);
+      // Close the loop the provider already reports: pair the measured prompt
+      // token count with the characters we estimated for the same request so
+      // the compaction ceiling stops relying on the fixed chars/4 assumption.
+      contextCalibration = observeModelCallEvidence(
+        contextCalibration,
+        evidence,
+        estimatedPromptCharsForRun,
+      );
       if (missionLedger) {
         missionLedger.providerUsage = observableModel.getUsage();
       }
@@ -1469,6 +1541,58 @@ export async function runAgentMission({
     observableModel.updateBudget(modelExecutionBudget);
   };
   modelClient = observableModel.client;
+  // Per-phase routing. The seven-phase taxonomy was already plumbed through
+  // `evidencePhase` and `ModelChatRequest.model` already accepted an override;
+  // only the decision was missing. Wrapping the client covers every phase at
+  // one seam, and routing runs before the observable client so call evidence
+  // records the model that actually served the request.
+  {
+    const settingsForRouting = toolContext.settings;
+    const utilityModel = settingsForRouting?.utilityModel?.trim() ?? "";
+    // A utility model on a *different* provider cannot be reached through this
+    // client, so it is not a routable candidate at all.
+    const utilityModelIsSameProvider =
+      Boolean(utilityModel) &&
+      (settingsForRouting?.utilityModelProvider ??
+        settingsForRouting?.modelProvider) ===
+        settingsForRouting?.modelProvider;
+    const defaultModel =
+      settingsForRouting?.model?.trim() ||
+      observableModel.client.descriptor?.model ||
+      "";
+    const phaseRouting = utilityModelIsSameProvider
+      ? buildStructuredDecisionRouting(utilityModel)
+      : createModelPhaseRouting();
+    const verifiedModels = [
+      defaultModel,
+      ...(utilityModelIsSameProvider ? [utilityModel] : []),
+    ].filter(Boolean);
+    if (defaultModel && verifiedModels.length > 1) {
+      const routedClient = observableModel.client;
+      const routeRequest = (request: ModelChatRequest): ModelChatRequest => {
+        if (request.model?.trim()) {
+          // An explicit per-request model (the utility-model research assist)
+          // already expresses intent; routing must not override it.
+          return request;
+        }
+        const decision = resolveModelForPhase(
+          request.evidencePhase ?? "unknown",
+          phaseRouting,
+          defaultModel,
+          verifiedModels,
+        );
+        return decision.routed
+          ? { ...request, model: decision.model }
+          : request;
+      };
+      modelClient = {
+        descriptor: routedClient.descriptor,
+        chat: (request) => routedClient.chat(routeRequest(request)),
+        streamChat: (request, streamEvents) =>
+          routedClient.streamChat(routeRequest(request), streamEvents),
+      };
+    }
+  }
   const approvalBroker = providedApprovalBroker ?? new ApprovalBroker();
   const portableHostApprovalReceipts = new Map<string, HostApprovalReceiptV1[]>();
   const maxToolCalls = normalizeInvocationToolCallLimit(providedMaxToolCalls);
@@ -1503,6 +1627,7 @@ export async function runAgentMission({
       client: modelClient,
       prompt: activeIntentPrompt,
       timeoutMs: structuredPlanningTimeoutMs,
+      abortSignal,
       recentAssistant: conversationHistory
         .filter((message) => message.role === "assistant")
         .slice(-1)[0]?.content,
@@ -1791,19 +1916,116 @@ export async function runAgentMission({
     outputPreview: noteOutputPlan,
   });
   let structuredIntent = classifyStructuredIntent(activeIntentPrompt, missionIntent);
+  const modelReportedContextLength = resolveVerifiedModelContextLength(
+    runToolContext.settings,
+  );
   const resolvedNumCtx = resolveNumCtxForCompoundRun({
     settingsNumCtx: runToolContext.settings?.numCtx ?? null,
     autonomyProfile: autonomyProfileForRun,
     compoundLifecycleDetected,
     workingMode: toolContext.settings?.workingMode,
+    modelReportedContextLength,
   });
   const baseModelOptions = buildModelRequestOptions(runToolContext.settings);
   const modelOptions: ModelRequestOptions | undefined =
     resolvedNumCtx !== null
       ? { ...(baseModelOptions ?? {}), num_ctx: resolvedNumCtx }
       : baseModelOptions;
-  const runContextBudget = createRunContextBudget(resolvedNumCtx);
-  let estimatedPromptCharsForRun = 0;
+  const runContextBudget = createRunContextBudget(
+    resolvedNumCtx,
+    resolveRunContextBudgetSource({
+      settingsNumCtx: runToolContext.settings?.numCtx ?? null,
+      modelReportedContextLength,
+      resolvedNumCtx,
+    }),
+  );
+  /**
+   * The compaction ceiling, re-priced at the measured chars-per-token ratio
+   * once enough provider-reported samples exist. Returns the untouched budget
+   * until then, and for providers that never report usage, so adopting this is
+   * behavior-preserving by default.
+   */
+  const resolveEffectiveContextBudget = (): RunContextBudget => {
+    const calibrated = calibratedMaxPromptChars(
+      runContextBudget,
+      contextCalibration,
+    );
+    return calibrated.source === "calibrated_ratio"
+      ? { ...runContextBudget, maxPromptChars: calibrated.maxPromptChars }
+      : runContextBudget;
+  };
+  /**
+   * Cross-run tool outcome ledger. Seeded from the host when it persists one;
+   * otherwise a run-local ledger that simply learns nothing across runs, which
+   * is the pre-existing behavior.
+   */
+  let toolOutcomeMemory =
+    runToolContext.getToolOutcomeMemory?.() ?? createToolOutcomeMemory();
+  let toolOutcomeMemoryDirty = false;
+  const recordRunToolOutcome = (
+    toolCall: ModelToolCall,
+    result: ToolExecutionResult,
+  ): void => {
+    toolOutcomeMemory = recordToolOutcome(toolOutcomeMemory, {
+      toolName: toolCall.name,
+      ok: result.ok,
+      errorCode: result.error?.code,
+      targetKind: classifyToolTargetKind(toolCall.name, toolCall.arguments),
+      observedAt: (runToolContext.now?.() ?? new Date()).toISOString(),
+    });
+    toolOutcomeMemoryDirty = true;
+  };
+  const persistToolOutcomeMemory = async (): Promise<void> => {
+    if (!toolOutcomeMemoryDirty) return;
+    toolOutcomeMemoryDirty = false;
+    try {
+      await runToolContext.setToolOutcomeMemory?.(toolOutcomeMemory);
+    } catch (error) {
+      // Outcome memory is an optimization, never a correctness requirement.
+      // A failed write must not take the run down with it.
+      events.onStatus?.(
+        `Tool outcome memory was not persisted: ${getUnknownErrorMessage(error)}`,
+      );
+    }
+  };
+  let outcomeRankingDiagnosticEmitted = false;
+  const emitOutcomeRankingDiagnostic = (
+    output: AgenticReflexOutput,
+    step = 0,
+  ): void => {
+    if (outcomeRankingDiagnosticEmitted) return;
+    const adjusted = output.actionScores
+      .filter(
+        (item) =>
+          item.outcomePenalty > 0 &&
+          typeof item.action.toolName === "string",
+      )
+      .sort(
+        (left, right) =>
+          right.outcomePenalty - left.outcomePenalty ||
+          (left.action.toolName ?? "").localeCompare(
+            right.action.toolName ?? "",
+          ),
+      );
+    if (adjusted.length === 0) return;
+    outcomeRankingDiagnosticEmitted = true;
+    const maxPenalty = adjusted[0]?.outcomePenalty ?? 0;
+    events.onTrace?.({
+      id: `outcome-ranking-${runId}`,
+      kind: "status",
+      step,
+      message:
+        `Outcome memory adjusted ${adjusted.length} reflex candidate(s); ` +
+        `outcome_penalty_max=${maxPenalty.toFixed(3)}.`,
+      outputPreview: {
+        adjustedActionCount: adjusted.length,
+        maxOutcomePenalty: maxPenalty,
+        penalizedTools: adjusted
+          .slice(0, 8)
+          .map((item) => item.action.toolName),
+      },
+    });
+  };
   let followupIntentContext =
     intentPrompt === prompt ? null : formatFollowupIntentContext(intentPrompt);
   const disableThinkingForRun = () => {
@@ -2002,7 +2224,9 @@ export async function runAgentMission({
     receipts: writeReceipts,
     settings: runToolContext.settings,
     embeddingProvider: runToolContext.semanticEmbeddingProvider,
+    toolOutcomeMemory,
   });
+  emitOutcomeRankingDiagnostic(capabilityAwareReflexOutput);
   reflexOutput = reflexIntentApplication.applied
     ? {
         ...capabilityAwareReflexOutput,
@@ -2018,7 +2242,8 @@ export async function runAgentMission({
       return false;
     }
     const deadlineExpired = Boolean(
-      runDeadlineController?.signal.aborted && !externalAbortSignal?.aborted,
+      (runDeadlineController?.signal.aborted && !externalAbortSignal?.aborted) ||
+        isDeadlineAbortSignal(externalAbortSignal),
     );
     const deadlineMessage =
       "Wall-clock run budget expired. The ledger was saved and this run can be continued.";
@@ -2520,7 +2745,8 @@ export async function runAgentMission({
   // the original mission into activeIntentPrompt, so reconstruct authority from
   // that durable source before the graph is resumed.
   missionGraphUsesExactPlannedFrontier ||=
-    hasExplicitOrderedWorkflowIntent(activeIntentPrompt);
+    hasExplicitOrderedWorkflowIntent(activeIntentPrompt) ||
+    getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0;
 
   if (
     runPlan.executionTier !== "direct_chat" &&
@@ -3175,6 +3401,11 @@ export async function runAgentMission({
     if (skipRepairAfterGreenFastValidation || greenValidateUnlocksCommitSoftUnion) {
       runtimeCache.passedFastRepairCycle = true;
     }
+    if (skipRepairAfterGreenFastValidation) {
+      if (!successfulToolNames.includes("code_repair_record_cycle")) {
+        successfulToolNames.push("code_repair_record_cycle");
+      }
+    }
     await missionGraphSession.finishToolExecution(execution, {
       ok: graphResultOk,
       ...(skipRepairAfterGreenFastValidation
@@ -3398,7 +3629,9 @@ export async function runAgentMission({
       receipts: writeReceipts,
       settings: runToolContext.settings,
       embeddingProvider: runToolContext.semanticEmbeddingProvider,
+      toolOutcomeMemory,
     });
+    emitOutcomeRankingDiagnostic(capabilityAwarePromptPageReflexOutput);
     reflexOutput = promptPageReflexIntentApplication.applied
       ? {
           ...capabilityAwarePromptPageReflexOutput,
@@ -4063,6 +4296,30 @@ export async function runAgentMission({
       countFetchedWebSources(missionEvidenceRecords) >=
         handoffFetchedSourceRequirement,
   );
+  if (
+    orchestratorContext?.trim() &&
+    countFetchedWebSources(missionEvidenceRecords) > 0 &&
+    missionPlan
+  ) {
+    const seededAdvance = advanceMissionPlanFromSeedEvidence({
+      plan: missionPlan,
+      evidence: missionEvidenceRecords,
+      now: runToolContext.now?.() ?? new Date(),
+    });
+    missionPlan = seededAdvance.plan;
+    if (seededAdvance.changed) {
+      events.onTrace?.({
+        id: "researcher-handoff-mission-plan-seed",
+        kind: "verification",
+        message:
+          "Accepted Researcher evidence satisfied matching Lead Mission Plan proof debt.",
+        outputPreview: {
+          evidenceCount: missionEvidenceRecords.length,
+          remainingTasks: countRemainingMissionPlanTasks(missionPlan),
+        },
+      });
+    }
+  }
   if (restoredResearcherHandoffSatisfiesWeb) {
     // Continuation restores evidence after the preliminary routing pass. Bind
     // the same provider-observed Researcher proof back into compatibility
@@ -5127,6 +5384,68 @@ export async function runAgentMission({
       directCurrentNoteWritebackKind,
     }),
   );
+  let capabilityReadiness: readonly CapabilityReadinessV2[] = [];
+  try {
+    capabilityReadiness = runToolContext.getCapabilityReadiness?.() ?? [];
+  } catch (error) {
+    events.onTrace?.({
+      id: "capability-readiness-unavailable",
+      kind: "error",
+      message:
+        "Capability readiness could not be refreshed before the model loop.",
+      error: {
+        code: "capability_readiness_unavailable",
+        message: getUnknownErrorMessage(error),
+      },
+    });
+  }
+  const codeCapabilityBlocker = getCodeCapabilityRegistrationBlockerV1({
+    prompt: activeIntentPrompt,
+    offeredToolNames: allowedToolNames,
+    registeredToolNames: knownToolNames,
+    readiness: capabilityReadiness,
+    executionTier: runPlan.executionTier,
+  });
+  if (codeCapabilityBlocker) {
+    const message = [
+      `Blocked before model loop: ${codeCapabilityBlocker.message}`,
+      `Capability readiness: ${codeCapabilityBlocker.reason}`,
+      `Next action: ${codeCapabilityBlocker.nextAction}.`,
+    ].join(" ");
+    if (missionLedger) {
+      addLedgerBlocker(
+        missionLedger,
+        message,
+        "tool_unavailable",
+        runToolContext.now?.() ?? new Date(),
+      );
+      setLedgerNextAction(
+        missionLedger,
+        codeCapabilityBlocker.nextAction,
+        runToolContext.now?.() ?? new Date(),
+      );
+      updateMissionLedgerStatus(
+        missionLedger,
+        "blocked",
+        runToolContext.now?.() ?? new Date(),
+      );
+      await persistMissionLedger("mission-ledger-code-capability-blocked");
+    }
+    events.onStatus?.(message);
+    events.onTrace?.({
+      id: "code-capability-registration-blocked",
+      kind: "error",
+      message,
+      outputPreview: codeCapabilityBlocker,
+      error: {
+        code: codeCapabilityBlocker.code,
+        message,
+      },
+    });
+    emitDirectAssistantAnswer(message, events, runPlan.requiresEnglishGuard);
+    completeRun(events, "error", 0, runStartedAt, runPlan.maxStepsForRun);
+    return;
+  }
   events.onTrace?.({
     id: "dependency-preflight",
     kind: "status",
@@ -5353,12 +5672,31 @@ export async function runAgentMission({
     acceptance: MissionAcceptanceResult,
     step: number,
     stepLimit: number,
+    readyToolNames: readonly string[] = [],
+    enforceExactExecutableFrontier = false,
   ): boolean => {
     if (step >= stepLimit || acceptance.status === "pass") {
       return false;
     }
 
     const missing = new Set(acceptance.missing);
+    const hasExecutableGraphProofDebt =
+      enforceExactExecutableFrontier &&
+      readyToolNames.length > 0 &&
+      acceptance.missing.some(
+        (item) =>
+          item.startsWith("tool:") ||
+          item.startsWith("plan:") ||
+          item.startsWith("verifier:"),
+      );
+    if (hasExecutableGraphProofDebt) {
+      // A model-authored final/prose response is not completion while the
+      // immutable graph still exposes an exact executable frontier. Keep the
+      // correction inside this segment so the model sees the ready schema
+      // instead of turning each missed tool call into a fresh Continue run.
+      return true;
+    }
+
     if (
       missing.has("write_receipt") ||
       missing.has("visible_title_rename") ||
@@ -5451,6 +5789,47 @@ export async function runAgentMission({
       message: `Mission acceptance: ${acceptance.status}`,
       outputPreview: acceptance,
     });
+    // Acceptance is the pass/fail gate; the scorecard is the gradient beside
+    // it, so a run that passes while burning far more budget or citing far
+    // less evidence is distinguishable from a clean pass. It never changes the
+    // gate: acceptancePassed is carried through, not recomputed.
+    const missionScorecard = scoreMissionV1({
+      acceptanceCriteriaTotal: lastVerificationChecks.length,
+      acceptanceCriteriaMissing: lastVerificationChecks.filter(
+        (check) => check.status !== "pass",
+      ).length,
+      acceptancePassed: acceptance.status === "pass",
+      claimsRequiringEvidence: lastClaimLedger?.claims.length ?? 0,
+      claimsWithEvidence:
+        lastClaimLedger?.claims.filter(
+          (claim) => claim.status === "grounded" || claim.status === "exempt",
+        ).length ?? 0,
+      mutationsPerformed: writeReceipts.length,
+      mutationsWithReceipts: missionLedger?.receipts.length ?? 0,
+      recoveryAttempts: recoveryAttemptSignatures.length,
+      modelCalls: missionLedger?.providerUsage?.modelCallCount ?? 0,
+      modelCallBudget: modelExecutionBudget.maxCalls,
+      wallClockMs: missionLedger?.providerUsage?.wallClockMs ?? 0,
+      wallClockBudgetMs: modelExecutionBudget.maxWallClockMs,
+    });
+    events.onMissionScorecard?.(missionScorecard);
+    // Keep the compact Run Details projection on trace. onPlanningDelta is a
+    // structured per-step channel with an established shape; the full typed
+    // scorecard travels through its dedicated event above instead.
+    events.onTrace?.({
+      id: `mission-scorecard-${step}`,
+      kind: "acceptance",
+      step,
+      message: `Mission scorecard: mission_score=${missionScorecard.total.toFixed(3)} acceptance=${
+        missionScorecard.acceptancePassed ? "pass" : "needs_more_work"
+      }`,
+      outputPreview: {
+        ...missionScorecard,
+        formatted: formatMissionScorecard(missionScorecard),
+      },
+    });
+    // Flush what this run learned so the next run starts with it.
+    await persistToolOutcomeMemory();
     for (const check of lastVerificationChecks) {
       events.onTrace?.({
         id: `${check.id}-${step}`,
@@ -6662,9 +7041,15 @@ export async function runAgentMission({
       "candidate-1",
     );
     if (proofVerificationRequired) {
-      let candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
-        evaluateCurrentAcceptance(candidate),
-        requiredWriteTools,
+      let candidateAcceptance = requireAcceptedPassageCitationCoverage(
+        getProofGatedWritebackCandidateAcceptance(
+          evaluateCurrentAcceptance(candidate),
+          requiredWriteTools,
+        ),
+        candidate,
+        acceptedWritebackPassageIds,
+        researchPlan,
+        activeIntentPrompt,
       );
       events.onTrace?.({
         id: `proof-gated-writeback-${step}:candidate-1`,
@@ -6704,9 +7089,15 @@ export async function runAgentMission({
           await stageCandidate(true),
           "candidate-2",
         );
-        candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
-          evaluateCurrentAcceptance(candidate),
-          requiredWriteTools,
+        candidateAcceptance = requireAcceptedPassageCitationCoverage(
+          getProofGatedWritebackCandidateAcceptance(
+            evaluateCurrentAcceptance(candidate),
+            requiredWriteTools,
+          ),
+          candidate,
+          acceptedWritebackPassageIds,
+          researchPlan,
+          activeIntentPrompt,
         );
         events.onTrace?.({
           id: `proof-gated-writeback-${step}:candidate-2`,
@@ -8166,7 +8557,7 @@ export async function runAgentMission({
       });
     }
   };
-  const runObservedModelToolCall = async ({
+  const executeObservedModelToolCall = async ({
     origin,
     toolCall,
     step,
@@ -8265,6 +8656,39 @@ export async function runAgentMission({
     }
     if (
       exactReplacement === null &&
+      (toolCall.name === "append_to_current_file" ||
+        toolCall.name === "replace_current_file")
+    ) {
+      const textKey =
+        typeof toolCall.arguments.text === "string"
+          ? "text"
+          : typeof toolCall.arguments.content === "string"
+            ? "content"
+            : null;
+      if (textKey) {
+        const modelText = toolCall.arguments[textKey] as string;
+        const cleanedText = stripLeadingVaultWriteToolArtifact(modelText);
+        if (cleanedText !== modelText) {
+          toolCall = {
+            ...toolCall,
+            arguments: {
+              ...toolCall.arguments,
+              [textKey]: cleanedText,
+            },
+          };
+          events.onTrace?.({
+            id: `${step}:${String(toolIndex)}:${toolCall.name}:leading-tool-artifact-removed`,
+            kind: "verification",
+            step,
+            toolName: toolCall.name,
+            message:
+              "Removed a leading model-emitted write-tool marker before note mutation and title extraction.",
+          });
+        }
+      }
+    }
+    if (
+      exactReplacement === null &&
       runToolContext.settings?.autoTitleOnWrite !== false &&
       (toolCall.name === "append_to_current_file" ||
         toolCall.name === "replace_current_file")
@@ -8295,9 +8719,28 @@ export async function runAgentMission({
         }
       }
     }
+    const reflectionPayload =
+      typeof toolCall.arguments.text === "string"
+        ? toolCall.arguments.text
+        : typeof toolCall.arguments.content === "string"
+          ? toolCall.arguments.content
+          : "";
+    const setLooseReflectionOnlyWriteback =
+      hasCompleteSetLooseNoteReflectionProof(reflectionPayload) &&
+      setLooseSoftWriteBypassesPlanDependency({
+        toolName: toolCall.name,
+        setLooseEnabled: setLooseCompoundEnabled,
+        unpaidDeliveryKeys: setLooseCompoundEnabled
+          ? setLooseDeliveryComplete({
+              stages: compoundLifecycleStages,
+              proofs: setLooseDeliveryProofs,
+            }).unpaid
+          : [],
+      });
     if (
       isProofGatedCurrentNoteContentTool(toolCall.name) &&
-      requiresVerifiedFinalOutput(missionPlan, researchPlan)
+      requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+      !setLooseReflectionOnlyWriteback
     ) {
       const textKey =
         typeof toolCall.arguments.text === "string"
@@ -8347,9 +8790,15 @@ export async function runAgentMission({
       const durablePreWriteProofSatisfied = hasSatisfiedDurablePreWriteProof();
       const finalPayloadAcceptance =
         durablePreWriteProofSatisfied && finalPayload.trim()
-          ? getProofGatedWritebackCandidateAcceptance(
-              evaluateCurrentAcceptance(finalPayload),
-              requiredWriteTools,
+          ? requireAcceptedPassageCitationCoverage(
+              getProofGatedWritebackCandidateAcceptance(
+                evaluateCurrentAcceptance(finalPayload),
+                requiredWriteTools,
+              ),
+              finalPayload,
+              acceptedPassageIds,
+              researchPlan,
+              activeIntentPrompt,
             )
           : null;
       if (
@@ -8935,6 +9384,30 @@ export async function runAgentMission({
           },
         });
       }
+    }
+    const boundExportToolCall = bindVerifiedWorkspaceDirectoryExport(
+      toolCall,
+      activeIntentPrompt,
+      runId,
+      writeReceipts,
+    );
+    if (boundExportToolCall) {
+      toolCall = boundExportToolCall;
+      events.onTrace?.({
+        id: `${step}:${String(toolIndex)}:code_workspace_export_directory:verified-binding`,
+        kind: "status",
+        step,
+        toolName: toolCall.name,
+        message:
+          "Bound the requested known-folder export to the independently verified workspace root.",
+        outputPreview: {
+          source: "verified_workspace_create_receipt",
+          workspaceId: toolCall.arguments.workspaceId,
+          sourcePath: toolCall.arguments.sourcePath,
+          destinationRoot: toolCall.arguments.destinationRoot,
+          destinationPath: toolCall.arguments.destinationPath,
+        },
+      });
     }
     if (
       toolCall.name === "code_workspace_read" &&
@@ -10136,6 +10609,7 @@ export async function runAgentMission({
     }
 
     executedModelTool = true;
+    const researchPhaseDeferred = isResearchPhaseToolDeferral(result);
     const recordedToolCall = recordTranscript
       ? appendToolTranscript({
           messages,
@@ -10145,7 +10619,7 @@ export async function runAgentMission({
           fallbackId: buildToolCallFallbackId(runId, step, toolIndex, toolCall.name),
         })
       : toolCall;
-    if (!backgroundSubmitted) {
+    if (!backgroundSubmitted && !researchPhaseDeferred) {
       markOperationGoalsForTool({
         operationGoals,
         toolName: recordedToolCall.name,
@@ -10153,21 +10627,23 @@ export async function runAgentMission({
         streamingWritebackKind,
       });
     }
-    recentActions.push({
-      kind: "tool",
-      name: recordedToolCall.name,
-      ok: result.ok,
-      signature: `${recordedToolCall.name}:${stableStringify(recordedToolCall.arguments)}`,
-      stateFingerprint: await sha256MissionFingerprint({
-        frontier:
-          (missionGraphSession?.graph ?? missionGraph)?.capabilityEnvelope
-            .fingerprint ?? null,
-        evidence: missionEvidenceRecords.map((item) => item.id).sort(),
-        receipts: writeReceipts
-          .map((item) => item.id ?? item.message)
-          .sort(),
-      }),
-    });
+    if (!researchPhaseDeferred) {
+      recentActions.push({
+        kind: "tool",
+        name: recordedToolCall.name,
+        ok: result.ok,
+        signature: `${recordedToolCall.name}:${stableStringify(recordedToolCall.arguments)}`,
+        stateFingerprint: await sha256MissionFingerprint({
+          frontier:
+            (missionGraphSession?.graph ?? missionGraph)?.capabilityEnvelope
+              .fingerprint ?? null,
+          evidence: missionEvidenceRecords.map((item) => item.id).sort(),
+          receipts: writeReceipts
+            .map((item) => item.id ?? item.message)
+            .sort(),
+        }),
+      });
+    }
 
     if (backgroundSubmitted) {
       const message =
@@ -10673,7 +11149,11 @@ export async function runAgentMission({
         setLooseCompoundEnabled &&
         toolCall.name === "code_workspace_create" &&
         failureCode === "workspace_exists";
-      if (!schemaCorrectionQueued && !ignoreSetLooseWorkspaceExistsFailure) {
+      if (
+        !schemaCorrectionQueued &&
+        !ignoreSetLooseWorkspaceExistsFailure &&
+        !researchPhaseDeferred
+      ) {
         failedToolNames.push(toolCall.name);
       }
       const failureStatus = formatObservedToolFailureStatus(
@@ -10696,12 +11176,33 @@ export async function runAgentMission({
         error: result.error,
         outputPreview: truncateTracePayload(result),
       });
-      await recordLedgerToolResult(toolCall.name, result, step);
-      await finishMissionGraphTool(
-        missionGraphExecution,
-        toolCall.name,
-        result,
-      );
+      if (researchPhaseDeferred) {
+        if (missionGraphSession && missionGraphExecution) {
+          await missionGraphSession.deferToolExecution(
+            missionGraphExecution,
+            result.error?.message ?? "Host policy deferred the tool before execution.",
+          );
+          missionGraph = missionGraphSession.graph;
+          missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
+          if (missionLedger) {
+            setLedgerMissionPlan(
+              missionLedger,
+              missionPlan,
+              runToolContext.now?.() ?? new Date(),
+            );
+            await persistMissionLedger(
+              `mission-ledger-tool-${toolCall.name}-phase-deferred`,
+            );
+          }
+        }
+      } else {
+        await recordLedgerToolResult(toolCall.name, result, step);
+        await finishMissionGraphTool(
+          missionGraphExecution,
+          toolCall.name,
+          result,
+        );
+      }
       if (modelArgumentFailure && argumentFailureSignature) {
         const failureSignature = argumentFailureSignature;
         if (invalidToolCallFailureSignatures.has(failureSignature)) {
@@ -10759,15 +11260,44 @@ export async function runAgentMission({
       receipts: writeReceipts,
       settings: runToolContext.settings,
       embeddingProvider: runToolContext.semanticEmbeddingProvider,
+      toolOutcomeMemory,
       checkpoint: "material_context_change",
       frontierFingerprint:
         (missionGraphSession?.graph ?? missionGraph)?.capabilityEnvelope
           .fingerprint ?? null,
     });
+    emitOutcomeRankingDiagnostic(reflexOutput, step);
     recordReflexCheckpoint("material_context_change");
     await persistMissionLedger(`mission-ledger-reflex-material-${step}`);
 
     return result;
+  };
+  /**
+   * Records every model-initiated tool outcome into the cross-run ledger, then
+   * returns the result untouched. Recording can only ever influence later
+   * *ranking* — it never blocks a call, changes a result, or grants authority.
+   */
+  const runObservedModelToolCall = async (
+    input: Parameters<typeof executeObservedModelToolCall>[0],
+  ): Promise<ToolExecutionResult> => {
+    try {
+      const result = await executeObservedModelToolCall(input);
+      recordRunToolOutcome(input.toolCall, result);
+      return result;
+    } catch (error) {
+      // A tool that throws is still a failed outcome the next run should know
+      // about. Record it before re-propagating.
+      const thrownCode =
+        error && typeof (error as { code?: unknown }).code === "string"
+          ? (error as { code: string }).code
+          : "execution_threw";
+      recordRunToolOutcome(input.toolCall, {
+        ok: false,
+        toolName: input.toolCall.name,
+        error: { code: thrownCode, message: getUnknownErrorMessage(error) },
+      });
+      throw error;
+    }
   };
   const runRequiredWebToolFallback = async (
     missingToolNames: string[],
@@ -10898,11 +11428,14 @@ export async function runAgentMission({
     });
   }
 
+  const codeWorkflowMission =
+    getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0;
   const shouldDescribePlatformCapabilities =
-    runPlan.executionTier === "direct_chat" &&
-    /\b(?:platform|harness|tool frontier|capabilit(?:y|ies)|frontier)\b/iu.test(
-      activeIntentPrompt,
-    );
+    codeWorkflowMission ||
+    (runPlan.executionTier === "direct_chat" &&
+      /\b(?:platform|harness|tool frontier|capabilit(?:y|ies)|frontier)\b/iu.test(
+        activeIntentPrompt,
+      ));
   const capabilitySnapshot = buildCapabilitySnapshotV1({
     installed: [...knownToolNames],
     authorized: initiallyAuthorizedToolNames,
@@ -10980,6 +11513,14 @@ export async function runAgentMission({
     ...([...allowedToolNames].some((name) => name.startsWith("code_"))
       ? [{ role: "system" as const, content: CODE_WORKFLOW_POLICY }]
       : []),
+    ...(shouldDescribePlatformCapabilities
+      ? [
+          {
+            role: "system" as const,
+            content: formatCapabilitySnapshotForModel(capabilitySnapshot),
+          },
+        ]
+      : []),
     {
       role: "system" as const,
       content: formatRuntimeContext(runToolContext, activeIntentPrompt),
@@ -11000,6 +11541,12 @@ export async function runAgentMission({
       role: "system" as const,
       content: formatMissionIntentContext(missionIntent),
     },
+    // Approaches that repeatedly failed in earlier runs on this project. Tool
+    // names, target kinds, and error codes only — never paths or URLs.
+    ...((): { role: "system"; content: string }[] => {
+      const learned = summarizeOutcomeMemoryForPrompt(toolOutcomeMemory);
+      return learned ? [{ role: "system" as const, content: learned }] : [];
+    })(),
     {
       role: "system" as const,
       content: formatStructuredIntentForPrompt(structuredIntent),
@@ -12098,10 +12645,50 @@ export async function runAgentMission({
       );
     }
     events.onPlanningStart?.(step);
+    // Mid-run steering applies here and only here: at a step boundary, after
+    // the previous tool result is recorded and before the next request is
+    // assembled. Applying it mid-tool-call would invalidate the payload
+    // fingerprint a prepared action's receipt is validated against.
+    const steeringDirectives = runSteering?.drain() ?? [];
+    if (steeringDirectives.length > 0) {
+      const steeringMessage = applySteeringToStepPrompt(steeringDirectives);
+      if (steeringMessage) {
+        messages.push({ role: "system", content: steeringMessage });
+      }
+      // Directives can only ever subtract from the tool set. There is no path
+      // here that adds a tool, so steering cannot reach a tool the host never
+      // authorized.
+      const droppedToolNames = toolNamesDroppedBySteering(steeringDirectives);
+      if (droppedToolNames.length > 0) {
+        for (const droppedToolName of droppedToolNames) {
+          allowedToolNames.delete(droppedToolName);
+        }
+        tools = tools.filter(
+          (tool) => !droppedToolNames.includes(tool.function.name),
+        );
+      }
+      events.onStatus?.(
+        `Applied ${steeringDirectives.length} steering directive(s) at step ${step}.`,
+      );
+      events.onTrace?.({
+        id: `run-steering-${step}`,
+        kind: "status",
+        step,
+        message: "Applied user steering at the step boundary.",
+        outputPreview: {
+          directives: steeringDirectives.map((directive) => ({
+            kind: directive.kind,
+            toolName: directive.toolName ?? null,
+          })),
+          dropped_tools: droppedToolNames,
+        },
+      });
+    }
     estimatedPromptCharsForRun = estimatePromptChars(messages);
+    const effectiveContextBudget = resolveEffectiveContextBudget();
     if (
       missionLedger &&
-      shouldCompactLoopMessages(messages, runContextBudget)
+      shouldCompactLoopMessages(messages, effectiveContextBudget)
     ) {
       const handoff = buildContinuationHandoffV1({
         ledger: missionLedger,
@@ -12123,9 +12710,9 @@ export async function runAgentMission({
             messages,
             ledger: missionLedger,
             keepRecentSteps: resolveKeepRecentLoopSteps(
-              runContextBudget.maxPromptChars,
+              effectiveContextBudget.maxPromptChars,
             ),
-            maxPromptChars: runContextBudget.maxPromptChars,
+            maxPromptChars: effectiveContextBudget.maxPromptChars,
             handoff,
             proofExcerpts: {
               validationDiagnostic:
@@ -12209,6 +12796,11 @@ export async function runAgentMission({
         `estimated_prompt_chars=${estimatedPromptCharsForRun}`,
         `num_ctx=${modelOptions?.num_ctx ?? "default"}`,
         `context_budget_source=${runContextBudget.budgetSource}`,
+        `context_budget_chars=${effectiveContextBudget.maxPromptChars}`,
+        formatContextCalibrationForRunDetails(
+          contextCalibration,
+          runContextBudget,
+        ),
         `tool_budget=${loopBudgetPlan.toolStepBudget}`,
         `finalization_reserved=${loopBudgetPlan.finalizationReserve}`,
         `tools=${Array.from(allowedToolNames).join(", ") || "none"}`,
@@ -12854,6 +13446,7 @@ export async function runAgentMission({
                   stepSupportingWorkspaceReadObservations,
                   activeIntentPrompt,
                   getLatestFastValidationDiagnostic(runtimeCache),
+                  runtimeCache.verifiedMermaidRead ?? null,
                 ),
                 codeSpecCard,
                 verifiedGitPathCard,
@@ -13174,7 +13767,12 @@ export async function runAgentMission({
       });
       if (
         !explanatoryToolRouteReclassified &&
-        (runPlan.speechAct === "explain" || runPlan.speechAct === "evaluate")
+        (runPlan.speechAct === "explain" || runPlan.speechAct === "evaluate") &&
+        !(
+          codeWorkflowMission &&
+          missionGraphUsesExactPlannedFrontier &&
+          stepTools.length > 0
+        )
       ) {
         explanatoryToolRouteReclassified = true;
         const candidate = sanitizeAssistantContent(
@@ -13225,6 +13823,26 @@ export async function runAgentMission({
           hasRenderableAssistantContent(response.message.content ?? "") &&
           (/https:\/\/linear\.app\//iu.test(response.message.content ?? "") ||
             /https:\/\/github\.com\//iu.test(response.message.content ?? "")));
+      if (
+        codeWorkflowMission &&
+        missionGraphUsesExactPlannedFrontier &&
+        stepTools.length > 0 &&
+        unchangedNoToolResponseCount === 1 &&
+        !hasHostManagedWritebackProgress &&
+        step < stepLimit
+      ) {
+        const readyToolNames = stepTools.map(
+          (tool) => tool.function.name,
+        );
+        events.onStatus?.(
+          `Executable frontier still requires ${readyToolNames.join(", ")}; asking the model for a tool-only correction...`,
+        );
+        messages.push({
+          role: "system" as const,
+          content: buildExactFrontierNoToolCorrection(readyToolNames),
+        });
+        continue;
+      }
       if (
         setLooseNoteReflectionUnpaid &&
         stepAllowedToolNames.has("append_to_current_file") &&
@@ -13289,6 +13907,42 @@ export async function runAgentMission({
             `Host set-loose note reflection append failed: ${appendResult.error?.message ?? "unknown"}`,
           );
         }
+      }
+      const hostValidationFallback =
+        missionGraphUsesExactPlannedFrontier &&
+        unchangedNoToolResponseCount >= 2
+          ? buildExactCodeValidationFallbackToolCall(
+              stepTools.map((tool) => tool.function.name),
+              runId,
+            )
+          : null;
+      if (hostValidationFallback) {
+        events.onStatus?.(
+          `Model did not call ${hostValidationFallback.name}; running the exact graph-bound sandbox validator with host-derived scope...`,
+        );
+        try {
+          await runObservedModelToolCall({
+            origin: "runner",
+            toolCall: hostValidationFallback,
+            step,
+            toolIndex: `exact-validation-fallback-${step}`,
+          });
+        } catch (error) {
+          if (stopIfRequested(step)) {
+            return;
+          }
+          await finishErroredRunFromException(
+            error,
+            step,
+            stepLimit,
+            "tool",
+          );
+          return;
+        }
+        unchangedNoToolResponseCount = 0;
+        lastNoToolFrontierFingerprint = "";
+        consecutiveNoProgressSteps = 0;
+        continue;
       }
       if (
         stepTools.length > 0 &&
@@ -13457,6 +14111,27 @@ export async function runAgentMission({
           (/https:\/\/linear\.app\//iu.test(verifiedFinalAppendCandidate) ||
             /https:\/\/github\.com\//iu.test(verifiedFinalAppendCandidate)))
       ) {
+        const literalNormalized = attachMissingRequiredLiteralAnchors(
+          verifiedFinalAppendCandidate,
+          activeIntentPrompt,
+        );
+        if (literalNormalized.insertedAnchors.length > 0) {
+          verifiedFinalAppendCandidate = literalNormalized.content;
+          events.onTrace?.({
+            id: `verified-final-append-${step}:literal-normalized`,
+            kind: "verification",
+            step,
+            toolName: "append_to_current_file",
+            message:
+              `Deterministically restored ${literalNormalized.insertedAnchors.length} exact user-required literal marker(s) before candidate verification.`,
+            outputPreview: {
+              insertedAnchors: literalNormalized.insertedAnchors,
+              payloadFingerprint: hashOperationInput(
+                verifiedFinalAppendCandidate,
+              ),
+            },
+          });
+        }
         if (
           hasClosedPassageCitationScope(
             researchPlan,
@@ -13486,9 +14161,15 @@ export async function runAgentMission({
             });
           }
         }
-        let candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
-          evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
-          requiredWriteTools,
+        let candidateAcceptance = requireAcceptedPassageCitationCoverage(
+          getProofGatedWritebackCandidateAcceptance(
+            evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
+            requiredWriteTools,
+          ),
+          verifiedFinalAppendCandidate,
+          acceptedWritebackPassageIds,
+          researchPlan,
+          activeIntentPrompt,
         );
         if (
           candidateAcceptance.status !== "pass" &&
@@ -13508,9 +14189,15 @@ export async function runAgentMission({
           );
           if (normalized.insertedPassageIds.length > 0) {
             verifiedFinalAppendCandidate = normalized.content;
-            candidateAcceptance = getProofGatedWritebackCandidateAcceptance(
-              evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
-              requiredWriteTools,
+            candidateAcceptance = requireAcceptedPassageCitationCoverage(
+              getProofGatedWritebackCandidateAcceptance(
+                evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
+                requiredWriteTools,
+              ),
+              verifiedFinalAppendCandidate,
+              acceptedWritebackPassageIds,
+              researchPlan,
+              activeIntentPrompt,
             );
             events.onTrace?.({
               id: `verified-final-append-${step}:citation-normalized`,
@@ -13935,7 +14622,9 @@ export async function runAgentMission({
         receipts: writeReceipts,
         settings: runToolContext.settings,
         embeddingProvider: runToolContext.semanticEmbeddingProvider,
+        toolOutcomeMemory,
       });
+      emitOutcomeRankingDiagnostic(reflexOutput, step);
       if (
         runToolContext.settings?.agenticReflexEnabled === true &&
         !reflexOutput.completion.complete
@@ -14073,23 +14762,30 @@ export async function runAgentMission({
         return;
       }
       if (
-        shouldContinueForMissionAcceptance(
-          acceptanceBeforeFinal,
-          step,
-          stepLimit,
-        )
+          shouldContinueForMissionAcceptance(
+            acceptanceBeforeFinal,
+            step,
+            stepLimit,
+            stepTools.map((tool) => tool.function.name),
+            codeWorkflowMission,
+          )
       ) {
         if (step < stepLimit) {
           events.onStatus?.(
             formatAcceptanceFailureCopy(acceptanceBeforeFinal.missing),
           );
-          messages.push({
-            role: "system" as const,
-            content: formatMissionAcceptanceCorrection(
-              acceptanceBeforeFinal,
-              stepTools.map((tool) => tool.function.name),
-            ),
-          });
+            messages.push({
+              role: "system" as const,
+              content: codeWorkflowMission
+                ? buildReadyFrontierNoToolCorrection(
+                    acceptanceBeforeFinal,
+                    stepTools.map((tool) => tool.function.name),
+                  )
+                : formatMissionAcceptanceCorrection(
+                    acceptanceBeforeFinal,
+                    stepTools.map((tool) => tool.function.name),
+                  ),
+            });
           continue;
         }
 
@@ -14105,10 +14801,16 @@ export async function runAgentMission({
       const hasDirectFinalContent = hasRenderableAssistantContent(
         response.message.content,
       );
+      const verifiedHostExportFinalAnswer =
+        buildVerifiedHostExportFinalAnswer(
+          activeIntentPrompt,
+          writeReceipts,
+          successfulToolNames,
+        );
       const requiresPreEmissionVerification = requiresVerifiedFinalOutput(
         missionPlan,
         researchPlan,
-      );
+      ) || verifiedHostExportFinalAnswer !== null;
 
       if (enableStreaming && !hasDirectFinalContent) {
         if (stopIfRequested(step)) {
@@ -14235,6 +14937,19 @@ export async function runAgentMission({
         }
         lastFinalOutput = directContent;
       }
+      if (verifiedHostExportFinalAnswer) {
+        lastFinalOutput = verifiedHostExportFinalAnswer;
+        events.onTrace?.({
+          id: `verified-host-export-final-${step}`,
+          kind: "verification",
+          step,
+          message:
+            "Replaced model-authored delivery prose with the verified host export receipt projection.",
+          outputPreview: {
+            payloadFingerprint: hashOperationInput(lastFinalOutput),
+          },
+        });
+      }
       if (requiresPreEmissionVerification) {
         const currentAcceptedPassageIds = getAcceptedMissionPassageIds(
           missionEvidenceRecords,
@@ -14266,7 +14981,13 @@ export async function runAgentMission({
             });
           }
         }
-        const candidateAcceptance = evaluateCurrentAcceptance(lastFinalOutput);
+        const candidateAcceptance = requireAcceptedPassageCitationCoverage(
+          evaluateCurrentAcceptance(lastFinalOutput),
+          lastFinalOutput,
+          currentAcceptedPassageIds,
+          researchPlan,
+          activeIntentPrompt,
+        );
         await recordMissionAcceptance(candidateAcceptance, step);
         if (candidateAcceptance.status !== "pass") {
           const rejectedCandidate = lastFinalOutput;
@@ -14515,6 +15236,27 @@ export async function runAgentMission({
       }
 
       let toolCall = responseToolCalls[toolIndex];
+      const explicitWebFetchBinding = bindExplicitWebFetchContract(
+        activeIntentPrompt,
+        toolCall,
+      );
+      if (
+        explicitWebFetchBinding &&
+        stableStringify(explicitWebFetchBinding.arguments) !==
+          stableStringify(toolCall.arguments)
+      ) {
+        toolCall = explicitWebFetchBinding;
+        responseToolCalls[toolIndex] = toolCall;
+        events.onTrace?.({
+          id: `${step}:${toolIndex}:${toolCall.name}:explicit-web-fetch-bound`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message:
+            "Bound web_fetch to the single exact URL and explicit cache policy named by the user.",
+          inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
+        });
+      }
       if (
         exactGraphPathBinding &&
         exactGraphPathBinding.toolName === "read_file" &&
@@ -14885,13 +15627,16 @@ export async function runAgentMission({
           now: runToolContext.now?.() ?? new Date(),
         });
         safeFailureRetryState = safeRetry.state;
-        events.onStatus?.(safeRetry.progressLine || literalContractError);
+        const literalRejectionMessage = safeRetry.progressLine
+          ? `${literalContractError} ${safeRetry.progressLine}`
+          : literalContractError;
+        events.onStatus?.(literalRejectionMessage);
         events.onTrace?.({
           id: `${toolEventBase.id}:required-literal-rejected`,
           kind: "tool_rejected",
           step,
           toolName: toolCall.name,
-          message: safeRetry.progressLine || literalContractError,
+          message: literalRejectionMessage,
           inputPreview: redactToolArguments(toolCall.name, toolCall.arguments),
           error: rejectedResult.error,
           outputPreview: {
@@ -14903,7 +15648,7 @@ export async function runAgentMission({
         events.onToolDone?.({
           ...toolEventBase,
           ok: false,
-          message: safeRetry.progressLine || literalContractError,
+          message: literalRejectionMessage,
           error: rejectedResult.error,
         });
         appendToolTranscript({
@@ -14997,9 +15742,30 @@ export async function runAgentMission({
         requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
         durablePreWriteProofSatisfied &&
         proposedWriteText.trim()
-          ? getProofGatedWritebackCandidateAcceptance(
-              evaluateCurrentAcceptance(proposedWriteText),
-              requiredWriteTools,
+          ? requireAcceptedPassageCitationCoverage(
+              getProofGatedWritebackCandidateAcceptance(
+                evaluateCurrentAcceptance(proposedWriteText),
+                requiredWriteTools,
+              ),
+              proposedWriteText,
+              acceptedWritebackPassageIds,
+              researchPlan,
+              activeIntentPrompt,
+            )
+          : null;
+      // The proof-gated candidate check evaluates a limitations-aware draft
+      // against a candidate-scoped projection of source conflicts. Carry that
+      // same projection into the one actual tool execution below. Otherwise a
+      // valid direct append is re-evaluated against the durable, still-open
+      // conflicts and is indefinitely blocked in analyze before its receipt
+      // can make the acknowledgement durable.
+      const projectedDirectWriteConflicts =
+        proofGatedCurrentNoteTool &&
+        proposedWriteAcceptance?.status === "pass" &&
+        proposedWriteText.trim()
+          ? projectEvidenceConflictAcknowledgements(
+              ignoreSoftEvidenceConflicts ? [] : lastEvidenceConflicts,
+              proposedWriteText,
             )
           : null;
       if (
@@ -15212,7 +15978,20 @@ export async function runAgentMission({
           toolCall,
           step,
           toolIndex,
+          ...(projectedDirectWriteConflicts
+            ? { researchPhaseConflicts: projectedDirectWriteConflicts }
+            : {}),
         });
+        if (
+          result.ok &&
+          projectedDirectWriteConflicts !== null &&
+          proposedWriteText.trim()
+        ) {
+          // Acknowledgements become durable only after the exact candidate
+          // mutation returned successfully and its receipt path completed.
+          // Failed/not-applied executions leave durable conflict state open.
+          commitAcceptedEvidenceConflictAcknowledgements(proposedWriteText);
+        }
         if (toolCall.name === "code_workspace_write_expected") {
           workspaceCorrectionAttemptedThisResponse = true;
         }
@@ -15575,7 +16354,11 @@ export async function runAgentMission({
     const requiresPostWriteAcceptance = researchPlan !== null;
     const postToolAcceptance =
       operationWriteComplete && requiresPostWriteAcceptance
-      ? evaluateCurrentAcceptance()
+      // A successful direct current-note tool call already supplies the
+      // receipt-backed final artifact. Re-evaluate that artifact rather than
+      // treating the post-tool turn as output-less and asking the model to
+      // write it again through the streaming finalizer.
+      ? evaluateCurrentAcceptance(lastFinalOutput || undefined)
       : null;
     const writeMissionComplete =
       operationWriteComplete &&
@@ -15726,11 +16509,13 @@ export async function runAgentMission({
       const acceptanceAfterToolUse = evaluateCurrentAcceptance();
       await recordMissionAcceptance(acceptanceAfterToolUse, step);
       if (
-        shouldContinueForMissionAcceptance(
-          acceptanceAfterToolUse,
-          step,
-          stepLimit,
-        )
+          shouldContinueForMissionAcceptance(
+            acceptanceAfterToolUse,
+            step,
+            stepLimit,
+            stepTools.map((tool) => tool.function.name),
+            codeWorkflowMission,
+          )
       ) {
         events.onStatus?.(
           formatAcceptanceFailureCopy(acceptanceAfterToolUse.missing),
@@ -16739,7 +17524,7 @@ function buildRunConfigEvent({
   reflexOutput?: AgenticReflexOutput;
   estimatedPromptChars?: number;
   contextBudgetChars?: number;
-  contextBudgetSource?: "setting" | "assumed_48k";
+  contextBudgetSource?: "setting" | "model_reported" | "assumed_48k";
   performanceGates?: PerformanceGateResult[];
   noteOutputPlan?: NoteOutputPlan;
 }): AgentRunConfigEvent {
@@ -18058,8 +18843,6 @@ export function buildSetLooseNoteReflectionMarkdown(input: {
     .join("\n");
 }
 
-const MAX_RECOVERED_TEXT_TOOL_CALLS = 4;
-
 /**
  * Models often emit `append_file` for current-note reflection. When the ready
  * frontier only offers `append_to_current_file` (set-loose Soft companions),
@@ -18106,16 +18889,12 @@ function getResponseToolCallsFromModelOutput(
   events: AgentRunEvents,
   step: number,
 ): ModelToolCall[] {
-  if (response.toolCalls.length > 0) {
-    return response.toolCalls;
-  }
-
-  const recoveredToolCalls = extractToolCallsFromAssistantText(
-    response.message.content,
+  const recoveredToolCalls = recoverToolCallsFromAssistantMessage(
+    response,
     knownToolNames,
   );
 
-  if (recoveredToolCalls.length > 0) {
+  if (response.toolCalls.length === 0 && recoveredToolCalls.length > 0) {
     const names = recoveredToolCalls.map((toolCall) => toolCall.name).join(", ");
     events.onStatus?.(`Recovered text tool request: ${names}`);
     events.onTrace?.({
@@ -18131,341 +18910,6 @@ function getResponseToolCallsFromModelOutput(
   }
 
   return recoveredToolCalls;
-}
-
-function extractToolCallsFromAssistantText(
-  content: string,
-  knownToolNames: Set<string>,
-): ModelToolCall[] {
-  if (!content.trim() || knownToolNames.size === 0) {
-    return [];
-  }
-
-  const toolCalls: ModelToolCall[] = [];
-
-  for (const toolCall of extractXmlToolCallCandidates(content, knownToolNames)) {
-    toolCalls.push(toolCall);
-
-    if (toolCalls.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
-      return toolCalls.slice(0, MAX_RECOVERED_TEXT_TOOL_CALLS);
-    }
-  }
-
-  const parsedCandidates = extractJsonCandidates(content);
-
-  for (const candidate of parsedCandidates) {
-    collectToolCallsFromJson(candidate, knownToolNames, toolCalls);
-
-    if (toolCalls.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
-      break;
-    }
-  }
-
-  return toolCalls.slice(0, MAX_RECOVERED_TEXT_TOOL_CALLS);
-}
-
-function extractXmlToolCallCandidates(
-  content: string,
-  knownToolNames: Set<string>,
-): ModelToolCall[] {
-  const toolCalls: ModelToolCall[] = [];
-  const pattern =
-    /<requested_tool_call\b[^>]*>([\s\S]*?)<\/requested_tool_call>/gi;
-  let match: RegExpExecArray | null;
-
-  while (
-    (match = pattern.exec(content)) !== null &&
-    toolCalls.length < MAX_RECOVERED_TEXT_TOOL_CALLS
-  ) {
-    const body = match[1];
-    const name = readXmlTag(body, "name");
-    if (!name || !knownToolNames.has(name)) {
-      continue;
-    }
-
-    const rawArgs =
-      readXmlTag(body, "arguments") ??
-      readXmlTag(body, "args") ??
-      readXmlTag(body, "parameters");
-    const parsedArgs = rawArgs ? parseJsonCandidate(rawArgs) : undefined;
-    const args = isRecord(parsedArgs) ? parsedArgs : {};
-
-    toolCalls.push({
-      name,
-      arguments: normalizeRecoveredToolArguments(name, args),
-      index: toolCalls.length,
-      raw: match[0],
-    });
-  }
-
-  return toolCalls;
-}
-
-function readXmlTag(content: string, tagName: string): string | null {
-  const pattern = new RegExp(
-    `<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`,
-    "i",
-  );
-  const match = pattern.exec(content);
-  return match ? decodeBasicXmlEntities(match[1].trim()) : null;
-}
-
-function decodeBasicXmlEntities(value: string): string {
-  return value
-    .replace(/&quot;/g, "\"")
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
-}
-
-function extractJsonCandidates(content: string): unknown[] {
-  const candidates: unknown[] = [];
-  const fencedJsonPattern =
-    /\\?`\\?`\\?`(?:json|tool_call|tool|function)?\s*([\s\S]*?)\\?`\\?`\\?`/gi;
-  let match: RegExpExecArray | null;
-
-  while ((match = fencedJsonPattern.exec(content)) !== null) {
-    const parsed = parseJsonCandidate(match[1]);
-    if (parsed !== undefined) {
-      candidates.push(parsed);
-    }
-  }
-
-  const trimmed = content.trim();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-    const parsed = parseJsonCandidate(trimmed);
-    if (parsed !== undefined) {
-      candidates.push(parsed);
-    }
-  }
-
-  if (candidates.length === 0) {
-    for (const snippet of extractInlineJsonObjectSnippets(content)) {
-      const parsed = parseJsonCandidate(snippet);
-      if (parsed !== undefined) {
-        candidates.push(parsed);
-      }
-    }
-  }
-
-  return candidates;
-}
-
-function extractInlineJsonObjectSnippets(content: string): string[] {
-  const snippets: string[] = [];
-  let searchStart = 0;
-
-  while (
-    snippets.length < MAX_RECOVERED_TEXT_TOOL_CALLS &&
-    searchStart < content.length
-  ) {
-    const start = content.indexOf("{", searchStart);
-    if (start < 0) {
-      break;
-    }
-
-    const end = findBalancedJsonObjectEnd(content, start);
-    if (end < 0) {
-      break;
-    }
-
-    const snippet = content.slice(start, end + 1);
-    if (/"(?:name|tool|tool_name)"\s*:/.test(snippet)) {
-      snippets.push(snippet);
-    }
-    searchStart = end + 1;
-  }
-
-  return snippets;
-}
-
-function findBalancedJsonObjectEnd(content: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-
-  for (let index = start; index < content.length; index += 1) {
-    const char = content[index];
-
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === "\"") {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (char === "\"") {
-      inString = true;
-      continue;
-    }
-
-    if (char === "{") {
-      depth += 1;
-    } else if (char === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        return index;
-      }
-    }
-  }
-
-  return -1;
-}
-
-function parseJsonCandidate(value: string): unknown | undefined {
-  try {
-    return JSON.parse(value.trim());
-  } catch {
-    return undefined;
-  }
-}
-
-function collectToolCallsFromJson(
-  value: unknown,
-  knownToolNames: Set<string>,
-  output: ModelToolCall[],
-) {
-  if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectToolCallsFromJson(item, knownToolNames, output);
-
-      if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
-        return;
-      }
-    }
-    return;
-  }
-
-  if (!isRecord(value)) {
-    return;
-  }
-
-  const directToolCall = parseToolCallRecord(value, knownToolNames, output.length);
-  if (directToolCall) {
-    output.push(directToolCall);
-    return;
-  }
-
-  for (const nestedKey of ["tool_calls", "toolCalls", "tools", "calls"]) {
-    collectToolCallsFromJson(value[nestedKey], knownToolNames, output);
-
-    if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
-      return;
-    }
-  }
-
-  collectToolCallsFromJson(value.function, knownToolNames, output);
-}
-
-function parseToolCallRecord(
-  value: Record<string, unknown>,
-  knownToolNames: Set<string>,
-  index: number,
-): ModelToolCall | null {
-  const name = getRecoveredToolName(value);
-  if (!name || !knownToolNames.has(name)) {
-    return null;
-  }
-
-  return {
-    name,
-    arguments: normalizeRecoveredToolArguments(
-      name,
-      parseRecoveredToolArguments(value),
-    ),
-    index,
-    raw: value,
-  };
-}
-
-function parseRecoveredToolArguments(
-  value: Record<string, unknown>,
-): Record<string, unknown> {
-  const args =
-    value.arguments ??
-    value.args ??
-    value.parameters ??
-    value.input;
-
-  if (isRecord(args)) {
-    return args;
-  }
-
-  if (typeof args === "string" && args.trim()) {
-    const parsedArgs = parseJsonCandidate(args);
-    if (isRecord(parsedArgs)) {
-      return parsedArgs;
-    }
-  }
-
-  return extractTopLevelRecoveredToolArguments(value);
-}
-
-function getRecoveredToolName(value: Record<string, unknown>): string | undefined {
-  const direct =
-    getString(value.name) ??
-    getString(value.tool) ??
-    getString(value.tool_name);
-  if (direct) {
-    return direct;
-  }
-
-  if (isRecord(value.function)) {
-    return getString(value.function.name);
-  }
-
-  return undefined;
-}
-
-function extractTopLevelRecoveredToolArguments(
-  value: Record<string, unknown>,
-): Record<string, unknown> {
-  const reservedKeys = new Set([
-    "name",
-    "tool",
-    "tool_name",
-    "arguments",
-    "args",
-    "parameters",
-    "input",
-    "function",
-    "id",
-    "index",
-    "type",
-  ]);
-  const args: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (!reservedKeys.has(key)) {
-      args[key] = item;
-    }
-  }
-  return args;
-}
-
-function normalizeRecoveredToolArguments(
-  toolName: string,
-  args: Record<string, unknown>,
-): Record<string, unknown> {
-  if (
-    (toolName === "list_folder" || toolName === "get_path_info") &&
-    args.path === "/"
-  ) {
-    return {
-      ...args,
-      path: "",
-    };
-  }
-
-  return args;
 }
 
 function emitRunDiagnostics({
@@ -19789,6 +20233,10 @@ const READ_NAV_TOOL_NAMES = new Set([
   "read_design_canvas",
   "read_svg_design",
   "read_mermaid_block",
+  "analyze_dataset",
+  "resolve_citation",
+  "verify_citation",
+  "export_bibtex",
   "browser_observe",
   "browser_screenshot",
   "browser_extract_markdown",
@@ -19812,6 +20260,7 @@ const WRITE_TOOL_NAMES = new Set([
   "upsert_mermaid_block",
   "create_design_package",
   "export_workspace_artifact",
+  "code_workspace_export_directory",
   "memory_write_observation",
   "memory_write_task_summary",
   "memory_write_procedural",
@@ -19914,6 +20363,7 @@ const CODE_TOOL_NAMES = new Set([
   "code_workspace_search",
   "code_workspace_mkdir",
   "code_workspace_create_file",
+  "code_workspace_export_directory",
   "code_workspace_append",
   "code_workspace_write_expected",
   "code_workspace_patch",
@@ -20012,6 +20462,10 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   read_design_canvas: "read",
   read_svg_design: "read",
   read_mermaid_block: "read",
+  analyze_dataset: "read",
+  resolve_citation: "web",
+  verify_citation: "web",
+  export_bibtex: "read",
   seed_default_templates: "write",
   create_template: "write",
   fill_template: "write",
@@ -20065,6 +20519,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   code_workspace_search: "code",
   code_workspace_mkdir: "code",
   code_workspace_create_file: "code",
+  code_workspace_export_directory: "code",
   code_workspace_append: "code",
   code_workspace_write_expected: "code",
   code_workspace_patch: "code",
@@ -20690,6 +21145,20 @@ function isAllowedForMission(
     return false;
   }
 
+  // Specialist reads stay out of generic missions so ordinary requests keep a
+  // compact tool schema; a matching prompt (or the Researcher catalog, which
+  // bypasses this gate) brings them in.
+  if (name === "analyze_dataset") {
+    return hasDatasetAnalysisIntent(prompt);
+  }
+  if (
+    name === "resolve_citation" ||
+    name === "verify_citation" ||
+    name === "export_bibtex"
+  ) {
+    return hasCitationWorkIntent(prompt);
+  }
+
   if (READ_NAV_TOOL_NAMES.has(name)) {
     return (
       intent.vaultContext ||
@@ -21070,6 +21539,22 @@ function markOperationGoalsForTool({
   }
 }
 
+function isResearchPhaseToolDeferral(result: ToolExecutionResult): boolean {
+  if (
+    result.ok ||
+    result.mutationState !== "not_applied" ||
+    result.error?.code !== "policy_blocked" ||
+    !isRecord(result.output)
+  ) {
+    return false;
+  }
+  return Array.isArray(result.output.policyTags) &&
+    result.output.policyTags.some(
+      (tag) =>
+        typeof tag === "string" && tag.startsWith("research_phase_gate"),
+    );
+}
+
 function markStreamingWritebackGoalDone(
   operationGoals: MissionOperationGoals,
   kind: StreamingWritebackKind,
@@ -21372,14 +21857,14 @@ function getRequiredWriteToolNames(
   ).filter((name) => allowedToolNames.has(name));
   if (
     inferredCodeWorkflowToolNames.length > 0 &&
-    hasRepositoryCodeMutationIntent(prompt) &&
     !hasExplicitObsidianVaultMutationTarget(prompt)
   ) {
-    // Repository-relative source paths (including README.md) belong to the
-    // Code workspace. They must not manufacture Obsidian append_file or
-    // create_file requirements merely because the same prompt says create,
-    // write, or document. A separately named Obsidian/vault/current-note
-    // destination still keeps the hybrid code + note workflow below.
+    // Repository-relative source paths and standalone code deliverables belong
+    // to the Code workspace. They must not manufacture Obsidian append_file,
+    // append_to_current_file, or create_file requirements merely because the
+    // same prompt says create, write, or document. A separately named
+    // Obsidian/vault/current-note destination still keeps the hybrid code +
+    // note workflow below.
     return inferredCodeWorkflowToolNames;
   }
   const requiredToolNames: string[] = [...lifecycleRequiredToolNames];
@@ -21633,6 +22118,60 @@ const CODE_COMMIT_LADDER_TOOL_NAMES = [
   "code_commit_verified",
 ] as const;
 
+export interface CodeCapabilityRegistrationBlockerV1 {
+  code: "code_capability_tools_unavailable";
+  message: string;
+  reason: string;
+  nextAction: string;
+  requiredToolNames: string[];
+  registeredCodeToolCount: number;
+}
+
+/**
+ * A code mission must never reach the model with zero Code tools and invite a
+ * fabricated "I cannot access the filesystem" refusal. Fail loudly from the
+ * host-owned catalog/readiness evidence instead.
+ */
+export function getCodeCapabilityRegistrationBlockerV1(input: {
+  prompt: string;
+  offeredToolNames: ReadonlySet<string>;
+  registeredToolNames: ReadonlySet<string>;
+  readiness?: readonly CapabilityReadinessV2[];
+  executionTier?: RunPlan["executionTier"];
+}): CodeCapabilityRegistrationBlockerV1 | null {
+  const requiredToolNames = getRequiredCodeWorkflowToolNames(input.prompt);
+  if (
+    input.executionTier === "direct_chat" ||
+    requiredToolNames.length === 0 ||
+    [...input.offeredToolNames].some((name) => name.startsWith("code_"))
+  ) {
+    return null;
+  }
+  const codeReadiness = input.readiness?.find((row) => row.id === "code");
+  const registeredCodeToolCount = [...input.registeredToolNames].filter((name) =>
+    name.startsWith("code_")
+  ).length;
+  return {
+    code: "code_capability_tools_unavailable",
+    message:
+      registeredCodeToolCount > 0
+        ? "This mission requires a Code deliverable, but the current run authorized none of the installed Code tools. No model call was made."
+        : "This mission requires a Code deliverable, but the Code tool catalog is not registered. No model call was made.",
+    reason:
+      codeReadiness?.reason ??
+      (registeredCodeToolCount > 0
+        ? "Code tools are installed, but the run frontier is empty."
+        : "The Code runtime is not registered."),
+    nextAction:
+      codeReadiness?.nextAction ??
+      (registeredCodeToolCount > 0
+        ? "Reload the plugin and retry the mission"
+        : "Reload Code capability"),
+    requiredToolNames,
+    registeredCodeToolCount,
+  };
+}
+
 /**
  * When a prompt names code tools (including commit) without the validate/repair
  * ladder, expand so MissionGraph cannot schedule code_commit_verified before a
@@ -21642,10 +22181,21 @@ export function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
   const repositoryRead = hasCodeWorkspaceReadIntent(prompt);
   const repositoryMutation = hasRepositoryCodeMutationIntent(prompt);
   const codeDeliverable = hasCodeDeliverableIntent(prompt);
-  const lifecycleCode =
-    detectProjectLifecycleStagesV1(prompt).includes("code_execution");
-  const implementationIntent =
-    repositoryMutation || codeDeliverable || lifecycleCode;
+  if (
+    hasExplicitGitHubPublicationIntent(prompt) &&
+    !hasRepositoryCodeEditIntent(prompt)
+  ) {
+    // Publishing an already verified commit is a GitHub delivery action. The
+    // word "repository" and the existing commit do not authorize a fresh Code
+    // workspace, validation, or commit ladder.
+    return [];
+  }
+  // Lifecycle labels are estimates, not execution authority. A question that
+  // discusses a research-to-code pipeline, a current-note code sample, or a
+  // one-off run_code_block request must not be promoted into a durable Code
+  // workspace mission merely because the stage detector sees a language or
+  // the word "code".
+  const implementationIntent = repositoryMutation || codeDeliverable;
   const explicitToolNames = getExplicitCodeToolNames(prompt);
   if (explicitToolNames.length > 0) {
     return expandExplicitCodeWorkflowToolNames(explicitToolNames, prompt);
@@ -21673,32 +22223,29 @@ export function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
     return tools;
   }
 
-  if (
-    hasRepositoryCodeEditIntent(prompt) ||
-    codeDeliverable ||
-    lifecycleCode
-  ) {
+  if (hasRepositoryCodeEditIntent(prompt) || codeDeliverable) {
     const editTool = selectCodeWorkspaceEditToolName(
       prompt,
       new Set<string>(CODE_EXECUTION_TOOL_ALLOW),
     );
-    tools.push(editTool, "code_validate_fast", "code_repair_record_cycle");
+    tools.push(editTool);
+    if (codeDeliverable && editTool === "code_workspace_mkdir") {
+      tools.push("code_workspace_create_file");
+    }
+    tools.push("code_validate_fast", "code_repair_record_cycle");
   }
 
   if (
     hasRepositoryCodeEditIntent(prompt) ||
     codeDeliverable ||
-    lifecycleCode ||
     /\b(validate|test|build|compile|commit)\b/i.test(prompt)
   ) {
     tools.push("code_validate_targeted", "code_validate_full");
   }
-  if (
-    hasRepositoryCodeEditIntent(prompt) ||
-    codeDeliverable ||
-    lifecycleCode ||
-    /\bcommit\b/i.test(prompt)
-  ) {
+  if (codeDeliverable && hasKnownHostDirectoryExportIntent(prompt)) {
+    tools.push("code_workspace_export_directory");
+  }
+  if (hasRepositoryCodeEditIntent(prompt) || /\bcommit\b/i.test(prompt)) {
     tools.push("code_commit_verified");
   }
   return [...new Set(tools)];
@@ -22396,6 +22943,37 @@ function buildUnavailableToolCorrectionPrompt(
     .join(" ");
 }
 
+function buildReadyFrontierNoToolCorrection(
+  acceptance: MissionAcceptanceResult,
+  readyToolNames: readonly string[],
+): string {
+  const exactInstruction =
+    readyToolNames.length === 1
+      ? `Call ${readyToolNames[0]} now using its offered schema.`
+      : `Call exactly one ready tool now: ${readyToolNames.join(", ")}.`;
+  return [
+    formatMissionAcceptanceCorrection(acceptance, [...readyToolNames]),
+    "Your prior response contained prose but no tool call, so it did not advance the executable MissionGraph.",
+    exactInstruction,
+    "Return the tool call only. Do not explain, summarize, claim completion, or emit code in prose.",
+  ].join(" ");
+}
+
+function buildExactFrontierNoToolCorrection(
+  readyToolNames: readonly string[],
+): string {
+  const exactInstruction =
+    readyToolNames.length === 1
+      ? `Call ${readyToolNames[0]} now using its offered schema.`
+      : `Call exactly one ready tool now: ${readyToolNames.join(", ")}.`;
+  return [
+    "Your prior response contained prose but no tool call, so it did not advance the executable MissionGraph.",
+    `The only ready frontier tools are: ${readyToolNames.join(", ")}.`,
+    exactInstruction,
+    "Return the tool call only. Do not explain, summarize, claim completion, or emit code in prose.",
+  ].join(" ");
+}
+
 function shouldObserveCurrentNote(
   prompt: string,
   allowedToolNames: Set<string>,
@@ -23002,6 +23580,10 @@ function getStreamingWritebackKind(
     !toolContext.writeAutonomy ||
     hasPriorAssistantResponseWritebackIntent(prompt) ||
     hasResearchMemoryWriteIntent(prompt) ||
+    hasCodeDeliverableIntent(prompt) ||
+    (hasCodeExecutionIntent(prompt) &&
+      !hasExplicitObsidianVaultMutationTarget(prompt)) ||
+    hasKnownHostDirectoryExportIntent(prompt) ||
     toolContext.settings?.streamWritebackMode !==
       "all_current_note_content_writes"
   ) {
@@ -23443,6 +24025,8 @@ function shouldDefaultToActiveNoteWriteback({
     hasResearchMemoryWriteIntent(prompt) ||
     hasTemplateIntent(prompt) ||
     hasDesignIntent(prompt) ||
+    hasCodeDeliverableIntent(prompt) ||
+    hasKnownHostDirectoryExportIntent(prompt) ||
     hasCodeExecutionIntent(prompt) ||
     hasWordCountIntent(prompt) ||
     hasHtmlPreviewIntent(prompt) ||
@@ -23703,6 +24287,25 @@ function hasVaultIndexIntent(prompt: string): boolean {
   );
 }
 
+/** Tabular-analysis prompts: dataset files or explicit data-analysis asks. */
+function hasDatasetAnalysisIntent(prompt: string): boolean {
+  return /\b(dataset|\w+\.(?:csv|tsv|ndjson)\b|data\s+analysis|analy[sz]e\s+(?:the\s+|my\s+)?data|column\s+statistics|histogram|scatter\s*plot)\b/i.test(
+    prompt,
+  );
+}
+
+/**
+ * Bibliographic-workflow prompts: DOIs, arXiv, BibTeX, bibliography building,
+ * or explicit citation resolution/verification. Deliberately NOT bare
+ * "cite/cited/citations" — ordinary "append a cited summary" prompts must keep
+ * their compact tool schema; inline citing needs no bibliographic tools.
+ */
+function hasCitationWorkIntent(prompt: string): boolean {
+  return /\b(doi\b|arxiv|bibtex|bibliograph\w*|reference\s+list|literature\s+(?:review|search)|(?:resolve|verify|check|look\s*up)\s+(?:the\s+|this\s+|these\s+)?citations?)\b|10\.\d{4,9}\//i.test(
+    prompt,
+  );
+}
+
 function hasOpenWebSourceIntent(prompt: string): boolean {
   return /\b(open|view|show|launch)\b[\s\S]{0,120}\b(source|sources|link|url|web|browser|reference|citation|page)\b|\b(source|sources|link|url|web\s+page|reference|citation|page)\b[\s\S]{0,120}\b(open|view|show|launch)\b/i.test(
     prompt,
@@ -23732,16 +24335,26 @@ function hasCodeDeliverableIntent(prompt: string): boolean {
   if (/\.(?:py|ts|tsx|js|jsx|rs|go|java|cs)\b/i.test(prompt)) {
     return true;
   }
-  if (
-    /\b(build|implement|create|write)\b[\s\S]{0,100}\b(game|app|script|module|library|package|checkers|chess|solver)\b/i.test(
-      prompt,
-    )
-  ) {
-    return true;
-  }
-  return /\b(build|implement|create|write|code)\b[\s\S]{0,120}\b(python|javascript|typescript|rust|golang|java)\b/i.test(
-    prompt,
-  );
+  return prompt
+    .split(/(?:[!?;\r\n]+|\.(?=\s|$))/u)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some((clause) => {
+      // A vault research path such as Projects/Checkers/Research.md is not a
+      // request to implement checkers merely because "write" and "Checkers"
+      // occur in the same sentence.
+      if (/\.md\b/iu.test(clause)) {
+        return false;
+      }
+      return (
+        /\b(build|implement|create|write)\b[\s\S]{0,100}\b(game|app|script|module|library|package|checkers|chess|solver)\b/i.test(
+          clause,
+        ) ||
+        /\b(build|implement|create|write|code)\b[\s\S]{0,120}\b(python|javascript|typescript|rust|golang|java)\b/i.test(
+          clause,
+        )
+      );
+    });
 }
 
 /** Note-local sample write/stream — not a repository/code-workspace deliverable. */
@@ -23826,6 +24439,12 @@ function hasRepositoryCodeEditIntent(prompt: string): boolean {
 
 function hasCodeWorkspaceReadIntent(prompt: string): boolean {
   return /\b(read|inspect|search|list|find|understand|analy[sz]e|review|explain|summari[sz]e|traverse)\b[\s\S]{0,180}\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b|\b(repository|repo|codebase|worktree|code\s+workspace|project\s+folder)\b[\s\S]{0,180}\b(read|inspect|search|list|find|understand|analy[sz]e|review|explain|summari[sz]e|traverse)\b/i.test(
+    prompt,
+  );
+}
+
+export function hasKnownHostDirectoryExportIntent(prompt: string): boolean {
+  return /\b(?:put|place|save|write|create|copy|export|deliver)\b[\s\S]{0,160}\b(?:desktop|documents?(?:\s+folder)?|downloads?(?:\s+folder)?)\b|\b(?:desktop|documents?(?:\s+folder)?|downloads?(?:\s+folder)?)\b[\s\S]{0,160}\b(?:put|place|save|write|create|copy|export|deliver)\b/iu.test(
     prompt,
   );
 }
@@ -26021,6 +26640,7 @@ export function buildObservedMissionGraphFrontierBinding(
   verifiedSupportingWorkspaceReads: readonly VerifiedWorkspaceReadObservation[] = [],
   missionRequirements: string | null = null,
   verifiedFastValidationDiagnostic: CodeValidationDiagnosticObservation | null = null,
+  verifiedMermaidReadObservation: VerifiedMermaidReadObservation | null = null,
 ): string | null {
   const names = stepTools.map((tool) => tool.function.name);
   if (names.length === 1 && names[0] === "linear_get_issue") {
@@ -26055,9 +26675,20 @@ export function buildObservedMissionGraphFrontierBinding(
     graphDestinationSelector &&
     !graphDestinationSelector.startsWith("prompt-scoped-")
   ) {
+    const requiresSelfContainedPythonEntryPoint =
+      graphDestinationSelector.toLowerCase() === "main.py" &&
+      typeof missionRequirements === "string" &&
+      /\bpython\b/iu.test(missionRequirements);
     const creationInstruction = /\.ipynb$/iu.test(graphDestinationSelector)
       ? "Call code_workspace_create_file with this exact path and a structured notebook object containing markdown/code cells. The host emits deterministic nbformat 4 JSON with empty outputs; file creation does not execute cells."
-      : "Call code_workspace_create_file with this exact path and the complete content string for only this file. Do not pass a notebook cells object unless the path ends in .ipynb; an Obsidian research notebook is not a Jupyter .ipynb workspace file.";
+      : [
+          "Call code_workspace_create_file with this exact path and the complete content string for only this file. Do not pass a notebook cells object unless the path ends in .ipynb; an Obsidian research notebook is not a Jupyter .ipynb workspace file.",
+          requiresSelfContainedPythonEntryPoint
+            ? "This graph schedules one Python source file. Make main.py directly runnable and self-contained with the Python standard library; do not import a local module or package that is not being created in this graph."
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
     return [
       "EXACT GRAPH-BOUND NEW WORKSPACE FILE:",
       `path=${JSON.stringify(graphDestinationSelector)}.`,
@@ -26197,35 +26828,43 @@ export function buildObservedMissionGraphFrontierBinding(
   if (names.length !== 1 || names[0] !== "upsert_mermaid_block") {
     return null;
   }
-  const readback = getLatestToolOutput(messages, "read_mermaid_block");
   const latestMermaidReceipt = [...durableReceipts]
     .reverse()
     .find((receipt) => receipt.toolName === "upsert_mermaid_block");
   const receiptOutput = isRecord(latestMermaidReceipt?.output)
     ? latestMermaidReceipt.output
     : null;
-  const baseHash = isRecord(readback)
-    ? getString(readback.sha256)
-    : latestMermaidReceipt?.readback?.observedRevision;
-  const path = isRecord(readback)
-    ? getString(readback.path)
-    : latestMermaidReceipt?.path ?? latestMermaidReceipt?.resource?.path;
+  const transcriptReadback = getLatestToolOutput(messages, "read_mermaid_block");
+  const readback = verifiedMermaidReadObservation ??
+    (latestMermaidReceipt ? receiptOutput : null) ??
+    transcriptReadback;
+  const baseHash = verifiedMermaidReadObservation?.sha256 ??
+    latestMermaidReceipt?.readback?.observedRevision ??
+    (isRecord(readback)
+      ? getString(readback.sha256) ?? getString(readback.afterSha256)
+      : undefined);
+  const path = verifiedMermaidReadObservation?.path ??
+    latestMermaidReceipt?.path ??
+    latestMermaidReceipt?.resource?.path ??
+    (isRecord(readback) ? getString(readback.path) : undefined);
   if (!baseHash || !/^sha256:[a-f0-9]{64}$/u.test(baseHash) || !path) {
     return null;
   }
-  const selectorValue = isRecord(readback)
-    ? readback.selector
-    : receiptOutput?.selector;
+  const selectorValue = verifiedMermaidReadObservation?.selector ??
+    receiptOutput?.selector ??
+    (isRecord(readback) ? readback.selector : undefined);
   const selector = isRecord(selectorValue)
     ? stableStringify(selectorValue)
     : null;
   return [
     "OBSERVED READBACK BINDING FROM THE COMPLETED DEPENDENCY:",
-    `path=${JSON.stringify(path)};`,
-    `baseHash=${JSON.stringify(baseHash)};`,
-    selector ? `selector=${selector}.` : "",
+    [
+      `path=${JSON.stringify(path)};`,
+      `baseHash=${JSON.stringify(baseHash)};`,
+      selector ? `selector=${selector}.` : "",
+    ].filter(Boolean).join(" "),
     "Use these exact observed values in your explicit upsert_mermaid_block call; supply the intended Mermaid text yourself.",
-  ].filter(Boolean).join(" ");
+  ].filter(Boolean).join("\n");
 }
 
 /**
@@ -26338,6 +26977,7 @@ function getReceiptOperation(toolName: string): AgentRunReceipt["operation"] {
     toolName === "create_svg_design" ||
     toolName === "create_design_package" ||
     toolName === "export_workspace_artifact" ||
+    toolName === "code_workspace_export_directory" ||
     toolName === "seed_default_templates"
   ) {
     return "create";
@@ -26449,6 +27089,7 @@ function isWriteToolName(toolName: string): boolean {
     toolName === "upsert_mermaid_block" ||
     toolName === "create_design_package" ||
     toolName === "export_workspace_artifact" ||
+    toolName === "code_workspace_export_directory" ||
     toolName === "seed_default_templates" ||
     toolName === "create_template" ||
     toolName === "fill_template" ||
@@ -26558,22 +27199,8 @@ function appendRelevancePromptContext(
     .join("\n\n");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function getString(value: unknown): string | undefined {
-  return typeof value === "string" && value ? value : undefined;
-}
-
 function getNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
-}
-
-function getStringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
-    : [];
 }
 
 function emitDirectAssistantAnswer(
@@ -27715,7 +28342,14 @@ async function requestWordCountCorrection({
       ...extractTokenUsageFields(response.raw),
     });
     emitThinking(response.message.thinking, events);
-    return sanitizeAssistantContent(response.message.content);
+    const sanitized = sanitizeAssistantContent(response.message.content);
+    const corrected = stripLeadingVaultWriteToolArtifact(sanitized);
+    if (corrected !== sanitized) {
+      events.onStatus?.(
+        "Removed a model-emitted write-tool marker from the corrected draft.",
+      );
+    }
+    return corrected;
   } catch (error) {
     emitMetricEvent(events, {
       kind: "model_chat",
@@ -28103,9 +28737,12 @@ async function createStreamingNoteWriter({
       flushTimer = null;
     }
     // Never flush process-narration into a replace stream — that wipes drafts.
-    if (kind === "replace" && isVaultWriteProcessNarration(streamedContent)) {
+    if (
+      (kind === "replace" || kind === "append") &&
+      isVaultWriteProcessNarration(streamedContent)
+    ) {
       throw new Error(
-        "Refused streamed replace: model emitted process narration instead of note body. Existing note left unchanged.",
+        "Refused streamed writeback: model emitted process narration instead of note body. Existing note left unchanged.",
       );
     }
     pendingChars = 0;
@@ -29106,6 +29743,7 @@ function isRepairableFinalOutputProof(item: string): boolean {
   return (
     item === "final_output" ||
     item === "citation_url_coverage" ||
+    item.startsWith("passage_citation_coverage:") ||
     item === "limitations_section" ||
     item === "confidence_section" ||
     item === "unanswered_questions" ||
@@ -29114,6 +29752,7 @@ function isRepairableFinalOutputProof(item: string): boolean {
     item.startsWith("verifier:citation_coverage:") ||
     item === "verifier:final_output" ||
     item === "verifier:final_relevance" ||
+    item === "research_phase_acceptance:analyze" ||
     item.includes("claim_grounding") ||
     /^verifier:[^:]+:final_relevance$/u.test(item) ||
     /^plan:[^:]+:final_relevance$/u.test(item)
@@ -29123,8 +29762,81 @@ function isRepairableFinalOutputProof(item: string): boolean {
 function isCitationCoverageProof(item: string): boolean {
   return (
     item === "citation_url_coverage" ||
+    item.startsWith("passage_citation_coverage:") ||
     item.startsWith("subquestion_citation_coverage:") ||
     item.startsWith("verifier:citation_coverage:")
+  );
+}
+
+function getMissingAcceptedPassageCitationIds(
+  draft: string,
+  acceptedPassageIds: string[],
+  researchPlan: ResearchPlan | null | undefined,
+  missionPrompt: string,
+): string[] {
+  if (!hasClosedPassageCitationScope(researchPlan, acceptedPassageIds)) {
+    return [];
+  }
+  if (!hasExplicitPassageCitationContract(missionPrompt)) {
+    return [];
+  }
+  const accepted = [
+    ...new Set(
+      acceptedPassageIds.filter((item) =>
+        /^source:[a-z0-9-]+:passage:\d+-\d+$/u.test(item),
+      ),
+    ),
+  ];
+  if (accepted.length === 0) {
+    return [];
+  }
+  const cited = new Set(
+    [...draft.matchAll(PASSAGE_CITATION_TOKEN_PATTERN)]
+      .map((match) => match[1] ?? match[2] ?? "")
+      .filter((item) => accepted.includes(item)),
+  );
+  return accepted.filter((item) => !cited.has(item));
+}
+
+function requireAcceptedPassageCitationCoverage(
+  acceptance: MissionAcceptanceResult,
+  draft: string,
+  acceptedPassageIds: string[],
+  researchPlan: ResearchPlan | null | undefined,
+  missionPrompt: string,
+): MissionAcceptanceResult {
+  const missingPassageIds = getMissingAcceptedPassageCitationIds(
+    draft,
+    acceptedPassageIds,
+    researchPlan,
+    missionPrompt,
+  );
+  if (missingPassageIds.length === 0) {
+    return acceptance;
+  }
+  const missingKey =
+    `passage_citation_coverage:${missingPassageIds.join(",")}`;
+  const missing = [...new Set([...acceptance.missing, missingKey])];
+  return {
+    ...acceptance,
+    status: acceptance.status === "fail" ? "fail" : "needs_more_work",
+    confidence: Math.min(acceptance.confidence, 0.55),
+    missing,
+    reasons: [
+      ...new Set([
+        ...acceptance.reasons,
+        "accepted_passage_citations_missing",
+      ]),
+    ],
+    nextAction:
+      acceptance.nextAction ??
+      "Cite every accepted fetched-source passage id before the note writeback can be committed.",
+  };
+}
+
+function hasExplicitPassageCitationContract(prompt: string): boolean {
+  return /source:<id>:passage|source:[a-z0-9-]+:passage:\d+-\d+|\bpassage[-\s]*(?:ids?|identifiers?|markers?|citations?)\b|\bexact\b[\s\S]{0,80}\bpassage(?:[-\s]*(?:ids?|identifiers?|markers?))?\b/iu.test(
+    prompt,
   );
 }
 
@@ -29178,6 +29890,10 @@ function buildFinalOutputVerificationCorrectionPrompt(
   researchPlan: ResearchPlan | null = null,
 ): string {
   const requirePassageIds = shouldRequireClaimGrounding(missionPrompt);
+  const requiredLiteralAnchors = extractRequiredLiteralAnchors(missionPrompt);
+  const finalRelevanceMissing = acceptance.missing.some(
+    (item) => /(?:^|:)final_relevance$/u.test(item),
+  );
   const acceptedPassageIds = [
     ...new Set(
       knownPassageIds.filter((item) =>
@@ -29195,6 +29911,12 @@ function buildFinalOutputVerificationCorrectionPrompt(
       ? match[1].split(",").map((id) => id.trim()).filter(Boolean)
       : [];
   });
+  const missingAcceptedPassageIds = acceptance.missing.flatMap((item) => {
+    const match = /^passage_citation_coverage:(.+)$/u.exec(item);
+    return match?.[1]
+      ? match[1].split(",").map((id) => id.trim()).filter(Boolean)
+      : [];
+  });
   const missingEvidenceIds = new Set(
     [
       ...(plan?.tasks ?? [])
@@ -29207,18 +29929,21 @@ function buildFinalOutputVerificationCorrectionPrompt(
   );
   const missingPassageIds = [
     ...new Set(
-      evidence
-        .filter((item) => missingEvidenceIds.has(item.id))
-        .flatMap((item) => [
-          ...(item.passageId ? [item.passageId] : []),
-          ...(item.passageIds ?? []),
-        ])
-        .filter((item) => acceptedPassageIds.includes(item)),
+      [
+        ...evidence
+          .filter((item) => missingEvidenceIds.has(item.id))
+          .flatMap((item) => [
+            ...(item.passageId ? [item.passageId] : []),
+            ...(item.passageIds ?? []),
+          ]),
+        ...missingAcceptedPassageIds,
+      ].filter((item) => acceptedPassageIds.includes(item)),
     ),
   ];
   const citationMissing = acceptance.missing.some(
     (item) =>
       item === "citation_url_coverage" ||
+      item.startsWith("passage_citation_coverage:") ||
       item.startsWith("subquestion_citation_coverage:") ||
       item.startsWith("verifier:citation_coverage:") ||
       item.includes("claim_grounding"),
@@ -29233,6 +29958,9 @@ function buildFinalOutputVerificationCorrectionPrompt(
       : "",
     acceptedPassageIds.length > 0 &&
     (requirePassageIds ||
+      acceptance.missing.some((item) =>
+        item.startsWith("passage_citation_coverage:"),
+      ) ||
       acceptance.missing.some((item) => item.startsWith("verifier:citation_coverage:")))
       ? `The complete accepted passage-id set is: ${acceptedPassageIds.join(", ")}. Use each applicable identifier exactly as written, on the same sentence as the claim it supports; when multiple fetched sources require coverage, cite every listed source at least once.`
       : "",
@@ -29240,13 +29968,19 @@ function buildFinalOutputVerificationCorrectionPrompt(
       ? `Your rejected draft specifically omitted coverage for: ${missingPassageIds.join(", ")}. Preserve the supported draft content and add each omitted identifier to the exact material claim sentence supported by that passage.`
       : "",
     acceptance.missing.some((item) => item.includes("open_evidence_conflicts"))
-      ? "Resolve or explicitly acknowledge open evidence conflicts with a Limitations note before finalizing."
+      ? "Include an explicit ## Limitations section that says the sources conflict, contradict, disagree, or differ. Do not imply that the disagreement was resolved when the evidence remains contradictory."
       : "",
     acceptance.missing.includes("limitations_section")
       ? "Include an explicit Limitations section."
       : "",
     acceptance.missing.includes("confidence_section")
       ? "Include an explicit Confidence section."
+      : "",
+    finalRelevanceMissing && requiredLiteralAnchors.length > 0
+      ? `Preserve every exact user-required literal marker in the final answer: ${requiredLiteralAnchors.join(", ")}. Copy each marker character-for-character.`
+      : "",
+    finalRelevanceMissing
+      ? "Directly answer the original mission subject; do not substitute an adjacent topic or return process commentary."
       : "",
     acceptance.missing.some((item) =>
       item.includes("claim_grounding:missing_quote") ||
@@ -29279,6 +30013,25 @@ function getMissionLedgerStatusForStopReason(
 
 function isRunStopRequested(abortSignal: AbortSignal | undefined): boolean {
   return abortSignal?.aborted ?? false;
+}
+
+/**
+ * Nested executors receive a host-linked signal rather than the coordinator's
+ * original controller. Preserve a budget terminal when that host signal
+ * carries an explicit deadline reason; a literal user stop remains distinct.
+ */
+function isDeadlineAbortSignal(signal: AbortSignal | undefined): boolean {
+  if (!signal?.aborted) return false;
+  const reason = signal.reason;
+  const message =
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : "";
+  return /(?:wall[-\s]?clock|deadline|time(?:out)?|budget)[\s\S]{0,80}(?:expired|exhausted|reached)|(?:expired|exhausted|reached)[\s\S]{0,80}(?:wall[-\s]?clock|deadline|time(?:out)?|budget)/iu.test(
+    message,
+  );
 }
 
 async function checkpointRunIfDue({
@@ -29427,6 +30180,13 @@ export async function executePreparedToolWithMetrics({
           getString(preparedAction.normalizedArgs.path),
       );
     }
+    if (
+      result.ok &&
+      preparedAction.toolName === "upsert_mermaid_block" &&
+      toolContext.runtimeCache
+    ) {
+      toolContext.runtimeCache.verifiedMermaidRead = undefined;
+    }
     emitMetricEvent(events, {
       kind: "tool",
       name: preparedAction.toolName,
@@ -29544,6 +30304,11 @@ async function executeToolWithMetrics({
       toolContext.runtimeCache,
       toolCall,
       toolContext,
+      result,
+    );
+    rememberVerifiedMermaidReadResult(
+      toolContext.runtimeCache,
+      toolCall,
       result,
     );
     rememberLatestFastValidationDiagnostic(
@@ -29947,6 +30712,37 @@ export function rememberVerifiedWorkspaceReadResult(
   });
 }
 
+function rememberVerifiedMermaidReadResult(
+  runtimeCache: AgentRuntimeCache | undefined,
+  toolCall: Pick<ModelToolCall, "name">,
+  result: ToolExecutionResult,
+): void {
+  if (!runtimeCache || !result.ok) return;
+  if (toolCall.name === "upsert_mermaid_block") {
+    runtimeCache.verifiedMermaidRead = undefined;
+    return;
+  }
+  if (toolCall.name !== "read_mermaid_block" || !isRecord(result.output)) {
+    return;
+  }
+  const path = getString(result.output.path);
+  const sha256 = getString(result.output.sha256);
+  const selector = result.output.selector;
+  if (
+    !path ||
+    !sha256 ||
+    !/^sha256:[a-f0-9]{64}$/u.test(sha256) ||
+    !isRecord(selector)
+  ) {
+    return;
+  }
+  runtimeCache.verifiedMermaidRead = {
+    path,
+    sha256,
+    selector: { ...selector },
+  };
+}
+
 export function getVerifiedWorkspaceReadObservation(
   runtimeCache: AgentRuntimeCache | undefined,
   path: string,
@@ -29985,6 +30781,70 @@ export function getVerifiedWorkspaceWriteObservation(
   return workspaceId
     ? getVerifiedWorkspaceReadObservation(runtimeCache, path, workspaceId)
     : null;
+}
+
+/**
+ * A single explicit web_fetch target is a user-owned read boundary. Bind the
+ * provider call back to that URL, and preserve an explicit refresh=true/false
+ * directive, so a model cannot silently substitute a sibling domain or bypass
+ * the user's cache choice.
+ */
+export function bindExplicitWebFetchContract(
+  prompt: string,
+  toolCall: ModelToolCall,
+): ModelToolCall | null {
+  if (
+    toolCall.name !== "web_fetch" ||
+    !/\bweb_fetch\b/iu.test(prompt)
+  ) {
+    return null;
+  }
+  const urls = new Set<string>();
+  for (const match of prompt.matchAll(/https?:\/\/[^\s<>"'`]+/giu)) {
+    const candidate = match[0]!.replace(/[)\],.;!?]+$/gu, "");
+    if (!candidate) continue;
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        parsed.hash = "";
+        urls.add(parsed.toString());
+      }
+    } catch {
+      // Invalid prompt URLs remain model text; do not create a host binding.
+    }
+  }
+  if (urls.size !== 1) return null;
+
+  const refreshMatch = /\brefresh\s*=\s*(true|false)\b/iu.exec(prompt);
+  const explicitUrl = [...urls][0]!;
+  return {
+    ...toolCall,
+    arguments: {
+      ...toolCall.arguments,
+      url: explicitUrl,
+      ...(refreshMatch
+        ? { refresh: refreshMatch[1]!.toLowerCase() === "true" }
+        : {}),
+    },
+  };
+}
+
+export function attachMissingRequiredLiteralAnchors(
+  content: string,
+  prompt: string,
+): { content: string; insertedAnchors: string[] } {
+  const normalizedContent = content.toLowerCase();
+  const insertedAnchors = extractRequiredLiteralAnchors(prompt).filter(
+    (anchor) => !normalizedContent.includes(anchor.toLowerCase()),
+  );
+  if (insertedAnchors.length === 0) {
+    return { content, insertedAnchors: [] };
+  }
+  const separator = content.endsWith("\n") ? "\n" : "\n\n";
+  return {
+    content: `${content}${separator}${insertedAnchors.join("\n")}`,
+    insertedAnchors,
+  };
 }
 
 export function bindVerifiedWorkspaceRead(
@@ -30074,6 +30934,192 @@ const VERIFIED_WORKSPACE_LIFECYCLE_TOOL_NAMES = new Set([
   "code_repair_record_cycle",
   "code_commit_verified",
 ]);
+
+const HOST_DRIVEN_EXACT_CODE_VALIDATION_TOOL_NAMES = new Set([
+  "code_validate_fast",
+  "code_validate_targeted",
+  "code_validate_full",
+]);
+
+/**
+ * Exact validation nodes have no model-authored command or destination: the
+ * RepositoryProfile/scratch profile, workspace, command, staging manifest,
+ * and artifacts are all rebound by the host. If a model twice refuses the
+ * only ready validation schema, the host may request that one graph-bound
+ * action with a deterministic per-run receipt scope. Approval and prepared
+ * action policy remain unchanged.
+ */
+export function buildExactCodeValidationFallbackToolCall(
+  readyToolNames: readonly string[],
+  runId: string,
+): ModelToolCall | null {
+  if (
+    readyToolNames.length !== 1 ||
+    !HOST_DRIVEN_EXACT_CODE_VALIDATION_TOOL_NAMES.has(readyToolNames[0] ?? "")
+  ) {
+    return null;
+  }
+  const normalizedRunId = runId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+  if (!normalizedRunId) {
+    return null;
+  }
+  const repairRequestId = `repair-${normalizedRunId}`.slice(0, 128);
+  return {
+    name: readyToolNames[0]!,
+    arguments: {
+      repairRequestId,
+      expectedArtifacts: [],
+      environment: {},
+    },
+  };
+}
+
+/**
+ * A known-folder delivery must export the verified workspace tree, not a
+ * model-selected file or workspace transcription. Bind the one foreground
+ * destination named by the user and use a run-scoped absent directory so the
+ * export remains exact, approval-gated, and non-overwriting.
+ */
+export function bindVerifiedWorkspaceDirectoryExport(
+  toolCall: ModelToolCall,
+  prompt: string,
+  runId: string,
+  durableReceipts: readonly AgentRunReceipt[],
+): ModelToolCall | null {
+  if (toolCall.name !== "code_workspace_export_directory") return null;
+  const workspaceId = getSingleVerifiedDurableWorkspaceId(durableReceipts);
+  if (!workspaceId || !hasKnownHostDirectoryExportIntent(prompt)) return null;
+
+  const destinationRoots = new Set<"desktop" | "documents" | "downloads">();
+  if (/\bdesktop\b/iu.test(prompt)) destinationRoots.add("desktop");
+  if (/\bdocuments?(?:\s+folder)?\b/iu.test(prompt)) {
+    destinationRoots.add("documents");
+  }
+  if (/\bdownloads?(?:\s+folder)?\b/iu.test(prompt)) {
+    destinationRoots.add("downloads");
+  }
+  if (destinationRoots.size !== 1) return null;
+
+  const normalizedRunId = runId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "");
+  const runSuffix = normalizedRunId.slice(-12) || "deliverable";
+  const deliverableLabel =
+    /\bnumber[\s-]+guessing(?:[\s-]+game)?\b/iu.test(prompt)
+      ? "number-guessing-game"
+      : "code-deliverable";
+  return {
+    ...toolCall,
+    arguments: {
+      ...toolCall.arguments,
+      workspaceId,
+      sourcePath: "",
+      destinationRoot: [...destinationRoots][0]!,
+      destinationPath: `${deliverableLabel}-${runSuffix}`,
+    },
+  };
+}
+
+/**
+ * The model may summarize an export, but only the verified host-directory
+ * receipt can name where the files landed. Project that receipt into the
+ * visible completion message so a plausible but false Desktop path is never
+ * shown after a successful delivery.
+ */
+export function buildVerifiedHostExportFinalAnswer(
+  prompt: string,
+  durableReceipts: readonly AgentRunReceipt[],
+  successfulToolNames: readonly string[],
+): string | null {
+  const verifiedExportReceipts = durableReceipts.filter(
+    (receipt) =>
+      receipt.toolName === "code_workspace_export_directory" &&
+      receipt.operation === "create" &&
+      receipt.readback?.status === "verified",
+  );
+  if (verifiedExportReceipts.length === 0) return null;
+  const exportPaths = new Set(
+    verifiedExportReceipts
+      .flatMap((receipt) => {
+        const output = isRecord(receipt.output) ? receipt.output : null;
+        return [
+          receipt.resource?.path?.trim() ?? "",
+          receipt.path?.trim() ?? "",
+          getString(output?.destinationPath)?.trim() ?? "",
+        ];
+      })
+      .filter(
+        (exportPath) =>
+          /^(?:[A-Za-z]:[\\/]|\/)/u.test(exportPath),
+      ),
+  );
+  if (exportPaths.size !== 1) {
+    return [
+      "## Delivery completed, but the export path needs review",
+      "",
+      "The host recorded a verified directory-export receipt, but it could not project one unambiguous absolute path into Chat.",
+      "",
+      "Open Run Details and use the verified export receipt path; do not rely on a path written by the model.",
+    ].join("\n");
+  }
+  const exportPath = [...exportPaths][0]!;
+  const createdPaths = durableReceipts
+    .filter(
+      (receipt) =>
+        receipt.toolName === "code_workspace_create_file" &&
+        (receipt.commitKind === "committed" ||
+          receipt.commitKind === "reconciled") &&
+        receipt.readback?.status === "verified",
+    )
+    .flatMap((receipt) => {
+      const output = isRecord(receipt.output) ? receipt.output : null;
+      return [
+        receipt.resource?.path?.trim() ?? "",
+        receipt.path?.trim() ?? "",
+        getString(output?.path)?.trim() ?? "",
+      ];
+    })
+    .filter((createdPath) => createdPath.length > 0);
+  const pythonEntryPoint =
+    createdPaths.find((createdPath) => /(?:^|\/)main\.py$/iu.test(createdPath)) ??
+    createdPaths.find((createdPath) => /\.py$/iu.test(createdPath)) ??
+    null;
+  const completedValidations = [
+    ["code_validate_fast", "fast"],
+    ["code_validate_targeted", "targeted"],
+    ["code_validate_full", "full"],
+  ]
+    .filter(([toolName]) => successfulToolNames.includes(toolName!))
+    .map(([, label]) => label!);
+  const isPythonGuessingGame =
+    /\bpython\b/iu.test(prompt) &&
+    /\bnumber[\s-]+guessing(?:[\s-]+game)?\b/iu.test(prompt);
+  const lines = [
+    isPythonGuessingGame
+      ? "## Done — Python number guessing game delivered"
+      : "## Done — Code delivered",
+    "",
+    isPythonGuessingGame
+      ? "I created the requested number guessing game and delivered the verified workspace to the requested folder."
+      : "I created the requested code deliverable and delivered the verified workspace to the requested folder.",
+    "",
+    `- Verified export path: \`${exportPath}\``,
+    pythonEntryPoint ? `- Entry point: \`${pythonEntryPoint}\`` : "",
+    completedValidations.length > 0
+      ? `- Sandbox validation passed: ${completedValidations.join(", ")}`
+      : "",
+    "",
+    pythonEntryPoint
+      ? `Run it from the exported directory with \`python ${pythonEntryPoint}\`.`
+      : "Open the verified export path above to use the delivered files.",
+  ];
+  return lines.filter((line, index) => line || lines[index - 1] !== "").join("\n");
+}
 
 /**
  * Validate/repair/commit must target the independently verified durable

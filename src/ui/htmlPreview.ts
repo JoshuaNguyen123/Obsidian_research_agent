@@ -28,7 +28,13 @@ export function buildHtmlPreviewDocument(
     '<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; img-src data: https: http:; media-src data: https: http:; font-src data: https: http:; style-src &#39;unsafe-inline&#39;; script-src &#39;none&#39;; connect-src &#39;none&#39;; frame-src https: http:;">',
     `<title>${title}</title>`,
     "<style>",
-    "html,body{margin:0;min-height:100%;background:#fff;color:#111;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}",
+    // CSS system colors (Canvas/CanvasText) resolve against the color-scheme
+    // the embedder propagates to the srcdoc root, so previews follow the
+    // Obsidian theme with a byte-identical document: no computed theme values
+    // are injected (tool receipts fingerprint this srcdoc, and the CSP's
+    // style-src 'unsafe-inline' must not become an injection surface).
+    "html{color-scheme:light dark;}",
+    "html,body{margin:0;min-height:100%;background:Canvas;color:CanvasText;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}",
     "body{padding:16px;}",
     "img,svg,video,canvas{max-width:100%;height:auto;}",
     "*{box-sizing:border-box;}",
@@ -53,6 +59,9 @@ export function renderHtmlPreview(
   iframe.title = options.title?.trim() || "HTML Preview";
   iframe.referrerPolicy = "no-referrer";
   iframe.setAttribute("sandbox", HTML_PREVIEW_IFRAME_SANDBOX);
+  // Propagate the embedder's light/dark scheme into the srcdoc so its
+  // Canvas/CanvasText system colors resolve to the active Obsidian theme.
+  iframe.style.colorScheme = "light dark";
   const srcdoc = buildHtmlPreviewDocument(html, options);
   iframe.srcdoc = srcdoc;
   wrapper.appendChild(iframe);
@@ -78,6 +87,9 @@ export function renderSandboxedHtmlPreview(
   iframe.title = options.title?.trim() || "HTML Preview";
   iframe.referrerPolicy = "no-referrer";
   iframe.setAttribute("sandbox", HTML_PREVIEW_IFRAME_SANDBOX);
+  // Propagate the embedder's light/dark scheme into the srcdoc so its
+  // Canvas/CanvasText system colors resolve to the active Obsidian theme.
+  iframe.style.colorScheme = "light dark";
   iframe.srcdoc = srcdoc;
   wrapper.appendChild(iframe);
   container.appendChild(wrapper);

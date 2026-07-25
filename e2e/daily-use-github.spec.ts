@@ -216,6 +216,7 @@ test.describe("Daily-use verified code publication", () => {
           title: firstRequest.title,
           body: firstRequest.body,
           binding: harness.binding,
+          handoff: firstRequest.handoff,
         });
       expect(resumedPublication.status).toBe("review_or_merge_ready");
       expect(resumedPublication.pullRequest?.head.sha).toBe(

@@ -518,6 +518,51 @@ test("host graph binds a singular source-file creation instead of the current no
   assert.notEqual(node?.destination?.selector, "E2E Agent Tests/phase4.md");
 });
 
+test("host graph binds a bare Python deliverable to one executable source path", async () => {
+  const names = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_workspace_export_directory",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-bare-python-deliverable",
+    objective: "write a number guessing game in Python on my desktop",
+    toolRegistry: registryForDescriptors(
+      names.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: names.length,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const node = Object.values(host.deterministicProposal.nodes).find(
+    (candidate) => candidate.id === "lifecycle-code_execution",
+  );
+  assert.ok(node);
+  const lifecycle = getMissionCompositeLifecycleSpecV1(node!);
+  assert.ok(lifecycle);
+  const create = lifecycle.actions.find(
+    (action) => action.toolName === "code_workspace_create_file",
+  );
+  const repair = lifecycle.actions.find(
+    (action) => action.toolName === "code_repair_record_cycle",
+  );
+  assert.equal(create?.selector, "main.py");
+  assert.equal(
+    create?.objective,
+    "Create the exact new workspace file main.py without overwrite.",
+  );
+  assert.equal(repair?.condition, "fast_validation_failed");
+});
+
 test("host graph adds one exact protected-contract read and two bounded correction passes", async () => {
   const planned = [
     "code_workspace_create",

@@ -4,12 +4,15 @@
  * // INTEGRATOR: researchWorker / runResearchTeamMission — apply
  * // filterResearcherToolNames to worker tool schemas; use
  * // buildResearcherAssignment for worker assignment text.
- * // INTEGRATOR: dedupe RESEARCHER_SOFT_TOOL_NAMES with RESEARCH_WORKER_ALLOWED_TOOLS.
  */
 
 import { effectClassForTool } from "../agent/autonomyEffectClass";
 
-/** Mirrors RESEARCH_WORKER_ALLOWED_TOOLS for Wave-0 ownership isolation. */
+/**
+ * The single authoritative Researcher tool catalog. researchWorker's
+ * RESEARCH_WORKER_ALLOWED_TOOLS is derived structurally from this list —
+ * add new Researcher-visible tools HERE only.
+ */
 export const RESEARCHER_SOFT_TOOL_NAMES: readonly string[] = [
   "read_current_file",
   "list_current_folder",
@@ -34,6 +37,14 @@ export const RESEARCHER_SOFT_TOOL_NAMES: readonly string[] = [
   "browser_extract_markdown",
   "search_research_memory",
   "read_research_memory",
+  "analyze_dataset",
+  "resolve_citation",
+  "verify_citation",
+  // Repository-scoped GitHub search reads (present only when GitHub is
+  // connected; harmless entries otherwise since the registry intersects).
+  "github_search_code",
+  "github_search_issues",
+  "github_search_commits",
 ];
 
 const RESEARCHER_ALLOW = new Set(RESEARCHER_SOFT_TOOL_NAMES);

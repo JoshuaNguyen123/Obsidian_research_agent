@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 // @ts-ignore The production runner is an intentionally unbundled Node ESM script.
-import { applyE2eAiMode, applyE2eLane, applyE2eProviderDefaults, applyPersistedWindowsSandboxEnvironment, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
+import { applyE2eAiMode, applyE2eLane, applyE2eProviderDefaults, applyPersistedWindowsSandboxEnvironment, assertExternalCredentialProjectPreconditions, normalizeExclusiveArgs } from "../scripts/run-e2e-exclusive.mjs";
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
 
@@ -145,6 +145,13 @@ test("live Windows workflows publish runner-temp vault paths from a step", () =>
 });
 
 test("real AI and live external flags cannot widen into other projects", () => {
+  assert.deepEqual(
+    normalizeExclusiveArgs([
+      "--real-ai",
+      "--project=desktop-code-delivery-real-live",
+    ]).projects,
+    ["desktop-code-delivery-real-live"],
+  );
   assert.throws(
     () => normalizeExclusiveArgs(["--real-ai", "--project=deterministic-core-mock"]),
     /restricted to attested live-provider/u,
@@ -164,6 +171,68 @@ test("real AI and live external flags cannot widen into other projects", () => {
   assert.throws(
     () => normalizeExclusiveArgs(["--mock-ai", "--project=compound-flow-real-live"]),
     /cannot target Tier A journey projects/u,
+  );
+});
+
+test("github askpass runtime lane routes under mock-ai and gates on its credential", () => {
+  const normalized = normalizeExclusiveArgs([
+    "--mock-ai",
+    "--project=github-askpass-runtime-live",
+  ]);
+  assert.equal(normalized.liveExternal, false);
+  assert.deepEqual(normalized.projects, ["github-askpass-runtime-live"]);
+  const env: NodeJS.ProcessEnv = {};
+  applyE2eLane(normalized, env);
+  assert.equal(env.E2E_PLAYWRIGHT_LANE, "github-askpass-runtime-live");
+
+  // The lane makes no model calls: --real-ai must reject it.
+  assert.throws(
+    () => normalizeExclusiveArgs(["--real-ai", "--project=github-askpass-runtime-live"]),
+    /restricted to attested live-provider/u,
+  );
+
+  // Credential and platform preconditions fail before any Obsidian boot.
+  assert.throws(
+    () =>
+      assertExternalCredentialProjectPreconditions(
+        { projects: ["github-askpass-runtime-live"] },
+        {},
+        "win32",
+      ),
+    /requires E2E_GITHUB_TOKEN/u,
+  );
+  assert.throws(
+    () =>
+      assertExternalCredentialProjectPreconditions(
+        { projects: ["github-askpass-runtime-live"] },
+        { E2E_GITHUB_TOKEN: "ghp_x" },
+        "linux",
+      ),
+    /supports only win32/u,
+  );
+  assert.throws(
+    () =>
+      assertExternalCredentialProjectPreconditions(
+        { projects: ["github-askpass-runtime-live", "deterministic-core-mock"] },
+        { E2E_GITHUB_TOKEN: "ghp_x" },
+        "win32",
+      ),
+    /only selected project/u,
+  );
+  assert.doesNotThrow(() =>
+    assertExternalCredentialProjectPreconditions(
+      { projects: ["github-askpass-runtime-live"] },
+      { E2E_GITHUB_TOKEN: "ghp_x" },
+      "win32",
+    ),
+  );
+  // Lanes without external-credential requirements are unaffected.
+  assert.doesNotThrow(() =>
+    assertExternalCredentialProjectPreconditions(
+      { projects: ["deterministic-core-mock"] },
+      {},
+      "linux",
+    ),
   );
 });
 
@@ -353,6 +422,10 @@ test("daily-use commands route to focused specs and live projects disable reruns
     /--real-ai --project=daily-use-code-live/u,
   );
   assert.match(
+    packageJson.scripts["test:e2e:desktop-code-delivery"],
+    /--real-ai --project=desktop-code-delivery-real-live/u,
+  );
+  assert.match(
     packageJson.scripts["test:e2e:hello-github"],
     /--real-ai --project=obsidian-hello-github-live/u,
   );
@@ -385,6 +458,7 @@ test("daily-use commands route to focused specs and live projects disable reruns
   for (const project of [
     "daily-use-research",
     "daily-use-code-live",
+    "desktop-code-delivery-real-live",
     "daily-use-compound",
     "real-ai-soak",
     "provider-canary",
@@ -507,10 +581,16 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   assert.match(realHarness, /markModelConnectionVerifiedForHarness/u);
   assert.match(realHarness, /utilityModel:\s*""/u);
   assert.match(realHarness, /if \(reuseWorkerAttestation\)/u);
-  assert.match(
-    realHarness,
-    /Validation completed red\|passing cycle is still required\|tool_failure_terminal\|tool_failure_repeated\|same fast-validation failure fingerprint/u,
-  );
+  for (const terminalMarker of [
+    "Validation completed red",
+    "Fast validation remained red",
+    "passing cycle is still required",
+    "tool_failure_terminal",
+    "tool_failure_repeated",
+    "same fast-validation failure fingerprint",
+  ]) {
+    assert.ok(realHarness.includes(terminalMarker), terminalMarker);
+  }
   assert.match(
     realHarness,
     /terminal validation\/MissionGraph blocker; refusing further Continue loops/u,

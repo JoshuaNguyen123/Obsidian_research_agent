@@ -801,21 +801,18 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       );
       expect(linkReceipt.toolName).toBe("linear_create_comment");
       expect(linkReceipt.resourceId).toBeTruthy();
-      const comments = await activeLinearClient.execute("comments.list", {
-        first: 50,
-        includeArchived: false,
-        filter: { issue: { id: { eq: completedIssueId } } },
+      const summaryComment = await activeLinearClient.execute("comments.get", {
+        id: linkReceipt.resourceId,
       }) as any;
-      const commentNodes: any[] = Array.isArray(comments?.nodes)
-        ? comments.nodes
-        : [];
-      const summaryComment = commentNodes.find(
-        (comment) => String(comment?.id ?? "") === linkReceipt.resourceId,
-      );
       expect(
-        summaryComment,
-        "durable summary comment from finalizeLinearLink must exist on the completed issue",
-      ).toBeTruthy();
+        String(summaryComment?.id ?? ""),
+        "durable summary comment from finalizeLinearLink must exist at its receipt-bound id",
+      ).toBe(linkReceipt.resourceId);
+      expect(
+        String(summaryComment?.issue?.id ?? ""),
+        "durable summary comment from finalizeLinearLink must belong to the completed issue",
+      ).toBe(completedIssueId);
+      expect(String(summaryComment?.archivedAt ?? "")).toBe("");
       const summaryBody = String(summaryComment?.body ?? "");
       expect(summaryBody).toMatch(
         new RegExp(`pull request #${exactPullRequestNumber}\\b`, "iu"),

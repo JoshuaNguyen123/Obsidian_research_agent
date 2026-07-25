@@ -16,8 +16,10 @@ import {
   DisposableExternalCleanupManifest,
   preflightDisposableRepositoryDeleteAuthority,
   proveRestCreateAndDeleteProbe,
+  orderGitHubHarnessTokensForPush,
   safeExternalCleanupError,
 } from "./fixtures/externalCleanup";
+import { ensureDurableLinearQueueProject } from "./fixtures/linearQueueProvisioning";
 import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import { createFlowRealTypeScriptFixture } from "./fixtures/phase4GitRepo";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
@@ -277,7 +279,10 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
       },
       { codePluginId: PHASE4_CODE_PLUGIN_ID, config: sandboxConfiguration },
     );
-    expect(sandboxProbe).toMatchObject({
+    expect(
+      sandboxProbe,
+      `Obsidian sandbox probe failed: ${JSON.stringify(sandboxProbe)}`,
+    ).toMatchObject({
       executionAvailable: true,
       selectedProvider: "wsl2",
     });
@@ -292,7 +297,7 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
       // sources unless COMPOUND_REAL_LIVE_WEB=1; "before accepting findings"
       // keeps the proof-gated acceptance path that publish_research_to_linear
       // requires.
-      `First research the Flow real ${marker} topic using exactly two public web sources and fetch both sources before accepting findings. Write the accepted findings into the current note ${notePath} using the exact headings ## Findings, ## Sources, and ## Implementation implications, citing both fetched source URLs and passages.`,
+      `First research the Flow real ${marker} topic using exactly two public web sources and fetch both sources before accepting findings. Write the accepted findings into the current note ${notePath} using the canonical headings ## Problem and impact, ## Evidence and source links, and ## Proposed work, citing both fetched source URLs and passages.`,
       // Stage 2 — research → Linear. publish_research_to_linear creates the
       // lineage that finalizeLinearLink/finalizeLinearCompletion resolve; a
       // bare linear_create_issue would leave the publication parked at
@@ -339,10 +344,10 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
     const finalNote = await readNote(harness.page, notePath);
 
     // Stage 1 — research evidence must live in the initiating note.
-    expect(finalNote, "research findings heading missing").toMatch(/##\s*Findings/iu);
-    expect(finalNote, "research sources heading missing").toMatch(/##\s*Sources/iu);
-    expect(finalNote, "research implications heading missing").toMatch(
-      /##\s*Implementation implications/iu,
+    expect(finalNote, "research problem heading missing").toMatch(/##\s*Problem and impact/iu);
+    expect(finalNote, "research evidence heading missing").toMatch(/##\s*Evidence and source links/iu);
+    expect(finalNote, "research work heading missing").toMatch(
+      /##\s*Proposed work/iu,
     );
     if (!liveWeb) {
       expect(
@@ -518,16 +523,23 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
     expect(completionProof.stateId).toBe(completionProof.configuredCompletedStateId);
     expect(completionProof.completedAt).toBeTruthy();
     expect(completionProof.trashed).toBe(false);
-    const summaryComment = completionProof.comments.find(
-      (comment) => comment.id === linkReceipt.resourceId,
+    // Read the exact durable comment identity from its receipt. This is a
+    // stronger independent provider check than a paginated/filterable list:
+    // it proves that the finalizer's own comment exists, is attached to this
+    // exact completed issue, and still contains the published PR lineage.
+    const summaryComment = await readLinearCommentProof(
+      harness.page,
+      linkReceipt.resourceId,
     );
+    expect(summaryComment.id).toBe(linkReceipt.resourceId);
     expect(
-      summaryComment,
-      "durable summary comment from finalizeLinearLink must exist on the completed issue",
-    ).toBeTruthy();
-    expect(summaryComment!.body).toMatch(/pull request #\d+/iu);
-    expect(summaryComment!.body).toContain(publication.pullRequestHtmlUrl);
-    expect(summaryComment!.body).toContain(
+      summaryComment.issueId,
+      "durable summary comment from finalizeLinearLink must belong to the completed issue",
+    ).toBe(completedIssueId);
+    expect(summaryComment.archivedAt).toBe("");
+    expect(summaryComment.body).toMatch(/pull request #\d+/iu);
+    expect(summaryComment.body).toContain(publication.pullRequestHtmlUrl);
+    expect(summaryComment.body).toContain(
       `Publication lineage: \`${publication.publicationId}\``,
     );
 
@@ -647,13 +659,15 @@ async function findLinearIssueByTitle(
             name,
             arguments:
               name === "linear_search_issues"
-                ? { query: title, teamId, first: 10 }
+                ? { query: title, first: 10 }
                 : { teamId, first: 25 },
           },
           { ...context, operationId: `${name}-find-${Date.now()}` },
         );
         if (!result?.ok) continue;
-        const issues = Array.isArray((result.output as any)?.issues)
+        const issues = Array.isArray((result.output as any)?.items)
+          ? (result.output as any).items
+          : Array.isArray((result.output as any)?.issues)
           ? (result.output as any).issues
           : Array.isArray((result.output as any)?.nodes)
             ? (result.output as any).nodes
@@ -814,7 +828,6 @@ async function readLinearIssueCompletionProof(
   completedAt: string;
   trashed: boolean;
   configuredCompletedStateId: string;
-  comments: Array<{ id: string; body: string }>;
 }> {
   return page.evaluate(async ({ pluginId, issueId }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins
@@ -824,12 +837,6 @@ async function readLinearIssueCompletionProof(
       throw new Error("Production Linear readback client is unavailable.");
     }
     const issue = await client.execute("issues.get", { id: issueId }) as any;
-    const comments = await client.execute("comments.list", {
-      first: 50,
-      includeArchived: false,
-      filter: { issue: { id: { eq: issueId } } },
-    }) as any;
-    const nodes = Array.isArray(comments?.nodes) ? comments.nodes : [];
     return {
       stateId: String(issue?.state?.id ?? ""),
       stateType: String(issue?.state?.type ?? ""),
@@ -838,12 +845,39 @@ async function readLinearIssueCompletionProof(
       configuredCompletedStateId: String(
         plugin.settings?.linearCompletedStateId ?? "",
       ),
-      comments: nodes.map((node: any) => ({
-        id: String(node?.id ?? ""),
-        body: String(node?.body ?? ""),
-      })),
     };
   }, { pluginId: NATIVE_CORE_PLUGIN_ID, issueId });
+}
+
+/**
+ * Re-read the exact comment resource named by the finalizer receipt. This
+ * avoids treating a connection-filter result as authority for a concrete,
+ * independently verified mutation target.
+ */
+async function readLinearCommentProof(
+  page: Page,
+  commentId: string,
+): Promise<{
+  id: string;
+  body: string;
+  issueId: string;
+  archivedAt: string;
+}> {
+  return page.evaluate(async ({ pluginId, commentId }) => {
+    const plugin = (window as typeof window & { app?: any }).app?.plugins
+      ?.plugins?.[pluginId];
+    const client = plugin?.createSecretBackedLinearClient?.();
+    if (!plugin || !client) {
+      throw new Error("Production Linear comment readback client is unavailable.");
+    }
+    const comment = await client.execute("comments.get", { id: commentId }) as any;
+    return {
+      id: String(comment?.id ?? ""),
+      body: String(comment?.body ?? ""),
+      issueId: String(comment?.issue?.id ?? ""),
+      archivedAt: String(comment?.archivedAt ?? ""),
+    };
+  }, { pluginId: NATIVE_CORE_PLUGIN_ID, commentId });
 }
 
 async function cleanupLinearIssue(page: Page, issueId: string): Promise<void> {
@@ -1108,6 +1142,19 @@ async function prepareAgentChatSurface(
     await dismiss.click().catch(() => undefined);
     await page.waitForTimeout(200);
   }
+  // The shared e2e team decays to zero projects (other lanes create then
+  // trash their own), and configureRecommendedLinearQueue only selects
+  // existing projects. Provision the durable queue project first so the
+  // readiness gate below stops failing closed on an empty team.
+  const durableQueue = await ensureDurableLinearQueueProject(page, {
+    pluginId: NATIVE_CORE_PLUGIN_ID,
+    teamId,
+  });
+  if (!durableQueue.ok) {
+    throw new Error(
+      `Durable Linear queue provisioning failed before COMPOUND-REAL: ${durableQueue.message}`,
+    );
+  }
   const linearReady = await page.evaluate(async ({ pluginId, teamId }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins?.plugins?.[pluginId];
     if (!plugin) throw new Error("Agentic Researcher plugin is unavailable.");
@@ -1201,7 +1248,7 @@ async function collectHarnessGitHubTokenCandidates(
   } catch {
     // gh may be unavailable; preferred token may still work after reinstall.
   }
-  return candidates;
+  return orderGitHubHarnessTokensForPush(candidates);
 }
 
 async function ensureGitHubCreateCapableCredential(input: {
@@ -1266,7 +1313,7 @@ async function ensureGitHubCreateCapableCredential(input: {
 
   if (candidates.length === 0) {
     throw new Error(
-      "Agentic GitHub create is blocked: vault/E2E credential cannot create private repositories, and no github_pat_/gh[pousr]_ harness token is available. Set E2E_GITHUB_TOKEN (Administration:write) or run gh auth login with repo+delete_repo.",
+      "Agentic GitHub create is blocked: vault/E2E credential cannot create private repositories, and no github_pat_/gh[pousr]_ harness token is available. Set E2E_GITHUB_TOKEN with Administration:write plus Contents:write (All repositories), or run gh auth login with repo+delete_repo.",
     );
   }
 
@@ -1311,7 +1358,7 @@ async function ensureGitHubCreateCapableCredential(input: {
     [
       "Agentic GitHub create is blocked after harness credential install: REST create+delete probe still failed.",
       lastInstallError,
-      "Fix: set E2E_GITHUB_TOKEN to a fine-grained PAT with Administration:write, or refresh gh auth with repo scope.",
+      "Fix: set E2E_GITHUB_TOKEN to a fine-grained PAT with Administration:write plus Contents:write (All repositories), or refresh gh auth with repo scope.",
     ].join(" "),
   );
 }

@@ -2,6 +2,8 @@ export interface ProjectMemoryLocation {
   memoryFolder: string;
   conversationPath: string;
   researchIndexPath: string;
+  /** Cross-run tool outcome ledger; see `outcomeMemory.ts`. */
+  toolOutcomePath: string;
   researchNotesFolder: string;
 }
 
@@ -22,6 +24,7 @@ export function getProjectMemoryLocation(
     memoryFolder,
     conversationPath: joinVaultPath(memoryFolder, "conversation-history.json"),
     researchIndexPath: joinVaultPath(memoryFolder, "research-memory-index.json"),
+    toolOutcomePath: joinVaultPath(memoryFolder, "tool-outcome-memory.json"),
     researchNotesFolder: joinVaultPath(memoryFolder, "Research"),
   };
 }

@@ -39,7 +39,9 @@ export type VerifierKind =
   | "write_safety"
   | "final_relevance"
   | "claim_grounding"
-  | "evidence_conflicts";
+  | "evidence_conflicts"
+  | "extension"
+  | "critic";
 
 export interface VerificationCheck {
   id: string;

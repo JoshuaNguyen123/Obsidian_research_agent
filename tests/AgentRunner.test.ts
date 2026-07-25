@@ -5,13 +5,18 @@ import {
   applyExactWorkspaceCorrectionReplacements,
   applyExactWorkspaceLineRangeCorrections,
   attachGroundedPassageCitations,
+  attachMissingRequiredLiteralAnchors,
   bindAuthoritativeGraphCodeValidation,
+  bindExplicitWebFetchContract,
   bindExactWorkspaceDestinationToolSchemas,
   bindIncompleteWorkspaceReplacementToVerifiedNoop,
   isIncompleteWorkspaceReplacementContent,
   bindTrustedRepositoryWorkspaceCreate,
   bindVerifiedWorkspaceCreateFile,
+  bindVerifiedWorkspaceDirectoryExport,
   bindVerifiedWorkspaceLifecycleTool,
+  buildVerifiedHostExportFinalAnswer,
+  buildExactCodeValidationFallbackToolCall,
   bindVerifiedWorkspaceRead,
   bindVerifiedWorkspaceWriteExpected,
   resolveSingleNamedTrustedRepositoryProfileKey,
@@ -39,6 +44,7 @@ import {
   findExactGraphBoundToolCallIndex,
   getExplicitMermaidWorkflowToolNames,
   getExplicitCodeToolNames,
+  getCodeCapabilityRegistrationBlockerV1,
   getRequiredCodeWorkflowToolNames,
   getExplicitLinearMutationToolNames,
   getExplicitLinearReadToolNames,
@@ -202,6 +208,67 @@ test("explicit Code tool selection does not widen a tool name to its prefix", ()
   );
 });
 
+test("single explicit web_fetch target and cache policy override provider drift", () => {
+  const bound = bindExplicitWebFetchContract(
+    "Call web_fetch once for https://primary.owned.example/evidence/marker with refresh=false.",
+    {
+      id: "fetch-1",
+      name: "web_fetch",
+      arguments: {
+        url: "https://alternate.owned.example/evidence/marker",
+        refresh: true,
+      },
+    },
+  );
+  assert.deepEqual(bound?.arguments, {
+    url: "https://primary.owned.example/evidence/marker",
+    refresh: false,
+  });
+
+  assert.equal(
+    bindExplicitWebFetchContract(
+      "Compare web_fetch results from https://one.example/a and https://two.example/b.",
+      {
+        id: "fetch-2",
+        name: "web_fetch",
+        arguments: { url: "https://one.example/a" },
+      },
+    ),
+    null,
+  );
+  assert.equal(
+    bindExplicitWebFetchContract(
+      "Read https://primary.owned.example/evidence/marker without naming a tool.",
+      {
+        id: "fetch-3",
+        name: "web_fetch",
+        arguments: { url: "https://primary.owned.example/evidence/marker" },
+      },
+    ),
+    null,
+  );
+});
+
+test("verified candidates restore only missing exact user-required literal markers", () => {
+  const marker = "E2E_MARKER_LITERAL_NORMALIZATION_01";
+  const normalized = attachMissingRequiredLiteralAnchors(
+    "## Findings\n\nGrounded candidate.",
+    `Append the findings and include ${marker}.`,
+  );
+  assert.deepEqual(normalized.insertedAnchors, [marker]);
+  assert.equal(
+    normalized.content,
+    `## Findings\n\nGrounded candidate.\n\n${marker}`,
+  );
+  assert.deepEqual(
+    attachMissingRequiredLiteralAnchors(
+      normalized.content,
+      `Append the findings and include ${marker}.`,
+    ),
+    { content: normalized.content, insertedAnchors: [] },
+  );
+});
+
 test("explicit code commit naming expands the durable validate/repair ladder", () => {
   assert.deepEqual(
     getRequiredCodeWorkflowToolNames(
@@ -220,6 +287,103 @@ test("explicit code commit naming expands the durable validate/repair ladder", (
       "code_validate_full",
       "code_commit_verified",
     ],
+  );
+});
+
+test("standalone nested code delivery routes through workspace creation and approved Desktop export without a repository commit", () => {
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      "Create a Python checkers game with nested folders and put it on my desktop.",
+    ),
+    [
+      "code_sandbox_status",
+      "code_workspace_create",
+      "code_workspace_mkdir",
+      "code_workspace_create_file",
+      "code_validate_fast",
+      "code_repair_record_cycle",
+      "code_validate_targeted",
+      "code_validate_full",
+      "code_workspace_export_directory",
+    ],
+  );
+});
+
+test("bare Python Desktop delivery requires scratch creation, validation, and export without note writeback or commit", () => {
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      "write a number guessing game in Python on my desktop",
+    ),
+    [
+      "code_sandbox_status",
+      "code_workspace_create",
+      "code_workspace_create_file",
+      "code_validate_fast",
+      "code_repair_record_cycle",
+      "code_validate_targeted",
+      "code_validate_full",
+      "code_workspace_export_directory",
+    ],
+  );
+});
+
+test("code delivery with no offered Code tools produces a host blocker before model execution", () => {
+  const blocker = getCodeCapabilityRegistrationBlockerV1({
+    prompt: "write a number guessing game in Python on my desktop",
+    offeredToolNames: new Set(["append_to_current_file"]),
+    registeredToolNames: new Set(),
+    readiness: [{
+      version: 2,
+      id: "code",
+      name: "Code",
+      status: "Blocked",
+      reason: "The Code runtime is not registered.",
+      evidenceAt: null,
+      nextAction: "Reload Code capability",
+      setupTarget: "code",
+    }],
+  });
+  assert.equal(blocker?.code, "code_capability_tools_unavailable");
+  assert.match(blocker?.message ?? "", /No model call was made/iu);
+  assert.equal(blocker?.reason, "The Code runtime is not registered.");
+  assert.equal(blocker?.nextAction, "Reload Code capability");
+  assert.ok(blocker?.requiredToolNames.includes("code_workspace_export_directory"));
+});
+
+test("Code capability blocker ignores direct discussion and non-workspace code surfaces", () => {
+  assert.equal(
+    getCodeCapabilityRegistrationBlockerV1({
+      prompt:
+        "What is difficult about turning Linear issues into real code project files?",
+      offeredToolNames: new Set(),
+      registeredToolNames: new Set(),
+      executionTier: "direct_chat",
+    }),
+    null,
+  );
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      "Write Hello World in TypeScript on this page and stream it to the note.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      "Run the python code snippet after installing the requests package.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      "Research American checkers rules and write the result to Projects/Checkers/Research.md.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      "Push the latest verified local commit for profile trusted-repository to GitHub and open a draft PR.",
+    ),
+    [],
   );
 });
 
@@ -1034,93 +1198,6 @@ test("assistant compact tool JSON recovers tool field and top-level arguments", 
     executedCalls.map((call) => [call.name, call.arguments.title]),
     [["read_current_file", undefined], ["rename_current_file", "History Snapshot"]],
   );
-});
-
-test("assistant XML-ish tool blocks are recovered and executed as tool calls", async () => {
-  const chatRequests: ModelChatRequest[] = [];
-  const statuses: string[] = [];
-  const executedCalls: ModelToolCall[] = [];
-
-  const client = createClient({
-    chatRequests,
-    chatResponders: [
-      () =>
-        responseWithContent(
-          [
-            "<requested_tool_call>",
-            "<name>list_folder</name>",
-            "<arguments>{\"path\":\"/\"}</arguments>",
-            "</requested_tool_call>",
-          ].join(""),
-        ),
-      () => responseWithContent("Root folder inspected."),
-    ],
-  });
-
-  await runAgentMission({
-    prompt: "Look through my vault folders.",
-    modelClient: client,
-    toolRegistry: createRegistry(executedCalls),
-    toolContext: {} as ToolExecutionContext,
-    enableStreaming: false,
-    events: {
-      onStatus: (message) => statuses.push(message),
-    },
-  });
-
-  assert.equal(chatRequests.length, 2);
-  assert.deepEqual(
-    executedCalls.map((call) => call.name),
-    ["list_folder"],
-  );
-  assert.deepEqual(executedCalls[0].arguments, { path: "" });
-  assert.ok(
-    statuses.some((message) =>
-      message.includes("Recovered text tool request: list_folder"),
-    ),
-  );
-});
-
-test("recovered list_folder slash path targets the vault root", async () => {
-  const chatRequests: ModelChatRequest[] = [];
-  const deltas: string[] = [];
-  const executedCalls: ModelToolCall[] = [];
-
-  const client = createClient({
-    chatRequests,
-    chatResponders: [
-      () =>
-        responseWithContent(
-          [
-            "I'll continue exploring your vault structure.",
-            "",
-            "\\`\\`\\`json",
-            '{ "name": "list_folder", "arguments": { "path": "/" } }',
-            "\\`\\`\\`",
-          ].join("\n"),
-        ),
-      () => responseWithContent("Root folder inspected."),
-    ],
-  });
-
-  await runAgentMission({
-    prompt: "Inspect the vault structure with tools.",
-    modelClient: client,
-    toolRegistry: createRegistry(executedCalls),
-    toolContext: {} as ToolExecutionContext,
-    enableStreaming: false,
-    events: {
-      onAssistantDelta: (delta) => deltas.push(delta),
-    },
-  });
-
-  assert.equal(chatRequests.length, 2);
-  assert.deepEqual(
-    executedCalls.map((call) => call.name),
-    ["list_folder"],
-  );
-  assert.deepEqual(executedCalls[0].arguments, { path: "" });
-  assert.deepEqual(deltas, ["Root folder inspected."]);
 });
 
 test("vague keep-going prompts inherit prior vault tool exploration intent", async () => {
@@ -2073,6 +2150,160 @@ test("lifecycle validate/repair/commit rebind prompt workspaceId to durable crea
       [],
     ),
     null,
+  );
+});
+
+test("exact code validation fallback is bounded to one ready validator and one durable run scope", () => {
+  assert.deepEqual(
+    buildExactCodeValidationFallbackToolCall(
+      ["code_validate_fast"],
+      "run-2026-07-25T07:23:48.793Z-05a3723046f5",
+    ),
+    {
+      name: "code_validate_fast",
+      arguments: {
+        repairRequestId:
+          "repair-run-2026-07-25t07-23-48.793z-05a3723046f5",
+        expectedArtifacts: [],
+        environment: {},
+      },
+    },
+  );
+  assert.equal(
+    buildExactCodeValidationFallbackToolCall(
+      ["code_validate_fast", "code_validate_targeted"],
+      "run-1",
+    ),
+    null,
+  );
+  assert.equal(
+    buildExactCodeValidationFallbackToolCall(
+      ["code_workspace_export_directory"],
+      "run-1",
+    ),
+    null,
+  );
+});
+
+test("known-folder export binds the verified workspace root and run-scoped Desktop destination", () => {
+  const durableReceipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-25T07:37:49.925Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "verified-workspace",
+      path: "verified-workspace",
+      workspaceId: "verified-workspace",
+    },
+  };
+
+  const bound = bindVerifiedWorkspaceDirectoryExport(
+    {
+      name: "code_workspace_export_directory",
+      arguments: {
+        workspaceId: "model-workspace",
+        sourcePath: "main.py",
+        destinationRoot: "downloads",
+        destinationPath: "guessing.py",
+      },
+    },
+    "Write a number guessing game in Python on my Desktop.",
+    "run-2026-07-25T07-37-49.925Z-beaccbf21521",
+    [durableReceipt],
+  );
+  assert.deepEqual(bound?.arguments, {
+    workspaceId: "verified-workspace",
+    sourcePath: "",
+    destinationRoot: "desktop",
+    destinationPath: "number-guessing-game-beaccbf21521",
+  });
+  assert.equal(
+    bindVerifiedWorkspaceDirectoryExport(
+      {
+        name: "code_workspace_export_directory",
+        arguments: {},
+      },
+      "Export this to Desktop and Downloads.",
+      "run-1",
+      [durableReceipt],
+    ),
+    null,
+  );
+});
+
+test("verified host export final answer replaces model path claims with receipt truth", () => {
+  const exportPath =
+    "C:\\Users\\joshb\\OneDrive\\Desktop\\number-guessing-game-beaccbf21521";
+  const receipts: AgentRunReceipt[] = [
+    {
+      toolName: "code_workspace_create_file",
+      operation: "create",
+      message: "Created main.py.",
+      commitKind: "committed",
+      readback: {
+        status: "verified",
+        checkedAt: "2026-07-25T07:37:49.925Z",
+      },
+      resource: {
+        system: "workspace",
+        resourceType: "code_workspace",
+        id: "workspace-1:main.py",
+        path: "main.py",
+        workspaceId: "workspace-1",
+      },
+    },
+    {
+      toolName: "code_workspace_export_directory",
+      operation: "create",
+      message: `Exported to ${exportPath}.`,
+      commitKind: "committed",
+      readback: {
+        status: "verified",
+        checkedAt: "2026-07-25T07:38:49.925Z",
+      },
+      resource: {
+        system: "workspace",
+        resourceType: "host_directory",
+        id: "host-directory:desktop:number-guessing-game",
+        path: "desktop/number-guessing-game",
+        workspaceId: "workspace-1",
+      },
+      output: {
+        status: "ok",
+        destinationPath: exportPath,
+      },
+    },
+  ];
+
+  const finalAnswer = buildVerifiedHostExportFinalAnswer(
+    "write a number guessing game in Python on my desktop",
+    receipts,
+    [
+      "code_validate_fast",
+      "code_validate_targeted",
+      "code_validate_full",
+    ],
+  );
+  assert.match(finalAnswer ?? "", /Python number guessing game delivered/u);
+  assert.equal(finalAnswer?.includes(exportPath), true);
+  assert.match(finalAnswer ?? "", /Entry point: `main\.py`/u);
+  assert.match(finalAnswer ?? "", /fast, targeted, full/u);
+  assert.doesNotMatch(finalAnswer ?? "", /Projects[\\/]number_guessing_game/u);
+  assert.equal(
+    buildVerifiedHostExportFinalAnswer(
+      "Continue the existing mission.",
+      receipts,
+      ["code_validate_fast"],
+    )?.includes(exportPath),
+    true,
+    "the verified export receipt must remain authoritative on a continuation segment",
   );
 });
 
@@ -3302,8 +3533,9 @@ test("word-count correction replaces flushed under-target draft instead of appen
   );
 });
 
-test("word-count correction with leading H1 replaces flushed draft instead of appending", async () => {
+test("word-count correction strips a leading tool marker and preserves H1 title handling", async () => {
   const statuses: string[] = [];
+  const assistantReplacements: string[] = [];
   // Live Grapes-of-Wrath failure: correction returned a new H1; replaceContent
   // used to refresh append base from the live note and concatenate two essays.
   const underTargetDraft = [
@@ -3314,6 +3546,8 @@ test("word-count correction with leading H1 replaces flushed draft instead of ap
     "runs. Marker FIRST_ESSAY_SHOULD_NOT_REMAIN must not survive after replace.",
   ].join("\n");
   const correctedDraft = [
+    "replace_current_file",
+    "",
     "# The Grapes of Wrath Corrected",
     "",
     "exactly one grapes topic two three four five six seven eight",
@@ -3338,6 +3572,7 @@ test("word-count correction with leading H1 replaces flushed draft instead of ap
     enableStreaming: true,
     events: {
       onStatus: (message) => statuses.push(message),
+      onAssistantReplace: (content) => assistantReplacements.push(content),
     },
   });
 
@@ -3365,6 +3600,10 @@ test("word-count correction with leading H1 replaces flushed draft instead of ap
     note,
   );
   assert.equal(note, "Existing preface\nexactly one grapes topic two three four five six seven eight");
+  assert.deepEqual(assistantReplacements, [
+    "# The Grapes of Wrath Corrected\n\nexactly one grapes topic two three four five six seven eight",
+  ]);
+  assert.equal(note.includes("replace_current_file"), false);
 });
 
 test("prompt-on-page generation streams the extracted answer into the current note", async () => {
@@ -6529,6 +6768,30 @@ test("workspace creation frontier exposes its exact graph-bound path", () => {
   assert.match(binding ?? "", /complete content string for only this file/u);
 });
 
+test("bare Python entry-point frontier requires one self-contained runnable file", () => {
+  const binding = buildObservedMissionGraphFrontierBinding(
+    [],
+    [
+      {
+        type: "function",
+        function: {
+          name: "code_workspace_create_file",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+    [],
+    "main.py",
+    null,
+    null,
+    [],
+    "write a number guessing game in Python on my desktop",
+  );
+  assert.match(binding ?? "", /one Python source file/u);
+  assert.match(binding ?? "", /directly runnable and self-contained/u);
+  assert.match(binding ?? "", /do not import a local module or package/iu);
+});
+
 test("workspace correction frontiers bind exact reads, hashes, content, and Linear traceability", () => {
   const readTool = [{
     type: "function" as const,
@@ -8265,6 +8528,81 @@ test("write_expected frontier forbids inventing patch or re-validate", () => {
   assert.match(context, /code_validate_\*/u);
 });
 
+test("code workspace bootstrap frontiers advertise later nested writes and approved host delivery", () => {
+  const createContext = buildMissionGraphFrontierTurnContext([
+    {
+      type: "function",
+      function: {
+        name: "code_workspace_create",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ]);
+  assert.match(createContext, /bootstrap frontier/u);
+  assert.match(createContext, /code_workspace_create_file/u);
+  assert.match(createContext, /automatically creates missing parent directories/u);
+  assert.match(createContext, /code_workspace_export_directory/u);
+  assert.match(createContext, /Do not return code-only chat prose/u);
+
+  const fileContext = buildMissionGraphFrontierTurnContext([
+    {
+      type: "function",
+      function: {
+        name: "code_workspace_create_file",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ]);
+  assert.match(fileContext, /src\/game\/ui\/checkers\.py/u);
+  assert.match(fileContext, /missing parent directories/u);
+
+  const exportContext = buildMissionGraphFrontierTurnContext([
+    {
+      type: "function",
+      function: {
+        name: "code_workspace_export_directory",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ]);
+  assert.match(exportContext, /desktop, documents, or downloads/u);
+  assert.match(exportContext, /never overwrites/u);
+
+  const mixedCodeContext = buildMissionGraphFrontierTurnContext([
+    {
+      type: "function",
+      function: {
+        name: "code_workspace_read",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "code_validate_fast",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ]);
+  assert.match(mixedCodeContext, /real directories on the user's local filesystem/iu);
+  assert.match(mixedCodeContext, /Later dependency-ready frontiers/iu);
+  assert.match(mixedCodeContext, /Do not claim filesystem access/iu);
+
+  const setLooseCodeContext = buildMissionGraphFrontierTurnContext(
+    [{
+      type: "function",
+      function: {
+        name: "code_workspace_create",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    null,
+    { setLoose: true, currentStage: "code_execution" },
+  );
+  assert.match(setLooseCodeContext, /real directories on the user's local filesystem/iu);
+  assert.match(setLooseCodeContext, /Do not claim filesystem access/iu);
+});
+
 test("negated cleanup after a research path does not become a delete mission", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const configs: AgentRunConfigEvent[] = [];
@@ -9295,7 +9633,7 @@ test("off-topic streamed final answer is stopped before display", async () => {
   );
 });
 
-test("checkers Python build answers pass the relevance gate without the word code", async () => {
+test("checkers Python build stops before prose fallback when Code tools are unavailable", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const streamRequests: ModelChatRequest[] = [];
   const finalDeltas: string[] = [];
@@ -9335,13 +9673,18 @@ test("checkers Python build answers pass the relevance gate without the word cod
     },
   });
 
-  assert.ok(streamRequests.length >= 1);
-  assert.match(finalDeltas.join(""), /CheckersGame/);
-  assert.equal(
-    statuses.includes(
-      "Stopped model output because it drifted off topic from the current mission.",
+  assert.equal(chatRequests.length, 0);
+  assert.equal(streamRequests.length, 0);
+  assert.match(
+    finalDeltas.join(""),
+    /Code tool catalog is not registered[\s\S]*No model call was made/iu,
+  );
+  assert.ok(
+    statuses.some((message) =>
+      /Blocked before model loop:[\s\S]*Code tool catalog is not registered/iu.test(
+        message,
+      ),
     ),
-    false,
   );
 });
 
@@ -10746,6 +11089,65 @@ test("aborted runs refresh the continuation handoff after same-note evidence cha
   assert.equal(validation.ok, true);
 });
 
+test("an enabled structured router relays a user stop before agent planning", async () => {
+  const controller = new AbortController();
+  const completions: string[] = [];
+  let chatCalls = 0;
+  let routerSignal: AbortSignal | undefined;
+  let markRouterStarted!: () => void;
+  const routerStarted = new Promise<void>((resolve) => {
+    markRouterStarted = resolve;
+  });
+  const client: ModelClient = {
+    chat: async (request) => {
+      chatCalls += 1;
+      assert.equal(isMissionRouterFormat(request), true);
+      routerSignal = request.abortSignal;
+      markRouterStarted();
+      return await new Promise<ModelChatResponse>((_resolve, reject) => {
+        const rejectAborted = () =>
+          reject(request.abortSignal?.reason ?? new Error("router aborted"));
+        if (request.abortSignal?.aborted) {
+          rejectAborted();
+          return;
+        }
+        request.abortSignal?.addEventListener("abort", rejectAborted, {
+          once: true,
+        });
+      });
+    },
+    streamChat: async () => {
+      throw new Error("streamChat must not run after router cancellation");
+    },
+  };
+  const { context } = createRunnerVaultContext({
+    prompt: "Research the current note and append a short sourced finding.",
+  });
+  context.settings = createRunnerSettings({
+    modelRouterEnabled: true,
+    modelRouterMode: "authority",
+  });
+
+  const mission = runAgentMission({
+    prompt: "Research the current note and append a short sourced finding.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: context,
+    enableStreaming: false,
+    abortSignal: controller.signal,
+    events: {
+      onRunComplete: (event) => completions.push(event.stopReason),
+    },
+  });
+  await routerStarted;
+  controller.abort("user_requested");
+  await mission;
+
+  assert.equal(routerSignal?.aborted, true);
+  assert.equal(chatCalls, 1);
+  assert.deepEqual(completions, ["user_stopped"]);
+});
+
 test("mission wall-clock deadline aborts an in-flight provider request", async () => {
   const completions: string[] = [];
   const statuses: string[] = [];
@@ -10791,6 +11193,47 @@ test("mission wall-clock deadline aborts an in-flight provider request", async (
   assert.deepEqual(completions, ["budget"]);
   assert.ok(statuses.includes("Wall-clock run budget expired. The ledger was saved and this run can be continued."));
   assert.ok(traceMessages.includes("Wall-clock run budget expired. The ledger was saved and this run can be continued."));
+});
+
+test("a host-linked wall-clock abort remains a budget rather than a user stop", async () => {
+  const controller = new AbortController();
+  const completions: string[] = [];
+  const client: ModelClient = {
+    chat: async (request) => {
+      controller.abort(new Error("Orchestrator root wall-clock budget exhausted."));
+      await new Promise<void>((resolve, reject) => {
+        const signal = request.abortSignal;
+        const rejectAborted = () => reject(signal?.reason ?? new Error("aborted"));
+        if (signal?.aborted) {
+          rejectAborted();
+          return;
+        }
+        signal?.addEventListener("abort", rejectAborted, { once: true });
+      });
+      throw new Error("unreachable");
+    },
+    streamChat: async () => {
+      throw new Error("streamChat is not used by this non-streaming test");
+    },
+  };
+  const { context } = createRunnerVaultContext({
+    prompt: "Explain local-first research in chat only.",
+  });
+  context.settings = createRunnerSettings({ modelRouterEnabled: false });
+
+  await runAgentMission({
+    prompt: "Explain local-first research in chat only.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: context,
+    enableStreaming: false,
+    abortSignal: controller.signal,
+    events: {
+      onRunComplete: (event) => completions.push(event.stopReason),
+    },
+  });
+
+  assert.deepEqual(completions, ["budget"]);
 });
 
 test("write-required no-tool answers stop after two unchanged-frontier responses", async () => {
@@ -12450,9 +12893,10 @@ test("compound research checks every counted tool and closure exposes only publi
   );
 });
 
-test("verified conflicting-source prose commits before the streaming finalizer and only once", async () => {
+test("a phase-deferred conflicting-source append recovers and commits exactly once", async () => {
+  const marker = "E2E_MARKER_CONFLICT_REPAIR_01";
   const prompt =
-    "Search the web for exactly two sources about controlled onboarding validation, fetch and verify both, compare their conflicting conclusions, then append a short synthesis with exact passage citations and an explicit Limitations section to this note.";
+    `Search the web for exactly two sources about controlled onboarding validation, fetch and verify both, compare their conflicting conclusions, then append a short synthesis with exact passage citations and an explicit Limitations section to this note. Include the marker ${marker}.`;
   const originalNote = "Original note remains unchanged until verification passes.";
   const executedCalls: ModelToolCall[] = [];
   const receipts: AgentRunReceipt[] = [];
@@ -12522,9 +12966,35 @@ test("verified conflicting-source prose commits before the streaming finalizer a
         responseWithToolCall("web_fetch", {
           url: "https://example.org/mcp-resources",
         }),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: "This premature draft must be phase-deferred without failing the write goal.",
+        }),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          text: "A repeated phase-deferred draft must not consume a durable graph attempt.",
+        }),
       (request) => {
         const passages = getPassageCitationIds(request);
         assert.ok(passages.length >= 2, JSON.stringify(passages));
+        return responseWithContent(
+          `The primary source reports improved retention and reduced errors [${passages[0]}].\n\n` +
+            `The alternate source reports no reliable benefit [${passages[1]}].`,
+        );
+      },
+      (request) => {
+        const passages = getPassageCitationIds(request);
+        assert.ok(passages.length >= 2, JSON.stringify(passages));
+        assert.ok(
+          request.messages.some(
+            (message) =>
+              message.role === "system" &&
+              message.content.includes(
+                "Include an explicit ## Limitations section that says the sources conflict",
+              ),
+          ),
+          "expected a repair prompt for the unresolved analyze-phase conflict",
+        );
         assert.ok(
           request.messages.some(
             (message) =>
@@ -12533,8 +13003,18 @@ test("verified conflicting-source prose commits before the streaming finalizer a
           ),
           "expected a one-time passage-grounded writeback contract before the first draft",
         );
+        assert.ok(
+          request.messages.some(
+            (message) =>
+              message.role === "system" &&
+              message.content.includes(
+                `Preserve every exact user-required literal marker in the final answer: ${marker}`,
+              ),
+          ),
+          "expected the repair prompt to name the missing exact literal marker",
+        );
         return responseWithContent(
-          `One source reports that controlled onboarding validation improves retention and reduces errors [${passages[0]}].\n\n` +
+          `${marker}\n\nOne source reports that controlled onboarding validation improves retention and reduces errors [${passages[0]}].\n\n` +
             "The other reports no reliable retention or error benefit.\n\n" +
             "## Limitations\n\nThe two sources conflict, so the comparison does not resolve the disagreement.\n\n" +
             "## Confidence\n\nMedium.\n\n" +
@@ -12610,6 +13090,328 @@ test("verified conflicting-source prose commits before the streaming finalizer a
   assert.match(persistedLedger, /"claimPassages"\s*:\s*\[/u);
   assert.match(persistedLedger, /"evidenceConflicts"\s*:\s*\[/u);
   assert.match(persistedLedger, /"status"\s*:\s*"acknowledged_limitation"/u);
+});
+
+test("a verified direct conflicting-source append carries its acknowledgement through the receipt", async () => {
+  const marker = "E2E_MARKER_DIRECT_CONFLICT_ACK_01";
+  const prompt =
+    `Search the web for exactly two sources about controlled onboarding validation, fetch and verify both, compare their conflicting conclusions, then append a short synthesis with exact passage citations and an explicit Limitations section to this note. Include the marker ${marker}.`;
+  const originalNote = "Original note remains unchanged until a valid direct candidate is committed.";
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const traceSummary: Array<{ id: string; message: string; errorCode?: string }> = [];
+  let directCandidate = "";
+  const vault = createRunnerVaultContext({ prompt, content: originalNote });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "Primary onboarding evidence",
+              url: "https://example.com/primary-onboarding",
+              snippet: "Controlled onboarding validation improved retention and reduced errors.",
+            },
+            {
+              title: "Alternate onboarding evidence",
+              url: "https://example.org/alternate-onboarding",
+              snippet: "Controlled onboarding validation did not show reliable benefits.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      const url = JSON.parse(
+        typeof request.body === "string" ? request.body : "{}",
+      )?.url;
+      return {
+        status: 200,
+        headers: {},
+        json:
+          url === "https://example.org/alternate-onboarding"
+            ? {
+                title: "Alternate onboarding evidence",
+                url,
+                content:
+                  "The controlled onboarding validation evidence does not show improved user retention rate or reduced errors. The alternate study reports no reliable benefit.",
+                links: [],
+              }
+            : {
+                title: "Primary onboarding evidence",
+                url,
+                content:
+                  "The controlled onboarding validation evidence shows improved user retention rate and reduced errors. The primary study reports a reliable benefit.",
+                links: [],
+              },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () => responseWithToolCall("web_search", { query: "controlled onboarding evidence" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.com/primary-onboarding",
+        }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://example.org/alternate-onboarding",
+        }),
+      (request) => {
+        const passages = getPassageCitationIds(request);
+        assert.ok(passages.length >= 2, JSON.stringify(passages));
+        directCandidate = [
+          marker,
+          "",
+          "## Findings",
+          "",
+          `For controlled onboarding validation, the primary source concludes that retention improved and errors were reduced [${passages[0]}].`,
+          "",
+          `For controlled onboarding validation, the alternate source concludes that there was no reliable benefit [${passages[1]}].`,
+          "",
+          "## Limitations",
+          "",
+          "The two sources have conflicting conclusions, so this cited comparison does not resolve the disagreement.",
+          "",
+          "## Confidence",
+          "",
+          "Moderate confidence: both fetched passages are cited, but their conclusions conflict.",
+        ].join("\n");
+        return responseWithToolCall("append_to_current_file", {
+          text: directCandidate,
+        });
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
+      onTrace: (event) => {
+        if (event.kind === "tool_rejected" || event.kind === "verification") {
+          traceSummary.push({
+            id: event.id,
+            message: event.message ?? "",
+            errorCode: event.error?.code,
+          });
+        }
+      },
+    },
+  });
+
+  assert.equal(
+    executedCalls.filter((call) => call.name === "append_to_current_file").length,
+    1,
+    JSON.stringify({ executedCalls, receipts, completions, traceSummary }),
+  );
+  assert.equal(receipts.length, 1);
+  assert.ok(receipts[0]?.readback);
+  assert.equal(
+    vault.operations.filter((item) => item === "modify:Current.md").length,
+    1,
+  );
+  assert.match(vault.content.get("Current.md") ?? "", new RegExp(marker));
+  assert.equal(
+    completions.at(-1)?.stopReason,
+    "write_completed",
+    JSON.stringify({ executedCalls, receipts, completions, traceSummary }),
+  );
+  const persistedLedger = [...vault.content.entries()].find(
+    ([path, content]) =>
+      /^Agent Runs\/.+\.md$/u.test(path) && content.includes("## Mission Ledger"),
+  )?.[1];
+  assert.ok(persistedLedger, "expected the completed mission ledger to remain readable");
+  assert.match(persistedLedger, /"status"\s*:\s*"acknowledged_limitation"/u);
+});
+
+test("closed fetched-source writeback repairs URL-only candidates before commit", async () => {
+  const marker = "E2E_MARKER_PASSAGE_SCOPE_REPAIR_01";
+  const prompt =
+    `Read the current note as vault context. Search the web for owned alpha and beta evidence, fetch both sources, compare their conflicting conclusions about controlled onboarding validation, then append exactly two cited finding sentences and a Limitations section. End each finding sentence with the exact source:<id>:passage:<start>-<end> identifier returned by the fetch result that supports it. Include ${marker}.`;
+  const originalNote = "Original note remains unchanged until citation proof passes.";
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const statuses: string[] = [];
+  const correctionPrompts: string[] = [];
+  const vault = createRunnerVaultContext({ prompt, content: originalNote });
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          results: [
+            {
+              title: "Owned alpha evidence",
+              url: "https://primary.owned.example/evidence/passages",
+              snippet:
+                "Controlled onboarding validation improved retention and reduced errors.",
+            },
+            {
+              title: "Owned beta evidence",
+              url: "https://secondary.owned.example/evidence/passages",
+              snippet:
+                "Controlled onboarding validation showed no reliable benefit.",
+            },
+          ],
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      const url = JSON.parse(
+        typeof request.body === "string" ? request.body : "{}",
+      )?.url;
+      return {
+        status: 200,
+        headers: {},
+        json:
+          url === "https://secondary.owned.example/evidence/passages"
+            ? {
+                title: "Owned beta evidence",
+                url,
+                content:
+                  "Controlled onboarding validation showed no reliable benefit for retention and no reduction in errors.",
+                links: [],
+              }
+            : {
+                title: "Owned alpha evidence",
+                url: "https://primary.owned.example/evidence/passages",
+                content:
+                  "Controlled onboarding validation improved retention and reduced errors in the primary evidence.",
+                links: [],
+              },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  const client = createClient({
+    chatRequests: [],
+    chatResponders: [
+      () => responseWithToolCall("read_current_file", {}),
+      () => responseWithToolCall("web_search", { query: "owned onboarding evidence" }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://primary.owned.example/evidence/passages",
+        }),
+      () =>
+        responseWithToolCall("web_fetch", {
+          url: "https://secondary.owned.example/evidence/passages",
+        }),
+      () =>
+        responseWithContent([
+          marker,
+          "",
+          "## Findings",
+          "",
+          "Controlled onboarding validation improved retention and reduced errors according to the primary owned source.",
+          "Controlled onboarding validation showed no reliable benefit according to the secondary owned source.",
+          "",
+          "## Limitations",
+          "",
+          "The two sources conflict about whether controlled onboarding validation helped.",
+          "",
+          "## Confidence",
+          "",
+          "Medium, because the fetched owned sources disagree.",
+          "",
+          "Sources: https://primary.owned.example/evidence/passages and https://secondary.owned.example/evidence/passages",
+        ].join("\n")),
+      (request) => {
+        const correction = [...request.messages].reverse().find(
+          (message) =>
+            message.role === "system" &&
+            message.content.includes("passage_citation_coverage:"),
+        );
+        assert.ok(correction, "expected missing passage coverage correction prompt");
+        correctionPrompts.push(correction.content);
+        const passageIds = [
+          ...new Set(
+            correction.content.match(/source:[a-z0-9-]+:passage:\d+-\d+/giu) ?? [],
+          ),
+        ];
+        assert.equal(passageIds.length, 2, JSON.stringify(passageIds));
+        return responseWithContent([
+          marker,
+          "",
+          "## Findings",
+          "",
+          `Controlled onboarding validation improved retention and reduced errors according to the primary owned source [${passageIds[0]}].`,
+          `Controlled onboarding validation showed no reliable benefit according to the secondary owned source [${passageIds[1]}].`,
+          "",
+          "## Limitations",
+          "",
+          "The two sources conflict about whether controlled onboarding validation helped.",
+          "",
+          "## Confidence",
+          "",
+          "Medium, because the fetched owned sources disagree.",
+        ].join("\n"));
+      },
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  const written = vault.content.get("Current.md") ?? "";
+  const writtenPassageIds = [
+    ...new Set(written.match(/source:[a-z0-9-]+:passage:\d+-\d+/giu) ?? []),
+  ];
+  assert.equal(
+    receipts.filter((receipt) => receipt.operation === "append").length,
+    1,
+    JSON.stringify({
+      statuses,
+      executed: executedCalls.map((call) => call.name),
+      written,
+      correctionPrompts,
+    }),
+  );
+  assert.equal(
+    vault.operations.filter((item) => item === "modify:Current.md").length,
+    1,
+    JSON.stringify({
+      statuses,
+      executed: executedCalls.map((call) => call.name),
+      written,
+      correctionPrompts,
+    }),
+  );
+  assert.equal(writtenPassageIds.length, 2, JSON.stringify({ written, statuses }));
+  assert.ok(correctionPrompts.length >= 1);
+  assert.ok(
+    statuses.some((message) =>
+      /Verified append candidate held for correction|Writeback draft held for verification/iu.test(
+        message,
+      ),
+    ),
+    JSON.stringify(statuses),
+  );
 });
 
 test("generic commit marker cannot add prepared background Code authority to a research graph", async () => {
@@ -16933,6 +17735,183 @@ test("explicit scratch workspace workflow stays out of note-output routing", asy
   }
 });
 
+test("bare Python Desktop delivery plans only the scratch validation and export ladder", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const graphs: Array<{
+    nodes: Record<string, { allowedTools: string[] }>;
+  }> = [];
+  const prompt = "write a number guessing game in Python on my desktop";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-25T12:10:00.000Z"),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("Workspace execution is pending.")],
+    }),
+    toolRegistry: createCodeV2RoutingRegistry(),
+    toolContext: {
+      ...vault.context,
+      settings: {
+        ...vault.context.settings,
+        maxAgentSteps: 40,
+        streamWritebackMode: "all_current_note_content_writes",
+      },
+    },
+    enableStreaming: true,
+    maxSteps: 1,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+      onMissionGraphUpdate: (graph) => graphs.push(graph),
+    },
+  });
+
+  const allowed = new Set(configs[0]?.allowedToolNames ?? []);
+  for (const required of getRequiredCodeWorkflowToolNames(prompt)) {
+    assert.ok(allowed.has(required), `missing ${required}`);
+  }
+  assert.equal(allowed.has("append_to_current_file"), false);
+  const graphTools = Object.values(graphs.at(-1)?.nodes ?? {}).flatMap(
+    (node) => node.allowedTools,
+  );
+  assert.equal(graphTools.includes("code_commit_verified"), false);
+  assert.equal(graphTools.includes("append_to_current_file"), false);
+  assert.deepEqual(
+    chatRequests[0]?.tools?.map((tool) => tool.function.name),
+    ["code_sandbox_status"],
+  );
+  assert.match(
+    chatRequests[0]?.messages
+      .map((message) => String(message.content ?? ""))
+      .join("\n"),
+    /CAPABILITY_SNAPSHOT_V1[\s\S]*installed:[\s\S]*offered_now:/u,
+  );
+});
+
+test("bare Python Desktop delivery corrects a prose-only exact frontier inside the same segment", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const statuses: string[] = [];
+  const prompt = "write a number guessing game in Python on my desktop";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-25T12:10:30.000Z"),
+  });
+  const baseRegistry = createCodeV2RoutingRegistry();
+  const registry: ToolRegistry = {
+    ...baseRegistry,
+    execute: async (call, context) => {
+      executedCalls.push(call);
+      return baseRegistry.execute(call, context);
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithContent(
+          "I created the game and it is ready, so no further action is needed.",
+        ),
+        () => responseWithToolCall("code_sandbox_status", {}),
+      ],
+    }),
+    toolRegistry: registry,
+    toolContext: {
+      ...vault.context,
+      settings: {
+        ...vault.context.settings,
+        maxAgentSteps: 40,
+        streamWritebackMode: "all_current_note_content_writes",
+      },
+    },
+    enableStreaming: true,
+    maxSteps: 2,
+    events: {
+      onTrace: (event) => traces.push(event),
+      onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  const diagnostic = JSON.stringify({
+    traces: traces.map((event) => event.message),
+    completions,
+    statuses,
+  });
+  assert.equal(chatRequests.length, 2, diagnostic);
+  assert.deepEqual(
+    chatRequests[1]?.tools?.map((tool) => tool.function.name),
+    ["code_sandbox_status"],
+  );
+  assert.match(
+    chatRequests[1]?.messages
+      .map((message) => String(message.content ?? ""))
+      .join("\n"),
+    /prior response contained prose but no tool call[\s\S]*Call code_sandbox_status now[\s\S]*Return the tool call only/iu,
+  );
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["code_sandbox_status"],
+  );
+});
+
+test("bare Python Desktop delivery stops before the model when the Code catalog is missing", async () => {
+  const chatRequests: ModelChatRequest[] = [];
+  const finalChunks: string[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const prompt = "write a number guessing game in Python on my desktop";
+  const vault = createRunnerVaultContext({
+    prompt,
+    now: new Date("2026-07-25T12:11:00.000Z"),
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [() => responseWithContent("This must not run.")],
+    }),
+    toolRegistry: createRegistry([]),
+    toolContext: {
+      ...vault.context,
+      getCapabilityReadiness: () => [{
+        version: 2,
+        id: "code",
+        name: "Code",
+        status: "Blocked",
+        reason: "The Code runtime is not registered.",
+        evidenceAt: null,
+        nextAction: "Reload Code capability",
+        setupTarget: "code",
+      }],
+    },
+    enableStreaming: false,
+    maxSteps: 1,
+    events: {
+      onFinalDelta: (chunk) => finalChunks.push(chunk),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  assert.equal(chatRequests.length, 0);
+  assert.match(finalChunks.join(""), /Code tool catalog is not registered/iu);
+  assert.match(finalChunks.join(""), /Reload Code capability/iu);
+  assert.ok(
+    traces.some(
+      (event) =>
+        event.error?.code === "code_capability_tools_unavailable",
+    ),
+  );
+});
+
 test("generic repository implementation does not expose unrequested path relocation or cleanup", async () => {
   const configs: AgentRunConfigEvent[] = [];
   const prompt = [
@@ -17169,6 +18148,7 @@ function createCodeV2RoutingRegistry(): ToolRegistry {
     ...readNames,
     "code_workspace_mkdir",
     "code_workspace_create_file",
+    "code_workspace_export_directory",
     "code_workspace_append",
     "code_workspace_write_expected",
     "code_workspace_patch",

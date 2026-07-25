@@ -20,6 +20,10 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT_BYTES = 1_048_576;
 const DEFAULT_ASKPASS_LIFETIME_MS = 60_000;
 const MAX_ASKPASS_REQUEST_BYTES = 1_024;
+// A verified publication uses one handle across preflight, push, and readback.
+// Keep the credential endpoint narrowly bounded while permitting that closed
+// sequence to authenticate each independent Git process.
+const MAX_ASKPASS_PASSWORD_REQUESTS = 8;
 
 const CALLER_ENVIRONMENT_KEYS = new Set([
   "AGENTIC_RESEARCHER_ASKPASS_HANDLE",
@@ -277,8 +281,9 @@ export interface LoopbackEphemeralGitAskpassBrokerOptionsV1 {
 }
 
 /**
- * One-shot loopback askpass broker. The helper answers the public username
- * locally and makes exactly one authenticated IPC request for the password.
+ * Lifetime-bounded loopback askpass broker. The helper answers the public
+ * username locally and permits only the closed publication sequence's bounded
+ * number of authenticated IPC password requests.
  */
 export class LoopbackEphemeralGitAskpassBrokerV1
   implements EphemeralGitAskpassBrokerV1
@@ -485,14 +490,13 @@ async function startOneShotAskpassServer(input: {
     "node:http",
     "secure Git askpass",
   );
-  let consumed = false;
+  let acceptedRequests = 0;
   let expectedHost = "";
   const server = http.createServer((request, response) => {
-    if (consumed) {
-      respond(response, 410, "Askpass credential was already consumed.");
+    if (acceptedRequests >= MAX_ASKPASS_PASSWORD_REQUESTS) {
+      respond(response, 410, "Askpass credential request limit was reached.");
       return;
     }
-    consumed = true;
     const fail = (status: number, message: string) => {
       respond(response, status, message);
       server.close();
@@ -551,13 +555,16 @@ async function startOneShotAskpassServer(input: {
         fail(403, "Askpass prompt rejected.");
         return;
       }
+      acceptedRequests += 1;
       response.writeHead(200, {
         "Cache-Control": "no-store",
         "Content-Type": "text/plain; charset=utf-8",
         "X-Content-Type-Options": "nosniff",
       });
       response.end(input.secret);
-      server.close();
+      if (acceptedRequests >= MAX_ASKPASS_PASSWORD_REQUESTS) {
+        server.close();
+      }
     });
     request.on("error", () => server.close());
   });

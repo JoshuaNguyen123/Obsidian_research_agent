@@ -145,7 +145,12 @@ export interface ResearchPublicationCheckpointV1 {
 }
 
 export interface ResearchPublicationLineagePortV1 {
-  get?(publicationId: string): Promise<ResearchPublicationCheckpointV1 | null>;
+  /**
+   * Required: crash-resume and cross-run dedup both depend on reading the
+   * prior checkpoint. A host that wired only persist() used to silently
+   * disable resume — that silent degradation is no longer representable.
+   */
+  get(publicationId: string): Promise<ResearchPublicationCheckpointV1 | null>;
   persist(checkpoint: ResearchPublicationCheckpointV1): Promise<void>;
 }
 
@@ -166,6 +171,7 @@ export type ResearchPublicationTraceStageV1 =
   | "backlink_started"
   | "backlink_verified"
   | "waiting_obsidian"
+  | "checkpoint_persist_failed"
   | "complete";
 
 export interface ResearchPublicationTraceEventV1 {
@@ -254,7 +260,7 @@ export class ResearchPublicationWorkflow {
   async execute(request: ResearchPublicationRequestV1): Promise<ResearchPublicationResultV1> {
     validateHostIntent(request);
     const publicationId = `publication-${request.note.artifactId}`;
-    const priorCheckpoint = await this.options.lineage.get?.(publicationId) ?? null;
+    const priorCheckpoint = await this.options.lineage.get(publicationId);
     const resumesReconciliation = priorCheckpoint?.status === "reconcile_required";
     const boundRequest = bindRequestToCheckpoint(request, priorCheckpoint);
     this.trace("explicit_intent_verified", publicationId);
@@ -445,7 +451,9 @@ export class ResearchPublicationWorkflow {
       const pendingAction = published.status === "reconcile_required"
         ? pendingFromFailure(published, preview.ticket.spec.fingerprint, error)
         : null;
-      await this.persist({
+      // Failure path: a checkpoint persist throw must not mask the publish
+      // failure, so best-effort persist and return the structured result below.
+      await this.persistBestEffort({
         publicationId,
         status,
         artifact,
@@ -488,7 +496,9 @@ export class ResearchPublicationWorkflow {
       };
     }
 
-    const drift = publicationDrift(preview.ticket, published.ticket);
+    const drift =
+      publicationSpecDeterminism(preview.ticket, published.ticket) ??
+      publicationCheckpointDrift(priorCheckpoint, published.ticket);
     const destinationMismatch = issueDestinationMismatch(
       published.issue,
       boundRequest.destination,
@@ -513,7 +523,10 @@ export class ResearchPublicationWorkflow {
         preview.ticket.spec.fingerprint,
         error,
       );
-      await this.persist({
+      // Post-issue-creation failure: the issue exists, so a checkpoint persist
+      // throw must not mask the real cause or reject; best-effort persist and
+      // return the structured reconcile result below.
+      await this.persistBestEffort({
         publicationId,
         status: "reconcile_required",
         artifact,
@@ -578,7 +591,10 @@ export class ResearchPublicationWorkflow {
         preview.ticket.spec.fingerprint,
         error,
       );
-      await this.persist({
+      // Post-issue-creation failure: the issue exists, so a checkpoint persist
+      // throw must not mask the real cause or reject; best-effort persist and
+      // return the structured reconcile result below.
+      await this.persistBestEffort({
         publicationId,
         status: "reconcile_required",
         artifact,
@@ -608,19 +624,33 @@ export class ResearchPublicationWorkflow {
       publication: published.status,
       issueIdentifier: published.issue.identifier,
     });
-    await this.persist({
-      publicationId,
-      status: "linear_verified",
-      artifact,
-      lineage,
-      workItemFingerprint: preview.ticket.spec.fingerprint,
-      approvalFingerprint: approvalRequest.approvalFingerprint,
-      binding,
-      issue: issueReference(published.issue),
-      pendingAction: null,
-      backlink: null,
-      error: null,
-    });
+    const linearVerifiedReconcile = await this.persistOrReconcile(
+      {
+        publicationId,
+        status: "linear_verified",
+        artifact,
+        lineage,
+        workItemFingerprint: preview.ticket.spec.fingerprint,
+        approvalFingerprint: approvalRequest.approvalFingerprint,
+        binding,
+        issue: issueReference(published.issue),
+        pendingAction: null,
+        backlink: null,
+        error: null,
+      },
+      (error) => ({
+        ok: false,
+        status: "reconcile_required",
+        error,
+        note,
+        artifact,
+        lineage,
+        approvalFingerprint: approvalRequest.approvalFingerprint,
+        pendingAction: pendingFromSuccess(published, preview.ticket.spec.fingerprint, error),
+        issue: published.issue,
+      }),
+    );
+    if (linearVerifiedReconcile) return linearVerifiedReconcile;
     this.trace("linear_lineage_persisted", publicationId);
 
     this.trace("backlink_started", publicationId);
@@ -634,7 +664,10 @@ export class ResearchPublicationWorkflow {
       });
     } catch (cause) {
       const error = normalizeError(cause, "research_publication_backlink_waiting_obsidian");
-      await this.persist({
+      // The issue exists and linear_verified is already durable, so a persist
+      // throw here is recoverable on resume; best-effort persist and surface the
+      // real backlink cause rather than rejecting on the checkpoint mechanics.
+      await this.persistBestEffort({
         publicationId,
         status: "waiting_obsidian",
         artifact,
@@ -662,19 +695,33 @@ export class ResearchPublicationWorkflow {
       };
     }
     this.trace("backlink_verified", publicationId, { noteSha256: backlink.afterSha256 });
-    await this.persist({
-      publicationId,
-      status: "complete",
-      artifact,
-      lineage,
-      workItemFingerprint: preview.ticket.spec.fingerprint,
-      approvalFingerprint: approvalRequest.approvalFingerprint,
-      binding,
-      issue: issueReference(published.issue),
-      pendingAction: null,
-      backlink,
-      error: null,
-    });
+    const completeReconcile = await this.persistOrReconcile(
+      {
+        publicationId,
+        status: "complete",
+        artifact,
+        lineage,
+        workItemFingerprint: preview.ticket.spec.fingerprint,
+        approvalFingerprint: approvalRequest.approvalFingerprint,
+        binding,
+        issue: issueReference(published.issue),
+        pendingAction: null,
+        backlink,
+        error: null,
+      },
+      (error) => ({
+        ok: false,
+        status: "reconcile_required",
+        error,
+        note,
+        artifact,
+        lineage,
+        approvalFingerprint: approvalRequest.approvalFingerprint,
+        pendingAction: pendingFromSuccess(published, preview.ticket.spec.fingerprint, error),
+        issue: published.issue,
+      }),
+    );
+    if (completeReconcile) return completeReconcile;
     this.trace("complete", publicationId);
     return {
       ok: true,
@@ -699,6 +746,50 @@ export class ResearchPublicationWorkflow {
       ...value,
       updatedAt: this.isoNowAtLeast(value.artifact.acceptedAt),
     });
+  }
+
+  /**
+   * Persist a checkpoint that follows a confirmed Linear issue creation. If the
+   * checkpoint store throws (limit, CAS conflict, invalid transition, stale
+   * timestamp) the issue already exists, so we must not reject and orphan it —
+   * downgrade to a reconcile_required result carrying the issue and a pending
+   * action so the caller can reconcile the durable binding later. Returns null
+   * when persistence succeeded and the caller should continue.
+   */
+  private async persistOrReconcile(
+    value: Omit<ResearchPublicationCheckpointV1, "schemaVersion" | "updatedAt">,
+    buildReconcile: (error: ResearchPublicationErrorV1) => ResearchPublicationResultV1,
+  ): Promise<ResearchPublicationResultV1 | null> {
+    try {
+      await this.persist(value);
+      return null;
+    } catch (cause) {
+      const error = normalizeError(cause, "research_publication_checkpoint_unpersisted");
+      this.trace("checkpoint_persist_failed", value.publicationId, {
+        status: value.status,
+      });
+      this.trace("reconcile_required", value.publicationId);
+      return buildReconcile(error);
+    }
+  }
+
+  /**
+   * Persist a checkpoint on a failure path that already produces a structured
+   * ok:false result. A checkpoint persist throw here must not mask the real
+   * cause, so trace it and let the caller return its intended result rather than
+   * rejecting execute() with the persistence error.
+   */
+  private async persistBestEffort(
+    value: Omit<ResearchPublicationCheckpointV1, "schemaVersion" | "updatedAt">,
+  ): Promise<void> {
+    try {
+      await this.persist(value);
+    } catch (cause) {
+      this.trace("checkpoint_persist_failed", value.publicationId, {
+        status: value.status,
+        error: normalizeError(cause, "research_publication_checkpoint_unpersisted").code,
+      });
+    }
   }
 
   private trace(
@@ -816,8 +907,6 @@ function sectionsFromAcceptedNote(
   ) {
     throw new Error("Accepted research source note path is unsafe.");
   }
-  const sourceNoteLink =
-    `[Open accepted research in Obsidian](obsidian://open?file=${encodeURIComponent(sourceNotePath)})`;
   return {
     contentKind: "synthesized",
     title: value.title,
@@ -825,7 +914,10 @@ function sectionsFromAcceptedNote(
     confidenceLimitations: value.confidenceLimitations,
     proposedWork: [...value.proposedWork],
     nonGoals: [...value.nonGoals],
-    scope: [sourceNoteLink, ...value.scope],
+    // The artifact/checkpoint already binds the exact vault note and hash.
+    // Do not copy an obsidian:// URI or vault path into provider-visible
+    // WorkItem scope where it could be mistaken for executable file authority.
+    scope: [...value.scope],
     dependencies: [...value.dependencies],
   };
 }
@@ -947,16 +1039,41 @@ function issueDestinationMismatch(
   return "Linear issue readback is outside the approved project.";
 }
 
-function publicationDrift(
+/**
+ * Both tickets come from the same deterministic build() over the same
+ * sections/draft, so this detects NONDETERMINISM leaking into the spec
+ * (Date.now(), Math.random(), unstable ordering) — not provider drift. The
+ * provider-level gate is the publisher's own ticketReadbackMismatch;
+ * checkpoint-level drift is publicationCheckpointDrift below.
+ */
+function publicationSpecDeterminism(
   preview: BuiltResearchTicket,
   published: BuiltResearchTicket,
 ): string | null {
   if (
     preview.spec.fingerprint !== published.spec.fingerprint ||
     preview.title !== published.title ||
-    preview.description !== published.description
+    published.description !== preview.description
   ) {
     return "The Linear publication changed after exact approval.";
+  }
+  return null;
+}
+
+/**
+ * Real cross-run drift: on resume, the freshly built work item must match the
+ * fingerprint the durable checkpoint recorded when the issue was created —
+ * otherwise the accepted research changed underneath an existing publication.
+ */
+function publicationCheckpointDrift(
+  priorCheckpoint: ResearchPublicationCheckpointV1 | null,
+  published: BuiltResearchTicket,
+): string | null {
+  if (
+    priorCheckpoint?.workItemFingerprint &&
+    priorCheckpoint.workItemFingerprint !== published.spec.fingerprint
+  ) {
+    return "The rebuilt work item no longer matches the durable publication checkpoint fingerprint.";
   }
   return null;
 }

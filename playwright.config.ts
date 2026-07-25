@@ -11,11 +11,12 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
     activeLanes.has("daily-use-compound")
   ? 120 * 60_000
   : activeLanes.has("daily-use-code-live") ||
+      activeLanes.has("desktop-code-delivery-real-live") ||
       activeLanes.has("real-ai-soak") ||
+      activeLanes.has("daily-use-research") ||
       activeLanes.has("obsidian-hello-github-live")
     ? 60 * 60_000
-    : activeLanes.has("real-ai-contract") ||
-        activeLanes.has("daily-use-research")
+    : activeLanes.has("real-ai-contract")
       ? 15 * 60_000
       : undefined;
 
@@ -80,6 +81,12 @@ export default defineConfig({
       grepInvert: nonCoreTitles,
       timeout: 180_000,
       expect: { timeout: 15_000 },
+    },
+    {
+      name: "agentic-capability-wireups",
+      testMatch: /agentic-capability-wireups\.spec\.ts/u,
+      timeout: 420_000,
+      expect: { timeout: 30_000 },
     },
     {
       name: "systems-diagrams",
@@ -175,6 +182,14 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
+      name: "desktop-code-delivery-real-live",
+      testMatch: /desktop-code-delivery-real-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 2_700_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
       name: "daily-use-linear",
       testMatch: /daily-use-linear\.spec\.ts/u,
       timeout: 420_000,
@@ -256,6 +271,14 @@ export default defineConfig({
       retries: 0,
       timeout: 3_600_000,
       expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "github-askpass-runtime-live",
+      testMatch: /github-askpass-runtime-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 600_000,
+      expect: { timeout: 30_000 },
       use: { trace: "off", screenshot: "off", video: "off" },
     },
   ],

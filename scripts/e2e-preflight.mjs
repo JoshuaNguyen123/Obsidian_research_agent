@@ -44,6 +44,7 @@ if (playwrightLanes.some((lane) => [
   "release-vertical",
   "daily-use-research",
   "daily-use-code-live",
+  "desktop-code-delivery-real-live",
   "daily-use-compound",
   "obsidian-hello-github-live",
   "compound-flow-real-live",
@@ -77,6 +78,7 @@ async function resolveExpectedPluginIds() {
     "daily-use-research": [],
     "daily-use-code": [],
     "daily-use-code-live": [],
+    "desktop-code-delivery-real-live": [],
     "daily-use-linear": [],
     "daily-use-github": [],
     "daily-use-compound": [],
@@ -94,6 +96,12 @@ async function resolveExpectedPluginIds() {
     "compound-flow-smoke-live": [],
     "compound-flow-real-live": [],
     "systems-diagrams": [],
+    // Core-only lane: the capability wire-ups live in the core plugin and need
+    // no companion or integration extension.
+    "agentic-capability-wireups": [],
+    // Real git + real GitHub askpass runtime proof; no model calls, no extra
+    // plugins. Credential presence is enforced by run-e2e-exclusive.mjs.
+    "github-askpass-runtime-live": [],
   };
   for (const lane of playwrightLanes) {
     const lanePlugins = requiredByLane[lane];

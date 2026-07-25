@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "tolerance": 0.05,
+  "records": [
+    {
+      "project": "daily-use-note",
+      "scenarioId": "DU-01",
+      "file": "e2e/daily-use-note.spec.ts",
+      "title": "DU-01 automatic mode creates one collision-free note when no markdown note is active",
+      "key": "daily-use-note|DU-01|e2e/daily-use-note.spec.ts|DU-01 automatic mode creates one collision-free note when no markdown note is active",
+      "scorecard": {
+        "version": 1,
+        "acceptancePassed": true,
+        "dimensions": [
+          {
+            "id": "acceptance_coverage",
+            "score": 1,
+            "weight": 0.3,
+            "detail": "4/4 criteria met"
+          },
+          {
+            "id": "evidence_grounding",
+            "score": 1,
+            "weight": 0.25,
+            "detail": "0/0 claims cited"
+          },
+          {
+            "id": "receipt_coverage",
+            "score": 1,
+            "weight": 0.15,
+            "detail": "1/1 mutations receipted"
+          },
+          {
+            "id": "recovery_cleanliness",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "0 recovery attempts"
+          },
+          {
+            "id": "model_call_efficiency",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "3/26 model calls"
+          },
+          {
+            "id": "wall_clock_efficiency",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "1s/3600s"
+          }
+        ],
+        "total": 1
+      }
+    }
+  ]
+}

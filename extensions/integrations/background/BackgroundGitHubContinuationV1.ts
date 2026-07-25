@@ -279,6 +279,7 @@ export class BackgroundGitHubContinuationRuntimeV1 {
         title: document.title,
         body: document.body,
         binding,
+        handoff: publicationDraftRefProof(preparedPackage),
         signal,
       });
       return this.acceptDraftCheckpoint(preparedPackage, attempt, checkpoint);
@@ -822,6 +823,25 @@ function publicationHandoff(
       handoff.fullValidationFingerprint,
     ],
     handoffFingerprint: handoff.fingerprint,
+  };
+}
+
+function publicationDraftRefProof(
+  preparedPackage: PreparedBackgroundGitHubPackageV1,
+) {
+  const action = preparedPackage.action;
+  if (action.operation !== GITHUB_DRAFT_PULL_REQUEST_OPERATION_V1) {
+    throw new BackgroundGitHubContinuationErrorV1(
+      "invalid_package",
+      "Draft publication ref proof requires a draft pull-request action.",
+    );
+  }
+  return {
+    profileKey: action.binding.repositoryProfileKey,
+    agentBranch: action.payload.branch,
+    baseSha: action.payload.baseSha,
+    commitSha: action.payload.headSha,
+    handoffFingerprint: action.payload.handoffFingerprint,
   };
 }
 

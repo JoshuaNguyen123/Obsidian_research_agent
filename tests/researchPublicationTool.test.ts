@@ -702,7 +702,7 @@ test("durable run evidence merges with a partial live proof cache before publica
   );
 });
 
-test("same-run web readback rejects a conflicting model-supplied evidence hash", async () => {
+test("same-run web readback replaces a conflicting model-supplied evidence hash", async () => {
   const fixture = createFixture("created");
   const args = argsFixture();
   const package_ = args.package as Record<string, unknown>;
@@ -727,15 +727,96 @@ test("same-run web readback rejects a conflicting model-supplied evidence hash",
       ],
     ]),
   };
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-host-evidence-hash",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
 
   const result = await new DefaultToolRegistry([fixture.tool]).execute(
     { name: "publish_research_to_linear", arguments: args },
     context,
   );
 
-  assert.equal(result.ok, false);
-  assert.equal(result.error?.code, "research_publication_evidence_changed");
-  assert.equal(fixture.noteWrites.length, 0);
+  assert.equal(result.ok, true);
+  assert.equal(fixture.noteWrites.length, 1);
+  assert.equal(
+    fixture.noteWrites[0]?.package.evidence[0]?.contentSha256,
+    HASH,
+  );
+});
+
+test("unsafe model acceptance commands become logical host validation criteria", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  const package_ = args.package as Record<string, unknown>;
+  package_.proposedWork = [
+    "Implement the number guess behavior.",
+    "Run npm test && inspect src/guess.ts.",
+  ];
+  package_.scope = ["src/guess.ts and tests/guess.test.ts"];
+  package_.acceptanceCriteria = [
+    {
+      text: "Run npm test && inspect src/guess.ts before committing.",
+    },
+  ];
+  const context = contextFixture(
+    "Publish this code research to Linear in Published.md",
+  );
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-safe-work-item-contract",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(fixture.noteWrites[0]?.package.acceptanceCriteria, [
+    {
+      id: "AC-1",
+      text: "The trusted validation requirement trusted.validation passes for the verified repository change.",
+    },
+  ]);
+  assert.deepEqual(fixture.noteWrites[0]?.package.proposedWork, [
+    "Implement the number guess behavior.",
+    "Implement accepted work item 2 through the trusted repository profile.",
+  ]);
+  assert.deepEqual(fixture.noteWrites[0]?.package.scope, [
+    "Accepted scope item 1 remains inside the trusted repository profile.",
+  ]);
+});
+
+test("host canonicalizes the compatible $text acceptance alias", async () => {
+  const fixture = createFixture("created");
+  const args = argsFixture();
+  (args.package as Record<string, unknown>).acceptanceCriteria = [
+    { $text: "The verified behavior matches the accepted requirement." },
+  ];
+  const context = contextFixture(
+    "Publish this code research to Linear in Published.md",
+  );
+  context.requestNestedApproval = async (request) => ({
+    approved: true,
+    approvalId: "approval-compatible-text-alias",
+    approvalFingerprint: request.preparedAction?.payloadFingerprint ?? "",
+  });
+
+  const result = await new DefaultToolRegistry([fixture.tool]).execute(
+    { name: "publish_research_to_linear", arguments: args },
+    context,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(fixture.noteWrites[0]?.package.acceptanceCriteria, [
+    {
+      id: "AC-1",
+      text: "The verified behavior matches the accepted requirement.",
+    },
+  ]);
 });
 
 test("same-run web readbacks replace unfetched model web claims with canonical sources", async () => {
@@ -960,16 +1041,16 @@ function createFixture(
     noteWriter: noteWriter as never,
     publisher,
     lineage: {
-      ...(options.resumeCheckpoints
-        ? {
-            get: async (publicationId: string) =>
-              structuredClone(
-                [...checkpoints]
-                  .reverse()
-                  .find((checkpoint) => checkpoint.publicationId === publicationId) ?? null,
-              ),
-          }
-        : {}),
+      // get is required by the port; without resumeCheckpoints the fixture
+      // returns null (no prior checkpoint) instead of omitting the method.
+      get: async (publicationId: string) =>
+        options.resumeCheckpoints
+          ? structuredClone(
+              [...checkpoints]
+                .reverse()
+                .find((checkpoint) => checkpoint.publicationId === publicationId) ?? null,
+            )
+          : null,
       persist: async (checkpoint) => {
         checkpoints.push(structuredClone(checkpoint));
       },

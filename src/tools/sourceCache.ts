@@ -1,3 +1,4 @@
+import type { TFile } from "obsidian";
 import type { ToolExecutionContext } from "./types";
 import { sha256Fingerprint } from "../agent/actions";
 import { normalizeVaultPath, truncateText } from "./validation";
@@ -50,6 +51,18 @@ export interface SourceCacheManifest {
 
 const manifestWriteQueues = new WeakMap<object, Promise<void>>();
 const sourceWriteQueues = new WeakMap<object, Map<string, Promise<void>>>();
+const sourceSectionReadCaches = new WeakMap<
+  object,
+  Map<
+    string,
+    {
+      stamp: string;
+      parsed: CachedSource;
+      sourceContent: string;
+    }
+  >
+>();
+const SOURCE_SECTION_READ_CACHE_ENTRIES = 32;
 
 export async function writeSourceCacheNote(
   ctx: ToolExecutionContext,
@@ -105,6 +118,7 @@ export async function writeSourceCacheNote(
     } else {
       await ctx.app.vault.create(vaultPath, note);
     }
+    invalidateSourceSectionReadCache(ctx, vaultPath);
   });
   const cached = {
     vaultPath,
@@ -172,12 +186,14 @@ export async function readSourceSection(
   if (!file) {
     throw new Error("Cached source was not found.");
   }
-  const markdown = await ctx.app.vault.read(file);
-  const parsed = parseCachedSourceNote(file.path, markdown);
-  if (!parsed) {
-    throw new Error("Cached source note is invalid.");
+  const payload = await readCachedSourcePayload(ctx, file);
+  const { parsed, sourceContent } = payload;
+  if (
+    ref.url &&
+    parsed.normalizedUrl !== normalizeSourceUrl(ref.url)
+  ) {
+    throw new Error("Cached source was not found.");
   }
-  const sourceContent = getCachedSourceContent(markdown, parsed);
   const sectionCount = Math.max(
     1,
     Math.ceil(sourceContent.length / SOURCE_CACHE_SECTION_CHARS),
@@ -201,16 +217,76 @@ async function findCachedFileByUrl(ctx: ToolExecutionContext, url: string) {
     return null;
   }
   const normalizedUrl = normalizeSourceUrl(url);
+  const manifest = await readSourceCacheManifest(ctx);
+  const direct = manifest.entries.find(
+    (entry) => entry.normalizedUrl === normalizedUrl,
+  );
+  if (direct) {
+    const file = ctx.app.vault.getFileByPath(direct.vaultPath);
+    if (file) return file;
+  }
   for (const file of ctx.app.vault.getFiles()) {
     if (!isSourceCachePath(file.path) || file.extension !== "md") {
       continue;
     }
-    const parsed = parseCachedSourceNote(file.path, await ctx.app.vault.read(file));
-    if (parsed?.normalizedUrl === normalizedUrl) {
+    const payload = await readCachedSourcePayload(ctx, file).catch(() => null);
+    if (payload?.parsed.normalizedUrl === normalizedUrl) {
       return file;
     }
   }
   return null;
+}
+
+async function readCachedSourcePayload(
+  ctx: ToolExecutionContext,
+  file: TFile,
+): Promise<{ parsed: CachedSource; sourceContent: string }> {
+  const stamp = sourceFileStamp(file);
+  const key = getVaultQueueKey(ctx);
+  const cache = sourceSectionReadCaches.get(key);
+  const cached = stamp ? cache?.get(file.path) : null;
+  if (cached?.stamp === stamp) {
+    cache!.delete(file.path);
+    cache!.set(file.path, cached);
+    return {
+      parsed: cached.parsed,
+      sourceContent: cached.sourceContent,
+    };
+  }
+
+  const markdown = await ctx.app.vault.read(file);
+  const parsed = parseCachedSourceNote(file.path, markdown);
+  if (!parsed) {
+    throw new Error("Cached source note is invalid.");
+  }
+  const sourceContent = getCachedSourceContent(markdown, parsed);
+  if (stamp) {
+    const next = cache ?? new Map();
+    next.delete(file.path);
+    next.set(file.path, { stamp, parsed, sourceContent });
+    while (next.size > SOURCE_SECTION_READ_CACHE_ENTRIES) {
+      const oldest = next.keys().next().value as string | undefined;
+      if (!oldest) break;
+      next.delete(oldest);
+    }
+    sourceSectionReadCaches.set(key, next);
+  }
+  return { parsed, sourceContent };
+}
+
+function sourceFileStamp(file: TFile): string | null {
+  const mtime = file.stat?.mtime;
+  const size = file.stat?.size;
+  return Number.isFinite(mtime) && Number.isFinite(size)
+    ? `${mtime}:${size}`
+    : null;
+}
+
+function invalidateSourceSectionReadCache(
+  ctx: ToolExecutionContext,
+  path: string,
+): void {
+  sourceSectionReadCaches.get(getVaultQueueKey(ctx))?.delete(path);
 }
 
 async function upsertSourceCacheManifest(

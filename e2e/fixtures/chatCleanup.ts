@@ -11,16 +11,24 @@ export async function clearChatInline(page: Page): Promise<void> {
   await clearButton.click();
   await expect(clearButton).toHaveText("Confirm clear");
   await expect(
-    page.locator(".agentic-researcher-log").getByText(
-      /Click Confirm clear to clear chat history only/i,
-    ),
+    page
+      .locator(
+        ".agentic-researcher-log .agentic-researcher-log-message",
+      )
+      .filter({ hasText: /Click Confirm clear to clear chat history only/i })
+      .last(),
   ).toBeVisible({ timeout: 5_000 });
   await clearButton.click();
   await expect(clearButton).toHaveText("Clear chat");
   await expect(
-    page.locator(".agentic-researcher-log").getByText(
-      /Chat memory cleared\. Vault notes were not modified/i,
-    ),
+    page
+      .locator(
+        ".agentic-researcher-log .agentic-researcher-log-message",
+      )
+      .filter({
+        hasText: /Chat memory cleared\. Vault notes were not modified/i,
+      })
+      .last(),
   ).toBeVisible({ timeout: 5_000 });
   await expect(page.locator("textarea.agentic-researcher-prompt")).toBeFocused();
 }

@@ -24,6 +24,22 @@ export const KNOWN_E2E_GITHUB_RESIDUE_REPOSITORY_NAMES = Object.freeze([
 ] as const);
 
 /**
+ * Prefer classic/OAuth `repo` credentials for the compound push lane. A
+ * fine-grained PAT may have Administration:write (repo create/delete) while
+ * lacking Contents:write on the newly-created repository.
+ */
+export function orderGitHubHarnessTokensForPush(
+  candidates: readonly string[],
+): string[] {
+  const unique = [...new Set(candidates.map((token) => token.trim()).filter(Boolean))];
+  return unique.sort((left, right) => {
+    const leftClassic = /^gh[pousr]_[A-Za-z0-9]{20,500}$/u.test(left);
+    const rightClassic = /^gh[pousr]_[A-Za-z0-9]{20,500}$/u.test(right);
+    return Number(rightClassic) - Number(leftClassic);
+  });
+}
+
+/**
  * The live lanes create provider resources in stages.  Keep their cleanup
  * host-owned and LIFO: a later resource is removed before an earlier resource
  * that it may reference.  All callbacks run so one residue never hides another.

@@ -2,9 +2,9 @@
  * Per-turn host routing + offered-tool purposes so the model calls exact frontier names.
  */
 
-export const HOST_ROUTING_TOOL_CARD_MAX_CHARS = 1500;
+export const HOST_ROUTING_TOOL_CARD_MAX_CHARS = 2200;
 export const HOST_ROUTING_OFFERED_TOOL_MAX = 12;
-export const HOST_ROUTING_PURPOSE_MAX_CHARS = 80;
+export const HOST_ROUTING_PURPOSE_MAX_CHARS = 150;
 
 export type HostRoutingToolCardV1 = {
   route: string;
@@ -20,13 +20,18 @@ export type HostRoutingToolCardV1 = {
 /** Fixed short purposes for compound ladder names; fallback = truncated descriptor. */
 export const COMPOUND_TOOL_PURPOSE: Readonly<Record<string, string>> = {
   code_sandbox_status: "verify sandbox Ready before validate/commit",
-  code_workspace_create: "isolated worktree + codex/workspace-* branch",
+  code_workspace_create:
+    "create a real local-filesystem workspace; export its finished tree to Desktop/Documents/Downloads with code_workspace_export_directory",
   code_workspace_status: "workspace binding and status",
   code_workspace_read: "read workspace/repo file (not vault)",
-  code_workspace_create_file: "create new workspace file",
+  code_workspace_create_file:
+    "create a file in the real local-filesystem workspace; export via code_workspace_export_directory to Desktop/Documents/Downloads",
+  code_workspace_export_directory:
+    "deliver a verified workspace tree to an explicitly requested known folder",
   code_workspace_append: "append to workspace file",
   code_workspace_patch: "patch workspace file",
-  code_workspace_write_expected: "hash-bound workspace correction",
+  code_workspace_write_expected:
+    "hash-bound correction in the real local-filesystem workspace; export via code_workspace_export_directory to Desktop/Documents/Downloads",
   code_workspace_mkdir: "create workspace directory",
   code_validate_fast: "sandbox smoke tests",
   code_validate_targeted: "targeted sandbox validation",

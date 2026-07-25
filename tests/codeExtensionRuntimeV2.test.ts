@@ -814,6 +814,130 @@ test("CodeExtensionRuntimeV2 stages exact workspace readback and imports only de
   }
 });
 
+test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces without repository authority", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-scratch-python-"));
+  try {
+    const manager = new WorkspaceManagerV2({
+      applicationDataRoot: path.join(root, "app-data"),
+      now: () => new Date(NOW),
+      randomId: incrementingId(),
+    });
+    let sandboxProbeCount = 0;
+    const sandboxRunner: SandboxCommandRunnerV2 = {
+      async run(spec) {
+        assert.equal(spec.purpose, "boundary_probe");
+        sandboxProbeCount += 1;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            version: 1,
+            uid: 65532,
+            networkBlocked: true,
+            rootReadOnly: true,
+            hostRootAbsent: true,
+            containerSocketAbsent: true,
+            runtimeReadOnly: true,
+            runtimeDigest: SHA("f"),
+            stagingIsolated: true,
+            resourceLimitsEnforced: true,
+          }),
+          stderr: "",
+        };
+      },
+    };
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: new MemoryPluginData({ schemaVersion: 1 }) as unknown as Plugin,
+      workspaceManager: manager,
+      sandboxRunner,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await runtime.configureSandboxProvider({
+      version: 1,
+      kind: "docker",
+      executable: "docker",
+      priority: 10,
+      runtimeReference: "registry.example/agentic-sandbox",
+      runtimeDigest: SHA("f"),
+      wslDistribution: null,
+      runtimeRoot: null,
+    });
+    const manifest = await manager.createScratchWorkspace({
+      workspaceId: "scratch-python",
+      ownerRunId: "scratch-python-run",
+    });
+    const leased = await manager.acquireLease(
+      manifest.workspaceId,
+      "extension:scratch-python-run",
+    );
+    const source = "number = 7\nprint(f'Guess: {number}')\n";
+    await manager.createFile(
+      manifest.workspaceId,
+      leased.lease!.id,
+      "number_game.py",
+      source,
+    );
+
+    const fast = await runtime.resolveSandboxPreparationInput(
+      "validation_fast",
+      manifest.workspaceId,
+    );
+    assert.equal(sandboxProbeCount, 1);
+    assert.match(fast.profile.key, /^scratch-[a-f0-9]{32}$/u);
+    assert.equal(fast.projectId, "scratch");
+    assert.equal(fast.commandId, "scratch-python-fast");
+    assert.equal(
+      fast.profile.validationCatalog.find((command) => command.id === fast.commandId)
+        ?.args.join(" "),
+      "-m compileall -q .",
+    );
+    assert.deepEqual(fast.stagingManifest.map((entry) => entry.path), [
+      "number_game.py",
+    ]);
+    assert.equal(
+      await runtime.getRepositoryProfile(fast.profile.key),
+      null,
+      "scratch validation profiles must not become trusted repository bindings",
+    );
+
+    const action = {
+      purpose: "validation_fast",
+      profileKey: fast.profile.key,
+      projectId: fast.projectId,
+      commandId: fast.commandId,
+      workspaceId: fast.workspaceId,
+      workspaceManifestFingerprint: fast.workspaceManifestFingerprint,
+      stagingManifest: fast.stagingManifest,
+      expectedArtifacts: [],
+    } as unknown as Parameters<
+      CodeExtensionRuntimeV2["resolveSandboxExecutionInput"]
+    >[0];
+    const staged = await runtime.resolveSandboxExecutionInput(
+      action,
+      extensionContext(),
+    );
+    assert.equal(staged.artifactImporter, undefined);
+    assert.equal(
+      new TextDecoder().decode(staged.stagedFiles[0]?.bytes),
+      source,
+    );
+
+    const targeted = await runtime.resolveSandboxPreparationInput(
+      "validation_targeted",
+      manifest.workspaceId,
+    );
+    const full = await runtime.resolveSandboxPreparationInput(
+      "validation_full",
+      manifest.workspaceId,
+    );
+    assert.equal(targeted.commandId, "scratch-python-targeted");
+    assert.equal(full.commandId, "scratch-python-full");
+    assert.equal(sandboxProbeCount, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CodeExtensionRuntimeV2 rejects oversized staging metadata before hashing workspace content", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "code-runtime-stage-bounds-"));
   try {

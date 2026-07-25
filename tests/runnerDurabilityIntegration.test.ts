@@ -1514,14 +1514,22 @@ test("resumed receipts do not spend the child segment tool budget or erase new g
 });
 
 test("required tool failure marks a budget outcome as ineligible for automatic continuation", async () => {
-  const vault = createVaultHarness();
-  vault.context.settings.maxAgentSteps = 4;
+  const vault = createVaultHarness({
+    beforeModify: (path) => {
+      if (path === "Current.md") {
+        throw new Error("Injected current-note write failure.");
+      }
+    },
+  });
+  vault.context.settings.maxAgentSteps = 1;
   const completions: AgentRunCompleteEvent[] = [];
 
   await runAgentMission({
     prompt: "Append required failure proof to the current note.",
     modelClient: createModelClient([
-      responseWithToolCall("append_to_current_file", {}),
+      responseWithToolCall("append_to_current_file", {
+        text: "required failure proof",
+      }),
     ]),
     toolRegistry: createDefaultToolRegistry(),
     toolContext: vault.context,

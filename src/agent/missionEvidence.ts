@@ -108,6 +108,76 @@ export function evidenceFromToolResult(
     };
   }
 
+  if (toolName === "analyze_dataset" && isRecord(result.output)) {
+    const path = getString(result.output.path) ?? "";
+    const contentHash = getString(result.output.contentHash);
+    const rowCount = getNumber(result.output.rowCount) ?? 0;
+    const columns = Array.isArray(result.output.columns)
+      ? result.output.columns.length
+      : 0;
+    if (!path) return null;
+    return {
+      id: `dataset:${hashEvidenceKey(path)}`,
+      kind: "vault_note",
+      title: `Dataset: ${path}`,
+      path,
+      sourceId: createEvidenceSourceId(path),
+      ...(contentHash && /^sha256:[a-f0-9]{64}$/u.test(contentHash)
+        ? { contentHash }
+        : {}),
+      summary: `Analyzed ${rowCount} rows across ${columns} columns.`,
+      confidence: "high",
+    };
+  }
+
+  if (
+    (toolName === "resolve_citation" || toolName === "verify_citation") &&
+    isRecord(result.output)
+  ) {
+    if (toolName === "verify_citation") {
+      const status = getString(result.output.status);
+      if (status !== "supported") return null;
+      const sourcePath = getString(result.output.sourcePath) ?? "";
+      const contentHash = getString(result.output.contentHash);
+      return {
+        id: `citation_check:${hashEvidenceKey(sourcePath || String(result.output.section ?? ""))}`,
+        kind: "web_source",
+        title: "Verified citation quote",
+        ...(sourcePath ? { path: sourcePath } : {}),
+        sourceId: createEvidenceSourceId(sourcePath || "citation_check"),
+        ...(contentHash && /^sha256:[a-f0-9]{64}$/u.test(contentHash)
+          ? { contentHash }
+          : {}),
+        summary: `Quote verified in cached source section ${String(result.output.section ?? "?")}.`,
+        confidence: "high",
+        usableSource: true,
+      };
+    }
+    const record = isRecord(result.output.record) ? result.output.record : null;
+    if (!record) return null;
+    const title = getString(record.title) ?? "";
+    const url = getString(record.url) ?? "";
+    if (!title) return null;
+    return {
+      id: `citation:${hashEvidenceKey(getString(record.sourceId) ?? title)}`,
+      kind: "web_source",
+      title,
+      ...(url ? { url } : {}),
+      sourceId: createEvidenceSourceId(getString(record.sourceId) ?? url ?? title),
+      summary: summarizeText(
+        [
+          (Array.isArray(record.authors) ? record.authors : []).slice(0, 4).join(", "),
+          getString(record.venue) ?? "",
+          String(getNumber(record.year) ?? ""),
+          getString(record.abstract) ?? "",
+        ]
+          .filter(Boolean)
+          .join(" — "),
+      ),
+      confidence: "high",
+    };
+  }
+
   if (toolName === "browser_extract_markdown" && isRecord(result.output)) {
     const url = getString(result.output.url) ?? "";
     const title = getString(result.output.title) ?? (url || "Browser source");

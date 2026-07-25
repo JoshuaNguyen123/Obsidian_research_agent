@@ -1160,7 +1160,15 @@ export function extractRequiredLiteralAnchors(text: string): string[] {
   const pattern = /\b(?:include(?:\s+the)?(?:\s+marker)?|containing)\s+[`"']?([a-z0-9][a-z0-9_.:-]{7,})[`"']?/giu;
   for (const match of text.matchAll(pattern)) {
     const anchor = match[1]?.replace(/[.,;!?]+$/gu, "") ?? "";
-    if (anchor) anchors.push(anchor);
+    // This contract is for opaque identifiers, not ordinary prose following
+    // verbs such as "include explicit limitations" or "include confidence".
+    // Require token-like entropy while retaining common run markers, versioned
+    // values, source IDs, and all-uppercase sentinels.
+    const tokenLike =
+      /[0-9_.:]/u.test(anchor) ||
+      anchor.includes("_") ||
+      /^[A-Z][A-Z0-9-]{7,}$/u.test(anchor);
+    if (anchor && tokenLike) anchors.push(anchor);
   }
   return anchors;
 }
@@ -1515,29 +1523,53 @@ function extractRelevanceTerms(value: string): string[] {
   const stopWords = new Set([
     "about",
     "across",
+    "after",
     "answer",
     "append",
+    "before",
+    "both",
     "cited",
     "citation",
     "citations",
     "compare",
+    "context",
     "current",
     "directly",
+    "each",
     "evidence",
+    "exactly",
     "final",
     "find",
+    "fetch",
+    "fetched",
+    "include",
+    "identifier",
+    "identifiers",
     "latest",
+    "marker",
+    "markers",
     "mission",
     "note",
     "notes",
+    "only",
     "please",
+    "read",
     "research",
     "requested",
+    "returned",
+    "search",
+    "section",
+    "sentence",
+    "sentences",
     "source",
     "sources",
     "summary",
+    "then",
     "verify",
+    "vault",
     "web",
+    "with",
+    "without",
     "write",
   ]);
   const selectedBlock =

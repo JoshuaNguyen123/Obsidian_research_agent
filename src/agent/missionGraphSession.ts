@@ -905,6 +905,38 @@ export class MissionGraphSession {
   }
 
   /**
+   * Return a started tool to the ready frontier without recording an attempt.
+   * This is reserved for host policy deferrals where the tool itself never ran
+   * (for example, an early write requested during research analysis).
+   */
+  async deferToolExecution(
+    execution: MissionGraphToolExecution,
+    reason: string,
+  ): Promise<MissionGraphV3> {
+    return this.enqueueMutation(async () => {
+      const node = this.requireExecutionNode(execution, "running");
+      try {
+        return await this.applyUnlocked(
+          `Defer ${execution.toolName} for ${node.id}: ${reason.slice(0, 240)}`,
+          [
+            {
+              op: "set_status",
+              nodeId: node.id,
+              expectedStatus: "running",
+              status: "ready",
+              blocker: null,
+            },
+          ],
+        );
+      } finally {
+        if (execution.lockLease) {
+          await this.releaseNodeLocksUnlocked(execution.lockLease);
+        }
+      }
+    });
+  }
+
+  /**
    * Persist that an already-started effectful tool is waiting on exact user
    * approval. The execution keeps its resource lease so another mutation
    * cannot race the prepared action while the approval surface is open.

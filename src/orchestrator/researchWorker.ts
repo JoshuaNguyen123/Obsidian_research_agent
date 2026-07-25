@@ -28,7 +28,10 @@ import {
   type ResearchEffortTier,
 } from "../agent/researchEffortPolicy";
 import { resolveThinkForCall } from "../agent/thinkPolicy";
-import { filterResearcherToolNames } from "./researcherSoftCatalog";
+import {
+  RESEARCHER_SOFT_TOOL_NAMES,
+  filterResearcherToolNames,
+} from "./researcherSoftCatalog";
 
 /** Align with settings default (40) and MAX_AGENT_STEPS hard ceiling. */
 const RESEARCH_WORKER_MAX_STEPS = MAX_AGENT_STEPS;
@@ -47,31 +50,13 @@ import {
   type SourceCandidateLedgerV1,
 } from "./sourceCandidateLedger";
 
-export const RESEARCH_WORKER_ALLOWED_TOOLS = new Set([
-  "read_current_file",
-  "list_current_folder",
-  "list_markdown_files",
-  "search_markdown_files",
-  "read_markdown_files",
-  "read_file",
-  "inspect_vault_context",
-  "list_folder",
-  "get_path_info",
-  "inspect_vault_index",
-  "inspect_semantic_index",
-  "semantic_search_notes",
-  "get_note_graph_context",
-  "find_related_notes",
-  "suggest_note_links",
-  "web_search",
-  "web_fetch",
-  "read_source_section",
-  "browser_open_page",
-  "browser_observe",
-  "browser_extract_markdown",
-  "search_research_memory",
-  "read_research_memory",
-]);
+/**
+ * The Researcher's read-only tool authority, derived structurally from the
+ * single Soft catalog so the two views can never drift.
+ */
+export const RESEARCH_WORKER_ALLOWED_TOOLS: ReadonlySet<string> = new Set(
+  RESEARCHER_SOFT_TOOL_NAMES,
+);
 
 /** Tools that must stay sequential (leases, browser session, or mutations). */
 const RESEARCH_WORKER_SERIAL_ONLY = new Set([

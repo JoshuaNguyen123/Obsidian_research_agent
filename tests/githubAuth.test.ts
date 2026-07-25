@@ -190,11 +190,98 @@ test("fine-grained PAT import stores first, verifies identity, and returns no pl
   assert.equal(validatedToken, PAT);
   assert.equal(credential.credentialKind, "fine_grained_pat");
   assert.deepEqual(credential.account, { id: 42, login: "pat-owner" });
+  // Fine-grained PAT permissions are not observable; scopes are unverified
+  // (null), never a fabricated empty claim.
+  assert.equal(credential.scopes, null);
   assert.equal(JSON.stringify(credential).includes(PAT), false);
   const description = await store.describe(credential.tokenReferenceId);
   assert.equal(description.metadata.credentialKind, "fine_grained_pat");
   assert.equal(await client.removeCredential(credential), true);
   await assert.rejects(() => store.describe(credential.tokenReferenceId));
+});
+
+test("harness import accepts all classic/OAuth prefixes and adopts observed x-oauth-scopes", async () => {
+  for (const prefix of ["ghp", "gho", "ghu", "ghs", "ghr"]) {
+    const token = `${prefix}_${"B".repeat(36)}`;
+    const { client } = createClient({
+      validateIdentity: async () => ({
+        id: 7,
+        login: "harness-owner",
+        // What GitHubRestClient.getAuthenticatedUserWithOAuthScopes surfaces
+        // from the x-oauth-scopes response header for classic tokens.
+        oauthScopes: ["repo", "delete_repo"],
+      }),
+    });
+    const credential = await client.importHarnessAccessToken(token);
+    assert.equal(credential.credentialKind, "oauth_device", prefix);
+    // Observed scopes are adopted — not the old hardcoded ["repo"] assertion.
+    assert.deepEqual(credential.scopes, ["repo", "delete_repo"], prefix);
+    assert.equal(JSON.stringify(credential).includes(token), false, prefix);
+  }
+});
+
+test("harness import without an observable scope header stays unverified", async () => {
+  const { client } = createClient({
+    validateIdentity: async () => ({ id: 7, login: "harness-owner" }),
+  });
+  const classic = await client.importHarnessAccessToken(`ghp_${"C".repeat(36)}`);
+  assert.equal(classic.scopes, null);
+
+  const fineGrained = await client.importHarnessAccessToken(PAT);
+  assert.equal(fineGrained.credentialKind, "fine_grained_pat");
+  assert.equal(fineGrained.scopes, null);
+});
+
+test("harness import rejects garbage without touching the secret store", async () => {
+  const delegate = new InMemorySecretStoreV1({ randomBytes: sequenceRandom() });
+  let puts = 0;
+  const store: SecretStoreV1 = {
+    version: 1,
+    health: () => delegate.health(),
+    put: async (input) => {
+      puts += 1;
+      return delegate.put(input);
+    },
+    describe: (id) => delegate.describe(id),
+    lease: (id, options) => delegate.lease(id, options),
+    remove: (id) => delegate.remove(id),
+  };
+  const { client } = createClient({ store });
+  for (const invalid of ["", "not-a-token", "sk-ant-xxxx", "github_pat", "ghz_abc"]) {
+    await assert.rejects(
+      () => client.importHarnessAccessToken(invalid),
+      (error: unknown) =>
+        error instanceof GitHubAuthErrorV1 &&
+        error.code === "github_auth_invalid_input",
+    );
+  }
+  assert.equal(puts, 0);
+});
+
+test("harness import honors an already-aborted signal", async () => {
+  const { client } = createClient();
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    () => client.importHarnessAccessToken(`ghp_${"D".repeat(36)}`, controller.signal),
+    (error: unknown) => error instanceof GitHubAuthErrorV1,
+  );
+});
+
+test("legacy persisted scope arrays still parse and null round-trips", async () => {
+  const { client } = createClient({
+    validateIdentity: async () => ({ id: 42, login: "pat-owner" }),
+  });
+  const credential = await client.importFineGrainedPat(PAT);
+  const roundTripped = parseGitHubCredentialV1(JSON.parse(JSON.stringify(credential)));
+  assert.equal(roundTripped.scopes, null);
+
+  // A legacy record persisted with a concrete scope array parses verbatim.
+  const legacy = parseGitHubCredentialV1({
+    ...JSON.parse(JSON.stringify(credential)),
+    scopes: ["repo"],
+  });
+  assert.deepEqual(legacy.scopes, ["repo"]);
 });
 
 test("invalid PAT input never reaches the secret store", async () => {

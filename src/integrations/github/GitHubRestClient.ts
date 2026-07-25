@@ -276,6 +276,30 @@ export interface GitHubMergeRecord {
   message: string;
 }
 
+export interface GitHubCodeSearchResultRecord {
+  path: string;
+  name: string;
+  htmlUrl: string;
+  sha: string;
+  score: number;
+}
+
+export interface GitHubIssueSearchResultRecord {
+  number: number;
+  title: string;
+  state: string;
+  htmlUrl: string;
+  pullRequest: boolean;
+  updatedAt: string;
+}
+
+export interface GitHubCommitSearchResultRecord {
+  sha: string;
+  message: string;
+  htmlUrl: string;
+  authoredAt: string;
+}
+
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export class GitHubRestClient {
@@ -289,6 +313,31 @@ export class GitHubRestClient {
 
   async getAuthenticatedUser(signal?: AbortSignal): Promise<GitHubAuthenticatedUserRecord> {
     return normalizeAuthenticatedUser(await this.request("GET", "/user", undefined, signal));
+  }
+
+  /**
+   * Authenticated identity plus the scopes GitHub actually reported in the
+   * `x-oauth-scopes` response header. Classic/OAuth tokens echo their scopes
+   * there; fine-grained PATs omit the header entirely, so `oauthScopes` is
+   * `null` (unverified) for them — never a fabricated claim.
+   */
+  async getAuthenticatedUserWithOAuthScopes(
+    signal?: AbortSignal,
+  ): Promise<GitHubAuthenticatedUserRecord & { oauthScopes: string[] | null }> {
+    let scopesHeader: string | null = null;
+    const payload = await this.request("GET", "/user", undefined, signal, false, (headers) => {
+      const raw = headers["x-oauth-scopes"];
+      scopesHeader = typeof raw === "string" ? raw : null;
+    });
+    const user = normalizeAuthenticatedUser(payload);
+    const oauthScopes = scopesHeader === null
+      ? null
+      : (scopesHeader as string)
+          .split(",")
+          .map((scope) => scope.trim())
+          .filter(Boolean)
+          .slice(0, 64);
+    return { ...user, oauthScopes };
   }
 
   async getRepository(
@@ -355,6 +404,42 @@ export class GitHubRestClient {
       signal,
       true,
     );
+  }
+
+  /**
+   * Change only the exact repository default branch. Callers must independently
+   * verify the target ref and enforce the allowed transition before invoking
+   * this mutation.
+   */
+  async updateRepositoryDefaultBranch(
+    owner: string,
+    repository: string,
+    branch: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubRepositoryRecord> {
+    const expectedFullName =
+      `${validateLogin(owner)}/${validateOwnerRepoSegment(repository, "repository")}`;
+    const defaultBranch = validateRef(branch);
+    const readback = normalizeRepository(
+      await this.request(
+        "PATCH",
+        repoPath(owner, repository),
+        { default_branch: defaultBranch },
+        signal,
+      ),
+    );
+    if (
+      readback.private !== true ||
+      readback.archived ||
+      readback.fullName.toLowerCase() !== expectedFullName.toLowerCase() ||
+      readback.defaultBranch !== defaultBranch
+    ) {
+      throw new GitHubApiError(
+        "github_conflict",
+        "GitHub default-branch mutation did not return the exact active private repository.",
+      );
+    }
+    return readback;
   }
 
   async getReference(
@@ -788,6 +873,105 @@ export class GitHubRestClient {
       throw invalidResponse("Expected jobs in the GitHub response.");
     }
     return normalizeList(payload.jobs, "workflow jobs", normalizeWorkflowJob);
+  }
+
+  /**
+   * Repository-scoped code search. The repo: qualifier is host-appended and
+   * caller qualifiers that would widen scope (repo:/org:/user:) are stripped,
+   * so search can never escape the trusted repository binding.
+   */
+  async searchCode(
+    owner: string,
+    repository: string,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubCodeSearchResultRecord[]> {
+    const payload = await this.searchRequest("code", owner, repository, query, signal);
+    return normalizeList(payload.items, "code search results", (value) => {
+      if (!isRecord(value)) throw invalidResponse("Invalid code search result.");
+      return {
+        path: requiredString(value.path, "item.path"),
+        name: requiredString(value.name, "item.name"),
+        htmlUrl: requiredString(value.html_url, "item.html_url"),
+        sha: requiredString(value.sha, "item.sha"),
+        score: typeof value.score === "number" ? value.score : 0,
+      };
+    });
+  }
+
+  /** Repository-scoped issue/PR search with the same widening protection. */
+  async searchIssues(
+    owner: string,
+    repository: string,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubIssueSearchResultRecord[]> {
+    const payload = await this.searchRequest("issues", owner, repository, query, signal);
+    return normalizeList(payload.items, "issue search results", (value) => {
+      if (!isRecord(value)) throw invalidResponse("Invalid issue search result.");
+      return {
+        number: requiredNumber(value.number, "item.number"),
+        title: requiredString(value.title, "item.title"),
+        state: requiredString(value.state, "item.state"),
+        htmlUrl: requiredString(value.html_url, "item.html_url"),
+        pullRequest: isRecord(value.pull_request),
+        updatedAt: requiredString(value.updated_at, "item.updated_at"),
+      };
+    });
+  }
+
+  /** Repository-scoped commit search with the same widening protection. */
+  async searchCommits(
+    owner: string,
+    repository: string,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubCommitSearchResultRecord[]> {
+    const payload = await this.searchRequest("commits", owner, repository, query, signal);
+    return normalizeList(payload.items, "commit search results", (value) => {
+      if (!isRecord(value) || !isRecord(value.commit)) {
+        throw invalidResponse("Invalid commit search result.");
+      }
+      return {
+        sha: requiredString(value.sha, "item.sha"),
+        message: requiredString(value.commit.message, "item.commit.message").slice(0, 500),
+        htmlUrl: requiredString(value.html_url, "item.html_url"),
+        authoredAt: isRecord(value.commit.author) && typeof value.commit.author.date === "string"
+          ? value.commit.author.date
+          : "",
+      };
+    });
+  }
+
+  private async searchRequest(
+    kind: "code" | "issues" | "commits",
+    owner: string,
+    repository: string,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    const cleaned = query
+      .replace(/\b(?:repo|org|user):\S+/giu, " ")
+      .replace(/\s+/gu, " ")
+      .trim()
+      .slice(0, 240);
+    if (!cleaned) {
+      throw new GitHubApiError(
+        "github_api",
+        "A non-empty search query is required after scope qualifiers are removed.",
+      );
+    }
+    const scoped = `${cleaned} repo:${validateLogin(owner)}/${validateOwnerRepoSegment(repository, "repository")}`;
+    const payload = await this.request(
+      "GET",
+      `/search/${kind}?q=${encodeURIComponent(scoped)}&per_page=50`,
+      undefined,
+      signal,
+    );
+    if (!isRecord(payload)) {
+      throw invalidResponse("Expected search results in the GitHub response.");
+    }
+    return payload;
   }
 
   async createAgentBranch(
@@ -1235,6 +1419,7 @@ export class GitHubRestClient {
     body?: Record<string, unknown>,
     signal?: AbortSignal,
     allowNoContent = false,
+    captureHeaders?: (headers: Record<string, string>) => void,
   ): Promise<unknown> {
     const token = this.options.token.trim();
     if (!token) {
@@ -1264,6 +1449,9 @@ export class GitHubRestClient {
         "github_api",
         redactSecret(error instanceof Error ? error.message : "GitHub request failed.", token),
       );
+    }
+    if (captureHeaders && response.status >= 200 && response.status < 300) {
+      captureHeaders(response.headers ?? {});
     }
     return parseResponse(response, token, allowNoContent);
   }
