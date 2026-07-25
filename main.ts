@@ -25,6 +25,7 @@ import {
   isDirectOllamaCloudApiBaseUrl,
   preflightOllamaCloudAgentCapabilities,
 } from "./src/model/ollamaCloudCapabilityPreflight";
+import { probeToolCallBehavior } from "./src/model/toolCallBehavioralProbe";
 import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
 import {
   createSemanticIndexService,
@@ -1403,6 +1404,17 @@ export default class AgenticResearcherPlugin extends Plugin {
       if (response.message.role !== "assistant") {
         throw new Error("Provider returned an invalid health-check role.");
       }
+      // Behavioral probe: metadata capability proof is not emission proof.
+      // Advisory only — a warning, never a connection failure.
+      const toolProbe = await probeToolCallBehavior((request) =>
+        client.chat({ ...request, model, evidencePhase: "unknown" }),
+      ).catch(() => null);
+      const toolProbeWarning =
+        toolProbe && toolProbe.outcome !== "native_tool_call"
+          ? toolProbe.outcome === "recovered_text_call"
+            ? " Warning: this model wrote its tool call as text instead of a structured call; missions will rely on text recovery."
+            : " Warning: this model did not emit a tool call in the behavioral probe; agent missions may stall on tool steps."
+          : "";
       const latencyMs = Math.max(0, Date.now() - startedAt);
       const cloudCapabilityMessage = cloudCapabilityProof
         ? ` Tools + Thinking verified by Ollama /api/show${
@@ -1413,7 +1425,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         : "";
       this.modelConnectionStatus = {
         status: "ready",
-        message: `Connected to ${provider} model ${model} in ${latencyMs}ms.${cloudCapabilityMessage}`,
+        message: `Connected to ${provider} model ${model} in ${latencyMs}ms.${cloudCapabilityMessage}${toolProbeWarning}`,
         checkedAt: new Date().toISOString(),
         latencyMs,
         provider,
@@ -1775,6 +1787,11 @@ export default class AgenticResearcherPlugin extends Plugin {
         ? "extract_only"
         : "supervised";
     settings.agenticReflexEnabled = settings.agenticReflexEnabled === true;
+    settings.speechActSemanticRescueMode =
+      settings.speechActSemanticRescueMode === "shadow" ||
+      settings.speechActSemanticRescueMode === "authority"
+        ? settings.speechActSemanticRescueMode
+        : "off";
     settings.agenticReflexDiagnosticsEnabled =
       settings.agenticReflexDiagnosticsEnabled !== false;
     settings.runDetailsDiagnosticsExpanded =
@@ -1930,6 +1947,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     settings.autoTitleOnWrite = normalizedProfiles.autoTitleOnWrite;
     settings.thinkingMode = normalizedProfiles.thinkingMode;
     settings.agenticReflexEnabled = normalizedProfiles.agenticReflexEnabled;
+    settings.speechActSemanticRescueMode =
+      normalizedProfiles.speechActSemanticRescueMode;
     settings.modelRouterMode = normalizedProfiles.modelRouterMode;
     settings.modelRouterEnabled = normalizedProfiles.modelRouterEnabled;
     settings.researchMemoryEnabled = normalizedProfiles.researchMemoryEnabled;

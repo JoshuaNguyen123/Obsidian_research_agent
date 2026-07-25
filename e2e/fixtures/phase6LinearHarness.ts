@@ -742,6 +742,7 @@ async function installPhase6LinearPageHarness(context: {
           orchestratorEnabled: false,
           orchestratorPreviewEnabled: false,
           agenticReflexEnabled: false,
+          speechActSemanticRescueMode: "off",
           completionDrivenLoops: false,
           semanticIndexEnabled: false,
           maxAgentSteps: 100,

@@ -38,6 +38,11 @@ export function extractToolCallsFromAssistantText(
     }
   }
 
+  extractVendorToolCallCandidates(content, knownToolNames, toolCalls);
+  if (toolCalls.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) {
+    return toolCalls.slice(0, MAX_RECOVERED_TEXT_TOOL_CALLS);
+  }
+
   const parsedCandidates = extractJsonCandidates(content);
 
   for (const candidate of parsedCandidates) {
@@ -86,6 +91,82 @@ function extractXmlToolCallCandidates(
   }
 
   return toolCalls;
+}
+
+/**
+ * Vendor-native text tool-call formats. Budget models on Ollama-compatible
+ * bridges frequently emit their chat-template syntax as plain content instead
+ * of a structured tool_calls array: Kimi K2 sentinel sections, Qwen/Hermes
+ * <tool_call> blocks, Llama <function=…> tags, and bare functions.name({…})
+ * pseudo-code. Recover every recognizable call; unknown tool names are
+ * dropped, and the shared cap bounds the total.
+ */
+function extractVendorToolCallCandidates(
+  content: string,
+  knownToolNames: ReadonlySet<string>,
+  output: ModelToolCall[],
+): void {
+  const push = (rawName: string, rawArgs: string, raw: string) => {
+    if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) return;
+    const name = rawName
+      .trim()
+      .replace(/^functions\./iu, "")
+      .replace(/:\d+$/u, "");
+    if (!knownToolNames.has(name)) return;
+    const parsed = parseJsonCandidate(rawArgs);
+    const candidate: ModelToolCall = {
+      name,
+      arguments: normalizeRecoveredToolArguments(
+        name,
+        isRecord(parsed) ? parsed : {},
+      ),
+      index: output.length,
+      raw,
+    };
+    if (!isDuplicateRecoveredToolCall(output, candidate)) {
+      output.push(candidate);
+    }
+  };
+
+  // Kimi K2: <|tool_call_begin|>functions.NAME:0<|tool_call_argument_begin|>{…}<|tool_call_end|>
+  const kimiPattern =
+    /<\|tool_call_begin\|>\s*([\w.:-]+?)\s*<\|tool_call_argument_begin\|>\s*([\s\S]*?)\s*<\|tool_call_end\|>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = kimiPattern.exec(content)) !== null) {
+    push(match[1], match[2], match[0]);
+  }
+
+  // Qwen / Hermes: <tool_call>{"name": …, "arguments": …}</tool_call>
+  const hermesPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+  while ((match = hermesPattern.exec(content)) !== null) {
+    const parsed = parseJsonCandidate(match[1]);
+    if (parsed !== undefined) {
+      collectToolCallsFromJson(parsed, knownToolNames, output);
+    }
+    if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) return;
+  }
+
+  // Llama 3.x: <function=NAME>{…}</function>
+  const llamaPattern = /<function=([\w.-]+)>\s*([\s\S]*?)\s*<\/function>/gi;
+  while ((match = llamaPattern.exec(content)) !== null) {
+    push(match[1], match[2], match[0]);
+  }
+
+  // Bare pseudo-code: functions.NAME({…}) or NAME({…}) for a known tool.
+  const barePattern = /\b(?:functions\.)?([A-Za-z][A-Za-z0-9_]*)\s*\(\s*(?=\{)/gu;
+  while ((match = barePattern.exec(content)) !== null) {
+    if (output.length >= MAX_RECOVERED_TEXT_TOOL_CALLS) return;
+    const name = match[1].trim();
+    if (!knownToolNames.has(name)) continue;
+    const objectStart = match.index + match[0].length;
+    const objectEnd = findBalancedJsonObjectEnd(content, objectStart);
+    if (objectEnd < 0) continue;
+    push(
+      name,
+      content.slice(objectStart, objectEnd + 1),
+      content.slice(match.index, objectEnd + 1),
+    );
+  }
 }
 
 function readXmlTag(content: string, tagName: string): string | null {
@@ -204,6 +285,23 @@ function findBalancedJsonObjectEnd(content: string, start: number): number {
   return -1;
 }
 
+/**
+ * The same textual call frequently parses through more than one recovery
+ * stage (a <tool_call> body is also a balanced inline JSON object). One
+ * textual request must never become two executions.
+ */
+function isDuplicateRecoveredToolCall(
+  output: readonly ModelToolCall[],
+  candidate: ModelToolCall,
+): boolean {
+  const fingerprint = JSON.stringify(candidate.arguments);
+  return output.some(
+    (existing) =>
+      existing.name === candidate.name &&
+      JSON.stringify(existing.arguments) === fingerprint,
+  );
+}
+
 function parseJsonCandidate(value: string): unknown | undefined {
   try {
     return JSON.parse(value.trim());
@@ -238,7 +336,9 @@ function collectToolCallsFromJson(
 
   const directToolCall = parseToolCallRecord(value, knownToolNames, output.length);
   if (directToolCall) {
-    output.push(directToolCall);
+    if (!isDuplicateRecoveredToolCall(output, directToolCall)) {
+      output.push(directToolCall);
+    }
     return;
   }
 

@@ -2388,6 +2388,9 @@ test("model connection setup performs a real bounded check and surfaces failure"
     await connection.getByRole("button", { name: "Test connection" }).click();
     connection = page.locator(".agentic-settings-model-connection");
     await expect(connection).toContainText("Connected to", { timeout: 10_000 });
+    await expect(connection).toContainText(
+      "did not emit a tool call in the behavioral probe",
+    );
 
     await page.evaluate(({ pluginId }) => {
       const obsidianWindow = window as typeof window & { app?: any };

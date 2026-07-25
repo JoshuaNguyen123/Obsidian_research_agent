@@ -3,6 +3,11 @@
  * authority: only an action clause can turn discussion about a pipeline into
  * execution of that pipeline.
  */
+import {
+  canonicalizeKeywordTypos,
+  fuzzyCorrectionReason,
+} from "./promptNormalization";
+
 export type MissionSpeechAct =
   | "explain"
   | "evaluate"
@@ -29,7 +34,28 @@ export function classifyMissionSpeechAct(
   if (!value) {
     return result("explain", "direct_chat", ["empty_prompt"]);
   }
+  const direct = classifyTrimmedPrompt(value);
+  if (direct.reasons[0] !== "ordinary_answer") return direct;
+  // Rescue position: a near-miss keyword typo ("crate a … game", "on my
+  // deskto") may only widen an ordinary-answer fallthrough toward what the
+  // corrected spelling would have classified as; it can never veto or narrow
+  // any decision made above the fallthrough.
+  const canonical = canonicalizeKeywordTypos(value);
+  if (canonical.corrections.length === 0) return direct;
+  const rescued = classifyTrimmedPrompt(canonical.text.trim());
+  if (rescued.reasons[0] === "ordinary_answer") return direct;
+  return {
+    ...rescued,
+    reasons: [
+      ...rescued.reasons,
+      ...canonical.corrections.map(fuzzyCorrectionReason),
+    ],
+  };
+}
 
+function classifyTrimmedPrompt(
+  value: string,
+): MissionSpeechActClassificationV1 {
   const explicitChatOnly =
     /\b(?:chat[- ]only|answer (?:only )?in (?:the )?chat|(?:do not|don'?t|without)\s+(?:write|writing|save|saving|append|appending|persist|persisting)(?:\s+(?:to|in))?\s+(?:the\s+)?(?:current\s+)?(?:document|note|page|file|vault|memory)|no (?:specific )?(?:document|note|page|file))\b/iu.test(
       value,
@@ -46,6 +72,23 @@ export function classifyMissionSpeechAct(
     ]);
   }
 
+  const conversationalRevision =
+    /\b(?:edit|revise|rewrite|expand|polish|improve|correct|proofread)\b/iu.test(
+      value,
+    ) &&
+    /\b(?:essay|answer|response|reply|draft|text|content|paragraph|article)\b/iu.test(
+      value,
+    ) &&
+    /\b(?:you\s+(?:gave|wrote|provided|sent|just\s+(?:gave|wrote|provided|sent))\s+me|your\s+(?:answer|response|reply|draft|text)|(?:previous|prior|last|above)\s+(?:answer|response|reply|draft|text|essay))\b/iu.test(
+      value,
+    ) &&
+    !/\b(?:(?:current|active|this)\s+(?:note|page|file|document|vault)|(?:save|write|append|put|persist|record|store)\b[\s\S]{0,80}\b(?:note|page|file|document|vault))\b/iu.test(
+      value,
+    );
+  if (conversationalRevision) {
+    return result("explain", "direct_chat", ["conversation_revision"]);
+  }
+
   const explicitPersistence =
     /\b(?:write|save|append|replace|edit|rewrite|retitle|rename|persist|record|store|trash|delete)\b/iu.test(
       value,
@@ -58,6 +101,16 @@ export function classifyMissionSpeechAct(
   const explicitExecution =
     new RegExp(
       `(?:^|[.!?]\\s*|\\b(?:please|then|and then|after that|i (?:want|need) you to)\\s+)${actionVerb}\\b|\\b(?:can|could|would|will) you\\s+${actionVerb}\\b`,
+      "iu",
+    ).test(value);
+  // "write/code/program" are execution verbs only when the clause carries no
+  // persistence noun: "write a game in Python on my desktop" executes, while
+  // "write this summary to the current note" stays bounded persistence below.
+  const writeVerb = "(?:write|code|program|script)";
+  const writeLikeExecution =
+    !explicitPersistence &&
+    new RegExp(
+      `(?:^|[.!?]\\s*|\\b(?:please|then|and then|after that|i (?:want|need) you to)\\s+)${writeVerb}\\b|\\b(?:can|could|would|will) you\\s+${writeVerb}\\b`,
       "iu",
     ).test(value);
   const namedExternalMutation =
@@ -90,14 +143,14 @@ export function classifyMissionSpeechAct(
       value,
     );
 
-  if (!explicitChatOnly && explicitExecution) {
+  if (!explicitChatOnly && (explicitExecution || writeLikeExecution)) {
     return result(
       "execute",
       namedExternalMutation || compoundStages >= 2 || lifecycleSignal
         ? "durable_mission"
         : "bounded_tool",
       [
-        "explicit_execution",
+        explicitExecution ? "explicit_execution" : "write_execution",
         ...(namedExternalMutation ? ["named_external_mutation"] : []),
         ...(compoundStages >= 2 ? ["compound_stage_request"] : []),
         ...(lifecycleSignal ? ["lifecycle_signal"] : []),

@@ -1,6 +1,7 @@
 import type { AgentSettings } from "../../settings";
 import type { SemanticEmbeddingProvider } from "../../embeddings/types";
 import type { AgenticReflexInput, ReflexDecision, ReflexLabel } from "./types";
+import { cosineSimilarity, normalizeCosine } from "../../utils/vectorMath";
 
 const INTENT_CONFIDENCE_THRESHOLD = 0.72;
 const INTENT_WINNING_MARGIN = 0.08;
@@ -73,12 +74,12 @@ const PROTOTYPES: Record<ReflexLabel, string[]> = {
 const prototypeVectorCache = new Map<string, PrototypeVectorSet>();
 
 interface PrototypeVectorSet {
-  labels: ReflexLabel[];
+  labels: string[];
   vectors: number[][];
 }
 
-interface ScoredIntent {
-  label: ReflexLabel;
+export interface PrototypeScoreV1<TLabel extends string> {
+  label: TLabel;
   score: number;
 }
 
@@ -97,12 +98,16 @@ export async function classifyIntent(
     );
   }
 
-  let scored: ScoredIntent[];
+  let scored: PrototypeScoreV1<ReflexLabel>[];
   try {
     scored = await scorePromptAgainstPrototypes({
       prompt: input.prompt,
       settings: input.settings,
       embeddingProvider: input.embeddingProvider,
+      prototypes: PROTOTYPES,
+      prototypeVersion: PROTOTYPE_VERSION,
+      cacheNamespace: "agentic-reflex",
+      fallbackLabel: "unknown",
     });
   } catch {
     return fallbackDecision(
@@ -222,29 +227,43 @@ function confidenceBand(value: number): ReflexDecision["confidenceBand"] {
   return value >= 0.8 ? "high" : value >= INTENT_CONFIDENCE_THRESHOLD ? "medium" : "low";
 }
 
-async function scorePromptAgainstPrototypes({
+/**
+ * Shared exemplar scorer for bounded semantic routers. The caller owns the
+ * labels, confidence policy, and authority boundary; this helper only embeds,
+ * caches a versioned prototype set, and returns per-label cosine scores.
+ */
+export async function scorePromptAgainstPrototypes<TLabel extends string>({
   prompt,
   settings,
   embeddingProvider,
+  prototypes: prototypeExamples,
+  prototypeVersion,
+  cacheNamespace,
+  fallbackLabel,
 }: {
   prompt: string;
   settings: AgentSettings;
   embeddingProvider: SemanticEmbeddingProvider;
-}): Promise<ScoredIntent[]> {
+  prototypes: Record<TLabel, readonly string[]>;
+  prototypeVersion: string;
+  cacheNamespace: string;
+  fallbackLabel: TLabel;
+}): Promise<PrototypeScoreV1<TLabel>[]> {
   const model = settings.semanticEmbeddingModel.trim();
   const dim = settings.semanticEmbeddingDim === 256 ? 256 : 512;
   const cacheKey = [
-    PROTOTYPE_VERSION,
+    cacheNamespace,
+    prototypeVersion,
     model,
     dim,
     settings.semanticModelCacheDir,
   ].join(":");
   let prototypes = prototypeVectorCache.get(cacheKey);
   if (!prototypes) {
-    const labels: ReflexLabel[] = [];
+    const labels: TLabel[] = [];
     const documents: string[] = [];
-    for (const [label, examples] of Object.entries(PROTOTYPES) as Array<
-      [ReflexLabel, string[]]
+    for (const [label, examples] of Object.entries(prototypeExamples) as Array<
+      [TLabel, readonly string[]]
     >) {
       for (const example of examples) {
         labels.push(label);
@@ -276,9 +295,9 @@ async function scorePromptAgainstPrototypes({
     return [];
   }
 
-  const byLabel = new Map<ReflexLabel, number>();
+  const byLabel = new Map<TLabel, number>();
   prototypes.vectors.forEach((vector, index) => {
-    const label = prototypes?.labels[index] ?? "unknown";
+    const label = (prototypes?.labels[index] as TLabel | undefined) ?? fallbackLabel;
     const score = normalizeCosine(cosineSimilarity(query.queries![0], vector));
     byLabel.set(label, Math.max(byLabel.get(label) ?? 0, score));
   });
@@ -286,29 +305,6 @@ async function scorePromptAgainstPrototypes({
   return [...byLabel.entries()]
     .map(([label, score]) => ({ label, score }))
     .sort((left, right) => right.score - left.score);
-}
-
-function cosineSimilarity(left: number[], right: number[]): number {
-  const length = Math.min(left.length, right.length);
-  if (length === 0) {
-    return 0;
-  }
-  let dot = 0;
-  let leftMagnitude = 0;
-  let rightMagnitude = 0;
-  for (let index = 0; index < length; index += 1) {
-    dot += left[index] * right[index];
-    leftMagnitude += left[index] * left[index];
-    rightMagnitude += right[index] * right[index];
-  }
-  if (leftMagnitude <= 0 || rightMagnitude <= 0) {
-    return 0;
-  }
-  return dot / Math.sqrt(leftMagnitude * rightMagnitude);
-}
-
-function normalizeCosine(value: number): number {
-  return Math.max(0, Math.min(1, (value + 1) / 2));
 }
 
 function roundScore(value: number): number {

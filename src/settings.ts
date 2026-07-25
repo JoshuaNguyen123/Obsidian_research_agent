@@ -129,6 +129,14 @@ export interface AgentSettings {
   agenticReflexEnabled: boolean;
   agenticReflexDiagnosticsEnabled: boolean;
   /**
+   * Semantic speech-act rescue for prompts the deterministic classifier lets
+   * fall through. "off" (default) never embeds; "shadow" logs disagreement
+   * diagnostics only; "authority" may widen a miss toward execute/persist.
+   * Optional so older persisted settings parse; load-time normalization
+   * coerces anything unrecognized to "off".
+   */
+  speechActSemanticRescueMode?: "off" | "shadow" | "authority";
+  /**
    * Whether the Run Details Diagnostics expander is unfolded. UI state,
    * persisted. Optional so older persisted settings and test fixtures parse;
    * the load-time normalizer coerces anything non-true to false.
@@ -230,6 +238,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   defaultBrowserMissionMode: "supervised",
   agenticReflexEnabled: true,
   agenticReflexDiagnosticsEnabled: true,
+  speechActSemanticRescueMode: "off",
   runDetailsDiagnosticsExpanded: false,
   semanticSearchEnabled: true,
   semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
@@ -2573,6 +2582,24 @@ export class AgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.agenticReflexDiagnosticsEnabled)
           .onChange(async (value) => {
             this.plugin.settings.agenticReflexDiagnosticsEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Semantic speech-act rescue")
+      .setDesc(
+        "When the deterministic router lets an actionable prompt fall through to a chat answer, local embeddings can propose the intended action. Shadow only logs disagreements in Run Details; Authority lets a confident proposal route the mission. Approval cards still gate every side effect.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({ off: "Off", shadow: "Shadow (log only)", authority: "Authority" })
+          .setValue(this.plugin.settings.speechActSemanticRescueMode ?? "off")
+          .onChange(async (value) => {
+            this.plugin.settings.speechActSemanticRescueMode =
+              value === "shadow" || value === "authority" ? value : "off";
+            this.plugin.settings.autonomyProfile = "custom";
+            this.plugin.settings.workingMode = "custom";
             await this.plugin.saveSettings();
           }),
       );

@@ -510,7 +510,8 @@ test("workspace tools prepare every mutation and return exact readback receipts"
     assert.equal((await fixture.manager.stat("tool-space", "public/assets")).kind, "directory");
 
     const createFileTool = tools.get("code_workspace_create_file")!;
-    assert.match(createFileTool.description, /absent path/u);
+    assert.match(createFileTool.description, /Retrying is safe/u);
+    assert.match(createFileTool.description, /never overwritten by create/u);
     assert.match(tools.get("code_workspace_patch")!.description, /existing file/u);
     await assert.rejects(
       createFileTool.execute(
@@ -904,6 +905,117 @@ test("workspace reconciliation resumes durable state and proves committed or not
     assert.equal(committed.receipt?.readback.status, "verified");
     const notApplied = await restarted.get("code_workspace_create_file")!.reconcile!(pendingAction, context);
     assert.equal(notApplied.outcome, "not_applied");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("retried create_file self-heals over prior-run debris with hash-verified idempotency", async () => {
+  const fixture = await createFixture("idempotent-create");
+  try {
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const createTool = tools.get("code_workspace_create_file")!;
+    const readTool = tools.get("code_workspace_read")!;
+    const context = fixture.context("Write a number guessing game in Python on my desktop.");
+    await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "retry-space", kind: "scratch" },
+      context,
+    );
+    const original = "import random\n\nprint('guess')\n";
+
+    // First mission run creates the file normally.
+    const first = await requirePrepared(
+      createTool,
+      { workspaceId: "retry-space", path: "game.py", content: original },
+      context,
+    );
+    assert.equal(first.normalizedArgs.expectedTargetState, "absent");
+    const firstResult = await createTool.executePrepared!(first, authorize(context, first));
+    const firstReceipt = (firstResult.output as { receipt: { afterSha256: string } }).receipt;
+
+    // Retry with identical content confirms the debris as a fingerprint-bound no-op.
+    const identical = await requirePrepared(
+      createTool,
+      { workspaceId: "retry-space", path: "game.py", content: original },
+      context,
+    );
+    assert.equal(identical.normalizedArgs.expectedTargetState, "existing");
+    assert.equal(identical.normalizedArgs.expectedSha256, firstReceipt.afterSha256);
+    assert.equal(identical.normalizedArgs.payloadBytes, 0);
+    assert.match(identical.preview.summary, /Confirm existing identical file game\.py/u);
+    const confirmed = await createTool.executePrepared!(identical, authorize(context, identical));
+    const confirmedReceipt = (confirmed.output as {
+      receipt: { bytesWritten: number; afterSha256: string; operation: string };
+    }).receipt;
+    assert.equal(confirmedReceipt.bytesWritten, 0);
+    assert.equal(confirmedReceipt.operation, "create");
+    assert.equal(confirmedReceipt.afterSha256, firstReceipt.afterSha256);
+
+    // Retry with re-authored content fails closed and teaches the explicit
+    // read -> write_expected remediation without changing the file.
+    const reauthored = "import random\n\nprint('guess the number')\n";
+    const differing = await createTool.prepare!(
+      { workspaceId: "retry-space", path: "game.py", content: reauthored },
+      context,
+    );
+    assert.equal(differing.ok, false);
+    if (!differing.ok) {
+      assert.equal(differing.error.code, "path_exists");
+      assert.match(differing.error.message, /different content/u);
+      assert.match(differing.error.message, /code_workspace_read/u);
+      assert.match(differing.error.message, /code_workspace_write_expected/u);
+      assert.match(differing.error.message, new RegExp(firstReceipt.afterSha256.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+    }
+    const unchangedReadback = await readTool.execute(
+      { workspaceId: "retry-space", path: "game.py" },
+      context,
+    ) as { content: string };
+    assert.equal(unchangedReadback.content, original);
+
+    // Drift between prepare and execute fails closed.
+    const stale = await requirePrepared(
+      createTool,
+      { workspaceId: "retry-space", path: "game.py", content: original },
+      context,
+    );
+    const writeTool = tools.get("code_workspace_write_expected")!;
+    const interloper = await requirePrepared(
+      writeTool,
+      {
+        workspaceId: "retry-space",
+        path: "game.py",
+        content: "print('mutated')\n",
+        expectedSha256: firstReceipt.afterSha256,
+      },
+      context,
+    );
+    await writeTool.executePrepared!(interloper, authorize(context, interloper));
+    await assert.rejects(
+      createTool.executePrepared!(stale, authorize(context, stale)),
+      /hash or kind changed/u,
+    );
+
+    // A directory at the prepared path stays a hard conflict.
+    await prepareAndExecute(
+      tools.get("code_workspace_mkdir")!,
+      { workspaceId: "retry-space", path: "assets" },
+      context,
+    );
+    const directoryCollision = await createTool.prepare!(
+      { workspaceId: "retry-space", path: "assets", content: "not a file\n" },
+      context,
+    );
+    assert.equal(directoryCollision.ok, false);
+    if (!directoryCollision.ok) {
+      assert.equal(directoryCollision.error.code, "path_exists");
+      assert.match(directoryCollision.error.message, /already exists as directory/u);
+      assert.match(directoryCollision.error.message, /code_workspace_read/u);
+    }
   } finally {
     await fixture.cleanup();
   }

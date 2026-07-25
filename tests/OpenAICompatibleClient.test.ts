@@ -95,6 +95,25 @@ test("builds OpenAI-compatible chat body with tools and options", () => {
   assert.equal(body.temperature, 0.2);
   assert.equal(body.top_p, 0.9);
   assert.equal(body.max_tokens, 1024);
+
+  const requiredBody = buildOpenAIChatBody(
+    {
+      messages: [{ role: "user", content: "Use the tool" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "web_search",
+            parameters: { type: "object", properties: {} },
+          },
+        },
+      ],
+      toolChoice: "required",
+    },
+    "gpt-test",
+    false,
+  ) as Record<string, unknown>;
+  assert.equal(requiredBody.tool_choice, "required");
 });
 
 test("parses OpenAI-compatible tool calls", () => {

@@ -186,7 +186,7 @@ export function buildOpenAIChatBody(
     model,
     messages: toOpenAIMessages(request.messages),
     tools: request.tools?.map(toOpenAITool),
-    tool_choice: request.tools?.length ? "auto" : undefined,
+    tool_choice: request.tools?.length ? request.toolChoice ?? "auto" : undefined,
     response_format: request.format
       ? {
           type: "json_schema",

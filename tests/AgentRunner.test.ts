@@ -796,6 +796,14 @@ test("unchanged executable frontier blocks after two no-tool model responses", a
   });
 
   assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests[1]?.toolChoice, "required");
+  assert.equal(chatRequests[1]?.think, false);
+  assert.match(
+    chatRequests[1]?.messages
+      .map((message) => String(message.content ?? ""))
+      .join("\n") ?? "",
+    /prior response contained prose but no tool call[\s\S]*Call the single most relevant tool now[\s\S]*Return the tool call only/iu,
+  );
   assert.deepEqual(executedCalls, []);
   assert.match(deltas.join(""), /twice returned no tool call/iu);
   assert.ok(
@@ -940,7 +948,12 @@ test("includes prior user and assistant chat history before current prompt", asy
 
   const client = createClient({
     chatRequests,
-    chatResponders: [() => responseWithContent("Expanded essay")],
+    chatResponders: [
+      () =>
+        responseWithContent(
+          "Coral reefs are living ocean cities with intricate food webs and natural storm protection.",
+        ),
+    ],
   });
 
   await runAgentMission({
@@ -969,7 +982,9 @@ test("includes prior user and assistant chat history before current prompt", asy
     { role: "assistant", content: "Coral reefs are living ocean cities." },
     { role: "user", content: "Edit the essay you gave me with more details." },
   ]);
-  assert.deepEqual(deltas, ["Expanded essay"]);
+  assert.deepEqual(deltas, [
+    "Coral reefs are living ocean cities with intricate food webs and natural storm protection.",
+  ]);
 });
 
 test("tool-loop turns use chat only and emit direct final answer without synthesis", async () => {
@@ -5922,10 +5937,13 @@ test("what do you know about me prompts expose read-only vault traversal tools",
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const deltas: string[] = [];
+  const executedCalls: ModelToolCall[] = [];
 
   const client = createClient({
     chatRequests,
     chatResponders: [
+      () => responseWithContent("I can answer from general context."),
+      () => responseWithToolCall("list_markdown_files", {}),
       () => responseWithContent("I found notes about you in the vault."),
     ],
   });
@@ -5933,7 +5951,7 @@ test("what do you know about me prompts expose read-only vault traversal tools",
   await runAgentMission({
     prompt: "What do you know about me?",
     modelClient: client,
-    toolRegistry: createRegistry([]),
+    toolRegistry: createRegistry(executedCalls),
     toolContext: {} as ToolExecutionContext,
     enableStreaming: false,
     events: {
@@ -5967,8 +5985,21 @@ test("what do you know about me prompts expose read-only vault traversal tools",
     assert.ok(!toolNames.includes(toolName), toolName);
   }
 
-  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests.length, 3);
+  assert.equal(chatRequests[1].toolChoice, "required");
+  assert.equal(chatRequests[1].think, false);
+  assert.deepEqual(
+    executedCalls.map((call) => call.name),
+    ["list_markdown_files"],
+  );
   assert.deepEqual(deltas, ["I found notes about you in the vault."]);
+  assert.ok(
+    statuses.some((message) =>
+      /Executable frontier still requires .*asking the model for a tool-only correction/.test(
+        message,
+      ),
+    ),
+  );
   assert.ok(!statuses.includes("Write required; asking model to use a write tool..."));
 });
 
@@ -9796,6 +9827,94 @@ test("checkers and end-to-end prompts expose code workspace tools", async () => 
       `${prompt} missing ready code_sandbox_status frontier; step tools: ${[...stepTools].join(", ")}`,
     );
   }
+});
+
+test("router code authority is default-off and seeds only the bounded code ladder when enabled", async () => {
+  const prompt = "Use tools to handle the little project we discussed.";
+  const runScenario = async (
+    speechActSemanticRescueMode: "off" | "authority",
+  ) => {
+    const chatRequests: ModelChatRequest[] = [];
+    const configs: AgentRunConfigEvent[] = [];
+    const vault = createRunnerVaultContext({
+      prompt,
+      now: new Date("2026-07-25T12:00:00.000Z"),
+    });
+    vault.context.settings.modelRouterMode = "authority";
+    vault.context.settings.speechActSemanticRescueMode =
+      speechActSemanticRescueMode;
+    const client: ModelClient = {
+      chat: async (request) => {
+        chatRequests.push(cloneRequest(request));
+        if (isMissionRouterFormat(request)) {
+          return responseWithContent(
+            JSON.stringify({
+              mode: "code_workflow",
+              writeScope: "none",
+              needsWebEvidence: false,
+              needsVaultContext: false,
+              needsCodeExecution: true,
+              wordTarget: null,
+              confidence: 0.96,
+              rationale: "The bounded tool request refers to an implementation project.",
+            }),
+          );
+        }
+        // Exercise the deterministic host-graph fallback; the router proposal
+        // must still seed a real exact frontier without model-planner help.
+        if (isMissionGraphPlannerFormat(request)) {
+          return responseWithContent("planner unavailable");
+        }
+        return responseWithContent("Ready.");
+      },
+      streamChat: async () => {
+        throw new Error("Router authority regression uses non-streaming calls only.");
+      },
+    };
+
+    await runAgentMission({
+      prompt,
+      modelClient: client,
+      toolRegistry: createCodeV2RoutingRegistry(),
+      toolContext: vault.context,
+      enableStreaming: false,
+      maxSteps: 1,
+      events: {
+        onRunConfig: (event) => configs.push(event),
+      },
+    });
+
+    const agentRequest = chatRequests.find(
+      (request) =>
+        !isMissionRouterFormat(request) &&
+        !isMissionGraphPlannerFormat(request),
+    );
+    return {
+      allowedToolNames: new Set(configs[0]?.allowedToolNames ?? []),
+      frontierToolNames: new Set(
+        agentRequest?.tools?.map((tool) => tool.function.name) ?? [],
+      ),
+      routerCalls: chatRequests.filter(isMissionRouterFormat).length,
+    };
+  };
+
+  const disabled = await runScenario("off");
+  assert.equal(disabled.routerCalls, 1);
+  assert.equal(disabled.allowedToolNames.has("code_sandbox_status"), false);
+  assert.equal(disabled.allowedToolNames.has("code_workspace_create_file"), false);
+  assert.equal(disabled.frontierToolNames.has("code_sandbox_status"), false);
+
+  const enabled = await runScenario("authority");
+  assert.equal(enabled.routerCalls, 1);
+  assert.ok(enabled.allowedToolNames.has("code_sandbox_status"));
+  assert.ok(enabled.allowedToolNames.has("code_workspace_create"));
+  assert.ok(enabled.allowedToolNames.has("code_workspace_create_file"));
+  assert.ok(enabled.allowedToolNames.has("code_validate_full"));
+  assert.equal(enabled.allowedToolNames.has("code_commit_verified"), false);
+  assert.equal(enabled.allowedToolNames.has("install_code_dependency"), false);
+  assert.equal(enabled.allowedToolNames.has("code_workspace_trash"), false);
+  assert.ok(enabled.frontierToolNames.has("code_sandbox_status"));
+  assert.equal(enabled.frontierToolNames.has("code_workspace_create"), false);
 });
 
 test("set-loose empty Soft-union intersection preserves code tools when graph has unpaid code work", () => {
@@ -17851,6 +17970,8 @@ test("bare Python Desktop delivery corrects a prose-only exact frontier inside t
     chatRequests[1]?.tools?.map((tool) => tool.function.name),
     ["code_sandbox_status"],
   );
+  assert.equal(chatRequests[1]?.toolChoice, "required");
+  assert.equal(chatRequests[1]?.think, false);
   assert.match(
     chatRequests[1]?.messages
       .map((message) => String(message.content ?? ""))

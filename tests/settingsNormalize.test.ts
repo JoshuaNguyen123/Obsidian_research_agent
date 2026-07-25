@@ -28,6 +28,7 @@ describe("settingsNormalize", () => {
     assert.equal(settings.streamWritebackMode, "all_current_note_content_writes");
     assert.equal(settings.autoTitleOnWrite, true);
     assert.equal(settings.agenticReflexEnabled, true);
+    assert.equal(settings.speechActSemanticRescueMode, "off");
     assert.equal(settings.modelRouterMode, "authority");
     assert.equal(settings.modelRouterEnabled, true);
     assert.equal(settings.model, "glm-5.2");
@@ -78,6 +79,23 @@ describe("settingsNormalize", () => {
     );
     assert.equal(settings.openAiCompatibleApiKey, "sk-test");
     assert.equal(settings.linearDefaultTeamId, "team-1");
+  });
+
+  it("semantic speech-act rescue is opt-in and rejects malformed values", () => {
+    assert.equal(
+      normalizeAgentSettings(
+        { speechActSemanticRescueMode: "authority" },
+        "existing_install",
+      ).speechActSemanticRescueMode,
+      "authority",
+    );
+    assert.equal(
+      normalizeAgentSettings(
+        { speechActSemanticRescueMode: "unsafe" },
+        "existing_install",
+      ).speechActSemanticRescueMode,
+      "off",
+    );
   });
 
   it("recommended defaults action moves Custom to Automatic", () => {

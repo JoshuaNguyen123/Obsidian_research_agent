@@ -284,21 +284,48 @@ class WorkspaceToolRuntimeV2 {
             : `Create directory ${targetPath} only while the target remains absent.`;
           action = "create";
         } else if (name === "code_workspace_create_file") {
-          await assertMissing(this.manager, workspaceId, targetPath);
+          // A retried mission may find debris from its own prior run at the
+          // prepared path. Mirror the mkdir confirm-existing pattern only for
+          // byte-identical content. Differing content remains a hard collision:
+          // the model must read it and request a separate hash-bound
+          // write_expected operation, so create never becomes an overwrite.
+          const current = await statOrMissing(this.manager, workspaceId, targetPath);
           const resolvedContent = resolveCreateFileContentV1(args, targetPath);
           const content = resolvedContent.content;
           const sourceLanguage = detectCodeCreationLanguageV1(targetPath);
-          outboundBytes = byteLength(content);
-          expected = absentFingerprint(workspaceId, targetPath);
-          normalizedArgs.expectedTargetState = "absent";
-          normalizedArgs.expectedSha256 = null;
-          normalizedArgs.content = content;
+          const incomingSha256 = sha256Text(content);
           if (sourceLanguage) normalizedArgs.creationLanguage = sourceLanguage.id;
           if (resolvedContent.notebookMetadata)
             normalizedArgs.notebookMetadata = resolvedContent.notebookMetadata;
-          normalizedArgs.expectedAfterSha256 = sha256Text(content);
-          normalizedArgs.payloadBytes = outboundBytes;
-          summary = `Create ${sourceLanguage ? `${sourceLanguage.displayName} source file ` : ""}${targetPath} without overwrite while the target remains absent.`;
+          if (current && current.sha256 === incomingSha256) {
+            expected = current.sha256;
+            normalizedArgs.expectedTargetState = "existing";
+            normalizedArgs.expectedSha256 = current.sha256;
+            normalizedArgs.expectedKind = "file";
+            normalizedArgs.expectedAfterSha256 = current.sha256;
+            normalizedArgs.payloadBytes = 0;
+            summary = `Confirm existing identical file ${targetPath} only if its fingerprint remains ${expected}.`;
+          } else if (current) {
+            const collision =
+              current.kind === "file"
+                ? "already exists with different content"
+                : `already exists as ${current.kind}`;
+            throw new WorkspaceManagerErrorV2(
+              "path_exists",
+              `${targetPath} ${collision} (${current.sha256.replace("sha256:", "sha256 ")}). ` +
+                `Read it with code_workspace_read, then update it with code_workspace_write_expected ` +
+                `using expectedSha256=${current.sha256}.`,
+            );
+          } else {
+            outboundBytes = byteLength(content);
+            expected = absentFingerprint(workspaceId, targetPath);
+            normalizedArgs.expectedTargetState = "absent";
+            normalizedArgs.expectedSha256 = null;
+            normalizedArgs.content = content;
+            normalizedArgs.expectedAfterSha256 = incomingSha256;
+            normalizedArgs.payloadBytes = outboundBytes;
+            summary = `Create ${sourceLanguage ? `${sourceLanguage.displayName} source file ` : ""}${targetPath} without overwrite while the target remains absent.`;
+          }
           action = "create";
         } else if (name === "code_workspace_append") {
           const stat = await this.manager.stat(workspaceId, targetPath);
@@ -500,7 +527,7 @@ class WorkspaceToolRuntimeV2 {
     if (ownerRunId !== runId(context) || action.target.workspaceId !== workspaceId) {
       throw new WorkspaceManagerErrorV2("prepared_binding_drift", "Prepared workspace owner or target binding changed.");
     }
-    await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+    const manifest = await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
     await assertPreparedTargetState(this.manager, workspaceId, targetPath, args);
     const profileKey = optionalString(args.repositoryProfileKey);
     if (profileKey) {
@@ -525,9 +552,26 @@ class WorkspaceToolRuntimeV2 {
       assertPayloadBytes(args, 0);
       result = await this.manager.mkdir(workspaceId, leaseId, targetPath);
     } else if (name === "code_workspace_create_file") {
-      const content = requiredString(args.content, "content", true);
-      assertPayloadBytes(args, byteLength(content));
-      result = await this.manager.createFile(workspaceId, leaseId, targetPath, content);
+      if (args.expectedTargetState === "existing") {
+        // Idempotent retry over prior-run debris. assertPreparedTargetState
+        // already verified the observed fingerprint still holds. The only
+        // legal existing-target action is an identical no-op; differing
+        // content must use the separately prepared write_expected tool.
+        const expectedBefore = requiredFingerprint(args.expectedSha256);
+        const expectedAfter = requiredFingerprint(args.expectedAfterSha256);
+        if (expectedAfter !== expectedBefore) {
+          throw new WorkspaceManagerErrorV2(
+            "precondition_failed",
+            "Prepared create-file retry is not byte-identical to the existing target.",
+          );
+        }
+        assertPayloadBytes(args, 0);
+        result = await reconciliationMutationReceipt(this.manager, manifest, name, targetPath, undefined, expectedAfter);
+      } else {
+        const content = requiredString(args.content, "content", true);
+        assertPayloadBytes(args, byteLength(content));
+        result = await this.manager.createFile(workspaceId, leaseId, targetPath, content);
+      }
     } else if (name === "code_workspace_append") {
       const content = requiredString(args.content, "content", true);
       assertPayloadBytes(args, byteLength(content));
@@ -2011,7 +2055,7 @@ function description(name: string): string {
   } else if (name === "code_workspace_export_directory") {
     text = `Purpose: Copy a completed workspace directory tree to a user-requested known host folder. Use when: the foreground mission explicitly names Desktop, Documents, or Downloads. Required: destinationRoot plus a safe nested destinationPath; sourcePath is optional and defaults to the workspace root. Side effects: exact approval-gated host write. ${base} The destination must be absent and every parent and file is verified. It never overwrites an existing file or directory.`;
   } else if (name === "code_workspace_create_file") {
-    text = `Purpose: Create a new file in the real local filesystem workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write. ${base} Use this only for an absent path; it never overwrites. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+    text = `Purpose: Create a new file in the real local filesystem workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write. ${base} Retrying is safe only when the existing file is byte-identical: that case returns a verified no-op. Different content is never overwritten by create; the error reports its SHA-256 and requires code_workspace_read followed by code_workspace_write_expected. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
     text += " Missing parent directories are created automatically, so paths such as src/game/ui/checkers.py are valid in one call.";
   } else if (name === "code_workspace_patch") {
     text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;

@@ -2290,12 +2290,110 @@ function rejectNewMutationAuthority(graph: MissionGraphV3, candidate: MissionNod
   const authorizedByExistingNode = Object.values(graph.nodes).some(
     (node) => authoritySignature(node) === signature,
   );
-  if (!authorizedByExistingNode) {
+  if (
+    !authorizedByExistingNode &&
+    !isExactCreateCollisionRepairNode(graph, candidate)
+  ) {
     fail(
       "authority_widening",
       `Patch cannot add new mutation, execution, or external authority for node ${candidate.id}.`,
     );
   }
+}
+
+/**
+ * A hash-bound write is a strict narrowing of one already-authorized create
+ * after that exact create target reports path_exists. The repair must depend
+ * on a graph-owned exact read, retain the same binding/path/host/effect/locks,
+ * and stay within the original node's capabilities.
+ */
+function isExactCreateCollisionRepairNode(
+  graph: MissionGraphV3,
+  candidate: MissionNodeV3,
+): boolean {
+  if (
+    candidate.allowedTools.length !== 1 ||
+    candidate.allowedTools[0] !== "code_workspace_write_expected" ||
+    candidate.dependencyIds.length !== 1
+  ) {
+    return false;
+  }
+  const originInput = candidate.inputs.create_collision_origin;
+  const readInput = candidate.inputs.create_collision_read;
+  if (
+    originInput?.kind !== "literal" ||
+    typeof originInput.value !== "string" ||
+    readInput?.kind !== "literal" ||
+    typeof readInput.value !== "string" ||
+    candidate.dependencyIds[0] !== readInput.value
+  ) {
+    return false;
+  }
+  const origin = graph.nodes[originInput.value];
+  const readNode = graph.nodes[readInput.value];
+  if (
+    !origin ||
+    origin.status !== "blocked" ||
+    origin.blocker?.code !== "create_file_path_exists" ||
+    !readNode ||
+    readNode.effect !== "read" ||
+    readNode.allowedTools.length !== 1 ||
+    readNode.allowedTools[0] !== "code_workspace_read"
+  ) {
+    return false;
+  }
+  const lifecycleAction = getCurrentMissionCompositeLifecycleActionV1(origin);
+  if (
+    lifecycleAction &&
+    lifecycleAction.toolName !== "code_workspace_create_file"
+  ) {
+    return false;
+  }
+  if (
+    !lifecycleAction &&
+    (origin.allowedTools.length !== 1 ||
+      origin.allowedTools[0] !== "code_workspace_create_file")
+  ) {
+    return false;
+  }
+  const bindingId =
+    lifecycleAction?.bindingId ?? origin.destination?.bindingId ?? null;
+  const selector =
+    lifecycleAction?.selector ?? origin.destination?.selector ?? null;
+  const readResource = readNode.inputs.resource;
+  const writeResource = candidate.inputs.resource;
+  if (
+    !bindingId ||
+    !selector ||
+    readResource?.kind !== "binding" ||
+    writeResource?.kind !== "binding" ||
+    readResource.bindingId !== bindingId ||
+    writeResource.bindingId !== bindingId ||
+    readResource.selector !== selector ||
+    writeResource.selector !== selector ||
+    candidate.destination?.bindingId !== bindingId ||
+    candidate.destination.selector !== selector ||
+    candidate.destination.effect !== candidate.effect
+  ) {
+    return false;
+  }
+  const originHasExactLock = origin.resourceLocks.some(
+    (lock) => lock.bindingId === bindingId && lock.mode === "exclusive",
+  );
+  const candidateHasOnlyExactLock =
+    candidate.resourceLocks.length === 1 &&
+    candidate.resourceLocks[0]?.bindingId === bindingId &&
+    candidate.resourceLocks[0]?.mode === "exclusive";
+  return (
+    originHasExactLock &&
+    candidateHasOnlyExactLock &&
+    candidate.executorId === origin.executorId &&
+    candidate.executionHost === origin.executionHost &&
+    candidate.effect === origin.effect &&
+    candidate.requiredCapabilities.every((capabilityId) =>
+      origin.requiredCapabilities.includes(capabilityId),
+    )
+  );
 }
 
 function authoritySignature(node: MissionNodeV3): string {

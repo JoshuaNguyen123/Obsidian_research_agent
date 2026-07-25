@@ -16,6 +16,7 @@ import type {
   ToolPrincipal,
 } from "./actions";
 import type { AuthorityGrantV1 } from "./authority";
+import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
 
 export type PolicyAction = "allow" | "require_approval" | "block";
 
@@ -351,6 +352,13 @@ export interface RoutedIntentFallbackInput {
   missionIntent?: MissionIntent;
   writeAutonomy: boolean;
   writeToolExposed: boolean;
+  /**
+   * When present, needsCodeExecution is derived from the shared deterministic
+   * code-deliverable gate instead of being hardcoded false — so an authority
+   * router proposing code execution feeds the exact same downstream gate a
+   * regex hit would, and can never grant it where the regex side says no.
+   */
+  prompt?: string;
 }
 
 /**
@@ -365,6 +373,7 @@ export function deriveRoutedIntentFallback({
   missionIntent,
   writeAutonomy,
   writeToolExposed,
+  prompt,
 }: RoutedIntentFallbackInput): RoutedMissionIntent {
   return {
     mode: toFallbackMode(missionIntent),
@@ -375,7 +384,7 @@ export function deriveRoutedIntentFallback({
     }),
     needsWebEvidence: missionIntent?.autonomyScope.read.web === true,
     needsVaultContext: missionIntent?.vaultContext === true,
-    needsCodeExecution: false,
+    needsCodeExecution: prompt ? hasCodeDeliverableIntent(prompt) : false,
     wordTarget: null,
     confidence: 1,
     rationale: "regex-derived fallback intent",
@@ -392,6 +401,8 @@ export function resolvePolicyRoutedIntent({
   missionIntent,
   writeAutonomy,
   writeToolExposed,
+  prompt,
+  allowRoutedCodeExecution = false,
   confidenceThreshold = ROUTER_AUTHORITY_CONFIDENCE_THRESHOLD,
 }: {
   mode: ModelRouterMode;
@@ -399,19 +410,43 @@ export function resolvePolicyRoutedIntent({
   missionIntent?: MissionIntent;
   writeAutonomy: boolean;
   writeToolExposed: boolean;
+  prompt?: string;
+  /**
+   * Phase-4 route ceiling, computed by the host speech-act gate. This can lift
+   * only a high-confidence authority-mode code proposal; write scope,
+   * approvals, exact frontiers, and all other policy fields stay intersected.
+   */
+  allowRoutedCodeExecution?: boolean;
   confidenceThreshold?: number;
 }): ResolvedRouterIntent {
   const regexIntent = deriveRoutedIntentFallback({
     missionIntent,
     writeAutonomy,
     writeToolExposed,
+    prompt,
   });
-  return resolveRoutedMissionIntent({
+  const resolved = resolveRoutedMissionIntent({
     mode,
     modelIntent,
     regexIntent,
     confidenceThreshold,
   });
+  if (
+    mode === "authority" &&
+    resolved.source === "model" &&
+    allowRoutedCodeExecution &&
+    modelIntent?.mode === "code_workflow" &&
+    modelIntent.needsCodeExecution === true
+  ) {
+    return {
+      ...resolved,
+      intent: {
+        ...resolved.intent,
+        needsCodeExecution: true,
+      },
+    };
+  }
+  return resolved;
 }
 
 function toFallbackMode(

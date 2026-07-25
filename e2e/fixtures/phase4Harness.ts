@@ -727,6 +727,7 @@ async function installPhase4PageHarness(
         orchestratorEnabled: false,
         orchestratorPreviewEnabled: false,
         agenticReflexEnabled: false,
+        speechActSemanticRescueMode: "off",
         semanticIndexEnabled: false,
         completionDrivenLoops: false,
         maxAgentSteps: 40,

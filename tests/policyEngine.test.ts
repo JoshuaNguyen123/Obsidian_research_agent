@@ -429,6 +429,49 @@ test("authority-resolved intent still cannot enable replace when regex is append
   assert.equal(appendAllowed.action, "allow");
 });
 
+test("flag-gated bounded execution lets only a high-confidence code proposal cross the route ceiling", () => {
+  const prompt = "Please handle that little project we discussed for my machine.";
+  const modelIntent = routedIntent({
+    mode: "code_workflow",
+    needsCodeExecution: true,
+    confidence: 0.98,
+  });
+  const disabled = resolvePolicyRoutedIntent({
+    mode: "authority",
+    modelIntent,
+    missionIntent: intentFixture(prompt),
+    writeAutonomy: false,
+    writeToolExposed: false,
+    prompt,
+    allowRoutedCodeExecution: false,
+  });
+  assert.equal(disabled.intent.needsCodeExecution, false);
+
+  const enabled = resolvePolicyRoutedIntent({
+    mode: "authority",
+    modelIntent,
+    missionIntent: intentFixture(prompt),
+    writeAutonomy: false,
+    writeToolExposed: false,
+    prompt,
+    allowRoutedCodeExecution: true,
+  });
+  assert.equal(enabled.source, "model");
+  assert.equal(enabled.intent.needsCodeExecution, true);
+  assert.equal(enabled.intent.writeScope, "none");
+
+  const shadow = resolvePolicyRoutedIntent({
+    mode: "shadow",
+    modelIntent,
+    missionIntent: intentFixture(prompt),
+    writeAutonomy: false,
+    writeToolExposed: false,
+    prompt,
+    allowRoutedCodeExecution: true,
+  });
+  assert.equal(shadow.intent.needsCodeExecution, false);
+});
+
 test("research gather phase blocks write tools even when write scope allows them", () => {
   const decision = evaluateToolPolicy(
     policyContext({

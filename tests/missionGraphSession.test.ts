@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildHostMissionGraphPlanV1 } from "../src/agent/missionGraphHost";
+import { constrainToolsToMissionGraphFrontier } from "../src/agent/missionGraphFrontier";
 import { planMissionGraphV3 } from "../src/agent/missionGraphPlanner";
 import {
   MissionGraphSession,
@@ -15,6 +16,7 @@ import {
 } from "../src/agent/missionGraphStore";
 import type { ToolDescriptor } from "../src/agent/actions";
 import {
+  getCurrentMissionCompositeLifecycleActionV1,
   getMissionCompositeLifecycleStateV1,
   validateMissionGraphV3,
   type MissionEvidenceRefV1,
@@ -526,6 +528,162 @@ test("two identical failures stop retrying and persist a resumable blocker", asy
   assert.equal(node.retries.consecutiveFailureCount, 2);
   assert.equal(node.blocker?.code, "tool_failure_repeated");
   assert.equal((await session.beginToolExecution("read_current_file")).ok, false);
+});
+
+test("a create collision replans the same node into read then hash-bound write", async () => {
+  const harness = createVaultHarness();
+  const graph = await workspaceCollisionGraphFor(
+    "session-create-file-collision-repair",
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const create = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file"),
+  );
+  const afterCollision = await session.finishToolExecution(create, {
+    ok: false,
+    failureFingerprint: fp("c"),
+    failureMessage: "path_exists",
+  });
+  assert.equal(afterCollision.nodes[create.nodeId]?.status, "ready");
+
+  const repaired = await session.scheduleCreateFileCollisionRepair(
+    create,
+    "app.py",
+  );
+  assert.equal(repaired.nodes[create.nodeId]?.status, "blocked");
+  assert.equal(
+    repaired.nodes[create.nodeId]?.blocker?.code,
+    "create_file_path_exists",
+  );
+  const repairReadNode = toolNode(repaired, "code_workspace_read");
+  const repairWriteNode = toolNode(repaired, "code_workspace_write_expected");
+  assert.equal(repairReadNode.status, "ready");
+  assert.equal(repairWriteNode.status, "queued");
+  assert.equal(repairReadNode.inputs.resource?.kind, "binding");
+  assert.equal(repairReadNode.inputs.resource?.selector, "app.py");
+  assert.equal(repairWriteNode.destination?.selector, "app.py");
+  const repairSchemas = [
+    "code_workspace_create_file",
+    "code_workspace_read",
+    "code_workspace_write_expected",
+  ].map((name) => ({
+    type: "function" as const,
+    function: { name, parameters: { type: "object" } },
+  }));
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(repairSchemas, repaired).map(
+      (schema) => schema.function.name,
+    ),
+    ["code_workspace_read"],
+  );
+  assert.equal(
+    (await session.beginToolExecution("code_workspace_write_expected")).ok,
+    false,
+  );
+
+  const read = requireExecution(
+    await session.beginToolExecution("code_workspace_read"),
+  );
+  const afterRead = await session.finishToolExecution(read, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[read.nodeId]!,
+      "d",
+      harness.nextTimestamp(),
+    ),
+  });
+  assert.equal(afterRead.nodes[read.nodeId]?.status, "complete");
+  assert.equal(afterRead.nodes[repairWriteNode.id]?.status, "ready");
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(repairSchemas, afterRead).map(
+      (schema) => schema.function.name,
+    ),
+    ["code_workspace_write_expected"],
+  );
+
+  const write = requireExecution(
+    await session.beginToolExecution("code_workspace_write_expected"),
+  );
+  const writeNode = session.graph.nodes[write.nodeId]!;
+  const completed = await session.finishToolExecution(write, {
+    ok: true,
+    evidence: evidenceFor(writeNode, "e", harness.nextTimestamp()),
+    receipt: receiptFor(writeNode, "f", harness.nextTimestamp()),
+  });
+  assert.equal(completed.nodes[write.nodeId]?.status, "complete");
+  assert.equal(completed.nodes[create.nodeId]?.status, "complete");
+  assert.doesNotThrow(() => validateMissionGraphV3(completed));
+});
+
+test("a composite code lifecycle resumes after bounded create collision repair", async () => {
+  const harness = createVaultHarness();
+  const graph = await compositeCodeCollisionGraphFor(
+    "session-composite-create-file-collision-repair",
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  for (const toolName of ["code_sandbox_status", "code_workspace_create"]) {
+    const execution = requireExecution(
+      await session.beginToolExecution(toolName),
+    );
+    const node = session.graph.nodes[execution.nodeId]!;
+    await session.finishToolExecution(
+      execution,
+      lifecycleProofFor(
+        node,
+        toolName === "code_sandbox_status" ? "0" : "1",
+        harness.nextTimestamp(),
+      ),
+    );
+  }
+
+  const create = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file"),
+  );
+  await session.finishToolExecution(create, {
+    ok: false,
+    failureFingerprint: fp("2"),
+    failureMessage: "path_exists",
+  });
+  await session.scheduleCreateFileCollisionRepair(create, "main.py");
+
+  const read = requireExecution(
+    await session.beginToolExecution("code_workspace_read"),
+  );
+  await session.finishToolExecution(read, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[read.nodeId]!,
+      "3",
+      harness.nextTimestamp(),
+    ),
+  });
+  const write = requireExecution(
+    await session.beginToolExecution("code_workspace_write_expected"),
+  );
+  const writeNode = session.graph.nodes[write.nodeId]!;
+  const repaired = await session.finishToolExecution(write, {
+    ok: true,
+    evidence: evidenceFor(writeNode, "4", harness.nextTimestamp()),
+    receipt: receiptFor(writeNode, "5", harness.nextTimestamp()),
+  });
+
+  const lifecycleNode = repaired.nodes[create.nodeId]!;
+  assert.equal(lifecycleNode.status, "ready");
+  assert.equal(
+    getMissionCompositeLifecycleStateV1(lifecycleNode)?.actionCursor,
+    3,
+  );
+  assert.equal(
+    getCurrentMissionCompositeLifecycleActionV1(lifecycleNode)?.toolName,
+    "code_validate_fast",
+  );
+  assert.doesNotThrow(() => validateMissionGraphV3(repaired));
 });
 
 test("a host-verified terminal domain outcome blocks on its first attempt", async () => {
@@ -1073,6 +1231,106 @@ async function graphFor(input: {
   ).graph;
 }
 
+async function workspaceCollisionGraphFor(
+  missionId: string,
+): Promise<MissionGraphV3> {
+  const descriptors = [
+    workspaceFileDescriptor("code_workspace_create_file"),
+    workspaceFileDescriptor("code_workspace_read"),
+    workspaceFileDescriptor("code_workspace_write_expected"),
+  ];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const objective = "Create app.py in the current code workspace.";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective,
+    toolRegistry: registry,
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: ["code_workspace_create_file"],
+    maxToolCalls: 4,
+    maxWallClockMs: 120_000,
+    now: GRAPH_TIME,
+  });
+  return (
+    await planMissionGraphV3({
+      mission: { missionId, objective },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+}
+
+async function compositeCodeCollisionGraphFor(
+  missionId: string,
+): Promise<MissionGraphV3> {
+  const planned = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_workspace_export_directory",
+  ];
+  const allowed = [
+    ...planned,
+    "code_workspace_read",
+    "code_workspace_write_expected",
+  ];
+  const descriptors = allowed.map(workspaceFileDescriptor);
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      allowed.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const objective = "write a number guessing game in Python on my desktop";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective,
+    toolRegistry: registry,
+    allowedToolNames: allowed,
+    modelVisibleToolNames: allowed,
+    plannedToolNames: planned,
+    maxToolCalls: 30,
+    maxWallClockMs: 600_000,
+    now: GRAPH_TIME,
+  });
+  return (
+    await planMissionGraphV3({
+      mission: { missionId, objective },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+}
+
 async function compositeLifecycleGraphFor(
   missionId: string,
   options: {
@@ -1235,6 +1493,40 @@ function sessionLifecycleDescriptor(
   };
 }
 
+function workspaceFileDescriptor(name: string): ToolDescriptor {
+  const readOnly =
+    name === "code_workspace_read" || name === "code_sandbox_status";
+  return {
+    version: 1,
+    name,
+    capability: {
+      system: "workspace",
+      resourceType: "workspace_file",
+      action: readOnly ? "read" : "update",
+    },
+    effect: readOnly ? "read" : "reversible_mutation",
+    risk: readOnly ? "low" : "medium",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: readOnly,
+      fallback: readOnly ? "none" : "exact",
+    },
+    execution: {
+      preparation: readOnly ? "none" : "required",
+      cacheable: readOnly,
+      parallelSafe: readOnly,
+    },
+    durability: {
+      journal: !readOnly,
+      receipt: !readOnly,
+      readback: readOnly ? "none" : "required",
+      reconciliation: readOnly ? "none" : "required",
+    },
+    allowedPrincipals: ["single_agent", "lead"],
+    ...(readOnly ? {} : { receiptKind: "code_change" as const }),
+  };
+}
+
 function registryFor(names: string[]): ToolRegistry {
   const descriptors = new Map(
     names.map((name) => [name, descriptorFor(name)] as const),
@@ -1308,6 +1600,38 @@ function evidenceFor(
     kind: node.completionContract.requiredEvidenceKinds[0] ?? "tool-result",
     fingerprint: fp(character),
     observedAt,
+  };
+}
+
+function lifecycleProofFor(
+  node: MissionNodeV3,
+  character: string,
+  observedAt: string,
+): {
+  ok: true;
+  evidence: MissionEvidenceRefV1;
+  receipt?: MissionReceiptRefV1;
+} {
+  const action = getCurrentMissionCompositeLifecycleActionV1(node);
+  if (!action) throw new Error(`Missing lifecycle action for ${node.id}.`);
+  return {
+    ok: true,
+    evidence: {
+      id: `evidence-${node.id}-${character}`.slice(0, 128),
+      kind: action.requiredEvidenceKinds[0] ?? "tool-result",
+      fingerprint: fp(character),
+      observedAt,
+    },
+    ...(action.minimumReceipts > 0
+      ? {
+          receipt: {
+            id: `receipt-${node.id}-${character}`.slice(0, 128),
+            kind: action.requiredReceiptKinds[0] ?? "action-receipt",
+            fingerprint: fp(character),
+            committedAt: observedAt,
+          },
+        }
+      : {}),
   };
 }
 

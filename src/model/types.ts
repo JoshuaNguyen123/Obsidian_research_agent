@@ -78,6 +78,12 @@ export interface ModelChatRequest {
   think?: ModelThink;
   options?: ModelRequestOptions;
   abortSignal?: AbortSignal;
+  /**
+   * Tool-choice escalation for corrective retries. OpenAI-compatible
+   * providers serialize it as tool_choice; providers without the concept
+   * (native Ollama) ignore it.
+   */
+  toolChoice?: "auto" | "required";
   /** Host-only observability label. It is never serialized to the provider. */
   evidencePhase?: ModelCallPhase;
 }

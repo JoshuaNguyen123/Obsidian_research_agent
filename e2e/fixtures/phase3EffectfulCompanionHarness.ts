@@ -305,6 +305,7 @@ async function installEffectfulPageHarness(context: {
       core.settings.orchestratorEnabled = false;
       core.settings.orchestratorPreviewEnabled = false;
       core.settings.agenticReflexEnabled = false;
+      core.settings.speechActSemanticRescueMode = "off";
       core.settings.semanticIndexEnabled = false;
       core.settings.streamWritebackMode = "off";
       core.settings.maxAgentSteps = 8;

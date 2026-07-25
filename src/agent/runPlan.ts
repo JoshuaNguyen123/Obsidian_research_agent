@@ -23,6 +23,10 @@ import {
   prefersStreamedReplaceForEditOrganize,
 } from "./editOrganizeIntent";
 import { hasDesignIntent as hasSharedDesignIntent } from "./codeDesignIntent";
+import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
+import { canonicalizeKeywordTypos } from "./promptNormalization";
+import type { RoutedMissionIntent } from "./missionRouter";
+import type { MissionSpeechActClassificationV1 } from "./missionSpeechAct";
 import {
   hasExplicitNoWebIntent,
   hasPrimaryTextCitationIntent,
@@ -85,6 +89,19 @@ export interface CreateRunPlanInput {
   streamingWritebackKind: StreamingWritebackKind | null;
   directCurrentNoteWritebackKind: StreamingWritebackKind | null;
   reflex?: ReflexDecision | null;
+  /**
+   * Authority-mode speech-act override (e.g. a confident semantic rescue
+   * upgraded an ordinary-answer fallthrough). When present it replaces the
+   * internal classification so the route derivation sees the rescued tier.
+   */
+  speechActOverride?: MissionSpeechActClassificationV1 | null;
+  /**
+   * Structured model-router proposal (authority mode). Consumed strictly as a
+   * ROUTE proposal: it may select the code-execution route for a prompt the
+   * deterministic gates already grant at-least-bounded execution; it never
+   * widens side-effect authority — frontier/approval synthesis is unchanged.
+   */
+  routedIntent?: RoutedMissionIntent | null;
 }
 
 export interface RunPlanDecision extends RunPlan {
@@ -101,8 +118,14 @@ export function createRunPlan({
   streamingWritebackKind,
   directCurrentNoteWritebackKind,
   reflex,
+  speechActOverride,
+  routedIntent,
 }: CreateRunPlanInput): RunPlanDecision {
-  const speechAct = classifyMissionSpeechAct(prompt);
+  const speechAct = speechActOverride ?? classifyMissionSpeechAct(prompt);
+  const routedCodeExecutionProposal =
+    routedIntent?.mode === "code_workflow" &&
+    routedIntent.needsCodeExecution === true &&
+    speechAct.executionTier !== "direct_chat";
   const requiresEnglishGuard = isLikelyEnglishPrompt(prompt);
   const configuredMaxSteps = resolveConfiguredMaxAgentSteps(settings?.maxAgentSteps);
   const explicitModelStepTarget = parseExplicitModelStepTarget(prompt);
@@ -328,6 +351,7 @@ export function createRunPlan({
   if (
     hasDesignIntent(prompt) ||
     hasCodeExecutionIntent(prompt) ||
+    routedCodeExecutionProposal ||
     hasHtmlPreviewIntent(prompt) ||
     hasOpenWebSourceIntent(prompt)
   ) {
@@ -369,9 +393,11 @@ export function createRunPlan({
             ? hasWebSearchIntent(prompt)
               ? "research_then_code_intent"
               : "code_execution_intent"
-            : hasHtmlPreviewIntent(prompt)
-              ? "html_preview_intent"
-              : "open_web_source_intent",
+            : routedCodeExecutionProposal
+              ? "routed_code_execution_proposal"
+              : hasHtmlPreviewIntent(prompt)
+                ? "html_preview_intent"
+                : "open_web_source_intent",
         ...(compoundLifecycle ? ["compound_lifecycle_step_budget"] : []),
       ],
     });
@@ -688,6 +714,18 @@ function hasOpenWebSourceIntent(prompt: string): boolean {
 }
 
 function hasCodeExecutionIntent(prompt: string): boolean {
+  if (hasCodeExecutionIntentExact(prompt)) return true;
+  // Fuzzy rescue, widen-only: a bounded keyword-typo correction ("crate a …
+  // game in Python") may propose the route the corrected spelling would take;
+  // it can never suppress an exact-match positive.
+  const canonical = canonicalizeKeywordTypos(prompt);
+  return (
+    canonical.corrections.length > 0 &&
+    hasCodeExecutionIntentExact(canonical.text)
+  );
+}
+
+function hasCodeExecutionIntentExact(prompt: string): boolean {
   return (
     /\b(run|execute|eval|evaluate|test|compile)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile)\b/i.test(
       prompt,
@@ -699,20 +737,9 @@ function hasCodeExecutionIntent(prompt: string): boolean {
       prompt,
     ) ||
     // Keep runPlan routing aligned with AgentRunner code-deliverable intent so
-    // "build a checkers game in Python" takes grounded_workflow, not a chat-only path.
-    // Exclude current-note sample writes ("Write … in TypeScript on this page").
-    (!(
-      /\b(?:on|to|into|in)\s+(?:this|the|current|active)\s+(?:page|note|file)\b/i.test(
-        prompt,
-      ) || /\bstream(?:\s+it)?\s+to\s+(?:the\s+)?note\b/i.test(prompt)
-    ) &&
-      (/\.(?:py|ts|tsx|js|jsx|rs|go|java|cs)\b/i.test(prompt) ||
-        /\b(build|implement|create|write)\b[\s\S]{0,100}\b(game|app|script|module|library|package|checkers|chess|solver)\b/i.test(
-          prompt,
-        ) ||
-        /\b(build|implement|create|write|code)\b[\s\S]{0,120}\b(python|javascript|typescript|rust|golang|java)\b/i.test(
-          prompt,
-        )))
+    // "build a checkers game in Python" takes grounded_workflow, not a chat-only
+    // path. One shared gate replaces the previously drifting private copy.
+    hasCodeDeliverableIntent(prompt)
   );
 }
 

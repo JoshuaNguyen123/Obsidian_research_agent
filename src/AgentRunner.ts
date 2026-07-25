@@ -225,6 +225,15 @@ import {
   type StreamingWritebackKind,
 } from "./agent/runPlan";
 import { classifyMissionSpeechAct } from "./agent/missionSpeechAct";
+import { canonicalizeKeywordTypos } from "./agent/promptNormalization";
+import {
+  hasCodeDeliverableIntent,
+  hasCurrentNoteCodeSampleWriteSurface,
+} from "./agent/codeDeliverableIntent";
+import {
+  isSpeechActRescueMissCandidate,
+  proposeSpeechActRescueV1,
+} from "./agent/speechActRescue";
 import {
   buildCapabilitySnapshotV1,
   formatCapabilitySnapshotForModel,
@@ -1607,20 +1616,73 @@ export async function runAgentMission({
   const intentPrompt = resolvePromptForIntent(prompt, conversationHistory);
   let activeIntentPrompt = intentPrompt;
   let speechActClassification = classifyMissionSpeechAct(activeIntentPrompt);
+  let semanticAuthorityRescueApplied = false;
+  // Authority-mode semantic rescue: a confident exemplar match may upgrade an
+  // ordinary-answer/direct-chat fallthrough to execute/persist BEFORE the
+  // router and run plan derive from it. Bounded to 1.5s and fail-closed; it
+  // can only propose tiers the deterministic classifier itself emits, and
+  // explicitChatOnly prompts are never candidates.
+  if (
+    toolContext.settings?.speechActSemanticRescueMode === "authority" &&
+    isSpeechActRescueMissCandidate(speechActClassification)
+  ) {
+    const authorityRescue = await proposeSpeechActRescueV1({
+      prompt: activeIntentPrompt,
+      deterministic: speechActClassification,
+      settings: toolContext.settings,
+      embeddingProvider: toolContext.semanticEmbeddingProvider,
+    }).catch(() => null);
+    if (authorityRescue) {
+      const deterministicBefore = speechActClassification;
+      semanticAuthorityRescueApplied = true;
+      speechActClassification = {
+        speechAct: authorityRescue.speechAct,
+        executionTier: authorityRescue.executionTier,
+        reasons: [...authorityRescue.reasons],
+        explicitChatOnly: false,
+      };
+      events.onTrace?.({
+        id: "speech-act-rescue-authority",
+        kind: "mission_intent",
+        message: `Semantic rescue upgraded ${deterministicBefore.speechAct}/${deterministicBefore.executionTier} to ${authorityRescue.speechAct}/${authorityRescue.executionTier} (${authorityRescue.label}, score=${authorityRescue.score}).`,
+        outputPreview: {
+          deterministic: deterministicBefore,
+          proposal: authorityRescue,
+        },
+      });
+    }
+  }
   const shouldForceCurrentPromptChatOnly = () =>
     forceChatOnly ||
-    classifyMissionSpeechAct(activeIntentPrompt).executionTier === "direct_chat";
+    speechActClassification.executionTier === "direct_chat";
   let missionIntent = classifyMissionIntent(activeIntentPrompt);
   if (shouldForceCurrentPromptChatOnly()) {
     missionIntent = suppressNoteWritebackForChatOnly(activeIntentPrompt, missionIntent);
   }
   const modelRouterMode = resolveModelRouterMode(toolContext.settings);
+  const routedCodeProposalEnabled =
+    toolContext.settings?.speechActSemanticRescueMode === "authority" &&
+    !speechActClassification.explicitChatOnly &&
+    (speechActClassification.executionTier !== "direct_chat" ||
+      semanticAuthorityRescueApplied);
   let routedModelIntent: RoutedMissionIntent | null = null;
   let routedModelFailureReason: string | null = null;
   let routedMissionIntent: RoutedMissionIntent | null = null;
+  const hasActiveRoutedCodeExecution = () =>
+    routedCodeProposalEnabled &&
+    routedMissionIntent?.mode === "code_workflow" &&
+    routedMissionIntent.needsCodeExecution === true;
+  const getActiveRoutedCodeToolNames = () =>
+    hasActiveRoutedCodeExecution()
+      ? getRoutedCodeWorkflowToolNames(activeIntentPrompt)
+      : [];
   if (
     modelRouterMode !== "off" &&
-    speechActClassification.executionTier !== "direct_chat"
+    (speechActClassification.executionTier !== "direct_chat" ||
+      // Direct-chat router empowerment is part of the opt-in semantic
+      // authority tier. The default-off flag must preserve the historical
+      // one-call direct-chat path even when the ordinary router is authoritative.
+      toolContext.settings?.speechActSemanticRescueMode === "authority")
   ) {
     events.onStatus?.("Classifying mission with structured router...");
     const routedClassification = await classifyMissionWithModelDetailed({
@@ -1638,6 +1700,7 @@ export async function runAgentMission({
       missionIntent,
       writeAutonomy: missionIntent.allowAutonomousWrite,
       writeToolExposed: false,
+      prompt: activeIntentPrompt,
     });
     const earlyResolved = resolvePolicyRoutedIntent({
       mode: modelRouterMode,
@@ -1645,6 +1708,8 @@ export async function runAgentMission({
       missionIntent,
       writeAutonomy: missionIntent.allowAutonomousWrite,
       writeToolExposed: false,
+      prompt: activeIntentPrompt,
+      allowRoutedCodeExecution: routedCodeProposalEnabled,
     });
     routedMissionIntent =
       modelRouterMode === "authority" ? earlyResolved.intent : null;
@@ -1737,6 +1802,80 @@ export async function runAgentMission({
       compoundLifecycleDetected,
     },
   };
+  // Shadow-tier semantic rescue telemetry: fire-and-forget so ordinary chat
+  // latency is untouched. In shadow mode nothing routes differently; the
+  // trace records deterministic-vs-semantic disagreement evidence for tuning
+  // before any authority is granted.
+  if (
+    (toolContext.settings?.speechActSemanticRescueMode === "shadow" ||
+      toolContext.settings?.speechActSemanticRescueMode === "authority") &&
+    isSpeechActRescueMissCandidate(speechActClassification)
+  ) {
+    const shadowDeterministic = speechActClassification;
+    void proposeSpeechActRescueV1({
+      prompt: activeIntentPrompt,
+      deterministic: shadowDeterministic,
+      settings: toolContext.settings,
+      embeddingProvider: runToolContext.semanticEmbeddingProvider,
+    })
+      .then((proposal) => {
+        events.onTrace?.({
+          id: "speech-act-rescue-shadow",
+          kind: "status",
+          message: proposal
+            ? `Semantic speech-act rescue proposes ${proposal.speechAct} (${proposal.label}, score=${proposal.score}, margin=${proposal.margin}); deterministic=${shadowDeterministic.speechAct}/${shadowDeterministic.executionTier}.`
+            : `Semantic speech-act rescue agrees with the deterministic fallthrough (${shadowDeterministic.speechAct}/${shadowDeterministic.executionTier}).`,
+          outputPreview: {
+            mode: toolContext.settings?.speechActSemanticRescueMode,
+            deterministic: {
+              speechAct: shadowDeterministic.speechAct,
+              executionTier: shadowDeterministic.executionTier,
+              reasons: shadowDeterministic.reasons,
+            },
+            proposal,
+            agreement: proposal === null,
+          },
+        });
+      })
+      .catch(() => undefined);
+  }
+  // Router evidence for false-direct_chat misses: the awaited router block
+  // above deliberately skips direct_chat prompts; log-only shadow evidence
+  // accumulates here (non-blocking) so Phase-4 authority can be tuned on
+  // real disagreements instead of guesses.
+  if (
+    toolContext.settings?.speechActSemanticRescueMode === "shadow" &&
+    modelRouterMode !== "off" &&
+    speechActClassification.executionTier === "direct_chat"
+  ) {
+    const shadowMissionIntent = missionIntent;
+    void classifyMissionWithModelDetailed({
+      client: modelClient,
+      prompt: activeIntentPrompt,
+      timeoutMs: structuredPlanningTimeoutMs,
+      abortSignal,
+      recentAssistant: conversationHistory
+        .filter((message) => message.role === "assistant")
+        .slice(-1)[0]?.content,
+    })
+      .then((routedClassification) => {
+        if (!routedClassification.intent) return;
+        events.onTrace?.({
+          id: "structured-router-directchat-shadow",
+          kind: "mission_intent",
+          message: `Structured router direct-chat shadow: ${routedClassification.intent.mode} (${routedClassification.intent.confidence}); regex stays authoritative.`,
+          outputPreview: {
+            modelIntent: routedClassification.intent,
+            regexMode: shadowMissionIntent.mode,
+            agreement: compareRouterWithRegex(
+              routedClassification.intent,
+              shadowMissionIntent,
+            ),
+          },
+        });
+      })
+      .catch(() => undefined);
+  }
   const resolveSetLooseCompoundEnabled = (): boolean => {
     const liveStages = detectProjectLifecycleStagesV1(
       runToolContext.originalPrompt ?? activeIntentPrompt,
@@ -2046,6 +2185,7 @@ export async function runAgentMission({
     runToolContext.settings,
     streamingWritebackKind,
     reflexOutput.intent,
+    getActiveRoutedCodeToolNames(),
   );
   tools = constrainOrchestratedHandoffTools(
     tools,
@@ -2074,6 +2214,7 @@ export async function runAgentMission({
     allowedToolNames,
     missionIntent,
     streamingWritebackKind,
+    getActiveRoutedCodeToolNames(),
   );
   let writeRequired =
     missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
@@ -2120,6 +2261,13 @@ export async function runAgentMission({
   let lastProgressSignature = "";
   let lastNoToolFrontierFingerprint = "";
   let unchangedNoToolResponseCount = 0;
+  /**
+   * Armed by the universal no-tool correction: the next model call escalates
+   * (tool_choice=required where the provider supports it, thinking off) so
+   * the second strike is spent on a maximally tool-biased request instead of
+   * a byte-identical retry.
+   */
+  let noToolEscalationActive = false;
   let explanatoryToolRouteReclassified = false;
   let lastStep = 0;
   let lastFinalOutput = "";
@@ -2186,6 +2334,8 @@ export async function runAgentMission({
     streamingWritebackKind,
     directCurrentNoteWritebackKind,
     reflex: reflexOutput.intent,
+    speechActOverride: speechActClassification,
+    routedIntent: routedCodeProposalEnabled ? routedMissionIntent : null,
   });
   const initialProjectLifecycleEstimate = safeProjectLifecycleEstimate(
     activeIntentPrompt,
@@ -2672,6 +2822,7 @@ export async function runAgentMission({
       runToolContext.settings,
       streamingWritebackKind,
       reflexOutput.intent,
+      getActiveRoutedCodeToolNames(),
     );
     tools = constrainOrchestratedHandoffTools(
       tools,
@@ -2698,6 +2849,7 @@ export async function runAgentMission({
       allowedToolNames,
       missionIntent,
       streamingWritebackKind,
+      getActiveRoutedCodeToolNames(),
     );
     writeRequired =
       missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
@@ -2746,7 +2898,8 @@ export async function runAgentMission({
   // that durable source before the graph is resumed.
   missionGraphUsesExactPlannedFrontier ||=
     hasExplicitOrderedWorkflowIntent(activeIntentPrompt) ||
-    getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0;
+    getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0 ||
+    hasActiveRoutedCodeExecution();
 
   if (
     runPlan.executionTier !== "direct_chat" &&
@@ -2846,11 +2999,17 @@ export async function runAgentMission({
         const hostSafeReadToolNames = [...installedToolNames].filter(
           (name) => toolRegistry.getDescriptor?.(name)?.effect === "read",
         );
-        const boundedWorkspaceRepairSupportToolNames =
-          extractExplicitNewWorkspaceFilePaths(activeIntentPrompt).length > 0 &&
-          allowedToolNames.has("code_repair_record_cycle") &&
-          installedToolNames.has("code_workspace_write_expected")
-            ? ["code_workspace_write_expected"]
+        // A create-file node may discover prior-run debris only at prepare
+        // time. Keep the exact read/write_expected grants in the closed graph
+        // envelope so that one differing-content collision can be replanned
+        // into a read -> hash-bound write lifecycle without widening to the
+        // rest of the Code catalog.
+        const createFileRepairSupportToolNames =
+          allowedToolNames.has("code_workspace_create_file")
+            ? [
+                "code_workspace_read",
+                "code_workspace_write_expected",
+              ].filter((name) => installedToolNames.has(name))
             : [];
         const graphAllowedToolNames = [
           ...new Set([
@@ -2858,7 +3017,7 @@ export async function runAgentMission({
             ...runnerOwnedToolNames,
             ...postAcceptanceToolNames,
             ...hostSafeReadToolNames,
-            ...boundedWorkspaceRepairSupportToolNames,
+            ...createFileRepairSupportToolNames,
           ]),
         ];
         const currentlyRunnableGraphToolNames = new Set([
@@ -2913,13 +3072,15 @@ export async function runAgentMission({
         const explicitGraphCodeToolNames = (
           explicitlyNamedGraphCodeToolNames.length > 0
             ? explicitlyNamedGraphCodeToolNames
-            : hasRepositoryCodeMutationIntent(activeIntentPrompt) ||
-                hasCodeDeliverableIntent(activeIntentPrompt) ||
-                detectProjectLifecycleStagesV1(activeIntentPrompt).includes(
-                  "code_execution",
-                )
-              ? getRequiredCodeWorkflowToolNames(activeIntentPrompt)
-              : []
+            : hasActiveRoutedCodeExecution()
+              ? getActiveRoutedCodeToolNames()
+              : hasRepositoryCodeMutationIntent(activeIntentPrompt) ||
+                  hasCodeDeliverableIntent(activeIntentPrompt) ||
+                  detectProjectLifecycleStagesV1(activeIntentPrompt).includes(
+                    "code_execution",
+                  )
+                ? getRequiredCodeWorkflowToolNames(activeIntentPrompt)
+                : []
         ).filter((name) => graphAllowedToolNames.includes(name));
         const explicitGraphGitHubReadToolNames =
           getExplicitGitHubCatalogMutationToolNames(activeIntentPrompt).length === 0
@@ -3489,6 +3650,9 @@ export async function runAgentMission({
         "read_current_file",
         initialCurrentNoteResult,
       );
+      if (!successfulToolNames.includes("read_current_file")) {
+        successfulToolNames.push("read_current_file");
+      }
     } catch (error) {
       if (graphExecution) {
         await finishMissionGraphTool(
@@ -3517,6 +3681,10 @@ export async function runAgentMission({
   );
   if (promptOnPageRoutingPrompt !== null) {
     activeIntentPrompt = promptOnPageRoutingPrompt;
+    // The structured router classified the outer "prompt on page" request, not
+    // the newly extracted note prompt. Do not carry that proposal across the
+    // authority boundary; deterministic prompt-on-page routing owns this turn.
+    routedMissionIntent = null;
     speechActClassification = classifyMissionSpeechAct(activeIntentPrompt);
     missionIntent = classifyPromptOnCurrentPageMissionIntent(activeIntentPrompt);
     if (shouldForceCurrentPromptChatOnly()) {
@@ -3582,6 +3750,7 @@ export async function runAgentMission({
       runToolContext.settings,
       streamingWritebackKind,
       reflexOutput.intent,
+      getActiveRoutedCodeToolNames(),
     );
     tools = constrainOrchestratedHandoffTools(
       tools,
@@ -3602,6 +3771,7 @@ export async function runAgentMission({
       allowedToolNames,
       missionIntent,
       streamingWritebackKind,
+      getActiveRoutedCodeToolNames(),
     );
     writeRequired =
       missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
@@ -3647,6 +3817,7 @@ export async function runAgentMission({
       allowedToolNames,
       missionIntent,
       streamingWritebackKind,
+      getActiveRoutedCodeToolNames(),
     );
     writeRequired =
       missionIntent.requireWriteCompletion && requiredWriteTools.length > 0;
@@ -5405,6 +5576,7 @@ export async function runAgentMission({
     registeredToolNames: knownToolNames,
     readiness: capabilityReadiness,
     executionTier: runPlan.executionTier,
+    requiredToolNames: getActiveRoutedCodeToolNames(),
   });
   if (codeCapabilityBlocker) {
     const message = [
@@ -7655,6 +7827,8 @@ export async function runAgentMission({
       missionIntent,
       writeAutonomy,
       writeToolExposed: hasExposedWriteTool(),
+      prompt: activeIntentPrompt,
+      allowRoutedCodeExecution: routedCodeProposalEnabled,
     });
     if (modelRouterMode === "authority") {
       routedMissionIntent = policyRouted.intent;
@@ -11023,12 +11197,49 @@ export async function runAgentMission({
       if (vaultMutation) {
         wroteToNote = true;
       }
+      const createCollisionOriginInput =
+        toolCall.name === "code_workspace_write_expected" &&
+        missionGraphSession &&
+        missionGraphExecution
+          ? missionGraphSession.graph.nodes[missionGraphExecution.nodeId]?.inputs
+              .create_collision_origin
+          : null;
       await finishMissionGraphTool(
         missionGraphExecution,
         toolCall.name,
         result,
         receipt,
       );
+      if (
+        createCollisionOriginInput?.kind === "literal" &&
+        typeof createCollisionOriginInput.value === "string" &&
+        missionGraphSession
+      ) {
+        const repairedCreateNode =
+          missionGraphSession.graph.nodes[createCollisionOriginInput.value];
+        const currentLifecycleAction = repairedCreateNode
+          ? getCurrentMissionCompositeLifecycleActionV1(repairedCreateNode)
+          : null;
+        const createReconciled =
+          repairedCreateNode?.status === "complete" ||
+          (repairedCreateNode?.status === "ready" &&
+            currentLifecycleAction?.toolName !==
+              "code_workspace_create_file");
+        if (createReconciled) {
+          if (!successfulToolNames.includes("code_workspace_create_file")) {
+            successfulToolNames.push("code_workspace_create_file");
+          }
+          if (
+            !currentSegmentSuccessfulToolNames.includes(
+              "code_workspace_create_file",
+            )
+          ) {
+            currentSegmentSuccessfulToolNames.push(
+              "code_workspace_create_file",
+            );
+          }
+        }
+      }
       if (missionLedger && missionPlan) {
         setLedgerMissionPlan(
           missionLedger,
@@ -11049,6 +11260,11 @@ export async function runAgentMission({
       }
     } else {
       const failureCode = result.error?.code;
+      const createFileCollisionPath =
+        toolCall.name === "code_workspace_create_file" &&
+        failureCode === "path_exists"
+          ? getString(toolCall.arguments.path)
+          : undefined;
       const durableWorkspaceIdForAck =
         getSingleVerifiedDurableWorkspaceId(writeReceipts);
       if (
@@ -11152,6 +11368,7 @@ export async function runAgentMission({
       if (
         !schemaCorrectionQueued &&
         !ignoreSetLooseWorkspaceExistsFailure &&
+        !createFileCollisionPath &&
         !researchPhaseDeferred
       ) {
         failedToolNames.push(toolCall.name);
@@ -11202,6 +11419,54 @@ export async function runAgentMission({
           toolCall.name,
           result,
         );
+        if (
+          createFileCollisionPath &&
+          missionGraphSession &&
+          missionGraphExecution
+        ) {
+          try {
+            missionGraph =
+              await missionGraphSession.scheduleCreateFileCollisionRepair(
+                missionGraphExecution,
+                createFileCollisionPath,
+              );
+            missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
+            const message =
+              `Existing different content at ${createFileCollisionPath}; ` +
+              "the exact frontier now requires code_workspace_read followed by code_workspace_write_expected.";
+            events.onStatus?.(message);
+            events.onTrace?.({
+              id: `${toolEventBase.id}:create-file-collision-replanned`,
+              kind: "status",
+              step,
+              toolName: toolCall.name,
+              message,
+              outputPreview: {
+                path: createFileCollisionPath,
+                repairTools: [
+                  "code_workspace_read",
+                  "code_workspace_write_expected",
+                ],
+              },
+            });
+          } catch (error) {
+            failedToolNames.push(toolCall.name);
+            events.onTrace?.({
+              id: `${toolEventBase.id}:create-file-collision-replan-failed`,
+              kind: "error",
+              step,
+              toolName: toolCall.name,
+              message:
+                "The create-file collision could not be replanned into an exact hash-bound repair.",
+              error: {
+                code: "create_file_collision_replan_failed",
+                message: getUnknownErrorMessage(error),
+              },
+            });
+          }
+        } else if (createFileCollisionPath) {
+          failedToolNames.push(toolCall.name);
+        }
       }
       if (modelArgumentFailure && argumentFailureSignature) {
         const failureSignature = argumentFailureSignature;
@@ -11429,7 +11694,8 @@ export async function runAgentMission({
   }
 
   const codeWorkflowMission =
-    getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0;
+    getRequiredCodeWorkflowToolNames(activeIntentPrompt).length > 0 ||
+    hasActiveRoutedCodeExecution();
   const shouldDescribePlatformCapabilities =
     codeWorkflowMission ||
     (runPlan.executionTier === "direct_chat" &&
@@ -11494,6 +11760,24 @@ export async function runAgentMission({
           },
         ]
       : []),
+    ...(conversationMessages.length === 0 &&
+      compactedConversation.summary === null
+      ? []
+      : [
+          {
+            role: "system" as const,
+            content: formatConversationHistoryContext(),
+          },
+          ...(compactedConversation.summary === null
+            ? []
+            : [
+                {
+                  role: "system" as const,
+                  content: compactedConversation.summary,
+                },
+              ]),
+          ...conversationMessages,
+        ]),
     {
       role: "user",
       content: activeIntentPrompt,
@@ -11874,6 +12158,7 @@ export async function runAgentMission({
         runToolContext.settings,
         streamingWritebackKind,
         reflexOutput.intent,
+        getActiveRoutedCodeToolNames(),
       );
       tools = constrainOrchestratedHandoffTools(
         tools,
@@ -13059,6 +13344,17 @@ export async function runAgentMission({
       );
       allowedToolNames = new Set(tools.map((tool) => tool.function.name));
     }
+    if (stepGraph) {
+      tools = addToolDefinitions(
+        tools,
+        toolRegistry,
+        Object.values(stepGraph.nodes)
+          .filter(
+            (node) => node.status === "ready" || node.status === "running",
+          )
+          .flatMap(getMissionGraphNodeFrontierToolNames),
+      );
+    }
     let stepTools = bindExactWorkspaceDestinationToolSchemas(
       constrainToolsToMissionGraphFrontier(
         tools,
@@ -13465,15 +13761,21 @@ export async function runAgentMission({
               },
             )
           : messages;
+      const escalateThisStep = noToolEscalationActive && stepTools.length > 0;
+      noToolEscalationActive = false;
+      const stepChatRequest = buildChatRequest(
+        stepMessages,
+        stepTools,
+        escalateThisStep ? false : activeThink,
+        modelOptions,
+        abortSignal,
+      );
+      if (escalateThisStep) {
+        stepChatRequest.toolChoice = "required";
+      }
       response = await chatForAgentStep(
         modelClient,
-        buildChatRequest(
-          stepMessages,
-          stepTools,
-          activeThink,
-          modelOptions,
-          abortSignal,
-        ),
+        stepChatRequest,
         events,
         step,
         disableThinkingForRun,
@@ -13594,13 +13896,16 @@ export async function runAgentMission({
     } else if (modelUsedGithubTool) {
       setLooseGithubOfferedUnusedSteps = 0;
     }
+    const sanitizedStepResponseContent = sanitizeAssistantContent(
+      response.message.content ?? "",
+    ).trim();
     events.onTrace?.({
       id: `agent-step-response-${step}`,
       kind: "status",
       step,
       message: [
         `tool_calls=${responseToolCalls.map((call) => call.name).join(",") || "none"}`,
-        `content_chars=${sanitizeAssistantContent(response.message.content ?? "").trim().length}`,
+        `content_chars=${sanitizedStepResponseContent.length}`,
         `recovered_text_tool_calls=${recoveredTextToolCalls}`,
         setLooseCompoundEnabled
           ? `github_offered_unused_steps=${setLooseGithubOfferedUnusedSteps}`
@@ -13608,6 +13913,15 @@ export async function runAgentMission({
       ]
         .filter(Boolean)
         .join("; "),
+      // A no-tool diagnosis is impossible when the model's actual prose is
+      // discarded; keep a bounded excerpt so noncompliance is inspectable.
+      ...(responseToolCalls.length === 0 && sanitizedStepResponseContent
+        ? {
+            outputPreview: {
+              contentExcerpt: sanitizedStepResponseContent.slice(0, 600),
+            },
+          }
+        : {}),
     });
 
     const missingRequiredWebToolsBeforeToolUse = getMissingRequiredWebToolNames({
@@ -13823,24 +14137,77 @@ export async function runAgentMission({
           hasRenderableAssistantContent(response.message.content ?? "") &&
           (/https:\/\/linear\.app\//iu.test(response.message.content ?? "") ||
             /https:\/\/github\.com\//iu.test(response.message.content ?? "")));
+      const requiredVaultTraversalStillMissing =
+        !executedModelTool &&
+        requiresVaultTraversalBeforeFinalAnswer(
+          activeIntentPrompt,
+          runPlan,
+          allowedToolNames,
+        );
+      const proseCannotFinishMission =
+        ((runPlan.route === "tool_required" ||
+          runPlan.route === "grounded_workflow") &&
+          successfulToolNames.length === 0) ||
+        (codeWorkflowMission && missionGraphUsesExactPlannedFrontier) ||
+        pendingRequiredWritesBeforeToolUse.length > 0 ||
+        missingRequiredWebToolsBeforeToolUse.length > 0 ||
+        requiredVaultTraversalStillMissing;
       if (
-        codeWorkflowMission &&
-        missionGraphUsesExactPlannedFrontier &&
+        proseCannotFinishMission &&
         stepTools.length > 0 &&
         unchangedNoToolResponseCount === 1 &&
         !hasHostManagedWritebackProgress &&
         step < stepLimit
       ) {
+        // Universal pre-block nudge: any mission whose contract still requires
+        // tool progress gets one corrective system message plus an escalated
+        // retry (tool_choice=required / think off) before the two-strike
+        // breaker fires — previously only exact code frontiers were corrected
+        // and every other shape burned strike two on a byte-identical request.
+        // A mission whose prose answer can legitimately terminate the run is
+        // deliberately NOT nudged; final-answer acceptance handles it below.
         const readyToolNames = stepTools.map(
           (tool) => tool.function.name,
         );
         events.onStatus?.(
           `Executable frontier still requires ${readyToolNames.join(", ")}; asking the model for a tool-only correction...`,
         );
+        const genericCorrection =
+          buildGenericNoToolCorrection(readyToolNames);
+        if (pendingRequiredWritesBeforeToolUse.length > 0) {
+          events.onStatus?.("Write required; asking model to use a write tool...");
+        } else if (missingRequiredWebToolsBeforeToolUse.length > 0) {
+          events.onStatus?.(
+            "Web research required; asking model to use web tools before answering...",
+          );
+        } else if (requiredVaultTraversalStillMissing) {
+          events.onStatus?.(
+            "Vault traversal required; asking model to inspect folders and notes before answering...",
+          );
+        }
+        const tailoredCorrection =
+          pendingRequiredWritesBeforeToolUse.length > 0
+            ? buildWriteCorrectionPrompt(
+                pendingRequiredWritesBeforeToolUse,
+              )
+            : missingRequiredWebToolsBeforeToolUse.length > 0
+              ? buildWebResearchBeforeFinalAnswerPrompt(
+                  missingRequiredWebToolsBeforeToolUse,
+                  stepTools,
+                )
+              : requiredVaultTraversalStillMissing
+                ? buildVaultTraversalBeforeFinalAnswerPrompt(stepTools)
+                : "";
         messages.push({
           role: "system" as const,
-          content: buildExactFrontierNoToolCorrection(readyToolNames),
+          content:
+            codeWorkflowMission && missionGraphUsesExactPlannedFrontier
+              ? buildExactFrontierNoToolCorrection(readyToolNames)
+              : [genericCorrection, tailoredCorrection]
+                  .filter(Boolean)
+                  .join("\n\n"),
         });
+        noToolEscalationActive = true;
         continue;
       }
       if (
@@ -14048,6 +14415,11 @@ export async function runAgentMission({
             rejectedFrontier,
             frontierFingerprint: hashOperationInput(noToolFrontierFingerprint),
             attempts: unchangedNoToolResponseCount,
+            assistantProseExcerpt: sanitizeAssistantContent(
+              response.message.content ?? "",
+            )
+              .trim()
+              .slice(0, 600),
             nextAction:
               "Use a tool-compliant model or change the dependency-ready frontier.",
           },
@@ -15089,7 +15461,7 @@ export async function runAgentMission({
         // response. This does not widen authority: the full tool catalog and
         // capability envelope are unchanged, and only nodes promoted to ready
         // by durable graph evidence become callable.
-        const refreshedGraph = missionGraphSession?.graph ?? missionGraph;
+        const refreshedGraph = (missionGraphSession?.graph ?? missionGraph)!;
         const refreshedCodePaid =
           setLooseDeliveryProofs.codeWorkspaceReadback === true ||
           setLoosePaidStages.has("code_execution");
@@ -15150,6 +15522,15 @@ export async function runAgentMission({
             refreshedSetLooseOffered,
           );
         }
+        tools = addToolDefinitions(
+          tools,
+          toolRegistry,
+          Object.values(refreshedGraph.nodes)
+            .filter(
+              (node) => node.status === "ready" || node.status === "running",
+            )
+            .flatMap(getMissionGraphNodeFrontierToolNames),
+        );
         const refreshedStepTools = bindExactWorkspaceDestinationToolSchemas(
           constrainToolsToMissionGraphFrontier(
             tools,
@@ -16440,7 +16821,10 @@ export async function runAgentMission({
         proofs: setLooseDeliveryProofs,
       }).complete;
     const loopLedger: LoopLedger = {
-      successfulTools: [...successfulToolNames],
+      // Finalization reserve is a per-segment budget. Host-prefetched context
+      // and restored parent-segment proof may satisfy acceptance, but must not
+      // consume one of this segment's model-driven tool slots.
+      successfulTools: [...currentSegmentSuccessfulToolNames],
       failedTools: [...failedToolNames],
       repeatedToolCalls: consecutiveNoProgressSteps,
       // Set-loose note reflection (and other delivery proofs) are not MissionGraph
@@ -20621,6 +21005,7 @@ function getAllowedToolDefinitions(
   settings: ToolExecutionContext["settings"] | undefined,
   streamingWritebackKind: StreamingWritebackKind | null = null,
   reflex: ReflexDecision | null = null,
+  routedCodeToolNames: readonly string[] = [],
 ) {
   // A broad mutation with no file, folder, artifact, or current-note target is
   // a clarification turn, not a vault-discovery mission. Exposing read tools
@@ -20706,9 +21091,11 @@ function getAllowedToolDefinitions(
   const allowOpenWebSource = hasOpenWebSourceIntent(prompt);
   const projectLifecycleStages = detectProjectLifecycleStagesV1(prompt);
   const compoundProjectLifecycle = projectLifecycleStages.length > 1;
+  const routedCodeToolNameSet = new Set(routedCodeToolNames);
   const allowCodeExecution =
     hasCodeExecutionIntent(prompt) ||
-    projectLifecycleStages.includes("code_execution");
+    projectLifecycleStages.includes("code_execution") ||
+    routedCodeToolNameSet.size > 0;
   const allowCodeWorkspaceRead = hasCodeWorkspaceReadIntent(prompt);
   const explicitCodeToolNames = getExplicitCodeToolNames(prompt);
   const allowHtmlPreview =
@@ -20838,7 +21225,15 @@ function getAllowedToolDefinitions(
       );
     }
 
-    if (!isAllowedForMission(name, prompt, missionIntent, reflex)) {
+    if (
+      !isAllowedForMission(
+        name,
+        prompt,
+        missionIntent,
+        reflex,
+        routedCodeToolNameSet,
+      )
+    ) {
       return false;
     }
 
@@ -20874,7 +21269,7 @@ function getAllowedToolDefinitions(
         (allowCodeExecution ||
           allowCodeWorkspaceRead ||
           explicitCodeToolNames.length > 0) &&
-        isCodeToolAllowedForPrompt(name, prompt)
+        isCodeToolAllowedForPrompt(name, prompt, routedCodeToolNameSet)
       );
     }
 
@@ -21140,6 +21535,7 @@ function isAllowedForMission(
   prompt: string,
   intent: MissionIntent,
   reflex: ReflexDecision | null = null,
+  routedCodeToolNames: ReadonlySet<string> = new Set(),
 ): boolean {
   if (!isToolWithinAutonomyScope(name, prompt, intent, reflex)) {
     return false;
@@ -21258,8 +21654,9 @@ function isAllowedForMission(
         detectProjectLifecycleStagesV1(prompt).includes("code_execution") ||
         hasCodeWorkspaceReadIntent(prompt) ||
         getExplicitCodeToolNames(prompt).length > 0 ||
+        routedCodeToolNames.size > 0 ||
         hasHtmlPreviewIntent(prompt)) &&
-      isCodeToolAllowedForPrompt(name, prompt)
+      isCodeToolAllowedForPrompt(name, prompt, routedCodeToolNames)
     );
   }
 
@@ -21656,6 +22053,7 @@ function getRequiredWriteToolNames(
   allowedToolNames: Set<string>,
   missionIntent: MissionIntent,
   streamingWritebackKind: StreamingWritebackKind | null = null,
+  routedCodeToolNames: readonly string[] = [],
 ): string[] {
   const lifecycleStages = detectProjectLifecycleStagesV1(prompt);
   const compoundLifecycle = lifecycleStages.length > 1;
@@ -22044,7 +22442,10 @@ function getRequiredWriteToolNames(
     requiredToolNames.push("link_related_notes_in_current_file");
   }
 
-  requiredToolNames.push(...getRequiredCodeWorkflowToolNames(prompt));
+  requiredToolNames.push(
+    ...getRequiredCodeWorkflowToolNames(prompt),
+    ...routedCodeToolNames,
+  );
 
   return [...new Set(requiredToolNames)].filter((name) =>
     allowedToolNames.has(name),
@@ -22138,8 +22539,14 @@ export function getCodeCapabilityRegistrationBlockerV1(input: {
   registeredToolNames: ReadonlySet<string>;
   readiness?: readonly CapabilityReadinessV2[];
   executionTier?: RunPlan["executionTier"];
+  requiredToolNames?: readonly string[];
 }): CodeCapabilityRegistrationBlockerV1 | null {
-  const requiredToolNames = getRequiredCodeWorkflowToolNames(input.prompt);
+  const requiredToolNames = [
+    ...new Set([
+      ...getRequiredCodeWorkflowToolNames(input.prompt),
+      ...(input.requiredToolNames ?? []),
+    ]),
+  ];
   if (
     input.executionTier === "direct_chat" ||
     requiredToolNames.length === 0 ||
@@ -22176,8 +22583,46 @@ export function getCodeCapabilityRegistrationBlockerV1(input: {
  * When a prompt names code tools (including commit) without the validate/repair
  * ladder, expand so MissionGraph cannot schedule code_commit_verified before a
  * durable repair checkpoint exists.
+ *
+ * Fuzzy rescue: when the exact-spelling ladder misses a step that a bounded
+ * keyword-typo correction would add ("deskto" → desktop export, "crate a …
+ * game" → the whole ladder), adopt the corrected prompt's LONGER ladder. The
+ * rescue can only widen toward what the deterministic gates produce for the
+ * canonical spelling; a shorter or empty rescued ladder never overrides the
+ * exact result.
  */
 export function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
+  const exact = getRequiredCodeWorkflowToolNamesExact(prompt);
+  const canonical = canonicalizeKeywordTypos(prompt);
+  if (canonical.corrections.length === 0) return exact;
+  const rescued = getRequiredCodeWorkflowToolNamesExact(canonical.text);
+  return rescued.length > exact.length ? rescued : exact;
+}
+
+/**
+ * Minimal code-delivery ladder that a high-confidence, opt-in router proposal
+ * may seed when deterministic wording grants a bounded execution turn but does
+ * not identify code work itself. It intentionally excludes commit, dependency
+ * installation, arbitrary edits, moves, copies, and deletion; host-directory
+ * export remains available only when the prompt explicitly names that target.
+ */
+export function getRoutedCodeWorkflowToolNames(prompt: string): string[] {
+  const tools = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+  ];
+  if (hasKnownHostDirectoryExportIntent(prompt)) {
+    tools.push("code_workspace_export_directory");
+  }
+  return tools;
+}
+
+function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
   const repositoryRead = hasCodeWorkspaceReadIntent(prompt);
   const repositoryMutation = hasRepositoryCodeMutationIntent(prompt);
   const codeDeliverable = hasCodeDeliverableIntent(prompt);
@@ -22971,6 +23416,18 @@ function buildExactFrontierNoToolCorrection(
     `The only ready frontier tools are: ${readyToolNames.join(", ")}.`,
     exactInstruction,
     "Return the tool call only. Do not explain, summarize, claim completion, or emit code in prose.",
+  ].join(" ");
+}
+
+/** Mission-shape-agnostic sibling of the exact-frontier correction. */
+function buildGenericNoToolCorrection(
+  readyToolNames: readonly string[],
+): string {
+  return [
+    "Your prior response contained prose but no tool call, so the mission did not advance.",
+    `The tools available this step are: ${readyToolNames.join(", ")}.`,
+    "Call the single most relevant tool now using its offered schema, or the run will stop as blocked.",
+    "Return the tool call only. Do not explain, summarize, or claim completion.",
   ].join(" ");
 }
 
@@ -24328,43 +24785,9 @@ function hasCodeExecutionIntent(prompt: string): boolean {
  * Current-note write/stream prompts ("Write … in TypeScript on this page")
  * stay note writeback — not the code workspace ladder.
  */
-function hasCodeDeliverableIntent(prompt: string): boolean {
-  if (hasCurrentNoteCodeSampleWriteSurface(prompt)) {
-    return false;
-  }
-  if (/\.(?:py|ts|tsx|js|jsx|rs|go|java|cs)\b/i.test(prompt)) {
-    return true;
-  }
-  return prompt
-    .split(/(?:[!?;\r\n]+|\.(?=\s|$))/u)
-    .map((clause) => clause.trim())
-    .filter(Boolean)
-    .some((clause) => {
-      // A vault research path such as Projects/Checkers/Research.md is not a
-      // request to implement checkers merely because "write" and "Checkers"
-      // occur in the same sentence.
-      if (/\.md\b/iu.test(clause)) {
-        return false;
-      }
-      return (
-        /\b(build|implement|create|write)\b[\s\S]{0,100}\b(game|app|script|module|library|package|checkers|chess|solver)\b/i.test(
-          clause,
-        ) ||
-        /\b(build|implement|create|write|code)\b[\s\S]{0,120}\b(python|javascript|typescript|rust|golang|java)\b/i.test(
-          clause,
-        )
-      );
-    });
-}
-
-/** Note-local sample write/stream — not a repository/code-workspace deliverable. */
-function hasCurrentNoteCodeSampleWriteSurface(prompt: string): boolean {
-  return (
-    /\b(?:on|to|into|in)\s+(?:this|the|current|active)\s+(?:page|note|file)\b/i.test(
-      prompt,
-    ) || /\bstream(?:\s+it)?\s+to\s+(?:the\s+)?note\b/i.test(prompt)
-  );
-}
+// hasCodeDeliverableIntent / hasCurrentNoteCodeSampleWriteSurface moved to
+// src/agent/codeDeliverableIntent.ts so runPlan route derivation and this
+// file's required-ladder derivation share one gate instead of drifting copies.
 
 function hasStandaloneCodeExecutionIntent(prompt: string): boolean {
   return /\b(run|execute|eval|evaluate|test|compile)\b[\s\S]{0,120}\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b|\b(code|script|program|snippet|python|javascript|typescript|html|css|c\+\+|cpp|c\s+code)\b[\s\S]{0,120}\b(run|execute|eval|evaluate|test|compile)\b/i.test(
@@ -24449,7 +24872,11 @@ export function hasKnownHostDirectoryExportIntent(prompt: string): boolean {
   );
 }
 
-function isCodeToolAllowedForPrompt(toolName: string, prompt: string): boolean {
+function isCodeToolAllowedForPrompt(
+  toolName: string,
+  prompt: string,
+  routedCodeToolNames: ReadonlySet<string> = new Set(),
+): boolean {
   if (/\b(install(?:ing|ed)?|dependency|dependencies|lockfile|bootstrap|restore)\b/i.test(prompt) === false &&
       (toolName === "install_code_dependency")) {
     return false;
@@ -24465,6 +24892,9 @@ function isCodeToolAllowedForPrompt(toolName: string, prompt: string): boolean {
   }
   if (toolName === "code_workspace_restore") {
     return hasAffirmativeCodePathAction(prompt, /\brestore\b/iu);
+  }
+  if (routedCodeToolNames.has(toolName)) {
+    return true;
   }
   if (
     hasRepositoryCodeMutationIntent(prompt) ||
@@ -29305,10 +29735,19 @@ export function validateRequiredLiteralWriteArguments(
 }
 
 export function sanitizeAssistantContent(content: string): string {
-  return content.replace(
-    /[<＜]\s*[|｜]\s*(?:begin\s*[_▁]+\s*of\s*[_▁]+\s*sentence|end\s*[_▁]+\s*of\s*[_▁]+\s*sentence|start\s*[_▁]+\s*header\s*[_▁]+\s*id|end\s*[_▁]+\s*header\s*[_▁]+\s*id|eot\s*[_▁]+\s*id|eom\s*[_▁]+\s*id)\s*[|｜]\s*[>＞]/gi,
-    "",
-  );
+  return content
+    .replace(
+      /[<＜]\s*[|｜]\s*(?:begin\s*[_▁]+\s*of\s*[_▁]+\s*sentence|end\s*[_▁]+\s*of\s*[_▁]+\s*sentence|start\s*[_▁]+\s*header\s*[_▁]+\s*id|end\s*[_▁]+\s*header\s*[_▁]+\s*id|eot\s*[_▁]+\s*id|eom\s*[_▁]+\s*id)\s*[|｜]\s*[>＞]/gi,
+      "",
+    )
+    // Vendor tool-call sentinels (Kimi K2 sections, Qwen/Hermes tags). The
+    // recovery parser reads the RAW content first; sanitization only shapes
+    // what is displayed, measured, or written back.
+    .replace(
+      /[<＜]\s*[|｜]\s*tool\s*[_▁]*\s*calls?\s*[_▁]*\s*(?:section\s*[_▁]*\s*)?(?:begin|end|argument\s*[_▁]*\s*begin)\s*[|｜]\s*[>＞]/gi,
+      "",
+    )
+    .replace(/<\/?tool_call>/gi, "");
 }
 
 export function createAssistantContentSanitizer() {
@@ -29344,6 +29783,14 @@ const NORMALIZED_SPECIAL_TOKENS = [
   "<|endheaderid|>",
   "<|eotid|>",
   "<|eomid|>",
+  "<|toolcallssectionbegin|>",
+  "<|toolcallssectionend|>",
+  "<|toolcallbegin|>",
+  "<|toolcallend|>",
+  "<|toolcallargumentbegin|>",
+  // normalizeSpecialTokenCandidate strips underscores before matching.
+  "<toolcall>",
+  "</toolcall>",
 ];
 
 const SPECIAL_TOKEN_LOOKBACK_CHARS = 80;

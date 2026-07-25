@@ -1,4 +1,5 @@
 import type { App, TFile } from "obsidian";
+import { cosineSimilarity, normalizeCosine } from "../utils/vectorMath";
 import type { AgentSettings } from "../settings";
 import {
   chunkMarkdownForSemanticSearch,
@@ -1574,28 +1575,6 @@ function overlapRatio(left: Set<string>, right: Set<string>): number {
   return overlap / left.size;
 }
 
-function cosineSimilarity(left: number[], right: number[]): number {
-  const length = Math.min(left.length, right.length);
-  if (length === 0) {
-    return 0;
-  }
-  let dot = 0;
-  let leftMagnitude = 0;
-  let rightMagnitude = 0;
-  for (let index = 0; index < length; index += 1) {
-    dot += left[index] * right[index];
-    leftMagnitude += left[index] * left[index];
-    rightMagnitude += right[index] * right[index];
-  }
-  if (leftMagnitude <= 0 || rightMagnitude <= 0) {
-    return 0;
-  }
-  return dot / Math.sqrt(leftMagnitude * rightMagnitude);
-}
-
-function normalizeCosine(value: number): number {
-  return Math.max(0, Math.min(1, (value + 1) / 2));
-}
 
 function compareHits(
   left: SemanticIndexSearchHit & { sortPath: string },

@@ -239,6 +239,49 @@ test("run planner exposes route decisions, allowed tool names, and trace reasons
   }
 });
 
+test("authority router code proposal selects the code route only above direct chat", () => {
+  const codeTools = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+  ].map((name) => tool(name));
+  const routedIntent = {
+    mode: "code_workflow",
+    writeScope: "none",
+    needsWebEvidence: false,
+    needsVaultContext: false,
+    needsCodeExecution: true,
+    wordTarget: null,
+    confidence: 0.9,
+    rationale: "model proposal",
+  } as const;
+  // A prompt whose regex gates miss the deliverable but the router proposes it.
+  const adopted = createRunPlan({
+    prompt: "Please handle that little project we discussed for my machine.",
+    missionIntent: missionIntent(),
+    tools: [...allTools, ...codeTools],
+    settings: settings(),
+    streamingWritebackKind: null,
+    directCurrentNoteWritebackKind: null,
+    routedIntent: routedIntent as never,
+  });
+  assert.equal(adopted.route, "grounded_workflow");
+  assert.ok(adopted.traceReasons.includes("routed_code_execution_proposal"));
+  // The same proposal is ignored when the deterministic tier is direct chat.
+  const vetoed = createRunPlan({
+    prompt: "Is the red list the complete current set of fully-agentic gaps?",
+    missionIntent: missionIntent(),
+    tools: [...allTools, ...codeTools],
+    settings: settings(),
+    streamingWritebackKind: null,
+    directCurrentNoteWritebackKind: null,
+    routedIntent: routedIntent as never,
+  });
+  assert.equal(vetoed.route, "single_model_answer");
+  assert.ok(vetoed.traceReasons.includes("speech_act_direct_chat"));
+});
+
 test("run planner keeps thinking mode resolution with planner boundary", () => {
   assert.equal(resolveThinkingMode(settings({ model: "gpt-oss:120b" })), "medium");
   assert.equal(resolveThinkingMode(settings({ model: "qwen3:32b" })), true);

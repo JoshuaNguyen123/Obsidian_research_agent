@@ -432,6 +432,7 @@ test.describe("Daily-use live research contract", () => {
           orchestratorWorkerMaxToolCalls: 6,
           orchestratorWorkerMaxMinutes: 2,
           agenticReflexEnabled: false,
+          speechActSemanticRescueMode: "off",
         },
       );
       await harness.installOwnedWebBackend({ sourceCount: 2 });

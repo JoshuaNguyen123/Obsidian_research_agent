@@ -900,8 +900,444 @@ export class MissionGraphSession {
           await this.releaseNodeLocksUnlocked(execution.lockLease);
         }
       }
+      if (
+        result.ok &&
+        execution.toolName === "code_workspace_write_expected"
+      ) {
+        graph = await this.reconcileCreateFileCollisionOriginUnlocked(
+          this.record.graph.nodes[execution.nodeId]!,
+          result,
+        );
+      }
       return graph;
     });
+  }
+
+  /**
+   * Replan one failed create-file node into two bounded sibling nodes:
+   * exact read -> hash-bound write_expected. The failed create stays blocked
+   * until the write receipt reconciles its original completion contract.
+   * This preserves the immutable planned lifecycle while keeping the repair
+   * on the same trusted binding and inside the original host envelope.
+   */
+  async scheduleCreateFileCollisionRepair(
+    execution: MissionGraphToolExecution,
+    targetPath: string,
+  ): Promise<MissionGraphV3> {
+    return this.enqueueMutation(async () => {
+      const node = this.requireNode(execution.nodeId);
+      if (
+        execution.toolName !== "code_workspace_create_file" ||
+        node.status !== "ready"
+      ) {
+        throw new Error(
+          `Create-file collision repair requires a ready failed create node; ${node.id} is ${node.status}.`,
+        );
+      }
+      const requestedSelector = targetPath.trim();
+      if (!requestedSelector) {
+        throw new Error("Create-file collision repair requires an exact path.");
+      }
+      const lifecycleAction =
+        getCurrentMissionCompositeLifecycleActionV1(node);
+      if (
+        lifecycleAction &&
+        lifecycleAction.toolName !== "code_workspace_create_file"
+      ) {
+        throw new Error(
+          `Create-file collision repair expected the current lifecycle action to be code_workspace_create_file, not ${lifecycleAction.toolName}.`,
+        );
+      }
+      const selector =
+        lifecycleAction?.selector ?? node.destination?.selector ?? null;
+      const bindingId =
+        lifecycleAction?.bindingId ?? node.destination?.bindingId ?? null;
+      if (selector !== requestedSelector) {
+        throw new Error(
+          `Create-file collision repair path ${requestedSelector} does not match the trusted graph selector ${selector ?? "(missing)"}.`,
+        );
+      }
+      if (!bindingId) {
+        throw new Error(
+          `Create-file collision repair lost the trusted workspace binding for ${node.id}.`,
+        );
+      }
+      const readGrant =
+        this.record.graph.capabilityEnvelope.tools.code_workspace_read;
+      const writeGrant =
+        this.record.graph.capabilityEnvelope.tools
+          .code_workspace_write_expected;
+      if (!readGrant || !writeGrant) {
+        throw new Error(
+          "Create-file collision repair requires code_workspace_read and code_workspace_write_expected grants.",
+        );
+      }
+      const readExecutionHost = readGrant.executionHosts.find((host) =>
+        Object.values(this.record.graph.capabilityEnvelope.executors).some(
+          (executor) =>
+            executor.executionHosts.includes(host) &&
+            executor.allowedEffects.includes("read"),
+        ),
+      );
+      const readExecutor = Object.values(
+        this.record.graph.capabilityEnvelope.executors,
+      ).find(
+        (executor) =>
+          readExecutionHost !== undefined &&
+          executor.executionHosts.includes(readExecutionHost) &&
+          executor.allowedEffects.includes("read"),
+      );
+      if (!readExecutionHost || !readExecutor) {
+        throw new Error(
+          "Create-file collision repair has no installed read executor.",
+        );
+      }
+      if (
+        node.effect === "read" ||
+        !writeGrant.executionHosts.includes(node.executionHost) ||
+        writeGrant.effect !== node.effect
+      ) {
+        throw new Error(
+          "Create-file collision repair cannot preserve the original execution host and mutation effect.",
+        );
+      }
+      const perNodeWallClockMs = missionGraphToolNodeWallClockMs(
+        this.record.graph.capabilityEnvelope.budgets.maxWallClockMs,
+        this.record.graph.capabilityEnvelope.budgets.maxTotalToolCalls,
+      );
+      const reserveNode = findContinuationReserveNode(this.record.graph);
+      if (!reserveNode || reserveNode.id === node.id) {
+        throw new Error(
+          "Create-file collision repair has no nonterminal continuation budget reserve.",
+        );
+      }
+      const allocation = transferReservedBudgetForContinuation(
+        this.record.graph,
+        reserveNode,
+        {
+          toolCalls: 2,
+          externalActions: 0,
+          wallClockMs: perNodeWallClockMs * 2,
+        },
+      );
+      const idSuffix = sanitizeMissionId(
+        `${this.record.graph.revision + 1}-${node.id}`,
+      );
+      const readNodeId = `repair-read-${idSuffix}`.slice(0, 128);
+      const writeNodeId = `repair-write-${idSuffix}`.slice(0, 128);
+      const retries = {
+        maxAttempts:
+          this.record.graph.capabilityEnvelope.budgets.maxAttemptsPerNode,
+        attempts: 0,
+        failureFingerprints: [],
+        consecutiveFailureFingerprint: null,
+        consecutiveFailureCount: 0,
+      };
+      const readNode: MissionNodeV3 = {
+        id: readNodeId,
+        dependencyIds: [...node.dependencyIds],
+        objective: `Read the existing workspace file ${selector} and observe its SHA-256 before collision repair.`,
+        executorId: readExecutor.id,
+        executionHost: readExecutionHost,
+        effect: "read",
+        inputs: {
+          resource: { kind: "binding", bindingId, selector },
+        },
+        outputs: {},
+        requiredCapabilities: [...readGrant.capabilityIds],
+        allowedTools: ["code_workspace_read"],
+        destination: null,
+        resourceLocks: [{ bindingId, mode: "shared" }],
+        budget: {
+          toolCalls: 1,
+          externalActions: 0,
+          wallClockMs: perNodeWallClockMs,
+        },
+        retries: clone(retries),
+        status: "ready",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        completionContract: {
+          criteria: [
+            `code_workspace_read observed ${selector} and returned its current SHA-256.`,
+          ],
+          minimumEvidence: 1,
+          requiredEvidenceKinds: ["tool-result"],
+          minimumReceipts: 0,
+          requiredReceiptKinds: [],
+          verifierId: null,
+        },
+        blocker: null,
+      };
+      const repairContract = lifecycleAction
+        ? {
+            minimumEvidence: lifecycleAction.minimumEvidence,
+            requiredEvidenceKinds: [
+              ...lifecycleAction.requiredEvidenceKinds,
+            ],
+            minimumReceipts: lifecycleAction.minimumReceipts,
+            requiredReceiptKinds: [
+              ...lifecycleAction.requiredReceiptKinds,
+            ],
+          }
+        : {
+            minimumEvidence: node.completionContract.minimumEvidence,
+            requiredEvidenceKinds: [
+              ...node.completionContract.requiredEvidenceKinds,
+            ],
+            minimumReceipts: node.completionContract.minimumReceipts,
+            requiredReceiptKinds: [
+              ...node.completionContract.requiredReceiptKinds,
+            ],
+          };
+      const writeNode: MissionNodeV3 = {
+        id: writeNodeId,
+        dependencyIds: [readNodeId],
+        objective: `Replace ${selector} only under the SHA-256 observed by the preceding exact read.`,
+        executorId: node.executorId,
+        executionHost: node.executionHost,
+        effect: node.effect,
+        inputs: {
+          resource: { kind: "binding", bindingId, selector },
+          create_collision_origin: { kind: "literal", value: node.id },
+          create_collision_read: { kind: "literal", value: readNodeId },
+        },
+        outputs: {},
+        requiredCapabilities: [...writeGrant.capabilityIds],
+        allowedTools: ["code_workspace_write_expected"],
+        destination: {
+          bindingId,
+          effect: node.effect,
+          selector,
+        },
+        resourceLocks: [{ bindingId, mode: "exclusive" }],
+        budget: {
+          toolCalls: 1,
+          externalActions: 0,
+          wallClockMs: perNodeWallClockMs,
+        },
+        retries: clone(retries),
+        status: "queued",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        completionContract: {
+          criteria: [
+            `code_workspace_write_expected reconciled ${selector} under the SHA-256 observed by ${readNodeId}.`,
+          ],
+          ...repairContract,
+          verifierId: null,
+        },
+        blocker: null,
+      };
+      const operations: MissionGraphPatchOperationV1[] = [
+        {
+          op: "set_status",
+          nodeId: node.id,
+          expectedStatus: "ready",
+          status: "blocked",
+          blocker: {
+            code: "create_file_path_exists",
+            message: `The planned create target ${selector} already exists with different content.`,
+            requiredAction:
+              "Complete the exact read and hash-bound write_expected repair nodes.",
+          },
+        },
+        { op: "add_node", node: readNode },
+        { op: "add_node", node: writeNode },
+        {
+          op: "update_node",
+          nodeId: node.id,
+          changes: {
+            retries: {
+              maxAttempts: node.retries.maxAttempts,
+              attempts: 0,
+              failureFingerprints: [],
+              consecutiveFailureFingerprint: null,
+              consecutiveFailureCount: 0,
+            },
+          },
+        },
+      ];
+      if (
+        JSON.stringify(allocation.reserveNodeBudget) !==
+        JSON.stringify(reserveNode.budget)
+      ) {
+        operations.push({
+          op: "update_node",
+          nodeId: reserveNode.id,
+          changes: { budget: allocation.reserveNodeBudget },
+        });
+      }
+      return this.applyUnlocked(
+        `Replan create-file collision at ${selector} into exact read and hash-bound write.`,
+        operations,
+      );
+    });
+  }
+
+  private async reconcileCreateFileCollisionOriginUnlocked(
+    repairNode: MissionNodeV3,
+    result: {
+      evidence?: MissionEvidenceRefV1;
+      receipt?: MissionReceiptRefV1;
+    },
+  ): Promise<MissionGraphV3> {
+    const originInput = repairNode.inputs.create_collision_origin;
+    if (
+      originInput?.kind !== "literal" ||
+      typeof originInput.value !== "string"
+    ) {
+      return this.record.graph;
+    }
+    const origin = this.record.graph.nodes[originInput.value];
+    if (
+      !origin ||
+      origin.status !== "blocked" ||
+      origin.blocker?.code !== "create_file_path_exists"
+    ) {
+      return this.record.graph;
+    }
+    const lifecycle = getMissionCompositeLifecycleSpecV1(origin);
+    const lifecycleState = getMissionCompositeLifecycleStateV1(origin);
+    const lifecycleAction = getCurrentMissionCompositeLifecycleActionV1(origin);
+    if (
+      lifecycle &&
+      (!lifecycleState ||
+        !lifecycleAction ||
+        lifecycleAction.toolName !== "code_workspace_create_file")
+    ) {
+      throw new Error(
+        `Create-file collision repair no longer matches the lifecycle cursor for ${origin.id}.`,
+      );
+    }
+    const proofContract = lifecycleAction ?? origin.completionContract;
+    const proofMissing =
+      !result.evidence ||
+      proofContract.requiredEvidenceKinds.some(
+        (kind) => result.evidence?.kind !== kind,
+      ) ||
+      (proofContract.minimumReceipts > 0 && !result.receipt) ||
+      proofContract.requiredReceiptKinds.some(
+        (kind) => result.receipt?.kind !== kind,
+      );
+    if (proofMissing) {
+      return this.record.graph;
+    }
+    const evidence: MissionEvidenceRefV1 = {
+      ...result.evidence!,
+      id: missionGraphLocalReferenceId(
+        "create-repair-evidence",
+        origin.id,
+        this.record.graph.revision + 1,
+      ),
+    };
+    const receipt = result.receipt
+      ? {
+          ...result.receipt,
+          id: missionGraphLocalReferenceId(
+            "create-repair-receipt",
+            origin.id,
+            this.record.graph.revision + 1,
+          ),
+        }
+      : null;
+    const operations: MissionGraphPatchOperationV1[] = [
+      {
+        op: "set_status",
+        nodeId: origin.id,
+        expectedStatus: "blocked",
+        status: "ready",
+        blocker: null,
+      },
+      {
+        op: "set_status",
+        nodeId: origin.id,
+        expectedStatus: "ready",
+        status: "running",
+        blocker: null,
+      },
+      { op: "append_evidence", nodeId: origin.id, evidence },
+      ...(receipt
+        ? ([{ op: "append_receipt", nodeId: origin.id, receipt }] as const)
+        : []),
+      {
+        op: "update_node",
+        nodeId: origin.id,
+        changes: {
+          retries: {
+            maxAttempts: origin.retries.maxAttempts,
+            attempts: 0,
+            failureFingerprints: [],
+            consecutiveFailureFingerprint: null,
+            consecutiveFailureCount: 0,
+          },
+        },
+      },
+    ];
+    if (lifecycle && lifecycleState && lifecycleAction) {
+      operations.push(
+        lifecycleOutputsOperationV1(
+          origin.id,
+          lifecycleState,
+          lifecycle,
+          lifecycleAction.id,
+          true,
+        ),
+      );
+      if (lifecycleState.actionCursor + 1 < lifecycle.actions.length) {
+        operations.push({
+          op: "set_status",
+          nodeId: origin.id,
+          expectedStatus: "running",
+          status: "ready",
+          blocker: null,
+        });
+        return this.applyUnlocked(
+          `Reconcile create-file collision repair into lifecycle node ${origin.id}.`,
+          operations,
+        );
+      }
+    }
+    operations.push(
+      {
+        op: "set_status",
+        nodeId: origin.id,
+        expectedStatus: "running",
+        status: "verifying",
+        blocker: null,
+      },
+      {
+        op: "set_status",
+        nodeId: origin.id,
+        expectedStatus: "verifying",
+        status: "complete",
+        blocker: null,
+      },
+    );
+    for (const candidate of Object.values(this.record.graph.nodes)) {
+      if (
+        candidate.status === "queued" &&
+        candidate.dependencyIds.every(
+          (dependencyId) =>
+            dependencyId === origin.id ||
+            this.record.graph.nodes[dependencyId]?.status === "complete",
+        )
+      ) {
+        operations.push({
+          op: "set_status",
+          nodeId: candidate.id,
+          expectedStatus: "queued",
+          status: "ready",
+          blocker: null,
+        });
+      }
+    }
+    return this.applyUnlocked(
+      `Reconcile create-file collision repair into mission node ${origin.id}.`,
+      operations,
+    );
   }
 
   /**

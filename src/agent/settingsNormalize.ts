@@ -51,6 +51,7 @@ export type MemoryModeSetting =
   | "research_and_experience";
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
+export type SpeechActSemanticRescueMode = "off" | "shadow" | "authority";
 
 /** Minimal settings shape used by normalize — compatible with AgentSettings. */
 export interface NormalizableAgentSettings {
@@ -103,6 +104,7 @@ export interface NormalizableAgentSettings {
   defaultBrowserMissionMode: "supervised" | "extract_only";
   agenticReflexEnabled: boolean;
   agenticReflexDiagnosticsEnabled: boolean;
+  speechActSemanticRescueMode: SpeechActSemanticRescueMode;
   semanticSearchEnabled: boolean;
   semanticEmbeddingModel: string;
   semanticEmbeddingDim: 256 | 512;
@@ -186,6 +188,7 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   defaultBrowserMissionMode: "supervised",
   agenticReflexEnabled: true,
   agenticReflexDiagnosticsEnabled: true,
+  speechActSemanticRescueMode: "off",
   semanticSearchEnabled: true,
   semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
   semanticEmbeddingDim: 512,
@@ -264,6 +267,11 @@ export function normalizeAgentSettings(
       (merged.modelRouterEnabled === true ? "shadow" : "off"),
   );
   merged.modelRouterEnabled = merged.modelRouterMode !== "off";
+  merged.speechActSemanticRescueMode =
+    merged.speechActSemanticRescueMode === "shadow" ||
+    merged.speechActSemanticRescueMode === "authority"
+      ? merged.speechActSemanticRescueMode
+      : "off";
   if (typeof merged.orchestratorEnabled !== "boolean") {
     merged.orchestratorEnabled = merged.orchestratorPreviewEnabled !== false;
   }
