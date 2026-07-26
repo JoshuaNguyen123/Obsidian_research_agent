@@ -46,7 +46,7 @@ test.describe("Daily-use live research contract", () => {
         /(?:retention.{0,80}(?:improved|increased|rose|grew)|(?:improved|increased|rose|grew).{0,80}retention)/iu,
       );
       expect(after).toMatch(
-        /(?:error(?:s|\s+rates?)?.{0,80}(?:fell|dropped|decreased|declined|reduced|lowered)|(?:fell|dropped|decreased|declined|reduced|lowered).{0,80}error(?:s|\s+rates?)?|(?:drop|reduction|decrease|decline)\s+in\s+(?:the\s+)?error(?:s|\s+rates?)?|fewer\s+error(?:s|\s+rates?)?)/iu,
+        /(?:error(?:s|\s+rates?)?.{0,80}(?:fell|falls?|dropped|drops?|decreased|decreases?|declined|declines?|reduced|reduces?|lowered|lowers?)|(?:fell|falls?|dropped|drops?|decreased|decreases?|declined|declines?|reduced|reduces?|lowered|lowers?).{0,80}error(?:s|\s+rates?)?|(?:drop|reduction|decrease|decline)\s+in\s+(?:the\s+)?error(?:s|\s+rates?)?|fewer\s+error(?:s|\s+rates?)?)/iu,
       );
       expect(appendReceipts[0]?.readback).toBeTruthy();
       expect(

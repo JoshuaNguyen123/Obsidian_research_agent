@@ -44,15 +44,23 @@ export async function terminateControlledObsidian(
     await runProbe("CDP port close", operations.waitForCdpClose),
   ];
   // The probes are intentionally serial because process drain and CDP closure
-  // can take longer than the owned-root handle to settle on Windows. If those
-  // two application-specific readbacks are clean, reconcile one boundary-race
-  // on the earlier PID probe before deciding teardown failed. A still-live PID
-  // remains a hard failure after this terminal recheck.
-  if (!probes[0].passed && probes[1].passed && probes[2].passed) {
-    probes[0] = await runProbe(
-      "owned process exit",
-      operations.waitForOwnedExit,
-    );
+  // can take longer than the owned-root handle to settle on Windows. Once CDP
+  // is confirmed closed, reconcile one boundary race on either earlier process
+  // readback before deciding teardown failed. A still-live PID or application
+  // process remains a hard failure after this terminal recheck.
+  if (probes[2].passed) {
+    if (!probes[0].passed) {
+      probes[0] = await runProbe(
+        "owned process exit",
+        operations.waitForOwnedExit,
+      );
+    }
+    if (!probes[1].passed) {
+      probes[1] = await runProbe(
+        "Obsidian process drain",
+        operations.waitForNoRunningProcess,
+      );
+    }
   }
   const failures = probes.filter((probe) => !probe.passed);
   if (failures.length === 0) {

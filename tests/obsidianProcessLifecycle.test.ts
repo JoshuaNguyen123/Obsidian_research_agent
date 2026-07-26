@@ -51,6 +51,7 @@ test("controlled Obsidian teardown targets only its owned PID and rejects an inc
     "owned-exit",
     "process-drain",
     "cdp-close",
+    "process-drain",
   ]);
 });
 
@@ -113,6 +114,29 @@ test("controlled teardown reconciles an owned-PID boundary race after app drain"
   assert.equal(ownedExitChecks, 2);
 });
 
+test("controlled teardown reconciles a terminal Windows process-drain boundary race", async () => {
+  let ownedExitChecks = 0;
+  let processDrainChecks = 0;
+  await terminateControlledObsidian(
+    { pid: 4567, exitCode: null },
+    {
+      terminateOwnedTree: async () => undefined,
+      waitForOwnedExit: async () => {
+        ownedExitChecks += 1;
+        return ownedExitChecks === 2;
+      },
+      waitForNoRunningProcess: async () => {
+        processDrainChecks += 1;
+        return processDrainChecks === 2;
+      },
+      waitForCdpClose: async () => true,
+    },
+  );
+
+  assert.equal(ownedExitChecks, 2);
+  assert.equal(processDrainChecks, 2);
+});
+
 test("controlled teardown still rejects a live owned PID after terminal recheck", async () => {
   let ownedExitChecks = 0;
   await assert.rejects(
@@ -132,4 +156,25 @@ test("controlled teardown still rejects a live owned PID after terminal recheck"
   );
 
   assert.equal(ownedExitChecks, 2);
+});
+
+test("controlled teardown still rejects a live Obsidian process after terminal recheck", async () => {
+  let processDrainChecks = 0;
+  await assert.rejects(
+    terminateControlledObsidian(
+      { pid: 8901, exitCode: null },
+      {
+        terminateOwnedTree: async () => undefined,
+        waitForOwnedExit: async () => true,
+        waitForNoRunningProcess: async () => {
+          processDrainChecks += 1;
+          return false;
+        },
+        waitForCdpClose: async () => true,
+      },
+    ),
+    /Controlled Obsidian teardown did not drain cleanly \(Obsidian process drain\)/u,
+  );
+
+  assert.equal(processDrainChecks, 2);
 });
