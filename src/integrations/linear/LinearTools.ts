@@ -40,6 +40,7 @@ import {
   type LinearResourceType,
 } from "./types";
 import { sha256LinearValue, stableLinearJson } from "./client";
+import { resolveLinearProjectAssociation } from "./resolveLinearProjectAssociation";
 
 const PREPARED_ACTION_TTL_MS = 5 * 60 * 1_000;
 const MAX_IDENTIFIER_CHARS = 256;
@@ -539,12 +540,19 @@ async function prepareMutation(
       runId,
       taskId: toolCallId,
     });
-    const effectiveArgs =
+    let effectiveArgs =
       config.kind === "issue_create" &&
       typeof args.teamId !== "string" &&
       context.settings?.linearDefaultTeamId
         ? { ...args, teamId: context.settings.linearDefaultTeamId }
         : args;
+    if (config.kind === "issue_create") {
+      effectiveArgs = await maybeAssociateIssueProject(
+        client,
+        effectiveArgs,
+        context,
+      );
+    }
     const variables = await normalizeMutationVariables(
       config,
       effectiveArgs,
@@ -2097,6 +2105,72 @@ function isDefinitelyNotApplied(error: unknown): boolean {
     return true;
   }
   return error.code === "linear_http" && (error.status ?? 500) < 500;
+}
+
+async function maybeAssociateIssueProject(
+  client: LinearToolClient,
+  args: Record<string, unknown>,
+  context: ToolExecutionContext,
+): Promise<Record<string, unknown>> {
+  if (typeof args.projectId === "string" && args.projectId.trim()) {
+    return args;
+  }
+  // Host association is driven by the user mission text. Prepared-action unit
+  // fixtures without an originalPrompt keep their explicit args unchanged.
+  if (
+    typeof context.originalPrompt !== "string" ||
+    !context.originalPrompt.trim()
+  ) {
+    return args;
+  }
+  const teamId =
+    typeof args.teamId === "string" && args.teamId.trim()
+      ? args.teamId.trim()
+      : typeof context.settings?.linearDefaultTeamId === "string"
+        ? context.settings.linearDefaultTeamId.trim()
+        : "";
+  if (!teamId) {
+    return args;
+  }
+  const associationText =
+    typeof args.title === "string" && args.title.trim()
+      ? args.title.trim()
+      : context.originalPrompt;
+  const lineageProjectIds = (context.getProjectLineages?.() ?? []).flatMap(
+    (lineage) =>
+      lineage.commits.flatMap((commit) => {
+        const proof = commit.proof;
+        return proof.stage === "linear_hierarchy" &&
+          typeof proof.projectId === "string"
+          ? [proof.projectId]
+          : [];
+      }),
+  );
+  try {
+    const resolved = await resolveLinearProjectAssociation({
+      client,
+      prompt: context.originalPrompt,
+      associationText,
+      teamId,
+      configuredProjectId: context.settings?.linearQueueProjectId,
+      lineageProjectIds,
+      context,
+      reportProgress: context.reportProgress,
+    });
+    if (!resolved.projectId) {
+      return args;
+    }
+    return { ...args, projectId: resolved.projectId };
+  } catch (error) {
+    // Association is best-effort for model-driven issue creates. Fall back to
+    // the explicit args (team-only) rather than blocking the prepare path.
+    context.reportProgress?.(
+      `Linear: project association skipped (${
+        error instanceof Error ? error.message : "unknown error"
+      }).`,
+    );
+    return args;
+  }
 }
 
 function requestOptions(context: ToolExecutionContext): LinearRequestOptions {

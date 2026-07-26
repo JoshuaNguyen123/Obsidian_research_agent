@@ -18,6 +18,7 @@ import {
   expectSha256,
   fingerprintContract,
 } from "./LinearContractSupport";
+import { matchAssociatedLinearProject } from "./linearProjectAssociation";
 import type { LinearBaseRecord, LinearPage } from "./types";
 
 export const RESEARCH_PROJECT_HIERARCHY_CHECKPOINT_VERSION = 1 as const;
@@ -766,10 +767,27 @@ export class ResearchProjectHierarchyWorkflowV1 {
       {
         key: plan.project.idempotencyKey,
         label: `project ${plan.project.title}`,
-        matches: (record) =>
-          record.resourceType === "project" &&
-          record.name === plan.project.title &&
-          record.content === plan.project.description,
+        matches: (record) => {
+          if (record.resourceType !== "project") return false;
+          if (
+            record.name === plan.project.title &&
+            record.content === plan.project.description
+          ) {
+            return true;
+          }
+          // Reuse an already-associated project by title when the clean
+          // description fingerprint differs (for example after a resume).
+          const associated = matchAssociatedLinearProject(
+            [
+              {
+                id: record.id,
+                name: String(record.name ?? record.title ?? "").trim() || record.id,
+              },
+            ],
+            plan.project.title,
+          );
+          return associated !== null && associated.id === record.id;
+        },
       },
       ...plan.issues.map((issue) => ({
         key: issue.idempotencyKey,

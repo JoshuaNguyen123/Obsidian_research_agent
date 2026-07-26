@@ -370,6 +370,7 @@ import {
   ResearchPublicationCheckpointStoreV1,
   ResearchProjectHierarchyCheckpointStoreV1,
   ResearchTicketPublisher,
+  resolveLinearProjectAssociation,
   parseResearchPublicationCheckpointNamespaceV1,
   parseResearchProjectHierarchyCheckpointNamespaceV1,
   resolveQueueCodePublicationOriginV1,
@@ -10326,20 +10327,23 @@ export default class AgenticResearcherPlugin extends Plugin {
       return null;
     }
     const team = snapshot.teams.find((item) => item.id === teamId);
+    if (!team) {
+      return null;
+    }
+    // Stale or team-mismatched queue project ids are ignored; association
+    // resolution finds an associated project or creates one at publish time.
     const project = projectId
       ? snapshot.projects.find((item) => item.id === projectId)
       : undefined;
-    if (
-      !team ||
-      (projectId && !project) ||
-      (project && project.teamIds.length > 0 && !project.teamIds.includes(team.id))
-    ) {
-      return null;
-    }
+    const usableProject =
+      project &&
+      (project.teamIds.length === 0 || project.teamIds.includes(team.id))
+        ? project
+        : undefined;
     return {
       workspaceId: snapshot.workspace.id,
       teamId,
-      ...(projectId ? { projectId } : {}),
+      ...(usableProject ? { projectId: usableProject.id } : {}),
     };
   }
 
@@ -10387,6 +10391,56 @@ export default class AgenticResearcherPlugin extends Plugin {
       lineage: this.researchPublicationCheckpointStore,
       destination,
       vaultBindingKey: "current-vault",
+      resolveProjectAssociation: async ({
+        prompt,
+        associationText,
+        destination: baseDestination,
+        context,
+      }) => {
+        const lineageProjectIds = (context.getProjectLineages?.() ?? [])
+          .flatMap((lineage) =>
+            lineage.commits.flatMap((commit) => {
+              const proof = commit.proof;
+              return proof.stage === "linear_hierarchy" &&
+                typeof proof.projectId === "string"
+                ? [proof.projectId]
+                : [];
+            }),
+          );
+        const resolved = await resolveLinearProjectAssociation({
+          client,
+          prompt,
+          associationText,
+          teamId: baseDestination.teamId,
+          configuredProjectId:
+            baseDestination.projectId ?? this.settings.linearQueueProjectId,
+          lineageProjectIds,
+          context,
+          reportProgress: context.reportProgress,
+        });
+        const nextDestination: ResearchPublicationDestinationV1 = {
+          workspaceId: baseDestination.workspaceId,
+          teamId: baseDestination.teamId,
+          ...(resolved.projectId ? { projectId: resolved.projectId } : {}),
+        };
+        if (
+          resolved.created &&
+          resolved.projectId &&
+          !this.settings.linearQueueProjectId
+        ) {
+          this.settings.linearQueueProjectId = resolved.projectId;
+          await this.saveSettings();
+        }
+        return {
+          destination: nextDestination,
+          publisher: new ResearchTicketPublisher({
+            readClient: client,
+            actionExecutor: executor,
+            queueTeamId: nextDestination.teamId,
+            queueProjectId: nextDestination.projectId,
+          }),
+        };
+      },
       resolveNotePath: resolveResearchPublicationNotePathV1,
       validateTrustedBindings: (package_) => {
         const repositoryKey = package_.repositoryKey;

@@ -256,6 +256,95 @@ test("prepared issue creation verifies readback and returns a valid receipt", as
   ]);
 });
 
+test("issue create associates to an existing project from the user mission", async () => {
+  let listed = false;
+  let createdInput: Record<string, unknown> | undefined;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "projects.list") {
+        listed = true;
+        return {
+          items: [
+            {
+              resourceType: "project",
+              id: "proj-checkers",
+              name: "Python Checkers Game",
+              attributes: { teams: ["team-1"] },
+              snapshotHash: HASH_A,
+            },
+          ],
+          pageInfo: { hasNextPage: false },
+          fetchedAt: "2026-07-11T12:00:00.000Z",
+        };
+      }
+      if (key === "issues.get" && !createdInput) throw notFound(key);
+      if (key === "issues.create") {
+        createdInput = variables.input as Record<string, unknown>;
+        return mutationAck(key, "issue");
+      }
+      if (key === "issues.get" && createdInput) {
+        return issueRecord({
+          id: String(createdInput.id),
+          title: String(createdInput.title),
+          teamId: String(createdInput.teamId),
+          projectId: String(createdInput.projectId ?? ""),
+          snapshotHash: HASH_B,
+        });
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture({
+    originalPrompt: "Create Linear issues for the Python Checkers Game mission.",
+  });
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: { teamId: "team-1", title: "Python Checkers Game rules" },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  assert.equal(listed, true);
+  assert.equal(prepared.action.target.projectId, "proj-checkers");
+  assert.equal(
+    (prepared.action.normalizedArgs.variables as { input?: { projectId?: string } })
+      .input?.projectId,
+    "proj-checkers",
+  );
+});
+
+test("general issue create stays team-only without inventing a project", async () => {
+  const calls: string[] = [];
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      calls.push(key);
+      if (key === "issues.get") throw notFound(key);
+      if (key === "issues.create") {
+        return mutationAck(key, "issue");
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture({
+    originalPrompt: "Create a general Linear issue about the README typo.",
+  });
+  const prepared = await registry.prepare(
+    {
+      name: "linear_create_issue",
+      arguments: { teamId: "team-1", title: "README typo" },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  assert.equal(prepared.action.target.projectId, undefined);
+  assert.deepEqual(calls, ["issues.get"]);
+});
+
 test("comment preparation inherits issue project scope for bounded authority", async () => {
   const scopedIssue = issueRecord({
     id: "issue-queue-1",

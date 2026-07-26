@@ -267,6 +267,19 @@ export interface CreateResearchPublicationToolOptionsV1 {
   validateTrustedBindings(package_: AcceptedResearchNotePackageV1): void;
   mintOneActionGrant(input: ResearchPublicationGrantInputV1): Promise<AuthorityGrantV1>;
   persistExternalReceipt(receipt: ActionReceipt): Promise<void>;
+  /**
+   * Host-owned find-or-create for the Linear project that should own the issue.
+   * Called after the accepted package is parsed so association can use the title.
+   */
+  resolveProjectAssociation?(input: {
+    prompt: string;
+    associationText: string;
+    destination: ResearchPublicationDestinationV1;
+    context: ToolExecutionContext;
+  }): Promise<{
+    destination: ResearchPublicationDestinationV1;
+    publisher: ResearchPublicationPublisherPortV1;
+  }>;
   persistAcceptedProjectLineage?(input: {
     artifact: AcceptedResearchArtifactV1;
     package: AcceptedResearchNotePackageV1;
@@ -365,9 +378,31 @@ export function createResearchPublicationTool(
           { mutationState: "not_applied" },
         );
       }
+      let destination = options.destination;
+      let publisher = options.publisher;
+      if (options.resolveProjectAssociation) {
+        try {
+          const resolved = await options.resolveProjectAssociation({
+            prompt: context.originalPrompt,
+            associationText: note.package.title,
+            destination: options.destination,
+            context,
+          });
+          destination = resolved.destination;
+          publisher = resolved.publisher;
+        } catch (error) {
+          throw new ToolExecutionError(
+            "research_publication_project_association_failed",
+            error instanceof Error
+              ? error.message
+              : "Failed to resolve or create the Linear project for research publication.",
+            { mutationState: "not_applied" },
+          );
+        }
+      }
       const workflow = new ResearchPublicationWorkflow({
         noteWriter: options.noteWriter,
-        publisher: options.publisher,
+        publisher,
         lineage: options.lineage,
         now: options.now ?? context.now,
         approval: {
@@ -430,7 +465,7 @@ export function createResearchPublicationTool(
         subject: { type: "run", id: runId },
         context,
         note,
-        destination: options.destination,
+        destination,
       });
       if ("artifact" in result) {
         await options.persistAcceptedProjectLineage?.({

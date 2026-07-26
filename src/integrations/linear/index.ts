@@ -30,6 +30,8 @@ export {
 } from "./LinearTools";
 export * from "./HostLinearActionExecutor";
 export * from "./ResearchTicketPublisher";
+export * from "./linearProjectAssociation";
+export * from "./resolveLinearProjectAssociation";
 export * from "./PendingLinearReconciliationState";
 export * from "./ExternalActionReceiptLedger";
 export * from "./WorkItemParser";
