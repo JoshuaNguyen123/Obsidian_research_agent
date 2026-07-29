@@ -104,8 +104,10 @@ function startCapture(windowTitle) {
     "gdigrab",
     "-framerate",
     String(fps),
+    // No cursor: the harness drives via CDP, so the physical pointer is an
+    // idle artifact that reads as an awkward extra actor in the footage.
     "-draw_mouse",
-    "1",
+    "0",
     "-i",
     input,
     "-c:v",

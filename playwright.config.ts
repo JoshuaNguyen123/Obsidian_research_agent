@@ -107,6 +107,15 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
+      // Demo footage driver, not a proof lane — see e2e/demo-recording.spec.ts.
+      name: "demo-recording",
+      testMatch: /demo-recording\.spec\.ts/u,
+      retries: 0,
+      timeout: 2_700_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
       name: "daily-use-code-live",
       testMatch: /daily-use-code-live\.spec\.ts/u,
       retries: 0,
