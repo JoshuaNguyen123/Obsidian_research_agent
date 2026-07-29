@@ -52,7 +52,14 @@ export function hasPlainLinearIssueOnlyIntent(prompt: string): boolean {
   }
 
   const withoutProject =
-    /\b(?:without|no|skip|exclude)\b[^.\n]{0,60}\b(?:a\s+)?project\b/iu.test(
+    /\b(?:without|no|skip|exclude)\b[^.\n]{0,60}\b(?:a\s+)?(?:linear\s+)?project\b/iu.test(
+      text,
+    ) ||
+    /\b(?:do\s+not|don't|never)\s+(?:create|open|use|associate|attach|place|add|link)\b[^.\n]{0,60}\b(?:a\s+)?(?:linear\s+)?project\b/iu.test(
+      text,
+    );
+  const explicitExistingProject =
+    /\b(?:use|reuse|keep|associate|attach|place|add|link)\b[^.\n]{0,60}\b(?:configured|existing|current)\s+(?:linear\s+)?project\b/iu.test(
       text,
     );
   const generalIssueLanguage =
@@ -67,7 +74,7 @@ export function hasPlainLinearIssueOnlyIntent(prompt: string): boolean {
   }
 
   // "…without a project" is an explicit opt-out even if the word "project" appears.
-  if (withoutProject) {
+  if (withoutProject && !explicitExistingProject) {
     return true;
   }
 
@@ -260,6 +267,9 @@ function mentionsLinearIssueCreation(text: string): boolean {
       text,
     ) ||
     /\b(?:linear\s+)?(?:issue|ticket)\b[\s\S]{0,80}\b(?:create|open|file|add)\b/iu.test(
+      text,
+    ) ||
+    /\b(?:publish|send|sync)\b[\s\S]{0,120}\b(?:linear\s+)?(?:implementation\s+)?(?:issue|ticket)\b/iu.test(
       text,
     )
   );

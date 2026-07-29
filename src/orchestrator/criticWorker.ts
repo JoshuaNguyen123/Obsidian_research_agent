@@ -4,6 +4,10 @@ import type {
   ModelClient,
   ModelToolDefinition,
 } from "../model/types";
+import {
+  createObservableModelClient,
+  type ModelCallEvidenceV1,
+} from "../model/modelCallEvidence";
 import type { MissionEvidence } from "../agent/missionLedger";
 import type { VerificationCheck } from "../agent/verifiers";
 import type { ToolExecutionContext, ToolRegistry } from "../tools/types";
@@ -59,11 +63,27 @@ export async function runCriticWorker(input: {
   toolContext: ToolExecutionContext;
   abortSignal?: AbortSignal;
   maxSteps?: number;
+  onModelCallEvidence?: (event: ModelCallEvidenceV1) => void;
   now?: () => Date;
 }): Promise<CriticWorkerResult> {
   const now = input.now ?? (() => new Date());
   const registry = createCriticRegistry(input.toolRegistry);
   const maxSteps = Math.min(CRITIC_MAX_STEPS, Math.max(1, input.maxSteps ?? CRITIC_MAX_STEPS));
+  const modelCallCap = Math.max(4, maxSteps * 3 + 8);
+  const contextTokens = Math.max(
+    4_096,
+    input.toolContext.settings?.numCtx ?? 48_000,
+  );
+  const observedModel = createObservableModelClient({
+    client: input.modelClient,
+    budget: {
+      schemaVersion: 1,
+      maxCalls: modelCallCap,
+      maxTokens: Math.max(32_768, modelCallCap * contextTokens),
+      maxWallClockMs: 60 * 60_000,
+    },
+    onEvidence: input.onModelCallEvidence,
+  });
   const messages: ModelChatMessage[] = [
     {
       role: "system",
@@ -107,8 +127,9 @@ export async function runCriticWorker(input: {
         messages,
         tools: registry.getDefinitions(),
         abortSignal: input.abortSignal,
+        evidencePhase: "worker",
       };
-      const response = await input.modelClient.chat(request);
+      const response = await observedModel.client.chat(request);
       messages.push(response.message);
       if (response.toolCalls.length === 0) {
         verdictText = response.message.content.trim();

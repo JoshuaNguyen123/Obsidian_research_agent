@@ -274,7 +274,7 @@ const PROBE_TIMEOUT_MS = 30_000;
 // A dedicated WSL distribution may need to cold-start before bwrap can run the
 // fixed boundary command. Keep the ordinary provider budget tight, but allow
 // WSL2 enough time to produce fresh attestation under normal workstation load.
-const WSL2_PROBE_TIMEOUT_MS = 90_000;
+export const WSL2_SANDBOX_PROBE_TIMEOUT_MS_V2 = 90_000;
 
 /**
  * Sandbox-only execution boundary. A runner must be injected explicitly; this
@@ -1000,7 +1000,7 @@ function buildProviderCommand(
     env: {},
     timeoutMs: purpose === "boundary_probe"
       ? provider.kind === "wsl2"
-        ? WSL2_PROBE_TIMEOUT_MS
+        ? WSL2_SANDBOX_PROBE_TIMEOUT_MS_V2
         : PROBE_TIMEOUT_MS
       : action!.resources.timeoutMs,
     stdinMode: purpose === "boundary_probe" ? "none" : "verified_staging_bundle",

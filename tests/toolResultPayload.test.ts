@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+﻿import assert from "node:assert/strict";
 import test from "node:test";
 
 import { serializeToolResultForModel } from "../src/model/toolResultPayload";
@@ -81,9 +81,59 @@ test("code repair cycle payload preserves the host-verified outcome", () => {
   assert.doesNotMatch(serialized, /must-not-cross/iu);
 });
 
+test("workspace creation payload preserves only the bounded repository write scope", () => {
+  const serialized = serializeToolResultForModel({
+    ok: true,
+    toolName: "code_workspace_create",
+    output: {
+      workspaceId: "private-workspace-id",
+      canonicalRoot: "C:\\private\\worktree",
+      repositoryWriteScope: {
+        profileKey: "crdt-library",
+        projects: [{
+          projectId: "root",
+          projectRoot: ".",
+          allowedPaths: [
+            "README.md",
+            "crdt_sync.py",
+            "docs",
+            "pyproject.toml",
+            "src",
+          ],
+          privateControl: "must-not-cross",
+        }],
+        credentialReferenceId: "must-not-cross",
+      },
+    },
+  });
+
+  const payload = JSON.parse(serialized) as Record<string, any>;
+  assert.deepEqual(payload.output.repositoryWriteScope, {
+    profileKey: "crdt-library",
+    projects: [{
+      projectId: "root",
+      projectRoot: ".",
+      allowedPaths: [
+        "README.md",
+        "crdt_sync.py",
+        "docs",
+        "pyproject.toml",
+        "src",
+      ],
+    }],
+    truncated: false,
+    totalProjects: 1,
+    totalAllowedPaths: 5,
+  });
+  assert.doesNotMatch(
+    serialized,
+    /private-workspace-id|C:\\\\private|must-not-cross/iu,
+  );
+});
+
 test("known-folder export payload preserves the verified absolute destination", () => {
   const destinationPath =
-    "C:\\Users\\joshb\\OneDrive\\Desktop\\number-guessing-game-run123";
+    "C:\\Users\\example\\OneDrive\\Desktop\\number-guessing-game-run123";
   const serialized = serializeToolResultForModel({
     ok: true,
     toolName: "code_workspace_export_directory",

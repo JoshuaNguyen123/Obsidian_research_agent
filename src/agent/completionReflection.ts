@@ -147,7 +147,7 @@ export function planCompoundCompletionReflection(
     context?.runId?.trim() ||
     context?.pipeline?.runId?.trim() ||
     "unknown-run";
-  const initiatingNote = buildInitiatingNoteReflectionV1({
+  const preparedInitiatingNote = buildInitiatingNoteReflectionV1({
     runId,
     context: context ?? null,
     pipeline: context?.pipeline ?? null,
@@ -161,6 +161,18 @@ export function planCompoundCompletionReflection(
     explicitChatOnly: input.explicitChatOnly,
     persistence: input.persistence ?? context?.persistence,
   });
+  const initiatingNote: InitiatingNoteReflectionPlanV1 = completion.done
+    ? preparedInitiatingNote
+    : {
+        ...preparedInitiatingNote,
+        shouldWriteNote: false,
+        destination: {
+          kind: "chat_only",
+          reason: "completion_incomplete",
+        },
+        markdown: "",
+        chatSummary: "",
+      };
   return {
     version: 1,
     completion,

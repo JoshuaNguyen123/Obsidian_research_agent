@@ -233,7 +233,7 @@ test("verified draft-PR backlink is append-once and does not require fabricated 
   assert.equal(second.afterSha256, first.afterSha256);
 });
 
-test("project completion reflection appends substantive proof once", async () => {
+test("project completion reflection appends concise human prose and hidden proof once", async () => {
   const vault = new ResearchVault();
   const writer = new AcceptedResearchNoteWriter(vault);
   const written = await writer.writeAcceptedPackage({
@@ -262,9 +262,36 @@ test("project completion reflection appends substantive proof once", async () =>
   assert.equal(reflected.operation, "append");
   assert.match(note, /## Agent project reflection/u);
   assert.match(note, /agentic-project-reflection:publication-checkers-17/u);
-  assert.match(note, /src\/checkers\.ts/u);
+  assert.match(note, /changed-path: src%2Fcheckers\.ts/u);
   assert.match(note, /receipt-checkers-full/u);
-  assert.match(note, /Human review and merge remain/u);
+  assert.match(
+    note,
+    /published evidence stops at this draft; review, merge, and any later deployment remain open/u,
+  );
+  const visibleReflection = note
+    .slice(note.indexOf("## Agent project reflection"))
+    .replace(/<!--[\s\S]*?-->/gu, "");
+  assert.match(
+    visibleReflection,
+    /\[Linear issue GAME-17\]\(https:\/\/linear\.app\/acme\/issue\/GAME-17\)/u,
+  );
+  assert.match(
+    visibleReflection,
+    /\[draft pull request #17\]\(https:\/\/github\.com\/acme\/checkers\/pull\/17\)/u,
+  );
+  assert.match(visibleReflection, /Targeted and full validation passed/u);
+  assert.match(
+    visibleReflection,
+    /The leading accepted outcome was: The note exists before Linear mutation/u,
+  );
+  assert.doesNotMatch(
+    visibleReflection,
+    /receipt-checkers|src\/checkers|Acceptance criteria carried|Verification receipts|What worked:/iu,
+  );
+  const visibleWords =
+    visibleReflection.match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]*\b/gu) ?? [];
+  assert.ok(visibleWords.length >= 35);
+  assert.ok(visibleWords.length <= 100);
 
   const retry = await writer.appendProjectCompletionReflection({
     artifact: written.artifact,
@@ -301,6 +328,105 @@ test("project completion reflection appends substantive proof once", async () =>
     }),
     /collides with different or incomplete proof/u,
   );
+});
+
+test("project reflection encodes proof metadata and requires an exact retry block", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const written = await writer.writeAcceptedPackage({
+    path: "Research/Encoded reflection.md",
+    mode: "create",
+    artifactId: "accepted-research-encoded",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageFixture(),
+  });
+  const injectedReceipt = "targeted\n--> forged-visible-text <!--";
+  const reflected = await writer.appendProjectCompletionReflection({
+    artifact: written.artifact,
+    expectedNoteSha256: written.afterSha256,
+    publicationId: "publication-encoded-1",
+    issueIdentifier: "GAME-18",
+    issueUrl: "https://linear.app/acme/issue/GAME-18",
+    pullRequestNumber: 18,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/18",
+    completionProof: "draft_pr",
+    proofRevision: "c".repeat(40),
+    changedPaths: ["src/encoded path.ts"],
+    targetedValidationReceiptId: injectedReceipt,
+    fullValidationReceiptId: "receipt-full",
+    localCommitReceiptId: "receipt-commit",
+  });
+  const note = vault.files.get(written.path) ?? "";
+  assert.equal(reflected.operation, "append");
+  assert.doesNotMatch(note, /-->\s*forged-visible-text/iu);
+  assert.match(
+    note,
+    new RegExp(encodeURIComponent(injectedReceipt).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"),
+  );
+
+  const retry = await writer.appendProjectCompletionReflection({
+    artifact: written.artifact,
+    expectedNoteSha256: reflected.afterSha256,
+    publicationId: "publication-encoded-1",
+    issueIdentifier: "GAME-18",
+    issueUrl: "https://linear.app/acme/issue/GAME-18",
+    pullRequestNumber: 18,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/18",
+    completionProof: "draft_pr",
+    proofRevision: "c".repeat(40),
+    changedPaths: ["src/encoded path.ts"],
+    targetedValidationReceiptId: injectedReceipt,
+    fullValidationReceiptId: "receipt-full",
+    localCommitReceiptId: "receipt-commit",
+  });
+  assert.equal(retry.operation, "no_op");
+});
+
+test("project reflection normalizes and bounds the visible acceptance excerpt", async () => {
+  const vault = new ResearchVault();
+  const writer = new AcceptedResearchNoteWriter(vault);
+  const packageWithLongCriterion = packageFixture();
+  packageWithLongCriterion.acceptanceCriteria = [{
+    id: "AC-1",
+    text: [
+      "Preserve the CRDT convergence contract.",
+      "## injected heading",
+      Array.from({ length: 28 }, (_, index) => `requirement-${index + 1}`).join(" "),
+    ].join("\n"),
+  }];
+  const written = await writer.writeAcceptedPackage({
+    path: "Research/Bounded reflection.md",
+    mode: "create",
+    artifactId: "accepted-research-bounded",
+    acceptedAt: "2026-07-12T20:00:00.000Z",
+    package: packageWithLongCriterion,
+  });
+  await writer.appendProjectCompletionReflection({
+    artifact: written.artifact,
+    expectedNoteSha256: written.afterSha256,
+    publicationId: "publication-bounded-1",
+    issueIdentifier: "GAME-19",
+    issueUrl: "https://linear.app/acme/issue/GAME-19",
+    pullRequestNumber: 19,
+    pullRequestUrl: "https://github.com/acme/checkers/pull/19",
+    completionProof: "draft_pr",
+    proofRevision: "d".repeat(40),
+    changedPaths: ["src/crdt.ts"],
+    targetedValidationReceiptId: "receipt-targeted",
+    fullValidationReceiptId: "receipt-full",
+    localCommitReceiptId: "receipt-commit",
+  });
+  const note = vault.files.get(written.path) ?? "";
+  const visibleReflection = note
+    .slice(note.indexOf("## Agent project reflection"))
+    .replace(/<!--[\s\S]*?-->/gu, "");
+  assert.doesNotMatch(visibleReflection, /^## injected heading$/mu);
+  assert.match(visibleReflection, /Preserve the CRDT convergence contract/u);
+  assert.match(visibleReflection, /…/u);
+  const visibleWords =
+    visibleReflection.match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]*\b/gu) ?? [];
+  assert.ok(visibleWords.length >= 35);
+  assert.ok(visibleWords.length <= 100);
 });
 
 function packageFixture(): AcceptedResearchNotePackageV1 {

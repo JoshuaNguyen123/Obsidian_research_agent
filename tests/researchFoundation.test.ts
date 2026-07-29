@@ -821,6 +821,12 @@ test("explicit source cardinality overrides the deep-research default without re
     ),
     2,
   );
+  assert.equal(
+    parseExplicitResearchSourceCount(
+      "Use and fetch at least four independent sources exposed through the configured research backend.",
+    ),
+    4,
+  );
   const plan = createResearchPlan({
     prompt:
       "Do deep research using exactly two owned sources and cite their passages.",

@@ -20,7 +20,7 @@ export function selectCodeWorkspaceEditToolName(
   const text = String(prompt ?? "");
 
   if (
-    /\b(create|add|new)\b[\s\S]{0,80}\b(folder|folders|directory|directories)\b/i.test(text) &&
+    isWorkspaceDirectoryCreationRequest(text) &&
     allowlist.has("code_workspace_mkdir")
   ) {
     return "code_workspace_mkdir";
@@ -71,6 +71,33 @@ export function selectCodeWorkspaceEditToolName(
     return "code_workspace_append";
   }
   return "code_workspace_create_file";
+}
+
+function isWorkspaceDirectoryCreationRequest(prompt: string): boolean {
+  const directoryAction =
+    /\b(?:create|add|make)\b[\s\S]{0,100}\b(?:empty\s+)?(?:folder|folders|directory|directories)\b/iu.test(
+      prompt,
+    );
+  if (!directoryAction) return false;
+
+  // A known-folder delivery describes the destination of the finished
+  // workspace, not a request to mkdir inside it. In particular, "a new
+  // absolute Desktop folder" must leave the edit action as prompt-scoped file
+  // creation and let the export tool own delivery.
+  const knownFolderDelivery =
+    /\b(?:deliver|export|save|write|copy|put|place)\b[\s\S]{0,140}\b(?:Desktop|Documents|Downloads)\b[\s\S]{0,50}\b(?:folder|directory)\b/iu.test(
+      prompt,
+    ) ||
+    /\b(?:create|make)\b[\s\S]{0,80}\b(?:Desktop|Documents|Downloads)\b[\s\S]{0,40}\b(?:folder|directory)\b/iu.test(
+      prompt,
+    );
+  if (knownFolderDelivery) return false;
+
+  // code_workspace_mkdir creates an empty directory *within* an already
+  // selected code workspace. Generic "new folder" prose is insufficient.
+  return /\b(?:workspace|project|repository|repo|codebase|worktree)\b/iu.test(
+    prompt,
+  );
 }
 
 /** True when a planned edit tool is a relocation/cleanup tool. */

@@ -9,6 +9,7 @@ import {
   createExternalWorkItemBindingV1,
   createWorkItemLineageV1,
   parseResearchPublicationCheckpointNamespaceV1,
+  type AcceptedResearchNotePackageV1,
   type ResearchPublicationCheckpointNamespaceV1,
   type ResearchPublicationCheckpointPersistenceV1,
   type ResearchPublicationCheckpointV1,
@@ -60,6 +61,72 @@ test("reconcile_required and waiting_obsidian checkpoints survive plugin-data ro
   assert.deepEqual(await restarted.get(waiting.publicationId), waiting);
   assert.equal((await restarted.get(reconcile.publicationId))?.pendingAction?.actionId, "action-42");
   assert.equal((await restarted.get(waiting.publicationId))?.binding?.issueIdentifier, "ENG-42");
+});
+
+test("checkpointed accepted package survives restart and cannot drift on retry", async () => {
+  const persistence = new MemoryPersistence();
+  const store = new ResearchPublicationCheckpointStoreV1(persistence);
+  const publicationId = "publication-accepted-package";
+  const acceptedPackage = acceptedPackageFixture();
+  await store.persist({
+    ...noteVerifiedCheckpoint(publicationId),
+    acceptedPackage,
+  });
+
+  const restarted = new ResearchPublicationCheckpointStoreV1(persistence);
+  assert.deepEqual(
+    (await restarted.get(publicationId))?.acceptedPackage,
+    acceptedPackage,
+  );
+  await assert.rejects(
+    restarted.persist({
+      ...noteVerifiedCheckpoint(publicationId),
+      updatedAt: VERIFIED_AT,
+      acceptedPackage: {
+        ...acceptedPackage,
+        title: "A retry attempted to replace accepted research",
+      },
+    }),
+    (error: unknown) =>
+      error instanceof ResearchPublicationCheckpointStoreError &&
+      error.code === "research_publication_checkpoint_identity_changed",
+  );
+  assert.equal(
+    (await restarted.get(publicationId))?.acceptedPackage?.title,
+    acceptedPackage.title,
+  );
+});
+
+test("note_written checkpoint survives restart and advances after preview", async () => {
+  const persistence = new MemoryPersistence();
+  const store = new ResearchPublicationCheckpointStoreV1(persistence);
+  const publicationId = "publication-note-written";
+  const acceptedPackage = acceptedPackageFixture();
+  await store.persist({
+    schemaVersion: 1,
+    publicationId,
+    status: "note_written",
+    updatedAt: ACCEPTED_AT,
+    artifact: artifact(),
+    acceptedPackage,
+    lineage: null,
+    workItemFingerprint: null,
+    approvalFingerprint: null,
+    binding: null,
+    issue: null,
+    pendingAction: null,
+    backlink: null,
+    error: null,
+  });
+
+  const restarted = new ResearchPublicationCheckpointStoreV1(persistence);
+  assert.equal((await restarted.get(publicationId))?.status, "note_written");
+  await restarted.persist({
+    ...noteVerifiedCheckpoint(publicationId),
+    updatedAt: VERIFIED_AT,
+    acceptedPackage,
+  });
+  assert.equal((await restarted.get(publicationId))?.status, "note_verified");
 });
 
 test("failed publication may restart at note_verified for the same research contract", async () => {
@@ -276,6 +343,37 @@ function artifact() {
     acceptedAt: ACCEPTED_AT,
     acceptedBy: "host",
   });
+}
+
+function acceptedPackageFixture(): AcceptedResearchNotePackageV1 {
+  return {
+    schemaVersion: 1,
+    title: "Agent platform gap closure",
+    problemImpact: "The publication handoff must be exact and durable.",
+    evidence: [{
+      id: "evidence-1",
+      kind: "web",
+      reference: "https://example.com/source",
+      contentSha256: ARTIFACT_HASH,
+      label: "Primary source",
+      summary: "The source supports the accepted implementation contract.",
+    }],
+    confidenceLimitations: "Provider behavior still requires live verification.",
+    proposedWork: ["Implement the accepted publication behavior."],
+    nonGoals: [],
+    scope: ["The trusted application harness."],
+    dependencies: [],
+    acceptanceCriteria: [{
+      id: "AC-1",
+      text: "The publication is verified.",
+    }],
+    validationRequirementKeys: ["trusted.validation"],
+    riskClass: "medium",
+    executionClass: "research",
+    objective: "Prove the durable research publication handoff.",
+    vaultBindingKey: "primary-vault",
+    originRunId: "run-42",
+  };
 }
 
 function noteLineage() {

@@ -38,6 +38,7 @@ interface DailyUseRunRecord extends Pick<
   | "toolCalls"
   | "continuations"
   | "approvals"
+  | "approvalBoundaryProofCount"
   | "artifactProofCount"
   | "cleanupProofCount"
   | "missingAcceptanceCriteria"
@@ -56,6 +57,8 @@ interface DailyUseRunRecord extends Pick<
   failureCategory: DailyUseFailureCategory | null;
   observed: DailyUseObservedAcceptanceV1 | null;
   missionScorecard: MissionScorecardV1 | null;
+  /** Explicit alias for the legacy `approvals` interaction counter. */
+  interactiveApprovals: number;
 }
 
 export interface DailyUseAtomicObservationRecord {
@@ -83,12 +86,11 @@ export default class DailyUseReporter implements Reporter {
       errorMessages,
     });
     const scenarioId = classification.scenarioId ?? extractScenarioId(test.title);
-    const relevant =
-      Boolean(scenarioId) ||
-      project.toLowerCase().includes("daily-use") ||
-      result.status !== "passed";
-    if (!relevant) return;
-
+    // Every test in every project is recorded. The previous filter kept only
+    // DU-0X-titled tests, projects named *daily-use*, and failures — so a
+    // passing `desktop-checkers-delivery-real-live` produced no summary file
+    // at all. That silently disabled the scorecard gate and made the CI job
+    // wired to `--lanes=desktop` fail on a passing run.
     const typedScenarioId = isDailyUseScenarioId(scenarioId)
       ? scenarioId
       : null;
@@ -132,6 +134,9 @@ export default class DailyUseReporter implements Reporter {
       toolCalls: metrics?.toolCalls ?? 0,
       continuations: metrics?.continuations ?? 0,
       approvals: metrics?.approvals ?? 0,
+      interactiveApprovals: metrics?.approvals ?? 0,
+      approvalBoundaryProofCount:
+        metrics?.approvalBoundaryProofCount ?? 0,
       artifactProofCount: metrics?.artifactProofCount ?? 0,
       cleanupProofCount: metrics?.cleanupProofCount ?? 0,
       missingAcceptanceCriteria: metrics?.missingAcceptanceCriteria ?? [],
@@ -217,6 +222,9 @@ function summarizeRecords(records: readonly DailyUseRunRecord[]) {
         toolCalls: metrics?.toolCalls ?? 0,
         continuations: metrics?.continuations ?? 0,
         approvals: metrics?.approvals ?? 0,
+        interactiveApprovals: metrics?.approvals ?? 0,
+        approvalBoundaryProofCount:
+          metrics?.approvalBoundaryProofCount ?? 0,
         artifactProofCount: metrics?.artifactProofCount ?? 0,
         cleanupProofCount: metrics?.cleanupProofCount ?? 0,
         acceptanceStatus: atomicPass ? "pass" : "needs_more_work",

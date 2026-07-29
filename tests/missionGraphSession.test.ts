@@ -10,11 +10,24 @@ import {
   type MissionGraphToolStartResult,
 } from "../src/agent/missionGraphSession";
 import {
+  reconcileCompositeOwnedCurrentNoteGraphOnResume,
+  type ResearchPublicationResumeReceiptV1,
+} from "../src/agent/researchPublicationGraphReconciliation";
+import {
   getMissionGraphStorePath,
   persistPreparedMissionGraphPatch,
   readMissionGraphStoreRecord,
 } from "../src/agent/missionGraphStore";
 import type { ToolDescriptor } from "../src/agent/actions";
+import { sha256DiagramContent } from "../src/design/diagramArtifactStore";
+import {
+  appendWorkItemLineageTransitionV1,
+  createAcceptedResearchArtifactV1,
+  createExternalWorkItemBindingV1,
+  createWorkItemLineageV1,
+  createWorkItemSpecV2,
+  renderQueueExecutableHumanWorkItemSpecV2,
+} from "../src/integrations/linear";
 import {
   getCurrentMissionCompositeLifecycleActionV1,
   getMissionCompositeLifecycleStateV1,
@@ -110,6 +123,130 @@ test("parallel same-name reads never recover an intentionally running node", asy
   for (const execution of executions) {
     assert.equal(session.graph.nodes[execution.nodeId]?.status, "complete");
   }
+});
+
+test("final output cancels every non-terminal node outside the required closure", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-terminalizes-off-path-nodes",
+    allowedTools: ["read_file", "replace_current_file"],
+    plannedTools: ["read_file", "replace_current_file"],
+  });
+  const readNode = toolNode(graph, "read_file");
+  const writeNode = toolNode(graph, "replace_current_file");
+  const originalReadId = readNode.id;
+  const optionalReadId = "optional-stale-read";
+  delete graph.nodes[originalReadId];
+  readNode.id = optionalReadId;
+  readNode.status = "blocked";
+  readNode.blocker = {
+    code: "tool_failure_terminal",
+    message: "Optional read failed before the required write completed.",
+    requiredAction: "Skip this off-path enrichment.",
+  };
+  graph.nodes[optionalReadId] = readNode;
+  for (const candidate of Object.values(graph.nodes)) {
+    candidate.dependencyIds = candidate.dependencyIds.flatMap((dependencyId) =>
+      dependencyId === originalReadId ? readNode.dependencyIds : [dependencyId],
+    );
+  }
+  writeNode.status = "ready";
+
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const execution = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  const executingNode = session.graph.nodes[execution.nodeId]!;
+  await session.finishToolExecution(execution, {
+    ok: true,
+    evidence: evidenceFor(
+      executingNode,
+      "7",
+      harness.nextTimestamp(),
+    ),
+    receipt: receiptFor(
+      executingNode,
+      "8",
+      harness.nextTimestamp(),
+    ),
+  });
+  assert.equal(session.graph.nodes.final.status, "ready");
+
+  const terminal = await session.completeFinalOutput({
+    outputFingerprint: fp("9"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(terminal.nodes.final.status, "complete");
+  assert.equal(terminal.nodes[optionalReadId]?.status, "cancelled");
+  assert.equal(terminal.nodes[optionalReadId]?.blocker, null);
+  assert.ok(
+    Object.values(terminal.nodes).every((node) =>
+      ["complete", "cancelled"].includes(node.status),
+    ),
+  );
+});
+
+test("final output preserves the canonical host post-acceptance action until it runs", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-preserves-host-post-acceptance",
+    allowedTools: ["replace_current_file", "append_research_memory"],
+    plannedTools: ["replace_current_file"],
+    postAcceptanceTools: ["append_research_memory"],
+  });
+  const postAcceptanceNode = toolNode(graph, "append_research_memory");
+  assert.match(
+    postAcceptanceNode.id,
+    /^post-acceptance-tool-\d{2}-append_research_memory$/u,
+  );
+
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const writeExecution = requireExecution(
+    await session.beginToolExecution("replace_current_file"),
+  );
+  const writeNode = session.graph.nodes[writeExecution.nodeId]!;
+  await session.finishToolExecution(writeExecution, {
+    ok: true,
+    evidence: evidenceFor(writeNode, "a", harness.nextTimestamp()),
+    receipt: receiptFor(writeNode, "b", harness.nextTimestamp()),
+  });
+  assert.equal(session.graph.nodes.final.status, "ready");
+  assert.equal(
+    session.graph.nodes[postAcceptanceNode.id]?.status,
+    "ready",
+  );
+
+  const accepted = await session.completeFinalOutput({
+    outputFingerprint: fp("c"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(accepted.nodes.final.status, "complete");
+  assert.equal(
+    accepted.nodes[postAcceptanceNode.id]?.status,
+    "ready",
+    "the host-owned post-acceptance action must remain callable after final proof",
+  );
+
+  const memoryExecution = requireExecution(
+    await session.beginToolExecution("append_research_memory"),
+  );
+  const memoryNode = session.graph.nodes[memoryExecution.nodeId]!;
+  const terminal = await session.finishToolExecution(memoryExecution, {
+    ok: true,
+    evidence: evidenceFor(memoryNode, "d", harness.nextTimestamp()),
+  });
+  assert.equal(terminal.nodes[postAcceptanceNode.id]?.status, "complete");
+  assert.ok(
+    Object.values(terminal.nodes).every((node) =>
+      ["complete", "cancelled"].includes(node.status),
+    ),
+  );
 });
 
 test("canonical evidence kinds satisfy the exact graph contract without weakening generic nodes", () => {
@@ -448,6 +585,638 @@ test("green fast validation skips the conditional repair checkpoint", async () =
   );
 });
 
+test("consecutive repaired conventional checkpoints each insert a fresh receipt-bound fast cycle before targeted validation", async () => {
+  const harness = createVaultHarness();
+  const missionId = "session-conventional-conditional-code-repair";
+  const names = [
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+  ];
+  const descriptors = [
+    sessionLifecycleDescriptor(
+      "code_validate_fast",
+      "workspace",
+      "reversible_mutation",
+    ),
+    sessionLifecycleDescriptor(
+      "code_repair_record_cycle",
+      "workspace",
+      "reversible_mutation",
+    ),
+    sessionLifecycleDescriptor(
+      "code_validate_targeted",
+      "workspace",
+      "reversible_mutation",
+    ),
+  ];
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective: "Execute the bounded session fixture mission.",
+    toolRegistry: registry,
+    allowedToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: 12,
+    maxWallClockMs: 120_000,
+    now: GRAPH_TIME,
+  });
+  const graph = (
+    await planMissionGraphV3({
+      mission: {
+        missionId,
+        objective: "Execute the bounded session fixture mission.",
+      },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const fast = requireExecution(
+    await session.beginToolExecution("code_validate_fast"),
+  );
+  const fastEvidence = evidenceFor(
+    session.graph.nodes[fast.nodeId],
+    "4",
+    harness.nextTimestamp(),
+  );
+  const afterFast = await session.finishToolExecution(fast, {
+    ok: true,
+    evidence: fastEvidence,
+    receipt: receiptFor(
+      session.graph.nodes[fast.nodeId],
+      "5",
+      harness.nextTimestamp(),
+    ),
+    skipNextToolNames: ["code_repair_record_cycle"],
+  });
+  const repair = toolNode(afterFast, "code_repair_record_cycle");
+  assert.equal(repair.status, "ready");
+  assert.equal(repair.retries.attempts, 0);
+  assert.equal(repair.evidence.length, 0);
+  assert.equal(repair.receipts.length, 0);
+  assert.equal(
+    toolNode(afterFast, "code_validate_targeted").status,
+    "queued",
+  );
+  const repairExecution = requireExecution(
+    await session.beginToolExecution("code_repair_record_cycle", {
+      allowDynamicReadContinuation: false,
+    }),
+  );
+  const envelopeFingerprint =
+    session.graph.capabilityEnvelope.fingerprint;
+  const beforeScheduleNodeCount = Object.keys(session.graph.nodes).length;
+  const scheduled = await session.scheduleRepairedFastValidationCycle(
+    repairExecution,
+  );
+  assert.equal(Object.keys(scheduled.nodes).length, beforeScheduleNodeCount + 2);
+  const repeatedFast = Object.values(scheduled.nodes).find(
+    (candidate) =>
+      candidate.id !== fast.nodeId &&
+      candidate.allowedTools.includes("code_validate_fast"),
+  );
+  const repeatedRepair = Object.values(scheduled.nodes).find(
+    (candidate) =>
+      candidate.id !== repairExecution.nodeId &&
+      candidate.allowedTools.includes("code_repair_record_cycle"),
+  );
+  assert.ok(repeatedFast);
+  assert.ok(repeatedRepair);
+  assert.equal(repeatedFast.status, "queued");
+  assert.deepEqual(
+    repeatedFast.dependencyIds,
+    session.graph.nodes[fast.nodeId]?.dependencyIds,
+  );
+  assert.equal(repeatedRepair.status, "queued");
+  assert.deepEqual(
+    repeatedRepair.dependencyIds,
+    [...new Set([
+      ...session.graph.nodes[repairExecution.nodeId]!.dependencyIds,
+      repeatedFast.id,
+    ])].sort(),
+  );
+  assert.ok(
+    toolNode(scheduled, "code_validate_targeted").dependencyIds.includes(
+      repeatedRepair.id,
+    ),
+  );
+  assert.ok(
+    graphBudget(scheduled).toolCalls <=
+      scheduled.capabilityEnvelope.budgets.maxTotalToolCalls,
+  );
+  assert.equal(
+    scheduled.capabilityEnvelope.fingerprint,
+    envelopeFingerprint,
+  );
+  const idempotent = await session.scheduleRepairedFastValidationCycle(
+    repairExecution,
+  );
+  assert.equal(Object.keys(idempotent.nodes).length, beforeScheduleNodeCount + 2);
+
+  const afterRepair = await session.finishToolExecution(repairExecution, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[repairExecution.nodeId],
+      "6",
+      harness.nextTimestamp(),
+    ),
+    receipt: receiptFor(
+      session.graph.nodes[repairExecution.nodeId],
+      "7",
+      harness.nextTimestamp(),
+    ),
+  });
+  assert.equal(
+    afterRepair.nodes[repairExecution.nodeId]?.status,
+    "complete",
+  );
+  assert.equal(
+    toolNode(afterRepair, "code_validate_targeted").status,
+    "queued",
+  );
+  assert.equal(afterRepair.nodes[repeatedFast.id]?.status, "queued");
+  assert.equal(
+    (await session.beginToolExecution("code_validate_fast")).ok,
+    false,
+    "the repeated fast node stays unavailable until a successful mutation receipt is recorded",
+  );
+  const afterPrematurePromotion = await session.promoteReadyNodes();
+  assert.equal(
+    afterPrematurePromotion.nodes[repeatedFast.id]?.status,
+    "queued",
+    "generic readiness promotion cannot bypass the correction receipt gate",
+  );
+  const unrelatedCorrection =
+    await session.recordValidationRecoveryCorrection({
+      toolName: "code_workspace_create_file",
+      path: "src/run_marker.py",
+      eligiblePaths: ["src/game.ts"],
+      receiptId: "receipt-unrelated-fast-correction",
+      receiptFingerprint: fp("7"),
+      observedAt: harness.nextTimestamp(),
+    });
+  assert.equal(unrelatedCorrection.recorded, false);
+  assert.equal(
+    unrelatedCorrection.graph.nodes[repeatedFast.id]?.status,
+    "queued",
+    "a changed but ineligible helper path cannot unlock fresh validation",
+  );
+  const firstCorrection = await session.recordValidationRecoveryCorrection({
+    toolName: "code_workspace_patch",
+    path: "src/game.ts",
+    eligiblePaths: ["src/game.ts"],
+    receiptId: "receipt-first-fast-correction",
+    receiptFingerprint: fp("8"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(firstCorrection.recorded, true);
+  assert.deepEqual(
+    Object.values(firstCorrection.graph.nodes)
+      .filter(
+        (candidate) =>
+          candidate.status === "ready" &&
+          afterPrematurePromotion.nodes[candidate.id]?.status !== "ready",
+      )
+      .map((candidate) => candidate.id),
+    [repeatedFast.id],
+    "the correction receipt unlocks exactly its bound fast-validation node",
+  );
+  assert.equal(
+    (
+      firstCorrection.graph.nodes[repeatedRepair.id]?.outputs
+        .validationRecovery as { status?: unknown }
+    )?.status,
+    "correction_recorded",
+  );
+
+  const repeatedFastExecution = requireExecution(
+    await session.beginToolExecution("code_validate_fast"),
+  );
+  assert.equal(repeatedFastExecution.nodeId, repeatedFast.id);
+  const afterRepeatedFast = await session.finishToolExecution(
+    repeatedFastExecution,
+    {
+      ok: true,
+      evidence: evidenceFor(
+        session.graph.nodes[repeatedFastExecution.nodeId],
+        "8",
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[repeatedFastExecution.nodeId],
+        "9",
+        harness.nextTimestamp(),
+      ),
+    },
+  );
+  assert.equal(afterRepeatedFast.nodes[repeatedRepair.id]?.status, "ready");
+  assert.equal(
+    toolNode(afterRepeatedFast, "code_validate_targeted").status,
+    "queued",
+  );
+
+  const repeatedRepairExecution = requireExecution(
+    await session.beginToolExecution("code_repair_record_cycle"),
+  );
+  assert.equal(repeatedRepairExecution.nodeId, repeatedRepair.id);
+  const beforeSecondScheduleNodeIds = new Set(
+    Object.keys(session.graph.nodes),
+  );
+  const secondScheduled = await session.scheduleRepairedFastValidationCycle(
+    repeatedRepairExecution,
+  );
+  assert.equal(
+    Object.keys(secondScheduled.nodes).length,
+    beforeSecondScheduleNodeIds.size + 2,
+  );
+  const secondRepeatedFast = Object.values(secondScheduled.nodes).find(
+    (candidate) =>
+      !beforeSecondScheduleNodeIds.has(candidate.id) &&
+      candidate.allowedTools.includes("code_validate_fast"),
+  );
+  const secondRepeatedRepair = Object.values(secondScheduled.nodes).find(
+    (candidate) =>
+      !beforeSecondScheduleNodeIds.has(candidate.id) &&
+      candidate.allowedTools.includes("code_repair_record_cycle"),
+  );
+  assert.ok(secondRepeatedFast);
+  assert.ok(secondRepeatedRepair);
+  assert.equal(secondRepeatedFast.status, "queued");
+  assert.equal(secondRepeatedRepair.status, "queued");
+  assert.ok(
+    toolNode(secondScheduled, "code_validate_targeted").dependencyIds.includes(
+      secondRepeatedRepair.id,
+    ),
+  );
+  assert.equal(
+    toolNode(secondScheduled, "code_validate_targeted").status,
+    "queued",
+  );
+
+  const afterRepeatedRepair = await session.finishToolExecution(
+    repeatedRepairExecution,
+    {
+      ok: true,
+      evidence: evidenceFor(
+        session.graph.nodes[repeatedRepairExecution.nodeId],
+        "a",
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[repeatedRepairExecution.nodeId],
+        "b",
+        harness.nextTimestamp(),
+      ),
+    },
+  );
+  assert.equal(
+    toolNode(afterRepeatedRepair, "code_validate_targeted").status,
+    "queued",
+  );
+  assert.equal(
+    afterRepeatedRepair.nodes[secondRepeatedFast.id]?.status,
+    "queued",
+  );
+  const secondCorrection = await session.recordValidationRecoveryCorrection({
+    toolName: "code_workspace_write_expected",
+    path: "src/game.ts",
+    eligiblePaths: ["src/game.ts"],
+    receiptId: "receipt-second-fast-correction",
+    receiptFingerprint: fp("c"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(secondCorrection.recorded, true);
+  assert.deepEqual(
+    Object.values(secondCorrection.graph.nodes)
+      .filter(
+        (candidate) =>
+          candidate.status === "ready" &&
+          afterRepeatedRepair.nodes[candidate.id]?.status !== "ready",
+      )
+      .map((candidate) => candidate.id),
+    [secondRepeatedFast.id],
+    "each correction receipt unlocks only the fresh fast node from its own cycle",
+  );
+
+  const secondRepeatedFastExecution = requireExecution(
+    await session.beginToolExecution("code_validate_fast"),
+  );
+  assert.equal(secondRepeatedFastExecution.nodeId, secondRepeatedFast.id);
+  const afterSecondRepeatedFast = await session.finishToolExecution(
+    secondRepeatedFastExecution,
+    {
+      ok: true,
+      evidence: evidenceFor(
+        session.graph.nodes[secondRepeatedFastExecution.nodeId],
+        "c",
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[secondRepeatedFastExecution.nodeId],
+        "d",
+        harness.nextTimestamp(),
+      ),
+    },
+  );
+  assert.equal(
+    afterSecondRepeatedFast.nodes[secondRepeatedRepair.id]?.status,
+    "ready",
+  );
+  assert.equal(
+    toolNode(afterSecondRepeatedFast, "code_validate_targeted").status,
+    "queued",
+  );
+
+  const secondRepeatedRepairExecution = requireExecution(
+    await session.beginToolExecution("code_repair_record_cycle"),
+  );
+  assert.equal(secondRepeatedRepairExecution.nodeId, secondRepeatedRepair.id);
+  const afterSecondRepeatedRepair = await session.finishToolExecution(
+    secondRepeatedRepairExecution,
+    {
+      ok: true,
+      evidence: evidenceFor(
+        session.graph.nodes[secondRepeatedRepairExecution.nodeId],
+        "e",
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[secondRepeatedRepairExecution.nodeId],
+        "f",
+        harness.nextTimestamp(),
+      ),
+    },
+  );
+  assert.equal(
+    toolNode(afterSecondRepeatedRepair, "code_validate_targeted").status,
+    "ready",
+  );
+  assert.doesNotThrow(() =>
+    validateMissionGraphV3(afterSecondRepeatedRepair),
+  );
+
+  const targetedExecution = requireExecution(
+    await session.beginToolExecution("code_validate_targeted"),
+  );
+  const targetedFailure = await session.finishFailedValidationWithRecovery(
+    targetedExecution,
+    {
+      evidence: evidenceFor(
+        session.graph.nodes[targetedExecution.nodeId],
+        "c",
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[targetedExecution.nodeId],
+        "d",
+        harness.nextTimestamp(),
+      ),
+      failureFingerprint: fp("e"),
+      failureMessage: "Protected targeted validation completed red.",
+    },
+  );
+  assert.equal(targetedFailure.scheduled, true);
+  const requeuedTargeted =
+    targetedFailure.graph.nodes[targetedExecution.nodeId];
+  assert.equal(requeuedTargeted?.status, "queued");
+  assert.equal(requeuedTargeted?.retries.attempts, 1);
+  const recoveryFast = Object.values(targetedFailure.graph.nodes).find(
+    (candidate) => candidate.id.startsWith("validation-recovery-fast-"),
+  );
+  const recoveryRepair = Object.values(targetedFailure.graph.nodes).find(
+    (candidate) => candidate.id.startsWith("validation-recovery-record-"),
+  );
+  assert.ok(recoveryFast);
+  assert.ok(recoveryRepair);
+  assert.equal(recoveryFast.status, "queued");
+  assert.equal(recoveryRepair.status, "queued");
+  assert.ok(requeuedTargeted?.dependencyIds.includes(recoveryRepair.id));
+  assert.equal(
+    (await session.beginToolExecution("code_validate_fast")).ok,
+    false,
+    "fresh validation is not callable until a correction receipt is recorded",
+  );
+  const correction = await session.recordValidationRecoveryCorrection({
+    toolName: "code_workspace_write_expected",
+    path: "src/game.ts",
+    eligiblePaths: ["src/game.ts"],
+    receiptId: "receipt-targeted-correction",
+    receiptFingerprint: fp("f"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(correction.recorded, true);
+  assert.equal(correction.graph.nodes[recoveryFast.id]?.status, "ready");
+  assert.equal(
+    (
+      correction.graph.nodes[targetedExecution.nodeId]?.outputs
+        .validationRecovery as { status?: unknown }
+    )?.status,
+    "correction_recorded",
+  );
+
+  const recoveryFastExecution = requireExecution(
+    await session.beginToolExecution("code_validate_fast"),
+  );
+  assert.equal(recoveryFastExecution.nodeId, recoveryFast.id);
+  await session.finishToolExecution(recoveryFastExecution, {
+    ok: true,
+    evidence: evidenceFor(
+      session.graph.nodes[recoveryFastExecution.nodeId],
+      "0",
+      harness.nextTimestamp(),
+    ),
+    receipt: receiptFor(
+      session.graph.nodes[recoveryFastExecution.nodeId],
+      "1",
+      harness.nextTimestamp(),
+    ),
+  });
+  const recoveryRepairExecution = requireExecution(
+    await session.beginToolExecution("code_repair_record_cycle"),
+  );
+  assert.equal(recoveryRepairExecution.nodeId, recoveryRepair.id);
+  const afterRecoveryRepair = await session.finishToolExecution(
+    recoveryRepairExecution,
+    {
+      ok: true,
+      evidence: evidenceFor(
+        session.graph.nodes[recoveryRepairExecution.nodeId],
+        "2",
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[recoveryRepairExecution.nodeId],
+        "3",
+        harness.nextTimestamp(),
+      ),
+    },
+  );
+  assert.equal(
+    afterRecoveryRepair.nodes[targetedExecution.nodeId]?.status,
+    "ready",
+  );
+  assert.ok(
+    graphBudget(afterRecoveryRepair).toolCalls <=
+      afterRecoveryRepair.capabilityEnvelope.budgets.maxTotalToolCalls,
+  );
+  assert.equal(
+    afterRecoveryRepair.capabilityEnvelope.fingerprint,
+    envelopeFingerprint,
+  );
+  assert.doesNotThrow(() => validateMissionGraphV3(afterRecoveryRepair));
+});
+
+test("red full validation recovery repeats targeted validation after a correction", async () => {
+  const harness = createVaultHarness();
+  const missionId = "session-full-validation-recovery";
+  const names = [
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+  ];
+  const descriptors = names.map((name) =>
+    sessionLifecycleDescriptor(name, "workspace", "reversible_mutation"),
+  );
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective: "Execute the bounded full-validation recovery mission.",
+    toolRegistry: registry,
+    allowedToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: 10,
+    maxWallClockMs: 180_000,
+    now: GRAPH_TIME,
+  });
+  const graph = (
+    await planMissionGraphV3({
+      mission: {
+        missionId,
+        objective: "Execute the bounded full-validation recovery mission.",
+      },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const complete = async (toolName: string, character: string) => {
+    const execution = requireExecution(
+      await session.beginToolExecution(toolName),
+    );
+    return session.finishToolExecution(execution, {
+      ok: true,
+      evidence: evidenceFor(
+        session.graph.nodes[execution.nodeId],
+        character,
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[execution.nodeId],
+        character,
+        harness.nextTimestamp(),
+      ),
+    });
+  };
+  await complete("code_validate_fast", "4");
+  await complete("code_repair_record_cycle", "5");
+  await complete("code_validate_targeted", "6");
+  const fullExecution = requireExecution(
+    await session.beginToolExecution("code_validate_full"),
+  );
+  const envelopeFingerprint = session.graph.capabilityEnvelope.fingerprint;
+  const recovery = await session.finishFailedValidationWithRecovery(
+    fullExecution,
+    {
+      evidence: evidenceFor(
+        session.graph.nodes[fullExecution.nodeId],
+        "7",
+        harness.nextTimestamp(),
+      ),
+      receipt: receiptFor(
+        session.graph.nodes[fullExecution.nodeId],
+        "8",
+        harness.nextTimestamp(),
+      ),
+      failureFingerprint: fp("9"),
+      failureMessage: "Fresh full validation completed red.",
+    },
+  );
+  assert.equal(recovery.scheduled, true);
+  const recoveryFast = Object.values(recovery.graph.nodes).find((candidate) =>
+    candidate.id.startsWith("validation-recovery-fast-"),
+  );
+  const recoveryRepair = Object.values(recovery.graph.nodes).find((candidate) =>
+    candidate.id.startsWith("validation-recovery-record-"),
+  );
+  const recoveryTargeted = Object.values(recovery.graph.nodes).find(
+    (candidate) =>
+      candidate.id.startsWith("validation-recovery-targeted-"),
+  );
+  assert.ok(recoveryFast);
+  assert.ok(recoveryRepair);
+  assert.ok(recoveryTargeted);
+  assert.equal(recoveryFast.status, "queued");
+  assert.equal(recoveryRepair.status, "queued");
+  assert.equal(recoveryTargeted.status, "queued");
+  assert.ok(recoveryTargeted.dependencyIds.includes(recoveryRepair.id));
+  assert.ok(
+    recovery.graph.nodes[fullExecution.nodeId]?.dependencyIds.includes(
+      recoveryTargeted.id,
+    ),
+  );
+  const correction = await session.recordValidationRecoveryCorrection({
+    toolName: "code_workspace_patch",
+    path: "src/game.ts",
+    eligiblePaths: ["src/game.ts"],
+    receiptId: "receipt-full-correction",
+    receiptFingerprint: fp("a"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(correction.recorded, true);
+  assert.equal(correction.graph.nodes[recoveryFast.id]?.status, "ready");
+  assert.equal(
+    correction.graph.capabilityEnvelope.fingerprint,
+    envelopeFingerprint,
+  );
+  assert.doesNotThrow(() => validateMissionGraphV3(correction.graph));
+});
+
 test("concurrent mutation starts serialize through the graph frontier and one exclusive lock", async () => {
   const harness = createVaultHarness();
   const graph = await graphFor({
@@ -489,6 +1258,180 @@ test("concurrent mutation starts serialize through the graph frontier and one ex
     await session.beginToolExecution("replace_current_file"),
   );
   assert.equal(replacement.toolName, "replace_current_file");
+});
+
+test("resume reconciles a legacy composite-owned append from exact note proof without replaying the write", async () => {
+  const fixture = await publicationReconciliationFixture(
+    "session-research-publication-legacy-append",
+  );
+  const { append, harness, receipt, session } = fixture;
+  assert.equal(append.status, "ready");
+  assert.equal(harness.files.get(fixture.notePath), fixture.noteContent);
+  assert.deepEqual(
+    harness.writes.filter((entry) => entry.endsWith(fixture.notePath)),
+    [],
+  );
+
+  const result = await reconcileCompositeOwnedCurrentNoteGraphOnResume({
+    session,
+    rootRunId: session.graph.missionId,
+    receipts: [receipt],
+    toolContext: harness.context,
+  });
+
+  assert.deepEqual(result, {
+    reconciled: true,
+    nodeId: append.id,
+    receiptId: receipt.id,
+    notePath: fixture.notePath,
+    reason: "reconciled",
+  });
+  const reconciled = session.graph.nodes[append.id]!;
+  assert.equal(reconciled.status, "complete");
+  assert.equal(
+    reconciled.retries.attempts,
+    0,
+    "proof reconciliation must not fabricate an append tool attempt",
+  );
+  assert.deepEqual(
+    reconciled.evidence.map(({ kind, fingerprint }) => ({
+      kind,
+      fingerprint,
+    })),
+    [
+      {
+        kind: "tool-result",
+        fingerprint: fixture.artifactFingerprint,
+      },
+    ],
+  );
+  assert.deepEqual(
+    reconciled.receipts.map(({ id, kind, fingerprint }) => ({
+      id,
+      kind,
+      fingerprint,
+    })),
+    [
+      {
+        id: fixture.noteReceiptId,
+        kind: "vault_write",
+        fingerprint: fixture.artifactNoteSha256,
+      },
+    ],
+  );
+  assert.equal(session.graph.nodes.final.status, "ready");
+  assert.equal(harness.files.get(fixture.notePath), fixture.noteContent);
+  assert.deepEqual(
+    harness.writes.filter((entry) => entry.endsWith(fixture.notePath)),
+    [],
+  );
+  assert.equal(
+    reconciled.receipts[0]?.committedAt,
+    GRAPH_TIME.toISOString(),
+    "the graph note proof retains the artifact acceptance time",
+  );
+});
+
+test("resume refuses publication graph closure when the current note is missing or drifted", async () => {
+  for (const state of ["missing", "drifted"] as const) {
+    const fixture = await publicationReconciliationFixture(
+      `session-research-publication-note-${state}`,
+    );
+    if (state === "missing") {
+      fixture.harness.files.delete(fixture.notePath);
+    } else {
+      fixture.harness.files.set(
+        fixture.notePath,
+        `${fixture.noteContent}\nUnverified drift.\n`,
+      );
+    }
+    const result = await reconcileCompositeOwnedCurrentNoteGraphOnResume({
+      session: fixture.session,
+      rootRunId: fixture.session.graph.missionId,
+      receipts: [fixture.receipt],
+      toolContext: fixture.harness.context,
+    });
+    assert.equal(result.reconciled, false);
+    assert.equal(result.reason, "publication_note_state_mismatch");
+    assert.equal(
+      fixture.session.graph.nodes[fixture.append.id]?.status,
+      "ready",
+    );
+    assert.deepEqual(
+      fixture.session.graph.nodes[fixture.append.id]?.receipts,
+      [],
+    );
+  }
+});
+
+test("resume refuses append-only and reflection graph nodes without exact publisher ancestry", async () => {
+  const appendOnlyHarness = createVaultHarness();
+  const appendOnlyGraph = await graphFor({
+    missionId: "session-research-publication-append-only",
+    allowedTools: ["append_to_current_file"],
+    plannedTools: ["append_to_current_file"],
+  });
+  const appendOnlySession = await MissionGraphSession.open({
+    context: appendOnlyHarness.context,
+    initialGraph: appendOnlyGraph,
+  });
+  const appendOnlyProof = await deduplicatedPublicationReceiptFor({
+    rootRunId: appendOnlyGraph.missionId,
+    noteContent: "# Accepted research\n\nVerified final note.\n",
+  });
+  appendOnlyHarness.files.set(
+    appendOnlyProof.notePath,
+    appendOnlyProof.noteContent,
+  );
+  const appendOnlyResult =
+    await reconcileCompositeOwnedCurrentNoteGraphOnResume({
+      session: appendOnlySession,
+      rootRunId: appendOnlyGraph.missionId,
+      receipts: [appendOnlyProof.receipt],
+      toolContext: appendOnlyHarness.context,
+    });
+  assert.equal(appendOnlyResult.reason, "legacy_append_not_ready");
+
+  const reflection = await publicationReconciliationFixture(
+    "session-research-publication-reflection",
+    "Write a concise reflection about the completed workflow.",
+  );
+  const reflectionResult =
+    await reconcileCompositeOwnedCurrentNoteGraphOnResume({
+      session: reflection.session,
+      rootRunId: reflection.session.graph.missionId,
+      receipts: [reflection.receipt],
+      toolContext: reflection.harness.context,
+    });
+  assert.equal(reflectionResult.reason, "legacy_append_not_ready");
+  assert.equal(
+    reflection.session.graph.nodes[reflection.append.id]?.status,
+    "ready",
+  );
+});
+
+test("resume fails closed on a same-id publication receipt conflict", async () => {
+  const fixture = await publicationReconciliationFixture(
+    "session-research-publication-receipt-conflict",
+  );
+  const result = await reconcileCompositeOwnedCurrentNoteGraphOnResume({
+    session: fixture.session,
+    rootRunId: fixture.session.graph.missionId,
+    receipts: [
+      fixture.receipt,
+      {
+        ...fixture.receipt,
+        message: `${fixture.receipt.message} conflicting replay`,
+      },
+    ],
+    toolContext: fixture.harness.context,
+  });
+  assert.equal(result.reconciled, false);
+  assert.equal(result.reason, "publication_receipt_conflict");
+  assert.equal(
+    fixture.session.graph.nodes[fixture.append.id]?.status,
+    "ready",
+  );
 });
 
 test("two identical failures stop retrying and persist a resumable blocker", async () => {
@@ -754,6 +1697,84 @@ test("ungranted mutation is rejected while a bounded envelope-approved read is a
     evidence: evidenceFor(dynamicNode, "6", harness.nextTimestamp()),
   });
   assert.equal(completed.nodes[read.nodeId].status, "complete");
+});
+
+test("failed optional dynamic reads are cancelled by final output while default retries still gate", async () => {
+  const openCompletedWriteSession = async (missionId: string) => {
+    const harness = createVaultHarness();
+    const graph = await graphFor({
+      missionId,
+      allowedTools: ["append_to_current_file", "web_search"],
+      plannedTools: ["append_to_current_file"],
+      maxToolCalls: 4,
+    });
+    const session = await MissionGraphSession.open({
+      context: harness.context,
+      initialGraph: graph,
+    });
+    const write = requireExecution(
+      await session.beginToolExecution("append_to_current_file"),
+    );
+    const writeNode = session.graph.nodes[write.nodeId]!;
+    await session.finishToolExecution(write, {
+      ok: true,
+      evidence: evidenceFor(writeNode, "1", harness.nextTimestamp()),
+      receipt: receiptFor(writeNode, "2", harness.nextTimestamp()),
+    });
+    assert.equal(session.graph.nodes.final.status, "ready");
+    return { harness, session };
+  };
+
+  const required = await openCompletedWriteSession(
+    "session-required-dynamic-read",
+  );
+  const requiredRead = requireExecution(
+    await required.session.beginToolExecution("web_search"),
+  );
+  assert.match(requiredRead.nodeId, /^retry-/u);
+  await required.session.finishToolExecution(requiredRead, {
+    ok: false,
+    failureFingerprint: fp("3"),
+    failureMessage: "The required dynamic read failed once.",
+  });
+  const requiredTerminal = await required.session.completeFinalOutput({
+    outputFingerprint: fp("4"),
+    observedAt: required.harness.nextTimestamp(),
+  });
+  assert.equal(requiredTerminal.nodes[requiredRead.nodeId]?.status, "ready");
+  assert.equal(requiredTerminal.nodes.final.status, "queued");
+  assert.ok(
+    requiredTerminal.nodes.final.dependencyIds.includes(requiredRead.nodeId),
+  );
+
+  const optional = await openCompletedWriteSession(
+    "session-optional-dynamic-read",
+  );
+  const optionalRead = requireExecution(
+    await optional.session.beginToolExecution("web_search", {
+      optionalDynamicContinuation: true,
+    }),
+  );
+  assert.match(optionalRead.nodeId, /^optional-retry-/u);
+  assert.equal(optional.session.graph.nodes.final.status, "ready");
+  assert.equal(
+    optional.session.graph.nodes.final.dependencyIds.includes(
+      optionalRead.nodeId,
+    ),
+    false,
+  );
+  await optional.session.finishToolExecution(optionalRead, {
+    ok: false,
+    failureFingerprint: fp("5"),
+    failureMessage: "The optional companion read failed once.",
+  });
+  const optionalTerminal = await optional.session.completeFinalOutput({
+    outputFingerprint: fp("6"),
+    observedAt: optional.harness.nextTimestamp(),
+  });
+  assert.equal(optionalTerminal.nodes.final.status, "complete");
+  assert.equal(optionalTerminal.nodes[optionalRead.nodeId]?.status, "cancelled");
+  assert.equal(optionalTerminal.nodes[optionalRead.nodeId]?.blocker, null);
 });
 
 test("composite lifecycle reserves bounded capacity for an initial host-safe note read", async () => {
@@ -1025,6 +2046,7 @@ test("a completed effectful template permits a bounded same-authority continuati
     await session.beginToolExecution("append_to_current_file"),
   );
   assert.equal(beforeIds.has(second.nodeId), false);
+  assert.match(second.nodeId, /^retry-/u);
   const secondNode = session.graph.nodes[second.nodeId];
   assert.equal(secondNode.effect, firstNode.effect);
   assert.deepEqual(secondNode.destination, firstNode.destination);
@@ -1044,6 +2066,66 @@ test("a completed effectful template permits a bounded same-authority continuati
   });
   assert.equal(completed.nodes[second.nodeId].status, "complete");
   assert.equal(completed.nodes.final.status, "ready");
+});
+
+test("failed optional effectful continuations do not strand final proof", async () => {
+  const harness = createVaultHarness();
+  const graph = await workspaceCollisionGraphFor(
+    "session-optional-effectful-continuation",
+  );
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const first = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file"),
+  );
+  const firstNode = session.graph.nodes[first.nodeId]!;
+  await session.finishToolExecution(first, {
+    ok: true,
+    evidence: evidenceFor(firstNode, "1", harness.nextTimestamp()),
+    receipt: receiptFor(firstNode, "2", harness.nextTimestamp()),
+  });
+  assert.equal(session.graph.nodes.final.status, "ready");
+
+  const optional = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file", {
+      optionalDynamicContinuation: true,
+    }),
+  );
+  assert.match(optional.nodeId, /^optional-retry-/u);
+  assert.equal(session.graph.nodes.final.status, "ready");
+  assert.equal(
+    session.graph.nodes.final.dependencyIds.includes(optional.nodeId),
+    false,
+  );
+  await session.finishToolExecution(optional, {
+    ok: false,
+    failureFingerprint: fp("3"),
+    failureMessage: "repository_path_out_of_scope for first candidate",
+  });
+  const retry = requireExecution(
+    await session.beginToolExecution("code_workspace_create_file", {
+      optionalDynamicContinuation: true,
+    }),
+  );
+  assert.equal(retry.nodeId, optional.nodeId);
+  const afterSecondFailure = await session.finishToolExecution(retry, {
+    ok: false,
+    failureFingerprint: fp("4"),
+    failureMessage: "repository_path_out_of_scope for second candidate",
+  });
+  assert.equal(afterSecondFailure.nodes[optional.nodeId]?.status, "ready");
+  assert.equal(afterSecondFailure.nodes[optional.nodeId]?.retries.attempts, 2);
+  assert.equal(afterSecondFailure.nodes[optional.nodeId]?.blocker, null);
+
+  const terminal = await session.completeFinalOutput({
+    outputFingerprint: fp("5"),
+    observedAt: harness.nextTimestamp(),
+  });
+  assert.equal(terminal.nodes.final.status, "complete");
+  assert.equal(terminal.nodes[optional.nodeId]?.status, "cancelled");
+  assert.equal(terminal.nodes[optional.nodeId]?.blocker, null);
 });
 
 test("a full-envelope effectful continuation transfers reserve without widening authority", async () => {
@@ -1197,10 +2279,300 @@ test("approval expiry is not misreported as a user denial", async () => {
   assert.deepEqual(stored.record.resourceLocks.locks, {});
 });
 
+async function publicationReconciliationFixture(
+  missionId: string,
+  appendObjective?: string,
+) {
+  const harness = createVaultHarness();
+  const graph = await publicationAppendGraphFor(missionId);
+  if (appendObjective) {
+    toolNode(graph, "append_to_current_file").objective = appendObjective;
+  }
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+  const publisher = toolNode(session.graph, "publish_research_to_linear");
+  const publicationExecution = requireExecution(
+    await session.beginToolExecution("publish_research_to_linear"),
+  );
+  await session.finishToolExecution(publicationExecution, {
+    ok: true,
+    evidence: evidenceFor(
+      publisher,
+      "1",
+      harness.nextTimestamp(),
+    ),
+    receipt: receiptFor(
+      publisher,
+      "2",
+      harness.nextTimestamp(),
+    ),
+  });
+  const append = toolNode(session.graph, "append_to_current_file");
+  const proof = await deduplicatedPublicationReceiptFor({
+    rootRunId: missionId,
+    noteContent: "# Accepted research\n\nVerified final note and Linear backlink.\n",
+  });
+  harness.files.set(proof.notePath, proof.noteContent);
+  return {
+    append,
+    artifactFingerprint: proof.artifactFingerprint,
+    artifactNoteSha256: proof.artifactNoteSha256,
+    harness,
+    noteContent: proof.noteContent,
+    notePath: proof.notePath,
+    noteReceiptId: proof.noteReceiptId,
+    receipt: proof.receipt,
+    session,
+  };
+}
+
+async function publicationAppendGraphFor(
+  missionId: string,
+): Promise<MissionGraphV3> {
+  const descriptors = [
+    sessionLifecycleDescriptor(
+      "publish_research_to_linear",
+      "linear",
+      "publish",
+    ),
+    descriptorFor("append_to_current_file"),
+  ];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const byName = new Map(
+    descriptors.map((descriptor) => [descriptor.name, descriptor] as const),
+  );
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      names.map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    getDescriptor: (name) => byName.get(name) ?? null,
+    execute: async (call) => ({ ok: true, toolName: call.name }),
+  };
+  const objective = "Execute the bounded compatibility fixture.";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId,
+    objective,
+    toolRegistry: registry,
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: "Research/Brief.md",
+    maxToolCalls: 4,
+    maxWallClockMs: 120_000,
+    now: GRAPH_TIME,
+  });
+  return (
+    await planMissionGraphV3({
+      mission: { missionId, objective },
+      routerMode: "off",
+      capabilityEnvelope: host.capabilityEnvelope,
+      deterministicProposal: host.deterministicProposal,
+      allowedToolDescriptors: host.allowedToolDescriptors,
+      now: () => GRAPH_TIME.toISOString(),
+    })
+  ).graph;
+}
+
+async function deduplicatedPublicationReceiptFor(input: {
+  rootRunId: string;
+  noteContent: string;
+}) {
+  const notePath = "Research/Brief.md";
+  const noteReceiptId = `research-note-${input.rootRunId}`.slice(0, 120);
+  const artifactNoteSha256 = fp("d");
+  const currentNoteSha256 = await sha256DiagramContent(input.noteContent);
+  const acceptedAt = GRAPH_TIME.toISOString();
+  const verifiedAt = new Date(
+    GRAPH_TIME.getTime() + 60_000,
+  ).toISOString();
+  const artifact = createAcceptedResearchArtifactV1({
+    schemaVersion: 1,
+    artifactId: `accepted-${input.rootRunId}`.slice(0, 150),
+    originRunId: input.rootRunId,
+    vaultBindingKey: "vault-test",
+    notePath,
+    noteSha256: artifactNoteSha256,
+    noteReceiptId,
+    evidence: [
+      {
+        id: "source-1",
+        kind: "web",
+        reference: "https://example.com/research-source",
+        contentSha256: fp("a"),
+      },
+    ],
+    acceptanceCriteria: [
+      {
+        id: "AC-1",
+        text: "The accepted research remains linked to the verified issue.",
+      },
+    ],
+    riskClass: "medium",
+    acceptedAt,
+    acceptedBy: "host",
+  });
+  const workItem = createWorkItemSpecV2({
+    schemaVersion: 2,
+    ready: true,
+    executionClass: "research",
+    objective: "Preserve the accepted research publication proof.",
+    acceptanceCriteria: [...artifact.acceptanceCriteria],
+    validationRequirementKeys: ["publication-proof"],
+    evidenceRefs: ["https://example.com/research-source"],
+    riskClass: artifact.riskClass,
+    originRunId: input.rootRunId,
+    acceptedResearchArtifactFingerprint: artifact.artifactFingerprint,
+    generation: 0,
+  });
+  const issueId = "issue-publication-1";
+  const issueIdentifier = "APP-1";
+  const issueUrl = "https://linear.app/team/issue/APP-1";
+  const issueSnapshotHash = fp("e");
+  const binding = createExternalWorkItemBindingV1({
+    schemaVersion: 1,
+    bindingId: `linear-${artifact.artifactId}`.slice(0, 150),
+    provider: "linear",
+    originRunId: input.rootRunId,
+    workspaceId: "workspace-1",
+    teamId: "team-1",
+    issueId,
+    issueIdentifier,
+    issueUrl,
+    issueUpdatedAt: verifiedAt,
+    workItemFingerprint: workItem.fingerprint,
+    acceptedResearchArtifactFingerprint: artifact.artifactFingerprint,
+    verifiedAt,
+  });
+  let lineage = createWorkItemLineageV1({
+    schemaVersion: 1,
+    lineageId: `publication-${artifact.artifactId}`.slice(0, 150),
+    originRunId: input.rootRunId,
+    executionClass: "research",
+    workItemFingerprint: workItem.fingerprint,
+    researchArtifactFingerprint: artifact.artifactFingerprint,
+    events: [
+      {
+        sequence: 1,
+        state: "accepted_research",
+        domain: "research",
+        occurredAt: acceptedAt,
+        receiptId: `accepted-${artifact.artifactId}`.slice(0, 120),
+        evidenceFingerprint: artifact.artifactFingerprint,
+      },
+    ],
+  });
+  lineage = appendWorkItemLineageTransitionV1(lineage, {
+    state: "note_verified",
+    occurredAt: acceptedAt,
+    receiptId: artifact.noteReceiptId,
+    evidenceFingerprint: artifact.noteSha256,
+  });
+  const publicationReceiptId =
+    `linear-research-readback-${input.rootRunId}`.slice(0, 120);
+  lineage = appendWorkItemLineageTransitionV1(lineage, {
+    state: "linear_verified",
+    occurredAt: verifiedAt,
+    receiptId: `linear-readback-${issueId}`,
+    evidenceFingerprint: binding.bindingFingerprint,
+    externalWorkItemBindingFingerprint: binding.bindingFingerprint,
+  });
+  const issue = {
+    resourceType: "issue" as const,
+    id: issueId,
+    identifier: issueIdentifier,
+    url: issueUrl,
+    title: "Accepted research",
+    description: renderQueueExecutableHumanWorkItemSpecV2(workItem),
+    priority: 0,
+    trashed: false,
+    team: { id: "team-1" },
+    project: { id: "project-1" },
+    state: { id: "state-1" },
+    labels: [],
+    createdAt: verifiedAt,
+    updatedAt: verifiedAt,
+    snapshotHash: issueSnapshotHash,
+  };
+  const approvalFingerprint = fp("f");
+  const receipt = {
+    version: 1,
+    id: publicationReceiptId,
+    runId: `${input.rootRunId}-segment`,
+    actionId: "linear-readback-call-1",
+    toolName: "linear_read_issue",
+    operation: "read",
+    resource: {
+      system: "linear",
+      resourceType: "issue",
+      id: issue.id,
+      identifier: issue.identifier,
+      url: issue.url,
+      teamId: issue.team.id,
+      projectId: issue.project.id,
+      revision: issue.updatedAt,
+    },
+    message:
+      "Verified exact duplicate Linear issue APP-1; no mutation grant was created or consumed.",
+    payloadFingerprint: approvalFingerprint,
+    grantId: "linear-deduplicated-readback",
+    idempotencyKey: `research-publication:${workItem.fingerprint}`,
+    startedAt: verifiedAt,
+    committedAt: verifiedAt,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: verifiedAt,
+      observedRevision: issue.updatedAt,
+      observedFingerprint: issue.snapshotHash,
+    },
+    output: {
+      ok: true,
+      status: "complete",
+      publication: "deduplicated",
+      note: {
+        path: notePath,
+        operation: "no_op",
+        beforeSha256: currentNoteSha256,
+        afterSha256: currentNoteSha256,
+        noteReceiptId,
+        artifact,
+        transaction: null,
+      },
+      artifact,
+      lineage,
+      approvalFingerprint,
+      binding,
+      issue,
+      backlink: {
+        path: notePath,
+        operation: "append",
+        beforeSha256: artifactNoteSha256,
+        afterSha256: currentNoteSha256,
+        issueUrl,
+        transaction: null,
+      },
+      receipt: null,
+    },
+  } as ResearchPublicationResumeReceiptV1;
+  return {
+    artifactFingerprint: artifact.artifactFingerprint,
+    artifactNoteSha256,
+    noteContent: input.noteContent,
+    notePath,
+    noteReceiptId,
+    receipt,
+  };
+}
+
 async function graphFor(input: {
   missionId: string;
   allowedTools: string[];
   plannedTools: string[];
+  postAcceptanceTools?: string[];
   maxToolCalls?: number;
   maxWallClockMs?: number;
 }): Promise<MissionGraphV3> {
@@ -1211,6 +2583,7 @@ async function graphFor(input: {
     toolRegistry: registry,
     allowedToolNames: input.allowedTools,
     plannedToolNames: input.plannedTools,
+    postAcceptanceToolNames: input.postAcceptanceTools,
     currentNotePath: "Research/Brief.md",
     maxToolCalls: input.maxToolCalls ?? 8,
     maxWallClockMs: input.maxWallClockMs ?? 120_000,

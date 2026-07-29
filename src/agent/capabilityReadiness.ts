@@ -30,10 +30,20 @@ export function evaluatePinnedGitIdentityReadinessV1(): boolean {
  * Classic OAuth `repo` includes delete for owned repositories; fine-grained
  * tokens need an explicit `delete_repo` grant. Returns null when scopes were
  * not observed so callers can fail closed for cleanup-required missions.
+ *
+ * `credentialKind` matters because GitHub only returns `X-OAuth-Scopes` for
+ * classic tokens. A fine-grained PAT therefore always reports no scopes, and
+ * inferring from that string alone declared every such credential incapable of
+ * cleanup — including one holding Administration: write. For that kind the
+ * scope list carries no signal at all, so authority is reported as unknown
+ * (null) and must be settled by an actual attempt rather than by guessing
+ * either way.
  */
 export function githubCleanupAuthorityFromScopesV1(
   scopes: readonly string[] | null | undefined,
+  credentialKind?: string | null,
 ): boolean | null {
+  if (credentialKind === "fine_grained_pat") return null;
   if (!scopes) return null;
   const normalized = scopes
     .map((scope) => scope.trim().toLowerCase())
@@ -42,6 +52,27 @@ export function githubCleanupAuthorityFromScopesV1(
   return normalized.some(
     (scope) => scope === "delete_repo" || scope === "repo",
   );
+}
+
+/**
+ * Copy for the cleanup readiness gate. A fine-grained PAT cannot advertise its
+ * permissions, so the operator needs to be told that specifically rather than
+ * being sent to re-grant a scope that does not exist for their token type.
+ */
+export function githubCleanupAuthorityReasonV1(input: {
+  authorized: boolean | null;
+  credentialKind?: string | null;
+}): string {
+  if (input.authorized === true) {
+    return "GitHub credential includes repository cleanup authority.";
+  }
+  if (input.authorized === false) {
+    return "The connected GitHub credential lacks delete_repo (or classic repo) cleanup authority.";
+  }
+  if (input.credentialKind === "fine_grained_pat") {
+    return "A fine-grained personal access token does not report its permissions, so cleanup authority cannot be read in advance. Grant Administration: write on the target repositories; a cleanup attempt will report the exact failure if it is missing.";
+  }
+  return "GitHub cleanup authority has not been observed on the connected credential.";
 }
 
 export interface CapabilityReadinessV2 {

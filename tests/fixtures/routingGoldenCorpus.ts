@@ -39,12 +39,18 @@ export interface RoutingGoldenCaseV1 {
   extraTools?: readonly string[];
 }
 
+/**
+ * Scratch delivery to a known host folder. It deliberately excludes
+ * code_repair_record_cycle and code_commit_verified: both resolve a trusted
+ * repository worktree and fail closed with trusted_repository_required on a
+ * scratch workspace, which stranded the mission after the files were authored
+ * but before they reached the folder the user named.
+ */
 export const FULL_DESKTOP_LADDER = [
   "code_sandbox_status",
   "code_workspace_create",
   "code_workspace_create_file",
   "code_validate_fast",
-  "code_repair_record_cycle",
   "code_validate_targeted",
   "code_validate_full",
   "code_workspace_export_directory",

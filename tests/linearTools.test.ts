@@ -128,6 +128,53 @@ test("read tools directly execute only their mapped catalog operation", async ()
   ]);
 });
 
+test("comment listing requires an exact issue ID and compiles it into the fixed provider filter", async () => {
+  const calls: Array<{
+    key: string;
+    variables: Record<string, unknown>;
+  }> = [];
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      calls.push({ key, variables });
+      return {
+        items: [],
+        pageInfo: { hasNextPage: false },
+        fetchedAt: "2026-07-28T15:00:00.000Z",
+      };
+    },
+  };
+  const tool = requireTool(
+    createLinearTools({ client, gate: 1 }),
+    "linear_list_comments",
+  );
+
+  assert.deepEqual(tool.parameters.required, ["issueId"]);
+  assert.equal("filter" in (tool.parameters.properties ?? {}), false);
+  await tool.execute(
+    {
+      issueId: "22d8feec-9e09-454b-9d6e-8c56581b14fa",
+      first: 25,
+      includeArchived: false,
+    },
+    contextFixture(),
+  );
+
+  assert.deepEqual(calls, [
+    {
+      key: "comments.list",
+      variables: {
+        filter: {
+          issue: {
+            id: { eq: "22d8feec-9e09-454b-9d6e-8c56581b14fa" },
+          },
+        },
+        first: 25,
+        includeArchived: false,
+      },
+    },
+  ]);
+});
+
 test("issue creation prepares a canonical action without dispatching a mutation", async () => {
   const calls: string[] = [];
   const client: LinearToolClient = {
@@ -735,6 +782,161 @@ test("comment deletion succeeds only after absence readback", async () => {
   });
   assert.equal(result.receipt?.readback.status, "verified");
   assert.equal(result.receipt?.effects?.changedFields?.[0], "deleted");
+});
+
+test("issue trash treats provider not-found as verified terminal readback", async () => {
+  let trashed = false;
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      if (key === "issues.get" && trashed) throw notFound(key);
+      if (key === "issues.get") return issueRecord();
+      if (key === "issues.trash") {
+        trashed = true;
+        return mutationAck(key, "issue");
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    { name: "linear_trash_issue", arguments: { id: "issue-1" } },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-trash",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.receipt?.readback.status, "verified");
+  assert.equal(result.receipt?.effects?.changedFields?.[0], "trashed");
+});
+
+test("permanent issue deletion from an active issue requires provider not-found readback for the exact issue", async () => {
+  const issueId = "issue-active-delete";
+  const calls: string[] = [];
+  let deleted = false;
+  let providerNotFoundReadbacks = 0;
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      calls.push(key);
+      if (key === "issues.get" && deleted) {
+        providerNotFoundReadbacks += 1;
+        throw notFound(key);
+      }
+      if (key === "issues.get") return issueRecord({ id: issueId });
+      if (key === "issues.delete_permanently") {
+        deleted = true;
+        return mutationAck(key, "issue");
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_delete_issue_permanently",
+      arguments: { id: issueId },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-permanent-delete-active",
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [
+    "issues.get",
+    "issues.get",
+    "issues.delete_permanently",
+    "issues.get",
+  ]);
+  assert.equal(providerNotFoundReadbacks, 1);
+  assert.deepEqual(result.output, {
+    success: true,
+    deleted: true,
+    id: issueId,
+  });
+  assert.equal(result.receipt?.readback.status, "verified");
+  assert.equal(result.receipt?.resource.system, "linear");
+  assert.equal(result.receipt?.resource.resourceType, "issue");
+  assert.equal(result.receipt?.resource.id, issueId);
+  assert.deepEqual(result.receipt?.effects?.changedFields, ["deleted"]);
+});
+
+test("permanent issue deletion from a trashed issue requires provider not-found readback for the exact issue", async () => {
+  const issueId = "issue-trashed-delete";
+  const calls: string[] = [];
+  let deleted = false;
+  let providerNotFoundReadbacks = 0;
+  const trashedIssue: LinearIssueRecord = {
+    ...issueRecord({ id: issueId }),
+    trashed: true,
+    snapshotHash: HASH_B,
+  };
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      calls.push(key);
+      if (key === "issues.get" && deleted) {
+        providerNotFoundReadbacks += 1;
+        throw notFound(key);
+      }
+      if (key === "issues.get") return trashedIssue;
+      if (key === "issues.delete_permanently") {
+        deleted = true;
+        return mutationAck(key, "issue");
+      }
+      throw new Error(`Unexpected operation ${key}`);
+    },
+  };
+  const registry = new DefaultToolRegistry(createLinearTools({ client, gate: 1 }));
+  const context = contextFixture();
+  const prepared = await registry.prepare(
+    {
+      name: "linear_delete_issue_permanently",
+      arguments: { id: issueId },
+    },
+    context,
+  );
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) return;
+  assert.equal(prepared.action.preview.before?.trashed, true);
+
+  const result = await registry.executePrepared(prepared.action, context, {
+    preparedActionId: prepared.action.id,
+    payloadFingerprint: prepared.action.payloadFingerprint,
+    grantId: "grant-linear-permanent-delete-trashed",
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [
+    "issues.get",
+    "issues.get",
+    "issues.delete_permanently",
+    "issues.get",
+  ]);
+  assert.equal(providerNotFoundReadbacks, 1);
+  assert.deepEqual(result.output, {
+    success: true,
+    deleted: true,
+    id: issueId,
+  });
+  assert.equal(result.receipt?.readback.status, "verified");
+  assert.equal(result.receipt?.resource.system, "linear");
+  assert.equal(result.receipt?.resource.resourceType, "issue");
+  assert.equal(result.receipt?.resource.id, issueId);
+  assert.deepEqual(result.receipt?.effects?.changedFields, ["deleted"]);
 });
 
 test("gate-two project creation uses generic prepared input and exact readback", async () => {

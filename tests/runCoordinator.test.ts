@@ -49,6 +49,54 @@ test("run coordinator replays buffered events to a replacement view", async () =
   assert.deepEqual(seen, ["working", "final"]);
 });
 
+test("provider usage scope is stable within one start and unique across starts", async () => {
+  const coordinator = new RunCoordinator();
+  let firstScope: string | null = null;
+  await coordinator.start(async (_signal, events) => {
+    firstScope = coordinator.getSnapshot().providerUsageScopeId;
+    events.onRunConfig?.({ runId: "lead-segment-1" } as never);
+    events.onRunConfig?.({ runId: "lead-segment-2" } as never);
+    assert.equal(coordinator.getSnapshot().providerUsageScopeId, firstScope);
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  assert.ok(firstScope);
+  let secondScope: string | null = null;
+  await coordinator.start(async (_signal, events) => {
+    secondScope = coordinator.getSnapshot().providerUsageScopeId;
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  assert.ok(secondScope);
+  assert.notEqual(secondScope, firstScope);
+});
+
+test("events from a completed coordinator generation cannot contaminate a later run", async () => {
+  const coordinator = new RunCoordinator();
+  let staleEvents:
+    | Parameters<Parameters<RunCoordinator["start"]>[0]>[1]
+    | undefined;
+  await coordinator.start(async (_signal, events) => {
+    staleEvents = events;
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  await coordinator.start(async (_signal, events) => {
+    staleEvents?.onModelCallEvidence?.(
+      modelCallEvidenceForTest("stale-model-call"),
+    );
+    events.onModelCallEvidence?.(modelCallEvidenceForTest("current-model-call"));
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.providerUsage.modelCallCount, 1);
+  assert.deepEqual(
+    snapshot.modelCallEvidence.map((item) => item.callId),
+    ["current-model-call"],
+  );
+});
+
 test("run coordinator aggregates redacted provider evidence", async () => {
   const coordinator = new RunCoordinator();
   await coordinator.start(async (_signal, events) => {
@@ -62,6 +110,7 @@ test("run coordinator aggregates redacted provider evidence", async () => {
       transportKind: "production",
       attempt: 1,
       durationMs: 42,
+      clientInvoked: true,
       outcome: "success",
       responseChars: 80,
       promptTokens: 9,
@@ -76,6 +125,69 @@ test("run coordinator aggregates redacted provider evidence", async () => {
   assert.equal(snapshot.providerUsage.modelCallCount, 1);
   assert.equal(snapshot.providerUsage.reportedTokens, 13);
   assert.equal(snapshot.providerUsage.wallClockMs, 42);
+});
+
+test("run coordinator does not count a pre-dispatch budget rejection as a provider call", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onModelCallEvidence?.({
+      schemaVersion: 1,
+      callId: "model-call-budget",
+      phase: "retry",
+      provider: "ollama",
+      model: "gpt-oss:120b-cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+      attempt: 2,
+      durationMs: 0,
+      clientInvoked: false,
+      outcome: "budget_exhausted",
+      responseChars: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      tokenUsageReported: false,
+      errorCategory: "provider_budget_exhausted",
+    });
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "budget" });
+  });
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.modelCallEvidence.length, 1);
+  assert.equal(snapshot.providerUsage.modelCallCount, 0);
+  assert.equal(snapshot.providerUsage.successfulCallCount, 0);
+  assert.equal(snapshot.providerUsage.failedCallCount, 0);
+});
+
+test("run coordinator counts a provider-returned quota error as a failed client call", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onModelCallEvidence?.({
+      schemaVersion: 1,
+      callId: "model-call-provider-quota",
+      phase: "agent_step",
+      provider: "ollama",
+      model: "gpt-oss:120b-cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+      attempt: 1,
+      durationMs: 25,
+      clientInvoked: true,
+      outcome: "budget_exhausted",
+      responseChars: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      tokenUsageReported: false,
+      errorCategory: "provider_budget_exhausted",
+    });
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "budget" });
+  });
+
+  const snapshot = coordinator.getSnapshot();
+  assert.equal(snapshot.providerUsage.modelCallCount, 1);
+  assert.equal(snapshot.providerUsage.successfulCallCount, 0);
+  assert.equal(snapshot.providerUsage.failedCallCount, 1);
+  assert.equal(snapshot.providerUsage.wallClockMs, 25);
 });
 
 test("run coordinator retains, replays, and resets the latest mission scorecard", async () => {
@@ -281,6 +393,7 @@ test("run coordinator hydrates and replays an idle persisted mission projection"
       status: "blocked",
       evidenceCount: 1,
       receiptCount: 1,
+      providerUsage: emptyProviderUsageForTest(),
       expectedTools: ["append_to_current_file"],
       nextAction: "Verify the final artifact.",
       remainingActions: ["Verify the final artifact."],
@@ -332,6 +445,7 @@ test("starting a new run clears the persisted restart projection", async () => {
       status: "running",
       evidenceCount: 0,
       receiptCount: 0,
+      providerUsage: emptyProviderUsageForTest(),
       expectedTools: [],
       nextAction: "Continue.",
       remainingActions: ["Continue."],
@@ -489,6 +603,7 @@ test("a continuation stopped before publishing authority retains its verified re
       status: "stopped",
       evidenceCount: 2,
       receiptCount: 1,
+      providerUsage: emptyProviderUsageForTest(),
       expectedTools: ["publish_research_project_to_linear"],
       nextAction: "Create the Linear hierarchy.",
       remainingActions: ["Create the Linear hierarchy."],
@@ -558,6 +673,7 @@ test("a durable continuation does not replace its projection with a routing-only
       status: "budget",
       evidenceCount: 3,
       receiptCount: 2,
+      providerUsage: emptyProviderUsageForTest(),
       expectedTools: ["publish_research_project_to_linear"],
       nextAction: "Resume the Linear hierarchy.",
       remainingActions: ["Resume the Linear hierarchy."],
@@ -598,6 +714,40 @@ test("a durable continuation does not replace its projection with a routing-only
     "run_returned_before_authority",
   );
 });
+
+function modelCallEvidenceForTest(callId: string) {
+  return {
+    schemaVersion: 1 as const,
+    callId,
+    phase: "agent_step" as const,
+    provider: "ollama" as const,
+    model: "gpt-oss:120b-cloud",
+    endpointCategory: "ollama_cloud" as const,
+    transportKind: "production" as const,
+    attempt: 1,
+    durationMs: 10,
+    clientInvoked: true,
+    outcome: "success" as const,
+    responseChars: 20,
+    promptTokens: 2,
+    completionTokens: 1,
+    totalTokens: 3,
+    tokenUsageReported: true,
+  };
+}
+
+function emptyProviderUsageForTest() {
+  return {
+    schemaVersion: 1 as const,
+    modelCallCount: 0,
+    successfulCallCount: 0,
+    failedCallCount: 0,
+    reportedTokens: 0,
+    estimatedTokens: 0,
+    retries: 0,
+    wallClockMs: 0,
+  };
+}
 
 test("run coordinator retains a bounded redacted terminal rejection", async () => {
   const coordinator = new RunCoordinator();

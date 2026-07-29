@@ -164,6 +164,48 @@ export function buildContinuationHandoffV1(input: {
   };
 }
 
+/**
+ * Semantic progress token for cross-segment loop control.
+ *
+ * Deliberately excludes run/segment identity, timestamps, graph revision and
+ * recovery prose/counters. Those values can churn while the executable
+ * frontier and every durable proof surface remain unchanged.
+ */
+export function continuationProgressFingerprintV1(
+  handoff: ContinuationHandoffV1,
+): string {
+  return fingerprint({
+    version: 1,
+    graphFrontier: handoff.graphFrontier
+      ? {
+          missionId: handoff.graphFrontier.missionId,
+          activeNodeIds: uniqueSorted(handoff.graphFrontier.activeNodeIds),
+          readyNodeIds: uniqueSorted(handoff.graphFrontier.readyNodeIds),
+        }
+      : null,
+    // Graph-derived evidence IDs may include a revision even when the
+    // underlying observation is byte-identical. Durable progress is the
+    // evidence fingerprint, not its transient graph-local identity.
+    evidence: uniqueSorted(
+      handoff.evidence.map((item) => item.fingerprint),
+    ),
+    readbackFingerprints: uniqueSorted(handoff.readbackFingerprints),
+    receiptFingerprints: uniqueSorted(handoff.receiptFingerprints),
+    approvals: handoff.approvals
+      .map(
+        (item) =>
+          `${item.id}:${item.decision}:${item.fingerprint}`,
+      )
+      .sort(),
+    bindingFingerprints: uniqueSorted(handoff.bindingFingerprints),
+    proofDebt: {
+      missing: uniqueSorted(handoff.proofDebt.missing),
+      blocked: handoff.proofDebt.blocked,
+      resumeBlocked: handoff.proofDebt.resumeBlocked,
+    },
+  });
+}
+
 export function validateContinuationHandoffV1(
   value: unknown,
   authority?: ContinuationHandoffAuthorityV1,

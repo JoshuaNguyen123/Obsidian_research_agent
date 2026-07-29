@@ -478,21 +478,27 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   const positive = (pattern: RegExp, targetPattern: string) =>
     pattern.test(normalized) &&
     !isNegated(targetPattern);
+  // References to an already accepted research contract are inputs to later
+  // lifecycle stages, not a new instruction to perform or republish research.
+  const researchIntentText = normalized.replace(
+    /\b(?:signed\s+)?accepted[- ]research(?:['’]s)?\b/gu,
+    "existing specification",
+  );
+  const positiveResearch = (pattern: RegExp) =>
+    pattern.test(researchIntentText) &&
+    !isNegated("research|investigat(?:e|ion)");
   // Include "research on/about X" and research→code sequencing so ordinary
   // "research then implement" missions become a two-stage compound without
   // requiring the full end-to-end Linear/GitHub vocabulary.
   if (
-    positive(
-      /\b(?:research|investigate|study|analy[sz]e)\b[^.\n]{0,120}\b(?:topic|product|problem|idea|market|vault|web|sources?|rules?|online)\b/u,
-      "research|investigat(?:e|ion)",
+    positiveResearch(
+      /\b(?:research|investigate|study|analy[sz]e)\b[^.\n]{0,120}\b(?:topic|product|problem|idea|market|vault|web|sources?|rules?|online|library|package|system|protocol|framework|technology|method|algorithm|architecture)\b/u,
     ) ||
-    positive(
+    positiveResearch(
       /\b(?:research|investigate|study|analy[sz]e)\b\s+(?:on|about|into)\s+\w/u,
-      "research|investigat(?:e|ion)",
     ) ||
-    positive(
+    positiveResearch(
       /\b(?:research|investigate|study)\b[\s\S]{0,160}\b(?:then|afterwards|and\s+then|next)\b[\s\S]{0,120}\b(?:implement|build|code|write|create)\b/u,
-      "research|investigat(?:e|ion)",
     )
   ) {
     stages.push("accepted_research");
@@ -518,7 +524,12 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
   if (positive(/\b(?:publish|push|open|create)\b[^.\n]{0,140}\b(?:github|draft\s+(?:pr|pull request)|pull request|private\s+repository)\b/u, "github|publish(?:ing|ation)?|push|pull request|draft pr|private repository")) {
     stages.push("private_github_publication");
   }
-  if (positive(/\b(?:reconcile|finalize|finish|clean\s*up|backlink|close)\b[^.\n]{0,140}\b(?:project|lifecycle|linear|github|issues?|branches?|links?)\b/u, "cleanup|clean\\s*up|reconcil(?:e|iation)|backlinks?|close")) {
+  if (
+    positive(
+      /\b(?:(?:reconcile|finalize|clean\s*up|close)\b[^.\n]{0,140}\b(?:project|lifecycle|linear|github|issues?|branches?|links?|backlinks?)|finish\b[^.\n]{0,80}\b(?:project|lifecycle))\b/u,
+      "cleanup|clean\\s*up|reconcil(?:e|iation)|backlinks?|close",
+    )
+  ) {
     stages.push("reconciliation_cleanup");
   }
   return PROJECT_LIFECYCLE_STAGES.filter((stage) => stages.includes(stage));

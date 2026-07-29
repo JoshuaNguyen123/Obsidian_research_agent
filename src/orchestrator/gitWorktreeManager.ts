@@ -404,6 +404,45 @@ export class GitWorktreeManager {
     }
     return this.disabledHooksPathPromise;
   }
+
+  /**
+   * Remove the temporary empty hooks directory this manager created.
+   *
+   * Each manager lazily made one `agentic-researcher-disabled-hooks-*`
+   * directory under the OS temp root and never removed it, so every
+   * orchestrator run that touched git leaked one permanently — 1,559 of them
+   * had accumulated on the development host. Best effort and idempotent: the
+   * directory is host-owned and always empty, and a failed cleanup must never
+   * fail a mission.
+   */
+  async dispose(): Promise<void> {
+    const pending = this.disabledHooksPathPromise;
+    if (!pending) return;
+    this.disabledHooksPathPromise = null;
+    try {
+      const hooksPath = await pending;
+      const fs = requireNodeModule<typeof import("fs/promises")>(
+        "fs/promises",
+        "git_worktree_manager",
+      );
+      const runtime = loadPathRuntime();
+      // Only ever remove a directory this manager created: it must sit
+      // directly below the temp root and carry the exact owned prefix.
+      const tempRoot = runtime.resolve(runtime.tmpdir());
+      const resolved = runtime.resolve(hooksPath);
+      if (!isPathInsideRoot(tempRoot, resolved, runtime.sep)) return;
+      const name = resolved.slice(tempRoot.length + runtime.sep.length);
+      if (
+        name.includes(runtime.sep) ||
+        !name.startsWith(DISABLED_HOOKS_PREFIX_V1)
+      ) {
+        return;
+      }
+      await fs.rm(resolved, { recursive: true, force: true });
+    } catch {
+      // Cleanup is advisory; the mission result must not depend on it.
+    }
+  }
 }
 
 function createGitCommandExecutor(): GitCommandExecutor {
@@ -439,13 +478,15 @@ function createGitCommandExecutor(): GitCommandExecutor {
   };
 }
 
+export const DISABLED_HOOKS_PREFIX_V1 = "agentic-researcher-disabled-hooks-";
+
 async function createDisabledHooksDirectory(): Promise<string> {
   const fs = requireNodeModule<typeof import("fs/promises")>(
     "fs/promises",
     "git_worktree_manager",
   );
   const runtime = loadPathRuntime();
-  return fs.mkdtemp(runtime.join(runtime.tmpdir(), "agentic-researcher-disabled-hooks-"));
+  return fs.mkdtemp(runtime.join(runtime.tmpdir(), DISABLED_HOOKS_PREFIX_V1));
 }
 
 function normalizeProtectedPaths(paths: string[]): string[] {

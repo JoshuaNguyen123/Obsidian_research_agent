@@ -21,6 +21,8 @@ import {
   NATIVE_CORE_PLUGIN_ID,
 } from "./fixtures/nativeObsidianHarness";
 import {
+  assertProductionAdoptedSandboxV1,
+  hostProvisionedSandboxRuntimeDigestV1,
   startRealAiHarness,
   type ProjectLifecycleStageName,
   type RealAiHarness,
@@ -36,7 +38,7 @@ import {
 import { LinearGraphqlClient } from "../src/integrations/linear/client";
 import { parseRenderedCompatibleWorkItemSpec } from "../src/integrations/linear/WorkItemParser";
 import type { HttpTransport } from "../src/model/types";
-import { liveProviderConfiguration } from "../scripts/ci-sandbox-boundary";
+import { laneSelectedV1 } from "./fixtures/laneSelection";
 
 const execFileAsync = promisify(execFile);
 const FULL_SHA = /^[a-f0-9]{40}$/u;
@@ -198,6 +200,12 @@ function resolveProtectedThinkingMode(model: string): string {
 }
 
 test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, and retains redacted Linear proof", async ({}, testInfo) => {
+  // Two projects match this file (daily-use-compound and release-vertical).
+  // Without a guard, selecting both ran 170 minutes of tests twice.
+  test.skip(
+    !laneSelectedV1("daily-use-compound") && !laneSelectedV1("release-vertical"),
+    "Run only with E2E_PLAYWRIGHT_LANE=daily-use-compound or release-vertical.",
+  );
   test.setTimeout(120 * 60_000);
   const protectedModel = getE2EAiConfig();
   expect(process.env.E2E_MODEL_PROVIDER?.trim() || "ollama").toBe("ollama");
@@ -265,7 +273,6 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
   const workspaceId = `du06-${suffix}`;
   const requestId = `du06-request-${suffix}`;
   const issueFingerprint = contractFingerprint(`${marker}:implementation`);
-  const sandboxConfiguration = liveProviderConfiguration("wsl2");
   const fixture = await createPhase4PythonCheckersProjectFixture(marker);
   const profile = createRepositoryProfile({
     key: PROFILE_KEY,
@@ -291,7 +298,7 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
       protectedPaths: ["scripts"],
       allowedGeneratedPaths: [],
     },
-    runtimeDigests: { python: sandboxConfiguration.runtimeDigest },
+    runtimeDigests: { python: hostProvisionedSandboxRuntimeDigestV1() },
     promotionPolicy: {
       localBasePromotion: "disabled",
       completionProof: "draft_pr",
@@ -410,29 +417,13 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     const activeLinearClient = linearClient;
 
     const startedAt = Date.now();
-    const sandboxProbe = await harness.page.evaluate(
-      async ({ codePluginId, config }) => {
-        const app = (window as typeof window & { app?: any }).app;
-        const code = app?.plugins?.plugins?.["agentic-researcher"]
-          ?.getBundledCapability?.(codePluginId);
-        if (!code?.configureSandboxProvider || !code?.probeConfiguredSandboxProviders) {
-          throw new Error("The built-in Code sandbox configuration API is unavailable.");
-        }
-        await code.configureSandboxProvider(config);
-        const status = await code.probeConfiguredSandboxProviders();
-        return { status, persisted: code.readState?.()?.sandbox?.lastProbe ?? null };
-      },
-      {
-        codePluginId: PHASE4_CODE_PLUGIN_ID,
-        config: sandboxConfiguration,
-      },
+    // No injected provider configuration: the plugin must adopt the
+    // host-provisioned binding and pass its own boundary probe.
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
+      harness.page,
+      startedAt,
     );
-    expect(sandboxProbe.status).toMatchObject({
-      executionAvailable: true,
-      selectedProvider: "wsl2",
-    });
-    expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? "")))
-      .toBeGreaterThanOrEqual(startedAt);
+    expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     await expectTrustedRepositoryProfile(
       harness.page,
       PROFILE_KEY,
@@ -1454,7 +1445,6 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
   const workspaceId = `du03-checkers-${suffix}`;
   const requestId = `du03-checkers-request-${suffix}`;
   const fixture = await createPhase4PythonCheckersProjectFixture(marker);
-  const sandboxConfiguration = liveProviderConfiguration("wsl2");
   const profile = createRepositoryProfile({
     key: CODE_STAGE_PROFILE_KEY,
     displayName: "Protected DU-03 Python checkers code stage",
@@ -1479,7 +1469,7 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
       protectedPaths: ["scripts"],
       allowedGeneratedPaths: [],
     },
-    runtimeDigests: { python: sandboxConfiguration.runtimeDigest },
+    runtimeDigests: { python: hostProvisionedSandboxRuntimeDigestV1() },
     promotionPolicy: {
       localBasePromotion: "disabled",
       completionProof: "local_verified",
@@ -1513,26 +1503,13 @@ test("DU-03 protected real-model Python checkers code stage validates and commit
         repositoryProfileRegistry: createRepositoryProfileRegistry([profile]),
       },
     );
-    const sandboxProbe = await harness.page.evaluate(
-      async ({ codePluginId, config }) => {
-        const app = (window as typeof window & { app?: any }).app;
-        const code = app?.plugins?.plugins?.["agentic-researcher"]
-          ?.getBundledCapability?.(codePluginId);
-        if (!code?.configureSandboxProvider || !code?.probeConfiguredSandboxProviders) {
-          throw new Error("The built-in Code sandbox configuration API is unavailable.");
-        }
-        await code.configureSandboxProvider(config);
-        const status = await code.probeConfiguredSandboxProviders();
-        return { status, persisted: code.readState?.()?.sandbox?.lastProbe ?? null };
-      },
-      { codePluginId: PHASE4_CODE_PLUGIN_ID, config: sandboxConfiguration },
+    // No injected provider configuration: the plugin must adopt the
+    // host-provisioned binding and pass its own boundary probe.
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
+      harness.page,
+      startedAt,
     );
-    expect(sandboxProbe.status).toMatchObject({
-      executionAvailable: true,
-      selectedProvider: "wsl2",
-    });
-    expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? "")))
-      .toBeGreaterThanOrEqual(startedAt);
+    expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     await expectTrustedRepositoryProfile(
       harness.page,
       CODE_STAGE_PROFILE_KEY,

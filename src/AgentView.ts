@@ -2,6 +2,7 @@ import { ItemView, Notice, WorkspaceLeaf, setIcon } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
 import {
   MAX_AGENT_STEPS,
+  missionRequiresSandboxValidationV1,
   type AgentRunCompleteEvent,
   type AgentRunConfigEvent,
   type AgentRunEvents,
@@ -1426,6 +1427,16 @@ export class AgentView extends ItemView {
     }
 
     const activeFile = this.app.workspace.getActiveFile();
+    // Adopt and re-prove a host-provisioned sandbox before gating, so a
+    // provisioned machine starts the mission instead of reporting a blocker
+    // the host had already resolved.
+    const sandboxValidationRequired = missionRequiresSandboxValidationV1(prompt);
+    if (sandboxValidationRequired) {
+      // Usually a cached read: plugin load already adopted and proved the
+      // binding, so this only starts a probe process when that proof is
+      // missing or has gone stale.
+      await this.plugin.ensureCodeSandboxReadinessForMission();
+    }
     const missionReadiness = evaluateMissionReadinessPreflightV1({
       prompt,
       readiness: this.plugin.getCapabilityReadiness(),
@@ -1435,7 +1446,9 @@ export class AgentView extends ItemView {
       },
       cleanupAuthority: {
         deleteRepoAuthorized: this.readGitHubCleanupAuthority(),
+        credentialKind: this.readGitHubCredentialKind(),
       },
+      sandboxValidationRequired,
     });
     if (!missionReadiness.ok) {
       const card = buildMissionReadinessCardModelV1(missionReadiness);
@@ -2254,7 +2267,7 @@ export class AgentView extends ItemView {
     this.setMetric(this.activityValueEl, formatStopReasonLabel(missionStop));
     this.setMetric(this.activeToolValueEl, "None");
     this.appendTrace("complete", formatStopReasonLabel(missionStop));
-    const stopLine = stopReasonChatLine(missionStop);
+    const stopLine = stopReasonChatLine(missionStop, event.stopDetail);
     this.appendLog("system", stopLine);
     this.appendWorkstreamLine(stopLine);
     if (
@@ -4588,12 +4601,30 @@ export class AgentView extends ItemView {
     this.pendingTextDeltas.delete(element);
     this.textFrameBatcher.cancel(element);
     const last = element.lastChild;
+    let node: Text;
     if (last?.nodeType === 3 && typeof (last as Text).appendData === "function") {
-      (last as Text).appendData(pending);
+      node = last as Text;
+      node.appendData(pending);
     } else {
-      element.appendChild(element.ownerDocument.createTextNode(pending));
+      node = element.ownerDocument.createTextNode(pending);
+      element.appendChild(node);
+    }
+    // A live stream node must stay bounded. Long reasoning streams (tens of
+    // thousands of chars, appended every frame with autoscroll) force Chromium
+    // to relayout and re-raster an ever-growing block; on compound missions
+    // that grew renderer native memory until the process died at ~4GB. Keep
+    // only the visible tail — the full text still reaches the run snapshot.
+    if (node.data.length > AgentView.LIVE_STREAM_NODE_MAX_CHARS) {
+      node.deleteData(
+        0,
+        node.data.length - AgentView.LIVE_STREAM_NODE_KEEP_CHARS,
+      );
+      node.replaceData(0, 0, "… ");
     }
   }
+
+  private static readonly LIVE_STREAM_NODE_MAX_CHARS = 24_000;
+  private static readonly LIVE_STREAM_NODE_KEEP_CHARS = 16_000;
 
   private scheduleScrollToEnd(
     element: HTMLElement,
@@ -4732,10 +4763,30 @@ export class AgentView extends ItemView {
   private readGitHubCleanupAuthority(): boolean | null {
     const credential = (
       this.plugin as unknown as {
-        githubCredential?: { scopes?: string[] } | null;
+        githubCredential?: {
+          scopes?: string[] | null;
+          credentialKind?: string | null;
+        } | null;
       }
     ).githubCredential;
-    return githubCleanupAuthorityFromScopesV1(credential?.scopes);
+    // credentialKind matters: a fine-grained PAT never reports scopes, so the
+    // scope list alone would declare it incapable of cleanup.
+    return githubCleanupAuthorityFromScopesV1(
+      credential?.scopes,
+      credential?.credentialKind,
+    );
+  }
+
+  /** Distinguishes "no scopes reported" from "no authority". */
+  private readGitHubCredentialKind(): string | null {
+    const credential = (
+      this.plugin as unknown as {
+        githubCredential?: { credentialKind?: string | null } | null;
+      }
+    ).githubCredential;
+    return typeof credential?.credentialKind === "string"
+      ? credential.credentialKind
+      : null;
   }
 
   private renderChatProviderBlocker(

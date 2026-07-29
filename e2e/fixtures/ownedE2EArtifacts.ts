@@ -12,12 +12,21 @@ import path from "node:path";
 
 const MAX_FILES = 50_000;
 const MAX_TOTAL_BYTES = 128 * 1024 * 1024;
-const MAX_AGENT_RUN_OWNERSHIP_BYTES = 2 * 1024 * 1024;
 const OWNED_TREE = "E2E Agent Tests";
-const AGENT_RUNS_ROOT = "Agent Runs";
-const MISSION_GRAPHS_ROOT = "Agent Runs/Mission Graphs";
-const E2E_AGENT_RUN_MARKER =
-  /(?:\bE2E_MARKER_\d+_\d+\b|\bE2E_[A-Z0-9][A-Z0-9_]*\b|E2E Agent Tests[\\/])/u;
+/**
+ * Vault areas the product itself writes during a mission. Ownership here is
+ * diff-based: anything that appears under these roots (or as a root-level
+ * markdown note) after the pre-run snapshot was created during this harness
+ * session and is removed at close unless the lane retains it. Content-marker
+ * matching was abandoned after real-AI lanes (CRDT_/FLOW_REAL_ markers) left
+ * 100+ run logs behind — one of them, truncated by a crash, froze Obsidian's
+ * indexer on every subsequent vault open.
+ */
+const MACHINE_GENERATED_ROOTS = [
+  "Agent Runs",
+  "Agent Sources",
+  "Agent Work",
+] as const;
 const OWNED_FIXED_FILES = [
   "Agent Memory/semantic-vault-index.json",
   "Agent Memory/Semantic Vault Index.md",
@@ -30,10 +39,78 @@ export interface OwnedE2EArtifactSnapshotV1 {
   treeFiles: Set<string>;
   treeDirectories: Set<string>;
   designFiles: Set<string>;
-  /** Agent run paths are captured per scenario; content is never snapshotted. */
-  agentRunFiles: Set<string>;
+  /** Pre-run listing of machine-generated files; new ones are removed. */
+  machineFiles: Set<string>;
+  machineDirectories: Set<string>;
   /** Only fixed shared fixtures need byte restoration after each scenario. */
   fixedFiles: Map<string, Uint8Array>;
+}
+
+export interface RestoreOwnedE2EArtifactOptionsV1 {
+  /**
+   * Vault-relative paths a lane deliberately keeps (e.g. the retained-journey
+   * deliverable note). Compared case-insensitively with forward slashes.
+   */
+  retainPaths?: readonly string[];
+}
+
+/** JSON-serializable cleanup contract for crash recovery via preflight. */
+export interface VaultCleanupManifestV1 {
+  version: 1;
+  vaultRoot: string;
+  machineFiles: string[];
+  machineDirectories: string[];
+  retainPaths: string[];
+}
+
+export function vaultCleanupManifestFromSnapshot(
+  snapshot: OwnedE2EArtifactSnapshotV1,
+  retainPaths: readonly string[] = [],
+): VaultCleanupManifestV1 {
+  // The crash sweeper has no separate tree pass, so the manifest baseline must
+  // also carry the owned E2E test tree — otherwise a killed run's seed note
+  // and semantic index survive preflight (observed live before this merge).
+  return {
+    version: 1,
+    vaultRoot: snapshot.vaultRoot,
+    machineFiles: [...snapshot.machineFiles, ...snapshot.treeFiles].sort(),
+    machineDirectories: [
+      ...snapshot.machineDirectories,
+      ...snapshot.treeDirectories,
+    ].sort(),
+    retainPaths: [...retainPaths],
+  };
+}
+
+/**
+ * Applies a leftover cleanup manifest (a prior run was killed before its own
+ * restore). Removes only machine-generated files that are new relative to the
+ * manifest baseline and not retained. Returns the removed file count.
+ */
+export async function applyVaultCleanupManifest(
+  manifest: VaultCleanupManifestV1,
+): Promise<{ removedFiles: number }> {
+  if (
+    manifest?.version !== 1 ||
+    typeof manifest.vaultRoot !== "string" ||
+    !Array.isArray(manifest.machineFiles) ||
+    !Array.isArray(manifest.machineDirectories) ||
+    !Array.isArray(manifest.retainPaths)
+  ) {
+    throw new Error("Unsupported vault cleanup manifest.");
+  }
+  const vaultRoot = await canonicalDirectory(manifest.vaultRoot).catch(
+    (error: NodeJS.ErrnoException) =>
+      error.code === "ENOENT" ? null : Promise.reject(error),
+  );
+  if (!vaultRoot) return { removedFiles: 0 };
+  return removeNewMachineGeneratedFiles(
+    vaultRoot,
+    new Set(manifest.machineFiles),
+    new Set(manifest.machineDirectories),
+    manifest.retainPaths,
+    { includeOwnedTree: true },
+  );
 }
 
 let cachedTreeBaseline: {
@@ -58,7 +135,7 @@ export async function snapshotOwnedE2EArtifacts(
     ? cachedTreeBaseline
     : await readTreeBaseline(vaultRoot);
   cachedTreeBaseline = baseline;
-  const agentRunFiles = await readAgentRunPaths(vaultRoot);
+  const machineListing = await readMachineGeneratedListing(vaultRoot);
   const fixedFiles = new Map<string, Uint8Array>();
   let totalBytes = 0;
   const capture = async (relativePath: string) => {
@@ -81,7 +158,7 @@ export async function snapshotOwnedE2EArtifacts(
   assertSnapshotFileCap(
     baseline.treeFiles.size +
       baseline.designFiles.size +
-      agentRunFiles.size +
+      machineListing.files.size +
       fixedFiles.size,
   );
   return {
@@ -90,20 +167,23 @@ export async function snapshotOwnedE2EArtifacts(
     treeFiles: new Set(baseline.treeFiles),
     treeDirectories: new Set(baseline.treeDirectories),
     designFiles: new Set(baseline.designFiles),
-    agentRunFiles,
+    machineFiles: machineListing.files,
+    machineDirectories: machineListing.directories,
     fixedFiles,
   };
 }
 
 export async function restoreOwnedE2EArtifacts(
   snapshot: OwnedE2EArtifactSnapshotV1,
+  options: RestoreOwnedE2EArtifactOptionsV1 = {},
 ): Promise<void> {
   if (
     snapshot.version !== 1 ||
     !(snapshot.treeFiles instanceof Set) ||
     !(snapshot.treeDirectories instanceof Set) ||
     !(snapshot.designFiles instanceof Set) ||
-    !(snapshot.agentRunFiles instanceof Set) ||
+    !(snapshot.machineFiles instanceof Set) ||
+    !(snapshot.machineDirectories instanceof Set) ||
     !(snapshot.fixedFiles instanceof Map)
   ) {
     throw new Error("Unsupported E2E artifact snapshot.");
@@ -143,7 +223,12 @@ export async function restoreOwnedE2EArtifacts(
       await rm(containedPath(vaultRoot, relativePath), { force: true });
     }
   }
-  await removeNewOwnedAgentRunFiles(vaultRoot, snapshot.agentRunFiles);
+  await removeNewMachineGeneratedFiles(
+    vaultRoot,
+    snapshot.machineFiles,
+    snapshot.machineDirectories,
+    options.retainPaths ?? [],
+  );
   for (const fixed of OWNED_FIXED_FILES) {
     await rm(containedPath(vaultRoot, fixed), { force: true });
   }
@@ -180,71 +265,81 @@ async function readTreeBaseline(vaultRoot: string) {
   };
 }
 
-async function readAgentRunPaths(vaultRoot: string): Promise<Set<string>> {
+/**
+ * Recursive listing of every machine-generated root plus root-level markdown
+ * notes (mission seed notes land at the vault root). Symlinks are refused
+ * anywhere in the walk.
+ */
+async function readMachineGeneratedListing(
+  vaultRoot: string,
+  options: { includeOwnedTree?: boolean } = {},
+): Promise<{ files: Set<string>; directories: Set<string> }> {
   const files = new Set<string>();
-  const agentRunsRoot = containedPath(vaultRoot, AGENT_RUNS_ROOT);
-  await assertNotLinkedIfPresent(agentRunsRoot);
-  const missionGraphsRoot = containedPath(vaultRoot, MISSION_GRAPHS_ROOT);
-
-  const addFile = (relativePath: string) => {
-    if (!isBoundedAgentRunFile(relativePath)) {
-      throw new Error(`Agent run path escaped its bounded directories: ${relativePath}`);
+  const directories = new Set<string>();
+  const roots = options.includeOwnedTree
+    ? [...MACHINE_GENERATED_ROOTS, OWNED_TREE]
+    : [...MACHINE_GENERATED_ROOTS];
+  for (const root of roots) {
+    const absolute = containedPath(vaultRoot, root);
+    await assertNotLinkedIfPresent(absolute);
+    const tree = await readOwnedTreePaths(absolute, root);
+    for (const file of tree.files) {
+      files.add(file);
+      assertSnapshotFileCap(files.size);
     }
-    files.add(relativePath);
-    assertSnapshotFileCap(files.size);
-  };
-
-  for (const entry of await readDirectory(agentRunsRoot)) {
-    const relativePath = `${AGENT_RUNS_ROOT}/${entry.name}`;
-    if (entry.isSymbolicLink()) {
-      throw new Error(`E2E artifact snapshot rejects linked path: ${relativePath}`);
-    }
+    for (const directory of tree.directories) directories.add(directory);
+  }
+  for (const entry of await readDirectory(vaultRoot)) {
+    if (entry.isSymbolicLink()) continue;
     if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
-      addFile(relativePath);
+      files.add(entry.name);
+      assertSnapshotFileCap(files.size);
     }
   }
-
-  await assertNotLinkedIfPresent(missionGraphsRoot);
-  for (const entry of await readDirectory(missionGraphsRoot)) {
-    const relativePath = `${MISSION_GRAPHS_ROOT}/${entry.name}`;
-    if (entry.isSymbolicLink()) {
-      throw new Error(`E2E artifact snapshot rejects linked path: ${relativePath}`);
-    }
-    if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
-      addFile(relativePath);
-    }
-  }
-  return files;
+  return { files, directories };
 }
 
-async function removeNewOwnedAgentRunFiles(
+async function removeNewMachineGeneratedFiles(
   vaultRoot: string,
-  baseline: Set<string>,
-): Promise<void> {
-  const current = await readAgentRunPaths(vaultRoot);
-  for (const relativePath of current) {
-    if (baseline.has(relativePath) || !isBoundedAgentRunFile(relativePath)) continue;
+  baselineFiles: ReadonlySet<string>,
+  baselineDirectories: ReadonlySet<string>,
+  retainPaths: readonly string[],
+  options: { includeOwnedTree?: boolean } = {},
+): Promise<{ removedFiles: number }> {
+  const retained = new Set(
+    retainPaths.map((value) => value.replace(/\\/gu, "/").toLowerCase()),
+  );
+  const isRetained = (relativePath: string) =>
+    retained.has(relativePath.toLowerCase());
+  const current = await readMachineGeneratedListing(vaultRoot, options);
+  let removedFiles = 0;
+  for (const relativePath of current.files) {
+    if (baselineFiles.has(relativePath) || isRetained(relativePath)) continue;
     const absolute = containedPath(vaultRoot, relativePath);
-    const stat = await lstat(absolute);
+    const stat = await lstat(absolute).catch((error: NodeJS.ErrnoException) =>
+      error.code === "ENOENT" ? null : Promise.reject(error));
+    if (!stat) continue;
     if (stat.isSymbolicLink() || !stat.isFile()) {
-      throw new Error(`Refusing to inspect a linked or non-file agent run: ${relativePath}`);
-    }
-    if (stat.size > MAX_AGENT_RUN_OWNERSHIP_BYTES) continue;
-    const content = await readFile(absolute, "utf8");
-    if (!E2E_AGENT_RUN_MARKER.test(content)) continue;
-    const currentStat = await lstat(absolute);
-    if (currentStat.isSymbolicLink() || !currentStat.isFile()) {
-      throw new Error(`Refusing to remove a linked or non-file agent run: ${relativePath}`);
+      throw new Error(
+        `Refusing to remove a linked or non-file machine artifact: ${relativePath}`,
+      );
     }
     await rm(absolute, { force: true });
+    removedFiles += 1;
   }
-}
-
-function isBoundedAgentRunFile(relativePath: string): boolean {
-  return (
-    /^Agent Runs\/[^/\\]+\.md$/iu.test(relativePath) ||
-    /^Agent Runs\/Mission Graphs\/[^/\\]+\.md$/iu.test(relativePath)
-  );
+  // Deepest-first so nested new directories fold up; retained descendants
+  // keep their ancestors alive via ENOTEMPTY.
+  for (const relativeDirectory of [...current.directories].sort(
+    (left, right) => right.split("/").length - left.split("/").length,
+  )) {
+    if (baselineDirectories.has(relativeDirectory)) continue;
+    await rmdir(containedPath(vaultRoot, relativeDirectory)).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error;
+      },
+    );
+  }
+  return { removedFiles };
 }
 
 function assertSnapshotFileCap(fileCount: number): void {

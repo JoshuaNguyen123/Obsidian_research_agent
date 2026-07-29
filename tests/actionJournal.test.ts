@@ -389,11 +389,13 @@ test("action journal v2 round-trips prepared authority and canonical receipt", a
   );
   assert.equal(restored?.operationJournal[0].descriptor?.effect, "reversible_mutation");
   assert.equal(restored?.operationJournal[0].authorization?.grantId, "grant-1");
+  assert.equal(restored?.operationJournal[0].receipt?.runId, "run-1");
   assert.equal(restored?.operationJournal[0].receipt?.resource?.system, "linear");
   assert.equal(restored?.operationJournal[0].receipt?.readback?.status, "verified");
   assert.deepEqual(restored?.operationJournal[0].receipt?.effects?.changedFields, [
     "title",
   ]);
+  assert.equal(restored?.receipts[0].runId, "run-1");
   assert.equal(restored?.receipts[0].resource?.id, "issue-123");
 });
 

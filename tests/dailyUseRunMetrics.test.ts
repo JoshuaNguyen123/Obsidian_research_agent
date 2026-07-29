@@ -28,6 +28,7 @@ test("DailyUseRunMetricsV1 records redacted counters and exact missing acceptanc
   assert.ok(metrics.missingAcceptanceCriteria.includes("code:readme"));
   assert.ok(metrics.missingAcceptanceCriteria.includes("approval:sandbox_execution"));
   assert.equal(metrics.artifactProofCount, 2);
+  assert.equal(metrics.approvalBoundaryProofCount, 0);
   assert.equal(metrics.toolCalls, 11);
   assert.doesNotMatch(JSON.stringify(metrics), /token|password|prompt/iu);
 });
@@ -52,6 +53,10 @@ test("DailyUseRunMetricsV1 fingerprint excludes observation time", () => {
     observedAt: "2026-07-16T17:01:00.000Z",
   });
   assert.equal(first.acceptanceStatus, "pass");
+  assert.equal(
+    first.approvalBoundaryProofCount,
+    contract.approvalBoundaries.length,
+  );
   assert.equal(first.fingerprint, second.fingerprint);
   assert.equal(first.fingerprint, fingerprintDailyUseRunMetricsV1(first));
 });

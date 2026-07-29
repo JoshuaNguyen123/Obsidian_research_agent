@@ -4,6 +4,9 @@ import {
   WRITE_RECEIPT_MISSING,
   receiptsSatisfyWriteProof,
 } from "../editOrganizeIntent";
+import {
+  isCompletedAcceptedResearchPublicationReceipt,
+} from "../setLooseCompoundAutonomy";
 
 export { WRITE_RECEIPT_MISSING, receiptsSatisfyWriteProof };
 
@@ -25,7 +28,10 @@ export function evaluateCompletion(input: AgenticReflexInput): CompletionSignal 
   if (
     input.missionIntent.mode !== "chat_only" &&
     input.missionIntent.requireWriteCompletion &&
-    !receiptsSatisfyWriteProof(input.receipts)
+    !receiptsSatisfyWriteProof(input.receipts) &&
+    !input.receipts.some((receipt) =>
+      isCompletedAcceptedResearchPublicationReceipt(receipt),
+    )
   ) {
     missing.push(WRITE_RECEIPT_MISSING);
   }

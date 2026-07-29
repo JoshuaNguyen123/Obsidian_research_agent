@@ -64,6 +64,23 @@ test("mission scope detects current-note, vault, web, artifact, and destructive 
   assert.equal(broadVault.read.vault, true);
   assert.equal(broadVault.write.currentNote, false);
   assert.equal(isBroadUnscopedVaultMutation(broadVault), true);
+
+  const initiatingNotePrompt =
+    "Inspect my whole vault and write the result into the initiating note.";
+  const unboundInitiatingNote = deriveAutonomyScope(initiatingNotePrompt, {
+    vaultContext: true,
+    explicitMutation: true,
+  });
+  assert.equal(unboundInitiatingNote.write.currentNote, false);
+  assert.equal(isBroadUnscopedVaultMutation(unboundInitiatingNote), true);
+
+  const boundInitiatingNote = deriveAutonomyScope(initiatingNotePrompt, {
+    vaultContext: true,
+    explicitMutation: true,
+    hasActiveMarkdownNote: true,
+  });
+  assert.equal(boundInitiatingNote.write.currentNote, true);
+  assert.equal(isBroadUnscopedVaultMutation(boundInitiatingNote), false);
 });
 
 test("mission ledger creates, updates, serializes, parses, and summarizes durable state", async () => {
@@ -168,6 +185,16 @@ test("mission ledger creates, updates, serializes, parses, and summarizes durabl
     },
     evidenceCount: 1,
     receiptCount: 1,
+    providerUsage: {
+      schemaVersion: 1,
+      modelCallCount: 0,
+      successfulCallCount: 0,
+      failedCallCount: 0,
+      reportedTokens: 0,
+      estimatedTokens: 0,
+      retries: 0,
+      wallClockMs: 0,
+    },
     expectedTools: ["web_search", "web_fetch"],
     nextAction: "none",
     remainingActions: [],

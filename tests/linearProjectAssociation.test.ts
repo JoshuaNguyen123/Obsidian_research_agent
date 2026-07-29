@@ -9,6 +9,7 @@ import {
 import { resolveLinearProjectAssociation } from "../src/integrations/linear/resolveLinearProjectAssociation";
 import type { LinearToolClient } from "../src/integrations/linear/LinearTools";
 import type { LinearBaseRecord, LinearPage } from "../src/integrations/linear/types";
+import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
 
 test("plain issue intent skips project association", () => {
   assert.equal(
@@ -54,6 +55,18 @@ test("mission-shaped Linear work is not plain issue intent", () => {
   assert.equal(
     hasPlainLinearIssueOnlyIntent(
       "Create a Linear project for this mission and file the issues there.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasPlainLinearIssueOnlyIntent(
+      "Create a Linear project for this mission, file one standalone Linear issue there, and do not create an initiative.",
+    ),
+    false,
+  );
+  assert.equal(
+    hasPlainLinearIssueOnlyIntent(
+      "Do not create a new project; use the configured project and create one Linear issue there.",
     ),
     false,
   );
@@ -229,6 +242,35 @@ test("resolveLinearProjectAssociation stays team-only for plain issues", async (
   });
 
   assert.equal(listed, false);
+  assert.equal(result.projectId, null);
+  assert.equal(result.decision.mode, "team_only");
+  assert.equal(result.created, false);
+});
+
+test("the BYOK research publication wording cannot list or create a Linear project", async () => {
+  const prompt = buildByokPhaseAResearchPrompt({
+    marker: "BYOK_AUTONOMOUS_projectless",
+    profileKey: "byok-disposable-repo",
+    validationProfileKey: "byok-python-unittest",
+  });
+  assert.equal(hasPlainLinearIssueOnlyIntent(prompt), true);
+  let providerCalls = 0;
+  const client: LinearToolClient = {
+    execute: async (key) => {
+      providerCalls += 1;
+      throw new Error(`Unexpected ${key}`);
+    },
+  };
+
+  const result = await resolveLinearProjectAssociation({
+    client,
+    prompt,
+    associationText: "Autonomous BYOK CRDT research",
+    teamId: "team-1",
+    configuredProjectId: "stale-project",
+  });
+
+  assert.equal(providerCalls, 0);
   assert.equal(result.projectId, null);
   assert.equal(result.decision.mode, "team_only");
   assert.equal(result.created, false);

@@ -23,6 +23,8 @@ export interface EvidenceConflict {
 export interface ConflictPassageInput {
   id: string;
   text: string;
+  /** Stable evidence/source identity when the passage id is not source-scoped. */
+  sourceId?: string;
   claimIds?: string[];
 }
 
@@ -86,6 +88,7 @@ export function detectEvidenceConflicts(
     .map((passage) => ({
       id: passage.id.trim(),
       text: passage.text.replace(/\s+/g, " ").trim(),
+      sourceId: passage.sourceId?.trim() || undefined,
       claimIds: dedupe((passage.claimIds ?? []).filter(Boolean)),
     }))
     .filter((passage) => passage.id.length > 0 && passage.text.length >= 12);
@@ -102,6 +105,14 @@ export function detectEvidenceConflicts(
       }
       const pairKey = [left.id, right.id].sort().join("|");
       if (seenPairs.has(pairKey)) {
+        continue;
+      }
+      const leftSource = evidenceSourceIdentity(left);
+      const rightSource = evidenceSourceIdentity(right);
+      // Different passages from one document provide context, not independent
+      // corroboration or contradiction. Comparing them generated dozens of
+      // false CRDT conflicts from section numbers and local caveats.
+      if (leftSource === rightSource) {
         continue;
       }
 
@@ -131,6 +142,19 @@ export function detectEvidenceConflicts(
   }
 
   return conflicts;
+}
+
+function evidenceSourceIdentity(passage: {
+  id: string;
+  sourceId?: string;
+}): string {
+  if (passage.sourceId) {
+    return passage.sourceId.startsWith("source:")
+      ? passage.sourceId
+      : `source:${passage.sourceId}`;
+  }
+  const sourcePassage = /^(source:[^:]+):passage:/u.exec(passage.id);
+  return sourcePassage?.[1] ?? `passage:${passage.id}`;
 }
 
 export function acknowledgeEvidenceConflict(

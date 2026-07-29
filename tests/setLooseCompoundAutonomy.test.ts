@@ -10,6 +10,7 @@ import {
   formatSetLooseResumeBindingCard,
   formatStageBudgetPromptBlock,
   hasSetLooseGithubCreateReceipt,
+  isCompletedAcceptedResearchPublicationReceipt,
   isSetLooseEnabled,
   lifecycleStagePaidBySuccessfulTool,
   missionGraphHasIncompleteReadTemplateNode,
@@ -28,6 +29,7 @@ import {
   toolsOfferedForSetLooseStage,
   toolsOfferedForSetLooseTurn,
   unpaidSetLooseDeliveryStages,
+  type SetLooseDeliveryReceiptLikeV1,
 } from "../src/agent/setLooseCompoundAutonomy";
 import { toolsAllowedForLifecycleStage } from "../src/agent/lifecycleStagePolicy";
 import {
@@ -41,6 +43,236 @@ import {
 } from "../src/agent/autonomyEffectClass";
 import { decideAutoContinuation } from "../src/agent/autoContinuation";
 import type { ProjectLifecycleStageV1 } from "../src/agent/projectLifecycle";
+import { createMissionRuntimeSnapshot } from "../src/agent/runStore";
+import {
+  appendWorkItemLineageTransitionV1,
+  createAcceptedResearchArtifactV1,
+  createExternalWorkItemBindingV1,
+  createWorkItemLineageV1,
+  createWorkItemSpecV2,
+  renderQueueExecutableHumanWorkItemSpecV2,
+} from "../src/integrations/linear";
+
+function completedResearchPublicationReceiptFixture(
+  publication: "created" | "deduplicated",
+  deduplicatedLineage: "fresh_readback" | "prior_create" = "fresh_readback",
+): SetLooseDeliveryReceiptLikeV1 {
+  const acceptedAt = "2026-07-27T20:00:00.000Z";
+  const issueUpdatedAt = "2026-07-27T20:02:00.000Z";
+  const observedAt =
+    publication === "created"
+      ? issueUpdatedAt
+      : "2026-07-27T20:03:00.000Z";
+  const noteSha256 = `sha256:${"a".repeat(64)}`;
+  const evidenceSha256 = `sha256:${"b".repeat(64)}`;
+  const providerPayloadFingerprint = `sha256:${"c".repeat(64)}`;
+  const issueSnapshotHash = `sha256:${"d".repeat(64)}`;
+  const backlinkSha256 = `sha256:${"e".repeat(64)}`;
+  const approvalFingerprint = `sha256:${"f".repeat(64)}`;
+  const issueId = "issue-publication-1";
+  const issueIdentifier = "APP-1";
+  const issueUrl = "https://linear.app/acme/issue/APP-1";
+  const issueTeamId = "team-1";
+  const issueProjectId = "project-1";
+  const receiptRunId = "segment:run:42";
+  const artifact = createAcceptedResearchArtifactV1({
+    schemaVersion: 1,
+    artifactId: "accepted-research-publication-1",
+    originRunId: "root-publication-run",
+    vaultBindingKey: "current-vault",
+    notePath: "Research/Accepted publication.md",
+    noteSha256,
+    noteReceiptId: "note-receipt-1",
+    evidence: [{
+      id: "evidence-1",
+      kind: "web",
+      reference: "https://example.com/research-source",
+      contentSha256: evidenceSha256,
+    }],
+    acceptanceCriteria: [{
+      id: "AC-1",
+      text: "The accepted research is represented by one verified Linear issue.",
+    }],
+    riskClass: "medium",
+    acceptedAt,
+    acceptedBy: "host",
+  });
+  const workItem = createWorkItemSpecV2({
+    schemaVersion: 2,
+    ready: true,
+    executionClass: "code",
+    objective: "Implement the actionable finding from the accepted research.",
+    repositoryKey: "agentic-researcher",
+    acceptanceCriteria: artifact.acceptanceCriteria,
+    validationRequirementKeys: ["unit-tests"],
+    evidenceRefs: artifact.evidence.map((entry) => entry.reference),
+    riskClass: artifact.riskClass,
+    originRunId: artifact.originRunId,
+    acceptedResearchArtifactFingerprint: artifact.artifactFingerprint,
+    generation: 0,
+  });
+  const issue = {
+    resourceType: "issue" as const,
+    id: issueId,
+    identifier: issueIdentifier,
+    url: issueUrl,
+    title: "Accepted research publication",
+    description: renderQueueExecutableHumanWorkItemSpecV2(workItem),
+    priority: 0,
+    trashed: false,
+    team: { id: issueTeamId },
+    project: { id: issueProjectId },
+    state: { id: "state-1" },
+    labels: [],
+    createdAt: issueUpdatedAt,
+    updatedAt: issueUpdatedAt,
+    snapshotHash: issueSnapshotHash,
+  };
+  const binding = createExternalWorkItemBindingV1({
+    schemaVersion: 1,
+    bindingId: "linear-accepted-research-publication-1",
+    provider: "linear",
+    originRunId: artifact.originRunId,
+    workspaceId: "workspace-1",
+    teamId: issueTeamId,
+    issueId,
+    issueIdentifier,
+    issueUrl,
+    issueUpdatedAt,
+    workItemFingerprint: workItem.fingerprint,
+    acceptedResearchArtifactFingerprint: artifact.artifactFingerprint,
+    verifiedAt: issueUpdatedAt,
+  });
+  const resource = {
+    system: "linear" as const,
+    resourceType: "issue",
+    id: issueId,
+    identifier: issueIdentifier,
+    url: issueUrl,
+    teamId: issueTeamId,
+    projectId: issueProjectId,
+    ...(publication === "deduplicated"
+      ? { revision: issueUpdatedAt }
+      : {}),
+  };
+  const createdProviderReceipt = {
+    version: 1 as const,
+    id: "linear-receipt-created-publication-1",
+    runId: receiptRunId,
+    actionId: "linear-action-created-publication-1",
+    toolName: "linear_create_issue",
+    operation: "create",
+    resource,
+    message: "Created and verified Linear issue APP-1.",
+    payloadFingerprint: providerPayloadFingerprint,
+    grantId: "grant-linear-create-1",
+    idempotencyKey:
+      "linear:issue:create:segment-run-42:publish-call-1:0",
+    startedAt: "2026-07-27T20:01:00.000Z",
+    committedAt: issueUpdatedAt,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: issueUpdatedAt,
+      observedRevision: issueSnapshotHash,
+      observedFingerprint: issueSnapshotHash,
+    },
+  } as const;
+  const deduplicatedReceipt = {
+    version: 1 as const,
+    id: "linear-research-readback-deduplicated-publication-1",
+    runId: receiptRunId,
+    actionId: "linear-readback-publish-call-1",
+    toolName: "linear_read_issue",
+    operation: "read",
+    resource,
+    message:
+      "Verified exact duplicate Linear issue APP-1; no mutation grant was created or consumed.",
+    payloadFingerprint: approvalFingerprint,
+    grantId: "linear-deduplicated-readback",
+    idempotencyKey: `research-publication:${workItem.fingerprint}`,
+    startedAt: observedAt,
+    committedAt: observedAt,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: observedAt,
+      observedRevision: issueUpdatedAt,
+      observedFingerprint: issueSnapshotHash,
+    },
+  } as const;
+  const outerReceipt =
+    publication === "created"
+      ? createdProviderReceipt
+      : deduplicatedReceipt;
+  let lineage = createWorkItemLineageV1({
+    schemaVersion: 1,
+    lineageId: "publication-accepted-research-publication-1",
+    originRunId: artifact.originRunId,
+    executionClass: workItem.executionClass,
+    workItemFingerprint: workItem.fingerprint,
+    researchArtifactFingerprint: artifact.artifactFingerprint,
+    repositoryKey: workItem.repositoryKey!,
+    events: [{
+      sequence: 1,
+      state: "accepted_research",
+      domain: "research",
+      occurredAt: acceptedAt,
+      receiptId: "accepted-accepted-research-publication-1",
+      evidenceFingerprint: artifact.artifactFingerprint,
+    }],
+  });
+  lineage = appendWorkItemLineageTransitionV1(lineage, {
+    state: "note_verified",
+    occurredAt: acceptedAt,
+    receiptId: artifact.noteReceiptId,
+    evidenceFingerprint: artifact.noteSha256,
+  });
+  lineage = appendWorkItemLineageTransitionV1(lineage, {
+    state: "linear_verified",
+    occurredAt: issueUpdatedAt,
+    receiptId:
+      publication === "created" || deduplicatedLineage === "prior_create"
+        ? createdProviderReceipt.id
+        : `linear-readback-${issueId}`,
+    evidenceFingerprint: binding.bindingFingerprint,
+    externalWorkItemBindingFingerprint: binding.bindingFingerprint,
+  });
+  return {
+    ...outerReceipt,
+    output: {
+      ok: true,
+      status: "complete",
+      publication,
+      note: {
+        path: artifact.notePath,
+        operation: "create",
+        beforeSha256: null,
+        afterSha256: artifact.noteSha256,
+        noteReceiptId: artifact.noteReceiptId,
+        artifact: structuredClone(artifact),
+        transaction: null,
+      },
+      artifact,
+      lineage,
+      approvalFingerprint,
+      binding,
+      issue,
+      backlink: {
+        path: artifact.notePath,
+        operation: "append",
+        beforeSha256: artifact.noteSha256,
+        afterSha256: backlinkSha256,
+        issueUrl,
+        transaction: null,
+      },
+      receipt:
+        publication === "created"
+          ? structuredClone(createdProviderReceipt)
+          : null,
+    },
+  };
+}
 
 test("isSetLooseEnabled requires automatic + compound", () => {
   assert.equal(
@@ -605,6 +837,17 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
   assert.equal(complete.complete, true);
   assert.deepEqual(complete.unpaid, []);
 
+  const missingReflection = setLooseDeliveryComplete({
+    stages,
+    proofs: {
+      acceptedResearchPublication: true,
+      linearIssueUrlOrId: true,
+      codeWorkspaceReadback: true,
+      githubPrivateRepoOrPrUrl: true,
+    },
+  });
+  assert.deepEqual(missingReflection.unpaid, ["note_reflection"]);
+
   assert.deepEqual(
     unpaidSetLooseDeliveryStages({
       stages: [...stages, "reconciliation_cleanup"],
@@ -876,6 +1119,278 @@ test("seedSetLooseDeliveryStateFromReceipts restores Linear and commit proofs", 
   );
 });
 
+test("completed canonical research publication receipts restore composite proof", () => {
+  const deduplicated =
+    completedResearchPublicationReceiptFixture("deduplicated");
+
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt(deduplicated),
+    true,
+  );
+  const restored = seedSetLooseDeliveryStateFromReceipts([deduplicated]);
+  assert.deepEqual(restored.paidStages.sort(), [
+    "accepted_research",
+    "linear_hierarchy",
+  ]);
+  assert.equal(restored.proofs.acceptedResearchPublication, true);
+  assert.equal(restored.proofs.linearIssueUrlOrId, true);
+  assert.deepEqual(
+    setLooseDeliveryComplete({
+      stages: ["accepted_research", "linear_hierarchy"],
+      proofs: restored.proofs,
+    }),
+    {
+      complete: true,
+      unpaid: [],
+      reason: "all_delivery_proofs_present",
+    },
+  );
+
+  const created = completedResearchPublicationReceiptFixture("created");
+  assert.equal(isCompletedAcceptedResearchPublicationReceipt(created), true);
+  assert.equal(
+    seedSetLooseDeliveryStateFromReceipts([created]).proofs
+      .acceptedResearchPublication,
+    true,
+  );
+  const persistedCreatedReceipt = createMissionRuntimeSnapshot({
+    runId: "segment-run-42",
+    originalMission:
+      "Research the topic, write accepted research, and publish it to Linear.",
+    receipts: [created],
+  }).receipts;
+  assert.equal(
+    persistedCreatedReceipt[0]?.toolName,
+    "linear_create_issue",
+    "the runtime store retains the provider operation name",
+  );
+  assert.equal(
+    seedSetLooseDeliveryStateFromReceipts(persistedCreatedReceipt).proofs
+      .acceptedResearchPublication,
+    true,
+    "a canonical persisted receipt must pay the composite proof on Continue",
+  );
+  const completedCheckpointReplay =
+    completedResearchPublicationReceiptFixture("deduplicated");
+  const completedCheckpointReplayOutput =
+    completedCheckpointReplay.output as Record<string, unknown>;
+  const completedCheckpointReplayBacklink =
+    completedCheckpointReplayOutput.backlink as Record<string, unknown>;
+  completedCheckpointReplay.output = {
+    ...completedCheckpointReplayOutput,
+    note: {
+      ...(completedCheckpointReplayOutput.note as Record<string, unknown>),
+      operation: "no_op",
+      beforeSha256: completedCheckpointReplayBacklink.afterSha256,
+      afterSha256: completedCheckpointReplayBacklink.afterSha256,
+    },
+  };
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt(completedCheckpointReplay),
+    true,
+  );
+  assert.equal(
+    seedSetLooseDeliveryStateFromReceipts([completedCheckpointReplay]).proofs
+      .acceptedResearchPublication,
+    true,
+  );
+  const completedReplayAfterNewerProviderRevision =
+    structuredClone(completedCheckpointReplay);
+  const newerReplayOutput =
+    completedReplayAfterNewerProviderRevision.output as Record<string, unknown>;
+  const newerReplayIssue =
+    newerReplayOutput.issue as Record<string, unknown>;
+  const newerIssueUpdatedAt = "2026-07-27T20:04:00.000Z";
+  const newerIssueSnapshotHash = `sha256:${"6".repeat(64)}`;
+  completedReplayAfterNewerProviderRevision.output = {
+    ...newerReplayOutput,
+    issue: {
+      ...newerReplayIssue,
+      updatedAt: newerIssueUpdatedAt,
+      snapshotHash: newerIssueSnapshotHash,
+    },
+  };
+  completedReplayAfterNewerProviderRevision.resource = {
+    ...(completedReplayAfterNewerProviderRevision.resource ?? {}),
+    revision: newerIssueUpdatedAt,
+  };
+  completedReplayAfterNewerProviderRevision.readback = {
+    ...(completedReplayAfterNewerProviderRevision.readback ?? {}),
+    observedRevision: newerIssueUpdatedAt,
+    observedFingerprint: newerIssueSnapshotHash,
+  };
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt(
+      completedReplayAfterNewerProviderRevision,
+    ),
+    true,
+  );
+  assert.equal(
+    seedSetLooseDeliveryStateFromReceipts([
+      completedReplayAfterNewerProviderRevision,
+    ]).proofs.acceptedResearchPublication,
+    true,
+  );
+  const continuedCreatedAsDeduplicated =
+    completedResearchPublicationReceiptFixture(
+      "deduplicated",
+      "prior_create",
+    );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt(
+      continuedCreatedAsDeduplicated,
+    ),
+    true,
+  );
+
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      idempotencyKey: "linear-generic-issue:issue-publication-1",
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...completedCheckpointReplay,
+      output: {
+        ...(completedCheckpointReplay.output as Record<string, unknown>),
+        note: {
+          ...((completedCheckpointReplay.output as {
+            note: Record<string, unknown>;
+          }).note),
+          afterSha256: `sha256:${"7".repeat(64)}`,
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      toolName: "linear_get_issue",
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      operation: "create",
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      idempotencyKey: `research-publication:sha256:${"d".repeat(64)}`,
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      commitKind: "reconciled",
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      readback: { status: "not_verified" },
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      output: {
+        ...(deduplicated.output as Record<string, unknown>),
+        status: "waiting_obsidian",
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      output: {
+        ...(deduplicated.output as Record<string, unknown>),
+        binding: {
+          ...((deduplicated.output as {
+            binding: Record<string, unknown>;
+          }).binding),
+          acceptedResearchArtifactFingerprint: `sha256:${"d".repeat(64)}`,
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...created,
+      idempotencyKey:
+        "linear:issue:create:wrong-segment-run:publish-call-1:0",
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...created,
+      output: {
+        ...(created.output as Record<string, unknown>),
+        receipt: {
+          ...((created.output as {
+            receipt: Record<string, unknown>;
+          }).receipt),
+          payloadFingerprint: `sha256:${"9".repeat(64)}`,
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...created,
+      commitKind: "reconciled",
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      payloadFingerprint: `sha256:${"8".repeat(64)}`,
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      grantId: "grant-linear-create-1",
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      resource: {
+        ...(deduplicated.resource ?? {}),
+        revision: "2026-07-27T20:04:00.000Z",
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...deduplicated,
+      readback: {
+        ...(deduplicated.readback ?? {}),
+        observedRevision: "2026-07-27T20:04:00.000Z",
+      },
+    }),
+    false,
+  );
+});
+
 test("a generic Linear issue does not pay accepted research publication", () => {
   const genericIssue = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "linear_create_issue",
@@ -892,7 +1407,7 @@ test("a generic Linear issue does not pay accepted research publication", () => 
       stages: ["accepted_research", "linear_hierarchy"],
       proofs: genericIssue,
     }).unpaid,
-    ["accepted_research", "note_reflection"],
+    ["accepted_research"],
   );
 
   const published = applySetLooseDeliveryProofFromSuccessfulTool({
@@ -905,6 +1420,17 @@ test("a generic Linear issue does not pay accepted research publication", () => 
   });
   assert.equal(published.acceptedResearchPublication, true);
   assert.equal(published.linearIssueUrlOrId, true);
+  assert.deepEqual(
+    setLooseDeliveryComplete({
+      stages: ["accepted_research", "linear_hierarchy"],
+      proofs: published,
+    }),
+    {
+      complete: true,
+      unpaid: [],
+      reason: "all_delivery_proofs_present",
+    },
+  );
 });
 
 test("applySetLooseDeliveryProofFromSuccessfulTool pays note reflection markers", () => {
@@ -915,6 +1441,42 @@ test("applySetLooseDeliveryProofFromSuccessfulTool pays note reflection markers"
     proofs: {},
   });
   assert.equal(proofs.noteReflectionWithMarkers, true);
+
+  const byokProof = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "append_to_current_file",
+    argumentsText:
+      "BYOK_AUTONOMOUS_abc123 https://linear.app/x https://github.com/o/r/pull/4",
+    proofs: {},
+  });
+  assert.equal(byokProof.noteReflectionWithMarkers, true);
+
+  const finalizedPublication = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "publish_verified_code_to_github",
+    output: {
+      status: "finalized",
+      obsidianReceiptId: "github-note-reflection-proof",
+      pullRequest: {
+        htmlUrl: "https://github.com/o/r/pull/5",
+      },
+    },
+    proofs: {},
+  });
+  assert.equal(finalizedPublication.githubPrivateRepoOrPrUrl, true);
+  assert.equal(finalizedPublication.noteReflectionWithMarkers, true);
+
+  const unfinalizedPublication = applySetLooseDeliveryProofFromSuccessfulTool({
+    toolName: "publish_verified_code_to_github",
+    output: {
+      status: "draft_pr_verified",
+      obsidianReceiptId: null,
+      pullRequest: {
+        htmlUrl: "https://github.com/o/r/pull/6",
+      },
+    },
+    proofs: {},
+  });
+  assert.equal(unfinalizedPublication.githubPrivateRepoOrPrUrl, true);
+  assert.equal(unfinalizedPublication.noteReflectionWithMarkers, undefined);
 
   const repoOnly = applySetLooseDeliveryProofFromSuccessfulTool({
     toolName: "append_to_current_file",

@@ -13,7 +13,10 @@ export interface DailyUseRunMetricsV1 {
   modelCalls: number;
   toolCalls: number;
   continuations: number;
+  /** Additional approval-button interactions during this run. */
   approvals: number;
+  /** Distinct fingerprint-bound approval or host-authorization boundaries proven at runtime. */
+  approvalBoundaryProofCount: number;
   artifactProofCount: number;
   cleanupProofCount: number;
   missingAcceptanceCriteria: string[];
@@ -48,6 +51,7 @@ export function createDailyUseRunMetricsV1(input: {
     toolCalls: counter(input.toolCalls),
     continuations: counter(input.continuations),
     approvals: counter(input.approvals),
+    approvalBoundaryProofCount: new Set(input.observed.approvals).size,
     artifactProofCount: new Set(input.observed.artifacts).size,
     cleanupProofCount: new Set(input.observed.cleanup).size,
     missingAcceptanceCriteria: [...acceptance.missing].sort(),

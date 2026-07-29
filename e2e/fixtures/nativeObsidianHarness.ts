@@ -1,6 +1,7 @@
 import { chromium, type Browser, type Page } from "@playwright/test";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +13,7 @@ import {
 import {
   restoreOwnedE2EArtifacts,
   snapshotOwnedE2EArtifacts,
+  vaultCleanupManifestFromSnapshot,
 } from "./ownedE2EArtifacts";
 import {
   createPluginDataBackup,
@@ -44,11 +46,18 @@ export interface NativeObsidianSetupContext {
 }
 
 export interface NativeObsidianHarness {
-  page: Page;
+  readonly page: Page;
   marker: string;
   notePath: string;
   noteFilePath: string;
   vaultRoot: string;
+  /**
+   * Relaunches only this harness's owned Obsidian process while retaining the
+   * original data/vault baseline and the current durable plugin state.
+   */
+  relaunchOwnedProcess(
+    afterConnect?: (context: NativeObsidianSetupContext) => Promise<void>,
+  ): Promise<Page>;
   close(): Promise<void>;
 }
 
@@ -65,9 +74,25 @@ export interface StartNativeObsidianHarnessOptions {
   preserveConfiguredLinearCredential?: boolean;
   /** Preserve only the existing opaque GitHub credential metadata. */
   preserveConfiguredGitHubCredential?: boolean;
+  /**
+   * Vault-relative paths this lane deliberately keeps after close (e.g. the
+   * retained-journey deliverable note). Everything else the session created in
+   * the machine-generated vault areas is removed when the harness closes.
+   */
+  retainVaultPaths?: readonly string[];
   setup(context: NativeObsidianSetupContext): Promise<void>;
   beforeClose?(context: NativeObsidianSetupContext): Promise<void>;
 }
+
+/**
+ * Written next to the Playwright outputs at snapshot time and deleted after a
+ * successful restore. If it survives, the run was killed before cleanup;
+ * scripts/e2e-preflight.mjs applies it before the next suite starts.
+ */
+export const VAULT_CLEANUP_MANIFEST_PATH = path.join(
+  "test-results",
+  "vault-cleanup-manifest.json",
+);
 
 /**
  * Starts one controlled Obsidian process against the isolated test vault.
@@ -95,6 +120,11 @@ export async function startNativeObsidianHarness(
       `Invalid OBSIDIAN_CDP_PORT: ${String(process.env.OBSIDIAN_CDP_PORT)}`,
     );
   }
+  // Establish exclusive ownership before recovering plugin state, snapshotting
+  // the vault, or arming the crash-cleanup manifest. A routine precondition
+  // failure must leave no cleanup authority behind.
+  await assertNoRunningObsidian();
+  await assertPortFree(cdpPort);
 
   const requestedPluginIds = uniqueStrings(
     options.pluginIds ?? [NATIVE_CORE_PLUGIN_ID],
@@ -129,6 +159,17 @@ export async function startNativeObsidianHarness(
       ...pluginDataPaths.map(readOptionalText),
     ]);
   const ownedArtifactsBefore = await snapshotOwnedE2EArtifacts(vaultRoot);
+  const retainVaultPaths = options.retainVaultPaths ?? [];
+  await mkdir(path.dirname(VAULT_CLEANUP_MANIFEST_PATH), { recursive: true });
+  await writeFile(
+    VAULT_CLEANUP_MANIFEST_PATH,
+    JSON.stringify(
+      vaultCleanupManifestFromSnapshot(ownedArtifactsBefore, retainVaultPaths),
+      null,
+      2,
+    ),
+    "utf8",
+  );
   const id = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
   const marker = `E2E_MARKER_${id}`;
   const notePath = `E2E Agent Tests/${options.label}-${id}.md`;
@@ -143,9 +184,39 @@ export async function startNativeObsidianHarness(
   let browser: Browser | null = null;
   let page: Page | null = null;
   let closed = false;
-
-  await assertNoRunningObsidian();
-  await assertPortFree(cdpPort);
+  const launchOwnedProcess = async (): Promise<Page> => {
+    processHandle = spawn(
+      obsidianExe,
+      [
+        `--remote-debugging-port=${cdpPort}`,
+        // --disable-gpu is deliberately absent. Under it, Chromium composites
+        // through SwiftShader, and the animated mission console leaked raster
+        // shared memory at ~35MB/s (measured: RSS 1->4.3GB in ~100s with JS
+        // heap, external, ArrayBuffers, and DOM count all flat) until the
+        // renderer died. Real users run with GPU compositing; the harness
+        // must match.
+        "--no-first-run",
+        // Without this, Electron on Windows discards renderer stderr entirely,
+        // so a renderer death (V8 OOM abort, FATAL) leaves no trace anywhere.
+        "--enable-logging=stderr",
+        // Compound missions currently OOM the renderer at V8's ~4GB default
+        // (observed: 2.3→4.3GB in 90s, then silent renderer death). The raised
+        // ceiling keeps a finite spike alive; the product allocation bug is
+        // tracked separately and this flag must not be treated as the fix.
+        "--js-flags=--max-old-space-size=8192",
+        vaultRoot,
+      ],
+      { windowsHide: true },
+    );
+    drainObsidianStdio(processHandle, options.label);
+    await waitForCdp(cdpPort, processHandle, 45_000);
+    browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
+    page = await findOnlyVaultPage(browser, vaultRoot);
+    await trustDisposableVaultIfPrompted(page);
+    await ensurePluginRuntimesLoaded(page, pluginIds);
+    setupContext.page = page;
+    return page;
+  };
 
   try {
     await forceOnlyVaultOpen(obsidianStatePath, obsidianStateBefore, vaultRoot);
@@ -161,40 +232,53 @@ export async function startNativeObsidianHarness(
       await ensureCommunityPluginEnabled(communityPluginsPath, pluginId);
     }
 
-    processHandle = spawn(
-      obsidianExe,
-      [
-        `--remote-debugging-port=${cdpPort}`,
-        "--disable-gpu",
-        "--no-first-run",
-        vaultRoot,
-      ],
-      { windowsHide: true },
-    );
-    await waitForCdp(cdpPort, processHandle, 45_000);
-    browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
-    page = await findOnlyVaultPage(browser, vaultRoot);
-    await trustDisposableVaultIfPrompted(page);
-    await ensurePluginRuntimesLoaded(page, pluginIds);
-    setupContext.page = page;
+    await launchOwnedProcess();
     await withTimeout(
       options.setup(setupContext),
       60_000,
       `Native Obsidian scenario setup (${options.label})`,
     );
 
-    const activePage = page;
     return {
-      page: activePage,
+      get page() {
+        if (!page) {
+          throw new Error("Native Obsidian page is unavailable.");
+        }
+        return page;
+      },
       marker,
       notePath,
       noteFilePath,
       vaultRoot,
+      async relaunchOwnedProcess(afterConnect) {
+        if (closed) {
+          throw new Error("Cannot relaunch a closed native Obsidian harness.");
+        }
+        await terminateObsidian(processHandle, cdpPort);
+        if (browser) {
+          await withTimeout(browser.close(), 5_000, "Playwright CDP relaunch close")
+            .catch(() => undefined);
+        }
+        processHandle = null;
+        browser = null;
+        page = null;
+        await assertPortFree(cdpPort);
+        const relaunchedPage = await launchOwnedProcess();
+        if (afterConnect) {
+          await withTimeout(
+            afterConnect({ ...setupContext, page: relaunchedPage }),
+            60_000,
+            `Native Obsidian relaunch setup (${options.label})`,
+          );
+        }
+        return relaunchedPage;
+      },
       async close() {
         if (closed) return;
         closed = true;
         let teardownError: unknown = null;
-        if (options.beforeClose && !activePage.isClosed()) {
+        const activePage = page;
+        if (options.beforeClose && activePage && !activePage.isClosed()) {
           await withTimeout(
             options.beforeClose({ ...setupContext, page: activePage }),
             5_000,
@@ -219,9 +303,13 @@ export async function startNativeObsidianHarness(
                 return null;
               })
             : null;
-        await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch((error) => {
-          teardownError ??= error;
-        });
+        await restoreOwnedE2EArtifacts(ownedArtifactsBefore, {
+          retainPaths: retainVaultPaths,
+        })
+          .then(() => rm(VAULT_CLEANUP_MANIFEST_PATH, { force: true }))
+          .catch((error) => {
+            teardownError ??= error;
+          });
         await restoreOptionalText(obsidianStatePath, obsidianStateBefore).catch(
           (error) => {
             teardownError ??= error;
@@ -252,23 +340,29 @@ export async function startNativeObsidianHarness(
       },
     };
   } catch (error) {
-    if (page && options.beforeClose && !page.isClosed()) {
+    const failedPage = page as Page | null;
+    const failedBrowser = browser as Browser | null;
+    if (failedPage && options.beforeClose && !failedPage.isClosed()) {
       await withTimeout(
-        options.beforeClose({ ...setupContext, page }),
+        options.beforeClose({ ...setupContext, page: failedPage }),
         5_000,
         "Native Obsidian failed-start beforeClose hook",
       ).catch(() => undefined);
     }
     await terminateObsidian(processHandle, cdpPort).catch(() => undefined);
-    if (browser) {
-      await withTimeout(browser.close(), 5_000, "Playwright failed-start CDP close")
+    if (failedBrowser) {
+      await withTimeout(failedBrowser.close(), 5_000, "Playwright failed-start CDP close")
         .catch(() => undefined);
     }
     const currentCorePluginData =
       options.preserveConfiguredLinearCredential === true
         ? await readOptionalText(pluginDataPaths[0]).catch(() => null)
         : null;
-    await restoreOwnedE2EArtifacts(ownedArtifactsBefore).catch(() => undefined);
+    await restoreOwnedE2EArtifacts(ownedArtifactsBefore, {
+      retainPaths: retainVaultPaths,
+    })
+      .then(() => rm(VAULT_CLEANUP_MANIFEST_PATH, { force: true }))
+      .catch(() => undefined);
     await restoreOptionalText(obsidianStatePath, obsidianStateBefore).catch(
       () => undefined,
     );
@@ -711,6 +805,56 @@ async function findOnlyVaultPage(
     await delay(250);
   }
   throw new Error(`Timed out waiting for Obsidian vault ${expectedVaultRoot}.`);
+}
+
+/**
+ * Obsidian is spawned with piped stdio, and a pipe nobody reads blocks the
+ * writer once the OS buffer (~64KB) fills. Long real-AI missions produced
+ * enough console output to fill it, freezing Obsidian mid-run at a point that
+ * depended on log volume — while short lanes stayed under the buffer and
+ * passed. Draining is therefore load-bearing, not just diagnostics; keeping
+ * the drained output also preserves the only place a renderer crash reason
+ * (for example a V8 out-of-memory abort) is ever printed.
+ */
+function drainObsidianStdio(
+  processHandle: ChildProcessWithoutNullStreams,
+  label: string,
+): void {
+  const directory = path.join(process.cwd(), "test-results");
+  const safeLabel = label.replace(/[^A-Za-z0-9-]+/gu, "_").slice(0, 60) || "obsidian";
+  const file = path.join(
+    directory,
+    `obsidian-stdio-${safeLabel}-${Date.now()}.log`,
+  );
+  let stream: WriteStream | null = null;
+  let closed = false;
+  const write = (chunk: Buffer | string) => {
+    try {
+      if (closed || stream?.writableEnded || stream?.destroyed) return;
+      if (!stream) {
+        mkdirSync(directory, { recursive: true });
+        stream = createWriteStream(file, { flags: "a" });
+        stream.on("error", () => {
+          // Diagnostics are best-effort; draining the child pipes is the
+          // load-bearing behavior.
+        });
+      }
+      stream.write(chunk);
+    } catch {
+      // Capture must never fail the run; the drain itself already happened.
+    }
+  };
+  processHandle.stdout.on("data", write);
+  processHandle.stderr.on("data", write);
+  processHandle.once("exit", (code, signal) => {
+    write(`\n[obsidian exited code=${String(code)} signal=${String(signal)}]\n`);
+  });
+  // `close` fires only after the child stdio streams have closed, so no
+  // trailing buffered chunk can race an already-ended log stream.
+  processHandle.once("close", () => {
+    closed = true;
+    stream?.end();
+  });
 }
 
 async function waitForCdp(

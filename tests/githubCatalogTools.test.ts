@@ -242,6 +242,71 @@ test("GitHub intent routing selects bounded reads or the exact requested mutatio
     getGitHubCatalogReadToolNames("List jobs for GitHub workflow run 70."),
     ["github_list_workflow_jobs"],
   );
+  const byokResearchPhase = [
+    "Deeply research a Python CRDT library.",
+    "The Linear issue contract must cover observed-remove tags and implementation behavior.",
+    "Do not implement code or publish to GitHub in this phase.",
+  ].join(" ");
+  assert.deepEqual(getGitHubCatalogReadToolNames(byokResearchPhase), []);
+  assert.deepEqual(
+    getExplicitGitHubCatalogMutationToolNames(byokResearchPhase),
+    [],
+  );
+  assert.deepEqual(
+    getGitHubCatalogReadToolNames(
+      "Review and implement Linear issue issue-1. Publish the tested commit to the issue-bound private GitHub destination as one open draft pull request.",
+    ),
+    [],
+  );
+  const byokImplementationPhase = [
+    "Review and implement Linear issue issue-1.",
+    "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it.",
+  ].join(" ");
+  assert.deepEqual(getGitHubCatalogReadToolNames(byokImplementationPhase), []);
+  assert.deepEqual(
+    getExplicitGitHubCatalogMutationToolNames(byokImplementationPhase),
+    [],
+  );
+  assert.deepEqual(
+    getGitHubCatalogReadToolNames(
+      "Without changing anything, read GitHub issue 12.",
+    ),
+    ["github_get_issue"],
+  );
+  assert.deepEqual(
+    getExplicitGitHubCatalogMutationToolNames(
+      "Without changing anything, read GitHub issue 12.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getGitHubCatalogReadToolNames(
+      "Inspect GitHub issue 12 without changing it.",
+    ),
+    ["github_get_issue"],
+  );
+  assert.deepEqual(
+    getExplicitGitHubCatalogMutationToolNames(
+      "Inspect GitHub issue 12 without changing it.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getGitHubCatalogReadToolNames(
+      "Review GitHub pull request 9 without merging it.",
+    ),
+    ["github_list_pull_request_reviews"],
+  );
+  assert.deepEqual(
+    getExplicitGitHubCatalogMutationToolNames(
+      "Review GitHub pull request 9 without merging it.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getGitHubCatalogReadToolNames("Do not read GitHub issue 12."),
+    [],
+  );
   assert.deepEqual(
     getGitHubCatalogReadToolNames("List GitHub review comments on PR 9."),
     ["github_list_pull_request_review_comments"],

@@ -10,6 +10,7 @@ import {
   PLUGIN_CATALOG,
   validatePluginCatalog,
 } from "./plugin-catalog.mjs";
+import { applyLeftoverVaultCleanupManifest } from "./vault-cleanup-manifest.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -21,7 +22,7 @@ const vaultRoot =
     : "");
 const cdpPort = Number.parseInt(process.env.OBSIDIAN_CDP_PORT ?? "11223", 10);
 const pluginsRoot = path.join(vaultRoot, ".obsidian", "plugins");
-const playwrightLanes = (process.env.E2E_PLAYWRIGHT_LANE ?? "deterministic-core-mock")
+const playwrightLanes = (process.env.E2E_PLAYWRIGHT_LANE ?? "desktop-checkers-delivery-real-live")
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
@@ -30,6 +31,19 @@ await validatePluginCatalog(repoRoot);
 await assertObsidianClosed();
 await assertPortFree(cdpPort);
 await assertReadable("test vault", vaultRoot);
+{
+  // A manifest that survived means the previous run was killed before its own
+  // vault restore; sweep its machine-generated residue before this suite runs.
+  const swept = await applyLeftoverVaultCleanupManifest(
+    path.join(repoRoot, "test-results", "vault-cleanup-manifest.json"),
+    vaultRoot,
+  );
+  if (swept.applied) {
+    console.log(
+      `Applied leftover vault cleanup manifest: removed ${swept.removedFiles} orphaned file(s).`,
+    );
+  }
+}
 
 const expectedPluginIds = await resolveExpectedPluginIds();
 for (const plugin of PLUGIN_CATALOG) {
@@ -43,8 +57,11 @@ if (playwrightLanes.some((lane) => [
   "provider-canary",
   "release-vertical",
   "daily-use-research",
+  "retained-journey",
+  "byok-autonomous-journey",
   "daily-use-code-live",
   "desktop-code-delivery-real-live",
+  "desktop-checkers-delivery-real-live",
   "daily-use-compound",
   "obsidian-hello-github-live",
   "compound-flow-real-live",
@@ -69,38 +86,25 @@ async function resolveExpectedPluginIds() {
     if (catalogIds.has(pluginId)) expected.add(pluginId);
   }
 
+  // Every remaining lane runs the single installed plugin; none needs an extra
+  // community plugin. Credential presence is enforced by run-e2e-exclusive.mjs.
   const requiredByLane = {
-    "deterministic-core-mock": [],
-    "daily-use-mock": [],
-    "daily-use-connections": [],
-    "daily-use-note": [],
-    "daily-use-memory-reflex": [],
+    "retained-journey": [],
+    "byok-autonomous-journey": [],
     "daily-use-research": [],
-    "daily-use-code": [],
     "daily-use-code-live": [],
     "desktop-code-delivery-real-live": [],
-    "daily-use-linear": [],
-    "daily-use-github": [],
+    "desktop-checkers-delivery-real-live": [],
     "daily-use-compound": [],
     "obsidian-hello-github-live": [],
-    "integration-mock": [],
-    "integration-mock-legacy": [],
-    sandbox: [],
-    "companion-restart": [],
     "real-ai-contract": [],
     "real-ai-soak": [],
     "provider-canary": [],
     "release-vertical": [],
     "disposable-live-external": [],
     "configured-linear-live": [],
-    "compound-flow-smoke-live": [],
+    "linear-flow-real-cleanup": [],
     "compound-flow-real-live": [],
-    "systems-diagrams": [],
-    // Core-only lane: the capability wire-ups live in the core plugin and need
-    // no companion or integration extension.
-    "agentic-capability-wireups": [],
-    // Real git + real GitHub askpass runtime proof; no model calls, no extra
-    // plugins. Credential presence is enforced by run-e2e-exclusive.mjs.
     "github-askpass-runtime-live": [],
   };
   for (const lane of playwrightLanes) {

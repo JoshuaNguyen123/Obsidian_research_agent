@@ -1,4 +1,5 @@
 import type { ResearchPublicationCheckpointV1 } from "./ResearchPublicationWorkflow";
+import type { VerifiedLinearCodeRepositoryBindingV1 } from "../../tools/types";
 import {
   appendWorkItemLineageTransitionV1,
   type AppendWorkItemLineageTransitionV1Input,
@@ -60,6 +61,59 @@ export function resolveQueueCodePublicationOriginV1(
     );
   });
   return requireUnique(matches, "queue_code_origin_unavailable", "queued Linear code item");
+}
+
+/**
+ * Resolve an isolated foreground code run back to the exact accepted-research
+ * publication selected by a fresh provider issue read. This is deliberately
+ * stricter than repository uniqueness: every immutable Linear/work-item
+ * identity plus the publication id and human-readable issue identifier must
+ * still agree.
+ */
+export function resolveVerifiedLinearBoundCodePublicationOriginV1(
+  checkpoints: readonly ResearchPublicationCheckpointV1[],
+  binding: VerifiedLinearCodeRepositoryBindingV1,
+  repositoryKey: string,
+): ResearchPublicationCheckpointV1 {
+  if (binding.repositoryProfileKey !== repositoryKey) {
+    throw new CodePublicationLineageErrorV1(
+      "verified_linear_code_origin_unavailable",
+      "The verified Linear repository binding does not match the publication destination.",
+    );
+  }
+  let origin: ResearchPublicationCheckpointV1;
+  try {
+    origin = resolveQueueCodePublicationOriginV1(checkpoints, {
+      issueId: binding.issueId,
+      originRunId: binding.originRunId,
+      repositoryKey,
+      workItemFingerprint: binding.workItemFingerprint,
+      acceptedResearchArtifactFingerprint:
+        binding.acceptedResearchArtifactFingerprint,
+    });
+  } catch (error) {
+    if (
+      error instanceof CodePublicationLineageErrorV1 &&
+      error.code === "code_publication_origin_ambiguous"
+    ) {
+      throw error;
+    }
+    throw new CodePublicationLineageErrorV1(
+      "verified_linear_code_origin_unavailable",
+      "No durable publication matches the host-verified Linear code binding.",
+    );
+  }
+  if (
+    origin.publicationId !== binding.publicationId ||
+    origin.issue?.id !== binding.issueId ||
+    origin.issue.identifier !== binding.issueIdentifier
+  ) {
+    throw new CodePublicationLineageErrorV1(
+      "verified_linear_code_origin_unavailable",
+      "The durable publication identity drifted from the host-verified Linear code binding.",
+    );
+  }
+  return origin;
 }
 
 /**

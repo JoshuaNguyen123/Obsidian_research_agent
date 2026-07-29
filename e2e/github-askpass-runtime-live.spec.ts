@@ -20,6 +20,7 @@ import {
   startNativeObsidianHarness,
   type NativeObsidianHarness,
 } from "./fixtures/nativeObsidianHarness";
+import { laneSelectedV1 } from "./fixtures/laneSelection";
 
 const execFileAsync = promisify(execFile);
 const LANE = "github-askpass-runtime-live";
@@ -37,7 +38,7 @@ const LANE = "github-askpass-runtime-live";
 test("production verified git push gateway pushes and reads back a disposable private repository", async () => {
   test.skip(process.platform !== "win32", "Native Obsidian askpass proof requires Windows.");
   test.skip(
-    process.env.E2E_PLAYWRIGHT_LANE !== LANE,
+    !laneSelectedV1(LANE),
     `Run only with E2E_PLAYWRIGHT_LANE=${LANE}.`,
   );
   test.setTimeout(10 * 60_000);

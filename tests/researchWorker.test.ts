@@ -6,6 +6,7 @@ import type {
   ModelClient,
   ModelToolCall,
 } from "../src/model/types";
+import type { ModelCallEvidenceV1 } from "../src/model/modelCallEvidence";
 import {
   createReadOnlyWorkerRegistry,
   isResearchWorkerParallelSafe,
@@ -26,6 +27,7 @@ test("research worker leases and deduplicates source candidates before fetch", a
     finalResponse("Primary evidence was fetched and passed to the Lead."),
   ]);
   const executed: string[] = [];
+  const modelEvidence: ModelCallEvidenceV1[] = [];
   const registry: ToolRegistry = {
     getDefinitions: () => ["web_search", "web_fetch"].map((name) => ({
       type: "function" as const,
@@ -65,8 +67,14 @@ test("research worker leases and deduplicates source candidates before fetch", a
     toolRegistry: registry,
     toolContext: {} as ToolExecutionContext,
     maxSteps: 6,
+    events: {
+      onModelCallEvidence: (event) => modelEvidence.push(event),
+    },
   });
 
+  assert.equal(modelEvidence.length, 4);
+  assert.ok(modelEvidence.every((event) => event.clientInvoked));
+  assert.ok(modelEvidence.every((event) => event.phase === "worker"));
   assert.deepEqual(executed, ["web_search", "web_fetch"]);
   assert.equal(result.toolCalls, 3);
   assert.equal(

@@ -24,6 +24,7 @@ import {
   extractExplicitWorkspaceWriteExpectedFilePaths,
   extractMarkdownPathMentions,
   hasExplicitCurrentNoteMutationIntent,
+  isBroadUnscopedVaultMutation,
 } from "../src/agent/missionScope";
 
 test("explicit vault read paths stay inside affirmative read clauses", () => {
@@ -647,6 +648,52 @@ test("delete-then-write keeps explicit current-note replacement authority", () =
   assert.equal(scope.write.currentNote, true);
 });
 
+test("initiating-note mutation authority requires a host-bound active Markdown note", () => {
+  const prompt =
+    "Inspect my whole vault, write accepted research into the initiating note, then publish it to Linear.";
+
+  assert.equal(hasExplicitCurrentNoteMutationIntent(prompt), false);
+  assert.equal(
+    hasExplicitCurrentNoteMutationIntent(prompt, {
+      hasActiveMarkdownNote: true,
+    }),
+    true,
+  );
+
+  const unbound = deriveAutonomyScope(prompt, {
+    vaultContext: true,
+    noteOutput: false,
+    explicitMutation: true,
+  });
+  assert.equal(unbound.write.currentNote, false);
+  assert.equal(isBroadUnscopedVaultMutation(unbound), true);
+
+  const bound = deriveAutonomyScope(prompt, {
+    vaultContext: true,
+    noteOutput: false,
+    explicitMutation: true,
+    hasActiveMarkdownNote: true,
+  });
+  assert.equal(bound.read.currentNote, true);
+  assert.equal(bound.write.currentNote, true);
+  assert.equal(isBroadUnscopedVaultMutation(bound), false);
+});
+
+test("initiating-note binding does not cross a mutation clause boundary", () => {
+  const prompt =
+    "Read the initiating note. Then update my whole vault with this summary.";
+  const scope = deriveAutonomyScope(prompt, {
+    vaultContext: true,
+    noteOutput: false,
+    explicitMutation: true,
+    hasActiveMarkdownNote: true,
+  });
+
+  assert.equal(scope.read.currentNote, true);
+  assert.equal(scope.write.currentNote, false);
+  assert.equal(isBroadUnscopedVaultMutation(scope), true);
+});
+
 test("loop decision forces final answer after required tools are satisfied", () => {
   const decision = decideNextLoopAction(
     {
@@ -670,6 +717,51 @@ test("loop decision forces final answer after required tools are satisfied", () 
     action: "force_final_no_tools",
     reason: "required_tools_satisfied",
   });
+});
+
+test("satisfied required tools outrank the repeated-call stop; unsatisfied repetition still stops", () => {
+  const budget = {
+    hardCap: 5,
+    toolStepBudget: 4,
+    finalizationReserve: 1,
+    expectedTools: ["web_search", "web_fetch"],
+    stopWhenSatisfied: true,
+  };
+  assert.deepEqual(
+    decideNextLoopAction(
+      {
+        successfulTools: ["web_search", "web_fetch"],
+        failedTools: [],
+        repeatedToolCalls: 2,
+        requiredToolsSatisfied: true,
+        finalizationReserved: true,
+        writeCompleted: false,
+      },
+      budget,
+    ),
+    {
+      action: "force_final_no_tools",
+      reason: "required_tools_satisfied",
+    },
+    "a complete proof set must synthesize, not die on the repeat counter",
+  );
+  assert.deepEqual(
+    decideNextLoopAction(
+      {
+        successfulTools: ["web_search"],
+        failedTools: [],
+        repeatedToolCalls: 2,
+        requiredToolsSatisfied: false,
+        finalizationReserved: true,
+        writeCompleted: false,
+      },
+      budget,
+    ),
+    {
+      action: "stop_budget",
+      reason: "repeated_tool_call_without_progress",
+    },
+  );
 });
 
 test("project memory paths live under the active note folder", () => {

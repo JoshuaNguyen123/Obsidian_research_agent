@@ -7,73 +7,196 @@ import { applyE2eAiMode, applyE2eLane, applyE2eProviderDefaults, applyPersistedW
 // @ts-ignore The production preflight is an intentionally unbundled Node ESM script.
 import { validateLiveExternalPreflight } from "../scripts/live-external-preflight.mjs";
 
-test("DU-04 Linear scenarios are owned by the dedicated file-routed spec", () => {
-  const phase6 = readFileSync(
-    new URL("../e2e/daily-use-linear.spec.ts", import.meta.url),
+test("no Playwright lane runs against a mocked model", () => {
+  const config = readFileSync(
+    new URL("../playwright.config.ts", import.meta.url),
     "utf8",
   );
-  const monolith = readFileSync(
-    new URL("../e2e/obsidian-agent.spec.ts", import.meta.url),
-    "utf8",
-  );
-  for (const title of [
-    "ordinary Linear-looking text does not expose or execute Linear tools",
-    "DU-04 accepted research creates a verified Linear hierarchy, backlink, and restart-safe dedupe",
-    "rereads claims executes vault work and reconciles completion without replay",
-  ]) {
-    assert.equal(phase6.includes(title), true, `missing Phase 6 title: ${title}`);
-    assert.equal(monolith.includes(title), false, `duplicate monolith title: ${title}`);
-  }
-});
-
-test("daily-use memory and reflex UI scenarios are physically owned by the focused spec", () => {
-  const focused = readFileSync(
-    new URL("../e2e/daily-use-memory-reflex.spec.ts", import.meta.url),
-    "utf8",
-  );
-  const monolith = readFileSync(
-    new URL("../e2e/obsidian-agent.spec.ts", import.meta.url),
-    "utf8",
-  );
-  assert.doesNotMatch(focused, /import\s+["']\.\/obsidian-agent\.spec["']/u);
-  for (const title of [
-    "agentic reflex routes ambiguous semantic prompt",
-    "small context budget compacts loop messages mid-run",
-    "research memory save clear reload recall",
-  ]) {
-    assert.equal(focused.includes(title), true, `missing focused title: ${title}`);
-    assert.equal(monolith.includes(title), false, `duplicate monolith title: ${title}`);
-  }
-});
-
-test("exclusive E2E runner defaults to deterministic core mock routing", () => {
-  const normalized = normalizeExclusiveArgs(["--mock-ai"]);
-  assert.deepEqual(normalized, {
-    playwrightArgs: ["--project=deterministic-core-mock"],
-    aiMode: "mock",
-    liveExternal: false,
-    projects: ["deterministic-core-mock"],
-  });
-});
-
-test("exclusive E2E runner permits the bounded deterministic matrix", () => {
-  const normalized = normalizeExclusiveArgs([
-    "--mock-ai",
-    "--project=deterministic-core-mock",
-    "--project",
-    "integration-mock",
-    "--project=integration-mock-legacy",
-    "--project=sandbox",
-    "--project=companion-restart",
-  ]);
-  assert.deepEqual(normalized.projects, [
+  for (const removed of [
     "deterministic-core-mock",
     "integration-mock",
     "integration-mock-legacy",
-    "sandbox",
     "companion-restart",
+    "daily-use-connections",
+    "daily-use-memory-reflex",
+    "daily-use-note",
+    "daily-use-linear",
+    "daily-use-github",
+    "agentic-capability-wireups",
+    "systems-diagrams",
+    "compound-flow-smoke-live",
+  ]) {
+    assert.equal(
+      config.includes(removed),
+      false,
+      `mock-model lane still routed: ${removed}`,
+    );
+  }
+  assert.match(config, /desktop-checkers-delivery-real-live/u);
+});
+
+test("the reported desktop failure has a dedicated real-model lane", () => {
+  const spec = readFileSync(
+    new URL("../e2e/desktop-checkers-delivery-real-live.spec.ts", import.meta.url),
+    "utf8",
+  );
+  // The user's verbatim prompt, and the state it failed from.
+  assert.match(spec, /Can you create a cli checkers game in Python on my desktop\?/u);
+  assert.match(spec, /removeSandboxProvider/u);
+  assert.match(spec, /sandbox_provider_unavailable/u);
+  assert.match(spec, /assertProductionAdoptedSandboxV1/u);
+  // It must never build its own provider configuration.
+  assert.doesNotMatch(spec, /configureSandboxProvider/u);
+  assert.doesNotMatch(spec, /liveProviderConfiguration/u);
+});
+
+test("real-model lanes assert the sandbox the product adopted for itself", () => {
+  for (const lane of [
+    "byok-autonomous-journey",
+    "desktop-checkers-delivery-real-live",
+    "desktop-code-delivery-real-live",
+    "daily-use-code-live",
+    "daily-use-compound",
+    "obsidian-hello-github-live",
+    "compound-flow-real-live",
+  ]) {
+    const spec = readFileSync(
+      new URL(`../e2e/${lane}.spec.ts`, import.meta.url),
+      "utf8",
+    );
+    assert.equal(
+      spec.includes("configureSandboxProvider"),
+      false,
+      `${lane} still injects a sandbox provider the product never adopts`,
+    );
+    assert.equal(
+      spec.includes("assertProductionAdoptedSandboxV1"),
+      true,
+      `${lane} does not assert production sandbox adoption`,
+    );
+  }
+});
+
+test("exclusive E2E runner defaults to the reported desktop delivery lane", () => {
+  const normalized = normalizeExclusiveArgs(["--real-ai"]);
+  assert.deepEqual(normalized, {
+    playwrightArgs: ["--project=desktop-checkers-delivery-real-live"],
+    aiMode: "real",
+    liveExternal: false,
+    projects: ["desktop-checkers-delivery-real-live"],
+  });
+});
+
+test("exclusive E2E runner permits the bounded real journey pack", () => {
+  const normalized = normalizeExclusiveArgs([
+    "--real-ai",
+    "--project=desktop-checkers-delivery-real-live",
+    "--project",
+    "daily-use-research",
+    "--project=daily-use-code-live",
+    "--project=daily-use-compound",
   ]);
-  assert.equal(normalized.aiMode, "mock");
+  assert.deepEqual(normalized.projects, [
+    "desktop-checkers-delivery-real-live",
+    "daily-use-research",
+    "daily-use-code-live",
+    "daily-use-compound",
+  ]);
+  assert.equal(normalized.aiMode, "real");
+});
+
+test("exclusive E2E runner routes the BYOK autonomous journey as real AI", () => {
+  const normalized = normalizeExclusiveArgs([
+    "--real-ai",
+    "--project=byok-autonomous-journey",
+  ]);
+  assert.deepEqual(normalized, {
+    playwrightArgs: ["--project=byok-autonomous-journey"],
+    aiMode: "real",
+    liveExternal: false,
+    projects: ["byok-autonomous-journey"],
+  });
+});
+
+test("BYOK autonomous journey requires its Linear cleanup scope before boot", () => {
+  assert.throws(
+    () =>
+      assertExternalCredentialProjectPreconditions(
+        { projects: ["byok-autonomous-journey"] },
+        {},
+        "win32",
+      ),
+    /requires LINEAR_LIVE_TEST_TEAM_ID/u,
+  );
+  assert.doesNotThrow(() =>
+    assertExternalCredentialProjectPreconditions(
+      { projects: ["byok-autonomous-journey"] },
+      { LINEAR_LIVE_TEST_TEAM_ID: "team-explicit-cleanup-scope" },
+      "win32",
+    ),
+  );
+});
+
+test("BYOK autonomous journey proves one root publication and cleans every owned issue", () => {
+  const spec = readFileSync(
+    new URL("../e2e/byok-autonomous-journey.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const harness = readFileSync(
+    new URL("../e2e/fixtures/realAiHarness.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(spec, /const ownedLinearIssueIds = new Set<string>\(\)/u);
+  assert.match(spec, /readCompleteResearchPublications/u);
+  assert.match(spec, /publications[\s\S]{0,220}\.toHaveLength\(1\)/u);
+  assert.match(spec, /activeMarkerIssues[\s\S]{0,260}\.toHaveLength\(1\)/u);
+  assert.match(spec, /receipt\?\.toolName === "linear_create_issue"/u);
+  assert.match(spec, /receipt\?\.resource\?\.id === issueId/u);
+  assert.match(spec, /publicationReceipts\[0\]\?\.runId/u);
+  assert.match(spec, /maxContinuations: 4/u);
+  assert.match(spec, /buildByokPhaseAResearchPrompt/u);
+  assert.match(spec, /hasExplicitResearchPublicationIntent\(phaseAPrompt\)/u);
+  assert.match(
+    spec,
+    /only within repositoryWriteScope\.allowedPaths,[\s\S]{0,120}never use a substitute helper or validator file as recovery/u,
+  );
+  assert.doesNotMatch(spec, /any additional files yourself/iu);
+  assert.match(spec, /cleanupExactOwnedLinearIssueToTrash/u);
+  assert.match(spec, /byok-linear-cleanup-v1/u);
+  assert.match(spec, /lastComplete\?\.stopReason\)\.not\.toBe\("budget"\)/u);
+  assert.match(spec, /set_loose_delivery_unpaid\|no_progress/u);
+  assert.match(
+    spec,
+    /Mission completion reflection\|Agent project reflection\|Flow real reflection/u,
+  );
+  assert.match(
+    spec,
+    /attestedRunLineage\?\.rootRunId[\s\S]{0,120}publication!\.originRunId/u,
+  );
+  assert.match(spec, /for \(const ownedIssueId of \[\.\.\.ownedLinearIssueIds\]\.sort\(\)\)/u);
+  assert.match(spec, /issue \$\{ownedIssueId\} cleanup failed/u);
+  assert.match(spec, /zero-survivor readback failed/u);
+  assert.match(spec, /cleanupFailures\.length > 0/u);
+  assert.match(spec, /output\?\.pageInfo\?\.hasNextPage/u);
+  assert.match(spec, /\.\.\.\(after \? \{ after \} : \{\}\)/u);
+  assert.match(spec, /completedReaders === 0/u);
+  assert.match(harness, /current\.attestedRunLineage = \{/u);
+  assert.match(harness, /segmentIds: \[\.\.\.priorSegmentIds, segmentId\]/u);
+  assert.match(
+    harness,
+    /ui\.stopReason === "budget" &&\s*ui\.autoContinueReason === "no_progress"[\s\S]{0,220}Mission stopped at the production no-progress circuit/u,
+  );
+  assert.match(
+    harness,
+    /const successfulTerminal =[\s\S]{0,180}ui\.stopReason === "write_completed"/u,
+  );
+});
+
+test("the removed mock mode is refused with an explicit message", () => {
+  assert.throws(
+    () => normalizeExclusiveArgs(["--mock-ai", "--project=daily-use-research"]),
+    /--mock-ai was removed/u,
+  );
 });
 
 test("free self-hosted daily-use job explicitly trusts only its created disposable vault", () => {
@@ -87,7 +210,7 @@ test("free self-hosted daily-use job explicitly trusts only its created disposab
   );
   assert.match(
     workflow,
-    /run-targeted-protected-release\.mjs[\s\S]{0,160}"--lanes=deterministic"/u,
+    /run-targeted-protected-release\.mjs[\s\S]{0,640}"--lanes=desktop"/u,
   );
   assert.match(
     workflow,
@@ -153,30 +276,21 @@ test("real AI and live external flags cannot widen into other projects", () => {
     ["desktop-code-delivery-real-live"],
   );
   assert.throws(
-    () => normalizeExclusiveArgs(["--real-ai", "--project=deterministic-core-mock"]),
+    () => normalizeExclusiveArgs(["--real-ai", "--project=configured-linear-live"]),
     /restricted to attested live-provider/u,
   );
   assert.throws(
-    () => normalizeExclusiveArgs(["--live-external", "--project=integration-mock"]),
+    () => normalizeExclusiveArgs(["--live-external", "--project=daily-use-research"]),
     /restricted to the disposable-live-external/u,
   );
   assert.throws(
     () => normalizeExclusiveArgs(["--project=unknown-lane"]),
     /Unknown E2E project/u,
   );
-  assert.throws(
-    () => normalizeExclusiveArgs(["--mock-ai", "--project=daily-use-compound"]),
-    /cannot target Tier A journey projects/u,
-  );
-  assert.throws(
-    () => normalizeExclusiveArgs(["--mock-ai", "--project=compound-flow-real-live"]),
-    /cannot target Tier A journey projects/u,
-  );
 });
 
-test("github askpass runtime lane routes under mock-ai and gates on its credential", () => {
+test("github askpass runtime lane makes no model calls and gates on its credential", () => {
   const normalized = normalizeExclusiveArgs([
-    "--mock-ai",
     "--project=github-askpass-runtime-live",
   ]);
   assert.equal(normalized.liveExternal, false);
@@ -213,7 +327,7 @@ test("github askpass runtime lane routes under mock-ai and gates on its credenti
   assert.throws(
     () =>
       assertExternalCredentialProjectPreconditions(
-        { projects: ["github-askpass-runtime-live", "deterministic-core-mock"] },
+        { projects: ["github-askpass-runtime-live", "daily-use-research"] },
         { E2E_GITHUB_TOKEN: "ghp_x" },
         "win32",
       ),
@@ -229,7 +343,7 @@ test("github askpass runtime lane routes under mock-ai and gates on its credenti
   // Lanes without external-credential requirements are unaffected.
   assert.doesNotThrow(() =>
     assertExternalCredentialProjectPreconditions(
-      { projects: ["deterministic-core-mock"] },
+      { projects: ["daily-use-research"] },
       {},
       "linux",
     ),
@@ -253,7 +367,6 @@ test("live external routing is single-project and explicitly exported", () => {
 
 test("configured Linear live routing is explicit and keeps secrets inside Obsidian", () => {
   const normalized = normalizeExclusiveArgs([
-    "--mock-ai",
     "--project=configured-linear-live",
   ]);
   assert.equal(normalized.liveExternal, false);
@@ -335,7 +448,7 @@ test("sandbox E2E lanes import only missing persisted Windows runtime declaratio
     AGENTIC_SANDBOX_CI_RUNTIME_ROOT: "/opt/agentic/runtime",
   };
   const imported = applyPersistedWindowsSandboxEnvironment(
-    { projects: ["daily-use-compound"] },
+    { projects: ["byok-autonomous-journey"] },
     env,
     {
       platform: "win32",
@@ -389,73 +502,72 @@ test("protected DU-06 binds retained Linear evidence to one verified project", (
   );
 });
 
-test("daily-use commands route to focused specs and live projects disable reruns", () => {
+test("package commands route only to real lanes and live projects disable reruns", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   );
-  assert.match(packageJson.scripts["test:e2e"], /--real-ai --project=daily-use-research/u);
-  assert.match(packageJson.scripts["test:e2e:mock"], /deterministic-core-mock/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use-note/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use"], /daily-use:focused/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use:focused"], /daily-use-connections/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use:focused"], /daily-use-memory-reflex/u);
-  assert.doesNotMatch(packageJson.scripts["test:e2e:daily-use"], /daily-use-mock/u);
-  assert.equal(
-    packageJson.scripts["test:e2e:daily-use:mock"],
-    "npm run test:e2e:daily-use",
-  );
-  assert.match(packageJson.scripts["test:e2e:daily-use:live-model"], /DU-02/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use:code"], /DU-03/u);
+  // Default `npm run test:e2e` is the exact reported daily-use failure.
   assert.match(
-    packageJson.scripts["test:e2e:daily-use:languages"],
-    /--project=daily-use-code --grep=LANG-01/u,
-  );
-  assert.match(packageJson.scripts["test:e2e:daily-use:linear"], /DU-04/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use:github"], /DU-05/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use:compound"], /DU-06/u);
-  assert.match(
-    packageJson.scripts["test:e2e:daily-use:compound"],
-    /--real-ai --project=daily-use-compound/u,
-  );
-  assert.match(
-    packageJson.scripts["test:e2e:daily-use:code:live"],
-    /--real-ai --project=daily-use-code-live/u,
+    packageJson.scripts["test:e2e"],
+    /--real-ai --project=desktop-checkers-delivery-real-live/u,
   );
   assert.match(
     packageJson.scripts["test:e2e:desktop-code-delivery"],
     /--real-ai --project=desktop-code-delivery-real-live/u,
   );
   assert.match(
-    packageJson.scripts["test:e2e:hello-github"],
-    /--real-ai --project=obsidian-hello-github-live/u,
+    packageJson.scripts["test:e2e:byok-autonomous-journey"],
+    /--real-ai --project=byok-autonomous-journey/u,
+  );
+  assert.match(
+    packageJson.scripts["test:e2e:research"],
+    /--real-ai --project=daily-use-research/u,
+  );
+  assert.match(
+    packageJson.scripts["test:e2e:code"],
+    /--real-ai --project=daily-use-code-live/u,
+  );
+  assert.match(
+    packageJson.scripts["test:e2e:compound"],
+    /--real-ai --project=daily-use-compound/u,
   );
   assert.match(
     packageJson.scripts["test:e2e:compound-real"],
     /--real-ai --project=compound-flow-real-live/u,
   );
   assert.match(
+    packageJson.scripts["test:e2e:hello-github"],
+    /--real-ai --project=obsidian-hello-github-live/u,
+  );
+  // test:e2e:journeys was removed: passing six --project flags made
+  // E2E_PLAYWRIGHT_LANE a comma-joined string, so exact-equality lane guards
+  // skipped themselves and the pack reported success having run almost
+  // nothing. Sequential multi-lane belongs to run-targeted-protected-release.
+  assert.equal(
     packageJson.scripts["test:e2e:journeys"],
-    /--real-ai --project=daily-use-research/u,
-  );
-  assert.match(
-    packageJson.scripts["cleanup:e2e-github-residue"],
-    /cleanup-e2e-github-residue\.mjs/u,
-  );
-  // Tier B policy/boundary lanes intentionally remain mock.
-  assert.match(packageJson.scripts["test:e2e:deterministic-matrix"], /--mock-ai/u);
-  assert.match(packageJson.scripts["test:e2e:compound-smoke"], /--mock-ai/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use:linear"], /--mock-ai/u);
-  assert.match(packageJson.scripts["test:e2e:daily-use:github"], /--mock-ai/u);
-  assert.match(
-    packageJson.scripts["test:e2e:daily-use:checkers"],
-    /--project=daily-use-compound --grep="DU-06 checkers"/u,
+    undefined,
+    "the multi-project journeys pack must not come back; it could not fail honestly",
   );
   assert.match(
     packageJson.scripts["test:e2e:configured-linear"],
     /--project=configured-linear-live/u,
   );
+  assert.match(
+    packageJson.scripts["cleanup:e2e-github-residue"],
+    /cleanup-e2e-github-residue\.mjs/u,
+  );
+  // No command may reintroduce a mocked model.
+  for (const [name, command] of Object.entries(packageJson.scripts)) {
+    assert.equal(
+      String(command).includes("--mock-ai"),
+      false,
+      `script ${name} still requests a mocked model`,
+    );
+  }
   const config = readFileSync(new URL("../playwright.config.ts", import.meta.url), "utf8");
   for (const project of [
+    "byok-autonomous-journey",
+    "desktop-checkers-delivery-real-live",
     "daily-use-research",
     "daily-use-code-live",
     "desktop-code-delivery-real-live",
@@ -468,6 +580,11 @@ test("daily-use commands route to focused specs and live projects disable reruns
       new RegExp(`name: "${project}"[\\s\\S]{0,160}retries: 0`, "u"),
     );
   }
+  const preflight = readFileSync(
+    new URL("../scripts/e2e-preflight.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(preflight, /"byok-autonomous-journey": \[\]/u);
 });
 
 test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch broad or merge lanes", () => {
@@ -534,13 +651,9 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
     "utf8",
   );
   for (const focusedFile of [
-    "e2e/daily-use-connections.spec.ts",
-    "e2e/daily-use-note.spec.ts",
-    "e2e/daily-use-memory-reflex.spec.ts",
-    "e2e/daily-use-code.spec.ts",
-    "e2e/daily-use-linear.spec.ts",
-    "e2e/daily-use-github.spec.ts",
     "e2e/daily-use-research.spec.ts",
+    "e2e/daily-use-code-live.spec.ts",
+    "e2e/desktop-checkers-delivery-real-live.spec.ts",
     "e2e/daily-use-compound.spec.ts",
   ]) {
     assert.match(targetedRunner, new RegExp(focusedFile.replace(/\./gu, "\\."), "u"));
@@ -559,6 +672,11 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
     /runNpmScript\("build", credentialFreeEnvironment\)/u,
   );
   assert.doesNotMatch(targetedRunner, /deterministic-matrix|real:soak/u);
+  assert.doesNotMatch(
+    targetedRunner,
+    /aiMode: "mock"/u,
+    "no protected lane may run against a mocked model",
+  );
 
   const compound = readFileSync(
     new URL("../e2e/daily-use-compound.spec.ts", import.meta.url),
@@ -644,9 +762,14 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
     realHarness,
     /ui\.stopReason === null &&\s*ui\.canResume &&\s*Boolean\(ui\.continuationCommand\)/u,
   );
+  assert.match(
+    realHarness,
+    /ui\.stopReason === "budget" &&\s*ui\.autoContinueReason !== "no_progress"/u,
+    "the autonomous harness must not override the production no-progress circuit",
+  );
   assert.match(realHarness, /durablyCompletedLifecycleTools\.includes/u);
   const approvalPoll = realHarness.indexOf(
-    "if (await approveFirstVisiblePreparedAction(page))",
+    "if (await raceRendererResponsive(approveFirstVisiblePreparedAction(page)))",
   );
   const durableRestartRead = realHarness.indexOf(
     "plugin?.getDurableMissionRestartReadiness?.()",
@@ -726,42 +849,19 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   assert.doesNotMatch(compound, /E2E_RELEASE_GITHUB_REPOSITORY["')]/u);
 });
 
-test("quick number-guess live lane creates, publishes, reads back, and cleans exact disposable projects", () => {
-  const source = readFileSync(
-    new URL("../e2e/compound-flow-smoke-live.spec.ts", import.meta.url),
+test("the delivered desktop game is actually executed, not just written", () => {
+  const spec = readFileSync(
+    new URL("../e2e/desktop-checkers-delivery-real-live.spec.ts", import.meta.url),
     "utf8",
   );
-  const fixture = readFileSync(
-    new URL("../e2e/fixtures/phase4GitRepo.ts", import.meta.url),
-    "utf8",
-  );
-  const packageJson = readFileSync(
-    new URL("../package.json", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(source, /NUMBER-GUESS-LIVE creates a real Linear project and GitHub repository/u);
-  assert.match(source, /"linear_create_project"/u);
-  assert.match(source, /"linear_get_project"/u);
-  assert.match(source, /teamId,\s*projectId,/u);
-  assert.match(source, /runNumberGuessValidation\(proof\.workspaceRoot\)/u);
-  assert.match(source, /--untracked-files=all/u);
-  assert.match(source, /AGENT_GIT_NAME = "Agentic Researcher"/u);
-  assert.match(source, /AGENT_GIT_EMAIL = "agentic-researcher@example\.invalid"/u);
-  assert.match(source, /HEAD:refs\/heads\/main/u);
-  assert.match(source, /remoteSha !== input\.expectedSha/u);
-  assert.match(source, /cleanupLinearNumberGuessResources/u);
-  assert.match(source, /deleteDisposableRepositoryAndVerify/u);
-  assert.match(source, /assertGhDeleteScopeForRepositoryFallback/u);
-  assert.match(source, /active token lacks delete_repo cleanup authority/u);
-  assert.match(source, /mandatory cleanup failed/u);
-  assert.match(fixture, /createNumberGuessJavaScriptFixture/u);
-  assert.match(fixture, /agentic-number-guess-javascript-/u);
-  assert.match(fixture, /game\.checkGuess\(42, 42\), 'correct'/u);
-  assert.match(
-    packageJson,
-    /"test:e2e:compound-smoke":\s*"[^"]*compound-flow-smoke-live"/u,
-  );
+  // Compile every delivered module, then run the entry point for real.
+  assert.match(spec, /py_compile/u);
+  assert.match(spec, /playDeliveredGame/u);
+  assert.match(spec, /spawn\("python"/u);
+  assert.match(spec, /Traceback/u);
+  // Checkers-specific evidence, so another game cannot satisfy the lane.
+  assert.match(spec, /king\|crown\|promot/u);
+  assert.match(spec, /captur\|jump\|take/u);
 });
 
 test("public workflows use only the free trusted self-hosted runner and SHA-pinned actions", () => {

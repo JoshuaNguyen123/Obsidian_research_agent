@@ -5,6 +5,7 @@ import {
   startNativeObsidianHarness,
   type NativeObsidianHarness,
 } from "./fixtures/nativeObsidianHarness";
+import { laneSelectedV1 } from "./fixtures/laneSelection";
 
 const CONFIGURED_LINEAR_LIVE_LANE = "configured-linear-live";
 
@@ -13,7 +14,7 @@ test.describe.serial("configured native Linear live proof", () => {
 
   test("uses the persisted opaque credential through production tools and cleans every disposable resource", async () => {
     test.skip(
-      process.env.E2E_PLAYWRIGHT_LANE !== CONFIGURED_LINEAR_LIVE_LANE,
+      !laneSelectedV1(CONFIGURED_LINEAR_LIVE_LANE),
       "Run only through npm run test:e2e:configured-linear.",
     );
     test.setTimeout(10 * 60_000);

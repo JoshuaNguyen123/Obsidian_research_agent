@@ -5,6 +5,7 @@ import type {
   AcceptedResearchArtifactV1,
 } from "./AcceptedResearchArtifactV1";
 import type {
+  AcceptedResearchNotePackageV1,
   AcceptedResearchNoteWriteRequestV1,
   AcceptedResearchNoteWriteResultV1,
   AcceptedResearchNoteWriter,
@@ -36,6 +37,7 @@ import type { LinearIssueRecord } from "./types";
 export const RESEARCH_PUBLICATION_CHECKPOINT_SCHEMA_VERSION = 1 as const;
 
 export type ResearchPublicationCheckpointStatusV1 =
+  | "note_written"
   | "note_verified"
   | "approval_denied"
   | "failed"
@@ -134,6 +136,8 @@ export interface ResearchPublicationCheckpointV1 {
   status: ResearchPublicationCheckpointStatusV1;
   updatedAt: string;
   artifact: AcceptedResearchArtifactV1;
+  /** Canonical package bytes that produced the accepted note and work item. */
+  acceptedPackage?: AcceptedResearchNotePackageV1;
   lineage: WorkItemLineageV1 | null;
   workItemFingerprint: string | null;
   approvalFingerprint: string | null;
@@ -184,6 +188,11 @@ export interface ResearchPublicationTraceEventV1 {
 export interface ResearchPublicationPublisherPortV1 {
   preview(request: ResearchTicketPreviewRequest): Promise<ResearchTicketPreviewResult>;
   publish(request: ResearchTicketPublishRequest): Promise<ResearchTicketPublishResult>;
+  /** Fresh normalized provider read used to prove a completed publication replay. */
+  readIssue(
+    id: string,
+    context: ToolExecutionContext,
+  ): Promise<LinearIssueRecord>;
 }
 
 export interface ResearchPublicationWorkflowOptionsV1 {
@@ -285,6 +294,25 @@ export class ResearchPublicationWorkflow {
       noteSha256: note.afterSha256,
       noteReceiptId: note.noteReceiptId,
     });
+    if (!priorCheckpoint) {
+      // Close the crash window between the host note write and Linear preview.
+      // A restarted provider must consume this exact package rather than
+      // attempting to recreate accepted research from model output.
+      await this.persist({
+        publicationId,
+        status: "note_written",
+        artifact,
+        acceptedPackage: boundRequest.note.package,
+        lineage: null,
+        workItemFingerprint: null,
+        approvalFingerprint: null,
+        binding: null,
+        issue: null,
+        pendingAction: null,
+        backlink: null,
+        error: null,
+      });
+    }
 
     const sections = sectionsFromAcceptedNote(boundRequest.note);
     const draft = draftFromAcceptedArtifact(boundRequest, artifact);
@@ -301,6 +329,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "failed",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage: null,
         workItemFingerprint: preview.ticket?.spec.fingerprint ?? null,
         approvalFingerprint: null,
@@ -340,6 +369,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "note_verified",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: null,
@@ -367,6 +397,7 @@ export class ResearchPublicationWorkflow {
           publicationId,
           status: "approval_denied",
           artifact,
+          acceptedPackage: boundRequest.note.package,
           lineage,
           workItemFingerprint: preview.ticket.spec.fingerprint,
           approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -400,6 +431,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "failed",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -457,6 +489,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status,
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -530,6 +563,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "reconcile_required",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -598,6 +632,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "reconcile_required",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -629,6 +664,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "linear_verified",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -671,6 +707,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "waiting_obsidian",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -700,6 +737,7 @@ export class ResearchPublicationWorkflow {
         publicationId,
         status: "complete",
         artifact,
+        acceptedPackage: boundRequest.note.package,
         lineage,
         workItemFingerprint: preview.ticket.spec.fingerprint,
         approvalFingerprint: approvalRequest.approvalFingerprint,
@@ -827,7 +865,7 @@ function bindRequestToCheckpoint(
   if (
     checkpoint.publicationId !== `publication-${request.note.artifactId}` ||
     checkpoint.artifact.artifactId !== request.note.artifactId ||
-    checkpoint.artifact.originRunId !== request.runId ||
+    checkpoint.artifact.originRunId !== requestOriginRunId(request) ||
     checkpoint.artifact.vaultBindingKey !== request.note.package.vaultBindingKey
   ) {
     throw new Error(
@@ -844,6 +882,9 @@ function bindRequestToCheckpoint(
       path: checkpoint.artifact.notePath,
       artifactId: checkpoint.artifact.artifactId,
       acceptedAt: checkpoint.artifact.acceptedAt,
+      ...(checkpoint.acceptedPackage
+        ? { package: structuredClone(checkpoint.acceptedPackage) }
+        : {}),
     },
   };
 }
@@ -861,10 +902,10 @@ function validateHostIntent(request: ResearchPublicationRequestV1): void {
       "Research publication requires run and tool-call identities.",
     );
   }
-  if (request.note.package.originRunId !== request.runId) {
+  if (request.note.package.originRunId !== requestOriginRunId(request)) {
     throw new ResearchPublicationWorkflowError(
       "research_publication_origin_mismatch",
-      "The accepted research package belongs to a different run.",
+      "The accepted research package belongs to a different durable root run.",
     );
   }
   if (
@@ -891,6 +932,10 @@ function validateHostIntent(request: ResearchPublicationRequestV1): void {
       );
     }
   }
+}
+
+function requestOriginRunId(request: ResearchPublicationRequestV1): string {
+  return request.context.rootMissionId?.trim() || request.runId;
 }
 
 function sectionsFromAcceptedNote(

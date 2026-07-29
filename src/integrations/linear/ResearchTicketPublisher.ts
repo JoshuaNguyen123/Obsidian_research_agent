@@ -143,6 +143,13 @@ export interface ResearchTicketPublisherOptions {
   /** Omit to publish a team-scoped issue that is not assigned to a project. */
   queueProjectId?: string | null;
   duplicateCandidateLimit?: number;
+  /**
+   * The Linear user a published research issue is assigned to, normally the
+   * connected viewer. Published issues previously landed unassigned even
+   * though the app had already discovered the viewer identity, so nobody owned
+   * the work the agent had just filed. Return null to leave it unassigned.
+   */
+  resolveDefaultAssigneeId?: () => string | null | undefined;
 }
 
 export type ResearchTicketPublishResult =
@@ -200,6 +207,21 @@ export class ResearchTicketPublisher {
     this.duplicateCandidateLimit = normalizeDuplicateCandidateLimit(
       options.duplicateCandidateLimit,
     );
+  }
+
+  /**
+   * Fail open to unassigned rather than propagate a resolver error: a bad
+   * assignee must never block publishing accepted research.
+   */
+  private resolveDefaultAssigneeId(): string | null {
+    try {
+      const resolved = this.options.resolveDefaultAssigneeId?.();
+      if (typeof resolved !== "string") return null;
+      const trimmed = resolved.trim();
+      return trimmed ? requireIdentifier(trimmed, "default assignee ID") : null;
+    } catch {
+      return null;
+    }
   }
 
   build(
@@ -329,12 +351,14 @@ export class ResearchTicketPublisher {
       };
     }
 
+    const defaultAssigneeId = this.resolveDefaultAssigneeId();
     const prepared = await this.options.actionExecutor.prepare({
       toolName: "linear_create_issue",
       arguments: {
         id: ticket.deterministicIssueId,
         teamId: this.queueTeamId,
         ...(this.queueProjectId ? { projectId: this.queueProjectId } : {}),
+        ...(defaultAssigneeId ? { assigneeId: defaultAssigneeId } : {}),
         title: ticket.title,
         description: ticket.description,
       },
@@ -512,7 +536,7 @@ export class ResearchTicketPublisher {
     return { issue: null, candidatesExamined: candidates.size };
   }
 
-  private async readIssue(
+  async readIssue(
     id: string,
     context: ToolExecutionContext,
   ): Promise<LinearIssueRecord> {
@@ -547,7 +571,17 @@ export class ResearchTicketPublisher {
         this.queueProjectId,
       );
       if (mismatch) {
-        return { issue: null, failureMessage: mismatch };
+        return {
+          issue: null,
+          failureMessage: `${mismatch}${
+            mismatch.includes("description")
+              ? comparableTicketDifferenceDiagnostic(
+                  issue.description,
+                  ticket.description,
+                )
+              : ""
+          }`,
+        };
       }
       return { issue };
     } catch (adoptError) {
@@ -908,12 +942,28 @@ function ownedDeterministicIssueMismatch(
   );
 }
 
-function normalizeComparableTicketText(value: string | undefined): string {
+export function normalizeComparableTicketText(value: string | undefined): string {
   return (value ?? "")
     .replace(/\r\n?/g, "\n")
     .replace(
       /\[([^\]\r\n]+)\]\(<(https?:\/\/[^>\r\n]+)>\)/gu,
       (match, label: string, target: string) => label === target ? target : match,
+    )
+    // Linear's Markdown serializer canonically rewrites whole-line `_text_`
+    // emphasis as `*text*`. These forms carry the same visible text and
+    // emphasis semantics; normalize only a complete, non-list line so actual
+    // content changes still fail closed.
+    .replace(
+      /^([*_])([^\s*_\r\n](?:[^\r\n]*?[^\s*_\r\n])?)\1$/gmu,
+      "_$2_",
+    )
+    // The serializer also rewrites inline `__strong__` as `**strong**`
+    // anywhere in a line (observed live: `__init__(replica_id)` came back as
+    // `**init**(replica_id)`). Both sides converge on the asterisk form; a
+    // genuinely different token still fails closed.
+    .replace(
+      /__([^\s_](?:[^_\r\n]*?[^\s_])?)__/gu,
+      "**$1**",
     )
     .replace(/(<!--[^>\r\n]+-->)[ \t]*\n(?:[ \t]*\n)+(?=```)/gu, "$1\n")
     .replace(/(```)[ \t]*\n(?:[ \t]*\n)+(?=<!--)/gu, "$1\n")

@@ -21,6 +21,10 @@ import {
   PROJECT_LIFECYCLE_STAGES,
   type ProjectLifecycleStageV1,
 } from "./projectLifecycle";
+import { parseAcceptedResearchArtifactV1 } from "../integrations/linear/AcceptedResearchArtifactV1";
+import { parseExternalWorkItemBindingV1 } from "../integrations/linear/ExternalWorkItemBindingV1";
+import { parseWorkItemLineageV1 } from "../integrations/linear/WorkItemLineageV1";
+import { parseRenderedCompatibleWorkItemSpec } from "../integrations/linear/WorkItemParser";
 
 export type { BundledStageGrantV1 };
 export { boundMayAutoUnderBundledGrant };
@@ -603,14 +607,38 @@ export type SetLooseDeliveryProofsV1 = {
 };
 
 export type SetLooseDeliveryReceiptLikeV1 = {
+  version?: number | null;
+  id?: string | null;
+  runId?: string | null;
   toolName?: string | null;
+  operation?: string | null;
   path?: string | null;
   message?: string | null;
   output?: unknown;
+  actionId?: string | null;
+  payloadFingerprint?: string | null;
+  grantId?: string | null;
+  idempotencyKey?: string | null;
+  providerRequestId?: string | null;
+  startedAt?: string | null;
+  committedAt?: string | null;
+  commitKind?: string | null;
+  readback?: {
+    status?: string | null;
+    checkedAt?: string | null;
+    observedRevision?: string | null;
+    observedFingerprint?: string | null;
+  } | null;
   resource?: {
     system?: string | null;
+    resourceType?: string | null;
     id?: string | null;
+    identifier?: string | null;
     url?: string | null;
+    workspaceId?: string | null;
+    teamId?: string | null;
+    projectId?: string | null;
+    revision?: string | null;
   } | null;
 };
 
@@ -635,10 +663,344 @@ function stringField(
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function isSha256(value: string | null): value is string {
+  return Boolean(value && /^sha256:[a-f0-9]{64}$/u.test(value));
+}
+
+function isIsoTimestamp(value: string | null): value is string {
+  return Boolean(value && Number.isFinite(Date.parse(value)));
+}
+
+function linearOperationPart(value: string): string {
+  return (
+    value
+      .trim()
+      .replace(/[^A-Za-z0-9._-]+/gu, "-")
+      .replace(/^-+|-+$/gu, "")
+      .slice(0, 64) || "unknown"
+  );
+}
+
+function hasProductionCreateOperationKey(
+  idempotencyKey: string | null | undefined,
+  runId: string | null | undefined,
+): boolean {
+  const normalizedRunId = typeof runId === "string" ? runId.trim() : "";
+  if (!normalizedRunId || typeof idempotencyKey !== "string") return false;
+  const parts = idempotencyKey.split(":");
+  if (
+    parts.length !== 6 ||
+    parts[0] !== "linear" ||
+    parts[1] !== "issue" ||
+    parts[2] !== "create" ||
+    parts[3] !== linearOperationPart(normalizedRunId) ||
+    parts[5] !== "0"
+  ) {
+    return false;
+  }
+  const callToken = parts[4];
+  return (
+    Boolean(callToken) &&
+    callToken === linearOperationPart(callToken) &&
+    idempotencyKey ===
+      `linear:issue:create:${linearOperationPart(normalizedRunId)}:${callToken}:0`
+  );
+}
+
+function fieldsMatch(
+  outer: Record<string, unknown>,
+  nested: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return keys.every((key) => outer[key] === nested[key]);
+}
+
+function nestedProviderReceiptMatchesOuter(
+  receipt: SetLooseDeliveryReceiptLikeV1,
+  nested: Record<string, unknown> | null,
+): boolean {
+  if (!nested) return false;
+  const outer = receipt as Record<string, unknown>;
+  const outerResource = isRecordLike(receipt.resource) ? receipt.resource : null;
+  const nestedResource = isRecordLike(nested.resource) ? nested.resource : null;
+  const outerReadback = isRecordLike(receipt.readback) ? receipt.readback : null;
+  const nestedReadback = isRecordLike(nested.readback) ? nested.readback : null;
+  return Boolean(
+    fieldsMatch(outer, nested, [
+      "version",
+      "id",
+      "runId",
+      "actionId",
+      "toolName",
+      "operation",
+      "message",
+      "payloadFingerprint",
+      "grantId",
+      "idempotencyKey",
+      "providerRequestId",
+      "startedAt",
+      "committedAt",
+      "commitKind",
+    ]) &&
+      outerResource &&
+      nestedResource &&
+      fieldsMatch(outerResource, nestedResource, [
+        "system",
+        "resourceType",
+        "id",
+        "identifier",
+        "url",
+        "workspaceId",
+        "teamId",
+        "projectId",
+        "revision",
+      ]) &&
+      outerReadback &&
+      nestedReadback &&
+      fieldsMatch(outerReadback, nestedReadback, [
+        "status",
+        "checkedAt",
+        "observedRevision",
+        "observedFingerprint",
+      ]),
+  );
+}
+
+/**
+ * Canonical research publication receipts intentionally retain the provider
+ * action name (`linear_create_issue` / `linear_read_issue`). Restore the outer
+ * composite proof only from its committed, verified, fingerprint-linked
+ * publication result; a generic Linear create/read must never pay this stage.
+ */
+export function isCompletedAcceptedResearchPublicationReceipt(
+  receipt: SetLooseDeliveryReceiptLikeV1,
+): boolean {
+  const output = isRecordLike(receipt.output) ? receipt.output : null;
+  const issue = isRecordLike(output?.issue)
+    ? (output.issue as Record<string, unknown>)
+    : null;
+  const note = isRecordLike(output?.note)
+    ? (output.note as Record<string, unknown>)
+    : null;
+  const backlink = isRecordLike(output?.backlink)
+    ? (output.backlink as Record<string, unknown>)
+    : null;
+  const nestedReceipt = isRecordLike(output?.receipt)
+    ? (output.receipt as Record<string, unknown>)
+    : null;
+  const issueId = stringField(issue, "id");
+  const issueIdentifier = stringField(issue, "identifier");
+  const issueUrl = stringField(issue, "url");
+  const issueUpdatedAt = stringField(issue, "updatedAt");
+  const issueSnapshotHash = stringField(issue, "snapshotHash");
+  const issueDescription = stringField(issue, "description");
+  const issueTeam = isRecordLike(issue?.team)
+    ? (issue.team as Record<string, unknown>)
+    : null;
+  const issueProject = isRecordLike(issue?.project)
+    ? (issue.project as Record<string, unknown>)
+    : null;
+  const issueTeamId = stringField(issueTeam, "id");
+  const issueProjectId = stringField(issueProject, "id");
+  const receiptId = typeof receipt.id === "string" ? receipt.id.trim() : "";
+  const receiptRunId =
+    typeof receipt.runId === "string" ? receipt.runId.trim() : "";
+  const receiptActionId =
+    typeof receipt.actionId === "string" ? receipt.actionId.trim() : "";
+  const receiptGrantId =
+    typeof receipt.grantId === "string" ? receipt.grantId.trim() : "";
+  const receiptMessage =
+    typeof receipt.message === "string" ? receipt.message.trim() : "";
+  const receiptPayloadFingerprint =
+    typeof receipt.payloadFingerprint === "string"
+      ? receipt.payloadFingerprint.trim()
+      : null;
+  const approvalFingerprint = stringField(output, "approvalFingerprint");
+  const createdPublication =
+    output?.publication === "created" &&
+    receipt.toolName === "linear_create_issue" &&
+    receipt.operation === "create" &&
+    receipt.commitKind === "committed";
+  const deduplicatedPublication =
+    output?.publication === "deduplicated" &&
+    receipt.toolName === "linear_read_issue" &&
+    receipt.operation === "read" &&
+    receipt.commitKind === "committed";
+
+  if (
+    output?.ok !== true ||
+    output?.status !== "complete" ||
+    (!createdPublication && !deduplicatedPublication) ||
+    receipt.version !== 1 ||
+    !receiptId ||
+    !receiptRunId ||
+    !receiptActionId ||
+    !receiptGrantId ||
+    !receiptMessage ||
+    !isSha256(receiptPayloadFingerprint) ||
+    !isIsoTimestamp(
+      typeof receipt.startedAt === "string" ? receipt.startedAt : null,
+    ) ||
+    !isIsoTimestamp(
+      typeof receipt.committedAt === "string" ? receipt.committedAt : null,
+    ) ||
+    Date.parse(receipt.committedAt!) < Date.parse(receipt.startedAt!) ||
+    receipt.resource?.system !== "linear" ||
+    receipt.resource?.resourceType !== "issue" ||
+    receipt.readback?.status !== "verified" ||
+    !isIsoTimestamp(
+      typeof receipt.readback.checkedAt === "string"
+        ? receipt.readback.checkedAt
+        : null,
+    ) ||
+    !isSha256(
+      typeof receipt.readback.observedFingerprint === "string"
+        ? receipt.readback.observedFingerprint
+        : null,
+    ) ||
+    !isSha256(approvalFingerprint) ||
+    !issueId ||
+    !issueIdentifier ||
+    !issueUrl ||
+    !issueTeamId ||
+    !isIsoTimestamp(issueUpdatedAt) ||
+    !isSha256(issueSnapshotHash) ||
+    !issueDescription ||
+    issue?.resourceType !== "issue" ||
+    issue?.trashed !== false ||
+    receipt.resource.id !== issueId ||
+    receipt.resource.identifier !== issueIdentifier ||
+    receipt.resource.url !== issueUrl ||
+    receipt.resource.teamId !== issueTeamId ||
+    (issueProjectId
+      ? receipt.resource.projectId !== issueProjectId
+      : Boolean(receipt.resource.projectId)) ||
+    (receipt.resource.revision !== undefined &&
+      receipt.resource.revision !== null &&
+      receipt.resource.revision !== issueUpdatedAt) ||
+    (!createdPublication &&
+      receipt.readback.observedFingerprint !== issueSnapshotHash)
+  ) {
+    return false;
+  }
+
+  let artifact;
+  let noteArtifact;
+  let binding;
+  let lineage;
+  let workItem;
+  try {
+    artifact = parseAcceptedResearchArtifactV1(output.artifact);
+    noteArtifact = parseAcceptedResearchArtifactV1(note?.artifact);
+    binding = parseExternalWorkItemBindingV1(output.binding);
+    lineage = parseWorkItemLineageV1(output.lineage);
+    workItem = parseRenderedCompatibleWorkItemSpec(issueDescription).spec;
+  } catch {
+    return false;
+  }
+
+  const notePath = stringField(note, "path");
+  const noteOperation = stringField(note, "operation");
+  const noteBeforeSha256 = stringField(note, "beforeSha256");
+  const noteAfterSha256 = stringField(note, "afterSha256");
+  const backlinkPath = stringField(backlink, "path");
+  const backlinkOperation = stringField(backlink, "operation");
+  const backlinkBeforeSha256 = stringField(backlink, "beforeSha256");
+  const backlinkAfterSha256 = stringField(backlink, "afterSha256");
+  const lastLineageEvent = lineage.events[lineage.events.length - 1];
+  const workItemArtifactFingerprint =
+    workItem.schemaVersion === 2
+      ? workItem.acceptedResearchArtifactFingerprint
+      : null;
+  const workItemVaultBindingKey =
+    workItem.schemaVersion === 2 ? workItem.vaultBindingKey ?? null : null;
+  const issueRevisionPreservesBinding =
+    createdPublication
+      ? binding.issueUpdatedAt === issueUpdatedAt
+      : Number.isFinite(Date.parse(binding.issueUpdatedAt)) &&
+        Date.parse(issueUpdatedAt!) >= Date.parse(binding.issueUpdatedAt);
+  const originalPublicationNoteBinding =
+    noteAfterSha256 === artifact.noteSha256 &&
+    backlinkBeforeSha256 === noteAfterSha256;
+  const completedCheckpointReplayNoteBinding =
+    noteOperation === "no_op" &&
+    noteBeforeSha256 === noteAfterSha256 &&
+    noteAfterSha256 === backlinkAfterSha256 &&
+    backlinkBeforeSha256 === artifact.noteSha256;
+
+  if (
+    notePath !== artifact.notePath ||
+    stringField(note, "noteReceiptId") !== artifact.noteReceiptId ||
+    noteArtifact.artifactFingerprint !== artifact.artifactFingerprint ||
+    !isSha256(noteAfterSha256) ||
+    !["create", "append", "no_op"].includes(noteOperation ?? "") ||
+    (noteOperation === "no_op" && noteBeforeSha256 !== noteAfterSha256) ||
+    backlinkPath !== artifact.notePath ||
+    stringField(backlink, "issueUrl") !== issueUrl ||
+    !isSha256(backlinkBeforeSha256) ||
+    !isSha256(backlinkAfterSha256) ||
+    (!originalPublicationNoteBinding &&
+      !completedCheckpointReplayNoteBinding) ||
+    !["append", "no_op"].includes(backlinkOperation ?? "") ||
+    (backlinkOperation === "no_op" &&
+      backlinkAfterSha256 !== backlinkBeforeSha256) ||
+    binding.provider !== "linear" ||
+    binding.originRunId !== artifact.originRunId ||
+    binding.teamId !== issueTeamId ||
+    binding.issueId !== issueId ||
+    binding.issueIdentifier !== issueIdentifier ||
+    binding.issueUrl !== issueUrl ||
+    !issueRevisionPreservesBinding ||
+    binding.acceptedResearchArtifactFingerprint !==
+      artifact.artifactFingerprint ||
+    workItem.schemaVersion !== 2 ||
+    workItem.fingerprint !== binding.workItemFingerprint ||
+    workItem.originRunId !== artifact.originRunId ||
+    workItemArtifactFingerprint !== artifact.artifactFingerprint ||
+    (workItem.executionClass === "vault"
+      ? workItemVaultBindingKey !== artifact.vaultBindingKey
+      : workItemVaultBindingKey !== null) ||
+    lineage.originRunId !== artifact.originRunId ||
+    lineage.executionClass !== workItem.executionClass ||
+    lineage.workItemFingerprint !== workItem.fingerprint ||
+    lineage.researchArtifactFingerprint !== artifact.artifactFingerprint ||
+    lineage.externalWorkItemBindingFingerprint !==
+      binding.bindingFingerprint ||
+    (lineage.repositoryKey ?? null) !== (workItem.repositoryKey ?? null) ||
+    (lineage.vaultBindingKey ?? null) !==
+      (workItem.vaultBindingKey ?? null) ||
+    lastLineageEvent?.state !== "linear_verified" ||
+    lastLineageEvent.evidenceFingerprint !== binding.bindingFingerprint
+  ) {
+    return false;
+  }
+
+  if (createdPublication) {
+    return Boolean(
+      hasProductionCreateOperationKey(receipt.idempotencyKey, receiptRunId) &&
+        nestedProviderReceiptMatchesOuter(receipt, nestedReceipt) &&
+        receipt.readback?.observedRevision ===
+          receipt.readback?.observedFingerprint &&
+        Date.parse(binding.verifiedAt) >= Date.parse(receipt.committedAt!) &&
+        lastLineageEvent.receiptId === receiptId,
+    );
+  }
+
+  return Boolean(
+    receipt.idempotencyKey ===
+      `research-publication:${workItem.fingerprint}` &&
+      receipt.grantId === "linear-deduplicated-readback" &&
+      output.receipt === null &&
+      receiptPayloadFingerprint === approvalFingerprint &&
+      receipt.resource.revision === issueUpdatedAt &&
+      receipt.readback?.observedRevision === issueUpdatedAt,
+  );
+}
+
 /** Exact cross-system markers required before final set-loose note reflection pays. */
 export function hasCompleteSetLooseNoteReflectionProof(text: string): boolean {
   return (
-    /\b(?:FLOW_REAL|COMPOUND)_[A-Za-z0-9_]+\b/u.test(text) &&
+    /\b(?:FLOW_REAL|COMPOUND|BYOK_AUTONOMOUS)_[A-Za-z0-9_]+\b/u.test(text) &&
     /https:\/\/linear\.app\/[^\s)\]"'<>]+/iu.test(text) &&
     /https:\/\/github\.com\/[^\s)\]"'<>]+\/pull\/\d+/iu.test(text)
   );
@@ -706,6 +1068,17 @@ export function applySetLooseDeliveryProofFromSuccessfulTool(input: {
   if (hasDraftPrUrl) {
     next.githubPrivateRepoOrPrUrl = true;
   }
+  const hasFinalizedProjectReflection =
+    toolName === "publish_verified_code_to_github" &&
+    outputRecord?.status === "finalized" &&
+    Boolean(stringField(outputRecord, "obsidianReceiptId")) &&
+    hasDraftPrUrl;
+  if (hasFinalizedProjectReflection) {
+    // The exact publication finalizer already appended and verified the
+    // accepted-research note reflection. Do not synthesize a second legacy
+    // "Flow real reflection" section merely to pay this delivery proof.
+    next.noteReflectionWithMarkers = true;
+  }
   if (
     (toolName === "append_to_current_file" ||
       toolName === "replace_current_file") &&
@@ -732,6 +1105,12 @@ export function seedSetLooseDeliveryStateFromReceipts(
     const toolName =
       typeof receipt.toolName === "string" ? receipt.toolName.trim() : "";
     if (!toolName) continue;
+    if (isCompletedAcceptedResearchPublicationReceipt(receipt)) {
+      paidStages.add("accepted_research");
+      paidStages.add("linear_hierarchy");
+      proofs.acceptedResearchPublication = true;
+      proofs.linearIssueUrlOrId = true;
+    }
     const paid = lifecycleStagePaidBySuccessfulTool({
       toolName,
       ok: true,
@@ -805,9 +1184,10 @@ export function setLooseDeliveryComplete(input: {
     unpaid.push("private_github_publication");
   }
 
+  // This proof requires a draft-PR URL. Charging it to a bounded
+  // Research -> Linear phase makes that phase structurally impossible to
+  // complete because GitHub is intentionally absent.
   const requiresNoteReflection =
-    planStages.has("linear_hierarchy") ||
-    planStages.has("code_execution") ||
     planStages.has("private_github_publication");
   if (
     requiresNoteReflection &&

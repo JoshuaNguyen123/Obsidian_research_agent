@@ -18,6 +18,8 @@ export interface ModelCallEvidenceV1 {
   transportKind: ModelClientDescriptor["transportKind"];
   attempt: number;
   durationMs: number;
+  /** True after the request crossed the observer's local budget gate and invoked the client. */
+  clientInvoked: boolean;
   outcome: "success" | "error" | "budget_exhausted";
   responseChars: number;
   promptTokens: number;
@@ -161,6 +163,7 @@ export function createObservableModelClient({
         descriptor,
         model: requestModel,
         durationMs: 0,
+        clientInvoked: false,
         outcome: "budget_exhausted",
         attempt,
         errorCategory: "provider_budget_exhausted",
@@ -193,6 +196,7 @@ export function createObservableModelClient({
           descriptor,
           model: requestModel,
           durationMs: Math.max(0, now() - callStartedAt),
+          clientInvoked: true,
           outcome: "success",
           attempt,
           responseChars,
@@ -210,6 +214,7 @@ export function createObservableModelClient({
           descriptor,
           model: requestModel,
           durationMs: Math.max(0, now() - callStartedAt),
+          clientInvoked: true,
           outcome:
             error instanceof ModelClientError &&
             error.category === "provider_budget_exhausted"
@@ -246,6 +251,7 @@ function buildEvidence({
   descriptor,
   model,
   durationMs,
+  clientInvoked,
   outcome,
   responseChars = 0,
   promptTokens = 0,
@@ -260,6 +266,7 @@ function buildEvidence({
   descriptor: ModelClientDescriptor;
   model: string;
   durationMs: number;
+  clientInvoked: boolean;
   outcome: ModelCallEvidenceV1["outcome"];
   responseChars?: number;
   promptTokens?: number;
@@ -279,6 +286,7 @@ function buildEvidence({
     transportKind: descriptor.transportKind,
     attempt,
     durationMs,
+    clientInvoked,
     outcome,
     responseChars,
     promptTokens,

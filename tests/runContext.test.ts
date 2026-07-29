@@ -15,7 +15,9 @@ import {
 import { resolveConversationPromptCharBudget } from "../src/memory/contextCompaction";
 import {
   buildContinuationHandoffV1,
+  continuationProgressFingerprintV1,
   validateContinuationHandoffV1,
+  type ContinuationHandoffV1,
 } from "../src/agent/continuationMemory";
 
 test("blank numCtx budgets as 48k tokens with assumed_48k source", () => {
@@ -253,6 +255,101 @@ test("fingerprinted continuation handoff survives compaction and rejects tamperi
     assert.ok(authorityValidation.errors.includes("authority_receipt_mismatch"));
     assert.ok(authorityValidation.errors.includes("authority_approval_mismatch"));
     assert.ok(authorityValidation.errors.includes("authority_lineage_mismatch"));
+  }
+});
+
+test("continuation progress ignores segment churn but changes with executable proof state", () => {
+  const ledger = createMissionLedger({
+    runId: "run-progress-a",
+    mission: "Prove durable progress",
+    route: "grounded_workflow",
+    loopBudget: {
+      hardCap: 20,
+      toolStepBudget: 16,
+      finalizationReserve: 4,
+      expectedTools: ["web_search"],
+      stopWhenSatisfied: true,
+    },
+  });
+  const built = buildContinuationHandoffV1({
+    ledger,
+    now: new Date("2026-07-16T00:00:00.000Z"),
+  });
+  const base: ContinuationHandoffV1 = {
+    ...built,
+    graphFrontier: {
+      missionId: "mission-progress",
+      revision: 1,
+      graphFingerprint: `sha256:${"a".repeat(64)}`,
+      activeNodeIds: [],
+      readyNodeIds: ["research"],
+    },
+  };
+  const baseline = continuationProgressFingerprintV1(base);
+  const bookkeepingOnly: ContinuationHandoffV1 = {
+    ...base,
+    runId: "run-progress-b",
+    createdAt: "2026-07-16T01:00:00.000Z",
+    lineageFingerprints: [`sha256:${"b".repeat(64)}`],
+    recovery: {
+      stalledCount: 99,
+      lastMeaningfulAction: "Narrative-only activity",
+      remainingActions: ["Same durable work, phrased differently"],
+    },
+    graphFrontier: {
+      ...base.graphFrontier!,
+      revision: 42,
+      graphFingerprint: `sha256:${"c".repeat(64)}`,
+    },
+  };
+  assert.equal(
+    continuationProgressFingerprintV1(bookkeepingOnly),
+    baseline,
+  );
+  const repeatedEvidenceWithNewGraphIdentity: ContinuationHandoffV1 = {
+    ...base,
+    evidence: [
+      { id: "graph-revision-1", fingerprint: `sha256:${"d".repeat(64)}` },
+    ],
+  };
+  assert.equal(
+    continuationProgressFingerprintV1({
+      ...repeatedEvidenceWithNewGraphIdentity,
+      evidence: [
+        { id: "graph-revision-42", fingerprint: `sha256:${"d".repeat(64)}` },
+      ],
+    }),
+    continuationProgressFingerprintV1(repeatedEvidenceWithNewGraphIdentity),
+  );
+
+  const stateChanges: ContinuationHandoffV1[] = [
+    {
+      ...base,
+      graphFrontier: {
+        ...base.graphFrontier!,
+        readyNodeIds: ["research", "write"],
+      },
+    },
+    {
+      ...base,
+      evidence: [
+        { id: "source-1", fingerprint: `sha256:${"d".repeat(64)}` },
+      ],
+    },
+    {
+      ...base,
+      receiptFingerprints: [`sha256:${"e".repeat(64)}`],
+    },
+    {
+      ...base,
+      proofDebt: {
+        ...base.proofDebt,
+        missing: [...base.proofDebt.missing, "tool:web_search"],
+      },
+    },
+  ];
+  for (const changed of stateChanges) {
+    assert.notEqual(continuationProgressFingerprintV1(changed), baseline);
   }
 });
 

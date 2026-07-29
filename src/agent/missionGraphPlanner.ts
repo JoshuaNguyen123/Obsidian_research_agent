@@ -3,6 +3,7 @@ import type {
   JsonSchemaObject,
   ModelChatMessage,
   ModelChatRequest,
+  ModelChatResponse,
   ModelClient,
 } from "../model/types";
 import { ModelClientError } from "../model/types";
@@ -23,6 +24,7 @@ import type { ModelRouterMode } from "./missionRouter";
 
 export const MISSION_GRAPH_PLANNER_CONFIDENCE_THRESHOLD = 0.75;
 export const MISSION_GRAPH_PLANNER_DEFAULT_TIMEOUT_MS = 10_000;
+const MISSION_GRAPH_PLANNER_TOOL_NAME = "submit_mission_graph";
 
 export type MissionGraphPlannerFallbackReason =
   | "router_mode_off_conservative"
@@ -157,14 +159,14 @@ export async function planMissionGraphV3(
         mission: input.mission,
         context,
         timeoutMs: input.timeoutMs ?? MISSION_GRAPH_PLANNER_DEFAULT_TIMEOUT_MS,
-        validateDag: async (proposal) => {
+        validateProposal: async (proposal) => {
           const candidate = await resolveAuthoritativeMissionGraphV3({
             deterministicGraph: context.deterministicGraph,
             optionalReadNodes: context.optionalReadNodes,
             structuredProposal: proposal,
             decidedAt,
           });
-          return candidate.ok || candidate.reason !== "structured_model_invalid_dag";
+          return candidate.ok ? null : candidate.reason;
         },
       })
     : ({ kind: "unavailable" } as const);
@@ -510,13 +512,18 @@ async function requestStructuredMissionGraph({
   mission,
   context,
   timeoutMs,
-  validateDag,
+  validateProposal,
 }: {
   client: ModelClient;
   mission: ExplicitMissionV1;
   context: PreparedPlanningContextV1;
   timeoutMs: number;
-  validateDag?: (proposal: StructuredMissionGraphProposalV1) => Promise<boolean>;
+  validateProposal?: (
+    proposal: StructuredMissionGraphProposalV1,
+  ) => Promise<
+    | Extract<AuthoritativeMissionGraphResolutionV1, { ok: false }>["reason"]
+    | null
+  >;
 }): Promise<StructuredModelCallResult> {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) {
     throw new Error("Mission graph planner timeout must be between 1 and 120000 ms.");
@@ -532,11 +539,59 @@ async function requestStructuredMissionGraph({
       hostDependencyIds: node.dependencyIds,
     };
   });
+  const allowedNodeIds = catalog.map((node) => node.id);
+  const requiredNodeSkeleton = catalog
+    .filter((node) => node.required)
+    .map((node) => ({
+      id: node.id,
+      objective: node.hostObjective,
+      dependencyIds: node.hostDependencyIds,
+    }));
+  const optionalReadNodeIds = catalog
+    .filter((node) => !node.required && node.effect === "read")
+    .map((node) => node.id);
+  const requiredProposalTemplate = JSON.stringify({
+    confidence: 0.9,
+    nodes: requiredNodeSkeleton,
+  });
+  const authorityRepairPrompt = [
+    "Authority repair: return the same exact JSON schema using only the closed host catalog below.",
+    `allowedNodeIds=${JSON.stringify(allowedNodeIds)}`,
+    `requiredNodeSkeleton=${JSON.stringify(requiredNodeSkeleton)}`,
+    `optionalReadNodeIds=${JSON.stringify(optionalReadNodeIds)}`,
+    `requiredProposalTemplate=${requiredProposalTemplate}`,
+    "Start with every requiredNodeSkeleton entry exactly once. Preserve each required id and dependencyIds array; you may rewrite only its objective text.",
+    "If uncertain, return only the requiredNodeSkeleton entries. Add an optional read only by copying its exact id from optionalReadNodeIds, and reference only IDs present in allowedNodeIds.",
+    "Remove every invented node and dependency ID. Do not translate semantic mission steps into new IDs.",
+    "Do not invent paths, commands, bindings, tools, destinations, capabilities, hosts, budgets, or authority.",
+    "Your entire response must start with { and end with }. Return one JSON object only: no Markdown fence, prose, analysis, or second object.",
+  ].join("\n");
+  const schemaRepairPrompt = [
+    "Schema repair: return exactly one valid JSON object matching the supplied schema.",
+    `allowedNodeIds=${JSON.stringify(allowedNodeIds)}`,
+    `requiredProposalTemplate=${requiredProposalTemplate}`,
+    "Copy requiredProposalTemplate exactly if you are uncertain. You may only rewrite objective strings or add exact optional read nodes from the original host catalog.",
+    "Use only catalog node IDs, include all required fields, and produce an acyclic dependency graph.",
+    "Your entire response must start with { and end with }. Do not use Markdown, prose, analysis, comments, trailing text, or a second object.",
+  ].join("\n");
+  const dagRepairPrompt = [
+    "DAG repair: return the same exact JSON schema using only catalog node IDs.",
+    `requiredProposalTemplate=${requiredProposalTemplate}`,
+    "Include every required=true node exactly once. Every dependencyId must also have its own node entry.",
+    "Preserve the direction of hostDependencyIds, remove self/cyclic/reversed/unknown dependencies, never make a node depend on final, and keep dependency depth at four or less.",
+    "Copy requiredProposalTemplate exactly if you are uncertain.",
+    "Your entire response must start with { and end with }. Return one JSON object only: no Markdown, prose, analysis, or second object.",
+  ].join("\n");
+  const usePlannerTool =
+    client.descriptor?.endpointCategory === "ollama_cloud";
+  const plannerSchema = createMissionGraphPlannerSchema(context.catalogNodeIds);
   const messages: ModelChatMessage[] = [
     {
       role: "system",
       content: [
-        "Propose only the semantic DAG for this mission and return exactly one JSON object with keys confidence and nodes.",
+        usePlannerTool
+          ? `Propose only the semantic DAG for this mission by calling ${MISSION_GRAPH_PLANNER_TOOL_NAME} exactly once. Do not execute any mission tool and do not place the proposal in prose.`
+          : "Propose only the semantic DAG for this mission and return exactly one JSON object with keys confidence and nodes.",
         'Use this exact shape: {"confidence":0.9,"nodes":[{"id":"catalog-node-id","objective":"semantic objective","dependencyIds":[]}]}',
         "confidence must be a JSON number from 0 through 1. nodes must be a JSON array. Every node must contain exactly id, objective, and dependencyIds; dependencyIds must be an array of catalog node ID strings.",
         "Use only host-catalogued node IDs. Required nodes remain in the graph even if omitted.",
@@ -564,9 +619,22 @@ async function requestStructuredMissionGraph({
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const request: ModelChatRequest = {
         messages,
-        ...(client.descriptor?.endpointCategory === "ollama_cloud"
-          ? {}
-          : { format: createMissionGraphPlannerSchema(context.catalogNodeIds) }),
+        ...(usePlannerTool
+          ? {
+              tools: [
+                {
+                  type: "function" as const,
+                  function: {
+                    name: MISSION_GRAPH_PLANNER_TOOL_NAME,
+                    description:
+                      "Submit one bounded semantic mission graph proposal for host validation. This tool does not execute the graph.",
+                    parameters: plannerSchema,
+                  },
+                },
+              ],
+              toolChoice: "required" as const,
+            }
+          : { format: plannerSchema }),
         abortSignal: controller.signal,
         evidencePhase: attempt === 1 ? "graph_planner" : "retry",
         think: false,
@@ -576,26 +644,46 @@ async function requestStructuredMissionGraph({
         policy: { maxAttempts: 2 },
         abortSignal: controller.signal,
       });
-      const parsed = parseStructuredJson(response.message.content);
-      if (parsed === null) lastInvalidKind = "invalid_json";
+      const extracted = extractStructuredPlannerCandidate(
+        response,
+        usePlannerTool,
+      );
+      const parsed = extracted.kind === "candidate" ? extracted.value : null;
+      if (extracted.kind !== "candidate") lastInvalidKind = extracted.kind;
       const proposal = normalizeStructuredMissionGraphProposalV1(parsed);
-      if (proposal && (!validateDag || await validateDag(proposal))) {
+      const validationReason =
+        proposal && validateProposal ? await validateProposal(proposal) : null;
+      const needsDagRepair =
+        validationReason === "structured_model_invalid_dag";
+      const needsAuthorityRepair =
+        validationReason === "structured_model_authority_widening";
+      if (proposal && !needsDagRepair && !needsAuthorityRepair) {
         return { kind: "ok", proposal };
       }
       if (proposal) {
-        lastInvalidKind = "invalid_dag";
-      } else if (parsed !== null) {
+        if (needsAuthorityRepair) {
+          if (attempt === 2) {
+            // Resolve once more in the host below so the exact authority
+            // rejection and model confidence survive the bounded repair.
+            return { kind: "ok", proposal };
+          }
+        } else {
+          lastInvalidKind = "invalid_dag";
+        }
+      } else if (extracted.kind === "candidate") {
         lastInvalidKind = "invalid_schema";
       }
       if (attempt === 1) {
         messages.push(
           { role: "assistant", content: response.message.content.slice(0, 8_000) },
           {
-            role: "system",
+            role: "user",
             content:
-              lastInvalidKind === "invalid_dag"
-                ? "DAG repair: return the same exact JSON schema using only catalog node IDs. Include every required=true node exactly once. Every dependencyId must also have its own node entry. Preserve the direction of hostDependencyIds, remove self/cyclic/reversed/unknown dependencies, never make a node depend on final, and keep dependency depth at four or less. Return JSON only."
-                : "Schema repair: return only a valid JSON object matching the supplied schema. Use only catalog node IDs, include all required fields, and produce an acyclic dependency graph.",
+              needsAuthorityRepair
+                ? authorityRepairPrompt
+                : lastInvalidKind === "invalid_dag"
+                ? dagRepairPrompt
+                : schemaRepairPrompt,
           },
         );
       }
@@ -612,6 +700,76 @@ async function requestStructuredMissionGraph({
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+type StructuredPlannerCandidate =
+  | { kind: "candidate"; value: unknown }
+  | { kind: "invalid_json" | "invalid_schema" };
+
+function extractStructuredPlannerCandidate(
+  response: ModelChatResponse,
+  usePlannerTool: boolean,
+): StructuredPlannerCandidate {
+  if (!usePlannerTool) {
+    const value = parseStructuredJson(response.message.content);
+    return value === null ? { kind: "invalid_json" } : { kind: "candidate", value };
+  }
+
+  const responseToolCalls =
+    response.toolCalls.length > 0
+      ? response.toolCalls
+      : response.message.toolCalls ?? [];
+  if (responseToolCalls.length === 0) {
+    const value = parseStructuredJson(response.message.content);
+    return value === null ? { kind: "invalid_json" } : { kind: "candidate", value };
+  }
+  if (
+    responseToolCalls.length !== 1 ||
+    responseToolCalls[0].name !== MISSION_GRAPH_PLANNER_TOOL_NAME
+  ) {
+    return { kind: "invalid_schema" };
+  }
+
+  const toolValue = responseToolCalls[0].arguments;
+  const toolProposal = normalizeStructuredMissionGraphProposalV1(toolValue);
+  if (!toolProposal) return { kind: "invalid_schema" };
+
+  const content = response.message.content.trim();
+  if (content) {
+    const contentValue = parseStructuredJson(content);
+    const contentProposal = normalizeStructuredMissionGraphProposalV1(contentValue);
+    if (contentProposal) {
+      if (
+        canonicalStructuredProposal(contentProposal) !==
+        canonicalStructuredProposal(toolProposal)
+      ) {
+        return { kind: "invalid_schema" };
+      }
+    } else if (
+      /[{}]/u.test(content) ||
+      /\b(?:confidence|nodes)\b/iu.test(content)
+    ) {
+      // A malformed or alternate proposal in content conflicts with the typed
+      // tool channel. Harmless non-JSON acknowledgement text remains inert.
+      return { kind: "invalid_schema" };
+    }
+  }
+  return { kind: "candidate", value: toolValue };
+}
+
+function canonicalStructuredProposal(
+  proposal: StructuredMissionGraphProposalV1,
+): string {
+  return JSON.stringify({
+    confidence: proposal.confidence,
+    nodes: [...proposal.nodes]
+      .map((node) => ({
+        id: node.id,
+        objective: node.objective,
+        dependencyIds: [...node.dependencyIds].sort(),
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id)),
+  });
 }
 
 function parseStructuredJson(value: string): unknown | null {

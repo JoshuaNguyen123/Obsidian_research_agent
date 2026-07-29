@@ -62,3 +62,25 @@ test("allows copy when allowlisted", () => {
     "code_workspace_copy",
   );
 });
+
+test("Desktop delivery folder prose does not select workspace mkdir", () => {
+  const allow = new Set<string>(CODE_EXECUTION_TOOL_ALLOW);
+  assert.equal(
+    selectCodeWorkspaceEditToolName(
+      "Implement the Python library in its trusted repository. Deliver the final verified working directory to a new absolute Desktop folder that an IDE can open.",
+      allow,
+    ),
+    "code_workspace_create_file",
+  );
+});
+
+test("selects mkdir only for an actual directory inside the code workspace", () => {
+  const allow = new Set<string>(CODE_EXECUTION_TOOL_ALLOW);
+  assert.equal(
+    selectCodeWorkspaceEditToolName(
+      "Create an empty fixtures directory inside the project workspace.",
+      allow,
+    ),
+    "code_workspace_mkdir",
+  );
+});

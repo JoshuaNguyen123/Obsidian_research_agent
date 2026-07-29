@@ -401,12 +401,35 @@ export function isGitHubCatalogToolName(name: string): name is GitHubCatalogTool
   return name in GITHUB_CATALOG_TOOL_OPERATION_MAP;
 }
 
+function githubCatalogIntentClauses(prompt: string): string[] {
+  return String(prompt ?? "")
+    .split(/(?:[!?;\r\n]+|\.(?=\s|$)|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(
+      (clause) =>
+        /\bgithub\b/iu.test(clause) &&
+        /\b(repositor(?:y|ies)|repos?|branch(?:es)?|tags?|releases?|ref(?:erence)?s?|commits?|trees?|blobs?|files?|issues?|comments?|pull requests?|prs?|reviews?|checks?|statuses|status|workflows?|actions?|runs?|jobs?|code|search)\b/iu.test(
+          clause,
+        ),
+    );
+}
+
 export function hasExplicitGitHubCatalogIntent(prompt: string): boolean {
-  return /\bgithub\b/iu.test(prompt) && /\b(repositor(?:y|ies)|repos?|branch(?:es)?|tags?|releases?|ref(?:erence)?s?|commits?|trees?|blobs?|files?|issues?|comments?|pull requests?|prs?|reviews?|checks?|statuses|status|workflows?|actions?|runs?|jobs?|code|search)\b/iu.test(prompt);
+  return (
+    getGitHubCatalogReadToolNames(prompt).length > 0 ||
+    getExplicitGitHubCatalogMutationToolNames(prompt).length > 0
+  );
 }
 
 export function getGitHubCatalogReadToolNames(prompt: string): GitHubCatalogToolName[] {
-  if (!hasExplicitGitHubCatalogIntent(prompt)) return [];
+  const readClauses = githubCatalogIntentClauses(prompt).filter((clause) =>
+    hasAffirmativeActionOccurrence(
+      clause,
+      /\b(?:read|get|list|all|browse|show|summari[sz]e|inspect|search|find|grep|look\s+for|where\s+is|check|review|what|which)\b/iu,
+    ),
+  );
+  if (readClauses.length === 0) return [];
+  prompt = readClauses.join(" ");
   const names = new Set<GitHubCatalogToolName>();
   const pullRequest = /\b(pull request|pr)\b/iu.test(prompt);
   const reviewComment = /\breview comments?\b/iu.test(prompt);
@@ -455,7 +478,14 @@ export function getGitHubCatalogReadToolNames(prompt: string): GitHubCatalogTool
 }
 
 export function getExplicitGitHubCatalogMutationToolNames(prompt: string): GitHubCatalogToolName[] {
-  if (!hasExplicitGitHubCatalogIntent(prompt)) return [];
+  const mutationClauses = githubCatalogIntentClauses(prompt).filter((clause) =>
+    hasAffirmativeActionOccurrence(
+      clause,
+      /\b(?:create|open|update|edit|change|revise|close|reopen|reply|respond|submit|approve|request|mark|make|transition|convert|merge|squash|rebase|delete|provision|fast[- ]?forward|advance|move|rerun)\b/iu,
+    ),
+  );
+  if (mutationClauses.length === 0) return [];
+  prompt = mutationClauses.join(" ");
   if (
     /\bwithout\s+(?:making\s+)?(?:any\s+)?(?:changes?|updates?|edits?|mutations?)\b|\bwithout\s+(?:changing|updating|editing|mutating)\b|\b(?:do\s+not|don't|no)\s+(?:change|update|edit|mutate)\b/iu.test(
       prompt,
@@ -469,7 +499,19 @@ export function getExplicitGitHubCatalogMutationToolNames(prompt: string): GitHu
   const reviewComment = /\breview comment\b/iu.test(prompt);
   const createDraftPullRequest =
     pullRequest &&
-    /\b(?:create|open)\b[\s\S]{0,60}\bdraft\b|\bdraft\b[\s\S]{0,60}\b(?:pull request|pr)\b[\s\S]{0,40}\b(?:create|open)\b/iu.test(prompt);
+    (hasAffirmativeActionClause(
+      prompt,
+      /\bcreate\b/iu,
+      /\bdraft\b[\s\S]{0,60}\b(?:pull request|pr)\b/iu,
+    ) ||
+      hasAffirmativeActionClause(
+        prompt,
+        /\bopen(?=\s+(?:a|an|the|new)\b)/iu,
+        /\bdraft\b[\s\S]{0,60}\b(?:pull request|pr)\b/iu,
+      ) ||
+      /^\s*open\s+draft\b[\s\S]{0,60}\b(?:pull request|pr)\b/iu.test(
+        prompt,
+      ));
   const markPullRequestReady =
     pullRequest &&
     /\b(?:mark|make|transition|convert)\b[\s\S]{0,50}\bready(?:\s+for\s+review)?\b|\bready\s+for\s+review\b/iu.test(prompt);
@@ -526,13 +568,34 @@ function hasAffirmativeActionClause(
     .map((clause) => clause.trim())
     .filter(Boolean)
     .some((clause) => {
-      const match = action.exec(clause);
-      if (!match || !target.test(clause)) return false;
-      const prefix = clause.slice(0, match.index);
-      return !/(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[\s\S]{0,80}$/iu.test(
-        prefix,
-      );
+      return target.test(clause) && hasAffirmativeActionOccurrence(clause, action);
     });
+}
+
+function hasAffirmativeActionOccurrence(
+  clause: string,
+  action: RegExp,
+): boolean {
+  const flags = [...new Set(`${action.flags.replace(/[gy]/gu, "")}g`)].join("");
+  const matcher = new RegExp(action.source, flags);
+  for (const match of clause.matchAll(matcher)) {
+    const actionIndex = match.index ?? -1;
+    if (actionIndex < 0) continue;
+    const prefix = clause.slice(Math.max(0, actionIndex - 120), actionIndex);
+    const boundaryIndex = Math.max(
+      prefix.lastIndexOf(","),
+      prefix.lastIndexOf(":"),
+    );
+    const localPrefix = prefix.slice(boundaryIndex + 1);
+    const negated =
+      /\b(?:do\s+not|don't|never|skip|exclude)\b[\s\S]{0,100}$/iu.test(
+        localPrefix,
+      ) ||
+      /\bwithout\b[\s\S]{0,60}$/iu.test(localPrefix) ||
+      /\bno\s+need\s+to\b[\s\S]{0,60}$/iu.test(localPrefix);
+    if (!negated) return true;
+  }
+  return false;
 }
 
 export function createGitHubCatalogTools(

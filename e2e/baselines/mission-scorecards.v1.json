@@ -3,11 +3,11 @@
   "tolerance": 0.05,
   "records": [
     {
-      "project": "daily-use-note",
-      "scenarioId": "DU-01",
-      "file": "e2e/daily-use-note.spec.ts",
-      "title": "DU-01 automatic mode creates one collision-free note when no markdown note is active",
-      "key": "daily-use-note|DU-01|e2e/daily-use-note.spec.ts|DU-01 automatic mode creates one collision-free note when no markdown note is active",
+      "key": "byok-autonomous-journey|BYOK-01|e2e/byok-autonomous-journey.spec.ts|BYOK-01 proves research to Linear to tested IDE files to GitHub to reflection",
+      "project": "byok-autonomous-journey",
+      "scenarioId": "BYOK-01",
+      "file": "e2e/byok-autonomous-journey.spec.ts",
+      "title": "BYOK-01 proves research to Linear to tested IDE files to GitHub to reflection",
       "scorecard": {
         "version": 1,
         "acceptancePassed": true,
@@ -16,7 +16,7 @@
             "id": "acceptance_coverage",
             "score": 1,
             "weight": 0.3,
-            "detail": "4/4 criteria met"
+            "detail": "18/18 criteria met"
           },
           {
             "id": "evidence_grounding",
@@ -28,7 +28,7 @@
             "id": "receipt_coverage",
             "score": 1,
             "weight": 0.15,
-            "detail": "1/1 mutations receipted"
+            "detail": "14/14 mutations receipted"
           },
           {
             "id": "recovery_cleanliness",
@@ -40,13 +40,63 @@
             "id": "model_call_efficiency",
             "score": 1,
             "weight": 0.1,
-            "detail": "3/26 model calls"
+            "detail": "10/80 model calls"
           },
           {
             "id": "wall_clock_efficiency",
             "score": 1,
             "weight": 0.1,
-            "detail": "1s/3600s"
+            "detail": "94s/5400s"
+          }
+        ],
+        "total": 1
+      }
+    },
+    {
+      "key": "desktop-checkers-delivery-real-live|DESKTOP-01|e2e/desktop-checkers-delivery-real-live.spec.ts|DESKTOP-01 a bare desktop prompt adopts the host sandbox and delivers a playable Python game",
+      "project": "desktop-checkers-delivery-real-live",
+      "scenarioId": "DESKTOP-01",
+      "file": "e2e/desktop-checkers-delivery-real-live.spec.ts",
+      "title": "DESKTOP-01 a bare desktop prompt adopts the host sandbox and delivers a playable Python game",
+      "scorecard": {
+        "version": 1,
+        "acceptancePassed": true,
+        "dimensions": [
+          {
+            "id": "acceptance_coverage",
+            "score": 1,
+            "weight": 0.3,
+            "detail": "10/10 criteria met"
+          },
+          {
+            "id": "evidence_grounding",
+            "score": 1,
+            "weight": 0.25,
+            "detail": "0/0 claims cited"
+          },
+          {
+            "id": "receipt_coverage",
+            "score": 1,
+            "weight": 0.15,
+            "detail": "6/6 mutations receipted"
+          },
+          {
+            "id": "recovery_cleanliness",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "0 recovery attempts"
+          },
+          {
+            "id": "model_call_efficiency",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "11/56 model calls"
+          },
+          {
+            "id": "wall_clock_efficiency",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "99s/2100s"
           }
         ],
         "total": 1

@@ -34,34 +34,6 @@ const allowlistedProofArtifactNames = Object.freeze([
 ]);
 
 const laneDefinitions = Object.freeze({
-  deterministic: {
-    aiMode: "mock",
-    projects: [
-      "daily-use-connections",
-      "daily-use-note",
-      "daily-use-memory-reflex",
-      "daily-use-code",
-      "daily-use-linear",
-      "daily-use-github",
-    ],
-    files: [
-      "e2e/daily-use-connections.spec.ts",
-      "e2e/daily-use-note.spec.ts",
-      "e2e/daily-use-memory-reflex.spec.ts",
-      "e2e/daily-use-code.spec.ts",
-      "e2e/daily-use-linear.spec.ts",
-      "e2e/daily-use-github.spec.ts",
-    ],
-    allowedRecordFiles: [
-      "e2e/daily-use-connections.spec.ts",
-      "e2e/daily-use-note.spec.ts",
-      "e2e/daily-use-memory-reflex.spec.ts",
-      "e2e/daily-use-code.spec.ts",
-      "e2e/daily-use-linear.spec.ts",
-      "e2e/daily-use-github.spec.ts",
-    ],
-    expectedRecords: 24,
-  },
   research: {
     aiMode: "real",
     projects: ["daily-use-research"],
@@ -73,9 +45,16 @@ const laneDefinitions = Object.freeze({
   code: {
     aiMode: "real",
     projects: ["daily-use-code-live"],
-    files: ["e2e/daily-use-code.spec.ts"],
+    files: ["e2e/daily-use-code-live.spec.ts"],
     grep:
       "DU-03 protected real-model TypeScript project creation, validation, README, commit, and readback",
+    expectedRecords: 1,
+  },
+  desktop: {
+    aiMode: "real",
+    projects: ["desktop-checkers-delivery-real-live"],
+    files: ["e2e/desktop-checkers-delivery-real-live.spec.ts"],
+    grep: "DESKTOP-CHECKERS",
     expectedRecords: 1,
   },
   compound: {
@@ -98,8 +77,18 @@ const modelCredentialNames = Object.freeze([
   "E2E_OLLAMA_API_KEY",
   "E2E_OPENAI_COMPATIBLE_API_KEY",
 ]);
+// Both name sets: the plugin adopts a host-provisioned binding from the
+// canonical AGENTIC_SANDBOX_* names, so a lane that must run without execution
+// has to strip those too.
 const sandboxConfigurationNames = Object.freeze([
   "AGENTIC_SANDBOX_CI_LIVE",
+  "AGENTIC_SANDBOX_PROVIDER",
+  "AGENTIC_SANDBOX_EXECUTABLE",
+  "AGENTIC_SANDBOX_RUNTIME_REFERENCE",
+  "AGENTIC_SANDBOX_RUNTIME_DIGEST",
+  "AGENTIC_SANDBOX_WSL_DISTRIBUTION",
+  "AGENTIC_SANDBOX_RUNTIME_ROOT",
+  "AGENTIC_SANDBOX_CI_PROVIDER",
   "AGENTIC_SANDBOX_CI_EXECUTABLE",
   "AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE",
   "AGENTIC_SANDBOX_CI_RUNTIME_DIGEST",
@@ -186,7 +175,7 @@ async function main() {
 
 function parseArgs(args) {
   let sha = "";
-  let requestedLanes = "deterministic,research,code,compound";
+  let requestedLanes = "research,code,desktop,compound";
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--sha") {
@@ -239,18 +228,12 @@ function buildLaneEnvironment(lane, definition, sha) {
     E2E_PLAYWRIGHT_LANE: definition.projects.join(","),
     E2E_RELEASE_COMMIT_SHA: sha,
   };
-  if (lane === "deterministic") {
-    removeEnvironmentVariables(env, [
-      ...externalCredentialNames,
-      ...modelCredentialNames,
-      ...sandboxConfigurationNames,
-    ]);
-  } else if (lane === "research") {
+  if (lane === "research") {
     removeEnvironmentVariables(env, [
       ...externalCredentialNames,
       ...sandboxConfigurationNames,
     ]);
-  } else if (lane === "code") {
+  } else if (lane === "code" || lane === "desktop") {
     removeEnvironmentVariables(env, externalCredentialNames);
   }
   return env;

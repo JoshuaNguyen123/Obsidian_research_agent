@@ -2808,9 +2808,26 @@ function hasExplicitLinearIssueMutationIntent(prompt: string): boolean {
 }
 
 function hasNegatedLinearIssueMutationIntent(prompt: string): boolean {
-  return /\b(?:do\s+not|don't|never)\b[\s\S]{0,80}\b(?:create|make|publish|prepare|shape|format|write|draft|update|edit)\b[\s\S]{0,120}\b(?:linear|issues?|tickets?|work\s+items?)\b/iu.test(
-    prompt,
-  );
+  return prompt
+    .split(/(?:[!?;\r\n]+|\.(?=\s|$)|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some((clause) => {
+      const negatedAction =
+        /\b(?:do\s+not|don't|never)\s+(?:(?:yet|now|currently)\s+)?(?:create|make|publish|prepare|shape|format|write|draft|update|edit)\b/iu.exec(
+          clause,
+        );
+      if (!negatedAction) {
+        return false;
+      }
+      const negatedTarget = clause.slice(negatedAction.index);
+      return (
+        /\blinear\b/iu.test(negatedTarget) &&
+        /\b(?:issue|issues|ticket|tickets|work\s+item|work\s+items)\b/iu.test(
+          negatedTarget,
+        )
+      );
+    });
 }
 
 function assertTemplateCreateIntent(

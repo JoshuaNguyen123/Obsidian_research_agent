@@ -72,6 +72,57 @@ test("host graph plan turns filtered descriptors into exact read-before-mutation
   );
 });
 
+test("the current-note selector fallback never binds workspace or GitHub nodes to the vault note", async () => {
+  const notePath = "E2E Agent Tests/BYOK-AUTONOMOUS-354b0aa81852.md";
+  const workspaceNames = [
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_workspace_export_directory",
+  ];
+  const descriptors = [
+    ...workspaceNames.map((name) => workspaceLifecycleDescriptor(name)),
+    lifecycleDescriptor("linear_get_issue", "linear", "read"),
+    lifecycleDescriptor("github_create_private_repository", "github", "publish"),
+  ];
+  const names = descriptors.map((descriptor) => descriptor.name);
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-phase-b-selector",
+    objective:
+      "Review and implement Linear issue 71aa708b-70a1-4b26-9e6f-fb8a9c31a4d2. Begin with an independent linear_get_issue read of that exact identity. Implement the requested Python library in its bound trusted repository and create one verified local commit. When the work is complete, write exactly one 35-100 word human reflection to the accepted research's initiating note through its durable lineage.",
+    toolRegistry: registryForDescriptors(descriptors),
+    allowedToolNames: names,
+    plannedToolNames: names,
+    currentNotePath: notePath,
+    maxToolCalls: 24,
+    maxWallClockMs: 60 * 60_000,
+    now: NOW,
+  });
+  for (const [id, node] of Object.entries(host.deterministicProposal.nodes)) {
+    const selector = node.destination?.selector ?? null;
+    assert.notEqual(
+      selector,
+      notePath,
+      `${id} must not inherit the vault note as its destination`,
+    );
+  }
+  const createFile = Object.values(host.deterministicProposal.nodes).find(
+    (node) => node.allowedTools.includes("code_workspace_create_file"),
+  );
+  assert.ok(createFile);
+  assert.equal(
+    createFile.destination?.selector,
+    "prompt-scoped-workspace-target",
+  );
+  const githubCreate = Object.values(host.deterministicProposal.nodes).find(
+    (node) => node.allowedTools.includes("github_create_private_repository"),
+  );
+  assert.ok(githubCreate);
+  assert.equal(
+    githubCreate.destination?.selector,
+    "prompt-scoped-github-target",
+  );
+});
+
 test("dormant safe-read grants cannot become structured graph debt unless the route exposes them", async () => {
   const host = await buildHostMissionGraphPlanV1({
     missionId: "run-visible-read-boundary",
@@ -561,6 +612,58 @@ test("host graph binds a bare Python deliverable to one executable source path",
     "Create the exact new workspace file main.py without overwrite.",
   );
   assert.equal(repair?.condition, "fast_validation_failed");
+});
+
+test("host graph leaves a BYOK issue-bound repository filename prompt-scoped", async () => {
+  const name = "code_workspace_create_file";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-byok-phase-b-repository-path",
+    objective: [
+      "Review and implement Linear issue 1234 from its signed accepted-research contract.",
+      "Publish the behaviorally tested commit as an open draft pull request.",
+      "Implement the requested Python library in its bound trusted repository and choose the files and design yourself.",
+      "Deliver the verified working directory to a new absolute Desktop folder.",
+      "Do not ask for a filename; obtain repository scope from trusted host bindings.",
+    ].join(" "),
+    toolRegistry: registryForDescriptors([workspaceLifecycleDescriptor(name)]),
+    allowedToolNames: [name],
+    modelVisibleToolNames: [name],
+    plannedToolNames: [name],
+    maxToolCalls: 2,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const node = Object.values(host.deterministicProposal.nodes).find(
+    (candidate) => candidate.allowedTools[0] === name,
+  );
+  assert.ok(node);
+  assert.equal(
+    node.destination?.selector,
+    "prompt-scoped-workspace-target",
+  );
+  assert.notEqual(node.destination?.selector, "main.py");
+});
+
+test("host graph preserves an explicit repository path across lifecycle deferral", async () => {
+  const name = "code_workspace_create_file";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-explicit-repository-path",
+    objective:
+      "Implement the Linear issue in the trusted Python repository and create src/worker.py before committing the branch.",
+    toolRegistry: registryForDescriptors([workspaceLifecycleDescriptor(name)]),
+    allowedToolNames: [name],
+    modelVisibleToolNames: [name],
+    plannedToolNames: [name],
+    maxToolCalls: 2,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const node = Object.values(host.deterministicProposal.nodes).find(
+    (candidate) => candidate.allowedTools[0] === name,
+  );
+  assert.equal(node?.destination?.selector, "src/worker.py");
 });
 
 test("host graph adds one exact protected-contract read and two bounded correction passes", async () => {

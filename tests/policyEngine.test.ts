@@ -460,6 +460,20 @@ test("flag-gated bounded execution lets only a high-confidence code proposal cro
   assert.equal(enabled.intent.needsCodeExecution, true);
   assert.equal(enabled.intent.writeScope, "none");
 
+  const explicitlyProhibited = resolvePolicyRoutedIntent({
+    mode: "authority",
+    modelIntent,
+    missionIntent: intentFixture(
+      "Research the package now. Do not implement code in this phase.",
+    ),
+    writeAutonomy: false,
+    writeToolExposed: false,
+    prompt: "Research the package now. Do not implement code in this phase.",
+    allowRoutedCodeExecution: true,
+  });
+  assert.equal(explicitlyProhibited.source, "model");
+  assert.equal(explicitlyProhibited.intent.needsCodeExecution, false);
+
   const shadow = resolvePolicyRoutedIntent({
     mode: "shadow",
     modelIntent,

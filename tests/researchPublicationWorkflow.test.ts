@@ -46,6 +46,7 @@ test("explicit research publication writes note, previews, exactly approves, pub
     /\[ENG-42\]\(https:\/\/linear\.app\/acme\/issue\/ENG-42\)/u,
   );
   assert.deepEqual(fixture.checkpoints.map((entry) => entry.status), [
+    "note_written",
     "note_verified",
     "linear_verified",
     "complete",
@@ -85,6 +86,7 @@ test("denied exact approval leaves the accepted note byte-identical and performs
   assert.equal(fixture.publisher.publishCount, 0);
   assert.equal(fixture.publisher.mutationCount, 0);
   assert.deepEqual(fixture.checkpoints.map((entry) => entry.status), [
+    "note_written",
     "note_verified",
     "approval_denied",
   ]);
@@ -123,7 +125,8 @@ test("ambiguous Linear publication persists reconcile_required and never backlin
   assert.equal(fixture.checkpoints.at(-1)?.status, "reconcile_required");
   assert.equal(
     fixture.checkpoints.at(-1)?.pendingAction?.workItemFingerprint,
-    fixture.checkpoints[0]?.workItemFingerprint,
+    fixture.checkpoints.find((entry) => entry.status === "note_verified")
+      ?.workItemFingerprint,
   );
   assert.doesNotMatch(
     fixture.vault.files.get("Research/Agent platform.md") ?? "",
@@ -174,9 +177,18 @@ test("a retry adopts the exact pending issue through fresh duplicate readback wi
   const fixture = workflowFixture("reconcile_required");
   const first = await fixture.workflow.execute(requestFixture());
   assert.equal(first.status, "reconcile_required");
+  assert.equal(
+    fixture.checkpoints.at(-1)?.acceptedPackage?.title,
+    "Agent platform gap closure",
+  );
   fixture.publisher.mode = "deduplicated";
 
-  const second = await fixture.workflow.execute(requestFixture());
+  const driftedRetry = requestFixture();
+  driftedRetry.note.package.title =
+    "A provider retry tried to replace the accepted research package";
+  driftedRetry.note.package.objective =
+    "A provider retry tried to change the accepted work item.";
+  const second = await fixture.workflow.execute(driftedRetry);
 
   assert.equal(second.ok, true);
   if (!second.ok) return;
@@ -187,15 +199,55 @@ test("a retry adopts the exact pending issue through fresh duplicate readback wi
     1,
   );
   assert.deepEqual(fixture.checkpoints.map((entry) => entry.status), [
+    "note_written",
     "note_verified",
     "reconcile_required",
     "linear_verified",
     "complete",
   ]);
   assert.equal(fixture.approvalRequests.at(-1)?.proposedAction, "reuse_duplicate");
+  assert.equal(
+    fixture.publisher.lastPreviewSections?.title,
+    "Agent platform gap closure",
+  );
   assert.match(
     fixture.vault.files.get("Research/Agent platform.md") ?? "",
     /https:\/\/linear\.app\/acme\/issue\/ENG-42/u,
+  );
+});
+
+test("note-written checkpoint closes the restart window before Linear preview", async () => {
+  const fixture = workflowFixture("created");
+  fixture.publisher.failPreview = true;
+  await assert.rejects(
+    fixture.workflow.execute(requestFixture()),
+    /simulated Linear preview interruption/u,
+  );
+  assert.deepEqual(
+    fixture.checkpoints.map((entry) => entry.status),
+    ["note_written"],
+  );
+  const acceptedBytes =
+    fixture.vault.files.get("Research/Agent platform.md") ?? "";
+  assert.match(acceptedBytes, /# Agent platform gap closure/u);
+
+  fixture.publisher.failPreview = false;
+  const providerDriftedRetry = requestFixture();
+  providerDriftedRetry.note.package.title =
+    "A restarted provider attempted to replace accepted research";
+  const resumed = await fixture.workflow.execute(providerDriftedRetry);
+
+  assert.equal(resumed.ok, true);
+  assert.equal(fixture.publisher.mutationCount, 1);
+  assert.equal(
+    fixture.vault.files.get("Research/Agent platform.md")?.match(
+      /# Agent platform gap closure/gu,
+    )?.length,
+    1,
+  );
+  assert.equal(
+    fixture.publisher.lastPreviewSections?.title,
+    "Agent platform gap closure",
   );
 });
 
@@ -318,6 +370,7 @@ test("backlink failure persists waiting_obsidian after verified Linear lineage w
   assert.equal(fixture.publisher.publishCount, 1);
   assert.equal(fixture.publisher.mutationCount, 1);
   assert.deepEqual(fixture.checkpoints.map((entry) => entry.status), [
+    "note_written",
     "note_verified",
     "linear_verified",
     "waiting_obsidian",
@@ -403,6 +456,7 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
   previewCount = 0;
   publishCount = 0;
   mutationCount = 0;
+  failPreview = false;
   private ticket: ReturnType<typeof ticketFromRequest> | null = null;
   lastPreviewSections: ResearchTicketPreviewRequest["sections"] | null = null;
 
@@ -412,6 +466,9 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
 
   async preview(request: ResearchTicketPreviewRequest) {
     this.previewCount += 1;
+    if (this.failPreview) {
+      throw new Error("simulated Linear preview interruption");
+    }
     this.lastPreviewSections = structuredClone(request.sections);
     const ticket = ticketFromRequest(request);
     this.ticket = ticket;
@@ -465,6 +522,10 @@ class FakePublisher implements ResearchPublicationPublisherPortV1 {
       grantId: "grant-publish-1",
       candidatesExamined: 0,
     };
+  }
+
+  async readIssue() {
+    return issue(this.ticket?.description ?? "");
   }
 }
 

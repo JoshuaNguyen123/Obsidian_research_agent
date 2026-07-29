@@ -230,6 +230,8 @@ export interface MissionLedgerSummary {
   };
   evidenceCount: number;
   receiptCount: number;
+  /** Redacted per-segment provider aggregate; never includes prompts or responses. */
+  providerUsage: ModelUsageAggregateV1;
   expectedTools: string[];
   nextAction: string;
   remainingActions: string[];
@@ -747,6 +749,7 @@ export function summarizeMissionLedger(
       : undefined,
     evidenceCount: ledger.evidence.length,
     receiptCount: ledger.receipts.length,
+    providerUsage: normalizeProviderUsage(ledger.providerUsage),
     expectedTools: [...ledger.loopBudget.expectedTools],
     nextAction: ledger.nextActions[0] ?? "none",
     remainingActions: [...ledger.remainingActions],

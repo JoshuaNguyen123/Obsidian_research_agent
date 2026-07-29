@@ -228,7 +228,7 @@ export function parseExplicitResearchSourceCount(prompt: string): number | null 
   if (/\bboth\s+(?:returned\s+|fetched\s+|owned\s+)*(?:sources?|passages?)\b/u.test(normalized)) {
     return 2;
   }
-  const match = /\b(?:exactly\s+|use\s+|fetch\s+|from\s+)?(one|two|three|four|five|six|seven|eight|\d{1,2})\s+(?:distinct\s+|returned\s+|fetched\s+|owned\s+|focused\s+|web\s+)*(?:sources?(?:\s+domains?)?|passages?)\b/u.exec(
+  const match = /\b(?:exactly\s+|at\s+least\s+|use(?:\s+and\s+fetch)?\s+|fetch\s+|from\s+)?(one|two|three|four|five|six|seven|eight|\d{1,2})\s+(?:distinct\s+|independent\s+|returned\s+|fetched\s+|owned\s+|focused\s+|web\s+)*(?:sources?(?:\s+domains?)?|passages?)\b/u.exec(
     normalized,
   );
   if (!match?.[1]) return null;

@@ -1,5 +1,15 @@
 import { defineConfig } from "@playwright/test";
 
+/**
+ * Every project here drives the installed production plugin inside real
+ * Obsidian. There is no mock-model lane: the deterministic suites were removed
+ * because they passed on a host whose plugin could not actually run a mission
+ * — they injected the sandbox provider configuration the product never adopted,
+ * which is exactly the failure they were supposed to catch. Each lane below
+ * calls a real model, a real external service, or both, and asserts on items
+ * that really exist afterwards.
+ */
+
 const activeLanes = new Set(
   (process.env.E2E_PLAYWRIGHT_LANE ?? "")
     .split(",")
@@ -10,8 +20,12 @@ const protectedLogMode = process.env.E2E_PROTECTED_LOG_MODE === "1";
 const liveGlobalTimeout = activeLanes.has("release-vertical") ||
     activeLanes.has("daily-use-compound")
   ? 120 * 60_000
+  : activeLanes.has("retained-journey") ||
+      activeLanes.has("byok-autonomous-journey")
+    ? 135 * 60_000
   : activeLanes.has("daily-use-code-live") ||
       activeLanes.has("desktop-code-delivery-real-live") ||
+      activeLanes.has("desktop-checkers-delivery-real-live") ||
       activeLanes.has("real-ai-soak") ||
       activeLanes.has("daily-use-research") ||
       activeLanes.has("obsidian-hello-github-live")
@@ -19,40 +33,6 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
     : activeLanes.has("real-ai-contract")
       ? 15 * 60_000
       : undefined;
-
-// These native UI/approval cases still share the monolithic harness.
-// New Phase 6/7 integration coverage is routed by dedicated spec file below.
-const legacyIntegrationMockTitles =
-  /(?:Linear settings start sanitized|explicit GitHub review repair uses the native exact approval surface)/iu;
-const companionRestartTitles =
-  /(?:phase-3 authenticated companion continuation|companion-owned Linear queue polling|background Code companion continuation|background GitHub companion continuation)/iu;
-const realAiTitles = /real ai generated output/iu;
-const dailyUseNoteTitles =
-  /DU-01 automatic mode creates one collision-free note when no markdown note is active/iu;
-const dailyUseMemoryReflexTitles =
-  /(?:agentic reflex routes ambiguous semantic prompt|small context budget compacts loop messages mid-run|research memory save clear reload recall|vault-scoped research memory isolation|canonical continuation handoff|reflex safety and unchanged-loop control)/iu;
-const systemsDiagramTitles =
-  /(?:distributed-system architecture creates editable Canvas, SVG image, and scale brief|manufacturing business process creates swimlanes, quality controls, and visual artifacts)/iu;
-const protectedDailyUseCodeTitles =
-  /DU-03 protected real-model TypeScript project creation, validation, README, commit, and readback/iu;
-// These historical core-host execution scenarios use the removed inline/native
-// run_code_block contract. Phase 4 owns the replacement coverage against the
-// production Code extension: durable workspaces, sandbox fail-closed behavior,
-// isolated repair/validation/commit, and extension disablement.
-const supersededCoreCodeTitles =
-  /(?:code workspace multi-file run|code workflow runs javascript with streamed output and exit-code proof|approval card gates long code runs through deny and approve)/iu;
-const nonCoreTitles = new RegExp(
-  [
-    legacyIntegrationMockTitles,
-    companionRestartTitles,
-    realAiTitles,
-    supersededCoreCodeTitles,
-    systemsDiagramTitles,
-  ]
-    .map((pattern) => pattern.source)
-    .join("|"),
-  "iu",
-);
 
 export default defineConfig({
   testDir: "./e2e",
@@ -76,86 +56,12 @@ export default defineConfig({
   },
   projects: [
     {
-      name: "deterministic-core-mock",
-      testMatch: /obsidian-agent\.spec\.ts/u,
-      grepInvert: nonCoreTitles,
-      timeout: 180_000,
-      expect: { timeout: 15_000 },
-    },
-    {
-      name: "agentic-capability-wireups",
-      testMatch: /agentic-capability-wireups\.spec\.ts/u,
-      timeout: 420_000,
-      expect: { timeout: 30_000 },
-    },
-    {
-      name: "systems-diagrams",
-      testMatch: /obsidian-agent\.spec\.ts/u,
-      grep: systemsDiagramTitles,
-      timeout: 300_000,
-      expect: { timeout: 30_000 },
-    },
-    {
-      name: "integration-mock",
-      testMatch: /(?:daily-use-linear|daily-use-github)\.spec\.ts/u,
-      timeout: 420_000,
-      expect: { timeout: 20_000 },
-    },
-    {
-      name: "integration-mock-legacy",
-      testMatch: /obsidian-agent\.spec\.ts/u,
-      grep: legacyIntegrationMockTitles,
-      timeout: 420_000,
-      expect: { timeout: 20_000 },
-    },
-    {
-      name: "sandbox",
-      testMatch: /daily-use-code\.spec\.ts/u,
-      grepInvert: protectedDailyUseCodeTitles,
-      timeout: 420_000,
-      expect: { timeout: 30_000 },
-    },
-    {
-      name: "companion-restart",
-      testMatch:
-        /(?:obsidian-agent|phase3-effectful-companion|companion-linear-queue|background-code-companion|background-github-companion)\.spec\.ts/u,
-      grep: companionRestartTitles,
-      timeout: 600_000,
-      expect: { timeout: 30_000 },
-    },
-    {
       name: "real-ai-contract",
       testMatch: /daily-use-research\.spec\.ts/u,
       retries: 0,
       timeout: 900_000,
       expect: { timeout: 180_000 },
       use: { trace: "off", screenshot: "off", video: "off" },
-    },
-    {
-      name: "daily-use-mock",
-      testMatch: /daily-use-connections\.spec\.ts/u,
-      timeout: 240_000,
-      expect: { timeout: 20_000 },
-    },
-    {
-      name: "daily-use-connections",
-      testMatch: /daily-use-connections\.spec\.ts/u,
-      timeout: 240_000,
-      expect: { timeout: 20_000 },
-    },
-    {
-      name: "daily-use-note",
-      testMatch: /daily-use-note\.spec\.ts/u,
-      grep: dailyUseNoteTitles,
-      timeout: 300_000,
-      expect: { timeout: 20_000 },
-    },
-    {
-      name: "daily-use-memory-reflex",
-      testMatch: /daily-use-memory-reflex\.spec\.ts/u,
-      grep: dailyUseMemoryReflexTitles,
-      timeout: 420_000,
-      expect: { timeout: 30_000 },
     },
     {
       name: "daily-use-research",
@@ -166,16 +72,27 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
-      name: "daily-use-code",
-      testMatch: /daily-use-code\.spec\.ts/u,
-      grepInvert: protectedDailyUseCodeTitles,
-      timeout: 420_000,
-      expect: { timeout: 30_000 },
+      name: "retained-journey",
+      testMatch: /retained-journey\.spec\.ts/u,
+      retries: 0,
+      // Attempt 12 measured ~40 min for research + Linear alone on the cheap
+      // reasoning model before its 60-minute ceiling; the full six-stage chain
+      // needs roughly double that.
+      timeout: 7_200_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
-      name: "daily-use-code-live",
-      testMatch: /daily-use-code\.spec\.ts/u,
-      grep: protectedDailyUseCodeTitles,
+      name: "byok-autonomous-journey",
+      testMatch: /byok-autonomous-journey\.spec\.ts/u,
+      retries: 0,
+      timeout: 7_200_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "desktop-checkers-delivery-real-live",
+      testMatch: /desktop-checkers-delivery-real-live\.spec\.ts/u,
       retries: 0,
       timeout: 2_700_000,
       expect: { timeout: 180_000 },
@@ -190,16 +107,12 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
-      name: "daily-use-linear",
-      testMatch: /daily-use-linear\.spec\.ts/u,
-      timeout: 420_000,
-      expect: { timeout: 30_000 },
-    },
-    {
-      name: "daily-use-github",
-      testMatch: /daily-use-github\.spec\.ts/u,
-      timeout: 420_000,
-      expect: { timeout: 30_000 },
+      name: "daily-use-code-live",
+      testMatch: /daily-use-code-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 2_700_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
       name: "daily-use-compound",
@@ -210,8 +123,24 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
+      name: "release-vertical",
+      testMatch: /daily-use-compound\.spec\.ts/u,
+      retries: 0,
+      timeout: 3_600_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
       name: "obsidian-hello-github-live",
       testMatch: /obsidian-hello-github-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 3_600_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "compound-flow-real-live",
+      testMatch: /compound-flow-real-live\.spec\.ts/u,
       retries: 0,
       timeout: 3_600_000,
       expect: { timeout: 180_000 },
@@ -234,18 +163,18 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
-      name: "release-vertical",
-      testMatch: /daily-use-compound\.spec\.ts/u,
-      retries: 0,
-      timeout: 3_600_000,
-      expect: { timeout: 180_000 },
-      use: { trace: "off", screenshot: "off", video: "off" },
-    },
-    {
       name: "disposable-live-external",
       testMatch: /disposable-live-external\.spec\.ts/u,
       retries: 0,
       timeout: 600_000,
+      expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "linear-flow-real-cleanup",
+      testMatch: /linear-flow-real-cleanup\.spec\.ts/u,
+      retries: 0,
+      timeout: 900_000,
       expect: { timeout: 30_000 },
       use: { trace: "off", screenshot: "off", video: "off" },
     },
@@ -255,22 +184,6 @@ export default defineConfig({
       retries: 0,
       timeout: 600_000,
       expect: { timeout: 30_000 },
-      use: { trace: "off", screenshot: "off", video: "off" },
-    },
-    {
-      name: "compound-flow-smoke-live",
-      testMatch: /compound-flow-smoke-live\.spec\.ts/u,
-      retries: 0,
-      timeout: 900_000,
-      expect: { timeout: 60_000 },
-      use: { trace: "off", screenshot: "off", video: "off" },
-    },
-    {
-      name: "compound-flow-real-live",
-      testMatch: /compound-flow-real-live\.spec\.ts/u,
-      retries: 0,
-      timeout: 3_600_000,
-      expect: { timeout: 180_000 },
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {

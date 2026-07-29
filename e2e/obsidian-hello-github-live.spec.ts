@@ -10,13 +10,18 @@ import {
   GitHubRestClient,
 } from "../src/integrations/github/GitHubRestClient";
 import type { HttpTransport } from "../src/model/types";
-import { liveProviderConfiguration } from "../scripts/ci-sandbox-boundary";
 import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import { createPhase4TypeScriptProjectFixture } from "./fixtures/phase4GitRepo";
 import {
   NATIVE_CORE_PLUGIN_ID,
 } from "./fixtures/nativeObsidianHarness";
-import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import {
+  assertProductionAdoptedSandboxV1,
+  hostProvisionedSandboxRuntimeDigestV1,
+  startRealAiHarness,
+  type RealAiHarness,
+} from "./fixtures/realAiHarness";
+import { laneSelectedV1 } from "./fixtures/laneSelection";
 
 const PROFILE_KEY = "obs-hello-github-ts";
 const VALIDATION_PROFILE_KEY = "obs-hello-github-ts-validation";
@@ -30,6 +35,13 @@ const VALIDATION_PROFILE_KEY = "obs-hello-github-ts-validation";
  */
 test("OBS-HELLO Obsidian prompt creates TypeScript app and private GitHub draft PR", async () => {
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
+  // This lane creates a real private repository and a draft PR, and retains
+  // both unless OBS_HELLO_CLEANUP=1. Without a lane guard it ran in any
+  // multi-project selection.
+  test.skip(
+    !laneSelectedV1("obsidian-hello-github-live"),
+    "Run only with E2E_PLAYWRIGHT_LANE=obsidian-hello-github-live.",
+  );
   test.skip(
     process.env.E2E_AI_MODE !== "real" || process.env.E2E_REAL_AI !== "1",
     "Set E2E_REAL_AI=1 and E2E_AI_MODE=real to run through the live Obsidian plugin.",
@@ -50,7 +62,6 @@ test("OBS-HELLO Obsidian prompt creates TypeScript app and private GitHub draft 
   const marker = `OBS_HELLO_${suffix}`;
   const workspaceId = `obs-hello-${suffix}`;
   const requestId = `obs-hello-request-${suffix}`;
-  const sandboxConfiguration = liveProviderConfiguration("wsl2");
   const fixture = await createPhase4TypeScriptProjectFixture(marker);
   const profile = createRepositoryProfile({
     key: PROFILE_KEY,
@@ -76,7 +87,7 @@ test("OBS-HELLO Obsidian prompt creates TypeScript app and private GitHub draft 
       protectedPaths: ["scripts", "package.json"],
       allowedGeneratedPaths: [],
     },
-    runtimeDigests: { node: sandboxConfiguration.runtimeDigest },
+    runtimeDigests: { node: hostProvisionedSandboxRuntimeDigestV1() },
     promotionPolicy: {
       localBasePromotion: "disabled",
       completionProof: "draft_pr",
@@ -114,26 +125,13 @@ test("OBS-HELLO Obsidian prompt creates TypeScript app and private GitHub draft 
 
     githubOwned = await ensureGitHubConnected(harness.page, githubToken);
     const startedAt = Date.now();
-    const sandboxProbe = await harness.page.evaluate(
-      async ({ codePluginId, config }) => {
-        const app = (window as typeof window & { app?: any }).app;
-        const code = app?.plugins?.plugins?.["agentic-researcher"]
-          ?.getBundledCapability?.(codePluginId);
-        if (!code?.configureSandboxProvider || !code?.probeConfiguredSandboxProviders) {
-          throw new Error("The built-in Code sandbox configuration API is unavailable.");
-        }
-        await code.configureSandboxProvider(config);
-        const status = await code.probeConfiguredSandboxProviders();
-        return { status, persisted: code.readState?.()?.sandbox?.lastProbe ?? null };
-      },
-      { codePluginId: PHASE4_CODE_PLUGIN_ID, config: sandboxConfiguration },
+    // No injected provider configuration: the plugin must adopt the
+    // host-provisioned binding and pass its own boundary probe.
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
+      harness.page,
+      startedAt,
     );
-    expect(sandboxProbe.status).toMatchObject({
-      executionAvailable: true,
-      selectedProvider: "wsl2",
-    });
-    expect(Date.parse(String(sandboxProbe.persisted?.observedAt ?? "")))
-      .toBeGreaterThanOrEqual(startedAt);
+    expect(adoptedSandbox.selectedProvider).toBe("wsl2");
     await expectTrustedRepositoryProfile(harness.page, PROFILE_KEY, fixture.root);
 
     // Phase 1: code only (mirrors protected DU-03). Avoid research-trigger

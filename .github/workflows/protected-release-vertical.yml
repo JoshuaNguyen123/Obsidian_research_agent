@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       lanes:
-        description: Comma-separated targeted lanes (deterministic,research,code,compound)
+        description: Comma-separated targeted lanes (research,code,desktop,compound)
         required: true
-        default: deterministic,research,code,compound
+        default: research,code,desktop,compound
         type: string
 
 permissions:
@@ -130,13 +130,13 @@ jobs:
         with:
           name: protected-targeted-summaries-${{ steps.verify-sha.outputs.sha }}
           path: |
-            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic.json
-            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic-summary-unavailable.json
-            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du03-checkers-fast-validation-diagnostic.json
-            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-fast-validation-diagnostic.json
-            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-stage-entry-proof.json
-            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-cleanup-proof.json
-            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/deterministic--daily-use-du06-retained-linear-evidence.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/desktop.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/desktop-summary-unavailable.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/desktop--daily-use-du03-checkers-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/desktop--daily-use-du06-fast-validation-diagnostic.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/desktop--daily-use-du06-stage-entry-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/desktop--daily-use-du06-cleanup-proof.json
+            .agentic-proof/${{ steps.verify-sha.outputs.sha }}/desktop--daily-use-du06-retained-linear-evidence.json
             .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research.json
             .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research-summary-unavailable.json
             .agentic-proof/${{ steps.verify-sha.outputs.sha }}/research--daily-use-du03-checkers-fast-validation-diagnostic.json

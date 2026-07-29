@@ -1442,6 +1442,7 @@ test("resumed receipts do not spend the child segment tool budget or erase new g
       receipts: [
         {
           id: "receipt-prior",
+          runId: seedRunId,
           toolName: "append_research_memory",
           operation: "append",
           message: "Prior segment receipt.",
@@ -1488,6 +1489,7 @@ test("resumed receipts do not spend the child segment tool budget or erase new g
     receipts.map((receipt) => receipt.id),
     ["receipt-prior", receipts.at(-1)?.id],
   );
+  assert.equal(receipts[0].runId, seedRunId);
   assert.deepEqual(receipts[0].readback, {
     status: "verified",
     checkedAt: "2026-07-10T12:00:00.000Z",

@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  BYOK_01_ACCEPTANCE_TOKENS,
   DAILY_USE_ACCEPTANCE_V1,
+  DESKTOP_01_ACCEPTANCE_TOKENS,
   evaluateDailyUseAcceptanceV1,
 } from "../src/agent/dailyUseAcceptance";
 
 describe("DailyUseAcceptanceV1", () => {
-  it("defines stable, complete contracts for DU-01 through DU-06", () => {
+  it("defines stable, complete contracts for the daily-use, BYOK, and Desktop journeys", () => {
     assert.deepEqual(Object.keys(DAILY_USE_ACCEPTANCE_V1), [
       "DU-01",
       "DU-02",
@@ -15,6 +17,8 @@ describe("DailyUseAcceptanceV1", () => {
       "DU-04",
       "DU-05",
       "DU-06",
+      "BYOK-01",
+      "DESKTOP-01",
     ]);
     for (const [scenarioId, contract] of Object.entries(DAILY_USE_ACCEPTANCE_V1)) {
       assert.equal(contract.version, 1);
@@ -47,6 +51,105 @@ describe("DailyUseAcceptanceV1", () => {
       }),
       { status: "pass", missing: [] },
     );
+  });
+
+  it("keeps the BYOK autonomy proof scoped to one issue and one retained IDE export", () => {
+    const contract = DAILY_USE_ACCEPTANCE_V1["BYOK-01"];
+    assert.ok(contract.requestedArtifacts.includes("linear:implementation_issue"));
+    assert.ok(contract.requestedArtifacts.includes("code:ide_readable_export"));
+    assert.equal(contract.requestedArtifacts.includes("linear:initiative"), false);
+    assert.equal(contract.requestedArtifacts.includes("linear:project"), false);
+    assert.ok(contract.cleanupObligations.includes("cleanup:retained_export_verified"));
+    assert.deepEqual(contract.requestedArtifacts, BYOK_01_ACCEPTANCE_TOKENS.artifacts);
+    assert.deepEqual(contract.requiredProofs, BYOK_01_ACCEPTANCE_TOKENS.proofs);
+    assert.deepEqual(contract.approvalBoundaries, BYOK_01_ACCEPTANCE_TOKENS.approvals);
+    assert.deepEqual(contract.finalBindings, BYOK_01_ACCEPTANCE_TOKENS.bindings);
+    assert.deepEqual(contract.cleanupObligations, BYOK_01_ACCEPTANCE_TOKENS.cleanup);
+    assert.ok(
+      contract.finalBindings.includes("binding:durable_workspace_identity"),
+    );
+    assert.ok(contract.requiredProofs.includes("idempotency:no_duplicates"));
+    assert.equal(
+      new Set<string>(contract.requiredProofs).has("resume:no_duplicates"),
+      false,
+    );
+  });
+
+  it("uses an idempotency contract rather than an unexercised resume claim", () => {
+    for (const contract of Object.values(DAILY_USE_ACCEPTANCE_V1)) {
+      assert.equal(
+        contract.requiredProofs.includes("resume:no_duplicates"),
+        false,
+        contract.scenarioId,
+      );
+    }
+    assert.ok(
+      DAILY_USE_ACCEPTANCE_V1["DU-06"].requiredProofs.includes(
+        "idempotency:no_duplicates",
+      ),
+    );
+  });
+
+  it("keeps scratch Desktop delivery separate from repository-based DU-03", () => {
+    const contract = DAILY_USE_ACCEPTANCE_V1["DESKTOP-01"];
+    assert.deepEqual(
+      contract.requestedArtifacts,
+      DESKTOP_01_ACCEPTANCE_TOKENS.artifacts,
+    );
+    assert.deepEqual(
+      contract.requiredProofs,
+      DESKTOP_01_ACCEPTANCE_TOKENS.proofs,
+    );
+    assert.deepEqual(
+      contract.approvalBoundaries,
+      DESKTOP_01_ACCEPTANCE_TOKENS.approvals,
+    );
+    assert.deepEqual(
+      contract.finalBindings,
+      DESKTOP_01_ACCEPTANCE_TOKENS.bindings,
+    );
+    assert.deepEqual(
+      contract.cleanupObligations,
+      DESKTOP_01_ACCEPTANCE_TOKENS.cleanup,
+    );
+    assert.equal(
+      new Set<string>(contract.requiredProofs).has("code:trusted_repository"),
+      false,
+    );
+    assert.equal(
+      new Set<string>(contract.requestedArtifacts).has("git:local_commit"),
+      false,
+    );
+    assert.ok(contract.cleanupObligations.includes("cleanup:desktop_export"));
+    assert.ok(contract.cleanupObligations.includes("cleanup:scratch_workspace"));
+  });
+
+  it("fails BYOK-01 when any one runtime observation token is absent", () => {
+    const contract = DAILY_USE_ACCEPTANCE_V1["BYOK-01"];
+    const complete = {
+      artifacts: [...BYOK_01_ACCEPTANCE_TOKENS.artifacts],
+      proofs: [...BYOK_01_ACCEPTANCE_TOKENS.proofs],
+      approvals: [...BYOK_01_ACCEPTANCE_TOKENS.approvals],
+      bindings: [...BYOK_01_ACCEPTANCE_TOKENS.bindings],
+      cleanup: [...BYOK_01_ACCEPTANCE_TOKENS.cleanup],
+    };
+    for (const category of Object.keys(complete) as Array<
+      keyof typeof complete
+    >) {
+      for (const token of complete[category]) {
+        const observed = {
+          ...complete,
+          [category]: complete[category].filter(
+            (candidate) => candidate !== token,
+          ),
+        };
+        assert.deepEqual(
+          evaluateDailyUseAcceptanceV1(contract, observed),
+          { status: "needs_more_work", missing: [token] },
+          `${category}:${token}`,
+        );
+      }
+    }
   });
 
   it("requires transport-free cache reuse evidence for DU-02", () => {

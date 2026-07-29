@@ -98,25 +98,23 @@ Sync the built plugin artifacts into the live test vault:
 npm run sync:test-vault
 ```
 
-Run only the Obsidian desktop journey you changed (Obsidian must be closed first):
+Run only the Obsidian desktop journey you changed (Obsidian must be closed first). Every lane drives the installed plugin inside real Obsidian against a real model, a real external service, or both — there is no mock-model lane:
 
 ```bash
-npm run test:e2e:daily-use              # two-launch deterministic DU-01/03/04/05 plus connection and memory/reflex pack
-npm run test:e2e:daily-use:connections  # first-run and capability readiness
-npm run test:e2e:daily-use-note         # DU-01 in an owned disposable vault
-npm run test:e2e:daily-use:memory-reflex
-npm run test:e2e:daily-use:code         # deterministic DU-03
-npm run test:e2e:daily-use:linear       # deterministic DU-04
-npm run test:e2e:daily-use:github       # deterministic DU-05
-npm run test:e2e:daily-use:live-model   # affected DU-02 live-model cases only
-npm run test:e2e:daily-use:code:live    # protected local WSL2 DU-03
-npm run test:e2e:daily-use:compound     # protected local WSL2/provider DU-06
-npm run test:e2e:daily-use:checkers     # single Ollama Cloud BYOK checkers-to-private-GitHub DU-06
-npm run test:e2e:daily-use:checkers-code # Ollama Cloud BYOK + WSL2 code/validation/commit stage only; no provider mutation
+npm run test:e2e                        # the reported daily-use failure: bare Desktop checkers prompt, real model
+npm run test:e2e:desktop-code-delivery  # bare Desktop prompt, number-guessing game
+npm run test:e2e:research               # DU-02 proof-gated sourced writeback
+npm run test:e2e:code                   # protected local WSL2 DU-03 repository delivery
+npm run test:e2e:compound               # protected local WSL2/provider DU-06
+npm run test:e2e:compound-real          # Obsidian → Linear → Code → GitHub → reflection
+npm run test:e2e:hello-github           # TypeScript app plus a real private GitHub draft PR
+npm run test:e2e:journeys               # every real-model journey lane in one pass
+npm run test:e2e:configured-linear      # real Linear workspace, no model calls
+npm run test:e2e:github-askpass         # real verified git push runtime, no model calls
 npm run test:e2e:live                   # opt-in disposable provider mutation and cleanup
 ```
 
-The daily-use pack builds once for the disposable-note lane and once for all other focused deterministic projects, instead of rebuilding for every project. Public workflows never invoke the full Playwright suite, deterministic matrix, or real-model soak. `npm run test:e2e:live` remains separately guarded: Linear uses one disposable issue and GitHub one disposable draft branch/PR, independently verifies the result, and cleans up. Live merge is not part of the protected release workflow.
+The deterministic mock-model matrix was removed. It passed on a machine where the product could not run a mission at all: those lanes called `configureSandboxProvider` themselves, so a plugin holding zero sandbox providers still looked healthy while a real "write a Python game on my desktop" request stopped at `code_validate_fast`. Live lanes now assert the sandbox the product adopted for itself, and `--mock-ai` is refused with an explicit error. `npm run test:e2e:live` remains separately guarded: Linear uses one disposable issue and GitHub one disposable draft branch/PR, independently verifies the result, and cleans up. Live merge is not part of the protected release workflow.
 
 GitHub Actions is manual-only and targets the repository owner's trusted self-hosted Windows runner, labeled `agentic-daily-use`; it does not consume GitHub-hosted runner minutes. Normal pushes and public-fork pull requests do not trigger that machine. Workflows pin every Action by commit SHA, keep live provider lanes manual and exact-SHA, expose each credential only to its exact provider step, and upload only redacted daily-use summaries for three days. The runner executes validation and agent-capability tests; it does not host the Obsidian agent itself.
 
@@ -124,7 +122,7 @@ The protected self-hosted Windows machine provides the dedicated attested WSL2 r
 
 The e2e harness builds the one plugin artifact set, syncs it without overwriting core `data.json`, safely retires split-plugin folders with their data intact, launches a controlled Obsidian process, and verifies missions against seeded notes. It resolves a user-profile-scoped local test vault by default; set `OBSIDIAN_VAULT` to override it. Close any already-running Obsidian window before running it.
 
-**Honest limits:** ordinary vault work and any unapproved external mutation still require Obsidian to remain open. The optional companion can resume only installed, already-authorized non-vault operations; vault nodes stop in `waiting_obsidian`. A secure persistent OS credential backend and explicit service installation are mandatory for unattended work. Generated-code execution stays disabled until a Docker, Podman, dedicated WSL2, or bubblewrap provider passes the boundary probe. The structured model router is authoritative only in the automatic autonomy profile; conservative mode remains deterministic.
+**Honest limits:** ordinary vault work and any unapproved external mutation still require Obsidian to remain open. The optional companion can resume only installed, already-authorized non-vault operations; vault nodes stop in `waiting_obsidian`. A secure persistent OS credential backend and explicit service installation are mandatory for unattended work. Generated-code execution stays disabled until a Docker, Podman, dedicated WSL2, or bubblewrap provider passes the boundary probe. The plugin adopts a binding that host provisioning (`npm run setup:sandbox:wsl2`) already recorded in the user environment and probes it once per session, so a provisioned machine needs no manual settings entry; the boundary probe remains the only authority for execution availability. The structured model router is authoritative only in the automatic autonomy profile; conservative mode remains deterministic.
 
 ## Linear-First Work Queue
 

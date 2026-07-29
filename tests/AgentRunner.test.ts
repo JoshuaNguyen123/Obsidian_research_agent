@@ -14,7 +14,10 @@ import {
   bindTrustedRepositoryWorkspaceCreate,
   bindVerifiedWorkspaceCreateFile,
   bindVerifiedWorkspaceDirectoryExport,
+  bindVerifiedWorkspaceIdentityToolCall,
+  bindVerifiedWorkspaceIdentityToolSchemas,
   bindVerifiedWorkspaceLifecycleTool,
+  bindVerifiedWorkspaceObservationTool,
   buildVerifiedHostExportFinalAnswer,
   buildExactCodeValidationFallbackToolCall,
   bindVerifiedWorkspaceRead,
@@ -30,13 +33,18 @@ import {
   canonicalMissionGraphId,
   countOutstandingMissionGraphToolActions,
   countReadyMissionGraphToolSlots,
+  constrainValidationRecoveryWorkspaceToolsV1,
   constrainPassageCitationScope,
+  constrainSetLooseTemplateDiscoveryToMissionIntent,
   constrainToolsToMissionGraphFrontier,
+  filterSetLooseToolNamesByMissionGraphAuthority,
   dedupeSingletonMissionGraphPrerequisites,
   isMissionGraphAcceptablyComplete,
+  isReceiptBackedFinalProjectionReady,
   constrainOrchestratedHandoffTools,
   ensureResearchSourceLoopBudget,
   ensureRequiredWriteLoopBudget,
+  evaluateValidationRecoveryCorrectionReceiptV1,
   evaluateCompoundResearchBudgetGateV1,
   evaluateCompoundResearchToolCallGateV1,
   executePreparedToolWithMetrics,
@@ -49,27 +57,37 @@ import {
   getExplicitLinearMutationToolNames,
   getExplicitLinearReadToolNames,
   getUnsafeModelLinearIssueCreateOutputMessage,
+  getActiveValidationRecoveryFrontierV1,
   diagnosticRequestsFullFileReplacement,
   getDiagnosticSelectedWorkspaceCorrectionPaths,
   getLatestFastValidationDiagnostic,
+  getValidationRecoveryCorrectionTargetPathV1,
   getVerifiedWorkspaceReadObservation,
   getVerifiedWorkspaceReadRefreshBinding,
   getVerifiedWorkspaceSupportingReadRefreshBindings,
   getVerifiedWorkspaceWriteObservation,
   getVerifiedLinearHierarchyIssueId,
   getCompoundLifecycleResearchGraphToolNames,
+  rejectDuplicateResearchSourceFetchV1,
   getMissionGraphFrontierDestinationSelector,
   getPendingMissionGraphWriteToolNames,
   getPendingRequiredWriteToolNames,
+  getRequiredWriteToolNamesForTests,
   getDurablyProvenCompletedGraphToolNames,
   getRestorableCompletedGraphToolNames,
   hasPreparedBackgroundCodeValidationCommitIntent,
   hasIgnoreRememberedContextIntent,
   insertExplicitLinearReadbacksIntoLifecycleToolNames,
   hasReadyOrRunningMissionGraphUnpaidWork,
+  hasUnpaidCodeExecutionTerminalValidationBlocker,
   isTerminalMissionGraphBlocker,
+  mayBypassMissionGraphStartForSetLooseSoftCompanion,
+  missionGraphOwnsAcceptedResearchNoteWritebackV1,
   shouldFinishRunForTerminalMissionGraphBlockers,
+  resolveEffectiveTerminalStopReasonV1,
   resolveMissionGraphToolResultOk,
+  resolveToolOutcomeMemoryDispositionV1,
+  receiptProvesWorkspaceContentChangeV1,
   resolveLinearIssueReadbackBinding,
   decideLinearGetIssueHostBindingV1,
   collectLinearIssueBindingCandidates,
@@ -81,6 +99,7 @@ import {
   rememberVerifiedWorkspaceReadResult,
   rememberLatestFastValidationDiagnostic,
   restoreLatestFastValidationDiagnosticFromReceipts,
+  restorePassedFastRepairCycleFromReceipts,
   reconcileOutstandingMissionGraphToolStepBudget,
   resolveMissionGraphExecutionProofContractV1,
   resolveHasMatchingGrantForAutoContinuation,
@@ -98,6 +117,10 @@ import {
   type AgentRunReceipt,
   type AgentTraceEvent,
 } from "../src/AgentRunner";
+import {
+  hasCodeDeliverableIntent,
+  hasExplicitCodeExecutionProhibition,
+} from "../src/agent/codeDeliverableIntent";
 import { ModelClientError } from "../src/model/types";
 import type {
   ModelChatRequest,
@@ -146,7 +169,11 @@ import type { AgentTool } from "../src/tools/types";
 import { parseMissionRuntimeSnapshotFromMarkdown } from "../src/agent/runStore";
 import { buildOperationReconciliationInputs } from "../src/agent/runStore";
 import { parseMissionGraphStoreRecordFromMarkdown } from "../src/agent/missionGraphStore";
-import { parseMissionLedgerFromMarkdown } from "../src/agent/missionLedger";
+import {
+  parseMissionLedgerFromMarkdown,
+  type MissionEvidence,
+} from "../src/agent/missionLedger";
+import type { MissionAcceptanceResult } from "../src/agent/missionAcceptance";
 import { validateContinuationHandoffV1 } from "../src/agent/continuationMemory";
 import {
   prepareCompanionJobV1,
@@ -165,6 +192,46 @@ import {
   createGitHubPrivateRepositoryTool,
 } from "../src/tools/githubPrivateRepositoryTool";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
+import { hasExplicitResearchPublicationIntent } from "../src/tools/researchPublicationTool";
+import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
+import { isCompletedAcceptedResearchPublicationReceipt } from "../src/agent/setLooseCompoundAutonomy";
+import { completedResearchPublicationReceiptFixture } from "./fixtures/completedResearchPublicationReceipt";
+
+test("resumed atomic publication graph keeps current-note ownership only without a standalone writer", () => {
+  const graph = (allowedTools: string[][]) => ({
+    nodes: Object.fromEntries(
+      allowedTools.map((tools, index) => [
+        `node-${index}`,
+        { allowedTools: tools },
+      ]),
+    ),
+  });
+  assert.equal(
+    missionGraphOwnsAcceptedResearchNoteWritebackV1(
+      graph([
+        ["web_fetch"],
+        ["publish_research_to_linear"],
+        ["read_current_file"],
+      ]),
+    ),
+    true,
+  );
+  assert.equal(
+    missionGraphOwnsAcceptedResearchNoteWritebackV1(
+      graph([
+        ["publish_research_to_linear"],
+        ["append_to_current_file"],
+      ]),
+    ),
+    false,
+  );
+  assert.equal(
+    missionGraphOwnsAcceptedResearchNoteWritebackV1(
+      graph([["linear_create_issue"], ["append_to_current_file"]]),
+    ),
+    false,
+  );
+});
 
 test("prepared background Code intent requires an affirmative scoped continuation", () => {
   assert.equal(
@@ -290,18 +357,55 @@ test("explicit code commit naming expands the durable validate/repair ladder", (
   );
 });
 
+test("issue-bound private publication bootstraps the repository before publish", () => {
+  const prompt = [
+    "Review and implement Linear issue issue-1.",
+    "Begin with an independent linear_get_issue read of that exact identity.",
+    "Implement the requested Python library in its bound trusted repository and create one verified local commit.",
+    "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it.",
+  ].join(" ");
+  const required = getRequiredWriteToolNamesForTests(prompt, [
+    "linear_get_issue",
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_commit_verified",
+    CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    "publish_verified_code_to_github",
+  ]);
+  const createIndex = required.indexOf(
+    CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  );
+  const publishIndex = required.indexOf("publish_verified_code_to_github");
+  assert.ok(
+    createIndex >= 0,
+    `expected repository bootstrap in ${required.join(", ")}`,
+  );
+  assert.ok(
+    publishIndex > createIndex,
+    `repository bootstrap must precede publication: ${required.join(", ")}`,
+  );
+});
+
 test("standalone nested code delivery routes through workspace creation and approved Desktop export without a repository commit", () => {
   assert.deepEqual(
     getRequiredCodeWorkflowToolNames(
       "Create a Python checkers game with nested folders and put it on my desktop.",
     ),
+    // No code_repair_record_cycle: it resolves a trusted repository worktree
+    // and fails closed on a scratch workspace, which stranded the mission
+    // after the files were authored but before they were exported. create_file
+    // creates missing parents, so delivery-folder prose must not add an empty
+    // mkdir action to this source-authoring ladder.
     [
       "code_sandbox_status",
       "code_workspace_create",
-      "code_workspace_mkdir",
       "code_workspace_create_file",
       "code_validate_fast",
-      "code_repair_record_cycle",
       "code_validate_targeted",
       "code_validate_full",
       "code_workspace_export_directory",
@@ -319,12 +423,62 @@ test("bare Python Desktop delivery requires scratch creation, validation, and ex
       "code_workspace_create",
       "code_workspace_create_file",
       "code_validate_fast",
-      "code_repair_record_cycle",
       "code_validate_targeted",
       "code_validate_full",
       "code_workspace_export_directory",
     ],
   );
+});
+
+test("phase-scoped code creation prohibition does not erase constrained authoring intent", () => {
+  const cases = [
+    {
+      prompt:
+        "Research the library. Do not implement code in this phase. The Phase B package uses Python.",
+      prohibited: true,
+      deliverable: false,
+    },
+    {
+      prompt: "Do not just research; implement code.",
+      prohibited: false,
+      deliverable: true,
+    },
+    {
+      prompt: "Implement a Python package without committing the code.",
+      prohibited: false,
+      deliverable: true,
+    },
+    {
+      prompt:
+        "Do not execute the script; write the Python script but do not run it.",
+      prohibited: false,
+      deliverable: true,
+    },
+    {
+      prompt: "Never implement code without tests; build the Python library.",
+      prohibited: false,
+      deliverable: true,
+    },
+    {
+      prompt:
+        "Do not implement code now; implement the accepted contract in Phase B.",
+      prohibited: true,
+      deliverable: false,
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    assert.equal(
+      hasExplicitCodeExecutionProhibition(fixture.prompt),
+      fixture.prohibited,
+      fixture.prompt,
+    );
+    assert.equal(
+      hasCodeDeliverableIntent(fixture.prompt),
+      fixture.deliverable,
+      fixture.prompt,
+    );
+  }
 });
 
 test("code delivery with no offered Code tools produces a host blocker before model execution", () => {
@@ -1508,6 +1662,93 @@ test("mission graph acceptance ignores unread optional sibling reads", () => {
   );
 });
 
+test("ready final suppresses optional tool frontiers and optional write debt", () => {
+  const definitions = ["linear_get_issue", "append_file", "web_search"].map((name) => ({
+    type: "function" as const,
+    function: {
+      name,
+      parameters: { type: "object" as const, properties: {} },
+    },
+  }));
+  const graph = {
+    capabilityEnvelope: {
+      tools: {
+        linear_get_issue: { effect: "read" },
+        append_file: { effect: "mutation" },
+      },
+    },
+    nodes: {
+      publication: {
+        status: "complete",
+        dependencyIds: [],
+        allowedTools: ["publish_research_to_linear"],
+        completionContract: { requiredEvidenceKinds: [] },
+      },
+      "optional-tool-12-linear_get_issue": {
+        status: "ready",
+        dependencyIds: [],
+        allowedTools: ["linear_get_issue"],
+        objective: "Optional provider readback enrichment.",
+        completionContract: { requiredEvidenceKinds: [] },
+      },
+      "optional-tool-13-append_file": {
+        status: "ready",
+        dependencyIds: [],
+        allowedTools: ["append_file"],
+        objective: "Optional compatibility write.",
+        completionContract: { requiredEvidenceKinds: [] },
+      },
+      final: {
+        status: "ready",
+        dependencyIds: ["publication"],
+        allowedTools: [],
+        completionContract: { requiredEvidenceKinds: ["final-output"] },
+      },
+    },
+  } as never;
+
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, graph, {
+      includeCapabilityReads: true,
+    }).map((tool) => tool.function.name),
+    [],
+    "optional reads must not force another model tool call after the required closure reaches final",
+  );
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, graph, {
+      setLooseOfferedToolNames: ["linear_get_issue", "append_file"],
+    }).map((tool) => tool.function.name),
+    [],
+    "the set-loose stage union must not re-add optional-only tools after final becomes ready",
+  );
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, graph, {
+      setLooseOfferedToolNames: [
+        "linear_get_issue",
+        "append_file",
+        "web_search",
+      ],
+    }).map((tool) => tool.function.name),
+    ["web_search"],
+    "unrelated unplanned Soft companions remain available until terminal projection",
+  );
+  assert.deepEqual(
+    getPendingMissionGraphWriteToolNames(graph),
+    [],
+    "optional mutations never become required write debt",
+  );
+
+  const beforeFinal = structuredClone(graph) as any;
+  beforeFinal.nodes.final.status = "queued";
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, beforeFinal, {
+      includeCapabilityReads: false,
+    }).map((tool) => tool.function.name),
+    ["linear_get_issue", "append_file"],
+    "optional enrichment remains callable before the required final frontier is ready",
+  );
+});
+
 test("authoritative graph writes remain required when router-derived writes are empty", () => {
   const graph = {
     nodes: {
@@ -2101,6 +2342,178 @@ test("graph-bound workspace creation keeps content but replaces workspace transc
   });
 });
 
+test("prompt-scoped workspace creation preserves the model file choice but replaces its stale workspace alias", () => {
+  const durableReceipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-28T15:11:31.000Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "byok-autonomous-python-31090d88debd:byok-autonomous-python-31090d88debd",
+      path: "byok-autonomous-python-31090d88debd",
+      workspaceId: "byok-autonomous-python-31090d88debd",
+    },
+  };
+  const bound = bindVerifiedWorkspaceCreateFile(
+    {
+      name: "code_workspace_create_file",
+      arguments: {
+        workspaceId: "byok-autonomous-python-ws",
+        path: "crdt_sync.py",
+        content: "# implementation chosen from the signed issue\n",
+      },
+    },
+    "prompt-scoped-workspace-target",
+    [durableReceipt],
+  );
+  assert.deepEqual(bound?.arguments, {
+    workspaceId: "byok-autonomous-python-31090d88debd",
+    path: "crdt_sync.py",
+    content: "# implementation chosen from the signed issue\n",
+  });
+});
+
+test("verified durable workspace identity is pinned across a multi-tool frontier without mutating registry schemas", () => {
+  const durableReceipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-28T15:11:31.000Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "verified-workspace:verified-workspace",
+      path: "verified-workspace",
+      workspaceId: "verified-workspace",
+    },
+  };
+  const definitions = [
+    "code_workspace_create_file",
+    "code_workspace_mkdir",
+    "code_workspace_read",
+    "code_workspace_write_expected",
+    "code_validate_fast",
+    "linear_get_issue",
+    "code_workspace_create",
+  ].map((name) => ({
+    type: "function" as const,
+    function: {
+      name,
+      parameters: {
+        type: "object" as const,
+        properties: {
+          workspaceId: { type: "string" as const },
+          path: { type: "string" as const },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  }));
+  const original = structuredClone(definitions);
+  const bound = bindVerifiedWorkspaceIdentityToolSchemas(
+    definitions,
+    [durableReceipt],
+  );
+  for (const definition of bound) {
+    const workspaceIdentity =
+      definition.function.parameters.properties?.workspaceId;
+    if (
+      definition.function.name === "linear_get_issue" ||
+      definition.function.name === "code_workspace_create"
+    ) {
+      assert.equal(workspaceIdentity?.enum, undefined);
+      assert.equal(
+        definition.function.parameters.required?.includes("workspaceId"),
+        false,
+      );
+      continue;
+    }
+    assert.deepEqual(workspaceIdentity?.enum, ["verified-workspace"]);
+    assert.equal(
+      definition.function.parameters.required?.includes("workspaceId"),
+      true,
+    );
+  }
+  assert.deepEqual(
+    definitions,
+    original,
+    "schema projection must not mutate shared registry definitions",
+  );
+
+  const rebound = bindVerifiedWorkspaceIdentityToolCall(
+    {
+      name: "code_workspace_mkdir",
+      arguments: {
+        workspaceId: "model-stale-alias",
+        path: "src",
+      },
+    },
+    [durableReceipt],
+  );
+  assert.deepEqual(rebound?.arguments, {
+    workspaceId: "verified-workspace",
+    path: "src",
+  });
+});
+
+test("downstream workspace identity binding fails closed on missing or ambiguous verified creation receipts", () => {
+  const call: ModelToolCall = {
+    name: "code_workspace_create_file",
+    arguments: {
+      workspaceId: "model-stale-alias",
+      path: "crdt_sync.py",
+      content: "pass\n",
+    },
+  };
+  assert.equal(bindVerifiedWorkspaceIdentityToolCall(call, []), null);
+  assert.equal(
+    bindVerifiedWorkspaceCreateFile(
+      call,
+      "prompt-scoped-workspace-target",
+      [],
+    ),
+    null,
+  );
+  const receiptFor = (workspaceId: string): AgentRunReceipt => ({
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: `Created ${workspaceId}.`,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-28T15:11:31.000Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: `${workspaceId}:${workspaceId}`,
+      path: workspaceId,
+      workspaceId,
+    },
+  });
+  const ambiguous = [receiptFor("workspace-a"), receiptFor("workspace-b")];
+  assert.equal(bindVerifiedWorkspaceIdentityToolCall(call, ambiguous), null);
+  assert.equal(
+    bindVerifiedWorkspaceCreateFile(
+      call,
+      "prompt-scoped-workspace-target",
+      ambiguous,
+    ),
+    null,
+  );
+});
+
 test("lifecycle validate/repair/commit rebind prompt workspaceId to durable create receipt", () => {
   const durableReceipt: AgentRunReceipt = {
     toolName: "code_workspace_create",
@@ -2126,6 +2539,7 @@ test("lifecycle validate/repair/commit rebind prompt workspaceId to durable crea
     "code_validate_targeted",
     "code_validate_full",
     "code_repair_record_cycle",
+    "code_repair_status",
     "code_commit_verified",
   ] as const) {
     const bound = bindVerifiedWorkspaceLifecycleTool(
@@ -2134,15 +2548,19 @@ test("lifecycle validate/repair/commit rebind prompt workspaceId to durable crea
         arguments: {
           workspaceId: promptWorkspaceId,
           requestId: "repair-1",
+          repairRequestId: "model-selected-repair",
           profileKey: "repo-profile",
         },
       },
       [durableReceipt],
+      "run-root-1",
     );
     assert.deepEqual(bound?.arguments, {
       workspaceId: "run-2026-07-23t09-05-27.467z-f700e841eec0",
-      requestId: "repair-1",
       profileKey: "repo-profile",
+      ...(name.startsWith("code_validate_")
+        ? { repairRequestId: "repair-run-root-1" }
+        : { requestId: "repair-run-root-1" }),
     });
   }
 
@@ -2153,6 +2571,7 @@ test("lifecycle validate/repair/commit rebind prompt workspaceId to durable crea
         arguments: { workspaceId: promptWorkspaceId, path: "README.md" },
       },
       [durableReceipt],
+      "run-root-1",
     ),
     null,
   );
@@ -2163,8 +2582,158 @@ test("lifecycle validate/repair/commit rebind prompt workspaceId to durable crea
         arguments: { workspaceId: promptWorkspaceId },
       },
       [],
+      "run-root-1",
     ),
     null,
+  );
+});
+
+test("receipt-backed final projection closes only a proof-complete final node", () => {
+  const graph = {
+    nodes: {
+      publish: {
+        status: "complete",
+        dependencyIds: [],
+        allowedTools: ["publish_research_to_linear"],
+        completionContract: { requiredEvidenceKinds: ["external-action"] },
+      },
+      final: {
+        status: "ready",
+        dependencyIds: ["publish"],
+        allowedTools: [],
+        completionContract: {
+          requiredEvidenceKinds: ["final-output", "final-relevance"],
+        },
+      },
+    },
+  };
+  const onlyFinalOutput = {
+    status: "needs_more_work",
+    confidence: 1,
+    missing: ["plan:final_output", "verifier:final_relevance"],
+    reasons: ["durable work is complete"],
+  } as MissionAcceptanceResult;
+
+  assert.equal(
+    isReceiptBackedFinalProjectionReady({
+      acceptance: onlyFinalOutput,
+      graph: graph as never,
+      frontierToolNames: [],
+      hasCompletedAcceptedResearchPublicationProof: true,
+    }),
+    true,
+  );
+  assert.equal(
+    isReceiptBackedFinalProjectionReady({
+      acceptance: {
+        ...onlyFinalOutput,
+        missing: ["web_evidence", ...onlyFinalOutput.missing],
+      },
+      graph: graph as never,
+      frontierToolNames: [],
+      hasCompletedAcceptedResearchPublicationProof: true,
+    }),
+    false,
+    "research or action proof debt must never be waived",
+  );
+  assert.equal(
+    isReceiptBackedFinalProjectionReady({
+      acceptance: onlyFinalOutput,
+      graph: graph as never,
+      frontierToolNames: [],
+      hasCompletedAcceptedResearchPublicationProof: false,
+    }),
+    false,
+    "a model-only turn cannot manufacture receipt-backed completion",
+  );
+  assert.equal(
+    isReceiptBackedFinalProjectionReady({
+      acceptance: onlyFinalOutput,
+      graph: {
+        nodes: {
+          ...graph.nodes,
+          publish: { ...graph.nodes.publish, status: "ready" },
+        },
+      } as never,
+      frontierToolNames: [],
+      hasCompletedAcceptedResearchPublicationProof: true,
+    }),
+    false,
+    "the final node cannot close before every exact dependency",
+  );
+  assert.equal(
+    isReceiptBackedFinalProjectionReady({
+      acceptance: onlyFinalOutput,
+      graph: graph as never,
+      frontierToolNames: ["web_fetch"],
+      hasCompletedAcceptedResearchPublicationProof: true,
+    }),
+    false,
+    "a callable frontier must remain model-directed",
+  );
+});
+
+test("read-only workspace observations rebind stale workspaceId to durable create receipt", () => {
+  const durableReceipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-28T05:24:41.767Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "run-verified-workspace",
+      path: "run-verified-workspace",
+      workspaceId: "run-verified-workspace",
+    },
+  };
+
+  const bound = bindVerifiedWorkspaceObservationTool(
+    {
+      name: "code_workspace_search",
+      arguments: {
+        workspaceId: "run-stale-workspace",
+        query: "class CRDTSync",
+        path: "src",
+        limit: 20,
+      },
+    },
+    [durableReceipt],
+  );
+  assert.deepEqual(bound?.arguments, {
+    workspaceId: "run-verified-workspace",
+    query: "class CRDTSync",
+    path: "src",
+    limit: 20,
+  });
+  assert.equal(
+    bindVerifiedWorkspaceObservationTool(
+      {
+        name: "code_workspace_create_file",
+        arguments: {
+          workspaceId: "run-stale-workspace",
+          path: "src/new.py",
+        },
+      },
+      [durableReceipt],
+    ),
+    null,
+    "mutation tools do not gain authority through an observation binding",
+  );
+  assert.equal(
+    bindVerifiedWorkspaceObservationTool(
+      {
+        name: "code_workspace_search",
+        arguments: { workspaceId: "run-stale-workspace", query: "CRDT" },
+      },
+      [],
+    ),
+    null,
+    "an absent durable workspace receipt fails closed",
   );
 });
 
@@ -2255,7 +2824,7 @@ test("known-folder export binds the verified workspace root and run-scoped Deskt
 
 test("verified host export final answer replaces model path claims with receipt truth", () => {
   const exportPath =
-    "C:\\Users\\joshb\\OneDrive\\Desktop\\number-guessing-game-beaccbf21521";
+    "C:\\Users\\example\\OneDrive\\Desktop\\number-guessing-game-beaccbf21521";
   const receipts: AgentRunReceipt[] = [
     {
       toolName: "code_workspace_create_file",
@@ -2306,7 +2875,9 @@ test("verified host export final answer replaces model path claims with receipt 
       "code_validate_full",
     ],
   );
-  assert.match(finalAnswer ?? "", /Python number guessing game delivered/u);
+  // The title is derived from the request now, so every deliverable is named
+  // rather than only the one prompt this assertion used to hardcode.
+  assert.match(finalAnswer ?? "", /number guessing game delivered/u);
   assert.equal(finalAnswer?.includes(exportPath), true);
   assert.match(finalAnswer ?? "", /Entry point: `main\.py`/u);
   assert.match(finalAnswer ?? "", /fast, targeted, full/u);
@@ -4813,17 +5384,11 @@ test("essay then Linear issues keeps append before template and create", async (
     true,
     `expected append_to_current_file allowed; got: ${allowed.join(", ")}`,
   );
-  const firstFrontier =
-    chatRequests[0]?.tools?.map((tool) => tool.function.name) ?? [];
-  if (firstFrontier.length > 0) {
-    assert.equal(
-      firstFrontier.includes("append_to_current_file"),
-      true,
-      `expected append first; got: ${firstFrontier.join(", ")}`,
-    );
-    assert.equal(firstFrontier.includes("read_template"), false);
-    assert.equal(firstFrontier.includes("linear_create_issue"), false);
-  }
+  assert.deepEqual(
+    getRequiredWriteToolNamesForTests(prompt, allowed),
+    ["append_to_current_file", "read_template", "linear_create_issue"],
+    "ordinary note-plus-Linear work must retain its standalone append before publication",
+  );
 });
 
 test("affirmative generic and literal Linear creates route through a template first", async () => {
@@ -7087,6 +7652,47 @@ test("workspace correction preserves the redacted fast diagnostic after transcri
   assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
 });
 
+test("workspace correction retains red diagnostics from targeted and full validation", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  rememberLatestFastValidationDiagnostic(
+    runtimeCache,
+    "code_validate_targeted",
+    {
+      ok: true,
+      toolName: "code_validate_targeted",
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          stdout: "",
+          stderr: "README.md must include the accepted proof marker",
+          truncated: false,
+          redactedLines: 0,
+        },
+      },
+    },
+  );
+  assert.deepEqual(getLatestFastValidationDiagnostic(runtimeCache), {
+    stdout: "",
+    stderr: "README.md must include the accepted proof marker",
+    truncated: false,
+    redactedLines: 0,
+  });
+
+  rememberLatestFastValidationDiagnostic(runtimeCache, "code_validate_full", {
+    ok: true,
+    toolName: "code_validate_full",
+    output: { status: "verified" },
+  });
+  assert.equal(
+    getLatestFastValidationDiagnostic(runtimeCache),
+    null,
+    "a newer green full validation clears the older targeted failure",
+  );
+});
+
 test("workspace correction surfaces the bounded protected assertion around a traceback line", () => {
   const verifier = [
     "from checkers.game import CheckersGame",
@@ -7261,6 +7867,55 @@ test("durable continuation does not revive an older validation failure", () => {
   assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
 });
 
+test("durable continuation restores targeted/full validation diagnostics chronologically", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  const canonical = {
+    version: 1 as const,
+    actionId: "validate-targeted-action",
+    payloadFingerprint: `sha256:${"e".repeat(64)}`,
+    grantId: "validate-targeted-grant",
+    commitKind: "committed" as const,
+    readback: {
+      status: "verified" as const,
+      checkedAt: "2026-07-28T00:00:00.000Z",
+    },
+  };
+  restoreLatestFastValidationDiagnosticFromReceipts(runtimeCache, [
+    {
+      ...canonical,
+      toolName: "code_validate_targeted",
+      output: {
+        status: "failed",
+        validationDiagnosticExcerpt: {
+          stdout: "",
+          stderr: "AssertionError: crdt_sync.py did not converge",
+          truncated: false,
+          redactedLines: 0,
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(getLatestFastValidationDiagnostic(runtimeCache), {
+    stdout: "",
+    stderr: "AssertionError: crdt_sync.py did not converge",
+    truncated: false,
+    redactedLines: 0,
+  });
+
+  restoreLatestFastValidationDiagnosticFromReceipts(runtimeCache, [
+    {
+      ...canonical,
+      toolName: "code_validate_full",
+      actionId: "validate-full-action",
+      output: { status: "verified" },
+    },
+  ]);
+  assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
+});
+
 test("durable continuation ignores non-canonical validation evidence", () => {
   const runtimeCache: AgentRuntimeCache = {
     toolResults: new Map(),
@@ -7280,6 +7935,35 @@ test("durable continuation ignores non-canonical validation evidence", () => {
   ]);
 
   assert.equal(getLatestFastValidationDiagnostic(runtimeCache), null);
+});
+
+test("durable continuation restores the commit gate only from a passed repair-cycle receipt", () => {
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  restorePassedFastRepairCycleFromReceipts(runtimeCache, [
+    {
+      toolName: "code_validate_fast",
+      output: {
+        status: "complete",
+        validationReceipt: { status: "passed" },
+      },
+    },
+    {
+      toolName: "code_validate_targeted",
+      output: { status: "complete" },
+    },
+  ]);
+  assert.equal(runtimeCache.passedFastRepairCycle, undefined);
+
+  restorePassedFastRepairCycleFromReceipts(runtimeCache, [
+    {
+      toolName: "code_repair_record_cycle",
+      output: { outcome: "passed" },
+    },
+  ]);
+  assert.equal(runtimeCache.passedFastRepairCycle, true);
 });
 
 test("prepared fast validation preserves its redacted diagnostic for bounded repair", async () => {
@@ -7413,6 +8097,30 @@ test("terminal mission graph blockers stop even before retry counters exhaust", 
   );
 });
 
+test("paid set-loose delivery stays resumable until graph and acceptance are terminal", () => {
+  assert.equal(
+    resolveEffectiveTerminalStopReasonV1({
+      terminalProjectionsAgree: true,
+      setLooseDeliveryUnpaid: false,
+      stopReason: "write_completed",
+      acceptanceStatus: "needs_more_work",
+      graphComplete: false,
+    }),
+    "budget",
+    "external delivery receipts must not bypass the authoritative final proof",
+  );
+  assert.equal(
+    resolveEffectiveTerminalStopReasonV1({
+      terminalProjectionsAgree: true,
+      setLooseDeliveryUnpaid: false,
+      stopReason: "write_completed",
+      acceptanceStatus: "pass",
+      graphComplete: true,
+    }),
+    "write_completed",
+  );
+});
+
 test("terminal MissionGraph blockers finish even when Soft companions keep tools offered", () => {
   const blocked = {
     status: "blocked" as const,
@@ -7478,6 +8186,127 @@ test("terminal MissionGraph blockers finish even when Soft companions keep tools
     false,
     "ready unpaid MissionGraph work still takes priority over finishing",
   );
+
+  const graphWithOptionalReady = {
+    nodes: {
+      "tool-targeted": blocked,
+      "optional-retry-code_workspace_read": {
+        ...complete,
+        status: "ready" as const,
+        allowedTools: ["code_workspace_read"],
+      },
+    },
+  };
+  assert.equal(
+    hasReadyOrRunningMissionGraphUnpaidWork(graphWithOptionalReady),
+    false,
+  );
+  assert.equal(
+    shouldFinishRunForTerminalMissionGraphBlockers(graphWithOptionalReady),
+    true,
+    "optional retry work must not mask a required terminal blocker",
+  );
+
+  const graphWithOnlyOptionalBlocked = {
+    nodes: {
+      "optional-tool-code_validate_targeted": blocked,
+    },
+  };
+  assert.equal(
+    shouldFinishRunForTerminalMissionGraphBlockers(
+      graphWithOnlyOptionalBlocked,
+    ),
+    false,
+    "an optional blocked node is not a terminal mission blocker",
+  );
+});
+
+test("unpaid code execution cannot bypass a required terminal validation blocker", () => {
+  const terminalRetries = {
+    maxAttempts: 3,
+    attempts: 1,
+    failureFingerprints: [],
+    consecutiveFailureFingerprint: null,
+    consecutiveFailureCount: 0,
+  };
+  const requiredRepairBlocker = {
+    id: "action-019-code_repair_record_cycle",
+    objective: "Record the required bounded repair cycle.",
+    status: "blocked" as const,
+    blocker: {
+      code: "tool_failure_terminal" as const,
+      message: "Fast validation remained red after the final repair cycle.",
+      requiredAction: "Inspect the terminal validation evidence.",
+    },
+    retries: terminalRetries,
+    allowedTools: ["code_repair_record_cycle"],
+  };
+  const graphWithIndependentReadyDelivery = {
+    nodes: {
+      "action-019-code_repair_record_cycle": requiredRepairBlocker,
+      "action-020-github_create_private_repository": {
+        id: "action-020-github_create_private_repository",
+        objective: "Create the private delivery repository.",
+        status: "ready" as const,
+        blocker: null,
+        retries: {
+          ...terminalRetries,
+          attempts: 0,
+        },
+        allowedTools: ["github_create_private_repository"],
+      },
+    },
+  };
+
+  assert.equal(
+    hasUnpaidCodeExecutionTerminalValidationBlocker(
+      graphWithIndependentReadyDelivery,
+      ["code_execution", "private_github_publication"],
+    ),
+    true,
+    "an offered GitHub companion cannot pay the terminally blocked code proof",
+  );
+  assert.equal(
+    hasUnpaidCodeExecutionTerminalValidationBlocker(
+      graphWithIndependentReadyDelivery,
+      ["private_github_publication"],
+    ),
+    false,
+    "independent Soft delivery remains legitimate after code_execution is paid",
+  );
+  assert.equal(
+    hasUnpaidCodeExecutionTerminalValidationBlocker(
+      {
+        nodes: {
+          "optional-repair-observation": {
+            ...requiredRepairBlocker,
+            id: "optional-repair-observation",
+            objective: "Optional repair-state observation.",
+          },
+        },
+      },
+      ["code_execution"],
+    ),
+    false,
+    "optional enrichment blockers do not terminate required delivery",
+  );
+  assert.equal(
+    hasUnpaidCodeExecutionTerminalValidationBlocker(
+      {
+        nodes: {
+          "required-linear-read": {
+            ...requiredRepairBlocker,
+            id: "required-linear-read",
+            objective: "Read an unrelated Linear issue.",
+            allowedTools: ["linear_get_issue"],
+          },
+        },
+      },
+      ["code_execution"],
+    ),
+    false,
+    "an unrelated terminal blocker does not impersonate the code proof chain",
+  );
 });
 
 test("red code_validate_fast advances the MissionGraph; red targeted/full do not", () => {
@@ -7526,6 +8355,564 @@ test("red code_validate_fast advances the MissionGraph; red targeted/full do not
       output: { outcome: "blocked" },
     }).ok,
     false,
+  );
+});
+
+test("tool outcome memory records semantic red validation and repair results as failures", () => {
+  for (const toolName of [
+    "code_validate_fast",
+    "code_validate_targeted",
+    "code_validate_full",
+  ]) {
+    assert.deepEqual(
+      resolveToolOutcomeMemoryDispositionV1(toolName, {
+        ok: true,
+        output: { status: "failed" },
+      }),
+      { ok: false, errorCode: "validation_red" },
+      `${toolName} red is not a successful outcome`,
+    );
+  }
+  assert.deepEqual(
+    resolveToolOutcomeMemoryDispositionV1("code_validate_targeted", {
+      ok: true,
+      output: {
+        status: "verified",
+        validationReceipt: { status: "failed" },
+      },
+    }),
+    { ok: false, errorCode: "validation_red" },
+  );
+  for (const outcome of ["repaired", "blocked"]) {
+    assert.deepEqual(
+      resolveToolOutcomeMemoryDispositionV1("code_repair_record_cycle", {
+        ok: true,
+        output: { outcome },
+      }),
+      { ok: false, errorCode: "repair_still_red" },
+      `${outcome} is not proof of a passing repair checkpoint`,
+    );
+  }
+  assert.deepEqual(
+    resolveToolOutcomeMemoryDispositionV1("code_repair_record_cycle", {
+      ok: true,
+      output: { outcome: "passed" },
+    }),
+    { ok: true, errorCode: undefined },
+  );
+  assert.deepEqual(
+    resolveToolOutcomeMemoryDispositionV1("linear_get_issue", {
+      ok: false,
+      error: { code: "provider_timeout", message: "timed out" },
+    }),
+    { ok: false, errorCode: "provider_timeout" },
+    "ordinary transport failures preserve their stable provider code",
+  );
+});
+
+test("validation recovery accepts only read-back workspace receipts with a changed content hash", () => {
+  const beforeSha256 = `sha256:${"a".repeat(64)}`;
+  const afterSha256 = `sha256:${"b".repeat(64)}`;
+  const receipt = {
+    toolName: "code_workspace_write_expected",
+    operation: "edit" as const,
+    message: "Workspace write committed.",
+    commitKind: "committed" as const,
+    readback: {
+      status: "verified" as const,
+      checkedAt: "2026-07-27T00:00:00.000Z",
+      observedRevision: afterSha256,
+    },
+    output: {
+      status: "ok",
+      receipt: {
+        version: 2,
+        beforeSha256,
+        afterSha256,
+      },
+    },
+  };
+  assert.equal(receiptProvesWorkspaceContentChangeV1(receipt), true);
+  assert.equal(
+    receiptProvesWorkspaceContentChangeV1({
+      ...receipt,
+      output: {
+        status: "ok",
+        receipt: {
+          version: 2,
+          beforeSha256,
+          afterSha256: beforeSha256,
+        },
+      },
+      readback: {
+        ...receipt.readback,
+        observedRevision: beforeSha256,
+      },
+    }),
+    false,
+    "a byte-identical write receipt is not a correction",
+  );
+  assert.equal(
+    receiptProvesWorkspaceContentChangeV1({
+      ...receipt,
+      readback: {
+        ...receipt.readback,
+        observedRevision: beforeSha256,
+      },
+    }),
+    false,
+    "the readback revision must match the changed content hash",
+  );
+  assert.equal(
+    receiptProvesWorkspaceContentChangeV1({
+      ...receipt,
+      commitKind: undefined,
+    }),
+    false,
+    "a noncanonical legacy receipt cannot unlock the recovery gate",
+  );
+});
+
+test("validation recovery rejects an unrelated changed path and binds the selected path read then write", () => {
+  const beforeSha256 = `sha256:${"a".repeat(64)}`;
+  const afterSha256 = `sha256:${"b".repeat(64)}`;
+  const diagnostic = {
+    stdout: "",
+    stderr:
+      'File "tests/test_crdt_contract.py", line 12\nAssertionError: crdt_sync.py merge did not converge',
+    truncated: false,
+    redactedLines: 0,
+  };
+  const graph = {
+    nodes: {
+      implementation: {
+        id: "implementation",
+        status: "complete",
+        allowedTools: ["code_workspace_create_file"],
+        inputs: {
+          lifecycle: {
+            kind: "literal",
+            value: {
+              version: 1,
+              composite: true,
+              intentFingerprint: `sha256:${"c".repeat(64)}`,
+              stage: "code_execution",
+              actions: [
+                {
+                  id: "action-crdt",
+                  toolName: "code_workspace_create_file",
+                  effect: "mutation",
+                  bindingId: "workspace-binding",
+                  selector: "crdt_sync.py",
+                  objective: "Create the public CRDT module.",
+                  minimumEvidence: 1,
+                  requiredEvidenceKinds: ["artifact_receipt"],
+                  minimumReceipts: 1,
+                  requiredReceiptKinds: ["code_change"],
+                },
+                {
+                  id: "action-readme",
+                  toolName: "code_workspace_create_file",
+                  effect: "mutation",
+                  bindingId: "workspace-binding",
+                  selector: "README.md",
+                  objective: "Create the public README.",
+                  minimumEvidence: 1,
+                  requiredEvidenceKinds: ["artifact_receipt"],
+                  minimumReceipts: 1,
+                  requiredReceiptKinds: ["code_change"],
+                },
+              ],
+            },
+          },
+        },
+        outputs: {},
+      },
+      fast: {
+        id: "fast",
+        status: "queued",
+        allowedTools: ["code_validate_fast"],
+        inputs: {},
+        outputs: {},
+      },
+      repair: {
+        id: "repair",
+        status: "queued",
+        allowedTools: ["code_repair_record_cycle"],
+        inputs: {},
+        outputs: {
+          validationRecovery: {
+            version: 1,
+            status: "awaiting_correction",
+            fastNodeId: "fast",
+            repairNodeId: "repair",
+          },
+        },
+      },
+    },
+  } as any;
+  const changedReceipt = (path: string): AgentRunReceipt => ({
+    toolName: "code_workspace_create_file",
+    operation: "create",
+    message: `Workspace create committed for ${path}.`,
+    path,
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-28T00:00:00.000Z",
+      observedRevision: afterSha256,
+    },
+    output: {
+      status: "ok",
+      path,
+      receipt: {
+        version: 2,
+        path,
+        beforeSha256,
+        afterSha256,
+      },
+    },
+  });
+
+  assert.deepEqual(
+    evaluateValidationRecoveryCorrectionReceiptV1({
+      graph,
+      diagnostic,
+      receipt: changedReceipt("src/run_marker.py"),
+    }),
+    {
+      eligible: false,
+      reason: "diagnostic_path_mismatch",
+      receiptPath: "src/run_marker.py",
+      selectedPaths: ["crdt_sync.py"],
+    },
+    "an unrelated but valid in-scope file cannot spend the next validation cycle",
+  );
+  assert.deepEqual(
+    evaluateValidationRecoveryCorrectionReceiptV1({
+      graph,
+      diagnostic,
+      receipt: changedReceipt("crdt_sync.py"),
+    }),
+    {
+      eligible: true,
+      reason: "verified_content_change",
+      receiptPath: "crdt_sync.py",
+      selectedPaths: ["crdt_sync.py"],
+    },
+  );
+  assert.equal(
+    getValidationRecoveryCorrectionTargetPathV1(graph, diagnostic),
+    "crdt_sync.py",
+  );
+
+  const durableWorkspaceReceipt: AgentRunReceipt = {
+    toolName: "code_workspace_create",
+    operation: "create",
+    message: "Created durable workspace.",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-28T00:00:00.000Z",
+    },
+    resource: {
+      system: "workspace",
+      resourceType: "code_workspace",
+      id: "verified-workspace:verified-workspace",
+      path: "verified-workspace",
+      workspaceId: "verified-workspace",
+    },
+    output: {
+      status: "ok",
+      repositoryWriteScope: {
+        profileKey: "byok-autonomous-python",
+        projects: [{
+          projectId: "root",
+          projectRoot: ".",
+          allowedPaths: [
+            "README.md",
+            "crdt_sync.py",
+            "pyproject.toml",
+            "src",
+            "docs",
+          ],
+        }],
+      },
+    },
+  };
+  const tools = [
+    "code_workspace_stat",
+    "code_workspace_list",
+    "code_workspace_read",
+    "code_workspace_search",
+    "code_workspace_create_file",
+    "code_workspace_append",
+    "code_workspace_patch",
+    "code_workspace_write_expected",
+  ].map((name) => ({
+    type: "function" as const,
+    function: {
+      name,
+      parameters: {
+        type: "object" as const,
+        properties: {
+          workspaceId: { type: "string" as const },
+          path: { type: "string" as const },
+          content: { type: "string" as const },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  }));
+  const runtimeCache: AgentRuntimeCache = {
+    toolResults: new Map(),
+    verifiedWorkspaceReads: new Map(),
+  };
+  const readFrontier = constrainValidationRecoveryWorkspaceToolsV1({
+    tools,
+    graph,
+    diagnostic,
+    runtimeCache,
+    durableReceipts: [durableWorkspaceReceipt],
+  });
+  assert.deepEqual(
+    readFrontier.map((tool) => tool.function.name),
+    ["code_workspace_read"],
+  );
+  assert.deepEqual(
+    readFrontier[0]?.function.parameters.properties?.path?.enum,
+    ["crdt_sync.py"],
+  );
+
+  rememberVerifiedWorkspaceReadResult(
+    runtimeCache,
+    {
+      name: "code_workspace_read",
+      arguments: {
+        workspaceId: "verified-workspace",
+        path: "crdt_sync.py",
+      },
+    },
+    { rootMissionId: "root-run" },
+    {
+      ok: true,
+      toolName: "code_workspace_read",
+      output: {
+        path: "crdt_sync.py",
+        sha256: beforeSha256,
+        content: "class GCounter:\n    pass\n",
+      },
+    },
+  );
+  const writeFrontier = constrainValidationRecoveryWorkspaceToolsV1({
+    tools,
+    graph,
+    diagnostic,
+    runtimeCache,
+    durableReceipts: [durableWorkspaceReceipt],
+  });
+  assert.deepEqual(
+    writeFrontier.map((tool) => tool.function.name),
+    ["code_workspace_write_expected"],
+  );
+  assert.deepEqual(
+    writeFrontier[0]?.function.parameters.properties?.path?.enum,
+    ["crdt_sync.py"],
+  );
+  assert.ok(
+    writeFrontier[0]?.function.parameters.properties?.lineReplacements,
+    "the correction stays on the existing SHA-bound line replacement path",
+  );
+  assert.equal(
+    writeFrontier[0]?.function.parameters.properties?.content,
+    undefined,
+  );
+
+  const promptScopedGraph = structuredClone(graph);
+  const promptScopedLifecycle =
+    promptScopedGraph.nodes.implementation.inputs.lifecycle.value;
+  for (const action of promptScopedLifecycle.actions) {
+    action.selector = null;
+  }
+  const readmeDiagnostic = {
+    stdout: "",
+    stderr: "README.md must include proof marker BYOK_AUTONOMOUS_TEST",
+    truncated: false,
+    redactedLines: 0,
+  };
+  assert.deepEqual(
+    getDiagnosticSelectedWorkspaceCorrectionPaths(
+      promptScopedGraph,
+      readmeDiagnostic,
+      [durableWorkspaceReceipt],
+    ),
+    ["README.md"],
+    "the canonical repository-write receipt narrows a model-chosen file absent from the initial graph",
+  );
+  assert.equal(
+    getValidationRecoveryCorrectionTargetPathV1(
+      promptScopedGraph,
+      readmeDiagnostic,
+      [durableWorkspaceReceipt],
+    ),
+    "README.md",
+  );
+  const scopeBoundReadFrontier = constrainValidationRecoveryWorkspaceToolsV1({
+    tools,
+    graph: promptScopedGraph,
+    diagnostic: readmeDiagnostic,
+    runtimeCache: {
+      toolResults: new Map(),
+      verifiedWorkspaceReads: new Map(),
+    },
+    durableReceipts: [durableWorkspaceReceipt],
+  });
+  assert.deepEqual(
+    scopeBoundReadFrontier.map((tool) => tool.function.name),
+    ["code_workspace_read"],
+  );
+  assert.deepEqual(
+    scopeBoundReadFrontier[0]?.function.parameters.properties?.path?.enum,
+    ["README.md"],
+  );
+  assert.deepEqual(
+    evaluateValidationRecoveryCorrectionReceiptV1({
+      graph: promptScopedGraph,
+      diagnostic: readmeDiagnostic,
+      receipt: changedReceipt("crdt_sync.py"),
+      durableReceipts: [durableWorkspaceReceipt],
+    }),
+    {
+      eligible: false,
+      reason: "diagnostic_path_mismatch",
+      receiptPath: "crdt_sync.py",
+      selectedPaths: ["README.md"],
+    },
+    "a different verified patch cannot spend the README correction gate",
+  );
+  assert.deepEqual(
+    evaluateValidationRecoveryCorrectionReceiptV1({
+      graph: promptScopedGraph,
+      diagnostic: readmeDiagnostic,
+      receipt: changedReceipt("README.md"),
+      durableReceipts: [durableWorkspaceReceipt],
+    }),
+    {
+      eligible: true,
+      reason: "verified_content_change",
+      receiptPath: "README.md",
+      selectedPaths: ["README.md"],
+    },
+  );
+  assert.deepEqual(
+    getDiagnosticSelectedWorkspaceCorrectionPaths(
+      promptScopedGraph,
+      {
+        stdout: "",
+        stderr:
+          "FAIL: test_observed_remove_and_concurrent_add\nAssertionError: expected convergence",
+        truncated: false,
+        redactedLines: 0,
+      },
+      [durableWorkspaceReceipt],
+    ),
+    ["crdt_sync.py"],
+    "a protected assertion with one allowlisted implementation candidate narrows to that module",
+  );
+});
+
+test("validation recovery fails closed when no exact diagnostic path is available", () => {
+  const graph = {
+    nodes: {
+      fast: {
+        id: "fast",
+        status: "queued",
+        allowedTools: ["code_validate_fast"],
+        inputs: {},
+        outputs: {},
+      },
+      repair: {
+        id: "repair",
+        status: "queued",
+        allowedTools: ["code_repair_record_cycle"],
+        inputs: {},
+        outputs: {
+          validationRecovery: {
+            version: 1,
+            status: "awaiting_correction",
+            fastNodeId: "fast",
+            repairNodeId: "repair",
+          },
+        },
+      },
+    },
+  } as any;
+  const tools = [
+    "code_workspace_stat",
+    "code_workspace_list",
+    "code_workspace_read",
+    "code_workspace_search",
+    "code_workspace_create_file",
+    "code_workspace_append",
+    "code_workspace_patch",
+    "code_workspace_write_expected",
+  ].map((name) => ({
+    type: "function" as const,
+    function: {
+      name,
+      parameters: {
+        type: "object" as const,
+        properties: { path: { type: "string" as const } },
+      },
+    },
+  }));
+  assert.deepEqual(
+    constrainValidationRecoveryWorkspaceToolsV1({
+      tools,
+      graph,
+      diagnostic: null,
+      runtimeCache: {
+        toolResults: new Map(),
+        verifiedWorkspaceReads: new Map(),
+      },
+      durableReceipts: [],
+    }),
+    [],
+    "an unresolved active recovery must not preserve broad diagnosis or mutation authority",
+  );
+  const changedReceipt = {
+    toolName: "code_workspace_patch",
+    operation: "update",
+    path: "unrelated.py",
+    commitKind: "committed",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-07-28T00:00:00.000Z",
+      observedRevision: `sha256:${"b".repeat(64)}`,
+    },
+    output: {
+      path: "unrelated.py",
+      receipt: {
+        version: 2,
+        path: "unrelated.py",
+        beforeSha256: `sha256:${"a".repeat(64)}`,
+        afterSha256: `sha256:${"b".repeat(64)}`,
+      },
+    },
+  } as AgentRunReceipt;
+  assert.deepEqual(
+    evaluateValidationRecoveryCorrectionReceiptV1({
+      graph,
+      diagnostic: null,
+      receipt: changedReceipt,
+    }),
+    {
+      eligible: false,
+      reason: "diagnostic_path_mismatch",
+      receiptPath: "unrelated.py",
+      selectedPaths: [],
+    },
   );
 });
 
@@ -8395,6 +9782,53 @@ test("compound public-web lifecycle reserves exact research reads before effects
     getCompoundLifecycleResearchGraphToolNames(prompt),
     ["web_search", "web_fetch", "web_fetch"],
   );
+  assert.deepEqual(
+    getCompoundLifecycleResearchGraphToolNames(prompt, 1),
+    ["web_search", "web_fetch"],
+  );
+  assert.deepEqual(
+    getCompoundLifecycleResearchGraphToolNames(prompt, 2),
+    [],
+  );
+});
+
+test("explicit source proof rejects duplicate fetches while distinct debt remains", () => {
+  const contentHash = `sha256:${"a".repeat(64)}`;
+  const evidence: MissionEvidence[] = [{
+    id: "web:source-1",
+    kind: "web_source",
+    title: "Source one",
+    url: "https://source-1.example.test/evidence",
+    contentHash,
+    summary: "Verified content.",
+    confidence: "high",
+    usableSource: true,
+    parserStatus: "parsed",
+    passageIds: ["passage-1"],
+  }];
+
+  assert.equal(
+    rejectDuplicateResearchSourceFetchV1({
+      toolCall: {
+        name: "web_fetch",
+        arguments: { url: "https://source-1.example.test/evidence#repeat" },
+      },
+      originalPrompt: "Use exactly two independent sources.",
+      evidence,
+    })?.error?.code,
+    "duplicate_research_source",
+  );
+  assert.equal(
+    rejectDuplicateResearchSourceFetchV1({
+      toolCall: {
+        name: "web_fetch",
+        arguments: { url: "https://source-2.example.test/evidence" },
+      },
+      originalPrompt: "Use exactly two independent sources.",
+      evidence,
+    }),
+    null,
+  );
 });
 
 test("continuation restores a mutation only from receipt-bound graph proof", () => {
@@ -8524,6 +9958,33 @@ test("accepted-research frontier separates publication from hierarchy arguments"
   assert.match(context, /exact riskClass values low, medium, or high/u);
   assert.match(context, /exact executionClass values research, vault, code, or human/u);
   assert.match(context, /executionClass=code/u);
+});
+
+test("set-loose accepted-research frontier retains the nonempty JSON array contract", () => {
+  const context = buildMissionGraphFrontierTurnContext(
+    [
+      {
+        type: "function",
+        function: {
+          name: "publish_research_to_linear",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "web_search",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+    null,
+    { setLoose: true, currentStage: "accepted_research" },
+  );
+  assert.match(context, /proposedWork, scope, acceptanceCriteria/u);
+  assert.match(context, /nonempty JSON arrays/u);
+  assert.match(context, /Even one proposedWork item must be written as \["\.\.\."\]/u);
+  assert.match(context, /never send a bare string, object, null, or empty array/u);
 });
 
 test("research-hierarchy frontier states exact issue list and fingerprint contracts", () => {
@@ -9269,6 +10730,902 @@ test("broad vault mutation without a target removes write tools and records no w
   assert.deepEqual(toolNames, []);
   assert.deepEqual(receipts, []);
   assert.equal(vault.content.get("Current.md"), "Do not overwrite this note.");
+});
+
+test("BYOK research binds initiating-note authority only to a real active Markdown note", async () => {
+  const prompt = [
+    "Deeply research a small dependency-free Python CRDT library for marker E2E_BYOK_SCOPE_UNIT.",
+    "Use and fetch at least four independent sources exposed through the configured research backend. Reconcile their guidance on state-based G-Counter joins and observed-remove sets, including convergence, idempotence, concurrent add versus remove, and practical validation.",
+    "Write accepted research into the initiating note as an implementation brief, then publish that accepted research to one Linear implementation issue in the configured destination.",
+    "The accepted package is executable code work for trusted repository key byok-autonomous-python and validation requirement key byok-autonomous-python-validation.",
+    "The issue must carry the source citations and behavioral acceptance contract: a GCounter supports replica-local non-negative increments, value, and convergent pointwise-max merge; an ORSet supports add, observed remove, value, union-style merge, concurrent add survival, and convergence after all tags are observed and removed.",
+    "Require the public implementation and README to carry proof marker E2E_BYOK_SCOPE_UNIT, but leave filenames, internal design, workspace identity, and implementation choices to the coding agent.",
+    "Do not implement code or publish to GitHub in this phase. Finish only after accepted-research lineage, Linear provider readback, and the note backlink are durable.",
+  ].join(" ");
+  const run = async (hasActiveMarkdownNote: boolean) => {
+    const requests: ModelChatRequest[] = [];
+    const configs: AgentRunConfigEvent[] = [];
+    const vault = createRunnerVaultContext({ prompt });
+    vault.context.settings.modelRouterMode = "off";
+    vault.context.settings.linearEnabled = true;
+    vault.context.settings.githubEnabled = true;
+    if (!hasActiveMarkdownNote) {
+      vault.context.getCurrentMarkdownFile = () => null;
+      (
+        vault.context.app as unknown as {
+          workspace: { getActiveFile: () => null };
+        }
+      ).workspace.getActiveFile = () => null;
+    }
+    const baseRegistry = createCollectingRegistry([]);
+    const registry: ToolRegistry = {
+      ...baseRegistry,
+      getDefinitions: () => [
+        ...baseRegistry.getDefinitions(),
+        {
+          type: "function",
+          function: {
+            name: "publish_research_to_linear",
+            parameters: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        },
+        ...[
+          "github_list_tags",
+          "github_get_issue",
+          "publish_verified_code_to_github",
+        ].map((name) => ({
+          type: "function" as const,
+          function: {
+            name,
+            parameters: {
+              type: "object" as const,
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        })),
+      ],
+    };
+
+    await runAgentMission({
+      prompt,
+      modelClient: createClient({
+        chatRequests: requests,
+        chatResponders: [() => responseWithContent("More tool work is required.")],
+      }),
+      toolRegistry: registry,
+      toolContext: vault.context,
+      enableStreaming: false,
+      maxSteps: 1,
+      events: {
+        onRunConfig: (event) => configs.push(event),
+      },
+    });
+
+    return {
+      config: configs[0],
+      toolNames:
+        requests[0]?.tools?.map((tool) => tool.function.name) ?? [],
+      requestTools: requests.map((request) => ({
+        phase: request.evidencePhase ?? null,
+        tools: request.tools?.map((tool) => tool.function.name) ?? [],
+      })),
+    };
+  };
+
+  const bound = await run(true);
+  assert.equal(bound.config.autonomyScope.write.currentNote, true);
+  assert.equal(bound.config.writeAutonomy, true);
+  assert.ok(bound.config.allowedToolNames.includes("web_search"));
+  assert.ok(bound.config.allowedToolNames.includes("web_fetch"));
+  assert.ok(bound.config.allowedToolNames.includes("append_to_current_file"));
+  assert.ok(
+    bound.config.allowedToolNames.includes("publish_research_to_linear"),
+  );
+  assert.ok(!bound.config.allowedToolNames.includes("replace_current_file"));
+  assert.ok(
+    !bound.config.allowedToolNames.some(
+      (name) =>
+        name === "publish_verified_code_to_github" ||
+        name.startsWith("github_"),
+    ),
+  );
+
+  const unbound = await run(false);
+  assert.equal(unbound.config.autonomyScope.write.currentNote, false);
+  assert.ok(!unbound.config.allowedToolNames.includes("append_to_current_file"));
+  assert.ok(!unbound.config.allowedToolNames.includes("replace_current_file"));
+  assert.ok(
+    !unbound.config.allowedToolNames.includes("publish_research_to_linear"),
+  );
+  assert.ok(
+    !unbound.toolNames.includes("append_to_current_file"),
+    JSON.stringify(unbound.requestTools),
+  );
+  assert.ok(!unbound.toolNames.includes("replace_current_file"));
+});
+
+test("BYOK Phase A authority graph excludes future GitHub tools and redundant note writes", async () => {
+  const prompt = buildByokPhaseAResearchPrompt({
+    marker: "E2E_BYOK_AUTHORITY_UNIT",
+    profileKey: "byok-autonomous-python",
+    validationProfileKey: "byok-autonomous-python-validation",
+  });
+  assert.match(
+    prompt,
+    /Additional implementation files are allowed only when the accepted contract requires them\./u,
+  );
+  assert.doesNotMatch(prompt, /any additional files/iu);
+  assert.equal(hasExplicitResearchPublicationIntent(prompt), true);
+  assert.equal(hasExplicitCodeExecutionProhibition(prompt), true);
+  assert.equal(hasCodeDeliverableIntent(prompt), false);
+  assert.deepEqual(getRequiredCodeWorkflowToolNames(prompt), []);
+  const forbiddenGitHubToolNames = new Set([
+    "github_list_tags",
+    "github_get_issue",
+    "publish_verified_code_to_github",
+  ]);
+  const codeRegistry = createCodeV2RoutingRegistry();
+  const codeToolNames = codeRegistry
+    .getDefinitions()
+    .map((definition) => definition.function.name);
+  const forbiddenToolNames = new Set([
+    ...forbiddenGitHubToolNames,
+    ...codeToolNames,
+  ]);
+  const requests: ModelChatRequest[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const plannerCatalogs: MissionGraphHostCatalogNode[][] = [];
+  const graphs: Array<{
+    nodes: Record<string, { allowedTools: string[] }>;
+  }> = [];
+  const traces: string[] = [];
+  const vault = createRunnerVaultContext({ prompt });
+  vault.context.settings.modelRouterMode = "authority";
+  vault.context.settings.speechActSemanticRescueMode = "authority";
+  vault.context.settings.workingMode = "automatic";
+  vault.context.settings.linearEnabled = true;
+  vault.context.settings.githubEnabled = true;
+  const baseRegistry = createCollectingRegistry([]);
+  const fixtureToolNames = [
+    "publish_research_to_linear",
+    ...forbiddenGitHubToolNames,
+  ];
+  const fixtureDescriptors = new Map<string, ToolDescriptor>(
+    fixtureToolNames.map((name) => {
+      const read = name === "github_list_tags" || name === "github_get_issue";
+      return [
+        name,
+        {
+          version: 1,
+          name,
+          capability: {
+            system: name.startsWith("github_") ||
+              name === "publish_verified_code_to_github"
+              ? "github"
+              : "linear",
+            resourceType: read ? "catalog" : "publication",
+            action: read ? "read" : "publish",
+          },
+          effect: read ? "read" : "publish",
+          risk: read ? "low" : "critical",
+          approval: {
+            allowPromptGrant: read,
+            allowPersistentGrant: false,
+            fallback: read ? "none" : "exact",
+          },
+          execution: {
+            preparation: read ? "none" : "required",
+            cacheable: read,
+            parallelSafe: read,
+          },
+          durability: {
+            journal: !read,
+            receipt: !read,
+            readback: read ? "none" : "required",
+            reconciliation: read ? "none" : "required",
+          },
+          allowedPrincipals: ["single_agent"],
+          ...(read ? {} : { receiptKind: "external_action" as const }),
+        },
+      ];
+    }),
+  );
+  const fixtureDefinitions = [
+    {
+      type: "function" as const,
+      function: {
+        name: "publish_research_to_linear",
+        parameters: {
+          type: "object" as const,
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    },
+    ...[...forbiddenGitHubToolNames].map((name) => ({
+      type: "function" as const,
+      function: {
+        name,
+        parameters: {
+          type: "object" as const,
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    })),
+  ];
+  const combinedDefinitions = [
+    ...baseRegistry.getDefinitions(),
+    ...codeRegistry.getDefinitions(),
+    ...fixtureDefinitions,
+  ];
+  const uniqueDefinitions = [
+    ...new Map(
+      combinedDefinitions.map((definition) => [
+        definition.function.name,
+        definition,
+      ]),
+    ).values(),
+  ];
+  const registry: ToolRegistry = {
+    ...baseRegistry,
+    getDefinitions: () => uniqueDefinitions,
+    getDescriptor: (name) =>
+      fixtureDescriptors.get(name) ??
+      codeRegistry.getDescriptor?.(name) ??
+      baseRegistry.getDescriptor?.(name) ??
+      null,
+  };
+  const respond = (request: ModelChatRequest): ModelChatResponse => {
+    requests.push(cloneRequest(request));
+    if (isMissionRouterFormat(request)) {
+      return responseWithContent(
+        JSON.stringify({
+          mode: "code_workflow",
+          writeScope: "none",
+          needsWebEvidence: true,
+          needsVaultContext: true,
+          needsCodeExecution: true,
+          wordTarget: null,
+          confidence: 0.97,
+          rationale:
+            "The later executable outcome appears to require code immediately.",
+        }),
+      );
+    }
+    if (isMissionGraphPlannerFormat(request)) {
+      const catalog = parseMissionGraphHostCatalog(request);
+      plannerCatalogs.push(catalog);
+      return responseWithContent(
+        JSON.stringify({
+          confidence: 0.96,
+          nodes: catalog
+            .filter((node) => node.id !== "final")
+            .map((node) => ({
+              id: node.id,
+              objective: node.hostObjective,
+              dependencyIds: [...node.hostDependencyIds],
+            })),
+        }),
+      );
+    }
+    return responseWithContent("The bounded Phase A work remains in progress.");
+  };
+  const client: ModelClient = {
+    chat: async (request) => respond(request),
+    streamChat: async (request, events = {}) => {
+      const response = respond(request);
+      if (response.message.content) {
+        events.onContentDelta?.(response.message.content);
+      }
+      return response;
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: true,
+    maxSteps: 1,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+      onMissionGraphUpdate: (graph) => graphs.push(graph),
+      onTrace: (event) => traces.push(event.message),
+    },
+  });
+
+  assert.ok(
+    plannerCatalogs.length > 0,
+    `authority mode must invoke the graph planner; requests=${JSON.stringify(
+      requests.map((request) => request.format?.required ?? null),
+    )}; traces=${traces.join(" | ")}`,
+  );
+  assert.ok(
+    traces.some((message) =>
+      /Structured MissionGraphV3 accepted as authoritative/iu.test(message)
+    ),
+    traces.join(" | "),
+  );
+  const assertNoForbidden = (
+    names: readonly string[],
+    surface: string,
+  ) => {
+    assert.deepEqual(
+      names.filter((name) => forbiddenToolNames.has(name)),
+      [],
+      `${surface}: ${names.join(", ")}`,
+    );
+  };
+  for (const [index, config] of configs.entries()) {
+    assertNoForbidden(config.allowedToolNames, `run config ${index}`);
+  }
+  for (const [index, catalog] of plannerCatalogs.entries()) {
+    for (const node of catalog) {
+      assertNoForbidden(node.allowedTools, `planner catalog ${index}/${node.id}`);
+    }
+  }
+  for (const [index, request] of requests.entries()) {
+    assertNoForbidden(
+      request.tools?.map((tool) => tool.function.name) ?? [],
+      `model request ${index}`,
+    );
+  }
+  for (const [index, graph] of graphs.entries()) {
+    for (const [nodeId, node] of Object.entries(graph.nodes)) {
+      assertNoForbidden(node.allowedTools, `graph ${index}/${nodeId}`);
+    }
+  }
+  const catalogTools = plannerCatalogs.flatMap((catalog) =>
+    catalog.flatMap((node) => node.allowedTools)
+  );
+  const graphTools = graphs.flatMap((graph) =>
+    Object.values(graph.nodes).flatMap((node) => node.allowedTools)
+  );
+  assert.equal(
+    catalogTools.includes("append_to_current_file"),
+    false,
+    `atomic publication must own note writeback; catalog=${catalogTools.join(",")}`,
+  );
+  assert.equal(
+    graphTools.includes("append_to_current_file"),
+    false,
+    `atomic publication must not create an append node; graph=${graphTools.join(",")}`,
+  );
+  assert.equal(
+    graphTools.filter((name) => name === "publish_research_to_linear").length,
+    1,
+  );
+  assert.equal(
+    catalogTools.includes("linear_create_issue"),
+    false,
+    `atomic publication must own issue creation; catalog=${catalogTools.join(",")}`,
+  );
+  assert.equal(
+    graphTools.includes("linear_create_issue"),
+    false,
+    `atomic publication must not create a second issue node; graph=${graphTools.join(",")}`,
+  );
+  const runtimeSnapshot = [...vault.content.values()]
+    .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
+    .find((snapshot) =>
+      snapshot?.originalMission.includes("E2E_BYOK_AUTHORITY_UNIT")
+    );
+  assert.ok(runtimeSnapshot);
+  assert.equal(
+    runtimeSnapshot.operationGoals.current_note_content,
+    "not_requested",
+    "the atomic publication owns accepted-note writeback and must not create a second content debt",
+  );
+});
+
+test("BYOK Phase A discards held terminal prose and accepts canonical receipt proof exactly once", async () => {
+  const marker = "E2E_BYOK_RECEIPT_TERMINAL_UNIT";
+  const prompt = buildByokPhaseAResearchPrompt({
+    marker,
+    profileKey: "byok-autonomous-python",
+    validationProfileKey: "byok-autonomous-python-validation",
+  });
+  const strictPublication =
+    completedResearchPublicationReceiptFixture("created");
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt(strictPublication),
+    true,
+    "the regression fixture must satisfy the production composite proof contract",
+  );
+  assert.equal(
+    isCompletedAcceptedResearchPublicationReceipt({
+      ...strictPublication,
+      readback: { status: "not_verified" },
+    }),
+    false,
+    "an unverified generic receipt must not satisfy terminal publication proof",
+  );
+
+  const sourceUrls = [
+    "https://crdt-one.example.com/g-counter",
+    "https://crdt-two.example.org/or-set",
+    "https://crdt-three.example.net/convergence",
+    "https://crdt-four.example.dev/validation",
+  ];
+  const requests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const assistantDeltas: string[] = [];
+  const statuses: string[] = [];
+  const traces: AgentTraceEvent[] = [];
+  const graphUpdates: Array<{
+    nodes: Record<string, { status: string; allowedTools: string[] }>;
+  }> = [];
+  const plannerCatalogs: MissionGraphHostCatalogNode[][] = [];
+  const runReceipts: AgentRunReceipt[] = [];
+  let terminalAgentRequestOrdinal: number | null = null;
+  let terminalResponseReturned = false;
+  let optionalLinearReadSelected = false;
+
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: `# Autonomous BYOK CRDT research ${marker}\n`,
+  });
+  vault.content.set(LINEAR_ISSUE_TEMPLATE_PATH, LINEAR_ISSUE_TEMPLATE_V1);
+  vault.context.settings.modelRouterMode = "authority";
+  vault.context.settings.speechActSemanticRescueMode = "authority";
+  vault.context.settings.workingMode = "automatic";
+  vault.context.settings.linearEnabled = true;
+  vault.context.settings.githubEnabled = true;
+  vault.context.settings.researchMemoryEnabled = false;
+  vault.context.settings.agenticReflexEnabled = true;
+  vault.context.httpTransport = async (request) => {
+    if (request.url.endsWith("/web_search")) {
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          query: "state-based G-Counter observed-remove set convergence",
+          results: sourceUrls.map((url, index) => ({
+            title: `Independent CRDT source ${index + 1}`,
+            url,
+            snippet:
+              "State-based CRDT merge, observed-remove semantics, convergence, and validation guidance.",
+          })),
+        },
+      };
+    }
+    if (request.url.endsWith("/web_fetch")) {
+      const url = JSON.parse(
+        typeof request.body === "string" ? request.body : "{}",
+      )?.url;
+      const sourceIndex = sourceUrls.indexOf(url);
+      assert.notEqual(sourceIndex, -1, `unexpected source fetch: ${url}`);
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          title: `Independent CRDT source ${sourceIndex + 1}`,
+          url,
+          content: [
+            "A state-based G-Counter stores replica-local non-negative components and computes value by summing them.",
+            "Its merge is the pointwise maximum, which is associative, commutative, and idempotent, so replicas converge.",
+            "An observed-remove set tracks unique add tags, removes only observed tags, preserves a concurrent unseen add, and converges under union-style merge.",
+            "Validation should cover repeated merge, reordered delivery, concurrent add versus remove, and removal after every tag becomes observed.",
+          ].join(" "),
+          links: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.url}`);
+  };
+
+  const publicationTool: AgentTool = {
+    name: "publish_research_to_linear",
+    description:
+      "Test-only exact accepted-research note and Linear publication fixture.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    descriptor: {
+      version: 1,
+      name: "publish_research_to_linear",
+      capability: {
+        system: "linear",
+        resourceType: "publication",
+        action: "publish",
+      },
+      effect: "publish",
+      risk: "high",
+      approval: {
+        allowPromptGrant: false,
+        allowPersistentGrant: false,
+        fallback: "exact",
+      },
+      execution: {
+        preparation: "none",
+        cacheable: false,
+        parallelSafe: false,
+      },
+      durability: {
+        journal: true,
+        receipt: true,
+        readback: "required",
+        reconciliation: "required",
+      },
+      allowedPrincipals: ["single_agent"],
+      receiptKind: "external_action",
+    },
+    async execute() {
+      return structuredClone(strictPublication.output);
+    },
+    async executeResult() {
+      const { output, ...receipt } = structuredClone(strictPublication);
+      return {
+        ok: true,
+        toolName: "publish_research_to_linear",
+        output,
+        receipt,
+        mutationState: "applied",
+      };
+    },
+  };
+  const unplannedLinearCommentsTool: AgentTool = {
+    name: "linear_list_comments",
+    description:
+      "Test-only optional Linear read that must not enter the exact Phase A frontier.",
+    parameters: {
+      type: "object",
+      properties: {
+        issueId: { type: "string" },
+      },
+      required: ["issueId"],
+      additionalProperties: false,
+    },
+    descriptor: {
+      version: 1,
+      name: "linear_list_comments",
+      capability: {
+        system: "linear",
+        resourceType: "comment",
+        action: "list",
+      },
+      effect: "read",
+      risk: "low",
+      approval: {
+        allowPromptGrant: true,
+        allowPersistentGrant: true,
+        fallback: "none",
+      },
+      execution: {
+        preparation: "none",
+        cacheable: true,
+        parallelSafe: true,
+      },
+      durability: {
+        journal: false,
+        receipt: false,
+        readback: "none",
+        reconciliation: "none",
+      },
+      allowedPrincipals: ["single_agent", "lead", "researcher"],
+    },
+    async execute() {
+      throw new Error(
+        "An unplanned Linear comments read must never execute in exact Phase A.",
+      );
+    },
+  };
+  const optionalLinearIssueReadTool: AgentTool = {
+    name: "linear_get_issue",
+    description:
+      "Test-only optional Linear issue read selected by the planner but never required after publication.",
+    parameters: {
+      type: "object",
+      properties: {
+        issueId: { type: "string" },
+      },
+      required: ["issueId"],
+      additionalProperties: false,
+    },
+    descriptor: {
+      version: 1,
+      name: "linear_get_issue",
+      capability: {
+        system: "linear",
+        resourceType: "issue",
+        action: "read",
+      },
+      effect: "read",
+      risk: "low",
+      approval: {
+        allowPromptGrant: true,
+        allowPersistentGrant: true,
+        fallback: "none",
+      },
+      execution: {
+        preparation: "none",
+        cacheable: true,
+        parallelSafe: true,
+      },
+      durability: {
+        journal: false,
+        receipt: false,
+        readback: "none",
+        reconciliation: "none",
+      },
+      allowedPrincipals: ["single_agent", "lead", "researcher"],
+    },
+    async execute() {
+      throw new Error(
+        "The optional Linear issue read must be cancelled after receipt-backed publication.",
+      );
+    },
+  };
+  const publicationRegistry = new DefaultToolRegistry([
+    publicationTool,
+    unplannedLinearCommentsTool,
+    optionalLinearIssueReadTool,
+  ]);
+  const baseRegistry = createDefaultToolRegistry();
+  const definitions = [
+    ...new Map(
+      [
+        ...baseRegistry.getDefinitions(),
+        ...publicationRegistry.getDefinitions(),
+      ].map((definition) => [definition.function.name, definition]),
+    ).values(),
+  ];
+  const registry: ToolRegistry = {
+    getDefinitions: () => definitions,
+    getDescriptor: (name) =>
+      publicationRegistry.getDescriptor(name) ??
+      baseRegistry.getDescriptor?.(name) ??
+      null,
+    execute: async (call, context) => {
+      executedCalls.push(structuredClone(call));
+      return publicationRegistry.getDescriptor(call.name)
+        ? publicationRegistry.execute(call, context)
+        : baseRegistry.execute(call, context);
+    },
+  };
+
+  const respond = (request: ModelChatRequest): ModelChatResponse => {
+    if (terminalResponseReturned) {
+      throw new Error(
+        "receipt-backed terminal completion must not retry the model",
+      );
+    }
+    requests.push(cloneRequest(request));
+    if (isMissionRouterFormat(request)) {
+      return responseWithContent(
+        JSON.stringify({
+          mode: "deep_research",
+          writeScope: "current_note_append",
+          needsWebEvidence: true,
+          needsVaultContext: true,
+          needsCodeExecution: false,
+          wordTarget: null,
+          confidence: 0.99,
+          rationale:
+            "This phase gathers four web sources and atomically publishes accepted research to the initiating note and Linear.",
+        }),
+      );
+    }
+    if (isMissionGraphPlannerFormat(request)) {
+      const catalog = parseMissionGraphHostCatalog(request);
+      plannerCatalogs.push(catalog);
+      const requiredNodes = catalog.filter(
+        (node) => node.required && node.id !== "final",
+      );
+      const optionalLinearRead = catalog.find(
+        (node) =>
+          !node.required &&
+          node.allowedTools.includes("linear_get_issue"),
+      );
+      assert.ok(
+        optionalLinearRead,
+        "Phase A planner catalog must expose the optional provider read used by the live regression",
+      );
+      optionalLinearReadSelected = true;
+      return responseWithContent(
+        JSON.stringify({
+          confidence: 0.99,
+          nodes: [...requiredNodes, optionalLinearRead].map((node) => ({
+              id: node.id,
+              objective: node.hostObjective,
+              dependencyIds: [...node.hostDependencyIds],
+            })),
+        }),
+      );
+    }
+    if (request.evidencePhase !== "agent_step") {
+      return responseWithContent("");
+    }
+
+    const toolNames =
+      request.tools?.map((tool) => tool.function.name) ?? [];
+    if (
+      toolNames.includes("web_search") &&
+      !executedCalls.some((call) => call.name === "web_search")
+    ) {
+      return responseWithToolCall(
+        "web_search",
+        { query: "state-based G-Counter observed-remove set convergence" },
+        "",
+      );
+    }
+    if (
+      toolNames.includes("web_fetch") &&
+      executedCalls.filter((call) => call.name === "web_fetch").length <
+        sourceUrls.length
+    ) {
+      const fetched = new Set(
+        executedCalls
+          .filter((call) => call.name === "web_fetch")
+          .map((call) => String(call.arguments.url ?? "")),
+      );
+      const nextUrl = sourceUrls.find((url) => !fetched.has(url));
+      assert.ok(nextUrl);
+      return responseWithToolCall("web_fetch", { url: nextUrl }, "");
+    }
+    if (
+      toolNames.includes("read_template") &&
+      !executedCalls.some((call) => call.name === "read_template")
+    ) {
+      return responseWithToolCall(
+        "read_template",
+        { path: LINEAR_ISSUE_TEMPLATE_PATH },
+        "",
+      );
+    }
+    if (toolNames.includes(publicationTool.name)) {
+      return responseWithToolCall(publicationTool.name, {}, "");
+    }
+    if (
+      toolNames.includes("read_current_file") &&
+      !executedCalls.some((call) => call.name === "read_current_file")
+    ) {
+      return responseWithToolCall("read_current_file", {}, "");
+    }
+
+    terminalAgentRequestOrdinal = requests.filter(
+      (candidate) => candidate.evidencePhase === "agent_step",
+    ).length;
+    terminalResponseReturned = true;
+    return responseWithContent(
+      "UNVERIFIED TERMINAL PROSE MUST BE DISCARDED IN FAVOR OF THE CANONICAL RECEIPT.",
+    );
+  };
+  const client: ModelClient = {
+    chat: async (request) => respond(request),
+    streamChat: async (request, events = {}) => {
+      const response = respond(request);
+      if (response.message.content) {
+        events.onContentDelta?.(response.message.content);
+      }
+      return response;
+    },
+  };
+
+  await runAgentMission({
+    prompt,
+    runId: "segment:run:42",
+    modelClient: client,
+    toolRegistry: registry,
+    toolContext: vault.context,
+    enableStreaming: false,
+    maxSteps: 12,
+    events: {
+      onAssistantDelta: (delta) => assistantDeltas.push(delta),
+      onMissionGraphUpdate: (graph) => graphUpdates.push(graph),
+      onReceipt: (receipt) => runReceipts.push(receipt),
+      onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
+      onTrace: (event) => traces.push(event),
+    },
+  });
+
+  assert.equal(plannerCatalogs.length > 0, true);
+  assert.equal(optionalLinearReadSelected, true);
+  assert.equal(completions.length, 1);
+  assert.equal(
+    completions[0]?.stopReason,
+    "write_completed",
+    JSON.stringify({
+      completion: completions[0],
+      executed: executedCalls.map((call) => call.name),
+      agentFrontiers: requests
+        .filter((request) => request.evidencePhase === "agent_step")
+        .map((request) =>
+          request.tools?.map((tool) => tool.function.name) ?? []
+        ),
+      latestGraph: graphUpdates.at(-1)?.nodes,
+      statuses,
+      traceErrors: traces
+        .filter((trace) => trace.kind === "error")
+        .map((trace) => ({
+          message: trace.message,
+          code: trace.error?.code,
+        })),
+    }),
+  );
+  assert.deepEqual(assistantDeltas, []);
+  assert.equal(
+    executedCalls.filter(
+      (call) => call.name === "publish_research_to_linear",
+    ).length,
+    1,
+  );
+  assert.equal(
+    executedCalls.filter((call) => call.name === "web_search").length,
+    1,
+  );
+  assert.equal(
+    executedCalls.filter((call) => call.name === "web_fetch").length,
+    4,
+  );
+  assert.equal(
+    executedCalls.filter((call) => call.name === "linear_get_issue").length,
+    0,
+    "an unread optional provider check cannot become mandatory after publication",
+  );
+  assert.equal(
+    runReceipts.some(isCompletedAcceptedResearchPublicationReceipt),
+    true,
+  );
+
+  const agentRequests = requests.filter(
+    (request) => request.evidencePhase === "agent_step",
+  );
+  assert.equal(
+    agentRequests.some((request) =>
+      request.tools?.some(
+        (tool) => tool.function.name === "linear_list_comments",
+      ),
+    ),
+    false,
+    "proof-bound Phase A must not expose unrelated capability reads or mint dynamic retry debt",
+  );
+  assert.equal(terminalResponseReturned, true);
+  assert.equal(
+    terminalAgentRequestOrdinal,
+    agentRequests.length,
+    "the held terminal turn must be the final model request",
+  );
+  assert.deepEqual(
+    agentRequests.at(-1)?.tools?.map((tool) => tool.function.name) ?? [],
+    [],
+    "the receipt-terminal turn must not expose an optional-only set-loose frontier",
+  );
+  const persistedLedger = [...vault.content.values()]
+    .map((markdown) => parseMissionLedgerFromMarkdown(markdown))
+    .find((ledger) => ledger?.mission.includes(marker));
+  assert.ok(persistedLedger);
+  assert.equal(persistedLedger.status, "complete");
+  assert.equal(persistedLedger.acceptance?.status, "pass");
+
+  const graphMarkdown = [...vault.content.entries()].find(([path]) =>
+    path.startsWith("Agent Runs/Mission Graphs/")
+  )?.[1];
+  assert.ok(graphMarkdown);
+  const graphRecord = await parseMissionGraphStoreRecordFromMarkdown(
+    graphMarkdown,
+  );
+  assert.ok(graphRecord);
+  assert.equal(graphRecord.graph.nodes.final?.status, "complete");
+  const optionalLinearNode = Object.entries(graphRecord.graph.nodes).find(
+    ([nodeId, node]) =>
+      nodeId.startsWith("optional-") &&
+      node.allowedTools.includes("linear_get_issue"),
+  )?.[1];
+  assert.ok(optionalLinearNode);
+  assert.equal(optionalLinearNode.status, "cancelled");
+  assert.equal(graphUpdates.at(-1)?.nodes.final?.status, "complete");
 });
 
 test("runner records tool evidence and receipts into the durable mission ledger", async () => {
@@ -10018,11 +12375,629 @@ test("set-loose Soft-union unions ready MissionGraph tools including read_templa
     `expected ready read_template node in set-loose offered schemas; got ${names.join(", ")}`,
   );
   assert.ok(names.includes("read_current_file"));
-  assert.ok(names.includes("linear_create_issue"));
+  assert.equal(
+    names.includes("linear_create_issue"),
+    false,
+    "queued Linear mutation must stay hidden until its graph dependency promotes it",
+  );
   assert.equal(
     names.includes("list_templates"),
     false,
     "queued-only / non-offered list_templates must not appear without Soft-union or ready node",
+  );
+});
+
+test("set-loose schema and execution authority preserve MissionGraph dependency order", () => {
+  const graph = {
+    nodes: {
+      sandbox: {
+        id: "sandbox",
+        status: "ready",
+        allowedTools: ["code_sandbox_status"],
+        inputs: {},
+        outputs: {},
+      },
+      workspace: {
+        id: "workspace",
+        status: "queued",
+        allowedTools: ["code_workspace_create"],
+        inputs: {},
+        outputs: {},
+      },
+      createFile: {
+        id: "createFile",
+        status: "queued",
+        allowedTools: ["code_workspace_create_file"],
+        inputs: {},
+        outputs: {},
+      },
+      validate: {
+        id: "validate",
+        status: "queued",
+        allowedTools: ["code_validate_fast"],
+        inputs: {},
+        outputs: {},
+      },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+  const offered = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_status",
+    "code_workspace_read",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "web_search",
+    "read_current_file",
+  ];
+  const definitions = offered.map((name) => ({
+    type: "function" as const,
+    function: {
+      name,
+      parameters: { type: "object" as const, properties: {} },
+    },
+  }));
+
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, graph, {
+      setLooseOfferedToolNames: offered,
+    }).map((tool) => tool.function.name),
+    ["code_sandbox_status", "web_search", "read_current_file"],
+    "only the ready sandbox node and true unplanned Soft companions are callable",
+  );
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    ["code_sandbox_status", "web_search", "read_current_file"],
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "code_workspace_create",
+      new Set(offered),
+      graph,
+    ),
+    false,
+    "Bound workspace creation can never bypass a graph-start rejection",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "web_search",
+      new Set(offered),
+      graph,
+    ),
+    true,
+    "a genuinely unplanned Soft companion remains available",
+  );
+
+  graph.nodes.sandbox.status = "complete";
+  graph.nodes.workspace.status = "ready";
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, graph, {
+      setLooseOfferedToolNames: offered,
+    }).map((tool) => tool.function.name),
+    [
+      "code_sandbox_status",
+      "code_workspace_create",
+      "web_search",
+      "read_current_file",
+    ],
+    "workspace creation appears only after sandbox proof promotes it",
+  );
+
+  graph.nodes.workspace.status = "complete";
+  graph.nodes.createFile.status = "ready";
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(definitions, graph, {
+      setLooseOfferedToolNames: offered,
+    }).map((tool) => tool.function.name),
+    [
+      "code_sandbox_status",
+      "code_workspace_status",
+      "code_workspace_read",
+      "code_workspace_create_file",
+      "web_search",
+      "read_current_file",
+    ],
+    "the one-shot workspace bootstrap disappears while the next ready node appears",
+  );
+});
+
+test("set-loose permits bounded repository edits discovered after workspace creation", () => {
+  const action = (
+    id: string,
+    toolName: string,
+    effect: "read" | "mutation" | "execution",
+  ) => ({
+    id,
+    toolName,
+    effect,
+    bindingId: toolName === "code_sandbox_status" ? null : "binding-workspace",
+    selector: null,
+    objective: `${toolName} objective`,
+    minimumEvidence: 1,
+    requiredEvidenceKinds: ["tool-result"],
+    minimumReceipts: effect === "read" ? 0 : 1,
+    requiredReceiptKinds: effect === "read" ? [] : ["code_change"],
+  });
+  const graph = {
+    nodes: {
+      code: {
+        id: "lifecycle-code_execution",
+        status: "ready",
+        allowedTools: [
+          "code_workspace_create",
+          "code_workspace_create_file",
+          "code_validate_fast",
+          "code_commit_verified",
+        ],
+        inputs: {
+          lifecycle: {
+            kind: "literal",
+            value: {
+              version: 1,
+              composite: true,
+              intentFingerprint: `sha256:${"b".repeat(64)}`,
+              stage: "code_execution",
+              actions: [
+                action(
+                  "action-001-code_workspace_create",
+                  "code_workspace_create",
+                  "mutation",
+                ),
+                action(
+                  "action-002-code_workspace_create_file",
+                  "code_workspace_create_file",
+                  "mutation",
+                ),
+                action(
+                  "action-003-code_validate_fast",
+                  "code_validate_fast",
+                  "execution",
+                ),
+                action(
+                  "action-004-code_repair_record_cycle",
+                  "code_repair_record_cycle",
+                  "mutation",
+                ),
+                action(
+                  "action-005-code_commit_verified",
+                  "code_commit_verified",
+                  "mutation",
+                ),
+              ],
+            },
+          },
+        },
+        outputs: {
+          lifecycleActionCursor: 2,
+          lifecycleCompletedActionIds: [
+            "action-001-code_workspace_create",
+            "action-002-code_workspace_create_file",
+          ],
+          lifecycleActionAttemptCounts: {
+            "action-001-code_workspace_create": 1,
+            "action-002-code_workspace_create_file": 1,
+          },
+        },
+      },
+    },
+  } as any;
+  const offered = [
+    "code_workspace_create_file",
+    "code_workspace_mkdir",
+    "code_workspace_write_expected",
+    "code_validate_fast",
+    "code_repair_record_cycle",
+    "code_commit_verified",
+  ];
+
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    [
+      "code_workspace_create_file",
+      "code_workspace_mkdir",
+      "code_workspace_write_expected",
+      "code_validate_fast",
+    ],
+    "additional scoped file edits are callable, but the queued commit remains closed",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "code_workspace_create_file",
+      new Set(offered),
+      graph,
+    ),
+    true,
+    "an issue-discovered additional file may use the existing code-stage grant",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "code_workspace_write_expected",
+      new Set(offered),
+      graph,
+    ),
+    true,
+    "a hash-bound edit of an issue-discovered existing file may run as a companion",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "code_validate_fast",
+      new Set(offered),
+      graph,
+    ),
+    false,
+    "the current planned validator still begins and finishes its graph action",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "code_commit_verified",
+      new Set(offered),
+      graph,
+    ),
+    false,
+    "a queued proof action never bypasses graph order",
+  );
+
+  graph.nodes.code.outputs.lifecycleActionCursor = 3;
+  graph.nodes.code.outputs.lifecycleCompletedActionIds.push(
+    "action-003-code_validate_fast",
+  );
+  graph.nodes.code.outputs.lifecycleActionAttemptCounts[
+    "action-003-code_validate_fast"
+  ] = 1;
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    ["code_repair_record_cycle"],
+    "the composite lifecycle also pauses adaptive edits at its repair-cycle cursor",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "code_workspace_create_file",
+      new Set(offered),
+      graph,
+    ),
+    false,
+  );
+});
+
+test("set-loose pauses adaptive edits while an exact validation receipt is being recorded", () => {
+  const graph = {
+    nodes: {
+      workspace: {
+        id: "workspace",
+        status: "complete",
+        allowedTools: ["code_workspace_create"],
+        inputs: {},
+        outputs: {},
+      },
+      fast: {
+        id: "fast",
+        status: "complete",
+        allowedTools: ["code_validate_fast"],
+        inputs: {},
+        outputs: {},
+      },
+      repair: {
+        id: "repair",
+        status: "ready",
+        allowedTools: ["code_repair_record_cycle"],
+        inputs: {},
+        outputs: {},
+      },
+      targeted: {
+        id: "targeted",
+        status: "queued",
+        allowedTools: ["code_validate_targeted"],
+        inputs: {},
+        outputs: {},
+      },
+    },
+  } as any;
+  const offered = [
+    "code_workspace_create_file",
+    "code_workspace_write_expected",
+    "code_repair_record_cycle",
+    "code_validate_targeted",
+  ];
+  const repairFrontierOffered = [
+    ...offered,
+    "code_workspace_status",
+    "code_workspace_stat",
+    "code_workspace_list",
+    "code_workspace_read",
+    "code_workspace_search",
+    "code_sandbox_status",
+    "code_repair_status",
+    "web_search",
+    "web_fetch",
+  ];
+
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(
+      repairFrontierOffered,
+      graph,
+    ),
+    ["code_repair_record_cycle"],
+    "the exact fast-validation receipt is recorded before any later edit can change workspace hashes",
+  );
+  assert.deepEqual(
+    constrainToolsToMissionGraphFrontier(
+      repairFrontierOffered.map((name) => ({
+        type: "function" as const,
+        function: {
+          name,
+          parameters: { type: "object", properties: {} },
+        },
+      })),
+      graph,
+      { setLooseOfferedToolNames: repairFrontierOffered },
+    ).map((tool) => tool.function.name),
+    ["code_repair_record_cycle"],
+    "the actual set-loose schema frontier cannot distract the model with status, read, search, or web tools",
+  );
+  for (const mutation of [
+    "code_workspace_create_file",
+    "code_workspace_write_expected",
+  ]) {
+    assert.equal(
+      mayBypassMissionGraphStartForSetLooseSoftCompanion(
+        mutation,
+        new Set(offered),
+        graph,
+      ),
+      false,
+      `${mutation} cannot bypass the active repair-cycle frontier`,
+    );
+  }
+
+  graph.nodes.repair.status = "complete";
+  graph.nodes.targeted.status = "ready";
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    [
+      "code_workspace_create_file",
+      "code_workspace_write_expected",
+      "code_validate_targeted",
+    ],
+    "adaptive edits resume before the next fresh targeted validation",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "code_workspace_create_file",
+      new Set(offered),
+      graph,
+    ),
+    true,
+  );
+});
+
+test("red targeted validation requires a correction receipt before fresh fast validation", () => {
+  const graph = {
+    nodes: {
+      workspace: {
+        id: "workspace",
+        status: "complete",
+        allowedTools: ["code_workspace_create"],
+        inputs: {},
+        outputs: {},
+      },
+      "validation-recovery-fast-targeted": {
+        id: "validation-recovery-fast-targeted",
+        status: "queued",
+        allowedTools: ["code_validate_fast"],
+        inputs: {},
+        outputs: {},
+      },
+      "validation-recovery-record-targeted": {
+        id: "validation-recovery-record-targeted",
+        status: "queued",
+        allowedTools: ["code_repair_record_cycle"],
+        inputs: {},
+        outputs: {},
+      },
+      targeted: {
+        id: "targeted",
+        status: "queued",
+        allowedTools: ["code_validate_targeted"],
+        inputs: {},
+        outputs: {
+          validationRecovery: {
+            version: 1,
+            status: "awaiting_correction",
+            fastNodeId: "validation-recovery-fast-targeted",
+            repairNodeId: "validation-recovery-record-targeted",
+          },
+        },
+      },
+    },
+  } as any;
+  const offered = [
+    "code_workspace_status",
+    "code_workspace_read",
+    "code_workspace_stat",
+    "code_workspace_list",
+    "code_workspace_search",
+    "code_workspace_create_file",
+    "code_workspace_append",
+    "code_workspace_patch",
+    "code_workspace_write_expected",
+    "code_validate_fast",
+    "code_repair_status",
+    "web_search",
+  ];
+
+  assert.deepEqual(getActiveValidationRecoveryFrontierV1(graph), {
+    validationNodeId: "targeted",
+    fastNodeId: "validation-recovery-fast-targeted",
+    repairNodeId: "validation-recovery-record-targeted",
+    status: "awaiting_correction",
+  });
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    [
+      "code_workspace_read",
+      "code_workspace_stat",
+      "code_workspace_list",
+      "code_workspace_search",
+      "code_workspace_create_file",
+      "code_workspace_append",
+      "code_workspace_patch",
+      "code_workspace_write_expected",
+    ],
+    "unchanged validators and unrelated status/web tools stay hidden until a real correction receipt exists",
+  );
+
+  graph.nodes.targeted.outputs.validationRecovery.status =
+    "correction_recorded";
+  graph.nodes["validation-recovery-fast-targeted"].status = "ready";
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    ["code_validate_fast"],
+    "after the correction receipt, the exact fresh fast validator is the only callable frontier",
+  );
+});
+
+test("planned queued Soft companions cannot swallow MissionGraph start rejection", () => {
+  const graph = {
+    nodes: {
+      reflection: {
+        id: "reflection",
+        status: "queued",
+        allowedTools: ["append_to_current_file"],
+        inputs: {},
+        outputs: {},
+      },
+    },
+  } as any;
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "append_to_current_file",
+      new Set(["append_to_current_file"]),
+      graph,
+    ),
+    false,
+  );
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(
+      ["append_to_current_file", "web_search"],
+      graph,
+    ),
+    ["web_search"],
+  );
+});
+
+test("atomic research publication suppresses generic note writers until an explicit reflection node", () => {
+  const graph = {
+    nodes: {
+      publisher: {
+        id: "publisher",
+        status: "blocked",
+        allowedTools: ["publish_research_to_linear"],
+        inputs: {},
+        outputs: {},
+      },
+    },
+  } as any;
+  const offered = [
+    "publish_research_to_linear",
+    "append_to_current_file",
+    "read_current_file",
+  ];
+
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    ["read_current_file"],
+    "the composite owns accepted-note writeback even while its publisher is blocked",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "append_to_current_file",
+      new Set(offered),
+      graph,
+    ),
+    false,
+    "a generic append cannot recover off-graph from a blocked atomic publisher",
+  );
+
+  graph.nodes.reflection = {
+    id: "reflection",
+    status: "ready",
+    allowedTools: ["append_to_current_file"],
+    inputs: {},
+    outputs: {},
+  };
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(offered, graph),
+    ["append_to_current_file", "read_current_file"],
+    "an independently planned reflection append remains callable",
+  );
+  assert.equal(
+    mayBypassMissionGraphStartForSetLooseSoftCompanion(
+      "append_to_current_file",
+      new Set(offered),
+      graph,
+    ),
+    false,
+    "the planned reflection follows graph authority rather than Soft bypass",
+  );
+});
+
+test("completed Bound publisher never re-enters the set-loose model catalog", () => {
+  const graph = {
+    nodes: {
+      publisher: {
+        id: "publisher",
+        status: "complete",
+        effect: "publish",
+        allowedTools: ["publish_research_to_linear"],
+        inputs: {},
+        outputs: {},
+      },
+      final: {
+        id: "final",
+        status: "queued",
+        effect: "read",
+        allowedTools: [],
+        inputs: {},
+        outputs: {},
+      },
+    },
+    capabilityEnvelope: { tools: {} },
+  } as any;
+
+  assert.deepEqual(
+    filterSetLooseToolNamesByMissionGraphAuthority(
+      ["publish_research_to_linear", "read_current_file"],
+      graph,
+    ),
+    ["read_current_file"],
+  );
+});
+
+test("set-loose Linear publication cannot enumerate templates without template intent", () => {
+  const offered = [
+    "publish_research_to_linear",
+    "read_template",
+    "list_templates",
+    "read_current_file",
+  ];
+  assert.deepEqual(
+    constrainSetLooseTemplateDiscoveryToMissionIntent(
+      offered,
+      "Deeply research CRDTs, write accepted research into this note, then publish it to one Linear implementation issue.",
+    ),
+    [
+      "publish_research_to_linear",
+      "read_template",
+      "read_current_file",
+    ],
+  );
+  assert.deepEqual(
+    constrainSetLooseTemplateDiscoveryToMissionIntent(
+      offered,
+      "List my templates, then fill the selected template.",
+    ),
+    offered,
   );
 });
 
@@ -11264,6 +14239,74 @@ test("an enabled structured router relays a user stop before agent planning", as
 
   assert.equal(routerSignal?.aborted, true);
   assert.equal(chatCalls, 1);
+  assert.deepEqual(completions, ["user_stopped"]);
+});
+
+test("a direct-chat stop joins an already-invoked shadow router before closing usage evidence", async () => {
+  const controller = new AbortController();
+  const completions: string[] = [];
+  const evidence: Array<{ clientInvoked: boolean; outcome: string }> = [];
+  let releaseShadow!: () => void;
+  let markShadowStarted!: () => void;
+  const shadowStarted = new Promise<void>((resolve) => {
+    markShadowStarted = resolve;
+  });
+  const shadowFinished = new Promise<ModelChatResponse>((_resolve, reject) => {
+    releaseShadow = () => reject(new Error("shadow router released"));
+  });
+  const client: ModelClient = {
+    chat: async (request) => {
+      assert.equal(isMissionRouterFormat(request), true);
+      markShadowStarted();
+      // Deliberately ignore the abort signal. The runner must still join this
+      // already-invoked client before it closes the coordinator generation.
+      return shadowFinished;
+    },
+    streamChat: async () => {
+      throw new Error("primary direct chat must not start after user stop");
+    },
+  };
+  const { context } = createRunnerVaultContext({
+    prompt: "What is two plus two? Answer in chat only.",
+  });
+  context.settings = createRunnerSettings({
+    modelRouterEnabled: true,
+    modelRouterMode: "shadow",
+    speechActSemanticRescueMode: "shadow",
+  });
+
+  let settled = false;
+  const mission = runAgentMission({
+    prompt: "What is two plus two? Answer in chat only.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: context,
+    enableStreaming: false,
+    abortSignal: controller.signal,
+    events: {
+      onModelCallEvidence: (event) =>
+        evidence.push({
+          clientInvoked: event.clientInvoked,
+          outcome: event.outcome,
+        }),
+      onRunComplete: (event) => completions.push(event.stopReason),
+    },
+  }).then(() => {
+    settled = true;
+  });
+
+  await shadowStarted;
+  controller.abort("user_requested");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(
+    settled,
+    false,
+    "the run closed while an invoked shadow client still owned evidence",
+  );
+  releaseShadow();
+  await mission;
+
+  assert.deepEqual(evidence, [{ clientInvoked: true, outcome: "error" }]);
   assert.deepEqual(completions, ["user_stopped"]);
 });
 
@@ -15493,6 +18536,7 @@ test("clarifying follow-up whole-note replace streams through mission graph", as
   const statuses: string[] = [];
   const traces: string[] = [];
   const receipts: AgentRunReceipt[] = [];
+  const configs: AgentRunConfigEvent[] = [];
   const broker = new ApprovalBroker();
   const prompt =
     "I prefer that you replace the entire note with a revised version";
@@ -15595,6 +18639,7 @@ test("clarifying follow-up whole-note replace streams through mission graph", as
         broker.resolve(request.id, "approved");
       },
       onReceipt: (receipt) => receipts.push(receipt),
+      onRunConfig: (event) => configs.push(event),
     },
   });
 
@@ -15648,6 +18693,13 @@ test("clarifying follow-up whole-note replace streams through mission graph", as
   assert.ok(!(vault.content.get("Current.md") ?? "").includes("| Period |"));
   assert.equal(receipts[0]?.operation, "replace");
   assert.ok(receipts[0]?.backupPath);
+  const recordedProviderCalls = Math.max(
+    ...configs.map(
+      (config) => config.missionLedger?.providerUsage.modelCallCount ?? 0,
+    ),
+  );
+  assert.ok(recordedProviderCalls >= 2, "pre-ledger router/planner calls must be retained");
+  assert.equal(recordedProviderCalls, chatRequests.length + streamRequests.length);
   if (graphPlannerSawOptionalReads) {
     assert.ok(
       traces.some((message) =>
@@ -16226,6 +19278,7 @@ type MissionGraphHostCatalogNode = {
   id: string;
   required: boolean;
   effect: string;
+  allowedTools: string[];
   hostObjective: string;
   hostDependencyIds: string[];
 };
@@ -19666,6 +22719,7 @@ test("required prepared actions bind double approval before one external executi
 
   await runAgentMission({
     prompt,
+    runId: "prepared-linear-run",
     modelClient: client,
     toolRegistry: new DefaultToolRegistry([tool]),
     toolContext: vault.context,
@@ -19698,6 +22752,7 @@ test("required prepared actions bind double approval before one external executi
   );
   assert.equal(receipts[0]?.resource?.system, "linear");
   assert.equal(receipts[0]?.path, undefined);
+  assert.equal(receipts[0]?.runId, "prepared-linear-run");
   assert.match(receipts[0]?.grantId ?? "", /^grant:approval-/);
   const graphMarkdown = [...vault.content.entries()].find(([path]) =>
     path.startsWith("Agent Runs/Mission Graphs/"),
@@ -19705,6 +22760,16 @@ test("required prepared actions bind double approval before one external executi
   assert.ok(graphMarkdown, "canonical mission graph should be persisted");
   const graphRecord = await parseMissionGraphStoreRecordFromMarkdown(graphMarkdown);
   assert.ok(graphRecord);
+  const completedMutationNode = Object.values(graphRecord.graph.nodes).find(
+    (node) => node.allowedTools.includes("linear_create_issue"),
+  );
+  assert.ok(completedMutationNode);
+  assert.equal(completedMutationNode.status, "complete");
+  assert.deepEqual(
+    completedMutationNode.receipts.map((receipt) => receipt.id),
+    ["linear-receipt-1"],
+    "the completed mutation node must retain the exact canonical action receipt id",
+  );
   const graphStatusOperations = graphRecord.journal.flatMap(
     (entry) => entry.patch.operations,
   );

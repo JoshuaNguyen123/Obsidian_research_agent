@@ -26,6 +26,7 @@ import {
   requiresVaultEvidenceProof,
   requiresWebEvidenceProof,
 } from "./evidenceIntent";
+import { isCompletedAcceptedResearchPublicationReceipt } from "./setLooseCompoundAutonomy";
 
 export {
   DAILY_USE_ACCEPTANCE_V1,
@@ -43,6 +44,8 @@ export type MissionAcceptanceStatus = "pass" | "fail" | "needs_more_work";
 export interface MissionAcceptanceReceiptLike {
   toolName?: string;
   operation?: string;
+  idempotencyKey?: string;
+  commitKind?: string;
   path?: string;
   toPath?: string;
   backupPath?: string;
@@ -54,7 +57,12 @@ export interface MissionAcceptanceReceiptLike {
     system?: string;
     resourceType?: string;
     id?: string;
+    url?: string;
   };
+  readback?: {
+    status?: string;
+  };
+  output?: unknown;
 }
 
 export interface MissionAcceptanceInput {
@@ -228,6 +236,16 @@ function receiptsSatisfyMatchingNonVaultProof(
   const successfulTools = new Set(input.successfulTools);
   return input.receipts.some(
     (receipt) => {
+      if (
+        requiredTools.has("publish_research_to_linear") &&
+        successfulTools.has("publish_research_to_linear") &&
+        isCompletedAcceptedResearchPublicationReceipt(receipt)
+      ) {
+        // The canonical receipt retains the provider action name, but its
+        // strict artifact/binding/lineage proof covers both the accepted note
+        // write and the Linear publication performed by the outer composite.
+        return true;
+      }
       const toolName = receipt.toolName?.trim() ?? "";
       if (
         !toolName ||

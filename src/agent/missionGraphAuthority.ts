@@ -45,7 +45,10 @@ export function collectRequiredDependencyIds(
   const stack = [...(graph.nodes[rootId]?.dependencyIds ?? [])];
   while (stack.length > 0) {
     const id = stack.pop()!;
-    if (collected.has(id) || isOptionalMissionGraphNodeId(id)) {
+    if (
+      collected.has(id) ||
+      isOptionalMissionGraphNode(id, graph.nodes[id])
+    ) {
       continue;
     }
     collected.add(id);
@@ -56,7 +59,10 @@ export function collectRequiredDependencyIds(
     for (const dependencyId of node.dependencyIds) {
       if (
         !collected.has(dependencyId) &&
-        !isOptionalMissionGraphNodeId(dependencyId)
+        !isOptionalMissionGraphNode(
+          dependencyId,
+          graph.nodes[dependencyId],
+        )
       ) {
         stack.push(dependencyId);
       }

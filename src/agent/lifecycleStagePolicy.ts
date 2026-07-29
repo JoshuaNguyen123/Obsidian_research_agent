@@ -23,6 +23,12 @@ const GITHUB_CATALOG_DESTRUCTIVE_TOOL_SET = new Set<string>(
   GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES,
 );
 
+const LINEAR_HANDOFF_PRODUCER_TOOL_NAMES = [
+  PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+  PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+  "linear_create_issue",
+] as const;
+
 /** Read-only GitHub catalog operations available in the GitHub lifecycle stage. */
 export const GITHUB_STAGE_READ_TOOL_ALLOW: readonly string[] =
   GITHUB_CATALOG_READ_TOOL_NAMES;
@@ -79,6 +85,15 @@ export const CODE_EXECUTION_TOOL_ALLOW = [
   "code_repair_status",
   "code_commit_verified",
 ] as const;
+
+const LINEAR_HANDOFF_CONSUMER_TOOL_NAMES = new Set<string>([
+  ...CODE_EXECUTION_TOOL_ALLOW,
+  CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+  DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  ...GITHUB_CATALOG_READ_TOOL_NAMES,
+  ...GITHUB_CATALOG_MUTATION_TOOL_NAMES,
+]);
 
 /** Note companions allowed inside the Bound code_execution envelope only. */
 export const CODE_EXECUTION_ENVELOPE_NOTE_COMPANIONS = [
@@ -168,18 +183,43 @@ export function insertExplicitLinearReadbacksIntoLifecycleToolNames(
   lifecycleToolNames: readonly string[],
   linearReadToolNames: readonly string[],
 ): string[] {
-  const ordered: string[] = [];
-  for (const name of lifecycleToolNames) {
-    ordered.push(name);
-    if (name === PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME) {
-      ordered.push(...linearReadToolNames);
+  const reads = [...new Set(linearReadToolNames)];
+  const readSet = new Set(reads);
+  const lifecycle = [
+    ...new Set(lifecycleToolNames.filter((name) => !readSet.has(name))),
+  ];
+  if (reads.length === 0) {
+    return lifecycle;
+  }
+
+  const firstConsumerIndex = lifecycle.findIndex((name) =>
+    LINEAR_HANDOFF_CONSUMER_TOOL_NAMES.has(name),
+  );
+  const predecessorLimit =
+    firstConsumerIndex >= 0 ? firstConsumerIndex : lifecycle.length;
+  let producerIndex = -1;
+
+  for (const producerName of LINEAR_HANDOFF_PRODUCER_TOOL_NAMES) {
+    for (let index = predecessorLimit - 1; index >= 0; index -= 1) {
+      if (lifecycle[index] === producerName) {
+        producerIndex = index;
+        break;
+      }
+    }
+    if (producerIndex >= 0) {
+      break;
     }
   }
-  if (
-    linearReadToolNames.length > 0 &&
-    !lifecycleToolNames.includes(PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME)
-  ) {
-    ordered.push(...linearReadToolNames);
-  }
-  return [...new Set(ordered)];
+
+  const insertionIndex =
+    producerIndex >= 0
+      ? producerIndex + 1
+      : firstConsumerIndex >= 0
+        ? firstConsumerIndex
+        : lifecycle.length;
+  return [
+    ...lifecycle.slice(0, insertionIndex),
+    ...reads,
+    ...lifecycle.slice(insertionIndex),
+  ];
 }

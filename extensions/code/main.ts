@@ -63,6 +63,32 @@ export default class AgenticResearcherCodeExtension extends Plugin {
         ...runtime.getContributions(),
       ],
     });
+    this.startHostProvisionedSandboxReadiness();
+  }
+
+  /**
+   * Adopt an already-provisioned host sandbox and prove its boundary once per
+   * session, off the plugin-load critical path.
+   */
+  private startHostProvisionedSandboxReadiness(): void {
+    const runtime = this.runtime;
+    if (!runtime || this.probeInFlight) return;
+    const controller = new AbortController();
+    this.probeController = controller;
+    this.probeInFlight = runtime
+      .ensureHostProvisionedSandboxReadinessV1(controller.signal)
+      .then(() => undefined)
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        console.warn(
+          "Agentic Researcher Code: host-provisioned sandbox readiness failed.",
+          error instanceof Error ? error.message : String(error),
+        );
+      })
+      .finally(() => {
+        if (this.probeController === controller) this.probeController = null;
+        this.probeInFlight = null;
+      });
   }
 
   onunload(): void {

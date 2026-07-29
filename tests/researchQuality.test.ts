@@ -372,6 +372,23 @@ test("two opposing passages detect an open evidence conflict", () => {
   assert.deepEqual(conflicts[0].claimIds, []);
 });
 
+test("passages from one source do not create self-conflicts", () => {
+  const conflicts = detectEvidenceConflicts([
+    {
+      id: "legacy-passage-a",
+      sourceId: "crdt-paper",
+      text: "The replicated counter evaluation reports merge success at 20 percent under sustained load.",
+    },
+    {
+      id: "legacy-passage-b",
+      sourceId: "crdt-paper",
+      text: "The replicated counter evaluation reports merge success at 80 percent under sustained load.",
+    },
+  ]);
+
+  assert.deepEqual(conflicts, []);
+});
+
 test("open evidence conflicts force research acceptance needs_more_work", () => {
   const conflicts = detectEvidenceConflicts([
     {

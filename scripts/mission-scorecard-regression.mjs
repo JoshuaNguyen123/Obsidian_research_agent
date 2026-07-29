@@ -15,6 +15,21 @@ export const DEFAULT_DAILY_USE_SUMMARY_PATH = path.join(
   "daily-use-run-summary.json",
 );
 
+/**
+ * Lanes that legitimately emit no mission scorecard, with the reason. Anything
+ * not listed here and not in the baseline is treated as proof debt and fails.
+ */
+export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
+  // No model calls: these drive production tools against real external
+  // services, so there is no mission to score.
+  "configured-linear-live",
+  "linear-flow-real-cleanup",
+  "github-askpass-runtime-live",
+  "disposable-live-external",
+  // Single-call provider smoke; qualifies a model, not a mission.
+  "provider-canary",
+]);
+
 const DIMENSION_IDS = Object.freeze([
   "acceptance_coverage",
   "evidence_grounding",
@@ -48,11 +63,26 @@ export async function assertMissionScorecardSummaryFile(options = {}) {
       ? baseline.records.map((record) => String(record?.project ?? ""))
       : [],
   );
-  if (
-    selectedProjects.size > 0 &&
-    ![...selectedProjects].some((project) => baselineProjects.has(project))
-  ) {
-    return { checkedRecords: 0, skipped: true };
+  // A project with no baseline record used to return success here, before the
+  // summary file was even read. Because the only baseline record named a
+  // deleted lane, that made the gate a no-op for every remaining project.
+  // Absence of a baseline is now proof debt, reported loudly, and only the
+  // named lanes below are allowed to carry none.
+  const unbaselined = [...selectedProjects].filter(
+    (project) =>
+      !baselineProjects.has(project) &&
+      !MISSION_SCORECARD_EXEMPT_PROJECTS.has(project),
+  );
+  if (unbaselined.length > 0) {
+    throw new Error(
+      `No mission-scorecard baseline exists for: ${unbaselined.join(", ")}. ` +
+        "Harvest the scorecards from a green run into " +
+        `${path.relative(process.cwd(), baselinePath).replace(/\\/gu, "/")}, ` +
+        "or add the lane to MISSION_SCORECARD_EXEMPT_PROJECTS with a reason.",
+    );
+  }
+  if (selectedProjects.size > 0 && baselineProjects.size === 0) {
+    return { checkedRecords: 0, skipped: true, reason: "empty_baseline" };
   }
 
   const summaryPath = path.resolve(

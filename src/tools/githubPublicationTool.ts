@@ -21,6 +21,7 @@ export interface CreateGitHubPublicationToolOptionsV1 {
   resolveBinding(input: {
     profileKey: string;
     handoff: VerifiedCodePublicationHandoffV1;
+    context: ToolExecutionContext;
   }): Promise<GitHubPublicationBindingResolutionV1 | null>;
   getCheckpoint(publicationId: string): Promise<GitHubPublicationCheckpointV1 | null>;
   createWorkflow(input: {
@@ -106,6 +107,14 @@ export function createGitHubPublicationTool(
         { mutationState: "may_have_applied" },
       );
     }
+    if (!isGitHubPublicationActionComplete(args.action, checkpoint)) {
+      throw new ToolExecutionError(
+        "github_publication_finalization_pending",
+        checkpoint.blocker?.message ??
+          `GitHub publication reached ${checkpoint.status}, but the requested ${String(args.action)} proof is not durably complete. Retry the same publication to resume from its checkpoint.`,
+        { mutationState: "may_have_applied" },
+      );
+    }
     const receipt = createWorkflowReceipt(checkpoint, context);
     await options.persistExternalReceipt(receipt);
     return {
@@ -121,10 +130,53 @@ export function createGitHubPublicationTool(
 
 export function hasExplicitGitHubPublicationIntent(prompt: string): boolean {
   const value = typeof prompt === "string" ? prompt : "";
+  return value
+    .split(/(?:[!?;\r\n]+|\.(?=\s|$)|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some(hasAffirmativeGitHubPublicationClause);
+}
+
+function hasAffirmativeGitHubPublicationClause(clause: string): boolean {
+  const target =
+    /\b(?:github|pull request|draft pr|branch)\b/giu;
+  const targetIndexes = [...clause.matchAll(target)].map(
+    (match) => match.index ?? -1,
+  );
+  if (targetIndexes.length === 0) return false;
+
+  const actions =
+    /\b(?:push|publish|send|open|create|update|merge)\b/giu;
+  for (const match of clause.matchAll(actions)) {
+    const actionIndex = match.index ?? -1;
+    if (
+      actionIndex < 0 ||
+      !targetIndexes.some((targetIndex) =>
+        Math.abs(targetIndex - actionIndex) <= 100
+      )
+    ) {
+      continue;
+    }
+    if (!isActionNegatedAt(clause, actionIndex)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isActionNegatedAt(clause: string, actionIndex: number): boolean {
+  const prefix = clause.slice(Math.max(0, actionIndex - 120), actionIndex);
+  const boundaryIndex = Math.max(
+    prefix.lastIndexOf(","),
+    prefix.lastIndexOf(":"),
+  );
+  const localPrefix = prefix.slice(boundaryIndex + 1);
   return (
-    /\b(?:push|publish|send|open|create|update)\b[\s\S]{0,100}\b(?:github|pull request|draft pr|branch)\b/iu.test(value) ||
-    /\b(?:github|pull request|draft pr)\b[\s\S]{0,100}\b(?:push|publish|create|update|merge)\b/iu.test(value) ||
-    /\bmerge\b[\s\S]{0,80}\b(?:github|pull request|pr)\b/iu.test(value)
+    /\b(?:do\s+not|don't|never|skip|exclude)\b[\s\S]{0,100}$/iu.test(
+      localPrefix,
+    ) ||
+    /\bwithout\b[\s\S]{0,60}$/iu.test(localPrefix) ||
+    /\bno\s+need\s+to\b[\s\S]{0,60}$/iu.test(localPrefix)
   );
 }
 
@@ -158,7 +210,7 @@ async function executeGitHubPublication(
       "No latest publication-eligible verified local commit exists for this repository profile.",
     );
   }
-  const binding = await options.resolveBinding({ profileKey, handoff });
+  const binding = await options.resolveBinding({ profileKey, handoff, context });
   if (!binding || binding.workflowBinding.profileKey !== profileKey) {
     throw notApplied(
       "github_trusted_binding_missing",
@@ -358,6 +410,36 @@ async function executeGitHubPublication(
     );
   }
   return workflow.merge(checkpoint, binding.workflowBinding, context.abortSignal);
+}
+
+function isGitHubPublicationActionComplete(
+  action: unknown,
+  checkpoint: GitHubPublicationCheckpointV1,
+): boolean {
+  if (checkpoint.blocker !== null || checkpoint.pendingAction !== null) {
+    return false;
+  }
+  if (action === "publish_draft") {
+    return (
+      checkpoint.status === "finalized" ||
+      (
+        checkpoint.status === "draft_pr_verified" &&
+        checkpoint.completionProof === "draft_pr"
+      ) ||
+      (
+        checkpoint.status === "review_or_merge_ready" &&
+        checkpoint.completionProof === "merged_pr"
+      )
+    );
+  }
+  return (
+    action === "merge" &&
+    checkpoint.status === "finalized" &&
+    checkpoint.completionProof === "merged_pr" &&
+    typeof checkpoint.mergeSha === "string" &&
+    /^[a-f0-9]{40}$/iu.test(checkpoint.mergeSha) &&
+    checkpoint.pullRequest?.merged === true
+  );
 }
 
 function adaptHandoff(

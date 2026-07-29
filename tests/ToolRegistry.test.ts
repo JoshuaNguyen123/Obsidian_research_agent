@@ -8,6 +8,7 @@ import {
   AGENT_TEMPLATE_FOLDER,
   LINEAR_ISSUE_TEMPLATE_V1,
 } from "../src/tools/agentTemplateLibrary";
+import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
 import { chunkMarkdownForSemanticSearch } from "../src/tools/semanticSearchTools";
 import {
   createSemanticIndexService,
@@ -1856,6 +1857,32 @@ test("read_template narrowly permits the managed Linear issue template for expli
   assert.equal(hierarchyResult.ok, true);
   assert.equal((hierarchyResult.output as { path: string }).path, managedPath);
 
+  const byokPhaseA = createMockContext({
+    prompt: buildByokPhaseAResearchPrompt({
+      marker: "BYOK_AUTONOMOUS_unit",
+      profileKey: "byok-autonomous-python",
+      validationProfileKey: "byok-autonomous-python-validation",
+    }),
+  });
+  byokPhaseA.content.set(managedPath, LINEAR_ISSUE_TEMPLATE_V1);
+  const byokPhaseAResult = await registry.execute(
+    { name: "read_template", arguments: { path: managedPath } },
+    byokPhaseA.context,
+  );
+  assert.equal(byokPhaseAResult.ok, true, byokPhaseAResult.error?.message);
+  assert.equal((byokPhaseAResult.output as { path: string }).path, managedPath);
+  const byokOtherTemplate = `${AGENT_TEMPLATE_FOLDER}/Research brief.md`;
+  byokPhaseA.content.set(byokOtherTemplate, "# {{topic}}");
+  const blockedByokOtherTemplate = await registry.execute(
+    { name: "read_template", arguments: { path: byokOtherTemplate } },
+    byokPhaseA.context,
+  );
+  assert.equal(blockedByokOtherTemplate.ok, false);
+  assert.match(
+    blockedByokOtherTemplate.error?.message ?? "",
+    /ask about templates/i,
+  );
+
   const readOnly = createMockContext({
     prompt: "Read Linear issue ENG-42 from the workspace.",
   });
@@ -1877,6 +1904,21 @@ test("read_template narrowly permits the managed Linear issue template for expli
   );
   assert.equal(blockedNegated.ok, false);
   assert.match(blockedNegated.error?.message ?? "", /ask about templates/i);
+
+  const negatedPublication = createMockContext({
+    prompt:
+      "Do not publish the accepted research report to Linear; explain the workflow only.",
+  });
+  negatedPublication.content.set(managedPath, LINEAR_ISSUE_TEMPLATE_V1);
+  const blockedNegatedPublication = await registry.execute(
+    { name: "read_template", arguments: { path: managedPath } },
+    negatedPublication.context,
+  );
+  assert.equal(blockedNegatedPublication.ok, false);
+  assert.match(
+    blockedNegatedPublication.error?.message ?? "",
+    /ask about templates/i,
+  );
 
   const otherManagedTemplate = `${AGENT_TEMPLATE_FOLDER}/Research brief.md`;
   allowed.content.set(otherManagedTemplate, "# {{topic}}");

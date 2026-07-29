@@ -78,19 +78,6 @@ export async function recordDailyUseAcceptance(
   return { evaluation, metrics };
 }
 
-export function completeObservedAcceptance(
-  scenarioId: DailyUseScenarioId,
-): DailyUseObservedAcceptanceV1 {
-  const contract = DAILY_USE_ACCEPTANCE_V1[scenarioId];
-  return {
-    artifacts: [...contract.requestedArtifacts],
-    proofs: [...contract.requiredProofs],
-    approvals: [...contract.approvalBoundaries],
-    bindings: [...contract.finalBindings],
-    cleanup: [...contract.cleanupObligations],
-  };
-}
-
 function normalizeObserved(
   value: DailyUseObservedAcceptanceV1,
 ): DailyUseObservedAcceptanceV1 {

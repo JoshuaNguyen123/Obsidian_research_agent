@@ -5,6 +5,7 @@ import type { ActionReceipt, PreparedAction } from "../src/agent/actions";
 import type { ToolExecutionContext } from "../src/tools/types";
 import {
   LinearClientError,
+  normalizeComparableTicketText,
   ResearchTicketPublisher,
   type HostLinearActionExecution,
   type HostLinearActionPreparation,
@@ -13,6 +14,7 @@ import {
   type LinearToolClient,
   type ResearchTicketPublisherOptions,
   type ResearchTicketWorkItemDraftV1,
+  type ResearchTicketWorkItemDraftV2,
   type SynthesizedResearchTicketSectionsV1,
 } from "../src/integrations/linear";
 
@@ -37,6 +39,23 @@ const DRAFT: ResearchTicketWorkItemDraftV1 = {
   evidenceRefs: ["https://example.test/evidence/accepted-synthesis"],
   riskClass: "medium",
   originRunId: "research-run-42",
+  generation: 0,
+  fingerprint: `sha256:${"0".repeat(64)}`,
+};
+const DRAFT_V2: ResearchTicketWorkItemDraftV2 = {
+  schemaVersion: 2,
+  ready: true,
+  executionClass: "code",
+  objective: "Add deterministic research-ticket publication.",
+  repositoryKey: "research-agent",
+  acceptanceCriteria: [
+    { id: "AC-1", text: "An accepted result creates at most one Linear issue." },
+  ],
+  validationRequirementKeys: ["tests.unit"],
+  evidenceRefs: ["https://example.test/evidence/accepted-synthesis"],
+  riskClass: "medium",
+  originRunId: "research-run-42",
+  acceptedResearchArtifactFingerprint: HASH,
   generation: 0,
   fingerprint: `sha256:${"0".repeat(64)}`,
 };
@@ -354,6 +373,122 @@ test("publisher adopts deterministic issue after prepare reports duplicate targe
   assert.equal(prepareCount, 1);
   assert.equal(executeCount, 0);
   assert.equal(getCount, 2);
+});
+
+test("publisher adopts deterministic v2 issue after Linear rewrites equivalent Markdown", async () => {
+  let prepareCount = 0;
+  let executeCount = 0;
+  let getCount = 0;
+  let deterministicId = "";
+  let description = "";
+  const sections = { ...SECTIONS, dependencies: [] };
+  const readClient: LinearToolClient = {
+    execute: async (operationKey, variables = {}) => {
+      if (operationKey === "issues.search") return page([]);
+      if (operationKey === "issues.get") {
+        getCount += 1;
+        assert.equal(variables.id, deterministicId);
+        if (getCount === 1) {
+          throw new LinearClientError(
+            "linear_not_found",
+            "Linear resource was not found.",
+            { operationKey },
+          );
+        }
+        const providerDescription = description
+          .replace(/^_([^_\r\n]+)_$/gmu, "*$1*")
+          .replace(
+            /^- (https:\/\/\S+)$/gmu,
+            "* [$1](<$1>)",
+          )
+          .replace(/^- /gmu, "* ")
+          .replace(
+            /(<!-- agentic-researcher:work-item:v2:start -->)\n```/u,
+            "$1\n\n```",
+          )
+          .replace(
+            /```\n(<!-- agentic-researcher:work-item:v2:end -->)/u,
+            "```\n\n$1",
+          );
+        return issue(deterministicId, providerDescription, QUEUE_PROJECT_ID);
+      }
+      throw new Error(`Unexpected operation ${operationKey}`);
+    },
+  };
+  const publisher = publisherFixture(
+    readClient,
+    fakeExecutor({
+      onPrepare: () => {
+        prepareCount += 1;
+        return {
+          ok: false as const,
+          status: "rejected" as const,
+          error: {
+            code: "linear_duplicate_target",
+            message: `Linear issue ${deterministicId} already exists.`,
+          },
+        };
+      },
+      onExecute: () => {
+        executeCount += 1;
+      },
+    }),
+  );
+  const built = publisher.build(sections, DRAFT_V2);
+  deterministicId = built.deterministicIssueId;
+  description = built.description;
+
+  const result = await publisher.publish({
+    runId: "research-run-42",
+    toolCallId: "publish-ticket-1",
+    subject: SUBJECT,
+    context: contextFixture(),
+    sections,
+    draft: DRAFT_V2,
+    approvedPreview: {
+      status: "create",
+      workItemFingerprint: built.spec.fingerprint,
+      duplicateId: null,
+      duplicateSnapshotHash: null,
+    },
+    preferredGrantId: "grant-queue",
+  });
+
+  assert.equal(
+    result.ok,
+    true,
+    result.ok ? undefined : JSON.stringify(result.error),
+  );
+  if (!result.ok || result.status !== "deduplicated") return;
+  assert.equal(result.issue.id, deterministicId);
+  assert.equal(prepareCount, 1);
+  assert.equal(executeCount, 0);
+  assert.equal(getCount, 2);
+});
+
+test("inline strong-emphasis rewrite from the Linear serializer compares equal without masking real drift", () => {
+  const expected =
+    "- Implement crdt_sync.py with public GCounter class supporting __init__(replica_id), increment(amount=1), value() -> int, and merge(other) with pointwise-max join";
+  const providerRewritten =
+    "- Implement crdt_sync.py with public GCounter class supporting **init**(replica_id), increment(amount=1), value() -> int, and merge(other) with pointwise-max join";
+  assert.equal(
+    normalizeComparableTicketText(providerRewritten),
+    normalizeComparableTicketText(expected),
+  );
+  const genuinelyDifferent = providerRewritten.replace(
+    "increment(amount=1)",
+    "increment(amount=2)",
+  );
+  assert.notEqual(
+    normalizeComparableTicketText(genuinelyDifferent),
+    normalizeComparableTicketText(expected),
+  );
+  // Underscore tokens that are not emphasis (single underscores, snake_case)
+  // must pass through untouched.
+  assert.equal(
+    normalizeComparableTicketText("- keep replica_id and snake_case intact"),
+    "- keep replica_id and snake_case intact",
+  );
 });
 
 test("publisher refuses deterministic issue adoption when project or description drift", async () => {

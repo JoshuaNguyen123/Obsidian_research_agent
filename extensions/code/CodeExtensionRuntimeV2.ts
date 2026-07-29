@@ -34,7 +34,11 @@ import {
   SandboxManagerV2,
   SpawnSandboxCommandRunnerV2,
   createCodeExecutionContributionsV2,
+  hostProvisionedSandboxAdoptionDecisionV1,
   parseSandboxProviderConfigV2,
+  readHostProvisionedSandboxBindingV1,
+  type HostProvisionedSandboxAdoptionReasonV1,
+  type HostProvisionedSandboxPlatformV1,
   type PreparedSandboxActionV2,
   type SandboxCapabilityStatusV2,
   type SandboxCommandRunnerV2,
@@ -239,6 +243,66 @@ interface RepositoryInventoryV2 {
 }
 
 /**
+ * Kept under the 15-minute freshness window that capability readiness applies
+ * to `sandbox.lastProbe`, so a mission never starts on evidence its own gate
+ * already considers stale.
+ */
+const DEFAULT_SANDBOX_PROBE_MAX_AGE_MS = 10 * 60_000;
+
+/**
+ * Host environment access that stays safe in every Obsidian runtime. The only
+ * values read are the non-secret sandbox identity names in
+ * HOST_PROVISIONED_SANDBOX_VARIABLE_NAMES_V1.
+ */
+function readHostEnvironmentV1(): Readonly<Record<string, string | undefined>> {
+  const host = globalThis as typeof globalThis & {
+    process?: { env?: Record<string, string | undefined> };
+  };
+  return host.process?.env ?? {};
+}
+
+function readHostPlatformV1(): HostProvisionedSandboxPlatformV1 {
+  const host = globalThis as typeof globalThis & {
+    process?: { platform?: string };
+  };
+  return host.process?.platform ?? "unknown";
+}
+
+function waitForSandboxProbe(
+  promise: Promise<SandboxCapabilityStatusV2>,
+  signal?: AbortSignal,
+): Promise<SandboxCapabilityStatusV2> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(sandboxProbeWaitAborted());
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(sandboxProbeWaitAborted());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (status) => {
+        cleanup();
+        resolve(status);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+function sandboxProbeWaitAborted(): Error {
+  const error = new Error(
+    "Waiting for the shared sandbox boundary probe was aborted.",
+  );
+  error.name = "AbortError";
+  return error;
+}
+
+/**
  * Production owner for the built-in Code capability. It owns no model, vault,
  * or credential handle. Every filesystem mutation remains workspace-scoped,
  * and every generated-code process remains behind SandboxManagerV2.
@@ -258,6 +322,10 @@ export class CodeExtensionRuntimeV2 {
   private repositoryProvisioner: ProfileAwareRepositoryProvisionerV2 | null = null;
   private initialized = false;
   private refreshQueue: Promise<void> = Promise.resolve();
+  private sandboxProbeInFlight: {
+    manager: SandboxManagerV2;
+    promise: Promise<SandboxCapabilityStatusV2>;
+  } | null = null;
 
   constructor(options: CodeExtensionRuntimeOptionsV2) {
     if (options.sandboxManager && options.sandboxRunner) {
@@ -987,8 +1055,33 @@ export class CodeExtensionRuntimeV2 {
   /** Host-controlled boundary probe. It never receives a model-supplied command. */
   async probeConfiguredSandboxProviders(signal?: AbortSignal): Promise<SandboxCapabilityStatusV2> {
     this.assertInitialized();
-    const status = await this.requireSandboxManager().probeProviders(signal);
+    const manager = this.requireSandboxManager();
+    const existing = this.sandboxProbeInFlight;
+    if (existing?.manager === manager) {
+      return await waitForSandboxProbe(existing.promise, signal);
+    }
+    let flight!: NonNullable<CodeExtensionRuntimeV2["sandboxProbeInFlight"]>;
+    const promise = this.runConfiguredSandboxProbe(manager, signal)
+      .finally(() => {
+        if (this.sandboxProbeInFlight === flight) {
+          this.sandboxProbeInFlight = null;
+        }
+      });
+    flight = { manager, promise };
+    this.sandboxProbeInFlight = flight;
+    return await promise;
+  }
+
+  private async runConfiguredSandboxProbe(
+    manager: SandboxManagerV2,
+    signal?: AbortSignal,
+  ): Promise<SandboxCapabilityStatusV2> {
+    const status = await manager.probeProviders(signal);
     await this.serializedRefresh(async () => {
+      // Provider settings replace the manager and invalidate all prior proof.
+      // A probe that began against the old immutable binding must never write
+      // its result into the new binding's durable state.
+      if (this.requireSandboxManager() !== manager) return;
       const next = parseCodeRuntimeStateV2({
         ...this.requireState(),
         sandbox: {
@@ -1003,7 +1096,94 @@ export class CodeExtensionRuntimeV2 {
       });
       this.state = await this.persistState(next);
     });
-    return status;
+    return this.requireSandboxManager() === manager
+      ? status
+      : this.requireSandboxManager().readStatus();
+  }
+
+  /**
+   * Adopt the immutable sandbox binding the host has already provisioned.
+   *
+   * Provisioning writes the runtime's non-secret identity to the user
+   * environment; without this step that identity never reached durable plugin
+   * state, so a fully provisioned machine still reported zero providers and
+   * every generated-code mission stopped at `code_validate_fast`. Adoption
+   * only records a candidate — `probeConfiguredSandboxProviders` remains the
+   * sole authority for execution availability.
+   */
+  async adoptHostProvisionedSandboxBindingV1(input?: {
+    env?: Readonly<Record<string, string | undefined>>;
+    platform?: HostProvisionedSandboxPlatformV1;
+  }): Promise<{
+    adopted: boolean;
+    reason: HostProvisionedSandboxAdoptionReasonV1 | "injected_manager";
+    provider: SandboxProviderConfigV2["kind"] | null;
+    variableNames: string[];
+  }> {
+    this.assertInitialized();
+    if (this.injectedSandboxManager) {
+      return {
+        adopted: false,
+        reason: "injected_manager",
+        provider: null,
+        variableNames: [],
+      };
+    }
+    const binding = readHostProvisionedSandboxBindingV1(
+      input?.env ?? readHostEnvironmentV1(),
+      input?.platform ?? readHostPlatformV1(),
+    );
+    const decision = hostProvisionedSandboxAdoptionDecisionV1({
+      configured: this.requireState().sandbox.providerConfigs,
+      binding: binding?.provider ?? null,
+    });
+    if (!decision.adopt || !binding) {
+      return {
+        adopted: false,
+        reason: decision.reason,
+        provider: binding?.provider.kind ?? null,
+        variableNames: binding?.variableNames ?? [],
+      };
+    }
+    await this.configureSandboxProvider(binding.provider);
+    return {
+      adopted: true,
+      reason: decision.reason,
+      provider: binding.provider.kind,
+      variableNames: binding.variableNames,
+    };
+  }
+
+  /**
+   * Startup readiness: adopt any host-provisioned binding, then run one
+   * boundary probe when a configured provider still lacks fresh in-memory
+   * proof. Persisted probe history is deliberately insufficient after restart,
+   * so this is what makes a provisioned host usable without the operator
+   * re-running the probe command by hand before every session.
+   */
+  async ensureHostProvisionedSandboxReadinessV1(
+    signal?: AbortSignal,
+    options?: { maxProbeAgeMs?: number },
+  ): Promise<SandboxCapabilityStatusV2> {
+    this.assertInitialized();
+    await this.adoptHostProvisionedSandboxBindingV1();
+    const manager = this.requireSandboxManager();
+    const state = this.requireState();
+    if (state.sandbox.providerConfigs.length === 0) {
+      return manager.readStatus();
+    }
+    const cached = manager.readStatus();
+    // Readiness consumers treat a probe older than their freshness window as
+    // unproven, so a verified in-memory manager with a stale persisted
+    // observation must re-probe rather than report Ready on old evidence.
+    const maxProbeAgeMs = options?.maxProbeAgeMs ?? DEFAULT_SANDBOX_PROBE_MAX_AGE_MS;
+    const observedAt = state.sandbox.lastProbe?.observedAt ?? null;
+    const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
+    const probeFresh =
+      Number.isFinite(observedMs) &&
+      this.now().getTime() - observedMs <= maxProbeAgeMs;
+    if (cached.executionAvailable && probeFresh) return cached;
+    return this.probeConfiguredSandboxProviders(signal);
   }
 
   /**
@@ -1025,6 +1205,12 @@ export class CodeExtensionRuntimeV2 {
         ...current.sandbox.providerConfigs.filter((candidate) => candidate.kind !== provider.kind),
         provider,
       ].sort((left, right) => left.priority - right.priority || left.kind.localeCompare(right.kind));
+      if (
+        canonicalJson(providerConfigs) ===
+        canonicalJson(current.sandbox.providerConfigs)
+      ) {
+        return;
+      }
       this.state = await this.persistState(parseCodeRuntimeStateV2({
         ...current,
         sandbox: { providerConfigs, lastProbe: null },

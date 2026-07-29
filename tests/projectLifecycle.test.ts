@@ -140,6 +140,34 @@ test("note reflection of a Linear ticket URL is not code_execution", () => {
   );
 });
 
+test("BYOK handoff phases classify existing proof as input instead of new work", () => {
+  const phaseA = [
+    "Deeply research a small dependency-free Python CRDT library for marker BYOK_AUTONOMOUS_unit.",
+    "Use and fetch at least four independent sources exposed through the configured research backend. Reconcile their guidance on state-based G-Counter joins and observed-remove sets, including convergence, idempotence, concurrent add versus remove, and practical validation.",
+    "Write accepted research into the initiating note as a concise but substantive implementation brief, then publish that accepted research to one Linear implementation issue in the configured destination.",
+    "The accepted package is executable code work for trusted repository key byok-autonomous-python and validation requirement key byok-autonomous-python-validation.",
+    "The issue must carry the source citations and behavioral acceptance contract: a GCounter supports replica-local non-negative increments, value, and convergent pointwise-max merge; an ORSet supports add, observed remove, value, union-style merge, concurrent add survival, and convergence after all tags are observed and removed.",
+    "Require the public implementation and README to carry proof marker BYOK_AUTONOMOUS_unit, but leave filenames, internal design, workspace identity, and implementation choices to the coding agent.",
+    "Do not implement code or publish to GitHub in this phase. Finish only after accepted-research lineage, Linear provider readback, and the note backlink are durable.",
+  ].join(" ");
+  assert.deepEqual(detectProjectLifecycleStagesV1(phaseA), [
+    "accepted_research",
+    "linear_hierarchy",
+  ]);
+
+  const phaseB = [
+    "Review and implement Linear issue issue-1.",
+    "Begin with an independent linear_get_issue read of that exact identity and treat its signed accepted-research contract as the sole product specification.",
+    "When the work is complete, write exactly one human reflection to the accepted research's initiating note through its durable lineage.",
+    "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it.",
+    "Implement the requested Python library in its bound trusted repository and create one verified local commit.",
+  ].join(" ");
+  assert.deepEqual(detectProjectLifecycleStagesV1(phaseB), [
+    "code_execution",
+    "private_github_publication",
+  ]);
+});
+
 test("research then code prompts detect accepted research and code execution without Linear", () => {
   assert.deepEqual(
     detectProjectLifecycleStagesV1(

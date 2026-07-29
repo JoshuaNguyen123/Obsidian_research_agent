@@ -17,7 +17,10 @@ import {
   toolsOfferedForSetLoosePipeline,
 } from "../src/agent/setLooseCompoundAutonomy";
 import { ROUTE_BASE_TOOLS } from "../src/agent/toolSchemaPolicy";
+import { CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME } from "../src/tools/githubPrivateRepositoryTool";
+import { PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME } from "../src/tools/githubPublicationTool";
 import { PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME } from "../src/tools/researchProjectHierarchyTool";
+import { PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME } from "../src/tools/researchPublicationTool";
 
 test("toolsAllowedForLifecycleStage returns stage-scoped tool names", () => {
   const research = toolsAllowedForLifecycleStage("accepted_research");
@@ -116,16 +119,104 @@ test("shouldDeferAdditionalProjectLifecycleMutation blocks second stage mutation
   );
 });
 
-test("insertExplicitLinearReadbacksIntoLifecycleToolNames inserts reads after hierarchy publish", () => {
+test("explicit Linear readback is first in an isolated Phase B code and GitHub lifecycle", () => {
   assert.deepEqual(
     insertExplicitLinearReadbacksIntoLifecycleToolNames(
-      ["publish_research_to_linear", PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME],
+      [
+        "code_sandbox_status",
+        "code_workspace_create",
+        "code_validate_targeted",
+        "code_commit_verified",
+        CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+        PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+        // Reproduce the stale planner placement that previously left the
+        // explicit issue read at the end of the effect chain.
+        "linear_get_issue",
+      ],
       ["linear_get_issue"],
     ),
     [
-      "publish_research_to_linear",
+      "linear_get_issue",
+      "code_sandbox_status",
+      "code_workspace_create",
+      "code_validate_targeted",
+      "code_commit_verified",
+      CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+      PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
+    ],
+  );
+});
+
+test("explicit Linear readback follows the atomic research publisher before code", () => {
+  assert.deepEqual(
+    insertExplicitLinearReadbacksIntoLifecycleToolNames(
+      [
+        PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+        "code_workspace_create",
+        "code_validate_targeted",
+      ],
+      ["linear_get_issue"],
+    ),
+    [
+      PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+      "linear_get_issue",
+      "code_workspace_create",
+      "code_validate_targeted",
+    ],
+  );
+});
+
+test("explicit Linear readback preserves hierarchy publisher ordering before code", () => {
+  assert.deepEqual(
+    insertExplicitLinearReadbacksIntoLifecycleToolNames(
+      [
+        PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+        PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
+        "code_workspace_create",
+      ],
+      ["linear_get_issue"],
+    ),
+    [
+      PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
       PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
       "linear_get_issue",
+      "code_workspace_create",
     ],
+  );
+});
+
+test("explicit Linear readback ordering retains create fallback and stable dedupe behavior", () => {
+  assert.deepEqual(
+    insertExplicitLinearReadbacksIntoLifecycleToolNames(
+      [
+        "read_template",
+        "linear_create_issue",
+        "linear_get_issue",
+        "linear_get_issue",
+        "code_workspace_create",
+        "code_workspace_create",
+      ],
+      ["linear_get_issue", "linear_get_issue"],
+    ),
+    [
+      "read_template",
+      "linear_create_issue",
+      "linear_get_issue",
+      "code_workspace_create",
+    ],
+  );
+  assert.deepEqual(
+    insertExplicitLinearReadbacksIntoLifecycleToolNames(
+      ["read_template", "read_template"],
+      [],
+    ),
+    ["read_template"],
+  );
+  assert.deepEqual(
+    insertExplicitLinearReadbacksIntoLifecycleToolNames(
+      ["read_template"],
+      ["linear_get_issue"],
+    ),
+    ["read_template", "linear_get_issue"],
   );
 });

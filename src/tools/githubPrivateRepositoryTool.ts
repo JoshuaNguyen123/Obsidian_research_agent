@@ -16,6 +16,7 @@ import {
   type TrustedGitHubRepositoryBindingV2,
 } from "../integrations/github/TrustedGitHubRepositoryBindingV2";
 import type { JsonSchemaObject } from "../model/types";
+import { hasExplicitGitHubPublicationIntent } from "./githubPublicationTool";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 
@@ -149,6 +150,58 @@ export function hasExplicitPrivateGitHubRepositoryCreationIntent(
   );
 }
 
+/**
+ * A private publication to an exact host/issue-bound destination necessarily
+ * needs repository existence proof before push. This is narrower than generic
+ * GitHub publication: it does not infer create authority for an arbitrary or
+ * model-invented destination. The tool still performs a read-only existence
+ * check first and requires its separate fingerprint-bound approval before it
+ * creates an absent repository.
+ */
+export function hasPrivateGitHubRepositoryBootstrapIntent(
+  prompt: string,
+): boolean {
+  const value = typeof prompt === "string" ? prompt : "";
+  if (hasExplicitPrivateGitHubRepositoryCreationIntent(value)) return true;
+  if (
+    hasPrivateGitHubRepositoryCreationNegation(value) ||
+    !hasExplicitGitHubPublicationIntent(value)
+  ) {
+    return false;
+  }
+  return (
+    /\b(?:issue|host|profile|repository)[-\s]?bound\b[\s\S]{0,100}\bprivate\s+github\s+(?:destination|repository|repo)\b/iu.test(
+      value,
+    ) ||
+    /\bprivate\s+github\s+(?:destination|repository|repo)\b[\s\S]{0,100}\b(?:issue|host|profile|repository)[-\s]?bound\b/iu.test(
+      value,
+    )
+  );
+}
+
+function hasPrivateGitHubRepositoryCreationNegation(value: string): boolean {
+  const normalized = value.toLowerCase();
+  const createTarget = /\b(?:create|github|repository|repo)\b/iu;
+  if (
+    /\b(?:without|skip|exclude)\b[^.\n]{0,100}\b(?:create|github|repository|repo)\b/iu.test(
+      value,
+    ) ||
+    /\bno\b\s+(?:github|repository|repo)\b/iu.test(value)
+  ) {
+    return true;
+  }
+  for (const match of normalized.matchAll(
+    /\b(?:do not|don't|never)\b([^.\n]{0,120})/gu,
+  )) {
+    const rest = match[1] ?? "";
+    if (/^\s*(?:stop|ask|wait|continue|idle|halt|pause)\b/u.test(rest)) {
+      continue;
+    }
+    if (createTarget.test(rest)) return true;
+  }
+  return false;
+}
+
 export function parseGitHubPrivateRepositoryCheckpointMapV1(
   value: unknown,
 ): Record<string, GitHubPrivateRepositoryCheckpointV1> {
@@ -182,10 +235,10 @@ async function executePrivateRepositoryCreation(
       "Private repository creation requires a verified GitHub credential and the Integrations and Code capabilities.",
     );
   }
-  if (!hasExplicitPrivateGitHubRepositoryCreationIntent(context.originalPrompt)) {
+  if (!hasPrivateGitHubRepositoryBootstrapIntent(context.originalPrompt)) {
     throw notApplied(
       "github_private_repository_explicit_intent_required",
-      "Creating a GitHub repository requires an explicit request to create the private repository.",
+      "Creating a GitHub repository requires either an explicit creation request or explicit publication to the exact host-bound private GitHub destination.",
     );
   }
   if (!context.requestNestedApproval) {

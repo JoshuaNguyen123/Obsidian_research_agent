@@ -220,6 +220,36 @@ test("repairs a later cycle, validates fresh, and emits only a readback-verified
   assert.ok(harness.order.indexOf("commit") < harness.order.indexOf("commit-readback"));
 });
 
+test("overlong composite repair scope uses a bounded deterministic checkpoint key", async () => {
+  const harness = createHarness({});
+  const request = createRequest(`repair-${"q".repeat(41)}`);
+  request.runId = `run-${"r".repeat(44)}`;
+  request.worktree.id = `workspace-${"w".repeat(39)}`;
+  const normalized = normalizedRequest(request);
+  const checkpointId = codeRepairCheckpointIdV1(normalized);
+
+  assert.match(checkpointId, /^code-repair:sha256-[0-9a-f]{64}$/u);
+  assert.ok(checkpointId.length <= 128);
+  assert.equal(codeRepairCheckpointIdV1(normalized), checkpointId);
+  assert.notEqual(
+    codeRepairCheckpointIdV1({
+      ...normalized,
+      id: `${normalized.id.slice(0, -1)}z`,
+    }),
+    checkpointId,
+  );
+
+  const result = await harness.coordinator.execute(request);
+  assert.equal(result.status, "complete");
+  assert.equal(result.checkpoint.id, checkpointId);
+  assert.ok(
+    harness.validationOperationIds.every((operationId) =>
+      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(operationId),
+    ),
+    "derived validation operation ids remain bounded durable identifiers",
+  );
+});
+
 test("stops early when the same failure fingerprint survives a repair", async () => {
   const harness = createHarness({ fastOutcomes: ["same compiler failure", "same compiler failure"] });
   const result = await harness.coordinator.execute(createRequest("unchanged-failure"));

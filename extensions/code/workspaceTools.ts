@@ -470,6 +470,9 @@ class WorkspaceToolRuntimeV2 {
         const profile = await this.repositories.resolveProfileContract?.(manifest.repositoryBinding.profileKey, context);
         if (!profile) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", "Repository mutation requires its trusted RepositoryProfileV2.");
         const changes = mutationChanges(targetPath, normalizedArgs);
+        const repositoryScope = resolveRepositoryMutationScopeV2(profile, changes);
+        normalizedArgs.repositoryScopeFingerprint = repositoryScope.fingerprint;
+        normalizedArgs.repositoryScopeBindings = repositoryScope.bindings;
         const classification = classifyProtectedControlChangesV2(profile, changes);
         if (classification.level === "blocked") {
           throw new WorkspaceManagerErrorV2("repository_control_blocked", `Repository controls block: ${classification.blockedPaths.join(", ")}.`);
@@ -533,7 +536,18 @@ class WorkspaceToolRuntimeV2 {
     if (profileKey) {
       const profile = await this.repositories.resolveProfileContract?.(profileKey, context);
       if (!profile) throw new WorkspaceManagerErrorV2("repository_profile_unavailable", "Repository mutation lost its trusted RepositoryProfileV2.");
-      const classification = classifyProtectedControlChangesV2(profile, mutationChanges(targetPath, args));
+      const changes = mutationChanges(targetPath, args);
+      const repositoryScope = resolveRepositoryMutationScopeV2(profile, changes);
+      if (
+        repositoryScope.fingerprint !==
+        requiredFingerprint(args.repositoryScopeFingerprint)
+      ) {
+        throw new WorkspaceManagerErrorV2(
+          "repository_path_scope_drift",
+          "Repository project allowedPaths changed after this mutation was prepared; prepare the action again against the current trusted profile.",
+        );
+      }
+      const classification = classifyProtectedControlChangesV2(profile, changes);
       const confirmations = classification.level === "double_exact" ? 2 : 1;
       if (
         classification.level === "blocked" ||
@@ -1307,8 +1321,15 @@ class WorkspaceToolRuntimeV2 {
       }
       this.leases.set(leaseCacheKey(workspaceId, ownerRunId), leaseId);
       await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+      const repositoryWriteScope = await this.resolveRepositoryWriteScopeOutput(
+        requiredString(args.profileKey, "profileKey"),
+        context,
+      );
       return {
-        output: readback,
+        output: {
+          ...readback,
+          repositoryWriteScope,
+        },
         receipt: workspaceCreationReceipt(
           action,
           context,
@@ -1363,8 +1384,15 @@ class WorkspaceToolRuntimeV2 {
     this.leases.set(leaseCacheKey(workspaceId, ownerRunId), leaseId);
     const manifest = await this.manager.loadManifest(workspaceId);
     await this.assertBoundWorkspace(workspaceId, ownerRunId, leaseId, leaseOwnerId);
+    const repositoryWriteScope = await this.resolveRepositoryWriteScopeOutput(
+      provisioned.profileKey,
+      context,
+    );
     return {
-      output: manifest,
+      output: {
+        ...manifest,
+        repositoryWriteScope,
+      },
       receipt: workspaceCreationReceipt(
         action,
         context,
@@ -1374,6 +1402,17 @@ class WorkspaceToolRuntimeV2 {
       ),
       mutationState: "applied" as const,
     };
+  }
+
+  private async resolveRepositoryWriteScopeOutput(
+    profileKey: string,
+    context: ScopedExtensionContextV1,
+  ): Promise<ReturnType<typeof repositoryWriteScopeOutputV2> | null> {
+    const profile = await this.repositories.resolveProfileContract?.(
+      profileKey,
+      context,
+    ) ?? null;
+    return profile ? repositoryWriteScopeOutputV2(profile) : null;
   }
 
   private async ensureLease(workspaceId: string, context: ScopedExtensionContextV1): Promise<string> {
@@ -2701,4 +2740,102 @@ function mutationChanges(
     afterSha256: args.expectedKind === "directory" ? before : after,
   }];
 }
+
+interface RepositoryMutationScopeBindingV2 extends Record<string, JsonValueV1> {
+  path: string;
+  projectId: string;
+  projectRoot: string;
+  allowedPath: string;
+}
+
+function repositoryWriteScopeOutputV2(profile: RepositoryProfileV2): {
+  profileKey: string;
+  projects: Array<{
+    projectId: string;
+    projectRoot: string;
+    allowedPaths: string[];
+  }>;
+} {
+  return {
+    profileKey: profile.key,
+    projects: profile.projects
+      .map((project) => ({
+        projectId: project.id,
+        projectRoot: project.root,
+        allowedPaths: [...project.allowedPaths].sort(),
+      }))
+      .sort((left, right) => left.projectId.localeCompare(right.projectId)),
+  };
+}
+
+function resolveRepositoryMutationScopeV2(
+  profile: RepositoryProfileV2,
+  changes: readonly RepositoryFileChangeV2[],
+): {
+  bindings: RepositoryMutationScopeBindingV2[];
+  fingerprint: string;
+} {
+  const projectAllowedPaths = repositoryWriteScopeOutputV2(profile).projects;
+  const bindings: RepositoryMutationScopeBindingV2[] = [];
+  const rejected: Array<{ path: string; matchedProjects: string[] }> = [];
+  for (const change of [...changes].sort((left, right) => left.path.localeCompare(right.path))) {
+    const matches = profile.projects.flatMap((project) =>
+      project.allowedPaths
+        .filter((allowedPath) => repositoryPathAtOrBelowV2(allowedPath, change.path))
+        .map((allowedPath) => ({
+          path: change.path,
+          projectId: project.id,
+          projectRoot: project.root,
+          allowedPath,
+        })),
+    );
+    const matchedProjects = [...new Set(matches.map((match) => match.projectId))].sort();
+    if (matchedProjects.length !== 1) {
+      rejected.push({ path: change.path, matchedProjects });
+      continue;
+    }
+    const projectMatches = matches
+      .filter((match) => match.projectId === matchedProjects[0])
+      .sort((left, right) =>
+        right.allowedPath.length - left.allowedPath.length ||
+        left.allowedPath.localeCompare(right.allowedPath),
+      );
+    bindings.push(projectMatches[0]);
+  }
+  if (rejected.length > 0) {
+    throw new WorkspaceManagerErrorV2(
+      "repository_path_out_of_scope",
+      [
+        "Every affected repository path must resolve to exactly one trusted project allowedPaths scope.",
+        `rejected=${JSON.stringify(rejected)}`,
+        `projectAllowedPaths=${JSON.stringify(projectAllowedPaths)}`,
+      ].join(" "),
+    );
+  }
+  const canonicalBindings = bindings.sort((left, right) =>
+    left.path.localeCompare(right.path) ||
+    left.projectId.localeCompare(right.projectId) ||
+    left.allowedPath.localeCompare(right.allowedPath),
+  );
+  return {
+    bindings: canonicalBindings,
+    fingerprint: sha256Canonical({
+      version: 1,
+      profileKey: profile.key,
+      profileAllowedPaths: [...profile.allowedPaths].sort(),
+      projectAllowedPaths,
+      bindings: canonicalBindings,
+    }),
+  };
+}
+
+function repositoryPathAtOrBelowV2(
+  allowedPath: string,
+  candidatePath: string,
+): boolean {
+  return allowedPath === "." ||
+    candidatePath === allowedPath ||
+    candidatePath.startsWith(`${allowedPath}/`);
+}
+
 function samePath(left: string, right: string): boolean { return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right; }

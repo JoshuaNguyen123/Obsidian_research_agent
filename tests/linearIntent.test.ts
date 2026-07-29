@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   detectLinearIntent,
+  extractExplicitLinearIssueReadIdentity,
   hasExplicitPermanentLinearDeleteIntent,
 } from "../src/agent/linearIntent";
 
@@ -26,6 +27,12 @@ test("detectLinearIntent recognizes explicit Linear resource language", () => {
   assert.equal(
     detectLinearIntent("Create a Linear issue for the accepted research.")
       .explicit,
+    true,
+  );
+  assert.equal(
+    detectLinearIntent(
+      "Publish the accepted research to one Linear implementation issue.",
+    ).explicit,
     true,
   );
   assert.equal(
@@ -61,6 +68,33 @@ test("detectLinearIntent recognizes named linear_* tool tokens", () => {
       "Required tools: linear_get_issue, append_to_current_file.",
     ).explicit,
     true,
+  );
+});
+
+test("extractExplicitLinearIssueReadIdentity binds only an acted-on Linear issue identity", () => {
+  assert.equal(
+    extractExplicitLinearIssueReadIdentity(
+      "Review and implement Linear issue 71AA708B-70A1-4B26-9E6F-FB8A9C31A4D2. Begin with linear_get_issue.",
+    ),
+    "71aa708b-70a1-4b26-9e6f-fb8a9c31a4d2",
+  );
+  assert.equal(
+    extractExplicitLinearIssueReadIdentity(
+      "Read Linear issue ENG-123 before implementing it.",
+    ),
+    "ENG-123",
+  );
+  assert.equal(
+    extractExplicitLinearIssueReadIdentity(
+      "Do not read Linear issue ENG-123; create a different issue.",
+    ),
+    null,
+  );
+  assert.equal(
+    extractExplicitLinearIssueReadIdentity(
+      "The note mentions Linear issue ENG-123 as historical context.",
+    ),
+    null,
   );
 });
 

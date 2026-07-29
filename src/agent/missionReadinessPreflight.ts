@@ -1,5 +1,6 @@
 import {
   evaluatePinnedGitIdentityReadinessV1,
+  githubCleanupAuthorityReasonV1,
   type CapabilityReadinessV2,
 } from "./capabilityReadiness";
 import type { CapabilitySetupTarget } from "./capabilitySetup";
@@ -59,9 +60,22 @@ export interface MissionReadinessPreflightInputV1 {
   cleanupAuthority?: {
     /** null = scopes not observed; fail closed when cleanup is required. */
     deleteRepoAuthorized: boolean | null;
+    /**
+     * A fine-grained PAT never reports scopes, so "not observed" carries no
+     * signal for that kind and must not be read as "not authorized".
+     */
+    credentialKind?: string | null;
   };
   /** Override for tests; defaults to host-pinned identity contract. */
   gitIdentityPinnedReady?: boolean;
+  /**
+   * True when the deterministic ladder for this prompt reaches sandbox
+   * validation. Single-stage code delivery ("write a checkers game in Python
+   * on my desktop") is then gated on the same sandbox proof as a compound run,
+   * so an unavailable sandbox is reported at submit with a one-click next
+   * action instead of stranding a half-authored workspace mid-mission.
+   */
+  sandboxValidationRequired?: boolean;
 }
 
 const CHECK_ORDER: readonly MissionReadinessCheckIdV1[] = [
@@ -73,9 +87,32 @@ const CHECK_ORDER: readonly MissionReadinessCheckIdV1[] = [
   "active_note",
 ] as const;
 
+const SINGLE_STAGE_OPTIONAL_LABELS: Readonly<
+  Record<MissionReadinessCheckIdV1, string>
+> = Object.freeze({
+  linear: "Linear",
+  sandbox: "Sandbox",
+  github: "GitHub",
+  git_identity: "Git identity",
+  cleanup_authority: "Cleanup authority",
+  active_note: "Active note",
+});
+
+const SINGLE_STAGE_OPTIONAL_TARGETS: Readonly<
+  Record<MissionReadinessCheckIdV1, CapabilitySetupTarget>
+> = Object.freeze({
+  linear: "linear",
+  sandbox: "code",
+  github: "github",
+  git_identity: "code",
+  cleanup_authority: "github",
+  active_note: "notes_research",
+});
+
 /**
- * One consolidated readiness gate for compound-shaped missions. Non-compound
- * prompts always pass so ordinary chat/note work is not blocked.
+ * One consolidated readiness gate for compound-shaped missions, plus the
+ * sandbox-only gate for single-stage code delivery. Prompts that need neither
+ * always pass, so ordinary chat/note work is never blocked.
  */
 export function evaluateMissionReadinessPreflightV1(
   input: MissionReadinessPreflightInputV1,
@@ -84,7 +121,9 @@ export function evaluateMissionReadinessPreflightV1(
     prompt: input.prompt,
     readiness: input.readiness,
   });
-  if (!lifecycle.compound) {
+  const sandboxOnlyGate =
+    !lifecycle.compound && input.sandboxValidationRequired === true;
+  if (!lifecycle.compound && !sandboxOnlyGate) {
     return {
       version: 1,
       compound: false,
@@ -93,6 +132,38 @@ export function evaluateMissionReadinessPreflightV1(
       checks: [],
       missing: [],
       primary: null,
+    };
+  }
+
+  if (sandboxOnlyGate) {
+    const checks = CHECK_ORDER.map((id) =>
+      id === "sandbox"
+        ? sandboxCheck(true, input.readiness.find((row) => row.id === "code"))
+        : optionalOk(
+            id,
+            SINGLE_STAGE_OPTIONAL_LABELS[id],
+            SINGLE_STAGE_OPTIONAL_TARGETS[id],
+          ),
+    );
+    const missing = checks
+      .filter((check) => check.required && !check.ok)
+      .map(
+        (check): MissionReadinessMissingItemV1 => ({
+          id: check.id,
+          label: check.label,
+          reason: check.reason,
+          nextAction: check.nextAction,
+          setupTarget: check.setupTarget,
+        }),
+      );
+    return {
+      version: 1,
+      compound: false,
+      ok: missing.length === 0,
+      stages: lifecycle.stages,
+      checks,
+      missing,
+      primary: missing[0] ?? null,
     };
   }
 
@@ -128,6 +199,7 @@ export function evaluateMissionReadinessPreflightV1(
         return cleanupAuthorityCheck(
           stages.has("reconciliation_cleanup"),
           deleteRepoAuthorized,
+          input.cleanupAuthority?.credentialKind ?? null,
         );
       case "active_note":
         return activeNoteCheck(
@@ -291,21 +363,28 @@ function gitIdentityCheck(
 function cleanupAuthorityCheck(
   required: boolean,
   deleteRepoAuthorized: boolean | null,
+  credentialKind: string | null,
 ): MissionReadinessCheckV1 {
   if (!required) {
     return optionalOk("cleanup_authority", "Cleanup authority", "github");
   }
-  const ok = deleteRepoAuthorized === true;
+  // A fine-grained PAT cannot advertise its permissions, so "unknown" is the
+  // best any pre-check can do for that kind. Blocking on it made cleanup
+  // missions impossible for the token type the plugin itself offers a field
+  // for, even with Administration: write granted. Let the mission run; the
+  // delete call reports the exact failure if the permission is absent.
+  const unreadable =
+    deleteRepoAuthorized === null && credentialKind === "fine_grained_pat";
+  const ok = deleteRepoAuthorized === true || unreadable;
   return {
     id: "cleanup_authority",
     label: "Cleanup authority",
     required: true,
     ok,
-    reason: ok
-      ? "GitHub credential includes repository cleanup authority."
-      : deleteRepoAuthorized === false
-        ? "The connected GitHub credential lacks delete_repo (or classic repo) cleanup authority."
-        : "GitHub cleanup authority has not been observed on the connected credential.",
+    reason: githubCleanupAuthorityReasonV1({
+      authorized: deleteRepoAuthorized,
+      credentialKind,
+    }),
     nextAction: ok
       ? "Review cleanup authority"
       : "Reconnect GitHub with cleanup scope",

@@ -12,6 +12,7 @@ import {
 } from "./toolSchemaPolicy";
 import { PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME } from "../tools/researchPublicationTool";
 import {
+  effectClassForTool,
   filterToolNamesByMaxEffectClass,
   type AutonomyEffectClass,
 } from "./autonomyEffectClass";
@@ -20,6 +21,10 @@ import {
   formatStagePromptProjection,
   projectStagePrompt,
 } from "./stagePromptProjection";
+import {
+  findFinalMissionGraphNode,
+  isOptionalMissionGraphNode,
+} from "./missionGraphAuthority";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -71,7 +76,143 @@ const CODE_WORKFLOW_OBSERVATION_TOOL_NAMES = new Set<string>([
   "code_workspace_list",
   "code_workspace_search",
   "code_repair_status",
+  "read_workspace_file",
+  "list_workspace_files",
+  "preview_workspace_html",
 ]);
+
+/**
+ * A repository implementation can legitimately discover additional files
+ * after the immutable graph is planned (most importantly after an independent
+ * Linear issue read). These mutations remain inside the existing code-stage
+ * capability envelope, prepared-action approval, durable workspace binding,
+ * repository write scope, and run budgets.
+ */
+const CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES = new Set<string>([
+  "code_workspace_mkdir",
+  "code_workspace_create_file",
+  "code_workspace_append",
+  "code_workspace_patch",
+  "code_workspace_write_expected",
+]);
+
+const VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES = new Set<string>([
+  "code_workspace_read",
+  "code_workspace_stat",
+  "code_workspace_list",
+  "code_workspace_search",
+]);
+
+const VALIDATION_RECOVERY_MUTATION_TOOL_NAMES = new Set<string>([
+  "code_workspace_create_file",
+  "code_workspace_append",
+  "code_workspace_patch",
+  "code_workspace_write_expected",
+]);
+
+export interface ActiveValidationRecoveryFrontierV1 {
+  validationNodeId: string;
+  fastNodeId: string;
+  repairNodeId: string;
+  status: "awaiting_correction" | "correction_recorded";
+}
+
+/**
+ * A queued targeted/full validator may carry one host-authored recovery gate.
+ * The gate stays active only until its referenced repair receipt completes;
+ * later targeted/full graph nodes then resume ordinary dependency authority.
+ */
+export function getActiveValidationRecoveryFrontierV1(
+  graph: MissionGraphV3 | null | undefined,
+): ActiveValidationRecoveryFrontierV1 | null {
+  if (!graph) return null;
+  for (const node of Object.values(graph.nodes)) {
+    if (node.status !== "queued") continue;
+    const raw = node.outputs?.validationRecovery;
+    if (!isRecord(raw)) continue;
+    const status = raw.status;
+    const fastNodeId = raw.fastNodeId;
+    const repairNodeId = raw.repairNodeId;
+    if (
+      (status !== "awaiting_correction" &&
+        status !== "correction_recorded") ||
+      typeof fastNodeId !== "string" ||
+      typeof repairNodeId !== "string" ||
+      graph.nodes[repairNodeId]?.status === "complete"
+    ) {
+      continue;
+    }
+    return {
+      validationNodeId: node.id,
+      fastNodeId,
+      repairNodeId,
+      status,
+    };
+  }
+  return null;
+}
+
+export function isAdaptiveCodeWorkspaceMutationToolNameV1(
+  toolName: string,
+): boolean {
+  return CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName);
+}
+
+function filterValidationRecoveryToolNamesV1(
+  toolNames: readonly string[],
+  graph: MissionGraphV3,
+): string[] | null {
+  const recovery = getActiveValidationRecoveryFrontierV1(graph);
+  if (!recovery) return null;
+  if (recovery.status === "correction_recorded") {
+    const fastNode = graph.nodes[recovery.fastNodeId];
+    return fastNode &&
+      (fastNode.status === "ready" || fastNode.status === "running") &&
+      toolNames.includes("code_validate_fast")
+      ? ["code_validate_fast"]
+      : [];
+  }
+  return toolNames.filter(
+    (toolName) =>
+      VALIDATION_RECOVERY_DIAGNOSTIC_TOOL_NAMES.has(toolName) ||
+      VALIDATION_RECOVERY_MUTATION_TOOL_NAMES.has(toolName),
+  );
+}
+
+const GENERIC_CURRENT_NOTE_WRITER_NAMES = new Set<string>([
+  "append_to_current_file",
+  "append_to_current_section",
+  "replace_current_file",
+  "edit_current_section",
+]);
+
+/**
+ * The publication composite writes the accepted package and backlink itself.
+ * Generic current-note writers remain valid only when the graph contains an
+ * independently planned writer (for example, the later reflection node).
+ */
+export function missionGraphOwnsAcceptedResearchNoteWritebackV1(
+  graph:
+    | Pick<MissionGraphV3, "nodes">
+    | {
+        nodes: Record<string, { allowedTools: readonly string[] }>;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!graph) return false;
+  const toolNames = Object.values(graph.nodes).flatMap(
+    (node) => node.allowedTools,
+  );
+  return (
+    toolNames.includes(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) &&
+    !toolNames.some(
+      (toolName) =>
+        toolName !== PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME &&
+        GENERIC_CURRENT_NOTE_WRITER_NAMES.has(toolName),
+    )
+  );
+}
 
 /**
  * A code workspace is isolated from the base repository, but creating it,
@@ -116,6 +257,260 @@ function getMissionGraphNodeFrontierToolNames(
 ): string[] {
   const action = getSafeMissionCompositeLifecycleActionV1(node);
   return action ? [action.toolName] : [...node.allowedTools];
+}
+
+function shouldSuppressOptionalMissionGraphFrontier(
+  graph: MissionGraphV3,
+): boolean {
+  const final = findFinalMissionGraphNode(graph);
+  if (
+    !final ||
+    (final.node.status !== "ready" &&
+      final.node.status !== "running" &&
+      final.node.status !== "complete")
+  ) {
+    return false;
+  }
+  return !Object.entries(graph.nodes).some(
+    ([nodeId, node]) =>
+      nodeId !== final.id &&
+      !isOptionalMissionGraphNode(nodeId, node) &&
+      (node.status === "ready" || node.status === "running") &&
+      getMissionGraphNodeFrontierToolNames(node).length > 0,
+  );
+}
+
+function getOptionalOnlyMissionGraphFrontierToolNames(
+  graph: MissionGraphV3,
+): Set<string> {
+  if (!shouldSuppressOptionalMissionGraphFrontier(graph)) {
+    return new Set();
+  }
+  const requiredNames = new Set<string>();
+  const optionalNames = new Set<string>();
+  for (const [nodeId, node] of Object.entries(graph.nodes)) {
+    if (node.status !== "ready" && node.status !== "running") continue;
+    const target = isOptionalMissionGraphNode(nodeId, node)
+      ? optionalNames
+      : requiredNames;
+    for (const toolName of getMissionGraphNodeFrontierToolNames(node)) {
+      target.add(toolName);
+    }
+  }
+  return new Set(
+    [...optionalNames].filter((toolName) => !requiredNames.has(toolName)),
+  );
+}
+
+function isNonterminalMissionGraphNode(
+  node: MissionGraphV3["nodes"][string],
+): boolean {
+  return node.status !== "complete" && node.status !== "cancelled";
+}
+
+function getMissionGraphNodeRemainingToolNames(
+  node: MissionGraphV3["nodes"][string],
+): string[] {
+  const lifecycle = getSafeMissionCompositeLifecycleSpecV1(node);
+  if (!lifecycle) return [...node.allowedTools];
+  const state = getSafeMissionCompositeLifecycleStateV1(node);
+  return lifecycle.actions
+    .slice(state?.actionCursor ?? 0)
+    .map((action) => action.toolName);
+}
+
+function graphHasCompletedCodeWorkspaceCreation(
+  graph: MissionGraphV3 | null | undefined,
+): boolean {
+  if (!graph) return false;
+  return Object.values(graph.nodes).some((node) => {
+    const lifecycle = getSafeMissionCompositeLifecycleSpecV1(node);
+    if (lifecycle) {
+      const state = getSafeMissionCompositeLifecycleStateV1(node);
+      const completed = new Set(state?.completedActionIds ?? []);
+      return lifecycle.actions.some(
+        (action) =>
+          action.toolName === "code_workspace_create" &&
+          completed.has(action.id),
+      );
+    }
+    return (
+      node.status === "complete" &&
+      node.allowedTools.includes("code_workspace_create")
+    );
+  });
+}
+
+/**
+ * A validation receipt proves one exact workspace hash index. Once the repair
+ * cycle reaches the frontier, no adaptive mutation may race ahead of recording
+ * that receipt: even a legitimate extra file would make the receipt stale.
+ * After the cycle is recorded, adaptive edits may resume before the next fresh
+ * validator.
+ */
+function graphHasActiveCodeRepairCycleFrontier(
+  graph: MissionGraphV3 | null | undefined,
+): boolean {
+  if (!graph) return false;
+  return Object.values(graph.nodes).some(
+    (node) =>
+      (node.status === "ready" || node.status === "running") &&
+      getMissionGraphNodeFrontierToolNames(node).includes(
+        "code_repair_record_cycle",
+      ),
+  );
+}
+
+function isAdaptiveCodeMutationCompanion(
+  toolName: string,
+  graph: MissionGraphV3 | null | undefined,
+): boolean {
+  return (
+    CODE_WORKFLOW_ADAPTIVE_MUTATION_TOOL_NAMES.has(toolName) &&
+    graphHasCompletedCodeWorkspaceCreation(graph) &&
+    graphHasIncompleteCodeExecutionWork(graph) &&
+    !graphHasActiveCodeRepairCycleFrontier(graph)
+  );
+}
+
+function requiresCreatedCodeWorkspace(toolName: string): boolean {
+  return (
+    (toolName.startsWith("code_workspace_") &&
+      toolName !== "code_workspace_create") ||
+    toolName.startsWith("code_validate_") ||
+    toolName.startsWith("code_repair_") ||
+    toolName === "code_commit_verified" ||
+    [
+      "write_workspace_file",
+      "read_workspace_file",
+      "list_workspace_files",
+      "replace_workspace_text",
+      "preview_workspace_html",
+      "export_workspace_artifact",
+    ].includes(toolName)
+  );
+}
+
+/**
+ * Set-loose expands the stage catalog, but it must not turn that catalog into
+ * execution authority. A queued/blocked graph node remains unavailable until
+ * its dependencies promote it to ready. True unplanned Soft companions remain
+ * available. Completed Bound/Hard nodes are one-shot proof and never re-enter
+ * the model catalog; MissionGraphSession may still support a host-selected
+ * continuation, but catalog projection must not invite one after completion.
+ * The sole Bound exception is a bounded code-workspace edit discovered after
+ * workspace creation (for example, a second artifact named by a verified
+ * Linear issue). The exception pauses while a repair-cycle receipt is at the
+ * frontier so that no edit can invalidate the exact validation it records.
+ * The prepared mutation path and repository scope still govern that edit; this
+ * function only makes the already-granted tool callable.
+ */
+export function filterSetLooseToolNamesByMissionGraphAuthority(
+  toolNames: readonly string[],
+  graph: MissionGraphV3 | null | undefined,
+): string[] {
+  const uniqueNames = [
+    ...new Set(toolNames.map((name) => name.trim()).filter(Boolean)),
+  ];
+  if (!graph) return uniqueNames;
+  if (graphHasActiveCodeRepairCycleFrontier(graph)) {
+    return uniqueNames.includes("code_repair_record_cycle")
+      ? ["code_repair_record_cycle"]
+      : [];
+  }
+  const validationRecoveryNames = filterValidationRecoveryToolNamesV1(
+    uniqueNames,
+    graph,
+  );
+  if (validationRecoveryNames) return validationRecoveryNames;
+
+  const nodes = Object.values(graph.nodes);
+  const readyOrRunningNames = new Set(
+    nodes
+      .filter(
+        (node) => node.status === "ready" || node.status === "running",
+      )
+      .flatMap((node) => getMissionGraphNodeFrontierToolNames(node)),
+  );
+  const pendingNames = new Set(
+    nodes
+      .filter(isNonterminalMissionGraphNode)
+      .flatMap(getMissionGraphNodeRemainingToolNames),
+  );
+  const workspaceCreateIncomplete = pendingNames.has("code_workspace_create");
+  const compositeOwnsCurrentNote =
+    missionGraphOwnsAcceptedResearchNoteWritebackV1(graph);
+
+  return uniqueNames.filter((toolName) => {
+    if (
+      compositeOwnsCurrentNote &&
+      GENERIC_CURRENT_NOTE_WRITER_NAMES.has(toolName)
+    ) {
+      return false;
+    }
+    if (readyOrRunningNames.has(toolName)) return true;
+    if (pendingNames.has(toolName)) return false;
+    if (isAdaptiveCodeMutationCompanion(toolName, graph)) return true;
+    if (
+      workspaceCreateIncomplete &&
+      requiresCreatedCodeWorkspace(toolName)
+    ) {
+      return false;
+    }
+    if (
+      effectClassForTool(toolName) === "soft" ||
+      CODE_WORKFLOW_OBSERVATION_TOOL_NAMES.has(toolName)
+    ) {
+      return true;
+    }
+    return false;
+  });
+}
+
+/**
+ * The runner may continue after a graph-start rejection only for a genuinely
+ * unplanned Soft companion. It also permits the same bounded adaptive
+ * code-workspace mutations projected above after the workspace-create action
+ * is durably complete. Planned nonterminal tools and every other Bound/Hard
+ * tool still fail closed on the authoritative MissionGraph result.
+ *
+ * The exported name is retained for compatibility with persisted callers.
+ */
+export function mayBypassMissionGraphStartForSetLooseSoftCompanion(
+  toolName: string,
+  offeredToolNames: ReadonlySet<string> | readonly string[],
+  graph: MissionGraphV3 | null | undefined,
+): boolean {
+  const normalized = toolName.trim();
+  const offeredSet = offeredToolNames as ReadonlySet<string>;
+  const offered =
+    typeof offeredSet.has === "function"
+      ? offeredSet.has(normalized)
+      : (offeredToolNames as readonly string[]).includes(normalized);
+  const adaptiveCodeMutation = isAdaptiveCodeMutationCompanion(
+    normalized,
+    graph,
+  );
+  if (
+    !offered ||
+    (effectClassForTool(normalized) !== "soft" &&
+      !CODE_WORKFLOW_OBSERVATION_TOOL_NAMES.has(normalized) &&
+      !adaptiveCodeMutation)
+  ) {
+    return false;
+  }
+  if (!graph) return true;
+  if (
+    missionGraphOwnsAcceptedResearchNoteWritebackV1(graph) &&
+    GENERIC_CURRENT_NOTE_WRITER_NAMES.has(normalized)
+  ) {
+    return false;
+  }
+  return !Object.values(graph.nodes).some(
+    (node) =>
+      isNonterminalMissionGraphNode(node) &&
+      getMissionGraphNodeRemainingToolNames(node).includes(normalized),
+  );
 }
 
 /** True when the graph still has incomplete nodes that authorize code_* tools. */
@@ -177,23 +572,41 @@ export function constrainToolsToMissionGraphFrontier(
     return schemas.filter((schema) => allowed.has(schema.function.name));
   };
 
-  const setLooseNames = (options.setLooseOfferedToolNames ?? [])
+  let setLooseNames = (options.setLooseOfferedToolNames ?? [])
     .map((name) => name.trim())
     .filter(Boolean);
+  const suppressOptionalFrontier =
+    graph !== null &&
+    graph !== undefined &&
+    shouldSuppressOptionalMissionGraphFrontier(graph);
+  if (graph && suppressOptionalFrontier && setLooseNames.length > 0) {
+    const optionalOnlyNames =
+      getOptionalOnlyMissionGraphFrontierToolNames(graph);
+    setLooseNames = setLooseNames.filter(
+      (toolName) => !optionalOnlyNames.has(toolName),
+    );
+  }
   if (setLooseNames.length > 0) {
     // Belt-and-suspenders: always union tools from ready/running MissionGraph
     // nodes into the set-loose callable set so Soft-union cannot strand a
     // required Soft gate (e.g. read_template before linear_create_issue).
     if (graph) {
-      for (const node of Object.values(graph.nodes)) {
+      for (const [nodeId, node] of Object.entries(graph.nodes)) {
         if (node.status !== "ready" && node.status !== "running") continue;
+        if (
+          suppressOptionalFrontier &&
+          isOptionalMissionGraphNode(nodeId, node)
+        ) {
+          continue;
+        }
         for (const toolName of getMissionGraphNodeFrontierToolNames(node)) {
           const trimmed = toolName.trim();
           if (trimmed) setLooseNames.push(trimmed);
         }
       }
     }
-    const setLooseCallable = [...new Set(setLooseNames)];
+    const setLooseCallable =
+      filterSetLooseToolNamesByMissionGraphAuthority(setLooseNames, graph);
     const setLooseConstrained = schemasForLifecycleStage({
       callableToolNames: setLooseCallable,
       allSchemas: tools,
@@ -208,9 +621,14 @@ export function constrainToolsToMissionGraphFrontier(
     }
     // Prefer the canonical code allowlist over Soft companions alone when the
     // Soft-union intended code tools or the graph still has unpaid code work.
-    const codeAllow = new Set<string>(CODE_EXECUTION_TOOL_ALLOW);
+    const dependencySafeCodeFallback = new Set(
+      filterSetLooseToolNamesByMissionGraphAuthority(
+        CODE_EXECUTION_TOOL_ALLOW,
+        graph,
+      ),
+    );
     const codeFallback = tools.filter((tool) =>
-      codeAllow.has(tool.function.name),
+      dependencySafeCodeFallback.has(tool.function.name),
     );
     const setLooseWantedCode = setLooseNames.some((name) =>
       name.startsWith("code_"),
@@ -223,15 +641,37 @@ export function constrainToolsToMissionGraphFrontier(
         respectMaxEffectClass: false,
       });
     }
-    const softFallback = tools.filter((tool) =>
-      /^(web_|read_|list_|search_|semantic_|find_related|get_note_graph|append_to_current|replace_current|count_words)/u.test(
-        tool.function.name,
+    const dependencySafeSoftFallback = new Set(
+      filterSetLooseToolNamesByMissionGraphAuthority(
+        tools.map((tool) => tool.function.name),
+        graph,
       ),
+    );
+    const softFallback = tools.filter(
+      (tool) =>
+        dependencySafeSoftFallback.has(tool.function.name) &&
+        /^(web_|read_|list_|search_|semantic_|find_related|get_note_graph|append_to_current|replace_current|count_words)/u.test(
+          tool.function.name,
+        ),
     );
     if (softFallback.length > 0) {
       return applyEffectClass(softFallback, {
         respectMaxEffectClass: false,
       });
+    }
+  }
+
+  if (graph) {
+    const validationRecoveryNames = filterValidationRecoveryToolNamesV1(
+      tools.map((tool) => tool.function.name),
+      graph,
+    );
+    if (validationRecoveryNames) {
+      const allowed = new Set(validationRecoveryNames);
+      return applyEffectClass(
+        tools.filter((tool) => allowed.has(tool.function.name)),
+        { respectMaxEffectClass: false },
+      );
     }
   }
 
@@ -262,13 +702,22 @@ export function constrainToolsToMissionGraphFrontier(
   // does not empty the offered frontier. beginToolExecution heals running→ready
   // before starting again.
   const frontierNames = new Set(
-    Object.values(graph.nodes)
+    Object.entries(graph.nodes)
       .filter(
-        (node) => node.status === "ready" || node.status === "running",
+        ([nodeId, node]) =>
+          (node.status === "ready" || node.status === "running") &&
+          !(
+            suppressOptionalFrontier &&
+            isOptionalMissionGraphNode(nodeId, node)
+          ),
       )
-      .flatMap((node) => getMissionGraphNodeFrontierToolNames(node)),
+      .flatMap(([, node]) => getMissionGraphNodeFrontierToolNames(node)),
   );
-  if (options.includeCapabilityReads) {
+  if (
+    options.includeCapabilityReads &&
+    !suppressOptionalFrontier &&
+    !graphHasActiveCodeRepairCycleFrontier(graph)
+  ) {
     for (const [toolName, grant] of Object.entries(
       graph.capabilityEnvelope.tools,
     )) {
@@ -287,9 +736,16 @@ export function constrainToolsToMissionGraphFrontier(
   }
   // Second pass: keep only route-base ∪ frontier ∪ graph-required names to
   // shrink cloud/local schema noise (drops Linear/GitHub on note routes).
-  const graphRequired = Object.values(graph.nodes)
-    .filter((node) => node.status === "ready" || node.status === "running")
-    .flatMap((node) => node.allowedTools);
+  const graphRequired = Object.entries(graph.nodes)
+    .filter(
+      ([nodeId, node]) =>
+        (node.status === "ready" || node.status === "running") &&
+        !(
+          suppressOptionalFrontier &&
+          isOptionalMissionGraphNode(nodeId, node)
+        ),
+    )
+    .flatMap(([, node]) => node.allowedTools);
   return applyEffectClass(
     schemasForStep({
       route: options.route,
@@ -307,12 +763,14 @@ export function getPendingMissionGraphWriteToolNames(
   if (!graph) return [];
   return [
     ...new Set(
-      Object.values(graph.nodes)
+      Object.entries(graph.nodes)
         .filter(
-          (node) =>
-            node.status !== "complete" && node.status !== "cancelled",
+          ([nodeId, node]) =>
+            !isOptionalMissionGraphNode(nodeId, node) &&
+            node.status !== "complete" &&
+            node.status !== "cancelled",
         )
-        .flatMap((node) => getMissionGraphNodePendingWriteToolNames(node))
+        .flatMap(([, node]) => getMissionGraphNodePendingWriteToolNames(node))
         .filter((toolName) => toolName !== "append_research_memory"),
     ),
   ];
@@ -344,11 +802,25 @@ export function buildMissionGraphFrontierTurnContext(
         "Do not claim filesystem access, file creation, validation, or export is unavailable merely because a later Code tool is not callable on this turn. Call only the Code tools listed in the current frontier.",
       ]
     : [];
+  const setLooseAcceptedResearchBoundary =
+    options.setLoose === true &&
+    options.currentStage === "accepted_research" &&
+    names.includes(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME)
+      ? [
+          "For publish_research_to_linear, arguments.package must use the exact accepted-research fields from the tool schema.",
+          "proposedWork, scope, acceptanceCriteria, and validationRequirementKeys are nonempty JSON arrays. Even one proposedWork item must be written as [\"...\"]; never send a bare string, object, null, or empty array.",
+          "nonGoals and dependencies are JSON arrays and may be []. Use only the exact schema enum values and do not nest project or hierarchy fields.",
+        ]
+      : [];
   if (options.setLoose === true) {
     // Durable set-loose turns stay stage-local: objective + evidence + tools.
     // Bulky routing/git/spec cards concatenated by the host are stripped inside
     // projectStagePrompt rather than re-emitted into the model context.
-    return [stageProjection, ...codeCapabilityBoundary].join("\n");
+    return [
+      stageProjection,
+      ...setLooseAcceptedResearchBoundary,
+      ...codeCapabilityBoundary,
+    ].join("\n");
   }
   const acceptedResearchBoundary =
     names.length === 1 && names[0] === PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME

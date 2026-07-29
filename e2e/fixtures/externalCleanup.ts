@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 
 import {
@@ -112,6 +113,11 @@ export async function preflightGhRepositoryDeleteAuthority(): Promise<void> {
 export async function preflightDisposableRepositoryDeleteAuthority(input?: {
   client?: GitHubRestClient | null;
   owner?: string | null;
+  onProbeRegistered?: (input: {
+    client: GitHubRestClient;
+    owner: string;
+    repository: string;
+  }) => void;
 }): Promise<{
   via: "rest_probe" | "rest_delete" | "gh_delete_repo";
   residue?: Awaited<ReturnType<typeof cleanupKnownE2EGitHubResidue>>;
@@ -123,12 +129,25 @@ export async function preflightDisposableRepositoryDeleteAuthority(input?: {
     residue = await cleanupKnownE2EGitHubResidue({ client, owner });
     const deleted = residue.some((item) => item.status === "deleted");
     try {
-      await proveRestCreateAndDeleteProbe(client, owner);
+      await proveRestCreateAndDeleteProbe(
+        client,
+        owner,
+        input?.onProbeRegistered,
+      );
       return {
         via: deleted ? "rest_delete" : "rest_probe",
         residue,
       };
     } catch (restError) {
+      if (
+        /exact registered resource could not be cleaned/iu.test(
+          safeExternalCleanupError(restError),
+        )
+      ) {
+        throw new Error(
+          `Disposable GitHub creation is blocked because the REST probe may have survived cleanup: ${safeExternalCleanupError(restError)}`,
+        );
+      }
       try {
         await preflightGhRepositoryDeleteAuthority();
         return { via: "gh_delete_repo", residue };
@@ -167,23 +186,98 @@ export async function preflightDisposableRepositoryDeleteAuthority(input?: {
 export async function proveRestCreateAndDeleteProbe(
   client: GitHubRestClient,
   owner: string,
-): Promise<void> {
+  onProbeRegistered?: (input: {
+    client: GitHubRestClient;
+    owner: string;
+    repository: string;
+  }) => void,
+): Promise<{
+  actorId: number;
+  actorLogin: string;
+  repositoryId: number;
+  repository: string;
+  private: true;
+  admin: true;
+}> {
   const login = owner.trim();
   if (!login) {
     throw new Error("GitHub owner is required for the delete probe.");
   }
-  const repository = `e2e-delete-probe-${Date.now().toString(36).slice(-6)}`;
-  await client.createPrivateRepository({
-    owner: login,
-    ownerKind: "user",
-    repository,
-    description: "Agentic Researcher disposable delete-authority probe",
-  });
-  await deleteDisposableGitHubRepositoryAndVerify({
-    client,
-    owner: login,
-    repository,
-  });
+  const actor = await client.getAuthenticatedUser();
+  if (
+    !Number.isSafeInteger(actor.id) ||
+    actor.id <= 0 ||
+    actor.login.toLowerCase() !== login.toLowerCase()
+  ) {
+    throw new Error(
+      `GitHub delete probe actor ${actor.login || "(missing)"} does not match expected owner ${login}.`,
+    );
+  }
+  const repository = `e2e-delete-probe-${randomUUID()
+    .replace(/-/gu, "")
+    .slice(0, 12)}`;
+  // Register the exact identity before the provider create starts. If the
+  // request commits remotely and its response or immediate delete fails, the
+  // caller's host-owned finalizer already knows what it must remove.
+  onProbeRegistered?.({ client, owner: login, repository });
+  let observedRepository:
+    | Awaited<ReturnType<GitHubRestClient["getRepository"]>>
+    | null = null;
+  try {
+    const created = await client.createPrivateRepository({
+      owner: login,
+      ownerKind: "user",
+      repository,
+      description: "Agentic Researcher disposable delete-authority probe",
+    });
+    observedRepository = await client.getRepository(login, repository);
+    if (
+      !Number.isSafeInteger(created.id) ||
+      created.id <= 0 ||
+      observedRepository.id !== created.id ||
+      observedRepository.fullName.toLowerCase() !==
+        `${login}/${repository}`.toLowerCase() ||
+      observedRepository.private !== true ||
+      observedRepository.permissions?.admin !== true
+    ) {
+      throw new Error(
+        "GitHub delete probe lacked exact private repository admin readback.",
+      );
+    }
+    await deleteDisposableGitHubRepositoryAndVerify({
+      client,
+      owner: login,
+      repository,
+    });
+  } catch (error) {
+    try {
+      await deleteDisposableGitHubRepositoryAndVerify({
+        client,
+        owner: login,
+        repository,
+      });
+    } catch (cleanupError) {
+      throw new Error(
+        `GitHub delete probe failed and its exact registered resource could not be cleaned: primary=${safeExternalCleanupError(error)} cleanup=${safeExternalCleanupError(cleanupError)}`,
+      );
+    }
+    throw error;
+  }
+  const actorAfter = await client.getAuthenticatedUser();
+  if (
+    actorAfter.id !== actor.id ||
+    actorAfter.login.toLowerCase() !== actor.login.toLowerCase()
+  ) {
+    throw new Error("GitHub delete probe credential identity drifted.");
+  }
+  return {
+    actorId: actor.id,
+    actorLogin: actor.login,
+    repositoryId: observedRepository!.id,
+    repository: `${login}/${repository}`,
+    private: true,
+    admin: true,
+  };
 }
 
 /** True when the REST credential has admin on at least one owned probe repo. */
@@ -303,6 +397,327 @@ export async function cleanupLinearResourceIfPresent(input: {
   if (!id) return "skipped";
   await input.trash(id);
   return "trashed";
+}
+
+export interface OwnedLinearIssueCleanupStateV1 {
+  id: string;
+  teamId: string;
+  title: string;
+  description: string;
+  trashed: boolean;
+}
+
+export interface OwnedLinearIssueCleanupResultV1 {
+  version: 1;
+  issueId: string;
+  initialState: "active" | "trashed" | "absent";
+  trashed: boolean;
+  permanentlyDeleted: boolean;
+  verifiedAbsent: true;
+}
+
+export interface OwnedLinearIssueTrashCleanupResultV1 {
+  version: 1;
+  issueId: string;
+  initialState: "active" | "trashed" | "absent";
+  trashApplied: boolean;
+  terminalState: "trashed" | "absent";
+  verifiedNoActiveMarkerIssue: true;
+}
+
+export function filterActiveLinearIssueReadbacks<
+  T extends { trashed: boolean },
+>(issues: readonly T[]): T[] {
+  return issues.filter((issue) => issue.trashed !== true);
+}
+
+export function isTransientExternalCleanupReadError(error: unknown): boolean {
+  const candidate =
+    error && typeof error === "object"
+      ? (error as { code?: unknown; retryable?: unknown; message?: unknown })
+      : null;
+  if (candidate?.retryable === true) {
+    return true;
+  }
+  const code = String(candidate?.code ?? "");
+  if (
+    ["linear_network", "linear_timeout", "linear_rate_limited"].includes(code)
+  ) {
+    return true;
+  }
+  const message = String(
+    candidate?.message ?? (error instanceof Error ? error.message : error),
+  );
+  return /Linear (?:network request failed|request timed out|rate limit was reached)|(?:ECONNRESET|ETIMEDOUT|socket hang up|fetch failed)/iu.test(
+    message,
+  );
+}
+
+/**
+ * Retry only authenticated readback failures that the provider classified as
+ * transient. Mutations are deliberately excluded: an ambiguous external
+ * action must be reconciled by readback instead of blindly replayed.
+ */
+export async function retryTransientExternalCleanupRead<T>(
+  read: () => Promise<T>,
+  options: {
+    maxAttempts?: number;
+    wait?: (delayMs: number) => Promise<void>;
+  } = {},
+): Promise<T> {
+  const maxAttempts = Math.max(
+    1,
+    Math.min(6, Math.trunc(options.maxAttempts ?? 3)),
+  );
+  const wait =
+    options.wait ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await read();
+    } catch (error) {
+      if (
+        !isTransientExternalCleanupReadError(error) ||
+        attempt + 1 >= maxAttempts
+      ) {
+        throw error;
+      }
+      await wait(250 * (attempt + 1));
+    }
+  }
+  throw new Error("Transient external cleanup read exhausted its retry budget.");
+}
+
+/**
+ * Apply Linear's ordinary Delete lifecycle to one marker-owned disposable
+ * issue. Linear deliberately retains deleted issues in Recently deleted for
+ * its provider retention window, so authenticated `trashed` readback is a
+ * valid terminal state here; it is never mislabeled as provider absence.
+ */
+export async function cleanupExactOwnedLinearIssueToTrash(input: {
+  issueId: string;
+  marker: string;
+  teamId: string;
+  readIssue: (
+    issueId: string,
+  ) => Promise<OwnedLinearIssueCleanupStateV1 | null>;
+  trashIssue: (issueId: string) => Promise<void>;
+  findActiveMarkerSurvivors: () => Promise<Array<{ id: string }>>;
+  maxReadAttempts?: number;
+  wait?: (delayMs: number) => Promise<void>;
+}): Promise<OwnedLinearIssueTrashCleanupResultV1> {
+  const issueId = input.issueId.trim();
+  const marker = input.marker.trim();
+  const teamId = input.teamId.trim();
+  if (
+    !/^[A-Za-z0-9-]{8,300}$/u.test(issueId) ||
+    !marker ||
+    !teamId
+  ) {
+    throw new Error("Exact Linear cleanup scope is incomplete or malformed.");
+  }
+  const assertOwned = (issue: OwnedLinearIssueCleanupStateV1): void => {
+    if (
+      issue.id !== issueId ||
+      issue.teamId !== teamId ||
+      !`${issue.title}\n${issue.description}`.includes(marker)
+    ) {
+      throw new Error(
+        "The exact Linear issue failed its ID, marker, or team ownership check.",
+      );
+    }
+  };
+  const maxReadAttempts = Math.max(
+    1,
+    Math.min(12, Math.trunc(input.maxReadAttempts ?? 5)),
+  );
+  const wait =
+    input.wait ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  const readExactIssue = () =>
+    retryTransientExternalCleanupRead(() => input.readIssue(issueId), {
+      maxAttempts: Math.min(3, maxReadAttempts),
+      wait,
+    });
+
+  let issue = await readExactIssue();
+  if (issue) assertOwned(issue);
+  const initialState = issue
+    ? issue.trashed
+      ? "trashed"
+      : "active"
+    : "absent";
+  let trashApplied = false;
+  if (issue && !issue.trashed) {
+    await input.trashIssue(issueId);
+    trashApplied = true;
+    for (let attempt = 0; attempt < maxReadAttempts; attempt += 1) {
+      issue = await readExactIssue();
+      if (issue) assertOwned(issue);
+      if (issue === null || issue.trashed) break;
+      if (attempt + 1 < maxReadAttempts) {
+        await wait(250 * (attempt + 1));
+      }
+    }
+  }
+  if (issue && !issue.trashed) {
+    throw new Error(
+      "The exact Linear issue remained active after the trash mutation.",
+    );
+  }
+  const activeSurvivors = await retryTransientExternalCleanupRead(
+    input.findActiveMarkerSurvivors,
+    {
+      maxAttempts: Math.min(3, maxReadAttempts),
+      wait,
+    },
+  );
+  if (activeSurvivors.length > 0) {
+    throw new Error(
+      `The disposable Linear marker still has active provider survivors: ${activeSurvivors
+        .map((item) => item.id)
+        .sort()
+        .join(", ")}.`,
+    );
+  }
+  return {
+    version: 1,
+    issueId,
+    initialState,
+    trashApplied,
+    terminalState: issue === null ? "absent" : "trashed",
+    verifiedNoActiveMarkerIssue: true,
+  };
+}
+
+/**
+ * Permanently remove one disposable Linear issue without broad cleanup
+ * authority. Provider absence is represented only by readIssue() returning
+ * null after an authenticated `linear_not_found`; forbidden/transport errors
+ * must propagate.
+ */
+export async function cleanupExactOwnedLinearIssuePermanently(input: {
+  issueId: string;
+  marker: string;
+  teamId: string;
+  readIssue: (
+    issueId: string,
+  ) => Promise<OwnedLinearIssueCleanupStateV1 | null>;
+  trashIssue: (issueId: string) => Promise<void>;
+  deleteIssuePermanently: (issueId: string) => Promise<void>;
+  findMarkerSurvivors: () => Promise<Array<{ id: string }>>;
+  maxReadAttempts?: number;
+  wait?: (delayMs: number) => Promise<void>;
+}): Promise<OwnedLinearIssueCleanupResultV1> {
+  const issueId = input.issueId.trim();
+  const marker = input.marker.trim();
+  const teamId = input.teamId.trim();
+  if (
+    !/^[A-Za-z0-9-]{8,300}$/u.test(issueId) ||
+    !marker ||
+    !teamId
+  ) {
+    throw new Error("Exact Linear cleanup scope is incomplete or malformed.");
+  }
+
+  const assertOwned = (issue: OwnedLinearIssueCleanupStateV1): void => {
+    const markerText = `${issue.title}\n${issue.description}`;
+    if (
+      issue.id !== issueId ||
+      issue.teamId !== teamId ||
+      !markerText.includes(marker)
+    ) {
+      throw new Error(
+        "The exact Linear issue failed its ID, marker, or team ownership check.",
+      );
+    }
+  };
+  const maxReadAttempts = Math.max(
+    1,
+    Math.min(12, Math.trunc(input.maxReadAttempts ?? 5)),
+  );
+  const wait =
+    input.wait ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  const readExactIssue = () =>
+    retryTransientExternalCleanupRead(() => input.readIssue(issueId), {
+      maxAttempts: Math.min(3, maxReadAttempts),
+      wait,
+    });
+  const poll = async (
+    accept: (state: OwnedLinearIssueCleanupStateV1 | null) => boolean,
+  ): Promise<OwnedLinearIssueCleanupStateV1 | null> => {
+    let state: OwnedLinearIssueCleanupStateV1 | null = null;
+    for (let attempt = 0; attempt < maxReadAttempts; attempt += 1) {
+      state = await readExactIssue();
+      if (state) assertOwned(state);
+      if (accept(state)) return state;
+      if (attempt + 1 < maxReadAttempts) {
+        await wait(250 * (attempt + 1));
+      }
+    }
+    return state;
+  };
+
+  let issue = await readExactIssue();
+  if (issue) assertOwned(issue);
+  const initialState = issue
+    ? issue.trashed
+      ? "trashed"
+      : "active"
+    : "absent";
+  let trashed = false;
+  let permanentlyDeleted = false;
+
+  if (issue && !issue.trashed) {
+    await input.trashIssue(issueId);
+    trashed = true;
+    issue = await poll((state) => state === null || state.trashed);
+    if (issue && !issue.trashed) {
+      throw new Error(
+        "The exact Linear issue remained active after the trash mutation.",
+      );
+    }
+  }
+
+  if (issue) {
+    await input.deleteIssuePermanently(issueId);
+    permanentlyDeleted = true;
+    issue = await poll((state) => state === null);
+    if (issue) {
+      throw new Error(
+        "The exact Linear issue remained provider-readable after permanent deletion.",
+      );
+    }
+  }
+
+  const survivors = await retryTransientExternalCleanupRead(
+    input.findMarkerSurvivors,
+    {
+      maxAttempts: Math.min(3, maxReadAttempts),
+      wait,
+    },
+  );
+  if (survivors.length > 0) {
+    throw new Error(
+      `The disposable Linear marker still has provider survivors: ${survivors
+        .map((item) => item.id)
+        .sort()
+        .join(", ")}.`,
+    );
+  }
+
+  return {
+    version: 1,
+    issueId,
+    initialState,
+    trashed,
+    permanentlyDeleted,
+    verifiedAbsent: true,
+  };
 }
 
 /** A 403/inaccessible response is never absence; only an authenticated API 404 is. */

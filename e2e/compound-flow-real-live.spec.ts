@@ -10,7 +10,6 @@ import {
   GitHubRestClient,
 } from "../src/integrations/github/GitHubRestClient";
 import type { HttpTransport } from "../src/model/types";
-import { liveProviderConfiguration } from "../scripts/ci-sandbox-boundary";
 import {
   deleteDisposableGitHubRepositoryAndVerify,
   DisposableExternalCleanupManifest,
@@ -23,7 +22,13 @@ import { ensureDurableLinearQueueProject } from "./fixtures/linearQueueProvision
 import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import { createFlowRealTypeScriptFixture } from "./fixtures/phase4GitRepo";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
-import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
+import {
+  assertProductionAdoptedSandboxV1,
+  hostProvisionedSandboxRuntimeDigestV1,
+  startRealAiHarness,
+  type RealAiHarness,
+} from "./fixtures/realAiHarness";
+import { laneSelectedV1 } from "./fixtures/laneSelection";
 
 const LANE = "compound-flow-real-live";
 const PROFILE_KEY = "compound-flow-real-ts";
@@ -46,7 +51,7 @@ const VALIDATION_PROFILE_KEY = "compound-flow-real-ts-validation";
 test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async () => {
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
   test.skip(
-    process.env.E2E_PLAYWRIGHT_LANE !== LANE,
+    !laneSelectedV1(LANE),
     `Run only with E2E_PLAYWRIGHT_LANE=${LANE}.`,
   );
   test.skip(
@@ -73,10 +78,12 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
   const repository = safeDisposableRepositoryName(`e2e-flow-real-${suffix}`);
   const workspaceId = `flow-real-${suffix}`;
   const relativeCodePath = "src/flow_real.ts";
-  const teamId =
-    process.env.LINEAR_LIVE_TEST_TEAM_ID?.trim() ||
-    "a96c6434-79c1-405f-87dc-c9ee9e1fcdc5";
-  const sandboxConfiguration = liveProviderConfiguration("wsl2");
+  // No hard-coded fallback. A literal team id here meant the lane appeared to
+  // work without the variable set, and would silently mutate whatever
+  // workspace that id belonged to after a credential change. Membership in the
+  // connected workspace is asserted against the live snapshot below.
+  const teamId = requiredEnvironment("LINEAR_LIVE_TEST_TEAM_ID");
+  const sandboxReadinessStartedAt = Date.now();
   const fixture = await createFlowRealTypeScriptFixture(marker);
   const requestId = `flow-real-request-${suffix}`;
 
@@ -125,7 +132,7 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
         protectedPaths: ["scripts", "package.json"],
         allowedGeneratedPaths: [],
       },
-      runtimeDigests: { python: sandboxConfiguration.runtimeDigest },
+      runtimeDigests: { python: hostProvisionedSandboxRuntimeDigestV1() },
       promotionPolicy: {
         localBasePromotion: "disabled",
         completionProof: "draft_pr",
@@ -266,26 +273,29 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
       true,
     );
 
-    const sandboxProbe = await harness.page.evaluate(
-      async ({ codePluginId, config }) => {
-        const app = (window as typeof window & { app?: any }).app;
-        const code = app?.plugins?.plugins?.["agentic-researcher"]
-          ?.getBundledCapability?.(codePluginId);
-        if (!code?.configureSandboxProvider || !code?.probeConfiguredSandboxProviders) {
-          throw new Error("Code sandbox configuration API is unavailable.");
-        }
-        await code.configureSandboxProvider(config);
-        return code.probeConfiguredSandboxProviders();
-      },
-      { codePluginId: PHASE4_CODE_PLUGIN_ID, config: sandboxConfiguration },
+    // No injected provider configuration: the plugin must adopt the
+    // host-provisioned binding and pass its own boundary probe.
+    const adoptedSandbox = await assertProductionAdoptedSandboxV1(
+      harness.page,
+      sandboxReadinessStartedAt,
     );
+    expect(adoptedSandbox.selectedProvider).toBe("wsl2");
+
+    // The env var names a team; this proves the connected workspace actually
+    // contains it. Without this the lane would happily mutate a stranger's
+    // workspace if the credential were swapped.
+    const connectedTeamIds = await harness.page.evaluate((pluginId) => {
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      const teams = plugin?.linearCapabilitySnapshot?.teams ?? [];
+      return Array.isArray(teams)
+        ? teams.map((team: any) => String(team?.id ?? ""))
+        : [];
+    }, NATIVE_CORE_PLUGIN_ID);
     expect(
-      sandboxProbe,
-      `Obsidian sandbox probe failed: ${JSON.stringify(sandboxProbe)}`,
-    ).toMatchObject({
-      executionAvailable: true,
-      selectedProvider: "wsl2",
-    });
+      connectedTeamIds,
+      `LINEAR_LIVE_TEST_TEAM_ID ${teamId} is not a team in the connected Linear workspace (${connectedTeamIds.join(", ") || "none discovered"}).`,
+    ).toContain(teamId);
 
     // Continuous set-loose compound mission (one Run Mission; no Bound approvals).
     // Prompt must hit full-pipeline / compound lifecycle detection: "full pipeline"
@@ -1556,3 +1566,14 @@ const fetchTransport: HttpTransport = async (request) => {
     json,
   };
 };
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(
+      `compound-flow-real-live is missing required environment ${name}. ` +
+        "It mutates a real Linear workspace, so the target team must be named explicitly.",
+    );
+  }
+  return value;
+}

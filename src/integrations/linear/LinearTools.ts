@@ -482,11 +482,18 @@ function createReadTool(
   const definition = requireMappedDefinition(config.name, config.operationKey, "read");
   return {
     name: config.name,
-    description: `Run the fixed Linear ${config.operationKey} read operation.`,
-    parameters: schemaForReadOperation(definition.variables.allowed, definition.variables.required),
+    description:
+      config.name === "linear_list_comments"
+        ? "List comments for one exact Linear issue ID using the fixed comments.list operation."
+        : `Run the fixed Linear ${config.operationKey} read operation.`,
+    parameters: schemaForReadTool(config, definition.variables.allowed, definition.variables.required),
     descriptor: readDescriptor(config),
     execute: (args, context) =>
-      client.execute(config.operationKey, args, requestOptions(context)),
+      client.execute(
+        config.operationKey,
+        variablesForReadTool(config, args),
+        requestOptions(context),
+      ),
   };
 }
 
@@ -1134,7 +1141,10 @@ function verifyPostcondition(
   observation: LinearReadback,
 ): { ok: boolean; changedFields: string[] } {
   const changedFields = mutationChangedFields(config, variables);
-  if (config.kind === "generic_trash" && !observation.found) {
+  if (
+    (config.kind === "issue_trash" || config.kind === "generic_trash") &&
+    !observation.found
+  ) {
     return { ok: true, changedFields };
   }
   if (expectsAbsence(config.kind)) {
@@ -1775,6 +1785,47 @@ function schemaForReadOperation(
           : stringSchema(`Linear ${key} value.`);
   }
   return objectSchema(properties, required ? [...required] : []);
+}
+
+function schemaForReadTool(
+  config: ReadToolConfig,
+  allowed: readonly string[],
+  required: readonly string[] | undefined,
+): JsonSchemaObject {
+  if (config.name !== "linear_list_comments") {
+    return schemaForReadOperation(allowed, required);
+  }
+  return objectSchema(
+    {
+      issueId: stringSchema(
+        "Exact opaque Linear issue ID returned by linear_get_issue; do not use the human-readable identifier.",
+      ),
+      first: integerSchema("Maximum comments to fetch (bounded to 50).", 1, 50),
+      after: stringSchema("Optional Linear pagination cursor."),
+      includeArchived: { type: "boolean" },
+    },
+    ["issueId"],
+  );
+}
+
+function variablesForReadTool(
+  config: ReadToolConfig,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  if (config.name !== "linear_list_comments") {
+    return args;
+  }
+  assertAllowedArgs(args, ["issueId", "first", "after", "includeArchived"]);
+  const issueId = boundedString(args.issueId, "issueId", MAX_IDENTIFIER_CHARS);
+  const variables: Record<string, unknown> = {
+    filter: { issue: { id: { eq: issueId } } },
+  };
+  for (const key of ["first", "after", "includeArchived"] as const) {
+    if (args[key] !== undefined) {
+      variables[key] = args[key];
+    }
+  }
+  return variables;
 }
 
 function requireMappedDefinition(

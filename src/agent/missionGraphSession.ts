@@ -29,6 +29,7 @@ import {
 } from "./missionGraphStore";
 import type { MissionGraphStoreReferenceV1 } from "./runStore";
 import { missionGraphToolNodeWallClockMs } from "./missionGraphHost";
+import { collectRequiredDependencyIds } from "./missionGraphAuthority";
 
 export interface MissionGraphSessionEvents {
   onGraphUpdate?: (
@@ -236,6 +237,8 @@ export class MissionGraphSession {
     toolName: string,
     options: {
       allowDynamicReadContinuation?: boolean;
+      /** Keep an unplanned companion outside the required final closure. */
+      optionalDynamicContinuation?: boolean;
       /** Disable only when the host intentionally prestarts parallel calls. */
       recoverOrphanedRunning?: boolean;
     } = {},
@@ -323,6 +326,8 @@ export class MissionGraphSession {
             reason: `Tool ${toolName} is not ready in the authoritative mission graph.`,
           };
         }
+        const optionalDynamicContinuation =
+          options.optionalDynamicContinuation === true;
         if (grant.effect !== "read") {
           const nonterminalTemplate = Object.values(this.record.graph.nodes).find(
             (candidate) =>
@@ -343,7 +348,7 @@ export class MissionGraphSession {
               reason: `Tool ${toolName} cannot continue after final mission completion.`,
             };
           }
-          const dynamicId = `retry-${this.record.graph.revision + 1}-${sanitizeMissionId(
+          const dynamicId = `${optionalDynamicContinuation ? "optional-retry" : "retry"}-${this.record.graph.revision + 1}-${sanitizeMissionId(
             toolName,
           )}`;
           let dynamicNode = {
@@ -384,39 +389,56 @@ export class MissionGraphSession {
               code: "budget_exhausted" as const,
             };
           }
-          const nextFinalDependencies = [
-            ...new Set([...continuationNode.dependencyIds, dynamicId]),
-          ].sort();
-          const finalDependencyOperations: MissionGraphPatchOperationV1[] =
-            continuationNode.status === "ready"
+          const continuationOperations: MissionGraphPatchOperationV1[] =
+            optionalDynamicContinuation
               ? [
-                  { op: "remove_node", nodeId: continuationNode.id },
-                  {
-                    op: "add_node",
-                    node: {
-                      ...clone(continuationNode),
-                      dependencyIds: nextFinalDependencies,
-                      budget: continuationBudget,
-                      status: "queued" as const,
-                    },
-                  },
-                ]
-              : [
                   {
                     op: "update_node",
                     nodeId: continuationNode.id,
                     changes: {
-                      dependencyIds: nextFinalDependencies,
                       budget: continuationBudget,
                     },
                   },
-                ];
+                ]
+              : continuationNode.status === "ready"
+                ? [
+                    { op: "remove_node", nodeId: continuationNode.id },
+                    {
+                      op: "add_node",
+                      node: {
+                        ...clone(continuationNode),
+                        dependencyIds: [
+                          ...new Set([
+                            ...continuationNode.dependencyIds,
+                            dynamicId,
+                          ]),
+                        ].sort(),
+                        budget: continuationBudget,
+                        status: "queued" as const,
+                      },
+                    },
+                  ]
+                : [
+                    {
+                      op: "update_node",
+                      nodeId: continuationNode.id,
+                      changes: {
+                        dependencyIds: [
+                          ...new Set([
+                            ...continuationNode.dependencyIds,
+                            dynamicId,
+                          ]),
+                        ].sort(),
+                        budget: continuationBudget,
+                      },
+                    },
+                  ];
           try {
             await this.applyUnlocked(
               `Add bounded effectful continuation for ${toolName}.`,
               [
                 { op: "add_node", node: dynamicNode },
-                ...finalDependencyOperations,
+                ...continuationOperations,
               ],
             );
           } catch (error) {
@@ -436,7 +458,7 @@ export class MissionGraphSession {
             reason: `Tool ${toolName} is not ready in the exact authoritative mission graph.`,
           };
         }
-        const dynamicId = `retry-${this.record.graph.revision + 1}-${sanitizeMissionId(
+        const dynamicId = `${optionalDynamicContinuation ? "optional-retry" : "retry"}-${this.record.graph.revision + 1}-${sanitizeMissionId(
           toolName,
         )}`;
         const readExecutor = Object.values(
@@ -546,39 +568,48 @@ export class MissionGraphSession {
             };
           }
         }
-        const finalDependencyOperations: MissionGraphPatchOperationV1[] = continuationNode
-          ? continuationNode.status === "ready"
-            ? [
-                { op: "remove_node", nodeId: continuationNode.id },
-                {
-                  op: "add_node",
-                  node: {
-                    ...clone(continuationNode),
-                    dependencyIds: [
-                      ...new Set([...continuationNode.dependencyIds, dynamicId]),
-                    ].sort(),
-                    ...(continuationBudget ? { budget: continuationBudget } : {}),
-                    status: "queued" as const,
-                  },
-                },
-              ]
-            : [
-                {
-                  op: "update_node",
-                  nodeId: continuationNode.id,
-                  changes: {
-                    dependencyIds: [
-                      ...new Set([...continuationNode.dependencyIds, dynamicId]),
-                    ].sort(),
-                    ...(continuationBudget ? { budget: continuationBudget } : {}),
-                  },
-                },
-              ]
-          : [];
+        const continuationOperations: MissionGraphPatchOperationV1[] = [];
+        if (
+          continuationNode &&
+          optionalDynamicContinuation &&
+          continuationBudget
+        ) {
+          continuationOperations.push({
+            op: "update_node",
+            nodeId: continuationNode.id,
+            changes: { budget: continuationBudget },
+          });
+        } else if (continuationNode?.status === "ready") {
+          continuationOperations.push(
+            { op: "remove_node", nodeId: continuationNode.id },
+            {
+              op: "add_node",
+              node: {
+                ...clone(continuationNode),
+                dependencyIds: [
+                  ...new Set([...continuationNode.dependencyIds, dynamicId]),
+                ].sort(),
+                ...(continuationBudget ? { budget: continuationBudget } : {}),
+                status: "queued" as const,
+              },
+            },
+          );
+        } else if (continuationNode) {
+          continuationOperations.push({
+            op: "update_node",
+            nodeId: continuationNode.id,
+            changes: {
+              dependencyIds: [
+                ...new Set([...continuationNode.dependencyIds, dynamicId]),
+              ].sort(),
+              ...(continuationBudget ? { budget: continuationBudget } : {}),
+            },
+          });
+        }
         try {
           await this.applyUnlocked(`Add bounded read retry for ${toolName}.`, [
             { op: "add_node", node: dynamicNode },
-            ...finalDependencyOperations,
+            ...continuationOperations,
           ]);
         } catch (error) {
           return {
@@ -826,13 +857,19 @@ export class MissionGraphSession {
             },
           );
           const graph = this.record.graph;
+          const projectedCompletedNodeIds = new Set(
+            Object.values(graph.nodes)
+              .filter((candidate) => candidate.status === "complete")
+              .map((candidate) => candidate.id),
+          );
+          projectedCompletedNodeIds.add(node.id);
           for (const candidate of Object.values(graph.nodes)) {
             if (
               candidate.status === "queued" &&
+              !isFastValidationAwaitingCorrection(graph, candidate.id) &&
               candidate.dependencyIds.every(
                 (dependencyId) =>
-                  dependencyId === node.id ||
-                  graph.nodes[dependencyId]?.status === "complete",
+                  projectedCompletedNodeIds.has(dependencyId),
               )
             ) {
               operations.push({
@@ -910,6 +947,696 @@ export class MissionGraphSession {
         );
       }
       return graph;
+    });
+  }
+
+  /**
+   * A recorded `repaired` outcome proves only that one red fast-validation
+   * receipt was journaled. Before that repair node completes, insert the next
+   * bounded fast-validation -> repair-record pair and make every unfinished
+   * direct dependent wait for it. Scheduling before completion is deliberate:
+   * there is never a durable graph revision where targeted/full validation can
+   * become ready without a receipt-backed passing fast cycle.
+   */
+  async scheduleRepairedFastValidationCycle(
+    execution: MissionGraphToolExecution,
+  ): Promise<MissionGraphV3> {
+    return this.enqueueMutation(async () => {
+      const repairTemplate = this.requireNode(execution.nodeId);
+      if (
+        execution.toolName !== "code_repair_record_cycle" ||
+        repairTemplate.status !== "running"
+      ) {
+        throw new Error(
+          `A repaired fast-validation continuation requires a running code_repair_record_cycle node; ${repairTemplate.id} is ${repairTemplate.status}.`,
+        );
+      }
+      if (getMissionCompositeLifecycleSpecV1(repairTemplate)) {
+        throw new Error(
+          "A repaired fast-validation continuation cannot rewrite a composite lifecycle cursor.",
+        );
+      }
+
+      const downstreamIds = new Set([repairTemplate.id]);
+      let discoveredDownstream = true;
+      while (discoveredDownstream) {
+        discoveredDownstream = false;
+        for (const candidate of Object.values(this.record.graph.nodes)) {
+          if (
+            candidate.status === "cancelled" ||
+            downstreamIds.has(candidate.id) ||
+            !candidate.dependencyIds.some((dependencyId) =>
+              downstreamIds.has(dependencyId),
+            )
+          ) {
+            continue;
+          }
+          downstreamIds.add(candidate.id);
+          discoveredDownstream = true;
+        }
+      }
+      const plannedFastNodes = Object.values(this.record.graph.nodes).filter(
+        (candidate) =>
+          candidate.id !== repairTemplate.id &&
+          downstreamIds.has(candidate.id) &&
+          candidate.status !== "complete" &&
+          candidate.allowedTools.includes("code_validate_fast"),
+      );
+      const alreadyScheduled = plannedFastNodes.some((fastNode) =>
+        Object.values(this.record.graph.nodes).some(
+          (candidate) =>
+            downstreamIds.has(candidate.id) &&
+            candidate.status !== "complete" &&
+            candidate.allowedTools.includes("code_repair_record_cycle") &&
+            candidate.dependencyIds.includes(fastNode.id),
+        ),
+      );
+      const parallelPairAlreadyScheduled = Object.values(
+        this.record.graph.nodes,
+      )
+        .filter((candidate) =>
+          candidate.dependencyIds.includes(repairTemplate.id),
+        )
+        .some((dependent) =>
+          dependent.dependencyIds.some((dependencyId) => {
+            const repeatedRepair = this.record.graph.nodes[dependencyId];
+            if (
+              !repeatedRepair ||
+              repeatedRepair.id === repairTemplate.id ||
+              repeatedRepair.status === "complete" ||
+              !repeatedRepair.allowedTools.includes(
+                "code_repair_record_cycle",
+              )
+            ) {
+              return false;
+            }
+            return repeatedRepair.dependencyIds.some((fastDependencyId) =>
+              this.record.graph.nodes[
+                fastDependencyId
+              ]?.allowedTools.includes("code_validate_fast"),
+            );
+          }),
+        );
+      if (alreadyScheduled || parallelPairAlreadyScheduled) {
+        return this.record.graph;
+      }
+
+      const fastTemplate = repairTemplate.dependencyIds
+        .map((dependencyId) => this.record.graph.nodes[dependencyId])
+        .find(
+          (candidate) =>
+            candidate?.status === "complete" &&
+            candidate.allowedTools.includes("code_validate_fast"),
+        );
+      if (!fastTemplate) {
+        throw new Error(
+          `Repair node ${repairTemplate.id} has no completed fast-validation dependency to repeat.`,
+        );
+      }
+      const downstreamNodes = Object.values(this.record.graph.nodes).filter(
+        (candidate) =>
+          candidate.dependencyIds.includes(repairTemplate.id) &&
+          candidate.status !== "complete" &&
+          candidate.status !== "cancelled",
+      );
+      if (downstreamNodes.length === 0) {
+        throw new Error(
+          `Repair node ${repairTemplate.id} has no unfinished downstream proof gate.`,
+        );
+      }
+
+      const reserveNode = findContinuationReserveNode(this.record.graph);
+      if (!reserveNode || reserveNode.id === repairTemplate.id) {
+        throw new Error(
+          "A repaired fast-validation continuation has no nonterminal continuation budget reserve.",
+        );
+      }
+      const requestedBudget: MissionNodeBudgetV1 = {
+        toolCalls:
+          fastTemplate.budget.toolCalls + repairTemplate.budget.toolCalls,
+        externalActions:
+          fastTemplate.budget.externalActions +
+          repairTemplate.budget.externalActions,
+        wallClockMs:
+          fastTemplate.budget.wallClockMs +
+          repairTemplate.budget.wallClockMs,
+      };
+      const allocation = transferReservedBudgetForContinuation(
+        this.record.graph,
+        reserveNode,
+        requestedBudget,
+      );
+      const idSuffix = sanitizeMissionId(
+        `${this.record.graph.revision + 1}-${repairTemplate.id}`,
+      );
+      const fastNodeId = `repair-fast-${idSuffix}`.slice(0, 128);
+      const repairNodeId = `repair-record-${idSuffix}`.slice(0, 128);
+      if (
+        this.record.graph.nodes[fastNodeId] ||
+        this.record.graph.nodes[repairNodeId]
+      ) {
+        throw new Error(
+          `The repaired fast-validation continuation IDs for ${repairTemplate.id} already exist without their durable origin marker.`,
+        );
+      }
+      const resetRetries = (template: MissionNodeV3) => ({
+        maxAttempts: template.retries.maxAttempts,
+        attempts: 0,
+        failureFingerprints: [],
+        consecutiveFailureFingerprint: null,
+        consecutiveFailureCount: 0,
+      });
+      const fastNode: MissionNodeV3 = {
+        ...clone(fastTemplate),
+        id: fastNodeId,
+        dependencyIds: [...fastTemplate.dependencyIds],
+        objective:
+          `Run a fresh fast validation after recorded repair cycle ${repairTemplate.id}; downstream validation remains gated on its exact receipt.`.slice(
+            0,
+            4_000,
+          ),
+        outputs: {},
+        retries: resetRetries(fastTemplate),
+        status: "queued",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        blocker: null,
+      };
+      const repairNode: MissionNodeV3 = {
+        ...clone(repairTemplate),
+        id: repairNodeId,
+        dependencyIds: [
+          ...new Set([...repairTemplate.dependencyIds, fastNodeId]),
+        ].sort(),
+        objective:
+          `Record the exact result of fresh fast validation ${fastNodeId}; only outcome passed may unlock downstream validation.`.slice(
+            0,
+            4_000,
+          ),
+        outputs: {
+          validationRecovery: {
+            version: 1,
+            status: "awaiting_correction",
+            failedToolName: "code_validate_fast",
+            failedAt: this.now(),
+            fastNodeId,
+            repairNodeId,
+            targetedNodeId: null,
+            originRepairNodeId: repairTemplate.id,
+            correction: null,
+          },
+        },
+        retries: resetRetries(repairTemplate),
+        status: "queued",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        blocker: null,
+      };
+      const operations: MissionGraphPatchOperationV1[] = [
+        { op: "add_node", node: fastNode },
+        { op: "add_node", node: repairNode },
+        ...downstreamNodes.map(
+          (candidate): MissionGraphPatchOperationV1 => ({
+            op: "update_node",
+            nodeId: candidate.id,
+            changes: {
+              dependencyIds: [
+                ...new Set([...candidate.dependencyIds, repairNodeId]),
+              ].sort(),
+            },
+          }),
+        ),
+      ];
+      if (
+        JSON.stringify(allocation.reserveNodeBudget) !==
+        JSON.stringify(reserveNode.budget)
+      ) {
+        operations.push({
+          op: "update_node",
+          nodeId: reserveNode.id,
+          changes: { budget: allocation.reserveNodeBudget },
+        });
+      }
+      return this.applyUnlocked(
+        `Gate downstream validation on a fresh fast cycle after repaired outcome from ${repairTemplate.id}.`,
+        operations,
+      );
+    });
+  }
+
+  /**
+   * A red targeted/full validator is evidence that the current workspace is
+   * not publishable. Requeue that exact validator behind a fresh fast/repair
+   * chain (and a fresh targeted validator before a failed full validator),
+   * while durably requiring one actual workspace mutation before the new fast
+   * node may be offered. This prevents unchanged red validation retries from
+   * exhausting the node and preserves the original capability/budget envelope.
+   */
+  async finishFailedValidationWithRecovery(
+    execution: MissionGraphToolExecution,
+    result: {
+      evidence?: MissionEvidenceRefV1;
+      receipt?: MissionReceiptRefV1;
+      failureFingerprint: string;
+      failureMessage: string;
+    },
+  ): Promise<{ graph: MissionGraphV3; scheduled: boolean }> {
+    return this.enqueueMutation(async () => {
+      const validationNode = this.requireNode(execution.nodeId);
+      if (
+        !["code_validate_targeted", "code_validate_full"].includes(
+          execution.toolName,
+        ) ||
+        validationNode.status !== "running"
+      ) {
+        throw new Error(
+          `Validation recovery requires a running targeted/full validator; ${validationNode.id} is ${validationNode.status}.`,
+        );
+      }
+      if (getMissionCompositeLifecycleSpecV1(validationNode)) {
+        throw new Error(
+          "Validation recovery cannot rewrite a composite lifecycle cursor.",
+        );
+      }
+
+      const operations: MissionGraphPatchOperationV1[] = [
+        {
+          op: "record_attempt",
+          nodeId: validationNode.id,
+          failureFingerprint: result.failureFingerprint,
+          observedAt: this.now(),
+        },
+      ];
+      if (result.evidence) {
+        operations.push({
+          op: "append_evidence",
+          nodeId: validationNode.id,
+          evidence: result.evidence,
+        });
+      }
+      if (result.receipt) {
+        operations.push({
+          op: "append_receipt",
+          nodeId: validationNode.id,
+          receipt: result.receipt,
+        });
+      }
+
+      const nextAttempts = validationNode.retries.attempts + 1;
+      if (nextAttempts >= validationNode.retries.maxAttempts) {
+        operations.push(
+          {
+            op: "set_outputs",
+            nodeId: validationNode.id,
+            outputs: {
+              ...validationNode.outputs,
+              validationRecovery: {
+                version: 1,
+                status: "exhausted",
+                failedToolName: execution.toolName,
+                failureFingerprint: result.failureFingerprint,
+                failedAt: this.now(),
+              },
+            },
+          },
+          {
+            op: "set_status",
+            nodeId: validationNode.id,
+            expectedStatus: "running",
+            status: "blocked",
+            blocker: {
+              code: "validation_repair_cycles_exhausted",
+              message:
+                "Validation remained red after the bounded correction cycles.",
+              requiredAction:
+                "Inspect the latest validation diagnostic before starting a new explicitly authorized repair run.",
+            },
+          },
+        );
+        let graph: MissionGraphV3;
+        try {
+          graph = await this.applyUnlocked(
+            `Block ${execution.toolName} after bounded validation recovery was exhausted.`,
+            operations,
+          );
+        } finally {
+          if (execution.lockLease) {
+            await this.releaseNodeLocksUnlocked(execution.lockLease);
+          }
+        }
+        return { graph, scheduled: false };
+      }
+
+      const ancestorIds = new Set<string>();
+      const pendingAncestors = [...validationNode.dependencyIds];
+      while (pendingAncestors.length > 0) {
+        const candidateId = pendingAncestors.pop()!;
+        if (ancestorIds.has(candidateId)) continue;
+        ancestorIds.add(candidateId);
+        const candidate = this.record.graph.nodes[candidateId];
+        if (candidate) pendingAncestors.push(...candidate.dependencyIds);
+      }
+      const completedAncestors = Object.values(this.record.graph.nodes).filter(
+        (candidate) =>
+          ancestorIds.has(candidate.id) && candidate.status === "complete",
+      );
+      const repairTemplate = completedAncestors
+        .filter((candidate) =>
+          candidate.allowedTools.includes("code_repair_record_cycle"),
+        )
+        .at(-1);
+      const fastTemplate = repairTemplate?.dependencyIds
+        .map((dependencyId) => this.record.graph.nodes[dependencyId])
+        .filter(
+          (candidate): candidate is MissionNodeV3 =>
+            Boolean(
+              candidate?.status === "complete" &&
+                candidate.allowedTools.includes("code_validate_fast"),
+            ),
+        )
+        .at(-1);
+      if (!repairTemplate || !fastTemplate) {
+        throw new Error(
+          `${execution.toolName} recovery requires completed fast-validation and repair-record ancestors.`,
+        );
+      }
+      const targetedTemplate =
+        execution.toolName === "code_validate_full"
+          ? validationNode.dependencyIds
+              .map((dependencyId) => this.record.graph.nodes[dependencyId])
+              .filter(
+                (candidate): candidate is MissionNodeV3 =>
+                  Boolean(
+                    candidate?.status === "complete" &&
+                      candidate.allowedTools.includes(
+                        "code_validate_targeted",
+                      ),
+                  ),
+              )
+              .at(-1)
+          : null;
+      if (
+        execution.toolName === "code_validate_full" &&
+        !targetedTemplate
+      ) {
+        throw new Error(
+          "Full-validation recovery requires a completed targeted-validation dependency to repeat.",
+        );
+      }
+
+      const requestedBudget: MissionNodeBudgetV1 = {
+        toolCalls:
+          fastTemplate.budget.toolCalls +
+          repairTemplate.budget.toolCalls +
+          (targetedTemplate?.budget.toolCalls ?? 0),
+        externalActions:
+          fastTemplate.budget.externalActions +
+          repairTemplate.budget.externalActions +
+          (targetedTemplate?.budget.externalActions ?? 0),
+        wallClockMs:
+          fastTemplate.budget.wallClockMs +
+          repairTemplate.budget.wallClockMs +
+          (targetedTemplate?.budget.wallClockMs ?? 0),
+      };
+      const reserveNode = findContinuationReserveNode(this.record.graph);
+      if (!reserveNode || reserveNode.id === validationNode.id) {
+        throw new Error(
+          "Validation recovery has no nonterminal continuation budget reserve.",
+        );
+      }
+      const allocation = transferReservedBudgetForContinuation(
+        this.record.graph,
+        reserveNode,
+        requestedBudget,
+      );
+      const idSuffix = sanitizeMissionId(
+        `${this.record.graph.revision + 1}-${validationNode.id}`,
+      );
+      const fastNodeId = `validation-recovery-fast-${idSuffix}`.slice(0, 128);
+      const repairNodeId =
+        `validation-recovery-record-${idSuffix}`.slice(0, 128);
+      const targetedNodeId =
+        `validation-recovery-targeted-${idSuffix}`.slice(0, 128);
+      for (const nodeId of [
+        fastNodeId,
+        repairNodeId,
+        ...(targetedTemplate ? [targetedNodeId] : []),
+      ]) {
+        if (this.record.graph.nodes[nodeId]) {
+          throw new Error(
+            `Validation recovery node ${nodeId} already exists without its durable origin marker.`,
+          );
+        }
+      }
+      const resetRetries = (template: MissionNodeV3) => ({
+        maxAttempts: template.retries.maxAttempts,
+        attempts: 0,
+        failureFingerprints: [],
+        consecutiveFailureFingerprint: null,
+        consecutiveFailureCount: 0,
+      });
+      const fastNode: MissionNodeV3 = {
+        ...clone(fastTemplate),
+        id: fastNodeId,
+        dependencyIds: [...fastTemplate.dependencyIds],
+        objective:
+          `Run fresh fast validation only after a receipt-backed correction for red ${validationNode.id}.`.slice(
+            0,
+            4_000,
+          ),
+        outputs: {},
+        retries: resetRetries(fastTemplate),
+        status: "queued",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        blocker: null,
+      };
+      const repairNode: MissionNodeV3 = {
+        ...clone(repairTemplate),
+        id: repairNodeId,
+        dependencyIds: [
+          ...new Set([
+            ...repairTemplate.dependencyIds.filter(
+              (dependencyId) =>
+                !this.record.graph.nodes[
+                  dependencyId
+                ]?.allowedTools.includes("code_validate_fast"),
+            ),
+            fastNodeId,
+          ]),
+        ].sort(),
+        objective:
+          `Record the exact result of recovery fast validation ${fastNodeId}.`.slice(
+            0,
+            4_000,
+          ),
+        outputs: {},
+        retries: resetRetries(repairTemplate),
+        status: "queued",
+        evidence: [],
+        receipts: [],
+        verification: null,
+        blocker: null,
+      };
+      const targetedNode: MissionNodeV3 | null = targetedTemplate
+        ? {
+            ...clone(targetedTemplate),
+            id: targetedNodeId,
+            dependencyIds: [
+              ...new Set([
+                ...targetedTemplate.dependencyIds,
+                repairNodeId,
+              ]),
+            ].sort(),
+            objective:
+              `Run fresh targeted validation after recovery receipt ${repairNodeId} before retrying full validation.`.slice(
+                0,
+                4_000,
+              ),
+            outputs: {},
+            retries: resetRetries(targetedTemplate),
+            status: "queued" as const,
+            evidence: [],
+            receipts: [],
+            verification: null,
+            blocker: null,
+          }
+        : null;
+      const nextDependencyId = targetedNode?.id ?? repairNode.id;
+      operations.push(
+        { op: "add_node", node: fastNode },
+        { op: "add_node", node: repairNode },
+        ...(targetedNode
+          ? [{ op: "add_node" as const, node: targetedNode }]
+          : []),
+        {
+          op: "update_node",
+          nodeId: validationNode.id,
+          changes: {
+            dependencyIds: [
+              ...new Set([
+                ...validationNode.dependencyIds,
+                nextDependencyId,
+              ]),
+            ].sort(),
+          },
+        },
+        {
+          op: "set_outputs",
+          nodeId: validationNode.id,
+          outputs: {
+            ...validationNode.outputs,
+            validationRecovery: {
+              version: 1,
+              status: "awaiting_correction",
+              failedToolName: execution.toolName,
+              failureFingerprint: result.failureFingerprint,
+              failedAt: this.now(),
+              fastNodeId,
+              repairNodeId,
+              targetedNodeId: targetedNode?.id ?? null,
+              correction: null,
+            },
+          },
+        },
+      );
+      if (
+        JSON.stringify(allocation.reserveNodeBudget) !==
+        JSON.stringify(reserveNode.budget)
+      ) {
+        operations.push({
+          op: "update_node",
+          nodeId: reserveNode.id,
+          changes: { budget: allocation.reserveNodeBudget },
+        });
+      }
+      operations.push({
+        op: "set_status",
+        nodeId: validationNode.id,
+        expectedStatus: "running",
+        status: "queued",
+        blocker: null,
+      });
+
+      let graph: MissionGraphV3;
+      try {
+        graph = await this.applyUnlocked(
+          `Require a workspace correction and fresh validation chain after red ${execution.toolName}.`,
+          operations,
+        );
+      } finally {
+        if (execution.lockLease) {
+          await this.releaseNodeLocksUnlocked(execution.lockLease);
+        }
+      }
+      return { graph, scheduled: true };
+    });
+  }
+
+  /**
+   * Pay the durable correction gate only from a successful, receipt-backed
+   * adaptive workspace mutation. Reads, prose, and unchanged validator calls
+   * cannot unlock the recovery fast node.
+   */
+  async recordValidationRecoveryCorrection(input: {
+    toolName: string;
+    path: string;
+    eligiblePaths: readonly string[];
+    receiptId: string;
+    receiptFingerprint: string;
+    observedAt: string;
+  }): Promise<{ graph: MissionGraphV3; recorded: boolean }> {
+    return this.enqueueMutation(async () => {
+      if (
+        ![
+          "code_workspace_create_file",
+          "code_workspace_append",
+          "code_workspace_patch",
+          "code_workspace_write_expected",
+        ].includes(input.toolName)
+      ) {
+        return { graph: this.record.graph, recorded: false };
+      }
+      const normalizedPath = normalizeValidationRecoveryPath(input.path);
+      const eligiblePaths = [
+        ...new Set(
+          input.eligiblePaths
+            .map(normalizeValidationRecoveryPath)
+            .filter(Boolean),
+        ),
+      ].sort();
+      if (
+        !normalizedPath ||
+        eligiblePaths.length === 0 ||
+        !eligiblePaths.includes(normalizedPath)
+      ) {
+        return { graph: this.record.graph, recorded: false };
+      }
+      const recoveryNode = Object.values(this.record.graph.nodes).find(
+        (candidate) => {
+          if (candidate.status !== "queued") return false;
+          const recovery = candidate.outputs.validationRecovery;
+          return (
+            recovery !== null &&
+            typeof recovery === "object" &&
+            !Array.isArray(recovery) &&
+            (recovery as Record<string, unknown>).status ===
+              "awaiting_correction"
+          );
+        },
+      );
+      if (!recoveryNode) {
+        return { graph: this.record.graph, recorded: false };
+      }
+      const recovery = recoveryNode.outputs
+        .validationRecovery as Record<string, unknown>;
+      const fastNodeId = recovery.fastNodeId;
+      if (typeof fastNodeId !== "string") {
+        throw new Error(
+          `Validation recovery on ${recoveryNode.id} lost its exact fast-validation node binding.`,
+        );
+      }
+      const fastNode = this.record.graph.nodes[fastNodeId];
+      if (!fastNode || fastNode.status !== "queued") {
+        throw new Error(
+          `Validation recovery fast node ${fastNodeId} is not queued for a correction receipt.`,
+        );
+      }
+      const graph = await this.applyUnlocked(
+        `Record receipt-backed workspace correction for ${recoveryNode.id}.`,
+        [
+          {
+            op: "set_outputs",
+            nodeId: recoveryNode.id,
+            outputs: {
+              ...recoveryNode.outputs,
+              validationRecovery: {
+                ...recovery,
+                status: "correction_recorded",
+                correction: {
+                  toolName: input.toolName,
+                  path: normalizedPath,
+                  eligiblePaths,
+                  receiptId: input.receiptId,
+                  receiptFingerprint: input.receiptFingerprint,
+                  observedAt: input.observedAt,
+                },
+              },
+            },
+          },
+          {
+            op: "set_status",
+            nodeId: fastNodeId,
+            expectedStatus: "queued",
+            status: "ready",
+            blocker: null,
+          },
+        ],
+      );
+      return { graph, recorded: true };
     });
   }
 
@@ -1542,39 +2269,28 @@ export class MissionGraphSession {
           blocker: null,
         },
       );
-      // Optional catalog reads may remain ready after a finished write. Cancel
-      // those off-critical-path siblings so terminal acceptance does not treat
-      // the graph as incomplete and downgrade a successful write to budget.
-      const requiredIds = new Set<string>([node.id, ...node.dependencyIds]);
-      const stack = [...node.dependencyIds];
-      while (stack.length > 0) {
-        const dependencyId = stack.pop()!;
-        const dependency = this.record.graph.nodes[dependencyId];
-        if (!dependency) continue;
-        for (const nestedId of dependency.dependencyIds) {
-          if (requiredIds.has(nestedId)) continue;
-          requiredIds.add(nestedId);
-          stack.push(nestedId);
-        }
-      }
+      // Once the required final node is verified, every node outside its
+      // transitive dependency closure is explicitly abandoned. This includes
+      // blocked optional reads and stale recovery siblings: leaving either
+      // non-terminal makes the authoritative graph disagree with the completed
+      // ledger and can surface phantom work after a successful mission. The one
+      // exception is a canonical host-built post-acceptance action: the runner
+      // may execute that hidden action only after this final proof is recorded.
+      const requiredIds = collectRequiredDependencyIds(
+        this.record.graph,
+        node.id,
+      );
+      requiredIds.add(node.id);
       for (const [id, candidate] of Object.entries(this.record.graph.nodes)) {
         if (requiredIds.has(id)) continue;
-        if (candidate.effect !== "read") continue;
+        if (isCanonicalHostPostAcceptanceNode(candidate)) continue;
         if (
           candidate.status === "complete" ||
-          candidate.status === "cancelled" ||
-          candidate.status === "blocked"
+          candidate.status === "cancelled"
         ) {
           continue;
         }
-        if (
-          candidate.status === "running" ||
-          candidate.status === "waiting_approval" ||
-          candidate.status === "waiting_obsidian" ||
-          candidate.status === "verifying"
-        ) {
-          continue;
-        }
+        await this.releaseOrphanedNodeLocksUnlocked(id);
         operations.push({
           op: "set_status",
           nodeId: id,
@@ -1745,6 +2461,7 @@ export class MissionGraphSession {
       .filter(
         (node) =>
           node.status === "queued" &&
+          !isFastValidationAwaitingCorrection(graph, node.id) &&
           node.dependencyIds.every(
             (dependencyId) => graph.nodes[dependencyId]?.status === "complete",
           ),
@@ -1970,6 +2687,32 @@ function lifecycleOutputsOperationV1(
   };
 }
 
+function isCanonicalHostPostAcceptanceNode(node: MissionNodeV3): boolean {
+  if (node.effect === "read" || node.allowedTools.length !== 1) return false;
+  const toolName = node.allowedTools[0]!;
+  const ordinal = /^post-acceptance-tool-(\d{2})-/u.exec(node.id)?.[1];
+  if (!ordinal) return false;
+  const stableToolToken =
+    toolName
+      .toLowerCase()
+      .replace(/[^a-z0-9._:-]+/g, "-")
+      .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "")
+      .slice(0, 128) || "resource";
+  const expectedId =
+    `post-acceptance-${`tool-${ordinal}-${stableToolToken}`.slice(0, 128)}`;
+  return (
+    node.id === expectedId &&
+    node.objective ===
+      `After result acceptance, run host-authorized ${toolName}.` &&
+    node.completionContract.minimumEvidence === 1 &&
+    node.completionContract.requiredEvidenceKinds.length === 1 &&
+    node.completionContract.requiredEvidenceKinds[0] === "tool-result" &&
+    node.completionContract.minimumReceipts === 0 &&
+    node.completionContract.requiredReceiptKinds.length === 0 &&
+    node.completionContract.verifierId === null
+  );
+}
+
 function nextLifecycleCursor(
   lifecycle: NonNullable<ReturnType<typeof getMissionCompositeLifecycleSpecV1>>,
   currentCursor: number,
@@ -1987,8 +2730,41 @@ function nextLifecycleCursor(
   return cursor;
 }
 
+function normalizeValidationRecoveryPath(value: string): string {
+  if (typeof value !== "string") return "";
+  const normalized = value
+    .trim()
+    .replace(/\\/gu, "/")
+    .replace(/^(?:\.\/)+/u, "");
+  if (
+    !normalized ||
+    normalized.startsWith("/") ||
+    /(^|\/)\.\.(?:\/|$)/u.test(normalized)
+  ) {
+    return "";
+  }
+  return normalized;
+}
+
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function isFastValidationAwaitingCorrection(
+  graph: MissionGraphV3,
+  fastNodeId: string,
+): boolean {
+  return Object.values(graph.nodes).some((candidate) => {
+    const recovery = candidate.outputs.validationRecovery;
+    return (
+      recovery !== null &&
+      typeof recovery === "object" &&
+      !Array.isArray(recovery) &&
+      (recovery as Record<string, unknown>).status ===
+        "awaiting_correction" &&
+      (recovery as Record<string, unknown>).fastNodeId === fastNodeId
+    );
+  });
 }
 
 function findContinuationReserveNode(

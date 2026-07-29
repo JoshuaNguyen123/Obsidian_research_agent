@@ -1,15 +1,34 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  DISABLED_HOOKS_PREFIX_V1,
   GitWorktreeManager,
   createNodeValidationProfile,
   type GitCommandExecutor,
   type ManagedGitWorktree,
 } from "../src/orchestrator/gitWorktreeManager";
+
+/**
+ * Every manager that performs a git operation creates one temporary hooks
+ * directory. Undisposed, this suite leaked three of them into the OS temp root
+ * on every `npm test` run — the dominant source of the 1,559 that had
+ * accumulated on the development host.
+ */
+const trackedManagers: GitWorktreeManager[] = [];
+
+function createTrackedManager(executor: GitCommandExecutor): GitWorktreeManager {
+  const manager = new GitWorktreeManager(executor);
+  trackedManagers.push(manager);
+  return manager;
+}
+
+after(async () => {
+  await Promise.all(trackedManagers.map((manager) => manager.dispose()));
+});
 
 const WORKER_SHA = "a".repeat(40);
 const INTEGRATION_SHA = "b".repeat(40);
@@ -23,7 +42,7 @@ test("Git operations disable hooks and integration returns the cherry-pick SHA",
     }
     return { exitCode: 0, stdout: "", stderr: "" };
   };
-  const manager = new GitWorktreeManager(executor);
+  const manager = createTrackedManager(executor);
   const actual = await manager.integrateCommit({
     integration: worktree("C:\\safe\\integration"),
     commitSha: WORKER_SHA,
@@ -76,7 +95,7 @@ test("legacy native validation is retired without running lifecycle scripts", as
       stdout: "",
       stderr: "",
     });
-    const manager = new GitWorktreeManager(executor);
+    const manager = createTrackedManager(executor);
     const validationCommands = [
       { command: "node", args: ["-e", "process.exit(0)"], label: "direct node check" },
     ];
@@ -100,7 +119,7 @@ test("validation profile rejects worker changes to protected controls", async ()
     stdout: args.includes("status") ? " M package.json\n" : "",
     stderr: "",
   });
-  const manager = new GitWorktreeManager(executor);
+  const manager = createTrackedManager(executor);
   const validationCommands = [
     { command: "node", args: ["-e", "process.exit(0)"], label: "direct node check" },
   ];
@@ -120,7 +139,7 @@ test("validation profile rejects worker changes to local GitHub Actions", async 
     stdout: args.includes("status") ? " M .github/actions/setup/action.yml\n" : "",
     stderr: "",
   });
-  const manager = new GitWorktreeManager(executor);
+  const manager = createTrackedManager(executor);
   const validationCommands = [
     { command: "node", args: ["-e", "process.exit(0)"], label: "direct node check" },
   ];
@@ -153,7 +172,7 @@ test("commit refuses files introduced by validation", async () => {
       if (args.includes("add")) addCalled = true;
       return { exitCode: 0, stdout: "", stderr: "" };
     };
-    const manager = new GitWorktreeManager(executor);
+    const manager = createTrackedManager(executor);
     await assert.rejects(
       manager.commitGreenWorktree({
         worktree: worktree(root),
@@ -193,7 +212,7 @@ test("legacy commit path cannot bypass retired native validation", async () => {
       }
       return { exitCode: 0, stdout: "", stderr: "" };
     };
-    const manager = new GitWorktreeManager(executor);
+    const manager = createTrackedManager(executor);
     const validationCommands = [
       { command: "node", args: ["-e", "process.exit(0)"], label: "direct check" },
     ];
@@ -228,4 +247,65 @@ function worktree(path: string): ManagedGitWorktree {
     baseSha: "c".repeat(40),
     baseWasClean: true,
   };
+}
+
+test("dispose removes the temporary hooks directory the manager created", async () => {
+  const hooksPaths: string[] = [];
+  const executor: GitCommandExecutor = async ({ args }) => {
+    const hooks = args.find((arg) => arg.startsWith("core.hooksPath="));
+    if (hooks) hooksPaths.push(hooks.slice("core.hooksPath=".length));
+    if (args.includes("rev-parse")) {
+      return { exitCode: 0, stdout: `${INTEGRATION_SHA}\n`, stderr: "" };
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  const manager = createTrackedManager(executor);
+  await manager.integrateCommit({
+    integration: worktree("C:\safe\integration"),
+    commitSha: WORKER_SHA,
+  });
+
+  const hooksPath = hooksPaths[0]!;
+  assert.ok(hooksPath.startsWith(join(tmpdir(), DISABLED_HOOKS_PREFIX_V1)));
+  assert.equal(await pathExists(hooksPath), true, "the manager created it");
+
+  // Every orchestrator coding mission used to leak one of these permanently.
+  await manager.dispose();
+  assert.equal(await pathExists(hooksPath), false, "dispose must remove it");
+
+  // Idempotent, and safe to call when nothing was ever created.
+  await manager.dispose();
+  await createTrackedManager(executor).dispose();
+});
+
+test("dispose refuses anything outside its own owned temp directory", async () => {
+  const foreign = await mkdtemp(join(tmpdir(), "not-agentic-owned-"));
+  try {
+    const manager = createTrackedManager(async () => ({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    }));
+    // Force the manager to believe it owns a directory it did not create.
+    (manager as unknown as { disabledHooksPathPromise: Promise<string> })
+      .disabledHooksPathPromise = Promise.resolve(foreign);
+    await manager.dispose();
+    assert.equal(
+      await pathExists(foreign),
+      true,
+      "a directory without the owned prefix must survive dispose",
+    );
+  } finally {
+    await rm(foreign, { recursive: true, force: true });
+  }
+});
+
+async function pathExists(target: string): Promise<boolean> {
+  try {
+    await stat(target);
+    return true;
+  } catch {
+    return false;
+  }
 }

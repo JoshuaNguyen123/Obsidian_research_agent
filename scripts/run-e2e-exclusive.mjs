@@ -12,43 +12,44 @@ import { fileURLToPath } from "node:url";
 import { assertMissionScorecardSummaryFile } from "./mission-scorecard-regression.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PLAYWRIGHT_EXECUTION_REPORT_PATH = path.join(
+  repoRoot,
+  "test-results",
+  "playwright-execution-report.json",
+);
 const DEFAULT_WAIT_MS = 30_000;
 const DEFAULT_POLL_MS = 250;
-const DEFAULT_PLAYWRIGHT_PROJECT = "deterministic-core-mock";
+const DEFAULT_PLAYWRIGHT_PROJECT = "desktop-checkers-delivery-real-live";
+// Only lanes that drive the production plugin against a real model, a real
+// external service, or both. Mock-model projects were removed: they proved
+// nothing about a host the product could not actually run on.
 const PLAYWRIGHT_PROJECTS = new Set([
   DEFAULT_PLAYWRIGHT_PROJECT,
-  "daily-use-mock",
-  "daily-use-connections",
-  "daily-use-note",
-  "daily-use-memory-reflex",
+  "retained-journey",
+  "byok-autonomous-journey",
   "daily-use-research",
-  "daily-use-code",
   "daily-use-code-live",
   "desktop-code-delivery-real-live",
-  "daily-use-linear",
-  "daily-use-github",
   "daily-use-compound",
   "obsidian-hello-github-live",
-  "integration-mock",
-  "integration-mock-legacy",
-  "sandbox",
-  "companion-restart",
   "real-ai-contract",
   "real-ai-soak",
   "provider-canary",
   "release-vertical",
   "disposable-live-external",
   "configured-linear-live",
-  "compound-flow-smoke-live",
+  "linear-flow-real-cleanup",
   "compound-flow-real-live",
-  "systems-diagrams",
-  "agentic-capability-wireups",
   "github-askpass-runtime-live",
 ]);
-// Lanes that talk to a real external service with a real credential but make
-// no model calls. They run under --mock-ai and gate on their credential being
-// present before Obsidian boots, so a missing token fails in seconds.
+// Lanes that require an explicit disposable external-service scope. They gate
+// before the lock, build, vault sync, or Obsidian boot, so a missing credential
+// or cleanup boundary fails in seconds.
 const EXTERNAL_CREDENTIAL_PROJECTS = Object.freeze({
+  "byok-autonomous-journey": {
+    requiredEnv: ["LINEAR_LIVE_TEST_TEAM_ID"],
+    platforms: ["win32"],
+  },
   "github-askpass-runtime-live": {
     requiredEnv: ["E2E_GITHUB_TOKEN"],
     platforms: ["win32"],
@@ -67,11 +68,13 @@ const WINDOWS_USER_SANDBOX_ENV_NAMES = Object.freeze([
   "AGENTIC_SANDBOX_CI_RUNTIME_ROOT",
 ]);
 const SANDBOX_E2E_PROJECTS = new Set([
+  "retained-journey",
+  "byok-autonomous-journey",
   "daily-use-code-live",
   "desktop-code-delivery-real-live",
+  "desktop-checkers-delivery-real-live",
   "daily-use-compound",
   "obsidian-hello-github-live",
-  "compound-flow-smoke-live",
   "compound-flow-real-live",
   "release-vertical",
 ]);
@@ -250,6 +253,9 @@ async function main() {
     );
     const exitCode = await runE2ePipeline(playwrightArgs);
     if (exitCode === 0) {
+      // Execution proof first: a scorecard check over a suite that never ran
+      // would just be a second way to report a green lie.
+      await assertSelectedProjectsExecuted(projects);
       await assertMissionScorecardSummaryFile({ selectedProjects: projects });
     }
     process.exitCode = interruptedSignal
@@ -323,14 +329,77 @@ function runPlaywright(playwrightArgs) {
     "test",
     "cli.js",
   );
-  return runCommand(process.execPath, [playwrightCli, "test", ...playwrightArgs]);
+  // CLI reporter selection replaces the config reporter list. Keep both the
+  // JSON execution proof and the scorecard summary reporter explicit here.
+  return runCommand(process.execPath, [
+    playwrightCli,
+    "test",
+    `--reporter=json,./e2e/reporters/dailyUseReporter.ts`,
+    ...playwrightArgs,
+  ], { PLAYWRIGHT_JSON_OUTPUT_NAME: PLAYWRIGHT_EXECUTION_REPORT_PATH });
 }
 
-function runCommand(command, args) {
+/**
+ * Fail a run in which a requested project executed no non-skipped test.
+ *
+ * A lane guard that cannot match makes its spec skip itself, and Playwright
+ * still exits 0 — which is exactly how `test:e2e:journeys` reported success
+ * while silently skipping half the lanes it selected. Reading the JSON report
+ * turns every such guard mistake, in any lane, into a red run.
+ */
+export function assertProjectsExecuted(report, selectedProjects) {
+  const projects = [...new Set(selectedProjects ?? [])].filter(Boolean);
+  if (projects.length === 0) return { checked: 0, executed: {} };
+  const executed = Object.fromEntries(projects.map((project) => [project, 0]));
+  const visit = (suite) => {
+    for (const spec of suite?.specs ?? []) {
+      for (const test of spec.tests ?? []) {
+        const project = String(test.projectName ?? "");
+        if (!(project in executed)) continue;
+        const ran = (test.results ?? []).some(
+          (result) => result?.status && result.status !== "skipped",
+        );
+        if (ran) executed[project] += 1;
+      }
+    }
+    for (const child of suite?.suites ?? []) visit(child);
+  };
+  for (const suite of report?.suites ?? []) visit(suite);
+
+  const empty = projects.filter((project) => executed[project] === 0);
+  if (empty.length > 0) {
+    throw new Error(
+      `Playwright exited 0 but these selected projects executed no test: ${empty.join(", ")}. ` +
+        "A skipped lane is not a pass — check the spec's E2E_PLAYWRIGHT_LANE guard.",
+    );
+  }
+  return { checked: projects.length, executed };
+}
+
+async function assertSelectedProjectsExecuted(projects) {
+  let raw;
+  try {
+    raw = await readFile(PLAYWRIGHT_EXECUTION_REPORT_PATH, "utf8");
+  } catch (error) {
+    throw new Error(
+      `Playwright exited 0 but wrote no execution report at ${PLAYWRIGHT_EXECUTION_REPORT_PATH}: ${
+        error?.message ?? error
+      }`,
+    );
+  }
+  const summary = assertProjectsExecuted(JSON.parse(raw), projects);
+  console.log(
+    `E2E execution proof: ${Object.entries(summary.executed)
+      .map(([project, count]) => `${project}=${count}`)
+      .join(" ")}`,
+  );
+}
+
+function runCommand(command, args, envOverrides) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: repoRoot,
-      env: process.env,
+      env: envOverrides ? { ...process.env, ...envOverrides } : process.env,
       stdio: "inherit",
       windowsHide: true,
     });
@@ -526,10 +595,9 @@ export function normalizeExclusiveArgs(rawArgs) {
       );
     }
   }
-  // Tier A journey lanes (real LLM via startRealAiHarness). Tier B policy /
-  // boundary / fingerprint projects stay on --mock-ai (deterministic-matrix,
-  // connections, memory-reflex, code/linear/github mock packs, compound-smoke,
-  // configured-linear, companion-restart, integration-mock*).
+  // Journey lanes that call a real model through startRealAiHarness. The
+  // remaining lanes make no model calls at all and instead drive production
+  // tools against real external services with real credentials.
   const realAiProjects = new Set([
     "real-ai-contract",
     "real-ai-soak",
@@ -538,6 +606,9 @@ export function normalizeExclusiveArgs(rawArgs) {
     "daily-use-research",
     "daily-use-code-live",
     "desktop-code-delivery-real-live",
+    "desktop-checkers-delivery-real-live",
+    "retained-journey",
+    "byok-autonomous-journey",
     "daily-use-compound",
     "obsidian-hello-github-live",
     "compound-flow-real-live",
@@ -545,12 +616,9 @@ export function normalizeExclusiveArgs(rawArgs) {
   if (aiMode === "real" && projects.some((project) => !realAiProjects.has(project))) {
     throw new Error("--real-ai is restricted to attested live-provider Playwright projects.");
   }
-  if (
-    aiMode === "mock" &&
-    projects.some((project) => realAiProjects.has(project))
-  ) {
+  if (aiMode === "mock") {
     throw new Error(
-      "--mock-ai cannot target Tier A journey projects (use --real-ai + startRealAiHarness). Keep mock for policy/boundary projects only.",
+      "--mock-ai was removed. Every Playwright lane now calls a real model, a real external service, or both.",
     );
   }
   if (
@@ -646,7 +714,7 @@ export function assertExternalCredentialProjectPreconditions(
     for (const name of requirements.requiredEnv) {
       if (!env[name]?.trim()) {
         throw new Error(
-          `${project} requires ${name} to be set (a disposable-scope credential) before the run starts.`,
+          `${project} requires ${name} to be set (an explicit disposable scope) before the run starts.`,
         );
       }
     }

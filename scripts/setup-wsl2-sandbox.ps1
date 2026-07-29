@@ -67,7 +67,16 @@ if ($LASTEXITCODE -ne 0 -or $runtimeDigest -notmatch '^sha256:[a-f0-9]{64}$') {
 }
 Invoke-Wsl @("--distribution", $TargetDistribution, "--user", "root", "--exec", "bash", $runtimeSetupLinux, "identity", $RuntimeRoot, $runtimeDigest)
 
+# The AGENTIC_SANDBOX_* names are what the production plugin reads to adopt an
+# already-provisioned binding at load. The AGENTIC_SANDBOX_CI_* names carry the
+# same non-secret identity for the e2e lanes.
 $environmentValues = [ordered]@{
+  AGENTIC_SANDBOX_PROVIDER = "wsl2"
+  AGENTIC_SANDBOX_EXECUTABLE = "wsl.exe"
+  AGENTIC_SANDBOX_RUNTIME_REFERENCE = "agentic-language-runtime"
+  AGENTIC_SANDBOX_RUNTIME_DIGEST = $runtimeDigest
+  AGENTIC_SANDBOX_WSL_DISTRIBUTION = $TargetDistribution
+  AGENTIC_SANDBOX_RUNTIME_ROOT = $RuntimeRoot
   AGENTIC_SANDBOX_CI_EXECUTABLE = "wsl.exe"
   AGENTIC_SANDBOX_CI_RUNTIME_REFERENCE = "agentic-language-runtime"
   AGENTIC_SANDBOX_CI_RUNTIME_DIGEST = $runtimeDigest

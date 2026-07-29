@@ -15,6 +15,10 @@ import type {
   ModelToolCall,
   ModelToolDefinition,
 } from "../model/types";
+import {
+  createObservableModelClient,
+  type ModelCallEvidenceV1,
+} from "../model/modelCallEvidence";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 import type {
   ToolExecutionContext,
@@ -87,6 +91,7 @@ export interface ResearchWorkerResult {
 }
 
 export interface ResearchWorkerEvents {
+  onModelCallEvidence?: (event: ModelCallEvidenceV1) => void;
   onStatus?: (status: string) => void | Promise<void>;
   onToolStart?: (event: {
     id: string;
@@ -129,6 +134,21 @@ export async function runResearchWorker(input: {
     1,
     RESEARCH_WORKER_MAX_TOOL_CALLS,
   );
+  const modelCallCap = Math.max(4, maxSteps * 3 + 8);
+  const contextTokens = Math.max(
+    4_096,
+    input.toolContext.settings?.numCtx ?? 48_000,
+  );
+  const observedModel = createObservableModelClient({
+    client: input.modelClient,
+    budget: {
+      schemaVersion: 1,
+      maxCalls: modelCallCap,
+      maxTokens: Math.max(32_768, modelCallCap * contextTokens),
+      maxWallClockMs: 60 * 60_000,
+    },
+    onEvidence: input.events?.onModelCallEvidence,
+  });
   const registry = createReadOnlyWorkerRegistry(input.toolRegistry);
   const researchEffortTier = input.researchEffortTier ??
     classifyResearchWorkerEffort(input.originalMission, input.assignment);
@@ -199,7 +219,7 @@ export async function runResearchWorker(input: {
     };
     // Prefer streamChat when streaming is enabled so graded think travels with
     // tools on the same Ollama-compatible turn (think + tools together).
-    const response = await chatResearcherTurn(input.modelClient, request, {
+    const response = await chatResearcherTurn(observedModel.client, request, {
       enableStreaming: input.toolContext.settings?.enableStreaming !== false,
     });
     messages.push(response.message);

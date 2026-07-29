@@ -89,17 +89,22 @@ test("protected summary accepts only records owned by the selected lane", () => 
 });
 
 test("protected proof reruns replace only the selected lane artifacts", () => {
-  const deterministicNames: string[] = proofArtifactNamesForLane("deterministic");
+  const desktopNames: string[] = proofArtifactNamesForLane("desktop");
   const compoundNames: string[] = proofArtifactNamesForLane("compound");
-  assert.ok(deterministicNames.every((name) => name.startsWith("deterministic")));
+  assert.ok(desktopNames.every((name) => name.startsWith("desktop")));
   assert.ok(compoundNames.every((name) => name.startsWith("compound")));
   assert.equal(
     compoundNames.includes("compound--daily-use-du06-retained-linear-evidence.json"),
     true,
   );
   assert.deepEqual(
-    deterministicNames.filter((name) => compoundNames.includes(name)),
+    desktopNames.filter((name) => compoundNames.includes(name)),
     [],
+  );
+  assert.throws(
+    () => proofArtifactNamesForLane("deterministic"),
+    /Unknown protected proof lane/u,
+    "the removed mock lane must not be reachable",
   );
 });
 

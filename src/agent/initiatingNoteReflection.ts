@@ -51,7 +51,9 @@ export type InitiatingNoteChatOnlyReasonV1 =
   | "working_mode_chat_only"
   | "explicit_chat_only"
   | "prompt_chat_only"
+  | "reflection_not_requested"
   | "persistence_chat_only_not_persisted"
+  | "completion_incomplete"
   | "no_initiating_note";
 
 export type InitiatingNoteReflectionDestinationV1 =
@@ -154,6 +156,9 @@ export function resolveInitiatingNoteReflectionSuppression(
   }
   const persistence =
     input.persistence ?? input.context?.persistence ?? undefined;
+  if (persistence === "not_requested") {
+    return { suppress: true, reason: "reflection_not_requested" };
+  }
   if (persistence === "chat_only_not_persisted") {
     return { suppress: true, reason: "persistence_chat_only_not_persisted" };
   }
@@ -347,46 +352,119 @@ function formatReflectionMarkdown(input: {
     "## Mission completion reflection",
     marker,
     "",
-    `Compound run \`${escapeInline(cites.runId)}\` closed with host-verified pipeline evidence.`,
-    "",
   ];
+  lines.push(formatReflectionJourneySentence(cites));
+  lines.push(formatReflectionValidationSentence(cites));
+  const publication = formatReflectionPublicationSentence(cites);
+  if (publication) lines.push(publication);
+  lines.push(formatReflectionClosureSentence(cites));
+  return lines.join("\n");
+}
 
-  const bullets: string[] = [];
-  const linearLine = formatLinearCite(cites);
-  if (linearLine) bullets.push(`- ${linearLine}`);
-  bullets.push(`- ${formatValidationCite(cites)}`);
-  if (cites.commitSha) {
-    bullets.push(`- Commit: \`${escapeInline(cites.commitSha)}\``);
+function formatReflectionJourneySentence(
+  cites: InitiatingNoteReflectionCitesV1,
+): string {
+  const issueId = cites.linearIssueIds[0]?.trim();
+  const issueUrl = cites.linearIssueUrls[0]?.trim();
+  const implementationPresent = Boolean(
+    cites.commitSha || cites.pullRequestUrl || cites.repositoryUrl,
+  );
+  if (issueUrl) {
+    const label = issueId
+      ? `Linear issue ${escapeInline(issueId)}`
+      : "the Linear issue";
+    return implementationPresent
+      ? `The research became [${label}](${issueUrl}) and a code change.`
+      : `The research is recorded in [${label}](${issueUrl}); implementation is still in progress.`;
   }
+  if (issueId) {
+    return implementationPresent
+      ? `The research became Linear issue \`${escapeInline(issueId)}\` and a code change.`
+      : `The research is recorded in Linear issue \`${escapeInline(issueId)}\`; implementation is still in progress.`;
+  }
+  return implementationPresent
+    ? "The research was carried through to an implementation."
+    : "The research is complete; implementation is still in progress.";
+}
+
+function formatReflectionValidationSentence(
+  cites: InitiatingNoteReflectionCitesV1,
+): string {
+  const { targetedPassed, fullPassed, state } = cites.validation;
+  if (targetedPassed && fullPassed) {
+    return "Targeted and full validation passed.";
+  }
+  if (targetedPassed) {
+    return "Targeted validation passed; full validation is still open.";
+  }
+  if (fullPassed) {
+    return "Full validation passed; the targeted check is still open.";
+  }
+  if (state === "not_requested" || state === "chat_only_not_persisted") {
+    return "No code validation was requested for this work.";
+  }
+  return "The code change is not yet fully validated.";
+}
+
+function formatReflectionPublicationSentence(
+  cites: InitiatingNoteReflectionCitesV1,
+): string | null {
+  const commit = cites.commitSha
+    ? ` at commit \`${escapeInline(shortSha(cites.commitSha))}\``
+    : "";
+  const repository = cites.repositoryUrl
+    ? `[the repository](${cites.repositoryUrl})`
+    : "the repository";
+  const subject =
+    cites.validation.targetedPassed && cites.validation.fullPassed
+      ? "The tested change"
+      : "The current change";
   if (cites.pullRequestUrl && cites.pullRequestNumber != null) {
-    bullets.push(
-      `- Draft PR: [#${cites.pullRequestNumber}](${cites.pullRequestUrl})${
-        cites.commitSha ? ` @ \`${escapeInline(shortSha(cites.commitSha))}\`` : ""
-      }`,
-    );
-  } else if (cites.pullRequestNumber != null) {
-    bullets.push(`- Draft PR: #${cites.pullRequestNumber}`);
+    return `${subject} is available in ${repository} as [draft PR #${cites.pullRequestNumber}](${cites.pullRequestUrl})${commit}.`;
+  }
+  if (cites.pullRequestNumber != null) {
+    return `${subject} is available in ${repository} as draft PR #${cites.pullRequestNumber}${commit}.`;
   }
   if (cites.repositoryUrl) {
-    bullets.push(`- Repository: ${cites.repositoryUrl}`);
+    return `${subject} is available in ${repository}${commit}.`;
   }
-  if (cites.branch) {
-    bullets.push(`- Branch: \`${escapeInline(cites.branch)}\``);
+  if (cites.commitSha) {
+    return `${subject} was recorded at commit \`${escapeInline(shortSha(cites.commitSha))}\`.`;
   }
-  if (cites.gaps.length > 0) {
-    bullets.push(
-      `- Remaining gaps: ${cites.gaps.map((gap) => escapeInline(gap)).join(", ")}`,
-    );
-  } else if (cites.pipelineVerified) {
-    bullets.push("- Pipeline verification: complete");
-  }
+  return null;
+}
 
-  lines.push(...bullets);
-  lines.push("");
-  lines.push(
-    "Full tool receipts and fingerprints remain in Run Details; this note cites durable identifiers only.",
-  );
-  return lines.join("\n");
+function formatReflectionClosureSentence(
+  cites: InitiatingNoteReflectionCitesV1,
+): string {
+  if (cites.gaps.length > 0) {
+    const visible = cites.gaps.slice(0, 3).map(humanizeReflectionGap);
+    const remainder = cites.gaps.length - visible.length;
+    const joined =
+      visible.length <= 1
+        ? visible[0] ?? "follow-up work"
+        : `${visible.slice(0, -1).join(", ")}, and ${visible[visible.length - 1]}`;
+    return `Still open: ${joined}${remainder > 0 ? `, plus ${remainder} other follow-up item${remainder === 1 ? "" : "s"}` : ""}.`;
+  }
+  return cites.pipelineVerified
+    ? "The evidence chain is complete, with no remaining follow-up."
+    : "The available evidence is linked above; any unfinished work remains open.";
+}
+
+function humanizeReflectionGap(gap: string): string {
+  const normalized = gap.trim().toLowerCase();
+  const known: Record<string, string> = {
+    linear_work_item_readback: "Linear issue verification",
+    workspace_validation_and_commit: "workspace validation and commit",
+    draft_pull_request_readback: "draft pull request verification",
+    reflection_artifact_proof: "reflection verification",
+  };
+  const fallback = normalized
+    .replace(/^tool:/u, "")
+    .replace(/[_:]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return (known[normalized] ?? fallback) || "follow-up work";
 }
 
 function formatChatSummary(cites: InitiatingNoteReflectionCitesV1): string {

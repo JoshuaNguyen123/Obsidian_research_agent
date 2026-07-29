@@ -135,7 +135,7 @@ export function createCodeRepairToolContributionsV1(
       tool: {
         name: CODE_REPAIR_RECORD_CYCLE_TOOL,
         description:
-          "Purpose: Open the next repair cycle after red validation. Use when: validate_fast failed. Do not use when: re-validating or writing before the cycle opens. Required: request/workspace ids. Next: hash-bound write then re-validate. Side effects: bound. " +
+          "Purpose: Persist the exact fast-validation checkpoint and open a repair cycle only when it is red. Use when: immediately after every code_validate_fast result, including green. Do not use when: no durable fast-validation receipt exists or before the workspace is bound. Required: request/workspace ids; the host resolves the exact receipt. Next: on passed continue to targeted validation; on repaired perform a hash-bound correction then re-validate. Side effects: bound. " +
           "Persist one fingerprint-bound code repair cycle and return a code_repair_cycle domain receipt.",
         parameters: {
           ...scopeSchema(),

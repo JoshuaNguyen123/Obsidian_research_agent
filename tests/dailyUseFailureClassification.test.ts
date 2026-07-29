@@ -18,6 +18,32 @@ describe("daily-use Playwright failure classification", () => {
         category: "product_assertion",
       },
     );
+    assert.deepEqual(
+      classifyDailyUseFailure({
+        title: "BYOK-01 autonomous lifecycle",
+        file: "e2e/byok-autonomous-journey.spec.ts",
+        project: "byok-autonomous-journey",
+        errorMessages: [],
+      }),
+      {
+        scenarioId: "BYOK-01",
+        taskFamily: "compound",
+        category: "product_assertion",
+      },
+    );
+    assert.deepEqual(
+      classifyDailyUseFailure({
+        title: "DESKTOP-01 bare-prompt scratch delivery",
+        file: "e2e/desktop-checkers-delivery-real-live.spec.ts",
+        project: "desktop-checkers-delivery-real-live",
+        errorMessages: [],
+      }),
+      {
+        scenarioId: "DESKTOP-01",
+        taskFamily: "code",
+        category: "product_assertion",
+      },
+    );
   });
 
   it("separates setup, provider competence, lifecycle, mapping, and cleanup failures", () => {
@@ -37,6 +63,69 @@ describe("daily-use Playwright failure classification", () => {
           errorMessages: [message],
         }).category,
         category,
+      );
+    }
+  });
+
+  it("keeps structured path-scope and harness assertion failures in product triage", () => {
+    const structuredPathScopeDiagnostic = JSON.stringify({
+      stopReason: "no_progress",
+      modelCallEvidence: {
+        providerUsage: {
+          successfulCallCount: 101,
+          failedCallCount: 0,
+        },
+      },
+      lastFailure: {
+        code: "repository_path_out_of_scope",
+        path: "pyproject.toml",
+      },
+    });
+    assert.equal(
+      classifyDailyUseFailure({
+        title: "BYOK-01 autonomous lifecycle",
+        file: "e2e/byok-autonomous-journey.spec.ts",
+        project: "byok-autonomous-journey",
+        errorMessages: [structuredPathScopeDiagnostic],
+      }).category,
+      "product_assertion",
+    );
+
+    const harnessAssertionDiagnostic = JSON.stringify({
+      code: "harness_assertion_failed",
+      modelCallEvidence: {
+        providerUsage: {
+          failedCallCount: 1,
+        },
+      },
+    });
+    assert.equal(
+      classifyDailyUseFailure({
+        title: "BYOK-01 independent verifier",
+        file: "e2e/byok-autonomous-journey.spec.ts",
+        project: "byok-autonomous-journey",
+        errorMessages: [harnessAssertionDiagnostic],
+      }).category,
+      "product_assertion",
+    );
+  });
+
+  it("still recognizes actual provider request and call failures", () => {
+    for (const message of [
+      "Provider request failed before a usable response.",
+      JSON.stringify({
+        code: "model_call_failed",
+        providerUsage: { failedCallCount: 1 },
+      }),
+    ]) {
+      assert.equal(
+        classifyDailyUseFailure({
+          title: "BYOK-01 autonomous lifecycle",
+          file: "e2e/byok-autonomous-journey.spec.ts",
+          project: "byok-autonomous-journey",
+          errorMessages: [message],
+        }).category,
+        "provider_competence",
       );
     }
   });

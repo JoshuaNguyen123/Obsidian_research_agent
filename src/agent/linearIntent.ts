@@ -14,8 +14,10 @@ export interface LinearIntentDetection {
 const LINEAR_URL_PATTERN =
   /https:\/\/linear\.app\/[a-z0-9][a-z0-9/_-]*(?:\?[a-z0-9%&=._-]*)?/i;
 const ISSUE_IDENTIFIER_PATTERN = /\b([A-Z][A-Z0-9]{1,15}-[1-9][0-9]*)\b/;
+const ISSUE_UUID_PATTERN =
+  /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i;
 const LINEAR_RESOURCE_PATTERN =
-  /\blinear\s+(?:issue|issues|ticket|tickets|project|projects|initiative|initiatives|cycle|cycles|comment|comments|document|documents|milestone|milestones|customer|customers|queue|workspace)\b/i;
+  /\blinear\s+(?:(?:implementation|engineering|product|research)\s+)?(?:issue|issues|ticket|tickets|project|projects|initiative|initiatives|cycle|cycles|comment|comments|document|documents|milestone|milestones|customer|customers|queue|workspace)\b/i;
 const LINEAR_ACTION_PATTERN =
   /\b(?:create|write|publish|open|read|get|find|search|list|update|edit|archive|unarchive|trash|delete|comment|link|unlink|execute|claim|complete|move)\b[\s\S]{0,100}\b(?:in|on|from|to)\s+linear\b/i;
 const ISSUE_ACTION_PATTERN =
@@ -68,6 +70,43 @@ export function detectLinearIntent(prompt: string): LinearIntentDetection {
   }
 
   return { explicit: false, reason: "none" };
+}
+
+/**
+ * Extract the one provider identity the user explicitly authorized for an
+ * existing-issue read. This is intentionally narrower than generic Linear
+ * intent: a UUID or human identifier must be attached to "Linear issue", and
+ * the surrounding clause must request a read/review/open/implementation handoff.
+ */
+export function extractExplicitLinearIssueReadIdentity(
+  prompt: string,
+): string | null {
+  const normalized = prompt.replace(/\r\n?/g, "\n");
+  if (!detectLinearIntent(normalized).explicit) return null;
+
+  const resourcePattern =
+    /\blinear\s+issue(?:\s+(?:id|identity))?\s*(?:[:#]\s*)?([A-Z][A-Z0-9]{1,15}-[1-9][0-9]*|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/giu;
+  for (const match of normalized.matchAll(resourcePattern)) {
+    const identity = match[1];
+    if (!identity || match.index === undefined) continue;
+    const prefix = normalized.slice(Math.max(0, match.index - 140), match.index);
+    if (
+      /\b(?:do\s+not|don't|never|without)\b[\s\S]{0,100}$/iu.test(prefix)
+    ) {
+      continue;
+    }
+    if (
+      /\b(?:review|read|get|open|inspect|implement|execute|work\s+(?:from|on))\b[\s\S]{0,120}$/iu.test(
+        prefix,
+      ) ||
+      /\blinear_get_issue\b/iu.test(normalized)
+    ) {
+      return ISSUE_UUID_PATTERN.test(identity)
+        ? identity.toLowerCase()
+        : identity.toUpperCase();
+    }
+  }
+  return null;
 }
 
 /** Permanent deletion is never inferred from ordinary delete/trash wording. */

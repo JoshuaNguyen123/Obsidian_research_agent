@@ -108,6 +108,8 @@ export interface MissionRuntimeReceipt {
   /** Canonical action receipts use version 1; absent for migrated legacy receipts. */
   version?: 1;
   id: string;
+  /** Owning run segment; optional only for backward-compatible legacy snapshots. */
+  runId?: string;
   toolName: string;
   operation: string;
   message: string;
@@ -3002,6 +3004,7 @@ function normalizeRuntimeReceipt(
   const effects = isRecord(value.effects) ? value.effects : null;
   const readback = normalizeActionReadback(value.readback);
   const actionId = getNonEmptyString(value.actionId);
+  const runId = getNonEmptyString(value.runId);
   const payloadFingerprint = getNonEmptyString(value.payloadFingerprint);
   const grantId = getNonEmptyString(value.grantId);
   const canonical =
@@ -3011,6 +3014,7 @@ function normalizeRuntimeReceipt(
   return {
     ...(canonical ? { version: 1 as const } : {}),
     id: getNonEmptyString(value.id) ?? `receipt-${index + 1}`,
+    ...(runId ? { runId } : {}),
     toolName,
     operation,
     message:

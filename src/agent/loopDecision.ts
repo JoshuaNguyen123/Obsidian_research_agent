@@ -62,17 +62,20 @@ export function decideNextLoopAction(
     return { action: "verify_active_task", reason: "mission_plan_needs_verification" };
   }
 
+  if (ledger.requiredToolsSatisfied) {
+    // Every required proof already exists, so repetition is wandering, not
+    // missing progress: steer to the final answer instead of dying on the
+    // repeat counter with a complete graph and an unwritten synthesis.
+    return {
+      action: "force_final_no_tools",
+      reason: "required_tools_satisfied",
+    };
+  }
+
   if (ledger.repeatedToolCalls > 1) {
     return {
       action: "stop_budget",
       reason: "repeated_tool_call_without_progress",
-    };
-  }
-
-  if (ledger.requiredToolsSatisfied) {
-    return {
-      action: "force_final_no_tools",
-      reason: "required_tools_satisfied",
     };
   }
 

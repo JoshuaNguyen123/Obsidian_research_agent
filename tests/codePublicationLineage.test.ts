@@ -11,6 +11,7 @@ import {
   createWorkItemLineageV1,
   latestCodePublicationLineageStateV1,
   resolveQueueCodePublicationOriginV1,
+  resolveVerifiedLinearBoundCodePublicationOriginV1,
   resolveVerifiedCodePublicationOriginV1,
   type CodePublicationLineageTransitionV1,
   type ResearchPublicationCheckpointNamespaceV1,
@@ -219,6 +220,51 @@ test("foreground publication retains the explicit origin-run compatibility fallb
     allowOriginRunFallback: true,
   });
   assert.equal(resolved.publicationId, checkpoint.publicationId);
+});
+
+test("isolated Phase B publication resolves only the exact host-verified Phase A Linear binding", () => {
+  const checkpoint = codeCheckpoint();
+  const binding = {
+    version: 1 as const,
+    repositoryProfileKey: "repo-main",
+    issueId: "issue-42",
+    issueIdentifier: "ENG-42",
+    publicationId: checkpoint.publicationId,
+    workItemFingerprint: WORK_ITEM_HASH,
+    acceptedResearchArtifactFingerprint:
+      checkpoint.artifact.artifactFingerprint,
+    originRunId: "origin-run-42",
+  };
+  const resolved = resolveVerifiedLinearBoundCodePublicationOriginV1(
+    [checkpoint],
+    binding,
+    "repo-main",
+  );
+  assert.equal(resolved.publicationId, checkpoint.publicationId);
+  assert.equal(latestCodePublicationLineageStateV1(resolved), "linear_verified");
+
+  const driftedBindings = [
+    { ...binding, publicationId: "publication-other" },
+    { ...binding, issueId: "issue-other" },
+    { ...binding, issueIdentifier: "ENG-99" },
+    { ...binding, workItemFingerprint: hash("4") },
+    { ...binding, acceptedResearchArtifactFingerprint: hash("5") },
+    { ...binding, originRunId: "origin-run-other" },
+    { ...binding, repositoryProfileKey: "repo-other" },
+  ];
+  for (const drifted of driftedBindings) {
+    assert.throws(
+      () =>
+        resolveVerifiedLinearBoundCodePublicationOriginV1(
+          [checkpoint],
+          drifted,
+          "repo-main",
+        ),
+      (error: unknown) =>
+        error instanceof CodePublicationLineageErrorV1 &&
+        error.code === "verified_linear_code_origin_unavailable",
+    );
+  }
 });
 
 class MemoryPersistence implements ResearchPublicationCheckpointPersistenceV1 {

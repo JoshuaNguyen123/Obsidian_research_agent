@@ -16,7 +16,10 @@ import type {
   ToolPrincipal,
 } from "./actions";
 import type { AuthorityGrantV1 } from "./authority";
-import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
+import {
+  hasCodeDeliverableIntent,
+  hasExplicitCodeExecutionProhibition,
+} from "./codeDeliverableIntent";
 
 export type PolicyAction = "allow" | "require_approval" | "block";
 
@@ -435,6 +438,7 @@ export function resolvePolicyRoutedIntent({
     mode === "authority" &&
     resolved.source === "model" &&
     allowRoutedCodeExecution &&
+    !hasExplicitCodeExecutionProhibition(prompt ?? "") &&
     modelIntent?.mode === "code_workflow" &&
     modelIntent.needsCodeExecution === true
   ) {

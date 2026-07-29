@@ -13,6 +13,10 @@ import {
 } from "./nativeObsidianHarness";
 import { clearChatInline } from "./chatCleanup";
 import {
+  HOST_PROVISIONED_SANDBOX_READINESS_TIMEOUT_MS_V1,
+  readHostProvisionedSandboxBindingV1,
+} from "../../extensions/code/sandbox/HostProvisionedSandboxBindingV1";
+import {
   assertRealAiLaneNonMock,
   RealAiConnectionAttestationRegistry,
   verifyWithWorkerConnectionAttestation,
@@ -22,6 +26,8 @@ export { clearChatInline } from "./chatCleanup";
 
 export interface RealAiHarness extends NativeObsidianHarness {
   config: E2EAiConfig;
+  /** Relaunch the same owned Obsidian process boundary without reseeding state. */
+  relaunch(): Promise<Page>;
   submitMission(
     prompt: string,
     options?: {
@@ -54,7 +60,15 @@ export interface RealAiHarness extends NativeObsidianHarness {
    * Fails if chat-approval-approve appears (set-loose Bound should auto-run).
    */
   waitUntilIdleOrComplete(timeoutMs?: number): Promise<void>;
-  readProgressCounters(): { approvals: number; continuations: number };
+  readProgressCounters(): {
+    approvals: number;
+    continuations: number;
+    modelCalls: number;
+    modelCallScopes: Array<{
+      usageScopeId: string;
+      modelCalls: number;
+    }>;
+  };
   activePreparedApproval(toolName: string): Locator;
   approve(approval: Locator): Promise<void>;
   deny(approval: Locator): Promise<void>;
@@ -73,6 +87,7 @@ export interface CompoundMissionApprovalOptions {
   onProgress?: (counters: {
     approvals: number;
     continuations: number;
+    modelCalls: number;
   }) => void;
   /** Restart the production plugin immediately after selected durable stage commits. */
   restartAfterProjectStages?: readonly ProjectLifecycleStageName[];
@@ -84,6 +99,8 @@ export interface RealAiHarnessNativeOptions {
   preserveConfiguredLinearCredential?: boolean;
   /** Reuse only the vault's opaque native GitHub reference; never copy a token. */
   preserveConfiguredGitHubCredential?: boolean;
+  /** Vault-relative paths the lane deliberately keeps after harness close. */
+  retainVaultPaths?: readonly string[];
 }
 
 export interface OwnedWebMetricsV1 {
@@ -119,6 +136,86 @@ function hasIdlePrimaryStatus(statusText: string): boolean {
  */
 const VERIFIED_REAL_AI_CONNECTIONS =
   new RealAiConnectionAttestationRegistry();
+
+const CODE_CAPABILITY_ID_V1 = "agentic-researcher-code";
+
+/**
+ * The runtime digest a repository profile must pin, read from the same
+ * host-provisioned source the production plugin adopts. Lanes no longer build
+ * their own provider configuration, so this is the only place the value enters
+ * a test.
+ */
+export function hostProvisionedSandboxRuntimeDigestV1(): string {
+  const binding = readHostProvisionedSandboxBindingV1(
+    process.env,
+    process.platform,
+  );
+  if (!binding) {
+    throw new Error(
+      "No host-provisioned sandbox binding is available. Run npm run setup:sandbox:wsl2 (or the platform equivalent) before a live code lane.",
+    );
+  }
+  return binding.provider.runtimeDigest;
+}
+
+/**
+ * Assert the sandbox the PRODUCTION plugin reached by itself.
+ *
+ * Live lanes used to call `configureSandboxProvider` with a test-built config,
+ * which made every one of them green on a host whose plugin held zero
+ * providers — the exact state that stopped a real "write me a Python game on
+ * my desktop" mission at code_validate_fast. Nothing here supplies provider
+ * configuration: the plugin must adopt the host-provisioned binding and pass
+ * its own boundary probe, so a regression in that path fails the lane.
+ */
+export async function assertProductionAdoptedSandboxV1(
+  page: Page,
+  notBeforeMs: number,
+): Promise<{
+  selectedProvider: string;
+  providerConfigCount: number;
+  observedAt: string;
+}> {
+  const observed = await page.evaluate(async (codePluginId) => {
+    const app = (window as typeof window & { app?: any }).app;
+    const code = app?.plugins?.plugins?.["agentic-researcher"]
+      ?.getBundledCapability?.(codePluginId);
+    if (typeof code?.ensureHostProvisionedSandboxReadinessV1 !== "function") {
+      throw new Error(
+        "The production Code capability exposes no host-provisioned sandbox readiness path.",
+      );
+    }
+    const status = await code.ensureHostProvisionedSandboxReadinessV1();
+    const state = code.readState?.() ?? null;
+    return {
+      status,
+      providerConfigCount: Array.isArray(state?.sandbox?.providerConfigs)
+        ? state.sandbox.providerConfigs.length
+        : 0,
+      observedAt: state?.sandbox?.lastProbe?.observedAt ?? null,
+    };
+  }, CODE_CAPABILITY_ID_V1);
+
+  expect(
+    observed.providerConfigCount,
+    "the plugin must adopt the host-provisioned sandbox binding without test injection",
+  ).toBeGreaterThan(0);
+  expect(observed.status).toMatchObject({
+    editingAvailable: true,
+    executionAvailable: true,
+  });
+  expect(typeof observed.status.selectedProvider).toBe("string");
+  const observedAtMs = Date.parse(String(observed.observedAt ?? ""));
+  expect(
+    Number.isFinite(observedAtMs) && observedAtMs >= notBeforeMs,
+    "the boundary probe must be proven fresh in this session, not replayed from durable history",
+  ).toBe(true);
+  return {
+    selectedProvider: String(observed.status.selectedProvider),
+    providerConfigCount: observed.providerConfigCount,
+    observedAt: String(observed.observedAt),
+  };
+}
 
 export async function startRealAiHarness(
   label: string,
@@ -180,11 +277,20 @@ export async function startRealAiHarness(
       nativeOptions.preserveConfiguredLinearCredential === true,
     preserveConfiguredGitHubCredential:
       nativeOptions.preserveConfiguredGitHubCredential === true,
+    ...(nativeOptions.retainVaultPaths
+      ? { retainVaultPaths: nativeOptions.retainVaultPaths }
+      : {}),
     setup: installRealAiPageHarness,
     beforeClose: async ({ page }) => restoreOwnedWebBackend(page),
   });
   let recordedApprovals = 0;
   let recordedContinuations = 0;
+  const recordedModelCallsByUsageScopeId = new Map<string, number>();
+  const totalRecordedModelCalls = () =>
+    [...recordedModelCallsByUsageScopeId.values()].reduce(
+      (total, count) => total + count,
+      0,
+    );
   try {
     await expect(native.page.locator(".agentic-researcher-view")).toHaveCount(1, {
       timeout: 30_000,
@@ -197,7 +303,28 @@ export async function startRealAiHarness(
 
   return {
     ...native,
+    get page() {
+      return native.page;
+    },
     config,
+    relaunch: async () =>
+      native.relaunchOwnedProcess(async ({ page }) => {
+        await page.evaluate(async (pluginId) => {
+          const app = (window as typeof window & { app?: any }).app;
+          const plugin = app?.plugins?.plugins?.[pluginId];
+          if (plugin?.agenticResearcherApi?.state !== "ready") {
+            throw new Error(
+              "Agentic Researcher core was not ready after owned-process relaunch.",
+            );
+          }
+          app.setting?.close?.();
+          await plugin.activateView?.();
+        }, NATIVE_CORE_PLUGIN_ID);
+        await expect(page.locator(".agentic-researcher-view")).toHaveCount(1, {
+          timeout: 30_000,
+        });
+        await assertProductionClientReady(page, config, provider);
+      }),
     submitMission: (prompt, options = {}) => submitMission(native.page, prompt, {
       timeoutMs: options.timeoutMs ?? config.missionTimeoutMs,
       waitForCompletion: options.waitForCompletion,
@@ -232,7 +359,20 @@ export async function startRealAiHarness(
               callContinuations,
               counters.continuations,
             );
-            options.onProgress?.(counters);
+            options.onProgress?.({
+              approvals: recordedApprovals + callApprovals,
+              continuations: recordedContinuations + callContinuations,
+              modelCalls: totalRecordedModelCalls(),
+            });
+          },
+          onUsageScopeModelCalls: (usageScopeId, modelCalls) => {
+            recordedModelCallsByUsageScopeId.set(
+              usageScopeId,
+              Math.max(
+                recordedModelCallsByUsageScopeId.get(usageScopeId) ?? 0,
+                modelCalls,
+              ),
+            );
           },
           restartCorePlugin: (stage) =>
             restartCorePlugin(native.page, config, provider, stage).then(async () => {
@@ -249,6 +389,15 @@ export async function startRealAiHarness(
     readProgressCounters: () => ({
       approvals: recordedApprovals,
       continuations: recordedContinuations,
+      modelCalls: totalRecordedModelCalls(),
+      modelCallScopes: [...recordedModelCallsByUsageScopeId]
+        .map(([usageScopeId, modelCalls]) => ({
+          usageScopeId,
+          modelCalls,
+        }))
+        .sort((left, right) =>
+          left.usageScopeId.localeCompare(right.usageScopeId),
+        ),
     }),
     activePreparedApproval: (toolName) => activePreparedApproval(native.page, toolName),
     approve: (approval) => resolveApproval(approval, "approve"),
@@ -774,16 +923,82 @@ async function safePageWait(
   }
 }
 
+/**
+ * page.evaluate has no timeout of its own, and page.isClosed() only reports a
+ * closure the browser process announced. When the renderer dies without the
+ * main process tearing down its CDP target — observed for real: the target
+ * stayed listed and a direct Runtime.evaluate went unanswered — every poll
+ * hangs until the outer test timeout and the run reports nothing useful.
+ * Bounding each poll converts that into a fast failure that names the cause.
+ */
+const RENDERER_POLL_DEADLINE_MS = 120_000;
+
+async function raceRendererResponsive<T>(evaluation: Promise<T>): Promise<T> {
+  // The losing evaluate settles later (usually on browser close); keep its
+  // rejection observed so it cannot surface as an unhandled rejection.
+  void Promise.resolve(evaluation).catch(() => undefined);
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      evaluation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `Obsidian did not answer a state poll within ${RENDERER_POLL_DEADLINE_MS}ms. ` +
+                "The renderer process has most likely crashed while its CDP target stayed registered; " +
+                "check the obsidian-stdio-*.log capture in test-results for the crash reason.",
+            ),
+          );
+        }, RENDERER_POLL_DEADLINE_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function approveUntilMissionComplete(
   page: Page,
   timeoutMs: number,
   options: CompoundMissionApprovalOptions & {
     restartCorePlugin?: (stage: ProjectLifecycleStageName) => Promise<void>;
+    onUsageScopeModelCalls?: (
+      usageScopeId: string,
+      modelCalls: number,
+    ) => void;
   } = {},
 ): Promise<number> {
   const deadline = Date.now() + timeoutMs;
   let approvals = 0;
   let continuations = 0;
+  const modelCallsByUsageScopeId = new Map<string, number>();
+  const progress = () => ({
+    approvals,
+    continuations,
+    modelCalls: [...modelCallsByUsageScopeId.values()].reduce(
+      (total, count) => total + count,
+      0,
+    ),
+  });
+  const recordModelCalls = (
+    usageScopeId: string | null,
+    modelCalls: number,
+  ) => {
+    if (
+      !usageScopeId ||
+      !Number.isSafeInteger(modelCalls) ||
+      modelCalls < 0
+    ) {
+      return;
+    }
+    const maximum = Math.max(
+      modelCallsByUsageScopeId.get(usageScopeId) ?? 0,
+      modelCalls,
+    );
+    modelCallsByUsageScopeId.set(usageScopeId, maximum);
+    options.onUsageScopeModelCalls?.(usageScopeId, maximum);
+  };
   let missingContinuationPolls = 0;
   let lastDurableState: Record<string, unknown> | null = null;
   // Long code-stage repair ladders (read → write_expected × N → revalidate)
@@ -794,6 +1009,43 @@ async function approveUntilMissionComplete(
   );
   const restartStages = new Set(options.restartAfterProjectStages ?? []);
   const restartedStages = new Set<ProjectLifecycleStageName>();
+  const sampleFinalModelProgress = async () => {
+    if (page.isClosed()) {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const sample = await Promise.race([
+        page
+          .evaluate(({ pluginId }) => {
+            const snapshot = (window as typeof window & { app?: any }).app
+              ?.plugins?.plugins?.[pluginId]?.getMissionRunSnapshot?.();
+            const usageScopeId =
+              typeof snapshot?.providerUsageScopeId === "string"
+                ? snapshot.providerUsageScopeId
+                : null;
+            const modelCalls =
+              Number.isSafeInteger(
+                snapshot?.providerUsage?.modelCallCount,
+              ) &&
+              snapshot.providerUsage.modelCallCount >= 0
+                ? snapshot.providerUsage.modelCallCount
+                : 0;
+            return { usageScopeId, modelCalls };
+          }, { pluginId: NATIVE_CORE_PLUGIN_ID })
+          .catch(() => null),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), 1_500);
+        }),
+      ]);
+      if (sample) {
+        recordModelCalls(sample.usageScopeId, sample.modelCalls);
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  try {
   while (Date.now() < deadline) {
     // Stay on Chat — do not flip Chat ↔ Run Details every poll (UI flicker).
     // Soft→Bound Chat Approve and Run Details cards are both clickable via DOM
@@ -803,9 +1055,9 @@ async function approveUntilMissionComplete(
         `Obsidian page closed while waiting for mission completion; approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
       );
     }
-    if (await approveFirstVisiblePreparedAction(page)) {
+    if (await raceRendererResponsive(approveFirstVisiblePreparedAction(page))) {
       approvals += 1;
-      options.onProgress?.({ approvals, continuations });
+      options.onProgress?.(progress());
       await safePageWait(page, 100, "post-approval settle");
       continue;
     }
@@ -815,6 +1067,7 @@ async function approveUntilMissionComplete(
       hasEnabledApproval: boolean;
       pluginRunning: boolean;
       stopReason: string | null;
+      autoContinueReason: string | null;
       canResume: boolean;
       continuationCommand: string;
       acceptanceStatus: string | null;
@@ -835,6 +1088,9 @@ async function approveUntilMissionComplete(
         blockerMessage: string | null;
       }>;
       providerUsage: unknown;
+      providerUsageScopeId: string | null;
+      runId: string | null;
+      coordinatorModelCalls: number;
       lastComplete: unknown;
       modelCallPhases: Array<{ phase: string | null; outcome: string | null }>;
       lastError: string;
@@ -844,7 +1100,7 @@ async function approveUntilMissionComplete(
       durablyCompletedLifecycleTools: string[];
     };
     try {
-      ui = await page.evaluate(async ({ pluginId }) => {
+      ui = await raceRendererResponsive(page.evaluate(async ({ pluginId }) => {
         const app = (window as typeof window & { app?: any }).app;
         const plugin = app?.plugins?.plugins?.[pluginId];
         const snapshot = plugin?.getMissionRunSnapshot?.();
@@ -868,6 +1124,8 @@ async function approveUntilMissionComplete(
           )).some((button) => button.getClientRects().length > 0),
           pluginRunning: plugin?.isMissionRunning?.() === true,
           stopReason: snapshot?.lastComplete?.stopReason ?? null,
+          autoContinueReason:
+            snapshot?.lastComplete?.autoContinueReason ?? null,
           canResume: snapshot?.lastMissionLedger?.canResume === true,
           continuationCommand:
             snapshot?.lastMissionLedger?.continuationCommand ?? "",
@@ -897,6 +1155,21 @@ async function approveUntilMissionComplete(
               }))
             : [],
           providerUsage: snapshot?.providerUsage ?? null,
+          providerUsageScopeId:
+            typeof snapshot?.providerUsageScopeId === "string"
+              ? snapshot.providerUsageScopeId
+              : null,
+          runId:
+            typeof snapshot?.lastMissionLedger?.runId === "string"
+              ? snapshot.lastMissionLedger.runId
+              : null,
+          coordinatorModelCalls:
+            Number.isSafeInteger(
+              snapshot?.providerUsage?.modelCallCount,
+            ) &&
+            snapshot.providerUsage.modelCallCount >= 0
+              ? snapshot.providerUsage.modelCallCount
+              : 0,
           lastComplete: snapshot?.lastComplete ?? null,
           modelCallPhases: Array.isArray(snapshot?.modelCallEvidence)
             ? snapshot.modelCallEvidence.slice(-4).map((item: any) => ({
@@ -938,7 +1211,7 @@ async function approveUntilMissionComplete(
               )
             : [],
         };
-      }, { pluginId: NATIVE_CORE_PLUGIN_ID });
+      }, { pluginId: NATIVE_CORE_PLUGIN_ID }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (page.isClosed() || /has been closed/iu.test(message)) {
@@ -948,6 +1221,8 @@ async function approveUntilMissionComplete(
       }
       throw error;
     }
+    recordModelCalls(ui.providerUsageScopeId, ui.coordinatorModelCalls);
+    options.onProgress?.(progress());
     const preAuthorityReconciliationBlock = ui.diagnostics.some(
       (diagnostic) =>
         diagnostic.id === "resume-mutation-reconciliation-required" ||
@@ -987,7 +1262,7 @@ async function approveUntilMissionComplete(
       const continued = await continueLatestRunAfterStageRestart(page);
       if (continued) {
         continuations += 1;
-        options.onProgress?.({ approvals, continuations });
+        options.onProgress?.(progress());
       }
       continue;
     }
@@ -995,7 +1270,7 @@ async function approveUntilMissionComplete(
       const clicked = await approveFirstVisiblePreparedAction(page);
       if (clicked) {
         approvals += 1;
-        options.onProgress?.({ approvals, continuations });
+        options.onProgress?.(progress());
       }
       await safePageWait(page, 100, "post-approval settle");
       continue;
@@ -1011,7 +1286,22 @@ async function approveUntilMissionComplete(
         await safePageWait(page, 250, "coordinator terminal settle");
         continue;
       }
-      if (ui.acceptanceStatus === "pass" || ui.ledgerStatus === "complete") {
+      if (
+        ui.stopReason === "budget" &&
+        ui.autoContinueReason === "no_progress"
+      ) {
+        throw new Error(
+          `Mission stopped at the production no-progress circuit; approved=${approvals}; continuations=${continuations}; state=${JSON.stringify(ui)}.`,
+        );
+      }
+      const successfulTerminal =
+        ui.stopReason === null ||
+        ui.stopReason === "final" ||
+        ui.stopReason === "write_completed";
+      if (
+        successfulTerminal &&
+        (ui.acceptanceStatus === "pass" || ui.ledgerStatus === "complete")
+      ) {
         return approvals;
       }
       const latestModelCall = ui.modelCallPhases.at(-1);
@@ -1036,7 +1326,10 @@ async function approveUntilMissionComplete(
       if (
         !ui.hasGraphBlocker &&
         (
-          ui.stopReason === "budget" ||
+          (
+            ui.stopReason === "budget" &&
+            ui.autoContinueReason !== "no_progress"
+          ) ||
           retryableProviderStop ||
           (
             ui.stopReason === null &&
@@ -1069,7 +1362,7 @@ async function approveUntilMissionComplete(
         }
         missingContinuationPolls = 0;
         continuations += 1;
-        options.onProgress?.({ approvals, continuations });
+        options.onProgress?.(progress());
         if (continuations > maximumContinuations) {
           throw new Error(
             `Mission exceeded ${maximumContinuations} explicit continuations; approved=${approvals}; state=${JSON.stringify(ui)}.`,
@@ -1260,6 +1553,7 @@ async function approveUntilMissionComplete(
           })),
         projectStages: ui.projectStages,
         durablyCompletedLifecycleTools: ui.durablyCompletedLifecycleTools,
+        autoContinueReason: ui.autoContinueReason,
         recentDiagnostics: ui.diagnostics.slice(-6),
       };
       throw new Error(
@@ -1267,7 +1561,14 @@ async function approveUntilMissionComplete(
       );
     }
     missingContinuationPolls = 0;
-    await safePageWait(page, 250, "mission-running poll");
+    try {
+      await safePageWait(page, 250, "mission-running poll");
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Mission page closed during the running poll; approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}. Cause: ${cause}`,
+      );
+    }
   }
   const safeState = await page.evaluate(({ pluginId }) => {
     const app = (window as typeof window & { app?: any }).app;
@@ -1310,6 +1611,10 @@ async function approveUntilMissionComplete(
   throw new Error(
     `Timed out after ${timeoutMs} ms while resolving prepared approvals; approved=${approvals}; state=${JSON.stringify(safeState)}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
   );
+  } finally {
+    await sampleFinalModelProgress().catch(() => undefined);
+    options.onProgress?.(progress());
+  }
 }
 
 async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
@@ -1564,6 +1869,16 @@ async function submitMission(
   if (options.clearChatFirst !== false) {
     await clearChatInline(page);
   }
+  const priorCoordinator = await page.evaluate((pluginId) => {
+    const plugin = (window as typeof window & { app?: any }).app?.plugins
+      ?.plugins?.[pluginId];
+    const snapshot = plugin?.getMissionRunSnapshot?.();
+    return {
+      runId: typeof snapshot?.runId === "string" ? snapshot.runId : null,
+      startedAtMs:
+        typeof snapshot?.startedAtMs === "number" ? snapshot.startedAtMs : null,
+    };
+  }, NATIVE_CORE_PLUGIN_ID);
   const input = page.locator("textarea.agentic-researcher-prompt");
   const runButton = page.locator("button.agentic-researcher-run");
   // Compound DU prompts exceed chat bubble text; match a stable unique marker.
@@ -1583,6 +1898,97 @@ async function submitMission(
       hasText: marker,
     }).last(),
   ).toBeVisible({ timeout: 30_000 });
+  try {
+    await expect
+      .poll(
+        () =>
+          page.evaluate(
+            ({ pluginId, priorCoordinator }) => {
+              const plugin = (window as typeof window & { app?: any }).app?.plugins
+                ?.plugins?.[pluginId];
+              const snapshot = plugin?.getMissionRunSnapshot?.();
+              const currentRunId =
+                typeof snapshot?.runId === "string" ? snapshot.runId : null;
+              const freshRunId =
+                currentRunId !== null &&
+                currentRunId.length > 0 &&
+                currentRunId !== priorCoordinator.runId;
+              const freshCoordinator =
+                snapshot?.isRunning === true &&
+                snapshot?.state === "running" &&
+                typeof snapshot?.startedAtMs === "number" &&
+                snapshot.startedAtMs !== priorCoordinator.startedAtMs;
+              return freshRunId || freshCoordinator;
+            },
+            { pluginId: NATIVE_CORE_PLUGIN_ID, priorCoordinator },
+          ),
+        {
+          // A code mission may spend the complete provider probe budget plus the
+          // production persistence margin before RunCoordinator.start(). Give
+          // that strict gate a separate handoff margin, but never hand the
+          // previous successful idle snapshot to the completion broker.
+          timeout: Math.min(
+            options.timeoutMs,
+            HOST_PROVISIONED_SANDBOX_READINESS_TIMEOUT_MS_V1 + 15_000,
+          ),
+          message:
+            "A submitted mission must publish a fresh run identity before completion polling begins.",
+        },
+      )
+      .toBe(true);
+  } catch (error) {
+    const diagnostic = await page.evaluate((pluginId) => {
+      const plugin = (window as typeof window & { app?: any }).app?.plugins
+        ?.plugins?.[pluginId];
+      const snapshot = plugin?.getMissionRunSnapshot?.();
+      const readiness = plugin?.getCapabilityReadiness?.();
+      const logText =
+        document.querySelector(".agentic-researcher-log")?.textContent ?? "";
+      return {
+        coordinator: {
+          isRunning: snapshot?.isRunning ?? null,
+          state: snapshot?.state ?? null,
+          runId: snapshot?.runId ?? null,
+          startedAtMs: snapshot?.startedAtMs ?? null,
+          stopReason: snapshot?.lastComplete?.stopReason ?? null,
+        },
+        runButton: {
+          text:
+            document
+              .querySelector("button.agentic-researcher-run")
+              ?.textContent?.trim() ?? null,
+          disabled:
+            (
+              document.querySelector(
+                "button.agentic-researcher-run",
+              ) as HTMLButtonElement | null
+            )?.disabled ?? null,
+        },
+        readiness: Array.isArray(readiness)
+          ? readiness.map((row: any) => ({
+              id: row?.id ?? null,
+              status: row?.status ?? null,
+              reason: row?.reason ?? null,
+              nextAction: row?.nextAction ?? null,
+            }))
+          : [],
+        blocker:
+          document
+            .querySelector(".agentic-researcher-mission-readiness-card")
+            ?.textContent?.trim()
+            .slice(0, 2_000) ?? null,
+        recentChat: logText.trim().slice(-4_000),
+      };
+    }, NATIVE_CORE_PLUGIN_ID);
+    const original =
+      error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Mission launch did not publish a fresh coordinator identity. ${original.slice(
+        0,
+        1_000,
+      )} Safe diagnostic: ${JSON.stringify(diagnostic)}`,
+    );
+  }
   if (options.waitForCompletion === false) return;
   await waitForMissionComplete(page, options.timeoutMs);
 }
@@ -1902,6 +2308,66 @@ async function attestProductionRun(
       ) {
         throw new Error(`Persisted runtime identity mismatch at ${ledgerPath}.`);
       }
+      const runtimeLineage = runtime.lineage;
+      const rootRunId =
+        typeof runtimeLineage?.rootRunId === "string"
+          ? runtimeLineage.rootRunId.trim()
+          : "";
+      const segmentId =
+        typeof runtimeLineage?.segmentId === "string"
+          ? runtimeLineage.segmentId.trim()
+          : "";
+      const segmentIndex = runtimeLineage?.segmentIndex;
+      const parentSegmentId =
+        typeof runtimeLineage?.parentSegmentId === "string"
+          ? runtimeLineage.parentSegmentId.trim()
+          : null;
+      const rawPriorSegmentIds = runtimeLineage?.priorSegmentIds;
+      const priorSegmentIds = Array.isArray(rawPriorSegmentIds)
+        ? rawPriorSegmentIds.filter(
+            (value: unknown): value is string =>
+              typeof value === "string" &&
+              value.length > 0 &&
+              value === value.trim(),
+          )
+        : [];
+      const uniquePriorSegmentIds = new Set(priorSegmentIds);
+      if (
+        !rootRunId ||
+        !segmentId ||
+        segmentId !== ledgerRunId ||
+        !Number.isInteger(segmentIndex) ||
+        segmentIndex < 0 ||
+        !Array.isArray(rawPriorSegmentIds) ||
+        priorSegmentIds.length !== rawPriorSegmentIds.length ||
+        uniquePriorSegmentIds.size !== priorSegmentIds.length ||
+        uniquePriorSegmentIds.has(segmentId)
+      ) {
+        throw new Error(`Persisted runtime lineage is invalid at ${ledgerPath}.`);
+      }
+      if (
+        segmentIndex === 0
+          ? (
+              rootRunId !== segmentId ||
+              parentSegmentId !== null ||
+              priorSegmentIds.length !== 0
+            )
+          : (
+              priorSegmentIds.length !== segmentIndex ||
+              priorSegmentIds[0] !== rootRunId ||
+              priorSegmentIds.at(-1) !== parentSegmentId
+            )
+      ) {
+        throw new Error(`Persisted runtime continuation chain is invalid at ${ledgerPath}.`);
+      }
+      current.attestedRunLineage = {
+        rootRunId,
+        segmentId,
+        segmentIndex,
+        parentSegmentId,
+        priorSegmentIds,
+        segmentIds: [...priorSegmentIds, segmentId],
+      };
       if (ledgerRunId !== runId) {
         const graph = current.lastMissionGraph;
         const orchestratorRootBound =

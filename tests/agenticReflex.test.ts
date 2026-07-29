@@ -18,6 +18,7 @@ import {
   createToolOutcomeMemory,
   recordToolOutcome,
 } from "../src/agent/outcomeMemory";
+import { completedResearchPublicationReceiptFixture } from "./fixtures/completedResearchPublicationReceipt";
 
 const missionIntent: MissionIntent = {
   mode: "chat_only",
@@ -465,6 +466,47 @@ test("completion evaluator requires vault evidence and write receipts", () => {
   assert.deepEqual(completion.missing.sort(), ["vault_evidence", "write_receipt"]);
   assert.equal(completion.mustContinue, true);
   assert.equal(completion.recommendedNextTool, "semantic_search_notes");
+});
+
+test("completion evaluator accepts only a canonical completed research publication as composite note-write proof", () => {
+  const publication = completedResearchPublicationReceiptFixture();
+  const publicationMissionIntent: MissionIntent = {
+    ...missionIntent,
+    mode: "note_output",
+    noteOutput: true,
+    allowAutonomousWrite: true,
+    requireWriteCompletion: true,
+  };
+
+  const completed = evaluateCompletion(
+    input({
+      prompt: "Publish the accepted research note to exactly one Linear issue.",
+      missionIntent: publicationMissionIntent,
+      allowedToolNames: new Set(),
+      receipts: [publication],
+    }),
+  );
+  assert.equal(completed.complete, true);
+  assert.deepEqual(completed.missing, []);
+
+  const unverified = evaluateCompletion(
+    input({
+      prompt: "Publish the accepted research note to exactly one Linear issue.",
+      missionIntent: publicationMissionIntent,
+      allowedToolNames: new Set(),
+      receipts: [
+        {
+          ...publication,
+          readback: {
+            ...publication.readback,
+            status: "unverified",
+          },
+        },
+      ],
+    }),
+  );
+  assert.equal(unverified.complete, false);
+  assert.deepEqual(unverified.missing, ["write_receipt"]);
 });
 
 test("completion evaluator recommends available recovery tools before final answer", () => {

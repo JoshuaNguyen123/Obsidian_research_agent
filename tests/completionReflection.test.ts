@@ -216,6 +216,44 @@ test("planCompoundCompletionReflection bundles note write plan from lineage cite
   );
 });
 
+test("planCompoundCompletionReflection never writes a completion note while proof is open", () => {
+  const openDebt = computeProofDebt({
+    status: "budget",
+    acceptance: {
+      status: "needs_more_work",
+      missing: ["full_validation"],
+    },
+  });
+  const pipeline = buildPipelineLineageV1({ lineage: compoundLineage() });
+  const context = buildReflectionContextV1({
+    runId: "run-compound",
+    ledger: null,
+    pipeline,
+    persistence: "missing",
+  });
+  const planned = planCompoundCompletionReflection({
+    prompt: "Finish the compound pipeline and reflect on the initiating note.",
+    acceptance: {
+      status: "needs_more_work",
+      missing: ["full_validation"],
+    },
+    proofDebt: openDebt,
+    writeReceiptCount: 1,
+    reflectionContext: context,
+    initiatingNotePath: "Projects/Initiating.md",
+    linearIssueUrls: ["https://linear.app/acme/issue/ISSUE-1"],
+  });
+
+  assert.equal(planned.completion.done, false);
+  assert.equal(planned.initiatingNote.shouldWriteNote, false);
+  assert.equal(planned.initiatingNote.markdown, "");
+  assert.equal(planned.initiatingNote.chatSummary, "");
+  assert.deepEqual(planned.initiatingNote.destination, {
+    kind: "chat_only",
+    reason: "completion_incomplete",
+  });
+});
+
 test("planCompoundCompletionReflection keeps Chat-only when explicitly selected", () => {
   const emptyDebt = computeProofDebt({
     status: "complete",
@@ -241,4 +279,35 @@ test("planCompoundCompletionReflection keeps Chat-only when explicitly selected"
   assert.equal(planned.initiatingNote.shouldWriteNote, false);
   assert.equal(planned.initiatingNote.markdown, "");
   assert.match(planned.initiatingNote.chatSummary, /PR #3|pull\/3/u);
+});
+
+test("planCompoundCompletionReflection never writes an unsolicited reflection", () => {
+  const emptyDebt = computeProofDebt({
+    status: "complete",
+    acceptance: { status: "pass", missing: [] },
+  });
+  const pipeline = buildPipelineLineageV1({ lineage: compoundLineage() });
+  const context = buildReflectionContextV1({
+    runId: "run-phase-a",
+    ledger: null,
+    pipeline,
+    persistence: "not_requested",
+  });
+  const planned = planCompoundCompletionReflection({
+    prompt: "Publish the accepted research to Linear.",
+    acceptance: { status: "pass", missing: [] },
+    proofDebt: emptyDebt,
+    writeReceiptCount: 1,
+    reflectionContext: context,
+    initiatingNotePath: "Projects/Initiating.md",
+    persistence: "not_requested",
+  });
+
+  assert.equal(planned.completion.done, true);
+  assert.equal(planned.initiatingNote.shouldWriteNote, false);
+  assert.equal(planned.initiatingNote.markdown, "");
+  assert.deepEqual(planned.initiatingNote.destination, {
+    kind: "chat_only",
+    reason: "reflection_not_requested",
+  });
 });

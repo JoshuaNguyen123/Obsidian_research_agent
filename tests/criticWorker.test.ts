@@ -12,6 +12,7 @@ import type {
   ModelClient,
   ModelToolDefinition,
 } from "../src/model/types";
+import type { ModelCallEvidenceV1 } from "../src/model/modelCallEvidence";
 import type { MissionEvidence } from "../src/agent/missionLedger";
 import type { ToolExecutionContext, ToolRegistry } from "../src/tools/types";
 
@@ -83,6 +84,7 @@ test("critic seeds only objective, final output, evidence, and receipts — neve
   const client = modelClient([
     () => reply('{"verdict":"pass","missing":[],"summary":"Result is grounded."}'),
   ]);
+  const modelEvidence: ModelCallEvidenceV1[] = [];
   const result = await runCriticWorker({
     runId: "run-1",
     objective: "Summarize the topic with sources.",
@@ -92,7 +94,11 @@ test("critic seeds only objective, final output, evidence, and receipts — neve
     modelClient: client,
     toolRegistry: fakeRegistry(),
     toolContext: context,
+    onModelCallEvidence: (event) => modelEvidence.push(event),
   });
+  assert.equal(modelEvidence.length, 1);
+  assert.equal(modelEvidence[0]?.phase, "worker");
+  assert.equal(modelEvidence[0]?.clientInvoked, true);
   assert.equal(result.status, "pass");
   assert.equal(result.check.kind, "critic");
   const seeded = JSON.stringify(client.requests[0]!.messages);

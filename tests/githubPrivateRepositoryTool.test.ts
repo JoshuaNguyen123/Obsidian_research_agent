@@ -6,6 +6,7 @@ import type { ActionReceipt } from "../src/agent/actions";
 import {
   createGitHubPrivateRepositoryTool,
   hasExplicitPrivateGitHubRepositoryCreationIntent,
+  hasPrivateGitHubRepositoryBootstrapIntent,
   type GitHubPrivateRepositoryCheckpointV1,
   type GitHubPrivateRepositoryDestinationV1,
 } from "../src/tools/githubPrivateRepositoryTool";
@@ -179,6 +180,26 @@ test("private repository intent honors explicit negation", () => {
       "Do not create a GitHub repository; only describe the setup.",
     ),
     false,
+  );
+  assert.equal(
+    hasPrivateGitHubRepositoryBootstrapIntent(
+      "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it.",
+    ),
+    true,
+  );
+  assert.equal(
+    hasPrivateGitHubRepositoryBootstrapIntent(
+      "Publish this commit to GitHub as a draft pull request.",
+    ),
+    false,
+    "generic publication must not infer private-repository creation authority",
+  );
+  assert.equal(
+    hasPrivateGitHubRepositoryBootstrapIntent(
+      "Do not create a GitHub repository; publish only to the issue-bound private GitHub destination if it already exists.",
+    ),
+    false,
+    "explicit creation negation must dominate bound-destination publication",
   );
 });
 

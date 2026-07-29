@@ -109,7 +109,7 @@ test("automatic planning accepts a high-confidence semantic DAG without trusting
   assert.match(requests[0].messages[0].content, /hostDependencyIds/);
 });
 
-test("Ollama Cloud graph planning omits provider format but keeps host DAG validation", async () => {
+test("Ollama Cloud graph planning omits provider format while repairing authority widening", async () => {
   const fixture = await createFixture();
   const requests: ModelChatRequest[] = [];
   const client: ModelClient = {
@@ -123,7 +123,10 @@ test("Ollama Cloud graph planning omits provider format but keeps host DAG valid
       requests.push(request);
       return response(
         requests.length === 1
-          ? "not-json"
+          ? structuredJson([
+              semanticNode("context", "Read context."),
+              semanticNode("delete-entire-vault", "Delete every note."),
+            ])
           : structuredJson([
               semanticNode("context", "Read context."),
               semanticNode("write", "Append verified output.", ["context"]),
@@ -142,8 +145,135 @@ test("Ollama Cloud graph planning omits provider format but keeps host DAG valid
   assert.equal(result.source, "structured_model");
   assert.equal(requests.length, 2);
   assert.ok(requests.every((request) => !("format" in request)));
-  assert.match(requests[0].messages[0].content, /return exactly one JSON object/);
-  assert.match(requests[1].messages.at(-1)?.content ?? "", /Schema repair/);
+  assert.ok(
+    requests.every(
+      (request) =>
+        request.toolChoice === "required" &&
+        request.tools?.length === 1 &&
+        request.tools[0].function.name === "submit_mission_graph",
+    ),
+  );
+  assert.equal(requests[1].evidencePhase, "retry");
+  assert.match(
+    requests[0].messages[0].content,
+    /calling submit_mission_graph exactly once/,
+  );
+  const repairPrompt = requests[1].messages.at(-1)?.content ?? "";
+  assert.match(repairPrompt, /Authority repair/);
+  assert.match(
+    repairPrompt,
+    /allowedNodeIds=\["context","research","search-a","search-b","write"\]/,
+  );
+  assert.match(
+    repairPrompt,
+    /requiredNodeSkeleton=\[\{"id":"context","objective":"Read the trusted current-note context\.","dependencyIds":\[\]\},\{"id":"write","objective":"Append the accepted result to the trusted note\.","dependencyIds":\["context"\]\}\]/,
+  );
+  assert.match(
+    repairPrompt,
+    /optionalReadNodeIds=\["research","search-a","search-b"\]/,
+  );
+  assert.match(repairPrompt, /If uncertain, return only the requiredNodeSkeleton/);
+});
+
+test("Ollama Cloud accepts one typed planner tool call with no free-text JSON", async () => {
+  const fixture = await createFixture();
+  const requests: ModelChatRequest[] = [];
+  const proposal = {
+    confidence: 0.96,
+    nodes: [
+      semanticNode("context", "Read context."),
+      semanticNode("write", "Append verified output.", ["context"]),
+    ],
+  };
+  const client: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "deepseek-v4-flash:cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+    },
+    chat: async (request) => {
+      requests.push(request);
+      return {
+        message: { role: "assistant", content: "" },
+        toolCalls: [
+          {
+            name: "submit_mission_graph",
+            arguments: proposal,
+          },
+        ],
+      };
+    },
+    streamChat: async (request) => client.chat(request),
+  };
+
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: client,
+  });
+
+  assert.equal(result.source, "structured_model");
+  assert.equal(result.fallbackReason, null);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].toolChoice, "required");
+  assert.equal(
+    requests[0].tools?.[0].function.parameters.additionalProperties,
+    false,
+  );
+});
+
+test("Ollama Cloud rejects multiple or conflicting planner tool proposals", async () => {
+  const fixture = await createFixture();
+  let calls = 0;
+  const proposal = {
+    confidence: 0.96,
+    nodes: [
+      semanticNode("context", "Read context."),
+      semanticNode("write", "Append verified output.", ["context"]),
+    ],
+  };
+  const client: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "deepseek-v4-flash:cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+    },
+    chat: async () => {
+      calls += 1;
+      return {
+        message: {
+          role: "assistant",
+          content:
+            calls === 1
+              ? ""
+              : structuredJson([
+                  semanticNode("context", "Different context."),
+                  semanticNode("write", "Different output.", ["context"]),
+                ]),
+        },
+        toolCalls:
+          calls === 1
+            ? [
+                { name: "submit_mission_graph", arguments: proposal },
+                { name: "submit_mission_graph", arguments: proposal },
+              ]
+            : [{ name: "submit_mission_graph", arguments: proposal }],
+      };
+    },
+    streamChat: async (request) => client.chat(request),
+  };
+
+  const result = await planMissionGraphV3({
+    ...fixture.input,
+    routerMode: "authority",
+    modelClient: client,
+  });
+
+  assert.equal(result.source, "deterministic");
+  assert.equal(result.fallbackReason, "structured_model_invalid_schema");
+  assert.equal(calls, 2);
 });
 
 test("conservative mode never calls the model and records the intentional fallback", async () => {
@@ -277,6 +407,15 @@ test("structured planner repairs invalid JSON exactly once", async () => {
   assert.equal(requests.length, 2);
   assert.equal(requests[0].evidencePhase, "graph_planner");
   assert.equal(requests[1].evidencePhase, "retry");
+  assert.equal(requests[1].messages.at(-1)?.role, "user");
+  assert.match(
+    requests[1].messages.at(-1)?.content ?? "",
+    /requiredProposalTemplate=\{"confidence":0\.9,"nodes":\[/,
+  );
+  assert.match(
+    requests[1].messages.at(-1)?.content ?? "",
+    /entire response must start with \{ and end with \}/,
+  );
 });
 
 test("structured planner repairs an invalid DAG exactly once", async () => {
@@ -370,20 +509,30 @@ test("structured planner rejects ambiguous wrapped proposals", async () => {
 
 test("unknown delete or mutation selection is rejected as authority widening", async () => {
   const fixture = await createFixture();
+  const requests: ModelChatRequest[] = [];
   const result = await planMissionGraphV3({
     ...fixture.input,
     routerMode: "authority",
-    modelClient: clientFrom(async () =>
-      response(
+    modelClient: clientFrom(async (request) => {
+      requests.push(request);
+      return response(
         structuredJson([
           semanticNode("context", "Read context."),
           semanticNode("delete-entire-vault", "Delete every note."),
         ]),
-      ),
-    ),
+      );
+    }),
   });
 
+  assert.equal(result.source, "deterministic");
   assert.equal(result.fallbackReason, "structured_model_authority_widening");
+  assert.equal(result.modelConfidence, 0.93);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].evidencePhase, "retry");
+  assert.ok(
+    requests.every((request) => request.format?.additionalProperties === false),
+  );
+  assert.match(requests[1].messages.at(-1)?.content ?? "", /Authority repair/);
   assert.equal(result.graph.nodes["delete-entire-vault"], undefined);
   assert.deepEqual(result.graph.nodes.write.allowedTools, ["append-note"]);
 });

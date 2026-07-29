@@ -30,6 +30,9 @@ import {
   type SandboxProviderConfigV2,
 } from "../extensions/code/sandbox";
 import {
+  readHostProvisionedSandboxBindingV1,
+} from "../extensions/code/sandbox/HostProvisionedSandboxBindingV1";
+import {
   CODE_COMMIT_VERIFIED_TOOL,
   CODE_REPAIR_RECORD_CYCLE_TOOL,
   CODE_REPAIR_STATUS_TOOL,
@@ -1482,6 +1485,232 @@ test("CodeExtensionRuntimeV2 persists settings-only immutable providers, invalid
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("CodeExtensionRuntimeV2 shares one host probe across readiness and direct callers", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-sandbox-single-flight-"));
+  try {
+    const provider = sandboxProviderForCurrentHost();
+    const gate = deferredSandboxResult();
+    let probeCalls = 0;
+    const runner: SandboxCommandRunnerV2 = {
+      async run(spec) {
+        assert.equal(spec.purpose, "boundary_probe");
+        probeCalls += 1;
+        return await gate.promise;
+      },
+    };
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({
+        applicationDataRoot: path.join(root, "app-data"),
+      }),
+      sandboxRunner: runner,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await runtime.configureSandboxProvider(provider);
+    const savesBeforeProbe = plugin.saveCount;
+
+    const firstReadiness = runtime.ensureHostProvisionedSandboxReadinessV1();
+    const secondReadiness = runtime.ensureHostProvisionedSandboxReadinessV1();
+    const direct = runtime.probeConfiguredSandboxProviders();
+    await runtime.configureSandboxProvider(provider);
+    assert.equal(
+      probeCalls,
+      1,
+      "an idempotent binding refresh must not replace the manager or duplicate its probe",
+    );
+
+    gate.resolve(validBoundaryProbe(provider.runtimeDigest));
+    const [firstReadinessStatus, secondReadinessStatus, directStatus] =
+      await Promise.all([
+        firstReadiness,
+        secondReadiness,
+        direct,
+      ]);
+    assert.equal(firstReadinessStatus.executionAvailable, true);
+    assert.deepEqual(secondReadinessStatus, firstReadinessStatus);
+    assert.equal(directStatus.executionAvailable, true);
+    assert.equal(probeCalls, 1);
+    assert.equal(
+      plugin.saveCount,
+      savesBeforeProbe + 1,
+      "one physical probe must produce exactly one durable observation",
+    );
+    assert.equal(
+      runtime.readState().sandbox.lastProbe?.status.executionAvailable,
+      true,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 clears a failed shared probe so a later probe can recover", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-sandbox-retry-"));
+  try {
+    const provider = sandboxProviderForCurrentHost();
+    let probeCalls = 0;
+    const runner: SandboxCommandRunnerV2 = {
+      async run(spec) {
+        assert.equal(spec.purpose, "boundary_probe");
+        probeCalls += 1;
+        return probeCalls === 1
+          ? { exitCode: 1, stdout: "", stderr: "provider unavailable" }
+          : validBoundaryProbe(provider.runtimeDigest);
+      },
+    };
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({
+        applicationDataRoot: path.join(root, "app-data"),
+      }),
+      sandboxRunner: runner,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await runtime.configureSandboxProvider(provider);
+
+    const [first, joined] = await Promise.all([
+      runtime.probeConfiguredSandboxProviders(),
+      runtime.ensureHostProvisionedSandboxReadinessV1(),
+    ]);
+    assert.equal(first.executionAvailable, false);
+    assert.equal(joined.executionAvailable, false);
+    assert.equal(probeCalls, 1);
+
+    const recovered = await runtime.probeConfiguredSandboxProviders();
+    assert.equal(recovered.executionAvailable, true);
+    assert.equal(probeCalls, 2);
+    assert.equal(
+      runtime.readState().sandbox.lastProbe?.status.executionAvailable,
+      true,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CodeExtensionRuntimeV2 cannot persist a probe across provider reconfiguration", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "code-runtime-sandbox-stale-probe-"));
+  try {
+    const provider = sandboxProviderForCurrentHost();
+    const reconfiguredProvider = {
+      ...provider,
+      runtimeDigest: SHA("e"),
+    } satisfies SandboxProviderConfigV2;
+    const firstGate = deferredSandboxResult();
+    const secondGate = deferredSandboxResult();
+    let probeCalls = 0;
+    const runner: SandboxCommandRunnerV2 = {
+      async run(spec) {
+        assert.equal(spec.purpose, "boundary_probe");
+        probeCalls += 1;
+        return probeCalls === 1
+          ? await firstGate.promise
+          : await secondGate.promise;
+      },
+    };
+    const plugin = new MemoryPluginData({ schemaVersion: 1 });
+    const runtime = new CodeExtensionRuntimeV2({
+      plugin: plugin as unknown as Plugin,
+      workspaceManager: new WorkspaceManagerV2({
+        applicationDataRoot: path.join(root, "app-data"),
+      }),
+      sandboxRunner: runner,
+      now: () => new Date(NOW),
+    });
+    await runtime.initialize();
+    await runtime.configureSandboxProvider(provider);
+
+    const staleProbe = runtime.probeConfiguredSandboxProviders();
+    assert.equal(probeCalls, 1);
+    await runtime.configureSandboxProvider(reconfiguredProvider);
+    const currentProbe = runtime.probeConfiguredSandboxProviders();
+    assert.equal(
+      probeCalls,
+      2,
+      "the reconfigured manager must start its own fresh probe",
+    );
+    firstGate.resolve(validBoundaryProbe(provider.runtimeDigest));
+
+    const staleResult = await staleProbe;
+    assert.equal(staleResult.executionAvailable, false);
+    assert.equal(runtime.readState().sandbox.lastProbe, null);
+    assert.equal(runtime.getSandboxCapabilityStatus().executionAvailable, false);
+
+    const joinedCurrentProbe = runtime.probeConfiguredSandboxProviders();
+    assert.equal(
+      probeCalls,
+      2,
+      "the stale flight finalizer must not clear the current manager's flight",
+    );
+    secondGate.resolve(validBoundaryProbe(reconfiguredProvider.runtimeDigest));
+    const [currentResult, joinedCurrentResult] = await Promise.all([
+      currentProbe,
+      joinedCurrentProbe,
+    ]);
+    assert.equal(currentResult.executionAvailable, true);
+    assert.deepEqual(joinedCurrentResult, currentResult);
+    assert.equal(probeCalls, 2);
+    assert.equal(
+      runtime.readState().sandbox.lastProbe?.status.selectedProvider,
+      reconfiguredProvider.kind,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function sandboxProviderForCurrentHost(): SandboxProviderConfigV2 {
+  return (
+    readHostProvisionedSandboxBindingV1(process.env, process.platform)?.provider ??
+    {
+      version: 1,
+      kind: "docker",
+      executable: "docker",
+      priority: 10,
+      runtimeReference: "registry.example/agentic-sandbox",
+      runtimeDigest: SHA("f"),
+      wslDistribution: null,
+      runtimeRoot: null,
+    }
+  );
+}
+
+function validBoundaryProbe(runtimeDigest: string) {
+  return {
+    exitCode: 0,
+    stdout: JSON.stringify({
+      version: 1,
+      uid: 65532,
+      networkBlocked: true,
+      rootReadOnly: true,
+      hostRootAbsent: true,
+      containerSocketAbsent: true,
+      runtimeReadOnly: true,
+      runtimeDigest,
+      stagingIsolated: true,
+      resourceLimitsEnforced: true,
+    }),
+    stderr: "",
+  };
+}
+
+function deferredSandboxResult(): {
+  promise: Promise<ReturnType<typeof validBoundaryProbe>>;
+  resolve: (value: ReturnType<typeof validBoundaryProbe>) => void;
+} {
+  let resolve!: (value: ReturnType<typeof validBoundaryProbe>) => void;
+  const promise = new Promise<ReturnType<typeof validBoundaryProbe>>(
+    (accept) => {
+      resolve = accept;
+    },
+  );
+  return { promise, resolve };
+}
 
 class MemoryPluginData {
   private data: Record<string, unknown>;

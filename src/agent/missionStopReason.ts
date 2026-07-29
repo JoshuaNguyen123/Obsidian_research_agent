@@ -89,7 +89,12 @@ export function stopReasonChatLine(
     case "model_budget":
       return `Paused at a safety limit. Ask me to continue.${suffix}`;
     case "graph_blocked":
-      return `Blocked — open Run Details for the blocker, or send the next message to continue.${suffix}`;
+      // Lead with the blocker when the caller has one. "Blocked — open Run
+      // Details" made the user open a panel to learn anything, and that
+      // useless line was what got saved into conversation history.
+      return suffix
+        ? `Blocked:${suffix} Send the next message to continue, or open Run Details.`
+        : "Blocked — open Run Details for the blocker, or send the next message to continue.";
     case "approval_denied":
       return `Approval denied.${suffix}`;
     case "relevance_rejected":
@@ -99,7 +104,9 @@ export function stopReasonChatLine(
     case "repeated_tool_no_progress":
       return `Paused: repeated tool calls without progress. Ask me to continue with a different approach.${suffix}`;
     case "required_tools_failed":
-      return `Blocked: a required tool failed. Open Run Details for details.${suffix}`;
+      return suffix
+        ? `Blocked: a required tool failed.${suffix}`
+        : "Blocked: a required tool failed. Open Run Details for details.";
     case "unknown":
     default:
       return `Run finished.${suffix}`;

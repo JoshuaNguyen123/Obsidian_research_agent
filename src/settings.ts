@@ -172,6 +172,8 @@ export interface AgentSettings {
   linearCapabilityGate?: 0 | 1 | 2 | 3 | 4 | 5;
   linearDefaultTeamId?: string;
   linearQueueEnabled?: boolean;
+  /** Assign research-published Linear issues to the connected viewer. */
+  linearAssignPublishedIssuesToViewer?: boolean;
   linearQueueProjectId?: string;
   /** Unstarted state that explicitly authorizes queue pickup. */
   linearReadyStateId?: string;
@@ -265,6 +267,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   linearCapabilityGate: 0,
   linearDefaultTeamId: "",
   linearQueueEnabled: false,
+  linearAssignPublishedIssuesToViewer: true,
   linearQueueProjectId: "",
   linearReadyStateId: "",
   linearStartedStateId: "",

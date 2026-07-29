@@ -57,3 +57,22 @@ test("user dismiss marks ledger non-resumable and persists timestamp", () => {
   assert.equal(buildMissionResumePlan(ledger).reason, "user_dismissed");
   assert.equal(summarizeMissionLedger(ledger).canResume, false);
 });
+
+test("mission ledger summaries retain only the redacted provider aggregate", () => {
+  const ledger = sampleLedger();
+  ledger.providerUsage = {
+    schemaVersion: 1,
+    modelCallCount: 7,
+    successfulCallCount: 5,
+    failedCallCount: 2,
+    reportedTokens: 1_234,
+    estimatedTokens: 56,
+    retries: 2,
+    wallClockMs: 9_876,
+  };
+
+  const summary = summarizeMissionLedger(ledger);
+
+  assert.deepEqual(summary.providerUsage, ledger.providerUsage);
+  assert.notEqual(summary.providerUsage, ledger.providerUsage);
+});

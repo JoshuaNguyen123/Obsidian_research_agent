@@ -46,7 +46,8 @@ export type AutoContinuationReason =
   | "acceptance_failed"
   | "required_tool_failure"
   | "segment_cap"
-  | "effect_class_blocked";
+  | "effect_class_blocked"
+  | "no_progress";
 
 export interface AutoContinuationDecision {
   recommended: boolean;
@@ -92,6 +93,12 @@ export interface AutoContinuationDecisionInput {
    * Chat grant (compound lifecycle detected by the host).
    */
   compoundLifecycleDetected?: boolean;
+  /**
+   * Host-computed durable comparison: this resumed segment completed no
+   * effectful successful tool and did not change frontier, proof debt, or
+   * durable proof surfaces. Successful reads do not defeat this circuit.
+   */
+  unchangedReadOnlySegment?: boolean;
 }
 
 /**
@@ -122,6 +129,7 @@ export function decideAutoContinuation({
   autonomyProfile = "automatic",
   hasMatchingGrant = false,
   compoundLifecycleDetected = false,
+  unchangedReadOnlySegment = false,
 }: AutoContinuationDecisionInput): AutoContinuationDecision {
   if (stopReason !== "budget") {
     return { recommended: false, reason: "not_budget" };
@@ -223,6 +231,9 @@ export function decideAutoContinuation({
       if (!allowEffectContinue) {
         return { recommended: false, reason: "effect_class_blocked" };
       }
+      if (unchangedReadOnlySegment) {
+        return { recommended: false, reason: "no_progress" };
+      }
       return { recommended: true, reason: "budget_exhausted" };
     }
     return { recommended: false, reason: "proof_satisfied" };
@@ -238,6 +249,10 @@ export function decideAutoContinuation({
 
   if (!allowEffectContinue) {
     return { recommended: false, reason: "effect_class_blocked" };
+  }
+
+  if (unchangedReadOnlySegment) {
+    return { recommended: false, reason: "no_progress" };
   }
 
   return { recommended: true, reason: "budget_exhausted" };

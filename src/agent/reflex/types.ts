@@ -3,6 +3,8 @@ import type { MissionIntent } from "../../tools/types";
 import type { SemanticEmbeddingProvider } from "../../embeddings/types";
 import type { MissionEvidence } from "../missionLedger";
 import type { ToolOutcomeMemoryV1 } from "../outcomeMemory";
+import type { WriteReceiptLike } from "../editOrganizeIntent";
+import type { SetLooseDeliveryReceiptLikeV1 } from "../setLooseCompoundAutonomy";
 
 export type ReflexLabel =
   | "chat_answer"
@@ -106,11 +108,10 @@ export interface AgentTrajectoryEvent {
   stateFingerprint?: string;
 }
 
-export interface ReflexReceiptLike {
-  toolName?: string;
-  operation: string;
-  path?: string;
-}
+export type ReflexReceiptLike = WriteReceiptLike &
+  SetLooseDeliveryReceiptLikeV1 & {
+    operation: string;
+  };
 
 export interface CandidateAgentAction {
   kind:

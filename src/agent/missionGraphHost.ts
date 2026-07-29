@@ -542,6 +542,13 @@ function inferCodeDeliverableEntryPath(objective: string): string | null {
   ) {
     return null;
   }
+  // Repository lifecycle missions receive their actual writable scope only
+  // after the trusted repository or independently read issue has been bound.
+  // Inventing a language-default path here (for example main.py) turns a
+  // prompt-scoped create action into immutable authority before that binding
+  // exists. Explicit paths are extracted before this helper runs, so this
+  // deferral never discards a filename the user actually named.
+  if (shouldDeferEntryPathToRepositoryBinding(objective)) return null;
   if (/\bpython\b|\.py\b/iu.test(objective)) return "main.py";
   if (/\btypescript\b|\.tsx?\b/iu.test(objective)) return "main.ts";
   if (/\bjavascript\b|\bnode(?:\.js)?\b|\.jsx?\b/iu.test(objective)) {
@@ -552,6 +559,33 @@ function inferCodeDeliverableEntryPath(objective: string): string | null {
   if (/\bjava\b|\.java\b/iu.test(objective)) return "Main.java";
   if (/\b(?:c#|csharp)\b|\.cs\b/iu.test(objective)) return "Program.cs";
   return null;
+}
+
+function shouldDeferEntryPathToRepositoryBinding(objective: string): boolean {
+  const text = objective.trim();
+  if (!text) return false;
+  const repositoryImplementation =
+    /\b(?:existing|trusted|bound|issue-bound|configured|checked[- ]out)\b[\s\S]{0,80}\b(?:repository|repo|codebase|worktree|project)\b/iu.test(
+      text,
+    ) ||
+    /\b(?:repository|repo|codebase|worktree)\b[\s\S]{0,120}\b(?:implement|fix|repair|patch|refactor|edit|update|change)\b/iu.test(
+      text,
+    ) ||
+    /\b(?:implement|fix|repair|patch|refactor|edit|update|change)\b[\s\S]{0,120}\b(?:repository|repo|codebase|worktree)\b/iu.test(
+      text,
+    );
+  const providerLifecycle =
+    /\bLinear\s+(?:issue|ticket)\b/iu.test(text) ||
+    /\b(?:GitHub|pull\s+request|draft\s+(?:pull\s+request|PR)|issue-bound)\b/iu.test(
+      text,
+    ) ||
+    /\b(?:commit|committing|committed)\b[\s\S]{0,100}\b(?:repository|repo|branch|worktree|GitHub)\b/iu.test(
+      text,
+    ) ||
+    /\b(?:repository|repo|branch|worktree|GitHub)\b[\s\S]{0,100}\b(?:commit|committing|committed)\b/iu.test(
+      text,
+    );
+  return repositoryImplementation || providerLifecycle;
 }
 
 function addPostAcceptanceNodes(input: {
@@ -681,11 +715,13 @@ function buildCompositeLifecyclePlanV1(input: {
   descriptorByName: ReadonlyMap<string, ToolDescriptor>;
 }): CompositeLifecyclePlanV1 | null {
   const stages = detectProjectLifecycleStagesV1(input.exactUserCommand);
+  // Scratch delivery plans intentionally omit code_repair_record_cycle, which
+  // is repository-only. Requiring it here would have dropped standalone
+  // Desktop deliveries out of the lifecycle plan entirely.
   const conditionalStandaloneCodeDelivery =
     stages.length === 1 &&
     stages[0] === "code_execution" &&
     input.steps.some((step) => step.name === "code_validate_fast") &&
-    input.steps.some((step) => step.name === "code_repair_record_cycle") &&
     input.steps.some(
       (step) => step.name === "code_workspace_export_directory",
     );
@@ -806,13 +842,20 @@ function buildCompositeLifecycleNodeProposalsV1(input: {
           headlessToolNames: new Set<string>(),
           preferBackground: false,
           bindingId: input.bindingIdByTool.get(step.name) ?? null,
+          // The current-note fallback is vault authority only. Workspace,
+          // GitHub, and Linear actions must keep their system-scoped
+          // prompt-scoped default or an explicitly named step selector; a
+          // vault note path on a non-vault action turns the exact-path
+          // guard into an unsatisfiable destination.
           selector:
             step.selector ??
-            explicitVaultSelector({
-              toolName: step.name,
-              objective: input.missionObjective,
-              currentNotePath: input.currentNotePath,
-            }),
+            (descriptor.capability.system === "vault"
+              ? explicitVaultSelector({
+                  toolName: step.name,
+                  objective: input.missionObjective,
+                  currentNotePath: input.currentNotePath,
+                })
+              : null),
           objective: step.objective,
         });
         const resourceInput = proposal.inputs.resource;
@@ -1007,13 +1050,17 @@ function buildToolNodeProposals(input: {
       headlessToolNames: input.headlessToolNames,
       preferBackground: input.preferBackground,
       bindingId: input.bindingIdByTool.get(name) ?? null,
+      // The current-note fallback is vault authority only; see the composite
+      // lifecycle proposal builder for the matching constraint.
       selector:
         step.selector ??
-        explicitVaultSelector({
-          toolName: name,
-          objective: input.objective,
-          currentNotePath: input.currentNotePath,
-        }),
+        (descriptor.capability.system === "vault"
+          ? explicitVaultSelector({
+              toolName: name,
+              objective: input.objective,
+              currentNotePath: input.currentNotePath,
+            })
+          : null),
       objective: step.objective,
     });
     if (effect === "read") {

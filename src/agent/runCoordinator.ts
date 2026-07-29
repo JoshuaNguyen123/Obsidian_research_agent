@@ -24,6 +24,7 @@ import {
 const MAX_BUFFERED_RUN_EVENTS = 800;
 const MAX_BUFFERED_RUN_EVENT_CHARS = 2_000_000;
 const MAX_RETAINED_RUN_RECEIPTS = 256;
+let providerUsageScopeSequence = 0;
 
 export type RunCoordinatorState = "idle" | "running" | "stopping";
 
@@ -49,6 +50,8 @@ export interface RunCoordinatorSnapshot {
   missionEvidence: MissionEvidenceAttestationV1[];
   lastMissionScorecard: MissionScorecardV1 | null;
   diagnosticAttestations: RunDiagnosticAttestationV1[];
+  /** Stable identity for one coordinator start, including all delegated model workers. */
+  providerUsageScopeId: string | null;
   providerUsage: ModelUsageAggregateV1;
   lastMissionGraph: MissionGraphV3 | null;
   /**
@@ -130,6 +133,7 @@ export class RunCoordinator {
   private readonly missionEvidence: MissionEvidenceAttestationV1[] = [];
   private lastMissionScorecard: MissionScorecardV1 | null = null;
   private readonly diagnosticAttestations: RunDiagnosticAttestationV1[] = [];
+  private providerUsageScopeId: string | null = null;
   private providerUsage: ModelUsageAggregateV1 = emptyProviderUsage();
   private lastMissionGraph: MissionGraphV3 | null = null;
   private lastMissionLedger: MissionLedgerSummary | null = null;
@@ -141,6 +145,7 @@ export class RunCoordinator {
   private eventSequence = 0;
   private startedAtMs: number | null = null;
   private lastActivityAtMs: number | null = null;
+  private activeProviderUsageScopeId: string | null = null;
   private activeRunPublishedAuthority = false;
   private activeRunStartedFromPersistedProjection = false;
   private activeRunRequiresDurableResumeAuthority = false;
@@ -173,6 +178,7 @@ export class RunCoordinator {
         ...item,
         missing: [...item.missing],
       })),
+      providerUsageScopeId: this.providerUsageScopeId,
       providerUsage: { ...this.providerUsage },
       lastMissionGraph: this.lastMissionGraph
         ? structuredCloneValue(this.lastMissionGraph)
@@ -239,6 +245,8 @@ export class RunCoordinator {
     this.missionEvidence.splice(0, this.missionEvidence.length);
     this.lastMissionScorecard = null;
     this.diagnosticAttestations.splice(0, this.diagnosticAttestations.length);
+    this.providerUsageScopeId = createProviderUsageScopeId();
+    this.activeProviderUsageScopeId = this.providerUsageScopeId;
     this.providerUsage = emptyProviderUsage();
     // Keep an integrity-checked restart projection visible until the accepted
     // executor publishes its own config or graph. A continuation can be
@@ -318,6 +326,7 @@ export class RunCoordinator {
         rejectOutcome(error);
       } finally {
         if (this.activePromise === promise) {
+          this.activeProviderUsageScopeId = null;
           this.activePromise = null;
           this.activeController = null;
           this.activeEventTap = null;
@@ -352,6 +361,9 @@ export class RunCoordinator {
     this.missionEvidence.splice(0, this.missionEvidence.length);
     this.lastMissionScorecard = null;
     this.diagnosticAttestations.splice(0, this.diagnosticAttestations.length);
+    this.providerUsageScopeId = null;
+    this.activeProviderUsageScopeId = null;
+    this.providerUsage = emptyProviderUsage();
     this.lastComplete = null;
     this.state = "idle";
     this.startedAtMs = null;
@@ -422,12 +434,19 @@ export class RunCoordinator {
   }
 
   private createEvents(): AgentRunEvents {
+    const providerUsageScopeId = this.activeProviderUsageScopeId;
     return new Proxy({} as AgentRunEvents, {
       get: (_target, property) => {
         if (typeof property !== "string") {
           return undefined;
         }
         return (...args: unknown[]) => {
+          if (
+            providerUsageScopeId === null ||
+            this.activeProviderUsageScopeId !== providerUsageScopeId
+          ) {
+            return;
+          }
           this.emit(property as keyof AgentRunEvents, args);
         };
       },
@@ -464,9 +483,12 @@ export class RunCoordinator {
       if (evidence) {
         this.modelCallEvidence.push({ ...evidence });
         if (this.modelCallEvidence.length > 256) this.modelCallEvidence.shift();
-        this.providerUsage.modelCallCount += 1;
+        // A local observer-budget rejection and a client-returned quota error
+        // can both use `budget_exhausted`; client invocation is the exact split.
+        this.providerUsage.modelCallCount += evidence.clientInvoked ? 1 : 0;
         this.providerUsage.successfulCallCount += evidence.outcome === "success" ? 1 : 0;
-        this.providerUsage.failedCallCount += evidence.outcome === "error" ? 1 : 0;
+        this.providerUsage.failedCallCount +=
+          evidence.clientInvoked && evidence.outcome !== "success" ? 1 : 0;
         this.providerUsage.reportedTokens += evidence.tokenUsageReported
           ? evidence.totalTokens
           : 0;
@@ -657,6 +679,15 @@ export class RunCoordinator {
     this.lastMissionLedger = null;
     this.persistedProjection = null;
   }
+}
+
+function createProviderUsageScopeId(): string {
+  providerUsageScopeSequence += 1;
+  return [
+    "provider-usage",
+    Date.now().toString(36),
+    providerUsageScopeSequence.toString(36),
+  ].join("-");
 }
 
 function emptyProviderUsage(): ModelUsageAggregateV1 {

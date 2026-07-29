@@ -10,6 +10,7 @@ import {
 import type { JsonSchemaObject } from "../model/types";
 import type { AuthorityGrantV1 } from "../agent/authority";
 import { extractMarkdownPathMentions } from "../agent/missionScope";
+import { parseExplicitResearchSourceCount } from "../agent/researchPlan";
 import { sha256DiagramContent } from "../design/diagramArtifactStore";
 import {
   assertNoRawAuthority,
@@ -17,12 +18,16 @@ import {
   type AcceptedResearchArtifactV1,
   type AcceptedResearchNotePackageV1,
   type AcceptedResearchNoteWriteRequestV1,
+  type LinearIssueRecord,
+  parseAcceptedResearchNotePackageV1,
+  parseRenderedCompatibleWorkItemSpec,
   parseResearchPublicationCheckpointV1,
   type ResearchPublicationCheckpointV1,
   type ResearchPublicationDestinationV1,
   type ResearchPublicationExactApprovalRequestV1,
   type ResearchPublicationLineagePortV1,
   type ResearchPublicationPublisherPortV1,
+  type ResearchPublicationResultV1,
 } from "../integrations/linear";
 import { AcceptedResearchNoteWriter } from "../integrations/linear";
 import type { AgentTool, ToolExecutionContext } from "./types";
@@ -243,6 +248,181 @@ function initiatingNoteFromCheckpoint(input: {
   }
 }
 
+async function replayCompletedResearchPublication(input: {
+  checkpoint: ResearchPublicationCheckpointV1;
+  publicationId: string;
+  artifactId: string;
+  rootRunId: string;
+  vaultBindingKey: string;
+  context: ToolExecutionContext;
+  publisher: ResearchPublicationPublisherPortV1;
+}): Promise<ResearchPublicationResultV1> {
+  let checkpoint: ResearchPublicationCheckpointV1;
+  try {
+    checkpoint = parseResearchPublicationCheckpointV1(input.checkpoint);
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_identity_invalid",
+      cause instanceof Error
+        ? `The completed research publication checkpoint is invalid: ${cause.message}`
+        : "The completed research publication checkpoint is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
+  initiatingNoteFromCheckpoint({
+    checkpoint,
+    publicationId: input.publicationId,
+    artifactId: input.artifactId,
+    runId: input.rootRunId,
+    vaultBindingKey: input.vaultBindingKey,
+  });
+  if (
+    checkpoint.status !== "complete" ||
+    !checkpoint.lineage ||
+    !checkpoint.workItemFingerprint ||
+    !checkpoint.approvalFingerprint ||
+    !checkpoint.binding ||
+    !checkpoint.issue ||
+    !checkpoint.backlink
+  ) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_incomplete",
+      "A completed research publication checkpoint is missing durable proof.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const lineage = checkpoint.lineage;
+  const binding = checkpoint.binding;
+  const checkpointIssue = checkpoint.issue;
+  const backlink = checkpoint.backlink;
+
+  const file = input.context.app.vault.getFileByPath(
+    checkpoint.artifact.notePath,
+  );
+  if (!file) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_note_missing",
+      "The completed research publication note is missing.",
+      { mutationState: "not_applied" },
+    );
+  }
+  let noteContent: string;
+  try {
+    noteContent = await input.context.app.vault.read(file);
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_note_unreadable",
+      cause instanceof Error
+        ? `The completed research publication note could not be read: ${cause.message}`
+        : "The completed research publication note could not be read.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const currentNoteSha256 = await sha256DiagramContent(noteContent);
+  if (currentNoteSha256 !== backlink.afterSha256) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_note_drift",
+      "The completed research publication note changed after its verified Linear backlink.",
+      { mutationState: "not_applied" },
+    );
+  }
+
+  let issue: LinearIssueRecord;
+  try {
+    issue = await input.publisher.readIssue(checkpointIssue.id, input.context);
+  } catch (cause) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_readback_failed",
+      cause instanceof Error
+        ? `The completed Linear issue could not be read: ${cause.message}`
+        : "The completed Linear issue could not be read.",
+      { mutationState: "not_applied" },
+    );
+  }
+  let workItem: ReturnType<
+    typeof parseRenderedCompatibleWorkItemSpec
+  >["spec"];
+  try {
+    workItem = parseRenderedCompatibleWorkItemSpec(issue.description ?? "").spec;
+  } catch {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_readback_mismatch",
+      "The completed Linear issue no longer contains one valid signed work-item contract.",
+      { mutationState: "not_applied" },
+    );
+  }
+  const issueUpdatedAt = typeof issue.updatedAt === "string"
+    ? Date.parse(issue.updatedAt)
+    : Number.NaN;
+  const checkpointIssueUpdatedAt = Date.parse(checkpointIssue.updatedAt);
+  const commonContractMismatch =
+    issue.resourceType !== "issue" ||
+    issue.trashed ||
+    issue.id !== checkpointIssue.id ||
+    issue.id !== binding.issueId ||
+    issue.identifier !== checkpointIssue.identifier ||
+    issue.identifier !== binding.issueIdentifier ||
+    issue.url !== checkpointIssue.url ||
+    issue.url !== binding.issueUrl ||
+    issue.team.id !== binding.teamId ||
+    !/^sha256:[a-f0-9]{64}$/u.test(issue.snapshotHash) ||
+    !Number.isFinite(issueUpdatedAt) ||
+    issueUpdatedAt < checkpointIssueUpdatedAt ||
+    binding.originRunId !== input.rootRunId ||
+    binding.workItemFingerprint !== checkpoint.workItemFingerprint ||
+    binding.acceptedResearchArtifactFingerprint !==
+      checkpoint.artifact.artifactFingerprint ||
+    lineage.originRunId !== input.rootRunId ||
+    lineage.workItemFingerprint !== checkpoint.workItemFingerprint ||
+    lineage.researchArtifactFingerprint !==
+      checkpoint.artifact.artifactFingerprint ||
+    lineage.externalWorkItemBindingFingerprint !== binding.bindingFingerprint ||
+    workItem.fingerprint !== checkpoint.workItemFingerprint ||
+    workItem.originRunId !== input.rootRunId ||
+    workItem.executionClass !== lineage.executionClass ||
+    (workItem.repositoryKey ?? null) !== (lineage.repositoryKey ?? null);
+  const v2ContractMismatch =
+    workItem.schemaVersion === 2 &&
+    (
+      workItem.acceptedResearchArtifactFingerprint !==
+        checkpoint.artifact.artifactFingerprint ||
+      (workItem.vaultBindingKey ?? null) !==
+        (lineage.vaultBindingKey ?? null)
+    );
+  if (
+    commonContractMismatch ||
+    v2ContractMismatch
+  ) {
+    throw new ToolExecutionError(
+      "research_publication_checkpoint_readback_mismatch",
+      "The completed Linear issue no longer matches its durable publication binding.",
+      { mutationState: "not_applied" },
+    );
+  }
+
+  return {
+    ok: true,
+    status: "complete",
+    publication: "deduplicated",
+    note: {
+      path: checkpoint.artifact.notePath,
+      operation: "no_op",
+      beforeSha256: currentNoteSha256,
+      afterSha256: currentNoteSha256,
+      noteReceiptId: checkpoint.artifact.noteReceiptId,
+      artifact: checkpoint.artifact,
+      transaction: null,
+    },
+    artifact: checkpoint.artifact,
+    lineage,
+    approvalFingerprint: checkpoint.approvalFingerprint,
+    binding,
+    issue,
+    backlink,
+    receipt: null,
+  };
+}
+
 export interface ResearchPublicationGrantInputV1 {
   runId: string;
   approvalId: string;
@@ -294,6 +474,37 @@ export interface CreateResearchPublicationToolOptionsV1 {
   }[]>;
   isAvailable?: () => boolean;
   now?: () => Date;
+  /**
+   * Host-owned view of the trusted repository catalog, used to make package
+   * negotiation self-describing: with exactly one trusted profile the
+   * repositoryKey defaults to it instead of requiring the model to echo it,
+   * and rejection errors enumerate the valid keys so a retry can succeed.
+   * Absent, the legacy strict behavior applies unchanged.
+   */
+  describeTrustedRepositoryCatalog?(): TrustedRepositoryCatalogV1;
+}
+
+export interface TrustedRepositoryCatalogV1 {
+  repositoryKeys: readonly string[];
+  validationKeysByRepository: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * The exact validation requirement keys a trusted repository profile accepts:
+ * its validation profile id plus one `<key>.validation.<n>` entry per
+ * configured command. Shared by the fail-closed check and the catalog the
+ * tool describes, so the two can never drift apart.
+ */
+export function trustedValidationKeysForProfileV1(profile: {
+  key: string;
+  validationProfile: { id: string; validationCommands: readonly unknown[] };
+}): string[] {
+  return [
+    profile.validationProfile.id,
+    ...profile.validationProfile.validationCommands.map(
+      (_command, index) => `${profile.key}.validation.${index + 1}`,
+    ),
+  ];
 }
 
 export function createResearchPublicationTool(
@@ -321,55 +532,73 @@ export function createResearchPublicationTool(
         );
       }
       const runId = requireIdentity(context.runId, "run id");
+      const rootRunId = requireIdentity(
+        context.rootMissionId?.trim() || runId,
+        "root mission id",
+      );
       const toolCallId = requireIdentity(context.operationId, "tool call id");
       const vaultBindingKey = requireLogicalKey(
         options.vaultBindingKey,
         "host vault binding key",
       );
       const artifactId = await createResearchPublicationArtifactId(
-        runId,
+        rootRunId,
         vaultBindingKey,
       );
       const publicationId = `publication-${artifactId}`;
       const priorCheckpoint = await options.lineage.get?.(publicationId) ?? null;
+      if (priorCheckpoint?.status === "complete") {
+        return replayCompletedResearchPublication({
+          checkpoint: priorCheckpoint,
+          publicationId,
+          artifactId,
+          rootRunId,
+          vaultBindingKey,
+          context,
+          publisher: options.publisher,
+        });
+      }
       const initiatingNote = priorCheckpoint
         ? initiatingNoteFromCheckpoint({
             checkpoint: priorCheckpoint,
             publicationId,
             artifactId,
-            runId,
+            runId: rootRunId,
             vaultBindingKey,
           })
         : await captureInitiatingNoteBinding(context);
       const proofCache = context.runtimeCache ?? { toolResults: new Map() };
       if (options.loadDurableWebEvidence) {
-        const evidenceRunId = requireIdentity(
-          context.rootMissionId?.trim() || runId,
-          "durable evidence run id",
-        );
         seedDurableWebEvidence(
           proofCache,
-          await options.loadDurableWebEvidence(evidenceRunId),
+          await options.loadDurableWebEvidence(rootRunId),
         );
       }
-      const parsedNote = await parseToolArguments({
-        value: args,
-        runId,
-        toolCallId,
-        originalPrompt: context.originalPrompt,
-        vaultBindingKey,
-        artifactId,
-        runtimeCache: proofCache,
-        resolveNotePath: options.resolveNotePath,
-        validateTrustedBindings: options.validateTrustedBindings,
-        initiatingNote,
-        nowProvider: options.now ?? context.now,
-      });
+      const parsedNote = priorCheckpoint?.acceptedPackage
+        ? acceptedResearchRequestFromCheckpoint(
+            priorCheckpoint,
+            priorCheckpoint.acceptedPackage,
+            options.validateTrustedBindings,
+          )
+        : await parseToolArguments({
+            value: args,
+            runId: rootRunId,
+            toolCallId,
+            originalPrompt: context.originalPrompt,
+            vaultBindingKey,
+            artifactId,
+            runtimeCache: proofCache,
+            resolveNotePath: options.resolveNotePath,
+            validateTrustedBindings: options.validateTrustedBindings,
+            describeTrustedRepositoryCatalog: options.describeTrustedRepositoryCatalog,
+            initiatingNote,
+            nowProvider: options.now ?? context.now,
+          });
       const note = stabilizeAcceptedResearchRequest(
         parsedNote,
         proofCache,
-        runId,
-        priorCheckpoint !== null,
+        rootRunId,
+        priorCheckpoint?.acceptedPackage ?? null,
       );
       if (!context.requestNestedApproval) {
         throw new ToolExecutionError(
@@ -494,7 +723,9 @@ export function createResearchPublicationTool(
     >;
     let receipt: ActionReceipt | undefined;
     if ((output.ok && output.status === "complete") || output.status === "waiting_obsidian") {
-      receipt = output.receipt ?? createDeduplicatedReadbackReceipt(output);
+      receipt =
+        output.receipt ??
+        (await createDeduplicatedReadbackReceipt(output, context));
       await options.persistExternalReceipt(receipt);
     }
     return {
@@ -512,21 +743,28 @@ export function hasExplicitResearchPublicationIntent(prompt: string): boolean {
   // "Obsidian note … create … Linear issue" is ordinary ticket writeback, not
   // publish_research_to_linear. Require research/findings/report language or an
   // explicit publish/send/sync verb before Linear.
-  if (
-    /\b(?:publish|send|sync|post)\b[\s\S]{0,120}\b(?:research|findings|report|accepted\s+research)\b[\s\S]{0,120}\b(?:to|in|on)\s+linear\b/iu.test(
-      normalized,
-    ) ||
-    /\b(?:research|findings|report|accepted\s+research)\b[\s\S]{0,120}\b(?:publish|send|sync|post)\b[\s\S]{0,120}\blinear\b/iu.test(
-      normalized,
-    )
-  ) {
-    return true;
-  }
-  return (
-    /\b(?:publish|send|sync|post|file)\b[\s\S]{0,120}\b(?:research|findings|report)\b[\s\S]{0,80}\b(?:ticket|issue)\b[\s\S]{0,80}\b(?:to|in|on)\s+linear\b/iu.test(
-      normalized,
-    )
-  );
+  return normalized
+    .split(/(?:[!?;\r\n]+|\.(?=\s|$)|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some((clause) => {
+      const publicationIntent =
+        /\b(?:publish|send|sync|post)\b[\s\S]{0,120}\b(?:research|findings|report|accepted\s+research)\b[\s\S]{0,120}\b(?:to|in|on)\s+(?:(?:exactly\s+)?(?:one|a|an|the)\s+)?linear\b/iu.test(
+          clause,
+        ) ||
+        /\b(?:research|findings|report|accepted\s+research)\b[\s\S]{0,120}\b(?:publish|send|sync|post)\b[\s\S]{0,120}\blinear\b/iu.test(
+          clause,
+        ) ||
+        /\b(?:publish|send|sync|post|file)\b[\s\S]{0,120}\b(?:research|findings|report)\b[\s\S]{0,80}\b(?:ticket|issue)\b[\s\S]{0,80}\b(?:to|in|on)\s+(?:(?:exactly\s+)?(?:one|a|an|the)\s+)?linear\b/iu.test(
+          clause,
+        );
+      if (!publicationIntent) {
+        return false;
+      }
+      return !/\b(?:do\s+not|don't|never)\s+(?:(?:yet|now|currently)\s+)?(?:publish|send|sync|post|file)\b/iu.test(
+        clause,
+      );
+    });
 }
 
 async function parseToolArguments(input: {
@@ -539,6 +777,7 @@ async function parseToolArguments(input: {
   runtimeCache: ToolExecutionContext["runtimeCache"];
   resolveNotePath: CreateResearchPublicationToolOptionsV1["resolveNotePath"];
   validateTrustedBindings: CreateResearchPublicationToolOptionsV1["validateTrustedBindings"];
+  describeTrustedRepositoryCatalog?: CreateResearchPublicationToolOptionsV1["describeTrustedRepositoryCatalog"];
   initiatingNote: InitiatingNoteBindingV1 | null;
   nowProvider?: () => Date;
 }) {
@@ -566,6 +805,7 @@ async function parseToolArguments(input: {
     ],
     ["repositoryKey"],
   );
+  canonicalizeCompatibleProposedWork(packageRecord);
   if (
     typeof packageRecord.schemaVersion === "string" &&
     /^(?:v(?:ersion)?[-_ ]*)?1(?:\.0)?$/iu.test(
@@ -599,13 +839,38 @@ async function parseToolArguments(input: {
     packageRecord.executionClass === "code" &&
     packageRecord.repositoryKey === undefined
   ) {
-    throw new ToolExecutionError(
-      "research_publication_invalid_arguments",
-      "A package with executionClass code must include the trusted repositoryKey named by the mission.",
-      { mutationState: "not_applied" },
-    );
+    // A model cannot invent a trusted key, and with exactly one registered
+    // profile there is nothing to disambiguate — requiring an echo of the key
+    // only converts good packages into repeated failures. With several
+    // profiles the choice is genuinely the mission's, so still fail closed,
+    // but name the candidates so a retry can succeed.
+    const catalog = input.describeTrustedRepositoryCatalog?.();
+    if (catalog && catalog.repositoryKeys.length === 1) {
+      packageRecord.repositoryKey = catalog.repositoryKeys[0];
+    } else {
+      const known = catalog?.repositoryKeys.length
+        ? ` Trusted repository keys: ${[...catalog.repositoryKeys].join(", ")}.`
+        : "";
+      throw new ToolExecutionError(
+        "research_publication_invalid_arguments",
+        `A package with executionClass code must include the trusted repositoryKey named by the mission.${known}`,
+        { mutationState: "not_applied" },
+      );
+    }
   }
-  hydrateTrustedWebEvidence(packageRecord, input.runtimeCache);
+  bindExplicitTrustedRepositoryContract({
+    packageRecord,
+    originalPrompt: input.originalPrompt,
+    catalog: input.describeTrustedRepositoryCatalog?.(),
+  });
+  const trustedWebReferences = hydrateTrustedWebEvidence(
+    packageRecord,
+    input.runtimeCache,
+  );
+  assertExplicitResearchEvidenceCoverage({
+    originalPrompt: input.originalPrompt,
+    trustedWebReferences,
+  });
   canonicalizePackageIdentifiers(packageRecord);
   canonicalizeProviderSafeWorkItemContract(packageRecord);
   if (value.mode !== "create" && value.mode !== "append") {
@@ -632,17 +897,21 @@ async function parseToolArguments(input: {
       { mutationState: "not_applied" },
     );
   }
-  const package_ = {
+  const providerPackage = {
     ...packageRecord,
     vaultBindingKey: requireLogicalKey(input.vaultBindingKey, "host vault binding key"),
     originRunId: runId,
   } as unknown as AcceptedResearchNotePackageV1;
+  const package_ = assertAcceptedResearchPackageShape(providerPackage);
   input.validateTrustedBindings(package_);
   const path = input.initiatingNote?.source === "checkpoint"
     ? input.initiatingNote.path
     : requireSafeVaultMarkdownPath(
         input.resolveNotePath({
-          ...(requestedPath ? { requestedPath } : {}),
+          // The active initiating note is the host-owned destination. A model
+          // may omit or mistranscribe notePath, but it can never redirect the
+          // write; only unbound publication falls back to a requested path.
+          ...(!input.initiatingNote && requestedPath ? { requestedPath } : {}),
           ...(input.initiatingNote
             ? { initiatingNotePath: input.initiatingNote.path }
             : {}),
@@ -690,6 +959,66 @@ async function parseToolArguments(input: {
   };
 }
 
+function bindExplicitTrustedRepositoryContract(input: {
+  packageRecord: Record<string, unknown>;
+  originalPrompt: string;
+  catalog: TrustedRepositoryCatalogV1 | undefined;
+}): void {
+  const { packageRecord, catalog } = input;
+  if (!catalog) return;
+  const promptRepositoryKeys = catalog.repositoryKeys.filter((key) =>
+    promptContainsLogicalKey(input.originalPrompt, key)
+  );
+  if (promptRepositoryKeys.length === 1) {
+    packageRecord.repositoryKey = promptRepositoryKeys[0];
+  }
+  const repositoryKey =
+    typeof packageRecord.repositoryKey === "string"
+      ? packageRecord.repositoryKey
+      : "";
+  const trustedValidationKeys =
+    catalog.validationKeysByRepository[repositoryKey] ?? [];
+  const promptValidationKeys = trustedValidationKeys.filter((key) =>
+    promptContainsLogicalKey(input.originalPrompt, key)
+  );
+  if (promptValidationKeys.length > 0) {
+    // Logical repository/validation keys are host controls named by the user,
+    // not creative model output. Bind the package to every exact trusted key
+    // present in the original mission and discard a mistranscribed echo.
+    packageRecord.validationRequirementKeys = [...promptValidationKeys];
+  }
+}
+
+function promptContainsLogicalKey(prompt: string, key: string): boolean {
+  const normalizedPrompt = prompt.toLowerCase();
+  const normalizedKey = key.trim().toLowerCase();
+  if (!normalizedKey) return false;
+  let offset = normalizedPrompt.indexOf(normalizedKey);
+  while (offset >= 0) {
+    const before = offset === 0 ? "" : normalizedPrompt[offset - 1] ?? "";
+    const afterIndex = offset + normalizedKey.length;
+    const after =
+      afterIndex >= normalizedPrompt.length
+        ? ""
+        : normalizedPrompt[afterIndex] ?? "";
+    const afterNext =
+      afterIndex + 1 >= normalizedPrompt.length
+        ? ""
+        : normalizedPrompt[afterIndex + 1] ?? "";
+    const afterContinuesLogicalKey =
+      /[a-z0-9_-]/u.test(after) ||
+      (after === "." && /[a-z0-9_-]/u.test(afterNext));
+    if (
+      !/[a-z0-9._-]/u.test(before) &&
+      !afterContinuesLogicalKey
+    ) {
+      return true;
+    }
+    offset = normalizedPrompt.indexOf(normalizedKey, offset + 1);
+  }
+  return false;
+}
+
 function canonicalizeRiskClass(value: unknown): unknown {
   if (typeof value !== "string") {
     return value;
@@ -714,20 +1043,27 @@ function stabilizeAcceptedResearchRequest(
   candidate: AcceptedResearchNoteWriteRequestV1,
   runtimeCache: ToolExecutionContext["runtimeCache"],
   runId: string,
-  checkpointBound: boolean,
+  checkpointPackage: AcceptedResearchNotePackageV1 | null,
 ): AcceptedResearchNoteWriteRequestV1 {
-  if (!runtimeCache) return cloneAcceptedResearchRequest(candidate);
+  const checkpointCanonical = checkpointPackage
+    ? {
+        ...cloneAcceptedResearchRequest(candidate),
+        package: structuredClone(checkpointPackage),
+      }
+    : null;
+  if (!runtimeCache) {
+    return checkpointCanonical ?? cloneAcceptedResearchRequest(candidate);
+  }
   runtimeCache.acceptedResearchPublicationRequests ??= new Map<string, unknown>();
   // One run has one immutable initiating-note binding. A changed active tab or
   // model-supplied path on retry must not fork the durable publication.
   const key = runId;
-  if (checkpointBound) {
-    const canonical = cloneAcceptedResearchRequest(candidate);
+  if (checkpointCanonical) {
     runtimeCache.acceptedResearchPublicationRequests.set(
       key,
-      cloneAcceptedResearchRequest(canonical),
+      cloneAcceptedResearchRequest(checkpointCanonical),
     );
-    return canonical;
+    return checkpointCanonical;
   }
   const stored = runtimeCache.acceptedResearchPublicationRequests.get(key);
   if (stored) {
@@ -747,6 +1083,26 @@ function cloneAcceptedResearchRequest(
   value: AcceptedResearchNoteWriteRequestV1,
 ): AcceptedResearchNoteWriteRequestV1 {
   return structuredClone(value);
+}
+
+function acceptedResearchRequestFromCheckpoint(
+  checkpoint: ResearchPublicationCheckpointV1,
+  acceptedPackage: AcceptedResearchNotePackageV1,
+  validateTrustedBindings: (
+    package_: AcceptedResearchNotePackageV1,
+  ) => void,
+): AcceptedResearchNoteWriteRequestV1 {
+  const package_ = structuredClone(acceptedPackage);
+  validateTrustedBindings(package_);
+  return {
+    path: checkpoint.artifact.notePath,
+    mode: "append",
+    baseHash:
+      checkpoint.backlink?.afterSha256 ?? checkpoint.artifact.noteSha256,
+    artifactId: checkpoint.artifact.artifactId,
+    acceptedAt: checkpoint.artifact.acceptedAt,
+    package: package_,
+  };
 }
 
 async function buildApprovalPreparedAction(
@@ -839,8 +1195,7 @@ function formatLinearDestination(
     : destination.teamId;
 }
 
-function createDeduplicatedReadbackReceipt(output: {
-  artifact: { originRunId: string };
+async function createDeduplicatedReadbackReceipt(output: {
   approvalFingerprint: string;
   binding: {
     verifiedAt: string;
@@ -855,13 +1210,25 @@ function createDeduplicatedReadbackReceipt(output: {
     team: { id: string };
     project?: { id: string };
   };
-}): ActionReceipt {
-  const startedAt = output.issue.updatedAt ?? output.binding.verifiedAt;
+}, context: ToolExecutionContext): Promise<ActionReceipt> {
+  const observedAt = canonicalNow(context.now);
+  const runId = requireIdentity(context.runId, "run id");
+  const operationId = requireIdentity(context.operationId, "tool call id");
+  const receiptFingerprint = await sha256Fingerprint({
+    runId,
+    operationId,
+    issueId: output.issue.id,
+    issueSnapshotHash: output.issue.snapshotHash,
+    workItemFingerprint: output.binding.workItemFingerprint,
+    observedAt,
+  });
   return {
     version: 1,
-    id: `linear-research-readback-${output.issue.id}`,
-    runId: output.artifact.originRunId,
-    actionId: `linear-readback-${output.issue.id}`,
+    id:
+      `linear-research-readback-` +
+      receiptFingerprint.slice("sha256:".length),
+    runId,
+    actionId: `linear-readback-${operationId}`,
     toolName: "linear_read_issue",
     operation: "read",
     resource: {
@@ -878,12 +1245,12 @@ function createDeduplicatedReadbackReceipt(output: {
     payloadFingerprint: output.approvalFingerprint,
     grantId: "linear-deduplicated-readback",
     idempotencyKey: `research-publication:${output.binding.workItemFingerprint}`,
-    startedAt,
-    committedAt: output.binding.verifiedAt,
+    startedAt: observedAt,
+    committedAt: observedAt,
     commitKind: "committed",
     readback: {
       status: "verified",
-      checkedAt: output.binding.verifiedAt,
+      checkedAt: observedAt,
       ...(output.issue.updatedAt ? { observedRevision: output.issue.updatedAt } : {}),
       observedFingerprint: output.issue.snapshotHash,
     },
@@ -975,7 +1342,11 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
           },
         },
         confidenceLimitations: STRING,
-        proposedWork: NON_EMPTY_STRING_ARRAY,
+        proposedWork: {
+          ...NON_EMPTY_STRING_ARRAY,
+          description:
+            "JSON array of 1-50 nonempty strings. Even one proposed work item must use [\"...\"]; never send a bare string, object, null, or empty array.",
+        },
         nonGoals: STRING_ARRAY,
         scope: NON_EMPTY_STRING_ARRAY,
         dependencies: STRING_ARRAY,
@@ -997,7 +1368,11 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
             required: ["text"],
           },
         },
-        validationRequirementKeys: NON_EMPTY_STRING_ARRAY,
+        validationRequirementKeys: {
+          ...NON_EMPTY_STRING_ARRAY,
+          description:
+            "Keys drawn ONLY from the trusted repository profile's validation catalog: the profile's validation profile id and its <repositoryKey>.validation.<n> command keys. Never invent names; on rejection the error lists the valid keys.",
+        },
         riskClass: { type: "string", enum: ["low", "medium", "high"] },
         executionClass: {
           type: "string",
@@ -1013,7 +1388,7 @@ const RESEARCH_PUBLICATION_PARAMETERS: JsonSchemaObject = {
         repositoryKey: {
           type: "string",
           description:
-            "Optional trusted repository profile key. If present, executionClass must be code.",
+            "Trusted repository profile key. If present, executionClass must be code. When the host has exactly one trusted repository profile it defaults to that profile; omit rather than guessing.",
         },
       },
       required: [
@@ -1053,6 +1428,39 @@ function hydratePackageObjective(packageRecord: Record<string, unknown>): void {
     return;
   }
   packageRecord.objective = "Deliver the accepted research work item.";
+}
+
+/**
+ * Some OpenAI-compatible providers emit a single proposed-work value as a
+ * scalar despite the array schema. A nonblank scalar can be canonicalized
+ * losslessly. Missing, blank, empty, object, and overlong shapes still fail
+ * closed at the pre-mutation package validator.
+ */
+function canonicalizeCompatibleProposedWork(
+  packageRecord: Record<string, unknown>,
+): void {
+  if (typeof packageRecord.proposedWork === "string") {
+    const proposedWork = packageRecord.proposedWork.trim();
+    if (proposedWork) {
+      packageRecord.proposedWork = [proposedWork];
+    }
+  }
+}
+
+function assertAcceptedResearchPackageShape(
+  package_: AcceptedResearchNotePackageV1,
+): AcceptedResearchNotePackageV1 {
+  try {
+    return parseAcceptedResearchNotePackageV1(package_);
+  } catch (error) {
+    throw new ToolExecutionError(
+      "research_publication_invalid_arguments",
+      error instanceof Error
+        ? `The accepted research package is invalid: ${error.message}`
+        : "The accepted research package is invalid.",
+      { mutationState: "not_applied" },
+    );
+  }
 }
 
 function assertExactKeys(
@@ -1225,8 +1633,8 @@ function canonicalizeProviderSafeWorkItemContract(
 function hydrateTrustedWebEvidence(
   packageRecord: Record<string, unknown>,
   runtimeCache: ToolExecutionContext["runtimeCache"],
-): void {
-  if (!Array.isArray(packageRecord.evidence) || !runtimeCache) return;
+): string[] {
+  if (!Array.isArray(packageRecord.evidence) || !runtimeCache) return [];
   const candidateResults = [
     ...[...(runtimeCache.trustedWebFetchResults?.values() ?? [])].map(
       (result) => ({ trustedRegistry: true, cacheKey: "", result }),
@@ -1286,7 +1694,7 @@ function hydrateTrustedWebEvidence(
   const trusted = [...trustedByReference.values()].sort((left, right) =>
     left.reference.localeCompare(right.reference),
   );
-  if (trusted.length === 0) return;
+  if (trusted.length === 0) return [];
 
   const modelEvidence = packageRecord.evidence;
   for (const candidate of modelEvidence) {
@@ -1319,6 +1727,34 @@ function hydrateTrustedWebEvidence(
       summary: entry.summary,
     })),
   ];
+  return trusted.map((entry) => entry.reference);
+}
+
+function assertExplicitResearchEvidenceCoverage(input: {
+  originalPrompt: string;
+  trustedWebReferences: readonly string[];
+}): void {
+  const required = parseExplicitResearchSourceCount(input.originalPrompt);
+  if (required === null) return;
+  const references = [...new Set(
+    input.trustedWebReferences
+      .map(normalizeTrustedWebReference)
+      .filter((value): value is string => value !== null),
+  )].sort();
+  if (references.length >= required) return;
+
+  const represented = references.length > 0
+    ? ` Host-verified references already bound: ${references.join(", ")}.`
+    : "";
+  throw new ToolExecutionError(
+    "research_publication_evidence_incomplete",
+    `Research publication requires ${required} distinct host-verified web sources, but only ${references.length} ${
+      references.length === 1 ? "is" : "are"
+    } bound. Fetch ${required - references.length} additional distinct source${
+      required - references.length === 1 ? "" : "s"
+    } with web_fetch before retrying.${represented}`,
+    { mutationState: "not_applied" },
+  );
 }
 
 function seedDurableWebEvidence(

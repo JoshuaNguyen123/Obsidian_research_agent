@@ -59,6 +59,7 @@ export function mergeResearchWorkerResult(input: {
       claimPassages.map((passage) => ({
         id: passage.id,
         text: passage.text,
+        sourceId: passage.evidenceId,
       })),
     ),
   ).length;

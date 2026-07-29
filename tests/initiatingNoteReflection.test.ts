@@ -164,14 +164,32 @@ test("note path cites Linear, commit, PR, and validation without receipt dumps",
 
   assert.equal(plan.shouldWriteNote, true);
   assert.equal(plan.destination.kind, "initiating_note");
-  assert.match(plan.markdown, /Linear issue: https:\/\/linear\.app\/acme\/issue\/ABC-1/u);
-  assert.match(plan.markdown, /Validation: targeted and full checks passed/u);
-  assert.match(plan.markdown, new RegExp(`Commit: \`${"a".repeat(40)}\``, "u"));
   assert.match(
     plan.markdown,
-    /Draft PR: \[#12\]\(https:\/\/github\.com\/owner\/repo\/pull\/12\)/u,
+    /\[Linear issue issue-abc\]\(https:\/\/linear\.app\/acme\/issue\/ABC-1\)/u,
   );
-  assert.match(plan.markdown, /Repository: https:\/\/github\.com\/owner\/repo/u);
+  assert.match(plan.markdown, /Targeted and full validation passed\./u);
+  assert.match(plan.markdown, /commit `aaaaaaaaaaaa`/u);
+  assert.match(
+    plan.markdown,
+    /\[draft PR #12\]\(https:\/\/github\.com\/owner\/repo\/pull\/12\)/u,
+  );
+  assert.match(
+    plan.markdown,
+    /\[the repository\]\(https:\/\/github\.com\/owner\/repo\)/u,
+  );
+  assert.match(plan.markdown, /evidence chain is complete/iu);
+  const visibleReflection = plan.markdown.replace(/<!--[\s\S]*?-->/gu, "");
+  assert.doesNotMatch(
+    visibleReflection,
+    /Compound run|host-verified|Run Details/iu,
+  );
+  assert.doesNotMatch(visibleReflection, /run-1/u);
+  const reflectionWords = visibleReflection
+    .replace(/https?:\/\/\S+/gu, "")
+    .match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]*\b/gu) ?? [];
+  assert.ok(reflectionWords.length >= 35);
+  assert.ok(reflectionWords.length <= 100);
   assert.equal(findRawReceiptDumpInReflectionMarkdown(plan.markdown), null);
   assert.ok(!plan.markdown.includes("receipt:linear-1"));
   assert.ok(!plan.markdown.includes(fp("c")));
@@ -203,7 +221,7 @@ test("explicit Chat-only skips note write but still returns chat summary cites",
   assert.match(plan.chatSummary, /github\.com\/owner\/repo/u);
 });
 
-test("forceChatOnly and persistence chat_only_not_persisted suppress note write", () => {
+test("forceChatOnly and non-write persistence states suppress note write", () => {
   const pipeline = buildPipelineLineageV1({ lineage: verifiedLineage() });
   const forced = buildInitiatingNoteReflectionV1({
     runId: "run-force",
@@ -228,6 +246,20 @@ test("forceChatOnly and persistence chat_only_not_persisted suppress note write"
     persisted.destination.kind === "chat_only" && persisted.destination.reason,
     "persistence_chat_only_not_persisted",
   );
+
+  const notRequested = buildInitiatingNoteReflectionV1({
+    runId: "run-not-requested",
+    pipeline,
+    initiatingNotePath: "Research/Source.md",
+    persistence: "not_requested",
+  });
+  assert.equal(notRequested.shouldWriteNote, false);
+  assert.equal(notRequested.markdown, "");
+  assert.equal(
+    notRequested.destination.kind === "chat_only" &&
+      notRequested.destination.reason,
+    "reflection_not_requested",
+  );
 });
 
 test("append helper is marker-idempotent", () => {
@@ -242,6 +274,34 @@ test("append helper is marker-idempotent", () => {
   assert.equal(once, twice);
   assert.equal(
     once.split("<!-- agentic-initiating-reflection:run-1 -->").length - 1,
+    1,
+  );
+});
+
+test("continuation segments sharing a root marker append one reflection", () => {
+  const pipeline = buildPipelineLineageV1({ lineage: verifiedLineage() });
+  const first = buildInitiatingNoteReflectionV1({
+    runId: "run-child-1",
+    markerId: "run-root",
+    pipeline,
+    initiatingNotePath: "Research/Source.md",
+  });
+  const second = buildInitiatingNoteReflectionV1({
+    runId: "run-child-2",
+    markerId: "run-root",
+    pipeline,
+    initiatingNotePath: "Research/Source.md",
+  });
+  const once = appendInitiatingNoteReflectionMarkdown("# Source\n\nBody.", first);
+  const twice = appendInitiatingNoteReflectionMarkdown(once, second);
+
+  assert.equal(once, twice);
+  assert.equal(
+    twice.split("<!-- agentic-initiating-reflection:run-root -->").length - 1,
+    1,
+  );
+  assert.equal(
+    (twice.match(/^## Mission completion reflection$/gmu) ?? []).length,
     1,
   );
 });

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { sha256Fingerprint } from "../../../packages/headless-runtime/src/canonicalize";
 
 import {
@@ -945,7 +947,16 @@ export function normalizeCodeRepairRequestV1(
 export function codeRepairCheckpointIdV1(
   request: Pick<NormalizedCodeRepairRequestV1, "id" | "runId" | "worktree">,
 ): string {
-  return `code-repair:${request.runId}:${request.worktree.id}:${request.id}`;
+  const direct =
+    `code-repair:${request.runId}:${request.worktree.id}:${request.id}`;
+  if (IDENTIFIER.test(direct)) return direct;
+  const digest = createHash("sha256")
+    .update(
+      JSON.stringify([request.runId, request.worktree.id, request.id]),
+      "utf8",
+    )
+    .digest("hex");
+  return `code-repair:sha256-${digest}`;
 }
 
 /**

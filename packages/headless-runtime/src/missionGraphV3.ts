@@ -2936,6 +2936,7 @@ function isStatusTransitionAllowed(
     queued: ["ready", "blocked", "cancelled"],
     ready: ["running", "waiting_approval", "waiting_obsidian", "blocked", "cancelled"],
     running: [
+      "queued",
       "ready",
       "waiting_approval",
       "waiting_obsidian",

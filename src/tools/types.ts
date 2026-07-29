@@ -84,6 +84,28 @@ export interface ResearchMemoryRecordV2 extends ResearchMemoryIndexEntry {
   verificationState: "unverified" | "verified" | "stale" | "superseded";
 }
 
+export interface VerifiedLinearCodeRepositoryBindingV1 {
+  version: 1;
+  repositoryProfileKey: string;
+  issueId: string;
+  issueIdentifier: string;
+  publicationId: string;
+  workItemFingerprint: string;
+  acceptedResearchArtifactFingerprint: string;
+  originRunId: string;
+}
+
+export type VerifiedLinearCodeRepositoryBindingResolutionV1 =
+  | {
+      status: "verified";
+      binding: VerifiedLinearCodeRepositoryBindingV1;
+    }
+  | {
+      status: "not_applicable" | "rejected";
+      code: string;
+      reason: string;
+    };
+
 export interface ToolExecutionContext {
   app: App;
   settings: AgentSettings;
@@ -146,6 +168,20 @@ export interface ToolExecutionContext {
    * `code_workspace_create` when the mission names exactly one of them.
    */
   getRepositoryProfileKeys?: () => readonly string[];
+  /**
+   * Resolve a provider-read Linear issue into repository authority only when
+   * its signed WorkItemSpecV2 agrees with the host's completed publication
+   * checkpoint, accepted-note lineage, external binding, and trusted registry.
+   */
+  resolveVerifiedLinearCodeRepositoryBinding?: (
+    issueRecord: Record<string, unknown>,
+  ) => Promise<VerifiedLinearCodeRepositoryBindingResolutionV1>;
+  /**
+   * Current run's host-verified Linear-to-repository authority. Publication
+   * code may read this binding, but model tool arguments can never supply it.
+   */
+  getVerifiedLinearCodeRepositoryBinding?: () =>
+    VerifiedLinearCodeRepositoryBindingV1 | null;
   /** Fresh host-owned readiness evidence for pre-model capability blockers. */
   getCapabilityReadiness?: () => readonly CapabilityReadinessV2[];
   semanticEmbeddingProvider?: SemanticEmbeddingProvider;

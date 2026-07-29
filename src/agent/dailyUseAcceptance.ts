@@ -4,7 +4,9 @@ export type DailyUseScenarioId =
   | "DU-03"
   | "DU-04"
   | "DU-05"
-  | "DU-06";
+  | "DU-06"
+  | "BYOK-01"
+  | "DESKTOP-01";
 
 export interface DailyUseAcceptanceV1 {
   version: 1;
@@ -30,9 +32,110 @@ export interface DailyUseAcceptanceResultV1 {
 }
 
 /**
- * Stable acceptance contracts for the six release journeys. These keys are
- * intentionally provider-neutral so deterministic, live-model, sandbox, and
- * protected external lanes can report against the same completion contract.
+ * Typed BYOK-01 observation vocabulary. The live lane imports this catalog so
+ * it can only record a contract token through an evidence-bearing runtime
+ * observation; it must never manufacture a complete contract from the schema.
+ */
+export const BYOK_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze([
+    "vault:accepted_research_note",
+    "linear:implementation_issue",
+    "code:ide_readable_export",
+    "git:verified_commit",
+    "github:private_repository",
+    "github:draft_pull_request",
+    "vault:completion_reflection",
+  ] as const),
+  proofs: Object.freeze([
+    "research:four_distinct_sources",
+    "research:accepted_lineage",
+    "linear:provider_readback",
+    "linear:independent_phase_b_read",
+    "sandbox:production_boundary",
+    "code:protected_contract",
+    "validation:targeted",
+    "validation:fresh_full",
+    "git:neutral_identity",
+    "github:private_visibility_readback",
+    "github:remote_sha_readback",
+    "github:single_open_draft_readback",
+    "reflection:human_35_100_words",
+    "graph:authoritative",
+    "idempotency:no_duplicates",
+    "authority:no_unapproved_mutations",
+  ] as const),
+  approvals: Object.freeze([
+    "approval:linear_issue_create",
+    "authorization:sandbox_execution",
+    "approval:github_private_repository_create",
+    "approval:github_publish",
+  ] as const),
+  bindings: Object.freeze([
+    "binding:note_linear_issue",
+    "binding:linear_commit",
+    "binding:commit_pr",
+    "binding:note_pr",
+    "binding:desktop_commit_tree",
+    "binding:durable_workspace_identity",
+  ] as const),
+  cleanup: Object.freeze([
+    "cleanup:linear_fixture",
+    "cleanup:github_fixture",
+    "cleanup:vault_fixture",
+    "cleanup:workspace_fixture",
+    "cleanup:source_fixture",
+    "cleanup:independent_readback",
+    "cleanup:retained_export_verified",
+  ] as const),
+});
+
+export type ByokAcceptanceObservationCategory =
+  keyof typeof BYOK_01_ACCEPTANCE_TOKENS;
+
+export type ByokAcceptanceObservationToken<
+  Category extends ByokAcceptanceObservationCategory,
+> = (typeof BYOK_01_ACCEPTANCE_TOKENS)[Category][number];
+
+/**
+ * Runtime observations for the no-repository scratch-code journey. This is a
+ * separate contract from DU-03: DU-03 intentionally requires a trusted Git
+ * repository, tests, README, and commit, while DESKTOP-01 intentionally proves
+ * a runnable artifact can be created from a bare prompt and exported safely.
+ */
+export const DESKTOP_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze([
+    "code:python_source",
+    "code:playable_cli",
+    "code:desktop_export",
+  ] as const),
+  proofs: Object.freeze([
+    "model:production_call",
+    "sandbox:host_adopted",
+    "graph:required_code_ladder_complete",
+    "validation:python_compile",
+    "runtime:board_rendered",
+    "runtime:no_crash",
+    "receipt:verified_desktop_export",
+    "ui:mission_surfaces_visible",
+  ] as const),
+  approvals: Object.freeze([
+    "authorization:sandbox_execution",
+  ] as const),
+  bindings: Object.freeze([
+    "binding:assistant_absolute_export_path",
+  ] as const),
+  cleanup: Object.freeze([
+    "cleanup:desktop_export",
+    "cleanup:scratch_workspace",
+  ] as const),
+});
+
+/**
+ * Stable acceptance contracts for the six release journeys, the exact BYOK
+ * autonomy proof, and the bare-prompt scratch-to-Desktop journey. These keys
+ * are intentionally provider-neutral so deterministic, live-model, sandbox,
+ * and protected external lanes can report against the same completion
+ * contract.
  */
 export const DAILY_USE_ACCEPTANCE_V1: Readonly<
   Record<DailyUseScenarioId, DailyUseAcceptanceV1>
@@ -146,7 +249,7 @@ export const DAILY_USE_ACCEPTANCE_V1: Readonly<
       "github:draft_pr_readback",
       "reconciliation:backlinks_and_status",
       "authority:no_unapproved_mutations",
-      "resume:no_duplicates",
+      "idempotency:no_duplicates",
     ],
     approvalBoundaries: [
       "approval:linear_issue_create",
@@ -166,6 +269,20 @@ export const DAILY_USE_ACCEPTANCE_V1: Readonly<
       "cleanup:github_fixture",
       "cleanup:independent_readback",
     ],
+  }),
+  "BYOK-01": contract("BYOK-01", {
+    requestedArtifacts: BYOK_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: BYOK_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: BYOK_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: BYOK_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: BYOK_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "DESKTOP-01": contract("DESKTOP-01", {
+    requestedArtifacts: DESKTOP_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: DESKTOP_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: DESKTOP_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: DESKTOP_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: DESKTOP_01_ACCEPTANCE_TOKENS.cleanup,
   }),
 });
 

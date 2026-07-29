@@ -154,6 +154,40 @@ export class BundledCodeCapability {
       this.token = null;
       throw error;
     }
+    this.startHostProvisionedSandboxReadiness();
+  }
+
+  /**
+   * Adopt an already-provisioned host sandbox and prove its boundary once per
+   * session, off the plugin-load critical path. Without this the durable state
+   * kept zero providers on a fully provisioned machine and every
+   * generated-code mission stopped at code_validate_fast.
+   */
+  private startHostProvisionedSandboxReadiness(): void {
+    if (this.probeInFlight) return;
+    const controller = new AbortController();
+    this.probeController = controller;
+    this.probeInFlight = this.runtime
+      .ensureHostProvisionedSandboxReadinessV1(controller.signal)
+      .then((status) => {
+        if (controller.signal.aborted) return;
+        if (status.executionAvailable) {
+          console.info(
+            `Agentic Researcher: code sandbox verified through ${status.selectedProvider}.`,
+          );
+        }
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        console.warn(
+          "Agentic Researcher: host-provisioned code sandbox readiness failed.",
+          safeNoticeError(error),
+        );
+      })
+      .finally(() => {
+        if (this.probeController === controller) this.probeController = null;
+        this.probeInFlight = null;
+      });
   }
 
   dispose(): void {
@@ -302,6 +336,12 @@ export class BundledCodeCapability {
     signal?: AbortSignal,
   ): Promise<SandboxCapabilityStatusV2> {
     return this.runtime.probeConfiguredSandboxProviders(signal);
+  }
+
+  async ensureHostProvisionedSandboxReadinessV1(
+    signal?: AbortSignal,
+  ): Promise<SandboxCapabilityStatusV2> {
+    return this.runtime.ensureHostProvisionedSandboxReadinessV1(signal);
   }
 
   private registerCommands(): void {

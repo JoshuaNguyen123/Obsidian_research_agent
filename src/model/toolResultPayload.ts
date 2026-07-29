@@ -8,6 +8,9 @@ const MAX_CURRENT_NOTE_SUMMARY_CHARS = 120_000;
 const MAX_SNIPPET_CHARS = 600;
 const MAX_RESULT_ITEMS = 8;
 const MAX_REF_COUNT = 20;
+const MAX_REPOSITORY_SCOPE_PROJECTS = 16;
+const MAX_REPOSITORY_SCOPE_PATHS = 96;
+const MAX_REPOSITORY_SCOPE_STRING_CHARS = 512;
 
 const FULL_CONTENT_NOTE_READ_TOOLS = new Set([
   "read_current_file",
@@ -271,6 +274,17 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
       if (output[key] !== undefined) keep[key] = output[key];
     }
   }
+  if (
+    toolName === "code_workspace_create" &&
+    isRecord(output.repositoryWriteScope)
+  ) {
+    const repositoryWriteScope = slimRepositoryWriteScopeForModel(
+      output.repositoryWriteScope,
+    );
+    if (repositoryWriteScope) {
+      keep.repositoryWriteScope = repositoryWriteScope;
+    }
+  }
   if (Array.isArray(output.results)) {
     keep.results = output.results
       .slice(0, MAX_RESULT_ITEMS)
@@ -315,6 +329,76 @@ function slimOutputForModel(toolName: string, output: unknown): unknown {
     }
   }
   return Object.keys(keep).length > 0 ? keep : undefined;
+}
+
+/**
+ * Preserve the host-authoritative repository mutation boundary without
+ * forwarding the rest of the workspace manifest. The scope is deliberately
+ * bounded and shape-selected so provider prompts cannot inherit credentials,
+ * host paths, or unrelated repository metadata.
+ */
+function slimRepositoryWriteScopeForModel(
+  value: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const profileKey =
+    typeof value.profileKey === "string" &&
+      value.profileKey.length > 0 &&
+      value.profileKey.length <= MAX_REPOSITORY_SCOPE_STRING_CHARS
+      ? value.profileKey
+      : null;
+  if (!profileKey || !Array.isArray(value.projects)) return null;
+
+  let retainedPathCount = 0;
+  let totalAllowedPathCount = 0;
+  const projects: Array<Record<string, unknown>> = [];
+  for (const rawProject of value.projects) {
+    if (!isRecord(rawProject)) continue;
+    const projectId =
+      typeof rawProject.projectId === "string" &&
+        rawProject.projectId.length > 0 &&
+        rawProject.projectId.length <= MAX_REPOSITORY_SCOPE_STRING_CHARS
+        ? rawProject.projectId
+        : null;
+    const projectRoot =
+      typeof rawProject.projectRoot === "string" &&
+        rawProject.projectRoot.length > 0 &&
+        rawProject.projectRoot.length <= MAX_REPOSITORY_SCOPE_STRING_CHARS
+        ? rawProject.projectRoot
+        : null;
+    if (!projectId || !projectRoot || !Array.isArray(rawProject.allowedPaths)) {
+      continue;
+    }
+    const validPaths = rawProject.allowedPaths.filter(
+      (candidate): candidate is string =>
+        typeof candidate === "string" &&
+        candidate.length > 0 &&
+        candidate.length <= MAX_REPOSITORY_SCOPE_STRING_CHARS,
+    );
+    totalAllowedPathCount += validPaths.length;
+    if (
+      projects.length >= MAX_REPOSITORY_SCOPE_PROJECTS ||
+      retainedPathCount >= MAX_REPOSITORY_SCOPE_PATHS
+    ) {
+      continue;
+    }
+    const allowedPaths = validPaths.slice(
+      0,
+      MAX_REPOSITORY_SCOPE_PATHS - retainedPathCount,
+    );
+    retainedPathCount += allowedPaths.length;
+    projects.push({ projectId, projectRoot, allowedPaths });
+  }
+  if (projects.length === 0) return null;
+
+  return {
+    profileKey,
+    projects,
+    truncated:
+      projects.length < value.projects.length ||
+      retainedPathCount < totalAllowedPathCount,
+    totalProjects: value.projects.length,
+    totalAllowedPaths: totalAllowedPathCount,
+  };
 }
 
 function selectFields(

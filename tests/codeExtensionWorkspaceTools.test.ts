@@ -283,9 +283,13 @@ test("prepared directory export preserves a nested workspace tree in an explicit
         return realpath(desktopRoot);
       },
     }));
-    const context = fixture.context(
-      "Create a Python checkers project and put it on my Desktop.",
-    );
+    const context: ScopedExtensionContextV1 = {
+      ...fixture.context(
+        "Create a Python checkers project and put it on my Desktop.",
+      ),
+      missionId: "run-directory-export-segment",
+      rootMissionId: "run-directory-export-root",
+    };
     await prepareAndExecute(
       tools.get("code_workspace_create")!,
       { workspaceId: "export-space", kind: "scratch" },
@@ -337,12 +341,18 @@ test("prepared directory export preserves a nested workspace tree in an explicit
       prepared.preview.destination,
       path.join(desktopRoot, "Games", "Python", "Checkers"),
     );
+    assert.equal(
+      prepared.normalizedArgs.ownerRunId,
+      "run-directory-export-root",
+    );
+    assert.equal(prepared.runId, "run-directory-export-segment");
     assert.equal(prepared.target.resourceType, "host_directory");
     const committed = await exportTool.executePrepared!(
       prepared,
       authorize(context, prepared),
     );
     assert.equal(committed.receipt.readback.status, "verified");
+    assert.equal(committed.receipt.runId, "run-directory-export-segment");
     assert.equal(
       committed.receipt.effects?.bytesWritten,
       Buffer.byteLength("class CheckersGame:\n    pass\n# Checkers\n", "utf8"),
@@ -398,7 +408,10 @@ test("prepared directory export preserves a nested workspace tree in an explicit
         destinationRoot: "desktop",
         destinationPath: "Another/Project",
       },
-      fixture.context("Create another project in the workspace."),
+      {
+        ...context,
+        originalPrompt: "Create another project in the workspace.",
+      },
     );
     assert.equal(unauthorized.ok, false);
     if (unauthorized.ok) {
@@ -794,6 +807,26 @@ test("raw repository roots require exact foreground prompt binding while logical
       authorize(rawContext, rawPrepared),
     );
     assert.equal((rawResult.output as { kind: string }).kind, "repository");
+    assert.deepEqual(
+      (rawResult.output as {
+        repositoryWriteScope: {
+          profileKey: string;
+          projects: Array<{
+            projectId: string;
+            projectRoot: string;
+            allowedPaths: string[];
+          }>;
+        };
+      }).repositoryWriteScope,
+      {
+        profileKey: "fixture-profile",
+        projects: [{
+          projectId: "root",
+          projectRoot: ".",
+          allowedPaths: ["."],
+        }],
+      },
+    );
 
     const profileContext = fixture.context("Use trusted profile fixture-profile.");
     const profilePrepared = await requirePrepared(
@@ -875,6 +908,203 @@ test("repository protected controls escalate exact approvals and require profile
     await assert.rejects(
       tools.get("code_workspace_write_expected")!.executePrepared!(weakened, authorize(context, weakened)),
       /fingerprint changed/u,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("repository workspace mutations enforce segment-aware project allowedPaths before prepare", async () => {
+  const fixture = await createFixture("repository-path-scope");
+  try {
+    fixture.setProfileAllowedPaths([
+      "README.md",
+      "crdt_sync.py",
+      "pyproject.toml",
+      "docs",
+      "src",
+    ]);
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const context = fixture.context("Use trusted profile fixture-profile within its allowed paths.");
+    const workspaceCreated = await prepareAndExecute(tools.get("code_workspace_create")!, {
+      workspaceId: "repository-path-scope",
+      kind: "repository",
+      repositoryProfileKey: "fixture-profile",
+    }, context);
+    assert.deepEqual(
+      (workspaceCreated.output as {
+        repositoryWriteScope: {
+          profileKey: string;
+          projects: Array<{
+            projectId: string;
+            projectRoot: string;
+            allowedPaths: string[];
+          }>;
+        };
+      }).repositoryWriteScope,
+      {
+        profileKey: "fixture-profile",
+        projects: [{
+          projectId: "root",
+          projectRoot: ".",
+          allowedPaths: [
+            "README.md",
+            "crdt_sync.py",
+            "docs",
+            "pyproject.toml",
+            "src",
+          ],
+        }],
+      },
+    );
+
+    const rejected = [
+      { tool: "code_workspace_create_file", args: { path: "main.py", content: "print('blocked')\n" } },
+      { tool: "code_workspace_create_file", args: { path: "src2/x.py", content: "blocked = True\n" } },
+      { tool: "code_workspace_create_file", args: { path: "README.md.bak", content: "blocked\n" } },
+      { tool: "code_workspace_create_file", args: { path: "pyproject.toml.bak", content: "blocked\n" } },
+      { tool: "code_workspace_create_file", args: { path: "scripts/verify_project.py", content: "blocked\n" } },
+      { tool: "code_workspace_create_file", args: { path: "tests/test_crdt_contract.py", content: "blocked\n" } },
+      { tool: "code_workspace_mkdir", args: { path: "outside" } },
+    ] as const;
+    for (const attempt of rejected) {
+      const result = await tools.get(attempt.tool)!.prepare!({
+        workspaceId: "repository-path-scope",
+        ...attempt.args,
+      }, context);
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.error.code, "repository_path_out_of_scope");
+        assert.match(result.error.message, /projectAllowedPaths/u);
+        assert.match(result.error.message, /README\.md/u);
+      }
+      assert.deepEqual(
+        (await fixture.manager.status("repository-path-scope")).manifest.budget.changedPaths,
+        [],
+        `rejected ${attempt.args.path} must not mutate the workspace manifest`,
+      );
+    }
+
+    await prepareAndExecute(tools.get("code_workspace_create_file")!, {
+      workspaceId: "repository-path-scope",
+      path: "README.md",
+      content: "# Proof\n",
+    }, context);
+    await prepareAndExecute(tools.get("code_workspace_create_file")!, {
+      workspaceId: "repository-path-scope",
+      path: "crdt_sync.py",
+      content: "PROOF = True\n",
+    }, context);
+    await prepareAndExecute(tools.get("code_workspace_create_file")!, {
+      workspaceId: "repository-path-scope",
+      path: "pyproject.toml",
+      content: "[project]\nname = \"crdt-sync\"\nversion = \"0.1.0\"\n",
+    }, context);
+    await prepareAndExecute(tools.get("code_workspace_mkdir")!, {
+      workspaceId: "repository-path-scope",
+      path: "src",
+    }, context);
+    await prepareAndExecute(tools.get("code_workspace_create_file")!, {
+      workspaceId: "repository-path-scope",
+      path: "src/x.py",
+      content: "SOURCE = True\n",
+    }, context);
+    await prepareAndExecute(tools.get("code_workspace_mkdir")!, {
+      workspaceId: "repository-path-scope",
+      path: "docs",
+    }, context);
+    await prepareAndExecute(tools.get("code_workspace_create_file")!, {
+      workspaceId: "repository-path-scope",
+      path: "docs/x.md",
+      content: "# Docs\n",
+    }, context);
+    assert.deepEqual(
+      (await fixture.manager.status("repository-path-scope")).manifest.budget.changedPaths,
+      [
+        "README.md",
+        "crdt_sync.py",
+        "docs/x.md",
+        "pyproject.toml",
+        "src/x.py",
+      ],
+    );
+
+    const readme = await fixture.manager.read("repository-path-scope", "README.md");
+    for (const toolName of ["code_workspace_move", "code_workspace_copy"] as const) {
+      const result = await tools.get(toolName)!.prepare!({
+        workspaceId: "repository-path-scope",
+        path: "README.md",
+        destinationPath: toolName === "code_workspace_move" ? "main.py" : "README.md.bak",
+        expectedSha256: readme.sha256,
+      }, context);
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.error.code, "repository_path_out_of_scope");
+    }
+    assert.equal(
+      await fixture.manager.stat("repository-path-scope", "main.py").then(
+        () => true,
+        () => false,
+      ),
+      false,
+    );
+    assert.equal(
+      await fixture.manager.stat("repository-path-scope", "README.md.bak").then(
+        () => true,
+        () => false,
+      ),
+      false,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("repository workspace execute rejects allowedPaths drift before mutation", async () => {
+  const fixture = await createFixture("repository-path-scope-drift");
+  try {
+    fixture.setProfileAllowedPaths(["README.md", "crdt_sync.py", "docs", "src"]);
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+    }));
+    const context = fixture.context("Use trusted profile fixture-profile within its allowed paths.");
+    await prepareAndExecute(tools.get("code_workspace_create")!, {
+      workspaceId: "repository-path-scope-drift",
+      kind: "repository",
+      repositoryProfileKey: "fixture-profile",
+    }, context);
+    const action = await requirePrepared(tools.get("code_workspace_create_file")!, {
+      workspaceId: "repository-path-scope-drift",
+      path: "README.md",
+      content: "# Prepared\n",
+    }, context);
+    assert.match(String(action.normalizedArgs.repositoryScopeFingerprint), /^sha256:/u);
+
+    fixture.setProfileAllowedPaths(["README.md", "crdt_sync.py", "other", "src"]);
+    await assert.rejects(
+      tools.get("code_workspace_create_file")!.executePrepared!(
+        action,
+        authorize(context, action),
+      ),
+      (error: unknown) =>
+        error instanceof Error &&
+        /allowedPaths changed after this mutation was prepared/u.test(error.message),
+    );
+    assert.deepEqual(
+      (await fixture.manager.status("repository-path-scope-drift")).manifest.budget.changedPaths,
+      [],
+    );
+    assert.equal(
+      await fixture.manager.stat("repository-path-scope-drift", "README.md").then(
+        () => true,
+        () => false,
+      ),
+      false,
     );
   } finally {
     await fixture.cleanup();
@@ -1039,14 +1269,15 @@ async function createFixture(name: string) {
     branch: "main",
     clean: true,
   };
-  const profile = detectRepositoryProfileV2({
+  const profileInput = {
     key: "fixture-profile",
     displayName: "Fixture profile",
     repositoryRoot: inspection.repositoryRoot,
     defaultBranch: "main",
     files: ["package.json", "package-lock.json", ".github/workflows/ci.yml"],
     fileContents: { "package.json": "{\"name\":\"fixture\"}\n" },
-  });
+  } as const;
+  let profile = detectRepositoryProfileV2(profileInput);
   let redetections = 0;
   const repositories: WorkspaceRepositoryProvisionerV2 = {
     resolveProfile: async (profileKey) =>
@@ -1098,6 +1329,9 @@ async function createFixture(name: string) {
     manager,
     repositories,
     redetectionCount: () => redetections,
+    setProfileAllowedPaths: (allowedPaths: readonly string[]) => {
+      profile = detectRepositoryProfileV2({ ...profileInput, allowedPaths });
+    },
     context,
     cleanup: () => rm(root, { recursive: true, force: true }),
   };

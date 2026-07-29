@@ -46,6 +46,7 @@ export * from "./ExternalWorkItemBindingV1";
 export * from "./LinearContractSupport";
 export * from "./WorkItemLineageV1";
 export * from "./CodePublicationLineageV1";
+export * from "./VerifiedLinearCodeRepositoryBindingV1";
 export * from "./WorkItemSpecV2";
 export * from "./LinearOAuth";
 export * from "./LinearOAuthLoopback";

@@ -74,6 +74,79 @@ test("set-loose unpaid delivery continues past failed_tools=workspace_exists noi
   );
 });
 
+test("auto continuation stops an unchanged resumed read-only segment", () => {
+  const unfinished = {
+    status: "needs_more_work",
+    reasons: ["set_loose_delivery_unpaid=linear_issue"],
+    missing: ["set_loose_delivery:linear_issue"],
+  };
+  const reflection = {
+    done: false,
+    confidence: 0,
+    reason: "linear_issue_unpaid",
+    remainingActions: ["publish_research_to_linear"],
+  };
+
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance: unfinished,
+      compoundLifecycleDetected: true,
+      completionDriven: true,
+      reflection,
+      unchangedReadOnlySegment: true,
+    }),
+    { recommended: false, reason: "no_progress" },
+  );
+
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance: unfinished,
+      compoundLifecycleDetected: true,
+      completionDriven: true,
+      reflection,
+      unchangedReadOnlySegment: false,
+    }),
+    { recommended: true, reason: "budget_exhausted" },
+  );
+});
+
+test("real blockers and segment caps outrank the no-progress circuit", () => {
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance: { status: "needs_more_work", reasons: [] },
+      blockerCategory: "safety_policy",
+      blockerCount: 1,
+      unchangedReadOnlySegment: true,
+    }),
+    { recommended: false, reason: "blocked" },
+  );
+
+  assert.deepEqual(
+    decideAutoContinuation({
+      stopReason: "budget",
+      acceptance: {
+        status: "needs_more_work",
+        reasons: [],
+        missing: ["web_evidence"],
+      },
+      completionDriven: true,
+      reflection: {
+        done: false,
+        confidence: 0,
+        reason: "evidence_unpaid",
+        remainingActions: ["web_search"],
+      },
+      segmentsUsed: 2,
+      maxSegments: 2,
+      unchangedReadOnlySegment: true,
+    }),
+    { recommended: false, reason: "segment_cap" },
+  );
+});
+
 test("auto continuation stops on blockers, unresolved tool failures, failed acceptance, and proof", () => {
   assert.deepEqual(
     decideAutoContinuation({

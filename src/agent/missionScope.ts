@@ -30,6 +30,11 @@ export interface DeriveAutonomyScopeInput {
   explicitPersistence?: boolean;
   explicitMutation?: boolean;
   explicitDelete?: boolean;
+  /**
+   * Trusted host fact. This must only be true when Obsidian has bound the
+   * mission to a real active Markdown note; prompt text cannot grant it.
+   */
+  hasActiveMarkdownNote?: boolean;
 }
 
 export function createDefaultAutonomyScope(): AutonomyScope {
@@ -63,6 +68,12 @@ export function deriveAutonomyScope(
   const scope = createDefaultAutonomyScope();
   const mentionedFiles = extractMarkdownPathMentions(prompt);
   const mentionedFolders = extractFolderMentions(prompt, mentionedFiles);
+  const initiatingNoteReference =
+    /\b(?:the\s+)?initiating\s+(?:note|markdown|document|page)\b/iu.test(
+      prompt,
+    );
+  const unboundInitiatingNote =
+    initiatingNoteReference && input.hasActiveMarkdownNote !== true;
   const broadVaultWriteTarget =
     /\b(all|whole|entire|every|my)\s+(vault|notes|files|folders|markdown files|md files)\b/i.test(
       prompt,
@@ -74,7 +85,8 @@ export function deriveAutonomyScope(
   scope.read.currentNote =
     /\b(current|this|active|the)\s+(note|page|document|file|space)\b/i.test(prompt) ||
     /\bnotepage\b/i.test(prompt) ||
-    input.noteOutput === true;
+    (input.hasActiveMarkdownNote === true && initiatingNoteReference) ||
+    (input.noteOutput === true && !unboundInitiatingNote);
   scope.read.web =
     /\b(web|online|source|sources|citation|citations|latest|current|verify|verified|fact[-\s]?check|research|browser|page|url|click|scroll|navigate|open\s+page)\b/i.test(
       prompt,
@@ -102,8 +114,11 @@ export function deriveAutonomyScope(
   scope.write.currentNote =
     (input.noteOutput === true &&
       mentionedFiles.length === 0 &&
-      !broadVaultWriteTarget) ||
-    hasExplicitCurrentNoteMutationIntent(prompt);
+      !broadVaultWriteTarget &&
+      !unboundInitiatingNote) ||
+    hasExplicitCurrentNoteMutationIntent(prompt, {
+      hasActiveMarkdownNote: input.hasActiveMarkdownNote,
+    });
   scope.write.researchMemory =
     /\b(remember|save|persist|store)\b[\s\S]{0,120}\b(research memory|memory)\b/i.test(
       prompt,
@@ -641,7 +656,10 @@ function isSafeExplicitWorkspaceFilePath(value: string): boolean {
  * occur in the same natural-language clause. Merely reading the current note
  * must not authorize a later mutation whose clause targets another vault path.
  */
-export function hasExplicitCurrentNoteMutationIntent(prompt: string): boolean {
+export function hasExplicitCurrentNoteMutationIntent(
+  prompt: string,
+  options: { hasActiveMarkdownNote?: boolean } = {},
+): boolean {
   const clauses = prompt.split(
     /(?:[.;!?\n]+|,\s*|\b(?:and\s+then|then)\b)/giu,
   );
@@ -649,8 +667,14 @@ export function hasExplicitCurrentNoteMutationIntent(prompt: string): boolean {
     /\b(?:append|write|save|insert|stream|add|paste|copy|edit|revise|update|retitle|rename|link|connect|undo|restore|revert|rollback|roll\s+back|replace|rewrite|reset|overwrite|clear|delete|remove|trash|empty)\b/iu;
   const currentTarget =
     /\b(?:current|this|active)\s+(?:note|file|markdown|document|page|section|heading)\b|\b(?:note|file|markdown|document|page|section|heading)\b[\s\S]{0,40}\b(?:current|this|active)\b/iu;
+  const initiatingTarget =
+    /\b(?:the\s+)?initiating\s+(?:note|markdown|document|page)\b/iu;
   return clauses.some(
-    (clause) => mutation.test(clause) && currentTarget.test(clause),
+    (clause) =>
+      mutation.test(clause) &&
+      (currentTarget.test(clause) ||
+        (options.hasActiveMarkdownNote === true &&
+          initiatingTarget.test(clause))),
   );
 }
 

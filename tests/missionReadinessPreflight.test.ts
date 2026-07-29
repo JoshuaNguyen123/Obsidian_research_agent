@@ -143,6 +143,36 @@ test("active note is required when accepted research is in the compound plan", (
   assert.equal(result.primary?.setupTarget, "notes_research");
 });
 
+test("isolated Linear-to-code handoff does not require an active note", () => {
+  const phaseBPrompt = [
+    "Review and implement Linear issue APP-271. Begin with an independent linear_get_issue read of that exact identity and treat its signed accepted-research contract as the sole product specification.",
+    "When the work is complete, write exactly one 35-100 word human reflection to the accepted research's initiating note through its durable lineage. Mention the research, Linear issue, code outcome, tests, draft pull request, and one honest remaining limitation without tool, receipt, run, or internal-path jargon.",
+    "Publish the exact behaviorally tested commit to the issue-bound private GitHub destination as one open draft pull request; never merge it.",
+    "Implement the requested Python library in its bound trusted repository, choose the files and design yourself, inspect protected acceptance material as needed, validate against the issue contract before committing, and create one verified local commit.",
+    "Deliver the final verified working directory to a new absolute Desktop folder that a normal IDE can open. Do not overwrite an existing folder.",
+    "Do not ask me for a filename, workspace ID, repository key, validation command, marker, or GitHub repository name: obtain those only from the Linear issue and trusted host bindings.",
+  ].join(" ");
+  const result = evaluateMissionReadinessPreflightV1({
+    prompt: phaseBPrompt,
+    readiness: readyBundle(),
+    activeNote: { hasActiveMarkdown: false },
+    cleanupAuthority: { deleteRepoAuthorized: false },
+    gitIdentityPinnedReady: true,
+    sandboxValidationRequired: true,
+  });
+
+  assert.equal(result.compound, true);
+  assert.deepEqual(result.stages, [
+    "code_execution",
+    "private_github_publication",
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.checks.find((check) => check.id === "active_note")?.required,
+    false,
+  );
+});
+
 test("pinned git identity helper matches host contract", () => {
   assert.equal(evaluatePinnedGitIdentityReadinessV1(), true);
 });

@@ -271,6 +271,7 @@ import type {
   AgentTool,
   ToolExecutionContext,
   ToolRegistry,
+  VerifiedLinearCodeRepositoryBindingV1,
 } from "./src/tools/types";
 import { ScopedToolRegistry } from "./src/tools/ScopedToolRegistry";
 import type { OrchestratorSnapshotV1 } from "./src/orchestrator/types";
@@ -374,6 +375,8 @@ import {
   parseResearchPublicationCheckpointNamespaceV1,
   parseResearchProjectHierarchyCheckpointNamespaceV1,
   resolveQueueCodePublicationOriginV1,
+  resolveVerifiedLinearBoundCodePublicationOriginV1,
+  resolveVerifiedLinearCodeRepositoryBindingV1,
   resolveVerifiedCodePublicationOriginV1,
   upsertUncertainLinearReconciliation,
   type CodePublicationLineageTransitionV1,
@@ -515,7 +518,11 @@ import {
   type ProjectLineageV1,
   type ResearchProjectPlanV1,
 } from "./src/agent/projectLifecycle";
+import { hasExplicitGitHubReviewRepairIntentV1 } from "./src/agent/githubReviewRepairIntent";
 import type { RepositoryProfileV2 } from "./extensions/code/repositories";
+import {
+  HOST_PROVISIONED_SANDBOX_READINESS_TIMEOUT_MS_V1,
+} from "./extensions/code/sandbox/HostProvisionedSandboxBindingV1";
 import { requireNodeModule } from "./src/platform/nodeRequire";
 import {
   AuthorityGrantStore,
@@ -532,6 +539,7 @@ import {
 import {
   createResearchPublicationTool,
   resolveResearchPublicationNotePathV1,
+  trustedValidationKeysForProfileV1,
 } from "./src/tools/researchPublicationTool";
 import {
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
@@ -619,14 +627,6 @@ interface RunMissionOptions {
   forceChatOnly?: boolean;
   /** Prevents the trusted Code capability's child mission from re-entering the review route. */
   skipGitHubReviewRepairRouting?: boolean;
-}
-
-function hasExplicitGitHubReviewRepairIntent(prompt: string): boolean {
-  const normalized = prompt.toLowerCase().replace(/\s+/gu, " ").trim();
-  const asksToAct = /\b(address|apply|fix|handle|implement|resolve|respond to)\b/u.test(normalized);
-  const mentionsReview = /\b(review|feedback|changes requested|review comments?)\b/u.test(normalized);
-  const mentionsPullRequest = /\b(github|pull request|pr)\b/u.test(normalized);
-  return asksToAct && mentionsReview && mentionsPullRequest;
 }
 
 type LinearQueueWorkResult =
@@ -6715,6 +6715,58 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
   }
 
+  /**
+   * Adopt any host-provisioned sandbox binding and refresh its boundary proof
+   * before a code-execution mission is gated. Provisioning records the runtime
+   * identity in the host environment; without this the durable state kept zero
+   * providers and the mission died at code_validate_fast. Failures are
+   * swallowed: the readiness gate reports the resulting blocker.
+   */
+  async ensureCodeSandboxReadinessForMission(
+    timeoutMs = HOST_PROVISIONED_SANDBOX_READINESS_TIMEOUT_MS_V1,
+  ): Promise<void> {
+    const code = this.getCapabilityRuntime<{
+      ensureHostProvisionedSandboxReadinessV1?(
+        signal?: AbortSignal,
+      ): Promise<unknown>;
+    }>("agentic-researcher-code");
+    if (typeof code?.ensureHostProvisionedSandboxReadinessV1 !== "function") {
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort("sandbox_readiness_timeout"),
+      Math.max(1_000, timeoutMs),
+    );
+    try {
+      await code.ensureHostProvisionedSandboxReadinessV1(controller.signal);
+    } catch (error) {
+      console.warn(
+        "Agentic Researcher: code sandbox readiness refresh failed.",
+        sanitizeExtensionRuntimeError(error),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The Linear user that published research issues are assigned to.
+   *
+   * Discovery already records the connected viewer in
+   * `linearCapabilitySnapshot.viewer`, but the publication path never passed an
+   * assignee, so every issue the agent filed landed unowned. Returns null when
+   * the user has opted out or no viewer has been discovered, which leaves the
+   * issue unassigned exactly as before.
+   */
+  private resolveLinearDefaultAssigneeIdV1(): string | null {
+    if (this.settings.linearAssignPublishedIssuesToViewer === false) return null;
+    const viewerId = this.linearCapabilitySnapshot?.viewer?.id;
+    return typeof viewerId === "string" && viewerId.trim()
+      ? viewerId.trim()
+      : null;
+  }
+
   private getCapabilityRuntime<T>(extensionId: string): T | null {
     const bundled = this.getBundledCapability<T>(extensionId);
     if (bundled) return bundled;
@@ -7554,7 +7606,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       options.skipGitHubReviewRepairRouting !== true &&
       options.forceChatOnly !== true &&
       !options.durableManifest &&
-      hasExplicitGitHubReviewRepairIntent(prompt)
+      hasExplicitGitHubReviewRepairIntentV1(prompt)
     ) {
       if (this.runCoordinator.getSnapshot().isRunning) {
         throw new Error("An agent mission is already running.");
@@ -8333,6 +8385,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         maxSteps: workerMaxSteps,
         maxToolCalls: workerMaxToolCalls,
         events: {
+          onModelCallEvidence: (event) => {
+            input.events.onModelCallEvidence?.(event);
+          },
           onStatus: async (status) => {
             recordResearcherStep(teamAutonomyStats);
             input.events.onStatus?.(`Researcher step: ${status}`);
@@ -8802,6 +8857,9 @@ export default class AgenticResearcherPlugin extends Plugin {
             toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
             toolContext: this.createToolExecutionContext(input.prompt),
             abortSignal: rootDeadline.signal,
+            onModelCallEvidence: (event) => {
+              input.events.onModelCallEvidence?.(event);
+            },
             now: () => new Date(),
           });
           input.events.onTrace?.({
@@ -8995,6 +9053,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       30 * 60_000,
       "Code orchestrator root wall-clock budget exhausted.",
     );
+    let worktreeManager: GitWorktreeManager | null = null;
     try {
     const runId = input.runId ?? createAgentRunId();
     const workerMaxSteps = this.settings.orchestratorWorkerMaxSteps ?? 40;
@@ -9048,6 +9107,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     const rootNodeId = `${runId}:mission`;
     await runtime.start(scaffold);
     const manager = new GitWorktreeManager();
+    worktreeManager = manager;
     let repository: RepositorySnapshot;
     try {
       repository = await manager.inspectRepository(
@@ -9626,6 +9686,9 @@ export default class AgenticResearcherPlugin extends Plugin {
     return runtime.getSnapshot();
     } finally {
       rootDeadline.dispose();
+      // The manager's temporary empty hooks directory is per-run; without this
+      // every orchestrator coding mission leaked one into the OS temp root.
+      await worktreeManager?.dispose();
     }
   }
 
@@ -10384,6 +10447,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       actionExecutor: executor,
       queueTeamId: destination.teamId,
       queueProjectId: destination.projectId,
+      resolveDefaultAssigneeId: () => this.resolveLinearDefaultAssigneeIdV1(),
     });
     return createResearchPublicationTool({
       noteWriter: new AcceptedResearchNoteWriter(this.app.vault),
@@ -10391,6 +10455,18 @@ export default class AgenticResearcherPlugin extends Plugin {
       lineage: this.researchPublicationCheckpointStore,
       destination,
       vaultBindingKey: "current-vault",
+      describeTrustedRepositoryCatalog: () => {
+        const profiles = Object.values(this.repositoryProfileRegistry.profiles);
+        return {
+          repositoryKeys: profiles.map((profile) => profile.key),
+          validationKeysByRepository: Object.fromEntries(
+            profiles.map((profile) => [
+              profile.key,
+              trustedValidationKeysForProfileV1(profile),
+            ]),
+          ),
+        };
+      },
       resolveProjectAssociation: async ({
         prompt,
         associationText,
@@ -10438,6 +10514,8 @@ export default class AgenticResearcherPlugin extends Plugin {
             actionExecutor: executor,
             queueTeamId: nextDestination.teamId,
             queueProjectId: nextDestination.projectId,
+            resolveDefaultAssigneeId: () =>
+              this.resolveLinearDefaultAssigneeIdV1(),
           }),
         };
       },
@@ -10457,18 +10535,18 @@ export default class AgenticResearcherPlugin extends Plugin {
         if (!profile) {
           throw new Error("The requested repository key is not a trusted host binding.");
         }
-        const allowedValidationKeys = new Set<string>([
-          profile.validationProfile.id,
-          ...profile.validationProfile.validationCommands.map(
-            (_command, index) => `${profile.key}.validation.${index + 1}`,
-          ),
-        ]);
+        const allowedValidationKeys = new Set<string>(
+          trustedValidationKeysForProfileV1(profile),
+        );
         const unknown = package_.validationRequirementKeys.filter(
           (key) => !allowedValidationKeys.has(key),
         );
         if (unknown.length > 0) {
+          // Enumerating the catalog lets a model retry with real keys instead
+          // of guessing a new wrong spelling three times.
           throw new Error(
-            `Validation requirement keys are outside the trusted profile catalog: ${unknown.join(", ")}.`,
+            `Validation requirement keys are outside the trusted profile catalog: ${unknown.join(", ")}. ` +
+              `Valid keys for ${profile.key}: ${[...allowedValidationKeys].join(", ")}.`,
           );
         }
       },
@@ -12015,7 +12093,19 @@ export default class AgenticResearcherPlugin extends Plugin {
     return createGitHubPublicationTool({
       resolveHandoff: (profileKey) =>
         this.resolveGitHubPublicationHandoff(profileKey),
-      resolveBinding: (input) => this.resolveGitHubPublicationBinding(input),
+      resolveBinding: async (input) => {
+        const binding = await this.resolveGitHubPublicationBinding(input);
+        if (!binding) return null;
+        // Establish durable local_verified lineage before any GitHub mutation.
+        // Isolated Phase B runs can select Phase A only through the fresh,
+        // host-verified Linear binding kept outside model-controlled arguments.
+        await this.resolveGitHubPublicationResearchOrigin(
+          input.profileKey,
+          input.handoff,
+          input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
+        );
+        return binding;
+      },
       getCheckpoint: (publicationId) =>
         this.githubPublicationCheckpointStore.get(publicationId),
       createWorkflow: ({
@@ -12232,6 +12322,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         let origin = await this.resolveGitHubPublicationResearchOrigin(
           input.profileKey,
           input.handoff,
+          input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
         );
         if (!origin.issue) {
           throw new Error("No exact Linear issue lineage matches this verified code handoff.");
@@ -12267,6 +12358,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         const origin = await this.resolveGitHubPublicationResearchOrigin(
           input.profileKey,
           input.handoff,
+          input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
         );
         if (!origin.issue) {
           throw new Error("No exact Linear issue lineage matches this verified code handoff.");
@@ -12297,6 +12389,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         const origin = await this.resolveGitHubPublicationResearchOrigin(
           input.profileKey,
           input.handoff,
+          input.context.getVerifiedLinearCodeRepositoryBinding?.() ?? null,
         );
         if (!origin.issue) {
           throw new Error("No exact Linear issue lineage matches this verified code handoff.");
@@ -12435,51 +12528,68 @@ export default class AgenticResearcherPlugin extends Plugin {
   private async resolveGitHubPublicationResearchOrigin(
     profileKey: string,
     handoff: VerifiedCodePublicationHandoffV1,
+    verifiedLinearBinding: VerifiedLinearCodeRepositoryBindingV1 | null = null,
   ): Promise<ResearchPublicationCheckpointV1> {
-    const origin = resolveVerifiedCodePublicationOriginV1(
+    const checkpoints = await this.researchPublicationCheckpointStore.list();
+    let origin = verifiedLinearBinding
+      ? resolveVerifiedLinearBoundCodePublicationOriginV1(
+          checkpoints,
+          verifiedLinearBinding,
+          profileKey,
+        )
+      : resolveVerifiedCodePublicationOriginV1(checkpoints, {
+        repositoryKey: profileKey,
+        handoffRunId: handoff.runId,
+        handoffFingerprint: handoff.fingerprint,
+        localCommitReceiptId: handoff.localCommitReceiptId,
+        allowOriginRunFallback: !handoff.runId.startsWith("queue-code-"),
+      });
+    const persistedLocalProof = origin.lineage?.events.find(
+      (event) => event.state === "local_verified",
+    );
+    if (
+      persistedLocalProof?.receiptId !== handoff.localCommitReceiptId ||
+      persistedLocalProof.evidenceFingerprint !== handoff.fingerprint
+    ) {
+      const linked = advanceCodePublicationLineageV1(origin, [
+        {
+          state: "claimed",
+          occurredAt: nextMonotonicIso(origin.updatedAt),
+          receiptId: `code-claim-${handoff.id}`,
+          evidenceFingerprint: origin.binding!.bindingFingerprint,
+        },
+        {
+          state: "workspace_ready",
+          occurredAt: nextMonotonicIso(origin.updatedAt),
+          receiptId: `workspace-ready-${handoff.workspaceId}`,
+          evidenceFingerprint: handoff.canonicalWorktreeFingerprint,
+        },
+        {
+          state: "local_verified",
+          occurredAt: nextMonotonicIso(origin.updatedAt, handoff.committedAt),
+          receiptId: handoff.localCommitReceiptId,
+          evidenceFingerprint: handoff.fingerprint,
+        },
+      ]);
+      if (linked !== origin) {
+        origin = await this.researchPublicationCheckpointStore.upsert(linked);
+      }
+    }
+    const resolved = resolveVerifiedCodePublicationOriginV1(
       await this.researchPublicationCheckpointStore.list(),
       {
         repositoryKey: profileKey,
         handoffRunId: handoff.runId,
         handoffFingerprint: handoff.fingerprint,
         localCommitReceiptId: handoff.localCommitReceiptId,
-        allowOriginRunFallback: !handoff.runId.startsWith("queue-code-"),
+        allowOriginRunFallback: false,
       },
     );
-    const persistedLocalProof = origin.lineage?.events.find(
-      (event) => event.state === "local_verified",
-    );
-    if (
-      persistedLocalProof?.receiptId === handoff.localCommitReceiptId &&
-      persistedLocalProof.evidenceFingerprint === handoff.fingerprint
-    ) {
-      await this.persistCodeExecutionProjectLineage(origin, handoff);
-      return origin;
+    if (resolved.publicationId !== origin.publicationId) {
+      throw new Error(
+        "The verified local commit resolved to a different accepted-research publication.",
+      );
     }
-    const linked = advanceCodePublicationLineageV1(origin, [
-      {
-        state: "claimed",
-        occurredAt: nextMonotonicIso(origin.updatedAt),
-        receiptId: `code-claim-${handoff.id}`,
-        evidenceFingerprint: origin.binding!.bindingFingerprint,
-      },
-      {
-        state: "workspace_ready",
-        occurredAt: nextMonotonicIso(origin.updatedAt),
-        receiptId: `workspace-ready-${handoff.workspaceId}`,
-        evidenceFingerprint: handoff.canonicalWorktreeFingerprint,
-      },
-      {
-        state: "local_verified",
-        occurredAt: nextMonotonicIso(origin.updatedAt, handoff.committedAt),
-        receiptId: handoff.localCommitReceiptId,
-        evidenceFingerprint: handoff.fingerprint,
-      },
-    ]);
-    const persisted = linked === origin
-      ? origin
-      : this.researchPublicationCheckpointStore.upsert(linked);
-    const resolved = await persisted;
     await this.persistCodeExecutionProjectLineage(resolved, handoff);
     return resolved;
   }
@@ -13043,6 +13153,14 @@ export default class AgenticResearcherPlugin extends Plugin {
       getProjectLineages: () => this.getProjectLineages(),
       getRepositoryProfileKeys: () =>
         Object.keys(this.repositoryProfileRegistry.profiles),
+      resolveVerifiedLinearCodeRepositoryBinding: async (issueRecord) =>
+        resolveVerifiedLinearCodeRepositoryBindingV1({
+          issueRecord,
+          checkpoints:
+            await this.researchPublicationCheckpointStore.list(),
+          trustedRepositoryProfileKeys:
+            Object.keys(this.repositoryProfileRegistry.profiles),
+        }),
       getCapabilityReadiness: () => this.getCapabilityReadiness(),
       semanticEmbeddingProvider: this.getSemanticEmbeddingProvider(),
       semanticIndexService: this.getSemanticIndexService(),

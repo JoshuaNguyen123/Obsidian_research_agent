@@ -18,10 +18,14 @@ import {
   expectPlainRecord,
   expectSha256,
   expectString,
+  fingerprintContract,
   parseHttpUrl,
   parseVaultMarkdownPath,
 } from "./LinearContractSupport";
-import type { ResearchNoteBacklinkResultV1 } from "./AcceptedResearchNoteWriter";
+import {
+  parseAcceptedResearchNotePackageV1,
+  type ResearchNoteBacklinkResultV1,
+} from "./AcceptedResearchNoteWriter";
 import {
   RESEARCH_PUBLICATION_CHECKPOINT_SCHEMA_VERSION,
   type ResearchPublicationCheckpointStatusV1,
@@ -206,7 +210,7 @@ export function parseResearchPublicationCheckpointV1(
       "backlink",
       "error",
     ],
-    [],
+    ["acceptedPackage"],
     "research publication checkpoint",
   );
   if (record.schemaVersion !== RESEARCH_PUBLICATION_CHECKPOINT_SCHEMA_VERSION) {
@@ -219,6 +223,7 @@ export function parseResearchPublicationCheckpointV1(
     record.status,
     "research publication checkpoint status",
     [
+      "note_written",
       "note_verified",
       "approval_denied",
       "failed",
@@ -230,6 +235,9 @@ export function parseResearchPublicationCheckpointV1(
   );
   const updatedAt = expectIsoTimestamp(record.updatedAt, "research publication checkpoint update time");
   const artifact = parseAcceptedResearchArtifactV1(record.artifact);
+  const acceptedPackage = record.acceptedPackage === undefined
+    ? undefined
+    : parseAcceptedResearchNotePackageV1(record.acceptedPackage);
   const lineage = record.lineage === null ? null : parseWorkItemLineageV1(record.lineage);
   const workItemFingerprint = nullableSha256(record.workItemFingerprint, "work item fingerprint");
   const approvalFingerprint = nullableSha256(record.approvalFingerprint, "approval fingerprint");
@@ -248,6 +256,7 @@ export function parseResearchPublicationCheckpointV1(
     status,
     updatedAt,
     artifact,
+    ...(acceptedPackage ? { acceptedPackage } : {}),
     lineage,
     workItemFingerprint,
     approvalFingerprint,
@@ -371,6 +380,37 @@ function validateCheckpointConsistency(checkpoint: ResearchPublicationCheckpoint
   if (Date.parse(checkpoint.updatedAt) < Date.parse(artifact.acceptedAt)) {
     throw new DurableLinearContractError("Checkpoint update cannot predate accepted research.");
   }
+  if (checkpoint.acceptedPackage) {
+    const package_ = checkpoint.acceptedPackage;
+    const artifactEvidence = artifact.evidence.map(
+      ({ id, kind, reference, contentSha256 }) => ({
+        id,
+        kind,
+        reference,
+        contentSha256,
+      }),
+    );
+    const packageEvidence = package_.evidence.map(
+      ({ id, kind, reference, contentSha256 }) => ({
+        id,
+        kind,
+        reference,
+        contentSha256,
+      }),
+    );
+    if (
+      package_.originRunId !== artifact.originRunId ||
+      package_.vaultBindingKey !== artifact.vaultBindingKey ||
+      package_.riskClass !== artifact.riskClass ||
+      fingerprintContract(packageEvidence) !== fingerprintContract(artifactEvidence) ||
+      fingerprintContract(package_.acceptanceCriteria) !==
+        fingerprintContract(artifact.acceptanceCriteria)
+    ) {
+      throw new DurableLinearContractError(
+        "Checkpoint accepted package does not match its accepted research artifact.",
+      );
+    }
+  }
   if (lineage) {
     if (
       lineage.originRunId !== artifact.originRunId ||
@@ -417,6 +457,19 @@ function validateCheckpointConsistency(checkpoint: ResearchPublicationCheckpoint
   if (status === "note_verified" && (!lineage || !workItemFingerprint || binding || issue || pendingAction || backlink || error)) {
     throw invalidStatus(status);
   }
+  if (status === "note_written" && (
+    !checkpoint.acceptedPackage ||
+    lineage ||
+    workItemFingerprint ||
+    checkpoint.approvalFingerprint ||
+    binding ||
+    issue ||
+    pendingAction ||
+    backlink ||
+    error
+  )) {
+    throw invalidStatus(status);
+  }
   if (status === "approval_denied" && (!lineage || !workItemFingerprint || !checkpoint.approvalFingerprint || binding || issue || pendingAction || backlink || !error)) {
     throw invalidStatus(status);
   }
@@ -452,7 +505,14 @@ function validateCheckpointTransition(
   const sameWorkItem =
     !previous.workItemFingerprint ||
     previous.workItemFingerprint === next.workItemFingerprint;
-  if (!sameArtifact || !sameWorkItem) {
+  const sameAcceptedPackage =
+    !previous.acceptedPackage ||
+    (
+      next.acceptedPackage !== undefined &&
+      fingerprintContract(previous.acceptedPackage) ===
+        fingerprintContract(next.acceptedPackage)
+    );
+  if (!sameArtifact || !sameWorkItem || !sameAcceptedPackage) {
     throw new ResearchPublicationCheckpointStoreError(
       "research_publication_checkpoint_identity_changed",
       "A durable research publication identity cannot be rewritten.",
@@ -543,6 +603,7 @@ const STATUS_TRANSITIONS: Readonly<Record<
   ResearchPublicationCheckpointStatusV1,
   readonly ResearchPublicationCheckpointStatusV1[]
 >> = {
+  note_written: ["note_written", "note_verified", "failed"],
   note_verified: ["note_verified", "approval_denied", "failed", "reconcile_required", "linear_verified"],
   approval_denied: ["approval_denied", "note_verified"],
   failed: ["failed", "note_verified"],
