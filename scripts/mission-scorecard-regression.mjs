@@ -32,8 +32,9 @@ export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
   // reporter records scenarioId=null for it, so no scorecard is ever emitted.
   // Its proof lives in the execution report and mission acceptance asserts.
   "desktop-code-delivery-real-live",
-  // Demo footage driver, not a proof lane; asserts only verified completion.
+  // Demo footage drivers, not proof lanes; assert only verified completion.
   "demo-recording",
+  "demo-journey-recording",
 ]);
 
 const DIMENSION_IDS = Object.freeze([

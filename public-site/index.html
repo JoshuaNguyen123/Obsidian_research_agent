@@ -7,44 +7,44 @@
       name="description"
       content="Agentic Researcher is one native Obsidian plugin for research, note work, bounded code tasks, Linear, GitHub, and verifiable writeback."
     />
-    <meta name="theme-color" content="#07110c" />
+    <meta name="theme-color" content="#0b0d12" />
     <title>Agentic Researcher for Obsidian</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="site-header">
-      <a class="brand" href="#top" aria-label="Agentic Researcher home">
-        <span class="brand-mark" aria-hidden="true">AR</span>
-        <span>Agentic Researcher</span>
-      </a>
-      <nav aria-label="Primary navigation">
-        <a href="#workflows">Workflows</a>
-        <a href="#principles">How it works</a>
-        <a class="nav-cta" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">GitHub</a>
-      </nav>
+      <div class="header-inner">
+        <a class="brand" href="#top" aria-label="Agentic Researcher home">
+          <span class="brand-mark" aria-hidden="true">AR</span>
+          <span>Agentic Researcher</span>
+        </a>
+        <nav aria-label="Primary navigation">
+          <a href="#workflows">Capabilities</a>
+          <a href="#how">How it works</a>
+          <a href="#principles">Trust</a>
+          <a class="nav-cta" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">View on GitHub</a>
+        </nav>
+      </div>
     </header>
 
     <main id="main">
       <section class="hero" id="top">
-        <div class="hero-copy">
-          <p class="eyebrow"><span class="status-dot"></span>Native Obsidian plugin · Desktop</p>
-          <h1>Your vault.<br /><span>Your agent.</span><br />One surface.</h1>
-          <p class="lede">
-            Research the web, work across notes, prepare bounded code changes, create Linear tasks,
-            and handle GitHub activity—without turning your vault into a control panel.
-          </p>
-          <div class="hero-actions">
-            <a class="button primary" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent#install-for-development">Install from GitHub</a>
-            <a class="button secondary" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">View source</a>
-          </div>
-          <p class="availability">Open source · Local-first · Ollama Cloud BYOK by default; local Ollama remains compatible</p>
+        <p class="hero-badge"><span class="status-dot"></span>Native Obsidian plugin · Desktop · Open source</p>
+        <h1>Your vault. Your agent.<br /><span>One surface.</span></h1>
+        <p class="lede">
+          Research the web, work across notes, prepare bounded code changes, create Linear tasks,
+          and handle GitHub activity — without turning your vault into a control panel.
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent#install-for-development">Install from GitHub</a>
+          <a class="button secondary" href="#workflows">See what it does</a>
         </div>
 
-        <figure class="terminal hero-demo">
-          <div class="terminal-bar">
-            <span></span><span></span><span></span>
-            <strong>REAL RUN / RECORDED</strong>
+        <figure class="demo-frame hero-demo">
+          <div class="frame-bar">
+            <span class="frame-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="frame-title">Real mission · recorded in the release build</span>
           </div>
           <video
             class="demo-video"
@@ -60,57 +60,96 @@
             <source src="./media/hero.mp4" type="video/mp4" />
           </video>
           <figcaption class="demo-caption">
-            Real screen recording of one mission in the release build (deepseek-v4-flash) — condensed
-            from a 1¾-minute run. Nothing staged, nothing mocked.
+            Real screen recording of one mission (deepseek-v4-flash) — condensed from a 1¾-minute
+            run. Nothing staged, nothing mocked.
           </figcaption>
         </figure>
+
+        <dl class="stat-strip" aria-label="What one recorded mission produced">
+          <div><dt>One prompt</dt><dd>plan → code → proof</dd></div>
+          <div><dt>3 validation rungs</dt><dd>fast · targeted · full</dd></div>
+          <div><dt>Every write</dt><dd>carries a receipt</dd></div>
+          <div><dt>Mission acceptance</dt><dd>pass · confidence 0.9</dd></div>
+        </dl>
       </section>
 
-      <section class="workflow-section" id="workflows">
+      <section class="section" id="workflows">
         <div class="section-heading">
-          <p class="eyebrow">Daily-use capability</p>
+          <p class="eyebrow">Capabilities</p>
           <h2>Start with the task, not the settings.</h2>
-          <p>Chat is the mission console. The agent chooses the relevant capability and only asks for setup when a required connection is missing.</p>
+          <p>Chat is the mission console. The agent picks the relevant capability and only asks for setup when a required connection is missing.</p>
         </div>
         <div class="capability-grid">
           <article>
-            <span class="cap-number">01</span>
+            <span class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            </span>
             <h3>Vault research</h3>
             <p>Read the current note, search the vault and web, compare evidence, then append sourced markdown.</p>
             <code>notes + web → cited brief</code>
           </article>
           <article>
-            <span class="cap-number">02</span>
+            <span class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m8 6-5 6 5 6"/><path d="m16 6 5 6-5 6"/><path d="m13 4-2 16"/></svg>
+            </span>
             <h3>Code work</h3>
-            <p>Create Python, TypeScript, JavaScript, C/C++, HTML/CSS, Rust, Go, Java, or C# in trusted workspaces with validation and receipts.</p>
+            <p>Author Python, TypeScript, Rust, Go, and more in trusted workspaces with sandboxed validation and receipts.</p>
             <code>task → patch → proof</code>
           </article>
           <article>
-            <span class="cap-number">03</span>
+            <span class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 10h8M8 14h5"/></svg>
+            </span>
             <h3>Linear</h3>
             <p>Turn research or a note into a structured work item through fixed, permission-aware actions.</p>
             <code>brief → issue → readback</code>
           </article>
           <article>
-            <span class="cap-number">04</span>
+            <span class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7M8.3 6.8 15.7 11M8.3 17.2 15.7 13"/></svg>
+            </span>
             <h3>GitHub</h3>
-            <p>Prepare commits and draft pull requests, inspect reviews, and keep merge separately approved.</p>
+            <p>Prepare verified commits and draft pull requests, inspect reviews, and keep merge separately approved.</p>
             <code>change → PR → receipt</code>
           </article>
         </div>
       </section>
 
-      <!-- Full-journey demo section lands with the retained-journey keeper run:
+      <section class="section" id="how">
+        <div class="section-heading">
+          <p class="eyebrow">How it works</p>
+          <h2>Ask once. Watch it prove its work.</h2>
+        </div>
+        <ol class="steps">
+          <li>
+            <span class="step-num">1</span>
+            <h3>Type a mission</h3>
+            <p>Plain language in the sidebar console. The router classifies it and builds a bounded, durable plan — no capability toggles to babysit.</p>
+          </li>
+          <li>
+            <span class="step-num">2</span>
+            <h3>The agent works, you steer</h3>
+            <p>Tools run against your real vault, sandbox, and integrations. Consequential steps wait behind approvals; a steering panel adjusts the run live.</p>
+          </li>
+          <li>
+            <span class="step-num">3</span>
+            <h3>Receipts, not vibes</h3>
+            <p>Every write lands with a verified receipt, and the mission ends with an acceptance check — pass or fail, with reasons you can read.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- Full-journey demo section lands with the journey keeper run:
            condensed footage + verifiable receipts (public archived repo, draft PR,
            Linear issue evidence, vault note). Parked in an inert template until
-           then; the hero above already shows a real recorded mission. To enable:
-           unwrap the <template>, fill every DATA_PENDING value from the keeper's
-           retained-journey-artifacts.json, and restore the "Live demo" nav link. -->
+           then. To enable: unwrap the <template>, fill every DATA_PENDING value
+           from test-results/demo-journey-artifacts.json, and add
+           <a href="#demo">Live demo</a> to the nav. -->
       <template id="journey-demo-pending">
-      <section class="demo-section" id="demo">
+      <section class="section" id="demo">
         <div class="section-heading">
           <p class="eyebrow">Live demo · real run</p>
-          <h2>One autonomous journey.<br />Nothing staged.</h2>
+          <h2>One autonomous journey. Nothing staged.</h2>
           <p>
             A single recorded mission, condensed: the agent researches with verified sources, writes
             the brief into a note, files a Linear issue, implements and validates the code in a
@@ -119,10 +158,10 @@
           </p>
         </div>
 
-        <figure class="terminal journey-demo">
-          <div class="terminal-bar">
-            <span></span><span></span><span></span>
-            <strong>AUTONOMOUS JOURNEY / CONDENSED</strong>
+        <figure class="demo-frame journey-demo">
+          <div class="frame-bar">
+            <span class="frame-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="frame-title">Autonomous journey · condensed</span>
           </div>
           <video
             class="demo-video"
@@ -135,12 +174,12 @@
             <source src="./media/journey.mp4" type="video/mp4" />
           </video>
           <figcaption class="demo-caption">
-            One real run, time-compressed from DATA_PENDING_DURATION of wall-clock autonomy. Recorded
+            One real run, condensed from DATA_PENDING_DURATION of wall-clock autonomy. Recorded
             DATA_PENDING_DATE against the release build.
           </figcaption>
         </figure>
 
-        <dl class="run-metadata" aria-label="Recorded run statistics">
+        <dl class="stat-strip" aria-label="Recorded run statistics">
           <div><dt>Model</dt><dd>DATA_PENDING_MODEL</dd></div>
           <div><dt>Wall clock</dt><dd>DATA_PENDING_DURATION</dd></div>
           <div><dt>Tool calls</dt><dd>DATA_PENDING_TOOLS</dd></div>
@@ -152,35 +191,35 @@
           <div class="receipt-grid">
             <a class="receipt-card" href="DATA_PENDING_REPO_URL" rel="noopener noreferrer" target="_blank">
               <span>GitHub repository</span>
-              <code>Made public and archived after the run so you can inspect every commit.</code>
+              <p>Made public and archived after the run so you can inspect every commit.</p>
             </a>
             <a class="receipt-card" href="DATA_PENDING_PR_URL" rel="noopener noreferrer" target="_blank">
               <span>Draft pull request</span>
-              <code>The verified commit behind a draft PR — merge stays a separate human decision.</code>
+              <p>The verified commit behind a draft PR — merge stays a separate human decision.</p>
             </a>
             <a class="receipt-card" href="./media/receipt-linear.png" rel="noopener noreferrer" target="_blank">
               <span>Linear issue</span>
-              <code>Screenshot of the real issue — the workspace is private, so the link cannot be public.</code>
+              <p>Screenshot of the real issue — the workspace is private, so the link cannot be public.</p>
             </a>
             <a class="receipt-card" href="./media/receipt-note.png" rel="noopener noreferrer" target="_blank">
               <span>Vault note</span>
-              <code>The research brief and closing reflection, linking the issue, commit, and PR.</code>
+              <p>The research brief and closing reflection, linking the issue, commit, and PR.</p>
             </a>
           </div>
         </div>
       </section>
       </template>
 
-      <section class="principles" id="principles">
+      <section class="section" id="principles">
         <div class="section-heading">
           <p class="eyebrow">Designed for trust</p>
           <h2>Agentic where useful.<br />Explicit where consequential.</h2>
         </div>
-        <div class="principle-list">
-          <div><span>01</span><div><h3>Native and local-first</h3><p>The assistant lives in Obsidian’s right sidebar and works through vault-relative paths and Obsidian APIs.</p></div></div>
-          <div><span>02</span><div><h3>Append first</h3><p>Ordinary writing appends safely. Replacement and destructive actions require intent, backup, or approval.</p></div></div>
-          <div><span>03</span><div><h3>Visible proof</h3><p>Run Details keeps plans, tool activity, validation, and write receipts available without crowding the chat.</p></div></div>
-          <div><span>04</span><div><h3>Minimal setup</h3><p>One working mode and connection-derived readiness replace a wall of independent capability toggles.</p></div></div>
+        <div class="principle-grid">
+          <div><h3>Native and local-first</h3><p>The assistant lives in Obsidian's right sidebar and works through vault-relative paths and Obsidian APIs. Your notes never become someone else's database.</p></div>
+          <div><h3>Append first</h3><p>Ordinary writing appends safely. Replacement and destructive actions require explicit intent, a backup, or an approval.</p></div>
+          <div><h3>Visible proof</h3><p>Run Details keeps plans, tool activity, validation, and write receipts inspectable without crowding the chat.</p></div>
+          <div><h3>Minimal setup</h3><p>One working mode and connection-derived readiness replace a wall of independent capability toggles. BYOK: your Ollama Cloud key stays in Obsidian SecretStorage.</p></div>
         </div>
       </section>
 

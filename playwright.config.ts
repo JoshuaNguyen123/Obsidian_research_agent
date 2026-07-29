@@ -116,6 +116,15 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
+      // Compound journey footage driver — see e2e/demo-journey-recording.spec.ts.
+      name: "demo-journey-recording",
+      testMatch: /demo-journey-recording\.spec\.ts/u,
+      retries: 0,
+      timeout: 7_200_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
       name: "daily-use-code-live",
       testMatch: /daily-use-code-live\.spec\.ts/u,
       retries: 0,
