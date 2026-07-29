@@ -41,24 +41,29 @@
           <p class="availability">Open source · Local-first · Ollama Cloud BYOK by default; local Ollama remains compatible</p>
         </div>
 
-        <div class="terminal" role="img" aria-label="Example mission progressing through research and note writeback">
+        <figure class="terminal hero-demo">
           <div class="terminal-bar">
             <span></span><span></span><span></span>
-            <strong>MISSION / ACTIVE</strong>
+            <strong>REAL RUN / RECORDED</strong>
           </div>
-          <div class="terminal-body">
-            <p class="prompt"><span>›</span> Research retrieval-augmented generation, compare the strongest sources, and append a brief to today’s note.</p>
-            <ol class="run-list">
-              <li><span class="check">✓</span><div><strong>Plan</strong><small>3 bounded steps</small></div></li>
-              <li><span class="check">✓</span><div><strong>Research</strong><small>Sources fetched and checked</small></div></li>
-              <li><span class="check">✓</span><div><strong>Writeback</strong><small>Daily/2026-07-15.md · append</small></div></li>
-            </ol>
-            <div class="receipt">
-              <span>RECEIPT</span>
-              <code>operation: append · backup: not required · status: verified</code>
-            </div>
-          </div>
-        </div>
+          <video
+            class="demo-video"
+            autoplay
+            muted
+            loop
+            playsinline
+            preload="metadata"
+            poster="./media/hero-poster.jpg"
+            aria-label="Screen recording of a real mission: the agent plans, writes, validates, and delivers working code inside Obsidian"
+          >
+            <source src="./media/hero.webm" type="video/webm" />
+            <source src="./media/hero.mp4" type="video/mp4" />
+          </video>
+          <figcaption class="demo-caption">
+            Real screen recording of one mission in the release build (deepseek-v4-flash) — condensed
+            from a 5½-minute run. Nothing staged, nothing mocked.
+          </figcaption>
+        </figure>
       </section>
 
       <section class="workflow-section" id="workflows">
@@ -95,6 +100,77 @@
         </div>
       </section>
 
+      <!-- Full-journey demo section lands with the retained-journey keeper run:
+           condensed footage + verifiable receipts (public archived repo, draft PR,
+           Linear issue evidence, vault note). Parked in an inert template until
+           then; the hero above already shows a real recorded mission. To enable:
+           unwrap the <template>, fill every DATA_PENDING value from the keeper's
+           retained-journey-artifacts.json, and restore the "Live demo" nav link. -->
+      <template id="journey-demo-pending">
+      <section class="demo-section" id="demo">
+        <div class="section-heading">
+          <p class="eyebrow">Live demo · real run</p>
+          <h2>One autonomous journey.<br />Nothing staged.</h2>
+          <p>
+            A single recorded mission, condensed: the agent researches with verified sources, writes
+            the brief into a note, files a Linear issue, implements and validates the code in a
+            sandboxed workspace, commits, opens a GitHub draft pull request, and reflects — with
+            every consequential step behind an approval or a receipt.
+          </p>
+        </div>
+
+        <figure class="terminal journey-demo">
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+            <strong>AUTONOMOUS JOURNEY / CONDENSED</strong>
+          </div>
+          <video
+            class="demo-video"
+            controls
+            preload="metadata"
+            poster="./media/journey-poster.jpg"
+            aria-label="Condensed screen recording of one autonomous run: research, Linear issue, validated code, GitHub draft pull request, and reflection"
+          >
+            <source src="./media/journey.webm" type="video/webm" />
+            <source src="./media/journey.mp4" type="video/mp4" />
+          </video>
+          <figcaption class="demo-caption">
+            One real run, time-compressed from DATA_PENDING_DURATION of wall-clock autonomy. Recorded
+            DATA_PENDING_DATE against the release build.
+          </figcaption>
+        </figure>
+
+        <dl class="run-metadata" aria-label="Recorded run statistics">
+          <div><dt>Model</dt><dd>DATA_PENDING_MODEL</dd></div>
+          <div><dt>Wall clock</dt><dd>DATA_PENDING_DURATION</dd></div>
+          <div><dt>Tool calls</dt><dd>DATA_PENDING_TOOLS</dd></div>
+          <div><dt>Human approvals</dt><dd>DATA_PENDING_APPROVALS</dd></div>
+        </dl>
+
+        <div class="receipts-row">
+          <p class="eyebrow">Receipts — artifacts this exact run produced</p>
+          <div class="receipt-grid">
+            <a class="receipt-card" href="DATA_PENDING_REPO_URL" rel="noopener noreferrer" target="_blank">
+              <span>GitHub repository</span>
+              <code>Made public and archived after the run so you can inspect every commit.</code>
+            </a>
+            <a class="receipt-card" href="DATA_PENDING_PR_URL" rel="noopener noreferrer" target="_blank">
+              <span>Draft pull request</span>
+              <code>The verified commit behind a draft PR — merge stays a separate human decision.</code>
+            </a>
+            <a class="receipt-card" href="./media/receipt-linear.png" rel="noopener noreferrer" target="_blank">
+              <span>Linear issue</span>
+              <code>Screenshot of the real issue — the workspace is private, so the link cannot be public.</code>
+            </a>
+            <a class="receipt-card" href="./media/receipt-note.png" rel="noopener noreferrer" target="_blank">
+              <span>Vault note</span>
+              <code>The research brief and closing reflection, linking the issue, commit, and PR.</code>
+            </a>
+          </div>
+        </div>
+      </section>
+      </template>
+
       <section class="principles" id="principles">
         <div class="section-heading">
           <p class="eyebrow">Designed for trust</p>
@@ -121,5 +197,16 @@
       <span>Independent community project. Not affiliated with Obsidian.</span>
       <a href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">Source</a>
     </footer>
+    <script>
+      // Respect reduced motion: show the hero poster instead of autoplaying.
+      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        document.querySelectorAll("video[autoplay]").forEach(function (video) {
+          video.removeAttribute("autoplay");
+          video.removeAttribute("loop");
+          video.setAttribute("controls", "");
+          video.pause();
+        });
+      }
+    </script>
   </body>
 </html>

@@ -82,7 +82,23 @@ h1 span { color: transparent; -webkit-text-stroke: 1px var(--green); text-stroke
 .receipt span { margin-bottom: .4rem; color: var(--green); font-size: .62rem; letter-spacing: .12em; }
 .receipt code { color: #afc4b3; font-size: .64rem; white-space: normal; }
 
-.workflow-section, .principles { padding: 7rem 0; border-top: 1px solid var(--line); }
+.workflow-section, .principles, .demo-section { padding: 7rem 0; border-top: 1px solid var(--line); }
+
+/* Live demo — real recorded runs. */
+.hero-demo, .journey-demo { margin: 0; }
+.demo-video { display: block; width: 100%; height: auto; background: #020503; }
+.demo-caption { padding: .8rem 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .68rem; }
+.journey-demo { max-width: 980px; margin: 0 auto; transform: none; }
+.run-metadata { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; max-width: 980px; margin: 2rem auto 0; padding: 0; border: 1px solid var(--line); background: var(--line); }
+.run-metadata > div { padding: 1rem 1.2rem; background: rgba(7, 17, 11, .9); }
+.run-metadata dt { color: var(--muted); font-size: .64rem; letter-spacing: .12em; text-transform: uppercase; }
+.run-metadata dd { margin: .35rem 0 0; color: var(--green); font-size: .95rem; font-weight: 700; }
+.receipts-row { max-width: 980px; margin: 3rem auto 0; }
+.receipt-grid { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+.receipt-card { display: block; padding: 1.1rem; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: rgba(7, 17, 11, .64); text-decoration: none; }
+.receipt-card:hover, .receipt-card:focus-visible { background: rgba(15, 40, 23, .65); }
+.receipt-card span { display: block; margin-bottom: .45rem; color: var(--green); font-size: .72rem; font-weight: 700; letter-spacing: .08em; }
+.receipt-card code { color: var(--muted); font-size: .64rem; }
 .section-heading { display: grid; grid-template-columns: 1fr 2fr; column-gap: 3rem; margin-bottom: 3.5rem; }
 .section-heading .eyebrow { grid-row: span 2; }
 h2 { max-width: 850px; margin-bottom: 1rem; font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: clamp(2.35rem, 5vw, 4.5rem); line-height: 1.02; letter-spacing: -.055em; }
@@ -116,6 +132,7 @@ footer a { color: var(--green); }
   .terminal { max-width: 650px; transform: none; }
   .capability-grid { grid-template-columns: repeat(2, 1fr); }
   .section-heading { display: block; }
+  .run-metadata, .receipt-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 620px) {
   .site-header { min-height: 66px; }
@@ -125,7 +142,8 @@ footer a { color: var(--green); }
   h1 { font-size: clamp(3rem, 15vw, 4.8rem); }
   .capability-grid { grid-template-columns: 1fr; }
   .capability-grid article { min-height: 250px; }
-  .workflow-section, .principles { padding: 5rem 0; }
+  .workflow-section, .principles, .demo-section { padding: 5rem 0; }
+  .run-metadata, .receipt-grid { grid-template-columns: 1fr; }
   footer { grid-template-columns: 1fr; gap: .5rem; }
 }
 
