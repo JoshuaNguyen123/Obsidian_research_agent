@@ -884,6 +884,25 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(section)
+      .setName("Utility model")
+      .setDesc(
+        "Optional cheaper model tag on the same provider as the primary model. When set, short structured decisions (mission routing, plan proposals) run on it automatically; research, synthesis, and writing stay on the primary model. Both decisions are host-validated, so a weaker utility model degrades into a retry, never into silent low-quality output. Leave blank to use the primary model for every phase.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("e.g. deepseek-v4-flash")
+          .setValue(this.plugin.settings.utilityModel ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.utilityModel = value.trim();
+            // Pin the provider to the active one: routing is same-provider
+            // only, and a stale provider here silently disables it.
+            this.plugin.settings.utilityModelProvider =
+              this.plugin.settings.modelProvider;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
       .setName("Thinking mode")
       .setDesc(
         "Uses Ollama thinking for supported models. Auto enables known thinking-capable families.",

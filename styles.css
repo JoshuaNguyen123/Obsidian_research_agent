@@ -1160,6 +1160,14 @@
   min-width: 0;
 }
 
+.agentic-researcher-chat-attention-missing-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .agentic-researcher-tab.needs-attention::after {
   background: var(--agent-terminal-warning);
   border-radius: 50%;

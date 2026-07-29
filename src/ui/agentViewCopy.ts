@@ -2,6 +2,8 @@
  * AgentView critical-path copy helpers — unit-testable without Obsidian.
  */
 
+import { isIntentGateFailureEvent } from "../agent/toolIntentGate";
+
 export function clearChatConfirmCopy(): string {
   return "Click Confirm clear to clear chat history only. Notes, memory, backups, receipts, and settings are unchanged.";
 }
@@ -67,8 +69,9 @@ export function isToolIntentGateFailure(event: {
   message?: string;
   error?: { message?: string } | null;
 }): boolean {
-  const text = `${event.message ?? ""} ${event.error?.message ?? ""}`;
-  return /requires the user to (?:ask|explicitly ask)/i.test(text);
+  // Classifier lives in agent/toolIntentGate so the runner's loop ledger and
+  // this timeline badge can never disagree about what counts as a gate skip.
+  return isIntentGateFailureEvent(event);
 }
 
 /**

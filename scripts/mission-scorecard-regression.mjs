@@ -28,6 +28,10 @@ export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
   "disposable-live-external",
   // Single-call provider smoke; qualifies a model, not a mission.
   "provider-canary",
+  // Bare-prompt Desktop delivery with no scenario mapping: the daily-use
+  // reporter records scenarioId=null for it, so no scorecard is ever emitted.
+  // Its proof lives in the execution report and mission acceptance asserts.
+  "desktop-code-delivery-real-live",
 ]);
 
 const DIMENSION_IDS = Object.freeze([

@@ -5,12 +5,25 @@ import type {
 } from "../agent/missionReadinessPreflight";
 import { missionReadinessMissingSummaries } from "../agent/missionReadinessPreflight";
 
+export interface MissionReadinessCardMissingItemV1 {
+  id: string;
+  label: string;
+  nextAction: string;
+  setupTarget: CapabilitySetupTarget;
+}
+
 export interface MissionReadinessCardModelV1 {
   title: string;
   what: string;
   why: string;
   next: string;
   missingLabels: string[];
+  /**
+   * Every missing check with its own setup target, so the card can offer a
+   * fix per item. One primary CTA alone forces a fix → resubmit → discover
+   * the next blocker loop when several capabilities are missing at once.
+   */
+  missingItems: MissionReadinessCardMissingItemV1[];
   primarySetupTarget: CapabilitySetupTarget;
   primaryNextAction: string;
   chatLine: string;
@@ -51,6 +64,12 @@ export function buildMissionReadinessCardModelV1(
     why: primary.reason,
     next: primary.nextAction,
     missingLabels: labels,
+    missingItems: missing.map((item) => ({
+      id: item.id,
+      label: item.label,
+      nextAction: item.nextAction,
+      setupTarget: item.setupTarget,
+    })),
     primarySetupTarget: primary.setupTarget,
     primaryNextAction: primary.nextAction,
     chatLine: missionReadinessChatLine(missionReadinessMissingSummaries(missing)),
@@ -81,12 +100,36 @@ export function renderMissionReadinessCard(
     text: `What: ${model.what}`,
     cls: "agentic-researcher-chat-attention-body",
   });
-  if (model.missingLabels.length > 1) {
-    banner.createDiv({
-      text: `Missing: ${model.missingLabels.join(" · ")}`,
+  if (model.missingItems.length > 1) {
+    const missingList = banner.createDiv({
       cls: "agentic-researcher-chat-attention-body",
       attr: { "data-testid": "chat-mission-readiness-missing" },
     });
+    // One fix button per distinct settings destination. The primary target is
+    // covered by the main CTA below, so its row stays label-only.
+    const offeredTargets = new Set<CapabilitySetupTarget>([
+      model.primarySetupTarget,
+    ]);
+    for (const item of model.missingItems) {
+      const row = missingList.createDiv({
+        cls: "agentic-researcher-chat-attention-missing-row",
+      });
+      row.createSpan({ text: `${item.label}: ${item.nextAction}` });
+      if (offeredTargets.has(item.setupTarget)) continue;
+      offeredTargets.add(item.setupTarget);
+      const fixButton = row.createEl("button", {
+        text: "Fix",
+        cls: "agentic-researcher-secondary-action",
+        attr: {
+          type: "button",
+          "data-testid": `chat-mission-readiness-fix-${item.id}`,
+        },
+      });
+      fixButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        handlers.onSetupAndResume(item.setupTarget);
+      });
+    }
   }
   banner.createDiv({
     text: `Why: ${model.why}`,

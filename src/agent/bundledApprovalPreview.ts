@@ -6,7 +6,11 @@
  * Hard / destructive / scope-changing tools are never covered by the bundle
  * and still require separate exact confirmation.
  *
- * ## Public API for AgentRunner wire-up (coordinator)
+ * ## Live wiring (AgentRunner is the coordinator — this is how it calls in)
+ *
+ * AgentRunner offers the preview once after "Planning..." for compound
+ * missions that are not set-loose (`shouldOfferBundledApprovalPreview` →
+ * `buildBundledApprovalPreview` → broker request → `issueBundledStageGrant`).
  *
  * 1. Near mission start (after stages known, before Bound mutations):
  *    `const preview = await buildBundledApprovalPreview({ runId, stages, ... })`

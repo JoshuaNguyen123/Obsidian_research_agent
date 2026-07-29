@@ -8,13 +8,20 @@
  * finalizer / streaming paths, codeWorker, researchWorker). `ModelChatRequest`
  * already accepts a per-request `model` override.
  *
- * Nothing sets it. `createConfiguredModelClient` binds one `settings.model` and
- * every phase pays the same price: a one-line route classification costs
+ * Without routing, `createConfiguredModelClient` binds one `settings.model`
+ * and every phase pays the same price: a one-line route classification costs
  * exactly what a long synthesis costs. The repo's own compound log records a
  * run reaching modelCallCount=294 before a 45.8m timeout; the bulk of those are
  * cheap phases running on the heavyweight model.
  *
- * The seam exists. This module supplies only the decision.
+ * This module supplies only the decision.
+ *
+ * Wired: AgentRunner wraps the observable model client once per run and routes
+ * requests through `resolveModelForPhase` using `buildStructuredDecisionRouting`
+ * over `settings.utilityModel` (same-provider only). The Settings tab exposes
+ * the utility model under Advanced → Model tuning, and the runner emits one
+ * status line when routing is active, so per-call evidence in Run Details can
+ * be read against a declared routing intent.
  *
  * Safety posture: fail-closed toward the configured default. A phase with no
  * mapping returns the default. A mapped model that is not in the caller's
@@ -24,7 +31,7 @@
  * verified provider and model still match the active ones), so routing must
  * never be able to smuggle an unverified model id into a live run.
  *
- * ## Public API (wire-up seam, not yet called from AgentRunner)
+ * ## Public API (called from AgentRunner's client wrap, once per run)
  *
  * 1. Build a `ModelPhaseRoutingV1` from settings once per run.
  * 2. Where a request is assembled with `evidencePhase`, add
@@ -151,7 +158,8 @@ export function resolveModelForPhase(
 /**
  * A conservative default table: route only the two structured-decision phases
  * to the cheaper model and leave everything that produces user-visible output
- * on the primary. Callers opt in explicitly; this is not applied anywhere yet.
+ * on the primary. AgentRunner applies this table whenever a same-provider
+ * utility model is configured.
  */
 export function buildStructuredDecisionRouting(
   cheapModel: string,

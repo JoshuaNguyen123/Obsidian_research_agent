@@ -12,7 +12,7 @@ user mission -> read Obsidian context -> plan -> use approved tools -> write bac
 
 ## Features
 
-- Native Obsidian view with a minimal green-on-black mission console.
+- Native Obsidian view with a minimal, theme-adaptive mission console (all colors derive from the active Obsidian theme's variables).
 - A durable `MissionGraphV3` is the authoritative plan; the conditional `Orchestrator` tab is a projection of that graph, while Chat and Run Details remain the primary surfaces.
 - Ollama Cloud BYOK is the default agentic model connection. The API key stays in Obsidian SecretStorage; local Ollama and other compatible endpoints remain supported as optional alternatives.
 - Agent loop with bounded steps, tool validation, and run receipts.
@@ -108,7 +108,8 @@ npm run test:e2e:code                   # protected local WSL2 DU-03 repository 
 npm run test:e2e:compound               # protected local WSL2/provider DU-06
 npm run test:e2e:compound-real          # Obsidian → Linear → Code → GitHub → reflection
 npm run test:e2e:hello-github           # TypeScript app plus a real private GitHub draft PR
-npm run test:e2e:journeys               # every real-model journey lane in one pass
+npm run test:e2e:retained-journey       # full autonomous journey that keeps its artifacts
+npm run test:e2e:byok-autonomous-journey # flagship two-phase journey with verifier
 npm run test:e2e:configured-linear      # real Linear workspace, no model calls
 npm run test:e2e:github-askpass         # real verified git push runtime, no model calls
 npm run test:e2e:live                   # opt-in disposable provider mutation and cleanup

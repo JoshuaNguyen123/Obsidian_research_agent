@@ -396,6 +396,10 @@ import {
 } from "./agent/codeSpecBinding";
 import { TOOL_USAGE_POLICY } from "./agent/toolUsagePolicy";
 import {
+  buildIntentGateCorrective,
+  isIntentGateMessage,
+} from "./agent/toolIntentGate";
+import {
   buildOfferedToolLines,
   formatHostRoutingToolCard,
   pickPreferredNextTool,
@@ -1627,6 +1631,12 @@ export async function runAgentMission({
         streamChat: (request, streamEvents) =>
           routedClient.streamChat(routeRequest(request), streamEvents),
       };
+      // One visible line per run: phase routing was invisible before this —
+      // configured only via data.json and observable only by diffing per-call
+      // evidence models in Run Details.
+      events.onStatus?.(
+        `Phase routing active: mission routing and plan proposals run on ${utilityModel}; synthesis and writing stay on ${defaultModel}.`,
+      );
     }
   }
   const approvalBroker = providedApprovalBroker ?? new ApprovalBroker();
@@ -2455,6 +2465,8 @@ export async function runAgentMission({
     previousFinalOutputCorrectionMissing = [...missing];
   };
   const invalidToolCallFailureSignatures = new Set<string>();
+  /** One corrective redirect per gated tool; repeats add noise, not signal. */
+  const intentGateCorrectedToolNames = new Set<string>();
   let consecutiveNoProgressSteps = 0;
   let lastProgressSignature = "";
   let lastNoToolFrontierFingerprint = "";
@@ -12308,13 +12320,33 @@ export async function runAgentMission({
         setLooseCompoundEnabled &&
         toolCall.name === "code_workspace_create" &&
         failureCode === "workspace_exists";
+      // Intent-gate refusals are policy skips (Chat already badges them as
+      // "skipped"); counting them as failed tools lets one unrequested call
+      // kill a healthy run through required_tools_failed.
+      const intentGateSkip =
+        origin === "model" && isIntentGateMessage(result.error?.message);
       if (
         !schemaCorrectionQueued &&
         !ignoreSetLooseWorkspaceExistsFailure &&
         !createFileCollisionPath &&
-        !researchPhaseDeferred
+        !researchPhaseDeferred &&
+        !intentGateSkip
       ) {
         failedToolNames.push(toolCall.name);
+      }
+      if (intentGateSkip && !intentGateCorrectedToolNames.has(toolCall.name)) {
+        intentGateCorrectedToolNames.add(toolCall.name);
+        messages.push({
+          role: "system" as const,
+          content: buildIntentGateCorrective(toolCall.name),
+        });
+        events.onTrace?.({
+          id: `${toolEventBase.id}:intent-gate-corrective`,
+          kind: "status",
+          step,
+          toolName: toolCall.name,
+          message: `Intent-gate skip redirected: ${toolCall.name} is out of scope for this prompt; model told once not to retry it.`,
+        });
       }
       const failureStatus = formatObservedToolFailureStatus(
         toolCall.name,
@@ -12394,6 +12426,14 @@ export async function runAgentMission({
             });
           } catch (error) {
             failedToolNames.push(toolCall.name);
+            const replanFailureReason = getUnknownErrorMessage(error);
+            // The trace alone proved insufficient in the field: retention
+            // windows dropped it, leaving no way to tell WHICH repair
+            // precondition failed. Surface the reason on the durable status
+            // stream too.
+            events.onStatus?.(
+              `Create-file collision repair unavailable for ${createFileCollisionPath}: ${replanFailureReason}`,
+            );
             events.onTrace?.({
               id: `${toolEventBase.id}:create-file-collision-replan-failed`,
               kind: "error",
@@ -12403,9 +12443,24 @@ export async function runAgentMission({
                 "The create-file collision could not be replanned into an exact hash-bound repair.",
               error: {
                 code: "create_file_collision_replan_failed",
-                message: getUnknownErrorMessage(error),
+                message: replanFailureReason,
               },
             });
+            // Without the repair nodes, the collision error's own advice
+            // ("use code_workspace_write_expected") is unfollowable — the
+            // frontier will reject that tool. Tell the model the truth once
+            // instead of letting it burn the node's remaining attempts on an
+            // instruction the host cannot honor.
+            if (!intentGateCorrectedToolNames.has("create_file_collision")) {
+              intentGateCorrectedToolNames.add("create_file_collision");
+              messages.push({
+                role: "system" as const,
+                content:
+                  `${createFileCollisionPath} already exists with different content and the host could not open a hash-bound repair path this run. ` +
+                  `Do not retry code_workspace_create_file for ${createFileCollisionPath} and do not attempt code_workspace_write_expected — it is not available. ` +
+                  "Report the blocker in your final answer instead.",
+              });
+            }
           }
         } else if (createFileCollisionPath) {
           failedToolNames.push(toolCall.name);
@@ -17907,10 +17962,16 @@ export async function runAgentMission({
       events.onStatus?.(
         "Repeated tool call detected; asking model to synthesize or choose a different tool...",
       );
+      // Naming the banned call matters for weaker tool-trained models: the
+      // recorded spin failures repeat one exact call (e.g. workspace_exists
+      // probes), and an unnamed prohibition invites a near-identical retry.
+      const repeatedCallName = recentActions.at(-1)?.name;
       messages.push({
         role: "system" as const,
         content:
-          "You repeated the same tool call without making progress. Do not repeat that same call again. Either use a different useful tool or draft the final answer/writeback from the context already gathered.",
+          `You repeated the same tool call${
+            repeatedCallName ? ` (${repeatedCallName})` : ""
+          } without making progress. Its previous result is already in this conversation — do not call it again. Either use a different useful tool or draft the final answer/writeback from the context already gathered.`,
       });
       continue;
     }

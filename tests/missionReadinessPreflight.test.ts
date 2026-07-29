@@ -110,6 +110,20 @@ test("compound preflight lists Linear, Sandbox, and GitHub before later checks",
   assert.match(card?.what ?? "", /Linear/);
   assert.match(card?.what ?? "", /Sandbox/);
   assert.match(card?.chatLine ?? "", /Connect Linear/);
+
+  // Every missing check must carry its own setup target so the card can
+  // offer a per-item fix instead of only the primary's single CTA.
+  assert.deepEqual(
+    card?.missingItems.map((item) => item.id),
+    ["linear", "sandbox", "github", "cleanup_authority", "active_note"],
+  );
+  assert.deepEqual(
+    card?.missingItems.map((item) => item.setupTarget),
+    ["linear", "code", "github", "github", "notes_research"],
+  );
+  assert.ok(
+    card?.missingItems.every((item) => item.nextAction.trim().length > 0),
+  );
 });
 
 test("git identity and cleanup authority are required for code/publish/cleanup stages", () => {
