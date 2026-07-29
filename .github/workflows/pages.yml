@@ -20,7 +20,13 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: [self-hosted, Windows, X64, agentic-daily-use]
+    # GitHub-hosted: the repo currently has zero registered self-hosted
+    # runners (the agentic-daily-use runner aged out), and this job only tars
+    # committed static files and deploys them with the ephemeral Pages OIDC
+    # token — no credentials or host state that would require the trusted
+    # machine. Dispatch stays manual. Restore the self-hosted label if that
+    # runner is ever re-registered and preferred.
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -42,7 +48,7 @@ jobs:
       - name: Archive static site
         shell: pwsh
         run: |
-          tar.exe --exclude=.git --exclude=.github -C public-site -cf "$env:RUNNER_TEMP\artifact.tar" .
+          tar --exclude=.git --exclude=.github -C public-site -cf (Join-Path $env:RUNNER_TEMP "artifact.tar") .
       - name: Upload static site
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
