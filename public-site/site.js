@@ -64,6 +64,7 @@ const description = document.querySelector("#demo-description");
 const proof = document.querySelector("#demo-proof");
 const transcriptSummary = document.querySelector("#demo-transcript-summary");
 const transcriptSteps = document.querySelector("#demo-transcript-steps");
+const demoMedia = document.querySelector(".demo-media");
 let activeRole = "researcher";
 
 function renderDemo(role, options = {}) {
@@ -133,7 +134,39 @@ async function playActiveDemo() {
   }
 }
 
-playButton?.addEventListener("click", playActiveDemo);
+function bindPlayHandlers() {
+  if (!video || !playButton) return;
+
+  const startPlayback = (event) => {
+    if (!video.paused) return;
+    event?.preventDefault();
+    void playActiveDemo();
+  };
+
+  playButton.addEventListener("click", startPlayback);
+
+  // Clicking the player surface (including poster area) should activate the
+  // selected role's video. Native controls remain available once media is loaded.
+  video.addEventListener("click", (event) => {
+    if (event.target !== video) return;
+    startPlayback(event);
+  });
+
+  demoMedia?.addEventListener("click", (event) => {
+    if (event.target !== demoMedia) return;
+    startPlayback(event);
+  });
+
+  video.addEventListener("ended", () => {
+    playButton.hidden = false;
+  });
+
+  video.addEventListener("pause", () => {
+    if (video.ended) {
+      playButton.hidden = false;
+    }
+  });
+}
 
 for (const [index, tab] of tabs.entries()) {
   tab.addEventListener("click", () => renderDemo(tab.dataset.demoRole));
@@ -148,3 +181,5 @@ for (const [index, tab] of tabs.entries()) {
     renderDemo(tabs[targetIndex].dataset.demoRole, { focus: true });
   });
 }
+
+bindPlayHandlers();
