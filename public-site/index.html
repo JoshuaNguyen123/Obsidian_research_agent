@@ -22,6 +22,7 @@
         <nav aria-label="Primary navigation">
           <a href="#workflows">Capabilities</a>
           <a href="#how">How it works</a>
+          <a href="#demo">Live demo</a>
           <a href="#principles">Trust</a>
           <a class="nav-cta" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">View on GitHub</a>
         </nav>
@@ -139,22 +140,15 @@
         </ol>
       </section>
 
-      <!-- Full-journey demo section lands with the journey keeper run:
-           condensed footage + verifiable receipts (public archived repo, draft PR,
-           Linear issue evidence, vault note). Parked in an inert template until
-           then. To enable: unwrap the <template>, fill every DATA_PENDING value
-           from test-results/demo-journey-artifacts.json, and add
-           <a href="#demo">Live demo</a> to the nav. -->
-      <template id="journey-demo-pending">
       <section class="section" id="demo">
         <div class="section-heading">
           <p class="eyebrow">Live demo · real run</p>
-          <h2>One autonomous journey. Nothing staged.</h2>
+          <h2>One question. One autonomous run.</h2>
           <p>
-            A single recorded mission, condensed: the agent researches with verified sources, writes
-            the brief into a note, files a Linear issue, implements and validates the code in a
-            sandboxed workspace, commits, opens a GitHub draft pull request, and reflects — with
-            every consequential step behind an approval or a receipt.
+            A single recorded mission, condensed from just under six minutes: the agent plans, researches
+            the web and fetches its sources, files a Linear issue, creates a sandboxed workspace, writes
+            and validates the code, makes a verified commit, and creates a private GitHub repository —
+            each step gated by a receipt.
           </p>
         </div>
 
@@ -168,47 +162,25 @@
             controls
             preload="metadata"
             poster="./media/journey-poster.jpg"
-            aria-label="Condensed screen recording of one autonomous run: research, Linear issue, validated code, GitHub draft pull request, and reflection"
+            aria-label="Condensed screen recording of one autonomous run: planning, web research, Linear issue, sandboxed workspace, validated code, verified commit, and private repository"
           >
             <source src="./media/journey.webm" type="video/webm" />
             <source src="./media/journey.mp4" type="video/mp4" />
           </video>
           <figcaption class="demo-caption">
-            One real run, condensed from DATA_PENDING_DURATION of wall-clock autonomy. Recorded
-            DATA_PENDING_DATE against the release build.
+            Real recording, 29 July 2026, release build on deepseek-v4-pro. Segments are trimmed and
+            sped up; the order is exactly as it ran. This run created a real Linear issue and a real
+            private repository. Publishing the draft pull request is not part of this recording.
           </figcaption>
         </figure>
 
         <dl class="stat-strip" aria-label="Recorded run statistics">
-          <div><dt>Model</dt><dd>DATA_PENDING_MODEL</dd></div>
-          <div><dt>Wall clock</dt><dd>DATA_PENDING_DURATION</dd></div>
-          <div><dt>Tool calls</dt><dd>DATA_PENDING_TOOLS</dd></div>
-          <div><dt>Human approvals</dt><dd>DATA_PENDING_APPROVALS</dd></div>
+          <div><dt>Model</dt><dd>deepseek-v4-pro</dd></div>
+          <div><dt>Wall clock</dt><dd>5 min 38 s</dd></div>
+          <div><dt>Verified steps</dt><dd>15 tool nodes</dd></div>
+          <div><dt>Sandbox</dt><dd>fresh per validation</dd></div>
         </dl>
-
-        <div class="receipts-row">
-          <p class="eyebrow">Receipts — artifacts this exact run produced</p>
-          <div class="receipt-grid">
-            <a class="receipt-card" href="DATA_PENDING_REPO_URL" rel="noopener noreferrer" target="_blank">
-              <span>GitHub repository</span>
-              <p>Made public and archived after the run so you can inspect every commit.</p>
-            </a>
-            <a class="receipt-card" href="DATA_PENDING_PR_URL" rel="noopener noreferrer" target="_blank">
-              <span>Draft pull request</span>
-              <p>The verified commit behind a draft PR — merge stays a separate human decision.</p>
-            </a>
-            <a class="receipt-card" href="./media/receipt-linear.png" rel="noopener noreferrer" target="_blank">
-              <span>Linear issue</span>
-              <p>Screenshot of the real issue — the workspace is private, so the link cannot be public.</p>
-            </a>
-            <a class="receipt-card" href="./media/receipt-note.png" rel="noopener noreferrer" target="_blank">
-              <span>Vault note</span>
-              <p>The research brief and closing reflection, linking the issue, commit, and PR.</p>
-            </a>
-          </div>
-        </div>
       </section>
-      </template>
 
       <section class="section" id="principles">
         <div class="section-heading">

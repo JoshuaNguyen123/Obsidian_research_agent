@@ -1,7 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 import {
   createRepositoryProfile,
@@ -37,6 +37,33 @@ import {
 const LANE = "demo-journey-recording";
 const LINEAR_CONTAINER_NAME = "Application_testing_dumping_grounds";
 
+/**
+ * Open the seeded note and make it the active leaf.
+ *
+ * Omitting this cost a 100-minute run: with no current note, the planner never
+ * schedules the accepted-research writeback, so no durable Obsidian lineage
+ * exists and `publish_verified_code_to_github` fail-closes at the last node
+ * with "No durable Linear and Obsidian lineage matches the verified local
+ * commit" — after every other stage had already succeeded.
+ */
+async function focusNote(page: Page, notePath: string): Promise<void> {
+  await page.evaluate(
+    async ({ pluginId, notePath }) => {
+      const app = (window as typeof window & { app?: any }).app;
+      const plugin = app?.plugins?.plugins?.[pluginId];
+      const file = app.vault.getAbstractFileByPath(notePath);
+      if (!file) throw new Error(`Demo note missing for focus: ${notePath}`);
+      const leaf =
+        app.workspace.getLeavesOfType("markdown")[0] ?? app.workspace.getLeaf("tab");
+      await leaf.openFile(file);
+      app.workspace.setActiveLeaf(leaf, { focus: true });
+      await plugin?.activateView?.();
+    },
+    { pluginId: NATIVE_CORE_PLUGIN_ID, notePath },
+  );
+  await page.getByRole("tab", { name: "Chat" }).click().catch(() => undefined);
+}
+
 async function boundedRead<T>(
   read: Promise<T>,
   fallback: T,
@@ -71,7 +98,11 @@ test("DEMO journey films a genuine research-to-PR mission with retained artifact
   const startedAt = Date.now();
   const marker = "note_search_v1";
   const notePath = "Instant note search research.md";
-  const workspaceId = "note-search";
+  // Unique per run, still readable on camera. A fixed id makes the SECOND
+  // demo adopt the first run's durable workspace binding, which points at a
+  // temp fixture that no longer exists — sandbox prepare then fail-closes with
+  // "requires the exact trusted repository-worktree profile binding".
+  const workspaceId = `note-search-${String(startedAt).slice(-5)}`;
   const relativeCodePath = "src/flow_real.ts";
   const repositoryName = `note-search-prototype-${startedAt}`;
   let harness: RealAiHarness | null = null;
@@ -155,7 +186,12 @@ test("DEMO journey films a genuine research-to-PR mission with retained artifact
     await harness.seedNote(
       notePath,
       [
-        "# Instant note search",
+        // The marker must appear in the note, the Linear issue title, AND the
+        // code. `publish_verified_code_to_github` matches durable Linear and
+        // Obsidian lineage against the verified commit, and with the marker
+        // only in the source file that match fails at the final node — twice,
+        // on two different models, after every other stage had succeeded.
+        `# Instant note search (${marker})`,
         "",
         "My vault is past 4,000 notes and search is starting to feel slow.",
         "How do serious editors make full-text search feel instant?",
@@ -166,11 +202,12 @@ test("DEMO journey films a genuine research-to-PR mission with retained artifact
       ].join("\n"),
       true,
     );
+    await focusNote(harness.page, notePath);
 
     const mission = [
-      "How should a notes app search thousands of files instantly? Run the full pipeline: web research, Linear issue, repository workspace, private GitHub, and note reflection.",
+      `How should a notes app search thousands of files instantly? Run the full pipeline for ${marker}: web research, Linear issue, repository workspace, private GitHub, and note reflection.`,
       `First research trigram-index text search using exactly two public web sources and fetch both sources before accepting findings. Write the accepted findings into the current note ${notePath} using the canonical headings ## Problem and impact, ## Evidence and source links, and ## Proposed work, citing both fetched source URLs and passages.`,
-      `Then create a Linear issue with linear_create_issue in the configured team ${LINEAR_CONTAINER_NAME}, titled Prototype instant note search, whose description summarizes the accepted findings, and read it back with linear_get_issue to confirm it is assigned to the current Linear viewer.`,
+      `Then create a Linear issue with linear_create_issue in the configured team ${LINEAR_CONTAINER_NAME}, titled Prototype instant note search ${marker}, whose description summarizes the accepted findings, and read it back with linear_get_issue to confirm it is assigned to the current Linear viewer.`,
       "The trusted repository key for this mission is demo-note-search.",
       `Then create repository workspace ${workspaceId} with code_workspace_create in the trusted local repository ${fixture.root} before reading or writing any workspace file.`,
       `Read the exact existing workspace file ${relativeCodePath} via code_workspace_read path ${relativeCodePath}, then code_workspace_write_expected path ${relativeCodePath} with a small TypeScript search implementation: an exported TrigramIndex class with add and search methods, an exported highlightMatch function, and the exact line export const marker = "${marker}"; (double quotes only).`,
