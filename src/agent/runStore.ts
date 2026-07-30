@@ -339,8 +339,13 @@ export interface MissionRuntimeSnapshotWriteResult {
   path: string;
   bytesWritten: number;
   revision: number;
-  commitProof: "vault_acknowledged" | "exact_readback";
+  commitProof: AgentRunMarkdownCommitProof;
 }
+
+export type AgentRunMarkdownCommitProof =
+  | "vault_acknowledged"
+  | "exact_readback"
+  | "adapter_exact_readback";
 
 export class RuntimeSnapshotWriteAmbiguousError extends Error {
   readonly code = "runtime_snapshot_write_ambiguous";
@@ -425,6 +430,53 @@ export async function settleRuntimeSnapshotModify({
           : undefined,
   });
 }
+
+export async function persistAgentRunMarkdownExact({
+  path,
+  expectedMarkdown,
+  adapterWrite,
+  adapterRead,
+  modify,
+  readback,
+}: {
+  path: string;
+  expectedMarkdown: string;
+  adapterWrite?: () => Promise<unknown>;
+  adapterRead?: () => Promise<string>;
+  modify: () => Promise<unknown>;
+  readback: () => Promise<string>;
+}): Promise<AgentRunMarkdownCommitProof> {
+  if (adapterWrite && adapterRead) {
+    await adapterWrite();
+    const persistedMarkdown = await adapterRead();
+    if (persistedMarkdown !== expectedMarkdown) {
+      throw new Error(
+        `Agent run persistence readback did not exactly match ${path}.`,
+      );
+    }
+    return "adapter_exact_readback";
+  }
+
+  return settleRuntimeSnapshotModify({
+    path,
+    expectedMarkdown,
+    modify,
+    readback,
+  });
+}
+
+export async function readAgentRunMarkdown({
+  adapterRead,
+  vaultRead,
+}: {
+  adapterRead?: () => Promise<string>;
+  vaultRead: () => Promise<string>;
+}): Promise<string> {
+  return adapterRead ? adapterRead() : vaultRead();
+}
+
+export const persistInternalFileExact = persistAgentRunMarkdownExact;
+export const readInternalFile = readAgentRunMarkdown;
 
 export interface StoredMissionRuntimeSnapshot {
   path: string;
@@ -797,7 +849,13 @@ async function persistMissionRuntimeSnapshotUnlocked(
   let current = "";
   let persistedRevision = 0;
   if (file) {
-    current = await vault.read(file as TFile);
+    current = await readAgentRunMarkdown({
+      adapterRead:
+        typeof vault.adapter?.read === "function"
+          ? () => vault.adapter.read(path)
+          : undefined,
+      vaultRead: () => vault.read(file as TFile),
+    });
     persistedRevision =
       parseMissionRuntimeSnapshotFromMarkdown(current)?.revision ?? 0;
   }
@@ -823,9 +881,17 @@ async function persistMissionRuntimeSnapshotUnlocked(
   }
 
   const next = replaceRuntimeSnapshotBlock(current, block);
-  const commitProof = await settleRuntimeSnapshotModify({
+  const commitProof = await persistAgentRunMarkdownExact({
     path,
     expectedMarkdown: next,
+    adapterWrite:
+      typeof vault.adapter?.write === "function"
+        ? () => vault.adapter.write(path, next)
+        : undefined,
+    adapterRead:
+      typeof vault.adapter?.read === "function"
+        ? () => vault.adapter.read(path)
+        : undefined,
     modify: () => vault.modify(file as TFile, next),
     readback: () => vault.read(file as TFile),
   });
@@ -3960,12 +4026,12 @@ function parseDateOrNow(value: string): Date {
   return Number.isFinite(timestamp) ? new Date(timestamp) : new Date();
 }
 
-type BoundedSettlement<T> =
+export type BoundedSettlement<T> =
   | { kind: "resolved"; value: T }
   | { kind: "rejected"; value: unknown }
   | { kind: "timed_out" };
 
-async function settleBounded<T>(
+export async function settleBounded<T>(
   promise: Promise<T>,
   timeoutMs: number,
 ): Promise<BoundedSettlement<T>> {

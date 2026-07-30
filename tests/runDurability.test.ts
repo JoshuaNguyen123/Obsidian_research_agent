@@ -15,9 +15,12 @@ import {
   formatMissionRuntimeSnapshotBlock,
   normalizeMissionRuntimeSnapshot,
   parseMissionRuntimeSnapshotFromMarkdown,
+  persistAgentRunMarkdownExact,
+  readAgentRunMarkdown,
   readLatestIncompleteMissionRuntimeSnapshot,
   readMissionRuntimeSnapshotByRunId,
   RuntimeSnapshotWriteAmbiguousError,
+  settleBounded,
   settleRuntimeSnapshotModify,
   transitionOperationJournalRecord,
   updateMissionRuntimeSnapshotByRunId,
@@ -25,6 +28,19 @@ import {
   writeMissionRuntimeSnapshot,
 } from "../src/agent/runStore";
 import type { ToolExecutionContext } from "../src/tools/types";
+
+test("best-effort persistence returns after its bounded timeout", async () => {
+  const neverSettles = new Promise<void>(() => undefined);
+  const startedAt = Date.now();
+
+  const result = await settleBounded(neverSettles, 20);
+
+  assert.deepEqual(result, { kind: "timed_out" });
+  assert.ok(
+    Date.now() - startedAt < 1_000,
+    "a stalled best-effort write must not retain terminal UI ownership",
+  );
+});
 
 test("run ids retain milliseconds, add entropy, and remain resume-parser compatible", () => {
   const now = new Date("2026-07-10T12:34:56.123Z");
@@ -225,6 +241,63 @@ test("runtime snapshot modify fails closed when acknowledgement and exact readba
       return true;
     },
   );
+});
+
+test("agent run persistence prefers adapter write with exact readback", async () => {
+  const expectedMarkdown = "# Agent Run\n\nverified";
+  let persistedMarkdown = "old";
+  let modifyCalled = false;
+
+  const proof = await persistAgentRunMarkdownExact({
+    path: "Agent Runs/run-adapter.md",
+    expectedMarkdown,
+    adapterWrite: async () => {
+      persistedMarkdown = expectedMarkdown;
+    },
+    adapterRead: async () => persistedMarkdown,
+    modify: async () => {
+      modifyCalled = true;
+    },
+    readback: async () => "unused",
+  });
+
+  assert.equal(proof, "adapter_exact_readback");
+  assert.equal(modifyCalled, false);
+});
+
+test("agent run adapter persistence fails closed on readback mismatch", async () => {
+  let modifyCalled = false;
+
+  await assert.rejects(
+    persistAgentRunMarkdownExact({
+      path: "Agent Runs/run-adapter-mismatch.md",
+      expectedMarkdown: "expected",
+      adapterWrite: async () => undefined,
+      adapterRead: async () => "stale",
+      modify: async () => {
+        modifyCalled = true;
+      },
+      readback: async () => "unused",
+    }),
+    /did not exactly match/,
+  );
+
+  assert.equal(modifyCalled, false);
+});
+
+test("agent run reads prefer the exact adapter path", async () => {
+  let vaultReadCalled = false;
+
+  const markdown = await readAgentRunMarkdown({
+    adapterRead: async () => "# exact adapter content",
+    vaultRead: async () => {
+      vaultReadCalled = true;
+      return "# stale vault content";
+    },
+  });
+
+  assert.equal(markdown, "# exact adapter content");
+  assert.equal(vaultReadCalled, false);
 });
 
 test("runtime snapshot v2 round-trips complete resumable mission state", () => {

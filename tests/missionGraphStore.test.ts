@@ -61,6 +61,45 @@ test("persists the initial MissionGraphV3 with a separate CAS revision and stric
   );
 });
 
+test("updates the internal mission graph through exact adapter persistence", async () => {
+  const harness = createVaultHarness();
+  const graph = await createGraph("mission-store-adapter");
+  const initial = await persistInitialMissionGraph(harness.context, graph);
+  const patch = createStatusPatch(graph, "patch-adapter", "ready", "running");
+  let vaultModifyCalled = false;
+  const vault = harness.context.app.vault as unknown as {
+    adapter?: {
+      read(path: string): Promise<string>;
+      write(path: string, content: string): Promise<void>;
+    };
+    modify(file: { path: string }, content: string): Promise<void>;
+  };
+  vault.adapter = {
+    read: async (path) => harness.files.get(path) ?? "",
+    write: async (path, content) => {
+      harness.files.set(path, content);
+    },
+  };
+  vault.modify = async () => {
+    vaultModifyCalled = true;
+    throw new Error("indexed vault modification must not run");
+  };
+
+  const prepared = await persistPreparedMissionGraphPatch(
+    harness.context,
+    graph.missionId,
+    patch,
+    {
+      expectedStoreRevision: initial.record.storeRevision,
+      appliedAt: PATCHED_AT,
+    },
+  );
+
+  assert.equal(prepared.record.storeRevision, 2);
+  assert.equal(prepared.record.graph.nodes.read.status, "ready");
+  assert.equal(vaultModifyCalled, false);
+});
+
 test("rejects stale writers without changing the stored record", async () => {
   const harness = createVaultHarness();
   const graph = await createGraph("mission-store-cas");

@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "role": "researcher",
+  "expectedDuration": {
+    "min": 20,
+    "max": 25
+  },
+  "output": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+  },
+  "crop": {
+    "inset": {
+      "top": 48,
+      "right": 0,
+      "bottom": 18,
+      "left": 0
+    },
+    "anchorX": 0.5,
+    "anchorY": 0.5
+  },
+  "segments": [
+    {
+      "at": "researcher-ready",
+      "offsetSeconds": 0,
+      "duration": 3.5,
+      "zoomFrom": 1.46,
+      "zoomTo": 1.49,
+      "anchorX": 0,
+      "anchorY": 0
+    },
+    {
+      "at": "researcher-submit",
+      "offsetSeconds": 0.6,
+      "duration": 4,
+      "zoomFrom": 1.48,
+      "zoomTo": 1.54,
+      "anchorX": 1,
+      "anchorY": 0.24
+    },
+    {
+      "start": 115,
+      "duration": 4,
+      "zoomFrom": 1.45,
+      "zoomTo": 1.5,
+      "anchorX": 1,
+      "anchorY": 0.2
+    },
+    {
+      "at": "researcher-note-verified",
+      "offsetSeconds": -2.5,
+      "duration": 4.5,
+      "zoomFrom": 1.28,
+      "zoomTo": 1.33,
+      "anchorX": 0,
+      "anchorY": 0.55
+    },
+    {
+      "at": "researcher-finale",
+      "offsetSeconds": -5,
+      "duration": 5,
+      "zoomFrom": 1,
+      "zoomTo": 1,
+      "anchorX": 0.5,
+      "anchorY": 0.12
+    }
+  ],
+  "poster": {
+    "atSeconds": 20.5,
+    "zoom": 1,
+    "anchorX": 0.5,
+    "anchorY": 0.5
+  }
+}

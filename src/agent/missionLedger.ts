@@ -20,7 +20,11 @@ import {
 } from "./missionPlan";
 import type { ToolExecutionContext } from "../tools/types";
 import { normalizeVaultPath } from "../tools/validation";
-import { withSerializedRunWrite } from "./runStore";
+import {
+  persistAgentRunMarkdownExact,
+  readAgentRunMarkdown,
+  withSerializedRunWrite,
+} from "./runStore";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
 import type { ModelUsageAggregateV1 } from "../model/modelCallEvidence";
 import { normalizeOrchestratorSnapshot } from "../orchestrator/orchestratorStore";
@@ -808,7 +812,13 @@ export async function writeMissionLedger(
     let current = "";
     let persistedRevision = 0;
     if (file) {
-      current = await vault.read(file as TFile);
+      current = await readAgentRunMarkdown({
+        adapterRead:
+          typeof vault.adapter?.read === "function"
+            ? () => vault.adapter.read(path)
+            : undefined,
+        vaultRead: () => vault.read(file as TFile),
+      });
       persistedRevision = parseMissionLedgerFromMarkdown(current)?.revision ?? 0;
     }
 
@@ -830,7 +840,20 @@ export async function writeMissionLedger(
     }
 
     const next = replaceMissionLedgerBlock(current, block);
-    await vault.modify(file as TFile, next);
+    await persistAgentRunMarkdownExact({
+      path,
+      expectedMarkdown: next,
+      adapterWrite:
+        typeof vault.adapter?.write === "function"
+          ? () => vault.adapter.write(path, next)
+          : undefined,
+      adapterRead:
+        typeof vault.adapter?.read === "function"
+          ? () => vault.adapter.read(path)
+          : undefined,
+      modify: () => vault.modify(file as TFile, next),
+      readback: () => vault.read(file as TFile),
+    });
     ledger.schemaVersion = MISSION_LEDGER_SCHEMA_VERSION;
     ledger.revision = Math.max(ledger.revision, requestedLedger.revision);
     return {

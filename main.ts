@@ -188,6 +188,8 @@ import {
   isBackgroundCodeCommitProofVerifiedV1,
   isBackgroundGitHubProofVerifiedV1,
   createMissionRuntimeSnapshot,
+  persistInternalFileExact,
+  readInternalFile,
   readMissionRuntimeSnapshotByCompanionLineageV1,
   readMissionRuntimeSnapshotByRunId,
   isExternalActionReadbackVerifiedV1,
@@ -7394,7 +7396,16 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
 
     try {
-      return JSON.parse(await this.app.vault.read(file));
+      const vault = this.app.vault;
+      return JSON.parse(
+        await readInternalFile({
+          adapterRead:
+            typeof vault.adapter?.read === "function"
+              ? () => vault.adapter.read(path)
+              : undefined,
+          vaultRead: () => vault.read(file),
+        }),
+      );
     } catch (error) {
       console.warn(`Unable to read Agent Memory file ${path}`, error);
       return null;
@@ -7407,7 +7418,21 @@ export default class AgenticResearcherPlugin extends Plugin {
       const text = `${JSON.stringify(value, null, 2)}\n`;
       const file = this.app.vault.getFileByPath(path);
       if (file) {
-        await this.app.vault.modify(file, text);
+        const vault = this.app.vault;
+        await persistInternalFileExact({
+          path,
+          expectedMarkdown: text,
+          adapterWrite:
+            typeof vault.adapter?.write === "function"
+              ? () => vault.adapter.write(path, text)
+              : undefined,
+          adapterRead:
+            typeof vault.adapter?.read === "function"
+              ? () => vault.adapter.read(path)
+              : undefined,
+          modify: () => vault.modify(file, text),
+          readback: () => vault.read(file),
+        });
       } else {
         await this.app.vault.create(path, text);
       }

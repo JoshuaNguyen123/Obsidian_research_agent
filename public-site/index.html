@@ -5,14 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Agentic Researcher is one native Obsidian plugin for research, note work, bounded code tasks, Linear, GitHub, and verifiable writeback."
+      content="Agentic Researcher is a native Obsidian assistant that reads context, runs approved tools, writes back, and shows receipts."
     />
-    <meta name="theme-color" content="#0b0d12" />
+    <meta name="theme-color" content="#0d0e10" />
     <title>Agentic Researcher for Obsidian</title>
     <link rel="stylesheet" href="./styles.css" />
+    <script src="./site.js" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
+
     <header class="site-header">
       <div class="header-inner">
         <a class="brand" href="#top" aria-label="Agentic Researcher home">
@@ -20,186 +22,199 @@
           <span>Agentic Researcher</span>
         </a>
         <nav aria-label="Primary navigation">
-          <a href="#workflows">Capabilities</a>
-          <a href="#how">How it works</a>
-          <a href="#demo">Live demo</a>
-          <a href="#principles">Trust</a>
-          <a class="nav-cta" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">View on GitHub</a>
+          <a href="#demos">Demos</a>
+          <a href="#trust">Trust</a>
+          <a
+            class="nav-cta"
+            href="https://github.com/JoshuaNguyen123/Obsidian_research_agent"
+          >GitHub</a>
         </nav>
       </div>
     </header>
 
     <main id="main">
-      <section class="hero" id="top">
-        <p class="hero-badge"><span class="status-dot"></span>Native Obsidian plugin · Desktop · Open source</p>
-        <h1>Your vault. Your agent.<br /><span>One surface.</span></h1>
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <p class="kicker">Native Obsidian assistant &middot; Open source</p>
+        <h1 id="hero-title">Research and build from the notes you already have.</h1>
         <p class="lede">
-          Research the web, work across notes, prepare bounded code changes, create Linear tasks,
-          and handle GitHub activity — without turning your vault into a control panel.
+          One native Obsidian assistant that reads context, runs approved tools, writes back,
+          and shows the receipts.
         </p>
         <div class="hero-actions">
-          <a class="button primary" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent#install-for-development">Install from GitHub</a>
-          <a class="button secondary" href="#workflows">See what it does</a>
+          <a class="button primary" href="#demos">Watch the demos</a>
+          <a
+            class="button secondary"
+            href="https://github.com/JoshuaNguyen123/Obsidian_research_agent#install-for-development"
+          >Install the development build</a>
         </div>
+      </section>
 
-        <figure class="demo-frame hero-demo">
-          <div class="frame-bar">
-            <span class="frame-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-            <span class="frame-title">Real mission · recorded in the release build</span>
+      <section class="role-showcase" id="demos" aria-labelledby="demos-title">
+        <div class="demo-heading">
+          <div>
+            <p class="kicker">Two ways to work</p>
+            <h2 id="demos-title">Choose the role. Give it the outcome.</h2>
           </div>
-          <video
-            class="demo-video"
-            autoplay
-            muted
-            loop
-            playsinline
-            preload="metadata"
-            poster="./media/hero-poster.jpg"
-            aria-label="Screen recording of a real mission: the agent plans, writes, validates, and delivers working code inside Obsidian"
-          >
-            <source src="./media/hero.webm" type="video/webm" />
-            <source src="./media/hero.mp4" type="video/mp4" />
-          </video>
-          <figcaption class="demo-caption">
-            Real screen recording of one mission (deepseek-v4-flash) — condensed from a 1¾-minute
-            run. Nothing staged, nothing mocked.
-          </figcaption>
-        </figure>
-
-        <dl class="stat-strip" aria-label="What one recorded mission produced">
-          <div><dt>One prompt</dt><dd>plan → code → proof</dd></div>
-          <div><dt>3 validation rungs</dt><dd>fast · targeted · full</dd></div>
-          <div><dt>Every write</dt><dd>carries a receipt</dd></div>
-          <div><dt>Mission acceptance</dt><dd>pass · confidence 0.9</dd></div>
-        </dl>
-      </section>
-
-      <section class="section" id="workflows">
-        <div class="section-heading">
-          <p class="eyebrow">Capabilities</p>
-          <h2>Start with the task, not the settings.</h2>
-          <p>Chat is the mission console. The agent picks the relevant capability and only asks for setup when a required connection is missing.</p>
+          <div class="role-tabs" role="tablist" aria-label="Choose a demo role">
+            <button
+              id="researcher-tab"
+              class="role-tab"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="demo-panel"
+              data-demo-role="researcher"
+              tabindex="0"
+            >Researcher</button>
+            <button
+              id="builder-tab"
+              class="role-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="demo-panel"
+              data-demo-role="builder"
+              tabindex="-1"
+            >Builder</button>
+          </div>
         </div>
-        <div class="capability-grid">
-          <article>
-            <span class="cap-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-            </span>
-            <h3>Vault research</h3>
-            <p>Read the current note, search the vault and web, compare evidence, then append sourced markdown.</p>
-            <code>notes + web → cited brief</code>
-          </article>
-          <article>
-            <span class="cap-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m8 6-5 6 5 6"/><path d="m16 6 5 6-5 6"/><path d="m13 4-2 16"/></svg>
-            </span>
-            <h3>Code work</h3>
-            <p>Author Python, TypeScript, Rust, Go, and more in trusted workspaces with sandboxed validation and receipts.</p>
-            <code>task → patch → proof</code>
-          </article>
-          <article>
-            <span class="cap-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 10h8M8 14h5"/></svg>
-            </span>
-            <h3>Linear</h3>
-            <p>Turn research or a note into a structured work item through fixed, permission-aware actions.</p>
-            <code>brief → issue → readback</code>
-          </article>
-          <article>
-            <span class="cap-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7M8.3 6.8 15.7 11M8.3 17.2 15.7 13"/></svg>
-            </span>
-            <h3>GitHub</h3>
-            <p>Prepare verified commits and draft pull requests, inspect reviews, and keep merge separately approved.</p>
-            <code>change → PR → receipt</code>
-          </article>
-        </div>
-      </section>
 
-      <section class="section" id="how">
-        <div class="section-heading">
-          <p class="eyebrow">How it works</p>
-          <h2>Ask once. Watch it prove its work.</h2>
-        </div>
-        <ol class="steps">
-          <li>
-            <span class="step-num">1</span>
-            <h3>Type a mission</h3>
-            <p>Plain language in the sidebar console. The router classifies it and builds a bounded, durable plan — no capability toggles to babysit.</p>
-          </li>
-          <li>
-            <span class="step-num">2</span>
-            <h3>The agent works, you steer</h3>
-            <p>Tools run against your real vault, sandbox, and integrations. Consequential steps wait behind approvals; a steering panel adjusts the run live.</p>
-          </li>
-          <li>
-            <span class="step-num">3</span>
-            <h3>Receipts, not vibes</h3>
-            <p>Every write lands with a verified receipt, and the mission ends with an acceptance check — pass or fail, with reasons you can read.</p>
-          </li>
-        </ol>
-      </section>
+        <div
+          class="demo-panel"
+          id="demo-panel"
+          role="tabpanel"
+          aria-labelledby="researcher-tab"
+          tabindex="0"
+        >
+          <div class="demo-media">
+            <video
+              id="role-demo"
+              controls
+              playsinline
+              preload="none"
+              poster="./media/researcher-demo-poster.jpg?v=2026-07-30-clean-demos-v2"
+              aria-label="Researcher demo: a real run turns a note-search brief into a cited decision"
+              aria-describedby="demo-description demo-run-note"
+            >
+              <source
+                id="role-demo-webm"
+                data-src="./media/researcher-demo.webm?v=2026-07-30-clean-demos-v2"
+                type="video/webm"
+              />
+              <source
+                id="role-demo-mp4"
+                data-src="./media/researcher-demo.mp4?v=2026-07-30-clean-demos-v2"
+                type="video/mp4"
+              />
+              Your browser does not support embedded video.
+            </video>
+            <button
+              class="demo-play"
+              id="demo-play"
+              type="button"
+              aria-label="Play 21-second Researcher demo"
+            >
+              <img
+                id="demo-poster-image"
+                src="./media/researcher-demo-poster.jpg?v=2026-07-30-clean-demos-v2"
+                alt=""
+              />
+              <span class="demo-play-icon" aria-hidden="true">&#9654;</span>
+            </button>
+          </div>
 
-      <section class="section" id="demo">
-        <div class="section-heading">
-          <p class="eyebrow">Live demo · real run</p>
-          <h2>One question. One autonomous run.</h2>
-          <p>
-            A single recorded mission, condensed from just under six minutes: the agent plans, researches
-            the web and fetches its sources, files a Linear issue, creates a sandboxed workspace, writes
-            and validates the code, makes a verified commit, and creates a private GitHub repository —
-            each step gated by a receipt.
+          <div class="demo-info">
+            <div class="demo-outcome">
+              <p class="role-label" id="demo-role-label">Researcher</p>
+              <h3 id="demo-outcome">Turn a research brief into a cited decision.</h3>
+              <p id="demo-description">
+                The agent reads one useful note, checks its two linked sources, and appends a
+                compact decision with citations and a verified write receipt.
+              </p>
+            </div>
+            <ul class="demo-proof" id="demo-proof" aria-label="Researcher demo proof">
+              <li>Active-note brief</li>
+              <li>Two source readbacks</li>
+              <li>Verified append</li>
+            </ul>
+          </div>
+
+          <p class="real-run-note" id="demo-run-note">
+            A genuine release-build run, edited only for time. No simulated agent states.
           </p>
-        </div>
 
-        <figure class="demo-frame journey-demo">
-          <div class="frame-bar">
-            <span class="frame-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-            <span class="frame-title">Autonomous journey · condensed</span>
+          <details class="transcript" id="demo-transcript">
+            <summary id="demo-transcript-summary">Researcher demo transcript</summary>
+            <ol id="demo-transcript-steps">
+              <li>The active note defines a real note-search decision and links two sources.</li>
+              <li>The user asks the agent to compare only those sources.</li>
+              <li>A concise, cited decision is appended to the note.</li>
+              <li>Run Details confirms the append with a verified receipt.</li>
+            </ol>
+          </details>
+        </div>
+      </section>
+
+      <section class="trust" id="trust" aria-labelledby="trust-title">
+        <div class="proof-flow" aria-label="How Agentic Researcher works">
+          <div>
+            <span aria-hidden="true">01</span>
+            <h3>Reads your context</h3>
+            <p>The active note, relevant vault files, and approved external sources.</p>
           </div>
-          <video
-            class="demo-video"
-            controls
-            preload="metadata"
-            poster="./media/journey-poster.jpg"
-            aria-label="Condensed screen recording of one autonomous run: planning, web research, Linear issue, sandboxed workspace, validated code, verified commit, and private repository"
-          >
-            <source src="./media/journey.webm" type="video/webm" />
-            <source src="./media/journey.mp4" type="video/mp4" />
-          </video>
-          <figcaption class="demo-caption">
-            Real recording, 29 July 2026, release build on deepseek-v4-pro. Segments are trimmed and
-            sped up; the order is exactly as it ran. This run created a real Linear issue and a real
-            private repository. Publishing the draft pull request is not part of this recording.
-          </figcaption>
-        </figure>
+          <div>
+            <span aria-hidden="true">02</span>
+            <h3>Runs approved tools</h3>
+            <p>The model chooses steps; the plugin validates and executes each call.</p>
+          </div>
+          <div>
+            <span aria-hidden="true">03</span>
+            <h3>Returns receipts</h3>
+            <p>Writes, validations, and consequential actions remain inspectable.</p>
+          </div>
+        </div>
 
-        <dl class="stat-strip" aria-label="Recorded run statistics">
-          <div><dt>Model</dt><dd>deepseek-v4-pro</dd></div>
-          <div><dt>Wall clock</dt><dd>5 min 38 s</dd></div>
-          <div><dt>Verified steps</dt><dd>15 tool nodes</dd></div>
-          <div><dt>Sandbox</dt><dd>fresh per validation</dd></div>
-        </dl>
+        <div class="trust-heading">
+          <p class="kicker">Designed for trust</p>
+          <h2 id="trust-title">Local by default. Explicit when it matters.</h2>
+        </div>
+        <div class="trust-lines">
+          <article>
+            <h3>Local-first context</h3>
+            <p>Notes stay in Obsidian and are accessed through vault-relative paths.</p>
+          </article>
+          <article>
+            <h3>Append-first writing</h3>
+            <p>Ordinary writeback adds safely; replacement requires explicit intent and backup.</p>
+          </article>
+          <article>
+            <h3>Approval-gated actions</h3>
+            <p>External publication and destructive actions remain behind clear authority gates.</p>
+          </article>
+        </div>
+        <p class="integration-note">
+          When a task calls for it, the same prompt-first workflow can connect to Linear and
+          GitHub without turning the sidebar into a control panel.
+        </p>
       </section>
 
-      <section class="section" id="principles">
-        <div class="section-heading">
-          <p class="eyebrow">Designed for trust</p>
-          <h2>Agentic where useful.<br />Explicit where consequential.</h2>
+      <section class="final-cta" aria-labelledby="cta-title">
+        <p class="kicker">Bring the work back to your vault</p>
+        <h2 id="cta-title">Bring the next task into your vault.</h2>
+        <p>
+          Agentic Researcher is under active development. Inspect the source or install the
+          development build to try the native workflow.
+        </p>
+        <div class="cta-actions">
+          <a
+            class="button primary"
+            href="https://github.com/JoshuaNguyen123/Obsidian_research_agent#install-for-development"
+          >Install the development build</a>
+          <a
+            class="text-link"
+            href="https://github.com/JoshuaNguyen123/Obsidian_research_agent"
+          >View the source <span aria-hidden="true">&rarr;</span></a>
         </div>
-        <div class="principle-grid">
-          <div><h3>Native and local-first</h3><p>The assistant lives in Obsidian's right sidebar and works through vault-relative paths and Obsidian APIs. Your notes never become someone else's database.</p></div>
-          <div><h3>Append first</h3><p>Ordinary writing appends safely. Replacement and destructive actions require explicit intent, a backup, or an approval.</p></div>
-          <div><h3>Visible proof</h3><p>Run Details keeps plans, tool activity, validation, and write receipts inspectable without crowding the chat.</p></div>
-          <div><h3>Minimal setup</h3><p>One working mode and connection-derived readiness replace a wall of independent capability toggles. BYOK: your Ollama Cloud key stays in Obsidian SecretStorage.</p></div>
-        </div>
-      </section>
-
-      <section class="cta">
-        <p class="eyebrow">Build with us</p>
-        <h2>One plugin for the work already living in your vault.</h2>
-        <p>Agentic Researcher is under active development. Explore the source, run the test lanes, and help shape the native Obsidian agent.</p>
-        <a class="button primary" href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">Open the GitHub repository</a>
       </section>
     </main>
 
@@ -208,16 +223,5 @@
       <span>Independent community project. Not affiliated with Obsidian.</span>
       <a href="https://github.com/JoshuaNguyen123/Obsidian_research_agent">Source</a>
     </footer>
-    <script>
-      // Respect reduced motion: show the hero poster instead of autoplaying.
-      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-        document.querySelectorAll("video[autoplay]").forEach(function (video) {
-          video.removeAttribute("autoplay");
-          video.removeAttribute("loop");
-          video.setAttribute("controls", "");
-          video.pause();
-        });
-      }
-    </script>
   </body>
 </html>

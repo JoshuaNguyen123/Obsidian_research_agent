@@ -17,6 +17,10 @@ import {
   normalizeResourceLockState,
   type ResourceLockStateV1,
 } from "./queue/resourceLocks";
+import {
+  persistAgentRunMarkdownExact,
+  readAgentRunMarkdown,
+} from "./runStore";
 
 export const MISSION_GRAPH_STORE_RECORD_VERSION = 1 as const;
 export const MISSION_GRAPH_STORE_FOLDER = "Agent Runs/Mission Graphs";
@@ -774,7 +778,14 @@ async function readStoredRecordUnlocked(
   if (!file) {
     return null;
   }
-  const markdown = await context.app.vault.read(file as TFile);
+  const vault = context.app.vault;
+  const markdown = await readAgentRunMarkdown({
+    adapterRead:
+      typeof vault.adapter?.read === "function"
+        ? () => vault.adapter.read(path)
+        : undefined,
+    vaultRead: () => vault.read(file as TFile),
+  });
   const record = await parseMissionGraphStoreRecordFromMarkdown(markdown);
   if (!record) {
     throw new MissionGraphStoreIntegrityError(
@@ -812,7 +823,14 @@ async function writeStoreRecordUnlocked(
       `Mission graph store disappeared before write: ${path}.`,
     );
   }
-  const current = await context.app.vault.read(file as TFile);
+  const vault = context.app.vault;
+  const current = await readAgentRunMarkdown({
+    adapterRead:
+      typeof vault.adapter?.read === "function"
+        ? () => vault.adapter.read(path)
+        : undefined,
+    vaultRead: () => vault.read(file as TFile),
+  });
   if (!MISSION_GRAPH_STORE_BLOCK_PATTERN.test(current)) {
     throw new MissionGraphStoreIntegrityError(
       `Refusing to overwrite mission graph file without a valid store block: ${path}.`,
@@ -822,7 +840,20 @@ async function writeStoreRecordUnlocked(
     MISSION_GRAPH_STORE_BLOCK_PATTERN,
     block.trimEnd(),
   );
-  await context.app.vault.modify(file as TFile, next);
+  await persistAgentRunMarkdownExact({
+    path,
+    expectedMarkdown: next,
+    adapterWrite:
+      typeof vault.adapter?.write === "function"
+        ? () => vault.adapter.write(path, next)
+        : undefined,
+    adapterRead:
+      typeof vault.adapter?.read === "function"
+        ? () => vault.adapter.read(path)
+        : undefined,
+    modify: () => vault.modify(file as TFile, next),
+    readback: () => vault.read(file as TFile),
+  });
   return getByteLength(block);
 }
 

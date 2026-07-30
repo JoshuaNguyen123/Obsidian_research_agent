@@ -116,7 +116,7 @@ export default defineConfig({
       use: { trace: "off", screenshot: "off", video: "off" },
     },
     {
-      // Compound journey footage driver — see e2e/demo-journey-recording.spec.ts.
+      // Researcher footage driver — see e2e/demo-journey-recording.spec.ts.
       name: "demo-journey-recording",
       testMatch: /demo-journey-recording\.spec\.ts/u,
       retries: 0,

@@ -1,10 +1,14 @@
+import { execFile } from "node:child_process";
 import { readdir, rm } from "node:fs/promises";
+import { promisify } from "node:util";
 
 import { expect, test } from "@playwright/test";
 
 import {
+  assertOwnedExportDirectory,
   cleanupOwnedExportDirectory,
   exportedDirectoryPath,
+  listFilesBounded,
   requireExportReceipt,
   resolveDesktopRoot,
   resolveScratchWorkspaceContainer,
@@ -14,6 +18,15 @@ import {
   startRealAiHarness,
   type RealAiHarness,
 } from "./fixtures/realAiHarness";
+import {
+  assertDemoFrameCleanV1,
+  assertDemoPresentationObserverSettlesV1,
+  installDemoMissionBrokerV1,
+  prepareDemoFinaleV1,
+  prepareDemoPresentationV1,
+  recordDemoMomentV1,
+  waitForDemoMissionBrokerV1,
+} from "./fixtures/demoPresentation";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
 
 /**
@@ -31,12 +44,15 @@ import { laneSelectedV1 } from "./fixtures/laneSelection";
  */
 
 const LANE = "demo-recording";
-// Single-stage scratch-delivery shape ("write a X in Python on my desktop"):
-// naming vault-flavored nouns (markdown notes) routes the mission into the
-// compound classifier, whose code_execution readiness demands a bound
-// repository, and the run blocks at Review Code setup before any footage.
+const DEMO_NOTE_TITLE = "Text file organizer";
+const DEMO_NOTE_PATH = `${DEMO_NOTE_TITLE}.md`;
+const execFileAsync = promisify(execFile);
+// Single-stage scratch-delivery shape ("write a X in Python on my Desktop").
+// Keep the foreground mission self-contained: saying "in this note" can bind a
+// current-note write goal ahead of the code workspace and deadlock the demo on
+// an irrelevant note receipt. The open note remains the readable visual brief.
 const DEMO_PROMPT =
-  "write a python script on my desktop that combines a folder of text files into one organized document with a table of contents";
+  "Write a text file organizer in Python on my desktop.";
 
 test("DEMO recording mission completes with a verified Desktop export", async (
   {},
@@ -90,12 +106,49 @@ test("DEMO recording mission completes with a verified Desktop export", async (
     );
 
     await assertProductionAdoptedSandboxV1(harness.page, startedAt);
+    await harness.seedNote(
+      DEMO_NOTE_PATH,
+      [
+        "Turn a folder of plain-text notes into one navigable Markdown brief.",
+        "",
+        "## Inputs",
+        "",
+        "- A folder of `.txt` notes.",
+        "- Input and output paths supplied at the command line.",
+        "",
+        "## Definition of done",
+        "",
+        "- Include only `.txt` files.",
+        "- Preserve alphabetical source order.",
+        "- Add a linked table of contents.",
+        "- Validate the result with three sample notes.",
+        "",
+      ].join("\n"),
+      true,
+    );
+    await harness.clearChat();
+    await prepareDemoPresentationV1(harness.page, DEMO_NOTE_PATH);
+    await assertDemoPresentationObserverSettlesV1(harness.page);
+    await assertDemoFrameCleanV1(harness.page, DEMO_NOTE_TITLE, {
+      requireSingleTitle: true,
+    });
+    await installDemoMissionBrokerV1(harness.page);
+    await recordDemoMomentV1("builder-ready", { notePath: DEMO_NOTE_PATH });
+    await harness.page.waitForTimeout(1_500);
 
+    await recordDemoMomentV1("builder-submit", { prompt: DEMO_PROMPT });
+    const brokerCompletion = waitForDemoMissionBrokerV1(
+      harness.page,
+      35 * 60_000,
+    );
+    void brokerCompletion.catch(() => undefined);
     await harness.submitMission(DEMO_PROMPT, {
+      clearChatFirst: false,
       waitForCompletion: false,
       timeoutMs: 35 * 60_000,
     });
-    await harness.approveUntilMissionComplete(35 * 60_000);
+    const brokerResult = await brokerCompletion;
+    expect(brokerResult.approvals).toBeGreaterThan(0);
 
     const snapshot = await harness.attestProductionRun();
     rawSnapshot = snapshot;
@@ -109,8 +162,60 @@ test("DEMO recording mission completes with a verified Desktop export", async (
     const exportReceipt = requireExportReceipt(snapshot);
     expect(exportReceipt.readback?.status).toBe("verified");
     expect(exportPath).not.toBeNull();
+    const canonicalExport = await assertOwnedExportDirectory(
+      desktopRoot,
+      exportPath!,
+      startedAt,
+    );
+    const deliveredPythonFiles = await listFilesBounded(canonicalExport, ".py");
+    expect(deliveredPythonFiles.length).toBeGreaterThan(0);
+    for (const deliveredPythonFile of deliveredPythonFiles) {
+      await execFileAsync("python", ["-m", "py_compile", deliveredPythonFile], {
+        timeout: 30_000,
+        windowsHide: true,
+        encoding: "utf8",
+      });
+    }
+    expect(
+      snapshot.lastMissionLedger?.acceptance?.status === "pass" ||
+        snapshot.lastMissionLedger?.status === "complete",
+    ).toBe(true);
+    const graphNodes = Object.values(
+      snapshot.lastMissionGraph?.nodes ?? {},
+    ) as any[];
+    for (const validationTool of [
+      "code_validate_fast",
+      "code_validate_targeted",
+      "code_validate_full",
+    ]) {
+      expect(
+        graphNodes.some(
+          (node: any) =>
+            node.status === "complete" &&
+            node.allowedTools?.includes(validationTool),
+        ),
+      ).toBe(true);
+    }
+    await assertDemoFrameCleanV1(harness.page, DEMO_NOTE_TITLE);
+    await recordDemoMomentV1("builder-delivery-verified", {
+      deliveredFiles: deliveredPythonFiles.length,
+      readback: exportReceipt.readback?.status ?? "missing",
+    });
+    await prepareDemoFinaleV1(harness.page);
+    await assertDemoFrameCleanV1(harness.page, DEMO_NOTE_TITLE);
+    await recordDemoMomentV1("builder-finale", { view: "run-details" });
     await testInfo.attach("demo-recording-export", {
-      body: JSON.stringify({ exportPath, prompt: DEMO_PROMPT }, null, 2),
+      body: JSON.stringify(
+        {
+          exportPath,
+          deliveredPythonFiles,
+          acceptance: snapshot.lastMissionLedger?.acceptance?.status ?? null,
+          prompt: DEMO_PROMPT,
+          approvals: brokerResult.approvals,
+        },
+        null,
+        2,
+      ),
       contentType: "application/json",
     });
   } finally {

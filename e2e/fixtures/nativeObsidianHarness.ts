@@ -184,7 +184,9 @@ export async function startNativeObsidianHarness(
   let browser: Browser | null = null;
   let page: Page | null = null;
   let closed = false;
-  const launchOwnedProcess = async (): Promise<Page> => {
+  const launchOwnedProcess = async (
+    allowTrustRestart = true,
+  ): Promise<Page> => {
     processHandle = spawn(
       obsidianExe,
       [
@@ -212,7 +214,22 @@ export async function startNativeObsidianHarness(
     await waitForCdp(cdpPort, processHandle, 45_000);
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     page = await findOnlyVaultPage(browser, vaultRoot);
-    await trustDisposableVaultIfPrompted(page);
+    const trustChanged = await trustDisposableVaultIfPrompted(page);
+    if (trustChanged) {
+      if (!allowTrustRestart) {
+        throw new Error(
+          "Obsidian still requested disposable-vault trust after the controlled restart.",
+        );
+      }
+      await terminateObsidian(processHandle, cdpPort);
+      await withTimeout(browser.close(), 5_000, "Disposable-vault trust restart close")
+        .catch(() => undefined);
+      processHandle = null;
+      browser = null;
+      page = null;
+      await assertPortFree(cdpPort);
+      return launchOwnedProcess(false);
+    }
     await ensurePluginRuntimesLoaded(page, pluginIds);
     setupContext.page = page;
     return page;
@@ -637,6 +654,7 @@ async function ensurePluginRuntimesLoaded(
       let plugin = app.plugins.plugins?.[pluginId];
       let loadAttempts = 0;
       let lastLoadErrorKind: string | null = null;
+      let lastLoadResult: string | null = null;
       // On a cold disposable vault Obsidian can persist the enabled id before
       // its community-plugin manager has installed the runtime instance. A
       // completed enable/load call is therefore not sufficient readback.
@@ -649,13 +667,15 @@ async function ensurePluginRuntimesLoaded(
             app.plugins.enabledPlugins?.includes?.(pluginId) ??
             false;
           if (!enabled) {
-            await app.plugins.enablePlugin(pluginId);
+            const result = await app.plugins.enablePlugin(pluginId);
+            lastLoadResult = `enable:${typeof result}:${String(result)}`;
           }
           if (
             !app.plugins.plugins?.[pluginId] &&
             typeof app.plugins.loadPlugin === "function"
           ) {
-            await app.plugins.loadPlugin(pluginId);
+            const result = await app.plugins.loadPlugin(pluginId);
+            lastLoadResult = `load:${typeof result}:${String(result)}`;
           }
           lastLoadErrorKind = null;
         } catch (error) {
@@ -684,6 +704,11 @@ async function ensurePluginRuntimesLoaded(
             restrictedMode: app.plugins.restrictedMode ?? null,
             loadAttempts,
             lastLoadErrorKind,
+            lastLoadResult,
+            visibleText: document.body.innerText
+              .replace(/\s+/gu, " ")
+              .trim()
+              .slice(0, 1_200),
           })}`,
         );
       }
@@ -714,11 +739,15 @@ async function ensurePluginRuntimesLoaded(
   }, { requiredPluginIds: [...pluginIds], corePluginId: NATIVE_CORE_PLUGIN_ID });
 }
 
-async function trustDisposableVaultIfPrompted(page: Page): Promise<void> {
+async function trustDisposableVaultIfPrompted(page: Page): Promise<boolean> {
   const trustVaultButton = page.getByRole("button", {
     name: "Trust author and enable plugins",
   });
-  if (!(await trustVaultButton.isVisible().catch(() => false))) return;
+  const trustPromptVisible = await trustVaultButton
+    .waitFor({ state: "visible", timeout: 5_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!trustPromptVisible) return false;
   if (process.env.E2E_TRUST_DISPOSABLE_VAULT !== "1") {
     throw new Error(
       "Obsidian opened this vault in Restricted Mode. Set E2E_TRUST_DISPOSABLE_VAULT=1 only for a controlled disposable vault containing trusted local plugin artifacts.",
@@ -726,6 +755,14 @@ async function trustDisposableVaultIfPrompted(page: Page): Promise<void> {
   }
   await trustVaultButton.click();
   await trustVaultButton.waitFor({ state: "hidden", timeout: 30_000 });
+  // Let Obsidian flush the trust decision before the host terminates this
+  // first-run renderer. An immediate restart can reopen the vault before its
+  // trust record reaches disk.
+  await page.waitForTimeout(2_500);
+  // Obsidian 1.12.x persists the decision but does not instantiate community
+  // plugins in the already-running renderer. The caller performs one owned
+  // process restart before requiring the production plugin runtime.
+  return true;
 }
 
 async function forceOnlyVaultOpen(
@@ -736,13 +773,33 @@ async function forceOnlyVaultOpen(
   const state = parseObject(existingContent) ?? {};
   const existingVaults = isRecord(state.vaults) ? state.vaults : {};
   const normalizedTarget = normalizePath(targetVaultPath);
-  let targetVaultId: string | null = null;
+  const requestedVaultId = process.env.OBSIDIAN_E2E_VAULT_ID?.trim() ?? "";
+  if (requestedVaultId) {
+    if (
+      process.env.E2E_TRUST_DISPOSABLE_VAULT !== "1" ||
+      path.basename(targetVaultPath) !== "Agentic Researcher Showcase" ||
+      !/^[a-f0-9]{16}$/u.test(requestedVaultId) ||
+      !isRecord(existingVaults[requestedVaultId])
+    ) {
+      throw new Error(
+        "OBSIDIAN_E2E_VAULT_ID is restricted to the explicitly trusted Agentic Researcher Showcase vault.",
+      );
+    }
+  }
+  let targetVaultId: string | null = requestedVaultId || null;
   const nextVaults: Record<string, Record<string, unknown>> = {};
   for (const [vaultId, rawVault] of Object.entries(existingVaults)) {
     if (!isRecord(rawVault)) continue;
     const candidatePath = typeof rawVault.path === "string" ? rawVault.path : "";
     const isTarget = normalizePath(candidatePath) === normalizedTarget;
-    if (isTarget) targetVaultId = vaultId;
+    if (isTarget) {
+      if (requestedVaultId && vaultId !== requestedVaultId) {
+        throw new Error(
+          "The showcase vault path is already bound to a different Obsidian vault id.",
+        );
+      }
+      targetVaultId = vaultId;
+    }
     nextVaults[vaultId] = { ...rawVault, open: isTarget };
   }
   targetVaultId ??= createHash("sha256")

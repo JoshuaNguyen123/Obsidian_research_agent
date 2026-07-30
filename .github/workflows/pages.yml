@@ -2,8 +2,14 @@ name: Publish public site
 
 on:
   # Manual-only so a normal source push never queues the owner's personal
-  # self-hosted runner. Deploy after reviewing the static artifact.
+  # self-hosted runner. Deploy only after reviewing the exact static artifact.
   workflow_dispatch:
+    inputs:
+      confirm_visual_approval:
+        description: I reviewed both final demos and approve this exact main revision.
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,7 +22,9 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      inputs.confirm_visual_approval == true
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -32,6 +40,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify exact trusted main tip
         shell: pwsh

@@ -19,6 +19,12 @@ import {
   bindVerifiedWorkspaceLifecycleTool,
   bindVerifiedWorkspaceObservationTool,
   buildVerifiedHostExportFinalAnswer,
+  missionAcceptanceHasOnlyFinalProjectionDebt,
+  settleTerminalRuntimeSnapshotPersistence,
+  settleToolOutcomeMemoryPersistence,
+  shouldFinalizeVerifiedHostExportAfterToolUse,
+  shouldInspectAutoContinuationGrant,
+  shouldRequestStreamingFinalProjection,
   buildExactCodeValidationFallbackToolCall,
   bindVerifiedWorkspaceRead,
   bindVerifiedWorkspaceWriteExpected,
@@ -2808,6 +2814,19 @@ test("known-folder export binds the verified workspace root and run-scoped Deskt
     destinationRoot: "desktop",
     destinationPath: "number-guessing-game-beaccbf21521",
   });
+  const organizer = bindVerifiedWorkspaceDirectoryExport(
+    {
+      name: "code_workspace_export_directory",
+      arguments: {},
+    },
+    "Write a text file organizer in Python on my Desktop.",
+    "run-2026-07-30T11-28-40.572Z-724046e1d674",
+    [durableReceipt],
+  );
+  assert.equal(
+    organizer?.arguments.destinationPath,
+    "text-file-organizer-724046e1d674",
+  );
   assert.equal(
     bindVerifiedWorkspaceDirectoryExport(
       {
@@ -2890,6 +2909,200 @@ test("verified host export final answer replaces model path claims with receipt 
     )?.includes(exportPath),
     true,
     "the verified export receipt must remain authoritative on a continuation segment",
+  );
+});
+
+test("verified host export skips a redundant streaming final projection", () => {
+  assert.equal(
+    shouldRequestStreamingFinalProjection({
+      enableStreaming: true,
+      hasDirectFinalContent: false,
+      verifiedHostExportFinalAnswer:
+        "Text file organizer delivered to C:\\Users\\example\\Desktop\\organizer.",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldRequestStreamingFinalProjection({
+      enableStreaming: true,
+      hasDirectFinalContent: false,
+      verifiedHostExportFinalAnswer: null,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldRequestStreamingFinalProjection({
+      enableStreaming: true,
+      hasDirectFinalContent: true,
+      verifiedHostExportFinalAnswer: null,
+    }),
+    false,
+  );
+});
+
+test("verified host export finalizes immediately only after all proof debt is paid", () => {
+  const ready = {
+    verifiedHostExportFinalAnswer:
+      "## Done — text file organizer delivered\n\nLocation: `C:\\Users\\example\\Desktop\\text-file-organizer`",
+    acceptanceStatus: "pass" as const,
+    onlyFinalProjectionProofMissing: false,
+    pendingRequiredWriteCount: 0,
+    missingRequiredWebToolCount: 0,
+    hasPendingOperationGoals: false,
+    pendingStreamingWriteback: false,
+    setLooseDeliveryStillUnpaid: false,
+  };
+
+  assert.equal(shouldFinalizeVerifiedHostExportAfterToolUse(ready), true);
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...ready,
+      verifiedHostExportFinalAnswer: null,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...ready,
+      acceptanceStatus: "needs_more_work",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...ready,
+      acceptanceStatus: "needs_more_work",
+      onlyFinalProjectionProofMissing: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...ready,
+      pendingRequiredWriteCount: 1,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...ready,
+      hasPendingOperationGoals: true,
+      onlyFinalProjectionProofMissing: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...ready,
+      setLooseDeliveryStillUnpaid: true,
+      onlyFinalProjectionProofMissing: true,
+    }),
+    false,
+  );
+});
+
+test("verified host export recognizes only terminal projection debt", () => {
+  assert.equal(
+    missionAcceptanceHasOnlyFinalProjectionDebt({
+      missing: ["plan:final:final_relevance", "final_output"],
+    }),
+    true,
+  );
+  assert.equal(
+    missionAcceptanceHasOnlyFinalProjectionDebt({
+      missing: ["plan:final:final_relevance", "receipt:write_receipt"],
+    }),
+    false,
+  );
+  assert.equal(
+    missionAcceptanceHasOnlyFinalProjectionDebt({ missing: [] }),
+    false,
+  );
+});
+
+test("verified host export rechecks readiness after active-task acceptance advances", () => {
+  const beforeActiveTaskAcceptance = {
+    verifiedHostExportFinalAnswer:
+      "## Done — text file organizer delivered\n\nLocation: `C:\\Users\\example\\Desktop\\text-file-organizer`",
+    acceptanceStatus: "needs_more_work" as const,
+    onlyFinalProjectionProofMissing: false,
+    pendingRequiredWriteCount: 0,
+    missingRequiredWebToolCount: 0,
+    hasPendingOperationGoals: false,
+    pendingStreamingWriteback: false,
+    setLooseDeliveryStillUnpaid: false,
+  };
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse(beforeActiveTaskAcceptance),
+    false,
+    "the lifecycle node must be verified first",
+  );
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...beforeActiveTaskAcceptance,
+      onlyFinalProjectionProofMissing: true,
+    }),
+    true,
+    "the receipt-backed answer may then pay only the final projection debt",
+  );
+  assert.equal(
+    shouldFinalizeVerifiedHostExportAfterToolUse({
+      ...beforeActiveTaskAcceptance,
+      onlyFinalProjectionProofMissing: true,
+      missingRequiredWebToolCount: 1,
+    }),
+    false,
+    "active-task verification must not waive unrelated proof debt",
+  );
+});
+
+test("terminal success never waits on an auto-continuation grant lookup", () => {
+  assert.equal(shouldInspectAutoContinuationGrant("final", false), false);
+  assert.equal(
+    shouldInspectAutoContinuationGrant("write_completed", false),
+    false,
+  );
+  assert.equal(shouldInspectAutoContinuationGrant("error", false), false);
+  assert.equal(shouldInspectAutoContinuationGrant("user_stopped", false), false);
+  assert.equal(shouldInspectAutoContinuationGrant("budget", false), true);
+  assert.equal(shouldInspectAutoContinuationGrant("budget", true), false);
+});
+
+test("advisory tool outcome memory cannot retain terminal UI ownership", async () => {
+  const startedAt = Date.now();
+
+  const result = await settleToolOutcomeMemoryPersistence(
+    new Promise<void>(() => undefined),
+    20,
+  );
+
+  assert.equal(result, "timed_out");
+  assert.ok(
+    Date.now() - startedAt < 1_000,
+    "a stalled advisory memory write must release mission completion",
+  );
+});
+
+test("terminal runtime snapshot cannot retain completion ownership indefinitely", async () => {
+  const startedAt = Date.now();
+  assert.equal(
+    await settleTerminalRuntimeSnapshotPersistence(
+      new Promise<boolean>(() => undefined),
+      20,
+    ),
+    "timed_out",
+  );
+  assert.ok(
+    Date.now() - startedAt < 1_000,
+    "a stalled duplicate runtime snapshot must release mission completion",
+  );
+  assert.equal(
+    await settleTerminalRuntimeSnapshotPersistence(Promise.resolve(true)),
+    "persisted",
+  );
+  assert.equal(
+    await settleTerminalRuntimeSnapshotPersistence(Promise.resolve(false)),
+    "not_available",
   );
 });
 

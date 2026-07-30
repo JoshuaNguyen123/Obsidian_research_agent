@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "output": {
+    "width": 1280,
+    "height": 720,
+    "aspectRatio": "16:9"
+  },
+  "maximumBytesPerFallback": 4194304,
+  "roles": {
+    "researcher": {
+      "minimumDurationSeconds": 20,
+      "maximumDurationSeconds": 25,
+      "mp4": "researcher-demo.mp4",
+      "webm": "researcher-demo.webm",
+      "poster": "researcher-demo-poster.jpg"
+    },
+    "builder": {
+      "minimumDurationSeconds": 25,
+      "maximumDurationSeconds": 30,
+      "mp4": "builder-demo.mp4",
+      "webm": "builder-demo.webm",
+      "poster": "builder-demo-poster.jpg"
+    }
+  }
+}

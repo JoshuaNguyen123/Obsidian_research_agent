@@ -632,6 +632,7 @@ import {
   markExternalActionJobSubmittedV1,
   markBackgroundCodeJobSubmittedV1,
   markBackgroundGitHubJobSubmittedV1,
+  settleBounded,
   transitionOperationJournalRecord,
   writeMissionRuntimeSnapshot,
   type MissionRuntimeReceipt,
@@ -1266,6 +1267,32 @@ const EMPTY_STREAMING_WRITEBACK_MESSAGE =
 const OFF_TOPIC_MODEL_OUTPUT_MESSAGE =
   "Stopped model output because it drifted off topic from the current mission.";
 const MAX_STRUCTURED_PLANNING_TIMEOUT_MS = 120_000;
+const BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS = 5_000;
+
+export async function settleToolOutcomeMemoryPersistence(
+  persistence: Promise<void>,
+  timeoutMs = BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
+): Promise<"persisted" | "timed_out"> {
+  const settlement = await settleBounded(persistence, timeoutMs);
+  if (settlement.kind === "rejected") {
+    throw settlement.value;
+  }
+  return settlement.kind === "timed_out" ? "timed_out" : "persisted";
+}
+
+export async function settleTerminalRuntimeSnapshotPersistence(
+  persistence: Promise<boolean>,
+  timeoutMs = BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
+): Promise<"persisted" | "not_available" | "timed_out"> {
+  const settlement = await settleBounded(persistence, timeoutMs);
+  if (settlement.kind === "rejected") {
+    throw settlement.value;
+  }
+  if (settlement.kind === "timed_out") {
+    return "timed_out";
+  }
+  return settlement.value ? "persisted" : "not_available";
+}
 
 function resolvePromptForIntent(
   prompt: string,
@@ -2317,7 +2344,24 @@ export async function runAgentMission({
     if (!toolOutcomeMemoryDirty) return;
     toolOutcomeMemoryDirty = false;
     try {
-      await runToolContext.setToolOutcomeMemory?.(toolOutcomeMemory);
+      const settlement = await settleToolOutcomeMemoryPersistence(
+        Promise.resolve(
+          runToolContext.setToolOutcomeMemory?.(toolOutcomeMemory),
+        ),
+      );
+      if (settlement === "timed_out") {
+        events.onTrace?.({
+          id: `tool-outcome-memory-${runId}:timeout`,
+          kind: "status",
+          message:
+            "Tool outcome memory persistence did not settle within 5 seconds; mission completion continued because outcome memory is advisory.",
+          error: {
+            code: "tool_outcome_memory_save_timed_out",
+            message:
+              "The advisory tool outcome memory write remained pending after the bounded wait.",
+          },
+        });
+      }
     } catch (error) {
       // Outcome memory is an optimization, never a correctness requirement.
       // A failed write must not take the run down with it.
@@ -6020,8 +6064,29 @@ export async function runAgentMission({
       missionLedger.orchestrator = latestOrchestrator;
     }
     try {
-      const result = await writeMissionLedger(runToolContext, missionLedger);
+      const ledgerSettlement = await settleBounded(
+        writeMissionLedger(runToolContext, missionLedger),
+        BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
+      );
       emitLedgerRunConfig();
+      if (ledgerSettlement.kind === "rejected") {
+        throw ledgerSettlement.value;
+      }
+      if (ledgerSettlement.kind === "timed_out") {
+        events.onTrace?.({
+          id: `${traceId}:timeout`,
+          kind: "error",
+          message:
+            "Mission ledger persistence did not settle within 5 seconds; terminal UI ownership was released after the bounded durability wait.",
+          error: {
+            code: "mission_ledger_save_timed_out",
+            message:
+              "The vault write remained pending after the bounded durability wait.",
+          },
+        });
+        return;
+      }
+      const result = ledgerSettlement.value;
       if (result) {
         events.onTrace?.({
           id: traceId,
@@ -6042,7 +6107,26 @@ export async function runAgentMission({
         },
       });
     }
-    await persistRuntimeSnapshot(traceId);
+    const runtimeSettlement = await settleBounded(
+      persistRuntimeSnapshot(traceId),
+      BEST_EFFORT_RUNTIME_SNAPSHOT_TIMEOUT_MS,
+    );
+    if (runtimeSettlement.kind === "rejected") {
+      throw runtimeSettlement.value;
+    }
+    if (runtimeSettlement.kind === "timed_out") {
+      events.onTrace?.({
+        id: `${traceId}:runtime:timeout`,
+        kind: "error",
+        message:
+          "Best-effort runtime snapshot persistence did not settle within 5 seconds; continuing from the authoritative mission ledger.",
+        error: {
+          code: "runtime_snapshot_save_timed_out",
+          message:
+            "The mission ledger was saved, but the duplicate runtime snapshot write did not settle before the bounded timeout.",
+        },
+      });
+    }
   };
   const recordReflexCheckpoint = (
     checkpoint:
@@ -6773,13 +6857,7 @@ export async function runAgentMission({
             }
         : evaluateCurrentAcceptance(lastFinalOutput || undefined);
     let onlyFinalProjectionProofMissing =
-      acceptance.missing.length > 0 &&
-      acceptance.missing.every(
-        (item) =>
-          item === "final_output" ||
-          /(?:^|:)final_relevance$/u.test(item) ||
-          /(?:^|:)final_output$/u.test(item),
-      );
+      missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
     if (
       missionGraphSession &&
       (stopReason === "final" || stopReason === "write_completed") &&
@@ -6797,13 +6875,7 @@ export async function runAgentMission({
       missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
       acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
       onlyFinalProjectionProofMissing =
-        acceptance.missing.length > 0 &&
-        acceptance.missing.every(
-          (item) =>
-            item === "final_output" ||
-            /(?:^|:)final_relevance$/u.test(item) ||
-            /(?:^|:)final_output$/u.test(item),
-        );
+        missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
     }
     // Research memory may only extract after honest acceptance — never force a
     // pass before final graph projection / verification.
@@ -6980,10 +7052,27 @@ export async function runAgentMission({
       runtimeSnapshot &&
       runtimeSnapshotPersistenceBlockedError === null
     ) {
-      await persistRuntimeSnapshot(
-        `terminal-checkpoint-${effectiveStopReason}-${step}`,
-        { required: runtimeSnapshotPersistenceAvailable },
-      );
+      const terminalRuntimeSettlement =
+        await settleTerminalRuntimeSnapshotPersistence(
+          persistRuntimeSnapshot(
+            `terminal-checkpoint-${effectiveStopReason}-${step}`,
+            { required: runtimeSnapshotPersistenceAvailable },
+          ),
+        );
+      if (terminalRuntimeSettlement === "timed_out") {
+        events.onTrace?.({
+          id: `terminal-checkpoint-${effectiveStopReason}-${step}:runtime:timeout`,
+          kind: "error",
+          step,
+          message:
+            "Terminal runtime snapshot persistence did not settle within 5 seconds; completion continued from the authoritative mission ledger and verified receipts.",
+          error: {
+            code: "terminal_runtime_snapshot_save_timed_out",
+            message:
+              "The duplicate runtime snapshot write remained pending after the bounded terminal durability wait.",
+          },
+        });
+      }
     }
     // Agent B: thin completion-reflection hook before auto-continue decision.
     const proofDebtSnapshot = runtimeSnapshot
@@ -7248,15 +7337,18 @@ export async function runAgentMission({
             ],
           }
         : acceptance;
-    const hasMatchingGrant = suppressAutoContinuation
-      ? false
-      : await resolveHasMatchingGrantForAutoContinuation({
+    const hasMatchingGrant = shouldInspectAutoContinuationGrant(
+      effectiveStopReason,
+      suppressAutoContinuation,
+    )
+      ? await resolveHasMatchingGrantForAutoContinuation({
           pendingToolNames,
           approvals: missionLedger?.approvals ?? [],
           receipts: writeReceipts,
           preparedActionAuthority,
           setLooseCompound: setLooseCompoundEnabled,
-        });
+        })
+      : false;
     const completionSegmentBudget = resolveCompoundCompletionSegmentBudgetV1({
       completionSegmentIndex,
       maxCompletionSegments,
@@ -14560,6 +14652,7 @@ export async function runAgentMission({
     if (
       !passageGroundedWriteContractInjected &&
       stepAllowedToolNames.has("append_to_current_file") &&
+      shouldRequireClaimGrounding(activeIntentPrompt) &&
       requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
       hasSatisfiedDurablePreWriteProof() &&
       acceptedWritebackPassageIds.length > 0
@@ -16352,7 +16445,13 @@ export async function runAgentMission({
         researchPlan,
       ) || verifiedHostExportFinalAnswer !== null;
 
-      if (enableStreaming && !hasDirectFinalContent) {
+      if (
+        shouldRequestStreamingFinalProjection({
+          enableStreaming,
+          hasDirectFinalContent,
+          verifiedHostExportFinalAnswer,
+        })
+      ) {
         if (await stopIfRequested(step)) {
           return;
         }
@@ -16411,8 +16510,16 @@ export async function runAgentMission({
         if (await stopIfRequested(step)) {
           return;
         }
-        let directContent = response.message.content;
-        const wordTarget = parseGeneratedWordCountTargetFromMessages(messages);
+        // A verified known-folder export already has an authoritative,
+        // receipt-derived completion projection. Do not spend another remote
+        // model call asking it to paraphrase content that will be discarded
+        // below in favor of that canonical path/readback/validation summary.
+        let directContent =
+          verifiedHostExportFinalAnswer ?? response.message.content;
+        const wordTarget =
+          verifiedHostExportFinalAnswer === null
+            ? parseGeneratedWordCountTargetFromMessages(messages)
+            : null;
         if (wordTarget) {
           const initialCount = countMarkdownVisibleText(directContent).wordCount;
           let correctionUsed = false;
@@ -16455,7 +16562,10 @@ export async function runAgentMission({
           finalMode: executedModelTool ? "buffered_final" : "direct",
           runPlan,
         });
-        if (runPlan.requiresEnglishGuard) {
+        if (
+          runPlan.requiresEnglishGuard &&
+          verifiedHostExportFinalAnswer === null
+        ) {
           directContent = await repairEnglishOnlyOutput({
             modelClient,
             messages,
@@ -18070,6 +18180,87 @@ export async function runAgentMission({
         `graph_final_only=${missionGraphFinalSynthesisOnly}`,
       ].join("; "),
     });
+    const verifiedHostExportFinalAnswerAfterToolUse =
+      buildVerifiedHostExportFinalAnswer(
+        activeIntentPrompt,
+        writeReceipts,
+        successfulToolNames,
+      );
+    const verifiedHostExportAcceptanceAfterToolUse =
+      verifiedHostExportFinalAnswerAfterToolUse !== null
+        ? evaluateCurrentAcceptance(verifiedHostExportFinalAnswerAfterToolUse)
+        : null;
+    const verifiedHostExportFinalizationState = {
+      verifiedHostExportFinalAnswer:
+        verifiedHostExportFinalAnswerAfterToolUse,
+      acceptanceStatus:
+        verifiedHostExportAcceptanceAfterToolUse?.status ?? "fail",
+      onlyFinalProjectionProofMissing:
+        verifiedHostExportAcceptanceAfterToolUse !== null &&
+        missionAcceptanceHasOnlyFinalProjectionDebt(
+          verifiedHostExportAcceptanceAfterToolUse,
+        ),
+      pendingRequiredWriteCount:
+        pendingRequiredWriteToolsAfterToolUse.length,
+      missingRequiredWebToolCount:
+        missingRequiredWebToolsAfterToolUse.length,
+      hasPendingOperationGoals: hasPendingOperationGoals(operationGoals),
+      pendingStreamingWriteback,
+      setLooseDeliveryStillUnpaid,
+    } as const;
+    const finalizeVerifiedHostExportAfterToolUse =
+      shouldFinalizeVerifiedHostExportAfterToolUse(
+        verifiedHostExportFinalizationState,
+      );
+    const finishVerifiedHostExportAfterToolUse = async () => {
+      lastFinalOutput = verifiedHostExportFinalAnswerAfterToolUse!;
+      events.onStatus?.("Verified delivery complete.");
+      events.onTrace?.({
+        id: `verified-host-export-tool-final-${step}`,
+        kind: "verification",
+        step,
+        message:
+          "Projected the verified host export receipt immediately; no additional provider turn was required.",
+        outputPreview: {
+          payloadFingerprint: hashOperationInput(lastFinalOutput),
+        },
+      });
+      emitRunDiagnostics({
+        events,
+        toolContext: runToolContext,
+        tools,
+        enableStreaming,
+        finalMode: "buffered_final",
+        runPlan,
+      });
+      emitDirectAssistantAnswer(
+        lastFinalOutput,
+        events,
+        runPlan.requiresEnglishGuard,
+      );
+      await finishRun("final", lastStep, stepLimit);
+    };
+    if (
+      verifiedHostExportFinalAnswerAfterToolUse !== null &&
+      !finalizeVerifiedHostExportAfterToolUse &&
+      loopDecision.action !== "verify_active_task"
+    ) {
+      events.onTrace?.({
+        id: `verified-host-export-tool-final-held-${step}`,
+        kind: "verification",
+        step,
+        message:
+          "Held the verified host export projection because explicit proof debt remains.",
+        outputPreview: {
+          ...verifiedHostExportFinalizationState,
+          verifiedHostExportFinalAnswer: "[receipt-backed answer available]",
+        },
+      });
+    }
+    if (finalizeVerifiedHostExportAfterToolUse) {
+      await finishVerifiedHostExportAfterToolUse();
+      return;
+    }
     if (
       loopDecision.action === "stop_budget" &&
       loopDecision.reason === "required_tools_failed"
@@ -18093,6 +18284,41 @@ export async function runAgentMission({
     if (loopDecision.action === "verify_active_task" && step < stepLimit) {
       const acceptanceAfterToolUse = evaluateCurrentAcceptance();
       await recordMissionAcceptance(acceptanceAfterToolUse, step);
+      if (verifiedHostExportFinalAnswerAfterToolUse !== null) {
+        // The first acceptance pass may be what advances the lifecycle node
+        // from needs-verification to complete. Re-evaluate the receipt-backed
+        // terminal projection against that updated graph before asking the
+        // provider for a redundant final-only turn.
+        const acceptanceAfterActiveTaskVerification =
+          evaluateCurrentAcceptance(verifiedHostExportFinalAnswerAfterToolUse);
+        const finalizationStateAfterActiveTaskVerification = {
+          ...verifiedHostExportFinalizationState,
+          acceptanceStatus: acceptanceAfterActiveTaskVerification.status,
+          onlyFinalProjectionProofMissing:
+            missionAcceptanceHasOnlyFinalProjectionDebt(
+              acceptanceAfterActiveTaskVerification,
+            ),
+        };
+        if (
+          shouldFinalizeVerifiedHostExportAfterToolUse(
+            finalizationStateAfterActiveTaskVerification,
+          )
+        ) {
+          await finishVerifiedHostExportAfterToolUse();
+          return;
+        }
+        events.onTrace?.({
+          id: `verified-host-export-tool-final-held-after-acceptance-${step}`,
+          kind: "verification",
+          step,
+          message:
+            "Held the verified host export projection after active-task verification because explicit proof debt remains.",
+          outputPreview: {
+            ...finalizationStateAfterActiveTaskVerification,
+            verifiedHostExportFinalAnswer: "[receipt-backed answer available]",
+          },
+        });
+      }
       if (
           shouldContinueForMissionAcceptance(
             acceptanceAfterToolUse,
@@ -31748,6 +31974,19 @@ export async function resolveHasMatchingGrantForAutoContinuation(input: {
   return false;
 }
 
+/**
+ * Grant discovery exists only to decide whether an unfinished budget stop may
+ * continue automatically. Successful and otherwise terminal runs must never
+ * wait on prepared-action authority after their ledger and receipts already
+ * prove the outcome.
+ */
+export function shouldInspectAutoContinuationGrant(
+  stopReason: AgentRunStopReason,
+  suppressAutoContinuation: boolean,
+): boolean {
+  return stopReason === "budget" && !suppressAutoContinuation;
+}
+
 function completeRun(
   events: AgentRunEvents,
   stopReason: AgentRunStopReason,
@@ -33612,7 +33851,7 @@ const DELIVERABLE_LABEL_STOPWORDS_V1 = new Set([
 
 /** Nouns that name the artifact itself. "cli" is a descriptor, not an artifact. */
 const DELIVERABLE_ARTIFACT_NOUNS_V1 =
-  /\b(game|app|application|script|tool|program|solver|library|package|module)\b/gu;
+  /\b(game|app|application|script|tool|program|solver|organizer|library|package|module)\b/gu;
 
 /**
  * A readable folder name for a delivered code artifact, derived from what the
@@ -33693,6 +33932,72 @@ export function bindVerifiedWorkspaceDirectoryExport(
       destinationPath: `${deliverableLabel}-${runSuffix}`,
     },
   };
+}
+
+/**
+ * A receipt-backed host export already owns the terminal delivery projection.
+ * Asking the provider for an empty-turn streaming rewrite adds latency and can
+ * strand an otherwise completed mission, while its prose is discarded anyway.
+ */
+export function shouldRequestStreamingFinalProjection(input: {
+  enableStreaming: boolean;
+  hasDirectFinalContent: boolean;
+  verifiedHostExportFinalAnswer: string | null;
+}): boolean {
+  return (
+    input.enableStreaming &&
+    !input.hasDirectFinalContent &&
+    input.verifiedHostExportFinalAnswer === null
+  );
+}
+
+/**
+ * A receipt-backed answer can itself pay the graph's terminal projection debt.
+ * This is intentionally narrow: tool, write, web, and lifecycle proof never
+ * qualify here and remain mandatory before finalization.
+ */
+export function missionAcceptanceHasOnlyFinalProjectionDebt(
+  acceptance: Pick<MissionAcceptanceResult, "missing">,
+): boolean {
+  return (
+    acceptance.missing.length > 0 &&
+    acceptance.missing.every(
+      (item) =>
+        item === "final_output" ||
+        /(?:^|:)final_relevance$/u.test(item) ||
+        /(?:^|:)final_output$/u.test(item),
+    )
+  );
+}
+
+/**
+ * A verified host-directory export is already a complete, receipt-backed
+ * terminal answer. Once acceptance passes and every explicit proof debt is
+ * paid, a controller routing label cannot add authority; another provider turn
+ * can only add latency or strand the completed run behind model prose that
+ * will be replaced.
+ */
+export function shouldFinalizeVerifiedHostExportAfterToolUse(input: {
+  verifiedHostExportFinalAnswer: string | null;
+  acceptanceStatus: MissionAcceptanceResult["status"];
+  onlyFinalProjectionProofMissing: boolean;
+  pendingRequiredWriteCount: number;
+  missingRequiredWebToolCount: number;
+  hasPendingOperationGoals: boolean;
+  pendingStreamingWriteback: boolean;
+  setLooseDeliveryStillUnpaid: boolean;
+}): boolean {
+  return (
+    input.verifiedHostExportFinalAnswer !== null &&
+    input.verifiedHostExportFinalAnswer.trim().length > 0 &&
+    (input.acceptanceStatus === "pass" ||
+      input.onlyFinalProjectionProofMissing) &&
+    input.pendingRequiredWriteCount === 0 &&
+    input.missingRequiredWebToolCount === 0 &&
+    !input.hasPendingOperationGoals &&
+    !input.pendingStreamingWriteback &&
+    !input.setLooseDeliveryStillUnpaid
+  );
 }
 
 /**

@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "role": "builder",
+  "expectedDuration": {
+    "min": 25,
+    "max": 30
+  },
+  "output": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+  },
+  "crop": {
+    "inset": {
+      "top": 48,
+      "right": 0,
+      "bottom": 18,
+      "left": 0
+    },
+    "anchorX": 0.5,
+    "anchorY": 0.5
+  },
+  "segments": [
+    {
+      "at": "builder-ready",
+      "offsetSeconds": 0,
+      "duration": 3.5,
+      "zoomFrom": 1.46,
+      "zoomTo": 1.49,
+      "anchorX": 0,
+      "anchorY": 0
+    },
+    {
+      "at": "builder-submit",
+      "offsetSeconds": 0,
+      "duration": 4.5,
+      "zoomFrom": 1.48,
+      "zoomTo": 1.53,
+      "anchorX": 1,
+      "anchorY": 0.28
+    },
+    {
+      "at": "builder-delivery-verified",
+      "offsetSeconds": -9,
+      "duration": 5,
+      "zoomFrom": 1.46,
+      "zoomTo": 1.51,
+      "anchorX": 1,
+      "anchorY": 0.22
+    },
+    {
+      "at": "builder-delivery-verified",
+      "offsetSeconds": -4,
+      "duration": 4,
+      "zoomFrom": 1.46,
+      "zoomTo": 1.51,
+      "anchorX": 1,
+      "anchorY": 0.15
+    },
+    {
+      "at": "builder-finale",
+      "offsetSeconds": -8,
+      "duration": 8,
+      "zoomFrom": 1,
+      "zoomTo": 1,
+      "anchorX": 0.5,
+      "anchorY": 0.12
+    }
+  ],
+  "poster": {
+    "atSeconds": 23.5,
+    "zoom": 1,
+    "anchorX": 0.5,
+    "anchorY": 0.5
+  }
+}

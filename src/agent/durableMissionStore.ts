@@ -6,6 +6,10 @@ import {
   normalizeDurableMissionManifest,
   type DurableMissionManifestV1,
 } from "./durableMission";
+import {
+  persistAgentRunMarkdownExact,
+  readAgentRunMarkdown,
+} from "./runStore";
 
 export const DURABLE_MISSION_FOLDER = "Agent Runs/Missions";
 export const DURABLE_MISSION_MANIFEST_HEADING =
@@ -130,7 +134,13 @@ export async function writeDurableMissionManifest(
       let current = "";
       let persisted: DurableMissionManifestV1 | null = null;
       if (file) {
-        current = await vault.read(file as TFile);
+        current = await readAgentRunMarkdown({
+          adapterRead:
+            typeof vault.adapter?.read === "function"
+              ? () => vault.adapter.read(path)
+              : undefined,
+          vaultRead: () => vault.read(file as TFile),
+        });
         persisted = parseDurableMissionManifestFromMarkdown(current);
         if (
           DURABLE_MISSION_MANIFEST_BLOCK_PATTERN.test(current) &&
@@ -173,7 +183,20 @@ export async function writeDurableMissionManifest(
       }
 
       const next = replaceDurableMissionManifestBlock(current, block);
-      await vault.modify(file as TFile, next);
+      await persistAgentRunMarkdownExact({
+        path,
+        expectedMarkdown: next,
+        adapterWrite:
+          typeof vault.adapter?.write === "function"
+            ? () => vault.adapter.write(path, next)
+            : undefined,
+        adapterRead:
+          typeof vault.adapter?.read === "function"
+            ? () => vault.adapter.read(path)
+            : undefined,
+        modify: () => vault.modify(file as TFile, next),
+        readback: () => vault.read(file as TFile),
+      });
       manifest.revision = requested.revision;
       manifest.updatedAt = requested.updatedAt;
       return {
@@ -199,7 +222,13 @@ export async function readDurableMissionManifestById(
     if (!file) {
       return null;
     }
-    const markdown = await vault.read(file as TFile);
+    const markdown = await readAgentRunMarkdown({
+      adapterRead:
+        typeof vault.adapter?.read === "function"
+          ? () => vault.adapter.read(path)
+          : undefined,
+      vaultRead: () => vault.read(file as TFile),
+    });
     const manifest = parseDurableMissionManifestFromMarkdown(markdown);
     return manifest ? { path, manifest } : null;
   });

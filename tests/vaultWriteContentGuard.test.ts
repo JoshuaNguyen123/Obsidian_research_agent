@@ -4,6 +4,7 @@ import {
   assertSafeCurrentNoteWritePayload,
   isVaultWriteProcessNarration,
   looksLikeProcessNarrationLead,
+  stripRepeatedCurrentNotePrefixFromAppend,
   stripLeadingVaultWriteToolArtifact,
 } from "../src/agent/vaultWriteContentGuard";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "../src/agent/replaceIntent";
@@ -74,6 +75,47 @@ test("assertSafe rejects catastrophic short replace", () => {
         currentContent: "y".repeat(3000),
       }),
     /far shorter|discard most/i,
+  );
+});
+
+test("append guard strips an exact repeated current-note prefix", () => {
+  const current = [
+    "Project brief",
+    "",
+    "## Reading list",
+    "- Source A",
+  ].join("\n");
+  const requested = [
+    current,
+    "",
+    "## Recommendation",
+    "- Keep the index local.",
+  ].join("\n");
+
+  assert.equal(
+    stripRepeatedCurrentNotePrefixFromAppend(requested, current),
+    "## Recommendation\n- Keep the index local.",
+  );
+});
+
+test("append guard rejects a payload that only repeats the current note", () => {
+  assert.throws(
+    () =>
+      stripRepeatedCurrentNotePrefixFromAppend(
+        "Project brief\n",
+        "Project brief",
+      ),
+    /only repeated the existing note/i,
+  );
+});
+
+test("append guard preserves a normal delta", () => {
+  assert.equal(
+    stripRepeatedCurrentNotePrefixFromAppend(
+      "## Recommendation\n- Keep the index local.",
+      "Project brief",
+    ),
+    "## Recommendation\n- Keep the index local.",
   );
 });
 

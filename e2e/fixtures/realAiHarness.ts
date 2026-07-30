@@ -931,9 +931,21 @@ async function safePageWait(
  * hangs until the outer test timeout and the run reports nothing useful.
  * Bounding each poll converts that into a fast failure that names the cause.
  */
-const RENDERER_POLL_DEADLINE_MS = 120_000;
+const configuredRendererPollDeadlineMs = Number.parseInt(
+  process.env.E2E_RENDERER_POLL_DEADLINE_MS ?? "",
+  10,
+);
+const RENDERER_POLL_DEADLINE_MS =
+  Number.isSafeInteger(configuredRendererPollDeadlineMs) &&
+  configuredRendererPollDeadlineMs >= 30_000 &&
+  configuredRendererPollDeadlineMs <= 15 * 60_000
+    ? configuredRendererPollDeadlineMs
+    : 120_000;
 
-async function raceRendererResponsive<T>(evaluation: Promise<T>): Promise<T> {
+async function raceRendererResponsive<T>(
+  evaluation: Promise<T>,
+  pollContext: string,
+): Promise<T> {
   // The losing evaluate settles later (usually on browser close); keep its
   // rejection observed so it cannot surface as an unhandled rejection.
   void Promise.resolve(evaluation).catch(() => undefined);
@@ -945,7 +957,7 @@ async function raceRendererResponsive<T>(evaluation: Promise<T>): Promise<T> {
         timer = setTimeout(() => {
           reject(
             new Error(
-              `Obsidian did not answer a state poll within ${RENDERER_POLL_DEADLINE_MS}ms. ` +
+              `Obsidian did not answer the ${pollContext} poll within ${RENDERER_POLL_DEADLINE_MS}ms. ` +
                 "The renderer process has most likely crashed while its CDP target stayed registered; " +
                 "check the obsidian-stdio-*.log capture in test-results for the crash reason.",
             ),
@@ -1055,7 +1067,12 @@ async function approveUntilMissionComplete(
         `Obsidian page closed while waiting for mission completion; approved=${approvals}; continuations=${continuations}; previousDurableState=${JSON.stringify(lastDurableState)}.`,
       );
     }
-    if (await raceRendererResponsive(approveFirstVisiblePreparedAction(page))) {
+    if (
+      await raceRendererResponsive(
+        approveFirstVisiblePreparedAction(page),
+        "prepared-approval",
+      )
+    ) {
       approvals += 1;
       options.onProgress?.(progress());
       await safePageWait(page, 100, "post-approval settle");
@@ -1104,15 +1121,21 @@ async function approveUntilMissionComplete(
         const app = (window as typeof window & { app?: any }).app;
         const plugin = app?.plugins?.plugins?.[pluginId];
         const snapshot = plugin?.getMissionRunSnapshot?.();
+        const pluginRunning = plugin?.isMissionRunning?.() === true;
         // A lifecycle stage can commit and render the next exact approval after
         // the outer pre-poll but before this durable read acquires its storage
-        // boundary. Never let that read starve the 120-second approval broker:
-        // return to the approval poll quickly and try durability again later.
-        const durableRestart = await Promise.race([
-          Promise.resolve(plugin?.getDurableMissionRestartReadiness?.())
-            .catch(() => null),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
-        ]) ?? null;
+        // boundary. Active runs do not need restart-readiness data, and the
+        // durable read can legitimately wait behind an in-flight host action.
+        // Skip it until the coordinator is idle so the approval broker keeps
+        // observing the live mission instead of misclassifying that lock wait
+        // as an unresponsive renderer.
+        const durableRestart = pluginRunning
+          ? null
+          : await Promise.race([
+              Promise.resolve(plugin?.getDurableMissionRestartReadiness?.())
+                .catch(() => null),
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+            ]) ?? null;
         const lastError = Array.from(document.querySelectorAll<HTMLElement>(
           ".agentic-researcher-log-error .agentic-researcher-log-message",
         )).at(-1)?.textContent ?? "";
@@ -1122,7 +1145,7 @@ async function approveUntilMissionComplete(
           hasEnabledApproval: Array.from(document.querySelectorAll<HTMLButtonElement>(
             "button.agentic-researcher-approval-approve:not(:disabled), button[data-testid='chat-approval-approve']:not(:disabled)",
           )).some((button) => button.getClientRects().length > 0),
-          pluginRunning: plugin?.isMissionRunning?.() === true,
+          pluginRunning,
           stopReason: snapshot?.lastComplete?.stopReason ?? null,
           autoContinueReason:
             snapshot?.lastComplete?.autoContinueReason ?? null,
@@ -1211,7 +1234,7 @@ async function approveUntilMissionComplete(
               )
             : [],
         };
-      }, { pluginId: NATIVE_CORE_PLUGIN_ID }));
+      }, { pluginId: NATIVE_CORE_PLUGIN_ID }), "mission-state");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (page.isClosed() || /has been closed/iu.test(message)) {
@@ -1629,7 +1652,7 @@ async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
     return await page.evaluate(() => {
       const buttons = Array.from(
         document.querySelectorAll<HTMLButtonElement>(
-          "button[data-testid='chat-approval-approve']:not(:disabled), button.agentic-researcher-approval-approve:not(:disabled)",
+          "button[data-testid='chat-approval-approve']:not(:disabled):not([data-e2e-approval-scheduled]), button.agentic-researcher-approval-approve:not(:disabled):not([data-e2e-approval-scheduled])",
         ),
       );
       const chat = buttons.find(
@@ -1640,20 +1663,25 @@ async function approveFirstVisiblePreparedAction(page: Page): Promise<boolean> {
         buttons.find((candidate) => candidate.getClientRects().length > 0) ??
         buttons.at(-1);
       if (!button) return false;
-      // Click first so host handlers still see an enabled control, then disable
-      // both actions so a slow async decision cannot be double-clicked on the
-      // next poll tick. Treat the click as success even before host disable.
-      button.click();
-      const card = button.closest(
-        ".agentic-researcher-approval-card, .agentic-researcher-chat-attention-controls, .agentic-researcher-chat-attention",
-      );
-      for (const action of Array.from(
-        card?.querySelectorAll<HTMLButtonElement>(
-          "button.agentic-researcher-approval-approve, button.agentic-researcher-approval-deny, button[data-testid='chat-approval-approve'], button[data-testid='chat-approval-deny']",
-        ) ?? [button],
-      )) {
-        action.disabled = true;
-      }
+      // Dispatch on the next renderer turn so Runtime.evaluate can return
+      // before the host approval handler starts a long code/tool action. A
+      // synchronous button.click() can keep the CDP request outstanding for
+      // the entire approved action even while Obsidian visibly keeps updating.
+      button.dataset.e2eApprovalScheduled = "true";
+      setTimeout(() => {
+        if (!button.isConnected || button.disabled) return;
+        button.click();
+        const card = button.closest(
+          ".agentic-researcher-approval-card, .agentic-researcher-chat-attention-controls, .agentic-researcher-chat-attention",
+        );
+        for (const action of Array.from(
+          card?.querySelectorAll<HTMLButtonElement>(
+            "button.agentic-researcher-approval-approve, button.agentic-researcher-approval-deny, button[data-testid='chat-approval-approve'], button[data-testid='chat-approval-deny']",
+          ) ?? [button],
+        )) {
+          action.disabled = true;
+        }
+      }, 0);
       return true;
     });
   } catch (error) {

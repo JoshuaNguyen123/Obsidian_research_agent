@@ -769,7 +769,7 @@ test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch 
   );
   assert.match(realHarness, /durablyCompletedLifecycleTools\.includes/u);
   const approvalPoll = realHarness.indexOf(
-    "if (await raceRendererResponsive(approveFirstVisiblePreparedAction(page)))",
+    "approveFirstVisiblePreparedAction(page)",
   );
   const durableRestartRead = realHarness.indexOf(
     "plugin?.getDurableMissionRestartReadiness?.()",

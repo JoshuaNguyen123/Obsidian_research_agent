@@ -2,7 +2,11 @@ import type { TFile } from "obsidian";
 import type { RunRoute } from "../AgentRunner";
 import type { ToolExecutionContext } from "../tools/types";
 import { normalizeVaultPath } from "../tools/validation";
-import { withSerializedRunWrite } from "./runStore";
+import {
+  persistAgentRunMarkdownExact,
+  readAgentRunMarkdown,
+  withSerializedRunWrite,
+} from "./runStore";
 
 const AGENT_RUNS_FOLDER = "Agent Runs";
 
@@ -73,10 +77,29 @@ export async function appendAgentRunCheckpoint(
       };
     }
 
-    const current = await vault.read(existingFile as TFile);
+    const current = await readAgentRunMarkdown({
+      adapterRead:
+        typeof vault.adapter?.read === "function"
+          ? () => vault.adapter.read(path)
+          : undefined,
+      vaultRead: () => vault.read(existingFile as TFile),
+    });
     const separator = current.endsWith("\n") ? "\n" : "\n\n";
     const next = `${current}${separator}${entry}`;
-    await vault.modify(existingFile as TFile, next);
+    await persistAgentRunMarkdownExact({
+      path,
+      expectedMarkdown: next,
+      adapterWrite:
+        typeof vault.adapter?.write === "function"
+          ? () => vault.adapter.write(path, next)
+          : undefined,
+      adapterRead:
+        typeof vault.adapter?.read === "function"
+          ? () => vault.adapter.read(path)
+          : undefined,
+      modify: () => vault.modify(existingFile as TFile, next),
+      readback: () => vault.read(existingFile as TFile),
+    });
 
     return {
       path,

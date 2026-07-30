@@ -34,6 +34,30 @@ export function stripLeadingVaultWriteToolArtifact(text: string): string {
   return match ? value.slice(match[0].length) : value;
 }
 
+/**
+ * An append payload must contain only the delta. Some providers occasionally
+ * repeat the entire current note before the requested new section. Remove that
+ * exact prefix so append semantics cannot duplicate the user's note.
+ */
+export function stripRepeatedCurrentNotePrefixFromAppend(
+  text: string,
+  currentContent: string,
+): string {
+  const value = String(text ?? "").trimStart();
+  const current = String(currentContent ?? "").trim();
+  if (!current || !value.startsWith(current)) {
+    return String(text ?? "");
+  }
+
+  const remainder = value.slice(current.length).trimStart();
+  if (!remainder) {
+    throw new Error(
+      "Refused append_to_current_file: the payload only repeated the existing note and contained no new content.",
+    );
+  }
+  return remainder;
+}
+
 /** First-person lead-ins that must not live-flush into a replace stream. */
 export function looksLikeProcessNarrationLead(text: string): boolean {
   const trimmed = String(text ?? "").trimStart();

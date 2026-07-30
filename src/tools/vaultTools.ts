@@ -27,7 +27,10 @@ import {
   type ToolExecutionContext,
 } from "./types";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "../agent/replaceIntent";
-import { assertSafeCurrentNoteWritePayload } from "../agent/vaultWriteContentGuard";
+import {
+  assertSafeCurrentNoteWritePayload,
+  stripRepeatedCurrentNotePrefixFromAppend,
+} from "../agent/vaultWriteContentGuard";
 import {
   getFirstH1,
   getFrontmatterTitle,
@@ -2199,7 +2202,7 @@ export const appendToCurrentFileTool: AgentTool = {
     additionalProperties: false,
   },
   async execute(args, context) {
-    const text = getRequiredString(args, "text");
+    const requestedText = getRequiredString(args, "text");
     if (!context.writeAutonomy && !APPEND_INTENT_PATTERN.test(context.originalPrompt)) {
       throw new Error(
         "append_to_current_file requires the user to explicitly ask to append, save, write, add, insert, or update the note.",
@@ -2208,6 +2211,10 @@ export const appendToCurrentFileTool: AgentTool = {
 
     const file = getActiveMarkdownFile(context);
     const current = await context.app.vault.read(file);
+    const text = stripRepeatedCurrentNotePrefixFromAppend(
+      requestedText,
+      current,
+    );
     assertSafeCurrentNoteWritePayload({
       kind: "append",
       text,

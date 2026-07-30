@@ -16,7 +16,9 @@
     "test:companion": "python -m pytest companion/tests -q",
     "check:path-hygiene": "node scripts/check-path-hygiene.mjs",
     "check:style-tokens": "node scripts/check-style-tokens.mjs",
+    "validate:public-site-media": "node scripts/validate-public-demo-media.mjs",
     "test:ci": "npm run check:path-hygiene && npm run check:style-tokens && npm test && npm run build",
+    "test:public-site:e2e": "playwright test --config=playwright.public-site.config.ts",
     "check:mission-scorecards": "node scripts/mission-scorecard-regression.mjs",
     "sync:test-vault": "node scripts/sync-test-vault.mjs",
     "cleanup:e2e-github-residue": "node scripts/cleanup-e2e-github-residue.mjs",
@@ -42,6 +44,8 @@
     "test:e2e:flow-real-cleanup": "node scripts/run-e2e-exclusive.mjs --project=linear-flow-real-cleanup",
     "test:e2e:github-askpass": "node scripts/run-e2e-exclusive.mjs --project=github-askpass-runtime-live",
     "test:e2e:live": "node scripts/run-e2e-exclusive.mjs --live-external --project=disposable-live-external",
+    "record:demo:researcher": "node scripts/record-e2e-demo.mjs --label=researcher-demo --model=glm-5.2 --showcase-vault -- --real-ai --project=demo-journey-recording",
+    "record:demo:builder": "node scripts/record-e2e-demo.mjs --label=builder-demo --model=glm-5.2 --showcase-vault -- --real-ai --project=demo-recording",
     "e2e:preflight": "node scripts/e2e-preflight.mjs",
     "setup:sandbox:wsl2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-wsl2-sandbox.ps1 -PersistUserEnvironment"
   },

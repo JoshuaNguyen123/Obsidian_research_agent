@@ -1,279 +1,285 @@
-import { writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 import {
-  createRepositoryProfile,
-  createRepositoryProfileRegistry,
-} from "../src/agent/repositories/RepositoryProfile";
+  assertDemoFrameCleanV1,
+  assertDemoPresentationObserverSettlesV1,
+  prepareDemoFinaleV1,
+  prepareDemoPresentationV1,
+  recordDemoMomentV1,
+} from "./fixtures/demoPresentation";
+import {
+  installDemoPublicSourceBoundaryV1,
+  readDemoPublicSourceMetricsV1,
+  restoreDemoPublicSourceBoundaryV1,
+} from "./fixtures/demoPublicSources";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
-import { createFlowRealTypeScriptFixture } from "./fixtures/phase4GitRepo";
-import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import {
   assertProductionAdoptedSandboxV1,
-  hostProvisionedSandboxRuntimeDigestV1,
   startRealAiHarness,
   type RealAiHarness,
 } from "./fixtures/realAiHarness";
 
 /**
- * JOURNEY DEMO RECORDING DRIVER — not a proof lane.
+ * RESEARCHER DEMO RECORDING DRIVER — not a proof lane.
  *
- * Films one real compound mission phrased as a question a person would
- * actually ask, so website footage can trace the whole flow — research with
- * sources, a brief written into the note, a Linear issue created, code
- * implemented and validated in a trusted repository, a draft GitHub PR, and a
- * closing reflection that links every artifact. `retained-journey` stays the
- * proof; this exists to be watched. Artifacts are deliberately kept so the
- * published page can link them as receipts.
- *
- * Everything mechanical mirrors the proven retained-journey recipe (trusted
- * repository binding, plain linear_create_issue routing, exact-path
- * write_expected, named repository key) because each of those phrasings paid
- * for itself across seventeen recorded attempts at that lane.
+ * This lane records a concise, genuine source-to-note mission using the same
+ * production model, public web tools, vault write path, receipt readback, and
+ * completion attestation as the proof lanes. It changes presentation only.
  */
 
 const LANE = "demo-journey-recording";
-const LINEAR_CONTAINER_NAME = "Application_testing_dumping_grounds";
+const DEMO_NOTE_TITLE = "Choosing a note-search index";
+const DEMO_NOTE_PATH = `${DEMO_NOTE_TITLE}.md`;
+const DEMO_SOURCE_URLS = [
+  "https://nlp.stanford.edu/IR-book/html/htmledition/k-gram-indexes-for-spelling-correction-1.html",
+  "https://nlp.stanford.edu/IR-book/html/htmledition/search-structures-for-dictionaries-1.html",
+] as const;
+const DEMO_PROMPT =
+  "Open the two source URLs under Reading list in this note and use only those two public pages. Then append a compact result: ## Recommendation, two one-sentence bullets with one source URL each formatted as [source name](URL), one Trade-off: sentence, ## Limitations, and one brief sentence noting that the pages cover different parts of the decision. Use six non-empty Markdown lines, stay under 1200 characters, do not repeat any existing note text, and omit internal evidence IDs.";
 
-/**
- * Open the seeded note and make it the active leaf.
- *
- * Omitting this cost a 100-minute run: with no current note, the planner never
- * schedules the accepted-research writeback, so no durable Obsidian lineage
- * exists and `publish_verified_code_to_github` fail-closes at the last node
- * with "No durable Linear and Obsidian lineage matches the verified local
- * commit" — after every other stage had already succeeded.
- */
-async function focusNote(page: Page, notePath: string): Promise<void> {
-  await page.evaluate(
-    async ({ pluginId, notePath }) => {
-      const app = (window as typeof window & { app?: any }).app;
-      const plugin = app?.plugins?.plugins?.[pluginId];
-      const file = app.vault.getAbstractFileByPath(notePath);
-      if (!file) throw new Error(`Demo note missing for focus: ${notePath}`);
-      const leaf =
-        app.workspace.getLeavesOfType("markdown")[0] ?? app.workspace.getLeaf("tab");
-      await leaf.openFile(file);
-      app.workspace.setActiveLeaf(leaf, { focus: true });
-      await plugin?.activateView?.();
-    },
-    { pluginId: NATIVE_CORE_PLUGIN_ID, notePath },
-  );
-  await page.getByRole("tab", { name: "Chat" }).click().catch(() => undefined);
-}
-
-async function boundedRead<T>(
-  read: Promise<T>,
-  fallback: T,
-  deadlineMs = 30_000,
-): Promise<T> {
-  void Promise.resolve(read).catch(() => undefined);
-  let timer: NodeJS.Timeout | null = null;
-  try {
-    return await Promise.race([
-      read.catch(() => fallback),
-      new Promise<T>((resolve) => {
-        timer = setTimeout(() => resolve(fallback), deadlineMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-test("DEMO journey films a genuine research-to-PR mission with retained artifacts", async (
+test("DEMO researcher mission appends a cited recommendation with verified sources", async (
   {},
   testInfo,
 ) => {
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
-  test.skip(!laneSelectedV1(LANE), `Run only with E2E_PLAYWRIGHT_LANE=${LANE}.`);
+  test.skip(
+    !laneSelectedV1(LANE),
+    `Run only with E2E_PLAYWRIGHT_LANE=${LANE}.`,
+  );
   test.skip(
     process.env.E2E_AI_MODE !== "real" || process.env.E2E_REAL_AI !== "1",
     "Requires E2E_REAL_AI=1 and E2E_AI_MODE=real.",
   );
-  test.setTimeout(120 * 60_000);
+  test.setTimeout(18 * 60_000);
 
   const startedAt = Date.now();
-  const marker = "note_search_v1";
-  const notePath = "Instant note search research.md";
-  // Unique per run, still readable on camera. A fixed id makes the SECOND
-  // demo adopt the first run's durable workspace binding, which points at a
-  // temp fixture that no longer exists — sandbox prepare then fail-closes with
-  // "requires the exact trusted repository-worktree profile binding".
-  const workspaceId = `note-search-${String(startedAt).slice(-5)}`;
-  const relativeCodePath = "src/flow_real.ts";
-  const repositoryName = `note-search-prototype-${startedAt}`;
   let harness: RealAiHarness | null = null;
-
-  const fixture = await createFlowRealTypeScriptFixture(marker);
-  const profile = createRepositoryProfile({
-    key: "demo-note-search",
-    displayName: "Instant note search prototype",
-    repositoryRoot: fixture.root,
-    defaultBranch: "main",
-    allowedPathPrefixes: ["src"],
-    validationProfile: {
-      id: "demo-note-search-validation",
-      bootstrapCommands: [],
-      validationCommands: [
-        {
-          command: "python3",
-          args: ["scripts/verify_project.py"],
-          label: "Prototype contract verification",
-        },
-      ],
-      protectedPaths: ["scripts", "package.json"],
-      allowedGeneratedPaths: [],
-    },
-    runtimeDigests: { python: hostProvisionedSandboxRuntimeDigestV1() },
-    promotionPolicy: {
-      localBasePromotion: "disabled",
-      completionProof: "draft_pr",
-      githubRepository: `JoshuaNguyen123/${repositoryName}`,
-      requiredChecks: [],
-    },
-  });
 
   try {
     harness = await startRealAiHarness(
-      `demo-journey-${startedAt}`,
+      `demo-researcher-${startedAt}`,
       {
-        missionTimeoutMs: 110 * 60_000,
-        completionTimeoutMs: 110 * 60_000,
+        missionTimeoutMs: 12 * 60_000,
+        completionTimeoutMs: 12 * 60_000,
       },
       {
-        maxAgentSteps: 240,
-        maxRunMinutes: 110,
-        requestTimeoutMs: 10 * 60_000,
+        maxAgentSteps: 32,
+        maxRunMinutes: 12,
+        requestTimeoutMs: 4 * 60_000,
         completionDrivenLoops: true,
         autoContinueLongRuns: true,
         workingMode: "automatic",
         autonomyProfile: "automatic",
         thinkingMode: "medium",
         orchestratorEnabled: false,
-        githubEnabled: true,
-        linearEnabled: true,
-        numCtx: 100_000,
-        repositoryProfileRegistry: createRepositoryProfileRegistry([profile]),
-      },
-      {
-        preserveConfiguredLinearCredential: true,
-        preserveConfiguredGitHubCredential: true,
-        retainVaultPaths: [notePath],
+        githubEnabled: false,
+        linearEnabled: false,
+        linearCapabilityGate: 0,
       },
     );
 
     await assertProductionAdoptedSandboxV1(harness.page, startedAt);
-
-    const linearReady = await harness.page.evaluate(async (pluginId) => {
-      const plugin = (window as typeof window & { app?: any }).app?.plugins
-        ?.plugins?.[pluginId];
-      const connection = await plugin?.testLinearConnection?.();
-      return {
-        ok: connection?.ok === true,
-        message: String(connection?.message ?? "").slice(0, 200),
-      };
-    }, NATIVE_CORE_PLUGIN_ID);
-    expect(
-      linearReady.ok,
-      `Linear must be connected for the journey demo: ${linearReady.message}`,
-    ).toBe(true);
-
-    // The note is on camera: title and body must read like a person's real
-    // working note, because in the published demo it is one.
-    await harness.seedNote(
-      notePath,
-      [
-        // The marker must appear in the note, the Linear issue title, AND the
-        // code. `publish_verified_code_to_github` matches durable Linear and
-        // Obsidian lineage against the verified commit, and with the marker
-        // only in the source file that match fails at the final node — twice,
-        // on two different models, after every other stage had succeeded.
-        `# Instant note search (${marker})`,
-        "",
-        "My vault is past 4,000 notes and search is starting to feel slow.",
-        "How do serious editors make full-text search feel instant?",
-        "",
-        "- What indexing approach do they use?",
-        "- Could we prototype it for the vault?",
-        "",
-      ].join("\n"),
-      true,
+    await installDemoPublicSourceBoundaryV1(
+      harness.page,
+      DEMO_SOURCE_URLS,
     );
-    await focusNote(harness.page, notePath);
+    const original = [
+      "Search in an 8,000-note vault is beginning to feel slow when a query only matches part of a word.",
+      "",
+      "## Decision criteria",
+      "",
+      "- Fast prefix lookup for commands, tags, and note titles.",
+      "- Useful fallback when a query contains a misspelling.",
+      "- Predictable local updates as notes change.",
+      "",
+      "## Question",
+      "",
+      "Should prefix search use the primary index, with fuzzy matching as a fallback?",
+      "",
+      "## Reading list",
+      "",
+      `- [Prefix search structures](${DEMO_SOURCE_URLS[1]})`,
+      `- [Fuzzy matching with k-grams](${DEMO_SOURCE_URLS[0]})`,
+      "",
+    ].join("\n");
+    await harness.seedNote(DEMO_NOTE_PATH, original, true);
+    await harness.clearChat();
+    await prepareDemoPresentationV1(harness.page, DEMO_NOTE_PATH);
+    await assertDemoPresentationObserverSettlesV1(harness.page);
+    await assertDemoFrameCleanV1(harness.page, DEMO_NOTE_TITLE, {
+      requireSingleTitle: true,
+    });
+    await recordDemoMomentV1("researcher-ready", { notePath: DEMO_NOTE_PATH });
+    await harness.page.waitForTimeout(1_500);
 
-    const mission = [
-      `How should a notes app search thousands of files instantly? Run the full pipeline for ${marker}: web research, Linear issue, repository workspace, private GitHub, and note reflection.`,
-      `First research trigram-index text search using exactly two public web sources and fetch both sources before accepting findings. Write the accepted findings into the current note ${notePath} using the canonical headings ## Problem and impact, ## Evidence and source links, and ## Proposed work, citing both fetched source URLs and passages.`,
-      `Then create a Linear issue with linear_create_issue in the configured team ${LINEAR_CONTAINER_NAME}, titled Prototype instant note search ${marker}, whose description summarizes the accepted findings, and read it back with linear_get_issue to confirm it is assigned to the current Linear viewer.`,
-      "The trusted repository key for this mission is demo-note-search.",
-      `Then create repository workspace ${workspaceId} with code_workspace_create in the trusted local repository ${fixture.root} before reading or writing any workspace file.`,
-      `Read the exact existing workspace file ${relativeCodePath} via code_workspace_read path ${relativeCodePath}, then code_workspace_write_expected path ${relativeCodePath} with a small TypeScript search implementation: an exported TrigramIndex class with add and search methods, an exported highlightMatch function, and the exact line export const marker = "${marker}"; (double quotes only).`,
-      "Run targeted validation, then a distinct fresh full validation, then create one local commit with message feat: add trigram note search prototype.",
-      `Then create a new private GitHub repository named ${repositoryName} and publish the verified commit to it as a draft pull request.`,
-      `Finally append a reflection to the current note via append_to_current_file containing the Linear issue URL, the private GitHub repository URL, and the draft pull request URL.`,
-    ].join(" ");
-
-    await harness.submitMission(mission, {
+    await recordDemoMomentV1("researcher-submit", { prompt: DEMO_PROMPT });
+    await harness.submitMission(DEMO_PROMPT, {
+      clearChatFirst: false,
       waitForCompletion: false,
-      timeoutMs: 110 * 60_000,
+      timeoutMs: 12 * 60_000,
     });
-    // Fail fast if a readiness gate blocked at submit: an idle UI four
-    // minutes in means the run never began and footage would be worthless.
-    await harness.page.waitForFunction(
-      (pluginId) => {
-        const plugin = (window as typeof window & { app?: any }).app?.plugins
-          ?.plugins?.[pluginId];
-        return plugin?.isMissionRunning?.() === true;
-      },
-      NATIVE_CORE_PLUGIN_ID,
-      { timeout: 4 * 60_000, polling: 2_000 },
-    );
-    await harness.approveUntilMissionComplete(100 * 60_000, {
-      maxContinuations: 24,
+    await harness.approveUntilMissionComplete(12 * 60_000, {
+      maxContinuations: 4,
     });
 
-    const noteBody = await boundedRead(harness.readNote(), "");
-    const urls = {
-      linearIssueUrl: /https:\/\/linear\.app\/[^\s)>\]"']+/u.exec(noteBody)?.[0] ?? null,
-      githubRepositoryUrl:
-        new RegExp(
-          `https://github\\.com/JoshuaNguyen123/${repositoryName}(?![\\w-])[^\\s)>\\]"']*`,
-          "u",
-        ).exec(noteBody)?.[0] ?? null,
-      pullRequestUrl:
-        /https:\/\/github\.com\/[^\s)>\]"']+\/pull\/\d+/u.exec(noteBody)?.[0] ?? null,
-    };
-    await writeFile(
-      path.join(process.cwd(), "test-results", "demo-journey-artifacts.json"),
-      `${JSON.stringify(
-        {
-          version: 1,
-          startedAt,
-          notePath,
-          repositoryName,
-          marker,
-          ...urls,
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
+    const after = await harness.readNote(
+      path.join(harness.vaultRoot, ...DEMO_NOTE_PATH.split("/")),
     );
-    await testInfo.attach("demo-journey-artifacts", {
-      body: JSON.stringify(urls, null, 2),
+    const snapshot = await harness.attestProductionRun({
+      requireStructuredRouting: true,
+    });
+    const publicSourceMetrics = await readDemoPublicSourceMetricsV1(
+      harness.page,
+    );
+    const graphNodes = Object.values(snapshot.lastMissionGraph.nodes) as any[];
+    const appendReceipts = snapshot.lastReceipts.filter(
+      (receipt: any) => receipt.operation === "append",
+    );
+    const fetchedEvidence = snapshot.missionEvidence.filter(
+      (item: any) =>
+        item.kind === "web_source" &&
+        item.usableSource === true &&
+        item.parserStatus === "parsed",
+    );
+    const fetchedEvidenceIds = new Set<string>(
+      fetchedEvidence.map((item: any) => String(item.id ?? "")).filter(Boolean),
+    );
+    const noteUrls = new Set(
+      [...after.matchAll(/https?:\/\/[^\s)>\]"']+/gu)].map(
+        (match) => match[0],
+      ),
+    );
+    const appended = after.slice(original.length);
+    const appendedWords = appended.trim().split(/\s+/u).filter(Boolean).length;
+    const appendedNonEmptyLines = appended
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const recommendationBullets = appendedNonEmptyLines.slice(1, 3);
+    const tradeOffLines = appendedNonEmptyLines.filter((line) =>
+      /^(?:-\s*)?Trade-off:\s+/iu.test(line),
+    );
+    const appendedMarkdownUrls = new Set(
+      [...appended.matchAll(/\[[^\]\r\n]+\]\((https?:\/\/[^)\s]+)\)/gu)].map(
+        (match) => match[1],
+      ),
+    );
+    const visiblePassageIds = [
+      ...appended.matchAll(/source:[a-z0-9-]+:passage:\d+-\d+/gu),
+    ].map((match) => match[0]);
+    const safeState = {
+      complete: snapshot.lastComplete,
+      receiptOperations: snapshot.lastReceipts.map(
+        (receipt: any) => receipt.operation,
+      ),
+      fetchedEvidence: snapshot.missionEvidence,
+      noteUrls: [...noteUrls],
+      appendedMarkdownUrls: [...appendedMarkdownUrls],
+      visiblePassageIds,
+      appendedChars: appended.length,
+      appendedWords,
+      appendedNonEmptyLines,
+      publicSourceMetrics,
+      graphTools: graphNodes.flatMap(
+        (node: any) => node.allowedTools ?? [],
+      ),
+    };
+
+    expect(after.startsWith(original), JSON.stringify(safeState)).toBe(true);
+    expect(after, JSON.stringify(safeState)).toContain("## Recommendation");
+    expect(after, JSON.stringify(safeState)).toMatch(/\btrade-off\b/iu);
+    expect(fetchedEvidenceIds.size, JSON.stringify(safeState)).toBe(2);
+    expect(noteUrls.size, JSON.stringify(safeState)).toBe(2);
+    expect([...noteUrls].sort(), JSON.stringify(safeState)).toEqual(
+      [...DEMO_SOURCE_URLS].sort(),
+    );
+    expect([...appendedMarkdownUrls].sort(), JSON.stringify(safeState)).toEqual(
+      [...DEMO_SOURCE_URLS].sort(),
+    );
+    expect(visiblePassageIds, JSON.stringify(safeState)).toHaveLength(0);
+    expect(appended.length, JSON.stringify(safeState)).toBeLessThanOrEqual(1200);
+    expect(appendedNonEmptyLines, JSON.stringify(safeState)).toHaveLength(6);
+    expect(appendedNonEmptyLines[0], JSON.stringify(safeState)).toBe(
+      "## Recommendation",
+    );
+    expect(recommendationBullets, JSON.stringify(safeState)).toHaveLength(2);
+    expect(
+      recommendationBullets.every((line) => /^-\s+/u.test(line)),
+      JSON.stringify(safeState),
+    ).toBe(true);
+    expect(tradeOffLines, JSON.stringify(safeState)).toHaveLength(1);
+    expect(appendedNonEmptyLines[4], JSON.stringify(safeState)).toBe(
+      "## Limitations",
+    );
+    expect(appendedNonEmptyLines[5], JSON.stringify(safeState)).toMatch(
+      /\b(?:pages?|sources?)\b/iu,
+    );
+    for (const bullet of recommendationBullets) {
+      expect(
+        [...bullet.matchAll(/\[[^\]\r\n]+\]\((https?:\/\/[^)\s]+)\)/gu)],
+        JSON.stringify(safeState),
+      ).toHaveLength(1);
+    }
+    expect(
+      new Set(publicSourceMetrics.fetchedUrls).size,
+      JSON.stringify(safeState),
+    ).toBe(2);
+    expect(
+      [...new Set(publicSourceMetrics.fetchedUrls)].sort(),
+      JSON.stringify(safeState),
+    ).toEqual([...noteUrls].sort());
+    expect(
+      publicSourceMetrics.allowedFetchTransportCalls,
+      JSON.stringify(safeState),
+    ).toBeGreaterThanOrEqual(2);
+    expect(
+      publicSourceMetrics.allowedFetchTransportCalls,
+      JSON.stringify(safeState),
+    ).toBeLessThanOrEqual(4);
+    expect(
+      publicSourceMetrics.searchTransportCalls,
+      JSON.stringify(safeState),
+    ).toBeLessThanOrEqual(3);
+    expect(
+      publicSourceMetrics.blockedFetchAttempts,
+      JSON.stringify(safeState),
+    ).toBe(0);
+    expect(appendReceipts, JSON.stringify(safeState)).toHaveLength(1);
+    expect(
+      snapshot.lastReceipts.map((receipt: any) => receipt.operation),
+      JSON.stringify(safeState),
+    ).toEqual(["append"]);
+    expect(
+      appendReceipts[0]?.readback?.status,
+      JSON.stringify(safeState),
+    ).toBe("verified");
+    expect(
+      graphNodes.some((node: any) =>
+        node.allowedTools?.includes("web_fetch"),
+      ),
+    ).toBe(true);
+    await testInfo.attach("demo-researcher-proof", {
+      body: JSON.stringify(safeState, null, 2),
       contentType: "application/json",
     });
 
-    expect(urls.linearIssueUrl, "reflection must cite the Linear issue URL").not.toBeNull();
-    expect(
-      urls.githubRepositoryUrl,
-      "reflection must cite the GitHub repository URL",
-    ).not.toBeNull();
-    expect(urls.pullRequestUrl, "reflection must cite the draft PR URL").not.toBeNull();
+    await assertDemoFrameCleanV1(harness.page, DEMO_NOTE_TITLE);
+    await recordDemoMomentV1("researcher-note-verified", {
+      sources: fetchedEvidenceIds.size,
+      receipt: appendReceipts[0]?.readback?.status ?? "missing",
+    });
+    await harness.page.waitForTimeout(3_000);
+    await prepareDemoFinaleV1(harness.page);
+    await assertDemoFrameCleanV1(harness.page, DEMO_NOTE_TITLE);
+    await recordDemoMomentV1("researcher-finale", { view: "run-details" });
   } finally {
+    if (harness) {
+      await restoreDemoPublicSourceBoundaryV1(harness.page).catch(
+        () => undefined,
+      );
+    }
     await harness?.close().catch(() => undefined);
   }
 });
