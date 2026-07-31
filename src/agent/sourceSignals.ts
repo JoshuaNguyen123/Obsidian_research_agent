@@ -2,6 +2,7 @@ import type {
   ResearchSourceType,
   SourceQualitySignals,
 } from "../orchestrator/sourceCandidateLedger";
+import type { MissionEvidence } from "./missionLedger";
 
 /**
  * Provider-neutral ranking signals for a search result.
@@ -316,4 +317,167 @@ function hostMatches(host: string, known: string): boolean {
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(0, value));
+}
+
+/* ------------------------------------------------------------------------- *
+ * Web search result ranking (Cluster D2, moved verbatim from AgentRunner.ts)
+ *
+ * The single-agent loop's own result ranking and domain-diversity selection.
+ * It predates the candidate-signal scoring above and uses a coarser authority
+ * heuristic; the two coexist deliberately — this ranks raw search output for
+ * the next fetch, the signals above rank ledger candidates. Unifying the
+ * heuristics would change live routing and belongs in its own change.
+ * ------------------------------------------------------------------------- */
+
+export function getFirstWebSearchResultUrl(output: unknown): string | null {
+  return getWebSearchResultUrls(output)[0] ?? null;
+}
+
+export function getWebSearchResultUrls(output: unknown): string[] {
+  if (!isRecord(output) || !Array.isArray(output.results)) {
+    return [];
+  }
+
+  const urls: string[] = [];
+  for (const result of output.results) {
+    if (!isRecord(result) || typeof result.url !== "string") {
+      continue;
+    }
+
+    const url = result.url.trim();
+    if (/^https?:\/\//i.test(url) && !urls.includes(url)) {
+      urls.push(url);
+    }
+  }
+
+  return urls;
+}
+
+export function rankWebSearchResultUrls(output: unknown, query: string): string[] {
+  if (!isRecord(output) || !Array.isArray(output.results)) {
+    return [];
+  }
+  const queryTerms = getSourceRankingTerms(query);
+  return output.results
+    .map((result, index) => {
+      if (!isRecord(result) || typeof result.url !== "string") return null;
+      const url = result.url.trim();
+      if (!/^https?:\/\//i.test(url)) return null;
+      const text = [result.title, result.snippet, result.content, url]
+        .filter((value): value is string => typeof value === "string")
+        .join(" ")
+        .toLowerCase();
+      const relevance = queryTerms.reduce(
+        (score, term) => score + (text.includes(term) ? 1 : 0),
+        0,
+      );
+      const authority = /(?:\.gov|\.edu|doi\.org|arxiv\.org|docs?\.)/i.test(url)
+        ? 0.25
+        : 0;
+      return { url, index, score: relevance + authority };
+    })
+    .filter(
+      (item): item is { url: string; index: number; score: number } => item !== null,
+    )
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map((item) => item.url)
+    .filter((url, index, urls) => urls.indexOf(url) === index);
+}
+
+export function getSourceRankingTerms(value: string): string[] {
+  const stopWords = new Set([
+    "about",
+    "after",
+    "before",
+    "cite",
+    "cited",
+    "citation",
+    "current",
+    "include",
+    "multiple",
+    "research",
+    "source",
+    "sources",
+    "that",
+    "their",
+    "this",
+    "verify",
+    "with",
+  ]);
+  return [
+    ...new Set(
+      (value.toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) ?? []).filter(
+        (term) => !stopWords.has(term),
+      ),
+    ),
+  ].slice(0, 40);
+}
+
+export function selectDomainDiverseUrls(
+  candidateUrls: string[],
+  alreadyFetchedUrls: string[],
+  limit: number,
+): string[] {
+  if (limit <= 0) {
+    return [];
+  }
+
+  const fetched = new Set(alreadyFetchedUrls);
+  const usedDomains = new Set(
+    alreadyFetchedUrls
+      .map(getUrlHostname)
+      .filter((domain): domain is string => Boolean(domain)),
+  );
+  const selected: string[] = [];
+  const deferred: string[] = [];
+
+  for (const url of candidateUrls) {
+    if (fetched.has(url)) {
+      continue;
+    }
+    const hostname = getUrlHostname(url);
+    if (hostname && !usedDomains.has(hostname)) {
+      selected.push(url);
+      usedDomains.add(hostname);
+    } else {
+      deferred.push(url);
+    }
+    if (selected.length >= limit) {
+      return selected;
+    }
+  }
+
+  for (const url of deferred) {
+    if (selected.length >= limit) {
+      break;
+    }
+    if (!selected.includes(url)) {
+      selected.push(url);
+    }
+  }
+
+  return selected;
+}
+
+export function getFetchedWebSourceUrls(evidence: MissionEvidence[]): string[] {
+  return [
+    ...new Set(
+      evidence
+        .filter((item) => item.kind === "web_source" || Boolean(item.url))
+        .map((item) => item.url)
+        .filter((url): url is string => Boolean(url)),
+    ),
+  ];
+}
+
+export function getUrlHostname(url: string): string | null {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
