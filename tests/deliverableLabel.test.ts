@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   deliverableLabelFromPromptV1,
   deliverableTitleFromPromptV1,
-} from "../src/AgentRunner";
+} from "../src/agent/verifiedWorkspaceBinding";
 import { stopReasonChatLine } from "../src/agent/missionStopReason";
 
 test("the delivered folder is named after what the user asked for", () => {

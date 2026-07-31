@@ -15,6 +15,7 @@ import {
   evaluateReportStructure,
   reportStrictnessForTier,
 } from "./researchReportStructure";
+import { getUrlHostname } from "./sourceSignals";
 import {
   RESEARCH_EFFORT_TIER_ORDER,
   resolveResearchEffortBudget,
@@ -1810,13 +1811,10 @@ function getEvidenceType(value: unknown): ResearchEvidenceType | null {
     : null;
 }
 
-function getUrlDomain(url: string): string | null {
-  try {
-    return new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
-  } catch {
-    return null;
-  }
-}
+// Byte-identical to the shared helper; kept as a local alias so acceptance
+// stats and candidate ranking can never silently diverge on what "the same
+// domain" means.
+const getUrlDomain = getUrlHostname;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

@@ -12,6 +12,7 @@ import type {
 } from "./HostLinearActionExecutor";
 import { assertCleanLinearHumanOutputV1 } from "./WorkItemRenderer";
 import type { LinearToolClient } from "./LinearTools";
+import { listAllLinearPages } from "./linearPagination";
 import {
   DurableLinearContractError,
   expectIsoTimestamp,
@@ -815,8 +816,20 @@ export class ResearchProjectHierarchyWorkflowV1 {
   }
 
   private async list(operationKey: string, context: ToolExecutionContext): Promise<LinearBaseRecord[]> {
-    const output = await this.options.readClient.execute(operationKey, { first: 50 }, requestOptions(context));
-    return isLinearPage(output) ? output.items : [];
+    // Paginate: these lists feed duplicate detection and unique-relation
+    // checks, and a single 50-row page silently missed existing records in any
+    // workspace past that size — the same class of bug that made project
+    // association create duplicates. Five pages bounds the sweep at 250 rows
+    // per collection; beyond that the pre-existing behaviour (treat as absent)
+    // resumes rather than a new failure mode appearing.
+    const sweep = await listAllLinearPages(
+      this.options.readClient,
+      operationKey,
+      { first: 50 },
+      requestOptions(context),
+      { maxPages: 5 },
+    );
+    return sweep.items;
   }
 
   private async findUniqueRelation(

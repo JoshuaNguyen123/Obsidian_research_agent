@@ -35,6 +35,25 @@ export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
   // Demo footage drivers, not proof lanes; assert only verified completion.
   "demo-recording",
   "demo-journey-recording",
+  // 2026-07-31 audit of every lane with neither baseline nor exemption.
+  // The two below never call recordDailyUseAcceptance, so the reporter maps
+  // no scenarioId and no scorecard record can exist for them; neither is a
+  // journey lane, so exempting them does not touch the journey guarantee
+  // below. If either gains a scenario contract later, REMOVE its exemption so
+  // the gate demands a baseline again.
+  "real-ai-soak", // orchestration/restart/CRUD/diagram structural asserts only
+  "obsidian-hello-github-live", // draft-PR delivery proof, no scenario contract
+  // Deliberately NOT exempt, still proof debt until resolved:
+  //   real-ai-contract    (runs daily-use-research.spec.ts -> DU-02 records)
+  //   daily-use-code-live (DU-03)
+  //   daily-use-compound  (DU-06)
+  //   release-vertical    (runs daily-use-compound.spec.ts -> DU-06 records)
+  //   retained-journey / compound-flow-real-live — journey lanes; the
+  //     e2eExecutionProof suite pins that a journey lane must never be
+  //     quietly exempted, so they stay loud until they gain scenario
+  //     contracts or harvested baselines.
+  // Exempting a lane that emits (or ought to emit) scenario-mapped scorecards
+  // would silently weaken the gate; these fail loudly by design.
 ]);
 
 // Must stay in lockstep with MissionScoreDimensionId in

@@ -2,16 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  bindTrustedRepositoryWorkspaceCreate,
   canonicalExactLinearIssueReadIdV1,
-  missionGraphOnlyFinalSynthesisRemainsV1,
-  decideLinearGetIssueHostBindingV1,
   filterToolsUntilVerifiedLinearCodeSpecReadbackV1,
   isVerifiedLinearCodeSpecConsumerToolV1,
   requiresVerifiedLinearCodeSpecReadbackV1,
   shouldEvaluateVerifiedLinearCodeRepositoryBindingV1,
   shouldRefreshVerifiedLinearCodeRepositoryBindingOnResumeV1,
 } from "../src/AgentRunner";
+import {
+  decideLinearGetIssueHostBindingV1,
+} from "../src/agent/linearIssueBinding";
+import {
+  missionGraphOnlyFinalSynthesisRemainsV1,
+} from "../src/agent/missionGraphSelectors";
+import {
+  bindTrustedRepositoryWorkspaceCreate,
+} from "../src/agent/verifiedWorkspaceBinding";
 
 const ISSUE_ID = "71aa708b-70a1-4b26-9e6f-fb8a9c31a4d2";
 const PHASE_B_PROMPT = [
