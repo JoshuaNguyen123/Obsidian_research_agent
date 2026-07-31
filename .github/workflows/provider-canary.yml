@@ -1,0 +1,72 @@
+name: Provider canary
+
+on:
+  # Manual-only, like every lane on this runner: the machine is personal,
+  # Obsidian must be closed, and the e2e lock is exclusive. No cron.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-canary-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: Self-hosted Windows / single-call model qualification
+    if: github.ref == 'refs/heads/main'
+    environment: protected-live-release
+    # Never execute untrusted pull-request code on this persistent machine.
+    runs-on: [self-hosted, Windows, X64, agentic-daily-use]
+    # The canary is one mission, one model call, one file assertion; the spec
+    # timeout is 15 minutes and anything past that is a hang, not a slow model.
+    timeout-minutes: 20
+    env:
+      E2E_PROTECTED_LOG_MODE: "1"
+      E2E_TRUST_DISPOSABLE_VAULT: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact trusted main tip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $trusted = (git rev-parse refs/remotes/origin/main).Trim().ToLowerInvariant()
+          if ($actual -ne $trusted -or $actual -ne "${{ github.sha }}") {
+            throw "Self-hosted execution accepts only the exact trusted origin/main tip."
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install verified Obsidian desktop
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "$env:LOCALAPPDATA\Obsidian\Obsidian.exe")) {
+            ./scripts/install-verified-obsidian.ps1
+          }
+
+      # The canary submits one mission ("append one marker sentence"), asserts
+      # the marker landed in the note, and attests the production run — the
+      # cheapest possible proof that a model qualifies for the real lanes.
+      # E2E_CANARY_MODEL is mandatory and overrides E2E_AI_MODEL for this lane,
+      # so the canary is authoritative about which model was qualified.
+      - name: Run the provider canary lane
+        shell: pwsh
+        env:
+          E2E_OLLAMA_API_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
+          E2E_CANARY_MODEL: ${{ vars.E2E_CANARY_MODEL }}
+        run: npm run test:e2e:provider-canary
