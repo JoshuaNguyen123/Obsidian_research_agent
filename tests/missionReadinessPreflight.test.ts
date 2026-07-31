@@ -187,6 +187,57 @@ test("isolated Linear-to-code handoff does not require an active note", () => {
   );
 });
 
+test("a blocked single-stage sandbox mission always produces a visible card", () => {
+  // Regression: the card builder returned null for !preflight.compound, and
+  // the single-stage sandbox gate reports compound:false — so a bare "write a
+  // checkers game on my desktop" with no sandbox silently failed to start:
+  // no chat line, no banner, just a re-focused prompt box.
+  const readiness = readyBundle().map((item) =>
+    item.id === "code"
+      ? row(
+          "code",
+          "Available",
+          "code",
+          "Install or repair Docker or the WSL2 sandbox, then run the boundary probe.",
+        )
+      : item,
+  );
+  const result = evaluateMissionReadinessPreflightV1({
+    prompt: "Can you create a cli checkers game in Python on my desktop?",
+    readiness,
+    activeNote: { hasActiveMarkdown: false },
+    cleanupAuthority: { deleteRepoAuthorized: null },
+    gitIdentityPinnedReady: true,
+    sandboxValidationRequired: true,
+  });
+  assert.equal(result.compound, false);
+  assert.equal(result.ok, false);
+  assert.equal(result.primary?.id, "sandbox");
+
+  const card = buildMissionReadinessCardModelV1(result);
+  assert.ok(card, "a blocked mission must explain itself");
+  assert.equal(card.title, missionReadinessCardTitle());
+  // The single-stage copy names the mission, not an end-to-end workflow.
+  assert.match(card.what, /This mission needs/u);
+  assert.equal(card.why, result.primary?.reason);
+  assert.match(card.next, /Install or repair/u);
+  assert.equal(card.primarySetupTarget, "code");
+  assert.ok(card.chatLine.length > 0);
+});
+
+test("a passing single-stage sandbox preflight still yields no card", () => {
+  const result = evaluateMissionReadinessPreflightV1({
+    prompt: "Can you create a cli checkers game in Python on my desktop?",
+    readiness: readyBundle(),
+    activeNote: { hasActiveMarkdown: false },
+    cleanupAuthority: { deleteRepoAuthorized: null },
+    gitIdentityPinnedReady: true,
+    sandboxValidationRequired: true,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(buildMissionReadinessCardModelV1(result), null);
+});
+
 test("pinned git identity helper matches host contract", () => {
   assert.equal(evaluatePinnedGitIdentityReadinessV1(), true);
 });

@@ -47,12 +47,19 @@ export function missionReadinessChatLine(missingSummaries: string[]): string {
 }
 
 /**
- * Builds the single Chat attention card model for a failed compound preflight.
+ * Builds the single Chat attention card model for a failed preflight.
+ *
+ * Covers both the compound gate and the single-stage sandbox-only gate. The
+ * builder previously returned null for `!preflight.compound`, but the
+ * single-stage sandbox gate reports `compound: false` with a populated
+ * `primary` — so a blocked bare code mission produced no card, no chat line,
+ * nothing: the mission silently failed to start with only a re-focused prompt
+ * box as evidence. A blocked mission must always explain itself.
  */
 export function buildMissionReadinessCardModelV1(
   preflight: MissionReadinessPreflightV1,
 ): MissionReadinessCardModelV1 | null {
-  if (preflight.ok || !preflight.compound || !preflight.primary) {
+  if (preflight.ok || !preflight.primary) {
     return null;
   }
   const missing = preflight.missing;
@@ -60,7 +67,9 @@ export function buildMissionReadinessCardModelV1(
   const labels = missing.map((item) => item.label);
   return {
     title: missionReadinessCardTitle(),
-    what: `End-to-end workflow needs ${labels.join(", ")} setup.`,
+    what: preflight.compound
+      ? `End-to-end workflow needs ${labels.join(", ")} setup.`
+      : `This mission needs ${labels.join(", ")} setup before it can start.`,
     why: primary.reason,
     next: primary.nextAction,
     missingLabels: labels,

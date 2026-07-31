@@ -1467,6 +1467,16 @@ export class AgentView extends ItemView {
       if (card) {
         this.appendLog("error", card.chatLine);
         this.renderMissionReadinessBlocker(card);
+      } else {
+        // Belt-and-braces: a blocked mission must never fail silently. The
+        // card builder covers every known failed-preflight shape, but if a
+        // future shape slips through, a plain chat line is still owed.
+        this.appendLog(
+          "error",
+          `Mission blocked before start: ${missionReadiness.missing
+            .map((item) => item.label)
+            .join(", ") || "required setup is missing"}.`,
+        );
       }
       this.promptEl?.focus();
       return null;

@@ -93,6 +93,63 @@ describe("CapabilityReadinessV2", () => {
     assert.equal(code?.nextAction, "Run sandbox boundary probe");
   });
 
+  it("surfaces the structured sandbox blocker on the scratch/desktop branch", () => {
+    // The common desktop flow has no repository binding, and that branch used
+    // to drop the blocker entirely: a user without WSL2 saw a generic
+    // "requires a fresh attested runtime probe" plus the useless advice to
+    // probe again. The blocker names the cause and the concrete fix.
+    const state = inputs();
+    state.code.repositoryProfileCount = 0;
+    state.code.executionAvailable = false;
+    state.code.probeObservedAt = null;
+    state.code.probeBlocker = {
+      code: "sandbox_provider_unavailable",
+      message:
+        "No sandbox provider has passed its boundary probe. wsl2 rejected: distribution not installed.",
+      requiredAction:
+        "Install or repair Docker, Podman, the dedicated WSL2 sandbox, or bubblewrap, then run the explicit boundary probe.",
+    };
+    const code = buildCapabilityReadinessV2(state, NOW).find(
+      (row) => row.id === "code",
+    );
+    assert.match(code?.reason ?? "", /wsl2 rejected: distribution not installed/iu);
+    // Editing staying available must still be stated — the blocker explains
+    // execution, not the whole capability.
+    assert.match(code?.reason ?? "", /editing and known-folder export are available/iu);
+    assert.match(code?.nextAction ?? "", /install or repair docker/iu);
+    assert.doesNotMatch(code?.nextAction ?? "", /^Run sandbox boundary probe$/u);
+  });
+
+  it("uses the structured blocker on the repository branch and accepts a plain string", () => {
+    const structured = inputs();
+    structured.code.executionAvailable = false;
+    structured.code.probeObservedAt = null;
+    structured.code.probeBlocker = {
+      message: "docker unavailable: daemon not running.",
+      requiredAction: "Start Docker Desktop, then run the boundary probe.",
+    };
+    const structuredRow = buildCapabilityReadinessV2(structured, NOW).find(
+      (row) => row.id === "code",
+    );
+    assert.match(structuredRow?.reason ?? "", /daemon not running/iu);
+    assert.equal(
+      structuredRow?.nextAction,
+      "Start Docker Desktop, then run the boundary probe.",
+    );
+
+    // A flattened string (e.g. a sanitized runtime error) still surfaces as
+    // the reason, with the generic probe advice as the only available action.
+    const flat = inputs();
+    flat.code.executionAvailable = false;
+    flat.code.probeObservedAt = null;
+    flat.code.probeBlocker = "Code runtime threw during status read.";
+    const flatRow = buildCapabilityReadinessV2(flat, NOW).find(
+      (row) => row.id === "code",
+    );
+    assert.match(flatRow?.reason ?? "", /threw during status read/iu);
+    assert.equal(flatRow?.nextAction, "Run sandbox boundary probe");
+  });
+
   it("gives every capability one stable setup target and plain-language next action", () => {
     const rows = buildCapabilityReadinessV2(inputs(), NOW);
     assert.deepEqual(

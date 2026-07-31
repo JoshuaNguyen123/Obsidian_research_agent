@@ -106,7 +106,15 @@ export interface CapabilityReadinessInputsV2 {
     editingAvailable: boolean;
     executionAvailable: boolean;
     probeObservedAt: string | null;
-    probeBlocker: string | null;
+    /**
+     * The sandbox manager's durable blocker. The structured form carries the
+     * per-provider diagnostics (`message`) and the concrete fix
+     * (`requiredAction`) — flattening it to a bare message is what used to
+     * leave the tile advising "run the probe again" when the true state was
+     * "WSL2 is not installed". A plain string is still accepted for callers
+     * that only have a flattened diagnostic.
+     */
+    probeBlocker: SandboxProbeBlockerV1 | string | null;
   };
   linear: {
     credentialPresent: boolean;
@@ -133,6 +141,27 @@ export interface CapabilityReadinessInputsV2 {
     checkedAt: string | null;
     blocker: string | null;
   };
+}
+
+export interface SandboxProbeBlockerV1 {
+  code?: string;
+  message: string;
+  requiredAction?: string;
+}
+
+function probeBlockerMessage(
+  blocker: SandboxProbeBlockerV1 | string | null,
+): string | null {
+  if (!blocker) return null;
+  const message = typeof blocker === "string" ? blocker : blocker.message;
+  return message?.trim() ? message.trim() : null;
+}
+
+function probeBlockerAction(
+  blocker: SandboxProbeBlockerV1 | string | null,
+): string | null {
+  if (!blocker || typeof blocker === "string") return null;
+  return blocker.requiredAction?.trim() ? blocker.requiredAction.trim() : null;
 }
 
 export function buildCapabilityReadinessV2(
@@ -207,6 +236,14 @@ export function buildCapabilityReadinessV2(
         : input.code.probeObservedAt
           ? "Degraded"
           : "Setup needed";
+  // The blocker's message names WHY execution is unavailable (per-provider
+  // diagnostics) and its requiredAction names the actual fix. Both branches
+  // must consult it: the scratch/desktop flow (repositoryProfileCount === 0)
+  // is the most common one, and it used to drop the blocker entirely — a user
+  // without WSL2 saw a generic "requires a fresh attested runtime probe" and
+  // the useless advice to probe again.
+  const blockerMessage = probeBlockerMessage(input.code.probeBlocker);
+  const blockerAction = probeBlockerAction(input.code.probeBlocker);
   const code = readiness({
     id: "code",
     name: "Code",
@@ -216,12 +253,14 @@ export function buildCapabilityReadinessV2(
       : input.code.repositoryProfileCount === 0
         ? input.code.executionAvailable && probeFresh
           ? "Scratch workspace editing, sandbox validation, and known-folder export are ready without a repository binding. A trusted binding is required only for repository work."
-          : "Scratch workspace editing and known-folder export are available without a repository binding. Sandbox validation requires a fresh attested runtime probe."
+          : blockerMessage
+            ? `Scratch workspace editing and known-folder export are available; sandbox execution is not: ${blockerMessage}`
+            : "Scratch workspace editing and known-folder export are available without a repository binding. Sandbox validation requires a fresh attested runtime probe."
         : input.code.runtimeUnresolvedProfileCount > 0
           ? `${input.code.runtimeUnresolvedProfileCount} trusted repository profile(s) still require a fresh immutable runtime binding.`
         : input.code.executionAvailable && probeFresh
           ? `Trusted repository binding and a fresh attested sandbox probe are ready (${input.code.repositoryProfileCount} profile(s)).`
-          : input.code.probeBlocker ??
+          : blockerMessage ??
             "Repository editing remains available, but execution requires a fresh attested sandbox probe.",
     evidenceAt: input.code.probeObservedAt ?? input.observedAt,
     nextAction: !input.code.registered
@@ -229,12 +268,12 @@ export function buildCapabilityReadinessV2(
       : input.code.repositoryProfileCount === 0
         ? codeStatus === "Ready"
           ? "Review Code setup"
-          : "Run sandbox boundary probe"
+          : blockerAction ?? "Run sandbox boundary probe"
         : input.code.runtimeUnresolvedProfileCount > 0
           ? "Refresh repository runtime binding"
         : codeStatus === "Ready"
           ? "Review execution setup"
-          : "Run sandbox boundary probe",
+          : blockerAction ?? "Run sandbox boundary probe",
     setupTarget: "code",
   });
 

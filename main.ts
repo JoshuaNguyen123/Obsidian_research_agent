@@ -6592,7 +6592,11 @@ export default class AgenticResearcherPlugin extends Plugin {
       getSandboxCapabilityStatus?(): {
         editingAvailable: boolean;
         executionAvailable: boolean;
-        blocker: { message: string } | null;
+        blocker: {
+          code?: string;
+          message: string;
+          requiredAction?: string;
+        } | null;
       };
       readCapabilityState?(): {
         repositoryProfiles: Record<string, unknown>;
@@ -6605,7 +6609,13 @@ export default class AgenticResearcherPlugin extends Plugin {
     let codeEditingAvailable = false;
     let codeExecutionAvailable = false;
     let codeProbeObservedAt: string | null = null;
-    let codeProbeBlocker: string | null = null;
+    // Structured, not flattened: the blocker's requiredAction is the concrete
+    // fix ("install WSL2…"), and flattening to .message used to leave the
+    // readiness tile advising "run the probe again" regardless of cause.
+    let codeProbeBlocker:
+      | { code?: string; message: string; requiredAction?: string }
+      | string
+      | null = null;
     try {
       const state = codeRuntime?.readCapabilityState?.();
       const sandbox = codeRuntime?.getSandboxCapabilityStatus?.();
@@ -6615,7 +6625,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       codeProbeObservedAt = state?.sandbox.lastProbe?.observedAt ?? null;
       codeEditingAvailable = sandbox?.editingAvailable === true;
       codeExecutionAvailable = sandbox?.executionAvailable === true;
-      codeProbeBlocker = sandbox?.blocker?.message ?? null;
+      codeProbeBlocker = sandbox?.blocker ?? null;
     } catch (error) {
       codeProbeBlocker = sanitizeExtensionRuntimeError(error);
     }
