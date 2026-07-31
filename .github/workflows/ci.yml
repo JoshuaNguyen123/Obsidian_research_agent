@@ -63,14 +63,13 @@ jobs:
       - name: Install Companion dependencies
         run: python -m pip install --disable-pip-version-check -r companion/requirements.txt
 
-      - name: Unit tests
-        run: npm test
-
-      - name: Path hygiene
-        run: npm run check:path-hygiene
-
-      - name: Build unified plugin artifact
-        run: npm run build
+      # test:ci = path hygiene + style tokens + unit tests + build. Calling the
+      # npm script instead of hand-listing steps keeps this workflow in
+      # lockstep with package.json — the previous hand-listed version had
+      # silently dropped check:style-tokens, the AGENTS.md-mandated gate
+      # against hardcoded colors in styles.css.
+      - name: Validation suite (hygiene, style tokens, unit tests, build)
+        run: npm run test:ci
 
       - name: Companion tests
         run: npm run test:companion
