@@ -19,6 +19,10 @@ export interface ApprovalSurfaceObservationV1 {
   toolName: string;
   destination: string;
   summary: string;
+  /** The `target=<system:resourceType> <id> <url>` meta line, or "". */
+  targetLine: string;
+  /** The `fingerprint=sha256:… outbound=…B confirmation=i/n` meta line, or "". */
+  fingerprintLine: string;
   hasApprove: boolean;
   hasDeny: boolean;
 }
@@ -39,10 +43,21 @@ export async function readApprovalSurfaceV1(
       ? ((await node.first().textContent()) ?? "").trim()
       : "";
   };
+  // The meta rows are positional (policy, target, fingerprint, decision), so
+  // read them all and pick lines by their stable prefixes.
+  const metaLines: string[] = [];
+  const metaNodes = card.locator(".agentic-researcher-approval-meta");
+  const metaCount = await metaNodes.count();
+  for (let index = 0; index < metaCount; index += 1) {
+    metaLines.push(((await metaNodes.nth(index).textContent()) ?? "").trim());
+  }
   return {
     toolName: await text(".agentic-researcher-approval-title"),
     destination: await text(".agentic-researcher-approval-destination"),
     summary: await text(".agentic-researcher-approval-summary"),
+    targetLine: metaLines.find((line) => line.startsWith("target=")) ?? "",
+    fingerprintLine:
+      metaLines.find((line) => line.startsWith("fingerprint=")) ?? "",
     hasApprove:
       (await card.locator(".agentic-researcher-approval-approve").count()) > 0,
     hasDeny:
@@ -68,6 +83,17 @@ export async function assertApprovalSurfaceUsableV1(
   expect(surface.hasApprove && surface.hasDeny, "both decisions must be offered").toBe(
     true,
   );
+  // A prepared card (one with a destination) must also carry its provenance:
+  // the target it will mutate and the payload fingerprint the user is
+  // approving. These are what make an approval auditable after the fact.
+  expect(
+    surface.targetLine,
+    "the card must name the exact target resource",
+  ).toMatch(/^target=\S/u);
+  expect(
+    surface.fingerprintLine,
+    "the card must carry the payload fingerprint being authorized",
+  ).toMatch(/^fingerprint=sha256:/u);
   return surface;
 }
 

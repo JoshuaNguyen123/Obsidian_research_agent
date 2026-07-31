@@ -20,6 +20,7 @@ import {
   type ApprovalRequest,
 } from "./agent/approvalBroker";
 import type { MissionScorecardV1 } from "./agent/missionScorecard";
+import { formatApprovalCardModelV1 } from "./ui/approvalCardModel";
 import type {
   ClarificationBroker,
   ClarificationRequest,
@@ -2439,68 +2440,57 @@ export class AgentView extends ItemView {
     this.clearPlaceholder(this.actionsDetailsEl);
     this.setRunDetailsNeedsAttention(true);
     this.renderChatApprovalAttention(request);
+    // Every user-visible string comes from the pure model so the card's
+    // wording is unit-tested and e2e-assertable. The rendered text must stay
+    // byte-identical to the model's output — do not compose strings inline
+    // here again.
+    const model = formatApprovalCardModelV1(request);
     const cardEl = this.actionsDetailsEl.createDiv({
       cls: "agentic-researcher-approval-card",
       attr: { "data-approval-id": request.id },
     });
     cardEl.createDiv({
-      text: `${request.toolName}: ${request.action}`,
+      text: model.title,
       cls: "agentic-researcher-approval-title",
     });
     cardEl.createDiv({
-      text: request.reason,
+      text: model.reason,
       cls: "agentic-researcher-approval-reason",
     });
     cardEl.createDiv({
-      text: `policy=${request.policyTags.join(",") || "approval_required"}`,
+      text: model.policyLine,
       cls: "agentic-researcher-approval-meta",
     });
-    if (request.preparedAction) {
-      const prepared = request.preparedAction;
+    if (model.preview) {
+      const preview = model.preview;
       const previewEl = cardEl.createDiv({
         cls: "agentic-researcher-approval-preview",
       });
       previewEl.createDiv({
-        text: prepared.preview.destination,
+        text: preview.destination,
         cls: "agentic-researcher-approval-destination",
       });
       previewEl.createDiv({
-        text: prepared.preview.summary,
+        text: preview.summary,
         cls: "agentic-researcher-approval-summary",
       });
-      const targetParts = [
-        `${prepared.target.system}:${prepared.target.resourceType}`,
-        prepared.target.identifier ?? prepared.target.id,
-        prepared.target.url,
-      ].filter((item): item is string => Boolean(item));
       previewEl.createDiv({
-        text: `target=${targetParts.join(" ")}`,
+        text: preview.targetLine,
         cls: "agentic-researcher-approval-meta",
       });
-      if (prepared.preview.before || prepared.preview.after) {
+      if (preview.diffJson) {
         const diffEl = previewEl.createEl("pre", {
           cls: "agentic-researcher-approval-payload",
         });
-        diffEl.setText(
-          JSON.stringify(
-            {
-              before: prepared.preview.before ?? null,
-              after: prepared.preview.after ?? null,
-            },
-            null,
-            2,
-          ),
-        );
+        diffEl.setText(preview.diffJson);
       }
-      if (prepared.preview.outboundPayload) {
+      if (preview.outboundPayloadJson) {
         const payloadEl = previewEl.createEl("pre", {
           cls: "agentic-researcher-approval-payload",
         });
-        payloadEl.setText(
-          JSON.stringify(prepared.preview.outboundPayload, null, 2),
-        );
+        payloadEl.setText(preview.outboundPayloadJson);
       }
-      if ((prepared.preview.duplicateCandidates?.length ?? 0) > 0) {
+      if (preview.duplicateLines.length > 0) {
         const duplicatesEl = previewEl.createDiv({
           cls: "agentic-researcher-approval-duplicates",
         });
@@ -2508,23 +2498,21 @@ export class AgentView extends ItemView {
           text: "Possible duplicates",
           cls: "agentic-researcher-approval-summary",
         });
-        for (const candidate of prepared.preview.duplicateCandidates ?? []) {
+        for (const line of preview.duplicateLines) {
           duplicatesEl.createDiv({
-            text: `${candidate.identifier ?? candidate.id}${candidate.url ? ` — ${candidate.url}` : ""}`,
+            text: line,
             cls: "agentic-researcher-approval-meta",
           });
         }
       }
-      for (const warning of prepared.preview.warnings) {
+      for (const line of preview.warningLines) {
         previewEl.createDiv({
-          text: `warning=${warning}`,
+          text: line,
           cls: "agentic-researcher-approval-warning",
         });
       }
-      const confirmation = request.requiredConfirmations ?? 1;
-      const confirmationIndex = request.confirmationIndex ?? 1;
       previewEl.createDiv({
-        text: `fingerprint=${prepared.payloadFingerprint.slice(0, 24)}… outbound=${prepared.preview.outboundBytes}B confirmation=${confirmationIndex}/${confirmation}`,
+        text: preview.fingerprintLine,
         cls: "agentic-researcher-approval-meta",
       });
     }
@@ -2532,17 +2520,12 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-approval-controls",
     });
     const approveButton = controlsEl.createEl("button", {
-      text:
-        request.requiredConfirmations === 2
-          ? request.confirmationIndex === 2
-            ? "Confirm permanent delete"
-            : "Approve deletion"
-          : "Approve",
+      text: model.approveLabel,
       cls: "agentic-researcher-secondary-action agentic-researcher-approval-approve",
       attr: { type: "button" },
     });
     const denyButton = controlsEl.createEl("button", {
-      text: "Deny",
+      text: model.denyLabel,
       cls: "agentic-researcher-secondary-action agentic-researcher-approval-deny",
       attr: { type: "button" },
     });
@@ -4989,6 +4972,18 @@ export class AgentView extends ItemView {
       text: request.reason,
       cls: "agentic-researcher-chat-attention-body",
     });
+    // The chat banner offers the same Approve/Deny authority as the Activity
+    // card, so it owes the user the same minimum context: WHERE the mutation
+    // is going. Title and reason alone let a user approve an outbound write
+    // without ever seeing its destination.
+    const attentionModel = formatApprovalCardModelV1(request);
+    if (attentionModel.preview?.destination) {
+      banner.createDiv({
+        text: attentionModel.preview.destination,
+        cls: "agentic-researcher-chat-attention-body",
+        attr: { "data-testid": "chat-approval-destination" },
+      });
+    }
     const controls = banner.createDiv({
       cls: "agentic-researcher-chat-attention-controls",
     });

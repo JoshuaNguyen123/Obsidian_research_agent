@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 
 import { startRealAiHarness, type RealAiHarness } from "./fixtures/realAiHarness";
 import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
+import { assertApprovalSurfaceUsableV1 } from "./fixtures/uiSurfaceAssertions";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 
 test.describe("Daily-use live research contract", () => {
@@ -324,7 +325,11 @@ test.describe("Daily-use live research contract", () => {
       await harness.page.getByRole("tab", { name: "Activity" }).click();
       const denied = harness.activePreparedApproval("replace_current_file");
       await expect(denied).toBeVisible({ timeout: harness.config.missionTimeoutMs });
-      await expect(denied).toContainText("fingerprint=sha256:");
+      // Full approval-surface contract, not just the fingerprint substring:
+      // the card must name the tool, the destination, the exact target, the
+      // payload fingerprint, and offer both decisions.
+      const approvalSurface = await assertApprovalSurfaceUsableV1(harness.page);
+      expect(approvalSurface.toolName).toContain("replace_current_file");
       expect(await readFile(harness.noteFilePath, "utf8")).toBe(original);
       await harness.deny(denied);
       const activeHarness = harness;
@@ -398,6 +403,7 @@ test.describe("Daily-use live research contract", () => {
       await harness.page.getByRole("tab", { name: "Activity" }).click();
       const approved = harness.activePreparedApproval("replace_current_file");
       await expect(approved).toBeVisible({ timeout: harness.config.missionTimeoutMs });
+      await assertApprovalSurfaceUsableV1(harness.page);
       await harness.approve(approved);
       await harness.waitForMissionComplete();
       const content = await readFile(harness.noteFilePath, "utf8");
