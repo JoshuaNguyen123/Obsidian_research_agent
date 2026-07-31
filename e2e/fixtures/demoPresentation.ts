@@ -503,7 +503,7 @@ export function waitForDemoMissionBrokerV1(
  * acceptance stay visible while presentation-only diagnostics remain hidden.
  */
 export async function prepareDemoFinaleV1(page: Page): Promise<void> {
-  await page.getByRole("tab", { name: "Run Details" }).click();
+  await page.getByRole("tab", { name: "Activity" }).click();
   await page.evaluate(() => {
     document
       .querySelectorAll<HTMLDetailsElement>(

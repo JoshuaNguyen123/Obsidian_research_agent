@@ -9,27 +9,33 @@ const viewports = [
   { name: "mobile", width: 390, height: 844 },
 ] as const;
 
-test("initial load is poster-only and the Researcher demo is the default", async ({
+test("initial load is executive, black, poster-only, Researcher-default", async ({
   page,
 }) => {
-  const mediaRequests: string[] = [];
+  const videoRequests: string[] = [];
   page.on("request", (request) => {
-    if (/\.(?:jpe?g|mp4|webm)(?:\?|$)/iu.test(request.url())) {
-      mediaRequests.push(request.url());
+    if (/\.(?:mp4|webm)(?:\?|$)/iu.test(request.url())) {
+      videoRequests.push(request.url());
     }
   });
 
   await page.goto("/");
   await page.waitForLoadState("networkidle");
 
-  const video = page.locator("#role-demo");
   await expect(
     page.getByRole("heading", {
       level: 1,
-      name: "Research and build from the notes you already have.",
+      name: "The research assistant that works inside your vault.",
     }),
   ).toBeVisible();
   await expect(page.locator("main > section")).toHaveCount(4);
+
+  // Executive black-and-white surface.
+  const bg = await page.evaluate(
+    () => getComputedStyle(document.body).backgroundColor,
+  );
+  expect(bg).toBe("rgb(0, 0, 0)");
+
   for (const assurance of [
     "Local-first context",
     "Append-first writing",
@@ -45,50 +51,79 @@ test("initial load is poster-only and the Researcher demo is the default", async
       name: "Bring the next task into your vault.",
     }),
   ).toBeAttached();
+
   await expect(page.getByRole("tab", { name: "Researcher" })).toHaveAttribute(
     "aria-selected",
     "true",
   );
+
+  const video = page.locator("#role-demo");
   await expect(video).toHaveAttribute(
     "poster",
     mediaPath("researcher-demo-poster.jpg"),
   );
+  await expect(video).toHaveAttribute("preload", "none");
   const webmSource = video.locator('source[type="video/webm"]');
-  const mp4Source = video.locator('source[type="video/mp4"]');
   await expect(webmSource).toHaveAttribute(
     "data-src",
     mediaPath("researcher-demo.webm"),
   );
-  await expect(mp4Source).toHaveAttribute(
-    "data-src",
-    mediaPath("researcher-demo.mp4"),
-  );
   expect(await webmSource.getAttribute("src")).toBeNull();
-  expect(await mp4Source.getAttribute("src")).toBeNull();
-  await expect(
-    page.getByRole("button", { name: "Play 21-second Researcher demo" }),
-  ).toBeVisible();
-  await expect(page.locator("#demo-poster-image")).toHaveAttribute(
-    "src",
-    mediaPath("researcher-demo-poster.jpg"),
-  );
-  await expect(video).toHaveAttribute("preload", "none");
-  expect(
-    await video.evaluate((element: HTMLVideoElement) => ({
-      autoplay: element.autoplay,
-      controls: element.controls,
-      paused: element.paused,
-    })),
-  ).toEqual({ autoplay: false, controls: true, paused: true });
-  expect(
-    mediaRequests.filter((url) => /\.(?:mp4|webm)(?:\?|$)/iu.test(url)),
-  ).toEqual([]);
-  expect(
-    mediaRequests.every((url) => /\.jpe?g(?:\?|$)/iu.test(url)),
-  ).toBe(true);
+
+  // Nothing heavy streams before the run scrolls into view.
+  expect(videoRequests).toEqual([]);
 });
 
-test("mouse and keyboard role switching update one accessible media panel", async ({
+test("scrolling scrubs the run: currentTime and progress advance with scroll", async ({
+  page,
+}) => {
+  await page.goto("/");
+  // Drive scroll to ~60% through the pinned demo track.
+  await page.evaluate(() => {
+    const track = document.querySelector(".demo-scroll") as HTMLElement;
+    const absTop = track.getBoundingClientRect().top + window.scrollY;
+    const start = absTop - 64;
+    const end = absTop + track.offsetHeight - window.innerHeight;
+    window.scrollTo(0, start + (end - start) * 0.6);
+    window.dispatchEvent(new Event("scroll"));
+  });
+
+  const video = page.locator("#role-demo");
+  // The active source is lazily attached once the run enters the viewport.
+  await expect(video.locator('source[type="video/mp4"]')).toHaveAttribute(
+    "src",
+    mediaPath("researcher-demo.mp4"),
+  );
+
+  // Nudge the scroll a few times so the metadata-loaded video seeks.
+  await expect
+    .poll(
+      async () => {
+        await page.evaluate(() =>
+          window.dispatchEvent(new Event("scroll")),
+        );
+        return page
+          .locator("#role-demo")
+          .evaluate((element: HTMLVideoElement) => element.currentTime);
+      },
+      { timeout: 8_000 },
+    )
+    .toBeGreaterThan(0.1);
+
+  const fillWidth = await page.evaluate(
+    () =>
+      (document.querySelector("#demo-scrubline-fill") as HTMLElement).style
+        .width,
+  );
+  expect(parseFloat(fillWidth)).toBeGreaterThan(0);
+
+  const activeSteps = await page
+    .locator('#demo-steps li[data-active="true"]')
+    .count();
+  expect(activeSteps).toBeGreaterThan(0);
+});
+
+test("mouse and keyboard role switching update one accessible panel", async ({
   page,
 }) => {
   await page.goto("/#demos");
@@ -115,21 +150,8 @@ test("mouse and keyboard role switching update one accessible media panel", asyn
     "data-src",
     mediaPath("builder-demo.webm"),
   );
-  expect(
-    await video.locator('source[type="video/webm"]').getAttribute("src"),
-  ).toBeNull();
-  await expect(page.locator("#demo-poster-image")).toHaveAttribute(
-    "src",
-    mediaPath("builder-demo-poster.jpg"),
-  );
   await expect(
-    page.getByRole("button", { name: "Play 25-second Builder demo" }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Targeted + full validation", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Builder demo transcript", { exact: true }),
+    page.getByText("Runs targeted and full checks", { exact: true }),
   ).toBeVisible();
 
   await builder.focus();
@@ -140,103 +162,41 @@ test("mouse and keyboard role switching update one accessible media panel", asyn
   await researcher.press("End");
   await expect(builder).toBeFocused();
   await expect(builder).toHaveAttribute("aria-selected", "true");
-  expect(
-    await video.evaluate((element: HTMLVideoElement) => element.paused),
-  ).toBe(true);
-});
-
-test("poster activation loads only the selected role and reveals native playback", async ({
-  page,
-}) => {
-  const videoRequests: string[] = [];
-  page.on("request", (request) => {
-    if (/\.(?:mp4|webm)(?:\?|$)/iu.test(request.url())) {
-      videoRequests.push(request.url());
-    }
-  });
-
-  await page.goto("/#demos");
-  await page.getByRole("tab", { name: "Builder" }).click();
-  const playButton = page.getByRole("button", {
-    name: "Play 25-second Builder demo",
-  });
-  const requestedMedia = page.waitForRequest((request) =>
-    /builder-demo\.(?:mp4|webm)(?:\?|$)/iu.test(request.url()),
-  );
-  await playButton.click();
-  await requestedMedia;
-
-  const video = page.locator("#role-demo");
-  await expect(playButton).toBeHidden();
-  await expect(video.locator('source[type="video/webm"]')).toHaveAttribute(
-    "src",
-    mediaPath("builder-demo.webm"),
-  );
-  await expect(video.locator('source[type="video/mp4"]')).toHaveAttribute(
-    "src",
-    mediaPath("builder-demo.mp4"),
-  );
-  expect(
-    await video.evaluate((element: HTMLVideoElement) => ({
-      autoplay: element.autoplay,
-      controls: element.controls,
-    })),
-  ).toEqual({ autoplay: false, controls: true });
-  expect(videoRequests.some((url) => /builder-demo\./iu.test(url))).toBe(true);
-  expect(videoRequests.some((url) => /researcher-demo\./iu.test(url))).toBe(false);
-  await video.evaluate((element: HTMLVideoElement) => element.pause());
 });
 
 for (const viewport of viewports) {
-  test(
-    `${viewport.name} layout has no horizontal overflow`,
-    async ({ page }, testInfo) => {
-      await page.setViewportSize(viewport);
-      await page.goto("/");
-      await expect(page.locator("#hero-title")).toBeVisible();
-      await page.screenshot({
-        path: testInfo.outputPath(`${viewport.name}-hero.png`),
-        animations: "disabled",
-        caret: "hide",
-      });
+  test(`${viewport.name} layout has no horizontal overflow`, async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(viewport);
+    await page.goto("/");
+    await expect(page.locator("#hero-title")).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath(`${viewport.name}-hero.png`),
+      animations: "disabled",
+      caret: "hide",
+    });
 
-      await page.getByRole("link", { name: "Watch the demos" }).click();
-      await expect(page).toHaveURL(/#demos$/u);
-      await expect(
-        page.getByRole("tablist", { name: "Choose a demo role" }),
-      ).toBeVisible();
-      await expect(page.locator("#role-demo")).toBeVisible();
-      await expect
-        .poll(
-          () =>
-            page.evaluate(
-              () =>
-                document.querySelector("#demos")?.getBoundingClientRect().top ??
-                Number.POSITIVE_INFINITY,
-            ),
-          { timeout: 5_000 },
-        )
-        .toBeLessThan(90);
+    const dimensions = await page.evaluate(() => ({
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    }));
+    expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
 
-      const dimensions = await page.evaluate(() => ({
-        clientWidth: document.documentElement.clientWidth,
-        scrollWidth: document.documentElement.scrollWidth,
-        demoTop: document.querySelector("#demos")?.getBoundingClientRect().top ?? null,
-      }));
-      expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
-      expect(dimensions.demoTop).not.toBeNull();
-      expect(dimensions.demoTop as number).toBeGreaterThanOrEqual(55);
-      expect(dimensions.demoTop as number).toBeLessThan(90);
-      await page.screenshot({
-        path: testInfo.outputPath(`${viewport.name}-demos.png`),
-        animations: "disabled",
-        caret: "hide",
-      });
-    },
-  );
+    await page.locator("#demos").scrollIntoViewIfNeeded();
+    await expect(
+      page.getByRole("tablist", { name: "Choose a demo role" }),
+    ).toBeVisible();
+    await expect(page.locator("#role-demo")).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath(`${viewport.name}-demos.png`),
+      animations: "disabled",
+      caret: "hide",
+    });
+  });
 }
 
-test("mobile keeps the heading, selector, and 16:9 poster readable", async ({
+test("mobile keeps the heading, selector, and 16:9 frame readable", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -244,29 +204,22 @@ test("mobile keeps the heading, selector, and 16:9 poster readable", async ({
 
   const heading = page.getByRole("heading", {
     level: 2,
-    name: "Choose the role. Give it the outcome.",
+    name: "Scroll to watch a real run unfold.",
   });
   const tablist = page.getByRole("tablist", { name: "Choose a demo role" });
-  const video = page.locator("#role-demo");
+  const frame = page.locator("#role-demo");
   await expect(heading).toBeVisible();
   await expect(tablist).toBeVisible();
-  await expect(video).toBeVisible();
+  await expect(frame).toBeVisible();
 
-  const [headingBox, tablistBox, videoBox] = await Promise.all([
-    heading.boundingBox(),
-    tablist.boundingBox(),
-    video.boundingBox(),
-  ]);
-  expect(headingBox?.width ?? 0).toBeGreaterThan(300);
-  expect(tablistBox?.width ?? 0).toBeGreaterThan(340);
-  expect(videoBox?.width ?? 0).toBeGreaterThanOrEqual(388);
-  expect(videoBox?.height ?? 0).toBeGreaterThanOrEqual(215);
-  expect(Math.abs((videoBox?.width ?? 0) / (videoBox?.height ?? 1) - 16 / 9)).toBeLessThan(
-    0.03,
+  const box = await frame.boundingBox();
+  expect(box?.width ?? 0).toBeGreaterThan(300);
+  expect(Math.abs((box?.width ?? 0) / (box?.height ?? 1) - 16 / 9)).toBeLessThan(
+    0.05,
   );
 });
 
-test("reduced-motion preference disables smooth scrolling and transitions", async ({
+test("reduced motion disables scrubbing, smooth scroll, and transitions", async ({
   page,
 }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
@@ -276,11 +229,15 @@ test("reduced-motion preference disables smooth scrolling and transitions", asyn
     buttonTransition: getComputedStyle(
       document.querySelector(".button") as HTMLElement,
     ).transitionDuration,
-    playTransition: getComputedStyle(
-      document.querySelector(".demo-play-icon") as HTMLElement,
-    ).transitionDuration,
+    stagePosition: getComputedStyle(
+      document.querySelector(".demo-stage") as HTMLElement,
+    ).position,
   }));
   expect(motion.scrollBehavior).toBe("auto");
   expect(motion.buttonTransition).toBe("0s");
-  expect(motion.playTransition).toBe("0s");
+  // No scrub track under reduced motion: the stage is a static block.
+  expect(motion.stagePosition).toBe("static");
+
+  // The run stays viewable via native controls instead of scroll scrubbing.
+  await expect(page.locator("#role-demo")).toHaveJSProperty("controls", true);
 });

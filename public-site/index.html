@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Agentic Researcher is a native Obsidian assistant that reads context, runs approved tools, writes back, and shows receipts."
+      content="Agentic Researcher is a native Obsidian assistant that reads context, runs approved tools, writes back, and shows receipts — autonomously, for as long as the question deserves."
     />
-    <meta name="theme-color" content="#0d0e10" />
+    <meta name="theme-color" content="#000000" />
     <title>Agentic Researcher for Obsidian</title>
     <link rel="stylesheet" href="./styles.css" />
     <script src="./site.js" defer></script>
@@ -22,7 +22,7 @@
           <span>Agentic Researcher</span>
         </a>
         <nav aria-label="Primary navigation">
-          <a href="#demos">Demos</a>
+          <a href="#demos">Demo</a>
           <a href="#trust">Trust</a>
           <a
             class="nav-cta"
@@ -34,67 +34,79 @@
 
     <main id="main">
       <section class="hero" id="top" aria-labelledby="hero-title">
-        <p class="kicker">Native Obsidian assistant &middot; Open source</p>
-        <h1 id="hero-title">Research and build from the notes you already have.</h1>
+        <p class="kicker">Native Obsidian assistant</p>
+        <h1 id="hero-title">The research assistant that works inside your vault.</h1>
         <p class="lede">
-          One native Obsidian assistant that reads context, runs approved tools, writes back,
-          and shows the receipts.
+          It reads your notes, runs approved tools, and writes back cited, verifiable
+          results — autonomously, for as long as the question truly deserves.
         </p>
         <div class="hero-actions">
-          <a class="button primary" href="#demos">Watch the demos</a>
+          <a class="button primary" href="#demos">See it work</a>
           <a
             class="button secondary"
             href="https://github.com/JoshuaNguyen123/Obsidian_research_agent#install-for-development"
           >Install the development build</a>
         </div>
+        <dl class="hero-stats" aria-label="What a run produces">
+          <div>
+            <dt>Reads</dt>
+            <dd>Your notes and approved sources</dd>
+          </div>
+          <div>
+            <dt>Runs</dt>
+            <dd>Only the tools you allow</dd>
+          </div>
+          <div>
+            <dt>Returns</dt>
+            <dd>Cited results with receipts</dd>
+          </div>
+        </dl>
       </section>
 
-      <section class="role-showcase" id="demos" aria-labelledby="demos-title">
-        <div class="demo-heading">
-          <div>
-            <p class="kicker">Two ways to work</p>
-            <h2 id="demos-title">Choose the role. Give it the outcome.</h2>
+      <section class="demo-scroll" id="demos" aria-labelledby="demos-title">
+        <div class="demo-stage">
+          <div class="demo-intro">
+            <p class="kicker">One autonomous run</p>
+            <h2 id="demos-title">Scroll to watch a real run unfold.</h2>
+            <div class="role-tabs" role="tablist" aria-label="Choose a demo role">
+              <button
+                id="researcher-tab"
+                class="role-tab"
+                type="button"
+                role="tab"
+                aria-selected="true"
+                aria-controls="demo-panel"
+                data-demo-role="researcher"
+                tabindex="0"
+              >Researcher</button>
+              <button
+                id="builder-tab"
+                class="role-tab"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="demo-panel"
+                data-demo-role="builder"
+                tabindex="-1"
+              >Builder</button>
+            </div>
           </div>
-          <div class="role-tabs" role="tablist" aria-label="Choose a demo role">
-            <button
-              id="researcher-tab"
-              class="role-tab"
-              type="button"
-              role="tab"
-              aria-selected="true"
-              aria-controls="demo-panel"
-              data-demo-role="researcher"
-              tabindex="0"
-            >Researcher</button>
-            <button
-              id="builder-tab"
-              class="role-tab"
-              type="button"
-              role="tab"
-              aria-selected="false"
-              aria-controls="demo-panel"
-              data-demo-role="builder"
-              tabindex="-1"
-            >Builder</button>
-          </div>
-        </div>
 
-        <div
-          class="demo-panel"
-          id="demo-panel"
-          role="tabpanel"
-          aria-labelledby="researcher-tab"
-          tabindex="0"
-        >
-          <div class="demo-media">
+          <div
+            class="demo-frame"
+            id="demo-panel"
+            role="tabpanel"
+            aria-labelledby="researcher-tab"
+            tabindex="0"
+          >
             <video
               id="role-demo"
-              controls
+              muted
               playsinline
               preload="none"
               poster="./media/researcher-demo-poster.jpg?v=2026-07-30-clean-demos-v2"
               aria-label="Researcher demo: a real run turns a note-search brief into a cited decision"
-              aria-describedby="demo-description demo-run-note"
+              aria-describedby="demo-description"
             >
               <source
                 id="role-demo-webm"
@@ -108,72 +120,32 @@
               />
               Your browser does not support embedded video.
             </video>
-            <button
-              class="demo-play"
-              id="demo-play"
-              type="button"
-              aria-label="Play 21-second Researcher demo"
-            >
-              <img
-                id="demo-poster-image"
-                src="./media/researcher-demo-poster.jpg?v=2026-07-30-clean-demos-v2"
-                alt=""
-              />
-              <span class="demo-play-icon" aria-hidden="true">&#9654;</span>
-            </button>
-          </div>
-
-          <div class="demo-info">
-            <div class="demo-outcome">
-              <p class="role-label" id="demo-role-label">Researcher</p>
-              <h3 id="demo-outcome">Turn a research brief into a cited decision.</h3>
-              <p id="demo-description">
-                The agent reads one useful note, checks its two linked sources, and appends a
-                compact decision with citations and a verified write receipt.
-              </p>
+            <div class="demo-scrubline" aria-hidden="true">
+              <span class="demo-scrubline-fill" id="demo-scrubline-fill"></span>
             </div>
-            <ul class="demo-proof" id="demo-proof" aria-label="Researcher demo proof">
-              <li>Active-note brief</li>
-              <li>Two source readbacks</li>
-              <li>Verified append</li>
-            </ul>
           </div>
 
-          <p class="real-run-note" id="demo-run-note">
-            A genuine release-build run, edited only for time. No simulated agent states.
-          </p>
-
-          <details class="transcript" id="demo-transcript">
-            <summary id="demo-transcript-summary">Researcher demo transcript</summary>
-            <ol id="demo-transcript-steps">
-              <li>The active note defines a real note-search decision and links two sources.</li>
-              <li>The user asks the agent to compare only those sources.</li>
-              <li>A concise, cited decision is appended to the note.</li>
-              <li>Run Details confirms the append with a verified receipt.</li>
+          <aside class="demo-readout">
+            <p class="role-label" id="demo-role-label">Researcher</p>
+            <h3 id="demo-outcome">Turn a research brief into a cited decision.</h3>
+            <p id="demo-description">
+              The agent reads one useful note, checks its two linked sources, and appends a
+              compact decision with citations and a verified write receipt.
+            </p>
+            <ol class="demo-steps" id="demo-steps" aria-label="Run progress">
+              <li>Reads the active-note brief</li>
+              <li>Reads both linked sources</li>
+              <li>Appends the cited decision</li>
+              <li>Confirms the verified receipt</li>
             </ol>
-          </details>
+            <p class="real-run-note" id="demo-run-note">
+              A genuine release-build run, edited only for time. No simulated agent states.
+            </p>
+          </aside>
         </div>
       </section>
 
       <section class="trust" id="trust" aria-labelledby="trust-title">
-        <div class="proof-flow" aria-label="How Agentic Researcher works">
-          <div>
-            <span aria-hidden="true">01</span>
-            <h3>Reads your context</h3>
-            <p>The active note, relevant vault files, and approved external sources.</p>
-          </div>
-          <div>
-            <span aria-hidden="true">02</span>
-            <h3>Runs approved tools</h3>
-            <p>The model chooses steps; the plugin validates and executes each call.</p>
-          </div>
-          <div>
-            <span aria-hidden="true">03</span>
-            <h3>Returns receipts</h3>
-            <p>Writes, validations, and consequential actions remain inspectable.</p>
-          </div>
-        </div>
-
         <div class="trust-heading">
           <p class="kicker">Designed for trust</p>
           <h2 id="trust-title">Local by default. Explicit when it matters.</h2>
@@ -189,12 +161,12 @@
           </article>
           <article>
             <h3>Approval-gated actions</h3>
-            <p>External publication and destructive actions remain behind clear authority gates.</p>
+            <p>External publication and destructive actions stay behind clear authority gates.</p>
           </article>
         </div>
         <p class="integration-note">
-          When a task calls for it, the same prompt-first workflow can connect to Linear and
-          GitHub without turning the sidebar into a control panel.
+          When a task calls for it, the same prompt-first workflow connects to Linear and GitHub
+          without turning the sidebar into a control panel.
         </p>
       </section>
 
