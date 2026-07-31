@@ -6,7 +6,8 @@ import {
   type LinearProjectAssociationDecision,
 } from "./linearProjectAssociation";
 import type { LinearToolClient } from "./LinearTools";
-import type { LinearBaseRecord, LinearPage, LinearRequestOptions } from "./types";
+import { listAllLinearPages } from "./linearPagination";
+import type { LinearBaseRecord, LinearRequestOptions } from "./types";
 
 export interface ResolveLinearProjectAssociationInput {
   client: LinearToolClient;
@@ -106,13 +107,21 @@ async function listTeamProjects(
   teamId: string,
   options?: LinearRequestOptions,
 ): Promise<LinearProjectAssociationCandidate[]> {
-  const output = await client.execute(
+  // Paginate rather than trusting page one: `first` is server-clamped to 50
+  // and team filtering happens client-side, so a workspace past 50 projects
+  // used to spend its whole budget on unrelated rows, miss the existing
+  // project, and create a duplicate — which the host then persisted as the
+  // sticky queue default. Five pages covers 250 projects; beyond that the
+  // sweep reports truncation and the policy layer may still choose to create,
+  // which is the pre-existing behaviour rather than a new failure mode.
+  const sweep = await listAllLinearPages(
+    client,
     "projects.list",
     { first: 50, includeArchived: false },
     options,
+    { maxPages: 5 },
   );
-  const items = isLinearPage(output) ? output.items : [];
-  return items
+  return sweep.items
     .filter((item) => item.resourceType === "project")
     .map((item) => ({
       id: item.id,
@@ -185,14 +194,6 @@ function extractId(value: unknown): string | null {
     }
   }
   return null;
-}
-
-function isLinearPage(value: unknown): value is LinearPage<LinearBaseRecord> {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    Array.isArray((value as LinearPage<LinearBaseRecord>).items)
-  );
 }
 
 function toRequestOptions(

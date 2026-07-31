@@ -7,6 +7,7 @@ import {
   matchAssociatedLinearProject,
 } from "../src/integrations/linear/linearProjectAssociation";
 import { resolveLinearProjectAssociation } from "../src/integrations/linear/resolveLinearProjectAssociation";
+import { listAllLinearPages } from "../src/integrations/linear/linearPagination";
 import type { LinearToolClient } from "../src/integrations/linear/LinearTools";
 import type { LinearBaseRecord, LinearPage } from "../src/integrations/linear/types";
 import { buildByokPhaseAResearchPrompt } from "../e2e/fixtures/byokAutonomousJourneyPrompt";
@@ -207,6 +208,141 @@ test("resolveLinearProjectAssociation creates when empty", async () => {
   assert.equal(result.projectId, "proj-new");
   assert.equal(created.length, 1);
   assert.deepEqual(created[0]?.teamIds, ["team-1"]);
+});
+
+function project(id: string, name: string, teamId = "team-1"): LinearBaseRecord {
+  return {
+    resourceType: "project",
+    id,
+    name,
+    attributes: { teams: [teamId] },
+    snapshotHash: "hash",
+  } as LinearBaseRecord;
+}
+
+function page(
+  items: LinearBaseRecord[],
+  hasNextPage: boolean,
+  endCursor?: string,
+): LinearPage<LinearBaseRecord> {
+  return {
+    items,
+    pageInfo: { hasNextPage, ...(endCursor ? { endCursor } : {}) },
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+test("an existing project on page two is found instead of creating a duplicate", async () => {
+  // Regression: only the first 50-row page was ever read, and team filtering
+  // is client-side, so a workspace past 50 projects missed its existing
+  // project, created a duplicate, and the host then persisted the duplicate
+  // id as the sticky queue default.
+  const listCalls: Array<Record<string, unknown>> = [];
+  let created = 0;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "projects.list") {
+        listCalls.push(variables);
+        return variables.after === "cursor-1"
+          ? page([project("proj-existing", "Checkers research")], false)
+          : page(
+              // Page one: fifty unrelated projects from other teams.
+              Array.from({ length: 50 }, (_, i) =>
+                project(`other-${i}`, `Other ${i}`, "team-other"),
+              ),
+              true,
+              "cursor-1",
+            );
+      }
+      if (key === "projects.create") {
+        created += 1;
+        return project("proj-duplicate", "Checkers research");
+      }
+      throw new Error(`Unexpected ${key}`);
+    },
+  };
+
+  const result = await resolveLinearProjectAssociation({
+    client,
+    prompt: "Publish research findings to Linear for checkers.",
+    associationText: "Checkers research",
+    teamId: "team-1",
+  });
+
+  assert.equal(created, 0, "must not create a duplicate");
+  assert.equal(result.created, false);
+  assert.equal(result.projectId, "proj-existing");
+  assert.equal(listCalls.length, 2);
+  assert.equal(listCalls[1]?.after, "cursor-1");
+});
+
+test("the page sweep is capped and a mutation-ack readback resolves across pages", async () => {
+  // The create path re-lists to find the new project when the adapter returns
+  // only a mutation ack; that readback must also paginate, or a create could
+  // throw after succeeding and orphan the project.
+  let phase: "before" | "after" = "before";
+  let listCallsThisPhase = 0;
+  const client: LinearToolClient = {
+    execute: async (key, variables = {}) => {
+      if (key === "projects.list") {
+        listCallsThisPhase += 1;
+        const cursor = typeof variables.after === "string" ? variables.after : "";
+        if (phase === "before") {
+          // Endless filler: every page claims another page. The sweep must
+          // stop at its cap rather than crawling forever.
+          const index = cursor ? Number.parseInt(cursor.slice(7), 10) : 0;
+          return page(
+            [project(`filler-${index}`, `Filler ${index}`, "team-other")],
+            true,
+            `cursor-${index + 1}`,
+          );
+        }
+        // Readback after create: the new project appears on page two.
+        return cursor === "rb-1"
+          ? page([project("proj-new", "Checkers research")], false)
+          : page([project("rb-filler", "Filler", "team-other")], true, "rb-1");
+      }
+      if (key === "projects.create") {
+        phase = "after";
+        listCallsThisPhase = 0;
+        // Mutation ack with no id: forces the readback path.
+        return { resourceType: "project", id: "", snapshotHash: "hash" } as LinearBaseRecord;
+      }
+      throw new Error(`Unexpected ${key}`);
+    },
+  };
+
+  const result = await resolveLinearProjectAssociation({
+    client,
+    prompt: "Publish research findings to Linear for checkers.",
+    associationText: "Checkers research",
+    teamId: "team-1",
+  });
+
+  assert.equal(result.created, true);
+  assert.equal(result.projectId, "proj-new");
+  assert.equal(listCallsThisPhase, 2, "readback found the project on page two");
+});
+
+test("listAllLinearPages dedupes shifted rows and stops on a repeated cursor", async () => {
+  let calls = 0;
+  const client: LinearToolClient = {
+    execute: async (_key, variables = {}) => {
+      calls += 1;
+      // The server repeats a row across pages (rows shift during pagination)
+      // and then repeats the cursor itself, which would loop forever.
+      return variables.after
+        ? page([project("p1", "One"), project("p2", "Two")], true, "same-cursor")
+        : page([project("p1", "One")], true, "same-cursor");
+    },
+  };
+  const sweep = await listAllLinearPages(client, "projects.list", { first: 50 });
+  assert.deepEqual(
+    sweep.items.map((item) => item.id),
+    ["p1", "p2"],
+  );
+  assert.equal(sweep.truncated, true);
+  assert.equal(calls, 2);
 });
 
 test("resolveLinearProjectAssociation stays team-only for plain issues", async () => {
