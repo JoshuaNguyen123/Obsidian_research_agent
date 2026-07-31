@@ -11,6 +11,10 @@ import {
 } from "./evidenceConflicts";
 import type { MissionEvidence } from "./missionLedger";
 import {
+  normalizeMissionScorecard,
+  type MissionScorecardV1,
+} from "./missionScorecard";
+import {
   normalizeMissionPlanLike,
   type MissionPlanLike,
 } from "./missionPlan";
@@ -332,6 +336,14 @@ export interface MissionRuntimeSnapshotV2 {
   claimLedger?: ClaimLedger;
   claimPassages?: ClaimPassageRef[];
   evidenceConflicts?: EvidenceConflict[];
+  /**
+   * The graded scorecard beside the acceptance gate. Persisted as-is because
+   * it is not recomputable from a snapshot — the efficiency dimensions read
+   * providerUsage and wall clock, which snapshots do not carry. Optional and
+   * additive within the current snapshot version, so ledgers written before
+   * this field existed still parse.
+   */
+  missionScorecard?: MissionScorecardV1;
   notes: string[];
 }
 
@@ -519,6 +531,7 @@ export interface CreateMissionRuntimeSnapshotInput {
   claimLedger?: ClaimLedger | null;
   claimPassages?: ClaimPassageRef[] | null;
   evidenceConflicts?: EvidenceConflict[] | null;
+  missionScorecard?: MissionScorecardV1 | null;
   notes?: string[];
   createdAt?: Date;
   updatedAt?: Date;
@@ -549,6 +562,7 @@ export function createMissionRuntimeSnapshot({
   claimLedger,
   claimPassages,
   evidenceConflicts,
+  missionScorecard,
   notes = [],
   createdAt = new Date(),
   updatedAt = createdAt,
@@ -560,6 +574,7 @@ export function createMissionRuntimeSnapshot({
     : null;
   const normalizedClaimPassages = normalizeClaimPassages(claimPassages);
   const normalizedConflicts = normalizeEvidenceConflicts(evidenceConflicts);
+  const normalizedScorecard = normalizeMissionScorecard(missionScorecard);
   const normalizedMissionGraphRef = normalizeMissionGraphStoreReference(
     missionGraphRef,
   );
@@ -611,6 +626,7 @@ export function createMissionRuntimeSnapshot({
     ...(normalizedConflicts.length > 0
       ? { evidenceConflicts: normalizedConflicts }
       : {}),
+    ...(normalizedScorecard ? { missionScorecard: normalizedScorecard } : {}),
     notes: notes.slice(-32).map((note) => note.slice(0, 2000)),
   };
 }
@@ -695,10 +711,12 @@ export function normalizeMissionRuntimeSnapshot(
       const claimLedger = normalizeClaimLedger(value.claimLedger);
       const claimPassages = normalizeClaimPassages(value.claimPassages);
       const evidenceConflicts = normalizeEvidenceConflicts(value.evidenceConflicts);
+      const missionScorecard = normalizeMissionScorecard(value.missionScorecard);
       return {
         ...(claimLedger ? { claimLedger } : {}),
         ...(claimPassages ? { claimPassages } : {}),
         ...(evidenceConflicts.length > 0 ? { evidenceConflicts } : {}),
+        ...(missionScorecard ? { missionScorecard } : {}),
       };
     })(),
     notes: getStringArray(value.notes)

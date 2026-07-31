@@ -19,6 +19,7 @@ import {
   type ApprovalDecision,
   type ApprovalRequest,
 } from "./agent/approvalBroker";
+import type { MissionScorecardV1 } from "./agent/missionScorecard";
 import type {
   ClarificationBroker,
   ClarificationRequest,
@@ -212,6 +213,7 @@ export class AgentView extends ItemView {
   private finalStreamEl: HTMLElement | null = null;
   private receiptsEl: HTMLElement | null = null;
   private acceptanceEl: HTMLElement | null = null;
+  private scorecardEl: HTMLElement | null = null;
   private browserDetailsEl: HTMLElement | null = null;
   private actionsDetailsEl: HTMLElement | null = null;
   private codeOutputEl: HTMLElement | null = null;
@@ -1186,6 +1188,14 @@ export class AgentView extends ItemView {
       "Mission acceptance",
       "acceptance",
     );
+    // Primary, not Diagnostics: the scorecard existed for a year as one line
+    // inside the collapsed Run log, which is indistinguishable from not
+    // existing. Acceptance is the gate; this is the gradient beside it.
+    this.scorecardEl = this.createDashboardSection(
+      dashboardEl,
+      "Mission score",
+      "scorecard",
+    );
     this.evidenceDetailsEl = this.createDashboardSection(
       dashboardEl,
       "Evidence",
@@ -1311,6 +1321,7 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
     this.setSectionPlaceholder(this.receiptsEl, "No receipts yet.");
     this.setSectionPlaceholder(this.acceptanceEl, "Acceptance not checked yet.");
+    this.setSectionPlaceholder(this.scorecardEl, "No score yet.");
     this.setSectionPlaceholder(
       this.browserDetailsEl,
       "Live browser embedding is unavailable. Showing screenshot and extracted page state instead.",
@@ -1550,6 +1561,7 @@ export class AgentView extends ItemView {
       onRunComplete: (event) => {
         void this.handleRunComplete(event);
       },
+      onMissionScorecard: (scorecard) => this.renderMissionScorecard(scorecard),
       onApprovalRequest: (request) => this.renderApprovalRequest(request),
       onClarificationRequest: (request, broker) =>
         this.renderClarificationRequest(request, broker),
@@ -1847,6 +1859,7 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.toolTimelineEl, "No tools yet.");
     this.setSectionPlaceholder(this.receiptsEl, "No receipts yet.");
     this.setSectionPlaceholder(this.acceptanceEl, "Acceptance not checked yet.");
+    this.setSectionPlaceholder(this.scorecardEl, "No score yet.");
     this.setSectionPlaceholder(
       this.browserDetailsEl,
       "Live browser embedding is unavailable. Showing screenshot and extracted page state instead.",
@@ -3430,6 +3443,49 @@ export class AgentView extends ItemView {
     }
   }
 
+  private renderMissionScorecard(scorecard: MissionScorecardV1 | null) {
+    if (!this.scorecardEl) {
+      return;
+    }
+    if (!scorecard) {
+      this.setSectionPlaceholder(this.scorecardEl, "No score yet.");
+      return;
+    }
+
+    this.scorecardEl.empty();
+    // Reuses the acceptance-row grid and status tints wholesale: no new CSS,
+    // which also sidesteps the style-token checker's hardcoded line regions.
+    const totalEl = this.scorecardEl.createDiv({
+      cls: `agentic-researcher-acceptance-row${
+        scorecard.acceptancePassed ? "" : " agentic-researcher-acceptance-needs_more_work"
+      }`,
+    });
+    totalEl.createSpan({
+      text: "total",
+      cls: "agentic-researcher-acceptance-key",
+    });
+    totalEl.createSpan({
+      text: `${scorecard.total.toFixed(3)} acceptance=${
+        scorecard.acceptancePassed ? "pass" : "needs_more_work"
+      }`,
+      cls: "agentic-researcher-acceptance-value",
+    });
+
+    for (const dimension of scorecard.dimensions) {
+      const rowEl = this.scorecardEl.createDiv({
+        cls: "agentic-researcher-acceptance-row",
+      });
+      rowEl.createSpan({
+        text: dimension.id,
+        cls: "agentic-researcher-acceptance-key",
+      });
+      rowEl.createSpan({
+        text: `${dimension.score.toFixed(3)} (${dimension.detail})`,
+        cls: "agentic-researcher-acceptance-value",
+      });
+    }
+  }
+
   private createAcceptanceRow(label: string, value: string) {
     if (!this.acceptanceEl) {
       return;
@@ -4280,10 +4336,16 @@ export class AgentView extends ItemView {
   private appendRunDetailProjection(event: AgentTraceEvent) {
     const toolName = event.toolName ?? "";
     if (event.kind === "acceptance") {
-      this.renderMissionAcceptance(
-        this.getMissionAcceptanceFromTrace(event),
-        "live",
-      );
+      // Not every acceptance-kind trace carries an acceptance payload: the
+      // mission scorecard is emitted under the same kind (deliberately — the
+      // trace-kind vocabulary is load-bearing in the run coordinator's
+      // attestation prefixes). Rendering the null parse blanked the acceptance
+      // rows the immediately-preceding trace had just drawn, on every
+      // evaluation, for the whole run.
+      const acceptance = this.getMissionAcceptanceFromTrace(event);
+      if (acceptance) {
+        this.renderMissionAcceptance(acceptance, "live");
+      }
       this.appendDetailLine(this.milestonesDetailsEl, event);
     }
 

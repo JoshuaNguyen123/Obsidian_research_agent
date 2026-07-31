@@ -265,6 +265,7 @@ import {
   type AutonomyScope,
 } from "./agent/missionScope";
 import { buildLivenessProbe, recheckLinkLiveness } from "./agent/deadLinkCheck";
+import { buildMissionResearchSignalsV1 } from "./agent/missionResearchSignals";
 import {
   decideSingleAgentLivenessRecheck,
   formatLivenessCaveat,
@@ -745,6 +746,7 @@ export {
   toolsAllowedForLifecycleStage,
 } from "./agent/lifecycleStagePolicy";
 export { canonicalMissionGraphId };
+export { buildMissionResearchSignalsV1 } from "./agent/missionResearchSignals";
 export type { RunPlan, RunRoute, SlowPathReason } from "./agent/runPlan";
 export type { AgentConversationMessage } from "./conversationHistory";
 export type { AgentMissionMode, MissionIntent } from "./tools/types";
@@ -2557,6 +2559,7 @@ export async function runAgentMission({
   let explanatoryToolRouteReclassified = false;
   let lastStep = 0;
   let lastFinalOutput = "";
+  let lastMissionScorecard: MissionScorecardV1 | null = null;
   let lastVerificationChecks: VerificationCheck[] = [];
   let lastClaimLedger: ClaimLedger | null = null;
   let lastEvidenceConflicts: EvidenceConflict[] = [];
@@ -5599,6 +5602,11 @@ export async function runAgentMission({
       claimLedger: lastClaimLedger,
       claimPassages: claimPassageRefs,
       evidenceConflicts: lastEvidenceConflicts,
+      // Persisted with the snapshot because it is not recomputable from one:
+      // the efficiency dimensions read provider usage and wall clock, which
+      // the snapshot does not carry. This is also what makes score history
+      // readable from Agent Runs notes with no new storage surface.
+      missionScorecard: lastMissionScorecard,
       notes: runtimeSnapshot.notes,
       createdAt: new Date(runtimeSnapshot.createdAt),
       updatedAt: now,
@@ -6677,7 +6685,18 @@ export async function runAgentMission({
       modelCallBudget: modelExecutionBudget.maxCalls,
       wallClockMs: missionLedger?.providerUsage?.wallClockMs ?? 0,
       wallClockBudgetMs: modelExecutionBudget.maxWallClockMs,
+      // Without this block the two research dimensions score a vacuous 1.0
+      // for every mission — thin summaries stay invisible. The builder
+      // returns undefined for non-research missions, which keeps their
+      // empty-set convention intact deliberately.
+      research: buildMissionResearchSignalsV1({
+        researchPlan,
+        evidence: missionEvidenceRecords,
+        claimLedger: lastClaimLedger,
+        finalOutput: lastFinalOutput,
+      }),
     });
+    lastMissionScorecard = missionScorecard;
     events.onMissionScorecard?.(missionScorecard);
     // Keep the compact Run Details projection on trace. onPlanningDelta is a
     // structured per-step channel with an established shape; the full typed

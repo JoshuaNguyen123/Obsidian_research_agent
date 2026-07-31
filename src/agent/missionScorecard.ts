@@ -227,6 +227,65 @@ export function regressedAgainst(
     .sort((left, right) => left.delta - right.delta);
 }
 
+/**
+ * Fail-closed parser for a persisted scorecard.
+ *
+ * Runtime snapshots round-trip through markdown JSON blocks that anything may
+ * have edited; a malformed card must degrade to "no scorecard recorded", never
+ * to a card with invented numbers. Unknown dimension ids are rejected rather
+ * than skipped so a snapshot written by a future dimension set does not
+ * silently reload as a partial card.
+ */
+export function normalizeMissionScorecard(
+  value: unknown,
+): MissionScorecardV1 | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.version !== 1 || typeof record.acceptancePassed !== "boolean") {
+    return null;
+  }
+  if (!Array.isArray(record.dimensions) || record.dimensions.length === 0) {
+    return null;
+  }
+  const knownIds = new Set(Object.keys(MISSION_SCORE_WEIGHTS));
+  const seen = new Set<string>();
+  const dimensions: MissionScoreDimension[] = [];
+  for (const item of record.dimensions) {
+    if (typeof item !== "object" || item === null) return null;
+    const dim = item as Record<string, unknown>;
+    if (
+      typeof dim.id !== "string" ||
+      !knownIds.has(dim.id) ||
+      seen.has(dim.id) ||
+      !isUnitInterval(dim.score) ||
+      !isUnitInterval(dim.weight) ||
+      typeof dim.detail !== "string"
+    ) {
+      return null;
+    }
+    seen.add(dim.id);
+    dimensions.push({
+      id: dim.id as MissionScoreDimensionId,
+      score: round4(dim.score as number),
+      weight: dim.weight as number,
+      detail: dim.detail.slice(0, 400),
+    });
+  }
+  if (!isUnitInterval(record.total)) return null;
+  return {
+    version: 1,
+    acceptancePassed: record.acceptancePassed,
+    dimensions,
+    total: round4(record.total as number),
+  };
+}
+
+function isUnitInterval(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
 /** Compact Run Details / CI projection. */
 export function formatMissionScorecard(card: MissionScorecardV1): string {
   return [
