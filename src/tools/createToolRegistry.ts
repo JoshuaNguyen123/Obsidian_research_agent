@@ -11,6 +11,7 @@ import { createVaultIndexTools } from "./vaultIndexTools";
 import { createVaultTools } from "./vaultTools";
 import { createWebViewerTools } from "./webViewerTools";
 import { createWebTools } from "./webTools";
+import { createClarificationTools } from "./clarificationTools";
 import { createSemanticSearchTools } from "./semanticSearchTools";
 import { withExplicitToolDescriptor } from "./toolDescriptors";
 import {
@@ -297,6 +298,7 @@ function createCoreOwnedTools(): AgentTool[] {
     ...createMermaidTools(),
     ...createDatasetTools(),
     ...createCitationTools(),
+    ...createClarificationTools(),
   ].map(withExplicitToolDescriptor);
 }
 

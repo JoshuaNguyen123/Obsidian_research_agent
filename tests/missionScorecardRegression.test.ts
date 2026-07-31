@@ -139,6 +139,34 @@ test("mission scorecard gate fails closed on a missing card or record", () => {
   );
 });
 
+test("mission scorecard gate skips unscored guard records and compares scored ones", () => {
+  // A research lane mixes a scored mission scenario with unscored guard tests
+  // (scenarioId=null). The guard tests cannot be keyed and carry nothing to
+  // regress, so they must be skipped rather than crash the comparison.
+  const mixed = {
+    version: 1,
+    status: "passed",
+    records: [
+      { ...identity, missionScorecard: cleanScorecard() },
+      {
+        project: "daily-use-note",
+        scenarioId: null,
+        file: "e2e/daily-use-note.spec.ts",
+        title: "an unscored guard test",
+        missionScorecard: null,
+      },
+    ],
+  };
+  assert.deepEqual(
+    assertMissionScorecardRegressions({
+      summary: mixed,
+      baseline: baseline(),
+      selectedProjects: ["daily-use-note"],
+    }),
+    { checkedRecords: 1, skipped: false },
+  );
+});
+
 test("mission scorecard gate skips projects with no committed baseline", () => {
   assert.deepEqual(
     assertMissionScorecardRegressions({

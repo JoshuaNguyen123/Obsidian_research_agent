@@ -1797,10 +1797,19 @@ export const createResearchPackTool: AgentTool = {
     additionalProperties: false,
   },
   async execute(args, context) {
-    if (!RESEARCH_PACK_INTENT_PATTERN.test(context.originalPrompt)) {
+    // Either the user asked for a pack by name, or the runner has certified
+    // this run as a genuine research mission that met its source floor. The
+    // phrase gate alone made a transactional, readback-verified, rollback-safe
+    // multi-note deliverable reachable only by users who already knew the
+    // magic words; the eligibility flag is what makes it the ordinary shape of
+    // a real research run.
+    if (
+      !RESEARCH_PACK_INTENT_PATTERN.test(context.originalPrompt) &&
+      context.researchPackEligible !== true
+    ) {
       throw new ToolExecutionError(
         "intent_required",
-        "create_research_pack requires an explicit request to create a research pack, brief, source index, or synthesis pack.",
+        "create_research_pack requires an explicit request to create a research pack, brief, source index, or synthesis pack, or an active research mission that has met its fetched-source floor.",
       );
     }
     const baseFolder = normalizeResearchPackFolder(
@@ -1826,6 +1835,13 @@ export const createResearchPackTool: AgentTool = {
       brief,
       sources,
       synthesis,
+      createdAt: now.toISOString(),
+      ...(context.runId?.trim() ? { runId: context.runId.trim() } : {}),
+      // Opt-in only: linking into a hub is a second write, so it stays off
+      // unless the user names a hub note in settings.
+      ...(context.settings?.researchHubNote?.trim()
+        ? { hubNote: context.settings.researchHubNote.trim() }
+        : {}),
       existingPaths: getVaultEntries(context).map((entry) => entry.path),
     });
     const findings: TemplateResearchFinding[] = sources.map((source, index) => ({

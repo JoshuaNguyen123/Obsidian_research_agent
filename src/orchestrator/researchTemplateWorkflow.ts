@@ -1,3 +1,5 @@
+import { withResearchNoteFrontmatter } from "../agent/researchNoteFrontmatter";
+
 export const RESEARCH_TEMPLATE_WORKFLOW_VERSION = 1 as const;
 
 export type ResearchTemplatePhase =
@@ -256,6 +258,14 @@ export function buildTransactionalResearchPackPlan(input: {
   sources: Array<{ id: string; title: string; url?: string; passage?: string }>;
   synthesis: string;
   existingPaths?: Iterable<string>;
+  /** ISO-8601 creation timestamp recorded in each note's frontmatter. */
+  createdAt?: string;
+  /** Run id, so a pack can be traced back to the mission that wrote it. */
+  runId?: string;
+  /** Stated confidence, when the run produced one. */
+  confidence?: string;
+  /** Optional hub note to link the pack into, for graph discoverability. */
+  hubNote?: string;
 }): TransactionalResearchPackPlan {
   const baseFolder = normalizeVaultFolderPath(input.baseFolder);
   const safeTitle = toSafeBasename(input.title) || "Research Pack";
@@ -268,34 +278,56 @@ export function buildTransactionalResearchPackPlan(input: {
   const briefPath = `${rootPath}/Brief.md`;
   const sourcesPath = `${rootPath}/Sources.md`;
   const synthesisPath = `${rootPath}/Synthesis.md`;
+
+  // Frontmatter goes on notes the agent creates, so the pack is tagged,
+  // dated, and queryable rather than being a dead end in the graph.
+  const frontmatter = (kind: string) => ({
+    title: `${input.title} — ${kind}`,
+    created: input.createdAt ?? "",
+    tags: [input.title, kind],
+    sourceCount: input.sources.length,
+    ...(input.confidence ? { confidence: input.confidence } : {}),
+    ...(input.runId ? { runId: input.runId } : {}),
+  });
+  const withMatter = (kind: string, body: string): string =>
+    input.createdAt ? withResearchNoteFrontmatter(body, frontmatter(kind)) : body;
+
+  const hubLink = input.hubNote?.trim()
+    ? `\nRelated: [[${withoutMarkdownExtension(input.hubNote.trim())}]]\n`
+    : "";
+
   const artifacts: TransactionalPackArtifact[] = [
-    createArtifact("brief", "brief", briefPath, input.brief, []),
+    createArtifact("brief", "brief", briefPath, withMatter("brief", input.brief), []),
     createArtifact(
       "sources",
       "sources",
       sourcesPath,
-      renderSourceIndex(input.sources),
+      withMatter("sources", renderSourceIndex(input.sources)),
       [],
     ),
     createArtifact(
       "synthesis",
       "synthesis",
       synthesisPath,
-      ensureTitle(input.synthesis, "Synthesis"),
+      withMatter("synthesis", ensureTitle(input.synthesis, "Synthesis")),
       ["brief", "sources"],
     ),
     createArtifact(
       "index",
       "index",
       indexPath,
-      [
-        `# ${safeTitle}`,
-        "",
-        `- [[${withoutMarkdownExtension(briefPath)}|Brief]]`,
-        `- [[${withoutMarkdownExtension(sourcesPath)}|Sources]]`,
-        `- [[${withoutMarkdownExtension(synthesisPath)}|Synthesis]]`,
-        "",
-      ].join("\n"),
+      withMatter(
+        "index",
+        [
+          `# ${safeTitle}`,
+          "",
+          `- [[${withoutMarkdownExtension(briefPath)}|Brief]]`,
+          `- [[${withoutMarkdownExtension(sourcesPath)}|Sources]]`,
+          `- [[${withoutMarkdownExtension(synthesisPath)}|Synthesis]]`,
+          hubLink,
+          "",
+        ].join("\n"),
+      ),
       ["brief", "sources", "synthesis"],
     ),
   ];

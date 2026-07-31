@@ -91,6 +91,27 @@ export function formatScopeList(values: readonly string[]): string {
   return values.length > 0 ? values.join(",") : "none";
 }
 
+/** How many items a diagnostic list shows before it summarizes the rest. */
+export const BOUNDED_LIST_PREVIEW = 6;
+
+/**
+ * A readable projection of a potentially huge diagnostic list.
+ *
+ * An unbounded `join` turned a run with fifty open evidence conflicts into a
+ * wall of `conflict:<hash>` text that buried the two lines a human actually
+ * reads (what is missing, what to do next). The count still tells the whole
+ * truth — only the enumeration is bounded.
+ */
+export function formatBoundedList(
+  values: readonly string[],
+  limit: number = BOUNDED_LIST_PREVIEW,
+): string {
+  if (values.length === 0) return "none";
+  const capped = Math.max(1, limit);
+  if (values.length <= capped) return values.join(", ");
+  return `${values.slice(0, capped).join(", ")} +${values.length - capped} more`;
+}
+
 export function formatTokenParts(event: AgentRunMetricEvent): string | null {
   const parts = [
     event.promptTokens !== undefined ? `prompt tokens ${event.promptTokens}` : null,

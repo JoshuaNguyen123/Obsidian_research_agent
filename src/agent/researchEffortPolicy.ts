@@ -162,7 +162,13 @@ export interface ResearchProgressDecision {
   };
 }
 
-const LOW_YIELD_THRESHOLD = 0.1;
+/**
+ * A batch whose normalized material-new-evidence rate falls below this value is
+ * "low yield". Exported so the live loop controller increments its
+ * consecutive-low-yield counter against the exact same boundary the stop/escalate
+ * decision uses — the two must never drift.
+ */
+export const LOW_YIELD_THRESHOLD = 0.1;
 const ESCALATION_UTILIZATION = 0.75;
 
 /** Deterministically select the smallest tier justified by observable inputs. */

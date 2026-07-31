@@ -218,6 +218,46 @@ test("quote/verify missions require quote spans inside passage text", () => {
   assert.ok((withQuote.claims[0].quoteSpans?.length ?? 0) > 0);
 });
 
+test("a quote differing only in smart quotes or spacing still verifies", () => {
+  // The ledger and the verify_citation tool must agree on what "verbatim"
+  // means. Passage text extracted from HTML routinely carries curly
+  // apostrophes and doubled spaces, so a raw substring comparison rejected
+  // quotes the model had copied honestly.
+  const source = fetchedSource();
+  // Curly apostrophe and a doubled space, exactly as an HTML extractor emits.
+  const passageText =
+    "Quantum battery evidence compares the laboratory’s  independent sources.";
+  const ledger = buildClaimLedger({
+    draft:
+      `Lab reports state "Quantum battery evidence compares the laboratory's independent sources." [${source.passageId}].`,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: passageText }],
+    prompt: "Verify and quote the source text for quantum battery claims.",
+    requireQuoteSpans: true,
+  });
+  assert.equal(ledger.status, "pass", ledger.missing.join(", "));
+});
+
+test("a paraphrase presented as a quote is still rejected", () => {
+  // Normalization folds only case, smart quotes, and whitespace. Anything that
+  // changes a word must still fail, or the check stops catching invention.
+  const source = fetchedSource();
+  const ledger = buildClaimLedger({
+    draft:
+      `Lab reports state "Quantum battery findings contrast several independent laboratories" [${source.passageId}].`,
+    evidence: [source],
+    passages: [{ id: source.passageId!, text: PASSAGE_TEXT }],
+    prompt: "Verify and quote the source text for quantum battery claims.",
+    requireQuoteSpans: true,
+  });
+  assert.equal(ledger.status, "needs_more_work");
+  assert.ok(
+    ledger.missing.some((item) => item.includes("quote_mismatch")) ||
+      ledger.missing.some((item) => item.includes("missing_quote")),
+    ledger.missing.join(", "),
+  );
+});
+
 test("quote missions allow grounded paraphrases once one exact quote is verified", () => {
   const source = fetchedSource();
   const ledger = buildClaimLedger({

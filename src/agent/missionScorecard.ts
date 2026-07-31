@@ -37,11 +37,20 @@
  *    projects are intentionally not baselined.
  */
 
+import {
+  scoreResearchDepth,
+  scoreSourceIndependence,
+  type ResearchDepthInput,
+} from "./researchDepthMetrics";
+import { registrableDomain } from "./sourceSignals";
+
 export type MissionScoreDimensionId =
   | "acceptance_coverage"
   | "evidence_grounding"
   | "receipt_coverage"
   | "recovery_cleanliness"
+  | "source_independence"
+  | "research_depth"
   | "model_call_efficiency"
   | "wall_clock_efficiency";
 
@@ -50,6 +59,14 @@ export type MissionScoreDimensionId =
  * research agent, so "did it do the job, with sources" must outrank "was it
  * cheap". Efficiency dimensions exist to make waste visible, not to reward
  * cutting the work short.
+ *
+ * The efficiency pair was cut from 0.10 to 0.05 each to fund the two research
+ * dimensions. They had earned the reduction: across the baselined runs they sat
+ * at 10/80, 6/47 and 11/56 model calls, and 94s/5400s, 70s/840s and 99s/2100s
+ * wall clock — 5x to 57x headroom, meaning they scored a constant 1.0 and
+ * carried 20% of the total while detecting nothing. `source_independence` and
+ * `research_depth` measure the failure the changelog actually names (thin,
+ * narrowly-sourced summaries) and vary with it.
  */
 export const MISSION_SCORE_WEIGHTS: Readonly<
   Record<MissionScoreDimensionId, number>
@@ -58,8 +75,10 @@ export const MISSION_SCORE_WEIGHTS: Readonly<
   evidence_grounding: 0.25,
   receipt_coverage: 0.15,
   recovery_cleanliness: 0.1,
-  model_call_efficiency: 0.1,
-  wall_clock_efficiency: 0.1,
+  source_independence: 0.05,
+  research_depth: 0.05,
+  model_call_efficiency: 0.05,
+  wall_clock_efficiency: 0.05,
 };
 
 export interface MissionScorecardInput {
@@ -85,6 +104,13 @@ export interface MissionScorecardInput {
   modelCallBudget: number;
   wallClockMs: number;
   wallClockBudgetMs: number;
+  /**
+   * Research depth inputs. Optional so a non-research mission keeps scoring
+   * without supplying them: an absent block means "no web sources required",
+   * which both research dimensions treat as a vacuous 1 via the same empty-set
+   * convention the coverage dimensions already use.
+   */
+  research?: ResearchDepthInput;
 }
 
 export interface MissionScoreDimension {
@@ -128,6 +154,20 @@ export function scoreMissionV1(
       "receipt_coverage",
       coverage(input.mutationsWithReceipts, input.mutationsPerformed),
       `${input.mutationsWithReceipts}/${input.mutationsPerformed} mutations receipted`,
+    ),
+    dimension(
+      "source_independence",
+      input.research ? scoreSourceIndependence(input.research) : 1,
+      input.research
+        ? `${distinctDomainCount(input.research.usableSourceUrls)}/${input.research.requiredDistinctDomains} distinct domains`
+        : "no web sources required",
+    ),
+    dimension(
+      "research_depth",
+      input.research ? scoreResearchDepth(input.research) : 1,
+      input.research
+        ? `${input.research.citedPassageCount} cited passages, ${distinctDomainCount(input.research.usableSourceUrls)} domains, ${input.research.quotedSpanCount} quotes, ${input.research.sectionCount} sections`
+        : "no web sources required",
     ),
     dimension(
       "recovery_cleanliness",
@@ -218,6 +258,15 @@ function dimension(
 function coverage(covered: number, total: number): number {
   if (total <= 0) return 1;
   return clampCount(covered, total) / total;
+}
+
+function distinctDomainCount(urls: readonly string[]): number {
+  const domains = new Set<string>();
+  for (const url of urls) {
+    const domain = registrableDomain(url);
+    if (domain) domains.add(domain);
+  }
+  return domains.size;
 }
 
 function ratioMet(total: number, missing: number): number {

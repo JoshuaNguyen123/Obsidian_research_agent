@@ -16060,6 +16060,132 @@ test("compound adaptive research closes quick tier without capping later stages"
   );
 });
 
+test("adaptive compound research escalates a spent tier while work is unresolved", () => {
+  const deepSpent = {
+    effort: {
+      tier: "deep",
+      budget: {
+        maxModelStepsPerSegment: 60,
+        maxToolCallsPerSegment: 30,
+        maxSegments: 1,
+        maxTotalModelSteps: 60,
+        maxTotalToolCalls: 30,
+        maxDurationMs: null,
+      },
+      reasons: [],
+      constrained: false,
+    },
+    effortUsage: {
+      modelSteps: 60,
+      toolCalls: 20,
+      segmentsStarted: 1,
+      modelStepsInCurrentSegment: 60,
+      toolCallsInCurrentSegment: 20,
+      elapsedMs: 1_000,
+    },
+  } as any;
+
+  // Unresolved work + adaptive → escalate one tier instead of closing.
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepSpent, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: true,
+    }),
+    { action: "escalate", nextTier: "extended", reason: "model_step_cap_reached" },
+  );
+
+  // No adaptive signal → unchanged close (backward compatible).
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepSpent, "accepted_research"),
+    { action: "close", reason: "model_step_cap_reached", closureAttempts: 0 },
+  );
+
+  // Work resolved → close even with adaptive enabled.
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepSpent, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: false,
+    }),
+    { action: "close", reason: "model_step_cap_reached", closureAttempts: 0 },
+  );
+
+  // A maxTier ceiling blocks escalation past it.
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepSpent, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: true,
+      maxTier: "deep",
+    }),
+    { action: "close", reason: "model_step_cap_reached", closureAttempts: 0 },
+  );
+});
+
+test("adaptive compound research never escalates past the hard duration cap", () => {
+  const deepAtDuration = {
+    effort: {
+      tier: "deep",
+      budget: {
+        maxModelStepsPerSegment: 60,
+        maxToolCallsPerSegment: 30,
+        maxSegments: 1,
+        maxTotalModelSteps: 60,
+        maxTotalToolCalls: 30,
+        maxDurationMs: 1_000,
+      },
+      reasons: [],
+      constrained: false,
+    },
+    effortUsage: {
+      modelSteps: 10,
+      toolCalls: 5,
+      segmentsStarted: 1,
+      modelStepsInCurrentSegment: 10,
+      toolCallsInCurrentSegment: 5,
+      elapsedMs: 1_000,
+    },
+  } as any;
+
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepAtDuration, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: true,
+    }),
+    { action: "close", reason: "duration_cap_reached", closureAttempts: 0 },
+  );
+
+  // At the top tier there is no tier to escalate into, so it closes.
+  const extendedSpent = {
+    effort: {
+      tier: "extended",
+      budget: {
+        maxModelStepsPerSegment: 100,
+        maxToolCallsPerSegment: 50,
+        maxSegments: 4,
+        maxTotalModelSteps: 400,
+        maxTotalToolCalls: 200,
+        maxDurationMs: 8 * 60 * 60_000,
+      },
+      reasons: [],
+      constrained: false,
+    },
+    effortUsage: {
+      modelSteps: 400,
+      toolCalls: 100,
+      segmentsStarted: 4,
+      modelStepsInCurrentSegment: 100,
+      toolCallsInCurrentSegment: 50,
+      elapsedMs: 60_000,
+    },
+  } as any;
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(extendedSpent, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: true,
+    }),
+    { action: "close", reason: "model_step_cap_reached", closureAttempts: 0 },
+  );
+});
+
 test("compound extended research rolls segments then reserves one durable closure turn", () => {
   const extendedPlan = {
     effort: {

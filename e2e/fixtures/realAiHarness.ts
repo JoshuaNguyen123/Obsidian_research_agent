@@ -1281,7 +1281,7 @@ async function approveUntilMissionComplete(
     if (committedRestartStage && options.restartCorePlugin) {
       restartedStages.add(committedRestartStage);
       await options.restartCorePlugin(committedRestartStage);
-      await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
+      await page.getByRole("tab", { name: "Activity" }).click({ timeout: 10_000 });
       const continued = await continueLatestRunAfterStageRestart(page);
       if (continued) {
         continuations += 1;

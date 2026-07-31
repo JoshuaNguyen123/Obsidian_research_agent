@@ -37,11 +37,18 @@ export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
   "demo-journey-recording",
 ]);
 
+// Must stay in lockstep with MissionScoreDimensionId in
+// src/agent/missionScorecard.ts. The shape is asserted at parse time, so
+// adding a dimension invalidates every baseline record until it is
+// regenerated from real runs — deliberately loud rather than silently
+// comparing a subset.
 const DIMENSION_IDS = Object.freeze([
   "acceptance_coverage",
   "evidence_grounding",
   "receipt_coverage",
   "recovery_cleanliness",
+  "source_independence",
+  "research_depth",
   "model_call_efficiency",
   "wall_clock_efficiency",
 ]);
@@ -133,6 +140,16 @@ export function assertMissionScorecardRegressions({
   const currentByKey = new Map();
   for (const record of summary.records) {
     if (!activeProjects.has(String(record?.project ?? ""))) continue;
+    // A lane can legitimately mix scored mission scenarios (an explicit
+    // scenarioId) with unscored guard tests (scenarioId=null). Guard tests carry
+    // nothing to regress and cannot be keyed, so skip them — but a *mapped*
+    // scenario that dropped its scorecard is still keyed and fails loudly below.
+    if (
+      typeof record?.scenarioId !== "string" ||
+      record.scenarioId.trim().length === 0
+    ) {
+      continue;
+    }
     const key = missionScorecardRecordKey(record);
     if (currentByKey.has(key)) {
       throw new Error(`Daily-use summary contains duplicate scorecard key ${key}.`);

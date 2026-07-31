@@ -31,6 +31,16 @@ import {
   selectInitialResearchEffort,
   type ResearchEffortTier,
 } from "../agent/researchEffortPolicy";
+import {
+  createResearchProgressController,
+  type ResearchProgressController,
+} from "../agent/researchProgressController";
+import {
+  buildLivenessProbe,
+  deadLinks,
+  recheckLinkLiveness,
+} from "../agent/deadLinkCheck";
+import { inferSourceSignals } from "../agent/sourceSignals";
 import { resolveThinkForCall } from "../agent/thinkPolicy";
 import {
   RESEARCHER_SOFT_TOOL_NAMES,
@@ -134,7 +144,14 @@ export async function runResearchWorker(input: {
     1,
     RESEARCH_WORKER_MAX_TOOL_CALLS,
   );
-  const modelCallCap = Math.max(4, maxSteps * 3 + 8);
+  const adaptiveProgressEnabled =
+    input.toolContext.settings?.adaptiveResearchProgress !== false;
+  // With the adaptive driver on, a productive researcher may extend toward the
+  // hard worker ceiling, so size the model-call budget for that growth.
+  const modelCallCap = Math.max(
+    4,
+    (adaptiveProgressEnabled ? RESEARCH_WORKER_MAX_STEPS : maxSteps) * 3 + 8,
+  );
   const contextTokens = Math.max(
     4_096,
     input.toolContext.settings?.numCtx ?? 48_000,
@@ -159,11 +176,16 @@ export async function runResearchWorker(input: {
   });
   const evidence: MissionEvidence[] = [];
   const claimPassages: ClaimPassageRef[] = [];
+  // A *floor*, not a target: the run gathers at least this many distinct usable
+  // sources, then keeps going while new sources add material evidence and stops
+  // on saturation (the adaptive controller). The ceiling matches the explicit
+  // parse range (up to 8) rather than an arbitrary cap, so a topic that warrants
+  // more sources is not boxed at five.
   const minimumUsableSources = clamp(
     parseExplicitResearchSourceCount(input.originalMission) ??
       (/\bdeep\s+research\b/iu.test(input.originalMission) ? 3 : 1),
     1,
-    5,
+    8,
   );
   let sourceLedger = createSourceCandidateLedger({
     runId: input.runId,
@@ -204,12 +226,31 @@ export async function runResearchWorker(input: {
   let modelSteps = 0;
   let toolCalls = 0;
   let alternativeSourceReads = 0;
+  // Deeper tiers may recover from more failed fetches before giving up, so a
+  // run that hits several dead or unusable sources still reaches its floor.
+  const maxAlternativeSourceReads =
+    researchEffortTier === "extended" ? 3 : researchEffortTier === "deep" ? 2 : 1;
   let finalSummary = "";
 
-  for (let step = 1; step <= maxSteps; step += 1) {
+  // Evidence-yield driver. The team-allocated `maxSteps` is the *starting*
+  // budget: when required sources are met and new evidence dries up the loop
+  // stops early, and when a tier's budget is spent while evidence is still
+  // productive it escalates — growing the effective budget toward the hard
+  // worker ceiling. Disabled by an explicit settings opt-out.
+  const progressController: ResearchProgressController | null =
+    adaptiveProgressEnabled
+      ? createResearchProgressController({ tier: researchEffortTier })
+      : null;
+  let effectiveMaxSteps = maxSteps;
+  let effectiveMaxToolCalls = maxToolCalls;
+  let saturationFinalize = false;
+
+  for (let step = 1; step <= effectiveMaxSteps; step += 1) {
     throwIfAborted(input.abortSignal);
     modelSteps = step;
-    await input.events?.onStatus?.(`Researcher step ${step}/${maxSteps}`);
+    const toolCallsAtStepStart = toolCalls;
+    const evidenceAtStepStart = evidence.length;
+    await input.events?.onStatus?.(`Researcher step ${step}/${effectiveMaxSteps}`);
     const request: ModelChatRequest = {
       ...modelRequestProfile,
       messages,
@@ -223,11 +264,17 @@ export async function runResearchWorker(input: {
       enableStreaming: input.toolContext.settings?.enableStreaming !== false,
     });
     messages.push(response.message);
+    if (saturationFinalize && response.toolCalls.length > 0) {
+      // The loop already asked for a final handoff after evidence saturated.
+      // Honor that stop rather than fetch further low-value sources.
+      finalSummary = response.message.content.trim() || finalSummary;
+      break;
+    }
     if (response.toolCalls.length === 0) {
       finalSummary = response.message.content.trim();
       const remainingProofDebt = computeSourceProofDebt(sourceLedger);
       if (finalSummary && remainingProofDebt.length === 0) break;
-      if (finalSummary && step < maxSteps) {
+      if (finalSummary && step < effectiveMaxSteps) {
         finalSummary = "";
         messages.push({
           role: "user",
@@ -245,7 +292,7 @@ export async function runResearchWorker(input: {
 
     let callCursor = 0;
     while (callCursor < response.toolCalls.length) {
-      if (toolCalls >= maxToolCalls) {
+      if (toolCalls >= effectiveMaxToolCalls) {
         finalSummary = "Researcher stopped at the shared tool-call budget.";
         break;
       }
@@ -253,7 +300,7 @@ export async function runResearchWorker(input: {
       let batchEnd = callCursor;
       while (
         batchEnd < response.toolCalls.length &&
-        toolCalls + (batchEnd - callCursor) < maxToolCalls &&
+        toolCalls + (batchEnd - callCursor) < effectiveMaxToolCalls &&
         batchEnd - callCursor < MAX_RESEARCH_WORKER_PARALLEL_READS &&
         isResearchWorkerParallelSafe(response.toolCalls[batchEnd]!.name)
       ) {
@@ -344,15 +391,28 @@ export async function runResearchWorker(input: {
       throwIfAborted(input.abortSignal);
       let claimedCandidateId: string | null = null;
       if (call.name === "web_fetch" && typeof call.arguments.url === "string") {
+        const fetchNow = input.now?.() ?? new Date();
+        // A directly-fetched URL carries no provider metadata, so only the
+        // URL-shape signals are real here — but those are exactly the ones
+        // that matter for a fetch: whether the page will parse at all.
+        const fetchSignals = inferSourceSignals({
+          url: call.arguments.url,
+          title: call.arguments.url,
+          now: fetchNow,
+        });
         const registered = addSourceCandidate(sourceLedger, {
           query: input.assignment,
           title: call.arguments.url,
           url: call.arguments.url,
           provider: "worker",
-          sourceType: inferSourceType(call.arguments.url, call.arguments.url),
-          signals: { quality: 0.55, freshness: 0.6, fetchability: 0.8 },
+          sourceType: fetchSignals.sourceType,
+          signals: {
+            quality: fetchSignals.quality,
+            freshness: fetchSignals.freshness,
+            fetchability: fetchSignals.fetchability,
+          },
           claimIds: ["mission"],
-        }, input.now?.() ?? new Date());
+        }, fetchNow);
         sourceLedger = registered.ledger;
         const claimed = claimSourceCandidate(
           sourceLedger,
@@ -410,7 +470,11 @@ export async function runResearchWorker(input: {
           sourceLedger,
           claimedCandidateId,
           nextEvidence
-            ? { status: "usable", evidenceIds: [nextEvidence.id] }
+            ? {
+                status: "usable",
+                evidenceIds: [nextEvidence.id],
+                contentHash: contentHashFromToolResult(result),
+              }
             : {
                 status: "unusable",
                 failure: result.error?.message ?? "No passage-backed evidence was extracted.",
@@ -429,8 +493,8 @@ export async function runResearchWorker(input: {
         call.name === "web_fetch" &&
         claimedCandidateId !== null &&
         nextEvidence === null &&
-        alternativeSourceReads < 1 &&
-        toolCalls < maxToolCalls
+        alternativeSourceReads < maxAlternativeSourceReads &&
+        toolCalls < effectiveMaxToolCalls
       ) {
         const alternativeClaim = claimNextSourceCandidate(
           sourceLedger,
@@ -501,7 +565,11 @@ export async function runResearchWorker(input: {
             sourceLedger,
             candidate.id,
             alternativeEvidence
-              ? { status: "usable", evidenceIds: [alternativeEvidence.id] }
+              ? {
+                  status: "usable",
+                  evidenceIds: [alternativeEvidence.id],
+                  contentHash: contentHashFromToolResult(alternativeResult),
+                }
               : {
                   status: "unusable",
                   failure:
@@ -521,6 +589,68 @@ export async function runResearchWorker(input: {
       }
     }
     if (finalSummary) break;
+
+    if (progressController && !saturationFinalize) {
+      const stepToolCalls = toolCalls - toolCallsAtStepStart;
+      const stepNewEvidence = evidence.length - evidenceAtStepStart;
+      if (stepToolCalls > 0) {
+        const proofDebtMissing = computeSourceProofDebt(sourceLedger).reduce(
+          (sum, item) => sum + item.missing,
+          0,
+        );
+        const decision = progressController.evaluateBatch(
+          {
+            modelSteps: 1,
+            toolCalls: stepToolCalls,
+            newEvidenceCount: stepNewEvidence,
+          },
+          {
+            acceptanceGaps: [],
+            remainingQuestions: proofDebtMissing,
+            conflicts: 0,
+          },
+        );
+        if (decision.action === "stop") {
+          saturationFinalize = true;
+          await input.events?.onStatus?.(
+            "Required sources are satisfied and evidence has saturated; requesting the final research handoff.",
+          );
+          messages.push({
+            role: "user",
+            content:
+              "Required sources are satisfied and new material evidence has stopped arriving. Provide the final structured evidence handoff now. Do not request more tools.",
+          });
+        } else if (
+          decision.action === "escalate" ||
+          decision.startNewSegment
+        ) {
+          // Evidence is still productive with work unresolved: grow the bounded
+          // budget toward the hard worker ceiling instead of stopping at the
+          // starting tier's allocation.
+          const budget = progressController.getBudget();
+          const grownSteps = clamp(
+            Math.max(effectiveMaxSteps, budget.maxModelStepsPerSegment),
+            1,
+            RESEARCH_WORKER_MAX_STEPS,
+          );
+          const grownToolCalls = clamp(
+            Math.max(effectiveMaxToolCalls, budget.maxToolCallsPerSegment),
+            1,
+            RESEARCH_WORKER_MAX_TOOL_CALLS,
+          );
+          if (
+            grownSteps > effectiveMaxSteps ||
+            grownToolCalls > effectiveMaxToolCalls
+          ) {
+            effectiveMaxSteps = grownSteps;
+            effectiveMaxToolCalls = grownToolCalls;
+            await input.events?.onStatus?.(
+              `Research is still productive; extending to ${effectiveMaxSteps} steps and ${effectiveMaxToolCalls} tool calls.`,
+            );
+          }
+        }
+      }
+    }
   }
 
   if (!finalSummary) {
@@ -528,6 +658,44 @@ export async function runResearchWorker(input: {
       ? `Researcher gathered ${evidence.length} evidence record(s) but reached its bounded step budget before prose synthesis.`
       : "Researcher could not gather usable evidence within the bounded worker budget.";
   }
+
+  // Pre-handoff liveness recheck: a content hash proves what was fetched, not
+  // that the page is still reachable. Surface any cited source that is now
+  // definitively gone (404/410) as a non-blocking caveat so the Lead can verify
+  // before publishing. Skipped when no transport is available (unit fixtures).
+  const deadLinkRecheckEnabled =
+    input.toolContext.settings?.deadLinkRecheckEnabled !== false;
+  if (
+    deadLinkRecheckEnabled &&
+    typeof input.toolContext.httpTransport === "function"
+  ) {
+    const citedUrls = evidence
+      .filter((item) => item.kind === "web_source" && isString(item.url))
+      .map((item) => item.url as string);
+    if (citedUrls.length > 0) {
+      const liveness = await recheckLinkLiveness({
+        urls: citedUrls,
+        probe: buildLivenessProbe(input.toolContext.httpTransport, {
+          timeoutMs: input.toolContext.settings?.requestTimeoutMs,
+        }),
+        maxChecks: 6,
+        signal: input.abortSignal,
+      });
+      const dead = deadLinks(liveness);
+      if (dead.length > 0) {
+        await input.events?.onStatus?.(
+          `Liveness recheck flagged ${dead.length} cited source(s) that may be dead.`,
+        );
+        finalSummary = `${finalSummary}\n\nLiveness caveats:\n${dead
+          .map(
+            (item) =>
+              `- ${item.url} returned ${item.status ?? "no response"} on recheck; verify before publishing.`,
+          )
+          .join("\n")}`;
+      }
+    }
+  }
+
   const now = (input.now?.() ?? new Date()).toISOString();
   const proofDebt = computeSourceProofDebt(sourceLedger);
   const sourceIds = unique(
@@ -708,6 +876,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   }
 }
 
+/** HEAD-first liveness probe with a ranged-GET fallback for HEAD-hostile hosts. */
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
@@ -731,6 +900,15 @@ function addSearchResultsToLedger(
   for (const item of output.results.slice(0, 10)) {
     if (!isRecord(item) || typeof item.url !== "string" || !item.url.trim()) continue;
     const title = typeof item.title === "string" ? item.title : item.url;
+    const publishedAt =
+      typeof item.published_at === "string" ? item.published_at : undefined;
+    const signals = inferSourceSignals({
+      url: item.url,
+      title,
+      snippet: typeof item.snippet === "string" ? item.snippet : undefined,
+      publishedAt,
+      now,
+    });
     const registered = addSourceCandidate(
       ledger,
       {
@@ -738,13 +916,14 @@ function addSearchResultsToLedger(
         title,
         url: item.url,
         provider: "web_search",
-        sourceType: inferSourceType(item.url, title),
+        sourceType: signals.sourceType,
         signals: {
-          quality: inferQuality(item.url, title),
-          freshness: 0.65,
-          fetchability: 0.75,
+          quality: signals.quality,
+          freshness: signals.freshness,
+          fetchability: signals.fetchability,
         },
         claimIds: ["mission"],
+        ...(publishedAt ? { publishedAt } : {}),
       },
       now,
     );
@@ -753,23 +932,15 @@ function addSearchResultsToLedger(
   return ledger;
 }
 
-function inferSourceType(urlValue: string, title: string): ResearchSourceType {
-  const lower = `${urlValue} ${title}`.toLowerCase();
-  if (/\.pdf(?:$|[?#])/.test(lower)) return "pdf";
-  if (/arxiv\.org|doi\.org|\b(journal|study|paper|research)\b/.test(lower)) return "paper";
-  if (/\.gov(?:\/|$)|\b(official|documentation|docs)\b/.test(lower)) return "official";
-  if (/\b(primary source|transcript|dataset)\b/.test(lower)) return "primary";
-  if (/\b(news|press|reuters|associated press)\b/.test(lower)) return "news";
-  return "web";
-}
-
-function inferQuality(urlValue: string, title: string): number {
-  const type = inferSourceType(urlValue, title);
-  if (type === "primary" || type === "official") return 0.9;
-  if (type === "paper") return 0.85;
-  if (type === "pdf" || type === "document") return 0.7;
-  if (type === "news") return 0.62;
-  return 0.5;
+/**
+ * Read the `contentHash` `web_fetch` reports on every successful path. Absent
+ * for tools that do not fetch a body, in which case duplicate-content detection
+ * simply does not apply to that outcome.
+ */
+function contentHashFromToolResult(result: ToolExecutionResult): string | undefined {
+  if (!result.ok || !isRecord(result.output)) return undefined;
+  const hash = result.output.contentHash;
+  return typeof hash === "string" && hash.trim() ? hash : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

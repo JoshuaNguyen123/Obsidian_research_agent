@@ -19,6 +19,10 @@ import {
   type ApprovalDecision,
   type ApprovalRequest,
 } from "./agent/approvalBroker";
+import type {
+  ClarificationBroker,
+  ClarificationRequest,
+} from "./agent/clarificationBroker";
 import {
   approvalDeniedFailureCopy,
   claimGroundingFailureCopy,
@@ -105,6 +109,7 @@ import {
   formatChars,
   formatOptionalNumber,
   formatReceiptOperationLabel,
+  formatBoundedList,
   formatScopeList,
   formatStepMetric,
   formatStreamLifecycleLabel,
@@ -555,18 +560,14 @@ export class AgentView extends ItemView {
     this.tabsEl = tabsEl;
     if (this.shouldShowOrchestrator()) {
       tabsEl.addClass("has-orchestrator");
-      this.orchestratorTabButtonEl = tabsEl.createEl("button", {
-        text: "Orchestrator",
-        cls: "agentic-researcher-tab",
-        attr: {
-          type: "button",
-          role: "tab",
-          "aria-selected": "false",
-        },
-      });
+      // The orchestrator is folded into Activity rather than owning a third
+      // tab. Its control still exists — deep links, snapshot updates, and the
+      // mount guards all key off it — it simply is not a separate destination.
+      this.orchestratorTabButtonEl = document.createElement("button");
+      this.orchestratorTabButtonEl.type = "button";
     }
     this.detailsTabButtonEl = tabsEl.createEl("button", {
-      text: "Run Details",
+      text: "Activity",
       cls: "agentic-researcher-tab",
       attr: {
         type: "button",
@@ -1550,6 +1551,8 @@ export class AgentView extends ItemView {
         void this.handleRunComplete(event);
       },
       onApprovalRequest: (request) => this.renderApprovalRequest(request),
+      onClarificationRequest: (request, broker) =>
+        this.renderClarificationRequest(request, broker),
       onApprovalResolved: (event) =>
         this.renderApprovalResolved(event.request, event.decision),
       onCodeOutput: (event) => this.appendCodeOutput(event),
@@ -3205,23 +3208,15 @@ export class AgentView extends ItemView {
       return;
     }
     this.modelConfigEl.empty();
+    // Idle view of a previous run: a short "where you left off" summary, not a
+    // full diagnostic dump. The panel should read as ready for the next
+    // mission; the complete ledger belongs to the run itself once continued.
     for (const line of [
-      `run_id=${ledger.runId}`,
-      "run_config=restored_from_durable_state",
-      `ledger_status=${ledger.status}`,
-      `ledger_acceptance_status=${ledger.acceptance?.status ?? "unchecked"}`,
-      `ledger_acceptance_missing=${formatScopeList(ledger.acceptance?.missing ?? [])}`,
-      `ledger_evidence=${ledger.evidenceCount}`,
-      `ledger_receipts=${ledger.receiptCount}`,
-      `ledger_expected_tools=${formatScopeList(ledger.expectedTools)}`,
-      `ledger_iterations=${ledger.iterationCount}`,
-      `ledger_progress=${formatOptionalNumber(ledger.progressScore)}`,
-      `ledger_last_action=${ledger.lastMeaningfulAction ?? "none"}`,
-      `ledger_next_action=${ledger.nextAction}`,
-      `ledger_remaining_actions=${formatScopeList(ledger.remainingActions)}`,
-      `ledger_continuation=${ledger.continuationCommand}`,
-      `ledger_can_resume=${ledger.canResume ? "on" : "off"}`,
-      `ledger_blocker=${ledger.blockerCategory ?? "none"}`,
+      `previous run ${ledger.runId}`,
+      `status=${ledger.status} · acceptance=${ledger.acceptance?.status ?? "unchecked"}`,
+      `evidence=${ledger.evidenceCount} · receipts=${ledger.receiptCount}`,
+      `next_action=${ledger.nextAction}`,
+      ...(ledger.blockerCategory ? [`blocker=${ledger.blockerCategory}`] : []),
       ...this.plugin.getExtensionStatusLines(),
     ]) {
       this.modelConfigEl.createDiv({
@@ -3422,12 +3417,14 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-acceptance-value",
     });
 
-    this.createAcceptanceRow("missing", formatScopeList(acceptance.missing));
+    // next_action first: it is the one line a human acts on. The lists below
+    // are bounded so a run with dozens of conflicts stays readable.
     this.createAcceptanceRow(
       "next_action",
       acceptance.nextAction?.trim() || "none",
     );
-    this.createAcceptanceRow("reasons", formatScopeList(acceptance.reasons));
+    this.createAcceptanceRow("missing", formatBoundedList(acceptance.missing));
+    this.createAcceptanceRow("reasons", formatBoundedList(acceptance.reasons));
     if (acceptance.checkedAt) {
       this.createAcceptanceRow("checked_at", acceptance.checkedAt);
     }
@@ -3864,13 +3861,16 @@ export class AgentView extends ItemView {
   }
 
   private setActiveTab(tab: AgentViewTab) {
-    if (tab === "orchestrator" && !this.orchestratorTabButtonEl) {
-      tab = "chat";
+    // Orchestrator and Run Details are one surface now: what the run is doing,
+    // in one place. Existing callers (deep links, "Open Activity") keep
+    // working by resolving to Activity.
+    if (tab === "orchestrator") {
+      tab = this.orchestratorTabButtonEl ? "details" : "chat";
     }
     this.activeTab = tab;
     const isChat = tab === "chat";
-    const isOrchestrator = tab === "orchestrator";
     const isDetails = tab === "details";
+    const isOrchestrator = isDetails && Boolean(this.orchestratorTabButtonEl);
 
     this.chatTabButtonEl?.classList.toggle("is-active", isChat);
     this.chatTabButtonEl?.setAttribute("aria-selected", String(isChat));
@@ -4931,7 +4931,7 @@ export class AgentView extends ItemView {
       attr: { type: "button", "data-testid": "chat-approval-deny" },
     });
     const openDetails = controls.createEl("button", {
-      text: "Open Run Details",
+      text: "Open Activity",
       cls: "agentic-researcher-secondary-action",
       attr: { type: "button" },
     });
@@ -4955,6 +4955,99 @@ export class AgentView extends ItemView {
       event.preventDefault();
       this.setActiveTab("details");
     });
+  }
+
+  /**
+   * The agent is unsure and asked one question. Rendered inline in chat with
+   * one-click suggested answers plus a free-text box, so answering is a single
+   * gesture and the transcript keeps the exchange.
+   */
+  private renderClarificationRequest(
+    request: ClarificationRequest,
+    broker: ClarificationBroker,
+  ) {
+    const banner = this.chatAttentionEl;
+    if (!banner) {
+      return;
+    }
+    banner.empty();
+    banner.removeClass("is-hidden");
+    banner.show();
+    banner.addClass("is-clarification");
+    banner.createDiv({
+      text: request.question,
+      cls: "agentic-researcher-chat-attention-title",
+    });
+    if (request.context) {
+      banner.createDiv({
+        text: request.context,
+        cls: "agentic-researcher-chat-attention-body",
+      });
+    }
+
+    const controls = banner.createDiv({
+      cls: "agentic-researcher-chat-attention-controls",
+    });
+    const settle = (run: () => boolean) => {
+      if (!run()) return;
+      banner.removeClass("is-clarification");
+      this.clearChatAttention();
+    };
+
+    for (const [index, option] of request.options.entries()) {
+      const chip = controls.createEl("button", {
+        text: option,
+        cls: "agentic-researcher-secondary-action agentic-researcher-clarification-chip",
+        attr: {
+          type: "button",
+          "data-testid": `clarification-option-${index}`,
+        },
+      });
+      chip.addEventListener("click", (event) => {
+        event.preventDefault();
+        settle(() => broker.answer(request.id, option));
+      });
+    }
+
+    const freeForm = banner.createDiv({
+      cls: "agentic-researcher-clarification-input",
+    });
+    const input = freeForm.createEl("input", {
+      attr: {
+        type: "text",
+        placeholder: "Type an answer…",
+        "data-testid": "clarification-answer",
+      },
+    });
+    const submit = () => {
+      const value = input.value.trim();
+      if (!value) return;
+      settle(() => broker.answer(request.id, value));
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      submit();
+    });
+    const sendButton = freeForm.createEl("button", {
+      text: "Send",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button", "data-testid": "clarification-send" },
+    });
+    sendButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      submit();
+    });
+    const skipButton = freeForm.createEl("button", {
+      text: "Skip",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button", "data-testid": "clarification-skip" },
+    });
+    skipButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      settle(() => broker.skip(request.id));
+    });
+    input.focus();
   }
 
   private clearChatAttention() {

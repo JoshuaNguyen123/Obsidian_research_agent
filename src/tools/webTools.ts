@@ -41,6 +41,8 @@ import {
   browserExtractMarkdownTool,
   browserOpenPageTool,
 } from "./companionTools";
+import { runFreeSearchFallback } from "./freeSearchProviders";
+import { requestWithRetry } from "./httpRetry";
 
 export function createWebTools(): AgentTool[] {
   return [webSearchTool, webFetchTool, readSourceSectionTool];
@@ -75,36 +77,83 @@ export const webSearchTool: AgentTool = {
     }
 
     const maxResults = clampMaxResults(getOptionalInteger(args, "max_results"));
-    const baseUrl = normalizeOllamaBaseUrl(context.settings.ollamaBaseUrl);
 
-    if (isOllamaCloudBaseUrl(baseUrl) && !context.settings.ollamaApiKey.trim()) {
-      throw new Error(
-        "Ollama web_search requires an API key. Add one in Agentic Researcher settings.",
-      );
+    let primaryError: unknown = null;
+    try {
+      const primary = await runOllamaWebSearch(query, maxResults, context);
+      if (primary.results.some((result) => result.url)) {
+        return primary;
+      }
+    } catch (error) {
+      primaryError = error;
     }
 
-    const request: HttpRequest = {
-      url: `${baseUrl}/web_search`,
-      method: "POST",
-      contentType: "application/json",
-      headers: buildHeaders(context),
-      throw: false,
-      timeoutMs: getOperationTimeoutMs(context),
-      abortSignal: context.abortSignal,
-      body: JSON.stringify({
+    // Primary provider failed or returned nothing usable: fall back to keyless
+    // official public APIs so research is never blocked by a single provider.
+    if (context.settings.freeSearchFallbackEnabled !== false) {
+      const fallback = await runFreeSearchFallback({
+        transport: context.httpTransport,
         query,
-        max_results: maxResults,
-      }),
-    };
-
-    const response = await context.httpTransport(request);
-    if (response.status >= 400) {
-      throw new Error(getHttpErrorMessage(response));
+        maxResults,
+        timeoutMs: getOperationTimeoutMs(context),
+        signal: context.abortSignal,
+      });
+      if (fallback.length > 0) {
+        return {
+          results: fallback.map((result) => ({
+            title: result.title,
+            url: result.url,
+            snippet: truncateText(result.snippet, MAX_WEB_SEARCH_SNIPPET_CHARS),
+            // Only the scholarly providers know a publication date. Passing it
+            // through lets candidate ranking score freshness for real instead
+            // of assuming a constant, and lets the model reason about recency.
+            ...(result.publishedAt ? { published_at: result.publishedAt } : {}),
+          })),
+        };
+      }
     }
 
-    return normalizeWebSearchResponse(response.json ?? parseJsonText(response.text));
+    if (primaryError) {
+      throw primaryError;
+    }
+    return { results: [] };
   },
 };
+
+async function runOllamaWebSearch(
+  query: string,
+  maxResults: number,
+  context: ToolExecutionContext,
+): Promise<{ results: Array<{ title: string; url: string; snippet: string }> }> {
+  const baseUrl = normalizeOllamaBaseUrl(context.settings.ollamaBaseUrl);
+
+  if (isOllamaCloudBaseUrl(baseUrl) && !context.settings.ollamaApiKey.trim()) {
+    throw new Error(
+      "Ollama web_search requires an API key. Add one in Agentic Researcher settings.",
+    );
+  }
+
+  const request: HttpRequest = {
+    url: `${baseUrl}/web_search`,
+    method: "POST",
+    contentType: "application/json",
+    headers: buildHeaders(context),
+    throw: false,
+    timeoutMs: getOperationTimeoutMs(context),
+    abortSignal: context.abortSignal,
+    body: JSON.stringify({
+      query,
+      max_results: maxResults,
+    }),
+  };
+
+  const response = await requestWithRetry(context.httpTransport, request);
+  if (response.status >= 400) {
+    throw new Error(getHttpErrorMessage(response));
+  }
+
+  return normalizeWebSearchResponse(response.json ?? parseJsonText(response.text));
+}
 
 export const webFetchTool: AgentTool = {
   name: "web_fetch",
@@ -213,7 +262,7 @@ export const webFetchTool: AgentTool = {
       body: JSON.stringify({ url }),
     };
 
-    const response = await context.httpTransport(request);
+    const response = await requestWithRetry(context.httpTransport, request);
     if (response.status >= 400) {
       throw new Error(getHttpErrorMessage(response, "web_fetch"));
     }
@@ -455,7 +504,7 @@ function createRuntimeResearchProviders(
       assertOperationActive(context);
       const normalizedUrl = normalizeWebFetchUrl(candidate.url);
       const baseUrl = normalizeOllamaBaseUrl(context.settings.ollamaBaseUrl);
-      const response = await context.httpTransport({
+      const response = await requestWithRetry(context.httpTransport, {
         url: `${baseUrl}/web_fetch`,
         method: "POST",
         contentType: "application/json",

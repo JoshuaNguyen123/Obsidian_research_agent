@@ -9,6 +9,10 @@ import { normalizeVaultPath } from "../tools/validation";
 import { isPathUnderVaultFolder, isVaultPathExcluded } from "../tools/vaultExclusions";
 import { mapWithBoundedConcurrency } from "../utils/boundedConcurrency";
 import type { SemanticEmbeddingProvider } from "./types";
+import {
+  buildSemanticGraphPrior,
+  type SemanticGraphPrior,
+} from "./semanticGraphPrior";
 import type {
   SemanticIndexBuildResult,
   SemanticIndexChunk,
@@ -345,6 +349,9 @@ class DefaultSemanticIndexService implements SemanticIndexService {
       );
     }
 
+    // Absent seedPaths this is an empty map, and scoring stays byte-identical.
+    const graphPrior = buildSemanticGraphPrior(index.notes, request.seedPaths ?? []);
+
     const searchResult = index.version === 2
       ? await searchIndexShards({
           app: this.app,
@@ -357,6 +364,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
           candidateLimit: getCandidateLimit(request),
           minScore: request.minScore,
           cursor: request.cursor ?? null,
+          graphPrior,
         })
       : {
           hits: searchIndexChunks({
@@ -368,6 +376,7 @@ class DefaultSemanticIndexService implements SemanticIndexService {
             maxSnippetChars: request.maxSnippetChars ?? MAX_INDEX_SNIPPET_CHARS,
             minScore: request.minScore,
             cursor: request.cursor ?? null,
+            graphPrior,
           }),
           candidateCount: index.notes.reduce((sum, note) => sum + note.chunks.length, 0),
           nextCursor: null,
@@ -812,6 +821,34 @@ async function embedIndexDocuments({
   return { ok: true, vectors: response.documents };
 }
 
+/**
+ * Blend the three retrieval signals.
+ *
+ * With no graph prior the weights are 0.85/0.15 — byte-identical to the
+ * scoring this index has always used, which is what makes the graph tier
+ * strictly opt-in. With a prior, 5% is taken from the semantic term: enough to
+ * break a tie between comparably relevant notes, never enough to let a
+ * densely-linked hub outrank a genuinely better match.
+ */
+function blendSemanticScore(
+  semanticScore: number,
+  lexicalScore: number,
+  graphScore: number | null,
+): number {
+  if (graphScore === null) {
+    return semanticScore * 0.85 + lexicalScore * 0.15;
+  }
+  return semanticScore * 0.8 + lexicalScore * 0.15 + graphScore * 0.05;
+}
+
+function graphScoreFor(
+  prior: SemanticGraphPrior | null,
+  path: string,
+): number | null {
+  if (!prior || prior.size === 0) return null;
+  return prior.get(path) ?? 0;
+}
+
 function searchIndexChunks({
   index,
   queryVector,
@@ -821,12 +858,14 @@ function searchIndexChunks({
   maxSnippetChars,
   minScore,
   cursor,
+  graphPrior,
 }: {
   index: SemanticVaultIndexV1;
   queryVector: number[];
   queryTerms: Set<string>;
   folder: string | null;
   limit: number;
+  graphPrior?: SemanticGraphPrior | null;
   maxSnippetChars: number;
   minScore?: number;
   cursor?: string | null;
@@ -840,11 +879,14 @@ function searchIndexChunks({
     for (const chunk of note.chunks) {
       const semanticScore = normalizeCosine(cosineSimilarity(queryVector, chunk.vector));
       const lexicalScore = lexicalScoreForChunk(note, chunk, queryTerms);
-      const score = semanticScore * 0.85 + lexicalScore.score * 0.15;
-      const reasons =
-        semanticScore > 0.55
+      const graphScore = graphScoreFor(graphPrior ?? null, note.path);
+      const score = blendSemanticScore(semanticScore, lexicalScore.score, graphScore);
+      const reasons = [
+        ...(semanticScore > 0.55
           ? ["indexed_semantic_similarity", ...lexicalScore.reasons]
-          : lexicalScore.reasons;
+          : lexicalScore.reasons),
+        ...(graphScore ? ["graph_proximity"] : []),
+      ];
       if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
         continue;
       }
@@ -890,7 +932,9 @@ async function searchIndexShards({
   candidateLimit,
   minScore,
   cursor,
+  graphPrior,
 }: {
+  graphPrior?: SemanticGraphPrior | null;
   app: App;
   index: SemanticVaultIndexV2;
   queryVector: number[];
@@ -929,7 +973,8 @@ async function searchIndexShards({
       candidateCount += 1;
       const semanticScore = normalizeCosine(cosineSimilarity(queryVector, vector));
       const lexicalScore = lexicalScoreForRow(note, row, queryTerms);
-      const score = semanticScore * 0.85 + lexicalScore.score * 0.15;
+      const graphScore = graphScoreFor(graphPrior ?? null, row.notePath);
+      const score = blendSemanticScore(semanticScore, lexicalScore.score, graphScore);
       if (semanticScore <= 0.1 && lexicalScore.score <= 0) {
         continue;
       }
@@ -939,11 +984,12 @@ async function searchIndexShards({
         score: roundScore(score),
         semanticScore: roundScore(semanticScore),
         lexicalScore: roundScore(lexicalScore.score),
-        reasons: dedupeStrings(
-          semanticScore > 0.55
+        reasons: dedupeStrings([
+          ...(semanticScore > 0.55
             ? ["indexed_semantic_similarity", ...lexicalScore.reasons]
-            : lexicalScore.reasons,
-        ),
+            : lexicalScore.reasons),
+          ...(graphScore ? ["graph_proximity"] : []),
+        ]),
         heading: row.heading,
         snippet: boundedSnippet(row.snippet, maxSnippetChars),
         sortPath: row.notePath,

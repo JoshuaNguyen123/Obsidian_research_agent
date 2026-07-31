@@ -1,5 +1,9 @@
 import { hasDesignIntent } from "./codeDesignIntent";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import {
+  hasAuthorizedCurrentNoteReplaceIntent,
+  stripNegatedReplaceClauses,
+} from "./replaceIntent";
 import { normalizeVaultPath } from "../tools/validation";
 
 export interface AutonomyScope {
@@ -141,16 +145,29 @@ export function deriveAutonomyScope(
       ? mentionedFolders
       : [];
 
+  // A refusal ("do not rewrite the note") must never read as authority, so every
+  // branch below sees the negation-stripped text — the same text
+  // hasAuthorizedCurrentNoteReplaceIntent judges.
+  const replaceScopePrompt = stripNegatedReplaceClauses(prompt);
   scope.destructive.replaceCurrentNote =
     /\b(replace|rewrite|clear|empty|delete all|overwrite|start\s+(?:fresh|cleanly)|reset|edit\s+over)\b[\s\S]{0,180}\b(note|page|document|file|space|contents?|text|writing)\b/i.test(
-      prompt,
+      replaceScopePrompt,
     ) ||
     /\b(note|page|document|file|space|contents?|text|writing)\b[\s\S]{0,180}\b(replace|rewrite|clear|empty|delete all|overwrite|start\s+(?:fresh|cleanly)|reset|edit\s+over)\b/i.test(
-      prompt,
+      replaceScopePrompt,
     ) ||
     /\bkeep\s+(?:the\s+)?(?:note|page|document|file)\b[\s\S]{0,180}\b(delete|remove|clear|empty)\b[\s\S]{0,120}\b(?:contents?|text|writing)\b/i.test(
-      prompt,
-    );
+      replaceScopePrompt,
+    ) ||
+    // The patterns above demand a noun like "note"/"document", so an ordinary
+    // revision follow-up ("rewrite it with some more details") failed here while
+    // the host's own gate (hasAuthorizedCurrentNoteReplaceIntent) said yes —
+    // leaving the run with no write tool AND no host write path. These two gate
+    // the same capability and must agree. Requiring the trusted
+    // hasActiveMarkdownNote fact keeps prompt text alone from granting it.
+    (input.hasActiveMarkdownNote === true &&
+      scope.write.currentNote &&
+      hasAuthorizedCurrentNoteReplaceIntent(prompt));
   scope.destructive.deleteCurrentNote =
     input.explicitDelete === true &&
     /\b(delete|trash|remove)\b[\s\S]{0,120}\b(current|this|active|the)\s+(note|page|document|file)\b/i.test(

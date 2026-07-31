@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  BOUNDED_LIST_PREVIEW,
   formatAgentMetric,
+  formatBoundedList,
   formatChars,
   formatOptionalNumber,
   formatReceiptOperationLabel,
@@ -9,6 +11,26 @@ import {
   formatStepMetric,
   formatStreamLifecycleLabel,
 } from "../src/ui/agentViewFormatters";
+
+test("long diagnostic lists stay readable while reporting the true total", () => {
+  // Run Details was dumping ~50 `conflict:<hash>` ids on one line, burying the
+  // next_action a human actually reads. Cap the enumeration, keep the count.
+  assert.equal(formatBoundedList([]), "none");
+  assert.equal(formatBoundedList(["a", "b"]), "a, b");
+
+  const conflicts = Array.from({ length: 50 }, (_, index) => `conflict:${index}`);
+  const rendered = formatBoundedList(conflicts);
+  assert.ok(rendered.startsWith("conflict:0, conflict:1"), rendered);
+  assert.ok(rendered.endsWith(`+${50 - BOUNDED_LIST_PREVIEW} more`), rendered);
+  assert.ok(
+    rendered.length < 200,
+    `expected a readable line, got ${rendered.length} chars`,
+  );
+
+  // Exactly at the boundary there is nothing more to report.
+  const exact = Array.from({ length: BOUNDED_LIST_PREVIEW }, (_, i) => `x${i}`);
+  assert.ok(!formatBoundedList(exact).includes("more"));
+});
 
 test("agent view formatters preserve visible run detail copy", () => {
   assert.equal(formatStreamLifecycleLabel("first_visible_content"), "chat_stream");

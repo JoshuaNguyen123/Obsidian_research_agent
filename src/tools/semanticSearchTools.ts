@@ -427,6 +427,12 @@ async function searchSemanticIndexFirst({
     return null;
   }
 
+  // Seed the graph prior with the note the user is working in, so notes the
+  // author already linked into this neighbourhood break ties among comparably
+  // relevant hits. With no active note the prior is empty and scoring is
+  // unchanged.
+  const activePath = context.app?.workspace?.getActiveFile?.()?.path;
+
   const search = await context.semanticIndexService.search({
     query,
     limit,
@@ -436,6 +442,7 @@ async function searchSemanticIndexFirst({
     candidateLimit,
     minScore,
     cursor,
+    ...(activePath ? { seedPaths: [activePath] } : {}),
   });
 
   if (!search.ok) {

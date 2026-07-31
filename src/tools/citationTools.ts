@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import type { HttpRequest } from "../model/types";
 import type { AgentTool, ToolExecutionContext } from "./types";
+import { normalizeForMatch } from "../agent/quoteMatch";
+import { collapseWhitespace, stripJats, xmlText } from "./atomText";
 import { readSourceSection } from "./sourceCache";
 import {
   getOptionalInteger,
@@ -23,6 +25,10 @@ import {
  * PDF ingestion is deliberately out of scope: there is no dependency-free
  * parser in this codebase, so full text comes from open-access HTML through
  * the existing web_fetch cache, and metadata/abstracts come from the APIs.
+ * `buildResearchFallbackCandidates` in `../orchestrator/researchProvider`
+ * carries this further by rewriting known PDF URLs (arXiv, PubMed, DOI) to
+ * their open HTML equivalents before any browser fallback is attempted, which
+ * recovers most of the full text a parser would have given us.
  */
 
 const CROSSREF_API = "https://api.crossref.org/works";
@@ -430,28 +436,6 @@ async function request(
     throw new Error(`Citation provider request failed with HTTP ${response.status}.`);
   }
   return response;
-}
-
-function xmlText(fragment: string, tag: string): string {
-  const match = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "u").exec(fragment);
-  return match?.[1] ?? "";
-}
-
-function stripJats(value: string): string {
-  return collapseWhitespace(value.replace(/<[^>]+>/gu, " "));
-}
-
-function collapseWhitespace(value: string): string {
-  return value.replace(/\s+/gu, " ").trim();
-}
-
-function normalizeForMatch(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[‘’]/gu, "'")
-    .replace(/[“”]/gu, '"')
-    .replace(/\s+/gu, " ")
-    .trim();
 }
 
 function sha256(value: string): string {

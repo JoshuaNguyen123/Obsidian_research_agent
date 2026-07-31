@@ -49,6 +49,8 @@ export interface SourceCandidate extends SourceCandidateInput {
   attemptedAt?: string;
   resolvedAt?: string;
   failure?: string;
+  /** `sha256:…` digest of the fetched body, once the source has been read. */
+  contentHash?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -66,6 +68,19 @@ export interface SourceCandidateLedgerV1 {
   queryVariants: string[];
   candidates: Record<string, SourceCandidate>;
   canonicalCandidateIds: Record<string, string>;
+  /**
+   * Content hash → the candidate id that first proved usable with that hash.
+   *
+   * `canonicalCandidateIds` catches the same URL twice; this catches the same
+   * *text* served from two different URLs — mirrors, syndicated copies, a press
+   * release republished by three outlets. Without it, two mirrors on distinct
+   * hostnames satisfied `minDistinctDomains` and the run reported corroboration
+   * it did not have.
+   *
+   * Additive since ledger version 1: readers default it, so a ledger persisted
+   * before this field existed still loads.
+   */
+  contentHashCandidateIds?: Record<string, string>;
   proofRequirements: SourceProofRequirement[];
   duplicateCount: number;
   createdAt: string;
@@ -93,7 +108,16 @@ export interface CandidateOutcome {
   status: Extract<SourceCandidateStatus, "usable" | "unusable" | "rejected">;
   evidenceIds?: string[];
   failure?: string;
+  /**
+   * `sha256:…` digest of the fetched body, when the fetch reported one. Supplied
+   * by `web_fetch` on every path; used to reject a source whose text a prior
+   * usable candidate already contributed.
+   */
+  contentHash?: string;
 }
+
+/** Failure code recorded when a candidate duplicates an accepted source's text. */
+export const DUPLICATE_CONTENT_FAILURE = "duplicate_content";
 
 const TYPE_AUTHORITY_SCORE: Record<ResearchSourceType, number> = {
   primary: 10,
@@ -154,6 +178,7 @@ export function createSourceCandidateLedger(input: {
     }),
     candidates: Object.create(null) as Record<string, SourceCandidate>,
     canonicalCandidateIds: Object.create(null) as Record<string, string>,
+    contentHashCandidateIds: Object.create(null) as Record<string, string>,
     proofRequirements: normalizeProofRequirements(input.proofRequirements ?? []),
     duplicateCount: 0,
     createdAt: now,
@@ -332,15 +357,32 @@ export function recordSourceCandidateOutcome(
   if (!candidate) {
     return ledger;
   }
+
+  // A source whose body hash matches an already-accepted source is a mirror,
+  // not corroboration. Downgrade it to `rejected` so it stops counting toward
+  // the source floor and the distinct-domain requirement — `computeSourceProofDebt`
+  // already filters on `status === "usable"`, so nothing downstream changes.
+  const contentHashIndex = ledger.contentHashCandidateIds ?? {};
+  const contentHash = normalizeContentHash(outcome.contentHash);
+  const duplicateOfId =
+    outcome.status === "usable" && contentHash ? contentHashIndex[contentHash] : undefined;
+  const isDuplicateContent =
+    duplicateOfId !== undefined &&
+    duplicateOfId !== candidateId &&
+    ledger.candidates[duplicateOfId]?.status === "usable";
+
+  const status = isDuplicateContent ? "rejected" : outcome.status;
   const updated: SourceCandidate = {
     ...candidate,
-    status: outcome.status,
+    status,
+    contentHash: contentHash ?? candidate.contentHash,
     evidenceIds:
-      outcome.status === "usable"
+      status === "usable"
         ? uniqueStrings([...(candidate.evidenceIds ?? []), ...(outcome.evidenceIds ?? [])])
         : [],
-    failure:
-      outcome.status === "usable"
+    failure: isDuplicateContent
+      ? DUPLICATE_CONTENT_FAILURE
+      : status === "usable"
         ? undefined
         : normalizeWhitespace(outcome.failure ?? "Source did not satisfy the proof contract."),
     ownerId: null,
@@ -348,11 +390,28 @@ export function recordSourceCandidateOutcome(
     resolvedAt: now.toISOString(),
     updatedAt: now.toISOString(),
   };
+
+  // Only the first usable candidate for a hash owns it; a rejected duplicate
+  // must not overwrite the index entry that caused its own rejection.
+  const nextContentHashIndex =
+    contentHash && status === "usable" && !isDuplicateContent
+      ? { ...contentHashIndex, [contentHash]: candidateId }
+      : contentHashIndex;
+
   return {
     ...ledger,
     candidates: { ...ledger.candidates, [candidateId]: updated },
+    contentHashCandidateIds: nextContentHashIndex,
+    duplicateCount: isDuplicateContent ? ledger.duplicateCount + 1 : ledger.duplicateCount,
     updatedAt: now.toISOString(),
   };
+}
+
+function normalizeContentHash(value: string | undefined): string | null {
+  const trimmed = (value ?? "").trim().toLowerCase();
+  // Only accept the exact shape `sourceCache` writes and validates; a partial
+  // or provider-invented value must never collapse two distinct sources.
+  return /^sha256:[a-f0-9]{64}$/u.test(trimmed) ? trimmed : null;
 }
 
 export function computeSourceProofDebt(

@@ -21,6 +21,7 @@ import {
   advanceMissionPlanFromToolResult,
 } from "../src/agent/missionPlanAdvance";
 import { runMissionVerifiers } from "../src/agent/verifiers";
+import { resolveResearchEffortBudget } from "../src/agent/researchEffortPolicy";
 import { deriveAutonomyScope } from "../src/agent/missionScope";
 import { evidenceFromToolResult } from "../src/agent/missionEvidence";
 import { upsertMissionEvidenceRecord } from "../src/agent/missionLedger";
@@ -571,6 +572,130 @@ test("hybrid web citation coverage does not expose opaque vault-context passage 
     ),
     JSON.stringify(vaultOnlyResult),
   );
+});
+
+const HASH_A = `sha256:${"a".repeat(64)}`;
+const HASH_B = `sha256:${"b".repeat(64)}`;
+
+/** Two-source web plan used by the mirror-collapsing tests below. */
+function twoSourcePlan(): ResearchPlan {
+  return {
+    version: 1,
+    mode: "deep_web",
+    sourceRequirements: { minFetchedSources: 2, minDistinctDomains: 2 },
+    coverageRequirements: {
+      minVaultCoverageConfidence: "medium",
+      expandWhenSampledOrTruncated: true,
+    },
+    subquestions: [],
+    evidenceIds: [],
+    status: "in_progress",
+  };
+}
+
+/** A single-source plan pinned to one effort tier, for the strictness tests. */
+function tieredPlan(tier: "standard" | "deep"): ResearchPlan {
+  return {
+    ...twoSourcePlan(),
+    sourceRequirements: { minFetchedSources: 1, minDistinctDomains: 1 },
+    effort: { tier, budget: resolveResearchEffortBudget(tier) },
+  } as ResearchPlan;
+}
+
+test("a standard-tier plan keeps the original word-level epistemic contract", () => {
+  // Every currently-baselined proof lane runs at standard tier. This is the
+  // assertion that keeps the strict checks from moving a scorecard.
+  const result = evaluateResearchAcceptance({
+    plan: tieredPlan("standard"),
+    evidence: [webEvidence("web:1", "https://origin.example/report", { contentHash: HASH_A })],
+    finalOutput:
+      "Findings cite https://origin.example/report. We note limitations. Confidence is discussed.",
+  });
+  assert.ok(!result.missing.includes("limitations_section"), result.missing.join(", "));
+  assert.ok(!result.missing.includes("confidence_section"), result.missing.join(", "));
+});
+
+test("a deep-tier plan rejects a report that only mentions the epistemic words", () => {
+  const result = evaluateResearchAcceptance({
+    plan: tieredPlan("deep"),
+    evidence: [webEvidence("web:1", "https://origin.example/report", { contentHash: HASH_A })],
+    finalOutput:
+      "Findings cite https://origin.example/report. We note limitations. Confidence is discussed.",
+  });
+  assert.ok(result.missing.includes("limitations_section"), result.missing.join(", "));
+  assert.ok(result.missing.includes("confidence_section"), result.missing.join(", "));
+});
+
+test("a deep-tier plan accepts a real limitations section and a graded confidence", () => {
+  const result = evaluateResearchAcceptance({
+    plan: tieredPlan("deep"),
+    evidence: [webEvidence("web:1", "https://origin.example/report", { contentHash: HASH_A })],
+    finalOutput: [
+      "Findings cite https://origin.example/report.",
+      "",
+      "## Limitations",
+      "",
+      "The single source covers an 18-month window and did not randomise",
+      "assignment, so the reported gain may reflect selection rather than the",
+      "change itself. Nothing here speaks to long-run retention.",
+      "",
+      "Confidence: low.",
+    ].join("\n"),
+  });
+  assert.ok(!result.missing.includes("limitations_section"), result.missing.join(", "));
+  assert.ok(!result.missing.includes("confidence_section"), result.missing.join(", "));
+});
+
+test("two mirrors serving identical text count as one source, not two domains", () => {
+  // Before content-hash collapsing, a press release republished under two
+  // hostnames satisfied both minFetchedSources and minDistinctDomains, and the
+  // run reported corroboration it never had.
+  const result = evaluateResearchAcceptance({
+    plan: twoSourcePlan(),
+    evidence: [
+      webEvidence("web:1", "https://origin.example/report", { contentHash: HASH_A }),
+      webEvidence("web:2", "https://mirror.example/report", { contentHash: HASH_A }),
+    ],
+    finalOutput:
+      "Findings cite https://origin.example/report.\n\nLimitations: one source.\n\nConfidence: low.",
+  });
+  assert.ok(
+    result.missing.includes("fetched_sources:1/2"),
+    `expected the mirror to be collapsed, got ${JSON.stringify(result.missing)}`,
+  );
+});
+
+test("genuinely distinct sources still satisfy the source and domain floors", () => {
+  const result = evaluateResearchAcceptance({
+    plan: twoSourcePlan(),
+    evidence: [
+      webEvidence("web:1", "https://origin.example/report", { contentHash: HASH_A }),
+      webEvidence("web:2", "https://other.example/study", { contentHash: HASH_B }),
+    ],
+    finalOutput:
+      "Findings cite https://origin.example/report and https://other.example/study.\n\nLimitations: bounded.\n\nConfidence: medium.",
+  });
+  assert.ok(!result.missing.some((item) => item.startsWith("fetched_sources")));
+  assert.ok(!result.missing.some((item) => item.startsWith("distinct_domains")));
+});
+
+test("evidence without a verifiable content hash keeps its own url identity", () => {
+  // Absence of proof of duplication is not proof of duplication: a source the
+  // fetch path could not hash must not be silently merged into another.
+  const result = evaluateResearchAcceptance({
+    plan: twoSourcePlan(),
+    evidence: [
+      webEvidence("web:1", "https://origin.example/report"),
+      webEvidence("web:2", "https://mirror.example/report"),
+      // A malformed hash is treated as no hash rather than as a match key.
+      webEvidence("web:3", "https://third.example/x", {
+        contentHash: "sha256:not-a-real-digest",
+      }),
+    ],
+    finalOutput:
+      "Findings cite https://origin.example/report and https://mirror.example/report.\n\nLimitations: bounded.\n\nConfidence: medium.",
+  });
+  assert.ok(!result.missing.some((item) => item.startsWith("fetched_sources")));
 });
 
 function hybridResearchPlan(): ResearchPlan {

@@ -53,6 +53,56 @@
       }
     },
     {
+      "key": "daily-use-research|DU-02|e2e/daily-use-research.spec.ts|DU-02 proof-gated sourced writeback binds owned fetched passages",
+      "project": "daily-use-research",
+      "scenarioId": "DU-02",
+      "file": "e2e/daily-use-research.spec.ts",
+      "title": "DU-02 proof-gated sourced writeback binds owned fetched passages",
+      "scorecard": {
+        "version": 1,
+        "acceptancePassed": true,
+        "dimensions": [
+          {
+            "id": "acceptance_coverage",
+            "score": 1,
+            "weight": 0.3,
+            "detail": "13/13 criteria met"
+          },
+          {
+            "id": "evidence_grounding",
+            "score": 1,
+            "weight": 0.25,
+            "detail": "6/6 claims cited"
+          },
+          {
+            "id": "receipt_coverage",
+            "score": 1,
+            "weight": 0.15,
+            "detail": "1/1 mutations receipted"
+          },
+          {
+            "id": "recovery_cleanliness",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "0 recovery attempts"
+          },
+          {
+            "id": "model_call_efficiency",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "6/47 model calls"
+          },
+          {
+            "id": "wall_clock_efficiency",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "70s/840s"
+          }
+        ],
+        "total": 1
+      }
+    },
+    {
       "key": "desktop-checkers-delivery-real-live|DESKTOP-01|e2e/desktop-checkers-delivery-real-live.spec.ts|DESKTOP-01 a bare desktop prompt adopts the host sandbox and delivers a playable Python game",
       "project": "desktop-checkers-delivery-real-live",
       "scenarioId": "DESKTOP-01",

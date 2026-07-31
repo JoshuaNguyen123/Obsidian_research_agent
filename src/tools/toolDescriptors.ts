@@ -4,6 +4,7 @@ import type {
   ToolDescriptor,
 } from "../agent/actions";
 import type { AgentTool } from "./types";
+import { ASK_USER_TOOL_NAME } from "./clarificationTools";
 
 const VAULT_READS = new Set([
   "analyze_dataset",
@@ -120,6 +121,9 @@ export function withExplicitToolDescriptor(tool: AgentTool): AgentTool {
 }
 
 export function descriptorFor(toolName: string): ToolDescriptor {
+  if (toolName === ASK_USER_TOOL_NAME) {
+    return clarificationDescriptor(toolName);
+  }
   if (VAULT_READS.has(toolName)) {
     return readDescriptor(toolName, "vault", "markdown");
   }
@@ -211,6 +215,38 @@ export function descriptorFor(toolName: string): ToolDescriptor {
     });
   }
   throw new TypeError(`Missing explicit tool descriptor: ${toolName}`);
+}
+
+/**
+ * Asking the user a question mutates nothing, so it is a read — but an
+ * interactive one: never cached (the answer is a fresh human decision) and
+ * never parallel (two questions racing in the panel is incoherent).
+ */
+function clarificationDescriptor(name: string): ToolDescriptor {
+  return {
+    version: 1,
+    name,
+    capability: { system: "workspace", resourceType: "clarification", action: "read" },
+    effect: "read",
+    risk: "low",
+    approval: {
+      allowPromptGrant: true,
+      allowPersistentGrant: true,
+      fallback: "none",
+    },
+    execution: {
+      preparation: "none",
+      cacheable: false,
+      parallelSafe: false,
+    },
+    durability: {
+      journal: false,
+      receipt: false,
+      readback: "none",
+      reconciliation: "none",
+    },
+    allowedPrincipals: ["single_agent", "lead", "researcher"],
+  };
 }
 
 function readDescriptor(

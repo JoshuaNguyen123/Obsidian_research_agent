@@ -280,6 +280,9 @@ test.describe("Daily-use live research contract", () => {
           toolCalls:
             snapshot.missionEvidence.length +
             cacheSnapshot.missionEvidence.length,
+          // Emit the runtime's graded scorecard so this lane can be baselined
+          // for regression (acceptance stays the independent gate).
+          missionScorecard: snapshot.lastMissionScorecard,
         },
         { requireComplete: true },
       );
@@ -318,7 +321,7 @@ test.describe("Daily-use live research contract", () => {
       const prompt = `Replace the entire current note with exactly this markdown:\n# Approved Replacement\n\n${harness.marker}\n`;
 
       await harness.submitMission(prompt, { waitForCompletion: false });
-      await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      await harness.page.getByRole("tab", { name: "Activity" }).click();
       const denied = harness.activePreparedApproval("replace_current_file");
       await expect(denied).toBeVisible({ timeout: harness.config.missionTimeoutMs });
       await expect(denied).toContainText("fingerprint=sha256:");
@@ -392,7 +395,7 @@ test.describe("Daily-use live research contract", () => {
         // cleanup while an historical approval card remains rendered.
         clearChatFirst: false,
       });
-      await harness.page.getByRole("tab", { name: "Run Details" }).click();
+      await harness.page.getByRole("tab", { name: "Activity" }).click();
       const approved = harness.activePreparedApproval("replace_current_file");
       await expect(approved).toBeVisible({ timeout: harness.config.missionTimeoutMs });
       await harness.approve(approved);

@@ -15,6 +15,9 @@ export type AutonomyEffectClass = "soft" | "bound" | "hard";
 export type AutonomyProfile = "automatic" | "conservative" | "custom";
 
 const SOFT_FORCE = new Set([
+  // Asking the user a question mutates nothing and must never be gated behind
+  // an approval — that would make the agent ask permission to ask.
+  "ask_user",
   "web_search",
   "web_fetch",
   "read_current_file",

@@ -1160,6 +1160,34 @@
   min-width: 0;
 }
 
+/* Clarifying question: a quiet prompt, not an alarm. */
+.agentic-researcher-chat-attention.is-clarification {
+  border-left: 2px solid var(--interactive-accent);
+}
+
+.agentic-researcher-clarification-chip {
+  border-radius: 999px;
+}
+
+.agentic-researcher-clarification-input {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  min-width: 0;
+}
+
+.agentic-researcher-clarification-input input {
+  flex: 1 1 180px;
+  min-width: 0;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
 .agentic-researcher-chat-attention-missing-row {
   display: flex;
   flex-wrap: wrap;

@@ -270,6 +270,200 @@ test("research worker performs one bounded alternative read and preserves prior 
   );
 });
 
+test("adaptive worker stops early on saturation instead of grinding to the budget", async () => {
+  const good = "https://primary.example/good";
+  // After the one good source, the model keeps trying to fetch it again;
+  // sequenceModel repeats the final duplicate-fetch response indefinitely.
+  const responses = [
+    toolResponse("web_search", { query: "saturating evidence" }),
+    toolResponse("web_fetch", { url: good }),
+    toolResponse("web_fetch", { url: good }),
+    toolResponse("web_fetch", { url: good }),
+  ];
+  const makeRegistry = (): ToolRegistry => ({
+    getDefinitions: () =>
+      ["web_search", "web_fetch"].map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    async execute(call) {
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: { results: [{ title: "Primary source", url: good, snippet: "R" }] },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: good,
+          url: good,
+          content:
+            "This primary source provides a detailed, passage-backed explanation with enough concrete context for verification and citation by the Lead agent.",
+          parserStatus: "parsed",
+        },
+      };
+    },
+  });
+
+  const baseInput = {
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Find one usable source for the claim.",
+    originalMission: "Research the claim.",
+    toolRegistry: makeRegistry(),
+    maxSteps: 12,
+  };
+
+  const adaptive = await runResearchWorker({
+    ...baseInput,
+    runId: "run-saturate-adaptive",
+    modelClient: sequenceModel(responses),
+    toolContext: { settings: { adaptiveResearchProgress: true } } as ToolExecutionContext,
+  });
+  assert.equal(adaptive.handoff.status, "ready");
+  assert.ok(
+    adaptive.modelSteps < 12,
+    `expected early stop on saturation, modelSteps=${adaptive.modelSteps}`,
+  );
+
+  const grinding = await runResearchWorker({
+    ...baseInput,
+    runId: "run-saturate-fixed",
+    toolRegistry: makeRegistry(),
+    modelClient: sequenceModel(responses),
+    toolContext: { settings: { adaptiveResearchProgress: false } } as ToolExecutionContext,
+  });
+  // With the driver disabled the loop grinds all the way to the fixed budget.
+  assert.equal(grinding.modelSteps, 12);
+  assert.ok(
+    adaptive.modelSteps < grinding.modelSteps,
+    `adaptive should stop earlier: ${adaptive.modelSteps} vs ${grinding.modelSteps}`,
+  );
+});
+
+test("adaptive worker escalates and grows its budget while research stays productive", async () => {
+  // Force the smallest tier so the tier cap (8 model steps) is reached quickly.
+  // Distinct web_search queries keep new evidence arriving (high yield) while no
+  // fetch ever satisfies the source floor, so work stays unresolved — the exact
+  // condition that escalates the tier and grows the worker's bounded budget.
+  const searches = Array.from({ length: 14 }, (_, index) =>
+    toolResponse("web_search", { query: `distinct query ${index + 1}` }),
+  );
+  const model = sequenceModel([
+    ...searches,
+    finalResponse("Only search navigation so far; no fetched sources yet."),
+  ]);
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      ["web_search", "web_fetch"].map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    async execute(call) {
+      const query = String(call.arguments.query ?? "");
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          query,
+          results: [
+            { title: `Result for ${query}`, url: `https://ex.com/${encodeURIComponent(query)}`, snippet: query },
+          ],
+        },
+      };
+    },
+  };
+
+  const statuses: string[] = [];
+  const result = await runResearchWorker({
+    runId: "run-escalate",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Investigate the topic.",
+    originalMission: "Research the topic.",
+    researchEffortTier: "quick",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 12,
+    maxToolCalls: 40,
+    events: {
+      onStatus: (status) => {
+        statuses.push(status);
+      },
+    },
+  });
+
+  // The loop grew past its 12-step starting budget once the quick tier's cap was
+  // reached with evidence still arriving — proof the escalate path is consumed.
+  assert.ok(
+    result.modelSteps > 12,
+    `expected the worker to extend past its starting budget, got ${result.modelSteps}`,
+  );
+  assert.ok(statuses.some((status) => /extending to/i.test(status)));
+});
+
+test("worker rechecks cited source liveness and flags a dead link in the handoff", async () => {
+  const url = "https://primary.example/gone";
+  const model = sequenceModel([
+    toolResponse("web_search", { query: "liveness" }),
+    toolResponse("web_fetch", { url }),
+    finalResponse("Evidence gathered and handed to the Lead."),
+  ]);
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      ["web_search", "web_fetch"].map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    async execute(call) {
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: { results: [{ title: "Primary", url, snippet: "R" }] },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: url,
+          url,
+          content:
+            "This primary source was fetched successfully and provides passage-backed, verifiable evidence with enough concrete context for the Lead to cite.",
+          parserStatus: "parsed",
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-liveness",
+    participantId: "researcher",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Find one usable source.",
+    originalMission: "Research the claim.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {
+      settings: { deadLinkRecheckEnabled: true, requestTimeoutMs: 5_000 },
+      // The cited page is now gone, even though the fetch earlier succeeded.
+      httpTransport: async () => ({ status: 404, headers: {} }),
+    } as unknown as ToolExecutionContext,
+    maxSteps: 5,
+  });
+
+  assert.match(result.finalSummary, /Liveness caveats/);
+  assert.match(result.finalSummary, /primary\.example\/gone/);
+});
+
 test("read-only worker registry blocks mutation tools without delegation", async () => {
   let delegated = false;
   const registry: ToolRegistry = {

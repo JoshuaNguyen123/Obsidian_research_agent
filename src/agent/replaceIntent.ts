@@ -14,20 +14,43 @@ export const CLASSIC_REPLACE_INTENT_PATTERN =
 // not authority to replace the active note, even though the classic detector
 // intentionally recognizes the same bare verbs as positive note requests.
 const NEGATED_CLASSIC_REPLACE_CLAUSE_PATTERN =
-  /\b(?:do\s+not|don't|never|avoid)\s+(?:rewrite|replace|reset|overwrite)\b[^.!?\n]*/giu;
+  /\b(?:do\s+not|don't|never|avoid)\s+(?:rewrite|replace|reset|overwrite|revise|expand|improve|polish)\b[^.!?\n]*/giu;
+
+/**
+ * A revision verb pointed at a pronoun — "revise it", "expand this".
+ *
+ * Natural revision follow-ups name no noun: the referent is the note the agent
+ * just wrote. Without this, "rewrite it with some more details" authorized
+ * nothing and the run had no way to write the note at all. Callers still gate on
+ * the trusted `hasActiveMarkdownNote` fact, so a pronoun alone never grants
+ * replace authority to a mission with no note in front of it.
+ */
+const PRONOUN_REVISION_INTENT_PATTERN =
+  /\b(rewrite|revise|expand|improve|polish|proofread|iterate|flesh\s+out)\b\s+(?:on\s+)?(?:it|this|that)\b/i;
 
 /**
  * True when replace_current_file (and host-owned streamed replace) is allowed.
  * Must stay aligned with AgentRunner preferHostOwnedReplace / streaming replace
  * so the vault gate never rejects a tool the host already offered.
  */
+/**
+ * Remove "do not rewrite …" style clauses so a refusal is never read as
+ * authority. Exported because every gate that decides whole-note replace must
+ * strip the same clauses — a gate that skips this treats an explicit refusal as
+ * permission.
+ */
+export function stripNegatedReplaceClauses(prompt: string): string {
+  return prompt.replace(NEGATED_CLASSIC_REPLACE_CLAUSE_PATTERN, " ");
+}
+
 export function hasAuthorizedCurrentNoteReplaceIntent(prompt: string): boolean {
-  const promptWithoutNegatedClassicReplaceClauses = prompt.replace(
-    NEGATED_CLASSIC_REPLACE_CLAUSE_PATTERN,
-    " ",
-  );
+  const promptWithoutNegatedClassicReplaceClauses =
+    stripNegatedReplaceClauses(prompt);
   return (
     CLASSIC_REPLACE_INTENT_PATTERN.test(
+      promptWithoutNegatedClassicReplaceClauses,
+    ) ||
+    PRONOUN_REVISION_INTENT_PATTERN.test(
       promptWithoutNegatedClassicReplaceClauses,
     ) ||
     hasWordCountShortfallFollowUp(

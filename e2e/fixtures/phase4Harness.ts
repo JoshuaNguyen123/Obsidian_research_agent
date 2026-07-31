@@ -186,7 +186,7 @@ export async function startPhase4Harness(label: string): Promise<Phase4Harness> 
       timeout: 30_000,
     });
     await expect(page.getByRole("tab", { name: "Chat" })).toBeVisible();
-    await expect(page.getByRole("tab", { name: "Run Details" })).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Activity" })).toBeVisible();
     await expect(page.locator("textarea.agentic-researcher-prompt")).toBeVisible();
     const requiredCodeTools = [
       ...PHASE4_REQUIRED_CRUD_TOOLS,
@@ -844,7 +844,7 @@ async function runPublicRepairWithApprovals(
     if (operation?.status === "failed") {
       return { available: true, approvals, error: operation.error };
     }
-    await page.getByRole("tab", { name: "Run Details" }).click();
+    await page.getByRole("tab", { name: "Activity" }).click();
     const approvalCard = page
       .locator(".agentic-researcher-approval-card")
       .filter({
@@ -981,7 +981,7 @@ async function submitMissionWithApprovals(
   let observedMissionStart = true;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    await page.getByRole("tab", { name: "Run Details" }).click();
+    await page.getByRole("tab", { name: "Activity" }).click();
     const approve = page
       .locator(".agentic-researcher-approval-card")
       .filter({
@@ -1021,7 +1021,7 @@ async function submitMissionWithApprovals(
       observedMissionStart = true;
     }
     if (observedMissionStart && buttonText === "Run Mission" && buttonEnabled) {
-      await page.getByRole("tab", { name: "Run Details" }).click();
+      await page.getByRole("tab", { name: "Activity" }).click();
       const currentRunContinuation = page
         .locator(".agentic-researcher-continuation-action")
         .filter({ hasText: currentRunId });

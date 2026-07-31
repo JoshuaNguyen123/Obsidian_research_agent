@@ -11,6 +11,11 @@ import {
 } from "./model/cloudProviderPresets";
 import { MAX_AGENT_STEPS, MAX_CODE_RUNS_PER_MISSION } from "./tools/constants";
 import {
+  SAFETY_CEILING_PRESETS,
+  applySafetyCeilingPreset,
+  type SafetyCeilingPreset,
+} from "./agent/safetyCeiling";
+import {
   normalizeScheduledMissions,
   type ScheduledMission,
 } from "./agent/missionScheduler";
@@ -38,6 +43,12 @@ import type {
 } from "./agent/capabilityReadiness";
 
 export type ThinkingMode = "auto" | "off" | "low" | "medium" | "high" | "max";
+
+export type {
+  SafetyCeilingLimits,
+  SafetyCeilingPreset,
+} from "./agent/safetyCeiling";
+export { SAFETY_CEILING_PRESETS, applySafetyCeilingPreset };
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
 export type BrowserMissionMode = "supervised" | "extract_only";
 export type AutonomyProfile = "automatic" | "conservative" | "custom";
@@ -85,6 +96,13 @@ export interface AgentSettings {
   modelRouterMode?: ModelRouterMode;
   enableStreaming: boolean;
   requestTimeoutMs: number;
+  /**
+   * How far an autonomous run may go before a safety backstop stops it. Since
+   * research depth is driven by evidence saturation rather than step counts,
+   * these numbers are guard rails, not tuning: one preset replaces nine knobs.
+   * "custom" reveals the individual limits for people who need exact control.
+   */
+  safetyCeiling?: SafetyCeilingPreset;
   maxAgentSteps: number;
   maxRunMinutes?: number | null;
   autoContinueLongRuns?: boolean;
@@ -93,6 +111,38 @@ export interface AgentSettings {
   completionDrivenLoops?: boolean;
   /** Max soft 100-step segments when completionDrivenLoops is on (clamped 4–48). */
   maxCompletionSegments?: number;
+  /**
+   * Drive research depth from evidence yield instead of a fixed step count: the
+   * loop continues while material evidence still arrives and proof is
+   * unresolved, escalating tiers as needed, and stops on saturation. The
+   * configured step/tool/time caps become the generous safety backstop rather
+   * than the primary driver. Default on.
+   */
+  adaptiveResearchProgress?: boolean;
+  /**
+   * When the configured Ollama-compatible web_search errors, is unauthenticated,
+   * or returns nothing, fall back to keyless official public APIs (Wikipedia,
+   * OpenAlex, arXiv, Crossref, PubMed) so research never has a single point of
+   * failure. Default on.
+   */
+  freeSearchFallbackEnabled?: boolean;
+  /**
+   * Highest research effort tier a mission may reach. A ceiling, not a target:
+   * the prompt still selects the tier and evidence saturation still ends the
+   * run early, this only caps how far escalation can go. Default "extended".
+   */
+  researchEffortCeiling?: "quick" | "standard" | "deep" | "extended";
+  /**
+   * Fetched web sources required when the prompt names no count of its own.
+   * An explicit count in the prompt always wins. Default 3.
+   */
+  defaultMinFetchedSources?: number;
+  /**
+   * Before a research handoff is declared ready, re-probe the cited source URLs
+   * and surface any that now return 404/410. A content hash proves what was
+   * fetched, not that the page is still live. Default on.
+   */
+  deadLinkRecheckEnabled?: boolean;
   overnightRunsEnabled?: boolean;
   overnightRunHours?: number;
   overnightMaxSegments?: number;
@@ -122,6 +172,12 @@ export interface AgentSettings {
   templateOutputFolder: string;
   researchMemoryEnabled: boolean;
   researchMemoryFolder: string;
+  /**
+   * Optional hub/MOC note that generated research packs link back to, for
+   * graph discoverability. Blank by default: writing into a hub is a second
+   * vault mutation, so it must be something the user asks for.
+   */
+  researchHubNote?: string;
   companionBaseUrl: string;
   browserToolsEnabled: boolean;
   experienceMemoryEnabled: boolean;
@@ -208,24 +264,24 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   modelRouterMode: "authority",
   enableStreaming: true,
   requestTimeoutMs: 180000,
-  maxAgentSteps: MAX_AGENT_STEPS,
-  maxRunMinutes: null,
+  safetyCeiling: "balanced",
+  // Derived, never duplicated: the shipped defaults ARE the Balanced preset, so
+  // the two can never silently drift apart.
+  ...SAFETY_CEILING_PRESETS.balanced,
   autoContinueLongRuns: true,
-  maxLongRunSegments: 4,
   completionDrivenLoops: true,
-  maxCompletionSegments: 24,
+  adaptiveResearchProgress: true,
+  freeSearchFallbackEnabled: true,
+  deadLinkRecheckEnabled: true,
+  researchEffortCeiling: "extended",
+  defaultMinFetchedSources: 3,
   overnightRunsEnabled: true,
-  overnightRunHours: 10,
-  overnightMaxSegments: 24,
   autoResumeOvernightRuns: true,
   showUnfinishedRunBannerOnOpen: false,
   keepAwakeDuringOvernightRuns: false,
   orchestratorPreviewEnabled: true,
   orchestratorEnabled: true,
   orchestratorAutoMergeGreen: true,
-  orchestratorWorkerMaxSteps: 40,
-  orchestratorWorkerMaxToolCalls: 40,
-  orchestratorWorkerMaxMinutes: 15,
   autoTitleOnWrite: true,
   maxCodeRunsPerMission: undefined,
   thinkingMode: "auto",
@@ -234,6 +290,7 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   templateOutputFolder: "",
   researchMemoryEnabled: true,
   researchMemoryFolder: "Agent Research Memory",
+  researchHubNote: "",
   companionBaseUrl: "http://127.0.0.1:8765",
   browserToolsEnabled: false,
   experienceMemoryEnabled: false,
@@ -801,6 +858,7 @@ export class AgentSettingTab extends PluginSettingTab {
     });
     this.renderAdvancedModelRouting(accordion);
     this.renderAdvancedOutputOverrides(accordion);
+    this.renderAdvancedResearchSources(accordion);
     this.renderAdvancedAutonomyBudgets(accordion);
     this.renderAdvancedBrowserIntegrations(accordion);
     this.renderAdvancedExtensionContributions(accordion);
@@ -1116,16 +1174,151 @@ export class AgentSettingTab extends PluginSettingTab {
     this.renderAdvancedSemanticControls(section);
   }
 
+  private renderAdvancedResearchSources(parent: HTMLElement): void {
+    const section = this.createAdvancedDetails(
+      parent,
+      "agentic-settings-research-sources",
+      "Research & sources",
+      "How deep a research run may go, how many sources it needs, and how sources are found and checked.",
+      ["Notes & research"],
+    );
+
+    new Setting(section)
+      .setName("Research depth ceiling")
+      .setDesc(
+        "The furthest a research run may escalate. Depth follows the evidence, so this is a cap rather than a target: a quick question still finishes quickly.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("quick", "Quick — one short pass")
+          .addOption("standard", "Standard — a single thorough pass")
+          .addOption("deep", "Deep — extended gathering and synthesis")
+          .addOption("extended", "Extended — multi-segment, long-running (default)")
+          .setValue(
+            this.plugin.settings.researchEffortCeiling ??
+              DEFAULT_SETTINGS.researchEffortCeiling ??
+              "extended",
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.researchEffortCeiling =
+              value === "quick" || value === "standard" || value === "deep"
+                ? value
+                : "extended";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Default source count")
+      .setDesc(
+        "Fetched web sources a research run needs when your prompt names no number. Asking for a specific count always wins.",
+      )
+      .addDropdown((dropdown) => {
+        for (const count of [1, 2, 3, 4, 5, 6, 7, 8]) {
+          dropdown.addOption(String(count), count === 3 ? "3 (default)" : String(count));
+        }
+        dropdown
+          .setValue(
+            String(
+              this.plugin.settings.defaultMinFetchedSources ??
+                DEFAULT_SETTINGS.defaultMinFetchedSources ??
+                3,
+            ),
+          )
+          .onChange(async (value) => {
+            const parsed = Number.parseInt(value, 10);
+            this.plugin.settings.defaultMinFetchedSources =
+              Number.isFinite(parsed) && parsed >= 1 && parsed <= 8 ? parsed : 3;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(section)
+      .setName("Free source fallback")
+      .setDesc(
+        "When your configured web search fails or returns nothing, fall back to keyless public APIs — Wikipedia, OpenAlex, arXiv, Crossref, and PubMed — so research is never blocked by one provider.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.freeSearchFallbackEnabled !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.freeSearchFallbackEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Research hub note")
+      .setDesc(
+        "Optional note that generated research packs link back to, so new research is reachable from your graph. Blank writes no hub link.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("e.g. Research/Index")
+          .setValue(this.plugin.settings.researchHubNote ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.researchHubNote = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(section)
+      .setName("Re-check cited links")
+      .setDesc(
+        "Before finishing, re-probe cited URLs and flag any that now return 404 or 410. A content hash proves what was fetched, not that the page is still there.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.deadLinkRecheckEnabled !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.deadLinkRecheckEnabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
+
   private renderAdvancedAutonomyBudgets(parent: HTMLElement): void {
     const section = this.createAdvancedDetails(
       parent,
       "agentic-settings-autonomy",
       "Autonomy & schedules",
-      "Step budgets, overnight runs, team workers, and recurring missions.",
+      "How far a run may go, overnight work, team workers, and recurring missions.",
       ["Background work"],
     );
 
     new Setting(section)
+      .setName("Safety ceiling")
+      .setDesc(
+        "Research depth follows the evidence, so these limits are guard rails rather than tuning. Balanced suits day-to-day work; Extended allows longer autonomous runs.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            balanced: "Balanced",
+            extended: "Extended",
+            custom: "Custom limits",
+          })
+          .setValue(this.plugin.settings.safetyCeiling ?? "balanced")
+          .onChange(async (value) => {
+            const preset = (value as SafetyCeilingPreset) ?? "balanced";
+            this.plugin.settings.safetyCeiling = preset;
+            if (preset !== "custom") {
+              applySafetyCeilingPreset(this.plugin.settings, preset);
+            }
+            await this.plugin.saveSettings();
+            // Re-render so the individual limits appear or fold away.
+            this.redisplayWithAdvancedSectionOpen("agentic-settings-autonomy");
+          }),
+      );
+
+    // Individual limits stay available but only surface under "Custom limits";
+    // a detached host means they simply are not rendered otherwise.
+    const limitsHost: HTMLElement =
+      (this.plugin.settings.safetyCeiling ?? "balanced") === "custom"
+        ? section
+        : document.createElement("div");
+
+    new Setting(limitsHost)
       .setName("Maximum agent steps")
       .setDesc(
         `Upper bound for autonomous planning/tool loops. The hard safety ceiling is ${MAX_AGENT_STEPS}.`,
@@ -1145,7 +1338,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Maximum run minutes")
       .setDesc(
         "Optional wall-clock budget. Blank means no wall-clock limit; step budget still applies.",
@@ -1195,7 +1388,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Maximum long-run segments")
       .setDesc(
         "Used only when completion-driven loops are off. Bounded number of soft 100-step segments for explicit long research missions (1–8).",
@@ -1232,7 +1425,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Maximum completion segments")
       .setDesc(
         "Soft cap on 100-step segments when completion-driven loops are on (4–48).",
@@ -1270,7 +1463,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Default overnight hours")
       .setDesc(
         "Maximum wall-clock window for an overnight mission. Explicit prompt durations override this value within 8-12 hours.",
@@ -1292,7 +1485,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Maximum overnight segments")
       .setDesc(
         "Additional hard bound for overnight work. Each segment remains limited to 100 agent steps.",
@@ -1388,7 +1581,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Orchestrator worker max steps")
       .setDesc("Per-worker step budget for Lead + Worker missions.")
       .addText((text) =>
@@ -1408,7 +1601,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Orchestrator worker max tool calls")
       .setDesc("Per-worker tool-call budget for Lead + Worker missions.")
       .addText((text) =>
@@ -1430,7 +1623,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(limitsHost)
       .setName("Orchestrator worker max minutes")
       .setDesc("Per-worker wall-clock budget in minutes.")
       .addText((text) =>

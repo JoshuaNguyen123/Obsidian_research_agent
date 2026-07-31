@@ -17,6 +17,7 @@ import type {
   PreparedActionResult,
   ToolDescriptor,
 } from "../agent/actions";
+import type { ClarificationOutcome } from "../agent/clarificationBroker";
 import type { ProjectLineageV1 } from "../agent/projectLifecycle";
 import type { ToolOutcomeMemoryV1 } from "../agent/outcomeMemory";
 import type { CapabilityReadinessV2 } from "../agent/capabilityReadiness";
@@ -110,6 +111,13 @@ export interface ToolExecutionContext {
   app: App;
   settings: AgentSettings;
   originalPrompt: string;
+  /**
+   * Set by the runner when a research plan is active and its fetched-source
+   * floor has been met, certifying that `create_research_pack` may run without
+   * the user having named a "research pack" in their prompt. Never set from a
+   * model argument — it is a host judgment about the run, not a tool input.
+   */
+  researchPackEligible?: boolean;
   runId?: string;
   /** Host-verified durable root shared by continuation segments. */
   rootMissionId?: string;
@@ -133,6 +141,17 @@ export interface ToolExecutionContext {
   requestNestedApproval?: (
     request: NestedToolApprovalRequest,
   ) => Promise<NestedToolApprovalDecision>;
+  /**
+   * Ask the user one clarifying question and wait for an answer. Absent on
+   * non-interactive hosts (headless, e2e), where `ask_user` proceeds on its
+   * stated assumption instead of hanging. An answer is intent, never authority:
+   * it can never substitute for an approval.
+   */
+  requestUserClarification?: (request: {
+    question: string;
+    options: string[];
+    context?: string;
+  }) => Promise<ClarificationOutcome>;
   userApprovalGranted?: boolean;
   /** Exact grant binding for descriptor-aware prepared action execution. */
   authorizedAction?: AuthorizedActionContext;

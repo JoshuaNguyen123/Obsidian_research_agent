@@ -264,6 +264,11 @@ import {
   isBroadUnscopedVaultMutation,
   type AutonomyScope,
 } from "./agent/missionScope";
+import { buildLivenessProbe, recheckLinkLiveness } from "./agent/deadLinkCheck";
+import {
+  decideSingleAgentLivenessRecheck,
+  formatLivenessCaveat,
+} from "./agent/livenessRecheckPolicy";
 import {
   addLedgerBlocker,
   addLedgerReceipt,
@@ -437,6 +442,7 @@ import {
   missingIncludesWriteReceipt,
   prefersStreamedReplaceForEditOrganize,
 } from "./agent/editOrganizeIntent";
+
 import {
   evaluateMissionPlanAcceptance,
 } from "./agent/missionPlanAcceptance";
@@ -535,8 +541,22 @@ import {
   createResearchPlanWithAssist,
   formatResearchPlanForPrompt,
   parseExplicitResearchSourceCount,
+  type ResearchEffortAssessment,
+  type ResearchEffortAssist,
+  type ResearchModeAssessment,
+  type ResearchModeAssist,
   type ResearchPlan,
 } from "./agent/researchPlan";
+import {
+  RESEARCH_EFFORT_TIER_ORDER,
+  resolveResearchEffortBudget,
+  type ResearchEffortTier,
+} from "./agent/researchEffortPolicy";
+import { ASK_USER_TOOL_NAME } from "./tools/clarificationTools";
+import {
+  ClarificationBroker,
+  type ClarificationRequest,
+} from "./agent/clarificationBroker";
 import { missionGraphPlannerFallbackCopy } from "./ui/agentViewCopy";
 import {
   isExplicitVisibleFileRenameIntent,
@@ -1008,6 +1028,15 @@ export interface AgentRunEvents {
   onRunConfig?: (event: AgentRunConfigEvent) => void;
   onRunComplete?: (event: AgentRunCompleteEvent) => void;
   onApprovalRequest?: (request: ApprovalRequest) => void | Promise<void>;
+  /**
+   * The agent is unsure and is asking one clarifying question. The host renders
+   * it and answers through the returned broker; an unanswered question expires
+   * so the run continues rather than hanging.
+   */
+  onClarificationRequest?: (
+    request: ClarificationRequest,
+    broker: ClarificationBroker,
+  ) => void | Promise<void>;
   onApprovalResolved?: (event: {
     request: ApprovalRequest;
     decision: ApprovalDecision;
@@ -1667,6 +1696,9 @@ export async function runAgentMission({
     }
   }
   const approvalBroker = providedApprovalBroker ?? new ApprovalBroker();
+  // Run-scoped: pending questions die with the run rather than leaking into the
+  // next one, and the host resolves them through this same instance.
+  const clarificationBroker = new ClarificationBroker();
   const portableHostApprovalReceipts = new Map<string, HostApprovalReceiptV1[]>();
   const maxToolCalls = normalizeInvocationToolCallLimit(providedMaxToolCalls);
   let observedToolCallCount = 0;
@@ -3343,6 +3375,15 @@ export async function runAgentMission({
                 modelClient,
                 runToolContext.settings?.utilityModel?.trim() || undefined,
               ),
+              effortAssist: buildResearchEffortAssist(
+                modelClient,
+                runToolContext.settings?.utilityModel?.trim() || undefined,
+              ),
+              modeAssist: buildResearchModeAssist(
+                modelClient,
+                runToolContext.settings?.utilityModel?.trim() || undefined,
+              ),
+              ...researchPlanSettingOverrides(runToolContext.settings),
             });
         const requiredGraphFetchCount = requiresWebEvidenceProof(
           activeIntentPrompt,
@@ -4562,6 +4603,15 @@ export async function runAgentMission({
           modelClient,
           runToolContext.settings?.utilityModel?.trim() || undefined,
         ),
+        effortAssist: buildResearchEffortAssist(
+          modelClient,
+          runToolContext.settings?.utilityModel?.trim() || undefined,
+        ),
+        modeAssist: buildResearchModeAssist(
+          modelClient,
+          runToolContext.settings?.utilityModel?.trim() || undefined,
+        ),
+        ...researchPlanSettingOverrides(runToolContext.settings),
       });
   const restoredResearchPlan =
     resumeSnapshot?.researchPlan ?? resumeLedger?.researchPlan;
@@ -4783,6 +4833,18 @@ export async function runAgentMission({
       loopBudgetPlan,
       parseExplicitResearchSourceCount(activeIntentPrompt) ?? 1,
     );
+  }
+  // Interactive clarification: offer ask_user only when the host listens for
+  // questions, so the agent can ask instead of guessing in the panel while a
+  // headless or e2e run keeps its compact schema and never stalls on a prompt.
+  if (events.onClarificationRequest) {
+    tools = addToolDefinitions(tools, toolRegistry, [ASK_USER_TOOL_NAME]);
+    allowedToolNames = new Set(tools.map((tool) => tool.function.name));
+    runPlan = {
+      ...runPlan,
+      allowedTools: tools,
+      allowedToolNames: [...allowedToolNames],
+    };
   }
   let orchestratorHandoffMissing: string[] = [];
   if (
@@ -6949,6 +7011,54 @@ export async function runAgentMission({
       acceptanceStatus: acceptance.status,
       graphComplete,
     });
+    // A content hash attests what was fetched, not that the page is still
+    // there. Deep and extended runs re-probe their cited sources and surface
+    // anything definitively gone. Non-blocking by design: the note is already
+    // committed, and a dead link is a caveat for the reader, not grounds to
+    // retract verified work. Gated on tier so lanes that count transport calls
+    // to prove cache reuse are unaffected.
+    {
+      const citedUrls = [
+        ...new Set(
+          missionEvidenceRecords
+            .filter(
+              (item): item is MissionEvidence & { url: string } =>
+                item.kind === "web_source" && typeof item.url === "string" && Boolean(item.url),
+            )
+            .map((item) => item.url),
+        ),
+      ];
+      const decision = decideSingleAgentLivenessRecheck({
+        tier: researchPlan?.effort?.tier,
+        enabled: runToolContext.settings?.deadLinkRecheckEnabled,
+        hasTransport: typeof runToolContext.httpTransport === "function",
+        citedUrlCount: citedUrls.length,
+      });
+      if (decision.recheck) {
+        try {
+          const liveness = await recheckLinkLiveness({
+            urls: citedUrls,
+            probe: buildLivenessProbe(runToolContext.httpTransport, {
+              timeoutMs: runToolContext.settings?.requestTimeoutMs,
+            }),
+            maxChecks: 6,
+            signal: abortSignal,
+          });
+          const caveat = formatLivenessCaveat(liveness);
+          if (caveat) {
+            events.onStatus?.(caveat.split("\n")[0]);
+            events.onTrace?.({
+              id: `liveness-recheck-${step}`,
+              kind: "verification",
+              step,
+              message: caveat,
+            });
+          }
+        } catch {
+          // A probe failure must never turn a completed mission into an error.
+        }
+      }
+    }
     await recordMissionAcceptance(acceptance, step, {
       // A budget/user stop is resumable. Persist the acceptance diagnosis but
       // do not turn a repairable, unfinished active task into a blocked task.
@@ -8476,6 +8586,38 @@ export async function runAgentMission({
       }
       const nestedApprovalContext: ToolExecutionContext = {
         ...toolContext,
+        // Certify a genuine research run so the transactional research pack is
+        // reachable without the user naming it. Evaluated per call against
+        // current evidence: a plan alone is not enough, the run must actually
+        // have gathered the sources its own plan demanded.
+        researchPackEligible: isResearchPackEligibleV1({
+          plan: researchPlan,
+          evidence: missionEvidenceRecords,
+        }),
+        // Interactive clarification. Only offered when the host actually
+        // listens; otherwise ask_user proceeds on its stated assumption rather
+        // than blocking a headless run.
+        ...(events.onClarificationRequest
+          ? {
+              requestUserClarification: async (request) =>
+                clarificationBroker.request(
+                  {
+                    runId,
+                    question: request.question,
+                    options: request.options,
+                    ...(request.context ? { context: request.context } : {}),
+                  },
+                  {
+                    abortSignal,
+                    onRequest: (pending) =>
+                      events.onClarificationRequest?.(
+                        pending,
+                        clarificationBroker,
+                      ),
+                  },
+                ),
+            }
+          : {}),
         requestNestedApproval: async (request) => {
           const binding = await resolveNestedApprovalBindingV1({
             outerToolName: toolCall.name,
@@ -14217,10 +14359,51 @@ export async function runAgentMission({
         currentStage: currentLifecycleStage,
       };
     }
+    const adaptiveResearchSignal =
+      runToolContext.settings?.adaptiveResearchProgress === false
+        ? undefined
+        : {
+            enabled: true,
+            // Material work remains while the mission plan is not yet complete.
+            // Once it completes the loop verdict stops the run before this gate
+            // can escalate, so escalation stays bounded by real progress.
+            hasUnresolvedWork: missionPlan
+              ? !isMissionPlanComplete(missionPlan)
+              : false,
+          };
     let compoundResearchGate = evaluateCompoundResearchBudgetGateV1(
       researchPlan,
       currentLifecycleStage,
+      adaptiveResearchSignal,
     );
+    if (compoundResearchGate.action === "escalate") {
+      const nextTier = compoundResearchGate.nextTier;
+      if (researchPlan?.effort) {
+        researchPlan = {
+          ...researchPlan,
+          effort: {
+            ...researchPlan.effort,
+            tier: nextTier,
+            budget: resolveResearchEffortBudget(nextTier),
+            reasons: [
+              ...researchPlan.effort.reasons,
+              `Escalated to ${nextTier}: material research remained unresolved at the ${compoundResearchGate.reason} boundary.`,
+            ],
+          },
+        };
+      }
+      const message = `Adaptive research escalated to the ${nextTier} tier while evidence remained material; saved a durable continuation.`;
+      events.onStatus?.(message);
+      events.onTrace?.({
+        id: `adaptive-research-escalate-${step}`,
+        kind: "status",
+        step,
+        message,
+        outputPreview: researchPlan?.effort,
+      });
+      await finishRun("budget", Math.max(0, step - 1), stepLimit, message);
+      return;
+    }
     if (compoundResearchGate.action === "start_next_segment") {
       const message =
         "Adaptive research segment budget reached; saved the accepted-research stage for a durable continuation.";
@@ -20138,7 +20321,36 @@ export type CompoundResearchBudgetGateV1 =
   | { action: "inactive" }
   | { action: "continue" }
   | { action: "start_next_segment"; reason: string }
+  | { action: "escalate"; nextTier: ResearchEffortTier; reason: string }
   | { action: "close"; reason: string; closureAttempts: number };
+
+/**
+ * Adaptive escalation signal for the compound research gate. When enabled and
+ * the current tier's budget is spent while material work is still unresolved,
+ * the gate escalates one tier (raising the budget) instead of closing —
+ * bounded by `maxTier` (default extended) and the hard duration cap, which is
+ * never escalated past. This is how "research as long as the topic warrants,
+ * no min/max loop" stays true while a generous safety ceiling holds.
+ */
+export interface CompoundResearchAdaptiveSignalV1 {
+  enabled: boolean;
+  hasUnresolvedWork: boolean;
+  maxTier?: ResearchEffortTier;
+}
+
+function nextCompoundResearchTierV1(
+  tier: ResearchEffortTier,
+  maxTier: ResearchEffortTier | undefined,
+): ResearchEffortTier | undefined {
+  const index = RESEARCH_EFFORT_TIER_ORDER.indexOf(tier);
+  const next = RESEARCH_EFFORT_TIER_ORDER[index + 1];
+  if (!next) return undefined;
+  const ceiling = maxTier ?? "extended";
+  return RESEARCH_EFFORT_TIER_ORDER.indexOf(next) >
+    RESEARCH_EFFORT_TIER_ORDER.indexOf(ceiling)
+    ? undefined
+    : next;
+}
 
 const COMPOUND_RESEARCH_COUNTED_TOOL_NAMES = new Set(
   toolsAllowedForLifecycleStage("accepted_research").filter(
@@ -20295,6 +20507,7 @@ export function resolveActiveCompoundLifecycleStageV1(
 export function evaluateCompoundResearchBudgetGateV1(
   plan: ResearchPlan | null | undefined,
   activeStage: ProjectLifecycleStageV1 | null,
+  adaptive?: CompoundResearchAdaptiveSignalV1,
 ): CompoundResearchBudgetGateV1 {
   if (activeStage !== "accepted_research" || !plan?.effort) {
     return { action: "inactive" };
@@ -20316,11 +20529,27 @@ export function evaluateCompoundResearchBudgetGateV1(
       closureAttempts,
     };
   }
+  // A tier budget spent with material work still unresolved escalates one tier
+  // rather than closing — unless the hard duration cap is reached, which is the
+  // ultimate backstop and is never escalated past.
+  const escalationTier =
+    adaptive?.enabled && adaptive.hasUnresolvedWork
+      ? nextCompoundResearchTierV1(plan.effort.tier, adaptive.maxTier)
+      : undefined;
   const durationReached =
     budget.maxDurationMs !== null && usage.elapsedMs >= budget.maxDurationMs;
   const totalModelReached = usage.modelSteps >= budget.maxTotalModelSteps;
   const totalToolsReached = usage.toolCalls >= budget.maxTotalToolCalls;
   if (durationReached || totalModelReached || totalToolsReached) {
+    if (!durationReached && escalationTier) {
+      return {
+        action: "escalate",
+        nextTier: escalationTier,
+        reason: totalModelReached
+          ? "model_step_cap_reached"
+          : "tool_call_cap_reached",
+      };
+    }
     return {
       action: "close",
       reason: durationReached
@@ -20344,6 +20573,13 @@ export function evaluateCompoundResearchBudgetGateV1(
   if (usage.segmentsStarted < budget.maxSegments) {
     return {
       action: "start_next_segment",
+      reason: "research_segment_cap_reached",
+    };
+  }
+  if (escalationTier) {
+    return {
+      action: "escalate",
+      nextTier: escalationTier,
       reason: "research_segment_cap_reached",
     };
   }
@@ -22404,6 +22640,7 @@ const TOOL_AUTHORITY: Record<string, ToolAuthority> = {
   ...Object.fromEntries(
     GITHUB_CATALOG_DESTRUCTIVE_TOOL_NAMES.map((name) => [name, "delete" as const]),
   ),
+  [ASK_USER_TOOL_NAME]: "read",
   read_current_file: "read",
   inspect_vault_context: "read",
   inspect_vault_index: "read",
@@ -23172,17 +23409,29 @@ function isAllowedForMission(
     return false;
   }
 
+  // Asking the user is never blanket-offered: it is added deliberately by the
+  // runner only when the host can actually answer (see the interactive
+  // clarification block), so a headless run never offers a tool that would
+  // expire, and ordinary missions keep a compact tool schema.
+  if (name === ASK_USER_TOOL_NAME) {
+    return false;
+  }
+
   // Specialist reads stay out of generic missions so ordinary requests keep a
   // compact tool schema; a matching prompt (or the Researcher catalog, which
   // bypasses this gate) brings them in.
   if (name === "analyze_dataset") {
     return hasDatasetAnalysisIntent(prompt);
   }
-  if (
-    name === "resolve_citation" ||
-    name === "verify_citation" ||
-    name === "export_bibtex"
-  ) {
+  if (name === "verify_citation") {
+    // Deep research is exactly the case where checking a quote against the
+    // cached source matters, but `hasCitationWorkIntent` demands bibliographic
+    // vocabulary (doi/arxiv/bibtex/…), so "research X and cite your sources"
+    // never saw the tool at all. Only this one tool widens — resolve_citation
+    // and export_bibtex keep the narrow gate so the schema stays compact.
+    return hasCitationWorkIntent(prompt) || hasDeepResearchIntent(prompt);
+  }
+  if (name === "resolve_citation" || name === "export_bibtex") {
     return hasCitationWorkIntent(prompt);
   }
 
@@ -23660,6 +23909,15 @@ export function getPendingRequiredWriteToolNames(
 ): string[] {
   const completed = new Set(operationGoals.completedTools);
   return requiredWriteTools.filter((toolName) => {
+    // A read tool can never satisfy a write obligation, and none of them carry
+    // TOOL_GOALS — so leaving one here made an unpayable gate: the run stayed
+    // "write pending" forever, never reached a terminal ledger, and therefore
+    // became the permanent target of the newest-unfinished-run resume lookup.
+    // Reads (read_design_canvas, read_svg_design, read_mermaid_block) are
+    // preconditions of the paired write, not the write itself.
+    if (TOOL_AUTHORITY[toolName] === "read") {
+      return false;
+    }
     const goals = TOOL_GOALS[toolName] ?? [];
     if (goals.length === 0) {
       return !completed.has(toolName);
@@ -25363,6 +25621,11 @@ function getDirectCurrentNoteWritebackKind({
   // Shortfall expand and host edit/organize replace must be able to stream
   // replace without a model tool call (vault gate stays aligned via
   // hasAuthorizedCurrentNoteReplaceIntent).
+  // Deliberately strict. Broadening this pushes ordinary revisions onto the
+  // no-tool fast path, which skips the tool loop that carries the approval and
+  // the pre-write backup. A revision reaches the host stream by calling
+  // replace_current_file (the authorization handshake); this branch is only for
+  // the narrow cases that may stream with no tool call at all.
   const hostAuthorizedReplace =
     hasWordCountShortfallFollowUp(prompt) ||
     prefersStreamedReplaceForEditOrganize(prompt);
@@ -26835,6 +27098,59 @@ export function getCompoundLifecycleResearchGraphToolNames(
     "web_search",
     ...Array.from({ length: remainingFetchCount }, () => "web_fetch"),
   ];
+}
+
+/**
+ * Map the two configured research-planning settings onto plan inputs.
+ *
+ * Both are lowest-precedence by design: the effort ceiling only caps a tier the
+ * prompt already justified, and the source floor applies only when neither the
+ * prompt nor the model named a count. Omitted keys leave the plan's own
+ * defaults untouched, so an unset setting is indistinguishable from the
+ * behaviour before these settings existed.
+ */
+export function researchPlanSettingOverrides(
+  settings: Partial<AgentSettings> | undefined,
+): {
+  defaultMinFetchedSources?: number;
+  researchEffortCeiling?: ResearchEffortTier;
+} {
+  const ceiling = RESEARCH_EFFORT_TIER_ORDER.find(
+    (tier) => tier === settings?.researchEffortCeiling,
+  );
+  const floor = settings?.defaultMinFetchedSources;
+  return {
+    ...(typeof floor === "number" && Number.isFinite(floor)
+      ? { defaultMinFetchedSources: floor }
+      : {}),
+    // The top tier is the default, so passing it as a ceiling constrains
+    // nothing; omit it rather than marking every plan "constrained".
+    ...(ceiling && ceiling !== "extended" ? { researchEffortCeiling: ceiling } : {}),
+  };
+}
+
+/**
+ * Whether this run has earned the transactional research pack without the user
+ * naming it.
+ *
+ * Two conditions, both necessary. An active web-bearing research plan proves
+ * the run is research rather than a write dressed up as one; meeting the plan's
+ * own fetched-source floor proves it actually gathered what it set out to. A
+ * plan alone would let a mission that fetched nothing emit a four-note pack of
+ * unsourced prose, which is worse than a plain append.
+ *
+ * Vault-only research (`minFetchedSources === 0`) stays phrase-gated: there is
+ * no source floor to clear, so there is nothing to certify.
+ */
+export function isResearchPackEligibleV1(input: {
+  plan: ResearchPlan | null | undefined;
+  evidence: readonly MissionEvidence[];
+}): boolean {
+  const plan = input.plan;
+  if (!plan || plan.mode === "none") return false;
+  const required = plan.sourceRequirements?.minFetchedSources ?? 0;
+  if (required <= 0) return false;
+  return countDistinctHostVerifiedWebSources([...input.evidence]) >= required;
 }
 
 export function rejectDuplicateResearchSourceFetchV1(input: {
@@ -35448,6 +35764,99 @@ function measureSerializedChars(value: unknown): number {
  * Dedicated utility-model assist for research subquestions. Returns null when
  * no utility model is configured so createResearchPlanWithAssist stays deterministic.
  */
+/**
+ * Optional utility-model call that lets the model decide whether a prompt
+ * warrants grounded research at all — activating it semantically for prompts
+ * that clearly need sources but name no research keywords. The deterministic
+ * keyword classifier remains the floor; this only fills its silence. Returns
+ * undefined when no dedicated utility model is configured.
+ */
+function buildResearchModeAssist(
+  modelClient: ModelClient,
+  utilityModel: string | undefined,
+): ResearchModeAssist | undefined {
+  const model = utilityModel?.trim();
+  if (!model) {
+    return undefined;
+  }
+  return async (request) => {
+    const response = await modelClient.chat({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            'Decide whether answering this request well requires grounding in real sources (facts, history, current events, data, comparisons, anything a careful writer would cite) versus pure composition or opinion. Return only a JSON object like {"mode":"deep_web","sourceFloor":3,"rationale":"one short sentence"}. mode: deep_web = needs public web sources; deep_vault = should draw on the user\'s own notes/vault; deep_hybrid = both; none = no grounding needed. sourceFloor: how many distinct sources the topic warrants, 1-8. No markdown, no extra text.',
+        },
+        {
+          role: "user",
+          content: request.prompt,
+        },
+      ],
+      think: false,
+    });
+    const raw = response.message.content.trim();
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start < 0 || end <= start) {
+      return null;
+    }
+    try {
+      return (JSON.parse(raw.slice(start, end + 1)) ??
+        null) as ResearchModeAssessment | null;
+    } catch {
+      return null;
+    }
+  };
+}
+
+/**
+ * Optional utility-model call that lets the model — not just a keyword
+ * classifier — set the starting research depth. Never uses the main mission
+ * model; returns undefined when no dedicated utility model is configured, in
+ * which case the deterministic classifier decides the tier.
+ */
+function buildResearchEffortAssist(
+  modelClient: ModelClient,
+  utilityModel: string | undefined,
+): ResearchEffortAssist | undefined {
+  const model = utilityModel?.trim();
+  if (!model) {
+    return undefined;
+  }
+  return async (request) => {
+    const response = await modelClient.chat({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            'Judge how much research effort a mission truly deserves. Return only a JSON object like {"tier":"quick","risk":"low","freshness":"helpful","rationale":"one short sentence"}. tier: quick = a single quick lookup; standard = a few sources; deep = multi-source comparison or verification; extended = exhaustive or overnight work. risk: low|medium|high|critical. freshness: none|helpful|required. No markdown, no extra text.',
+        },
+        {
+          role: "user",
+          content: [`Mode: ${request.mode}`, `Mission: ${request.prompt}`].join(
+            "\n",
+          ),
+        },
+      ],
+      think: false,
+    });
+    const raw = response.message.content.trim();
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start < 0 || end <= start) {
+      return null;
+    }
+    try {
+      return (JSON.parse(raw.slice(start, end + 1)) ??
+        null) as ResearchEffortAssessment | null;
+    } catch {
+      return null;
+    }
+  };
+}
+
 function buildResearchSubquestionAssist(
   modelClient: ModelClient,
   utilityModel: string | undefined,

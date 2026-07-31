@@ -110,13 +110,14 @@ test("selecting no project is a no-op rather than a false failure", () => {
 test("a lane with no scorecard baseline is proof debt, not a silent pass", async () => {
   // Previously this returned {skipped:true} before even reading the summary,
   // which disabled the gate for every lane once the only baseline record
-  // referenced a deleted project.
+  // referenced a deleted project. A hypothetical lane keeps this guard stable
+  // as real lanes gain baselines over time.
   await assert.rejects(
     () =>
       assertMissionScorecardSummaryFile({
-        selectedProjects: ["daily-use-research"],
+        selectedProjects: ["hypothetical-unbaselined-lane"],
       }),
-    /No mission-scorecard baseline exists for: daily-use-research/u,
+    /No mission-scorecard baseline exists for: hypothetical-unbaselined-lane/u,
   );
 });
 

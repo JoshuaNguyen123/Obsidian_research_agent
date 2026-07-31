@@ -100,6 +100,192 @@ test("createResearchPlanWithAssist merges utility questions when confidence is l
   );
 });
 
+test("semantic mode assist activates research on a keywordless prompt", async () => {
+  const prompt = "Write an essay on the causes of World War I.";
+  const runPlan = {
+    route: "grounded_workflow",
+    slowPathReason: "needs_web_sources",
+  } as const;
+
+  // The keyword floor alone finds no research intent here.
+  assert.equal(
+    createResearchPlan({ prompt, missionIntent: researchIntent(), runPlan }),
+    null,
+  );
+
+  // The model recognizes it warrants grounding and how many sources.
+  const upgraded = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    modeAssist: async () => ({
+      mode: "deep_web",
+      sourceFloor: 4,
+      rationale: "Historical claims should be grounded in sources.",
+    }),
+  });
+  assert.ok(upgraded);
+  assert.equal(upgraded!.mode, "deep_web");
+  assert.equal(upgraded!.sourceRequirements.minFetchedSources, 4);
+});
+
+test("keyword floor still wins and the mode assist only fills silence", async () => {
+  const prompt = "Do deep research and compare sources on renewable subsidies.";
+  const runPlan = {
+    route: "grounded_workflow",
+    slowPathReason: "needs_web_sources",
+  } as const;
+
+  let modeAssistCalled = false;
+  const plan = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    // Even a contrarian model cannot downgrade an explicit keyword signal,
+    // because the assist is only consulted when the floor found nothing.
+    modeAssist: async () => {
+      modeAssistCalled = true;
+      return { mode: "none" };
+    },
+  });
+  assert.ok(plan);
+  assert.notEqual(plan!.mode, "none");
+  assert.equal(modeAssistCalled, false);
+});
+
+test("semantic activation is gated on a utility model and a non-none verdict", async () => {
+  const prompt = "Write an essay on the causes of World War I.";
+  const runPlan = {
+    route: "grounded_workflow",
+    slowPathReason: "needs_web_sources",
+  } as const;
+
+  let called = false;
+  const notConfigured = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: false,
+    modeAssist: async () => {
+      called = true;
+      return { mode: "deep_web" };
+    },
+  });
+  assert.equal(called, false);
+  assert.equal(notConfigured, null);
+
+  // Model agrees no grounding is needed → stays a plain composition.
+  const declined = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    modeAssist: async () => ({ mode: "none" }),
+  });
+  assert.equal(declined, null);
+
+  // A malformed verdict is discarded (no upgrade).
+  const garbage = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    modeAssist: async () => ({ mode: "turbo" } as never),
+  });
+  assert.equal(garbage, null);
+});
+
+test("semantic activation never upgrades a structurally non-research command", async () => {
+  let called = false;
+  const plan = await createResearchPlanWithAssist({
+    prompt: "Delete my draft note.",
+    missionIntent: { ...researchIntent(), explicitDelete: true },
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+    utilityModelConfigured: true,
+    // Even if the model over-eagerly wants to research, a delete command must
+    // never become a grounded run.
+    modeAssist: async () => {
+      called = true;
+      return { mode: "deep_web", sourceFloor: 3 };
+    },
+  });
+  assert.equal(plan, null);
+  assert.equal(called, false);
+});
+
+test("createResearchPlanWithAssist lets the model set the starting research depth", async () => {
+  const prompt = "Investigate onboarding validation briefly";
+  const runPlan = {
+    route: "grounded_workflow",
+    slowPathReason: "needs_web_sources",
+  } as const;
+
+  const deterministic = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    assist: async () => null,
+  });
+  assert.ok(deterministic);
+  assert.notEqual(deterministic!.effort?.tier, "extended");
+
+  const modelDeep = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    assist: async () => null,
+    effortAssist: async () => ({
+      tier: "extended",
+      risk: "high",
+      freshness: "required",
+      rationale: "Broad, high-stakes investigation.",
+    }),
+  });
+  assert.ok(modelDeep);
+  assert.equal(modelDeep!.effort?.tier, "extended");
+});
+
+test("model effort assist is ignored without a utility model and validates its output", async () => {
+  const prompt = "Investigate onboarding validation briefly";
+  const runPlan = {
+    route: "grounded_workflow",
+    slowPathReason: "needs_web_sources",
+  } as const;
+
+  let called = false;
+  const notConfigured = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: false,
+    effortAssist: async () => {
+      called = true;
+      return { tier: "extended" };
+    },
+  });
+  assert.equal(called, false);
+  assert.ok(notConfigured);
+  assert.notEqual(notConfigured!.effort?.tier, "extended");
+
+  // A malformed assessment is discarded; the deterministic tier stands.
+  const garbage = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent: researchIntent(),
+    runPlan,
+    utilityModelConfigured: true,
+    effortAssist: async () => ({ tier: "turbo" } as never),
+  });
+  assert.ok(garbage);
+  assert.notEqual(garbage!.effort?.tier, "extended");
+});
+
 test("createResearchPlanWithAssist ignores assist when utility model is not configured", async () => {
   let called = false;
   const assisted = await createResearchPlanWithAssist({

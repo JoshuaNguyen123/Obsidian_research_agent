@@ -1,6 +1,7 @@
 import type { MissionEvidence } from "./missionLedger";
 import { getEvidencePassageIdentifiers } from "./missionPlan";
 import { hasPrimaryTextCitationIntent } from "./evidenceIntent";
+import { quoteAppearsVerbatim } from "./quoteMatch";
 
 export const MAX_RESEARCH_CLAIMS = 40;
 
@@ -388,7 +389,13 @@ export function validateClaimGrounding(
           reasons.push("quote_span_unknown_passage");
           continue;
         }
-        if (!passage.text.includes(span.quote)) {
+        // Match on the same normalized basis as the `verify_citation` tool.
+        // A raw `includes` made the two disagree: passage text extracted from
+        // HTML routinely carries smart quotes and collapsed whitespace, so an
+        // honestly copied quote failed here while passing verify_citation.
+        // Normalization folds only case, smart quotes, and whitespace runs —
+        // a paraphrase still fails, which is the point of the check.
+        if (!quoteAppearsVerbatim(span.quote, passage.text)) {
           missing.push(`claim_grounding:quote_mismatch:${claim.id}`);
           reasons.push("quote_span_not_in_passage");
         } else {

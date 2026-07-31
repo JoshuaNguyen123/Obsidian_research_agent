@@ -117,6 +117,12 @@ export interface SemanticIndexSearchRequest {
   candidateLimit?: number;
   minScore?: number;
   cursor?: string | null;
+  /**
+   * Vault paths whose graph neighbourhood should receive a small ranking
+   * boost — typically the note the user is working in. Omitting this (the
+   * default) leaves scoring byte-identical to the pure semantic+lexical blend.
+   */
+  seedPaths?: string[];
 }
 
 export interface SemanticIndexSearchResult {

@@ -12,11 +12,17 @@ import {
 } from "./missionPlan";
 import { hasExplicitNoWebIntent } from "./evidenceIntent";
 import {
+  evaluateReportStructure,
+  reportStrictnessForTier,
+} from "./researchReportStructure";
+import {
   RESEARCH_EFFORT_TIER_ORDER,
   resolveResearchEffortBudget,
   selectInitialResearchEffort,
   type ResearchEffortBudget,
+  type ResearchEffortConstraints,
   type ResearchEffortSelection,
+  type ResearchEffortTier,
   type ResearchEffortUsage,
   type ResearchFreshnessRequirement,
   type ResearchRisk,
@@ -84,6 +90,31 @@ export interface CreateResearchPlanInput {
   prompt: string;
   missionIntent: MissionIntent;
   runPlan: Pick<RunPlan, "route" | "slowPathReason">;
+  /**
+   * Semantic upgrade from a model: force a research mode when the deterministic
+   * keyword floor found none (e.g. a factual essay that clearly warrants
+   * grounding but names no research keywords). Never downgrades an explicit
+   * keyword signal — regex remains the floor.
+   */
+  modeOverride?: ResearchMode;
+  /**
+   * The model's judgment of how many distinct sources the topic warrants, used
+   * as the fetched-source floor when the user named no explicit count. Clamped
+   * to a sane range; the run still gathers more when evidence keeps arriving.
+   */
+  sourceFloorOverride?: number;
+  /**
+   * Configured fetched-source floor used when neither the prompt nor the model
+   * named a count. Lowest precedence of the three by design: a user who says
+   * "two sources" means two, whatever the setting says.
+   */
+  defaultMinFetchedSources?: number;
+  /**
+   * Highest tier automatic selection or escalation may reach. A ceiling in the
+   * same sense as the safety ceiling: it never raises the tier the prompt
+   * warrants, it only caps it.
+   */
+  researchEffortCeiling?: ResearchEffortTier;
 }
 
 export interface ResearchAcceptanceFinding {
@@ -104,15 +135,40 @@ export function createResearchPlan({
   prompt,
   missionIntent,
   runPlan,
+  modeOverride,
+  sourceFloorOverride,
+  defaultMinFetchedSources,
+  researchEffortCeiling,
 }: CreateResearchPlanInput): ResearchPlan | null {
-  const mode = classifyResearchMode(prompt, missionIntent, runPlan);
+  const regexMode = classifyResearchMode(prompt, missionIntent, runPlan);
+  // Regex is the deterministic floor; a semantic override only *upgrades* an
+  // otherwise-ungrounded prompt into research, never downgrades explicit intent.
+  const mode: ResearchMode =
+    regexMode !== "none"
+      ? regexMode
+      : modeOverride && modeOverride !== "none"
+        ? modeOverride
+        : "none";
   if (mode === "none") {
     return null;
   }
 
   const explicitSourceCount = parseExplicitResearchSourceCount(prompt);
+  const semanticFloor =
+    typeof sourceFloorOverride === "number" && Number.isFinite(sourceFloorOverride)
+      ? Math.max(1, Math.min(8, Math.trunc(sourceFloorOverride)))
+      : undefined;
+  // Precedence, strongest first: an explicit count in the prompt, the model's
+  // topic judgment, the configured default. A user who names a number means it.
+  const configuredFloor =
+    typeof defaultMinFetchedSources === "number" &&
+    Number.isFinite(defaultMinFetchedSources)
+      ? Math.max(1, Math.min(8, Math.trunc(defaultMinFetchedSources)))
+      : undefined;
   const minFetchedSources =
-    mode === "deep_vault" ? 0 : (explicitSourceCount ?? 3);
+    mode === "deep_vault"
+      ? 0
+      : (explicitSourceCount ?? semanticFloor ?? configuredFloor ?? 3);
   const sourceRequirements: ResearchSourceRequirements = {
     minFetchedSources,
     minDistinctDomains:
@@ -135,7 +191,14 @@ export function createResearchPlan({
     evidenceIds: [],
     status: "in_progress",
   };
-  plan.effort = selectResearchEffort(prompt, missionIntent, runPlan, plan);
+  plan.effort = selectResearchEffort(
+    prompt,
+    missionIntent,
+    runPlan,
+    plan,
+    undefined,
+    researchEffortCeiling,
+  );
   plan.nextAction = getNextResearchAction(plan);
   return plan;
 }
@@ -147,6 +210,96 @@ export type ResearchSubquestionAssist = (request: {
 }) => Promise<string[] | null>;
 
 /**
+ * The utility model's view of how much effort a mission deserves. Every field
+ * is advisory: the host still clamps the tier to any configured ceiling, and
+ * runtime evidence-yield escalation covers an under-estimate. Lets the model —
+ * not just a keyword classifier — set the starting research depth.
+ */
+export interface ResearchEffortAssessment {
+  tier?: ResearchEffortTier;
+  risk?: ResearchRisk;
+  freshness?: ResearchFreshnessRequirement;
+  rationale?: string;
+}
+
+export type ResearchEffortAssist = (request: {
+  prompt: string;
+  mode: ResearchMode;
+}) => Promise<ResearchEffortAssessment | null>;
+
+/**
+ * Semantic research-activation judgment. The keyword classifier
+ * ({@link classifyResearchMode}) is a fast deterministic floor; this lets the
+ * model *also* activate research on prompts that clearly warrant grounding but
+ * name no research keywords (e.g. an essay full of factual/historical claims).
+ * Regex still wins when it fires — the model only fills the silence.
+ */
+export interface ResearchModeAssessment {
+  /** "none" means the model agrees no grounding is warranted. */
+  mode: ResearchMode;
+  /** How many distinct sources the topic warrants (advisory floor, 1..8). */
+  sourceFloor?: number;
+  rationale?: string;
+}
+
+export type ResearchModeAssist = (request: {
+  prompt: string;
+}) => Promise<ResearchModeAssessment | null>;
+
+/** Validate an untrusted model-supplied research-mode assessment. */
+export function normalizeResearchModeAssessment(
+  value: unknown,
+): ResearchModeAssessment | undefined {
+  if (!isRecord(value)) return undefined;
+  const mode = (["none", "deep_web", "deep_vault", "deep_hybrid"] as const).find(
+    (candidate) => candidate === value.mode,
+  );
+  if (!mode) return undefined;
+  const rawFloor =
+    typeof value.sourceFloor === "number" ? value.sourceFloor : undefined;
+  const sourceFloor =
+    rawFloor !== undefined && Number.isFinite(rawFloor)
+      ? Math.max(1, Math.min(8, Math.trunc(rawFloor)))
+      : undefined;
+  const rationale =
+    typeof value.rationale === "string" && value.rationale.trim()
+      ? value.rationale.replace(/\s+/g, " ").trim().slice(0, 240)
+      : undefined;
+  return {
+    mode,
+    ...(sourceFloor !== undefined ? { sourceFloor } : {}),
+    ...(rationale ? { rationale } : {}),
+  };
+}
+
+/** Validate an untrusted model-supplied effort assessment. */
+export function normalizeResearchEffortAssessment(
+  value: unknown,
+): ResearchEffortAssessment | undefined {
+  if (!isRecord(value)) return undefined;
+  const tier = RESEARCH_EFFORT_TIER_ORDER.find(
+    (candidate) => candidate === value.tier,
+  );
+  const risk = (["low", "medium", "high", "critical"] as const).find(
+    (candidate) => candidate === value.risk,
+  );
+  const freshness = (["none", "helpful", "required"] as const).find(
+    (candidate) => candidate === value.freshness,
+  );
+  const rationale =
+    typeof value.rationale === "string" && value.rationale.trim()
+      ? value.rationale.replace(/\s+/g, " ").trim().slice(0, 240)
+      : undefined;
+  if (!tier && !risk && !freshness) return undefined;
+  return {
+    ...(tier ? { tier } : {}),
+    ...(risk ? { risk } : {}),
+    ...(freshness ? { freshness } : {}),
+    ...(rationale ? { rationale } : {}),
+  };
+}
+
+/**
  * Same as {@link createResearchPlan}, then optionally merges utility-model
  * subquestions when configured and deterministic confidence is low.
  * Never calls the main mission model for planning — pass a dedicated utility assist.
@@ -155,11 +308,60 @@ export async function createResearchPlanWithAssist(
   input: CreateResearchPlanInput & {
     utilityModelConfigured?: boolean;
     assist?: ResearchSubquestionAssist;
+    effortAssist?: ResearchEffortAssist;
+    modeAssist?: ResearchModeAssist;
   },
 ): Promise<ResearchPlan | null> {
-  const plan = createResearchPlan(input);
+  let plan = createResearchPlan(input);
+  // Semantic activation: when the deterministic keyword floor found no research
+  // but a utility model is configured, let the model decide whether the prompt
+  // actually warrants grounding (and roughly how many sources). Regex still wins
+  // when it fired — this only fills the silence, so research becomes agentic
+  // rather than purely keyword-triggered.
+  if (
+    !plan &&
+    input.utilityModelConfigured === true &&
+    typeof input.modeAssist === "function" &&
+    input.modeOverride === undefined &&
+    // Only fill genuine silence. A delete or simple write-only command is
+    // structurally not research, so never let the model upgrade it into a
+    // grounded run.
+    !input.missionIntent.explicitDelete &&
+    !isSimpleWriteOnlyPrompt(input.prompt)
+  ) {
+    const modeAssessment = await runResearchModeAssist(input.modeAssist, {
+      prompt: input.prompt,
+    });
+    if (modeAssessment && modeAssessment.mode !== "none") {
+      plan = createResearchPlan({
+        ...input,
+        modeOverride: modeAssessment.mode,
+        sourceFloorOverride: modeAssessment.sourceFloor,
+      });
+    }
+  }
   if (!plan) {
     return null;
+  }
+  // Let the utility model set the starting research depth before anything else,
+  // so both the explicit-source and assisted-subquestion paths inherit it.
+  const effortAssessment =
+    input.utilityModelConfigured === true &&
+    typeof input.effortAssist === "function"
+      ? await runResearchEffortAssist(input.effortAssist, {
+          prompt: input.prompt,
+          mode: plan.mode,
+        })
+      : undefined;
+  if (effortAssessment) {
+    plan.effort = selectResearchEffort(
+      input.prompt,
+      input.missionIntent,
+      input.runPlan,
+      plan,
+      effortAssessment,
+      input.researchEffortCeiling,
+    );
   }
   // An explicit source cardinality is a closed evidence-set contract. Do not
   // let the optional utility planner expand a bounded two-source writeback
@@ -217,9 +419,34 @@ export async function createResearchPlanWithAssist(
     input.missionIntent,
     input.runPlan,
     plan,
+    effortAssessment,
   );
   plan.nextAction = getNextResearchAction(plan);
   return plan;
+}
+
+/** Run the optional effort assist, validating and never throwing. */
+async function runResearchEffortAssist(
+  assist: ResearchEffortAssist,
+  request: { prompt: string; mode: ResearchMode },
+): Promise<ResearchEffortAssessment | undefined> {
+  try {
+    return normalizeResearchEffortAssessment(await assist(request));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Run the optional research-mode assist, validating and never throwing. */
+async function runResearchModeAssist(
+  assist: ResearchModeAssist,
+  request: { prompt: string },
+): Promise<ResearchModeAssessment | undefined> {
+  try {
+    return normalizeResearchModeAssessment(await assist(request));
+  } catch {
+    return undefined;
+  }
 }
 
 export function parseExplicitResearchSourceCount(prompt: string): number | null {
@@ -481,11 +708,18 @@ export function evaluateResearchAcceptance({
       }
     }
 
-    if (!/\blimitations?\b|\bopen questions?\b|\bunanswered\b/i.test(output)) {
+    // Deep and extended missions claim thoroughness, so they are held to a
+    // real structural bar: a limitations heading with prose beneath it, and a
+    // graded confidence statement. Quick and standard missions keep the
+    // original word-level contract exactly. The acceptance key names are
+    // unchanged either way so persisted ledgers stay readable.
+    const structure = evaluateReportStructure(output, {
+      strictness: reportStrictnessForTier(plan.effort?.tier),
+    });
+    if (!structure.hasLimitationsSection) {
       missing.add("limitations_section");
     }
-
-    if (!/\bconfidence\b/i.test(output)) {
+    if (!structure.hasConfidenceSection) {
       missing.add("confidence_section");
     }
 
@@ -631,17 +865,30 @@ function selectResearchEffort(
   missionIntent: MissionIntent,
   runPlan: Pick<RunPlan, "route" | "slowPathReason">,
   plan: Pick<ResearchPlan, "subquestions" | "sourceRequirements">,
+  assessment?: ResearchEffortAssessment,
+  effortCeiling?: ResearchEffortTier,
 ): ResearchEffortSelection {
+  // The model's assessment, when present, overrides the keyword heuristics for
+  // freshness/risk and sets the starting tier; the deterministic classifier
+  // remains the offline fallback.
   const freshness: ResearchFreshnessRequirement =
-    /\b(?:latest|current|recent|today|as of)\b/iu.test(prompt)
+    assessment?.freshness ??
+    (/\b(?:latest|current|recent|today|as of)\b/iu.test(prompt)
       ? "required"
-      : "helpful";
+      : "helpful");
   const risk: ResearchRisk =
-    /\b(?:medical|legal|financial|security|safety[- ]critical)\b/iu.test(prompt)
+    assessment?.risk ??
+    (/\b(?:medical|legal|financial|security|safety[- ]critical)\b/iu.test(prompt)
       ? "high"
       : missionIntent.explicitMutation || missionIntent.requireWriteCompletion
         ? "medium"
-        : "low";
+        : "low");
+  // The ceiling is a hard limit on escalation, applied on top of whatever tier
+  // the prompt or the model asks for — the same shape as the safety ceiling.
+  const constraints: ResearchEffortConstraints = {
+    ...(assessment?.tier ? { requestedTier: assessment.tier } : {}),
+    ...(effortCeiling ? { maxTier: effortCeiling } : {}),
+  };
   return selectInitialResearchEffort({
     prompt,
     route: `${runPlan.route} ${runPlan.slowPathReason}`,
@@ -649,6 +896,7 @@ function selectResearchEffort(
     requiredSources: plan.sourceRequirements.minFetchedSources,
     freshness,
     risk,
+    ...(Object.keys(constraints).length > 0 ? { constraints } : {}),
   });
 }
 
@@ -1368,12 +1616,31 @@ function getRelevanceTerms(value: string): string[] {
 }
 
 function getResearchEvidenceStats(evidence: ResearchEvidence[]) {
-  const fetchedUrls = dedupe(
-    evidence
-      .filter(isFetchedWebEvidence)
-      .map((item) => item.url)
-      .filter((url): url is string => Boolean(url)),
-  );
+  // Collapse sources that served byte-identical text before counting anything.
+  // Mirrors, syndicated copies, and a press release republished under three
+  // hostnames are one source of authority, not three — without this they
+  // satisfied both `minFetchedSources` and `minDistinctDomains` and the run
+  // reported corroboration it never had. Evidence with no verifiable content
+  // hash keeps its own URL identity: absence of proof of duplication is not
+  // proof of duplication.
+  const seenContentHashes = new Set<string>();
+  const fetchedUrls: string[] = [];
+  const seenUrls = new Set<string>();
+  for (const item of evidence.filter(isFetchedWebEvidence)) {
+    const url = item.url;
+    if (!url || seenUrls.has(url)) continue;
+    const contentHash =
+      typeof item.contentHash === "string" &&
+      /^sha256:[a-f0-9]{64}$/u.test(item.contentHash)
+        ? item.contentHash
+        : null;
+    if (contentHash) {
+      if (seenContentHashes.has(contentHash)) continue;
+      seenContentHashes.add(contentHash);
+    }
+    seenUrls.add(url);
+    fetchedUrls.push(url);
+  }
   const domains = dedupe(
     fetchedUrls
       .map(getUrlDomain)
