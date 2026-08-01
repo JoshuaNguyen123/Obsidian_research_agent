@@ -314,6 +314,18 @@ function dimension(
  * failed receipt coverage — it had nothing to receipt. Scoring it 0 would
  * punish read-only missions for being read-only.
  */
+/**
+ * Fraction of a required set that was covered.
+ *
+ * KNOWN LIMITATION: an empty requirement scores 1, so "0 of 0 claims needed a
+ * citation" is indistinguishable from "every claim that needed one got it". A
+ * mission that quietly does less work therefore scores *higher*. This measures
+ * degradation within a fixed scenario; it does not detect a scenario becoming
+ * less demanding, so a perfect total is not evidence the mission was hard.
+ *
+ * Changing this changes every score, which invalidates every harvested
+ * baseline — treat it as a dimension change and re-harvest (see AGENTS.md).
+ */
 function coverage(covered: number, total: number): number {
   if (total <= 0) return 1;
   return clampCount(covered, total) / total;
@@ -328,6 +340,7 @@ function distinctDomainCount(urls: readonly string[]): number {
   return domains.size;
 }
 
+/** Fraction of declared criteria met. Same empty-set caveat as {@link coverage}. */
 function ratioMet(total: number, missing: number): number {
   if (total <= 0) return 1;
   return (total - clampCount(missing, total)) / total;
