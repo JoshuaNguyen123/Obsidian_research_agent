@@ -121,7 +121,24 @@ export async function assertMissionScorecardSummaryFile(options = {}) {
   const summaryPath = path.resolve(
     options.summaryPath ?? DEFAULT_DAILY_USE_SUMMARY_PATH,
   );
-  const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+  // A bare ENOENT here reads as a broken gate. It usually means only that no
+  // scored lane has run on this machine yet, which is the ordinary state of a
+  // fresh checkout — say so, and name the lane to run.
+  let summaryText;
+  try {
+    summaryText = await readFile(summaryPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(
+        `No daily-use run summary at ${path.relative(process.cwd(), summaryPath).replace(/\\/gu, "/")}. ` +
+          "This gate compares a real run against the harvested baseline, so a scored lane has to run first:\n" +
+          "  npm run test:e2e:research\n" +
+          "Then harvest it with: npm run scorecards:harvest",
+      );
+    }
+    throw error;
+  }
+  const summary = JSON.parse(summaryText);
   return assertMissionScorecardRegressions({
     summary,
     baseline,

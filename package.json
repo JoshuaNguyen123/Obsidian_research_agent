@@ -20,6 +20,7 @@
     "test:ci": "npm run check:path-hygiene && npm run check:style-tokens && npm test && npm run build",
     "test:public-site:e2e": "playwright test --config=playwright.public-site.config.ts",
     "check:mission-scorecards": "node scripts/mission-scorecard-regression.mjs",
+    "scorecards:harvest": "node scripts/harvest-mission-scorecards.mjs",
     "sync:test-vault": "node scripts/sync-test-vault.mjs",
     "cleanup:e2e-github-residue": "node scripts/cleanup-e2e-github-residue.mjs",
     "cleanup:e2e-runtime-residue": "node scripts/cleanup-owned-e2e-runtime-residue.mjs",
