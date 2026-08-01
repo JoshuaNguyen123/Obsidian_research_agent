@@ -28,12 +28,13 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    # GitHub-hosted: the repo currently has zero registered self-hosted
-    # runners (the agentic-daily-use runner aged out), and this job only tars
-    # committed static files and deploys them with the ephemeral Pages OIDC
-    # token — no credentials or host state that would require the trusted
-    # machine. Dispatch stays manual. Restore the self-hosted label if that
-    # runner is ever re-registered and preferred.
+    # GitHub-hosted on purpose, and this is a standing decision rather than a
+    # temporary state to be reverted. This job only tars committed static files
+    # and deploys them with the ephemeral Pages OIDC token: no credentials, no
+    # host state, nothing that wants the trusted machine. Because it handles no
+    # secrets it is also the one workflow here that is safe to run on a public
+    # repository without the fail-closed guard the credentialed lanes carry.
+    # Dispatch stays manual.
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository

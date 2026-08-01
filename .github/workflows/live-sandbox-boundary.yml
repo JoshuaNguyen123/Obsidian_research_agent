@@ -10,6 +10,12 @@ concurrency:
   group: hosted-sandbox-contract-${{ github.ref }}
   cancel-in-progress: true
 
+# WARNING: THIS REPOSITORY IS PUBLIC.
+# Workflow logs and artifacts here are world-readable. GitHub masks the literal
+# value of a registered secret; it does NOT mask model output, Linear workspace
+# and issue names, vault paths, or note content that a live lane prints. Adding
+# E2E_OLLAMA_API_KEY to this repository publishes every live run.
+# This lane injects no secret and must stay that way; do not add one here.
 jobs:
   contract:
     name: Windows / secret-free WSL2 sandbox contract

@@ -10,6 +10,13 @@ concurrency:
   group: targeted-live-model-${{ github.ref }}
   cancel-in-progress: true
 
+# WARNING: THIS REPOSITORY IS PUBLIC.
+# Workflow logs and artifacts here are world-readable. GitHub masks the literal
+# value of a registered secret; it does NOT mask model output, Linear workspace
+# and issue names, vault paths, or note content that a live lane prints. Adding
+# E2E_OLLAMA_API_KEY to this repository publishes every live run.
+# This job therefore fails closed until that secret is added deliberately AND
+# the leak is explicitly acknowledged. Run these lanes locally instead.
 jobs:
   live-research:
     if: github.ref == 'refs/heads/main'
@@ -20,6 +27,19 @@ jobs:
       E2E_RELEASE_COMMIT_SHA: ${{ github.sha }}
       E2E_PROTECTED_LOG_MODE: "1"
     steps:
+      - name: Refuse to run without a deliberately configured live secret
+        shell: pwsh
+        env:
+          LIVE_KEY: ${{ secrets.E2E_OLLAMA_API_KEY }}
+          PUBLIC_ACK: ${{ vars.E2E_PUBLIC_REPO_LEAK_ACKNOWLEDGED }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:LIVE_KEY)) {
+            throw "E2E_OLLAMA_API_KEY is not configured. This is intentional: the repository is public and this lane streams live model and Linear data into world-readable logs. Run these lanes locally instead."
+          }
+          if ($env:PUBLIC_ACK -ne "yes") {
+            throw "Set repository variable E2E_PUBLIC_REPO_LEAK_ACKNOWLEDGED=yes to confirm you accept publishing live run output, or make the repository private."
+          }
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

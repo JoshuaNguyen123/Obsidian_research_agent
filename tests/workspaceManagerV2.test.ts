@@ -345,6 +345,76 @@ test("repository workspace registration accepts only an explicit distinct truste
   }
 });
 
+// The base-checkout rule above was the only registration guard under test, yet
+// each of the others is load-bearing: together they are what make it safe to
+// let an agent write into a repository workspace without asking every time.
+test("repository workspace registration rejects every unsafe binding", async () => {
+  const fixture = await fixtureManager("repository-guards");
+  const repository = path.join(fixture.root, "repo");
+  const worktree = path.join(fixture.root, "worktree");
+  const notAWorktree = path.join(fixture.root, "plain-directory");
+  await mkdir(repository);
+  await mkdir(worktree);
+  await mkdir(notAWorktree);
+  await writeFile(path.join(repository, ".git"), "gitdir: fixture", "utf8");
+  await writeFile(path.join(worktree, ".git"), "gitdir: fixture", "utf8");
+
+  const base = {
+    ownerRunId: "run-repository",
+    profileKey: "fixture-repo",
+    repositoryRoot: repository,
+    worktreeRoot: worktree,
+    branch: "codex/workspace-guarded",
+    baseSha: "a".repeat(40),
+    bindingFingerprint: fp("d"),
+    trusted: true as const,
+  };
+
+  try {
+    // `trusted` must be a literal true, not merely truthy: an accidental
+    // pass-through of an untrusted path must not register.
+    await assert.rejects(
+      fixture.manager.registerTrustedRepositoryWorkspace({
+        ...base,
+        workspaceId: "guard-untrusted",
+        trusted: false as unknown as true,
+      }),
+      /explicit trusted worktree binding/u,
+    );
+
+    await assert.rejects(
+      fixture.manager.registerTrustedRepositoryWorkspace({
+        ...base,
+        workspaceId: "guard-base-sha",
+        baseSha: "not-a-sha",
+      }),
+      /base SHA is invalid/u,
+    );
+
+    await assert.rejects(
+      fixture.manager.registerTrustedRepositoryWorkspace({
+        ...base,
+        workspaceId: "guard-fingerprint",
+        bindingFingerprint: "nope",
+      }),
+      /fingerprint is invalid/u,
+    );
+
+    // A directory with no .git marker is not a worktree, however plausible the
+    // rest of the binding looks.
+    await assert.rejects(
+      fixture.manager.registerTrustedRepositoryWorkspace({
+        ...base,
+        workspaceId: "guard-not-a-worktree",
+        worktreeRoot: notAWorktree,
+      }),
+      /not a Git worktree/u,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("repository base advances only from exact clean verified head readback and reconciles after restart", async () => {
   const fixture = await fixtureManager("repository-base-advance");
   const repository = path.join(fixture.root, "repo");
