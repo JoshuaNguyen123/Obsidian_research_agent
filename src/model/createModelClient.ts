@@ -5,6 +5,7 @@ import type {
   HttpRequest,
   HttpResponse,
   ModelClient,
+  ModelProvider,
   StreamingHttpResponse,
 } from "./types";
 import { ModelClientError as ModelClientErrorClass } from "./types";
@@ -19,26 +20,97 @@ type ObsidianRequestUrl = (request: HttpRequest) => Promise<{
   arrayBuffer?: ArrayBuffer;
 }>;
 
-export function createConfiguredModelClient(settings: AgentSettings): ModelClient {
+/**
+ * One endpoint's worth of configuration. Extracted so the same construction
+ * path serves the primary model and the second agent's slot — two builders
+ * reading different field names would drift the moment either provider gains
+ * an option.
+ */
+export interface ModelSlotConfig {
+  provider: ModelProvider;
+  model: string;
+  baseUrl: string;
+  apiKey: string;
+  requestTimeoutMs: number;
+}
+
+export function createModelClientForSlot(slot: ModelSlotConfig): ModelClient {
   const common = {
-    model: settings.model,
+    model: slot.model,
     transport: requestUrlTransport,
     streamingTransport: hybridStreamingTransport,
-    requestTimeoutMs: settings.requestTimeoutMs,
+    requestTimeoutMs: slot.requestTimeoutMs,
   };
 
-  if (settings.modelProvider === "openai_compatible") {
+  if (slot.provider === "openai_compatible") {
     return new OpenAICompatibleClient({
       ...common,
-      baseUrl: settings.openAiCompatibleBaseUrl,
-      apiKey: settings.openAiCompatibleApiKey,
+      baseUrl: slot.baseUrl,
+      apiKey: slot.apiKey,
     });
   }
 
   return new OllamaClient({
     ...common,
-    baseUrl: settings.ollamaBaseUrl,
-    apiKey: settings.ollamaApiKey,
+    baseUrl: slot.baseUrl,
+    apiKey: slot.apiKey,
+  });
+}
+
+function endpointForProvider(
+  settings: AgentSettings,
+  provider: ModelProvider,
+): { baseUrl: string; apiKey: string } {
+  return provider === "openai_compatible"
+    ? {
+        baseUrl: settings.openAiCompatibleBaseUrl,
+        apiKey: settings.openAiCompatibleApiKey,
+      }
+    : { baseUrl: settings.ollamaBaseUrl, apiKey: settings.ollamaApiKey };
+}
+
+export function createConfiguredModelClient(settings: AgentSettings): ModelClient {
+  const endpoint = endpointForProvider(settings, settings.modelProvider);
+  return createModelClientForSlot({
+    provider: settings.modelProvider,
+    model: settings.model,
+    baseUrl: endpoint.baseUrl,
+    apiKey: endpoint.apiKey,
+    requestTimeoutMs: settings.requestTimeoutMs,
+  });
+}
+
+/**
+ * The second agent's client, or null when it shares the primary endpoint.
+ *
+ * Null is the common, correct answer: a utility model on the primary endpoint
+ * is already reachable through the primary client, and the existing in-client
+ * phase routing handles it.
+ *
+ * A distinct client requires an explicit `utilityBaseUrl`. Deliberately not
+ * "provider differs" alone: the Utility model field historically auto-pinned
+ * `utilityModelProvider` to whatever the primary provider was at the time, so
+ * a vault whose primary provider later changed can carry a stale value nobody
+ * chose. Keying on a base URL the user actually typed means a stale pin stays
+ * inert instead of quietly directing traffic — and spend — at a second
+ * provider.
+ */
+export function createUtilitySlotClient(
+  settings: AgentSettings,
+): ModelClient | null {
+  const model = settings.utilityModel?.trim();
+  const baseUrl = settings.utilityBaseUrl?.trim();
+  if (!model || !baseUrl) {
+    return null;
+  }
+  const provider = settings.utilityModelProvider ?? settings.modelProvider;
+  const inherited = endpointForProvider(settings, provider);
+  return createModelClientForSlot({
+    provider,
+    model,
+    baseUrl,
+    apiKey: settings.utilityApiKey?.trim() || inherited.apiKey,
+    requestTimeoutMs: settings.requestTimeoutMs,
   });
 }
 

@@ -12,6 +12,11 @@ import type {
 import type { AgentSettings } from "./settings";
 import type { CapabilityReadinessV2 } from "./agent/capabilityReadiness";
 import { ModelClientError } from "./model/types";
+import { createUtilitySlotClient } from "./model/createModelClient";
+import {
+  runWatchdogWorker,
+  summarizeTranscriptForWatchdog,
+} from "./orchestrator/watchdogWorker";
 import { appendToolTranscript } from "./model/toolTranscript";
 import { serializeToolResultForModel } from "./model/toolResultPayload";
 import { isTransientModelError, withModelRetry } from "./model/retry";
@@ -1858,6 +1863,9 @@ export async function runAgentMission({
     observableModel.updateBudget(modelExecutionBudget);
   };
   modelClient = observableModel.client;
+  // Built once and kept for the whole run: the loop controller needs to know
+  // whether a second agent exists before it decides to give up on a stuck run.
+  let utilitySlotClientForWatchdog: ModelClient | null = null;
   // Per-phase routing. The seven-phase taxonomy was already plumbed through
   // `evidencePhase` and `ModelChatRequest.model` already accepted an override;
   // only the decision was missing. Wrapping the client covers every phase at
@@ -1866,23 +1874,31 @@ export async function runAgentMission({
   {
     const settingsForRouting = toolContext.settings;
     const utilityModel = settingsForRouting?.utilityModel?.trim() ?? "";
-    // A utility model on a *different* provider cannot be reached through this
-    // client, so it is not a routable candidate at all.
+    // A second slot on a different provider/endpoint gets its own client, so it
+    // is now routable too. Null means it shares the primary endpoint, which the
+    // single client already reaches.
+    const utilitySlotClient = settingsForRouting
+      ? createUtilitySlotClient(settingsForRouting)
+      : null;
+    utilitySlotClientForWatchdog = utilitySlotClient;
     const utilityModelIsSameProvider =
       Boolean(utilityModel) &&
       (settingsForRouting?.utilityModelProvider ??
         settingsForRouting?.modelProvider) ===
         settingsForRouting?.modelProvider;
+    const utilityModelIsRoutable =
+      Boolean(utilityModel) &&
+      (utilityModelIsSameProvider || utilitySlotClient !== null);
     const defaultModel =
       settingsForRouting?.model?.trim() ||
       observableModel.client.descriptor?.model ||
       "";
-    const phaseRouting = utilityModelIsSameProvider
+    const phaseRouting = utilityModelIsRoutable
       ? buildStructuredDecisionRouting(utilityModel)
       : createModelPhaseRouting();
     const verifiedModels = [
       defaultModel,
-      ...(utilityModelIsSameProvider ? [utilityModel] : []),
+      ...(utilityModelIsRoutable ? [utilityModel] : []),
     ].filter(Boolean);
     if (defaultModel && verifiedModels.length > 1) {
       const routedClient = observableModel.client;
@@ -1902,17 +1918,37 @@ export async function runAgentMission({
           ? { ...request, model: decision.model }
           : request;
       };
+      // A routed request may belong to the second slot's endpoint rather than
+      // the primary one. Selecting the client by resolved model keeps the
+      // decision in resolveModelForPhase and the transport concern here.
+      const clientForModel = (model: string): ModelClient =>
+        utilitySlotClient && model === utilityModel
+          ? utilitySlotClient
+          : routedClient;
       modelClient = {
         descriptor: routedClient.descriptor,
-        chat: (request) => routedClient.chat(routeRequest(request)),
-        streamChat: (request, streamEvents) =>
-          routedClient.streamChat(routeRequest(request), streamEvents),
+        chat: (request) => {
+          const routed = routeRequest(request);
+          return clientForModel(routed.model ?? "").chat(routed);
+        },
+        streamChat: (request, streamEvents) => {
+          const routed = routeRequest(request);
+          return clientForModel(routed.model ?? "").streamChat(
+            routed,
+            streamEvents,
+          );
+        },
       };
       // One visible line per run: phase routing was invisible before this —
       // configured only via data.json and observable only by diffing per-call
-      // evidence models in Run Details.
+      // evidence models in Run Details. When the second slot is a separate
+      // endpoint, name it: a different provider silently serving half the
+      // phases (and billing for them) must never be invisible.
+      const secondEndpoint = utilitySlotClient
+        ? ` via a separate ${settingsForRouting?.utilityModelProvider ?? "configured"} endpoint`
+        : "";
       events.onStatus?.(
-        `Phase routing active: mission routing and plan proposals run on ${utilityModel}; synthesis and writing stay on ${defaultModel}.`,
+        `Phase routing active: mission routing and plan proposals run on ${utilityModel}${secondEndpoint}; synthesis and writing stay on ${defaultModel}.`,
       );
     }
   }
@@ -14353,6 +14389,11 @@ export async function runAgentMission({
       : "progressed";
   };
 
+  // At most one watchdog consultation per run. Two agents handing a stuck run
+  // back and forth would spend the whole budget looking busy, which is worse
+  // than stopping.
+  let secondAgentConsulted = false;
+
   for (let step = 1; step <= stepLimit; step += 1) {
     if (await stopIfRequested(step)) {
       return;
@@ -18582,6 +18623,8 @@ export async function runAgentMission({
       researchWriteToolsBlocked:
         researchPhaseDescriptor?.researchBearing === true &&
         researchPhaseDescriptor.writeToolsAllowed !== true,
+      secondAgentAvailable: utilitySlotClientForWatchdog !== null,
+      secondAgentConsulted: secondAgentConsulted,
     };
     const loopDecision = applyResearchPhaseToLoopDecision(
       decideNextLoopAction(loopLedger, loopBudgetPlan),
@@ -19008,7 +19051,53 @@ export async function runAgentMission({
       continue;
     }
     if (
-      loopDecision.action === "stop_budget" &&
+      loopDecision.action === "escalate_to_second_agent" &&
+      utilitySlotClientForWatchdog &&
+      !secondAgentConsulted
+    ) {
+      // Consume the escalation before running it: a watchdog that itself fails
+      // must not leave the run eligible to escalate again next iteration.
+      secondAgentConsulted = true;
+      const watchdogModel = runToolContext.settings?.utilityModel?.trim();
+      // Escalation spends money on a second endpoint. Never do that silently.
+      events.onStatus?.(
+        `Primary agent is repeating itself; asking the second agent (${watchdogModel || "utility model"}) how to proceed...`,
+      );
+      const verdict = await runWatchdogWorker({
+        runId,
+        missionPrompt: prompt,
+        recentTranscript: summarizeTranscriptForWatchdog(messages),
+        blockerSignature: researchPhaseDescriptor?.researchBearing
+          ? `research_phase_gate:${researchPhaseDescriptor.phase}`
+          : null,
+        repeatedToolCalls: loopLedger.repeatedToolCalls,
+        modelClient: utilitySlotClientForWatchdog,
+        ...(watchdogModel ? { model: watchdogModel } : {}),
+        abortSignal: runToolContext.abortSignal,
+      });
+      events.onStatus?.(`Second agent: ${verdict.action} — ${verdict.rationale}`);
+      if (verdict.action === "stop") {
+        recordLedgerBlocker(`Second agent stopped the run: ${verdict.rationale}`);
+        await finishRun("budget", lastStep, stepLimit);
+        return;
+      }
+      // Every other verdict is advice injected into the primary agent's own
+      // transcript. The primary agent still acts, so every write gate stays on
+      // exactly one path.
+      messages.push({
+        role: "system" as const,
+        content:
+          verdict.action === "replan"
+            ? `A reviewing agent observed you repeating the same step without progress. Change approach: ${verdict.revisedApproach}`
+            : verdict.action === "ask_user"
+              ? `A reviewing agent observed you repeating the same step without progress. Ask the user exactly this, using the ask_user tool if it is available, otherwise as your final answer: ${verdict.question}`
+              : "A reviewing agent observed you repeating the same step without progress. Do not request more tools. Draft the best final answer you can from what you already have, and state plainly what remains unresolved.",
+      });
+      continue;
+    }
+    if (
+      (loopDecision.action === "stop_budget" ||
+        loopDecision.action === "escalate_to_second_agent") &&
       loopDecision.reason === "repeated_tool_call_without_progress" &&
       !missionComplete &&
       !writeMissionComplete
