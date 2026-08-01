@@ -14,3 +14,5 @@ export function assertMissionScorecardSummaryFile(options?: {
   summaryPath?: string;
   selectedProjects?: string[];
 }): Promise<MissionScorecardRegressionResult>;
+
+export function baselineRecordIsCurrent(record: unknown): boolean;

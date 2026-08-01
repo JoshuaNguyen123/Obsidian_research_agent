@@ -5,6 +5,7 @@ import {
   DEFAULT_DAILY_USE_SUMMARY_PATH,
   DEFAULT_MISSION_SCORECARD_BASELINE_PATH,
   MISSION_SCORECARD_EXEMPT_PROJECTS,
+  baselineRecordIsCurrent,
   missionScorecardRecordKey,
 } from "./mission-scorecard-regression.mjs";
 
@@ -110,9 +111,20 @@ export function selectHarvestableRecords(summary) {
   return { harvestable, skipped };
 }
 
-export function mergeBaselineRecords(existing, harvested) {
+export function mergeBaselineRecords(existing, harvested, options = {}) {
+  const isCurrent = options.isCurrent ?? (() => true);
   const byKey = new Map();
+  const dropped = [];
   for (const record of existing) {
+    // A record written before a dimension was added no longer parses, and
+    // validateBaseline rejects the entire file over a single such record.
+    // Keeping it would make the baseline unreadable rather than incomplete,
+    // so a stale record is dropped and reported as proof debt for its lane:
+    // the gate then demands a fresh harvest the next time that lane runs.
+    if (!isCurrent(record)) {
+      dropped.push(record.key);
+      continue;
+    }
     byKey.set(record.key, { record, origin: "kept" });
   }
   const added = [];
@@ -129,7 +141,7 @@ export function mergeBaselineRecords(existing, harvested) {
   const records = [...byKey.values()]
     .map((entry) => entry.record)
     .sort((left, right) => left.key.localeCompare(right.key));
-  return { records, added, updated };
+  return { records, added, updated, dropped };
 }
 
 async function main() {
@@ -157,14 +169,26 @@ async function main() {
   }
 
   const existing = Array.isArray(baseline.records) ? baseline.records : [];
-  const { records, added, updated } = mergeBaselineRecords(existing, harvestable);
+  const { records, added, updated, dropped } = mergeBaselineRecords(
+    existing,
+    harvestable,
+    { isCurrent: baselineRecordIsCurrent },
+  );
+  for (const key of dropped) console.log(`dropped  ${key}: stale dimension set`);
   for (const key of added) console.log(`added    ${key}`);
   for (const key of updated) console.log(`updated  ${key}`);
 
   const kept = records.length - added.length - updated.length;
   console.log(
-    `\n${added.length} added, ${updated.length} updated, ${kept} kept from lanes not run.`,
+    `\n${added.length} added, ${updated.length} updated, ${kept} kept from lanes not run` +
+      `${dropped.length > 0 ? `, ${dropped.length} dropped as stale` : ""}.`,
   );
+  if (dropped.length > 0) {
+    console.log(
+      "Dropped records predate a dimension change and no longer parse. Their lanes now\n" +
+        "carry no baseline, so the gate will demand a fresh harvest the next time each runs.",
+    );
+  }
 
   if (options.dryRun) {
     console.log("Dry run: baseline not written.");

@@ -119,6 +119,37 @@ test("merged records are ordered stably so the diff shows only real changes", ()
   assert.deepEqual(keys, [...keys].sort((a, b) => a.localeCompare(b)));
 });
 
+test("a structurally stale record is dropped, not carried forward", () => {
+  // Found the hard way: validateBaseline rejects the WHOLE file over a single
+  // unparseable record, so preserving one written before a dimension was added
+  // left the baseline unreadable rather than merely incomplete — which defeated
+  // harvesting one lane at a time, the property the merge exists for.
+  const stale = { key: "old-lane|O-01|e2e/old.spec.ts|Old", project: "old-lane" };
+  const fresh = { key: "new-lane|N-01|e2e/new.spec.ts|New", project: "new-lane" };
+  const { harvestable } = selectHarvestableRecords(summary([record()]));
+
+  const { records, dropped } = mergeBaselineRecords(
+    [stale, fresh],
+    harvestable,
+    { isCurrent: (entry) => entry.key !== stale.key },
+  );
+
+  assert.deepEqual(dropped, [stale.key]);
+  assert.ok(!records.some((entry) => entry.key === stale.key));
+  assert.ok(
+    records.some((entry) => entry.key === fresh.key),
+    "a still-valid record from a lane that did not run is still preserved",
+  );
+});
+
+test("dropping defaults off so merge stays pure without an explicit predicate", () => {
+  const legacy = { key: "any|A-01|e2e/a.spec.ts|A", project: "any" };
+  const { harvestable } = selectHarvestableRecords(summary([record()]));
+  const { records, dropped } = mergeBaselineRecords([legacy], harvestable);
+  assert.deepEqual(dropped, []);
+  assert.equal(records.length, 2);
+});
+
 test("a non-v1 summary is rejected rather than partially harvested", () => {
   assert.throws(() => selectHarvestableRecords({ version: 2, records: [] }), /v1 daily-use/u);
   assert.throws(() => selectHarvestableRecords(null), /v1 daily-use/u);

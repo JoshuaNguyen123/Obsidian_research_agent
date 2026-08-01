@@ -236,6 +236,24 @@ export function assertMissionScorecardRegressions({
   return { checkedRecords: applicableBaselines.length, skipped: false };
 }
 
+/**
+ * True when a baseline record still parses against the current dimension set.
+ *
+ * Exported for the harvester: a record written before a dimension was added is
+ * structurally invalid, and validateBaseline rejects the WHOLE file over one
+ * such record. Carrying a stale record forward therefore makes the baseline
+ * unreadable rather than merely incomplete, which would defeat harvesting one
+ * lane at a time.
+ */
+export function baselineRecordIsCurrent(record) {
+  try {
+    validateScorecard(record?.scorecard, "record");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function validateBaseline(value) {
   if (
     !value ||
