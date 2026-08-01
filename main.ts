@@ -225,6 +225,7 @@ import { resolveOptionalExtensionCapabilities } from "./src/extensions/extension
 import {
   createEmptyExtensionRuntimeProjection,
   readExtensionRuntimeProjection,
+  type ExtensionHealthProjectionEntryV1,
   type ExtensionRuntimeProjectionV1,
   type ExtensionSettingsSectionProjectionV1,
 } from "./src/extensions/extensionHealthProjection";
@@ -6900,6 +6901,18 @@ export default class AgenticResearcherPlugin extends Plugin {
     Readonly<ExtensionSettingsSectionProjectionV1>
   > {
     return this.extensionHealthProjection.settings;
+  }
+
+  /**
+   * Live capability health, the counterpart to the declared settings metadata
+   * above. The projection has always carried this; it simply had no reader, so
+   * the only place it surfaced was the diagnostics report. Settings showed the
+   * declared contract alone, which reads as current state and is not.
+   */
+  getExtensionHealthEntries(): ReadonlyArray<
+    Readonly<ExtensionHealthProjectionEntryV1>
+  > {
+    return this.extensionHealthProjection.health;
   }
 
   private refreshExtensionRuntimeProjection(): void {

@@ -16,6 +16,11 @@ import {
   type SafetyCeilingPreset,
 } from "./agent/safetyCeiling";
 import {
+  SEMANTIC_PROFILE_PRESETS,
+  applySemanticProfilePreset,
+  type SemanticProfilePreset,
+} from "./agent/semanticProfile";
+import {
   normalizeScheduledMissions,
   type ScheduledMission,
 } from "./agent/missionScheduler";
@@ -49,6 +54,11 @@ export type {
   SafetyCeilingPreset,
 } from "./agent/safetyCeiling";
 export { SAFETY_CEILING_PRESETS, applySafetyCeilingPreset };
+export type {
+  SemanticProfileLimits,
+  SemanticProfilePreset,
+} from "./agent/semanticProfile";
+export { SEMANTIC_PROFILE_PRESETS, applySemanticProfilePreset };
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
 export type BrowserMissionMode = "supervised" | "extract_only";
 export type AutonomyProfile = "automatic" | "conservative" | "custom";
@@ -90,6 +100,14 @@ export interface AgentSettings {
   model: string;
   utilityModel?: string;
   utilityModelProvider?: ModelProvider;
+  /**
+   * The second agent's own endpoint. Empty means "share the primary provider's
+   * endpoint", which is the pre-existing behaviour: routing then happens inside
+   * the single client and nothing new is reachable. Filling these in is what
+   * makes a second *provider* usable rather than only a second model name.
+   */
+  utilityBaseUrl?: string;
+  utilityApiKey?: string;
   /** @deprecated Prefer modelRouterMode. true maps to shadow. */
   modelRouterEnabled?: boolean;
   /** Automatic uses authority; Conservative uses off; Custom may choose any mode. */
@@ -199,6 +217,12 @@ export interface AgentSettings {
    */
   runDetailsDiagnosticsExpanded?: boolean;
   semanticSearchEnabled: boolean;
+  /**
+   * One choice standing in for eight tuning values, the same way
+   * {@link safetyCeiling} stands in for nine. "custom" reveals the individual
+   * values for people who need exact control.
+   */
+  semanticProfile?: SemanticProfilePreset;
   semanticEmbeddingModel: string;
   semanticEmbeddingDim: 256 | 512;
   semanticChunkMinTokens: number;
@@ -260,6 +284,10 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   e2eHarnessAttestationEnabled: false,
   utilityModel: "",
   utilityModelProvider: "ollama",
+  // Empty by default: an existing install keeps exactly today's single-client
+  // behaviour until a second endpoint is deliberately configured.
+  utilityBaseUrl: "",
+  utilityApiKey: "",
   modelRouterEnabled: true,
   modelRouterMode: "authority",
   enableStreaming: true,
@@ -300,19 +328,15 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   speechActSemanticRescueMode: "off",
   runDetailsDiagnosticsExpanded: false,
   semanticSearchEnabled: true,
-  semanticEmbeddingModel: "nomic-ai/nomic-embed-text-v1.5-Q",
-  semanticEmbeddingDim: 512,
-  semanticChunkMinTokens: 300,
-  semanticChunkTargetTokens: 500,
-  semanticChunkMaxTokens: 700,
-  semanticChunkOverlapTokens: 80,
+  semanticProfile: "balanced",
+  // Derived, never duplicated: the shipped defaults ARE the Balanced preset, so
+  // the two can never silently drift apart. Capability and environment settings
+  // below stay literal — they are choices, not tuning.
+  ...SEMANTIC_PROFILE_PRESETS.balanced,
   semanticPythonCommand: "",
   semanticModelCacheDir: "",
   semanticIndexEnabled: true,
   semanticIndexFolder: "Agent Memory",
-  semanticIndexDebounceMs: 3000,
-  semanticIndexMaxFiles: 10000,
-  semanticIndexPersistVectors: true,
   temperature: null,
   topK: null,
   topP: null,
@@ -952,13 +976,76 @@ export class AgentSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.utilityModel ?? "")
           .onChange(async (value) => {
             this.plugin.settings.utilityModel = value.trim();
-            // Pin the provider to the active one: routing is same-provider
-            // only, and a stale provider here silently disables it.
-            this.plugin.settings.utilityModelProvider =
-              this.plugin.settings.modelProvider;
+            // Follow the active provider only while this model shares the
+            // primary endpoint. Once a separate endpoint is configured below,
+            // that choice is the user's and must not be overwritten here.
+            if (!this.plugin.settings.utilityBaseUrl?.trim()) {
+              this.plugin.settings.utilityModelProvider =
+                this.plugin.settings.modelProvider;
+            }
             await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen(
+              "agentic-settings-model-routing",
+            );
           }),
       );
+
+    // Only meaningful once a utility model exists; showing an endpoint for a
+    // model that was never named is noise (see the settings-minimalism pass).
+    const secondEndpointHost: HTMLElement = this.plugin.settings.utilityModel?.trim()
+      ? section
+      : document.createElement("div");
+
+    new Setting(secondEndpointHost)
+      .setName("Second agent endpoint")
+      .setDesc(
+        "Leave blank to run the utility model on the primary provider's endpoint. Enter a base URL to give the second agent its own endpoint — this is what lets it use a different provider entirely, and what enables the stuck-run watchdog. The second agent's phases will be billed against this endpoint.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({ ollama: "Ollama", openai_compatible: "OpenAI-compatible" })
+          .setValue(
+            this.plugin.settings.utilityModelProvider ??
+              this.plugin.settings.modelProvider,
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.utilityModelProvider = value as ModelProvider;
+            await this.plugin.saveSettings();
+          }),
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("blank = share primary endpoint")
+          .setValue(this.plugin.settings.utilityBaseUrl ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.utilityBaseUrl = value.trim();
+            await this.plugin.saveSettings();
+            this.redisplayWithAdvancedSectionOpen(
+              "agentic-settings-model-routing",
+            );
+          }),
+      );
+
+    // Credential field appears only once a separate endpoint actually exists.
+    const secondKeyHost: HTMLElement = this.plugin.settings.utilityBaseUrl?.trim()
+      ? section
+      : document.createElement("div");
+
+    new Setting(secondKeyHost)
+      .setName("Second agent API key")
+      .setDesc(
+        "Optional. Blank reuses the key already configured for the selected provider, which is correct when both endpoints belong to the same account.",
+      )
+      .addText((text) => {
+        text.inputEl.type = "password";
+        return text
+          .setPlaceholder("blank = reuse provider key")
+          .setValue(this.plugin.settings.utilityApiKey ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.utilityApiKey = value.trim();
+            await this.plugin.saveSettings();
+          });
+      });
 
     new Setting(section)
       .setName("Thinking mode")
@@ -1507,7 +1594,15 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    // Children of a switched-off capability are noise. Same detached-host idiom
+    // as the safety-ceiling limits; both toggles re-render on change, so these
+    // appear and fold away immediately.
+    const overnightHost: HTMLElement =
+      this.plugin.settings.overnightRunsEnabled !== false
+        ? section
+        : document.createElement("div");
+
+    new Setting(overnightHost)
       .setName("Resume overnight runs after reload")
       .setDesc(
         "Resume the newest safe overnight mission after a plugin reload or crash. Explicitly stopped missions never resume automatically.",
@@ -1535,7 +1630,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(overnightHost)
       .setName("Keep computer awake during overnight runs (experimental)")
       .setDesc(
         "Experimental desktop-only opt-in (default off). Best-effort prevention of application suspension while an overnight mission is active.",
@@ -1567,7 +1662,12 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    const orchestratorHost: HTMLElement =
+      this.plugin.settings.orchestratorEnabled !== false
+        ? section
+        : document.createElement("div");
+
+    new Setting(orchestratorHost)
       .setName("Auto-merge green orchestrator worktrees")
       .setDesc(
         "After an approved coding mission, fast-forward only when the isolated integration worktree is green and the base checkout is still clean.",
@@ -1677,6 +1777,41 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     new Setting(section)
+      .setName("Semantic tuning")
+      .setDesc(
+        "Balanced suits most vaults. Thorough uses larger chunks and a much bigger index ceiling for large vaults. Custom values exposes every individual setting.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            balanced: "Balanced",
+            thorough: "Thorough",
+            custom: "Custom values",
+          })
+          .setValue(this.plugin.settings.semanticProfile ?? "balanced")
+          .onChange(async (value) => {
+            const preset = (value as SemanticProfilePreset) ?? "balanced";
+            this.plugin.settings.semanticProfile = preset;
+            if (preset !== "custom") {
+              applySemanticProfilePreset(this.plugin.settings, preset);
+            }
+            await this.plugin.saveSettings();
+            // Re-render so the individual values appear or fold away.
+            this.redisplayWithAdvancedSectionOpen(
+              "agentic-settings-output-memory",
+            );
+          }),
+      );
+
+    // Individual values stay available but only surface under "Custom values";
+    // a detached host means they simply are not rendered otherwise. Same idiom
+    // as the safety-ceiling limits.
+    const semanticHost: HTMLElement =
+      (this.plugin.settings.semanticProfile ?? "balanced") === "custom"
+        ? section
+        : document.createElement("div");
+
+    new Setting(semanticHost)
       .setName("Semantic embedding model")
       .setDesc("FastEmbed model used for semantic_search_notes.")
       .addText((text) =>
@@ -1690,7 +1825,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(semanticHost)
       .setName("Semantic embedding dimension")
       .setDesc(
         "Matryoshka truncation dimension. Use 512 for quality or 256 for a smaller/faster search footprint.",
@@ -1707,7 +1842,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    const semanticChunkSetting = new Setting(section)
+    const semanticChunkSetting = new Setting(semanticHost)
       .setName("Semantic chunk tokens")
       .setDesc(
         "Token estimates for markdown chunks. These control semantic search and the derived semantic index.",
@@ -1767,7 +1902,7 @@ export class AgentSettingTab extends PluginSettingTab {
       },
     });
 
-    new Setting(section)
+    new Setting(semanticHost)
       .setName("Semantic Python command")
       .setDesc(
         "Optional Python command for FastEmbed. Leave blank to try python, then py.",
@@ -1782,7 +1917,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(semanticHost)
       .setName("Semantic model cache folder")
       .setDesc("Optional local folder for downloaded FastEmbed model files.")
       .addText((text) =>
@@ -1809,7 +1944,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(semanticHost)
       .setName("Semantic index folder")
       .setDesc(
         "Vault folder for Semantic Vault Index.md and semantic-vault-index.json.",
@@ -1828,7 +1963,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(semanticHost)
       .setName("Semantic index debounce")
       .setDesc(
         "Milliseconds to wait before indexing changed markdown files after vault events.",
@@ -1845,7 +1980,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(semanticHost)
       .setName("Semantic index max files")
       .setDesc(
         "Maximum markdown files to include in the derived semantic index.",
@@ -1862,7 +1997,7 @@ export class AgentSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(section)
+    new Setting(semanticHost)
       .setName("Persist semantic vectors")
       .setDesc(
         "Stores local embedding vectors in semantic-vault-index.json. Vectors are never shown to the model.",
@@ -2832,12 +2967,47 @@ export class AgentSettingTab extends PluginSettingTab {
 
     this.renderAdvancedDiagnosticsControls(section);
 
+    // Live status first. This is the surface that answers the question people
+    // actually bring here — "is execution available?" — and until it existed
+    // the only honest answer lived in the diagnostics report.
     section.createEl("h4", {
-      text: "Built-in capability health",
+      text: "Live capability health",
+      cls: "agentic-settings-subgroup-title",
+    });
+    const healthEntries = this.plugin.getExtensionHealthEntries();
+    if (healthEntries.length === 0) {
+      section.createEl("p", {
+        text: "Health has not been probed yet. Reload Agentic Researcher if this persists.",
+        cls: "setting-item-description agentic-extension-health-empty",
+      });
+    } else {
+      for (const entry of healthEntries) {
+        const row = section.createDiv({ cls: "agentic-extension-health-row" });
+        row.createSpan({
+          text: `${entry.displayName} · ${entry.status}`,
+          // Health statuses are their own union, not CapabilityReadinessStatusV2,
+          // so they get the same slug shape without borrowing that helper's type.
+          cls: `agentic-settings-status-badge is-${entry.status.toLowerCase().replace(/\s+/gu, "-")}`,
+        });
+        row.createEl("p", {
+          text: entry.failureCode
+            ? `${entry.summary} (failure=${entry.failureCode}; checked ${entry.checkedAt})`
+            : `${entry.summary} (checked ${entry.checkedAt})`,
+          cls: "setting-item-description",
+        });
+      }
+    }
+
+    // Declared contract second, and explicitly labelled. These values are
+    // compiled-in literals, identical on every install; read as live state they
+    // are actively misleading — a declared default of "editing_only" says
+    // nothing about whether this machine's sandbox probe passed.
+    section.createEl("h4", {
+      text: "Declared contract (not live state)",
       cls: "agentic-settings-subgroup-title",
     });
     section.createEl("p", {
-      text: "Code, Companion, and Integrations ship inside Agentic Researcher. This is diagnostic metadata only.",
+      text: "Static values from each built-in capability's manifest. Identical on every install; these do not reflect your runtime and cannot be changed here.",
       cls: "setting-item-description agentic-settings-subsection-intro",
     });
 

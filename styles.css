@@ -276,6 +276,29 @@
   color: var(--text-error);
 }
 
+/* Extension health uses its own status union (healthy/degraded/blocked/
+   disabled), distinct from capability readiness above. */
+.agentic-researcher-settings .agentic-settings-status-badge.is-healthy {
+  color: var(--color-green, var(--interactive-accent));
+}
+
+.agentic-researcher-settings .agentic-settings-status-badge.is-disabled {
+  color: var(--text-faint);
+}
+
+/* Live capability health rows sit above the declared-contract block, so they
+   need to read as status lines rather than as settings. */
+.agentic-researcher-settings .agentic-extension-health-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.agentic-researcher-settings .agentic-extension-health-row p {
+  margin: 0;
+}
+
 .agentic-researcher-settings .agentic-settings-advanced {
   padding-bottom: 16px;
 }

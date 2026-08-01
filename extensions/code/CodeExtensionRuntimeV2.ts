@@ -2023,13 +2023,19 @@ export class CodeExtensionRuntimeV2 {
         id: `${EXTENSION_ID}:repair-health`,
         displayName: "Code repair and verified commit health",
       },
-      async readStatus(context) {
+      // Reads the durable repair state rather than asserting a fixed verdict.
+      // This previously returned "degraded" unconditionally, so a runtime that
+      // had successfully wired its production adapters still reported itself
+      // broken — on every install, permanently, with no way to clear.
+      readStatus: async (context) => {
+        const repair = this.requireState().repair;
+        const wired = repair.mode === "production_wired";
         return {
-          status: "degraded",
-          summary: "The durable repair contracts are installed, but production mutator, validator, approval, and verified-commit handlers are not connected; no commit is simulated.",
+          status: wired ? "healthy" : "degraded",
+          summary: repair.message,
           details: {
-            blockerCode: "repair_handlers_not_production_wired",
-            publicationEligible: false,
+            blockerCode: repair.blockerCode,
+            publicationEligible: wired,
           },
           checkedAt: context.now().toISOString(),
         };
