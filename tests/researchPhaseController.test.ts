@@ -332,6 +332,41 @@ test("loopDecision soft-gates streamed writeback during gather", () => {
   assert.equal(allowed.action, "stream_note_writeback");
 });
 
+// Reported live: a blocked write in analyze was diverted back to continue_tools,
+// so the model retried the write, the gate blocked it again, and each resume
+// re-entered analyze under a fresh run id. phaseGateFailureCopy already tells
+// the model to answer without a tool call in this phase; the loop controller
+// has to steer to the same place or the instruction is unreachable.
+test("loopDecision steers a blocked analyze write to a final answer, not more tools", () => {
+  const gatherCompletePlan = researchPlanFixture({
+    status: "complete",
+    subquestions: researchPlanFixture().subquestions.map((item) => ({
+      ...item,
+      status: "complete" as const,
+      evidenceIds: ["web_fetch:x"],
+    })),
+    evidenceIds: ["web_fetch:x"],
+  });
+
+  const analyzePhase = deriveResearchPhase({
+    researchPlan: gatherCompletePlan,
+    claimConflict: { openConflictCount: 1, analyzeComplete: false },
+  });
+  assert.equal(analyzePhase.phase, "analyze");
+  assert.equal(analyzePhase.writeToolsAllowed, false);
+
+  const diverted = applyResearchPhaseToLoopDecision(
+    { action: "stream_note_writeback", reason: "ready" },
+    analyzePhase,
+  );
+  assert.equal(
+    diverted.action,
+    "force_final_no_tools",
+    "analyze must not be sent back to continue_tools — that is the deadlock",
+  );
+  assert.match(diverted.reason, /research_phase_analyze_blocks_write/);
+});
+
 function missionPlanFixture(
   proof: "write_receipt" | "external_action_receipt",
   allowedTools: string[],

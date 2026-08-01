@@ -869,6 +869,81 @@ test("current-note sourced writeback is not misclassified as current-events deep
   assert.equal(plan, null);
 });
 
+// Reported live: "make this page more in depth" wrote nothing, and the
+// continue-run recovery deadlocked. A bare `in depth` matched
+// hasDeepResearchIntent, routing an ordinary note revision to deep_web, which
+// then demanded per-subquestion fetched-web citations the prompt could never
+// satisfy and blocked the write behind the research phase gate.
+const REVISION_RUN_PLAN = {
+  route: "grounded_workflow" as const,
+  slowPathReason: "needs_web_sources" as const,
+};
+
+test("current-note revision with 'in depth' is not research-bearing", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "I like the explanation of passive and aggressive threadlocking on this page. However, I want it to be more in depth with some examples. Please edit, and modify the current page.",
+    missionIntent: researchIntent(),
+    runPlan: REVISION_RUN_PLAN,
+  });
+
+  assert.equal(
+    plan,
+    null,
+    "a self-contained revision of the current note must not acquire a citation contract",
+  );
+});
+
+test("revision that explicitly asks for sources stays research-bearing", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "Rewrite this note to be more in depth and back every claim with web sources and citations.",
+    missionIntent: researchIntent(),
+    runPlan: REVISION_RUN_PLAN,
+  });
+
+  assert.ok(plan, "an explicit source request keeps the research contract");
+  assert.equal(plan.mode, "deep_web");
+});
+
+test("revision that names the vault stays research-bearing", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "Expand this page with an in-depth synthesis drawn from across my notes in the vault.",
+    missionIntent: researchIntent(),
+    runPlan: REVISION_RUN_PLAN,
+  });
+
+  assert.ok(plan, "a vault-wide signal keeps the research contract");
+  assert.equal(plan.mode, "deep_vault");
+});
+
+test("semantic mode override cannot overturn the revision opt-out", () => {
+  const plan = createResearchPlan({
+    prompt: "Please edit and expand the current page with some examples.",
+    missionIntent: researchIntent(),
+    runPlan: REVISION_RUN_PLAN,
+    modeOverride: "deep_web",
+  });
+
+  assert.equal(
+    plan,
+    null,
+    "the assist may upgrade an ungrounded prompt, never a deliberate revision opt-out",
+  );
+});
+
+test("pure research without a revision verb is unaffected", () => {
+  const plan = createResearchPlan({
+    prompt: "Do in-depth research on CRDT convergence and write a new note.",
+    missionIntent: researchIntent(),
+    runPlan: REVISION_RUN_PLAN,
+  });
+
+  assert.ok(plan, "a research brief with no revision intent still routes to research");
+  assert.equal(plan.mode, "deep_web");
+});
+
 function researchIntent() {
   return {
     mode: "vault_context_answer" as const,

@@ -11,6 +11,7 @@ import {
   isVaultReadEvidence,
 } from "./missionPlan";
 import { hasExplicitNoWebIntent } from "./evidenceIntent";
+import { hasAuthorizedCurrentNoteReplaceIntent } from "./replaceIntent";
 import {
   evaluateReportStructure,
   reportStrictnessForTier,
@@ -142,12 +143,17 @@ export function createResearchPlan({
   researchEffortCeiling,
 }: CreateResearchPlanInput): ResearchPlan | null {
   const regexMode = classifyResearchMode(prompt, missionIntent, runPlan);
+  // A self-contained revision of the current note is a positive "not research"
+  // verdict, not merely an unclassified prompt. The semantic assist may upgrade
+  // an ungrounded prompt, but it must not overturn this one — doing so would
+  // reintroduce exactly the citation contract the guard exists to remove.
+  const revisionOptOut = isCurrentNoteRevisionWithoutExternalResearch(prompt);
   // Regex is the deterministic floor; a semantic override only *upgrades* an
   // otherwise-ungrounded prompt into research, never downgrades explicit intent.
   const mode: ResearchMode =
     regexMode !== "none"
       ? regexMode
-      : modeOverride && modeOverride !== "none"
+      : !revisionOptOut && modeOverride && modeOverride !== "none"
         ? modeOverride
         : "none";
   if (mode === "none") {
@@ -1078,7 +1084,11 @@ function classifyResearchMode(
   missionIntent: MissionIntent,
   runPlan: Pick<RunPlan, "route" | "slowPathReason">,
 ): ResearchMode {
-  if (missionIntent.explicitDelete || isSimpleWriteOnlyPrompt(prompt)) {
+  if (
+    missionIntent.explicitDelete ||
+    isSimpleWriteOnlyPrompt(prompt) ||
+    isCurrentNoteRevisionWithoutExternalResearch(prompt)
+  ) {
     return "none";
   }
 
@@ -1716,6 +1726,30 @@ function hasBroadVaultSynthesisIntent(prompt: string): boolean {
   return hasDeepVaultResearchIntent(prompt) &&
     /\b(all\s+(?:of\s+)?(?:my\s+)?notes?|entire\s+vault|large\s+vault|across\s+(?:my\s+)?notes?|broad\s+vault|vault-wide|100|1000|10,?000|many\s+notes?)\b/i.test(prompt) &&
     /\b(synthesi[sz]e|summari[sz]e|themes?|patterns?|retrieve|search|find|surface|compare|coverage)\b/i.test(prompt);
+}
+
+/**
+ * "Make this page more in depth" is a revision of the note in front of the
+ * user, not a research brief.
+ *
+ * `hasDeepResearchIntent` matches a bare `in[-\s]?depth`, so an ordinary edit
+ * request routed to `deep_web`. That gave the run a fetched-web citation
+ * contract it could never satisfy: the writeback failed
+ * `subquestion_citation_coverage`, and because the run was then research-bearing
+ * the phase gate blocked the very mutation the user asked for. The result was a
+ * revision request that wrote nothing and could not be resumed.
+ *
+ * Deliberately conjunctive. An explicit web/source signal or a vault-wide
+ * signal keeps the full research contract, so "rewrite this note with
+ * citations" and "expand this page across my vault" are unaffected — only a
+ * self-contained revision of the current note opts out.
+ */
+function isCurrentNoteRevisionWithoutExternalResearch(prompt: string): boolean {
+  return (
+    hasAuthorizedCurrentNoteReplaceIntent(prompt) &&
+    !hasExplicitWebSignal(prompt) &&
+    !hasDeepVaultResearchIntent(prompt)
+  );
 }
 
 function isSimpleWriteOnlyPrompt(prompt: string): boolean {

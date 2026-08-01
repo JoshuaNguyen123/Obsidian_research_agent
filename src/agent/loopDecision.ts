@@ -19,6 +19,14 @@ export interface LoopLedger {
   /** Optional research phase gate signal from researchPhaseController. */
   researchPhase?: ResearchRunPhase;
   researchWriteToolsBlocked?: boolean;
+  /** A distinct second-agent slot is configured and reachable this run. */
+  secondAgentAvailable?: boolean;
+  /**
+   * Already escalated once this run. Without this the two agents can hand a
+   * stuck run back and forth and spend the whole budget looking busy, which is
+   * worse than stopping.
+   */
+  secondAgentConsulted?: boolean;
 }
 
 export type LoopDecision =
@@ -30,7 +38,8 @@ export type LoopDecision =
   | { action: "stream_note_writeback"; reason: string }
   | { action: "stop_resumable_blocker"; reason: string }
   | { action: "stop_verified_complete"; reason: string }
-  | { action: "stop_budget"; reason: string };
+  | { action: "stop_budget"; reason: string }
+  | { action: "escalate_to_second_agent"; reason: string };
 
 export function decideNextLoopAction(
   ledger: LoopLedger,
@@ -73,6 +82,15 @@ export function decideNextLoopAction(
   }
 
   if (ledger.repeatedToolCalls > 1) {
+    // Repeating a tool without progress is the clearest "stuck" signal we have.
+    // Giving up was the only option before a second agent existed; when one is
+    // configured, ask it once before spending the stop.
+    if (ledger.secondAgentAvailable && !ledger.secondAgentConsulted) {
+      return {
+        action: "escalate_to_second_agent",
+        reason: "repeated_tool_call_without_progress",
+      };
+    }
     return {
       action: "stop_budget",
       reason: "repeated_tool_call_without_progress",
@@ -107,7 +125,19 @@ export function decideNextLoopAction(
 
 /**
  * Soft gate: when research phase still blocks writes, divert streamed
- * writeback decisions back into tool gathering/analysis.
+ * writeback away from the blocked mutation.
+ *
+ * The destination depends on the phase, and must match what
+ * `phaseGateFailureCopy` tells the model to do — otherwise the run is steered
+ * into the one action the gate will reject again:
+ *
+ * - gather  → "finish required search/fetch/read proof first". More tools is
+ *             genuinely the way forward, so continue_tools is correct.
+ * - analyze → "return the complete cited synthesis as the final answer without
+ *             a tool call; the host will verify it before one write". Sending
+ *             this phase back to continue_tools instead produced an
+ *             unrecoverable loop: the model retried the write, the gate blocked
+ *             it, the resume re-entered analyze under a fresh run id, forever.
  */
 export function applyResearchPhaseToLoopDecision(
   decision: LoopDecision,
@@ -118,7 +148,8 @@ export function applyResearchPhaseToLoopDecision(
   }
   if (decision.action === "stream_note_writeback") {
     return {
-      action: "continue_tools",
+      action:
+        phase.phase === "analyze" ? "force_final_no_tools" : "continue_tools",
       reason: `research_phase_${phase.phase}_blocks_write`,
     };
   }
