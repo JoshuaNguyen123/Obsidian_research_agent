@@ -21,10 +21,12 @@ import {
   PROJECT_LIFECYCLE_STAGES,
   type ProjectLifecycleStageV1,
 } from "./projectLifecycle";
+import { REPORT_PROGRESS_TO_LINEAR_TOOL_NAME } from "../tools/reportProgressToLinearTool";
 import { parseAcceptedResearchArtifactV1 } from "../integrations/linear/AcceptedResearchArtifactV1";
 import { parseExternalWorkItemBindingV1 } from "../integrations/linear/ExternalWorkItemBindingV1";
 import { parseWorkItemLineageV1 } from "../integrations/linear/WorkItemLineageV1";
 import { parseRenderedCompatibleWorkItemSpec } from "../integrations/linear/WorkItemParser";
+import { resolveExplicitRepositoryVisibilityChoiceV1 } from "../integrations/github/RepositoryVisibility";
 
 export type { BundledStageGrantV1 };
 export { boundMayAutoUnderBundledGrant };
@@ -62,6 +64,8 @@ const STAGE_PAID_CODE_EXECUTION = new Set<string>([
 const STAGE_PAID_PRIVATE_GITHUB = new Set<string>([
   // Create advances budget toward publish, but Soft-union delivery proofs still
   // require a draft PR URL (see applySetLooseDeliveryProofFromSuccessfulTool).
+  "github_create_repository",
+  // Persisted V1 receipts retain the private-only alias.
   "github_create_private_repository",
   "github_publish_verified_branch",
   "publish_verified_code_to_github",
@@ -124,10 +128,13 @@ export function boundMayAutoWithoutGrant(input: {
   autonomyProfile: AutonomyProfile;
   compoundLifecycleDetected: boolean;
   workingMode?: string | null;
+  currentPrompt?: string;
+  toolArguments?: Readonly<Record<string, unknown>>;
 }): boolean {
   if (!isSetLooseEnabled(input)) return false;
   const toolName = input.toolName.trim();
   if (!toolName) return false;
+  if (publicGitHubMutationRequiresInteractiveApprovalV1(input)) return false;
   // Hard (trash/delete/merge/cleanup) never auto under set-loose.
   if (effectClassForTool(toolName) === "hard") return false;
   // Named delivery tools plus any other Bound-class tool (sandbox nested
@@ -150,8 +157,11 @@ export function boundMayAutoWithoutChatGrant(input: {
   workingMode?: string | null;
   bundledGrant?: BundledStageGrantV1 | null;
   now?: Date;
+  currentPrompt?: string;
+  toolArguments?: Readonly<Record<string, unknown>>;
 }): boolean {
   if (effectClassForTool(input.toolName) === "hard") return false;
+  if (publicGitHubMutationRequiresInteractiveApprovalV1(input)) return false;
   if (
     boundMayAutoUnderBundledGrant({
       toolName: input.toolName,
@@ -162,6 +172,49 @@ export function boundMayAutoWithoutChatGrant(input: {
     return true;
   }
   return boundMayAutoWithoutGrant(input);
+}
+
+const PUBLIC_GITHUB_MUTATION_TOOL_NAMES_V1 = new Set([
+  "github_create_repository",
+  "github_publish_verified_branch",
+  "publish_verified_code_to_github",
+]);
+
+/**
+ * Public GitHub publication is internet-visible and always needs a fresh,
+ * exact interactive approval. Neither Automatic/set-loose nor a bundled stage
+ * grant can stand in for that acknowledgement. Private publication keeps the
+ * existing proof-bound automation path.
+ */
+export function publicGitHubMutationRequiresInteractiveApprovalV1(input: {
+  toolName: string;
+  currentPrompt?: string;
+  toolArguments?: Readonly<Record<string, unknown>>;
+}): boolean {
+  const toolName = input.toolName.trim();
+  if (!PUBLIC_GITHUB_MUTATION_TOOL_NAMES_V1.has(toolName)) return false;
+  if (readRepositoryVisibilityArgumentV1(input.toolArguments) === "public") {
+    return true;
+  }
+  const choice = resolveExplicitRepositoryVisibilityChoiceV1(
+    input.currentPrompt ?? "",
+  );
+  return choice.status === "chosen" && choice.visibility === "public";
+}
+
+function readRepositoryVisibilityArgumentV1(
+  args: Readonly<Record<string, unknown>> | undefined,
+): "public" | "private" | null {
+  if (!args) return null;
+  const direct = args.visibility ?? args.repositoryVisibility;
+  if (direct === "public" || direct === "private") return direct;
+  for (const key of ["destination", "repository", "binding"] as const) {
+    const nested = args[key];
+    if (!nested || typeof nested !== "object" || Array.isArray(nested)) continue;
+    const visibility = (nested as Record<string, unknown>).visibility;
+    if (visibility === "public" || visibility === "private") return visibility;
+  }
+  return null;
 }
 
 /**
@@ -406,6 +459,8 @@ export function filterSetLooseCodeLadderUntilPassedFast(input: {
 }
 
 const GITHUB_PUBLICATION_TOOLS = new Set<string>([
+  "github_create_repository",
+  // Filter persisted V1 frontier nodes as publication tools too.
   "github_create_private_repository",
   "publish_verified_code_to_github",
   "github_publish_verified_branch",
@@ -1234,6 +1289,7 @@ export function pendingToolsForUnpaidSetLooseDelivery(
           "linear_create_issue",
           "linear_get_issue",
           "linear_search_issues",
+          REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
         );
         break;
       case "code_execution":
@@ -1244,12 +1300,15 @@ export function pendingToolsForUnpaidSetLooseDelivery(
         break;
       case "private_github_publication":
         tools.push(
-          "github_create_private_repository",
+          "github_create_repository",
           "publish_verified_code_to_github",
         );
         break;
       case "note_reflection":
-        tools.push("append_to_current_file");
+        // The reflection moment: the note write, and the report back to the
+        // issue that started the work. This switch — not the lifecycle
+        // allowlists — is what actually reaches a set-loose frontier.
+        tools.push("append_to_current_file", REPORT_PROGRESS_TO_LINEAR_TOOL_NAME);
         break;
       default:
         break;
@@ -1461,7 +1520,10 @@ export function hasSetLooseGithubCreateReceipt(
   for (const receipt of receipts) {
     const toolName =
       typeof receipt.toolName === "string" ? receipt.toolName.trim() : "";
-    if (toolName === "github_create_private_repository") {
+    if (
+      toolName === "github_create_repository" ||
+      toolName === "github_create_private_repository"
+    ) {
       return true;
     }
     const blob = receiptTextBlob(receipt);
@@ -1595,7 +1657,7 @@ export function formatSetLooseResumeBindingCard(input: {
       ? `- Unpaid delivery proofs: ${unpaid.join(", ")}.`
       : "- All delivery proofs are paid.",
     unpaid.includes("private_github_publication")
-      ? "- Prefer github_create_private_repository then publish_verified_code_to_github action=publish_draft next."
+      ? "- Ask the user whether the repository is public or private if unanswered; then prefer github_create_repository with that exact choice, followed by publish_verified_code_to_github action=publish_draft."
       : null,
     unpaid.includes("note_reflection") &&
     !unpaid.includes("private_github_publication")

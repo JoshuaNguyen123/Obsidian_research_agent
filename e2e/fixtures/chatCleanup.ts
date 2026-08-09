@@ -6,6 +6,11 @@ import { expect, type Page } from "@playwright/test";
  */
 export async function clearChatInline(page: Page): Promise<void> {
   await page.getByRole("tab", { name: "Chat" }).click();
+  const options = page.locator("details.agentic-researcher-composer-options");
+  if (!(await options.evaluate((element: HTMLDetailsElement) => element.open))) {
+    await options.locator("summary").click();
+  }
+  await expect(options).toHaveAttribute("open", "");
   const clearButton = page.locator("button.agentic-researcher-clear");
   await expect(clearButton).toHaveText("Clear chat");
   await clearButton.click();

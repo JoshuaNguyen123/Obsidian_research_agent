@@ -117,7 +117,7 @@ test("schemasForLifecycleStage keeps only callable stage tools", () => {
     allSchemas: [
       tool("code_validate_fast"),
       tool("append_to_current_file"),
-      tool("github_create_private_repository"),
+      tool("github_create_repository"),
       tool("web_search"),
     ],
   });

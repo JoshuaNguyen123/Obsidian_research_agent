@@ -4,50 +4,20 @@
  * after their first creation and startup only repairs missing defaults.
  */
 
+import { buildLinearIssueTemplateV1 } from "../integrations/linear/LinearIssueFormatV1";
+
 export const AGENT_WORK_FOLDER = "Agent Work";
 export const AGENT_TEMPLATE_FOLDER = `${AGENT_WORK_FOLDER}/templates`;
 export const LINEAR_ISSUE_TEMPLATE_NAME = "Linear issue.md";
 export const LINEAR_ISSUE_TEMPLATE_PATH =
   `${AGENT_TEMPLATE_FOLDER}/${LINEAR_ISSUE_TEMPLATE_NAME}`;
 
-export const LINEAR_ISSUE_TEMPLATE_V1 = `# {{title}}
-
-## Problem / impact
-
-{{problem_impact}}
-
-## Evidence / source links
-
-{{evidence}}
-
-## Confidence / limitations
-
-{{confidence_limitations}}
-
-## Proposed work
-
-{{proposed_work}}
-
-## Non-goals
-
-{{non_goals}}
-
-## Scope
-
-{{scope}}
-
-## Dependencies
-
-{{dependencies}}
-
-## Acceptance criteria
-
-{{acceptance_criteria}}
-
-## Validation
-
-{{validation}}
-`;
+/**
+ * Generated from `LINEAR_ISSUE_SECTIONS_V1` so the shape the agent is told to
+ * fill is the same shape the host renders. The library never overwrites an
+ * existing template file, so this must stay byte-stable across releases.
+ */
+export const LINEAR_ISSUE_TEMPLATE_V1 = buildLinearIssueTemplateV1();
 
 export const DEFAULT_AGENT_TEMPLATE_SEEDS: Readonly<Record<string, string>> =
   Object.freeze({

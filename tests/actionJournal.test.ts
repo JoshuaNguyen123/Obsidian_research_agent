@@ -13,8 +13,93 @@ import {
   reconcileHistoricalCanvasPreflightJournalRecord,
   reconcilePersistedExactLifecycleJournalRecords,
   reconcilePriorExactLifecycleJournalRecords,
+  resolveReceiptBackedOutputTargetPathV1,
   transitionOperationJournalRecord,
 } from "../src/agent/runStore";
+
+test("resumed new-note target requires an exact committed creation receipt", () => {
+  const at = new Date("2026-08-09T08:00:00.000Z");
+  let record = createOperationJournalRecord({
+    operationId: "run-output:1:stream:append",
+    rootRunId: "run-output",
+    segmentId: "run-output",
+    toolName: "append_to_current_file",
+    operation: "append",
+    now: at,
+  });
+  record = transitionOperationJournalRecord(record, "applying", {
+    message: "Stream started.",
+    now: at,
+  });
+  record = transitionOperationJournalRecord(record, "applied", {
+    message: "Stream applied.",
+    mutationMayHaveApplied: true,
+    now: at,
+  });
+  record = transitionOperationJournalRecord(record, "verified", {
+    message: "Readback verified.",
+    receipt: {
+      id: "receipt-output",
+      toolName: "append_to_current_file",
+      operation: "append",
+      path: "Research/Verified report.md",
+      message: "append Research/Verified report.md",
+      createdAt: at.toISOString(),
+      readback: {
+        status: "verified",
+        checkedAt: at.toISOString(),
+        observedFingerprint: "fnv1a32:12345678",
+      },
+      output: {
+        path: "Research/Verified report.md",
+        createdPath: "Research/Verified report.md",
+        partial: false,
+      },
+    },
+    now: at,
+  });
+  record = transitionOperationJournalRecord(record, "committed", {
+    message: "Receipt committed.",
+    now: at,
+  });
+  const snapshot = createMissionRuntimeSnapshot({
+    runId: "run-output",
+    originalMission: "Create a report in a new note.",
+    outputTargetPath: "Research/Verified report.md",
+    operationJournal: [record],
+    createdAt: at,
+  });
+
+  assert.deepEqual(resolveReceiptBackedOutputTargetPathV1(snapshot), {
+    path: "Research/Verified report.md",
+    observedFingerprint: "fnv1a32:12345678",
+    receiptId: "receipt-output",
+    operationId: "run-output:1:stream:append",
+  });
+
+  const tampered = {
+    ...snapshot,
+    outputTargetPath: "Private/Victim.md",
+  };
+  assert.equal(resolveReceiptBackedOutputTargetPathV1(tampered), null);
+
+  const partial = {
+    ...snapshot,
+    operationJournal: snapshot.operationJournal.map((item) => ({
+      ...item,
+      receipt: item.receipt
+        ? {
+            ...item.receipt,
+            output: {
+              ...(item.receipt.output as Record<string, unknown>),
+              partial: true,
+            },
+          }
+        : undefined,
+    })),
+  };
+  assert.equal(resolveReceiptBackedOutputTargetPathV1(partial), null);
+});
 
 test("historical Canvas preflight WAL recovery is fail-closed", async () => {
   const descriptor: ToolDescriptor = {
@@ -116,6 +201,31 @@ test("historical Canvas preflight WAL recovery is fail-closed", async () => {
 });
 
 test("verified exact lifecycle retry closes an older ambiguous WAL row for the same graph node", () => {
+  const preparedAction = {
+    version: 1 as const,
+    id: "publication-action",
+    runId: "run-lifecycle",
+    toolCallId: "publication-call",
+    toolName: "publish_research_to_linear",
+    target: {
+      system: "linear" as const,
+      resourceType: "issue",
+      id: "issue-1",
+      teamId: "team-1",
+    },
+    relatedResources: [],
+    normalizedArgs: { issueId: "issue-1", visibility: "private" },
+    preview: {
+      summary: "Publish accepted research",
+      destination: "Linear issue issue-1",
+      warnings: [],
+      outboundBytes: 128,
+    },
+    payloadFingerprint: `sha256:${"c".repeat(64)}`,
+    idempotencyKey: "research-publication:stable-work-item",
+    preparedAt: "2026-07-18T10:00:00.000Z",
+    expiresAt: "2026-07-18T10:05:00.000Z",
+  };
   const make = (operationId: string) =>
     createOperationJournalRecord({
       operationId,
@@ -124,6 +234,7 @@ test("verified exact lifecycle retry closes an older ambiguous WAL row for the s
       nodeId: "tool-04-publish-research",
       toolName: "publish_research_to_linear",
       operation: "publish",
+      preparedAction: { ...preparedAction, id: `${operationId}-action` },
       now: new Date("2026-07-18T10:00:00.000Z"),
     });
   const prior = transitionOperationJournalRecord(
@@ -206,6 +317,99 @@ test("verified exact lifecycle retry closes an older ambiguous WAL row for the s
     "committed",
   ]);
   assert.equal(restarted[0].receipt?.id, receipt.id);
+});
+
+test("same-node lifecycle reconciliation cannot cross exact repository or visibility identity", () => {
+  const action = (visibility: "public" | "private", repository: string) => ({
+    version: 1 as const,
+    id: `create-${visibility}-${repository}`,
+    runId: "run-github",
+    toolCallId: `call-${visibility}-${repository}`,
+    toolName: "github_create_repository",
+    target: {
+      system: "github" as const,
+      resourceType: "repository",
+      id: `acme/${repository}`,
+      repositoryId: repository,
+    },
+    relatedResources: [],
+    normalizedArgs: { owner: "acme", repository, visibility },
+    preview: {
+      summary: `Create ${visibility} repository`,
+      destination: `acme/${repository}`,
+      warnings: visibility === "public" ? ["internet_visible"] : [],
+      outboundBytes: 0,
+    },
+    payloadFingerprint: `sha256:${(visibility === "public" ? "d" : "e").repeat(64)}`,
+    idempotencyKey: `github:create:acme:${repository}:${visibility}`,
+    preparedAt: "2026-08-09T10:00:00.000Z",
+    expiresAt: "2026-08-09T10:05:00.000Z",
+  });
+  const make = (
+    operationId: string,
+    preparedAction: ReturnType<typeof action>,
+  ) => createOperationJournalRecord({
+    operationId,
+    rootRunId: "run-github",
+    segmentId: "run-github",
+    nodeId: "lifecycle-github-publication",
+    toolName: "github_create_repository",
+    operation: "create",
+    preparedAction,
+    now: new Date("2026-08-09T10:00:00.000Z"),
+  });
+  let prior = transitionOperationJournalRecord(
+    make("prior", action("private", "safe-private")),
+    "applying",
+    { message: "dispatch", mutationMayHaveApplied: true },
+  );
+  prior = transitionOperationJournalRecord(prior, "reconcile_required", {
+    message: "ambiguous",
+    mutationMayHaveApplied: true,
+  });
+  let current = transitionOperationJournalRecord(
+    make("current", action("public", "different-public")),
+    "applying",
+    { message: "dispatch" },
+  );
+  const receipt = {
+    version: 1 as const,
+    id: "receipt-public",
+    runId: "run-github",
+    actionId: "create-public",
+    toolName: "github_create_repository",
+    operation: "create" as const,
+    resource: {
+      system: "github" as const,
+      resourceType: "public_repository",
+      id: "acme/different-public",
+    },
+    message: "Verified public repository.",
+    payloadFingerprint: `sha256:${"f".repeat(64)}`,
+    grantId: "grant-public",
+    idempotencyKey: "github:create:acme:different-public:public",
+    startedAt: "2026-08-09T10:00:01.000Z",
+    committedAt: "2026-08-09T10:00:02.000Z",
+    commitKind: "committed" as const,
+    readback: { status: "verified" as const, checkedAt: "2026-08-09T10:00:02.000Z" },
+  };
+  current = transitionOperationJournalRecord(current, "applied", {
+    message: "applied",
+  });
+  current = transitionOperationJournalRecord(current, "verified", {
+    message: "verified",
+    receipt,
+  });
+  current = transitionOperationJournalRecord(current, "committed", {
+    message: "committed",
+    receipt,
+  });
+  const reconciled = reconcilePriorExactLifecycleJournalRecords(
+    [prior, current],
+    current,
+    receipt,
+  );
+  assert.equal(reconciled[0]?.state, "reconcile_required");
 });
 
 test("an exact lifecycle composite may re-enter its own durable reconciliation checkpoint", () => {

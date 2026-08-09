@@ -9,6 +9,7 @@ import {
   type OrchestratorSnapshotV1,
   type OrchestratorWorkNode,
   type WorkerHandoff,
+  type SpecialistHandoffV2,
 } from "./types";
 
 export interface CreateOrchestratorSnapshotInput {
@@ -418,7 +419,13 @@ function cloneSnapshot(snapshot: OrchestratorSnapshotV1): OrchestratorSnapshotV1
 }
 
 function cloneParticipant(participant: AgentParticipant): AgentParticipant {
-  return { ...participant, budget: cloneBudget(participant.budget) };
+  return {
+    ...participant,
+    budget: cloneBudget(participant.budget),
+    ...(participant.repairState
+      ? { repairState: { ...participant.repairState } }
+      : {}),
+  };
 }
 
 function cloneBudget(budget: AgentParticipantBudget): AgentParticipantBudget {
@@ -459,12 +466,45 @@ function cloneWorktree(worktree: GitWorktreeState): GitWorktreeState {
 }
 
 function cloneHandoff(handoff: WorkerHandoff): WorkerHandoff {
-  return {
+  const cloned: WorkerHandoff = {
     ...handoff,
     sourceIds: [...handoff.sourceIds],
     evidenceIds: [...handoff.evidenceIds],
     unresolvedQuestions: [...handoff.unresolvedQuestions],
   };
+  if ((handoff as Partial<SpecialistHandoffV2>).schemaVersion !== 2) {
+    return cloned;
+  }
+  const specialist = handoff as SpecialistHandoffV2;
+  const specialistClone: SpecialistHandoffV2 = {
+    ...cloned,
+    schemaVersion: 2,
+    fromParticipantId: "specialist",
+    toParticipantId: "lead",
+    missionGraphId: specialist.missionGraphId,
+    specialistMode: specialist.specialistMode,
+    inputFingerprint: specialist.inputFingerprint,
+    progressFingerprint: specialist.progressFingerprint,
+    acceptanceCriteria: [...specialist.acceptanceCriteria],
+    proofReferences: {
+      evidenceIds: [...specialist.proofReferences.evidenceIds],
+      receiptIds: [...specialist.proofReferences.receiptIds],
+      artifactIds: [...specialist.proofReferences.artifactIds],
+      validationIds: [...specialist.proofReferences.validationIds],
+    },
+    changedFiles: [...specialist.changedFiles],
+    conflicts: [...specialist.conflicts],
+    limitations: [...specialist.limitations],
+    recommendedNextAction: specialist.recommendedNextAction,
+    ...(specialist.workspaceLeaseId
+      ? { workspaceLeaseId: specialist.workspaceLeaseId }
+      : {}),
+    ...(specialist.workspaceDiffFingerprint
+      ? { workspaceDiffFingerprint: specialist.workspaceDiffFingerprint }
+      : {}),
+    repairCycle: specialist.repairCycle,
+  };
+  return specialistClone;
 }
 
 function cloneMergeSummary(summary: MergeSummary): MergeSummary {

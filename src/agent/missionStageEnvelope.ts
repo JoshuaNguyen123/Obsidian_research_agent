@@ -57,6 +57,10 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
     "replace_current_file",
     "count_words",
     "publish_research_to_linear",
+    // Reflection reports back to the issue this run created. The composite is
+    // allowlisted; the raw linear_update_issue deliberately stays out so a
+    // state change cannot be aimed at an arbitrary state id.
+    "report_progress_to_linear",
   ],
   linear_hierarchy: [
     "publish_research_to_linear",
@@ -64,6 +68,7 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
     "linear_create_issue",
     "linear_get_issue",
     "linear_search_issues",
+    "report_progress_to_linear",
     "append_to_current_file",
     "read_current_file",
   ],
@@ -74,9 +79,10 @@ const STAGE_TOOL_ALLOW: Record<ProjectLifecycleStageV1, readonly string[]> = {
   private_github_publication: [
     "publish_verified_code_to_github",
     "github_publish_verified_branch",
-    "github_create_private_repository",
+    "github_create_repository",
     ...GITHUB_STAGE_READ_TOOL_ALLOW,
     ...GITHUB_STAGE_SAFE_MUTATION_TOOL_ALLOW,
+    "report_progress_to_linear",
     "append_to_current_file",
     "read_current_file",
   ],
@@ -98,7 +104,7 @@ export function toolsAllowedForEnvelopeStage(
 export function lifecycleStageForEnvelopeTool(
   toolName: string,
 ): ProjectLifecycleStageV1 | null {
-  const name = toolName.trim();
+  const name = canonicalEnvelopeToolName(toolName);
   if (!name) return null;
   for (const stage of PROJECT_LIFECYCLE_STAGES) {
     if (STAGE_TOOL_ALLOW[stage].includes(name)) {
@@ -206,7 +212,7 @@ export function envelopeAllowsTool(
     return false;
   }
   const allowed = new Set(toolsAllowedForEnvelopeStage(envelope.stage));
-  if (!allowed.has(toolName)) return false;
+  if (!allowed.has(canonicalEnvelopeToolName(toolName))) return false;
   // Soft tools are always fine inside a Bound envelope; Hard tools never are.
   // Stage allowlists are authoritative even when a descriptor is missing.
   try {
@@ -215,6 +221,14 @@ export function envelopeAllowsTool(
   } catch {
     return true;
   }
+}
+
+/** Persisted V1 graph nodes may still carry the old private-only tool name. */
+function canonicalEnvelopeToolName(toolName: string): string {
+  const name = toolName.trim();
+  return name === "github_create_private_repository"
+    ? "github_create_repository"
+    : name;
 }
 
 export type EnvelopeBoundExecuteGate =

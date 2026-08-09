@@ -306,6 +306,31 @@ test("planned reads after a prerequisite mutation wait for that mutation", async
   assert.deepEqual(createFile.dependencyIds, [createFolder.id, listFolder.id]);
 });
 
+test("automatic note output binds create_file to the host-allocated path", async () => {
+  const path = "Reports/Agent Orchestration Guide.md";
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-automatic-report-note",
+    objective:
+      "Write an in depth guide to agent orchestration, why it matters, and how to execute it successfully.",
+    toolRegistry: registryFor(["create_file"]),
+    allowedToolNames: ["create_file"],
+    modelVisibleToolNames: ["create_file"],
+    plannedToolNames: ["create_file"],
+    plannedVaultCreatePath: path,
+    currentNotePath: "Current.md",
+    maxToolCalls: 1,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const create = Object.values(host.deterministicProposal.nodes).find((node) =>
+    node.allowedTools.includes("create_file"),
+  );
+  assert.ok(create);
+  assert.equal(create.destination?.selector, path);
+  assert.match(create.objective, /exact new vault note/u);
+});
+
 test("Mermaid creation and verified revision retain two separately budgeted upserts", async () => {
   const names = [
     "read_mermaid_block",
@@ -543,6 +568,114 @@ test("host graph binds every explicit new repository file to its own ordered nod
     assert.ok(nodes[index]!.dependencyIds.includes(nodes[index - 1]!.id));
   }
   assert.equal(host.capabilityEnvelope.budgets.maxDepth, paths.length + 1);
+});
+
+test("host graph binds natural standalone source and test filenames before validation", async () => {
+  const names = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_workspace_export_directory",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-natural-multifile-project",
+    objective:
+      "Build a working Python calculator project with calculator.py and test_calculator.py using unittest. " +
+      "Create both source and test files, validate the full test suite, and report where the project was created.",
+    toolRegistry: registryForDescriptors(
+      names.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+
+  const node = Object.values(host.deterministicProposal.nodes).find(
+    (candidate) => candidate.id === "lifecycle-code_execution",
+  );
+  assert.ok(node);
+  const lifecycle = getMissionCompositeLifecycleSpecV1(node!);
+  assert.ok(lifecycle);
+  assert.deepEqual(
+    lifecycle.actions.map((action) => action.toolName),
+    [
+      "code_sandbox_status",
+      "code_workspace_create",
+      "code_workspace_create_file",
+      "code_workspace_create_file",
+      "code_validate_fast",
+      "code_validate_targeted",
+      "code_validate_full",
+      "code_workspace_export_directory",
+    ],
+  );
+  assert.deepEqual(
+    lifecycle.actions
+      .filter((action) => action.toolName === "code_workspace_create_file")
+      .map((action) => action.selector),
+    ["calculator.py", "test_calculator.py"],
+  );
+  assert.equal(
+    lifecycle.actions.some((action) => action.selector === "main.py"),
+    false,
+  );
+});
+
+test("sandbox-only code missions validate every named file without planning host export", async () => {
+  const names = [
+    "code_sandbox_status",
+    "code_workspace_create",
+    "code_workspace_create_file",
+    "code_validate_fast",
+    "code_validate_targeted",
+    "code_validate_full",
+    "code_workspace_export_directory",
+  ];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-sandbox-only-multifile",
+    objective:
+      "Build a Python project with calculator.py and test_calculator.py. " +
+      "Create both files and run the full unittest suite, but do not export or write anything outside the sandbox.",
+    toolRegistry: registryForDescriptors(
+      names.map((name) => workspaceLifecycleDescriptor(name)),
+    ),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: names,
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  const node = Object.values(host.deterministicProposal.nodes).find(
+    (candidate) => candidate.id === "lifecycle-code_execution",
+  );
+  assert.ok(node);
+  const lifecycle = getMissionCompositeLifecycleSpecV1(node!);
+  assert.ok(lifecycle);
+  assert.deepEqual(
+    lifecycle.actions.map((action) => action.toolName),
+    [
+      "code_sandbox_status",
+      "code_workspace_create",
+      "code_workspace_create_file",
+      "code_workspace_create_file",
+      "code_validate_fast",
+      "code_validate_targeted",
+      "code_validate_full",
+    ],
+  );
+  assert.deepEqual(
+    lifecycle.actions
+      .filter((action) => action.toolName === "code_workspace_create_file")
+      .map((action) => action.selector),
+    ["calculator.py", "test_calculator.py"],
+  );
 });
 
 test("host graph binds a singular source-file creation instead of the current note", async () => {

@@ -126,3 +126,18 @@ test("failed transport or validation never populates the worker cache", async ()
     assert.equal(reused, false);
   }
 });
+
+test("connection attestation times out before a stalled provider can consume a mission test", async () => {
+  const registry = new RealAiConnectionAttestationRegistry();
+  await assert.rejects(
+    verifyWithWorkerConnectionAttestation({
+      registry,
+      target: TARGET,
+      timeoutMs: 20,
+      verify: async () => new Promise<never>(() => undefined),
+      validate: () => undefined,
+    }),
+    /connection attestation timed out after 20 ms/iu,
+  );
+  assert.equal(registry.has(TARGET), false);
+});

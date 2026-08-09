@@ -2,6 +2,7 @@ import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type AgenticResearcherPlugin from "../main";
 import type { ExtensionSettingFieldProjectionV1 } from "./extensions/extensionHealthProjection";
 import type { ModelProvider } from "./model/types";
+import { normalizeSecureProviderBaseUrlV1 } from "./model/providerEndpointPolicy";
 import {
   applyCloudProviderPreset,
   CLOUD_PROVIDER_PRESETS,
@@ -32,6 +33,7 @@ import {
   applyMemoryModeDefaults,
   applyRecommendedAutomaticDefaults,
   applyWorkingModeDefaults,
+  SETTINGS_SCHEMA_VERSION,
 } from "./agent/settingsNormalize";
 import type {
   MemoryModeSetting,
@@ -62,6 +64,15 @@ export { SEMANTIC_PROFILE_PRESETS, applySemanticProfilePreset };
 export type StreamWritebackMode = "off" | "all_current_note_content_writes";
 export type BrowserMissionMode = "supervised" | "extract_only";
 export type AutonomyProfile = "automatic" | "conservative" | "custom";
+export type AgentSlotId = "lead" | "specialist";
+export type AgentConnectionMode = "shared_primary" | "separate";
+export interface AgentModelSlotV2 {
+  slotId: AgentSlotId;
+  provider: ModelProvider;
+  model: string;
+  baseUrl: string;
+  connectionMode: AgentConnectionMode;
+}
 export type OutputProfile =
   | "active_or_new_note"
   | "active_note_only"
@@ -98,15 +109,27 @@ export interface AgentSettings {
   openAiCompatibleApiKey: string;
   openAiCompatibleBaseUrl: string;
   model: string;
+  /** Enables Agent 2 for complex missions; simple note/chat work remains single-agent. */
+  specialistEnabled?: boolean;
+  /** Empty means Agent 2 uses the Lead model with an independent role/prompt. */
+  specialistModel?: string;
+  specialistConnectionMode?: AgentConnectionMode;
+  specialistProvider?: ModelProvider;
+  specialistBaseUrl?: string;
+  /** Runtime-only; persisted through an Agent-2-specific SecretStorage reference. */
+  specialistApiKey?: string;
+  specialistConnectionVerifiedAt?: string;
+  specialistConnectionVerifiedProvider?: ModelProvider;
+  specialistConnectionVerifiedModel?: string;
+  specialistConnectionVerifiedBaseUrl?: string;
+  specialistConnectionVerifiedMode?: AgentConnectionMode;
+  /** @deprecated Schema-4 migration input/runtime alias only. */
   utilityModel?: string;
+  /** @deprecated Schema-4 migration input/runtime alias only. */
   utilityModelProvider?: ModelProvider;
-  /**
-   * The second agent's own endpoint. Empty means "share the primary provider's
-   * endpoint", which is the pre-existing behaviour: routing then happens inside
-   * the single client and nothing new is reachable. Filling these in is what
-   * makes a second *provider* usable rather than only a second model name.
-   */
+  /** @deprecated Schema-4 migration input/runtime alias only. */
   utilityBaseUrl?: string;
+  /** @deprecated Schema-4 plaintext migration input only. */
   utilityApiKey?: string;
   /** @deprecated Prefer modelRouterMode. true maps to shadow. */
   modelRouterEnabled?: boolean;
@@ -210,12 +233,6 @@ export interface AgentSettings {
    * coerces anything unrecognized to "off".
    */
   speechActSemanticRescueMode?: "off" | "shadow" | "authority";
-  /**
-   * Whether the Run Details Diagnostics expander is unfolded. UI state,
-   * persisted. Optional so older persisted settings and test fixtures parse;
-   * the load-time normalizer coerces anything non-true to false.
-   */
-  runDetailsDiagnosticsExpanded?: boolean;
   semanticSearchEnabled: boolean;
   /**
    * One choice standing in for eight tuning values, the same way
@@ -270,7 +287,7 @@ export interface AgentSettings {
 }
 
 export const DEFAULT_SETTINGS: AgentSettings = {
-  settingsSchemaVersion: 4,
+  settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
   workingMode: "automatic",
   memoryMode: "research",
   autonomyProfile: "automatic",
@@ -282,12 +299,12 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
   model: "glm-5.2",
   e2eHarnessAttestationEnabled: false,
-  utilityModel: "",
-  utilityModelProvider: "ollama",
-  // Empty by default: an existing install keeps exactly today's single-client
-  // behaviour until a second endpoint is deliberately configured.
-  utilityBaseUrl: "",
-  utilityApiKey: "",
+  specialistEnabled: true,
+  specialistModel: "",
+  specialistConnectionMode: "shared_primary",
+  specialistProvider: "ollama",
+  specialistBaseUrl: "",
+  specialistApiKey: "",
   modelRouterEnabled: true,
   modelRouterMode: "authority",
   enableStreaming: true,
@@ -326,7 +343,6 @@ export const DEFAULT_SETTINGS: AgentSettings = {
   agenticReflexEnabled: true,
   agenticReflexDiagnosticsEnabled: true,
   speechActSemanticRescueMode: "off",
-  runDetailsDiagnosticsExpanded: false,
   semanticSearchEnabled: true,
   semanticProfile: "balanced",
   // Derived, never duplicated: the shipped defaults ARE the Balanced preset, so
@@ -452,14 +468,14 @@ export class AgentSettingTab extends PluginSettingTab {
     });
     basicEl.createEl("h3", { text: "Essentials" });
     basicEl.createEl("p", {
-      text: "These three choices cover most daily use: model, working style, and memory.",
+      text: "Choose the Lead connection, optionally give the Specialist its own model/API slot, then set working style and memory.",
       cls: "setting-item-description agentic-settings-section-intro",
     });
 
     const provider = this.plugin.settings.modelProvider;
 
     basicEl.createEl("h4", {
-      text: "Model",
+      text: "Agent 1 — Lead",
       cls: "agentic-settings-subgroup-title",
     });
 
@@ -482,35 +498,69 @@ export class AgentSettingTab extends PluginSettingTab {
       );
 
     if (provider === "openai_compatible") {
-      new Setting(basicEl)
+      const apiKeySetting = new Setting(basicEl)
         .setName("API key")
         .setDesc("Stored in Obsidian SecretStorage.")
         .addText((text) => {
           text
-            .setPlaceholder("sk-...")
-            .setValue(this.plugin.settings.openAiCompatibleApiKey)
+            .setPlaceholder(
+              this.plugin.settings.openAiCompatibleApiKey
+                ? "Saved securely; enter a replacement"
+                : "sk-...",
+            )
+            .setValue("")
             .onChange(async (value) => {
-              this.plugin.settings.openAiCompatibleApiKey = value.trim();
+              const next = value.trim();
+              if (!next) return;
+              this.plugin.settings.openAiCompatibleApiKey = next;
               this.plugin.invalidateModelConnectionStatus();
               await this.plugin.saveSettings();
             });
           text.inputEl.type = "password";
         });
+      apiKeySetting.addButton((button) =>
+        button
+          .setButtonText("Clear key")
+          .setDisabled(!this.plugin.settings.openAiCompatibleApiKey)
+          .onClick(async () => {
+            this.plugin.settings.openAiCompatibleApiKey = "";
+            this.plugin.invalidateModelConnectionStatus();
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
     } else {
-      new Setting(basicEl)
+      const apiKeySetting = new Setting(basicEl)
         .setName("API key")
         .setDesc("For Ollama Cloud or a compatible endpoint. Stored in Obsidian SecretStorage.")
         .addText((text) => {
           text
-            .setPlaceholder("ollama_...")
-            .setValue(this.plugin.settings.ollamaApiKey)
+            .setPlaceholder(
+              this.plugin.settings.ollamaApiKey
+                ? "Saved securely; enter a replacement"
+                : "ollama_...",
+            )
+            .setValue("")
             .onChange(async (value) => {
-              this.plugin.settings.ollamaApiKey = value.trim();
+              const next = value.trim();
+              if (!next) return;
+              this.plugin.settings.ollamaApiKey = next;
               this.plugin.invalidateModelConnectionStatus();
               await this.plugin.saveSettings();
             });
           text.inputEl.type = "password";
         });
+      apiKeySetting.addButton((button) =>
+        button
+          .setButtonText("Clear key")
+          .setDisabled(!this.plugin.settings.ollamaApiKey)
+          .onClick(async () => {
+            this.plugin.settings.ollamaApiKey = "";
+            this.plugin.invalidateModelConnectionStatus();
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
     }
 
     const modelSetting = new Setting(basicEl).setName("Model");
@@ -613,6 +663,7 @@ export class AgentSettingTab extends PluginSettingTab {
     }
 
     this.renderConnectionStatusRow(basicEl);
+    this.renderSpecialistModelSettings(basicEl);
 
     basicEl.createEl("h4", {
       text: "Behavior",
@@ -745,6 +796,207 @@ export class AgentSettingTab extends PluginSettingTab {
           this.display();
         }),
     );
+  }
+
+  private renderSpecialistModelSettings(containerEl: HTMLElement): void {
+    const settings = this.plugin.settings;
+    const enabled = settings.specialistEnabled !== false;
+    const connectionMode =
+      settings.specialistConnectionMode === "separate"
+        ? "separate"
+        : "shared_primary";
+    const provider =
+      settings.specialistProvider === "openai_compatible"
+        ? "openai_compatible"
+        : "ollama";
+
+    containerEl.createEl("h4", {
+      text: "Agent 2 — Specialist",
+      cls: "agentic-settings-subgroup-title",
+    });
+
+    new Setting(containerEl)
+      .setName("Use two-agent workflow for complex missions")
+      .setDesc(
+        "Deep research, Linear, code, GitHub, and recovery work may use a bounded Specialist. Simple chat and note work stay with the Lead.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(enabled).onChange(async (value) => {
+          settings.specialistEnabled = value;
+          this.plugin.invalidateSpecialistModelConnectionStatus();
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+      );
+
+    if (!enabled) return;
+
+    new Setting(containerEl)
+      .setName("Specialist model")
+      .setDesc(
+        "Exact Agent 2 model name. Leave blank to use the Lead model with a separate Specialist role and call trace.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("blank = Lead model")
+          .setValue(settings.specialistModel ?? "")
+          .onChange(async (value) => {
+            settings.specialistModel = value.trim();
+            // Runtime compatibility only. savePluginData strips this schema-4
+            // alias so newly persisted settings stay on the Agent-slot contract.
+            settings.utilityModel = settings.specialistModel;
+            this.plugin.invalidateSpecialistModelConnectionStatus();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Specialist connection")
+      .setDesc(
+        connectionMode === "shared_primary"
+          ? "Share the Lead endpoint and credential. Agent 2 can still use a different model, but both agents share one provider account and rate limit."
+          : "Use an independent endpoint and dedicated Agent 2 credential. Missing credentials fail closed and never inherit the Lead key.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("shared_primary", "Share Agent 1 connection")
+          .addOption("separate", "Use separate connection")
+          .setValue(connectionMode)
+          .onChange(async (value) => {
+            const nextMode =
+              value === "separate" ? "separate" : "shared_primary";
+            if (nextMode !== settings.specialistConnectionMode) {
+              settings.specialistApiKey = "";
+            }
+            settings.specialistConnectionMode = nextMode;
+            settings.utilityModelProvider =
+              settings.specialistConnectionMode === "separate"
+                ? settings.specialistProvider ?? settings.modelProvider
+                : settings.modelProvider;
+            settings.utilityBaseUrl =
+              settings.specialistConnectionMode === "separate"
+                ? settings.specialistBaseUrl ?? ""
+                : "";
+            this.plugin.invalidateSpecialistModelConnectionStatus();
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    if (connectionMode === "separate") {
+      new Setting(containerEl)
+        .setName("Specialist provider")
+        .setDesc("Agent 2 provider. This selection never changes Agent 1.")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("ollama", "Ollama-compatible")
+            .addOption("openai_compatible", "GPT/OpenAI-compatible")
+            .setValue(provider)
+            .onChange(async (value) => {
+              const nextProvider = isModelProvider(value)
+                ? value
+                : "ollama";
+              if (nextProvider !== settings.specialistProvider) {
+                settings.specialistApiKey = "";
+              }
+              settings.specialistProvider = nextProvider;
+              settings.utilityModelProvider = settings.specialistProvider;
+              this.plugin.invalidateSpecialistModelConnectionStatus();
+              await this.plugin.saveSettings();
+              this.display();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("Specialist base URL")
+        .setDesc(
+          provider === "openai_compatible"
+            ? "Dedicated Agent 2 endpoint; usually ends with /v1."
+            : "Dedicated Agent 2 Ollama-compatible /chat endpoint.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder(
+              provider === "openai_compatible"
+                ? DEFAULT_SETTINGS.openAiCompatibleBaseUrl
+                : DEFAULT_SETTINGS.ollamaBaseUrl,
+            )
+            .setValue(settings.specialistBaseUrl ?? "")
+            .onChange(async (value) => {
+              const nextBaseUrl = normalizeProviderBaseUrl(value) ?? "";
+              if (nextBaseUrl !== settings.specialistBaseUrl) {
+                settings.specialistApiKey = "";
+              }
+              settings.specialistBaseUrl = nextBaseUrl;
+              settings.utilityBaseUrl = settings.specialistBaseUrl;
+              this.plugin.invalidateSpecialistModelConnectionStatus();
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      const specialistKeySetting = new Setting(containerEl)
+        .setName("Specialist API key")
+        .setDesc(
+          "Dedicated Agent 2 credential, stored in its own Obsidian SecretStorage entry. It is required in separate mode and never falls back to the Lead key.",
+        )
+        .addText((text) => {
+          text.inputEl.type = "password";
+          return text
+            .setPlaceholder(
+              settings.specialistApiKey
+                ? "Saved securely; enter a replacement"
+                : "Agent 2 API key",
+            )
+            .setValue("")
+            .onChange(async (value) => {
+              const next = value.trim();
+              if (!next) return;
+              settings.specialistApiKey = next;
+              this.plugin.invalidateSpecialistModelConnectionStatus();
+              await this.plugin.saveSettings();
+            });
+        });
+      specialistKeySetting.addButton((button) =>
+        button
+          .setButtonText("Clear Agent 2 key")
+          .setDisabled(!settings.specialistApiKey)
+          .onClick(async () => {
+            settings.specialistApiKey = "";
+            this.plugin.invalidateSpecialistModelConnectionStatus();
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+    }
+
+    const live = this.plugin.getSpecialistModelConnectionStatus();
+    new Setting(containerEl)
+      .setName("Agent 2 connection")
+      .setDesc(live.message)
+      .addButton((button) =>
+        button
+          .setButtonText(live.status === "testing" ? "Testing..." : "Test Agent 2")
+          .setDisabled(live.status === "testing")
+          .onClick(async () => {
+            const pending = this.plugin.testSpecialistModelConnection();
+            this.display();
+            await pending;
+            this.display();
+          }),
+      )
+      .addButton((button) =>
+        button.setButtonText("Test both agents").setCta().onClick(async () => {
+          button.setDisabled(true);
+          const result = await this.plugin.testBothModelConnections();
+          new Notice(
+            result.ready
+              ? "Both model slots are ready."
+              : "One or more model slots need attention; review the connection rows.",
+            result.ready ? 6_000 : 10_000,
+          );
+          this.display();
+        }),
+      );
   }
 
   private renderCapabilityStatus(containerEl: HTMLElement): void {
@@ -964,88 +1216,6 @@ export class AgentSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
-
-    new Setting(section)
-      .setName("Utility model")
-      .setDesc(
-        "Optional cheaper model tag on the same provider as the primary model. When set, short structured decisions (mission routing, plan proposals) run on it automatically; research, synthesis, and writing stay on the primary model. Both decisions are host-validated, so a weaker utility model degrades into a retry, never into silent low-quality output. Leave blank to use the primary model for every phase.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("e.g. deepseek-v4-flash")
-          .setValue(this.plugin.settings.utilityModel ?? "")
-          .onChange(async (value) => {
-            this.plugin.settings.utilityModel = value.trim();
-            // Follow the active provider only while this model shares the
-            // primary endpoint. Once a separate endpoint is configured below,
-            // that choice is the user's and must not be overwritten here.
-            if (!this.plugin.settings.utilityBaseUrl?.trim()) {
-              this.plugin.settings.utilityModelProvider =
-                this.plugin.settings.modelProvider;
-            }
-            await this.plugin.saveSettings();
-            this.redisplayWithAdvancedSectionOpen(
-              "agentic-settings-model-routing",
-            );
-          }),
-      );
-
-    // Only meaningful once a utility model exists; showing an endpoint for a
-    // model that was never named is noise (see the settings-minimalism pass).
-    const secondEndpointHost: HTMLElement = this.plugin.settings.utilityModel?.trim()
-      ? section
-      : document.createElement("div");
-
-    new Setting(secondEndpointHost)
-      .setName("Second agent endpoint")
-      .setDesc(
-        "Leave blank to run the utility model on the primary provider's endpoint. Enter a base URL to give the second agent its own endpoint — this is what lets it use a different provider entirely, and what enables the stuck-run watchdog. The second agent's phases will be billed against this endpoint.",
-      )
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({ ollama: "Ollama", openai_compatible: "OpenAI-compatible" })
-          .setValue(
-            this.plugin.settings.utilityModelProvider ??
-              this.plugin.settings.modelProvider,
-          )
-          .onChange(async (value) => {
-            this.plugin.settings.utilityModelProvider = value as ModelProvider;
-            await this.plugin.saveSettings();
-          }),
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("blank = share primary endpoint")
-          .setValue(this.plugin.settings.utilityBaseUrl ?? "")
-          .onChange(async (value) => {
-            this.plugin.settings.utilityBaseUrl = value.trim();
-            await this.plugin.saveSettings();
-            this.redisplayWithAdvancedSectionOpen(
-              "agentic-settings-model-routing",
-            );
-          }),
-      );
-
-    // Credential field appears only once a separate endpoint actually exists.
-    const secondKeyHost: HTMLElement = this.plugin.settings.utilityBaseUrl?.trim()
-      ? section
-      : document.createElement("div");
-
-    new Setting(secondKeyHost)
-      .setName("Second agent API key")
-      .setDesc(
-        "Optional. Blank reuses the key already configured for the selected provider, which is correct when both endpoints belong to the same account.",
-      )
-      .addText((text) => {
-        text.inputEl.type = "password";
-        return text
-          .setPlaceholder("blank = reuse provider key")
-          .setValue(this.plugin.settings.utilityApiKey ?? "")
-          .onChange(async (value) => {
-            this.plugin.settings.utilityApiKey = value.trim();
-            await this.plugin.saveSettings();
-          });
-      });
 
     new Setting(section)
       .setName("Thinking mode")
@@ -2974,10 +3144,60 @@ export class AgentSettingTab extends PluginSettingTab {
       text: "Live capability health",
       cls: "agentic-settings-subgroup-title",
     });
+    new Setting(section)
+      .setName("Verify live capabilities")
+      .setDesc(
+        "Run local Code checks now and make read-only Linear and GitHub provider calls. External verification is cached in memory for 15 minutes.",
+      )
+      .addButton((button) =>
+        button.setButtonText("Refresh health").setCta().onClick(async () => {
+          button.setDisabled(true);
+          button.setButtonText("Refreshing...");
+          const result = await this.plugin.refreshCapabilityHealth();
+          new Notice(result.message, result.ok ? 6_000 : 10_000);
+          this.refreshExtensionContributions();
+        }),
+      );
+    new Setting(section)
+      .setName("Companion service")
+      .setDesc(
+        "Install or reconnect the authenticated local service explicitly, provision its signing key, or inspect diagnostics. Installation never happens silently.",
+      )
+      .addButton((button) =>
+        button.setButtonText("Install").onClick(async () => {
+          button.setDisabled(true);
+          const result = await this.plugin.runCompanionCapabilityAction("install");
+          new Notice(result.message, result.ok ? 8_000 : 12_000);
+          this.refreshExtensionContributions();
+        }),
+      )
+      .addButton((button) =>
+        button.setButtonText("Provision signing key").onClick(async () => {
+          button.setDisabled(true);
+          const result = await this.plugin.runCompanionCapabilityAction(
+            "provision_signer",
+          );
+          new Notice(result.message, result.ok ? 8_000 : 12_000);
+          this.refreshExtensionContributions();
+        }),
+      )
+      .addButton((button) =>
+        button.setButtonText("Connect / reconnect").onClick(async () => {
+          button.setDisabled(true);
+          const result = await this.plugin.runCompanionCapabilityAction("connect");
+          new Notice(result.message, result.ok ? 8_000 : 12_000);
+          this.refreshExtensionContributions();
+        }),
+      )
+      .addButton((button) =>
+        button.setButtonText("Open diagnostics").onClick(async () => {
+          await this.plugin.openCapabilityDiagnostics();
+        }),
+      );
     const healthEntries = this.plugin.getExtensionHealthEntries();
     if (healthEntries.length === 0) {
       section.createEl("p", {
-        text: "Health has not been probed yet. Reload Agentic Researcher if this persists.",
+        text: "Health has not been projected yet. Select Refresh health; reload Agentic Researcher only if no rows appear.",
         cls: "setting-item-description agentic-extension-health-empty",
       });
     } else {
@@ -3392,23 +3612,7 @@ function normalizeCompanionBaseUrl(value: string): string | null {
 }
 
 function normalizeProviderBaseUrl(value: string): string | null {
-  const trimmed = value.trim().replace(/\/+$/, "");
-  if (!trimmed) {
-    return null;
-  }
-
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return null;
-    }
-    if (parsed.username || parsed.password) {
-      return null;
-    }
-    return parsed.toString().replace(/\/+$/, "");
-  } catch {
-    return null;
-  }
+  return normalizeSecureProviderBaseUrlV1(value);
 }
 
 function openLinearAuthorizationUrl(value: string): boolean {

@@ -2,6 +2,10 @@ import type {
   GitHubReferenceRecord,
   GitHubRepositoryRecord,
 } from "./GitHubRestClient";
+import {
+  repositoryVisibilityFromReadback,
+  type RepositoryVisibility,
+} from "./RepositoryVisibility";
 
 export interface GitHubPublicationDefaultBranchClientV1 {
   getRepository(
@@ -30,6 +34,8 @@ export interface EnsureGitHubPublicationDefaultBranchInputV1 {
   baseSha: string;
   headBranch: string;
   headSha: string;
+  /** Defaults to private for V1 callers and persisted private workflows. */
+  expectedVisibility?: RepositoryVisibility;
 }
 
 export interface GitHubPublicationDefaultBranchProofV1 {
@@ -68,7 +74,8 @@ export async function ensureGitHubPublicationDefaultBranchV1(
   }
 
   const before = await client.getRepository(owner, repository, signal);
-  assertExactPrivateRepository(before, owner, repository);
+  const expectedVisibility = input.expectedVisibility ?? "private";
+  assertExactRepository(before, owner, repository, expectedVisibility);
   const beforeReferences = await readExactReferences(
     client,
     { owner, repository, baseBranch, baseSha, headBranch, headSha },
@@ -95,7 +102,7 @@ export async function ensureGitHubPublicationDefaultBranchV1(
     signal,
   );
   const after = await client.getRepository(owner, repository, signal);
-  assertExactPrivateRepository(after, owner, repository);
+  assertExactRepository(after, owner, repository, expectedVisibility);
   if (
     after.id !== before.id ||
     after.defaultBranch !== baseBranch
@@ -165,18 +172,19 @@ async function readExactReferences(
   return { baseReference, headReference };
 }
 
-function assertExactPrivateRepository(
+function assertExactRepository(
   value: GitHubRepositoryRecord,
   owner: string,
   repository: string,
+  expectedVisibility: RepositoryVisibility,
 ): void {
   if (
-    value.private !== true ||
+    repositoryVisibilityFromReadback(value) !== expectedVisibility ||
     value.archived ||
     value.fullName.toLowerCase() !== `${owner}/${repository}`.toLowerCase()
   ) {
     throw new Error(
-      "GitHub publication requires the exact active private repository.",
+      `GitHub publication requires the exact active ${expectedVisibility} repository.`,
     );
   }
 }

@@ -76,7 +76,13 @@ const BOUND_FORCE = new Set([
   "replace_current_file",
   "publish_research_to_linear",
   "publish_research_project_to_linear",
+  // Bound, not Soft: it comments on and re-states a real ticket. Bound is also
+  // what makes set-loose auto-approve it while interactive runs still prompt.
+  "report_progress_to_linear",
   "github_publish_verified_branch",
+  "github_create_repository",
+  // Persisted V1 plans may still address the legacy alias. It has the same
+  // explicit visibility gate as the canonical tool.
   "github_create_private_repository",
   "code_commit_verified",
 ]);

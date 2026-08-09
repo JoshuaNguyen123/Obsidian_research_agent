@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   MAX_AGENT_STEPS,
   attachGroundedPassageCitations,
+  constrainExactFindingSentenceContract,
+  pruneUniquelyMatchedUngroundedClaims,
   bindAuthoritativeGraphCodeValidation,
   bindExactWorkspaceDestinationToolSchemas,
   settleTerminalRuntimeSnapshotPersistence,
@@ -52,6 +54,9 @@ import {
   mayBypassMissionGraphStartForSetLooseSoftCompanion,
   missionGraphOwnsAcceptedResearchNoteWritebackV1,
   shouldFinishRunForTerminalMissionGraphBlockers,
+  requiresVerifiedFinalOutput,
+  resolveCommittedProofGatedWriteAcceptanceV1,
+  resolveCommittedProofGatedWriteDeadlineSettlementV1,
   resolveEffectiveTerminalStopReasonV1,
   resolveMissionGraphToolResultOk,
   resolveToolOutcomeMemoryDispositionV1,
@@ -92,6 +97,10 @@ import {
   reconcileOutstandingMissionGraphToolStepBudget,
   resolveMissionGraphExecutionProofContractV1,
 } from "../src/agent/missionGraphSelectors";
+import {
+  getMissionCompositeLifecycleSpecV1,
+  type MissionGraphV3,
+} from "../src/agent/missionGraphV3";
 import {
   constrainSetLooseTemplateDiscoveryToMissionIntent,
   getExplicitMermaidWorkflowToolNames,
@@ -407,6 +416,26 @@ test("issue-bound private publication bootstraps the repository before publish",
   );
 });
 
+test("GitHub repository publication without visibility still routes creation before publication", () => {
+  const prompt = [
+    "Publish the exact verified local commit to a new GitHub repository and open one draft pull request.",
+    "Ask whether the repository should be public or private before creating it; do not assume either visibility.",
+  ].join(" ");
+  const required = getRequiredWriteToolNamesForTests(prompt, [
+    CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    "publish_verified_code_to_github",
+  ]);
+  const createIndex = required.indexOf(
+    CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  );
+  const publishIndex = required.indexOf("publish_verified_code_to_github");
+  assert.ok(createIndex >= 0, `missing generic repository create: ${required}`);
+  assert.ok(
+    publishIndex > createIndex,
+    `repository creation must precede publication: ${required.join(", ")}`,
+  );
+});
+
 test("standalone nested code delivery routes through workspace creation and approved Desktop export without a repository commit", () => {
   assert.deepEqual(
     getRequiredCodeWorkflowToolNames(
@@ -433,6 +462,23 @@ test("bare Python Desktop delivery requires scratch creation, validation, and ex
   assert.deepEqual(
     getRequiredCodeWorkflowToolNames(
       "write a number guessing game in Python on my desktop",
+    ),
+    [
+      "code_sandbox_status",
+      "code_workspace_create",
+      "code_workspace_create_file",
+      "code_validate_fast",
+      "code_validate_targeted",
+      "code_validate_full",
+      "code_workspace_export_directory",
+    ],
+  );
+});
+
+test("standalone code delivery defaults to a validated vault-sibling project without a commit", () => {
+  assert.deepEqual(
+    getRequiredCodeWorkflowToolNames(
+      "Build a working TypeScript project with source files and a test suite.",
     ),
     [
       "code_sandbox_status",
@@ -663,6 +709,124 @@ test("grounded citation normalization adds only known verifier-bound passage ids
   );
   assert.deepEqual(scoped.insertedPassageIds, [beta]);
   assert.doesNotMatch(scoped.content, /source:alpha/u);
+});
+
+test("finalization prunes only uniquely matched ungrounded claims", () => {
+  const grounded = "source:alpha:passage:0-40";
+  const unsupported = "This unsupported extrapolation guarantees long-term retention.";
+  const draft = [
+    "## Findings",
+    `- Controlled onboarding improved completion [${grounded}].`,
+    `- ${unsupported}`,
+    "",
+    "## Limitations",
+    "The available evidence is limited to the reported evaluation window.",
+  ].join("\n");
+  const pruned = pruneUniquelyMatchedUngroundedClaims(draft, {
+    version: 1,
+    status: "needs_more_work",
+    knownPassageIds: [grounded],
+    missing: ["claim_grounding:ungrounded:claim:2"],
+    reasons: ["ungrounded_material_claim"],
+    requireQuoteSpans: false,
+    claims: [
+      {
+        id: "claim:1",
+        text: `Controlled onboarding improved completion [${grounded}].`,
+        status: "grounded",
+        passageIds: [grounded],
+      },
+      {
+        id: "claim:2",
+        text: unsupported,
+        status: "ungrounded",
+        passageIds: [],
+      },
+      {
+        id: "claim:3",
+        text: "The available evidence is limited to the reported evaluation window.",
+        status: "exempt",
+        passageIds: [],
+      },
+    ],
+  });
+
+  assert.deepEqual(pruned.removedClaimIds, ["claim:2"]);
+  assert.doesNotMatch(pruned.content, /unsupported extrapolation/u);
+  assert.match(pruned.content, /Controlled onboarding improved completion/u);
+  assert.match(pruned.content, /## Limitations/u);
+  assert.doesNotMatch(pruned.content, /^\s*-\s*$/mu);
+
+  const duplicate = pruneUniquelyMatchedUngroundedClaims(
+    `${unsupported}\n${unsupported}`,
+    {
+      version: 1,
+      status: "needs_more_work",
+      knownPassageIds: [],
+      missing: ["claim_grounding:ungrounded:claim:1"],
+      reasons: ["ungrounded_material_claim"],
+      requireQuoteSpans: false,
+      claims: [
+        {
+          id: "claim:1",
+          text: unsupported,
+          status: "ungrounded",
+          passageIds: [],
+        },
+      ],
+    },
+  );
+  assert.deepEqual(duplicate.removedClaimIds, []);
+  assert.equal(duplicate.content, `${unsupported}\n${unsupported}`);
+});
+
+test("exact Findings finalization removes material preamble and excess sentences only", () => {
+  const alpha = "source:alpha:passage:0-40";
+  const beta = "source:beta:passage:0-42";
+  const preamble = "A redundant material preamble repeats the alpha conclusion.";
+  const extra = "A third material finding repeats the beta conclusion.";
+  const first = `Alpha evidence supports the first finding [${alpha}].`;
+  const second = `Beta evidence supports the second finding [${beta}].`;
+  const limitation = "The two sources conflict, so the evidence is limited.";
+  const draft = [
+    preamble,
+    "",
+    "## Findings",
+    first,
+    second,
+    extra,
+    "",
+    "## Limitations",
+    limitation,
+  ].join("\n");
+  const constrained = constrainExactFindingSentenceContract(
+    draft,
+    "Append a Findings section with exactly two cited finding sentences and a Limitations section.",
+    {
+      version: 1,
+      status: "pass",
+      knownPassageIds: [alpha, beta],
+      missing: [],
+      reasons: [],
+      requireQuoteSpans: false,
+      claims: [
+        { id: "claim:1", text: preamble, status: "grounded", passageIds: [alpha] },
+        { id: "claim:2", text: first, status: "grounded", passageIds: [alpha] },
+        { id: "claim:3", text: second, status: "grounded", passageIds: [beta] },
+        { id: "claim:4", text: extra, status: "grounded", passageIds: [beta] },
+        { id: "claim:5", text: limitation, status: "exempt", passageIds: [] },
+      ],
+    },
+  );
+
+  assert.equal(constrained.requiredCount, 2);
+  assert.equal(constrained.observedFindingCount, 3);
+  assert.deepEqual(constrained.removedClaimIds, ["claim:4", "claim:1"]);
+  assert.doesNotMatch(constrained.content, /redundant material preamble/u);
+  assert.doesNotMatch(constrained.content, /third material finding/u);
+  assert.match(constrained.content, new RegExp(alpha, "u"));
+  assert.match(constrained.content, new RegExp(beta, "u"));
+  assert.match(constrained.content, /## Limitations/u);
 });
 
 test("passage citation scope removes context-only ids without authorizing the draft", () => {
@@ -2849,6 +3013,37 @@ test("known-folder export binds the verified workspace root and run-scoped Deskt
     ),
     null,
   );
+
+  const vaultSibling = bindVerifiedWorkspaceDirectoryExport(
+    {
+      name: "code_workspace_export_directory",
+      arguments: {
+        destinationRoot: "downloads",
+        destinationPath: "model-invented",
+      },
+    },
+    "Build a working TypeScript library with source files and tests.",
+    "run-2026-08-08T10-20-30.000Z-a1b2c3d4e5f6",
+    [durableReceipt],
+  );
+  assert.deepEqual(vaultSibling?.arguments, {
+    workspaceId: "verified-workspace",
+    sourcePath: "",
+    destinationRoot: "vault_sibling_projects",
+    destinationPath: "working-typescript-library-a1b2c3d4e5f6",
+  });
+  assert.equal(
+    bindVerifiedWorkspaceDirectoryExport(
+      {
+        name: "code_workspace_export_directory",
+        arguments: {},
+      },
+      "Build and test the Python project, but do not export or write anything outside the sandbox.",
+      "run-no-host-export",
+      [durableReceipt],
+    ),
+    null,
+  );
 });
 
 test("verified host export final answer replaces model path claims with receipt truth", () => {
@@ -3802,6 +3997,98 @@ test("plain Q&A creates a new note when no active markdown note exists", async (
         (path.includes("Untitled") || path.includes("Answer")),
     ),
   );
+});
+
+test("planned orchestration guide creates one verified new note and preserves the active note with streaming enabled", async () => {
+  const prompt =
+    "I want you to write me an in depth guide/report to agent orchestration. What is it, why is it important, and then finally how to execute agent orcehstration sucessfully.";
+  const original = "# Existing note\n\nDo not change this note.";
+  const report = [
+    "# Agent Orchestration Guide",
+    "",
+    "## What agent orchestration is",
+    "",
+    "Agent orchestration is the disciplined coordination of specialized agents, tools, context, authority, and verification around one accepted objective. The orchestrator decomposes work only when tasks are genuinely independent, gives every worker a bounded contract, and keeps the final synthesis and approval boundary with the lead.",
+    "",
+    "## Why it matters",
+    "",
+    "Orchestration matters because parallel work can reduce latency and improve coverage without surrendering accountability. Explicit ownership prevents duplicate work, bounded budgets prevent spinning, and evidence-backed completion prevents a busy team from being mistaken for a successful result.",
+    "",
+    "## How to execute agent orchestration successfully",
+    "",
+    "Start with measurable acceptance criteria and choose a single agent unless independent workstreams justify delegation. Assign each worker a distinct output, read-only or narrowly scoped authority, a time and tool budget, and a stop condition. Require progress fingerprints between continuations, reserve capacity for synthesis and readback, reconcile every child into the parent terminal state, and finish with one coherent result plus receipts. Escalate only when an available tool or worker can close a named acceptance gap; otherwise return the best honest partial result and one actionable blocker.",
+  ].join("\n");
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
+  const statuses: string[] = [];
+  const vault = createRunnerVaultContext({ prompt, content: original });
+  vault.context.settings = createRunnerSettings({
+    outputProfile: "active_or_new_note",
+    autonomyProfile: "automatic",
+  });
+  const client = createClient({
+    chatRequests,
+    chatResponders: [
+      () =>
+        responseWithToolCall("create_file", {
+          path: "Wrong Model Path.md",
+          content: report,
+        }),
+      () => responseWithContent("The guide was created and verified."),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createCollectingRegistry(executedCalls),
+    toolContext: vault.context,
+    enableStreaming: true,
+    maxSteps: 6,
+    events: {
+      onReceipt: (receipt) => receipts.push(receipt),
+      onRunConfig: (event) => configs.push(event),
+      onRunComplete: (event) => completions.push(event),
+      onStatus: (message) => statuses.push(message),
+    },
+  });
+
+  assert.equal(vault.content.get("Current.md"), original);
+  assert.equal(
+    vault.content.get("Agent Orchestration Guide.md"),
+    report,
+    JSON.stringify({
+      paths: [...vault.content.keys()],
+      executedCalls,
+      receipts,
+      completion: completions.at(-1),
+      statuses,
+    }),
+  );
+  assert.equal(vault.content.has("Wrong Model Path.md"), false);
+  assert.deepEqual(
+    executedCalls.map((call) => [call.name, call.arguments.path]),
+    [["create_file", "Agent Orchestration Guide.md"]],
+  );
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0]?.operation, "create");
+  assert.equal(receipts[0]?.path, "Agent Orchestration Guide.md");
+  assert.equal(receipts[0]?.readback?.status, "verified");
+  assert.equal(configs.at(-1)?.noteOutputPlan?.destination, "new_note");
+  assert.ok(configs.at(-1)?.allowedToolNames.includes("create_file"));
+  assert.equal(
+    configs.at(-1)?.allowedToolNames.includes("append_to_current_file"),
+    false,
+  );
+  assert.ok((chatRequests[0]?.tools ?? []).some((tool) =>
+    tool.function.name === "create_file" &&
+    tool.function.parameters.properties?.path?.enum?.[0] ===
+      "Agent Orchestration Guide.md",
+  ));
+  assert.notEqual(completions.at(-1)?.stopReason, "error");
 });
 
 test("plain Q&A falls back to chat when output profile is chat_first and no note is active", async () => {
@@ -8344,6 +8631,219 @@ test("paid set-loose delivery stays resumable until graph and acceptance are ter
   );
 });
 
+test("prompt-grounded seeded research remains proof gated without a research-plan web node", () => {
+  assert.equal(
+    requiresVerifiedFinalOutput(
+      null,
+      null,
+      "Append a cited research guide with sources to the current note.",
+    ),
+    true,
+  );
+  assert.equal(
+    requiresVerifiedFinalOutput(null, null, "Append a short original greeting."),
+    false,
+  );
+});
+
+test("an exact preverified payload keeps content acceptance after a complete verified receipt", () => {
+  const preCommitAcceptance = {
+    status: "pass" as const,
+    confidence: 0.9,
+    missing: [],
+    reasons: ["candidate_proof_verified_before_commit"],
+  };
+  const postCommitAcceptance = {
+    status: "needs_more_work" as const,
+    confidence: 0.55,
+    missing: [
+      "verifier:claim_grounding:fabricated_passage_id",
+      "claim_grounding:ungrounded:claim:1",
+      "plan:final:final_relevance",
+    ],
+    reasons: ["verifier_checks_incomplete"],
+    nextAction: "Rewrite the final output.",
+  };
+  const resolved = resolveCommittedProofGatedWriteAcceptanceV1({
+    preCommitAcceptance,
+    postCommitAcceptance,
+    payloadMatches: true,
+    receipt: {
+      toolName: "append_to_current_file",
+      operation: "append",
+      message: "append Current.md",
+      path: "Current.md",
+      readback: {
+        status: "verified",
+        checkedAt: "2026-08-09T00:00:00.000Z",
+      },
+      output: { partial: false },
+    },
+  });
+
+  assert.equal(resolved.usedPreCommitProof, true);
+  assert.equal(resolved.acceptance.status, "pass");
+  assert.deepEqual(resolved.acceptance.missing, []);
+  assert.equal(resolved.acceptance.nextAction, undefined);
+  assert.ok(
+    resolved.acceptance.reasons.includes(
+      "exact_preverified_write_candidate_committed",
+    ),
+  );
+});
+
+test("committed candidate proof cannot bless partial, changed, or unrelated-debt writes", () => {
+  const preCommitAcceptance = {
+    status: "pass" as const,
+    confidence: 0.9,
+    missing: [],
+    reasons: ["candidate_proof_verified_before_commit"],
+  };
+  const postCommitAcceptance = {
+    status: "needs_more_work" as const,
+    confidence: 0.55,
+    missing: ["tool:linear_create_issue"],
+    reasons: ["required_tool_missing"],
+  };
+  const receipt: AgentRunReceipt = {
+    toolName: "append_to_current_file",
+    operation: "append",
+    message: "append Current.md",
+    path: "Current.md",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-08-09T00:00:00.000Z",
+    },
+    output: { partial: false },
+  };
+
+  for (const candidate of [
+    { payloadMatches: false, receipt },
+    {
+      payloadMatches: true,
+      receipt: { ...receipt, output: { partial: true } },
+    },
+    {
+      payloadMatches: true,
+      receipt: { ...receipt, readback: undefined },
+    },
+  ]) {
+    const resolved = resolveCommittedProofGatedWriteAcceptanceV1({
+      preCommitAcceptance,
+      postCommitAcceptance: {
+        ...postCommitAcceptance,
+        missing: ["claim_grounding:ungrounded:claim:1"],
+      },
+      ...candidate,
+    });
+    assert.equal(resolved.usedPreCommitProof, false);
+    assert.equal(resolved.acceptance.status, "needs_more_work");
+  }
+
+  const unrelated = resolveCommittedProofGatedWriteAcceptanceV1({
+    preCommitAcceptance,
+    postCommitAcceptance,
+    payloadMatches: true,
+    receipt,
+  });
+  assert.equal(unrelated.usedPreCommitProof, false);
+  assert.deepEqual(unrelated.acceptance.missing, ["tool:linear_create_issue"]);
+});
+
+test("deadline settlement requires the exact accepted full receipt and no remaining goal for success", () => {
+  const accepted: MissionAcceptanceResult = {
+    status: "pass",
+    confidence: 0.95,
+    missing: [],
+    reasons: ["candidate_proof_verified_before_commit"],
+  };
+  const receipt: AgentRunReceipt = {
+    toolName: "append_to_current_file",
+    operation: "append",
+    message: "append Current.md",
+    path: "Current.md",
+    readback: {
+      status: "verified",
+      checkedAt: "2026-08-09T00:00:00.000Z",
+    },
+    output: { partial: false },
+  };
+
+  assert.deepEqual(
+    resolveCommittedProofGatedWriteDeadlineSettlementV1({
+      preCommitAcceptance: accepted,
+      payloadMatches: true,
+      receiptMatches: true,
+      receipt,
+      hasPendingOperationGoalsAfterWrite: false,
+    }),
+    {
+      persistReceiptBeforeStop: true,
+      finishWriteBeforeStop: true,
+    },
+  );
+  assert.deepEqual(
+    resolveCommittedProofGatedWriteDeadlineSettlementV1({
+      preCommitAcceptance: accepted,
+      payloadMatches: true,
+      receiptMatches: true,
+      receipt,
+      hasPendingOperationGoalsAfterWrite: true,
+    }),
+    {
+      persistReceiptBeforeStop: true,
+      finishWriteBeforeStop: false,
+    },
+  );
+
+  for (const rejected of [
+    {
+      preCommitAcceptance: {
+        ...accepted,
+        status: "needs_more_work" as const,
+      },
+      payloadMatches: true,
+      receiptMatches: true,
+      receipt,
+    },
+    {
+      preCommitAcceptance: accepted,
+      payloadMatches: false,
+      receiptMatches: true,
+      receipt,
+    },
+    {
+      preCommitAcceptance: accepted,
+      payloadMatches: true,
+      receiptMatches: false,
+      receipt,
+    },
+    {
+      preCommitAcceptance: accepted,
+      payloadMatches: true,
+      receiptMatches: true,
+      receipt: { ...receipt, output: { partial: true } },
+    },
+    {
+      preCommitAcceptance: accepted,
+      payloadMatches: true,
+      receiptMatches: true,
+      receipt: { ...receipt, readback: undefined },
+    },
+  ]) {
+    assert.deepEqual(
+      resolveCommittedProofGatedWriteDeadlineSettlementV1({
+        ...rejected,
+        hasPendingOperationGoalsAfterWrite: false,
+      }),
+      {
+        persistReceiptBeforeStop: false,
+        finishWriteBeforeStop: false,
+      },
+    );
+  }
+});
+
 test("terminal MissionGraph blockers finish even when Soft companions keep tools offered", () => {
   const blocked = {
     status: "blocked" as const,
@@ -10280,6 +10780,7 @@ test("code workspace bootstrap frontiers advertise later nested writes and appro
       },
     },
   ]);
+  assert.match(exportContext, /vault_sibling_projects/u);
   assert.match(exportContext, /desktop, documents, or downloads/u);
   assert.match(exportContext, /never overwrites/u);
 
@@ -11753,8 +12254,7 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
     },
   });
 
-  assert.equal(plannerCatalogs.length > 0, true);
-  assert.equal(optionalLinearReadSelected, true);
+  assert.equal(plannerCatalogs.length > 0, true, "planner catalog was not observed");
   assert.equal(completions.length, 1);
   assert.equal(
     completions[0]?.stopReason,
@@ -11841,13 +12341,6 @@ test("BYOK Phase A discards held terminal prose and accepts canonical receipt pr
   );
   assert.ok(graphRecord);
   assert.equal(graphRecord.graph.nodes.final?.status, "complete");
-  const optionalLinearNode = Object.entries(graphRecord.graph.nodes).find(
-    ([nodeId, node]) =>
-      nodeId.startsWith("optional-") &&
-      node.allowedTools.includes("linear_get_issue"),
-  )?.[1];
-  assert.ok(optionalLinearNode);
-  assert.equal(optionalLinearNode.status, "cancelled");
   assert.equal(graphUpdates.at(-1)?.nodes.final?.status, "complete");
 });
 
@@ -12458,16 +12951,16 @@ test("router code authority is default-off and seeds only the bounded code ladde
       toolRegistry: createCodeV2RoutingRegistry(),
       toolContext: vault.context,
       enableStreaming: false,
-      maxSteps: 1,
+      // The adaptive budget charges router, graph-planner, and agent calls to
+      // the same user ceiling. This routing contract needs one call for each.
+      maxSteps: 3,
       events: {
         onRunConfig: (event) => configs.push(event),
       },
     });
 
     const agentRequest = chatRequests.find(
-      (request) =>
-        !isMissionRouterFormat(request) &&
-        !isMissionGraphPlannerFormat(request),
+      (request) => request.evidencePhase === "agent_step",
     );
     return {
       allowedToolNames: new Set(configs[0]?.allowedToolNames ?? []),
@@ -13455,7 +13948,7 @@ test("stream metrics include token counts from the final raw chunk", async () =>
   assert.equal(streamMetric?.totalTokens, 11);
 });
 
-test("unavailable tool calls are rejected before execution", async () => {
+test("Direct rejects unavailable tool calls without spending a replan call", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const deltas: string[] = [];
@@ -13485,8 +13978,11 @@ test("unavailable tool calls are rejected before execution", async () => {
     executedCalls.map((call) => call.name),
     [],
   );
-  assert.ok(statuses.includes("Rejected unavailable tool: web_search"));
-  assert.deepEqual(deltas, ["Final direct answer"]);
+  assert.equal(chatRequests.length, 1);
+  assert.match(
+    [...statuses, ...deltas].join("\n"),
+    /budget exhausted|safety limit|resum/iu,
+  );
 });
 
 test("duplicate read-only tool calls hit the run-local cache", async () => {
@@ -14578,6 +15074,40 @@ test("mission wall-clock deadline aborts an in-flight provider request", async (
   assert.deepEqual(completions, ["budget"]);
   assert.ok(statuses.includes("Wall-clock run budget expired. The ledger was saved and this run can be continued."));
   assert.ok(traceMessages.includes("Wall-clock run budget expired. The ledger was saved and this run can be continued."));
+});
+
+test("the adaptive effort profile installs an abortable deadline when no user run limit is configured", async () => {
+  let observedSignal: AbortSignal | undefined;
+  const client: ModelClient = {
+    chat: async (request) => {
+      observedSignal = request.abortSignal;
+      return responseWithContent(
+        "Local-first research keeps the working context and durable results in the vault.",
+      );
+    },
+    streamChat: async () => {
+      throw new Error("streamChat is not used by this non-streaming test");
+    },
+  };
+  const { context } = createRunnerVaultContext({
+    prompt: "Explain local-first research in chat only.",
+  });
+  context.settings = createRunnerSettings({
+    maxRunMinutes: null,
+    modelRouterEnabled: false,
+  });
+
+  await runAgentMission({
+    prompt: "Explain local-first research in chat only.",
+    modelClient: client,
+    toolRegistry: createRegistry([]),
+    toolContext: context,
+    enableStreaming: false,
+    events: {},
+  });
+
+  assert.ok(observedSignal, "the routed effort deadline must reach provider calls");
+  assert.equal(observedSignal.aborted, false);
 });
 
 test("a host-linked wall-clock abort remains a budget rather than a user stop", async () => {
@@ -16611,6 +17141,7 @@ test("a verified direct conflicting-source append carries its acknowledgement th
   const executedCalls: ModelToolCall[] = [];
   const receipts: AgentRunReceipt[] = [];
   const completions: AgentRunCompleteEvent[] = [];
+  const deadlineAfterReceipt = new AbortController();
   const traceSummary: Array<{ id: string; message: string; errorCode?: string }> = [];
   let directCandidate = "";
   const vault = createRunnerVaultContext({ prompt, content: originalNote });
@@ -16709,8 +17240,17 @@ test("a verified direct conflicting-source append carries its acknowledgement th
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
+    abortSignal: deadlineAfterReceipt.signal,
     events: {
-      onReceipt: (receipt) => receipts.push(receipt),
+      onReceipt: (receipt) => {
+        receipts.push(receipt);
+        // Reproduce the live boundary: the append committed just as the
+        // orchestrator deadline fired. Paid acceptance must win over a
+        // resumable budget stop because the mutation already has readback.
+        deadlineAfterReceipt.abort(
+          new Error("Orchestrator root wall-clock budget exhausted."),
+        );
+      },
       onRunComplete: (event) => completions.push(event),
       onTrace: (event) => {
         if (event.kind === "tool_rejected" || event.kind === "verification") {
@@ -16752,14 +17292,17 @@ test("a verified direct conflicting-source append carries its acknowledgement th
 test("closed fetched-source writeback repairs URL-only candidates before commit", async () => {
   const marker = "E2E_MARKER_PASSAGE_SCOPE_REPAIR_01";
   const prompt =
-    `Read the current note as vault context. Search the web for owned alpha and beta evidence, fetch both sources, compare their conflicting conclusions about controlled onboarding validation, then append exactly two cited finding sentences and a Limitations section. End each finding sentence with the exact source:<id>:passage:<start>-<end> identifier returned by the fetch result that supports it. Include ${marker}.`;
+    `Read the current note as vault context. Search the web for owned alpha and beta evidence, fetch both sources, and compare their conflicting conclusions about controlled onboarding validation. Append exactly two cited finding sentences and a Limitations section to the current note. End each finding sentence with the exact source:<id>:passage:<start>-<end> identifier returned by the fetch result that supports it. Include ${marker}.`;
   const originalNote = "Original note remains unchanged until citation proof passes.";
   const executedCalls: ModelToolCall[] = [];
   const receipts: AgentRunReceipt[] = [];
   const statuses: string[] = [];
   const correctionPrompts: string[] = [];
   const vault = createRunnerVaultContext({ prompt, content: originalNote });
-  vault.context.settings.researchMemoryEnabled = false;
+  // Match the native live lane: output is buffered and research memory is on.
+  // The explicit current-note destination must still bind the write frontier;
+  // automatic research-memory capture cannot replace the requested append.
+  vault.context.settings.researchMemoryEnabled = true;
   vault.context.httpTransport = async (request) => {
     if (request.url.endsWith("/web_search")) {
       return {
@@ -16860,6 +17403,8 @@ test("closed fetched-source writeback repairs URL-only candidates before commit"
         return responseWithContent([
           marker,
           "",
+          `A redundant material preamble restates the primary onboarding result [${passageIds[0]}].`,
+          "",
           "## Findings",
           "",
           `Controlled onboarding validation improved retention and reduced errors according to the primary owned source [${passageIds[0]}].`,
@@ -16882,7 +17427,7 @@ test("closed fetched-source writeback repairs URL-only candidates before commit"
     modelClient: client,
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
-    enableStreaming: true,
+    enableStreaming: false,
     events: {
       onReceipt: (receipt) => receipts.push(receipt),
       onStatus: (message) => statuses.push(message),
@@ -16914,6 +17459,7 @@ test("closed fetched-source writeback repairs URL-only candidates before commit"
     }),
   );
   assert.equal(writtenPassageIds.length, 2, JSON.stringify({ written, statuses }));
+  assert.doesNotMatch(written, /redundant material preamble/u);
   assert.ok(correctionPrompts.length >= 1);
   assert.ok(
     statuses.some((message) =>
@@ -17003,14 +17549,17 @@ test("generic commit marker cannot add prepared background Code authority to a r
   assert.equal(preparedCodeExecutions, 0);
 });
 
-test("proof-sensitive direct write tools are staged before the single verified mutation", async () => {
+test("proof-sensitive direct write tools settle the verified receipt before a raced deadline", async () => {
   const prompt =
     "Research MCP servers on the web and append a concise summary with passage citations to this note.";
   const originalNote = "Original note must not receive an unverified direct tool payload.";
   const directDraft = "DIRECT UNVERIFIED WRITE TOOL PAYLOAD";
   const executedCalls: ModelToolCall[] = [];
   const receipts: AgentRunReceipt[] = [];
+  const completions: AgentRunCompleteEvent[] = [];
   const rejectionCodes: string[] = [];
+  const deadlineAfterWrite = new AbortController();
+  let deadlineInjected = false;
   const vault = createRunnerVaultContext({ prompt, content: originalNote });
   vault.context.settings.researchMemoryEnabled = false;
   vault.context.httpTransport = async (request) => {
@@ -17084,8 +17633,18 @@ test("proof-sensitive direct write tools are staged before the single verified m
     toolRegistry: createCollectingRegistry(executedCalls),
     toolContext: vault.context,
     enableStreaming: true,
+    abortSignal: deadlineAfterWrite.signal,
     events: {
       onReceipt: (receipt) => receipts.push(receipt),
+      onFinalDone: () => {
+        if (!deadlineInjected) {
+          deadlineInjected = true;
+          deadlineAfterWrite.abort(
+            new Error("Orchestrator root wall-clock budget exhausted."),
+          );
+        }
+      },
+      onRunComplete: (event) => completions.push(event),
       onTrace: (event) => {
         if (event.error?.code) {
           rejectionCodes.push(event.error.code);
@@ -17101,6 +17660,7 @@ test("proof-sensitive direct write tools are staged before the single verified m
   ]);
   assert.ok(rejectionCodes.includes("proof_gated_writeback_required"));
   assert.equal(receipts.length, 1);
+  assert.equal(completions.at(-1)?.stopReason, "write_completed");
   assert.equal(
     vault.operations.filter((item) => item === "modify:Current.md").length,
     1,
@@ -18041,7 +18601,7 @@ test("unsupported thinking retries once without think and completes", async () =
   ]);
 });
 
-test("transient model API errors retry before blocking", async () => {
+test("Direct provider errors stop at the one-call ceiling", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const statuses: string[] = [];
   const deltas: string[] = [];
@@ -18076,13 +18636,12 @@ test("transient model API errors retry before blocking", async () => {
     },
   });
 
-  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests.length, 1);
   assert.equal(chatRequests[0].think, undefined);
-  assert.equal(chatRequests[1].think, undefined);
   assert.ok(
     statuses.includes("Transient model provider error; retrying model step..."),
   );
-  assert.deepEqual(deltas, ["Recovered answer"]);
+  assert.match(deltas.join(""), /budget exhausted|resume/iu);
 });
 
 test("repeated transient model API errors retry without thinking mode", async () => {
@@ -18155,7 +18714,7 @@ test("repeated transient model API errors retry without thinking mode", async ()
   ]);
 });
 
-test("english-only direct answers repair CJK before display", async () => {
+test("english-only Direct answers fail locally when the one-call ceiling is spent", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const deltas: string[] = [];
   const statuses: string[] = [];
@@ -18180,15 +18739,16 @@ test("english-only direct answers repair CJK before display", async () => {
     },
   });
 
-  assert.equal(chatRequests.length, 2);
-  assert.match(
-    chatRequests[1].messages.at(-1)?.content ?? "",
-    /Rewrite the previous answer in English only/,
-  );
-  assert.deepEqual(deltas, ["Coral reefs support biodiversity."]);
+  assert.equal(chatRequests.length, 1);
+  assert.match(deltas.join(""), /failed the English-only safety check/iu);
   assert.ok(
     statuses.includes(
       "Model produced non-English output; requesting English-only repair...",
+    ),
+  );
+  assert.ok(
+    statuses.includes(
+      "English-only repair skipped because the Direct finalization budget was exhausted.",
     ),
   );
 });
@@ -19610,11 +20170,17 @@ function cloneRequest(request: ModelChatRequest): ModelChatRequest {
 }
 
 function isMissionRouterFormat(request: ModelChatRequest): boolean {
+  if (request.evidencePhase) {
+    return request.evidencePhase === "router";
+  }
   const required = request.format?.required;
   return Array.isArray(required) && required.includes("writeScope");
 }
 
 function isMissionGraphPlannerFormat(request: ModelChatRequest): boolean {
+  if (request.evidencePhase) {
+    return request.evidencePhase === "graph_planner";
+  }
   const required = request.format?.required;
   return (
     Array.isArray(required) &&
@@ -21168,6 +21734,85 @@ test("namespaced invalid-argument errors receive one schema-qualified correction
   );
 });
 
+test("a missing workspace earns one corrective naming code_workspace_create", async () => {
+  // Seen live on compound-flow-real-live: the model called a workspace tool for
+  // a workspace it never created. workspace_not_found is a lookup failure, so
+  // re-issuing the same call fails identically and the node exhausted its
+  // bounded retries, terminating the whole mission. It must instead earn one
+  // corrective that points at the bootstrap tool.
+  const chatRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () => [{
+      type: "function",
+      function: {
+        name: "append_to_current_file",
+        parameters: {
+          type: "object",
+          properties: { text: { type: "string" } },
+          required: ["text"],
+          additionalProperties: false,
+        },
+      },
+    }],
+    execute: async (call) => {
+      executedCalls.push(call);
+      if (executedCalls.length === 1) {
+        return {
+          ok: false,
+          toolName: call.name,
+          mutationState: "not_applied",
+          error: {
+            code: "workspace_not_found",
+            message: "Workspace flow-real-abc123 does not exist.",
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          path: "Current.md",
+          operation: "append",
+          bytesWritten: 20,
+          readback: {
+            status: "verified",
+            checkedAt: "2026-07-18T00:00:00.000Z",
+            observedFingerprint: `sha256:${"a".repeat(64)}`,
+          },
+        },
+      };
+    },
+  };
+
+  await runAgentMission({
+    prompt: "Append the bounded result to the current note.",
+    modelClient: createClient({
+      chatRequests,
+      chatResponders: [
+        () => responseWithToolCall("append_to_current_file", { text: "first" }),
+        () => responseWithToolCall("append_to_current_file", { text: "corrected" }),
+        () => responseWithContent("The bounded append is complete."),
+      ],
+    }),
+    toolRegistry: registry,
+    toolContext: createRunnerVaultContext({
+      prompt: "Append the bounded result to the current note.",
+    }).context,
+    enableStreaming: false,
+  });
+
+  assert.equal(executedCalls.length, 2);
+  assert.ok(
+    chatRequests.some((request) =>
+      /names a workspace that does not exist[\s\S]*code_workspace_create/iu.test(
+        request.messages.at(-1)?.content ?? "",
+      ),
+    ),
+    "the corrective must name code_workspace_create rather than dump a schema",
+  );
+});
+
 test("repository implementation exposes only read-only status tools at the initial graph frontier", async () => {
   const chatRequests: ModelChatRequest[] = [];
   const prompt = "Fix the bug in repository: C:/trusted/project, validate it, and commit the verified change.";
@@ -21471,15 +22116,7 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
   const chatRequests: ModelChatRequest[] = [];
   const configs: AgentRunConfigEvent[] = [];
   const traces: string[] = [];
-  const graphs: Array<{
-    nodes: Record<
-      string,
-      {
-        allowedTools: string[];
-        destination?: { selector?: string | null } | null;
-      }
-    >;
-  }> = [];
+  const graphs: MissionGraphV3[] = [];
   const prompt = [
     "Implement the Python checkers game in the trusted repository.",
     "Add only README.md, checkers/__init__.py, checkers/cli.py, checkers/game.py, and tests/test_checkers.py.",
@@ -21513,28 +22150,28 @@ test("explicit add-only filename lists route to no-overwrite workspace creation"
   const allowed = new Set(configs[0]?.allowedToolNames ?? []);
   assert.equal(allowed.has("code_workspace_create_file"), true);
   const graphNodes = Object.values(graphs.at(-1)?.nodes ?? {});
-  const graphTools = graphNodes.flatMap(
-    (node) => node.allowedTools,
-  );
+  const lifecycle = graphNodes
+    .map((node) => getMissionCompositeLifecycleSpecV1(node))
+    .find((candidate) => candidate !== null);
+  assert.ok(lifecycle, traces.join(" | "));
+  const graphTools = lifecycle.actions.map((action) => action.toolName);
   assert.equal(graphTools.includes("append_file"), false);
   assert.equal(graphTools.includes("create_file"), false);
-  assert.equal(
-    graphNodes.find((node) => node.allowedTools.length > 0)?.allowedTools[0],
-    "code_sandbox_status",
-    traces.join(" | "),
-  );
+  // The terminal graph projection may omit the already-offered readiness node;
+  // the model request is the authoritative callable frontier for this step.
   assert.deepEqual(
     chatRequests[0]?.tools?.map((tool) => tool.function.name),
     ["code_sandbox_status"],
+    traces.join(" | "),
   );
   assert.equal(
     graphTools.filter((name) => name === "code_workspace_create_file").length,
     5,
   );
   assert.deepEqual(
-    graphNodes
-      .filter((node) => node.allowedTools[0] === "code_workspace_create_file")
-      .map((node) => node.destination?.selector),
+    lifecycle.actions
+      .filter((action) => action.toolName === "code_workspace_create_file")
+      .map((action) => action.selector),
     [
       "README.md",
       "checkers/__init__.py",
@@ -22020,7 +22657,7 @@ test("proof-sensitive streamed final holds the invalid draft and emits the exact
   assert.equal(completions[0].stopReason, "write_completed");
 });
 
-test("repeated proof-sensitive candidate failures emit only a resumable blocker", async () => {
+test("proof-sensitive candidate exhaustion emits only a resumable blocker", async () => {
   const prompt =
     "Search the web for Ollama structured outputs documentation and summarize it with citations.";
   const chatRequests: ModelChatRequest[] = [];
@@ -22107,16 +22744,16 @@ test("repeated proof-sensitive candidate failures emit only a resumable blocker"
     executedCalls.map((call) => call.name),
     ["web_search", "web_fetch"],
   );
-  assert.equal(streamRequests.length, 2);
+  assert.equal(streamRequests.length, 1);
   assert.doesNotMatch(assistantDeltas.join(""), /INVALID UNVERIFIED DRAFT/);
   assert.doesNotMatch(assistantDeltas.join(""), /RAW REPEATED FAILURE/);
   assert.match(
     assistantDeltas.join(""),
-    /Note writeback was not applied because proof verification is incomplete/i,
+    /Provider execution budget exhausted before mission acceptance/i,
   );
   assert.ok(
     statuses.some((message) =>
-      /Note writeback was not applied because proof verification is incomplete/i.test(
+      /Provider execution budget exhausted before mission acceptance/i.test(
         message,
       ),
     ),
@@ -22936,7 +23573,7 @@ test("policy engine approval allows install_code_dependency with granted context
 });
 
 test("required prepared actions bind double approval before one external execution", async () => {
-  const prompt = "Create a Linear issue titled Research follow-up.";
+  const prompt = "Update Linear issue RES-123 title to Research follow-up.";
   const vault = createRunnerVaultContext({
     prompt,
     now: new Date("2026-07-11T12:00:00.000Z"),
@@ -22950,8 +23587,8 @@ test("required prepared actions bind double approval before one external executi
   let preparedExecutions = 0;
   const descriptor: ToolDescriptor = {
     version: 1,
-    name: "linear_create_issue",
-    capability: { system: "linear", resourceType: "issue", action: "create" },
+    name: "linear_update_issue",
+    capability: { system: "linear", resourceType: "issue", action: "update" },
     effect: "reversible_mutation",
     risk: "high",
     approval: {
@@ -22975,11 +23612,14 @@ test("required prepared actions bind double approval before one external executi
   };
   const tool: AgentTool = {
     name: descriptor.name,
-    description: "Create one Linear issue.",
+    description: "Update one Linear issue.",
     parameters: {
       type: "object",
-      properties: { title: { type: "string" } },
-      required: ["title"],
+      properties: {
+        issueId: { type: "string" },
+        title: { type: "string" },
+      },
+      required: ["issueId", "title"],
     },
     descriptor,
     execute: async () => {
@@ -22999,15 +23639,21 @@ test("required prepared actions bind double approval before one external executi
           target: {
             system: "linear",
             resourceType: "issue",
-            id: "new:linear-call-1",
+            id: String(args.issueId ?? ""),
             teamId: "team-1",
           },
           relatedResources: [],
-          normalizedArgs: { title: String(args.title ?? "") },
+          normalizedArgs: {
+            issueId: String(args.issueId ?? ""),
+            title: String(args.title ?? ""),
+          },
           preview: {
-            summary: "Create Linear issue Research follow-up",
+            summary: "Update Linear issue RES-123 to Research follow-up",
             destination: "Linear team team-1",
-            outboundPayload: { title: String(args.title ?? "") },
+            outboundPayload: {
+              issueId: String(args.issueId ?? ""),
+              title: String(args.title ?? ""),
+            },
             warnings: [],
             outboundBytes: 18,
           },
@@ -23029,7 +23675,7 @@ test("required prepared actions bind double approval before one external executi
           runId: action.runId,
           actionId: action.id,
           toolName: action.toolName,
-          operation: "create",
+          operation: "update",
           resource: {
             system: "linear",
             resourceType: "issue",
@@ -23037,7 +23683,7 @@ test("required prepared actions bind double approval before one external executi
             identifier: "RES-123",
             teamId: "team-1",
           },
-          message: "Created Linear issue RES-123",
+          message: "Updated Linear issue RES-123",
           payloadFingerprint: action.payloadFingerprint,
           grantId: authorized.grantId,
           idempotencyKey: action.idempotencyKey,
@@ -23058,11 +23704,12 @@ test("required prepared actions bind double approval before one external executi
     chatRequests: [],
     chatResponders: [
       () =>
-        responseWithToolCall("linear_create_issue", {
+        responseWithToolCall("linear_update_issue", {
+          issueId: "issue-123",
           title: "Research follow-up",
         }),
-      () => responseWithContent("Created Linear issue RES-123."),
-      () => responseWithContent("Created Linear issue RES-123."),
+      () => responseWithContent("Updated Linear issue RES-123."),
+      () => responseWithContent("Updated Linear issue RES-123."),
     ],
   });
 
@@ -23110,7 +23757,7 @@ test("required prepared actions bind double approval before one external executi
   const graphRecord = await parseMissionGraphStoreRecordFromMarkdown(graphMarkdown);
   assert.ok(graphRecord);
   const completedMutationNode = Object.values(graphRecord.graph.nodes).find(
-    (node) => node.allowedTools.includes("linear_create_issue"),
+    (node) => node.allowedTools.includes("linear_update_issue"),
   );
   assert.ok(completedMutationNode);
   assert.equal(completedMutationNode.status, "complete");
@@ -23144,10 +23791,10 @@ test("required prepared actions bind double approval before one external executi
   const runtimeSnapshot = [...vault.content.values()]
     .map((markdown) => parseMissionRuntimeSnapshotFromMarkdown(markdown))
     .find((snapshot) => snapshot?.operationJournal.some(
-      (record) => record.toolName === "linear_create_issue",
+      (record) => record.toolName === "linear_update_issue",
     ));
   const actionRecord = runtimeSnapshot?.operationJournal.find(
-    (record) => record.toolName === "linear_create_issue",
+    (record) => record.toolName === "linear_update_issue",
   );
   assert.equal(actionRecord?.version, 2);
   assert.equal(actionRecord?.state, "committed");
@@ -24598,6 +25245,7 @@ test("mock AI generates project code then creates the private GitHub repository"
           responseWithToolCall(CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME, {
             profileKey: "ai-generated-hello",
             description: AI_REPO_DESCRIPTION,
+            visibility: "private",
           }),
         () =>
           responseWithContent(

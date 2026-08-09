@@ -366,7 +366,7 @@ export class OrchestratorTab {
       summary.appendChild(textBadge(node.ownerLabel));
     }
     if (node.worktreeId) {
-      summary.appendChild(textBadge("WORKTREE", "is-worktree"));
+      summary.appendChild(textBadge("Worktree", "is-worktree"));
     }
     summary.appendChild(statusBadge(node.status));
     summary.addEventListener("click", () => this.selectNode(node.id));
@@ -918,12 +918,20 @@ function actionButton(
 }
 
 function statusBadge(status: string): HTMLElement {
-  const badge = textBadge(status.replace(/_/g, " "));
+  const label = status.replace(/_/g, " ");
+  const badge = textBadge(
+    label.charAt(0).toUpperCase() + label.slice(1),
+  );
   badge.classList.add("agentic-researcher-orchestrator-status");
   badge.dataset.status = status;
   return badge;
 }
 
+/**
+ * Renders the label as given. It used to force uppercase, which shouted every
+ * badge and also mangled owner labels that carry their own casing; the pill's
+ * tint carries the emphasis instead.
+ */
 function textBadge(text: string, extraClass?: string): HTMLElement {
   const badge = createElement(
     "span",
@@ -932,7 +940,7 @@ function textBadge(text: string, extraClass?: string): HTMLElement {
   if (extraClass) {
     badge.classList.add(extraClass);
   }
-  badge.textContent = text.toUpperCase();
+  badge.textContent = text;
   return badge;
 }
 

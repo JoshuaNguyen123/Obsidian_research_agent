@@ -1,23 +1,30 @@
-.agentic-researcher-view {
+/*
+ * Design tokens for both plugin roots.
+ *
+ * The settings tab is a sibling root — it renders inside Obsidian's settings
+ * modal, not inside the view — so it cannot inherit anything declared on
+ * .agentic-researcher-view. Declaring the scale on both keeps one source of
+ * truth instead of the orphan --agentic-settings-radius this replaced.
+ */
+.agentic-researcher-view,
+.agentic-researcher-settings {
   /*
-   * Theme-adaptive palette. Every console color derives from Obsidian's own
-   * variables so the pane inherits whatever theme (and accent) the user runs.
-   * The --agent-terminal-* names are kept so the ~130 existing var() references
-   * migrate without touching the rules that consume them.
+   * Palette. Every color derives from Obsidian's own variables so the plugin
+   * inherits whatever theme (and accent) the user runs.
    */
-  --agent-terminal-bg: var(--background-primary);
-  --agent-terminal-panel: var(--background-secondary);
-  --agent-terminal-panel-strong: var(--background-secondary-alt, var(--background-secondary));
-  --agent-terminal-green: var(--text-normal);
-  --agent-terminal-green-soft: var(--text-accent);
-  --agent-terminal-muted: var(--text-muted);
-  --agent-terminal-border: var(--background-modifier-border);
-  --agent-terminal-error: var(--text-error);
-  --agent-terminal-warning: var(--text-warning);
+  --agent-bg: var(--background-primary);
+  --agent-surface: var(--background-secondary);
+  --agent-surface-raised: var(--background-secondary-alt, var(--background-secondary));
+  --agent-text: var(--text-normal);
+  --agent-text-accent: var(--text-accent);
+  --agent-text-muted: var(--text-muted);
+  --agent-error: var(--text-error);
+  --agent-warning: var(--text-warning);
+
   /*
-   * Derived tint layer replacing the former hand-encoded rgba() literals:
-   * accent washes for fills/glows, rules for separators, a scrim for overlays,
-   * and error/warning washes. Adjust intensity here, never with raw colors.
+   * Derived tint layer: accent washes for fills, rules for separators, a scrim
+   * for overlays, error/warning washes. Adjust intensity here, never with raw
+   * colors.
    */
   --agent-tint-weak: color-mix(in srgb, var(--text-accent) 4%, transparent);
   --agent-tint-soft: color-mix(in srgb, var(--text-accent) 8%, transparent);
@@ -28,25 +35,77 @@
   --agent-scrim: color-mix(in srgb, var(--background-primary) 88%, transparent);
   --agent-error-tint: color-mix(in srgb, var(--text-error) 12%, transparent);
   --agent-warning-tint: color-mix(in srgb, var(--text-warning) 12%, transparent);
-  background: var(--agent-terminal-bg);
+
+  /*
+   * Spacing scale. px rather than em: Obsidian's own metrics are px, the
+   * container queries below are px, and em compounds unpredictably through the
+   * dashboard's four-deep nesting. Narrow panes re-densify by overriding these
+   * values in the container query, not by respecifying padding per rule.
+   */
+  --agent-space-1: 2px;
+  --agent-space-2: 4px;
+  --agent-space-3: 8px;
+  --agent-space-4: 12px;
+  --agent-space-5: 16px;
+  --agent-space-6: 24px;
+  --agent-space-7: 32px;
+
+  /* Radius. 50% stays inline where it means "circle" (spinner, loader dots). */
+  --agent-radius-sm: 6px;
+  --agent-radius-md: 10px;
+  --agent-radius-lg: 14px;
+  --agent-radius-full: 999px;
+
+  /*
+   * Elevation is carried by surface steps and hairlines, not shadows. The focus
+   * ring is the only box-shadow the console draws.
+   */
+  --agent-hairline: 1px solid var(--agent-rule);
+  --agent-focus-ring: 0 0 0 2px var(--agent-tint-strong);
+
+  /*
+   * Motion. Only paint properties are ever transitioned — never box-shadow,
+   * height, or transform: the frame batcher appends streamed text every frame
+   * and a layout transition would fight it.
+   */
+  --agent-motion-fast: 90ms;
+  --agent-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /*
+   * Type. Obsidian defines four UI rungs; --font-ui-medium was previously
+   * unused here, which is why almost everything collapsed onto the smallest
+   * step. Labels read as labels by being muted and strong, not by shouting.
+   */
+  --agent-type-label: var(--font-ui-smaller);
+  --agent-type-body: var(--font-ui-small);
+  --agent-type-title: var(--font-ui-medium, var(--font-ui-large));
+  --agent-weight-strong: var(--font-semibold, 600);
+  /* @style-tokens:token-block-end — literal hex is tolerated only above this
+     line, and only inside color-mix()/var() fallbacks. Keep new tokens above
+     it; see scripts/check-style-tokens.mjs. */
+}
+
+.agentic-researcher-view {
+  background: var(--agent-bg);
   box-sizing: border-box;
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   container-name: agentic-researcher-pane;
   container-type: inline-size;
   display: flex;
   flex-direction: column;
   font-family: var(--font-interface);
-  gap: 10px;
+  gap: var(--agent-space-4);
   height: 100%;
   max-width: 100%;
   min-height: 0;
   min-width: 0;
-  padding: 12px;
+  padding: var(--agent-space-5);
   width: 100%;
 }
 
 /* Accent tints read weaker on light backgrounds; boost only the tint layer. */
-.theme-light .agentic-researcher-view {
+.theme-light .agentic-researcher-view,
+.theme-light .agentic-researcher-settings {
   --agent-tint-weak: color-mix(in srgb, var(--text-accent) 6%, transparent);
   --agent-tint-soft: color-mix(in srgb, var(--text-accent) 11%, transparent);
   --agent-tint: color-mix(in srgb, var(--text-accent) 18%, transparent);
@@ -58,27 +117,45 @@
   letter-spacing: 0;
 }
 
+/*
+ * Paint-only transitions on every interactive surface. Deliberately excludes
+ * box-shadow, height, and transform — see the motion tokens above.
+ */
+.agentic-researcher-view button,
+.agentic-researcher-view summary,
+.agentic-researcher-view select,
+.agentic-researcher-view input,
+.agentic-researcher-view textarea {
+  transition:
+    background-color var(--agent-motion-fast) var(--agent-ease),
+    border-color var(--agent-motion-fast) var(--agent-ease),
+    color var(--agent-motion-fast) var(--agent-ease),
+    opacity var(--agent-motion-fast) var(--agent-ease);
+}
+
 .agentic-researcher-settings {
-  --agentic-settings-radius: 12px;
+  --agentic-settings-radius: var(--agent-radius-lg);
   container-name: agentic-settings;
   container-type: inline-size;
   max-width: 920px;
-  padding-bottom: 32px;
+  padding-bottom: var(--agent-space-7);
 }
 
 .agentic-researcher-settings .agentic-settings-intro {
   line-height: 1.55;
-  margin-bottom: 18px;
+  margin-bottom: var(--agent-space-5);
   max-width: 76ch;
 }
 
+/* Fill or outline, not both — the surface step already separates the panel
+   from the settings background. */
 .agentic-researcher-settings .agentic-settings-panel {
-  background: var(--background-secondary-alt, var(--background-secondary));
-  border: 1px solid var(--background-modifier-border);
+  background: var(--agent-surface-raised);
+  border: 0;
   border-radius: var(--agentic-settings-radius);
-  margin-bottom: 14px;
+  margin-bottom: var(--agent-space-5);
   overflow: hidden;
-  padding: 16px;
+  padding: var(--agent-space-6);
 }
 
 .agentic-researcher-settings .agentic-settings-panel > h3,
@@ -86,34 +163,34 @@
   margin: 0;
 }
 
+/* The one panel that does get an outline: it is an interrupt, so it has to
+   read as different from the panels around it. */
 .agentic-researcher-settings .agentic-settings-pending-resume {
-  border-color: var(--interactive-accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 35%, transparent);
+  border: 1px solid var(--interactive-accent);
 }
 
 .agentic-researcher-settings .agentic-settings-pending-resume-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--agent-space-3);
+  margin-top: var(--agent-space-4);
 }
 
 .agentic-researcher-settings .agentic-settings-section-intro,
 .agentic-researcher-settings .agentic-settings-subsection-intro {
   line-height: 1.45;
-  margin: 4px 0 12px;
+  margin: var(--agent-space-2) 0 var(--agent-space-4);
 }
 
 .agentic-researcher-settings .agentic-settings-subgroup-title {
   color: var(--text-normal);
   font-size: var(--font-ui-small);
-  font-weight: 650;
-  letter-spacing: 0.01em;
-  margin: 16px 0 4px;
+  font-weight: var(--agent-weight-strong);
+  margin: var(--agent-space-5) 0 var(--agent-space-2);
 }
 
 .agentic-researcher-settings .agentic-settings-basic > .agentic-settings-subgroup-title:first-of-type {
-  margin-top: 8px;
+  margin-top: var(--agent-space-3);
 }
 
 .agentic-researcher-settings .agentic-settings-nested-anchor {
@@ -124,7 +201,7 @@
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   line-height: 1.4;
-  margin-top: 4px;
+  margin-top: var(--agent-space-2);
 }
 
 .agentic-researcher-settings .agentic-settings-basic > .setting-item:last-child {
@@ -132,10 +209,10 @@
 }
 
 .agentic-researcher-settings .agentic-settings-disclosure {
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  margin: 10px 0;
-  padding: 6px 12px 8px;
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
+  margin: var(--agent-space-4) 0;
+  padding: var(--agent-space-3) var(--agent-space-4) var(--agent-space-3);
 }
 
 .agentic-researcher-settings .agentic-settings-disclosure > summary {
@@ -143,7 +220,7 @@
   cursor: pointer;
   font-weight: 600;
   list-style: disclosure-closed;
-  padding: 4px 0;
+  padding: var(--agent-space-2) 0;
 }
 
 .agentic-researcher-settings .agentic-settings-disclosure[open] > summary {
@@ -151,35 +228,37 @@
 }
 
 .agentic-researcher-settings .agentic-settings-readiness {
-  padding-bottom: 4px;
+  padding-bottom: var(--agent-space-2);
 }
 
 .agentic-researcher-settings .agentic-settings-readiness-header {
   align-items: flex-start;
   display: flex;
-  gap: 16px;
+  gap: var(--agent-space-5);
   justify-content: space-between;
 }
 
 .agentic-researcher-settings .agentic-settings-readiness-count {
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 999px;
+  border: 0;
+  border-radius: var(--agent-radius-full);
   color: var(--text-muted);
   flex: 0 0 auto;
-  font-size: var(--font-ui-smaller);
-  padding: 3px 9px;
+  font-size: var(--agent-type-label);
+  padding: var(--agent-space-1) var(--agent-space-2);
 }
 
+/* Always one column. The two-column variant needed a vertical rule between
+   pairs to stay legible, which is a second border inside a bordered panel. */
 .agentic-researcher-settings .agentic-settings-readiness-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  margin: 0 -16px;
+  margin: 0 calc(-1 * var(--agent-space-5));
 }
 
 .agentic-researcher-settings .agentic-settings-readiness-item {
   background: transparent;
   border: 0;
-  border-top: 1px solid var(--background-modifier-border);
+  border-top: var(--agent-hairline);
   color: var(--text-normal);
   cursor: pointer;
   display: block;
@@ -187,32 +266,34 @@
   height: auto;
   min-width: 0;
   overflow: hidden;
-  padding: 12px 16px;
+  padding: var(--agent-space-4) var(--agent-space-5);
   text-align: left;
   white-space: normal;
   width: 100%;
 }
 
-.agentic-researcher-settings .agentic-settings-readiness-item:nth-child(even) {
-  border-left: 0;
-}
-
+/*
+ * Colour only — never background. renderCapabilityStatus() polls once a second
+ * and rebuilds this subtree via statusEl.empty(), so a background transition
+ * would flash on every tick.
+ */
 .agentic-researcher-settings .agentic-settings-readiness-item:hover,
 .agentic-researcher-settings .agentic-settings-readiness-item:focus-visible {
   background: var(--background-modifier-hover);
   outline: none;
+  transition: none;
 }
 
 .agentic-researcher-settings .agentic-settings-readiness-item:focus-visible {
-  box-shadow: inset 0 0 0 2px var(--interactive-accent);
+  box-shadow: var(--agent-focus-ring);
 }
 
 .agentic-researcher-settings .agentic-settings-readiness-item-header {
   align-items: center;
   display: flex;
-  gap: 8px;
+  gap: var(--agent-space-3);
   justify-content: space-between;
-  margin-bottom: 4px;
+  margin-bottom: var(--agent-space-2);
 }
 
 .agentic-researcher-settings .agentic-settings-readiness-name {
@@ -228,30 +309,24 @@
   overflow-wrap: anywhere;
 }
 
-.agentic-researcher-settings .agentic-settings-readiness-evidence {
-  color: var(--text-faint);
-  display: block;
-  font-family: var(--font-monospace);
-  font-size: 0.72em;
-  margin-top: 4px;
-  overflow-wrap: anywhere;
-}
-
 .agentic-researcher-settings .agentic-settings-readiness-action {
   color: var(--interactive-accent);
   font-size: var(--font-ui-smaller);
   font-weight: var(--font-semibold);
-  margin-top: 2px;
+  margin-top: var(--agent-space-1);
 }
 
+/* Borderless tinted pills, matching the orchestrator's. The fill carries the
+   state; an outline in the same colour just doubles it. */
 .agentic-researcher-settings .agentic-settings-status-badge {
-  border: 1px solid currentColor;
-  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  border: 0;
+  border-radius: var(--agent-radius-full);
   flex: 0 0 auto;
-  font-size: var(--font-ui-smaller);
-  font-weight: 600;
+  font-size: var(--agent-type-label);
+  font-weight: var(--agent-weight-strong);
   line-height: 1.2;
-  padding: 2px 7px;
+  padding: var(--agent-space-1) var(--agent-space-3);
   white-space: nowrap;
 }
 
@@ -291,8 +366,8 @@
 .agentic-researcher-settings .agentic-extension-health-row {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  padding: 4px 0;
+  gap: var(--agent-space-3);
+  padding: var(--agent-space-2) 0;
 }
 
 .agentic-researcher-settings .agentic-extension-health-row p {
@@ -300,20 +375,20 @@
 }
 
 .agentic-researcher-settings .agentic-settings-advanced {
-  padding-bottom: 16px;
+  padding-bottom: var(--agent-space-5);
 }
 
 .agentic-researcher-settings .agentic-settings-accordion {
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 10px;
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
   overflow: hidden;
 }
 
 .agentic-researcher-settings .agentic-settings-advanced-section {
   border: 0;
-  border-top: 1px solid var(--background-modifier-border);
+  border-top: var(--agent-hairline);
   margin: 0;
-  padding: 0 0 10px;
+  padding: 0 0 var(--agent-space-4);
 }
 
 .agentic-researcher-settings .agentic-settings-advanced-section:first-child {
@@ -324,7 +399,7 @@
   color: var(--text-normal);
   cursor: pointer;
   list-style: disclosure-closed;
-  padding: 12px 14px;
+  padding: var(--agent-space-4) var(--agent-space-5);
 }
 
 .agentic-researcher-settings .agentic-settings-advanced-section[open] > summary {
@@ -336,7 +411,7 @@
   align-items: flex-start;
   display: inline-flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--agent-space-4);
   justify-content: space-between;
   vertical-align: top;
   width: calc(100% - 12px);
@@ -346,7 +421,7 @@
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--agent-space-1);
   min-width: 0;
 }
 
@@ -365,13 +440,13 @@
   display: flex;
   flex: 0 0 auto;
   flex-wrap: wrap;
-  gap: 5px;
+  gap: var(--agent-space-2);
   justify-content: flex-start;
 }
 
 .agentic-researcher-settings .agentic-settings-advanced-section > :not(summary) {
-  margin-left: 16px;
-  margin-right: 16px;
+  margin-left: var(--agent-space-5);
+  margin-right: var(--agent-space-5);
 }
 
 .agentic-researcher-settings .agentic-settings-advanced-section > .setting-item {
@@ -395,7 +470,7 @@
 }
 
 .agentic-researcher-settings .agentic-researcher-semantic-chunk-setting .setting-item-info {
-  margin-bottom: 12px;
+  margin-bottom: var(--agent-space-4);
   max-width: 100%;
   width: 100%;
 }
@@ -408,7 +483,7 @@
 
 .agentic-researcher-settings .agentic-researcher-semantic-chunk-grid {
   display: grid;
-  gap: 10px;
+  gap: var(--agent-space-4);
   grid-template-columns: repeat(4, minmax(82px, 1fr));
   max-width: 520px;
   min-width: 0;
@@ -418,7 +493,7 @@
 .agentic-researcher-settings .agentic-researcher-semantic-chunk-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--agent-space-2);
   min-width: 0;
 }
 
@@ -443,30 +518,30 @@
 
 .agentic-researcher-settings .agentic-schedule-list {
   display: grid;
-  gap: 12px;
-  margin-bottom: 8px;
+  gap: var(--agent-space-4);
+  margin-bottom: var(--agent-space-3);
 }
 
 .agentic-researcher-settings .agentic-schedule-empty {
   border: 1px dashed var(--background-modifier-border);
-  border-radius: 8px;
+  border-radius: var(--agent-radius-md);
   margin: 0;
-  padding: 14px;
+  padding: var(--agent-space-5);
 }
 
 .agentic-researcher-settings .agentic-schedule-card {
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 10px;
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
   min-width: 0;
-  padding: 12px;
+  padding: var(--agent-space-4);
 }
 
 .agentic-researcher-settings .agentic-schedule-card-header {
   align-items: center;
   display: flex;
-  gap: 10px;
+  gap: var(--agent-space-4);
   justify-content: space-between;
-  margin-bottom: 4px;
+  margin-bottom: var(--agent-space-2);
 }
 
 .agentic-researcher-settings .agentic-schedule-card-header h5 {
@@ -497,10 +572,10 @@
 }
 
 .agentic-researcher-settings .agentic-linear-oauth-primary .setting-item {
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  margin-top: 8px;
-  padding: 12px;
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
+  margin-top: var(--agent-space-3);
+  padding: var(--agent-space-4);
 }
 
 @media (max-width: 760px) {
@@ -510,14 +585,6 @@
 }
 
 @container agentic-settings (min-width: 640px) {
-  .agentic-researcher-settings .agentic-settings-readiness-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .agentic-researcher-settings .agentic-settings-readiness-item:nth-child(even) {
-    border-left: 1px solid var(--background-modifier-border);
-  }
-
   .agentic-researcher-settings .agentic-settings-advanced-summary {
     align-items: center;
     flex-direction: row;
@@ -530,17 +597,17 @@
 
 @container agentic-settings (max-width: 639px) {
   .agentic-researcher-settings .agentic-settings-panel {
-    border-radius: 8px;
-    padding: 12px;
+    border-radius: var(--agent-radius-md);
+    padding: var(--agent-space-4);
   }
 
   .agentic-researcher-settings .agentic-settings-readiness-grid {
-    margin: 0 -12px;
+    margin: 0 calc(-1 * var(--agent-space-4));
   }
 
   .agentic-researcher-settings .agentic-settings-readiness-item {
-    padding-left: 12px;
-    padding-right: 12px;
+    padding-left: var(--agent-space-4);
+    padding-right: var(--agent-space-4);
   }
 
   .agentic-researcher-settings .agentic-schedule-card .setting-item {
@@ -549,51 +616,38 @@
 
   .agentic-researcher-settings .agentic-schedule-card .setting-item-control {
     justify-content: flex-start;
-    margin-top: 8px;
+    margin-top: var(--agent-space-3);
     width: 100%;
   }
 
 }
 
+/* @style-tokens:settings-region-end — everything below is the mission console,
+   where fixed px min/max-height is a violation (boxes must scale with the theme
+   font). Settings rules above are grandfathered. Keep this marker directly
+   after the last settings rule; see scripts/check-style-tokens.mjs. */
+
 .agentic-researcher-log,
 .agentic-researcher-log-item,
 .agentic-researcher-log-message,
 .agentic-researcher-dashboard-body,
-.agentic-researcher-run-log,
 .agentic-researcher-trace-row,
 .agentic-researcher-payload pre,
 .agentic-researcher-prompt {
   user-select: text;
 }
 
-.agentic-researcher-header {
-  border-bottom: 1px solid var(--agent-terminal-border);
-  flex: 0 0 auto;
-  max-width: 100%;
-  min-width: 0;
-  padding-bottom: 8px;
-  width: 100%;
-}
-
-.agentic-researcher-header h2 {
-  color: var(--agent-terminal-green);
-  font-family: inherit;
-  font-size: var(--font-ui-large);
-  line-height: 1.2;
-  margin: 0;
-}
-
-.agentic-researcher-subtitle {
-  color: var(--agent-terminal-muted);
-  font-size: var(--font-ui-small);
-  margin: 4px 0 0;
-}
-
+/*
+ * Underline tab bar rather than a bordered grid. Tabs size to their labels, so
+ * the bar is correct at two or three buttons without a modifier class — the
+ * empty-third-column defect the old .has-orchestrator grid could produce is
+ * structurally impossible here.
+ */
 .agentic-researcher-tabs {
-  border: 1px solid var(--agent-terminal-border);
-  display: grid;
+  border-bottom: var(--agent-hairline);
+  display: flex;
   flex: 0 0 auto;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--agent-space-5);
   max-width: 100%;
   min-width: 0;
   width: 100%;
@@ -605,34 +659,58 @@
 .agentic-researcher-secondary-action {
   background: transparent;
   border: 0;
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   cursor: pointer;
   font-family: inherit;
   font-size: var(--font-ui-small);
   min-height: 2em;
 }
 
-.agentic-researcher-tab {
-  border-right: 1px solid var(--agent-terminal-border);
+/*
+ * Tag-qualified and view-scoped on purpose. Themes style bare `button`, and a
+ * plain .agentic-researcher-tab loses to them — measured against Tom's Theme,
+ * which painted both tabs with a filled background and a 5px radius, burying
+ * the underline. The run/clear buttons below already defend this way.
+ */
+.agentic-researcher-view button.agentic-researcher-tab {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  box-shadow: none;
+  color: var(--agent-text-muted);
+  margin-bottom: -1px;
   min-width: 0;
   overflow-wrap: anywhere;
+  padding: var(--agent-space-2) var(--agent-space-1);
 }
 
-.agentic-researcher-tab:last-child {
-  border-right: 0;
+/* The active tab is marked by its underline and weight, not a filled box.
+   Matches the base rule's specificity so the state still wins. */
+.agentic-researcher-view button.agentic-researcher-tab.is-active {
+  border-bottom-color: var(--agent-text-accent);
+  color: var(--agent-text);
+  font-weight: var(--agent-weight-strong);
 }
 
-.agentic-researcher-tab.is-active,
-.agentic-researcher-tab:focus-visible,
+.agentic-researcher-view button.agentic-researcher-tab:hover {
+  color: var(--agent-text);
+}
+
+.agentic-researcher-view button.agentic-researcher-tab:focus-visible {
+  background: var(--agent-tint-soft);
+  box-shadow: var(--agent-focus-ring);
+  outline: 0;
+}
+
 .agentic-researcher-run:focus-visible,
 .agentic-researcher-clear:focus-visible,
 .agentic-researcher-secondary-action:focus-visible {
   background: var(--agent-tint-soft);
-  box-shadow: inset 0 0 0 1px var(--agent-terminal-green);
+  box-shadow: var(--agent-focus-ring);
   outline: 0;
 }
 
-.agentic-researcher-tab:hover,
 .agentic-researcher-run:hover,
 .agentic-researcher-clear:hover,
 .agentic-researcher-secondary-action:hover {
@@ -660,27 +738,26 @@
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--agent-space-3);
   min-height: 0;
 }
 
 /* ChatGPT-like message thread, terminal palette. */
+/* The transcript is the page, not a widget on it: no outline, no fill. The
+   composer below keeps its border because it is the interactive surface. */
 .agentic-researcher-log {
-  background:
-    linear-gradient(180deg, var(--agent-tint-weak), transparent 48px),
-    var(--agent-terminal-panel);
-  border: 1px solid var(--agent-rule-strong);
-  border-radius: 10px;
-  color: var(--agent-terminal-green);
+  background: transparent;
+  border: 0;
+  color: var(--agent-text);
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--agent-space-4);
   max-width: 100%;
   min-height: 16.25em;
   min-width: 0;
   overflow-y: auto;
-  padding: 12px 12px 14px;
+  padding: var(--agent-space-4) var(--agent-space-4) var(--agent-space-5);
   position: relative;
   scroll-behavior: smooth;
   width: 100%;
@@ -689,17 +766,70 @@
 
 .agentic-researcher-log-assistant.is-streaming .agentic-researcher-log-message {
   border-left: 2px solid var(--agent-tint-strong);
-  padding-left: 8px;
+  padding-left: var(--agent-space-3);
+}
+
+.agentic-researcher-chat-empty {
+  align-self: center;
+  display: grid;
+  gap: var(--agent-space-3);
+  margin-block: auto;
+  max-width: 32em;
+  padding: var(--agent-space-7) 0;
+  width: 100%;
+}
+
+.agentic-researcher-chat-empty h3,
+.agentic-researcher-chat-empty p {
+  margin: 0;
+}
+
+.agentic-researcher-chat-empty h3 {
+  color: var(--agent-text);
+  font-size: var(--agent-type-title);
+  font-weight: var(--agent-weight-strong);
+}
+
+.agentic-researcher-chat-empty p {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-body);
+  line-height: 1.5;
+}
+
+.agentic-researcher-chat-suggestions {
+  border-top: var(--agent-hairline);
+  display: grid;
+  margin-top: var(--agent-space-3);
+}
+
+.agentic-researcher-view button.agentic-researcher-chat-suggestion {
+  background: transparent;
+  border: 0;
+  border-bottom: var(--agent-hairline);
+  border-radius: 0;
+  color: var(--agent-text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--agent-type-body);
+  padding: var(--agent-space-4) 0;
+  text-align: left;
+}
+
+.agentic-researcher-view button.agentic-researcher-chat-suggestion:hover,
+.agentic-researcher-view button.agentic-researcher-chat-suggestion:focus-visible {
+  background: var(--agent-tint-weak);
+  box-shadow: var(--agent-focus-ring);
+  outline: 0;
 }
 
 .agentic-researcher-first-run {
   background: linear-gradient(135deg, var(--agent-tint-soft), var(--agent-scrim));
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
-  color: var(--agent-terminal-green);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
+  color: var(--agent-text);
   display: grid;
-  gap: 8px;
-  padding: 14px;
+  gap: var(--agent-space-3);
+  padding: var(--agent-space-5);
 }
 
 .agentic-researcher-first-run.is-hidden {
@@ -712,31 +842,24 @@
 }
 
 .agentic-researcher-first-run p {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-size: var(--font-ui-small);
   line-height: 1.45;
 }
 
-.agentic-researcher-first-run-kicker {
-  color: var(--text-accent);
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
-  letter-spacing: 0.12em;
-}
-
 .agentic-researcher-first-run-action {
   background: transparent;
-  border: 1px solid var(--agent-terminal-green);
-  color: var(--agent-terminal-green);
+  border: 1px solid var(--agent-text);
+  color: var(--agent-text);
   justify-self: start;
 }
 
 .agentic-researcher-lifecycle-strip {
-  border: 1px solid var(--agent-terminal-border);
-  color: var(--agent-terminal-green);
+  border: var(--agent-hairline);
+  color: var(--agent-text);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
-  padding: 6px 10px;
+  padding: var(--agent-space-3) var(--agent-space-4);
 }
 
 .agentic-researcher-lifecycle-strip.is-hidden {
@@ -748,16 +871,16 @@
   background: transparent;
   border: 0;
   border-top: 1px solid var(--agent-rule);
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   flex: 0 0 auto;
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-  margin-top: 2px;
+  margin-top: var(--agent-space-1);
   max-height: 4.5em;
   min-height: 0;
   opacity: 0.9;
   overflow-y: auto;
-  padding: 4px 2px 0;
+  padding: var(--agent-space-2) var(--agent-space-1) 0;
 }
 
 .agentic-researcher-live-workstream.is-hidden {
@@ -780,78 +903,24 @@
 }
 
 .agentic-researcher-thinking-stream {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   white-space: pre-wrap;
 }
 
 .agentic-researcher-chat-team {
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
-  color: var(--agent-terminal-green);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
+  color: var(--agent-text);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-  margin: 0 0 8px;
-  padding: 6px 8px;
+  margin: 0 0 var(--agent-space-3);
+  padding: var(--agent-space-3) var(--agent-space-3);
 }
 
 .agentic-researcher-chat-team.is-hidden {
   display: none;
-}
-
-.agentic-researcher-chat-thinking {
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
-  margin: 0 0 8px;
-  padding: 4px 8px 8px;
-}
-
-.agentic-researcher-chat-thinking.is-collapsed .agentic-researcher-chat-thinking-body {
-  display: none;
-}
-
-.agentic-researcher-chat-section-header {
-  display: flex;
-  align-items: center;
-}
-
-.agentic-researcher-chat-section-toggle {
-  background: transparent;
-  border: 0;
-  color: var(--agent-terminal-muted);
-  cursor: pointer;
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
-  padding: 2px 0;
-  text-align: left;
-}
-
-.agentic-researcher-chat-thinking-body {
-  max-height: 10em;
-  overflow-y: auto;
-  margin-top: 4px;
-}
-
-.agentic-researcher-chat-stats {
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
-  margin: 0 0 8px;
-  padding: 6px 8px;
-}
-
-.agentic-researcher-chat-section-title {
-  color: var(--agent-terminal-muted);
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
-  margin-bottom: 4px;
-  text-transform: uppercase;
-}
-
-.agentic-researcher-chat-stats-line {
-  color: var(--agent-terminal-green);
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
 }
 
 .agentic-researcher-receipt-artifact-link {
@@ -860,7 +929,7 @@
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   overflow-wrap: anywhere;
-  padding: 4px 0 0;
+  padding: var(--agent-space-2) 0 0;
 }
 
 .agentic-researcher-log-item {
@@ -868,28 +937,28 @@
   border-radius: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--agent-space-1);
   max-width: 100%;
-  padding: 6px 2px;
+  padding: var(--agent-space-3) var(--agent-space-1);
 }
 
 .agentic-researcher-log-item:first-child {
-  padding-top: 4px;
+  padding-top: var(--agent-space-2);
 }
 
 .agentic-researcher-log-item:last-child {
   border-bottom: 0;
-  padding-bottom: 4px;
+  padding-bottom: var(--agent-space-2);
 }
 
 .agentic-researcher-log-user {
   align-self: flex-end;
   background: var(--agent-tint-soft);
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--agent-radius-md);
   margin-left: 18%;
   max-width: 82%;
-  padding: 6px 10px;
+  padding: var(--agent-space-3) var(--agent-space-4);
 }
 
 .agentic-researcher-log-assistant {
@@ -907,24 +976,22 @@
   border-left: 2px solid var(--agent-rule);
   max-width: 100%;
   opacity: 0.9;
-  padding-left: 8px;
+  padding-left: var(--agent-space-3);
 }
 
 .agentic-researcher-log-header {
   align-items: center;
   display: flex;
-  gap: 8px;
+  gap: var(--agent-space-3);
   justify-content: space-between;
   min-width: 0;
 }
 
 .agentic-researcher-log-label {
-  color: var(--agent-terminal-muted);
-  font-size: var(--font-ui-smaller);
-  font-weight: var(--font-semibold);
-  letter-spacing: 0.04em;
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
+  font-weight: var(--agent-weight-strong);
   margin-bottom: 0;
-  text-transform: uppercase;
 }
 
 .agentic-researcher-log-user .agentic-researcher-log-label {
@@ -936,7 +1003,7 @@
 }
 
 .agentic-researcher-log-message {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   font-size: var(--font-ui-small);
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -948,11 +1015,63 @@
 }
 
 .agentic-researcher-log-assistant .agentic-researcher-log-message {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
+}
+
+.agentic-researcher-log-message.is-rendered {
+  white-space: normal;
+}
+
+.agentic-researcher-log-message.is-rendered > :first-child {
+  margin-top: 0;
+}
+
+.agentic-researcher-log-message.is-rendered > :last-child {
+  margin-bottom: 0;
+}
+
+.agentic-researcher-log-message.is-rendered :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--agent-text);
+  font-family: var(--font-interface);
+  line-height: 1.25;
+  margin-block: var(--agent-space-5) var(--agent-space-3);
+}
+
+.agentic-researcher-log-message.is-rendered :is(p, ul, ol, blockquote, pre, table) {
+  margin-block: 0 var(--agent-space-4);
+}
+
+.agentic-researcher-log-message.is-rendered :is(code, pre) {
+  font-family: var(--font-monospace);
+}
+
+.agentic-researcher-log-message.is-rendered pre {
+  background: var(--agent-surface);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-sm);
+  overflow-x: auto;
+  padding: var(--agent-space-3) var(--agent-space-4);
+}
+
+.agentic-researcher-log-message.is-rendered table {
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.agentic-researcher-log-message.is-rendered :is(th, td) {
+  border: var(--agent-hairline);
+  padding: var(--agent-space-2) var(--agent-space-3);
+  text-align: left;
+}
+
+.agentic-researcher-log-message.is-rendered a {
+  color: var(--agent-text-accent);
 }
 
 .agentic-researcher-log-error .agentic-researcher-log-message {
-  color: var(--agent-terminal-error);
+  color: var(--agent-error);
 }
 
 /* Inline ChatGPT-like activity indicator below the latest Chat text. */
@@ -963,11 +1082,11 @@
   border: 0;
   border-left: 2px solid var(--agent-rule);
   border-radius: 0;
-  gap: 8px;
+  gap: var(--agent-space-3);
   display: none;
-  margin-top: 2px;
+  margin-top: var(--agent-space-1);
   max-width: 100%;
-  padding: 2px 2px 2px 8px;
+  padding: var(--agent-space-1) var(--agent-space-1) var(--agent-space-1) var(--agent-space-3);
   pointer-events: none;
   position: relative;
   z-index: 0;
@@ -981,13 +1100,13 @@
   align-items: baseline;
   display: flex;
   flex: 1 1 auto;
-  gap: 8px;
+  gap: var(--agent-space-3);
   justify-content: flex-start;
   min-width: 0;
 }
 
 .agentic-researcher-chat-loader-text {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   flex: 1 1 auto;
   font-size: var(--font-ui-smaller);
   min-width: 0;
@@ -1001,7 +1120,7 @@
   align-items: center;
   display: flex;
   flex: 0 0 auto;
-  gap: 5px;
+  gap: var(--agent-space-2);
   margin-top: 0;
   min-height: 0.5em;
 }
@@ -1010,7 +1129,6 @@
   animation: agentic-researcher-loader-pulse 1.2s ease-in-out infinite;
   background: var(--text-accent);
   border-radius: 50%;
-  box-shadow: 0 0 6px var(--agent-tint-strong);
   display: inline-block;
   height: 6px;
   opacity: 0.35;
@@ -1042,8 +1160,7 @@
 .agentic-researcher-composer {
   background: var(--background-primary);
   border: 1px solid var(--agent-rule-strong);
-  border-radius: 0;
-  box-shadow: inset 0 0 22px var(--agent-tint-weak);
+  border-radius: var(--agent-radius-md);
   display: flex;
   flex: 0 0 auto;
   flex-direction: column;
@@ -1059,58 +1176,17 @@
   z-index: 10;
 }
 
-.agentic-researcher-prompt-header {
-  align-items: center;
-  background: var(--agent-tint-weak);
-  border-bottom: 1px solid var(--agent-rule);
-  display: flex;
-  gap: 8px;
-  justify-content: space-between;
-  min-width: 0;
-  padding: 5px 8px;
-}
-
-.agentic-researcher-prompt-title {
-  color: var(--text-accent);
-  flex: 0 0 auto;
-  font-size: var(--font-ui-smaller);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.agentic-researcher-prompt-shortcut {
-  color: var(--agent-terminal-muted);
-  font-size: var(--font-ui-smaller);
-  line-height: 1.2;
-  min-width: 0;
-  text-align: right;
-}
-
+/* One column now that the shell holds only the textarea. */
 .agentic-researcher-prompt-shell {
-  align-items: start;
-  background:
-    linear-gradient(90deg, var(--agent-tint-weak), transparent 45%),
-    var(--background-primary);
-  border-bottom: 1px solid var(--agent-rule);
+  background: var(--background-primary);
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   position: relative;
 }
 
 .agentic-researcher-prompt-shell:focus-within {
-  box-shadow: inset 3px 0 0 var(--agent-terminal-green);
-}
-
-.agentic-researcher-prompt-prefix {
-  color: var(--text-accent);
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-small);
-  font-weight: 650;
-  line-height: 1.45;
-  padding: 12px 0 0 10px;
-  user-select: none;
-  white-space: nowrap;
+  box-shadow: var(--agent-focus-ring);
 }
 
 .agentic-researcher-prompt {
@@ -1118,14 +1194,16 @@
   border: 0;
   border-radius: 0;
   box-shadow: none;
-  caret-color: var(--agent-terminal-green);
-  color: var(--agent-terminal-green);
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-small);
-  line-height: 1.45;
+  caret-color: var(--agent-text);
+  color: var(--agent-text);
+  /* The composer takes prose, not data — monospace stays on the receipt,
+     trace, config and payload columns where alignment carries meaning. */
+  font-family: inherit;
+  font-size: var(--agent-type-body);
+  line-height: 1.5;
   margin: 0;
   min-height: 5.5em;
-  padding: 12px 12px 10px 8px;
+  padding: var(--agent-space-4) var(--agent-space-4) var(--agent-space-4) var(--agent-space-3);
   pointer-events: auto;
   position: relative;
   resize: vertical;
@@ -1135,29 +1213,29 @@
 }
 
 .agentic-researcher-prompt::placeholder {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   opacity: 0.82;
 }
 
 .agentic-researcher-resume-banner {
-  border: 1px solid var(--agent-terminal-warning);
-  color: var(--agent-terminal-warning);
+  border: 1px solid var(--agent-warning);
+  color: var(--agent-warning);
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   max-width: 100%;
   min-width: 0;
-  padding: 8px;
+  padding: var(--agent-space-3);
   width: 100%;
 }
 
 .agentic-researcher-chat-attention {
-  border: 1px solid var(--agent-terminal-warning);
-  color: var(--agent-terminal-warning);
+  border: 1px solid var(--agent-warning);
+  color: var(--agent-warning);
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   max-width: 100%;
   min-width: 0;
-  padding: 8px;
+  padding: var(--agent-space-3);
   width: 100%;
 }
 
@@ -1172,14 +1250,14 @@
 }
 
 .agentic-researcher-chat-attention-body {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   overflow-wrap: anywhere;
 }
 
 .agentic-researcher-chat-attention-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--agent-space-3);
   min-width: 0;
 }
 
@@ -1189,15 +1267,15 @@
 }
 
 .agentic-researcher-clarification-chip {
-  border-radius: 999px;
+  border-radius: var(--agent-radius-full);
 }
 
 .agentic-researcher-clarification-input {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  margin-top: 8px;
+  gap: var(--agent-space-3);
+  margin-top: var(--agent-space-3);
   min-width: 0;
 }
 
@@ -1206,21 +1284,21 @@
   min-width: 0;
   background: var(--background-primary);
   color: var(--text-normal);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  padding: 4px 8px;
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-sm);
+  padding: var(--agent-space-2) var(--agent-space-3);
 }
 
 .agentic-researcher-chat-attention-missing-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--agent-space-3);
   min-width: 0;
 }
 
 .agentic-researcher-tab.needs-attention::after {
-  background: var(--agent-terminal-warning);
+  background: var(--agent-warning);
   border-radius: 50%;
   content: "";
   display: inline-block;
@@ -1245,14 +1323,14 @@
 }
 
 .agentic-researcher-resume-banner-next {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   overflow-wrap: anywhere;
 }
 
 .agentic-researcher-resume-banner-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--agent-space-3);
   min-width: 0;
 }
 
@@ -1265,24 +1343,94 @@
 .agentic-researcher-actions {
   background: var(--agent-scrim);
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-template-columns: minmax(0, 1fr) auto;
   max-width: 100%;
   min-width: 0;
-  padding: 8px;
+  padding: var(--agent-space-3);
   position: relative;
   width: 100%;
   z-index: 12;
+}
+
+.agentic-researcher-live-run-card {
+  background: var(--agent-surface);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
+  display: grid;
+  gap: var(--agent-space-4);
+  padding: var(--agent-space-4);
+}
+
+.agentic-researcher-live-run-card[hidden],
+.agentic-researcher-live-run-card.is-hidden {
+  display: none;
+}
+
+.agentic-researcher-live-run-header,
+.agentic-researcher-live-run-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-3);
+}
+
+.agentic-researcher-live-run-header {
+  color: var(--agent-text);
+  font-size: var(--agent-type-body);
+  font-weight: var(--agent-weight-strong);
+}
+
+.agentic-researcher-live-run-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-3) var(--agent-space-5);
+}
+
+.agentic-researcher-live-run-metric {
+  display: grid;
+  gap: var(--agent-space-1);
+  min-width: 0;
+}
+
+.agentic-researcher-live-run-metric-label {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
+}
+
+.agentic-researcher-live-run-metric-value {
+  color: var(--agent-text);
+  font-size: var(--agent-type-body);
+  overflow-wrap: anywhere;
+}
+
+.agentic-researcher-composer-options {
+  grid-column: 1 / -1;
+}
+
+.agentic-researcher-composer-options > summary {
+  color: var(--agent-text-muted);
+  cursor: pointer;
+  font-size: var(--agent-type-label);
+  width: max-content;
+}
+
+.agentic-researcher-composer-secondary {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--agent-space-3);
+  padding-top: var(--agent-space-3);
 }
 
 .agentic-researcher-steering {
   background: var(--agent-scrim);
   border: 1px solid var(--agent-tint-strong);
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-column: 1 / -1;
   min-width: 0;
-  padding: 8px;
+  padding: var(--agent-space-3);
 }
 
 .agentic-researcher-steering[hidden] {
@@ -1290,23 +1438,22 @@
 }
 
 .agentic-researcher-steering-title {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-size: var(--font-ui-smaller);
-  letter-spacing: 0.08em;
 }
 
 .agentic-researcher-steering-fields {
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-template-columns: minmax(110px, 0.65fr) minmax(0, 1.35fr);
   min-width: 0;
 }
 
 .agentic-researcher-steering-field {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   display: grid;
   font-size: var(--font-ui-smaller);
-  gap: 4px;
+  gap: var(--agent-space-2);
   min-width: 0;
 }
 
@@ -1321,38 +1468,38 @@
 .agentic-researcher-steering select,
 .agentic-researcher-steering input {
   background: var(--agent-scrim);
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 2px;
-  color: var(--agent-terminal-green);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-sm);
+  color: var(--agent-text);
   font-family: inherit;
   font-size: var(--font-ui-small);
   min-height: 2em;
   min-width: 0;
-  padding: 6px 8px;
+  padding: var(--agent-space-3) var(--agent-space-3);
   width: 100%;
 }
 
 .agentic-researcher-steering select:focus-visible,
 .agentic-researcher-steering input:focus-visible {
-  border-color: var(--agent-terminal-green);
-  box-shadow: inset 0 0 0 1px var(--agent-tint);
+  border-color: var(--agent-text);
+  box-shadow: var(--agent-focus-ring);
   outline: 0;
 }
 
 .agentic-researcher-steering-submit {
-  border: 1px solid var(--agent-terminal-border);
+  border: var(--agent-hairline);
   width: 100%;
 }
 
 .agentic-researcher-steering-status {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-size: var(--font-ui-smaller);
   min-height: 1.2em;
   overflow-wrap: anywhere;
 }
 
 .agentic-researcher-steering-status.is-error {
-  color: var(--agent-terminal-warning);
+  color: var(--agent-warning);
 }
 
 .agentic-researcher-run,
@@ -1365,33 +1512,31 @@
   display: none;
 }
 
+/* A checkbox and its label, not a field. The border made it read as an input
+   sitting next to the buttons rather than as the modifier it is. */
 .agentic-researcher-chat-only-toggle {
   align-items: center;
   background: transparent;
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
-  color: var(--agent-terminal-green);
+  border: 0;
+  color: var(--agent-text-muted);
   cursor: pointer;
   display: flex;
-  font-size: var(--font-ui-small);
-  gap: 6px;
+  font-size: var(--agent-type-label);
+  gap: var(--agent-space-2);
   justify-content: flex-start;
   min-height: 2em;
   min-width: 0;
-  padding: 0 10px;
-  text-transform: uppercase;
+  padding: 0;
   white-space: nowrap;
 }
 
 .agentic-researcher-chat-only-toggle:hover,
 .agentic-researcher-chat-only-toggle:focus-within {
-  background: var(--agent-tint-soft);
-  border-color: var(--agent-terminal-green);
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
 }
 
 .agentic-researcher-chat-only-input {
-  accent-color: var(--agent-terminal-green);
+  accent-color: var(--agent-text);
   flex: 0 0 auto;
   margin: 0;
 }
@@ -1409,10 +1554,10 @@
 
 .agentic-researcher-run-status {
   align-items: center;
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   display: flex;
   font-size: var(--font-ui-smaller);
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-column: 1 / -1;
   min-height: 1em;
 }
@@ -1423,7 +1568,7 @@
 
 .agentic-researcher-spinner {
   border: 1px solid var(--agent-tint);
-  border-left-color: var(--agent-terminal-green);
+  border-left-color: var(--agent-text);
   border-radius: 50%;
   display: inline-block;
   height: 12px;
@@ -1431,26 +1576,27 @@
   width: 12px;
 }
 
-.agentic-researcher-run-status.is-running .agentic-researcher-spinner {
+.agentic-researcher-run-status.is-running .agentic-researcher-spinner,
+.agentic-researcher-live-run-card.is-running .agentic-researcher-spinner {
   animation: agentic-researcher-spin 0.8s linear infinite;
   opacity: 1;
 }
 
 .agentic-researcher-run-status.is-running {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
 }
 
 .agentic-researcher-approval-card {
-  border: 1px solid var(--agent-terminal-warning);
-  color: var(--agent-terminal-warning);
+  border: 1px solid var(--agent-warning);
+  color: var(--agent-warning);
   display: grid;
-  gap: 6px;
+  gap: var(--agent-space-3);
   grid-column: 1 / -1;
-  padding: 8px;
+  padding: var(--agent-space-3);
 }
 
 .agentic-researcher-approval-title {
-  color: var(--agent-terminal-warning);
+  color: var(--agent-warning);
   font-weight: 700;
   overflow-wrap: anywhere;
 }
@@ -1468,18 +1614,18 @@
 .agentic-researcher-approval-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--agent-space-3);
 }
 
 .agentic-researcher-view button.agentic-researcher-approval-deny {
-  border-color: var(--agent-terminal-error);
-  color: var(--agent-terminal-error);
+  border-color: var(--agent-error);
+  color: var(--agent-error);
 }
 
 .agentic-researcher-view button.agentic-researcher-approval-deny:hover,
 .agentic-researcher-view button.agentic-researcher-approval-deny:focus-visible {
   background: var(--agent-error-tint);
-  box-shadow: inset 0 0 0 1px var(--agent-terminal-error);
+  box-shadow: 0 0 0 2px var(--agent-error-tint);
 }
 
 @keyframes agentic-researcher-spin {
@@ -1494,67 +1640,75 @@
   -webkit-appearance: none;
   appearance: none;
   background: transparent;
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-sm);
   box-shadow: none;
-  color: var(--agent-terminal-green);
-  padding: 0 12px;
+  color: var(--agent-text);
+  padding: 0 var(--agent-space-4);
 }
 
 .agentic-researcher-continuation-action {
-  border-top: 1px dotted var(--agent-terminal-border);
+  border-top: 1px dotted var(--agent-rule);
   display: grid;
-  gap: 6px;
-  margin-top: 8px;
-  padding-top: 8px;
+  gap: var(--agent-space-3);
+  margin-top: var(--agent-space-3);
+  padding-top: var(--agent-space-3);
 }
 
+/* The primary action reads as primary through a flat accent tint and weight —
+   the gradient and full-strength outline were doing the same job three times. */
 .agentic-researcher-view button.agentic-researcher-run {
-  background-color: var(--agent-tint-soft);
-  background-image: linear-gradient(
-    180deg,
-    var(--agent-tint),
-    var(--agent-tint-soft)
-  );
-  border-color: var(--agent-terminal-green);
-  border-radius: 2px;
-  color: var(--text-normal);
-  font-weight: 650;
-  letter-spacing: 0.02em;
+  background: var(--interactive-accent);
+  border-color: transparent;
+  border-radius: var(--agent-radius-sm);
+  color: var(--text-on-accent);
+  font-weight: var(--agent-weight-strong);
   min-height: 2.5em;
   pointer-events: auto;
   position: relative;
   z-index: 4;
 }
 
+/* Needs its own hover: the shared button rule sets the same tint this button
+   already rests at, so it would otherwise read as inert on hover. */
+.agentic-researcher-view button.agentic-researcher-run:hover,
+.agentic-researcher-view button.agentic-researcher-run:focus-visible {
+  background: var(--interactive-accent-hover, var(--interactive-accent));
+}
+
 .agentic-researcher-view button.agentic-researcher-run.is-stop {
   background: transparent;
-  border-color: var(--agent-terminal-warning);
-  color: var(--agent-terminal-warning);
+  border-color: var(--agent-warning);
+  color: var(--agent-warning);
 }
 
 .agentic-researcher-view button.agentic-researcher-run.is-stop:hover,
 .agentic-researcher-view button.agentic-researcher-run.is-stop:focus-visible {
   background: var(--agent-warning-tint);
-  box-shadow: inset 0 0 0 1px var(--agent-terminal-warning);
+  box-shadow: 0 0 0 2px var(--agent-warning-tint);
 }
 
 .agentic-researcher-view button.agentic-researcher-clear,
 .agentic-researcher-view button.agentic-researcher-secondary-action {
   background: transparent;
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
+}
+
+.agentic-researcher-view button.agentic-researcher-clear {
+  border-color: transparent;
+  color: var(--agent-text-muted);
 }
 
 .agentic-researcher-view button.agentic-researcher-clear.is-confirming {
   background: transparent;
-  border-color: var(--agent-terminal-warning);
-  color: var(--agent-terminal-warning);
+  border-color: var(--agent-warning);
+  color: var(--agent-warning);
 }
 
 .agentic-researcher-view button.agentic-researcher-clear.is-confirming:hover,
 .agentic-researcher-view button.agentic-researcher-clear.is-confirming:focus-visible {
   background: var(--agent-warning-tint);
-  box-shadow: inset 0 0 0 1px var(--agent-terminal-warning);
+  box-shadow: 0 0 0 2px var(--agent-warning-tint);
 }
 
 .agentic-researcher-view button.agentic-researcher-run:disabled,
@@ -1573,9 +1727,9 @@
 }
 
 .agentic-researcher-dashboard {
-  background: var(--agent-terminal-panel);
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
+  background: var(--agent-surface);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
   display: block;
   flex: 1 1 auto;
   min-height: 0;
@@ -1584,25 +1738,42 @@
   scrollbar-gutter: stable;
 }
 
+/*
+ * Four tiles collapse into one wrapping status line. The label/value pairs are
+ * the same DOM — they simply read as "Phase Idle · Step 0/12 · ..." instead of
+ * as a grid of boxes, which is four borders and four backgrounds of chrome for
+ * four short strings.
+ */
 .agentic-researcher-metrics {
-  background: var(--agent-tint);
-  display: grid;
-  gap: 1px;
-  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  background: transparent;
+  border-bottom: var(--agent-hairline);
+  column-gap: var(--agent-space-5);
+  display: flex;
+  flex-wrap: wrap;
+  padding: var(--agent-space-4) var(--agent-space-5);
+  row-gap: var(--agent-space-2);
 }
 
 .agentic-researcher-metric {
-  background: var(--agent-terminal-panel-strong);
+  align-items: baseline;
+  background: transparent;
+  display: flex;
+  gap: var(--agent-space-2);
   min-width: 0;
-  padding: 8px;
+  padding: 0;
 }
 
-.agentic-researcher-metric-label,
 .agentic-researcher-dashboard-label {
-  color: var(--agent-terminal-muted);
-  font-size: var(--font-ui-smaller);
-  font-weight: var(--font-semibold);
-  text-transform: uppercase;
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
+  font-weight: var(--agent-weight-strong);
+}
+
+/* On the status line the label is the quiet half of the pair, so it stays at
+   normal weight — the value carries the emphasis. */
+.agentic-researcher-metric-label {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
 }
 
 .agentic-researcher-dashboard-label-row,
@@ -1610,7 +1781,7 @@
 .agentic-researcher-receipt-header {
   align-items: center;
   display: flex;
-  gap: 8px;
+  gap: var(--agent-space-3);
   justify-content: space-between;
   min-width: 0;
 }
@@ -1622,54 +1793,73 @@
   overflow-wrap: anywhere;
 }
 
+/*
+ * The value carries the weight so the pair stays readable on themes that map
+ * --text-muted to the same colour as --text-normal (Tom's Theme does exactly
+ * this — every text token is #44cf6e). Hierarchy must not rest on colour alone.
+ */
 .agentic-researcher-metric-value {
-  color: var(--agent-terminal-green);
-  font-size: var(--font-ui-small);
+  color: var(--agent-text);
+  font-size: var(--agent-type-body);
+  font-weight: var(--agent-weight-strong);
   line-height: 1.35;
-  margin-top: 3px;
-  min-height: 1em;
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 
+/* The enclosing section already draws a rule; a second one here is the
+   boxes-in-boxes pattern this redesign removes. */
 .agentic-researcher-stream-grid {
-  border-top: 1px solid var(--agent-terminal-border);
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   min-height: 0;
 }
 
 .agentic-researcher-dashboard-section {
-  background: var(--agent-terminal-panel);
-  border-top: 1px solid var(--agent-terminal-border);
+  background: var(--agent-surface);
+  border-top: var(--agent-hairline);
   contain: layout paint;
   flex: 0 0 auto;
   isolation: isolate;
-  min-height: 4.75em;
   min-width: 0;
   overflow: hidden;
-  padding: 8px;
+  padding: var(--agent-space-4) var(--agent-space-5) var(--agent-space-5);
   position: relative;
+}
+
+/*
+ * A section holding nothing but its "No X yet." placeholder is chrome with no
+ * content: 19 of them render before a mission produces anything. Deriving this
+ * from the DOM's actual state keeps it correct at every append path, including
+ * the ones that bypass clearPlaceholder(). The node stays in the tree — e2e
+ * counts hidden elements, so hiding is safe where removal would not be.
+ */
+.agentic-researcher-dashboard-section:not([data-ever-populated]):has(
+    > .agentic-researcher-dashboard-body > .agentic-researcher-placeholder:only-child
+  ),
+.agentic-researcher-dashboard-section:not([data-ever-populated]):has(
+    > .agentic-researcher-dashboard-body:empty
+  ) {
+  display: none;
 }
 
 /* One expander groups every process/system diagnostics section so the default
    Run Details surface stays quiet. Section reveal semantics are unchanged. */
 .agentic-researcher-dashboard-diagnostics {
-  border-top: 1px solid var(--agent-terminal-border);
+  border-top: 1px solid var(--agent-rule);
   min-width: 0;
 }
 
 .agentic-researcher-dashboard-diagnostics-summary {
   align-items: baseline;
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   cursor: pointer;
   display: flex;
-  font-size: var(--font-ui-smaller);
+  font-size: var(--agent-type-title);
   font-weight: var(--font-semibold);
-  gap: 6px;
-  letter-spacing: 0.08em;
+  gap: var(--agent-space-3);
   list-style: none;
-  padding: 8px;
-  text-transform: uppercase;
+  padding: var(--agent-space-3);
   user-select: none;
 }
 
@@ -1688,13 +1878,11 @@
 }
 
 .agentic-researcher-dashboard-diagnostics-summary:hover {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
 }
 
 .agentic-researcher-dashboard-diagnostics-badge {
   font-weight: normal;
-  letter-spacing: 0;
-  text-transform: none;
 }
 
 .agentic-researcher-dashboard-diagnostics-body {
@@ -1709,22 +1897,22 @@
 
 .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
   border-left: 0;
-  border-top: 1px solid var(--agent-terminal-border);
+  border-top: 1px solid var(--agent-rule);
 }
 
 .agentic-researcher-dashboard-body {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   contain: layout paint;
   display: flow-root;
   font-size: var(--font-ui-small);
   isolation: isolate;
   line-height: 1.45;
-  margin-top: 6px;
+  margin-top: var(--agent-space-3);
   max-height: clamp(6em, 24vh, 16.25em);
   min-width: 0;
   overflow: auto;
   overflow-wrap: anywhere;
-  padding-right: 6px;
+  padding-right: var(--agent-space-3);
   position: relative;
   scrollbar-gutter: stable;
   white-space: normal;
@@ -1758,9 +1946,9 @@
 .agentic-researcher-open-note {
   align-items: center;
   background: transparent;
-  border: 1px solid var(--agent-tint-strong);
-  border-radius: 4px;
-  color: var(--agent-terminal-muted);
+  border: 0;
+  border-radius: var(--agent-radius-sm);
+  color: var(--agent-text-muted);
   cursor: pointer;
   display: inline-flex;
   flex: 0 0 auto;
@@ -1771,12 +1959,52 @@
   width: 24px;
 }
 
+/*
+ * Copy affordances stay out of the way until the row they belong to is hovered
+ * or focused — there is one per log message and one per dashboard section, so
+ * always-on they are the single densest source of chrome in the pane.
+ *
+ * opacity rather than display/visibility: the 24px box stays reserved so
+ * nothing reflows on hover, and the button remains focusable and in the
+ * accessibility tree, which display:none would forfeit.
+ */
+.agentic-researcher-copy {
+  opacity: 0;
+}
+
+/*
+ * Generous hover targets on the rows that own a copy button, plus a generic
+ * `*:hover >` fallback so a call site added later can never end up permanently
+ * invisible — createCopyButton() always appends the button as a direct child of
+ * the row it belongs to, so the fallback covers every site by construction.
+ */
+.agentic-researcher-dashboard-label-row:hover .agentic-researcher-copy,
+.agentic-researcher-dashboard-label-row:focus-within .agentic-researcher-copy,
+.agentic-researcher-log-item:hover .agentic-researcher-copy,
+.agentic-researcher-log-item:focus-within .agentic-researcher-copy,
+.agentic-researcher-receipt:hover .agentic-researcher-copy,
+.agentic-researcher-receipt:focus-within .agentic-researcher-copy,
+.agentic-researcher-trace-row:hover .agentic-researcher-copy,
+.agentic-researcher-trace-row:focus-within .agentic-researcher-copy,
+.agentic-researcher-view *:hover > .agentic-researcher-copy,
+.agentic-researcher-view *:focus-within > .agentic-researcher-copy,
+.agentic-researcher-copy:focus-visible {
+  opacity: 1;
+}
+
+/* Touch and pen have no hover state to reveal them with. */
+@media (hover: none) {
+  .agentic-researcher-copy {
+    opacity: 1;
+  }
+}
+
 .agentic-researcher-copy:hover,
 .agentic-researcher-copy:focus-visible,
 .agentic-researcher-open-note:hover,
 .agentic-researcher-open-note:focus-visible {
   background: var(--agent-tint-soft);
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   outline: 0;
 }
 
@@ -1788,7 +2016,7 @@
 
 .agentic-researcher-status-line {
   border-top: 1px dotted var(--agent-tint);
-  padding: 4px 0;
+  padding: var(--agent-space-2) 0;
   white-space: pre-wrap;
 }
 
@@ -1807,14 +2035,14 @@
 }
 
 .agentic-researcher-placeholder {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   white-space: pre-wrap;
 }
 
 .agentic-researcher-tool-item,
 .agentic-researcher-receipt {
   border-top: 1px dotted var(--agent-tint-strong);
-  padding: 6px 0;
+  padding: var(--agent-space-3) 0;
 }
 
 .agentic-researcher-tool-item,
@@ -1833,7 +2061,7 @@
 .agentic-researcher-tool-item:focus-visible,
 .agentic-researcher-receipt:focus-visible,
 .agentic-researcher-trace-row:focus-visible {
-  box-shadow: inset 0 0 0 1px var(--agent-terminal-green);
+  box-shadow: var(--agent-focus-ring);
   outline: 0;
 }
 
@@ -1846,48 +2074,48 @@
 .agentic-researcher-tool-header {
   align-items: start;
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .agentic-researcher-tool-name {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   font-weight: var(--font-semibold);
   min-width: 0;
   overflow-wrap: anywhere;
 }
 
 .agentic-researcher-tool-status {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   font-size: var(--font-ui-smaller);
   line-height: 1.4;
   white-space: nowrap;
 }
 
 .agentic-researcher-tool-item.is-complete .agentic-researcher-tool-status {
-  color: var(--agent-terminal-green-soft);
+  color: var(--agent-text-accent);
 }
 
 .agentic-researcher-tool-item.is-skipped .agentic-researcher-tool-status {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
 }
 
 .agentic-researcher-tool-item.is-error .agentic-researcher-tool-status {
-  color: var(--agent-terminal-error);
+  color: var(--agent-error);
 }
 
 .agentic-researcher-tool-detail,
 .agentic-researcher-receipt-meta {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-size: var(--font-ui-smaller);
   line-height: 1.4;
-  margin-top: 3px;
+  margin-top: var(--agent-space-2);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
 
 .agentic-researcher-receipt-message {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -1895,7 +2123,7 @@
 .agentic-researcher-config-line,
 .agentic-researcher-trace-row {
   border-top: 1px dotted var(--agent-tint);
-  padding: 4px 0;
+  padding: var(--agent-space-2) 0;
 }
 
 .agentic-researcher-config-line {
@@ -1910,9 +2138,9 @@
 .agentic-researcher-acceptance-row {
   border-top: 1px dotted var(--agent-tint);
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-template-columns: minmax(82px, 108px) minmax(0, 1fr);
-  padding: 4px 0;
+  padding: var(--agent-space-2) 0;
 }
 
 .agentic-researcher-acceptance-row:first-child {
@@ -1920,28 +2148,28 @@
 }
 
 .agentic-researcher-acceptance-key {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-size: var(--font-ui-smaller);
   overflow-wrap: anywhere;
 }
 
 .agentic-researcher-acceptance-value {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   min-width: 0;
   overflow-wrap: anywhere;
 }
 
 .agentic-researcher-acceptance-fail .agentic-researcher-acceptance-value {
-  color: var(--agent-terminal-error);
+  color: var(--agent-error);
 }
 
 .agentic-researcher-acceptance-needs_more_work .agentic-researcher-acceptance-value {
-  color: var(--agent-terminal-warning);
+  color: var(--agent-warning);
 }
 
 .agentic-researcher-trace-row {
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-template-columns: minmax(88px, 110px) minmax(0, 1fr);
   min-width: 0;
   overflow: hidden;
@@ -1957,25 +2185,24 @@
 }
 
 .agentic-researcher-trace-receipt {
-  border-left: 2px solid var(--agent-terminal-green-soft);
-  padding-left: 6px;
+  border-left: 2px solid var(--agent-text-accent);
+  padding-left: var(--agent-space-3);
 }
 
 .agentic-researcher-trace-tool_rejected,
 .agentic-researcher-trace-error {
-  border-left: 2px solid var(--agent-terminal-error);
-  padding-left: 6px;
+  border-left: 2px solid var(--agent-error);
+  padding-left: var(--agent-space-3);
 }
 
 .agentic-researcher-trace-kind {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-size: var(--font-ui-smaller);
   line-height: 1.4;
-  text-transform: uppercase;
 }
 
 .agentic-researcher-trace-message {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   min-width: 0;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -1983,11 +2210,11 @@
 
 .agentic-researcher-trace-meta {
   align-items: center;
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   display: inline-flex;
   flex-wrap: wrap;
   font-size: var(--font-ui-smaller);
-  gap: 6px;
+  gap: var(--agent-space-3);
   grid-column: 2;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -1995,12 +2222,12 @@
 
 .agentic-researcher-detail-line {
   border-top: 1px dotted var(--agent-tint);
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   line-height: 1.4;
   min-width: 0;
-  padding: 4px 0;
+  padding: var(--agent-space-2) 0;
   overflow-wrap: anywhere;
 }
 
@@ -2011,8 +2238,8 @@
 .agentic-researcher-code-output-row {
   border-top: 1px dotted var(--agent-tint);
   display: grid;
-  gap: 4px;
-  padding: 6px 0;
+  gap: var(--agent-space-2);
+  padding: var(--agent-space-3) 0;
 }
 
 .agentic-researcher-code-output-row:first-child {
@@ -2020,40 +2247,38 @@
 }
 
 .agentic-researcher-code-output-stream {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   font-size: var(--font-ui-smaller);
-  font-weight: 700;
-  text-transform: uppercase;
+  font-weight: var(--agent-weight-strong);
 }
 
 .agentic-researcher-code-output-stderr .agentic-researcher-code-output-stream {
-  color: var(--agent-terminal-warning);
+  color: var(--agent-warning);
 }
 
 .agentic-researcher-code-output-chunk {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   font-family: var(--font-monospace);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
 
 .agentic-researcher-detail-kind {
-  color: var(--agent-terminal-muted);
-  font-weight: 700;
-  text-transform: uppercase;
+  color: var(--agent-text-muted);
+  font-weight: var(--agent-weight-strong);
 }
 
 .agentic-researcher-detail-meta {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   display: block;
   font-size: var(--font-ui-smaller);
-  margin-top: 2px;
+  margin-top: var(--agent-space-1);
 }
 
 .agentic-researcher-payload {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
   grid-column: 1 / -1;
-  margin-top: 6px;
+  margin-top: var(--agent-space-3);
   max-width: 100%;
   overflow: auto;
 }
@@ -2066,20 +2291,20 @@
 .agentic-researcher-payload pre {
   background: var(--background-primary);
   border: 1px solid var(--agent-tint);
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   font-family: inherit;
   font-size: var(--font-ui-smaller);
-  margin: 6px 0 0;
+  margin: var(--agent-space-3) 0 0;
   max-height: 11.25em;
   max-width: 100%;
   overflow: auto;
-  padding: 8px;
+  padding: var(--agent-space-3);
   white-space: pre-wrap;
 }
 
 .agentic-researcher-html-preview {
   background: var(--background-primary);
-  border: 1px solid var(--agent-terminal-border);
+  border: var(--agent-hairline);
   min-height: 17.5em;
   overflow: hidden;
   width: 100%;
@@ -2096,8 +2321,8 @@
 .agentic-researcher-verification-row {
   border-top: 1px dotted var(--agent-tint);
   display: grid;
-  gap: 4px;
-  padding: 6px 0;
+  gap: var(--agent-space-2);
+  padding: var(--agent-space-3) 0;
 }
 
 .agentic-researcher-verification-row:first-child {
@@ -2107,17 +2332,16 @@
 .agentic-researcher-verification-kind {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  text-transform: uppercase;
 }
 
 .agentic-researcher-verification-message {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
 }
 
 .agentic-researcher-compacted {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  padding: 4px 0;
+  padding: var(--agent-space-2) 0;
 }
 
 .agentic-researcher-log-item.is-trace-highlighted {
@@ -2134,8 +2358,29 @@
   }
 }
 
+/*
+ * Narrow panes re-densify by overriding the spacing scale itself rather than by
+ * respecifying padding rule by rule. A container query cannot style its own
+ * container, so the override lands on the view's children and inherits down.
+ */
+@container agentic-researcher-pane (max-width: 520px) {
+  .agentic-researcher-view > * {
+    --agent-space-4: 10px;
+    --agent-space-5: 12px;
+    --agent-space-6: 16px;
+    --agent-space-7: 20px;
+  }
+}
+
 @container agentic-researcher-pane (max-width: 360px) {
-  .agentic-researcher-metrics,
+  .agentic-researcher-view > * {
+    --agent-space-3: 6px;
+    --agent-space-4: 8px;
+    --agent-space-5: 10px;
+    --agent-space-6: 12px;
+    --agent-space-7: 16px;
+  }
+
   .agentic-researcher-stream-grid,
   .agentic-researcher-actions {
     grid-template-columns: 1fr;
@@ -2143,7 +2388,7 @@
 
   .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
     border-left: 0;
-    border-top: 1px solid var(--agent-terminal-border);
+    border-top: 1px solid var(--agent-rule);
   }
 }
 
@@ -2154,7 +2399,7 @@
 
   .agentic-researcher-responsive-run-details .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
     border-left: 0;
-    border-top: 1px solid var(--agent-terminal-border);
+    border-top: 1px solid var(--agent-rule);
   }
 
   .agentic-researcher-responsive-run-details .agentic-researcher-trace-row {
@@ -2174,14 +2419,8 @@
 
   .agentic-researcher-responsive-run-details .agentic-researcher-stream-grid .agentic-researcher-dashboard-section + .agentic-researcher-dashboard-section {
     border-left: 0;
-    border-top: 1px solid var(--agent-terminal-border);
+    border-top: 1px solid var(--agent-rule);
   }
-}
-
-/* Orchestrator Preview is conditional; the original two-tab layout remains the
-   default unless AgentView opts into this explicit class. */
-.agentic-researcher-tabs.has-orchestrator {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .agentic-researcher-orchestrator-panel {
@@ -2194,10 +2433,10 @@
 }
 
 .agentic-researcher-orchestrator {
-  background: var(--agent-terminal-panel);
-  border: 1px solid var(--agent-terminal-border);
-  border-radius: 4px;
-  color: var(--agent-terminal-green);
+  background: var(--agent-surface);
+  border: var(--agent-hairline);
+  border-radius: var(--agent-radius-md);
+  color: var(--agent-text);
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
@@ -2217,9 +2456,9 @@
 }
 
 .agentic-researcher-orchestrator-section {
-  border-top: 1px solid var(--agent-terminal-border);
+  border-top: 1px solid var(--agent-rule);
   min-width: 0;
-  padding: 10px;
+  padding: var(--agent-space-4);
 }
 
 .agentic-researcher-orchestrator-section:first-child {
@@ -2231,36 +2470,38 @@
 .agentic-researcher-orchestrator-inspector-heading {
   align-items: center;
   display: flex;
-  gap: 8px;
+  gap: var(--agent-space-3);
   justify-content: space-between;
   min-width: 0;
 }
 
 .agentic-researcher-orchestrator-section-title {
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
   font-family: inherit;
-  font-size: var(--font-ui-small);
+  font-size: var(--agent-type-title);
   line-height: 1.3;
   margin: 0;
   min-width: 0;
   overflow-wrap: anywhere;
-  text-transform: uppercase;
 }
 
+/* Label/value pairs on an open grid, matching the Activity status line — the
+   1px-gap tint grid drew a cell border around each of seven short strings. */
 .agentic-researcher-orchestrator-summary-grid,
 .agentic-researcher-orchestrator-merge-grid {
+  column-gap: var(--agent-space-5);
   display: grid;
-  gap: 1px;
   grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
-  margin-top: 8px;
+  margin-top: var(--agent-space-4);
   min-width: 0;
+  row-gap: var(--agent-space-3);
 }
 
 .agentic-researcher-orchestrator-summary-metric,
 .agentic-researcher-orchestrator-merge-item {
-  background: var(--agent-terminal-panel-strong);
+  background: transparent;
   min-width: 0;
-  padding: 7px;
+  padding: 0;
 }
 
 .agentic-researcher-orchestrator-summary-metric > *,
@@ -2271,23 +2512,24 @@
 }
 
 .agentic-researcher-orchestrator-kicker {
-  color: var(--agent-terminal-muted);
-  font-size: var(--font-ui-smaller);
-  font-weight: var(--font-semibold);
-  text-transform: uppercase;
+  color: var(--agent-text-muted);
+  font-size: var(--agent-type-label);
 }
 
+/* Same reasoning as the metric status line: weight, not colour, separates the
+   kicker from its value. */
 .agentic-researcher-orchestrator-value {
-  color: var(--agent-terminal-green);
-  font-size: var(--font-ui-small);
-  margin-top: 2px;
+  color: var(--agent-text);
+  font-size: var(--agent-type-body);
+  font-weight: var(--agent-weight-strong);
+  margin-top: var(--agent-space-1);
 }
 
 .agentic-researcher-orchestrator-task-layout {
   display: grid;
-  gap: 10px;
+  gap: var(--agent-space-4);
   grid-template-columns: minmax(0, 1.15fr) minmax(190px, 0.85fr);
-  margin-top: 8px;
+  margin-top: var(--agent-space-3);
   min-width: 0;
 }
 
@@ -2298,36 +2540,36 @@
 .agentic-researcher-orchestrator-handoff-card {
   background: var(--agent-tint-weak);
   border: 1px solid var(--agent-tint);
-  border-radius: 4px;
+  border-radius: var(--agent-radius-md);
   min-width: 0;
 }
 
 .agentic-researcher-orchestrator-tree {
   max-height: clamp(13.75em, 48vh, 32.5em);
   overflow: auto;
-  padding: 7px;
+  padding: var(--agent-space-3);
   scrollbar-gutter: stable;
 }
 
 .agentic-researcher-orchestrator-tree-node {
   border-left: 1px dotted var(--agent-tint-strong);
-  margin-left: 5px;
+  margin-left: var(--agent-space-2);
   min-width: 0;
-  padding-left: 7px;
+  padding-left: var(--agent-space-3);
 }
 
 .agentic-researcher-orchestrator-tree-node.is-selected {
-  border-left-color: var(--agent-terminal-green);
+  border-left-color: var(--agent-text);
 }
 
 .agentic-researcher-orchestrator-tree-summary {
   align-items: center;
   cursor: pointer;
   display: flex;
-  gap: 6px;
+  gap: var(--agent-space-3);
   min-height: 2em;
   min-width: 0;
-  padding: 3px;
+  padding: var(--agent-space-2);
 }
 
 .agentic-researcher-orchestrator-tree-summary:hover,
@@ -2348,27 +2590,28 @@
   min-width: 0;
 }
 
+/* Borderless tinted pills. The fill carries the status; a border around it is
+   the second outline this redesign removes everywhere else. Labels wrap rather
+   than truncate now that the surrounding layout can give them the room. */
 .agentic-researcher-orchestrator-badge {
-  border: 1px solid var(--agent-tint-strong);
-  border-radius: 999px;
-  color: var(--agent-terminal-muted);
+  background: var(--agent-tint-weak);
+  border: 0;
+  border-radius: var(--agent-radius-full);
+  color: var(--agent-text-muted);
   flex: 0 0 auto;
-  font-size: calc(var(--font-ui-smaller) * 0.9);
+  font-size: var(--agent-type-label);
   line-height: 1.2;
-  max-width: 110px;
-  overflow: hidden;
-  padding: 2px 5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: var(--agent-space-1) var(--agent-space-3);
 }
 
 .agentic-researcher-orchestrator-status[data-status="complete"],
 .agentic-researcher-orchestrator-status[data-status="green"],
 .agentic-researcher-orchestrator-status[data-status="merged"],
 .agentic-researcher-orchestrator-status[data-status="accepted"] {
-  background: var(--agent-tint-soft);
-  border-color: var(--agent-terminal-green-soft);
-  color: var(--agent-terminal-green-soft);
+  background: var(--agent-tint);
+  color: var(--agent-text-accent);
 }
 
 .agentic-researcher-orchestrator-status[data-status="running"],
@@ -2381,8 +2624,7 @@
 .agentic-researcher-orchestrator-status[data-status="ready"],
 .agentic-researcher-orchestrator-status[data-status="queued"] {
   background: var(--agent-tint-soft);
-  border-color: var(--agent-terminal-green);
-  color: var(--agent-terminal-green);
+  color: var(--agent-text);
 }
 
 .agentic-researcher-orchestrator-status[data-status="blocked"],
@@ -2390,22 +2632,21 @@
 .agentic-researcher-orchestrator-status[data-status="promotion_blocked"],
 .agentic-researcher-orchestrator-status[data-status="rejected"] {
   background: var(--agent-error-tint);
-  border-color: var(--agent-terminal-error);
-  color: var(--agent-terminal-error);
+  color: var(--agent-error);
 }
 
 .agentic-researcher-orchestrator-inspector {
   align-self: start;
   max-height: clamp(13.75em, 48vh, 32.5em);
   overflow: auto;
-  padding: 8px;
+  padding: var(--agent-space-3);
   scrollbar-gutter: stable;
 }
 
 .agentic-researcher-orchestrator-inspector-title {
   font-size: var(--font-ui-small);
   font-weight: var(--font-semibold);
-  margin: 8px 0;
+  margin: var(--agent-space-3) 0;
   overflow-wrap: anywhere;
 }
 
@@ -2416,7 +2657,7 @@
   line-height: 1.45;
   min-width: 0;
   overflow-wrap: anywhere;
-  padding: 5px 0;
+  padding: var(--agent-space-2) 0;
 }
 
 .agentic-researcher-orchestrator-inspector-row > * {
@@ -2425,16 +2666,16 @@
 }
 
 .agentic-researcher-orchestrator-inspector-value {
-  color: var(--agent-terminal-green);
-  margin-top: 2px;
+  color: var(--agent-text);
+  margin-top: var(--agent-space-1);
   white-space: pre-wrap;
 }
 
 .agentic-researcher-orchestrator-agent-grid {
   display: grid;
-  gap: 8px;
+  gap: var(--agent-space-3);
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  margin-top: 8px;
+  margin-top: var(--agent-space-3);
   min-width: 0;
 }
 
@@ -2444,14 +2685,14 @@
   font-size: var(--font-ui-small);
   overflow: hidden;
   overflow-wrap: anywhere;
-  padding: 8px;
+  padding: var(--agent-space-3);
 }
 
 .agentic-researcher-orchestrator-worktree-list,
 .agentic-researcher-orchestrator-handoff-list {
   display: grid;
-  gap: 8px;
-  margin-top: 8px;
+  gap: var(--agent-space-3);
+  margin-top: var(--agent-space-3);
   min-width: 0;
 }
 
@@ -2459,7 +2700,7 @@
 .agentic-researcher-orchestrator-command-list {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  margin: 6px 0;
+  margin: var(--agent-space-3) 0;
   max-width: 100%;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -2467,42 +2708,42 @@
 }
 
 .agentic-researcher-orchestrator-command-list {
-  padding-left: 18px;
+  padding-left: var(--agent-space-5);
 }
 
 .agentic-researcher-orchestrator-meta,
 .agentic-researcher-orchestrator-card-copy {
   font-size: var(--font-ui-smaller);
   line-height: 1.4;
-  margin-top: 6px;
+  margin-top: var(--agent-space-3);
   overflow-wrap: anywhere;
 }
 
 .agentic-researcher-orchestrator-meta {
-  color: var(--agent-terminal-muted);
+  color: var(--agent-text-muted);
 }
 
 .agentic-researcher-orchestrator-link-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 4px;
+  gap: var(--agent-space-2);
+  margin-top: var(--agent-space-2);
   min-width: 0;
 }
 
 button.agentic-researcher-orchestrator-link {
   background: transparent;
   border: 1px solid var(--agent-tint-strong);
-  border-radius: 4px;
-  color: var(--agent-terminal-green);
+  border-radius: var(--agent-radius-sm);
+  color: var(--agent-text);
   cursor: pointer;
   font-family: inherit;
   font-size: var(--font-ui-smaller);
-  margin-top: 6px;
+  margin-top: var(--agent-space-3);
   max-width: 100%;
   min-height: 1.5em;
   overflow: hidden;
-  padding: 3px 7px;
+  padding: var(--agent-space-2) var(--agent-space-3);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2510,7 +2751,7 @@ button.agentic-researcher-orchestrator-link {
 button.agentic-researcher-orchestrator-link:hover,
 button.agentic-researcher-orchestrator-link:focus-visible {
   background: var(--agent-tint-soft);
-  box-shadow: inset 0 0 0 1px var(--agent-terminal-green);
+  box-shadow: var(--agent-focus-ring);
   outline: 0;
 }
 
@@ -2523,17 +2764,17 @@ button.agentic-researcher-orchestrator-link:focus-visible {
 }
 
 .agentic-researcher-orchestrator .is-error {
-  color: var(--agent-terminal-error);
+  color: var(--agent-error);
 }
 
 .agentic-researcher-orchestrator-reference {
   border-left: 2px solid var(--agent-tint-strong);
-  padding-left: 7px;
+  padding-left: var(--agent-space-3);
 }
 
 .agentic-researcher-orchestrator-compacted {
   border-top: 1px dotted var(--agent-tint);
-  margin-top: 5px;
+  margin-top: var(--agent-space-2);
 }
 
 @container agentic-researcher-pane (max-width: 520px) {
@@ -2549,17 +2790,13 @@ button.agentic-researcher-orchestrator-link:focus-visible {
 }
 
 @container agentic-researcher-pane (max-width: 360px) {
-  .agentic-researcher-tabs.has-orchestrator {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
   .agentic-researcher-orchestrator-summary-grid,
   .agentic-researcher-orchestrator-merge-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .agentic-researcher-orchestrator-section {
-    padding: 8px;
+    padding: var(--agent-space-3);
   }
 
   .agentic-researcher-orchestrator-tree-summary {
@@ -2573,11 +2810,11 @@ button.agentic-researcher-orchestrator-link:focus-visible {
 }
 .agentic-researcher-approval-preview {
   display: grid;
-  gap: 6px;
-  margin-top: 8px;
-  padding: 8px;
-  border: 1px solid var(--agent-rule);
-  background: var(--agent-terminal-panel);
+  gap: var(--agent-space-3);
+  margin-top: var(--agent-space-3);
+  padding: var(--agent-space-3);
+  border: var(--agent-hairline);
+  background: var(--agent-surface);
 }
 
 .agentic-researcher-approval-destination,
@@ -2589,7 +2826,7 @@ button.agentic-researcher-orchestrator-link:focus-visible {
 .agentic-researcher-approval-payload {
   max-height: 13.75em;
   margin: 0;
-  padding: 8px;
+  padding: var(--agent-space-3);
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -2615,5 +2852,15 @@ button.agentic-researcher-orchestrator-link:focus-visible {
 
   .agentic-researcher-log-item.is-trace-highlighted {
     animation: none;
+  }
+
+  /* Mirrors the interactive-surface transition declared with the tokens. */
+  .agentic-researcher-view button,
+  .agentic-researcher-view summary,
+  .agentic-researcher-view select,
+  .agentic-researcher-view input,
+  .agentic-researcher-view textarea,
+  .agentic-researcher-copy {
+    transition: none;
   }
 }

@@ -22,9 +22,14 @@ import {
 import type { LinearCapabilityGate } from "../integrations/linear/types";
 import type { OptionalExtensionCapabilityStateV1 } from "../extensions/extensionCapabilities";
 import { PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME } from "./researchPublicationTool";
+import { REPORT_PROGRESS_TO_LINEAR_TOOL_NAME } from "./reportProgressToLinearTool";
 import { PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME } from "./researchProjectHierarchyTool";
 import { PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME } from "./githubPublicationTool";
-import { CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME } from "./githubPrivateRepositoryTool";
+import {
+  CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  createLegacyPrivateGitHubRepositoryToolAlias,
+} from "./githubPrivateRepositoryTool";
 import { DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME } from "./githubPrivateRepositoryCleanupTool";
 import { GITHUB_CATALOG_TOOL_OPERATION_MAP } from "./githubCatalogTools";
 
@@ -34,6 +39,7 @@ export interface DefaultToolRegistryOptions {
     gate: LinearCapabilityGate;
     researchPublicationTool?: AgentTool;
     researchProjectHierarchyTool?: AgentTool;
+    reportProgressTool?: AgentTool;
   };
   githubPublicationTool?: AgentTool;
   githubPrivateRepositoryTool?: AgentTool;
@@ -149,11 +155,19 @@ export function getCoreToolNameReservations(): ReadonlyArray<CoreToolNameReserva
         ownerExtensionId: "agentic-researcher-integrations",
       },
       {
+        name: REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
+        ownerExtensionId: "agentic-researcher-integrations",
+      },
+      {
         name: PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
         ownerExtensionId: "agentic-researcher-integrations",
       },
       {
         name: CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+        ownerExtensionId: "agentic-researcher-integrations",
+      },
+      {
+        name: LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
         ownerExtensionId: "agentic-researcher-integrations",
       },
       {
@@ -217,6 +231,14 @@ export function createDefaultToolRegistry(
           options.isOptionalCapabilityAvailable,
         ).filter((tool) => !extensionToolNames.has(tool.name))
       : [];
+  const reportProgressTools =
+    capabilities.integrations && options.linear?.reportProgressTool
+      ? guardCompatibilityTools(
+          [options.linear.reportProgressTool],
+          "integrations",
+          options.isOptionalCapabilityAvailable,
+        ).filter((tool) => !extensionToolNames.has(tool.name))
+      : [];
   const githubPublicationTools =
     capabilities.integrations && options.githubPublicationTool
       ? guardCompatibilityTools(
@@ -228,7 +250,17 @@ export function createDefaultToolRegistry(
   const githubPrivateRepositoryTools =
     capabilities.integrations && options.githubPrivateRepositoryTool
       ? guardCompatibilityTools(
-          [options.githubPrivateRepositoryTool],
+          [
+            options.githubPrivateRepositoryTool,
+            ...(options.githubPrivateRepositoryTool.name ===
+              CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME
+              ? [
+                  createLegacyPrivateGitHubRepositoryToolAlias(
+                    options.githubPrivateRepositoryTool,
+                  ),
+                ]
+              : []),
+          ],
           "integrations",
           options.isOptionalCapabilityAvailable,
         ).filter((tool) => !extensionToolNames.has(tool.name))
@@ -254,6 +286,7 @@ export function createDefaultToolRegistry(
     ...linearTools,
     ...researchPublicationTools,
     ...researchProjectHierarchyTools,
+    ...reportProgressTools,
     ...githubCatalogTools,
     ...githubPrivateRepositoryTools,
     ...githubPrivateRepositoryCleanupTools,

@@ -13,7 +13,11 @@
  * coverage, never in a move.
  */
 
-import { assertCleanLinearHumanOutputV1 } from "../integrations/linear/WorkItemRenderer";
+import {
+  assertCleanLinearHumanOutputV1,
+  assertLinearIssueBodyV1,
+  getLinearIssueTitleProblemV1,
+} from "../integrations/linear/LinearIssueFormatV1";
 import { type ModelToolCall } from "../model/types";
 import { hasExplicitResearchProjectHierarchyIntent } from "../tools/researchProjectHierarchyTool";
 import { hasExplicitResearchPublicationIntent } from "../tools/researchPublicationTool";
@@ -216,11 +220,35 @@ export function hasCodeWorkspaceReadIntent(prompt: string): boolean {
 }
 
 export function hasKnownHostDirectoryExportIntent(prompt: string): boolean {
+  if (hasExplicitNoHostDirectoryExportIntent(prompt)) {
+    return false;
+  }
   // The verb list must cover the ordinary ways a user names a destination.
   // "generate a python snake game on my desktop" planned the whole authoring
   // ladder but no export, so the work never reached the folder they named.
   return /\b(?:put|place|save|write|create|copy|export|deliver|generate|make|build)\b[\s\S]{0,160}\b(?:desktop|documents?(?:\s+folder)?|downloads?(?:\s+folder)?)\b|\b(?:desktop|documents?(?:\s+folder)?|downloads?(?:\s+folder)?)\b[\s\S]{0,160}\b(?:put|place|save|write|create|copy|export|deliver|generate|make|build)\b/iu.test(
     prompt,
+  );
+}
+
+/**
+ * An explicit sandbox-only instruction is a hard negative delivery boundary.
+ * It wins over the ordinary standalone-code fallback that otherwise exports a
+ * completed project to a host directory.
+ */
+export function hasExplicitNoHostDirectoryExportIntent(prompt: string): boolean {
+  const normalized = prompt.replace(/\r\n?/gu, "\n");
+  return (
+    /\b(?:do\s+not|don't|never|without)\b[^.;\n]{0,120}\b(?:export|copy|deliver|write|save|create|put|place)(?:ing)?\b[^.;\n]{0,140}\b(?:outside|beyond|off)\s+(?:of\s+)?(?:the\s+)?(?:sandbox|workspace)\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:keep|leave|retain)\b[^.;\n]{0,100}\b(?:inside|in)\s+(?:the\s+)?(?:sandbox|workspace)\b[^.;\n]{0,40}\b(?:only)?\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:sandbox|workspace)[ -]?only\b/iu.test(normalized) ||
+    /\bno\s+(?:(?:host|desktop|documents?|downloads?|vault[- ]sibling)\s+)?(?:export|delivery|copy)\b/iu.test(
+      normalized,
+    )
   );
 }
 
@@ -368,6 +396,10 @@ export function getExplicitLinearTemplatePathOverride(prompt: string): string | 
   return null;
 }
 
+/**
+ * Safety gate: reject host-internal metadata leaking into provider-visible
+ * fields. This is a hard block, not a formatting nudge.
+ */
 export function getUnsafeModelLinearIssueCreateOutputMessage(
   toolCall: ModelToolCall,
 ): string | null {
@@ -387,6 +419,40 @@ export function getUnsafeModelLinearIssueCreateOutputMessage(
     } catch (error) {
       return getErrorMessage(error);
     }
+  }
+  return null;
+}
+
+/**
+ * Format gate: hold a model-authored issue to the managed template's section
+ * contract. Callers apply this only to ticket-shaped missions — the same signal
+ * that already forces the template read, so reading it and using it are now
+ * enforced together. An ordinary "open an issue for X" stays free-form.
+ *
+ * A returned message names the exact sections at fault so the host's existing
+ * one-shot schema-correction path can hand the model something actionable.
+ */
+export function getModelLinearIssueTemplateStructureProblem(
+  toolCall: ModelToolCall,
+): string | null {
+  if (toolCall.name !== "linear_create_issue") {
+    return null;
+  }
+  const title = toolCall.arguments.title;
+  if (typeof title === "string") {
+    const titleProblem = getLinearIssueTitleProblemV1(title);
+    if (titleProblem) {
+      return titleProblem;
+    }
+  }
+  const description = toolCall.arguments.description;
+  if (typeof description !== "string") {
+    return "Linear issue description is required and must use the managed issue-template sections.";
+  }
+  try {
+    assertLinearIssueBodyV1(description, "Linear issue description");
+  } catch (error) {
+    return getErrorMessage(error);
   }
   return null;
 }
@@ -1207,7 +1273,7 @@ export function hasCurrentWebFactIntent(prompt: string): boolean {
 }
 
 export function hasDeepResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|in[-\s]?depth(?:\s+(?:research|analysis|investigation|report))?|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
+  return /\b(deep\s+research|in[-\s]?depth\s+(?:research|analysis|investigation)|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
     prompt,
   );
 }

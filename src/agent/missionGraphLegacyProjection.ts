@@ -1,6 +1,7 @@
 import {
   flattenMissionPlanTasks,
   CODE_RUN_SUCCESS_EVIDENCE_ID,
+  extractRelevanceTerms,
   FINAL_OUTPUT_RELEVANT_EVIDENCE_ID,
   RECEIPT_PROOF_ID_PREFIX,
   normalizeMissionPlan,
@@ -45,6 +46,7 @@ import {
   type OrchestratorRunStatus,
   type OrchestratorSnapshotV1,
   type OrchestratorWorkNode,
+  type SpecialistMode,
   type WorkNodeKind,
   type WorkNodeStatus,
 } from "../orchestrator/types";
@@ -59,9 +61,22 @@ export function projectMissionGraphToLegacyPlan(
 ): MissionPlan {
   const ordered = topologicallyOrderGraphNodes(graph);
   const projectedCitationMode = resolveProjectedCitationMode(graph.objective);
+  const projectedRelevanceTerms = extractRelevanceTerms(graph.objective);
   let citationContractProjected = false;
   const tasks = ordered.map((node) => {
-    const task = projectGraphNodeToLegacyTask(node);
+    let task = projectGraphNodeToLegacyTask(node);
+    if (
+      projectedRelevanceTerms.length > 0 &&
+      task.completionContract.requiredProof.includes("final_relevance")
+    ) {
+      task = {
+        ...task,
+        completionContract: {
+          ...task.completionContract,
+          relevanceTerms: projectedRelevanceTerms,
+        },
+      };
+    }
     if (
       projectedCitationMode !== undefined &&
       !citationContractProjected &&
@@ -171,6 +186,8 @@ export function projectMissionGraphToOrchestratorSnapshot(
   graph: MissionGraphV3,
 ): OrchestratorSnapshotV1 {
   const ordered = topologicallyOrderGraphNodes(graph);
+  const mode = projectOrchestrationMode(ordered);
+  const specialistMode = projectSpecialistMode(ordered);
   const { required } = partitionGraphNodes(graph);
   const requiredIds = new Set(required.map(({ id }) => id));
   const requiredNodes = ordered.filter((node) => requiredIds.has(node.id));
@@ -192,7 +209,10 @@ export function projectMissionGraphToOrchestratorSnapshot(
         kind: projectOrchestratorNodeKind(node),
         title: node.objective,
         status: projectOrchestratorNodeStatus(node.status),
-        ownerId: "lead",
+        ownerId:
+          mode === "adaptive_team" && nodeOwnedBySpecialist(node)
+            ? "specialist"
+            : "lead",
         dependencyIds: [...node.dependencyIds],
         evidenceIds: node.evidence.map((item) => item.id),
         receiptIds: node.receipts.map((item) => item.id),
@@ -220,6 +240,12 @@ export function projectMissionGraphToOrchestratorSnapshot(
       return [node.id, projected];
     }),
   );
+  const activeLeadNode =
+    activeNode && nodes[activeNode.id]?.ownerId === "lead" ? activeNode : null;
+  const activeSpecialistNode =
+    activeNode && nodes[activeNode.id]?.ownerId === "specialist"
+      ? activeNode
+      : null;
   const status = projectOrchestratorRunStatus(requiredNodes);
   const totalToolCalls = ordered.reduce(
     (total, node) => total + node.budget.toolCalls,
@@ -233,10 +259,25 @@ export function projectMissionGraphToOrchestratorSnapshot(
     (total, node) => total + node.budget.wallClockMs,
     0,
   );
+  const specialistNodes = ordered.filter(
+    (node) => nodes[node.id]?.ownerId === "specialist",
+  );
+  const specialistToolLimit = specialistNodes.reduce(
+    (total, node) => total + node.budget.toolCalls,
+    0,
+  );
+  const specialistWallClockLimit = specialistNodes.reduce(
+    (total, node) => total + node.budget.wallClockMs,
+    0,
+  );
+  const specialistAttempts = specialistNodes.reduce(
+    (total, node) => total + node.retries.attempts,
+    0,
+  );
   const raw: OrchestratorSnapshotV1 = {
     version: ORCHESTRATOR_SNAPSHOT_VERSION,
     runId: graph.missionId,
-    mode: projectOrchestrationMode(ordered),
+    mode,
     status,
     rootNodeIds: ordered
       .filter((node) => node.dependencyIds.length === 0)
@@ -247,25 +288,75 @@ export function projectMissionGraphToOrchestratorSnapshot(
         id: "lead",
         role: "lead",
         displayName: "Lead",
-        status: projectParticipantStatus(status, activeNode),
-        currentNodeId: activeNode?.id ?? null,
+        status: projectParticipantStatus(status, activeLeadNode),
+        currentNodeId: activeLeadNode?.id ?? null,
         budget: {
           modelSteps: {
-            used: Math.min(graph.revision, graph.capabilityEnvelope.budgets.maxTotalToolCalls),
-            limit: graph.capabilityEnvelope.budgets.maxTotalToolCalls,
+            used: Math.min(
+              Math.max(0, usedAttempts - specialistAttempts),
+              Math.max(0, totalToolCalls - specialistToolLimit),
+            ),
+            limit: Math.max(0, totalToolCalls - specialistToolLimit),
           },
           toolCalls: {
-            used: Math.min(usedAttempts, totalToolCalls),
-            limit: totalToolCalls,
+            used: Math.min(
+              Math.max(0, usedAttempts - specialistAttempts),
+              Math.max(0, totalToolCalls - specialistToolLimit),
+            ),
+            limit: Math.max(0, totalToolCalls - specialistToolLimit),
           },
-          wallClockMs: { used: 0, limit: totalWallClockMs },
+          wallClockMs: {
+            used: 0,
+            limit: Math.max(0, totalWallClockMs - specialistWallClockLimit),
+          },
         },
-        ...(activeNode ? { lastAction: describeGraphNodeAction(activeNode) } : {}),
+        ...(activeLeadNode
+          ? { lastAction: describeGraphNodeAction(activeLeadNode) }
+          : {}),
         handoffStatus: "none",
         startedAt: graph.createdAt,
         updatedAt: graph.updatedAt,
-        ...(activeNode?.blocker ? { blocker: activeNode.blocker.message } : {}),
+        ...(activeLeadNode?.blocker
+          ? { blocker: activeLeadNode.blocker.message }
+          : {}),
       },
+      ...(mode === "adaptive_team"
+        ? {
+            specialist: {
+              id: "specialist",
+              role: "specialist" as const,
+              displayName: "Adaptive Specialist",
+              status: projectParticipantStatus(status, activeSpecialistNode),
+              currentNodeId: activeSpecialistNode?.id ?? null,
+              budget: {
+                modelSteps: {
+                  used: Math.min(specialistAttempts, specialistToolLimit),
+                  limit: specialistToolLimit,
+                },
+                toolCalls: {
+                  used: Math.min(specialistAttempts, specialistToolLimit),
+                  limit: specialistToolLimit,
+                },
+                wallClockMs: { used: 0, limit: specialistWallClockLimit },
+              },
+              ...(activeSpecialistNode
+                ? { lastAction: describeGraphNodeAction(activeSpecialistNode) }
+                : {}),
+              handoffStatus: "none" as const,
+              specialistMode,
+              repairState: {
+                schemaVersion: 2 as const,
+                cyclesUsed: 0 as const,
+                status: "idle" as const,
+              },
+              startedAt: graph.createdAt,
+              updatedAt: graph.updatedAt,
+              ...(activeSpecialistNode?.blocker
+                ? { blocker: activeSpecialistNode.blocker.message }
+                : {}),
+            },
+          }
+        : {}),
     },
     worktrees: {},
     handoffs: [],
@@ -865,6 +956,19 @@ function projectOrchestratorRunStatus(
   }
   if (
     nodes.length > 0 &&
+    nodes.every((node) => ["complete", "blocked", "cancelled"].includes(node.status)) &&
+    nodes.some(
+      (node) =>
+        node.status === "blocked" &&
+        /(?:executor_failed|provider_failed|internal_failure)/iu.test(
+          node.blocker?.code ?? "",
+        ),
+    )
+  ) {
+    return "failed";
+  }
+  if (
+    nodes.length > 0 &&
     nodes.every((node) => ["complete", "blocked", "cancelled"].includes(node.status))
   ) {
     return "blocked";
@@ -873,15 +977,59 @@ function projectOrchestratorRunStatus(
 }
 
 function projectOrchestrationMode(nodes: MissionNodeV3[]): OrchestrationMode {
-  if (nodes.some((node) => node.effect === "execution")) return "code_team";
-  return nodes.length > 1 ? "research_team" : "single";
+  return nodes.length > 1 ||
+    nodes.some(
+      (node) =>
+        node.effect === "execution" ||
+        (node.effect === "mutation" &&
+          node.allowedTools.some((tool) => /^code_workspace_/u.test(tool))),
+    )
+    ? "adaptive_team"
+    : "single";
+}
+
+function projectSpecialistMode(nodes: MissionNodeV3[]): SpecialistMode {
+  const contract = nodes
+    .flatMap((node) => [node.objective, ...node.allowedTools])
+    .join(" ");
+  if (/\blinear[_\s-]|initiative|project[_\s-]?update/iu.test(contract)) {
+    return "linear_planner";
+  }
+  if (/github|pull[_\s-]?request|draft[_\s-]?pr/iu.test(contract)) {
+    return "code_reviewer";
+  }
+  if (
+    nodes.some(
+      (node) =>
+        node.effect === "execution" ||
+        node.allowedTools.some((tool) => /^code_workspace_/u.test(tool)),
+    )
+  ) {
+    return "code_builder";
+  }
+  return "researcher";
+}
+
+function nodeOwnedBySpecialist(node: MissionNodeV3): boolean {
+  if (node.effect === "read" || node.effect === "execution") return true;
+  if (node.effect !== "mutation" || node.allowedTools.length === 0) return false;
+  return node.allowedTools.every((toolName) =>
+    /^code_workspace_(?:create_file|patch_file|write_file|move_file|copy_file|trash_file|restore_file|mkdir)$/u.test(
+      toolName,
+    ),
+  );
 }
 
 function projectParticipantStatus(
   status: OrchestratorRunStatus,
   active: MissionNodeV3 | null,
 ): AgentParticipantStatus {
-  if (status === "complete" || status === "blocked" || status === "cancelled") {
+  if (
+    status === "complete" ||
+    status === "blocked" ||
+    status === "cancelled" ||
+    status === "failed"
+  ) {
     return status;
   }
   if (!active) return "planning";

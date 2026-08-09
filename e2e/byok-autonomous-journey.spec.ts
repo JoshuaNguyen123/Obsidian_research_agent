@@ -1141,7 +1141,7 @@ test("BYOK-01 proves research to Linear to tested IDE files to GitHub to reflect
     );
     observations.observe("approvals", "authorization:sandbox_execution");
     expect(authorityEvidence.nestedApprovedTools).toContain(
-      "github_create_private_repository",
+      "github_create_repository",
     );
     observations.observe(
       "approvals",

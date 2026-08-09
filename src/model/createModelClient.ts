@@ -1,4 +1,9 @@
-import type { AgentSettings } from "../settings";
+import type {
+  AgentConnectionMode,
+  AgentModelSlotV2,
+  AgentSettings,
+  AgentSlotId,
+} from "../settings";
 import { OllamaClient } from "./OllamaClient";
 import { OpenAICompatibleClient } from "./OpenAICompatibleClient";
 import type {
@@ -9,6 +14,7 @@ import type {
   StreamingHttpResponse,
 } from "./types";
 import { ModelClientError as ModelClientErrorClass } from "./types";
+import { requireSecureProviderBaseUrlV1 } from "./providerEndpointPolicy";
 
 type NodeHttpModule = typeof import("http");
 
@@ -34,7 +40,23 @@ export interface ModelSlotConfig {
   requestTimeoutMs: number;
 }
 
+export type AgentModelSlotUnavailableReasonV2 =
+  | "disabled"
+  | "missing_model"
+  | "missing_endpoint"
+  | "missing_specialist_credential";
+
+/** Secret-free projection suitable for settings, diagnostics, and tests. */
+export interface AgentModelSlotResolutionV2 {
+  slot: AgentModelSlotV2;
+  available: boolean;
+  credentialSource: "lead" | "specialist";
+  credentialPresent: boolean;
+  unavailableReason: AgentModelSlotUnavailableReasonV2 | null;
+}
+
 export function createModelClientForSlot(slot: ModelSlotConfig): ModelClient {
+  const baseUrl = requireSecureProviderBaseUrlV1(slot.baseUrl);
   const common = {
     model: slot.model,
     transport: requestUrlTransport,
@@ -45,14 +67,14 @@ export function createModelClientForSlot(slot: ModelSlotConfig): ModelClient {
   if (slot.provider === "openai_compatible") {
     return new OpenAICompatibleClient({
       ...common,
-      baseUrl: slot.baseUrl,
+      baseUrl,
       apiKey: slot.apiKey,
     });
   }
 
   return new OllamaClient({
     ...common,
-    baseUrl: slot.baseUrl,
+    baseUrl,
     apiKey: slot.apiKey,
   });
 }
@@ -80,38 +102,145 @@ export function createConfiguredModelClient(settings: AgentSettings): ModelClien
   });
 }
 
-/**
- * The second agent's client, or null when it shares the primary endpoint.
- *
- * Null is the common, correct answer: a utility model on the primary endpoint
- * is already reachable through the primary client, and the existing in-client
- * phase routing handles it.
- *
- * A distinct client requires an explicit `utilityBaseUrl`. Deliberately not
- * "provider differs" alone: the Utility model field historically auto-pinned
- * `utilityModelProvider` to whatever the primary provider was at the time, so
- * a vault whose primary provider later changed can carry a stale value nobody
- * chose. Keying on a base URL the user actually typed means a stale pin stays
- * inert instead of quietly directing traffic — and spend — at a second
- * provider.
- */
+/** Resolve either agent slot without exposing credential material. */
+export function resolveAgentModelSlotV2(
+  settings: AgentSettings,
+  slotId: AgentSlotId,
+): AgentModelSlotResolutionV2 {
+  const resolved = resolveAgentModelSlotWithSecret(settings, slotId);
+  return {
+    slot: resolved.slot,
+    available: resolved.available,
+    credentialSource: resolved.credentialSource,
+    credentialPresent: Boolean(resolved.apiKey),
+    unavailableReason: resolved.unavailableReason,
+  };
+}
+
+export function createAgentModelClient(
+  settings: AgentSettings,
+  slotId: AgentSlotId,
+): ModelClient | null {
+  if (slotId === "lead") return createConfiguredModelClient(settings);
+  return createSpecialistModelClient(settings);
+}
+
+export function createSpecialistModelClient(
+  settings: AgentSettings,
+): ModelClient | null {
+  const resolved = resolveAgentModelSlotWithSecret(settings, "specialist");
+  if (!resolved.available) return null;
+  return createModelClientForSlot({
+    provider: resolved.slot.provider,
+    model: resolved.slot.model,
+    baseUrl: resolved.slot.baseUrl,
+    apiKey: resolved.apiKey,
+    requestTimeoutMs: settings.requestTimeoutMs,
+  });
+}
+
+export function getAgentModelSlotV2(
+  settings: AgentSettings,
+  slotId: AgentSlotId,
+): AgentModelSlotV2 {
+  return resolveAgentModelSlotV2(settings, slotId).slot;
+}
+
+/** @deprecated Use createSpecialistModelClient. */
 export function createUtilitySlotClient(
   settings: AgentSettings,
 ): ModelClient | null {
-  const model = settings.utilityModel?.trim();
-  const baseUrl = settings.utilityBaseUrl?.trim();
-  if (!model || !baseUrl) {
-    return null;
+  return createSpecialistModelClient(settings);
+}
+
+interface AgentModelSlotResolutionWithSecretV2
+  extends AgentModelSlotResolutionV2 {
+  apiKey: string;
+}
+
+function resolveAgentModelSlotWithSecret(
+  settings: AgentSettings,
+  slotId: AgentSlotId,
+): AgentModelSlotResolutionWithSecretV2 {
+  if (slotId === "lead") {
+    const endpoint = endpointForProvider(settings, settings.modelProvider);
+    const model = settings.model.trim();
+    const baseUrl = endpoint.baseUrl.trim();
+    const unavailableReason = !model
+      ? "missing_model"
+      : !baseUrl
+        ? "missing_endpoint"
+        : null;
+    return {
+      slot: {
+        slotId,
+        provider: settings.modelProvider,
+        model,
+        baseUrl,
+        connectionMode: "separate",
+      },
+      available: unavailableReason === null,
+      credentialSource: "lead",
+      credentialPresent: Boolean(endpoint.apiKey.trim()),
+      unavailableReason,
+      apiKey: endpoint.apiKey.trim(),
+    };
   }
-  const provider = settings.utilityModelProvider ?? settings.modelProvider;
-  const inherited = endpointForProvider(settings, provider);
-  return createModelClientForSlot({
-    provider,
-    model,
-    baseUrl,
-    apiKey: settings.utilityApiKey?.trim() || inherited.apiKey,
-    requestTimeoutMs: settings.requestTimeoutMs,
-  });
+
+  const legacySeparateBaseUrl = settings.utilityBaseUrl?.trim() ?? "";
+  const mode: AgentConnectionMode =
+    settings.specialistConnectionMode === "separate" ||
+    settings.specialistConnectionMode === "shared_primary"
+      ? settings.specialistConnectionMode
+      : legacySeparateBaseUrl
+        ? "separate"
+        : "shared_primary";
+  const model =
+    settings.specialistModel?.trim() ||
+    settings.utilityModel?.trim() ||
+    settings.model.trim();
+  const provider =
+    mode === "shared_primary"
+      ? settings.modelProvider
+      : settings.specialistProvider ??
+        settings.utilityModelProvider ??
+        settings.modelProvider;
+  const leadEndpoint = endpointForProvider(settings, provider);
+  const baseUrl =
+    mode === "shared_primary"
+      ? leadEndpoint.baseUrl.trim()
+      : settings.specialistBaseUrl?.trim() || legacySeparateBaseUrl;
+  // The old utility key is accepted only as an explicit migration input. A
+  // selected Lead/provider key is never a fallback in separate mode.
+  const apiKey =
+    mode === "shared_primary"
+      ? leadEndpoint.apiKey.trim()
+      : settings.specialistApiKey?.trim() || settings.utilityApiKey?.trim() || "";
+  const enabled = settings.specialistEnabled !== false;
+  const unavailableReason: AgentModelSlotUnavailableReasonV2 | null = !enabled
+    ? "disabled"
+    : !model
+      ? "missing_model"
+      : !baseUrl
+        ? "missing_endpoint"
+        : mode === "separate" && !apiKey
+          ? "missing_specialist_credential"
+          : null;
+
+  return {
+    slot: {
+      slotId,
+      provider,
+      model,
+      baseUrl,
+      connectionMode: mode,
+    },
+    available: unavailableReason === null,
+    credentialSource: mode === "shared_primary" ? "lead" : "specialist",
+    credentialPresent: Boolean(apiKey),
+    unavailableReason,
+    apiKey,
+  };
 }
 
 export async function requestUrlTransport(

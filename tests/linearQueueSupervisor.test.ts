@@ -36,7 +36,7 @@ import type {
   LinearOperationResult,
 } from "../src/integrations/linear/types";
 import { createWorkItemSpecV1 } from "../src/integrations/linear/WorkItemSpecV1";
-import { renderWorkItemSpecV1 } from "../src/integrations/linear/WorkItemRenderer";
+import { renderContractBoundIssueBodyV1 } from "./fixtures/linearWorkItemBody";
 
 const PROJECT_ID = "project-queue";
 const READY_STATE_ID = "state-todo";
@@ -939,7 +939,7 @@ function makeIssue(index: number, projectId: string, updatedAt: string): LinearI
     identifier: `ENG-${index}`,
     url: `https://linear.app/acme/issue/ENG-${index}`,
     title: `Candidate ${index}`,
-    description: renderWorkItemSpecV1(workItem),
+    description: renderContractBoundIssueBodyV1(workItem),
     priority: 2,
     trashed: false,
     team: { id: "team-1", key: "ENG", name: "Engineering" },

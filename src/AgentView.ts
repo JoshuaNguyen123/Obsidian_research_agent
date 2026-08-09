@@ -1,4 +1,10 @@
-import { ItemView, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import {
+  ItemView,
+  Notice,
+  WorkspaceLeaf,
+  setIcon,
+} from "obsidian";
+import { renderSafeAssistantMarkdownV1 } from "./ui/safeAssistantMarkdown";
 import type AgenticResearcherPlugin from "../main";
 import {
   MAX_AGENT_STEPS,
@@ -129,6 +135,7 @@ import {
   createBrowserFrameScheduler,
   KeyedFrameBatcher,
 } from "./ui/frameBatcher";
+import { LatestRenderGate } from "./ui/latestRenderGate";
 
 export const AGENT_VIEW_TYPE = "agentic-researcher-view";
 
@@ -190,6 +197,7 @@ export class AgentView extends ItemView {
   private resumeBannerEl: HTMLElement | null = null;
   private chatAttentionEl: HTMLElement | null = null;
   private firstRunEl: HTMLElement | null = null;
+  private chatEmptyStateEl: HTMLElement | null = null;
   private liveWorkstreamEl: HTMLElement | null = null;
   private lifecycleStageStripEl: HTMLElement | null = null;
   private chatTeamStripEl: HTMLElement | null = null;
@@ -204,8 +212,20 @@ export class AgentView extends ItemView {
   private stepValueEl: HTMLElement | null = null;
   private activeToolValueEl: HTMLElement | null = null;
   private activityValueEl: HTMLElement | null = null;
+  private effortValueEl: HTMLElement | null = null;
+  private elapsedValueEl: HTMLElement | null = null;
+  private destinationValueEl: HTMLElement | null = null;
   private runStatusEl: HTMLElement | null = null;
   private runStatusTextEl: HTMLElement | null = null;
+  private liveRunPhaseEl: HTMLElement | null = null;
+  private liveRunEffortEl: HTMLElement | null = null;
+  private liveRunElapsedEl: HTMLElement | null = null;
+  private liveRunBudgetEl: HTMLElement | null = null;
+  private liveRunDestinationEl: HTMLElement | null = null;
+  private liveRunStartedAt: number | null = null;
+  private liveRunTimer: number | null = null;
+  private liveRunModelCalls = 0;
+  private liveRunToolCalls = 0;
   private statusStreamEl: HTMLElement | null = null;
   private modelConfigEl: HTMLElement | null = null;
   private missionGraphEl: HTMLElement | null = null;
@@ -216,6 +236,7 @@ export class AgentView extends ItemView {
   private acceptanceEl: HTMLElement | null = null;
   private scorecardEl: HTMLElement | null = null;
   private browserDetailsEl: HTMLElement | null = null;
+  private approvalDetailsEl: HTMLElement | null = null;
   private actionsDetailsEl: HTMLElement | null = null;
   private codeOutputEl: HTMLElement | null = null;
   private milestonesDetailsEl: HTMLElement | null = null;
@@ -234,6 +255,8 @@ export class AgentView extends ItemView {
   private readonly toolTimelineItems = new Map<string, HTMLElement>();
   private toolTimelineOrdinal = 0;
   private readonly chatMessageEls = new Map<string, HTMLElement>();
+  private readonly chatMessageRawContent = new WeakMap<HTMLElement, string>();
+  private readonly assistantRenderGate = new LatestRenderGate<HTMLElement>();
   private readonly traceRowEls = new Map<string, HTMLElement>();
   private readonly approvalCardEls = new Map<string, HTMLElement>();
   private readonly receiptKeys = new Set<string>();
@@ -329,6 +352,7 @@ export class AgentView extends ItemView {
 
   async onClose() {
     this.clearRunningStateSyncTimers();
+    this.stopLiveRunTimer();
     this.textFrameBatcher.cancelAll();
     this.scrollFrameBatcher.cancelAll();
     this.pendingTextDeltas.clear();
@@ -470,18 +494,21 @@ export class AgentView extends ItemView {
     container.empty();
     container.addClass("agentic-researcher-view");
     this.orchestratorSnapshot = this.plugin.getLatestOrchestratorSnapshot();
+    // Every mount begins prompt-first. Run Details is contextual, not a
+    // persistent preference or an alternate home screen.
+    this.activeTab = "chat";
 
-    const headerEl = container.createDiv({ cls: "agentic-researcher-header" });
-    headerEl.createEl("h2", { text: "Agentic Researcher" });
-    headerEl.createEl("p", {
-      text: "Mission console",
-      cls: "agentic-researcher-subtitle",
-    });
-
+    // No in-pane title: getDisplayText() already names the leaf in Obsidian's
+    // own tab header, so an h2 here was the same words a second time.
     this.renderTabs(container);
 
     this.chatPanelEl = container.createDiv({
       cls: "agentic-researcher-tab-panel",
+      attr: {
+        id: "agentic-researcher-chat-panel",
+        role: "tabpanel",
+        "aria-labelledby": "agentic-researcher-chat-tab",
+      },
     });
     if (this.shouldShowOrchestrator()) {
       this.orchestratorPanelEl = container.createDiv({
@@ -494,6 +521,11 @@ export class AgentView extends ItemView {
     }
     this.detailsPanelEl = container.createDiv({
       cls: "agentic-researcher-tab-panel",
+      attr: {
+        id: "agentic-researcher-run-details-panel",
+        role: "tabpanel",
+        "aria-labelledby": "agentic-researcher-run-details-tab",
+      },
     });
 
     this.renderChat(this.chatPanelEl);
@@ -523,6 +555,16 @@ export class AgentView extends ItemView {
     this.chatLoaderEl = null;
     this.chatLoaderTextEl = null;
     this.liveWorkstreamEl = null;
+    this.runStatusEl = null;
+    this.runStatusTextEl = null;
+    this.liveRunPhaseEl = null;
+    this.liveRunEffortEl = null;
+    this.liveRunElapsedEl = null;
+    this.liveRunBudgetEl = null;
+    this.liveRunDestinationEl = null;
+    this.effortValueEl = null;
+    this.elapsedValueEl = null;
+    this.destinationValueEl = null;
     this.liveAssistantMessageEl = null;
     this.livePlanningMessageEl = null;
     this.liveFinalMessageEl = null;
@@ -555,27 +597,30 @@ export class AgentView extends ItemView {
       text: "Chat",
       cls: "agentic-researcher-tab is-active",
       attr: {
+        id: "agentic-researcher-chat-tab",
         type: "button",
         role: "tab",
         "aria-selected": "true",
+        "aria-controls": "agentic-researcher-chat-panel",
       },
     });
     this.tabsEl = tabsEl;
     if (this.shouldShowOrchestrator()) {
-      tabsEl.addClass("has-orchestrator");
-      // The orchestrator is folded into Activity rather than owning a third
+      // The orchestrator is folded into Run Details rather than owning a third
       // tab. Its control still exists — deep links, snapshot updates, and the
       // mount guards all key off it — it simply is not a separate destination.
       this.orchestratorTabButtonEl = document.createElement("button");
       this.orchestratorTabButtonEl.type = "button";
     }
     this.detailsTabButtonEl = tabsEl.createEl("button", {
-      text: "Activity",
+      text: "Run Details",
       cls: "agentic-researcher-tab",
       attr: {
+        id: "agentic-researcher-run-details-tab",
         type: "button",
         role: "tab",
         "aria-selected": "false",
+        "aria-controls": "agentic-researcher-run-details-panel",
       },
     });
 
@@ -586,6 +631,26 @@ export class AgentView extends ItemView {
     this.detailsTabButtonEl.addEventListener("click", () =>
       this.setActiveTab("details"),
     );
+    const visibleTabs = [
+      { button: this.chatTabButtonEl, tab: "chat" as const },
+      { button: this.detailsTabButtonEl, tab: "details" as const },
+    ];
+    for (const [index, entry] of visibleTabs.entries()) {
+      entry.button.addEventListener("keydown", (event) => {
+        let targetIndex: number | null = null;
+        if (event.key === "ArrowRight") targetIndex = (index + 1) % visibleTabs.length;
+        if (event.key === "ArrowLeft") {
+          targetIndex = (index - 1 + visibleTabs.length) % visibleTabs.length;
+        }
+        if (event.key === "Home") targetIndex = 0;
+        if (event.key === "End") targetIndex = visibleTabs.length - 1;
+        if (targetIndex === null) return;
+        event.preventDefault();
+        const target = visibleTabs[targetIndex];
+        this.setActiveTab(target.tab);
+        target.button.focus();
+      });
+    }
   }
 
   private renderFirstRunEmptyState(): void {
@@ -599,10 +664,6 @@ export class AgentView extends ItemView {
     }
     emptyState.show();
     emptyState.removeClass("is-hidden");
-    emptyState.createSpan({
-      text: "FIRST RUN",
-      cls: "agentic-researcher-first-run-kicker",
-    });
     emptyState.createEl("h3", { text: "Connect a model to start" });
     emptyState.createEl("p", {
       text: "Choose your provider and model, then pass the connection test. Successful setup returns here with your prompt and conversation intact.",
@@ -628,16 +689,8 @@ export class AgentView extends ItemView {
     });
     this.renderFirstRunEmptyState();
 
-    this.lifecycleStageStripEl = container.createDiv({
-      cls: "agentic-researcher-lifecycle-strip is-hidden",
-      attr: {
-        "data-testid": "lifecycle-stage-strip",
-        "aria-live": "polite",
-      },
-    });
-    this.lifecycleStageStripEl.hide();
-
-    // Primary Chat surface: message thread + terminal-style mission prompt.
+    // Primary Chat surface: conversation first. Lifecycle, team, tool, and raw
+    // status streams belong in Run Details rather than competing with it here.
     this.logEl = container.createDiv({
       cls: "agentic-researcher-log",
       attr: {
@@ -647,15 +700,57 @@ export class AgentView extends ItemView {
     });
     this.renderConversationLog();
 
-    this.chatTeamStripEl = container.createDiv({
-      cls: "agentic-researcher-chat-team is-hidden",
+    this.runStatusEl = container.createDiv({
+      cls: "agentic-researcher-live-run-card is-hidden",
       attr: {
-        "data-testid": "chat-team-strip",
+        "data-testid": "live-run-card",
         "aria-live": "polite",
       },
     });
-    this.chatTeamStripEl.hide();
-    this.renderChatTeamStrip();
+    this.runStatusEl.hidden = true;
+    const liveRunHeaderEl = this.runStatusEl.createDiv({
+      cls: "agentic-researcher-live-run-header",
+    });
+    liveRunHeaderEl.createSpan({ cls: "agentic-researcher-spinner" });
+    this.runStatusTextEl = liveRunHeaderEl.createSpan({
+      text: "Preparing mission",
+      cls: "agentic-researcher-run-status-text",
+    });
+    const liveRunMetricsEl = this.runStatusEl.createDiv({
+      cls: "agentic-researcher-live-run-metrics",
+    });
+    this.liveRunPhaseEl = this.createLiveRunMetric(liveRunMetricsEl, "Phase", "Queued");
+    this.liveRunEffortEl = this.createLiveRunMetric(liveRunMetricsEl, "Effort", "Selecting");
+    this.liveRunElapsedEl = this.createLiveRunMetric(liveRunMetricsEl, "Elapsed", "0:00");
+    this.liveRunBudgetEl = this.createLiveRunMetric(liveRunMetricsEl, "Budget", "Pending");
+    this.liveRunDestinationEl = this.createLiveRunMetric(
+      liveRunMetricsEl,
+      "Destination",
+      "Resolving",
+    );
+    const liveRunActionsEl = this.runStatusEl.createDiv({
+      cls: "agentic-researcher-live-run-actions",
+    });
+    const stopButtonEl = liveRunActionsEl.createEl("button", {
+      text: "Stop",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button", "data-testid": "live-run-stop" },
+    });
+    stopButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.requestStop();
+    });
+    const detailsButtonEl = liveRunActionsEl.createEl("button", {
+      text: "Open Run Details",
+      cls: "agentic-researcher-secondary-action",
+      attr: { type: "button", "data-testid": "live-run-details" },
+    });
+    detailsButtonEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.openRunDetails();
+    });
 
     this.chatAttentionEl = container.createDiv({
       cls: "agentic-researcher-chat-attention is-hidden",
@@ -674,37 +769,24 @@ export class AgentView extends ItemView {
     const formEl = container.createEl("form", {
       cls: "agentic-researcher-form agentic-researcher-composer",
       attr: {
-        "aria-label": "Agent terminal prompt",
+        "aria-label": "Mission prompt",
         "data-testid": "terminal-prompt",
       },
     });
 
-    const promptHeaderEl = formEl.createDiv({
-      cls: "agentic-researcher-prompt-header",
-    });
-    promptHeaderEl.createSpan({
-      text: "MISSION PROMPT",
-      cls: "agentic-researcher-prompt-title",
-    });
-    promptHeaderEl.createSpan({
-      text: "ENTER: RUN · SHIFT+ENTER: NEW LINE",
-      cls: "agentic-researcher-prompt-shortcut",
-    });
-
+    // The composer carries its own instructions in the placeholder rather than
+    // in a header row plus a shortcut hint plus a shell prefix — three pieces of
+    // chrome around one textarea.
     const promptShellEl = formEl.createDiv({
       cls: "agentic-researcher-prompt-shell",
       attr: { "data-testid": "terminal-prompt-shell" },
-    });
-    promptShellEl.createSpan({
-      text: "agent@vault:~$",
-      cls: "agentic-researcher-prompt-prefix",
-      attr: { "aria-hidden": "true" },
     });
 
     this.promptEl = promptShellEl.createEl("textarea", {
       cls: "agentic-researcher-prompt",
       attr: {
-        placeholder: "Type a mission, question, or command…",
+        placeholder:
+          "Message the agent — Enter to run, Shift+Enter for a new line",
         rows: "3",
         "aria-label": "Message the agent",
         tabindex: "0",
@@ -737,7 +819,7 @@ export class AgentView extends ItemView {
     });
     this.steeringEl.hidden = true;
     this.steeringEl.createDiv({
-      text: "STEER CURRENT RUN",
+      text: "Steer current run",
       cls: "agentic-researcher-steering-title",
     });
     const steeringFieldsEl = this.steeringEl.createDiv({
@@ -812,7 +894,14 @@ export class AgentView extends ItemView {
     });
     this.continueButtonEl.hidden = true;
 
-    const chatOnlyLabelEl = actionsEl.createEl("label", {
+    const secondaryOptionsEl = actionsEl.createEl("details", {
+      cls: "agentic-researcher-composer-options",
+    });
+    secondaryOptionsEl.createEl("summary", { text: "Options" });
+    const secondaryControlsEl = secondaryOptionsEl.createDiv({
+      cls: "agentic-researcher-composer-secondary",
+    });
+    const chatOnlyLabelEl = secondaryControlsEl.createEl("label", {
       cls: "agentic-researcher-chat-only-toggle",
       attr: {
         title: "Keep this run in chat without writing to the active note.",
@@ -830,24 +919,13 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-chat-only-label",
     });
 
-    this.clearButtonEl = actionsEl.createEl("button", {
+    this.clearButtonEl = secondaryControlsEl.createEl("button", {
       text: "Clear chat",
       cls: "agentic-researcher-clear",
       attr: {
         type: "button",
       },
     });
-
-    this.runStatusEl = actionsEl.createDiv({
-      cls: "agentic-researcher-run-status",
-      attr: { "aria-live": "polite" },
-    });
-    this.runStatusEl.createSpan({ cls: "agentic-researcher-spinner" });
-    this.runStatusTextEl = this.runStatusEl.createSpan({
-      text: "Idle",
-      cls: "agentic-researcher-run-status-text",
-    });
-    this.runStatusEl.hidden = true;
 
     formEl.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -964,28 +1042,58 @@ export class AgentView extends ItemView {
     }
 
     this.logEl.empty();
+    this.chatEmptyStateEl = null;
     this.chatLoaderEl = null;
     this.chatLoaderTextEl = null;
-    this.createLogItem(
-      "system",
-      "Agent ready. Persistent chat memory is on.",
-    );
-
-    for (const message of this.plugin.conversationHistory) {
-      this.createLogItem(message.role, message.content);
+    if (this.plugin.conversationHistory.length === 0) {
+      this.renderChatEmptyState();
+    } else {
+      for (const message of this.plugin.conversationHistory) {
+        this.createLogItem(message.role, message.content);
+      }
     }
 
-    // Keep live tool/progress activity in the transcript, immediately after
-    // the latest message, instead of occupying a separate strip above the
-    // composer.
-    this.liveWorkstreamEl = this.logEl.createDiv({
-      cls: "agentic-researcher-live-workstream is-hidden",
-      attr: {
-        "data-testid": "live-workstream",
-        "aria-live": "polite",
-      },
+    // Active work is summarized by the one live-run card outside conversation.
+    // Full tool and status streams remain available in Run Details.
+    this.liveWorkstreamEl = null;
+  }
+
+  private renderChatEmptyState(): void {
+    if (!this.logEl) return;
+    const emptyState = this.logEl.createDiv({
+      cls: "agentic-researcher-chat-empty",
+      attr: { "data-testid": "chat-empty-state" },
     });
-    this.liveWorkstreamEl.hide();
+    this.chatEmptyStateEl = emptyState;
+    emptyState.createEl("h3", { text: "What should we work on?" });
+    emptyState.createEl("p", {
+      text: "Start with an outcome. The agent will read relevant context, use approved tools, and return the result with receipts.",
+    });
+    const suggestions = emptyState.createDiv({
+      cls: "agentic-researcher-chat-suggestions",
+      attr: { "aria-label": "Example missions" },
+    });
+    for (const prompt of [
+      "Research this note and append a cited recommendation.",
+      "Turn the acceptance criteria in this note into a tested tool.",
+      "Summarize the active note and suggest related vault links.",
+    ]) {
+      const button = suggestions.createEl("button", {
+        text: prompt,
+        cls: "agentic-researcher-chat-suggestion",
+        attr: { type: "button" },
+      });
+      button.addEventListener("click", () => {
+        if (!this.promptEl) return;
+        this.promptEl.value = prompt;
+        this.focusPrompt({ moveCaretToEnd: true });
+      });
+    }
+  }
+
+  private dismissChatEmptyState(): void {
+    this.chatEmptyStateEl?.remove();
+    this.chatEmptyStateEl = null;
   }
 
   private async renderStartupResumeBanner() {
@@ -1164,49 +1272,55 @@ export class AgentView extends ItemView {
       formatStepMetric(0, this.runConfig?.maxStepsForRun ?? MAX_AGENT_STEPS),
     );
     this.activeToolValueEl = this.createMetric(metricsEl, "Active tool", "None");
-    this.activityValueEl = this.createMetric(metricsEl, "Activity", "Idle");
+    this.activityValueEl = this.createMetric(metricsEl, "State", "Idle");
+    this.effortValueEl = this.createMetric(metricsEl, "Effort", "Not selected");
+    this.elapsedValueEl = this.createMetric(metricsEl, "Elapsed", "0:00");
+    this.destinationValueEl = this.createMetric(metricsEl, "Destination", "None");
+    if (this.steeringEl) {
+      dashboardEl.appendChild(this.steeringEl);
+    }
 
     // Primary surface: what the mission produced and what proves it. Process
     // detail lives behind one Diagnostics expander below so the default view
     // stays quiet.
-    this.statusStreamEl = this.createDashboardSection(
-      dashboardEl,
-      "Status",
-      "status",
-    );
     this.finalStreamEl = this.createDashboardSection(
       dashboardEl,
-      "Final answer",
+      "Result",
       "final-answer",
+    );
+    this.toolTimelineEl = this.createDashboardSection(
+      dashboardEl,
+      "Plan and steps",
+      "tool-timeline",
+      { collapseUntilPopulated: true },
     );
     this.receiptsEl = this.createDashboardSection(
       dashboardEl,
-      "Receipts",
+      "Result and receipts",
       "receipts",
+      { collapseUntilPopulated: true },
     );
     this.acceptanceEl = this.createDashboardSection(
       dashboardEl,
-      "Mission acceptance",
+      "Acceptance and next action",
       "acceptance",
-    );
-    // Primary, not Diagnostics: the scorecard existed for a year as one line
-    // inside the collapsed Run log, which is indistinguishable from not
-    // existing. Acceptance is the gate; this is the gradient beside it.
-    this.scorecardEl = this.createDashboardSection(
-      dashboardEl,
-      "Mission score",
-      "scorecard",
     );
     this.evidenceDetailsEl = this.createDashboardSection(
       dashboardEl,
-      "Evidence",
+      "Sources and evidence",
       "evidence",
       { collapseUntilPopulated: true },
     );
     this.previewEl = this.createDashboardSection(
       dashboardEl,
-      "Preview",
+      "Output preview",
       "preview",
+      { collapseUntilPopulated: true },
+    );
+    this.approvalDetailsEl = this.createDashboardSection(
+      dashboardEl,
+      "Approval required",
+      "approval",
       { collapseUntilPopulated: true },
     );
 
@@ -1217,8 +1331,7 @@ export class AgentView extends ItemView {
       cls: "agentic-researcher-dashboard-diagnostics",
     });
     this.diagnosticsDetailsEl = diagnosticsEl;
-    diagnosticsEl.open =
-      this.plugin.settings.runDetailsDiagnosticsExpanded === true;
+    diagnosticsEl.open = false;
     const summaryEl = diagnosticsEl.createEl("summary", {
       cls: "agentic-researcher-dashboard-diagnostics-summary",
     });
@@ -1229,17 +1342,15 @@ export class AgentView extends ItemView {
     this.diagnosticsBadgeEl = summaryEl.createSpan({
       cls: "agentic-researcher-dashboard-diagnostics-badge",
     });
-    diagnosticsEl.addEventListener("toggle", () => {
-      if (
-        this.plugin.settings.runDetailsDiagnosticsExpanded !== diagnosticsEl.open
-      ) {
-        this.plugin.settings.runDetailsDiagnosticsExpanded = diagnosticsEl.open;
-        void this.plugin.saveSettings();
-      }
-    });
     const diagnosticsBodyEl = diagnosticsEl.createDiv({
       cls: "agentic-researcher-dashboard-diagnostics-body",
     });
+
+    this.statusStreamEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Status timeline",
+      "status",
+    );
 
     this.modelConfigEl = this.createDashboardSection(
       diagnosticsBodyEl,
@@ -1250,6 +1361,12 @@ export class AgentView extends ItemView {
       diagnosticsBodyEl,
       "Mission",
       "mission-graph",
+    );
+    this.scorecardEl = this.createDashboardSection(
+      diagnosticsBodyEl,
+      "Scorecard dimensions",
+      "scorecard",
+      { collapseUntilPopulated: true },
     );
 
     const streamsEl = diagnosticsBodyEl.createDiv({
@@ -1267,11 +1384,6 @@ export class AgentView extends ItemView {
       "planning",
     );
 
-    this.toolTimelineEl = this.createDashboardSection(
-      diagnosticsBodyEl,
-      "Tool timeline",
-      "tool-timeline",
-    );
     this.browserDetailsEl = this.createDashboardSection(
       diagnosticsBodyEl,
       "Browser",
@@ -1334,7 +1446,71 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
     this.setSectionPlaceholder(this.verificationEl, "No verification yet.");
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
+    this.setSectionPlaceholder(this.approvalDetailsEl, "No approval required.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
+  }
+
+  /** Opens the single details surface; diagnostics stay opt-in unless requested. */
+  openRunDetails(openDiagnostics = false): void {
+    this.setActiveTab("details");
+    if (openDiagnostics && this.diagnosticsDetailsEl) {
+      this.diagnosticsDetailsEl.open = true;
+      this.diagnosticsDetailsEl.scrollIntoView({ block: "start" });
+    }
+  }
+
+  private createLiveRunMetric(
+    container: HTMLElement,
+    label: string,
+    value: string,
+  ): HTMLElement {
+    const metricEl = container.createDiv({ cls: "agentic-researcher-live-run-metric" });
+    metricEl.createSpan({
+      text: label,
+      cls: "agentic-researcher-live-run-metric-label",
+    });
+    return metricEl.createSpan({
+      text: value,
+      cls: "agentic-researcher-live-run-metric-value",
+    });
+  }
+
+  private startLiveRunTimer(): void {
+    this.stopLiveRunTimer();
+    this.liveRunStartedAt = Date.now();
+    const refresh = () => {
+      if (this.liveRunStartedAt === null || !this.liveRunElapsedEl) return;
+      const totalSeconds = Math.max(
+        0,
+        Math.floor((Date.now() - this.liveRunStartedAt) / 1_000),
+      );
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = String(totalSeconds % 60).padStart(2, "0");
+      const elapsed = `${minutes}:${seconds}`;
+      this.liveRunElapsedEl.setText(elapsed);
+      this.setMetric(this.elapsedValueEl, elapsed);
+    };
+    refresh();
+    this.liveRunTimer = window.setInterval(refresh, 1_000);
+  }
+
+  private stopLiveRunTimer(): void {
+    if (this.liveRunTimer !== null) {
+      window.clearInterval(this.liveRunTimer);
+      this.liveRunTimer = null;
+    }
+  }
+
+  private refreshLiveRunBudget(): void {
+    if (!this.liveRunBudgetEl) return;
+    const effort = this.runConfig?.effortDecision;
+    if (!effort) {
+      this.liveRunBudgetEl.setText("Pending");
+      return;
+    }
+    this.liveRunBudgetEl.setText(
+      `${this.liveRunModelCalls}/${effort.maxModelCalls} model · ${this.liveRunToolCalls}/${effort.maxToolCalls} tools`,
+    );
   }
 
   private createMetric(
@@ -1406,8 +1582,17 @@ export class AgentView extends ItemView {
    */
   private updateDiagnosticsBadge() {
     if (!this.diagnosticsDetailsEl || !this.diagnosticsBadgeEl) return;
+    // Sections holding nothing but their placeholder are hidden by CSS, which
+    // leaves the `hidden` attribute untouched — so the count has to exclude
+    // them the same way styles.css does or the badge reports every section as
+    // active before a mission has produced anything.
+    // Mirrors the visibility rule in styles.css exactly, including the
+    // data-ever-populated exemption, so the count matches what is on screen.
     const active = this.diagnosticsDetailsEl.querySelectorAll(
-      ".agentic-researcher-dashboard-section:not([hidden])",
+      ".agentic-researcher-dashboard-section:not([hidden])" +
+        ":is([data-ever-populated]," +
+        ":not(:has(> .agentic-researcher-dashboard-body > .agentic-researcher-placeholder:only-child))" +
+        ":not(:has(> .agentic-researcher-dashboard-body:empty)))",
     ).length;
     this.diagnosticsBadgeEl.setText(`· ${active} active`);
   }
@@ -1848,6 +2033,13 @@ export class AgentView extends ItemView {
     this.teamPhase = "idle";
     this.teamHandoffReady = undefined;
     this.runConfig = null;
+    this.liveRunModelCalls = 0;
+    this.liveRunToolCalls = 0;
+    this.liveRunEffortEl?.setText("Selecting");
+    this.liveRunBudgetEl?.setText("Pending");
+    this.liveRunDestinationEl?.setText("Resolving");
+    this.setMetric(this.effortValueEl, "Not selected");
+    this.setMetric(this.destinationValueEl, "None");
     this.resetSteeringComposer();
     this.missionGraphProjection = null;
     this.usageTotals = this.createEmptyUsageTotals();
@@ -1882,6 +2074,7 @@ export class AgentView extends ItemView {
     this.setSectionPlaceholder(this.evidenceDetailsEl, "No evidence yet.");
     this.setSectionPlaceholder(this.verificationEl, "No verification yet.");
     this.setSectionPlaceholder(this.previewEl, "No preview yet.");
+    this.setSectionPlaceholder(this.approvalDetailsEl, "No approval required.");
     this.setSectionPlaceholder(this.runLogEl, "No trace yet.");
     if (this.liveWorkstreamEl) {
       this.liveWorkstreamEl.empty();
@@ -1923,8 +2116,10 @@ export class AgentView extends ItemView {
   }
 
   private updatePhase(phase: AgentRunPhase, message: string) {
-    this.setMetric(this.phaseValueEl, message || this.formatPhase(phase));
+    const phaseLabel = message || this.formatPhase(phase);
+    this.setMetric(this.phaseValueEl, phaseLabel);
     this.setMetric(this.activityValueEl, message || this.formatPhase(phase));
+    this.liveRunPhaseEl?.setText(phaseLabel);
 
     if (phase === "planning" && !this.livePlanningMessageEl) {
       this.setSectionPlaceholder(
@@ -2432,12 +2627,12 @@ export class AgentView extends ItemView {
   }
 
   private renderApprovalRequest(request: ApprovalRequest) {
-    if (!this.actionsDetailsEl) {
+    if (!this.approvalDetailsEl) {
       return;
     }
 
-    this.revealDashboardSection(this.actionsDetailsEl);
-    this.clearPlaceholder(this.actionsDetailsEl);
+    this.revealDashboardSection(this.approvalDetailsEl);
+    this.clearPlaceholder(this.approvalDetailsEl);
     this.setRunDetailsNeedsAttention(true);
     this.renderChatApprovalAttention(request);
     // Every user-visible string comes from the pure model so the card's
@@ -2445,7 +2640,7 @@ export class AgentView extends ItemView {
     // byte-identical to the model's output — do not compose strings inline
     // here again.
     const model = formatApprovalCardModelV1(request);
-    const cardEl = this.actionsDetailsEl.createDiv({
+    const cardEl = this.approvalDetailsEl.createDiv({
       cls: "agentic-researcher-approval-card",
       attr: { "data-approval-id": request.id },
     });
@@ -2934,6 +3129,12 @@ export class AgentView extends ItemView {
   }
 
   private appendMetric(event: AgentRunMetricEvent) {
+    if (event.kind === "model_chat" || event.kind === "model_stream") {
+      this.liveRunModelCalls += 1;
+    } else if (event.kind === "tool") {
+      this.liveRunToolCalls += 1;
+    }
+    this.refreshLiveRunBudget();
     this.updateUsageTotals(event);
     this.renderModelConfig();
     this.appendStatus(formatAgentMetric(event), "metric");
@@ -2941,6 +3142,22 @@ export class AgentView extends ItemView {
 
   private handleRunConfig(event: AgentRunConfigEvent) {
     this.runConfig = event;
+    const effort = event.effortDecision;
+    const effortLabel = effort
+      ? `${formatEffortProfile(effort.profile)} · ${event.route.replace(/_/gu, " ")} · ${effort.outputDepth.replace(/_/gu, " ")}`
+      : event.route.replace(/_/gu, " ");
+    const destination = event.noteOutputPlan
+      ? event.noteOutputPlan.destination === "chat"
+        ? "Chat"
+        : event.noteOutputPlan.title
+      : event.chatOnlyOverride
+        ? "Chat"
+        : "Resolved by run";
+    this.liveRunEffortEl?.setText(effortLabel);
+    this.liveRunDestinationEl?.setText(destination);
+    this.setMetric(this.effortValueEl, effortLabel);
+    this.setMetric(this.destinationValueEl, destination);
+    this.refreshLiveRunBudget();
     if (this.plugin.isMissionRunning() && !this.isRunning) {
       this.setRunning(true, "SYS> reattached to active mission");
     }
@@ -3446,8 +3663,7 @@ export class AgentView extends ItemView {
     }
 
     this.scorecardEl.empty();
-    // Reuses the acceptance-row grid and status tints wholesale: no new CSS,
-    // which also sidesteps the style-token checker's hardcoded line regions.
+    // Reuses the acceptance-row grid and status tints wholesale: no new CSS.
     const totalEl = this.scorecardEl.createDiv({
       cls: `agentic-researcher-acceptance-row${
         scorecard.acceptancePassed ? "" : " agentic-researcher-acceptance-needs_more_work"
@@ -3531,6 +3747,7 @@ export class AgentView extends ItemView {
       return null;
     }
 
+    if (kind !== "system") this.dismissChatEmptyState();
     const chatId = this.nextChatMessageId();
     const itemEl = this.logEl.createDiv({
       cls: `agentic-researcher-log-item agentic-researcher-log-${kind}`,
@@ -3550,11 +3767,15 @@ export class AgentView extends ItemView {
       text: message,
       cls: "agentic-researcher-log-message",
     });
+    this.chatMessageRawContent.set(messageEl, message);
     this.createCopyButton(
       headerEl,
-      () => messageEl.textContent ?? "",
+      () => this.chatMessageRawContent.get(messageEl) ?? messageEl.textContent ?? "",
       `Copy ${this.getLogLabel(kind)} message`,
     );
+    if (kind === "assistant" && message.trim()) {
+      void this.renderCompletedAssistantMarkdown(messageEl, message);
+    }
 
     this.moveChatActivityToEnd();
     while (this.chatMessageEls.size > MAX_CHAT_ROWS) {
@@ -3588,6 +3809,14 @@ export class AgentView extends ItemView {
     }
 
     this.pendingAssistantContent = `${this.pendingAssistantContent}${delta}`;
+    if (this.liveAssistantMessageEl) {
+      this.assistantRenderGate.invalidate(this.liveAssistantMessageEl);
+      this.chatMessageRawContent.set(
+        this.liveAssistantMessageEl,
+        this.pendingAssistantContent,
+      );
+      this.liveAssistantMessageEl.removeClass("is-rendered");
+    }
     this.appendText(this.liveAssistantMessageEl, delta);
 
     if (this.logEl) {
@@ -3606,6 +3835,11 @@ export class AgentView extends ItemView {
       ) as HTMLElement | null;
     }
 
+    if (this.liveAssistantMessageEl) {
+      this.assistantRenderGate.invalidate(this.liveAssistantMessageEl);
+      this.chatMessageRawContent.set(this.liveAssistantMessageEl, content);
+      this.liveAssistantMessageEl.removeClass("is-rendered");
+    }
     this.replaceText(this.liveAssistantMessageEl, content);
 
     if (this.logEl) {
@@ -3614,11 +3848,38 @@ export class AgentView extends ItemView {
   }
 
   private finishLiveAssistantMessage() {
-    this.flushText(this.liveAssistantMessageEl);
-    this.liveAssistantMessageEl
+    const messageEl = this.liveAssistantMessageEl;
+    this.flushText(messageEl);
+    messageEl
       ?.closest(".agentic-researcher-log-item")
       ?.removeClass("is-streaming");
     this.liveAssistantMessageEl = null;
+    if (messageEl && this.pendingAssistantContent.trim()) {
+      void this.renderCompletedAssistantMarkdown(
+        messageEl,
+        this.pendingAssistantContent,
+      );
+    }
+  }
+
+  private async renderCompletedAssistantMarkdown(
+    messageEl: HTMLElement,
+    markdown: string,
+  ): Promise<void> {
+    const raw = markdown.trimEnd();
+    if (!raw) return;
+    const revision = this.assistantRenderGate.begin(messageEl);
+    const rendered = document.createElement("div");
+    rendered.addClass("agentic-researcher-markdown");
+    renderSafeAssistantMarkdownV1(raw, rendered);
+    if (
+      !this.assistantRenderGate.isCurrent(messageEl, revision) ||
+      this.chatMessageRawContent.get(messageEl) !== markdown
+    ) {
+      return;
+    }
+    messageEl.replaceChildren(...Array.from(rendered.childNodes));
+    messageEl.addClass("is-rendered");
   }
 
   private startLiveThinkingMessage() {
@@ -3691,11 +3952,20 @@ export class AgentView extends ItemView {
 
     if (this.runStatusEl) {
       this.runStatusEl.classList.toggle("is-running", isRunning);
+      this.runStatusEl.classList.toggle("is-hidden", !isRunning);
       this.runStatusEl.hidden = !isRunning;
     }
 
     if (this.runStatusTextEl) {
-      this.runStatusTextEl.setText(isRunning ? "Running mission..." : "Idle");
+      this.runStatusTextEl.setText(
+        isRunning ? this.compactLoaderMessage(loaderMessage ?? "Running mission") : "Idle",
+      );
+    }
+
+    if (isRunning) {
+      this.startLiveRunTimer();
+    } else {
+      this.stopLiveRunTimer();
     }
 
     this.setChatLoaderActive(isRunning, loaderMessage);
@@ -3767,25 +4037,12 @@ export class AgentView extends ItemView {
   }
 
   private setChatLoaderActive(isActive: boolean, loaderMessage?: string) {
-    const loaderEl = this.ensureChatLoader();
-    if (!loaderEl) {
-      return;
-    }
-
-    loaderEl.classList.toggle("is-active", isActive);
-    loaderEl.setAttribute("aria-hidden", String(!isActive));
-    if (this.chatLoaderTextEl) {
-      if (isActive) {
-        const message =
-          loaderMessage?.trim() ||
-          this.chatLoaderTextEl.textContent?.trim() ||
-          "loading...";
-        this.chatLoaderTextEl.setText(this.compactLoaderMessage(message));
-      } else {
-        this.chatLoaderTextEl.setText("");
-      }
-    }
-    this.moveChatActivityToEnd();
+    if (!this.runStatusTextEl) return;
+    this.runStatusTextEl.setText(
+      isActive
+        ? this.compactLoaderMessage(loaderMessage?.trim() || "Running mission")
+        : "Idle",
+    );
   }
 
   private updateChatLoader(message: string) {
@@ -3793,15 +4050,7 @@ export class AgentView extends ItemView {
       return;
     }
 
-    const loaderEl = this.ensureChatLoader();
-    if (!loaderEl || !this.chatLoaderTextEl) {
-      return;
-    }
-
-    this.chatLoaderTextEl.setText(this.compactLoaderMessage(message));
-    loaderEl.classList.add("is-active");
-    loaderEl.setAttribute("aria-hidden", "false");
-    this.moveChatActivityToEnd();
+    this.runStatusTextEl?.setText(this.compactLoaderMessage(message));
   }
 
   private moveChatActivityToEnd() {
@@ -3825,31 +4074,20 @@ export class AgentView extends ItemView {
     const connectionReady = this.plugin.hasVerifiedModelConnection();
     const idleBlocked = !this.isRunning && !connectionReady;
     this.runButtonEl.disabled =
-      (this.isRunning && this.stopRequested) || idleBlocked;
-    this.runButtonEl.classList.toggle(
-      "is-stop",
-      this.isRunning && !this.stopRequested,
-    );
-    this.runButtonEl.classList.toggle(
-      "is-stopping",
-      this.isRunning && this.stopRequested,
-    );
+      this.isRunning || idleBlocked;
+    this.runButtonEl.classList.remove("is-stop", "is-stopping");
     this.runButtonEl.classList.toggle("is-connection-blocked", idleBlocked);
     this.runButtonEl.setAttribute(
       "aria-label",
       this.isRunning
-        ? this.stopRequested
-          ? "Stopping mission"
-          : "Stop mission"
+        ? "Mission is running; use Stop in the live-run card"
         : idleBlocked
           ? "Connect and test a model before Run Mission"
           : "Run Mission",
     );
     this.runButtonEl.setText(
       this.isRunning
-        ? this.stopRequested
-          ? "Stopping..."
-          : "Stop Mission"
+        ? "Run Mission"
         : idleBlocked
           ? "Connect model"
           : "Run Mission",
@@ -3867,7 +4105,12 @@ export class AgentView extends ItemView {
     ) {
       return;
     }
-    this.tabsEl.addClass("has-orchestrator");
+    // Detached, exactly as renderTabs() builds it. The orchestrator is folded
+    // into Run Details — setActiveTab("orchestrator") resolves to "details" and
+    // unhides both panels — so appending a visible button here produced a
+    // second tab that showed the same surface as Run Details and lit up alongside
+    // it. The control still exists because deep links, snapshot updates, and
+    // the mount guards all key off it; it just is not a separate destination.
     const button = document.createElement("button");
     button.type = "button";
     button.className = "agentic-researcher-tab";
@@ -3875,7 +4118,6 @@ export class AgentView extends ItemView {
     button.setAttribute("role", "tab");
     button.setAttribute("aria-selected", "false");
     button.addEventListener("click", () => this.setActiveTab("orchestrator"));
-    this.tabsEl.insertBefore(button, this.detailsTabButtonEl);
     this.orchestratorTabButtonEl = button;
 
     const panel = document.createElement("div");
@@ -3903,7 +4145,6 @@ export class AgentView extends ItemView {
     this.clearOrchestratorRunDetailReferences();
     this.orchestratorPanelEl?.remove();
     this.orchestratorTabButtonEl?.remove();
-    this.tabsEl?.removeClass("has-orchestrator");
     this.orchestratorTab = null;
     this.orchestratorPanelEl = null;
     this.orchestratorTabButtonEl = null;
@@ -3911,8 +4152,7 @@ export class AgentView extends ItemView {
 
   private setActiveTab(tab: AgentViewTab) {
     // Orchestrator and Run Details are one surface now: what the run is doing,
-    // in one place. Existing callers (deep links, "Open Activity") keep
-    // working by resolving to Activity.
+    // in one place. Existing callers keep working by resolving to Run Details.
     if (tab === "orchestrator") {
       tab = this.orchestratorTabButtonEl ? "details" : "chat";
     }
@@ -3923,6 +4163,7 @@ export class AgentView extends ItemView {
 
     this.chatTabButtonEl?.classList.toggle("is-active", isChat);
     this.chatTabButtonEl?.setAttribute("aria-selected", String(isChat));
+    if (this.chatTabButtonEl) this.chatTabButtonEl.tabIndex = isChat ? 0 : -1;
     this.orchestratorTabButtonEl?.classList.toggle("is-active", isOrchestrator);
     this.orchestratorTabButtonEl?.setAttribute(
       "aria-selected",
@@ -3930,6 +4171,9 @@ export class AgentView extends ItemView {
     );
     this.detailsTabButtonEl?.classList.toggle("is-active", isDetails);
     this.detailsTabButtonEl?.setAttribute("aria-selected", String(isDetails));
+    if (this.detailsTabButtonEl) {
+      this.detailsTabButtonEl.tabIndex = isDetails ? 0 : -1;
+    }
 
     if (this.chatPanelEl) {
       this.chatPanelEl.hidden = !isChat;
@@ -4198,6 +4442,22 @@ export class AgentView extends ItemView {
   private setSectionPlaceholder(element: HTMLElement | null, text: string) {
     if (!element) {
       return;
+    }
+
+    // A section that has held real data keeps its place for the rest of this
+    // mount, even while it is reset to a placeholder between runs. Empty
+    // sections are hidden so a fresh pane is not 19 rows of "No X yet.", but
+    // hiding one the user has been reading collapses the panel under them and
+    // loses their scroll position — the reason Run Details felt like it reset
+    // on every run. This is the single place where content becomes placeholder,
+    // so it is the only place that has to notice.
+    const hadContent =
+      element.childElementCount > 0 &&
+      !element.querySelector(":scope > .agentic-researcher-placeholder");
+    if (hadContent) {
+      element
+        .closest(".agentic-researcher-dashboard-section")
+        ?.setAttribute("data-ever-populated", "true");
     }
 
     element.empty();
@@ -4972,7 +5232,7 @@ export class AgentView extends ItemView {
       text: request.reason,
       cls: "agentic-researcher-chat-attention-body",
     });
-    // The chat banner offers the same Approve/Deny authority as the Activity
+    // The chat banner offers the same Approve/Deny authority as Run Details.
     // card, so it owes the user the same minimum context: WHERE the mutation
     // is going. Title and reason alone let a user approve an outbound write
     // without ever seeing its destination.
@@ -4998,7 +5258,7 @@ export class AgentView extends ItemView {
       attr: { type: "button", "data-testid": "chat-approval-deny" },
     });
     const openDetails = controls.createEl("button", {
-      text: "Open Activity",
+      text: "Open Run Details",
       cls: "agentic-researcher-secondary-action",
       attr: { type: "button" },
     });
@@ -5148,4 +5408,11 @@ export class AgentView extends ItemView {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatEffortProfile(profile: string): string {
+  return profile
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }

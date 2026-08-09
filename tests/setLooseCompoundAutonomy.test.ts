@@ -670,7 +670,7 @@ test("toolsOfferedForSetLoosePipeline keeps later-stage Bound tools from accepte
   });
   assert.ok(offered.includes("linear_create_issue"));
   assert.ok(offered.includes("code_commit_verified"));
-  assert.ok(offered.includes("github_create_private_repository"));
+  assert.ok(offered.includes("github_create_repository"));
   assert.ok(offered.includes("github_get_issue"));
   assert.ok(offered.includes("github_update_issue"));
   assert.ok(offered.includes("semantic_search_notes"));
@@ -690,7 +690,7 @@ test("toolsOfferedForSetLoosePipeline keeps later-stage Bound tools from accepte
   });
   assert.ok(withoutCleanup.includes("linear_create_issue"));
   assert.ok(withoutCleanup.includes("code_commit_verified"));
-  assert.ok(withoutCleanup.includes("github_create_private_repository"));
+  assert.ok(withoutCleanup.includes("github_create_repository"));
   assert.ok(withoutCleanup.includes("github_get_issue"));
   assert.ok(withoutCleanup.includes("github_update_issue"));
   assert.equal(withoutCleanup.includes("linear_trash_issue"), false);
@@ -772,6 +772,13 @@ test("lifecycleStagePaidBySuccessfulTool maps key tools and fails closed", () =>
       ok: true,
     }),
     "code_execution",
+  );
+  assert.equal(
+    lifecycleStagePaidBySuccessfulTool({
+      toolName: "github_create_repository",
+      ok: true,
+    }),
+    "private_github_publication",
   );
   assert.equal(
     lifecycleStagePaidBySuccessfulTool({
@@ -874,7 +881,7 @@ test("setLooseDeliveryComplete requires delivery proofs without cleanup", () => 
   assert.ok(pending.includes("code_workspace_create"));
   assert.ok(pending.includes("code_validate_fast"));
   assert.ok(pending.includes("code_commit_verified"));
-  assert.ok(pending.includes("github_create_private_repository"));
+  assert.ok(pending.includes("github_create_repository"));
   assert.ok(pending.includes("publish_verified_code_to_github"));
   assert.ok(pending.includes("append_to_current_file"));
 });
@@ -894,7 +901,7 @@ test("toolsOfferedForSetLooseCodeStage withholds GitHub until code paid", () => 
   assert.ok(unpaid.includes("code_commit_verified"));
   assert.ok(unpaid.includes("code_workspace_write_expected"));
   assert.ok(unpaid.includes("linear_get_issue"));
-  assert.equal(unpaid.includes("github_create_private_repository"), false);
+  assert.equal(unpaid.includes("github_create_repository"), false);
   assert.equal(unpaid.includes("publish_verified_code_to_github"), false);
 
   const paidPipeline = toolsOfferedForSetLoosePipeline({
@@ -931,7 +938,7 @@ test("toolsOfferedForSetLooseTurn stages Soft-union after Linear / code / reflec
   assert.equal(beforeResearchPublication.includes("linear_create_issue"), false);
   assert.equal(beforeResearchPublication.includes("code_validate_fast"), false);
   assert.equal(
-    beforeResearchPublication.includes("github_create_private_repository"),
+    beforeResearchPublication.includes("github_create_repository"),
     false,
   );
 
@@ -951,7 +958,7 @@ test("toolsOfferedForSetLooseTurn stages Soft-union after Linear / code / reflec
   assert.ok(afterLinear.includes("code_workspace_create"));
   assert.ok(afterLinear.includes("append_to_current_file"));
   assert.equal(afterLinear.includes("code_commit_verified"), false);
-  assert.equal(afterLinear.includes("github_create_private_repository"), false);
+  assert.equal(afterLinear.includes("github_create_repository"), false);
   assert.equal(afterLinear.includes("publish_verified_code_to_github"), false);
 
   const afterPassedFast = toolsOfferedForSetLooseTurn({
@@ -967,7 +974,7 @@ test("toolsOfferedForSetLooseTurn stages Soft-union after Linear / code / reflec
   });
   assert.ok(afterPassedFast.includes("code_commit_verified"));
   assert.equal(
-    afterPassedFast.includes("github_create_private_repository"),
+    afterPassedFast.includes("github_create_repository"),
     false,
     "GitHub must stay withheld while code delivery unpaid even if unpaid keys list it",
   );
@@ -979,7 +986,7 @@ test("toolsOfferedForSetLooseTurn stages Soft-union after Linear / code / reflec
     codeDeliveryPaid: true,
     unpaidDeliveryKeys: ["private_github_publication", "note_reflection"],
   });
-  assert.ok(afterCode.includes("github_create_private_repository"));
+  assert.ok(afterCode.includes("github_create_repository"));
   assert.ok(afterCode.includes("publish_verified_code_to_github"));
   assert.ok(afterCode.includes("append_to_current_file"));
 
@@ -997,6 +1004,40 @@ test("toolsOfferedForSetLooseTurn stages Soft-union after Linear / code / reflec
   assert.equal(
     reflectionOnly.includes("publish_verified_code_to_github"),
     false,
+  );
+});
+
+test("public GitHub mutations always require fresh interactive approval", () => {
+  const common = {
+    autonomyProfile: "automatic" as const,
+    compoundLifecycleDetected: true,
+  };
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      ...common,
+      toolName: "github_create_repository",
+      currentPrompt: "Create a public GitHub repository.",
+      toolArguments: { visibility: "public" },
+    }),
+    false,
+  );
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      ...common,
+      toolName: "publish_verified_code_to_github",
+      currentPrompt: "Publish this code to the public GitHub repository.",
+    }),
+    false,
+  );
+  assert.equal(
+    boundMayAutoWithoutGrant({
+      ...common,
+      toolName: "github_create_repository",
+      currentPrompt: "Create a private GitHub repository.",
+      toolArguments: { visibility: "private" },
+    }),
+    true,
+    "private proof-bound publication keeps set-loose automation",
   );
 });
 
@@ -1658,6 +1699,6 @@ test("hasSetLooseGithubCreateReceipt and resume binding card surface paid work",
   });
   assert.match(card, /Durable workspace binding already exists: flow-real-abc/);
   assert.match(card, /passed fast repair cycle/i);
-  assert.match(card, /github_create_private_repository/);
+  assert.match(card, /github_create_repository/);
   assert.match(card, /Do NOT call code_workspace_create/);
 });

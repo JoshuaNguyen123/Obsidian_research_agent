@@ -15,6 +15,7 @@ import { verifyPreparedActionFingerprint } from "../src/agent/actions/canonicali
 import {
   CODE_WORKSPACE_TOOL_NAMES_V2,
   createCodeWorkspaceToolContributionsV2,
+  resolveVaultSiblingProjectsDirectoryV2,
   type RepositoryInspectionV2,
   type WorkspaceRepositoryProvisionerV2,
 } from "../extensions/code/workspaceTools";
@@ -911,6 +912,119 @@ test("repository protected controls escalate exact approvals and require profile
     );
   } finally {
     await fixture.cleanup();
+  }
+});
+
+test("standalone code defaults to an exact no-overwrite vault-sibling project folder", async () => {
+  const fixture = await createFixture("vault-sibling-export");
+  try {
+    const vaultRoot = path.join(fixture.root, "Research Vault");
+    await mkdir(vaultRoot);
+    const siblingContainer = path.join(
+      fixture.root,
+      "Research Vault Agent Projects",
+    );
+    const tools = toolMap(createCodeWorkspaceToolContributionsV2({
+      manager: fixture.manager,
+      repositoryProvisioner: fixture.repositories,
+      isForegroundUserMission: () => true,
+      resolveKnownHostDirectory: async (directory) => {
+        assert.equal(directory, "vault_sibling_projects");
+        return siblingContainer;
+      },
+    }));
+    const context: ScopedExtensionContextV1 = {
+      ...fixture.context(
+        "Build a working TypeScript project with a meaningful test suite.",
+      ),
+      missionId: "run-vault-sibling-segment",
+      rootMissionId: "run-vault-sibling-root",
+    };
+    await prepareAndExecute(
+      tools.get("code_workspace_create")!,
+      { workspaceId: "vault-sibling-space", kind: "scratch" },
+      context,
+    );
+    await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      {
+        workspaceId: "vault-sibling-space",
+        path: "src/index.ts",
+        content: "export const ready = true;\n",
+      },
+      context,
+    );
+    await prepareAndExecute(
+      tools.get("code_workspace_create_file")!,
+      {
+        workspaceId: "vault-sibling-space",
+        path: "tests/index.test.ts",
+        content: "import { ready } from '../src/index.js';\nif (!ready) throw new Error('not ready');\n",
+      },
+      context,
+    );
+
+    const exportTool = tools.get("code_workspace_export_directory")!;
+    const prepared = await requirePrepared(
+      exportTool,
+      {
+        workspaceId: "vault-sibling-space",
+        destinationRoot: "vault_sibling_projects",
+        destinationPath: "Reliable Researcher",
+      },
+      context,
+    );
+    const expected = path.join(siblingContainer, "Reliable Researcher");
+    assert.equal(prepared.preview.destination, expected);
+    assert.equal(
+      prepared.normalizedArgs.destinationPath,
+      "Research Vault Agent Projects/Reliable Researcher",
+    );
+    assert.equal(
+      prepared.normalizedArgs.requestedDestinationPath,
+      "Reliable Researcher",
+    );
+    const committed = await exportTool.executePrepared!(
+      prepared,
+      authorize(context, prepared),
+    );
+    assert.equal(committed.receipt.readback.status, "verified");
+    assert.equal(
+      await readFile(path.join(expected, "src", "index.ts"), "utf8"),
+      "export const ready = true;\n",
+    );
+    const duplicate = await exportTool.prepare!(
+      {
+        workspaceId: "vault-sibling-space",
+        destinationRoot: "vault_sibling_projects",
+        destinationPath: "Reliable Researcher",
+      },
+      context,
+    );
+    assert.equal(duplicate.ok, false);
+    if (!duplicate.ok) {
+      assert.equal(duplicate.error.code, "host_export_destination_exists");
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("vault-sibling project resolution is derived only from an existing absolute vault root", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agentic-vault-sibling-root-"));
+  try {
+    const vaultRoot = path.join(root, "Project Notes");
+    await mkdir(vaultRoot);
+    assert.equal(
+      await resolveVaultSiblingProjectsDirectoryV2(vaultRoot),
+      path.join(root, "Project Notes Agent Projects"),
+    );
+    await assert.rejects(
+      resolveVaultSiblingProjectsDirectoryV2("Project Notes"),
+      /must be absolute/iu,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

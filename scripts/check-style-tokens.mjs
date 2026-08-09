@@ -4,26 +4,31 @@ import { dirname, join } from "node:path";
 
 // Enforces the theme-adaptive contract for the mission console in styles.css.
 //
-// After the Phase 6 tokenization, every color in the console must resolve to an
-// Obsidian CSS variable (directly or through a color-mix over one of the
-// --agent-* tokens), and box dimensions must scale with type. This checker fails
-// the build if a hardcoded color or fixed px height sneaks back in, so the
-// green-on-black terminal palette cannot be reintroduced by accident.
+// Every color in the console must resolve to an Obsidian CSS variable (directly
+// or through a color-mix over one of the --agent-* tokens), and box dimensions
+// must scale with type. This checker fails the build if a hardcoded color or
+// fixed px height sneaks back in, so the green-on-black terminal palette cannot
+// be reintroduced by accident.
+//
+// Region boundaries live in styles.css as marker comments rather than as line
+// numbers here. Line numbers drift silently every time the stylesheet is
+// restructured — and a drifted boundary makes this checker stop policing
+// without ever failing. A marker moves in the same diff as the rules it bounds.
 //
 // See AGENTS.md "Product Direction" for the governing directive.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STYLES_PATH = join(__dirname, "..", "styles.css");
 
-// Lines 1..TOKEN_BLOCK_END define the --agent-* token palette in terms of
-// Obsidian variables and color-mix(). Literal hex is permitted only here, and
-// only inside color-mix()/var() fallbacks — see assertions below.
-const TOKEN_BLOCK_END = 31;
+// Lines up to the token-block-end marker define the --agent-* palette in terms
+// of Obsidian variables and color-mix(). Literal hex is permitted only here, and
+// only inside color-mix()/var() fallbacks.
+const TOKEN_BLOCK_END_MARKER = "@style-tokens:token-block-end";
 
-// The settings tab (already theme-correct) occupies the region up to this line.
-// Fixed px min/max-height is tolerated there because it predates this work and
-// is not part of the console restyle; only the console region below is policed.
-const SETTINGS_REGION_END = 505;
+// The settings tab (already theme-correct) occupies the region up to this
+// marker. Fixed px min/max-height is tolerated there because it predates the
+// console restyle; only the console region below is policed.
+const SETTINGS_REGION_END_MARKER = "@style-tokens:settings-region-end";
 
 const HEX_PATTERN = /#[0-9a-fA-F]{3,8}\b/u;
 const RGBA_PATTERN = /\brgba?\(/u;
@@ -37,15 +42,42 @@ function stripComments(source) {
   );
 }
 
+// Marker lookup runs against the raw source: stripComments() blanks the very
+// comments that carry the markers, so resolving them afterwards would find
+// nothing and silently collapse both regions to zero.
+function findMarkerLine(rawLines, marker) {
+  const index = rawLines.findIndex((line) => line.includes(marker));
+  if (index === -1) {
+    throw new Error(
+      `styles.css is missing the '${marker}' marker comment. ` +
+        `Region boundaries are defined by these markers — restore it (as '/* ${marker} */') ` +
+        `rather than removing it, or this check stops policing that region.`,
+    );
+  }
+  return index + 1;
+}
+
 async function main() {
   const raw = await readFile(STYLES_PATH, "utf8");
+  const rawLines = raw.split(/\r?\n/u);
+
+  const tokenBlockEnd = findMarkerLine(rawLines, TOKEN_BLOCK_END_MARKER);
+  const settingsRegionEnd = findMarkerLine(rawLines, SETTINGS_REGION_END_MARKER);
+
+  if (settingsRegionEnd <= tokenBlockEnd) {
+    throw new Error(
+      `styles.css markers are out of order: '${SETTINGS_REGION_END_MARKER}' (line ${settingsRegionEnd}) ` +
+        `must come after '${TOKEN_BLOCK_END_MARKER}' (line ${tokenBlockEnd}).`,
+    );
+  }
+
   const lines = stripComments(raw).split(/\r?\n/u);
   const violations = [];
 
   lines.forEach((line, index) => {
     const lineNumber = index + 1;
-    const inTokenBlock = lineNumber <= TOKEN_BLOCK_END;
-    const inConsoleRegion = lineNumber > SETTINGS_REGION_END;
+    const inTokenBlock = lineNumber <= tokenBlockEnd;
+    const inConsoleRegion = lineNumber > settingsRegionEnd;
 
     if (RGBA_PATTERN.test(line)) {
       violations.push({
@@ -93,7 +125,8 @@ async function main() {
   }
 
   console.log(
-    `styles.css style-token check passed; console palette is fully tokenized.`,
+    `styles.css style-token check passed; console palette is fully tokenized ` +
+      `(token block ends line ${tokenBlockEnd}, settings region ends line ${settingsRegionEnd}).`,
   );
 }
 

@@ -185,12 +185,13 @@ test("DESKTOP-CODE-REAL bare prompt authors and delivers a runnable Python game"
       encoding: "utf8",
     });
 
-    const assistantReply = await harness.page
+    const assistantMessage = harness.page
       .locator(
         ".agentic-researcher-log-assistant .agentic-researcher-log-message",
       )
-      .last()
-      .textContent();
+      .last();
+    await expect(assistantMessage).toHaveClass(/\bis-rendered\b/u);
+    const assistantReply = await assistantMessage.textContent();
     const exportDiagnostic = {
       resource: exportReceipt.resource ?? null,
       path: exportReceipt.path ?? null,

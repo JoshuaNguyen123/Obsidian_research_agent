@@ -9,6 +9,7 @@ import {
 } from "../src/AgentRunner";
 import {
   createMissionLedger,
+  getMissionLedgerPath,
   parseMissionLedgerFromMarkdown,
   setLedgerMissionPlan,
   writeMissionLedger,
@@ -50,6 +51,12 @@ import type {
   ModelClient,
   ModelToolCall,
 } from "../src/model/types";
+import { createAdaptiveTeamScaffoldV2 } from "../src/orchestrator/adaptiveTeam";
+import {
+  createSpecialistHandoffV2,
+  isSpecialistHandoffV2,
+} from "../src/orchestrator/specialistHandoff";
+import { OrchestratorRuntime } from "../src/orchestrator/orchestratorRuntime";
 
 test("write mission persists WAL intent before mutation and commits the receipt afterward", async () => {
   let snapshotAtMutation: MissionRuntimeSnapshotV2 | null = null;
@@ -866,7 +873,13 @@ test("current-note rename and move receipts repin continuation to the relocated 
   });
 
   assert.ok(resumedRequests.length >= 1);
-  assert.ok(resumedToolStarts.includes("append_to_current_file"));
+  assert.ok(
+    resumedToolStarts.includes("append_to_current_file"),
+    JSON.stringify(resumedRequests.map((request) => ({
+      phase: request.evidencePhase,
+      tools: request.tools?.map((tool) => tool.function.name) ?? [],
+    }))),
+  );
   assert.doesNotMatch(resumedAssistant.join(""), /active note is/i);
   assert.equal(
     vault.files.get("Moved.md"),
@@ -905,6 +918,109 @@ test("coordinator-backed runner preserves config tool and completion events", as
   assert.ok(observed.includes("start:append_to_current_file"));
   assert.ok(observed.includes("done:append_to_current_file"));
   assert.ok(observed.includes("complete:write_completed"));
+});
+
+test("coordinator-backed runner retains the accepted adaptive Specialist handoff", async () => {
+  const vault = createVaultHarness();
+  const coordinator = new RunCoordinator();
+  const parentRunId = "mission-adaptive-parent";
+  const runtime = new OrchestratorRuntime({
+    runId: parentRunId,
+    mode: "adaptive_team",
+  });
+  const scaffold = createAdaptiveTeamScaffoldV2({
+    runId: parentRunId,
+    mission: "Gather bounded evidence, then let the Lead append verified proof.",
+    specialistModes: ["researcher"],
+    specialistMaxSteps: 4,
+    specialistMaxToolCalls: 4,
+    specialistMaxMinutes: 1,
+    leadMaxSteps: 8,
+    leadMaxToolCalls: 8,
+    leadMaxMinutes: 2,
+  });
+  await runtime.start(scaffold);
+  const handoff = createSpecialistHandoffV2({
+    handoff: {
+      id: "handoff-adaptive-parent",
+      fromParticipantId: "specialist",
+      toParticipantId: "lead",
+      taskId: scaffold.nodeIds.specialist,
+      status: "ready",
+      summary: "Host-observed evidence is ready for Lead verification.",
+      sourceIds: ["source-adaptive-parent"],
+      evidenceIds: ["evidence-adaptive-parent"],
+      unresolvedQuestions: [],
+      confidence: "high",
+      createdAt: "2026-08-09T12:00:00.000Z",
+      updatedAt: "2026-08-09T12:00:00.000Z",
+    },
+    missionGraphId: parentRunId,
+    specialistMode: "researcher",
+    missionInput: {
+      prompt: "Gather bounded evidence, then let the Lead append verified proof.",
+    },
+    acceptanceCriteria: ["The referenced evidence resolves in host-observed state."],
+    recommendedNextAction: "Lead verifies the handoff and appends the result.",
+  });
+  await runtime.specialistHandoffReady(handoff, {
+    missionGraphId: parentRunId,
+    evidenceIds: new Set(["evidence-adaptive-parent"]),
+    receiptIds: new Set(),
+    artifactIds: new Set(),
+    validationIds: new Set(),
+  });
+  await runtime.updateHandoff(handoff.id, "accepted", handoff.summary);
+
+  await coordinator.start((abortSignal, events) =>
+    runAgentMission({
+      prompt: "Append exactly this text to the current note: adaptive coordinator proof",
+      modelClient: createModelClient([
+        responseWithToolCall("append_to_current_file", {
+          text: "adaptive coordinator proof",
+        }),
+      ]),
+      toolRegistry: createDefaultToolRegistry(),
+      toolContext: vault.context,
+      enableStreaming: false,
+      abortSignal,
+      events,
+      orchestratorSnapshot: runtime.getSnapshot() ?? undefined,
+      getOrchestratorSnapshot: () => runtime.getSnapshot(),
+    }),
+  );
+
+  const snapshot = coordinator.getSnapshot();
+  assert.ok(
+    snapshot.lastMissionGraph,
+    "the Lead's local MissionGraph should coexist with the parent runtime projection",
+  );
+  const retained = snapshot.lastMissionLedger?.orchestrator;
+  assert.ok(retained, "the coordinator should retain the parent runtime projection");
+  assert.equal(retained.mode, "adaptive_team");
+  assert.deepEqual(Object.keys(retained.participants).sort(), [
+    "lead",
+    "specialist",
+  ]);
+  assert.equal(retained.participants.lead?.role, "lead");
+  assert.equal(retained.participants.specialist?.role, "specialist");
+  assert.equal(retained.handoffs.length, 1);
+  const retainedHandoff = retained.handoffs[0];
+  assert.ok(retainedHandoff && isSpecialistHandoffV2(retainedHandoff));
+  assert.equal(retainedHandoff.status, "accepted");
+  assert.equal(retainedHandoff.inputFingerprint, handoff.inputFingerprint);
+  assert.equal(retainedHandoff.progressFingerprint, handoff.progressFingerprint);
+  assert.match(retainedHandoff.inputFingerprint, /^sha256:[a-f0-9]{64}$/u);
+  assert.match(retainedHandoff.progressFingerprint, /^sha256:[a-f0-9]{64}$/u);
+
+  const ledgerRunId = snapshot.lastMissionLedger?.runId;
+  assert.ok(ledgerRunId);
+  const runMarkdown = vault.files.get(getMissionLedgerPath(ledgerRunId)) ?? "";
+  assert.ok(runMarkdown, "the Agent Runs markdown should be persisted");
+  const persistedLedger = parseMissionLedgerFromMarkdown(runMarkdown);
+  const persistedRuntime = parseMissionRuntimeSnapshotFromMarkdown(runMarkdown);
+  assert.deepEqual(persistedLedger?.orchestrator, retained);
+  assert.deepEqual(persistedRuntime?.orchestrator, retained);
 });
 
 test("continue run hydrates plan, evidence, goals, and lineage into a new segment", async () => {
@@ -1484,7 +1600,13 @@ test("resumed receipts do not spend the child segment tool budget or erase new g
   });
 
   assert.ok(requests.length >= 1);
-  assert.ok(toolStarts.includes("append_to_current_file"));
+  assert.ok(
+    toolStarts.includes("append_to_current_file"),
+    JSON.stringify(requests.map((request) => ({
+      phase: request.evidencePhase,
+      tools: request.tools?.map((tool) => tool.function.name) ?? [],
+    }))),
+  );
   assert.deepEqual(
     receipts.map((receipt) => receipt.id),
     ["receipt-prior", receipts.at(-1)?.id],

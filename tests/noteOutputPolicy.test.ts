@@ -59,22 +59,33 @@ describe("noteOutputPolicy decision table", () => {
     assert.equal(result.reason, "specialized_route");
   });
 
-  it("content-producing with active note uses active_note append stream", () => {
+  it("untargeted reports with an active note create a new note", () => {
     const result = plan({
-      prompt: "Write a short explanation of gravity.",
+      prompt: "Write an in-depth guide/report to agent orchestration.",
+      hasActiveMarkdownNote: true,
+      activeNoteIsPlaceholder: false,
+    });
+    assert.equal(result.destination, "new_note");
+    assert.equal(result.mutation, "create");
+    assert.equal(result.delivery, "stream");
+    assert.equal(result.title, "automatic");
+    assert.equal(result.reason, "untargeted_content_create");
+  });
+
+  it("explicit current-note language uses active_note append stream", () => {
+    const result = plan({
+      prompt: "Write a short explanation of gravity into this note.",
       hasActiveMarkdownNote: true,
       activeNoteIsPlaceholder: false,
     });
     assert.equal(result.destination, "active_note");
     assert.equal(result.mutation, "append");
-    assert.equal(result.delivery, "stream");
-    assert.equal(result.title, "preserve");
     assert.equal(result.reason, "active_note_available");
   });
 
   it("placeholder active note allows automatic title", () => {
     const result = plan({
-      prompt: "Draft a one-paragraph summary of the moon landing.",
+      prompt: "Draft a one-paragraph summary of the moon landing in this note.",
       hasActiveMarkdownNote: true,
       activeNoteIsPlaceholder: true,
     });
@@ -138,7 +149,7 @@ describe("noteOutputPolicy decision table", () => {
 
   it("fresh word-count essay stays append", () => {
     const result = plan({
-      prompt: "Write a 1000 word essay about the moon landing.",
+      prompt: "Write a 1000 word essay about the moon landing in this note.",
       hasActiveMarkdownNote: true,
     });
     assert.equal(result.destination, "active_note");
@@ -148,7 +159,7 @@ describe("noteOutputPolicy decision table", () => {
 
   it("preserve title wording suppresses automatic title", () => {
     const result = plan({
-      prompt: "Write an essay about forests. Keep the title unchanged.",
+      prompt: "Write an essay about forests in this note. Keep the title unchanged.",
       hasActiveMarkdownNote: true,
       activeNoteIsPlaceholder: true,
     });
@@ -177,14 +188,14 @@ describe("noteOutputPolicy decision table", () => {
 
   it("section correction and fresh essay prompts stay append", () => {
     const sectionCorrection = plan({
-      prompt: "Append a correction section at the bottom with grammar fixes.",
+      prompt: "Append a correction section at the bottom of this note with grammar fixes.",
       hasActiveMarkdownNote: true,
     });
     assert.equal(sectionCorrection.mutation, "append");
     assert.equal(sectionCorrection.reason, "active_note_available");
 
     const freshEssay = plan({
-      prompt: "Write a 1000 word essay on Grapes of Wrath.",
+      prompt: "Write a 1000 word essay on Grapes of Wrath in this note.",
       hasActiveMarkdownNote: true,
     });
     assert.equal(freshEssay.mutation, "append");

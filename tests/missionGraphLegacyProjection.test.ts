@@ -16,6 +16,7 @@ import {
 } from "../src/agent/missionGraphLegacyProjection";
 import {
   createHierarchicalMissionPlanFromV1,
+  isFinalOutputRelevant,
   type MissionPlan,
 } from "../src/agent/missionPlan";
 import type { OrchestratorSnapshotV1 } from "../src/orchestrator/types";
@@ -181,6 +182,52 @@ test("legacy citation projection keeps ordinary cited research at source level",
     projected.tasks.find((task) => task.id === "research")
       ?.completionContract.citationMode,
     "source",
+  );
+});
+
+test("legacy final-relevance projection keeps the mission objective instead of the generic final-node title", async () => {
+  const envelope = await createEnvelope();
+  const objective =
+    "Compare conflicting conclusions about controlled onboarding validation and include the run marker OWNED_RELEVANCE_123.";
+  const migrated = await migrateLegacyMissionPlanToMissionGraphV3(
+    completePlan(),
+    {
+      ...migrationOptions(envelope),
+      objective,
+    },
+  );
+  const graph = await parseMissionGraphV3({
+    ...migrated,
+    objective,
+    nodes: {
+      ...migrated.nodes,
+      write: {
+        ...migrated.nodes.write,
+        objective: "Synthesize and verify the final response.",
+        status: "ready",
+        receipts: [],
+        completionContract: {
+          ...migrated.nodes.write.completionContract,
+          requiredEvidenceKinds: ["final-relevance"],
+          requiredReceiptKinds: [],
+        },
+      },
+    },
+  });
+
+  const projected = projectMissionGraphToLegacyPlan(graph);
+  const finalTask = projected.tasks.find((task) => task.id === "write");
+  assert.ok(finalTask?.completionContract.relevanceTerms?.includes("controlled"));
+  assert.equal(
+    isFinalOutputRelevant(
+      projected,
+      "## Findings\nControlled onboarding validation produced conflicting conclusions. OWNED_RELEVANCE_123",
+    ),
+    true,
+  );
+  assert.equal(
+    isFinalOutputRelevant(projected, "A generic response about unrelated weather."),
+    false,
   );
 });
 

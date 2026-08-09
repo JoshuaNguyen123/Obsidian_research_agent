@@ -1,6 +1,17 @@
 export const ORCHESTRATOR_SNAPSHOT_VERSION = 1 as const;
 
-export type OrchestrationMode = "single" | "research_team" | "code_team";
+/** The active runtime has one Lead and, when needed, one Adaptive Specialist. */
+export type OrchestrationModeV2 = "single" | "adaptive_team";
+
+/**
+ * Persisted preview snapshots used these names before the Adaptive Specialist
+ * contract existed. They remain readable, but new runtimes must use
+ * `adaptive_team`.
+ */
+export type LegacyOrchestrationModeV1 = "research_team" | "code_team";
+export type OrchestrationMode =
+  | OrchestrationModeV2
+  | LegacyOrchestrationModeV1;
 
 export type OrchestratorRunStatus =
   | "running"
@@ -26,7 +37,17 @@ export type WorkNodeKind =
   | "merge"
   | "verify";
 
-export type AgentRole = "lead" | "researcher" | "code_worker";
+export type AgentRoleV2 = "lead" | "specialist";
+export type LegacyAgentRoleV1 = "researcher" | "code_worker";
+export type AgentRole = AgentRoleV2 | LegacyAgentRoleV1;
+
+/** One second participant changes modes; these are not extra agent identities. */
+export type SpecialistMode =
+  | "researcher"
+  | "linear_planner"
+  | "code_builder"
+  | "code_reviewer"
+  | "recovery_verifier";
 
 export type AgentParticipantStatus =
   | "queued"
@@ -72,6 +93,10 @@ export interface AgentParticipant {
   startedAt?: string;
   updatedAt: string;
   blocker?: string;
+  /** Present only for the Adaptive Specialist participant. */
+  specialistMode?: SpecialistMode;
+  /** Durable one-cycle repair accounting; never grants tool authority. */
+  repairState?: SpecialistRepairStateV2;
 }
 
 export interface OrchestratorProofContract {
@@ -158,6 +183,46 @@ export interface WorkerHandoff {
   commitSha?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SpecialistProofReferencesV2 {
+  evidenceIds: string[];
+  receiptIds: string[];
+  artifactIds: string[];
+  validationIds: string[];
+}
+
+/**
+ * Proof-bearing handoff from the one Adaptive Specialist to the Lead.
+ * MissionGraph remains authoritative: these references are claims for the host
+ * to resolve against the graph and receipt stores, not proof by themselves.
+ */
+export interface SpecialistHandoffV2 extends WorkerHandoff {
+  schemaVersion: 2;
+  fromParticipantId: "specialist";
+  toParticipantId: "lead";
+  missionGraphId: string;
+  specialistMode: SpecialistMode;
+  inputFingerprint: string;
+  progressFingerprint: string;
+  acceptanceCriteria: string[];
+  proofReferences: SpecialistProofReferencesV2;
+  changedFiles: string[];
+  conflicts: string[];
+  limitations: string[];
+  recommendedNextAction: string;
+  workspaceLeaseId?: string;
+  workspaceDiffFingerprint?: string;
+  repairCycle: 0 | 1;
+}
+
+export interface SpecialistRepairStateV2 {
+  schemaVersion: 2;
+  cyclesUsed: 0 | 1;
+  status: "idle" | "authorized" | "exhausted";
+  failedProgressFingerprint?: string;
+  priorApproachFingerprint?: string;
+  revisedApproachFingerprint?: string;
 }
 
 export type MergeStatus = "idle" | "running" | "complete" | "blocked";
@@ -357,4 +422,3 @@ export type OrchestratorEvent =
   | MergeCompletedEvent
   | VerificationUpdatedEvent
   | OrchestratorRunCompletedEvent;
-

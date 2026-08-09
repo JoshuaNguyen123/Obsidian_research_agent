@@ -6,13 +6,14 @@ const DEMOS = Object.freeze({
     label: "Researcher",
     outcome: "Turn a research brief into a cited decision.",
     description:
-      "The agent reads one useful note, checks its two linked sources, and appends a compact decision with citations and a verified write receipt.",
+      "The agent reads one useful note, checks its linked sources, and appends a compact decision with citations.",
     steps: Object.freeze([
       "Reads the active-note brief",
       "Reads both linked sources",
       "Appends the cited decision",
       "Confirms the verified receipt",
     ]),
+    receipt: "Decision appended and verified",
     poster: mediaPath("researcher-demo-poster.jpg"),
     webm: mediaPath("researcher-demo.webm"),
     mp4: mediaPath("researcher-demo.mp4"),
@@ -23,13 +24,14 @@ const DEMOS = Object.freeze({
     label: "Builder",
     outcome: "Turn a working brief into a tested tool.",
     description:
-      "The agent reads the note's acceptance criteria, builds a Python CLI, validates it with sample files, and delivers the verified result.",
+      "The agent reads the acceptance criteria, builds a Python CLI, validates it with sample files, and delivers the result.",
     steps: Object.freeze([
       "Reads the acceptance criteria",
       "Builds the Python CLI",
       "Runs targeted and full checks",
       "Delivers the verified file",
     ]),
+    receipt: "Tool delivered and checks passed",
     poster: mediaPath("builder-demo-poster.jpg"),
     webm: mediaPath("builder-demo.webm"),
     mp4: mediaPath("builder-demo.mp4"),
@@ -39,26 +41,48 @@ const DEMOS = Object.freeze({
 });
 
 const tabs = Array.from(document.querySelectorAll("[data-demo-role]"));
-const scrollTrack = document.querySelector(".demo-scroll");
 const panel = document.querySelector("#demo-panel");
 const video = document.querySelector("#role-demo");
 const webmSource = document.querySelector("#role-demo-webm");
 const mp4Source = document.querySelector("#role-demo-mp4");
-const fill = document.querySelector("#demo-scrubline-fill");
+const playButton = document.querySelector("#demo-play");
+const status = document.querySelector("#demo-status");
 const roleLabel = document.querySelector("#demo-role-label");
 const outcome = document.querySelector("#demo-outcome");
 const description = document.querySelector("#demo-description");
 const stepsList = document.querySelector("#demo-steps");
-
-const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
-const compact = window.matchMedia("(max-width: 900px)");
+const receipt = document.querySelector("#demo-receipt");
 
 let activeRole = "researcher";
 let mediaLoaded = false;
 
-/** Whether the scroll-scrub interaction is active for the current environment. */
-function scrubEnabled() {
-  return !reducedMotion.matches && !compact.matches;
+function setStatus(message) {
+  if (status) status.textContent = message;
+}
+
+function resetMedia(demo) {
+  mediaLoaded = false;
+  video?.pause();
+  if (video) {
+    video.controls = false;
+    video.poster = demo.poster;
+    video.preload = "none";
+    video.setAttribute("aria-label", demo.ariaLabel);
+    try {
+      video.currentTime = 0;
+    } catch {
+      // Metadata is intentionally unloaded until the viewer presses Play.
+    }
+  }
+  webmSource?.setAttribute("data-src", demo.webm);
+  mp4Source?.setAttribute("data-src", demo.mp4);
+  webmSource?.removeAttribute("src");
+  mp4Source?.removeAttribute("src");
+  if (playButton) {
+    playButton.hidden = false;
+    playButton.textContent = `Play ${demo.label} run`;
+  }
+  setStatus("");
 }
 
 function renderDemo(role, options = {}) {
@@ -73,24 +97,11 @@ function renderDemo(role, options = {}) {
   }
 
   activeRole = role;
-  mediaLoaded = false;
-  video.pause();
-  video.poster = demo.poster;
-  video.setAttribute("aria-label", demo.ariaLabel);
-  webmSource?.setAttribute("data-src", demo.webm);
-  mp4Source?.setAttribute("data-src", demo.mp4);
-  webmSource?.removeAttribute("src");
-  mp4Source?.removeAttribute("src");
-  try {
-    video.currentTime = 0;
-  } catch {
-    /* metadata not ready yet */
-  }
-
   panel.setAttribute("aria-labelledby", selectedTab.id);
   if (roleLabel) roleLabel.textContent = demo.label;
   if (outcome) outcome.textContent = demo.outcome;
   if (description) description.textContent = demo.description;
+  if (receipt) receipt.textContent = demo.receipt;
   if (stepsList) {
     stepsList.replaceChildren(
       ...demo.steps.map((item) => {
@@ -100,18 +111,7 @@ function renderDemo(role, options = {}) {
       }),
     );
   }
-  setProgress(0);
-
-  // Reduced-motion / compact: give the viewer normal playback controls since
-  // there is no scroll track to scrub. Otherwise, load eagerly so scrubbing is
-  // smooth as soon as the run comes into view.
-  if (scrubEnabled()) {
-    video.controls = false;
-    if (isTrackInView()) ensureMediaLoaded();
-  } else {
-    video.controls = true;
-  }
-
+  resetMedia(demo);
   if (options.focus === true) selectedTab.focus();
 }
 
@@ -120,66 +120,27 @@ function ensureMediaLoaded() {
   const demo = DEMOS[activeRole];
   webmSource?.setAttribute("src", demo.webm);
   mp4Source?.setAttribute("src", demo.mp4);
-  video.preload = "auto";
+  video.preload = "metadata";
   video.load();
   mediaLoaded = true;
 }
 
-function isTrackInView() {
-  if (!scrollTrack) return false;
-  const rect = scrollTrack.getBoundingClientRect();
-  return rect.top < window.innerHeight && rect.bottom > 0;
-}
-
-function setProgress(progress) {
-  const clamped = Math.min(1, Math.max(0, progress));
-  if (fill) fill.style.width = `${(clamped * 100).toFixed(2)}%`;
-  if (stepsList) {
-    const items = stepsList.children;
-    const activeIndex = Math.min(
-      items.length - 1,
-      Math.floor(clamped * items.length),
-    );
-    for (let index = 0; index < items.length; index += 1) {
-      items[index].setAttribute("data-active", String(index <= activeIndex));
-    }
+async function playActiveDemo() {
+  if (!video || !playButton) return;
+  ensureMediaLoaded();
+  playButton.disabled = true;
+  setStatus(`Loading ${DEMOS[activeRole].label} run...`);
+  try {
+    await video.play();
+    video.controls = true;
+    playButton.hidden = true;
+    setStatus("");
+  } catch {
+    playButton.disabled = false;
+    playButton.textContent = "Try playback again";
+    setStatus("Playback could not start. Try again or use the video controls.");
+    video.controls = true;
   }
-}
-
-function trackProgress() {
-  if (!scrollTrack) return 0;
-  const absoluteTop =
-    scrollTrack.getBoundingClientRect().top + window.scrollY;
-  const headerOffset = 64;
-  const start = absoluteTop - headerOffset;
-  const end = absoluteTop + scrollTrack.offsetHeight - window.innerHeight;
-  if (end <= start) return 0;
-  return Math.min(1, Math.max(0, (window.scrollY - start) / (end - start)));
-}
-
-let ticking = false;
-function onScroll() {
-  if (ticking) return;
-  ticking = true;
-  requestAnimationFrame(() => {
-    ticking = false;
-    if (!scrubEnabled()) return;
-    if (!isTrackInView()) return;
-    ensureMediaLoaded();
-    const progress = trackProgress();
-    setProgress(progress);
-    const duration = video?.duration;
-    if (video && typeof duration === "number" && Number.isFinite(duration)) {
-      const target = progress * duration;
-      if (Math.abs(target - video.currentTime) > 0.03) {
-        try {
-          video.currentTime = target;
-        } catch {
-          /* seek not ready */
-        }
-      }
-    }
-  });
 }
 
 for (const [index, tab] of tabs.entries()) {
@@ -187,8 +148,9 @@ for (const [index, tab] of tabs.entries()) {
   tab.addEventListener("keydown", (event) => {
     let targetIndex = null;
     if (event.key === "ArrowRight") targetIndex = (index + 1) % tabs.length;
-    if (event.key === "ArrowLeft")
+    if (event.key === "ArrowLeft") {
       targetIndex = (index - 1 + tabs.length) % tabs.length;
+    }
     if (event.key === "Home") targetIndex = 0;
     if (event.key === "End") targetIndex = tabs.length - 1;
     if (targetIndex === null) return;
@@ -197,9 +159,24 @@ for (const [index, tab] of tabs.entries()) {
   });
 }
 
-window.addEventListener("scroll", onScroll, { passive: true });
-window.addEventListener("resize", onScroll, { passive: true });
-reducedMotion.addEventListener?.("change", () => renderDemo(activeRole));
-compact.addEventListener?.("change", () => renderDemo(activeRole));
+playButton?.addEventListener("click", () => void playActiveDemo());
+video?.addEventListener("play", () => {
+  if (playButton) playButton.hidden = true;
+  setStatus("");
+});
+video?.addEventListener("ended", () => {
+  if (!playButton) return;
+  playButton.disabled = false;
+  playButton.hidden = false;
+  playButton.textContent = `Replay ${DEMOS[activeRole].label} run`;
+  setStatus("Run complete.");
+});
+video?.addEventListener("error", () => {
+  if (!mediaLoaded || !playButton) return;
+  playButton.disabled = false;
+  playButton.hidden = false;
+  playButton.textContent = "Try playback again";
+  setStatus("The demo could not be loaded.");
+});
 
 renderDemo("researcher");

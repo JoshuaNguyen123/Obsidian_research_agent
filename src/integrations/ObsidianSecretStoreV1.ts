@@ -16,6 +16,7 @@ const METADATA_KEYS = new Set([
   "account",
   "actor",
   "credentialKind",
+  "endpoint",
   "provider",
   "scope",
 ]);

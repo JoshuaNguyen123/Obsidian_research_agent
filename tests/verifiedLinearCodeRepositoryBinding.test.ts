@@ -8,7 +8,7 @@ import {
   createWorkItemLineageV1,
   createWorkItemSpecV2,
   fingerprintContract,
-  renderWorkItemSpecV2,
+  renderQueueExecutableHumanWorkItemSpecV2,
   resolveVerifiedLinearCodeRepositoryBindingV1,
   sha256LinearValue,
   type LinearIssueRecord,
@@ -215,7 +215,7 @@ test("unsigned and signed non-code issues are not applicable", async (t) => {
   });
   const nonCode = replaceDescription(
     fixture.issue,
-    renderWorkItemSpecV2(researchWorkItem),
+    renderQueueExecutableHumanWorkItemSpecV2(researchWorkItem),
   );
   const cases: Array<[string, LinearIssueRecord, string]> = [
     ["unsigned", unsigned, "linear_code_contract_absent"],
@@ -275,7 +275,7 @@ function codePublicationFixture() {
     acceptedResearchArtifactFingerprint: artifact.artifactFingerprint,
     generation: 0,
   });
-  const issue = makeIssue(renderWorkItemSpecV2(workItem));
+  const issue = makeIssue(renderQueueExecutableHumanWorkItemSpecV2(workItem));
   let lineage = createWorkItemLineageV1({
     schemaVersion: 1,
     lineageId: "lineage-phase-b",

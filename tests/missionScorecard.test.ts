@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   MISSION_SCORE_WEIGHTS,
   formatMissionScorecard,
+  mergeMissionScorecardObservationsV1,
+  normalizeMissionScorecard,
   regressedAgainst,
   scoreMissionV1,
   type MissionScorecardInput,
@@ -32,6 +34,145 @@ test("a clean pass scores 1.0 across every dimension", () => {
   for (const dimension of card.dimensions) {
     assert.equal(dimension.score, 1, `${dimension.id} should be 1`);
   }
+});
+
+test("a dimension with nothing to measure is excluded rather than banking a free 1", () => {
+  // The live FLOW-REAL-01 shape: no claims needing citation and no web
+  // research, so evidence_grounding (0.25), source_independence (0.05) and
+  // research_depth (0.05) measured nothing — 35% of the weight.
+  const card = scoreMissionV1({
+    ...CLEAN_PASS,
+    claimsRequiringEvidence: 0,
+    claimsWithEvidence: 0,
+    modelCalls: CLEAN_PASS.modelCallBudget * 3,
+  });
+  const byId = new Map(card.dimensions.map((item) => [item.id, item]));
+
+  for (const id of ["evidence_grounding", "source_independence", "research_depth"] as const) {
+    assert.equal(byId.get(id)?.applicable, false, id);
+  }
+  assert.equal(byId.get("receipt_coverage")?.applicable, true);
+
+  // The wasteful model-call score must actually move the total. Under the old
+  // empty-set convention the three unmeasured 1.0s diluted it by 35%.
+  const measured = card.dimensions.filter((item) => item.applicable !== false);
+  const weight = measured.reduce((sum, item) => sum + item.weight, 0);
+  const expected =
+    measured.reduce((sum, item) => sum + item.score * item.weight, 0) / weight;
+  assert.ok(Math.abs(card.total - expected) < 1e-4, `total was ${card.total}`);
+  assert.ok(card.total < 1, "an over-budget run must not total 1");
+});
+
+test("a read-only mission is graded only on what it could be graded on", () => {
+  const card = scoreMissionV1({
+    ...CLEAN_PASS,
+    mutationsPerformed: 0,
+    mutationsWithReceipts: 0,
+  });
+  const receipt = card.dimensions.find((item) => item.id === "receipt_coverage");
+  assert.equal(receipt?.applicable, false);
+  // Still not punished — excluded, not zeroed.
+  assert.equal(card.total, 1);
+});
+
+test("inherited claims can be declared inapplicable to a non-research segment", () => {
+  const card = scoreMissionV1({
+    ...CLEAN_PASS,
+    claimsRequiringEvidence: 31,
+    claimsWithEvidence: 0,
+    evidenceGroundingApplicable: false,
+  });
+  const grounding = card.dimensions.find(
+    (item) => item.id === "evidence_grounding",
+  );
+  assert.equal(grounding?.score, 0);
+  assert.equal(grounding?.applicable, false);
+});
+
+test("compound scorecards retain earlier research measurements across later non-research segments", () => {
+  const research = scoreMissionV1({
+    ...CLEAN_PASS,
+    research: {
+      usableSourceUrls: [
+        "https://example.com/a",
+        "https://example.org/b",
+        "https://example.net/c",
+        "https://example.edu/d",
+      ],
+      requiredDistinctDomains: 4,
+      claimsRequiringEvidence: 10,
+      citedPassageCount: 10,
+      quotedSpanCount: 3,
+      sectionCount: 4,
+    },
+  });
+  const laterCode = scoreMissionV1({
+    ...CLEAN_PASS,
+    acceptancePassed: false,
+    claimsRequiringEvidence: 31,
+    claimsWithEvidence: 0,
+    evidenceGroundingApplicable: false,
+    mutationsPerformed: 10,
+    mutationsWithReceipts: 9,
+    modelCalls: 30,
+  });
+
+  const merged = mergeMissionScorecardObservationsV1(research, laterCode);
+  const byId = new Map(merged.dimensions.map((item) => [item.id, item]));
+
+  assert.equal(merged.acceptancePassed, false);
+  assert.equal(byId.get("evidence_grounding")?.score, 1);
+  assert.equal(byId.get("evidence_grounding")?.applicable, true);
+  assert.equal(byId.get("source_independence")?.score, 1);
+  assert.equal(byId.get("source_independence")?.applicable, true);
+  assert.equal(byId.get("research_depth")?.score, 1);
+  assert.equal(byId.get("research_depth")?.applicable, true);
+  assert.equal(byId.get("receipt_coverage")?.score, 0.9);
+  assert.equal(byId.get("model_call_efficiency")?.score, 1);
+});
+
+test("regression comparison skips a dimension either side could not measure", () => {
+  // Baseline banked an unmeasured 1; the later run actually measured the
+  // dimension and scored honestly below it. That is more work, not a
+  // regression, and must not fail the gate.
+  const baseline = scoreMissionV1({
+    ...CLEAN_PASS,
+    claimsRequiringEvidence: 0,
+    claimsWithEvidence: 0,
+  });
+  const measured = scoreMissionV1({
+    ...CLEAN_PASS,
+    claimsRequiringEvidence: 10,
+    claimsWithEvidence: 4,
+  });
+  assert.deepEqual(
+    regressedAgainst(measured, baseline).map((item) => item.id),
+    [],
+  );
+  // A genuine drop between two measured runs is still caught.
+  assert.deepEqual(
+    regressedAgainst(measured, scoreMissionV1(CLEAN_PASS)).map((item) => item.id),
+    ["evidence_grounding"],
+  );
+});
+
+test("a baseline written before applicability existed still parses as applicable", () => {
+  const card = scoreMissionV1(CLEAN_PASS);
+  const legacy = {
+    ...card,
+    dimensions: card.dimensions.map(({ applicable: _dropped, ...rest }) => rest),
+  };
+  const parsed = normalizeMissionScorecard(JSON.parse(JSON.stringify(legacy)));
+  assert.ok(parsed);
+  for (const dimension of parsed.dimensions) {
+    assert.equal(dimension.applicable, true, dimension.id);
+  }
+  assert.equal(normalizeMissionScorecard({
+    ...legacy,
+    dimensions: legacy.dimensions.map((item, index) =>
+      index === 0 ? { ...item, applicable: "yes" } : item,
+    ),
+  }), null);
 });
 
 test("dimension weights sum to 1", () => {

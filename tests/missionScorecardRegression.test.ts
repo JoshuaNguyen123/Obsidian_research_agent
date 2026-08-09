@@ -177,3 +177,80 @@ test("mission scorecard gate skips projects with no committed baseline", () => {
     { checkedRecords: 0, skipped: true },
   );
 });
+
+test("targeted unscored tests do not demand an unrelated project baseline", () => {
+  assert.deepEqual(
+    assertMissionScorecardRegressions({
+      summary: {
+        version: 1,
+        status: "passed",
+        records: [
+          {
+            project: identity.project,
+            scenarioId: null,
+            file: identity.file,
+            title: "Agent settings expose an API slot",
+            missionScorecard: null,
+          },
+        ],
+      },
+      baseline: baseline(),
+      selectedProjects: [identity.project],
+      executedTests: [
+        {
+          project: identity.project,
+          file: "daily-use-note.spec.ts",
+          title: "Agent settings expose an API slot",
+        },
+      ],
+    }),
+    { checkedRecords: 0, skipped: true },
+  );
+});
+
+test("targeted scored tests still fail closed when their record is missing", () => {
+  assert.throws(
+    () =>
+      assertMissionScorecardRegressions({
+        summary: { ...summary(), records: [] },
+        baseline: baseline(),
+        selectedProjects: [identity.project],
+        executedTests: [
+          {
+            project: identity.project,
+            file: "daily-use-note.spec.ts",
+            title: identity.title,
+          },
+        ],
+      }),
+    /required baseline record is missing/u,
+  );
+});
+
+test("targeted scored test cannot borrow a sibling baseline from the same project", () => {
+  const exact = {
+    ...identity,
+    scenarioId: "DU-01-B",
+    title: "DU-01-B creates a second note",
+  };
+  assert.throws(
+    () =>
+      assertMissionScorecardRegressions({
+        summary: {
+          version: 1,
+          status: "passed",
+          records: [{ ...exact, missionScorecard: cleanScorecard() }],
+        },
+        baseline: baseline(),
+        selectedProjects: [identity.project],
+        executedTests: [
+          {
+            project: exact.project,
+            file: "daily-use-note.spec.ts",
+            title: exact.title,
+          },
+        ],
+      }),
+    /No exact mission-scorecard baseline exists/u,
+  );
+});

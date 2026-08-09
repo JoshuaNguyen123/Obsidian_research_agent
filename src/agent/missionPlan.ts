@@ -1519,7 +1519,7 @@ function toolSupportsProof(
   );
 }
 
-function extractRelevanceTerms(value: string): string[] {
+export function extractRelevanceTerms(value: string): string[] {
   const stopWords = new Set([
     "about",
     "across",

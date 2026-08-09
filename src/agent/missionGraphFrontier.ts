@@ -798,7 +798,7 @@ export function buildMissionGraphFrontierTurnContext(
   const codeCapabilityBoundary = names.some((name) => name.startsWith("code_"))
     ? [
         "This is one dependency-ready code-workflow frontier, not the full Code capability catalog.",
-        "Code workspaces are real directories on the user's local filesystem. Later dependency-ready frontiers can open file creation, sandbox validation, and user-authorized export to Desktop, Documents, or Downloads.",
+        "Code workspaces are real directories on the user's local filesystem. Later dependency-ready frontiers can open file creation, sandbox validation, and approval-gated delivery beside the active vault by default or to an explicitly named Desktop, Documents, or Downloads folder.",
         "Do not claim filesystem access, file creation, validation, or export is unavailable merely because a later Code tool is not callable on this turn. Call only the Code tools listed in the current frontier.",
       ]
     : [];
@@ -881,7 +881,7 @@ export function buildMissionGraphFrontierTurnContext(
           "This is the writable-workspace bootstrap frontier, not the final deliverable.",
           "Call code_workspace_create now. For a new standalone app or script, use kind=scratch and one stable workspaceId.",
           "After the creation receipt, code_workspace_mkdir and code_workspace_create_file become callable. create_file accepts a safe path at any depth and automatically creates missing parent directories.",
-          "If the foreground mission requests Desktop, Documents, or Downloads delivery, keep working in the workspace; the approval-gated code_workspace_export_directory frontier opens after the project files and validation steps.",
+          "For every new standalone project, keep working in the workspace until the approval-gated code_workspace_export_directory frontier opens after the project files and validation steps. It defaults beside the active vault; an explicitly named Desktop, Documents, or Downloads folder overrides that default.",
           "Do not return code-only chat prose or claim filesystem tools are unavailable while this bootstrap action is ready.",
         ]
       : [];
@@ -896,7 +896,7 @@ export function buildMissionGraphFrontierTurnContext(
     names.length === 1 && names[0] === "code_workspace_export_directory"
       ? [
           "This frontier performs the user-requested host delivery after workspace creation.",
-          "Use only the known destinationRoot explicitly named by the foreground user: desktop, documents, or downloads. Choose a safe project-relative destinationPath; the exact destination is shown for approval and must remain absent.",
+          "Use destinationRoot vault_sibling_projects for the default standalone-project delivery beside the active vault. Use desktop, documents, or downloads only when the foreground user explicitly names that folder. Choose a safe project-relative destinationPath; the exact destination is shown for approval and must remain absent.",
           "The export preserves nested directories and never overwrites existing files or folders.",
         ]
       : [];

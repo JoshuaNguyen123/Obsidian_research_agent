@@ -61,7 +61,7 @@ test("usable handoff makes the Lead-only proof and write contract explicit", () 
         summary: "Fetched primary evidence.",
         url: "https://example.com/source",
         sourceId: "https://example.com/source",
-        passageIds: ["passage-source-1"],
+        passageIds: ["source:abc123:passage:0-120"],
         usableSource: true,
         confidence: "high",
       },
@@ -78,8 +78,58 @@ test("usable handoff makes the Lead-only proof and write contract explicit", () 
 
   const merged = mergeResearchWorkerResult({ worker });
   assert.match(merged.promptContext, /Researcher is read-only/iu);
-  assert.match(merged.promptContext, /\[passage:<id>\]/u);
+  assert.match(
+    merged.promptContext,
+    /passages=\[source:abc123:passage:0-120\]/u,
+  );
+  assert.match(merged.promptContext, /Never prepend another passage:/iu);
   assert.match(merged.promptContext, /## Limitations/iu);
   assert.match(merged.promptContext, /## Confidence/iu);
   assert.match(merged.promptContext, /append exactly once/iu);
+});
+
+test("usable partial evidence cannot upgrade a rejected worker handoff", () => {
+  const worker: ResearchWorkerResult = {
+    handoff: {
+      id: "h-rejected-partial",
+      fromParticipantId: "specialist",
+      toParticipantId: "lead",
+      taskId: "research",
+      status: "rejected",
+      summary: "One of two required sources was gathered.",
+      sourceIds: ["https://example.com/partial"],
+      evidenceIds: ["web_fetch:https://example.com/partial"],
+      unresolvedQuestions: ["One usable source is still missing."],
+      confidence: "medium",
+      stopReason: "no_usable_evidence",
+      createdAt: "2026-08-09T00:00:00.000Z",
+      updatedAt: "2026-08-09T00:00:00.000Z",
+    },
+    evidence: [
+      {
+        id: "web_fetch:https://example.com/partial",
+        kind: "web_source",
+        title: "Partial evidence",
+        summary: "A usable but incomplete evidence record.",
+        url: "https://example.com/partial",
+        sourceId: "https://example.com/partial",
+        passageIds: ["passage-partial-1"],
+        usableSource: true,
+        confidence: "medium",
+      },
+    ],
+    claimPassages: [],
+    finalSummary: "One of two required sources was gathered.",
+    modelSteps: 6,
+    toolCalls: 2,
+    sourceLedger: createSourceCandidateLedger({
+      runId: "run-rejected-partial",
+      query: "partial proof",
+    }),
+  };
+
+  const merged = mergeResearchWorkerResult({ worker });
+  assert.equal(merged.handoff.status, "rejected");
+  assert.equal(merged.merge.evidenceAccepted, 1);
+  assert.match(merged.promptContext, /One usable source is still missing/iu);
 });

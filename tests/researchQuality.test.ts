@@ -395,10 +395,12 @@ test("open evidence conflicts force research acceptance needs_more_work", () => 
     {
       id: "p1",
       text: "The catalyst efficiency reaches 92 percent in production trials.",
+      claimIds: ["claim:catalyst-efficiency"],
     },
     {
       id: "p2",
       text: "The catalyst efficiency reaches 41 percent in production trials.",
+      claimIds: ["claim:catalyst-efficiency"],
     },
   ]);
   assert.equal(conflicts.length, 1);
@@ -433,6 +435,30 @@ test("open evidence conflicts force research acceptance needs_more_work", () => 
   assert.ok(
     verifier.missing.some((item) => item.includes("open_evidence_conflicts")),
   );
+});
+
+test("unbound evidence conflicts remain visible diagnostics but do not block acceptance", () => {
+  const conflicts = detectEvidenceConflicts([
+    {
+      id: "p1",
+      text: "The catalyst efficiency reaches 92 percent in production trials.",
+    },
+    {
+      id: "p2",
+      text: "The catalyst efficiency reaches 41 percent in production trials.",
+    },
+  ]);
+  assert.equal(conflicts.length, 1);
+  assert.deepEqual(conflicts[0].claimIds, []);
+
+  const result = evaluateResearchAcceptance({
+    plan: hybridResearchPlan(),
+    evidence: hybridEvidence(),
+    conflicts,
+    finalOutput:
+      "Hybrid findings cite https://alpha.example.com/a and Notes/Alpha.md.\n\nLimitations: e2e.\n\nConfidence: medium.",
+  });
+  assert.ok(!result.missing.some((item) => item.startsWith("open_evidence_conflicts")));
 });
 
 test("acknowledged_limitation allows research acceptance with explicit limitation text", () => {

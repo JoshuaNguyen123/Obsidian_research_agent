@@ -84,7 +84,11 @@ export function renderedBoardRowCount(stdout: string): number {
       (char) => !/\s/u.test(char),
     );
     return (
-      fixedWidthBody.length >= (mirroredLabel || outerFrame ? 16 : 24) &&
+      // Compact renderers use two printable columns per logical square and
+      // emit only the four playable squares, yielding a 16-character body.
+      // The numbered-row and restricted-glyph checks above still prevent
+      // ordinary prose from being treated as a board.
+      fixedWidthBody.length >= 16 &&
       visibleGlyphs.length <= 8 &&
       visibleGlyphs.every((char) => glyph.test(char))
     );
@@ -173,7 +177,7 @@ export function unresolvedScratchPythonImports(
 }
 
 export async function captureCatalogAndFrontierTrace(page: Page): Promise<string[]> {
-  await page.getByRole("tab", { name: "Activity" }).click();
+  await page.getByRole("tab", { name: "Run Details" }).click();
   const text =
     (await page
       .locator(".agentic-researcher-details-panel")

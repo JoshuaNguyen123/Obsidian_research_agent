@@ -4,6 +4,7 @@ export type SecretMetadataKeyV1 =
   | "account"
   | "actor"
   | "credentialKind"
+  | "endpoint"
   | "provider"
   | "scope";
 

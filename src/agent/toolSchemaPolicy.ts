@@ -108,6 +108,9 @@ export const ROUTE_BASE_TOOLS: Readonly<
 const LIFECYCLE_WORKFLOW_TOOLS = new Set([
   "publish_research_to_linear",
   "publish_research_project_to_linear",
+  // End-of-mission progress report. It must survive the note/research route
+  // shrink, because reflection runs on exactly those routes.
+  "report_progress_to_linear",
 ]);
 
 /**

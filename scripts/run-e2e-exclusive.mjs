@@ -25,11 +25,13 @@ const DEFAULT_PLAYWRIGHT_PROJECT = "desktop-checkers-delivery-real-live";
 // nothing about a host the product could not actually run on.
 const PLAYWRIGHT_PROJECTS = new Set([
   DEFAULT_PLAYWRIGHT_PROJECT,
+  "safe-assistant-renderer",
   "retained-journey",
   "byok-autonomous-journey",
   "daily-use-research",
   "daily-use-code-live",
   "desktop-code-delivery-real-live",
+  "vault-sibling-code-delivery-real-live",
   "demo-recording",
   "demo-journey-recording",
   "daily-use-compound",
@@ -40,6 +42,7 @@ const PLAYWRIGHT_PROJECTS = new Set([
   "release-vertical",
   "disposable-live-external",
   "configured-linear-live",
+  "configured-github-visibility-live",
   "linear-flow-real-cleanup",
   "compound-flow-real-live",
   "github-askpass-runtime-live",
@@ -54,6 +57,12 @@ const EXTERNAL_CREDENTIAL_PROJECTS = Object.freeze({
   },
   "github-askpass-runtime-live": {
     requiredEnv: ["E2E_GITHUB_TOKEN"],
+    platforms: ["win32"],
+  },
+  "configured-github-visibility-live": {
+    // Visibility is intentionally hard-pinned to private by the spec. The
+    // cleanup actor comes from the already authenticated gh session.
+    requiredEnv: [],
     platforms: ["win32"],
   },
 });
@@ -74,6 +83,7 @@ const SANDBOX_E2E_PROJECTS = new Set([
   "byok-autonomous-journey",
   "daily-use-code-live",
   "desktop-code-delivery-real-live",
+  "vault-sibling-code-delivery-real-live",
   "desktop-checkers-delivery-real-live",
   "demo-recording",
   "demo-journey-recording",
@@ -259,8 +269,17 @@ async function main() {
     if (exitCode === 0) {
       // Execution proof first: a scorecard check over a suite that never ran
       // would just be a second way to report a green lie.
-      await assertSelectedProjectsExecuted(projects);
-      await assertMissionScorecardSummaryFile({ selectedProjects: projects });
+      const executionProof = await assertSelectedProjectsExecuted(projects);
+      await assertMissionScorecardSummaryFile({
+        selectedProjects: projects,
+        // A targeted grep may intentionally run an unscored settings/guard
+        // test inside a scored project. In that case compare only baselined
+        // tests that actually ran. Full project lanes remain fail-closed and
+        // still require every committed baseline record.
+        ...(hasTargetedPlaywrightSelection(playwrightArgs)
+          ? { executedTests: executionProof.executedTests }
+          : {}),
+      });
     }
     process.exitCode = interruptedSignal
       ? SIGNAL_EXIT_CODES[interruptedSignal] ?? 1
@@ -380,6 +399,49 @@ export function assertProjectsExecuted(report, selectedProjects) {
   return { checked: projects.length, executed };
 }
 
+export function collectExecutedPlaywrightTests(report, selectedProjects) {
+  const projects = new Set(
+    [...new Set(selectedProjects ?? [])].filter(Boolean),
+  );
+  const executedTests = [];
+  const seen = new Set();
+  const visit = (suite) => {
+    for (const spec of suite?.specs ?? []) {
+      for (const test of spec.tests ?? []) {
+        const project = String(test.projectName ?? "");
+        if (!projects.has(project)) continue;
+        const ran = (test.results ?? []).some(
+          (result) => result?.status && result.status !== "skipped",
+        );
+        if (!ran) continue;
+        const identity = {
+          project,
+          file: String(spec.file ?? suite?.file ?? ""),
+          title: String(spec.title ?? ""),
+        };
+        const key = `${identity.project}|${identity.file}|${identity.title}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          executedTests.push(identity);
+        }
+      }
+    }
+    for (const child of suite?.suites ?? []) visit(child);
+  };
+  for (const suite of report?.suites ?? []) visit(suite);
+  return executedTests;
+}
+
+export function hasTargetedPlaywrightSelection(playwrightArgs) {
+  return (playwrightArgs ?? []).some(
+    (arg) =>
+      arg === "--grep" ||
+      arg === "--grep-invert" ||
+      arg.startsWith("--grep=") ||
+      arg.startsWith("--grep-invert="),
+  );
+}
+
 async function assertSelectedProjectsExecuted(projects) {
   let raw;
   try {
@@ -391,12 +453,15 @@ async function assertSelectedProjectsExecuted(projects) {
       }`,
     );
   }
-  const summary = assertProjectsExecuted(JSON.parse(raw), projects);
+  const report = JSON.parse(raw);
+  const summary = assertProjectsExecuted(report, projects);
+  const executedTests = collectExecutedPlaywrightTests(report, projects);
   console.log(
     `E2E execution proof: ${Object.entries(summary.executed)
       .map(([project, count]) => `${project}=${count}`)
       .join(" ")}`,
   );
+  return { ...summary, executedTests };
 }
 
 function runCommand(command, args, envOverrides) {
@@ -610,6 +675,7 @@ export function normalizeExclusiveArgs(rawArgs) {
     "daily-use-research",
     "daily-use-code-live",
     "desktop-code-delivery-real-live",
+    "vault-sibling-code-delivery-real-live",
     "desktop-checkers-delivery-real-live",
     "demo-recording",
     "demo-journey-recording",

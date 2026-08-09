@@ -61,6 +61,7 @@ import {
   createSourceCandidateLedger,
   recordSourceCandidateOutcome,
   type ResearchSourceType,
+  type SourceCandidate,
   type SourceCandidateLedgerV1,
 } from "./sourceCandidateLedger";
 
@@ -167,6 +168,9 @@ export async function runResearchWorker(input: {
     onEvidence: input.events?.onModelCallEvidence,
   });
   const registry = createReadOnlyWorkerRegistry(input.toolRegistry);
+  const webFetchAvailable = registry
+    .getDefinitions()
+    .some((definition) => definition.function.name === "web_fetch");
   const researchEffortTier = input.researchEffortTier ??
     classifyResearchWorkerEffort(input.originalMission, input.assignment);
   const modelRequestProfile = resolveResearchWorkerModelRequestProfile({
@@ -196,9 +200,10 @@ export async function runResearchWorker(input: {
         claimId: "mission",
         description: input.assignment,
         minUsableSources: minimumUsableSources,
-        // At least one primary source is a hard quality floor. Requiring both
-        // primary and official types made a complete three-source handoff
-        // impossible for bounded owned fixtures and many legitimate topics.
+        // Prefer a primary source when one is available, but keep the explicit
+        // usable-source count as the blocking proof contract. Many legitimate
+        // topics have no primary source, so a type preference must never turn
+        // a satisfied count into a misleading "0 source(s) still missing" loop.
         preferredSourceTypes: ["primary"],
       },
     ],
@@ -245,11 +250,89 @@ export async function runResearchWorker(input: {
   let effectiveMaxToolCalls = maxToolCalls;
   let saturationFinalize = false;
 
+  const executeHostOwnedCandidateFetch = async (options: {
+    candidate: SourceCandidate;
+    step: number;
+    callId: string;
+    status: string;
+    failureMessage: string;
+  }): Promise<boolean> => {
+    if (toolCalls >= effectiveMaxToolCalls) return false;
+
+    throwIfAborted(input.abortSignal);
+    toolCalls += 1;
+    const call: ModelToolCall = {
+      id: options.callId,
+      name: "web_fetch",
+      arguments: { url: options.candidate.url },
+    };
+    const eventId = `${input.participantId}-tool-${toolCalls}`;
+    await input.events?.onStatus?.(options.status);
+    await input.events?.onToolStart?.({
+      id: eventId,
+      name: call.name,
+      step: options.step,
+    });
+    throwIfAborted(input.abortSignal);
+    const result = await registry.execute(call, {
+      ...input.toolContext,
+      runId: `${input.runId}-${input.participantId}`,
+      originalPrompt: input.assignment,
+      abortSignal: input.abortSignal,
+      writeAutonomy: false,
+      userApprovalGranted: false,
+    });
+    throwIfAborted(input.abortSignal);
+    await input.events?.onToolDone?.({
+      id: eventId,
+      name: call.name,
+      step: options.step,
+      result,
+    });
+    const nextEvidence = evidenceFromToolResult(call.name, result);
+    if (
+      nextEvidence &&
+      !evidence.some((item) => item.id === nextEvidence.id)
+    ) {
+      evidence.push(nextEvidence);
+    }
+    for (const passage of claimPassagesFromToolResult(call.name, result)) {
+      if (!claimPassages.some((item) => item.id === passage.id)) {
+        claimPassages.push(passage);
+      }
+    }
+    sourceLedger = recordSourceCandidateOutcome(
+      sourceLedger,
+      options.candidate.id,
+      nextEvidence
+        ? {
+            status: "usable",
+            evidenceIds: [nextEvidence.id],
+            contentHash: contentHashFromToolResult(result),
+          }
+        : {
+            status: "unusable",
+            failure: result.error?.message ?? options.failureMessage,
+          },
+      input.now?.() ?? new Date(),
+    );
+    appendToolTranscript({
+      messages,
+      toolCall: call,
+      resultContent: serializeToolResultForModel(result),
+      origin: "runner",
+      fallbackId: eventId,
+    });
+    return true;
+  };
+
   for (let step = 1; step <= effectiveMaxSteps; step += 1) {
     throwIfAborted(input.abortSignal);
     modelSteps = step;
     const toolCallsAtStepStart = toolCalls;
     const evidenceAtStepStart = evidence.length;
+    let successfulWebSearchThisStep = false;
+    let hostOwnedFetchExecutedThisStep = false;
     await input.events?.onStatus?.(`Researcher step ${step}/${effectiveMaxSteps}`);
     const request: ModelChatRequest = {
       ...modelRequestProfile,
@@ -272,7 +355,9 @@ export async function runResearchWorker(input: {
     }
     if (response.toolCalls.length === 0) {
       finalSummary = response.message.content.trim();
-      const remainingProofDebt = computeSourceProofDebt(sourceLedger);
+      const remainingProofDebt = computeSourceProofDebt(sourceLedger).filter(
+        (item) => item.missing > 0,
+      );
       if (finalSummary && remainingProofDebt.length === 0) break;
       if (finalSummary && step < effectiveMaxSteps) {
         finalSummary = "";
@@ -363,6 +448,7 @@ export async function runResearchWorker(input: {
             }
           }
           if (call.name === "web_search" && result.ok) {
+            successfulWebSearchThisStep = true;
             sourceLedger = addSearchResultsToLedger(
               sourceLedger,
               result.output,
@@ -458,6 +544,7 @@ export async function runResearchWorker(input: {
         }
       }
       if (call.name === "web_search" && result.ok) {
+        successfulWebSearchThisStep = true;
         sourceLedger = addSearchResultsToLedger(
           sourceLedger,
           result.output,
@@ -493,6 +580,7 @@ export async function runResearchWorker(input: {
         call.name === "web_fetch" &&
         claimedCandidateId !== null &&
         nextEvidence === null &&
+        !hostOwnedFetchExecutedThisStep &&
         alternativeSourceReads < maxAlternativeSourceReads &&
         toolCalls < effectiveMaxToolCalls
       ) {
@@ -513,79 +601,51 @@ export async function runResearchWorker(input: {
         ) {
           sourceLedger = alternativeClaim.ledger;
           alternativeSourceReads += 1;
-          toolCalls += 1;
-          const alternativeCall: ModelToolCall = {
-            id: `${input.runId}-worker-alternative-${alternativeSourceReads}`,
-            name: "web_fetch",
-            arguments: { url: candidate.url },
-          };
-          const alternativeEventId =
-            `${input.participantId}-tool-${toolCalls}`;
-          await input.events?.onStatus?.(
-            "The first public source was unusable; reading one bounded alternative source.",
-          );
-          await input.events?.onToolStart?.({
-            id: alternativeEventId,
-            name: alternativeCall.name,
-            step,
-          });
-          const alternativeResult = await registry.execute(alternativeCall, {
-            ...input.toolContext,
-            runId: `${input.runId}-${input.participantId}`,
-            originalPrompt: input.assignment,
-            abortSignal: input.abortSignal,
-            writeAutonomy: false,
-            userApprovalGranted: false,
-          });
-          await input.events?.onToolDone?.({
-            id: alternativeEventId,
-            name: alternativeCall.name,
-            step,
-            result: alternativeResult,
-          });
-          const alternativeEvidence = evidenceFromToolResult(
-            alternativeCall.name,
-            alternativeResult,
-          );
-          if (
-            alternativeEvidence &&
-            !evidence.some((item) => item.id === alternativeEvidence.id)
-          ) {
-            evidence.push(alternativeEvidence);
-          }
-          for (const passage of claimPassagesFromToolResult(
-            alternativeCall.name,
-            alternativeResult,
-          )) {
-            if (!claimPassages.some((item) => item.id === passage.id)) {
-              claimPassages.push(passage);
-            }
-          }
-          sourceLedger = recordSourceCandidateOutcome(
-            sourceLedger,
-            candidate.id,
-            alternativeEvidence
-              ? {
-                  status: "usable",
-                  evidenceIds: [alternativeEvidence.id],
-                  contentHash: contentHashFromToolResult(alternativeResult),
-                }
-              : {
-                  status: "unusable",
-                  failure:
-                    alternativeResult.error?.message ??
-                    "The bounded alternative source did not yield passage-backed evidence.",
-                },
-            input.now?.() ?? new Date(),
-          );
-          appendToolTranscript({
-            messages,
-            toolCall: alternativeCall,
-            resultContent: serializeToolResultForModel(alternativeResult),
-            origin: "runner",
-            fallbackId: alternativeEventId,
-          });
+          hostOwnedFetchExecutedThisStep =
+            await executeHostOwnedCandidateFetch({
+              candidate,
+              step,
+              callId: `${input.runId}-worker-alternative-${alternativeSourceReads}`,
+              status:
+                "The first public source was unusable; reading one bounded alternative source.",
+              failureMessage:
+                "The bounded alternative source did not yield passage-backed evidence.",
+            });
         }
+      }
+    }
+
+    if (
+      successfulWebSearchThisStep &&
+      !hostOwnedFetchExecutedThisStep &&
+      webFetchAvailable &&
+      toolCalls < effectiveMaxToolCalls &&
+      computeSourceProofDebt(sourceLedger).some((item) => item.missing > 0)
+    ) {
+      const searchClaim = claimNextFetchableSourceCandidate(
+        sourceLedger,
+        input.participantId,
+        "mission",
+        input.now?.() ?? new Date(),
+      );
+      const candidate = searchClaim.candidate;
+      if (
+        searchClaim.accepted &&
+        candidate &&
+        typeof candidate.url === "string" &&
+        candidate.url.trim()
+      ) {
+        sourceLedger = searchClaim.ledger;
+        hostOwnedFetchExecutedThisStep =
+          await executeHostOwnedCandidateFetch({
+            candidate,
+            step,
+            callId: `${input.runId}-worker-search-fetch-${step}`,
+            status:
+              "Search found a claim-bound source while proof remains open; reading one bounded result.",
+            failureMessage:
+              "The bounded search result did not yield passage-backed evidence.",
+          });
       }
     }
     if (finalSummary) break;
@@ -696,8 +756,23 @@ export async function runResearchWorker(input: {
     }
   }
 
+  const sourceProofDebt = computeSourceProofDebt(sourceLedger);
+  const blockingProofDebt = sourceProofDebt.filter((item) => item.missing > 0);
+  const preferredTypesMissing = unique(
+    sourceProofDebt.flatMap((item) => item.preferredTypesMissing),
+  );
+  if (blockingProofDebt.length === 0 && preferredTypesMissing.length > 0) {
+    finalSummary = [
+      finalSummary,
+      `Source-quality limitation: the usable-source floor was met, but no ${preferredTypesMissing.join(
+        " or ",
+      )} source was identified.`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
   const now = (input.now?.() ?? new Date()).toISOString();
-  const proofDebt = computeSourceProofDebt(sourceLedger);
   const sourceIds = unique(
     evidence.flatMap((item) => [item.sourceId, item.url, item.path].filter(isString)),
   );
@@ -708,13 +783,15 @@ export async function runResearchWorker(input: {
       toParticipantId: input.leadParticipantId,
       taskId: input.taskId,
       status:
-        evidence.length > 0 && proofDebt.length === 0 ? "ready" : "rejected",
+        evidence.length > 0 && blockingProofDebt.length === 0
+          ? "ready"
+          : "rejected",
       summary: finalSummary,
       sourceIds,
       evidenceIds: evidence.map((item) => item.id),
       unresolvedQuestions:
-        proofDebt.length > 0
-          ? proofDebt.map(
+        blockingProofDebt.length > 0
+          ? blockingProofDebt.map(
               (item) =>
                 `${item.description}: ${item.missing} usable source(s) still missing`,
             )
@@ -725,7 +802,7 @@ export async function runResearchWorker(input: {
           ? "medium"
           : "low",
       stopReason:
-        evidence.length > 0 && proofDebt.length === 0
+        evidence.length > 0 && blockingProofDebt.length === 0
           ? "handoff_ready"
           : "no_usable_evidence",
       createdAt: now,
@@ -930,6 +1007,32 @@ function addSearchResultsToLedger(
     ledger = registered.ledger;
   }
   return ledger;
+}
+
+function claimNextFetchableSourceCandidate(
+  initial: SourceCandidateLedgerV1,
+  ownerId: string,
+  claimId: string,
+  now: Date,
+): ReturnType<typeof claimSourceCandidate> {
+  let ledger = initial;
+  const candidates = Object.values(initial.candidates)
+    .filter(
+      (candidate) =>
+        typeof candidate.url === "string" &&
+        candidate.url.trim().length > 0 &&
+        (candidate.claimIds ?? []).includes(claimId),
+    )
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.id.localeCompare(right.id),
+    );
+  for (const candidate of candidates) {
+    const claimed = claimSourceCandidate(ledger, candidate.id, ownerId, { now });
+    ledger = claimed.ledger;
+    if (claimed.accepted) return claimed;
+  }
+  return { accepted: false, reason: "missing", ledger };
 }
 
 /**

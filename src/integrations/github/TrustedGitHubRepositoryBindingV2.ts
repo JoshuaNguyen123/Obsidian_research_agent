@@ -8,6 +8,11 @@ import {
   type TrustedGitHubRepositoryBindingV1,
 } from "./TrustedGitHubRepositoryBindingV1";
 import type { GitHubRepositoryRecord } from "./GitHubRestClient";
+import {
+  isRepositoryVisibility,
+  repositoryVisibilityFromReadback,
+  type RepositoryVisibility,
+} from "./RepositoryVisibility";
 
 export const TRUSTED_GITHUB_REPOSITORY_BINDING_V2_VERSION = 2 as const;
 export const GITHUB_REPOSITORY_VISIBILITY_MAX_AGE_MS = 5 * 60_000;
@@ -25,7 +30,7 @@ export interface TrustedGitHubRepositoryBindingV2 {
   repository: string;
   repositoryId: number;
   defaultBranch: string;
-  visibility: "private";
+  visibility: RepositoryVisibility;
   repositoryReadbackFingerprint: string;
   observedAt: string;
   remoteName: "origin";
@@ -42,6 +47,8 @@ export interface CreateTrustedGitHubRepositoryBindingInputV2 {
   owner: string;
   repository: string;
   repositoryReadback: GitHubRepositoryRecord;
+  /** Required for public bindings; omitted legacy callers remain private-only. */
+  expectedVisibility?: RepositoryVisibility;
   observedAt: string;
   verifiedAccountId: number;
   verifiedAccountLogin: string;
@@ -62,11 +69,13 @@ export function createTrustedGitHubRepositoryBindingV2(
   const owner = githubLogin(input.owner, "GitHub owner");
   const repository = githubName(input.repository, "GitHub repository");
   const observedAt = timestamp(input.observedAt, "repository observation time");
-  const readback = normalizePrivateReadback(
+  const expectedVisibility = input.expectedVisibility ?? "private";
+  const readback = normalizeRepositoryReadback(
     input.repositoryReadback,
     owner,
     repository,
     profile.defaultBranch,
+    expectedVisibility,
   );
   const unsigned: Omit<TrustedGitHubRepositoryBindingV2, "fingerprint"> = {
     version: TRUSTED_GITHUB_REPOSITORY_BINDING_V2_VERSION,
@@ -79,7 +88,7 @@ export function createTrustedGitHubRepositoryBindingV2(
     repository,
     repositoryId: readback.id,
     defaultBranch: readback.defaultBranch,
-    visibility: "private",
+    visibility: expectedVisibility,
     repositoryReadbackFingerprint: fingerprintGitHubRepositoryReadbackV2(readback),
     observedAt,
     remoteName: "origin",
@@ -98,11 +107,12 @@ export function upgradeTrustedGitHubRepositoryBindingV1ToV2(input: {
 }): TrustedGitHubRepositoryBindingV2 {
   const legacy = parseTrustedGitHubRepositoryBindingV1(input.binding);
   const observedAt = timestamp(input.observedAt, "repository observation time");
-  const readback = normalizePrivateReadback(
+  const readback = normalizeRepositoryReadback(
     input.repositoryReadback,
     legacy.owner,
     legacy.repository,
     legacy.defaultBranch,
+    "private",
   );
   if (readback.id !== legacy.repositoryId) {
     fail("GitHub repository readback ID does not match the legacy trusted binding.");
@@ -143,7 +153,7 @@ export function parseTrustedGitHubRepositoryBindingV2(
   if (
     record.version !== 2 ||
     record.githubHost !== "github.com" ||
-    record.visibility !== "private" ||
+    !isRepositoryVisibility(record.visibility) ||
     record.remoteName !== "origin" ||
     record.agentBranchPrefix !== "codex/"
   ) {
@@ -160,7 +170,7 @@ export function parseTrustedGitHubRepositoryBindingV2(
     repository: githubName(record.repository, "GitHub repository"),
     repositoryId: positiveInteger(record.repositoryId, "repository id"),
     defaultBranch: gitBranch(record.defaultBranch, "default branch"),
-    visibility: "private",
+    visibility: record.visibility,
     repositoryReadbackFingerprint: fingerprint(record.repositoryReadbackFingerprint, "repository readback fingerprint"),
     observedAt: timestamp(record.observedAt, "repository observation time"),
     remoteName: "origin",
@@ -227,11 +237,22 @@ export function assertFreshPrivateGitHubRepositoryBindingV2(
   options: { now?: Date; maxAgeMs?: number } = {},
 ): TrustedGitHubRepositoryBindingV2 {
   const binding = parseTrustedGitHubRepositoryBindingV2(value);
+  if (binding.visibility !== "private") {
+    fail("Trusted GitHub repository binding is not private.");
+  }
+  return assertFreshGitHubRepositoryBindingV2(binding, options);
+}
+
+export function assertFreshGitHubRepositoryBindingV2(
+  value: unknown,
+  options: { now?: Date; maxAgeMs?: number } = {},
+): TrustedGitHubRepositoryBindingV2 {
+  const binding = parseTrustedGitHubRepositoryBindingV2(value);
   const now = options.now ?? new Date();
   const maxAgeMs = options.maxAgeMs ?? GITHUB_REPOSITORY_VISIBILITY_MAX_AGE_MS;
   const age = now.getTime() - Date.parse(binding.observedAt);
   if (age < -5_000 || age > maxAgeMs) {
-    fail("Private GitHub repository visibility evidence is stale; perform a fresh provider readback.");
+    fail("GitHub repository visibility evidence is stale; perform a fresh provider readback.");
   }
   return binding;
 }
@@ -257,9 +278,9 @@ export function assertGitHubApprovalBindingFreshV2(input: {
     visibilityAgeAtPreparation >
       (input.maxAgeMs ?? GITHUB_REPOSITORY_VISIBILITY_MAX_AGE_MS)
   ) {
-    fail("GitHub approval was prepared against stale private-visibility evidence.");
+    fail("GitHub approval was prepared against stale repository-visibility evidence.");
   }
-  return assertFreshPrivateGitHubRepositoryBindingV2(binding, {
+  return assertFreshGitHubRepositoryBindingV2(binding, {
     now: input.now,
     maxAgeMs: input.maxAgeMs,
   });
@@ -269,28 +290,32 @@ export type CompatibleTrustedGitHubRepositoryBinding =
   | TrustedGitHubRepositoryBindingV1
   | TrustedGitHubRepositoryBindingV2;
 
-function normalizePrivateReadback(
+function normalizeRepositoryReadback(
   value: GitHubRepositoryRecord,
   owner: string,
   repository: string,
   defaultBranch: string,
+  expectedVisibility: RepositoryVisibility,
 ): GitHubRepositoryRecord {
   if (!value || typeof value !== "object") fail("GitHub repository readback is missing.");
   const observedOwnerRepo = fullName(value.fullName);
   if (
-    value.private !== true ||
+    repositoryVisibilityFromReadback(value) !== expectedVisibility ||
     value.archived === true ||
     observedOwnerRepo.toLowerCase() !== `${owner}/${repository}`.toLowerCase() ||
     gitBranch(value.defaultBranch, "readback default branch") !== defaultBranch
   ) {
-    fail("GitHub repository readback is not the exact active private repository binding.");
+    fail(
+      `GitHub repository readback is not the exact active ${expectedVisibility} repository binding.`,
+    );
   }
   return {
     id: positiveInteger(value.id, "repository id"),
     fullName: observedOwnerRepo,
     htmlUrl: httpsUrl(value.htmlUrl),
     defaultBranch: value.defaultBranch,
-    private: true,
+    private: expectedVisibility === "private",
+    visibility: expectedVisibility,
     archived: false,
   };
 }

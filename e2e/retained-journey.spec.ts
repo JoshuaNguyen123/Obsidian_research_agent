@@ -348,7 +348,7 @@ test("DU-06 RETAINED-JOURNEY research to Linear to code to private GitHub, with 
       "code_commit_verified",
       "linear_create_issue",
       "linear_get_issue",
-      "github_create_private_repository",
+      "github_create_repository",
       "publish_verified_code_to_github",
     ]) {
       expect(

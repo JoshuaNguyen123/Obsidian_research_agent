@@ -6,6 +6,7 @@ import {
   DAILY_USE_ACCEPTANCE_V1,
   DESKTOP_01_ACCEPTANCE_TOKENS,
   evaluateDailyUseAcceptanceV1,
+  FLOW_REAL_01_ACCEPTANCE_TOKENS,
 } from "../src/agent/dailyUseAcceptance";
 
 describe("DailyUseAcceptanceV1", () => {
@@ -19,6 +20,7 @@ describe("DailyUseAcceptanceV1", () => {
       "DU-06",
       "BYOK-01",
       "DESKTOP-01",
+      "FLOW-REAL-01",
     ]);
     for (const [scenarioId, contract] of Object.entries(DAILY_USE_ACCEPTANCE_V1)) {
       assert.equal(contract.version, 1);
@@ -73,6 +75,26 @@ describe("DailyUseAcceptanceV1", () => {
       new Set<string>(contract.requiredProofs).has("resume:no_duplicates"),
       false,
     );
+  });
+
+  it("keeps FLOW-REAL-01 on the single-issue chain rather than folding it into DU-06", () => {
+    const contract = DAILY_USE_ACCEPTANCE_V1["FLOW-REAL-01"];
+    // The whole reason this contract exists: the lane publishes exactly one
+    // issue through publish_research_to_linear and never builds a hierarchy,
+    // so requiring DU-06's initiative/project would force the lane to record
+    // artifacts it does not create. Membership is checked before the
+    // deep-equals below, which narrow these to their literal tuple types.
+    assert.equal(contract.requestedArtifacts.includes("linear:initiative"), false);
+    assert.equal(contract.requestedArtifacts.includes("linear:project"), false);
+    assert.equal(contract.requiredProofs.includes("linear:hierarchy_readback"), false);
+    assert.ok(DAILY_USE_ACCEPTANCE_V1["DU-06"].requestedArtifacts.includes("linear:initiative"));
+    // Unattended set-loose: no approval stops, and cleanup runs after the
+    // acceptance record, so both stay empty rather than being asserted unseen.
+    assert.deepEqual(contract.approvalBoundaries, []);
+    assert.deepEqual(contract.cleanupObligations, []);
+    assert.deepEqual(contract.requestedArtifacts, FLOW_REAL_01_ACCEPTANCE_TOKENS.artifacts);
+    assert.deepEqual(contract.requiredProofs, FLOW_REAL_01_ACCEPTANCE_TOKENS.proofs);
+    assert.deepEqual(contract.finalBindings, FLOW_REAL_01_ACCEPTANCE_TOKENS.bindings);
   });
 
   it("uses an idempotency contract rather than an unexercised resume claim", () => {

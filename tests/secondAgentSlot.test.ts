@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  createSpecialistModelClient,
   createUtilitySlotClient,
   createModelClientForSlot,
+  resolveAgentModelSlotV2,
 } from "../src/model/createModelClient";
 import { decideNextLoopAction, type LoopLedger } from "../src/agent/loopDecision";
 import {
@@ -29,25 +31,48 @@ function settings(overrides: Partial<AgentSettings> = {}): AgentSettings {
 
 // ---------------------------------------------------------------- slot client
 
-test("no utility model configured means no second client", () => {
-  assert.equal(createUtilitySlotClient(settings()), null);
+test("Agent 2 can share the active Ollama connection with an independent client", () => {
+  const configured = settings({
+    specialistEnabled: true,
+    specialistModel: "specialist-model",
+    specialistConnectionMode: "shared_primary",
+  });
+  const client = createSpecialistModelClient(configured);
+  const resolution = resolveAgentModelSlotV2(configured, "specialist");
+
+  assert.ok(client);
+  assert.equal(client.descriptor?.model, "specialist-model");
+  assert.equal(resolution.slot.provider, "ollama");
+  assert.equal(resolution.credentialSource, "lead");
+  assert.equal(resolution.available, true);
 });
 
-test("a utility model on the primary endpoint needs no second client", () => {
-  // Pre-existing behaviour: in-client phase routing already reaches this model,
-  // so building a second client would be pure overhead.
-  const client = createUtilitySlotClient(
-    settings({ utilityModel: "fast-model", utilityModelProvider: "ollama" }),
+test("a blank Specialist model deliberately falls back to the Lead model", () => {
+  const client = createSpecialistModelClient(
+    settings({
+      specialistEnabled: true,
+      specialistModel: "",
+      specialistConnectionMode: "shared_primary",
+    }),
+  );
+  assert.equal(client?.descriptor?.model, "primary-model");
+});
+
+test("disabled Agent 2 creates no Specialist client", () => {
+  const client = createSpecialistModelClient(
+    settings({ specialistEnabled: false }),
   );
   assert.equal(client, null);
 });
 
 test("an explicit second endpoint on a different provider gets its own client", () => {
-  const client = createUtilitySlotClient(
+  const client = createSpecialistModelClient(
     settings({
-      utilityModel: "fast-model",
-      utilityModelProvider: "openai_compatible",
-      utilityBaseUrl: "https://second.example/v1",
+      specialistModel: "fast-model",
+      specialistConnectionMode: "separate",
+      specialistProvider: "openai_compatible",
+      specialistBaseUrl: "https://second.example/v1",
+      specialistApiKey: "specialist-key",
     }),
   );
   assert.ok(client, "a different provider was previously unreachable");
@@ -55,42 +80,61 @@ test("an explicit second endpoint on a different provider gets its own client", 
 });
 
 test("an explicit second endpoint on the same provider is still distinct", () => {
-  const client = createUtilitySlotClient(
+  const client = createSpecialistModelClient(
     settings({
-      utilityModel: "fast-model",
-      utilityModelProvider: "ollama",
-      utilityBaseUrl: "https://second.example/api",
+      specialistModel: "fast-model",
+      specialistConnectionMode: "separate",
+      specialistProvider: "ollama",
+      specialistBaseUrl: "https://second.example/api",
+      specialistApiKey: "specialist-key",
     }),
   );
   assert.ok(client);
 });
 
-test("a stale auto-pinned provider stays inert without an explicit endpoint", () => {
-  // The Utility model field used to pin utilityModelProvider to whatever the
-  // primary provider was at the time. A vault that later switched primaries
-  // carries a value nobody chose; it must not start directing spend at a
-  // second provider on its own.
+test("separate mode never inherits a Lead key", () => {
+  const configured = settings({
+    specialistModel: "fast-model",
+    specialistConnectionMode: "separate",
+    specialistProvider: "ollama",
+    specialistBaseUrl: "https://second.example/api",
+    specialistApiKey: "",
+    ollamaApiKey: "lead-key-that-must-not-cross-slots",
+  });
+  const client = createSpecialistModelClient(configured);
+  const resolution = resolveAgentModelSlotV2(configured, "specialist");
+  assert.equal(client, null);
+  assert.equal(resolution.credentialSource, "specialist");
+  assert.equal(resolution.credentialPresent, false);
+  assert.equal(resolution.unavailableReason, "missing_specialist_credential");
+});
+
+test("schema-4 utility fields remain a migration-only compatibility input", () => {
   const client = createUtilitySlotClient(
     settings({
-      modelProvider: "openai_compatible",
       utilityModel: "fast-model",
       utilityModelProvider: "ollama",
+      utilityBaseUrl: "https://second.example/api",
+      utilityApiKey: "legacy-explicit-specialist-key",
+      specialistConnectionMode: undefined,
+      specialistModel: undefined,
+    }),
+  );
+  assert.ok(client);
+});
+
+test("a schema-4 separate endpoint without its own key fails closed", () => {
+  const client = createUtilitySlotClient(
+    settings({
+      utilityModel: "fast-model",
+      utilityModelProvider: "ollama",
+      utilityBaseUrl: "https://second.example/api",
+      utilityApiKey: "",
+      specialistConnectionMode: undefined,
+      specialistModel: undefined,
     }),
   );
   assert.equal(client, null);
-});
-
-test("the second slot inherits the primary credentials when it declares none", () => {
-  // Sharing a key across two endpoints on one provider is common; making the
-  // user retype it would invite a stale copy.
-  const client = createUtilitySlotClient(
-    settings({
-      utilityModel: "fast-model",
-      utilityModelProvider: "ollama",
-      utilityBaseUrl: "https://second.example/api",
-    }),
-  );
-  assert.ok(client);
 });
 
 test("slot construction is provider-driven, not field-name-driven", () => {

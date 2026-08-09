@@ -32,6 +32,9 @@ describe("settingsNormalize", () => {
     assert.equal(settings.modelRouterMode, "authority");
     assert.equal(settings.modelRouterEnabled, true);
     assert.equal(settings.model, "glm-5.2");
+    assert.equal(settings.specialistEnabled, true);
+    assert.equal(settings.specialistConnectionMode, "shared_primary");
+    assert.equal(settings.specialistModel, "");
     assert.equal(settings.showUnfinishedRunBannerOnOpen, false);
     assert.equal(settings.settingsSchemaVersion, SETTINGS_SCHEMA_VERSION);
   });
@@ -233,8 +236,8 @@ describe("settingsNormalize", () => {
     assert.equal(settings.modelRouterEnabled, true);
   });
 
-  it("accepts schemas 1 through 4 and rejects malformed or future schemas", () => {
-    for (const schema of [1, 2, 3, 4] as const) {
+  it("accepts schemas 1 through 5 and rejects malformed or future schemas", () => {
+    for (const schema of [1, 2, 3, 4, 5] as const) {
       const settings = normalizeAgentSettings(
         { settingsSchemaVersion: schema, ollamaApiKey: "keep-me" },
         "existing_install",
@@ -246,19 +249,50 @@ describe("settingsNormalize", () => {
     assert.throws(
       () =>
         normalizeAgentSettings(
-          { settingsSchemaVersion: 5 },
+          { settingsSchemaVersion: 6 },
           "existing_install",
         ),
-      /unsupported future settings schema 5/i,
+      /unsupported future settings schema 6/i,
     );
     assert.throws(
       () =>
         normalizeAgentSettings(
-          { settingsSchemaVersion: "4" },
+          { settingsSchemaVersion: "5" },
           "existing_install",
         ),
       /supported integer schemas/i,
     );
+  });
+
+  it("migrates schema-4 utility fields into the canonical Specialist slot", () => {
+    const shared = normalizeAgentSettings(
+      {
+        settingsSchemaVersion: 4,
+        modelProvider: "ollama",
+        utilityModel: "legacy-specialist-model",
+        utilityModelProvider: "ollama",
+      },
+      "existing_install",
+    );
+    assert.equal(shared.settingsSchemaVersion, 5);
+    assert.equal(shared.specialistModel, "legacy-specialist-model");
+    assert.equal(shared.specialistConnectionMode, "shared_primary");
+    assert.equal(shared.specialistProvider, "ollama");
+    assert.equal("utilityModel" in shared, false);
+
+    const separate = normalizeAgentSettings(
+      {
+        settingsSchemaVersion: 4,
+        utilityModel: "legacy-specialist-model",
+        utilityModelProvider: "openai_compatible",
+        utilityBaseUrl: "https://agent-2.example/v1",
+      },
+      "existing_install",
+    );
+    assert.equal(separate.specialistConnectionMode, "separate");
+    assert.equal(separate.specialistProvider, "openai_compatible");
+    assert.equal(separate.specialistBaseUrl, "https://agent-2.example/v1");
+    assert.equal("utilityApiKey" in separate, false);
   });
 
   it("migrates legacy autonomy and memory flags into canonical modes", () => {

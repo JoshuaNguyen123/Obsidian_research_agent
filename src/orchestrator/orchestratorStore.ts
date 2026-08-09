@@ -19,6 +19,10 @@ import {
   type OrchestratorSnapshotV1,
   type OrchestratorWorkNode,
   type SourceLedgerSummary,
+  type SpecialistHandoffV2,
+  type SpecialistMode,
+  type SpecialistProofReferencesV2,
+  type SpecialistRepairStateV2,
   type VerificationStatus,
   type WorkerHandoff,
   type WorkerHandoffStatus,
@@ -121,8 +125,8 @@ export function normalizeOrchestratorSnapshot(
     .filter(
       (item) =>
         Boolean(nodes[item.taskId]) &&
-        Boolean(participants[item.fromParticipantId]) &&
-        Boolean(participants[item.toParticipantId]),
+        hasParticipantOrLegacySpecialist(participants, item.fromParticipantId) &&
+        hasParticipantOrLegacySpecialist(participants, item.toParticipantId),
     );
 
   const requestedRoots = strings(value.rootNodeIds, MAX_ORCHESTRATOR_NODES).filter(
@@ -132,7 +136,7 @@ export function normalizeOrchestratorSnapshot(
     .filter((node) => node.parentId === null)
     .map((node) => node.id);
 
-  return {
+  return migrateNormalizedLegacyTeam({
     version: ORCHESTRATOR_SNAPSHOT_VERSION,
     runId,
     mode: enumValue(value.mode, MODES) ?? inferMode(participants),
@@ -153,7 +157,7 @@ export function normalizeOrchestratorSnapshot(
     sequence: nonNegativeInteger(value.sequence),
     createdAt,
     updatedAt,
-  };
+  });
 }
 
 /**
@@ -345,7 +349,12 @@ function normalizeParticipant(
   if (!isRecord(value)) return null;
   const id = value.id !== undefined ? safeId(value.id) : safeId(fallbackId);
   if (!id) return null;
-  const role = enumValue(value.role, AGENT_ROLES) ?? (id === "lead" ? "lead" : "researcher");
+  const role =
+    enumValue(value.role, AGENT_ROLES) ??
+    (id === "lead" ? "lead" : id === "specialist" ? "specialist" : "researcher");
+  const specialistMode =
+    enumValue(value.specialistMode, SPECIALIST_MODES) ??
+    (role === "specialist" ? "researcher" : undefined);
   return {
     id,
     role,
@@ -358,6 +367,132 @@ function normalizeParticipant(
     ...(timestampOptional(value.startedAt) ? { startedAt: timestampOptional(value.startedAt) } : {}),
     updatedAt: timestamp(value.updatedAt, fallbackTime),
     ...(text(value.blocker, 2_000) ? { blocker: text(value.blocker, 2_000) } : {}),
+    ...(specialistMode ? { specialistMode } : {}),
+    ...(normalizeSpecialistRepairState(value.repairState)
+      ? { repairState: normalizeSpecialistRepairState(value.repairState)! }
+      : {}),
+  };
+}
+
+function hasParticipantOrLegacySpecialist(
+  participants: Record<string, AgentParticipant>,
+  participantId: string,
+): boolean {
+  if (participants[participantId]) return true;
+  if (participantId === "specialist") {
+    return Boolean(participants.researcher || participants.code_worker);
+  }
+  if (participantId === "researcher" || participantId === "code_worker") {
+    return Boolean(participants.specialist);
+  }
+  return false;
+}
+
+/** Transparently project persisted V1 worker identities onto the V2 pair. */
+function migrateNormalizedLegacyTeam(
+  snapshot: OrchestratorSnapshotV1,
+): OrchestratorSnapshotV1 {
+  const legacyParticipants = Object.values(snapshot.participants).filter(
+    (participant) =>
+      participant.role === "researcher" || participant.role === "code_worker",
+  );
+  const hasLegacyHandoffIdentity = snapshot.handoffs.some(
+    (handoff) =>
+      handoff.fromParticipantId === "researcher" ||
+      handoff.fromParticipantId === "code_worker" ||
+      handoff.toParticipantId === "researcher" ||
+      handoff.toParticipantId === "code_worker",
+  );
+  if (
+    snapshot.mode !== "research_team" &&
+    snapshot.mode !== "code_team" &&
+    legacyParticipants.length === 0 &&
+    !hasLegacyHandoffIdentity
+  ) {
+    return snapshot;
+  }
+  const preferred =
+    legacyParticipants.find((participant) => participant.role === "code_worker") ??
+    legacyParticipants[0] ??
+    snapshot.participants.specialist;
+  if (!preferred) return { ...snapshot, mode: "adaptive_team" };
+  const specialistMode: SpecialistMode =
+    preferred.specialistMode ??
+    (preferred.role === "code_worker" ? "code_builder" : "researcher");
+  const legacyIds = new Set([
+    ...legacyParticipants.map((participant) => participant.id),
+    "researcher",
+    "code_worker",
+  ]);
+  const lead =
+    snapshot.participants.lead ??
+    normalizeParticipant(
+      { id: "lead", role: "lead", displayName: "Lead", status: "planning" },
+      "lead",
+      snapshot.updatedAt,
+    )!;
+  const specialist: AgentParticipant = {
+    ...preferred,
+    id: "specialist",
+    role: "specialist",
+    displayName: "Adaptive Specialist",
+    specialistMode,
+    repairState:
+      preferred.repairState ?? {
+        schemaVersion: 2,
+        cyclesUsed: 0,
+        status: "idle",
+      },
+  };
+  const nodes = Object.fromEntries(
+    Object.entries(snapshot.nodes).map(([id, node]) => [
+      id,
+      {
+        ...node,
+        ownerId:
+          node.ownerId && legacyIds.has(node.ownerId)
+            ? "specialist"
+            : node.ownerId,
+      },
+    ]),
+  );
+  const handoffs = snapshot.handoffs.map((handoff) => ({
+    ...handoff,
+    fromParticipantId: legacyIds.has(handoff.fromParticipantId)
+      ? "specialist"
+      : handoff.fromParticipantId,
+    toParticipantId: legacyIds.has(handoff.toParticipantId)
+      ? "specialist"
+      : handoff.toParticipantId,
+  }));
+  return {
+    ...snapshot,
+    mode: "adaptive_team",
+    nodes,
+    participants: { lead, specialist },
+    handoffs,
+  };
+}
+
+function normalizeSpecialistRepairState(
+  value: unknown,
+): SpecialistRepairStateV2 | null {
+  if (!isRecord(value) || value.schemaVersion !== 2) return null;
+  const cyclesUsed = value.cyclesUsed === 1 ? 1 : 0;
+  const status = enumValue(value.status, SPECIALIST_REPAIR_STATUSES) ?? "idle";
+  return {
+    schemaVersion: 2,
+    cyclesUsed,
+    status,
+    ...(fingerprint(value.failedProgressFingerprint)
+      ? { failedProgressFingerprint: fingerprint(value.failedProgressFingerprint)! }
+      : {}),
+    ...(fingerprint(value.priorApproachFingerprint)
+      ? { priorApproachFingerprint: fingerprint(value.priorApproachFingerprint)! }
+      : {}),
+    ...(fingerprint(value.revisedApproachFingerprint)
+      ? { revisedApproachFingerprint: fingerprint(value.revisedApproachFingerprint)! }
+      : {}),
   };
 }
 
@@ -483,7 +618,7 @@ function normalizeHandoff(value: unknown, fallbackTime: string): WorkerHandoff |
   const toParticipantId = safeId(value.toParticipantId);
   const taskId = safeId(value.taskId);
   if (!id || !fromParticipantId || !toParticipantId || !taskId) return null;
-  return {
+  const base: WorkerHandoff = {
     id,
     fromParticipantId,
     toParticipantId,
@@ -498,6 +633,73 @@ function normalizeHandoff(value: unknown, fallbackTime: string): WorkerHandoff |
     ...(text(value.commitSha, 200) ? { commitSha: text(value.commitSha, 200) } : {}),
     createdAt: timestamp(value.createdAt, fallbackTime),
     updatedAt: timestamp(value.updatedAt, fallbackTime),
+  };
+  if (value.schemaVersion !== 2) return base;
+  if (
+    base.fromParticipantId !== "specialist" ||
+    base.toParticipantId !== "lead"
+  ) {
+    return null;
+  }
+  const missionGraphId = safeId(value.missionGraphId);
+  const specialistMode = enumValue(value.specialistMode, SPECIALIST_MODES);
+  const inputFingerprint = fingerprint(value.inputFingerprint);
+  const progressFingerprint = fingerprint(value.progressFingerprint);
+  const recommendedNextAction = text(value.recommendedNextAction, 2_000);
+  const proofReferences = normalizeSpecialistProofReferences(
+    value.proofReferences,
+  );
+  const acceptanceCriteria = plainStrings(
+    value.acceptanceCriteria,
+    64,
+    1_000,
+  );
+  if (
+    !missionGraphId ||
+    !specialistMode ||
+    !inputFingerprint ||
+    !progressFingerprint ||
+    !recommendedNextAction ||
+    !proofReferences ||
+    acceptanceCriteria.length === 0
+  ) {
+    return null;
+  }
+  const handoff: SpecialistHandoffV2 = {
+    ...base,
+    schemaVersion: 2,
+    fromParticipantId: "specialist",
+    toParticipantId: "lead",
+    missionGraphId,
+    specialistMode,
+    inputFingerprint,
+    progressFingerprint,
+    acceptanceCriteria,
+    proofReferences,
+    changedFiles: relativePaths(value.changedFiles, 256),
+    conflicts: plainStrings(value.conflicts, 64, 1_000),
+    limitations: plainStrings(value.limitations, 64, 1_000),
+    recommendedNextAction,
+    ...(safeId(value.workspaceLeaseId)
+      ? { workspaceLeaseId: safeId(value.workspaceLeaseId) }
+      : {}),
+    ...(fingerprint(value.workspaceDiffFingerprint)
+      ? { workspaceDiffFingerprint: fingerprint(value.workspaceDiffFingerprint)! }
+      : {}),
+    repairCycle: value.repairCycle === 1 ? 1 : 0,
+  };
+  return handoff;
+}
+
+function normalizeSpecialistProofReferences(
+  value: unknown,
+): SpecialistProofReferencesV2 | null {
+  if (!isRecord(value)) return null;
+  return {
+    evidenceIds: strings(value.evidenceIds, 256),
+    receiptIds: strings(value.receiptIds, 256),
+    artifactIds: strings(value.artifactIds, 256),
+    validationIds: strings(value.validationIds, 256),
   };
 }
 
@@ -562,6 +764,7 @@ function recordEntries(value: unknown): [string, unknown][] {
 
 function inferMode(participants: Record<string, AgentParticipant>): OrchestrationMode {
   const roles = Object.values(participants).map((item) => item.role);
+  if (roles.includes("specialist")) return "adaptive_team";
   if (roles.includes("code_worker")) return "code_team";
   if (roles.includes("researcher")) return "research_team";
   return "single";
@@ -576,7 +779,34 @@ function normalizeNodeStatus(value: unknown): WorkNodeStatus {
 }
 
 function roleLabel(role: AgentRole): string {
-  return role === "lead" ? "Lead" : role === "researcher" ? "Researcher" : "Code Worker";
+  return role === "lead"
+    ? "Lead"
+    : role === "specialist"
+      ? "Adaptive Specialist"
+      : role === "researcher"
+        ? "Researcher"
+        : "Code Worker";
+}
+
+function fingerprint(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return /^sha256:[a-f0-9]{64}$/u.test(normalized) ? normalized : undefined;
+}
+
+function relativePaths(value: unknown, limit: number): string[] {
+  return unique(
+    (Array.isArray(value) ? value : [])
+      .map((item) => text(item, 2_000)?.replace(/\\/gu, "/"))
+      .filter((item): item is string => Boolean(item))
+      .filter(
+        (item) =>
+          !item.startsWith("/") &&
+          !/^[A-Za-z]:/u.test(item) &&
+          !item.split("/").includes(".."),
+      )
+      .slice(0, limit),
+  );
 }
 
 function strings(value: unknown, limit: number): string[] {
@@ -637,11 +867,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const MODES = ["single", "research_team", "code_team"] as const satisfies readonly OrchestrationMode[];
+const MODES = ["single", "adaptive_team", "research_team", "code_team"] as const satisfies readonly OrchestrationMode[];
 const RUN_STATUSES = ["running", "complete", "blocked", "cancelled", "failed"] as const satisfies readonly OrchestratorRunStatus[];
 const NODE_KINDS = ["mission", "research", "code", "handoff", "merge", "verify"] as const satisfies readonly WorkNodeKind[];
 const NODE_STATUSES = ["queued", "ready", "running", "waiting", "blocked", "complete", "cancelled"] as const satisfies readonly WorkNodeStatus[];
-const AGENT_ROLES = ["lead", "researcher", "code_worker"] as const satisfies readonly AgentRole[];
+const AGENT_ROLES = ["lead", "specialist", "researcher", "code_worker"] as const satisfies readonly AgentRole[];
+const SPECIALIST_MODES = ["researcher", "linear_planner", "code_builder", "code_reviewer", "recovery_verifier"] as const satisfies readonly SpecialistMode[];
+const SPECIALIST_REPAIR_STATUSES = ["idle", "authorized", "exhausted"] as const satisfies readonly SpecialistRepairStateV2["status"][];
 const PARTICIPANT_STATUSES = ["queued", "planning", "researching", "coding", "waiting", "handoff", "merging", "verifying", "complete", "blocked", "cancelled", "failed"] as const satisfies readonly AgentParticipantStatus[];
 const HANDOFF_AGENT_STATUSES = ["none", "preparing", "ready", "accepted", "rejected"] as const satisfies readonly AgentHandoffStatus[];
 const WORKTREE_STATUSES = ["planned", "creating", "ready", "editing", "testing", "green", "failed", "integrating", "merged", "promotion_blocked", "retained"] as const satisfies readonly GitWorktreeStatus[];

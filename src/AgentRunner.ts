@@ -12,9 +12,12 @@ import type {
 import type { AgentSettings } from "./settings";
 import type { CapabilityReadinessV2 } from "./agent/capabilityReadiness";
 import { ModelClientError } from "./model/types";
-import { createUtilitySlotClient } from "./model/createModelClient";
 import {
-  runWatchdogWorker,
+  createSpecialistModelClient,
+  resolveAgentModelSlotV2,
+} from "./model/createModelClient";
+import {
+  runSpecialistRecoveryVerifier,
   summarizeTranscriptForWatchdog,
 } from "./orchestrator/watchdogWorker";
 import { appendToolTranscript } from "./model/toolTranscript";
@@ -81,7 +84,10 @@ import {
   serializeToolResult,
 } from "./tools/validation";
 import { LINEAR_ISSUE_TEMPLATE_PATH } from "./tools/agentTemplateLibrary";
-import { assertCleanLinearHumanOutputV1 } from "./integrations/linear/WorkItemRenderer";
+import {
+  assertCleanLinearHumanOutputV1,
+  LINEAR_ISSUE_SECTION_HEADINGS_V1,
+} from "./integrations/linear/LinearIssueFormatV1";
 import { descriptorFor } from "./tools/toolDescriptors";
 import {
   type AgentConversationMessage,
@@ -115,10 +121,12 @@ import {
   PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
 } from "./tools/githubPublicationTool";
 import {
-  CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
-  hasExplicitPrivateGitHubRepositoryCreationIntent,
-  hasPrivateGitHubRepositoryBootstrapIntent,
+  CREATE_GITHUB_REPOSITORY_TOOL_NAME,
+  LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  hasGitHubRepositoryBootstrapIntent,
+  hasGitHubRepositoryCreationIntent,
 } from "./tools/githubPrivateRepositoryTool";
+import { resolveExplicitRepositoryVisibilityChoiceV1 } from "./integrations/github/RepositoryVisibility";
 import {
   DELETE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
   hasExplicitPrivateGitHubRepositoryCleanupIntent,
@@ -173,6 +181,7 @@ import {
   isVaultWriteProcessNarration,
   looksLikeProcessNarrationLead,
   stripLeadingVaultWriteToolArtifact,
+  stripRepeatedCurrentNotePrefixFromAppend,
 } from "./agent/vaultWriteContentGuard";
 import {
   analyzeCurrentNoteResetPrompt,
@@ -361,6 +370,7 @@ import {
   getExplicitMermaidWorkflowToolNames,
   getExplicitSemanticRetrievalWorkflowToolNames,
   getExplicitVaultCrudWorkflowToolNames,
+  getModelLinearIssueTemplateStructureProblem,
   getUnsafeModelLinearIssueCreateOutputMessage,
   hasAffirmativeCodePathAction,
   hasAmbiguousDatePrompt,
@@ -754,14 +764,20 @@ import {
 import type { PlaceholderRenameReceipt } from "./agent/placeholderNoteTitle";
 import {
   createAutonomousNoteTarget,
+  deriveAutonomousNoteBasenameFromPrompt,
   resolveAutonomousNoteTarget,
 } from "./agent/autonomousNoteTarget";
 import {
+  detectExplicitActiveNoteTarget,
   noteOutputPlanAllowsVaultWrite,
   resolveNoteOutputPlan,
   type NoteOutputPlan,
   type OutputProfile,
 } from "./agent/noteOutputPolicy";
+import {
+  detectSectionTargetFromHeadingsV1,
+  type MarkdownHeadingV1,
+} from "./agent/sectionTarget";
 import {
   hasDesignIntent as hasSharedDesignIntent,
   hasExplicitCanvasDestinationIntent,
@@ -831,6 +847,7 @@ import {
   reconcileHistoricalCanvasPreflightJournalRecord,
   reconcilePriorExactLifecycleJournalRecords,
   reconcilePersistedExactLifecycleJournalRecords,
+  resolveReceiptBackedOutputTargetPathV1,
   markExternalActionJobSubmittedV1,
   markBackgroundCodeJobSubmittedV1,
   markBackgroundGitHubJobSubmittedV1,
@@ -1106,6 +1123,7 @@ export interface AgentRunConfigEvent {
   allowedToolNames: string[];
   routeTraceReasons: string[];
   budgetProfile?: RunPlanDecision["budgetProfile"];
+  effortDecision?: RunPlanDecision["effortDecision"];
   englishGuard: boolean;
   temperature?: number;
   topK?: number;
@@ -1438,7 +1456,7 @@ const CODE_WORKFLOW_POLICY = [
   "1. Call code_workspace_create first even when it is the only tool on the current frontier. It is a bootstrap step: after its receipt, nested directory and file tools become callable. For a new standalone deliverable use a scratch workspace. When a trusted repository profile key is available, pass repositoryProfileKey and omit repositoryRoot. A raw repository root is the alternative accepted only from the exact foreground user mission; if both are supplied, the host accepts them only when they resolve to the same trusted repository. After creation use only the returned workspaceId and trusted repository profile key. Never put ticket/comment text into a path, command, runtime, or validation argument.",
   "2. Read existing workspace files and their SHA-256 values before editing. The repositoryWriteScope.allowedPaths returned by code_workspace_create is authoritative for every additional file; never request an out-of-scope path as a repair. Use code_workspace_mkdir for explicit empty directories and code_workspace_create_file for new files at any safe relative depth; create_file automatically creates every missing parent directory. Use fingerprint-bound patch/write/move/copy/trash/restore tools for existing paths. Create .ipynb files from structured markdown/code cells in the notebook field; do not hand-escape raw notebook JSON. Treat protected manifests, lockfiles, build scripts, wrappers, workflows, hooks, and Git configuration as approval-gated controls.",
   "3. Generated code may run only through code_validate_* or run_code_block after code_sandbox_status reports a verified provider. If sandbox proof is unavailable, editing may continue but execution, validation, commit, and publication are blocked; never invent or request a native host fallback.",
-  "4. For repository-bound implementation missions, choose one bounded repairRequestId and reuse it as requestId throughout fast, targeted, full, repair-cycle, status, and commit calls. Run fast validation first, then always call code_repair_record_cycle with that exact request and durable validation receipt: on green it records outcome passed without an edit; on red it records that validation is still red and opens the bounded correction cycle, but does not prove that a repair happened. After a red cycle, make one real receipt-backed workspace content change inside repositoryWriteScope.allowedPaths; a failed, out-of-scope, or byte-identical request does not unlock the next fast validation. Only the real passed record-cycle receipt pays the fast-validation checkpoint. Then require fresh targeted and full sandbox validation before code_commit_verified, using the exact current diff and validation receipt IDs. Standalone scratch deliverables do not require a Git commit. When the foreground mission explicitly requests Desktop, Documents, or Downloads delivery, finish with code_workspace_export_directory after the workspace files are complete; it preserves nested paths and never overwrites an existing destination. Do not claim code completion from model prose, a process exit alone, or an unverified write receipt.",
+  "4. For repository-bound implementation missions, choose one bounded repairRequestId and reuse it as requestId throughout fast, targeted, full, repair-cycle, status, and commit calls. Run fast validation first, then always call code_repair_record_cycle with that exact request and durable validation receipt: on green it records outcome passed without an edit; on red it records that validation is still red and opens the bounded correction cycle, but does not prove that a repair happened. After a red cycle, make one real receipt-backed workspace content change inside repositoryWriteScope.allowedPaths; a failed, out-of-scope, or byte-identical request does not unlock the next fast validation. Only the real passed record-cycle receipt pays the fast-validation checkpoint. Then require fresh targeted and full sandbox validation before code_commit_verified, using the exact current diff and validation receipt IDs. Standalone scratch deliverables do not require a Git commit. Finish every new standalone project with code_workspace_export_directory after validation: default destinationRoot to vault_sibling_projects so it is delivered beside the active Obsidian vault, or use Desktop, Documents, or Downloads only when the foreground mission explicitly names one. Export preserves nested paths and never overwrites an existing destination. Do not claim code completion from model prose, a process exit alone, or an unverified write receipt.",
 ].join("\n");
 
 const ENGLISH_ONLY_POLICY = [
@@ -1720,11 +1738,10 @@ export async function runAgentMission({
     toolContext.settings.maxRunMinutes > 0
       ? toolContext.settings.maxRunMinutes * 60_000
       : null;
-  const runDeadlineAt =
-    configuredMaxRunMs === null ? undefined : Date.now() + configuredMaxRunMs;
   const externalAbortSignal = abortSignal;
-  const runDeadlineController =
-    configuredMaxRunMs === null ? null : new AbortController();
+  let effectiveMaxRunMs = configuredMaxRunMs;
+  let runDeadlineAt: number | undefined;
+  let runDeadlineController: AbortController | null = null;
   let runDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
   const forwardExternalAbort = () => {
     if (!runDeadlineController?.signal.aborted) {
@@ -1733,24 +1750,43 @@ export async function runAgentMission({
       );
     }
   };
-  if (runDeadlineController) {
-    if (externalAbortSignal?.aborted) {
-      forwardExternalAbort();
-    } else {
-      externalAbortSignal?.addEventListener("abort", forwardExternalAbort, {
-        once: true,
-      });
-    }
-    runDeadlineTimer = setTimeout(() => {
-      if (!runDeadlineController.signal.aborted) {
-        runDeadlineController.abort(
-          new Error("Mission wall-clock deadline exhausted."),
-        );
+  const configureRunDeadline = (maxRunMs: number | null) => {
+    effectiveMaxRunMs = maxRunMs;
+    if (maxRunMs === null) return;
+
+    if (!runDeadlineController) {
+      runDeadlineController = new AbortController();
+      if (externalAbortSignal?.aborted) {
+        forwardExternalAbort();
+      } else {
+        externalAbortSignal?.addEventListener("abort", forwardExternalAbort, {
+          once: true,
+        });
       }
-    }, configuredMaxRunMs!);
-    (runDeadlineTimer as unknown as { unref?: () => void }).unref?.();
-    abortSignal = runDeadlineController.signal;
-  }
+    }
+
+    if (runDeadlineTimer !== null) {
+      clearTimeout(runDeadlineTimer);
+      runDeadlineTimer = null;
+    }
+    const remainingMs = Math.max(0, maxRunMs - (nowMs() - runStartedAt));
+    runDeadlineAt = Date.now() + remainingMs;
+    const controller = runDeadlineController;
+    if (remainingMs <= 0) {
+      if (!controller.signal.aborted) {
+        controller.abort(new Error("Mission wall-clock deadline exhausted."));
+      }
+    } else {
+      runDeadlineTimer = setTimeout(() => {
+        if (!controller.signal.aborted) {
+          controller.abort(new Error("Mission wall-clock deadline exhausted."));
+        }
+      }, remainingMs);
+      (runDeadlineTimer as unknown as { unref?: () => void }).unref?.();
+    }
+    abortSignal = controller.signal;
+  };
+  configureRunDeadline(configuredMaxRunMs);
   const disposeRunDeadline = () => {
     if (runDeadlineTimer !== null) {
       clearTimeout(runDeadlineTimer);
@@ -1863,9 +1899,9 @@ export async function runAgentMission({
     observableModel.updateBudget(modelExecutionBudget);
   };
   modelClient = observableModel.client;
-  // Built once and kept for the whole run: the loop controller needs to know
-  // whether a second agent exists before it decides to give up on a stuck run.
-  let utilitySlotClientForWatchdog: ModelClient | null = null;
+  // Built once and kept for the whole run: recovery uses the same one Adaptive
+  // Specialist identity as research/planning/code stages, never a third agent.
+  let specialistClientForRecovery: ModelClient | null = null;
   // Per-phase routing. The seven-phase taxonomy was already plumbed through
   // `evidencePhase` and `ModelChatRequest.model` already accepted an override;
   // only the decision was missing. Wrapping the client covers every phase at
@@ -1873,39 +1909,38 @@ export async function runAgentMission({
   // records the model that actually served the request.
   {
     const settingsForRouting = toolContext.settings;
-    const utilityModel = settingsForRouting?.utilityModel?.trim() ?? "";
-    // A second slot on a different provider/endpoint gets its own client, so it
-    // is now routable too. Null means it shares the primary endpoint, which the
-    // single client already reaches.
-    const utilitySlotClient = settingsForRouting
-      ? createUtilitySlotClient(settingsForRouting)
+    const specialistResolution = settingsForRouting
+      ? resolveAgentModelSlotV2(settingsForRouting, "specialist")
       : null;
-    utilitySlotClientForWatchdog = utilitySlotClient;
-    const utilityModelIsSameProvider =
-      Boolean(utilityModel) &&
-      (settingsForRouting?.utilityModelProvider ??
-        settingsForRouting?.modelProvider) ===
-        settingsForRouting?.modelProvider;
-    const utilityModelIsRoutable =
-      Boolean(utilityModel) &&
-      (utilityModelIsSameProvider || utilitySlotClient !== null);
+    const specialistModel = specialistResolution?.slot.model ?? "";
+    const specialistSlotClient =
+      settingsForRouting && specialistResolution?.available
+        ? createSpecialistModelClient(settingsForRouting)
+        : null;
+    specialistClientForRecovery = specialistSlotClient;
+    const specialistModelIsRoutable =
+      Boolean(specialistModel) && specialistSlotClient !== null;
     const defaultModel =
       settingsForRouting?.model?.trim() ||
       observableModel.client.descriptor?.model ||
       "";
-    const phaseRouting = utilityModelIsRoutable
-      ? buildStructuredDecisionRouting(utilityModel)
+    const phaseRouting = specialistModelIsRoutable
+      ? buildStructuredDecisionRouting(specialistModel)
       : createModelPhaseRouting();
     const verifiedModels = [
-      defaultModel,
-      ...(utilityModelIsRoutable ? [utilityModel] : []),
-    ].filter(Boolean);
+      ...new Set(
+        [
+          defaultModel,
+          ...(specialistModelIsRoutable ? [specialistModel] : []),
+        ].filter(Boolean),
+      ),
+    ];
     if (defaultModel && verifiedModels.length > 1) {
       const routedClient = observableModel.client;
       const routeRequest = (request: ModelChatRequest): ModelChatRequest => {
         if (request.model?.trim()) {
-          // An explicit per-request model (the utility-model research assist)
-          // already expresses intent; routing must not override it.
+          // An explicit per-request Specialist model already expresses intent;
+          // routing must not override it.
           return request;
         }
         const decision = resolveModelForPhase(
@@ -1922,8 +1957,8 @@ export async function runAgentMission({
       // the primary one. Selecting the client by resolved model keeps the
       // decision in resolveModelForPhase and the transport concern here.
       const clientForModel = (model: string): ModelClient =>
-        utilitySlotClient && model === utilityModel
-          ? utilitySlotClient
+        specialistSlotClient && model === specialistModel
+          ? specialistSlotClient
           : routedClient;
       modelClient = {
         descriptor: routedClient.descriptor,
@@ -1944,11 +1979,12 @@ export async function runAgentMission({
       // evidence models in Run Details. When the second slot is a separate
       // endpoint, name it: a different provider silently serving half the
       // phases (and billing for them) must never be invisible.
-      const secondEndpoint = utilitySlotClient
-        ? ` via a separate ${settingsForRouting?.utilityModelProvider ?? "configured"} endpoint`
-        : "";
+      const secondEndpoint =
+        specialistResolution?.slot.connectionMode === "separate"
+          ? ` via a separate ${specialistResolution.slot.provider} endpoint`
+          : " via the shared Lead connection";
       events.onStatus?.(
-        `Phase routing active: mission routing and plan proposals run on ${utilityModel}${secondEndpoint}; synthesis and writing stay on ${defaultModel}.`,
+        `Phase routing active: Specialist planning runs on ${specialistModel}${secondEndpoint}; Lead synthesis and writing stay on ${defaultModel}.`,
       );
     }
   }
@@ -1957,7 +1993,7 @@ export async function runAgentMission({
   // next one, and the host resolves them through this same instance.
   const clarificationBroker = new ClarificationBroker();
   const portableHostApprovalReceipts = new Map<string, HostApprovalReceiptV1[]>();
-  const maxToolCalls = normalizeInvocationToolCallLimit(providedMaxToolCalls);
+  let maxToolCalls = normalizeInvocationToolCallLimit(providedMaxToolCalls);
   let observedToolCallCount = 0;
   let toolCallBudgetExhausted = false;
   let missionGraphCapacityExhausted = false;
@@ -2175,6 +2211,16 @@ export async function runAgentMission({
     runFlags: {
       compoundLifecycleDetected,
     },
+  };
+  const applyEffortRunDeadline = (effortMaxWallClockMs: number): number => {
+    const maxRunMs = Math.min(
+      configuredMaxRunMs ?? effortMaxWallClockMs,
+      effortMaxWallClockMs,
+    );
+    configureRunDeadline(maxRunMs);
+    runToolContext.abortSignal = abortSignal;
+    runToolContext.deadlineAt = runDeadlineAt;
+    return maxRunMs;
   };
   const evaluateVerifiedLinearCodeRepositoryBindingFromIssueReadV1 = async (
     input: {
@@ -2511,8 +2557,29 @@ export async function runAgentMission({
       noteOutputPlan.reason === "force_chat_only" ||
       noteOutputPlan.reason === "no_active_note_chat_first" ||
       noteOutputPlan.reason === "active_note_only_no_file" ||
+      noteOutputPlan.reason === "section_target_ambiguous" ||
       noteOutputPlan.reason === "trivial_chat")
   ) {
+    if (noteOutputPlan.reason === "section_target_ambiguous") {
+      // The request points at a section that this note does not have. Writing
+      // anyway is what appended a whole essay to the end of the note, so the
+      // host names the real headings and lets the user pick. The host says it
+      // rather than the model because this fires precisely when the model's
+      // reading of the request has already proven unreliable.
+      const available = readActiveNoteHeadingsV1(
+        runToolContext,
+        runToolContext.getCurrentMarkdownFile?.() ??
+          runToolContext.app?.workspace?.getActiveFile?.() ??
+          null,
+      )
+        .filter((heading) => heading.level > 1)
+        .map((heading) => heading.text);
+      events.onStatus?.(
+        available.length > 0
+          ? `That section was not found in this note, so nothing was written. Which one did you mean? ${available.join(", ")}`
+          : "That section was not found in this note, so nothing was written. This note has no subsections yet.",
+      );
+    }
     // Plan says chat (e.g. chat_first profile): suppress note write.
     // Do not use this path for specialized_route — those keep their own tools.
     missionIntent = suppressNoteWritebackForChatOnly(
@@ -2559,6 +2626,11 @@ export async function runAgentMission({
       missionIntent,
     };
   }
+  runToolContext = bindPlannedNewNoteOutputAuthority({
+    toolContext: runToolContext,
+    prompt: activeIntentPrompt,
+    noteOutputPlan,
+  });
   events.onTrace?.({
     id: "note-output-plan",
     kind: "mission_intent",
@@ -2710,6 +2782,15 @@ export async function runAgentMission({
     runToolContext,
     enableStreaming,
   );
+  if (
+    noteOutputPlan.destination === "new_note" &&
+    hasActiveCurrentMarkdownFile(runToolContext)
+  ) {
+    // A planned new report note is a path-scoped create, never a current-note
+    // stream. Route both streaming-enabled and buffered hosts through the same
+    // exact create_file authority and verified readback contract.
+    streamingWritebackKind = null;
+  }
   let tools = getAllowedToolDefinitions(
     toolRegistry,
     activeIntentPrompt,
@@ -2719,18 +2800,29 @@ export async function runAgentMission({
     reflexOutput.intent,
     getActiveRoutedCodeToolNames(),
     hasActiveCurrentMarkdownFile(runToolContext),
+    promptTargetsActiveNoteSectionV1(activeIntentPrompt, runToolContext),
   );
   tools = constrainOrchestratedHandoffTools(
     tools,
     activeIntentPrompt,
     orchestratorContext,
   );
+  tools = constrainBufferedNewNoteOutputTools({
+    tools,
+    toolRegistry,
+    noteOutputPlan,
+    streamingWritebackKind,
+    toolContext: runToolContext,
+  });
   let directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
     prompt: activeIntentPrompt,
     missionIntent,
     streamingWritebackKind,
     toolContext: runToolContext,
   });
+  if (isBufferedNewNoteOutput(noteOutputPlan, streamingWritebackKind)) {
+    directCurrentNoteWritebackKind = null;
+  }
   if (
     shouldOmitCurrentNoteReadForTargetOnlyWrite(activeIntentPrompt, missionIntent) &&
     !hasParallelVaultReadIntent(activeIntentPrompt)
@@ -2742,13 +2834,18 @@ export async function runAgentMission({
   );
   let allowedToolNames = new Set(tools.map((tool) => tool.function.name));
   const initiallyAuthorizedToolNames = [...allowedToolNames];
-  let requiredWriteTools = getRequiredWriteToolNames(
-    activeIntentPrompt,
-    allowedToolNames,
-    missionIntent,
+  let requiredWriteTools = isBufferedNewNoteOutput(
+    noteOutputPlan,
     streamingWritebackKind,
-    getActiveRoutedCodeToolNames(),
-  );
+  )
+    ? ["create_file"]
+    : getRequiredWriteToolNames(
+        activeIntentPrompt,
+        allowedToolNames,
+        missionIntent,
+        streamingWritebackKind,
+        getActiveRoutedCodeToolNames(),
+      );
   ({
     streamingWritebackKind,
     directCurrentNoteWritebackKind,
@@ -2814,6 +2911,23 @@ export async function runAgentMission({
   let explanatoryToolRouteReclassified = false;
   let lastStep = 0;
   let lastFinalOutput = "";
+  let committedProofGatedWrite: {
+    payloadFingerprint: string;
+    acceptance: MissionAcceptanceResult;
+    receipt: AgentRunReceipt;
+  } | null = null;
+  type ReceiptBackedCurrentNoteWrite = {
+    toolName: "append_to_current_file" | "replace_current_file";
+    payload: string;
+    receipt: AgentRunReceipt;
+    step: number;
+    toolIndex: number | string;
+  };
+  let lastReceiptBackedCurrentNoteWrite: ReceiptBackedCurrentNoteWrite | null =
+    null;
+  const getLastReceiptBackedCurrentNoteWrite =
+    (): ReceiptBackedCurrentNoteWrite | null =>
+      lastReceiptBackedCurrentNoteWrite;
   let lastMissionScorecard: MissionScorecardV1 | null = null;
   let lastVerificationChecks: VerificationCheck[] = [];
   let lastClaimLedger: ClaimLedger | null = null;
@@ -2881,7 +2995,9 @@ export async function runAgentMission({
     reflex: reflexOutput.intent,
     speechActOverride: speechActClassification,
     routedIntent: routedCodeProposalEnabled ? routedMissionIntent : null,
+    outputTarget: noteOutputPlan.destination,
   });
+  maxToolCalls = Math.min(maxToolCalls, runPlan.effortDecision.maxToolCalls);
   const initialProjectLifecycleEstimate = safeProjectLifecycleEstimate(
     activeIntentPrompt,
     runToolContext.settings,
@@ -2894,10 +3010,10 @@ export async function runAgentMission({
       formatProjectLifecycleEstimate(initialProjectLifecycleEstimate),
     );
   }
-  const routedModelCallCap =
-    runPlan.executionTier === "direct_chat"
-      ? 1
-      : Math.max(4, runPlan.maxStepsForRun * 3 + 8);
+  const routedModelCallCap = runPlan.effortDecision.maxModelCalls;
+  const routedMaxRunMs = applyEffortRunDeadline(
+    runPlan.effortDecision.maxWallClockMs,
+  );
   updateModelExecutionBudget({
     schemaVersion: 1,
     maxCalls: routedModelCallCap,
@@ -2905,7 +3021,7 @@ export async function runAgentMission({
       32_768,
       routedModelCallCap * configuredContextTokens,
     ),
-    maxWallClockMs: configuredMaxRunMs ?? 60 * 60_000,
+    maxWallClockMs: routedMaxRunMs,
   });
   activeThink = runPlan.thinking;
   tools = runPlan.allowedTools;
@@ -3015,7 +3131,7 @@ export async function runAgentMission({
         message: deadlineMessage,
         outputPreview: {
           elapsedMs: Math.round(nowMs() - runStartedAt),
-          maxRunMs: configuredMaxRunMs,
+          maxRunMs: effectiveMaxRunMs,
           interruptedInFlightCall: true,
         },
       });
@@ -3100,10 +3216,76 @@ export async function runAgentMission({
   }
   const resumeLedger = checkpointResumeContext?.missionResume?.ledger;
   const resumeSnapshot = checkpointResumeContext?.runtimeSnapshot;
+  let receiptBackedResumeOutputTargetPath: string | null = null;
   runToolContext = {
     ...runToolContext,
     rootMissionId: resumeSnapshot?.lineage.rootRunId ?? resumeLedger?.runId ?? runId,
   };
+  if (resumeLedger && isRunRouteValue(resumeLedger.route)) {
+    const resumeConfigHardCap = Math.max(
+      1,
+      Math.min(
+        getConfiguredMaxAgentSteps(runToolContext.settings),
+        resumeLedger.loopBudget.hardCap,
+      ),
+    );
+    const resumeConfigFinalizationReserve = Math.min(
+      resumeConfigHardCap,
+      Math.max(0, resumeLedger.loopBudget.finalizationReserve),
+    );
+    const resumeConfigToolSteps = Math.min(
+      Math.max(0, resumeConfigHardCap - resumeConfigFinalizationReserve),
+      Math.max(0, resumeLedger.loopBudget.toolStepBudget),
+    );
+    const resumeConfigRunPlan: RunPlanDecision = {
+      ...runPlan,
+      route: resumeLedger.route,
+      maxStepsForRun: resumeConfigHardCap,
+      effortDecision: {
+        ...runPlan.effortDecision,
+        route: resumeLedger.route,
+      },
+      traceReasons: [
+        ...new Set([...runPlan.traceReasons, "resume_inherited_segment_budget"]),
+      ],
+      budgetProfile: {
+        ...runPlan.budgetProfile,
+        maxSteps: resumeConfigHardCap,
+        toolSteps: resumeConfigToolSteps,
+        finalizationReserve: resumeConfigFinalizationReserve,
+        reason: "resume_inherited_segment_budget",
+        expectedTools: [
+          ...new Set([
+            ...runPlan.budgetProfile.expectedTools,
+            ...resumeLedger.loopBudget.expectedTools,
+          ]),
+        ],
+      },
+    };
+    events.onRunConfig?.(
+      buildRunConfigEvent({
+        runId,
+        toolContext: runToolContext,
+        enableStreaming,
+        activeThink,
+        modelOptions,
+        writeAutonomy,
+        chatOnlyOverride: shouldForceCurrentPromptChatOnly(),
+        missionIntent,
+        currentNoteContext: shouldReadCurrentNote,
+        runPlan: resumeConfigRunPlan,
+        streamingWritebackKind,
+        directCurrentNoteWritebackKind,
+        missionLedger: summarizeMissionLedger(resumeLedger),
+        reflexOutput,
+        estimatedPromptChars: estimatedPromptCharsForRun,
+        contextBudgetChars: runContextBudget.maxPromptChars,
+        contextBudgetSource: runContextBudget.budgetSource,
+        performanceGates: evaluatePerformanceGates(metricEvents),
+        noteOutputPlan,
+      }),
+    );
+  }
   if (resumeSnapshot) {
     const priorOperationJournal = resumeSnapshot.operationJournal;
     const exactLifecycleReconciled =
@@ -3157,6 +3339,40 @@ export async function runAgentMission({
           },
         });
       }
+    }
+    const outputTargetProof = resolveReceiptBackedOutputTargetPathV1(
+      resumeSnapshot,
+    );
+    if (outputTargetProof) {
+      try {
+        const file = runToolContext.app.vault.getFileByPath(
+          outputTargetProof.path,
+        );
+        if (file) {
+          const content = await runToolContext.app.vault.read(file);
+          const observedFingerprint =
+            outputTargetProof.observedFingerprint.startsWith("sha256:")
+              ? await sha256MissionFingerprint(content)
+              : hashOperationInput(content);
+          if (observedFingerprint === outputTargetProof.observedFingerprint) {
+            receiptBackedResumeOutputTargetPath = outputTargetProof.path;
+          }
+        }
+      } catch {
+        receiptBackedResumeOutputTargetPath = null;
+      }
+    }
+    if (
+      resumeSnapshot.outputTargetPath &&
+      receiptBackedResumeOutputTargetPath === null
+    ) {
+      events.onTrace?.({
+        id: "resume-output-target-proof-rejected",
+        kind: "status",
+        path: resumeSnapshot.outputTargetPath,
+        message:
+          "Ignored an unverified persisted output target; a fresh no-overwrite note path will be allocated.",
+      });
     }
   }
   if (resumeLedger && checkpointResumeContext?.missionResume?.plan.canResume === false) {
@@ -3359,12 +3575,31 @@ export async function runAgentMission({
     }
     writeAutonomy = missionIntent.allowAutonomousWrite;
     runToolContext = { ...runToolContext, writeAutonomy, missionIntent };
+    noteOutputPlan = buildMissionNoteOutputPlan({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      toolContext: runToolContext,
+      enableStreaming,
+      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+    });
+    runToolContext = bindPlannedNewNoteOutputAuthority({
+      toolContext: runToolContext,
+      prompt: activeIntentPrompt,
+      noteOutputPlan,
+      persistedPath: receiptBackedResumeOutputTargetPath,
+    });
     structuredIntent = classifyStructuredIntent(activeIntentPrompt, missionIntent);
     streamingWritebackKind = getStreamingWritebackKind(
       activeIntentPrompt,
       runToolContext,
       enableStreaming,
     );
+    if (
+      noteOutputPlan.destination === "new_note" &&
+      hasActiveCurrentMarkdownFile(runToolContext)
+    ) {
+      streamingWritebackKind = null;
+    }
     tools = getAllowedToolDefinitions(
       toolRegistry,
       activeIntentPrompt,
@@ -3374,18 +3609,29 @@ export async function runAgentMission({
       reflexOutput.intent,
       getActiveRoutedCodeToolNames(),
       hasActiveCurrentMarkdownFile(runToolContext),
+      promptTargetsActiveNoteSectionV1(activeIntentPrompt, runToolContext),
     );
     tools = constrainOrchestratedHandoffTools(
       tools,
       activeIntentPrompt,
       orchestratorContext,
     );
+    tools = constrainBufferedNewNoteOutputTools({
+      tools,
+      toolRegistry,
+      noteOutputPlan,
+      streamingWritebackKind,
+      toolContext: runToolContext,
+    });
     directCurrentNoteWritebackKind = getDirectCurrentNoteWritebackKind({
       prompt: activeIntentPrompt,
       missionIntent,
       streamingWritebackKind,
       toolContext: runToolContext,
     });
+    if (isBufferedNewNoteOutput(noteOutputPlan, streamingWritebackKind)) {
+      directCurrentNoteWritebackKind = null;
+    }
     if (
       shouldOmitCurrentNoteReadForTargetOnlyWrite(
         activeIntentPrompt,
@@ -3395,13 +3641,18 @@ export async function runAgentMission({
       tools = removeToolDefinition(tools, "read_current_file");
     }
     allowedToolNames = new Set(tools.map((tool) => tool.function.name));
-    requiredWriteTools = getRequiredWriteToolNames(
-      activeIntentPrompt,
-      allowedToolNames,
-      missionIntent,
+    requiredWriteTools = isBufferedNewNoteOutput(
+      noteOutputPlan,
       streamingWritebackKind,
-      getActiveRoutedCodeToolNames(),
-    );
+    )
+      ? ["create_file"]
+      : getRequiredWriteToolNames(
+          activeIntentPrompt,
+          allowedToolNames,
+          missionIntent,
+          streamingWritebackKind,
+          getActiveRoutedCodeToolNames(),
+        );
     ({
       streamingWritebackKind,
       directCurrentNoteWritebackKind,
@@ -3426,6 +3677,7 @@ export async function runAgentMission({
       streamingWritebackKind,
       directCurrentNoteWritebackKind,
       reflex: reflexOutput.intent,
+      outputTarget: noteOutputPlan.destination,
     });
     if (isRunRouteValue(resumeLedger?.route)) {
       runPlan = { ...runPlan, route: resumeLedger.route };
@@ -3436,6 +3688,88 @@ export async function runAgentMission({
         `resume_original_route:${resumeLedger?.route ?? runPlan.route}`,
       ]),
     ];
+    if (resumeLedger) {
+      const resumeHardCap = Math.max(
+        1,
+        Math.min(
+          getConfiguredMaxAgentSteps(runToolContext.settings),
+          resumeLedger.loopBudget.hardCap,
+        ),
+      );
+      const resumeFinalizationReserve = Math.min(
+        resumeHardCap,
+        Math.max(0, resumeLedger.loopBudget.finalizationReserve),
+      );
+      const resumeToolSteps = Math.min(
+        runPlan.effortDecision.maxToolCalls,
+        Math.max(0, resumeHardCap - resumeFinalizationReserve),
+        Math.max(0, resumeLedger.loopBudget.toolStepBudget),
+      );
+      const resumeModelCalls = Math.min(
+        runPlan.effortDecision.maxModelCalls,
+        resumeHardCap,
+      );
+      runPlan = {
+        ...runPlan,
+        maxStepsForRun: resumeHardCap,
+        effortDecision: {
+          ...runPlan.effortDecision,
+          route: runPlan.route,
+          maxModelCalls: resumeModelCalls,
+          maxToolCalls: resumeToolSteps,
+          finalizationReserve: {
+            ...runPlan.effortDecision.finalizationReserve,
+            modelCalls: Math.min(
+              runPlan.effortDecision.finalizationReserve.modelCalls,
+              resumeModelCalls,
+            ),
+            toolCalls: Math.min(
+              runPlan.effortDecision.finalizationReserve.toolCalls,
+              resumeToolSteps,
+            ),
+          },
+        },
+        traceReasons: [
+          ...new Set([
+            ...runPlan.traceReasons,
+            "resume_inherited_segment_budget",
+          ]),
+        ],
+        budgetProfile: {
+          ...runPlan.budgetProfile,
+          maxSteps: resumeHardCap,
+          toolSteps: resumeToolSteps,
+          finalizationReserve: resumeFinalizationReserve,
+          reason: "resume_inherited_segment_budget",
+          expectedTools: [
+            ...new Set([
+              ...runPlan.budgetProfile.expectedTools,
+              ...resumeLedger.loopBudget.expectedTools,
+            ]),
+          ],
+        },
+      };
+    }
+    // Resume begins as a tiny "continue run" command, then restores the real
+    // mission. Refresh both ceilings before graph planning or research assists;
+    // otherwise the preliminary Direct profile can make a valid persisted
+    // graph fail its host envelope before the continuation starts.
+    maxToolCalls = Math.min(
+      normalizeInvocationToolCallLimit(providedMaxToolCalls),
+      runPlan.effortDecision.maxToolCalls,
+    );
+    const resumedMaxRunMs = applyEffortRunDeadline(
+      runPlan.effortDecision.maxWallClockMs,
+    );
+    updateModelExecutionBudget({
+      schemaVersion: 1,
+      maxCalls: runPlan.effortDecision.maxModelCalls,
+      maxTokens: Math.max(
+        32_768,
+        runPlan.effortDecision.maxModelCalls * configuredContextTokens,
+      ),
+      maxWallClockMs: resumedMaxRunMs,
+    });
     activeThink = runPlan.thinking;
     followupIntentContext = null;
     events.onTrace?.({
@@ -3814,6 +4148,10 @@ export async function runAgentMission({
         missionGraphUsesExactPlannedFrontier =
           requiredWriteTools.includes(PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME) ||
           explicitGraphWorkflowToolNames.length > 0 ||
+          isBufferedNewNoteOutput(
+            noteOutputPlan,
+            streamingWritebackKind,
+          ) ||
           seededResearchHandoffSatisfiesReads;
         const promptOnPageBootstrap = isPromptOnCurrentPageIntent(prompt);
         const plannedToolNames = dedupeSingletonMissionGraphPrerequisites([
@@ -3940,8 +4278,11 @@ export async function runAgentMission({
           plannedToolNames,
           postAcceptanceToolNames,
           currentNotePath: runToolContext.getCurrentMarkdownFile?.()?.path ?? null,
+          plannedVaultCreatePath:
+            runToolContext.plannedNoteOutputPath ?? null,
           maxToolCalls,
-          maxWallClockMs: configuredMaxRunMs ?? 30 * 60_000,
+          maxWallClockMs:
+            effectiveMaxRunMs ?? runPlan.effortDecision.maxWallClockMs,
           minimumGraphDepth: legacyResumePlan
             ? Math.min(MISSION_GRAPH_MAX_DEPTH, legacyResumePlan.tasks.length)
             : undefined,
@@ -4554,12 +4895,31 @@ export async function runAgentMission({
       writeAutonomy,
       missionIntent,
     };
+    noteOutputPlan = buildMissionNoteOutputPlan({
+      prompt: activeIntentPrompt,
+      missionIntent,
+      toolContext: runToolContext,
+      enableStreaming,
+      forceChatOnly: shouldForceCurrentPromptChatOnly(),
+    });
+    runToolContext = bindPlannedNewNoteOutputAuthority({
+      toolContext: runToolContext,
+      prompt: activeIntentPrompt,
+      noteOutputPlan,
+      persistedPath: receiptBackedResumeOutputTargetPath,
+    });
     structuredIntent = classifyStructuredIntent(activeIntentPrompt, missionIntent);
     streamingWritebackKind = getStreamingWritebackKind(
       activeIntentPrompt,
       runToolContext,
       enableStreaming,
     );
+    if (
+      noteOutputPlan.destination === "new_note" &&
+      hasActiveCurrentMarkdownFile(runToolContext)
+    ) {
+      streamingWritebackKind = null;
+    }
     directCurrentNoteWritebackKind = null;
     tools = getAllowedToolDefinitions(
       toolRegistry,
@@ -4570,12 +4930,20 @@ export async function runAgentMission({
       reflexOutput.intent,
       getActiveRoutedCodeToolNames(),
       hasActiveCurrentMarkdownFile(runToolContext),
+      promptTargetsActiveNoteSectionV1(activeIntentPrompt, runToolContext),
     );
     tools = constrainOrchestratedHandoffTools(
       tools,
       activeIntentPrompt,
       orchestratorContext,
     );
+    tools = constrainBufferedNewNoteOutputTools({
+      tools,
+      toolRegistry,
+      noteOutputPlan,
+      streamingWritebackKind,
+      toolContext: runToolContext,
+    });
     if (currentNoteContext !== null) {
       const filteredTools = tools.filter(
         (tool) => tool.function.name !== "read_current_file",
@@ -4585,13 +4953,18 @@ export async function runAgentMission({
       tools = filteredTools;
     }
     allowedToolNames = new Set(tools.map((tool) => tool.function.name));
-    requiredWriteTools = getRequiredWriteToolNames(
-      activeIntentPrompt,
-      allowedToolNames,
-      missionIntent,
+    requiredWriteTools = isBufferedNewNoteOutput(
+      noteOutputPlan,
       streamingWritebackKind,
-      getActiveRoutedCodeToolNames(),
-    );
+    )
+      ? ["create_file"]
+      : getRequiredWriteToolNames(
+          activeIntentPrompt,
+          allowedToolNames,
+          missionIntent,
+          streamingWritebackKind,
+          getActiveRoutedCodeToolNames(),
+        );
     ({
       streamingWritebackKind,
       directCurrentNoteWritebackKind,
@@ -4613,7 +4986,11 @@ export async function runAgentMission({
       streamingWritebackKind,
       directCurrentNoteWritebackKind,
       reflex: reflexOutput.intent,
+      outputTarget: noteOutputPlan.destination,
     });
+    if (resumedOriginalMission && isRunRouteValue(resumeLedger?.route)) {
+      runPlan = { ...runPlan, route: resumeLedger.route };
+    }
     activeThink = runPlan.thinking;
     tools = runPlan.allowedTools;
     allowedToolNames = new Set(tools.map((tool) => tool.function.name));
@@ -4639,13 +5016,18 @@ export async function runAgentMission({
           },
         }
       : capabilityAwarePromptPageReflexOutput;
-    requiredWriteTools = getRequiredWriteToolNames(
-      activeIntentPrompt,
-      allowedToolNames,
-      missionIntent,
+    requiredWriteTools = isBufferedNewNoteOutput(
+      noteOutputPlan,
       streamingWritebackKind,
-      getActiveRoutedCodeToolNames(),
-    );
+    )
+      ? ["create_file"]
+      : getRequiredWriteToolNames(
+          activeIntentPrompt,
+          allowedToolNames,
+          missionIntent,
+          streamingWritebackKind,
+          getActiveRoutedCodeToolNames(),
+        );
     ({
       streamingWritebackKind,
       directCurrentNoteWritebackKind,
@@ -4682,6 +5064,7 @@ export async function runAgentMission({
         missionLedger: undefined,
         reflexOutput,
         performanceGates: evaluatePerformanceGates(metricEvents),
+        noteOutputPlan,
       }),
     );
     events.onTrace?.({
@@ -5235,10 +5618,24 @@ export async function runAgentMission({
   // route after the preliminary client was created. Refresh the same global
   // budget here without resetting usage, so pre-loop calls remain charged but
   // cannot leave the routed loop trapped behind a stale smaller ceiling.
-  const finalizedModelCallCap =
-    runPlan.executionTier === "direct_chat"
-      ? 1
-      : Math.max(4, routeDerivedLoopCap * 3 + 8);
+  if (resumedOriginalMission && isRunRouteValue(resumeLedger?.route)) {
+    runPlan = {
+      ...runPlan,
+      route: resumeLedger.route,
+      effortDecision: {
+        ...runPlan.effortDecision,
+        route: resumeLedger.route,
+      },
+    };
+  }
+  maxToolCalls = Math.min(
+    normalizeInvocationToolCallLimit(providedMaxToolCalls),
+    runPlan.effortDecision.maxToolCalls,
+  );
+  const finalizedModelCallCap = runPlan.effortDecision.maxModelCalls;
+  const finalizedMaxRunMs = applyEffortRunDeadline(
+    runPlan.effortDecision.maxWallClockMs,
+  );
   updateModelExecutionBudget({
     schemaVersion: 1,
     maxCalls: finalizedModelCallCap,
@@ -5246,8 +5643,35 @@ export async function runAgentMission({
       32_768,
       finalizedModelCallCap * configuredContextTokens,
     ),
-    maxWallClockMs: configuredMaxRunMs ?? 60 * 60_000,
+    maxWallClockMs: finalizedMaxRunMs,
   });
+  if (resumedOriginalMission) {
+    events.onRunConfig?.(
+      buildRunConfigEvent({
+        runId,
+        toolContext: runToolContext,
+        enableStreaming,
+        activeThink,
+        modelOptions,
+        writeAutonomy,
+        chatOnlyOverride: shouldForceCurrentPromptChatOnly(),
+        missionIntent,
+        currentNoteContext: shouldReadCurrentNote,
+        runPlan,
+        streamingWritebackKind,
+        directCurrentNoteWritebackKind,
+        missionLedger: resumeLedger
+          ? summarizeMissionLedger(resumeLedger)
+          : undefined,
+        reflexOutput,
+        estimatedPromptChars: estimatedPromptCharsForRun,
+        contextBudgetChars: runContextBudget.maxPromptChars,
+        contextBudgetSource: runContextBudget.budgetSource,
+        performanceGates: evaluatePerformanceGates(metricEvents),
+        noteOutputPlan,
+      }),
+    );
+  }
   const compositePublicationOwnsCurrentNoteWriteback =
     missionGraphOwnsAcceptedResearchNoteWritebackV1(
       missionGraphSession?.graph ?? missionGraph,
@@ -5271,10 +5695,15 @@ export async function runAgentMission({
   if (currentNoteContext !== null) {
     markOperationGoalDone(operationGoals, "read_current_note");
   }
-  const resolveOrchestratorSnapshot = () =>
-    missionGraph
-      ? projectMissionGraphToOrchestratorSnapshot(missionGraph)
-      : getOrchestratorSnapshot?.() ?? orchestratorSnapshot ?? null;
+  const resolveOrchestratorSnapshot = () => {
+    const parentOrchestrator =
+      getOrchestratorSnapshot?.() ?? orchestratorSnapshot ?? null;
+    // A parent Lead/Specialist runtime is the operational team projection. The
+    // Lead's own MissionGraph remains authoritative for its tool loop, but its
+    // compatibility projection must not erase the parent's accepted handoff.
+    return parentOrchestrator ??
+      (missionGraph ? projectMissionGraphToOrchestratorSnapshot(missionGraph) : null);
+  };
   missionLedger = createMissionLedger({
     runId,
     mission: activeIntentPrompt,
@@ -5731,6 +6160,11 @@ export async function runAgentMission({
           currentNotePath:
             resumeSnapshot?.currentNotePath ??
             runToolContext.getCurrentMarkdownFile?.()?.path,
+          outputTargetPath:
+            noteOutputPlan.destination === "new_note"
+              ? runToolContext.plannedNoteOutputPath ??
+                receiptBackedResumeOutputTargetPath
+              : null,
           rootRunId: previousLineage?.rootRunId ?? resumeLedger?.runId ?? runId,
           segmentId: runId,
           segmentIndex: previousLineage
@@ -5821,6 +6255,7 @@ export async function runAgentMission({
         missionLedger: summarizeMissionLedger(missionLedger),
         reflexOutput,
         performanceGates: evaluatePerformanceGates(metricEvents),
+        noteOutputPlan,
       }),
     );
   };
@@ -5836,6 +6271,7 @@ export async function runAgentMission({
       runId,
       originalMission: runtimeSnapshot.originalMission,
       currentNotePath: runtimeSnapshot.currentNotePath,
+      outputTargetPath: runtimeSnapshot.outputTargetPath,
       rootRunId: runtimeSnapshot.lineage.rootRunId,
       segmentId: runtimeSnapshot.lineage.segmentId,
       segmentIndex: runtimeSnapshot.lineage.segmentIndex,
@@ -6028,25 +6464,26 @@ export async function runAgentMission({
       let pinnedCreatedFile: ReturnType<
         NonNullable<ToolExecutionContext["getCurrentMarkdownFile"]>
       > = null;
-      if (
-        noteOutputPlan.destination === "new_note" &&
-        !hasActiveCurrentMarkdownFile(runToolContext)
-      ) {
-        const existingPinned = runtimeSnapshot?.currentNotePath
-          ? runToolContext.app.vault.getFileByPath(runtimeSnapshot.currentNotePath)
+      if (noteOutputPlan.destination === "new_note") {
+        const persistedTargetPath = runtimeSnapshot?.outputTargetPath;
+        const existingPinned = persistedTargetPath
+          ? runToolContext.app.vault.getFileByPath(persistedTargetPath)
           : null;
         if (existingPinned) {
           pinnedCreatedFile = existingPinned;
-        } else if (runtimeSnapshot?.currentNotePath) {
-          lazyCreatePath = runtimeSnapshot.currentNotePath;
+        } else if (persistedTargetPath) {
+          lazyCreatePath = persistedTargetPath;
         } else {
           const target = resolveAutonomousNoteTarget({
             app: runToolContext.app,
-            preferredBasename: "Untitled",
+            activeNotePath:
+              runToolContext.getCurrentMarkdownFile?.()?.path ?? null,
+            preferredBasename:
+              deriveAutonomousNoteBasenameFromPrompt(activeIntentPrompt),
           });
           lazyCreatePath = target.path;
           if (runtimeSnapshot) {
-            runtimeSnapshot.currentNotePath = target.path;
+            runtimeSnapshot.outputTargetPath = target.path;
           }
         }
       }
@@ -6111,7 +6548,7 @@ export async function runAgentMission({
               writebackToolContext.app.vault.getFileByPath(created.path) ??
               pinnedCreatedFile;
             if (runtimeSnapshot) {
-              runtimeSnapshot.currentNotePath = created.path;
+              runtimeSnapshot.outputTargetPath = created.path;
             }
             events.onTrace?.({
               id: `${operationId}:autonomous-note-created`,
@@ -6758,6 +7195,37 @@ export async function runAgentMission({
         verification.claimLedger,
       );
     }
+    if (finalOutput && verification.claimLedger) {
+      const exactFindings = inspectExactFindingSentenceContract(
+        finalOutput,
+        activeIntentPrompt,
+        verification.claimLedger,
+      );
+      if (
+        exactFindings &&
+        (!exactFindings.mappingComplete ||
+          exactFindings.observedFindingCount !== exactFindings.requiredCount ||
+          exactFindings.outsideMaterialClaimIds.length > 0)
+      ) {
+        const missingKey =
+          `final_output:findings_sentence_count:${exactFindings.requiredCount}/${exactFindings.observedFindingCount}`;
+        acceptance = {
+          ...acceptance,
+          status: acceptance.status === "fail" ? "fail" : "needs_more_work",
+          confidence: Math.min(acceptance.confidence, 0.65),
+          missing: [...new Set([...acceptance.missing, missingKey])],
+          reasons: [
+            ...new Set([
+              ...acceptance.reasons,
+              "exact_findings_sentence_count_incomplete",
+            ]),
+          ],
+          nextAction:
+            acceptance.nextAction ??
+            `Return exactly ${exactFindings.requiredCount} material finding sentence(s) inside the Findings section and no material preamble outside it.`,
+        };
+      }
+    }
     // Final acceptance only after verify-complete for research-bearing missions.
     const phase = refreshResearchPhase(
       hasRequiredActionReceipt(missionPlan, writeReceipts) &&
@@ -6765,6 +7233,56 @@ export async function runAgentMission({
       candidateConflicts,
     );
     return gateAcceptanceByResearchPhase(acceptance, phase);
+  };
+  const reconcileCommittedProofGatedWriteAcceptance = (
+    acceptance: MissionAcceptanceResult,
+    step: number,
+  ): MissionAcceptanceResult => {
+    if (!committedProofGatedWrite || !lastFinalOutput.trim()) {
+      return acceptance;
+    }
+    const resolved = resolveCommittedProofGatedWriteAcceptanceV1({
+      preCommitAcceptance: committedProofGatedWrite.acceptance,
+      postCommitAcceptance: acceptance,
+      payloadMatches:
+        committedProofGatedWrite.payloadFingerprint ===
+        hashOperationInput(lastFinalOutput),
+      receipt: committedProofGatedWrite.receipt,
+    });
+    if (resolved.usedPreCommitProof) {
+      events.onTrace?.({
+        id: `committed-write-acceptance-invariant-${step}`,
+        kind: "acceptance",
+        step,
+        toolName: committedProofGatedWrite.receipt.toolName,
+        message:
+          "Preserved the exact pre-mutation candidate acceptance after its verified, non-partial receipt.",
+        outputPreview: {
+          payloadFingerprint: committedProofGatedWrite.payloadFingerprint,
+          postCommitMissing: acceptance.missing,
+          acceptance: resolved.acceptance,
+        },
+      });
+    }
+    return resolved.acceptance;
+  };
+  const recordCommittedProofGatedWrite = (
+    payload: string,
+    acceptance: MissionAcceptanceResult,
+    receipt: AgentRunReceipt,
+  ): void => {
+    if (acceptance.status !== "pass" || !payload.trim()) {
+      return;
+    }
+    committedProofGatedWrite = {
+      payloadFingerprint: hashOperationInput(payload),
+      acceptance: {
+        ...acceptance,
+        missing: [...acceptance.missing],
+        reasons: [...acceptance.reasons],
+      },
+      receipt,
+    };
   };
   const commitAcceptedEvidenceConflictAcknowledgements = (
     finalOutput: string,
@@ -6922,6 +7440,12 @@ export async function runAgentMission({
     // it, so a run that passes while burning far more budget or citing far
     // less evidence is distinguishable from a clean pass. It never changes the
     // gate: acceptancePassed is carried through, not recomputed.
+    const missionResearchSignals = buildMissionResearchSignalsV1({
+      researchPlan,
+      evidence: missionEvidenceRecords,
+      claimLedger: lastClaimLedger,
+      finalOutput: lastFinalOutput,
+    });
     const missionScorecard = scoreMissionV1({
       acceptanceCriteriaTotal: lastVerificationChecks.length,
       acceptanceCriteriaMissing: lastVerificationChecks.filter(
@@ -6933,6 +7457,9 @@ export async function runAgentMission({
         lastClaimLedger?.claims.filter(
           (claim) => claim.status === "grounded" || claim.status === "exempt",
         ).length ?? 0,
+      evidenceGroundingApplicable:
+        Boolean(missionResearchSignals) ||
+        shouldRequireClaimGrounding(activeIntentPrompt),
       mutationsPerformed: writeReceipts.length,
       mutationsWithReceipts: missionLedger?.receipts.length ?? 0,
       recoveryAttempts: recoveryAttemptSignatures.length,
@@ -6944,12 +7471,7 @@ export async function runAgentMission({
       // for every mission — thin summaries stay invisible. The builder
       // returns undefined for non-research missions, which keeps their
       // empty-set convention intact deliberately.
-      research: buildMissionResearchSignalsV1({
-        researchPlan,
-        evidence: missionEvidenceRecords,
-        claimLedger: lastClaimLedger,
-        finalOutput: lastFinalOutput,
-      }),
+      research: missionResearchSignals,
     });
     lastMissionScorecard = missionScorecard;
     events.onMissionScorecard?.(missionScorecard);
@@ -7192,6 +7714,12 @@ export async function runAgentMission({
               nextAction: "Retry the direct-chat response.",
             }
         : evaluateCurrentAcceptance(lastFinalOutput || undefined);
+    if (stopReason === "write_completed") {
+      acceptance = reconcileCommittedProofGatedWriteAcceptance(
+        acceptance,
+        step,
+      );
+    }
     let onlyFinalProjectionProofMissing =
       missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
     if (
@@ -7210,6 +7738,12 @@ export async function runAgentMission({
       missionGraph = missionGraphSession.graph;
       missionPlan = projectMissionGraphToLegacyPlan(missionGraph);
       acceptance = evaluateCurrentAcceptance(lastFinalOutput || undefined);
+      if (stopReason === "write_completed") {
+        acceptance = reconcileCommittedProofGatedWriteAcceptance(
+          acceptance,
+          step,
+        );
+      }
       onlyFinalProjectionProofMissing =
         missionAcceptanceHasOnlyFinalProjectionDebt(acceptance);
     }
@@ -8112,6 +8646,74 @@ export async function runAgentMission({
       providerBudgetExhausted,
     );
   };
+  const settleCommittedProofGatedWriteBeforeDeadlineStop = async (input: {
+    receipt: AgentRunReceipt;
+    kind: StreamingWritebackKind;
+    step: number;
+    maxSteps: number;
+  }): Promise<"not_applicable" | "receipt_persisted" | "run_finished"> => {
+    const deadlineExpired = Boolean(
+      (runDeadlineController?.signal.aborted && !externalAbortSignal?.aborted) ||
+        isDeadlineAbortSignal(externalAbortSignal),
+    );
+    if (!deadlineExpired) {
+      return "not_applicable";
+    }
+
+    const projectedOperationGoals: MissionOperationGoals = {
+      goals: { ...operationGoals.goals },
+      completedTools: [...operationGoals.completedTools],
+    };
+    markStreamingWritebackGoalDone(projectedOperationGoals, input.kind);
+    const decision = resolveCommittedProofGatedWriteDeadlineSettlementV1({
+      preCommitAcceptance: committedProofGatedWrite?.acceptance,
+      payloadMatches: Boolean(
+        committedProofGatedWrite &&
+          lastFinalOutput.trim() &&
+          committedProofGatedWrite.payloadFingerprint ===
+            hashOperationInput(lastFinalOutput),
+      ),
+      receiptMatches: committedProofGatedWrite?.receipt === input.receipt,
+      receipt: input.receipt,
+      hasPendingOperationGoalsAfterWrite: hasPendingOperationGoals(
+        projectedOperationGoals,
+      ),
+    });
+    if (!decision.persistReceiptBeforeStop) {
+      return "not_applicable";
+    }
+
+    // The mutation is already committed and independently read back. Publish
+    // its receipt before the deadline stop snapshot so a completed effect never
+    // disappears from the durable ledger merely because the clock fired in the
+    // narrow return-to-caller window.
+    markStreamingWritebackGoalDone(operationGoals, input.kind);
+    if (!writeReceipts.includes(input.receipt)) {
+      writeReceipts.push(input.receipt);
+      events.onReceipt?.(input.receipt);
+      await recordLedgerReceipt(input.receipt, input.step);
+    }
+    events.onTrace?.({
+      id: `proof-gated-writeback-${input.step}:deadline-receipt-settled`,
+      kind: "receipt",
+      step: input.step,
+      toolName: input.receipt.toolName,
+      operation: input.receipt.operation,
+      path: input.receipt.path,
+      message:
+        "Persisted the exact preaccepted write receipt before deadline stop handling.",
+      outputPreview: {
+        finishWriteBeforeStop: decision.finishWriteBeforeStop,
+        payloadFingerprint: committedProofGatedWrite?.payloadFingerprint,
+      },
+    });
+    if (!decision.finishWriteBeforeStop) {
+      return "receipt_persisted";
+    }
+
+    await finishRun("write_completed", input.step, input.maxSteps);
+    return "run_finished";
+  };
   const runProofGatedCurrentNoteWriteback = async (
     input: Parameters<typeof streamCurrentNoteWriteback>[0],
     step: number,
@@ -8177,6 +8779,7 @@ export async function runAgentMission({
     const proofVerificationRequired = requiresVerifiedFinalOutput(
       missionPlan,
       researchPlan,
+      activeIntentPrompt,
     );
     const exactReplacementApprovalRequired = input.kind === "replace";
     if (!proofVerificationRequired && !exactReplacementApprovalRequired) {
@@ -8280,10 +8883,24 @@ export async function runAgentMission({
       return response?.message.content ?? "";
     };
 
+    let initialCandidate: string;
+    try {
+      initialCandidate = await stageCandidate(false);
+    } catch (error) {
+      if (!isProviderBudgetExhaustedError(error)) throw error;
+      await finishErroredRunFromException(
+        error,
+        step,
+        maxSteps,
+        "model",
+      );
+      return null;
+    }
     let candidate = constrainCandidatePassageScope(
-      await stageCandidate(false),
+      initialCandidate,
       "candidate-1",
     );
+    let acceptedCandidateAcceptance: MissionAcceptanceResult | null = null;
     if (proofVerificationRequired) {
       let candidateAcceptance = requireAcceptedPassageCitationCoverage(
         getProofGatedWritebackCandidateAcceptance(
@@ -8329,8 +8946,21 @@ export async function runAgentMission({
             researchPlan,
           ),
         });
+        let correctedCandidate: string;
+        try {
+          correctedCandidate = await stageCandidate(true);
+        } catch (error) {
+          if (!isProviderBudgetExhaustedError(error)) throw error;
+          await finishErroredRunFromException(
+            error,
+            step,
+            maxSteps,
+            "model",
+          );
+          return null;
+        }
         candidate = constrainCandidatePassageScope(
-          await stageCandidate(true),
+          correctedCandidate,
           "candidate-2",
         );
         candidateAcceptance = requireAcceptedPassageCitationCoverage(
@@ -8368,6 +8998,7 @@ export async function runAgentMission({
         );
         return null;
       }
+      acceptedCandidateAcceptance = candidateAcceptance;
     } else {
       events.onTrace?.({
         id: `replacement-writeback-${step}:candidate-held`,
@@ -8393,6 +9024,13 @@ export async function runAgentMission({
         },
         step,
       );
+      if (acceptedCandidateAcceptance) {
+        recordCommittedProofGatedWrite(
+          candidate,
+          acceptedCandidateAcceptance,
+          receipt,
+        );
+      }
       commitAcceptedEvidenceConflictAcknowledgements(candidate);
       return receipt;
     } catch (error) {
@@ -8456,6 +9094,8 @@ export async function runAgentMission({
         compoundLifecycleDetected: true,
         workingMode: runToolContext.settings?.workingMode,
         bundledGrant: bundledStageGrant,
+        currentPrompt: activeIntentPrompt,
+        toolArguments: toolCall.arguments,
       }) ||
         runnerBoundMayAutoWithoutChatGrant({
           toolName: approvalToolName,
@@ -8463,6 +9103,8 @@ export async function runAgentMission({
           compoundLifecycleDetected: true,
           workingMode: runToolContext.settings?.workingMode,
           bundledGrant: bundledStageGrant,
+          currentPrompt: activeIntentPrompt,
+          toolArguments: toolCall.arguments,
         }));
     if (mayAutoBound && (setLooseLive || bundledStageGrant)) {
       let autoViaBundle = false;
@@ -8909,12 +9551,16 @@ export async function runAgentMission({
               autonomyProfile: autonomyProfileForRun,
               compoundLifecycleDetected: true,
               workingMode: runToolContext.settings?.workingMode,
+              currentPrompt: activeIntentPrompt,
+              toolArguments: toolCall.arguments,
             }) ||
               runnerBoundMayAutoWithoutGrant({
                 toolName: binding.toolName,
                 autonomyProfile: autonomyProfileForRun,
                 compoundLifecycleDetected: true,
                 workingMode: runToolContext.settings?.workingMode,
+                currentPrompt: activeIntentPrompt,
+                toolArguments: toolCall.arguments,
               }));
           if (setLooseNestedAuto) {
             return {
@@ -9360,6 +10006,8 @@ export async function runAgentMission({
             autonomyProfile: autonomyProfileForRun,
             compoundLifecycleDetected: true,
             workingMode: runToolContext.settings?.workingMode,
+            currentPrompt: activeIntentPrompt,
+            toolArguments: toolCall.arguments,
           });
         if (setLooseBoundAuto) {
           // Still mint a one-shot grant — Bound executePrepared rejects
@@ -9611,6 +10259,8 @@ export async function runAgentMission({
               autonomyProfile: autonomyProfileForRun,
               compoundLifecycleDetected: true,
               workingMode: runToolContext.settings?.workingMode,
+              currentPrompt: activeIntentPrompt,
+              toolArguments: toolCall.arguments,
             });
           const stageBudgetMs =
             compoundRunBudgetPlan?.stages.find((s) => s.stage === envelopeStage)
@@ -9747,6 +10397,8 @@ export async function runAgentMission({
         autonomyProfile: autonomyProfileForRun,
         compoundLifecycleDetected: true,
         workingMode: runToolContext.settings?.workingMode,
+        currentPrompt: activeIntentPrompt,
+        toolArguments: toolCall.arguments,
       });
 
     if (
@@ -10035,6 +10687,56 @@ export async function runAgentMission({
         }
       }
     }
+    if (toolCall.name === "append_to_current_file") {
+      const textKey =
+        typeof toolCall.arguments.text === "string"
+          ? "text"
+          : typeof toolCall.arguments.content === "string"
+            ? "content"
+            : null;
+      const activeFile =
+        runToolContext.getCurrentMarkdownFile?.() ??
+        runToolContext.app?.workspace?.getActiveFile?.();
+      if (textKey && activeFile) {
+        try {
+          // The vault tool also removes an accidentally repeated copy of the
+          // current note before appending. Apply that deterministic transform
+          // at the runner boundary too, so the receipt-backed payload captured
+          // below is the exact argument the tool actually executes rather than
+          // the model's pre-normalized candidate.
+          const current = await runToolContext.app.vault.read(activeFile);
+          const requestedText = toolCall.arguments[textKey] as string;
+          const normalizedText = stripRepeatedCurrentNotePrefixFromAppend(
+            requestedText,
+            current,
+          );
+          if (normalizedText !== requestedText) {
+            toolCall = {
+              ...toolCall,
+              arguments: {
+                ...toolCall.arguments,
+                [textKey]: normalizedText,
+              },
+            };
+            events.onTrace?.({
+              id: `${step}:${String(toolIndex)}:${toolCall.name}:repeated-note-prefix-removed`,
+              kind: "verification",
+              step,
+              toolName: toolCall.name,
+              message:
+                "Removed a repeated current-note prefix before append execution and proof fingerprinting.",
+              outputPreview: {
+                payloadFingerprint: hashOperationInput(normalizedText),
+              },
+            });
+          }
+        } catch {
+          // The tool performs the authoritative current-note read and will
+          // return the typed failure. This best-effort normalization must not
+          // invent a different pre-execution error path.
+        }
+      }
+    }
     const reflectionPayload =
       typeof toolCall.arguments.text === "string"
         ? toolCall.arguments.text
@@ -10055,7 +10757,11 @@ export async function runAgentMission({
       });
     if (
       isProofGatedCurrentNoteContentTool(toolCall.name) &&
-      requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+      requiresVerifiedFinalOutput(
+        missionPlan,
+        researchPlan,
+        activeIntentPrompt,
+      ) &&
       !setLooseReflectionOnlyWriteback
     ) {
       const textKey =
@@ -11888,6 +12594,15 @@ export async function runAgentMission({
       origin === "model"
         ? getUnsafeModelLinearIssueCreateOutputMessage(toolCall)
         : null;
+    // Ticket-shaped missions must also match the managed template's sections.
+    // This rides the ordinary invalid-arguments repair path, so the first
+    // malformed body earns one corrective retry and a repeat is blocked.
+    const linearIssueStructureProblem =
+      origin === "model" &&
+      !unsafeLinearCreateOutput &&
+      hasLinearIssueTemplateIntent(activeIntentPrompt)
+        ? getModelLinearIssueTemplateStructureProblem(toolCall)
+        : null;
     let result: ToolExecutionResult;
     if (unsafeLinearCreateOutput) {
       events.onTrace?.({
@@ -11909,6 +12624,27 @@ export async function runAgentMission({
         error: {
           code: "linear_issue_provider_output_rejected",
           message: unsafeLinearCreateOutput,
+        },
+      };
+    } else if (linearIssueStructureProblem) {
+      events.onTrace?.({
+        id: `${toolEventBase.id}:linear-issue-template-structure-rejected`,
+        kind: "verification",
+        step,
+        toolName: toolCall.name,
+        message: `Blocked a model-authored Linear issue before preparation because it does not follow the managed template. ${linearIssueStructureProblem}`,
+      });
+      result = {
+        ok: false,
+        toolName: toolCall.name,
+        mutationState: "not_applied",
+        output: {
+          status: "blocked",
+          reason: linearIssueStructureProblem,
+        },
+        error: {
+          code: "linear_issue_template_invalid_arguments",
+          message: linearIssueStructureProblem,
         },
       };
     } else {
@@ -12255,7 +12991,8 @@ export async function runAgentMission({
         await recordLedgerReceipt(receipt, step);
         if (
           toolCall.name === "append_to_current_file" ||
-          toolCall.name === "replace_current_file"
+          toolCall.name === "replace_current_file" ||
+          toolCall.name === "create_file"
         ) {
           const writtenText =
             typeof toolCall.arguments.text === "string"
@@ -12269,13 +13006,27 @@ export async function runAgentMission({
             // a completed research write does not ask the model for unrelated
             // post-write tools merely because no separate chat answer exists.
             lastFinalOutput = writtenText;
+            if (
+              toolCall.name === "append_to_current_file" ||
+              toolCall.name === "replace_current_file"
+            ) {
+              lastReceiptBackedCurrentNoteWrite = {
+                toolName: toolCall.name,
+                payload: writtenText,
+                receipt,
+                step,
+                toolIndex,
+              };
+            }
           }
-          await publishPlaceholderAutoRename(
-            toolCall.name === "replace_current_file" ? "replace" : "append",
-            step,
-            writtenText,
-            automaticLeadingTitle,
-          );
+          if (toolCall.name !== "create_file") {
+            await publishPlaceholderAutoRename(
+              toolCall.name === "replace_current_file" ? "replace" : "append",
+              step,
+              writtenText,
+              automaticLeadingTitle,
+            );
+          }
         }
         if (vaultTransaction) {
           if (receipt.backupPath) {
@@ -12812,9 +13563,26 @@ export async function runAgentMission({
           setLooseGithubPublishBlockReason = publishFailure.slice(0, 1_200);
         }
       }
+      // workspace_not_found means the workspaceId argument names nothing, so
+      // it belongs with the argument failures: re-issuing the same call fails
+      // identically, and the model needs one corrective that points at
+      // code_workspace_create. Without this the node exhausts its bounded
+      // retries and terminates the whole mission (seen live: the model called
+      // code_validate_fast for a workspace it never created). It is a pure
+      // lookup failure, so nothing was applied.
+      // Off-frontier rejections belong here too. Re-issuing the identical call
+      // is always futile, and without a registered failure signature the
+      // repeated_invalid_tool_call blocker never fires: a live run burned 14 of
+      // its 30 steps re-requesting the same unavailable tool. The generic
+      // correction for an unknown definition already names the exact frontier,
+      // which is the right guidance for this class.
       const modelArgumentFailure =
         origin === "model" &&
-        (isToolArgumentErrorCode(failureCode) || failureCode === "unknown_tool");
+        (isToolArgumentErrorCode(failureCode) ||
+          failureCode === "unknown_tool" ||
+          failureCode === "workspace_not_found" ||
+          failureCode === "tool_not_allowed" ||
+          failureCode === "plan_dependency_violation");
       const argumentFailureSignature = modelArgumentFailure && failureCode
         ? `${toolCall.name}:${failureCode}:${stableStringify(toolCall.arguments)}`
         : null;
@@ -12992,11 +13760,25 @@ export async function runAgentMission({
           const definition = tools.find(
             (candidate) => candidate.function.name === toolCall.name,
           );
+          const workspaceCorrection =
+            failureCode === "workspace_not_found"
+              ? `Tool-call correction: ${toolCall.name} names a workspace that does not exist. Call code_workspace_create first and reuse the exact workspaceId it returns; do not invent or reuse a workspace id from the mission text.`
+              : null;
+          const linearTemplateCorrection =
+            failureCode === "linear_issue_template_invalid_arguments"
+              ? `Tool-call format correction: ${toolCall.name} rejected the description. ${result.error?.message ?? ""} Return one corrected call whose description contains exactly these level-two sections, in this order, with plain "- " bullets and no task-list checkboxes: ${LINEAR_ISSUE_SECTION_HEADINGS_V1.map(
+                  (heading) => `## ${heading}`,
+                ).join(", ")}. Keep the prose user-facing; do not add other sections.`
+              : null;
           messages.push({
             role: "system" as const,
-            content: definition
-              ? `Tool-call schema correction: ${toolCall.name} rejected the supplied arguments. Return one corrected call using exactly this JSON Schema and do not infer omitted mutation values: ${JSON.stringify(definition.function.parameters)}`
-              : `Tool-call schema correction: ${toolCall.name} is not an allowed tool. Choose one exact name from: ${tools.map((candidate) => candidate.function.name).join(", ")}.`,
+            content: workspaceCorrection
+              ? workspaceCorrection
+              : linearTemplateCorrection
+              ? linearTemplateCorrection
+              : definition
+                ? `Tool-call schema correction: ${toolCall.name} rejected the supplied arguments. Return one corrected call using exactly this JSON Schema and do not infer omitted mutation values: ${JSON.stringify(definition.function.parameters)}`
+                : `Tool-call schema correction: ${toolCall.name} is not an allowed tool. Choose one exact name from: ${tools.map((candidate) => candidate.function.name).join(", ")}.`,
           });
         }
       }
@@ -13535,6 +14317,7 @@ export async function runAgentMission({
       contextBudgetChars: runContextBudget.maxPromptChars,
       contextBudgetSource: runContextBudget.budgetSource,
       performanceGates: evaluatePerformanceGates(metricEvents),
+      noteOutputPlan,
     }),
   );
 
@@ -13790,13 +14573,25 @@ export async function runAgentMission({
       );
       throw error;
     }
+    const deadlineWriteSettlement =
+      await settleCommittedProofGatedWriteBeforeDeadlineStop({
+        receipt,
+        kind: "append",
+        step: 1,
+        maxSteps: runPlan.maxStepsForRun,
+      });
+    if (deadlineWriteSettlement === "run_finished") {
+      return;
+    }
     if (await stopIfRequested(1)) {
       return;
     }
-    markStreamingWritebackGoalDone(operationGoals, "append");
-    writeReceipts.push(receipt);
-    events.onReceipt?.(receipt);
-    await recordLedgerReceipt(receipt);
+    if (deadlineWriteSettlement === "not_applicable") {
+      markStreamingWritebackGoalDone(operationGoals, "append");
+      writeReceipts.push(receipt);
+      events.onReceipt?.(receipt);
+      await recordLedgerReceipt(receipt);
+    }
     await finishRun("write_completed", 1, runPlan.maxStepsForRun);
     return;
   }
@@ -13855,13 +14650,25 @@ export async function runAgentMission({
       );
       throw error;
     }
+    const deadlineWriteSettlement =
+      await settleCommittedProofGatedWriteBeforeDeadlineStop({
+        receipt,
+        kind: promptOnPageWritebackKind,
+        step: 1,
+        maxSteps: runPlan.maxStepsForRun,
+      });
+    if (deadlineWriteSettlement === "run_finished") {
+      return;
+    }
     if (await stopIfRequested(1)) {
       return;
     }
-    markStreamingWritebackGoalDone(operationGoals, promptOnPageWritebackKind);
-    writeReceipts.push(receipt);
-    events.onReceipt?.(receipt);
-    await recordLedgerReceipt(receipt);
+    if (deadlineWriteSettlement === "not_applicable") {
+      markStreamingWritebackGoalDone(operationGoals, promptOnPageWritebackKind);
+      writeReceipts.push(receipt);
+      events.onReceipt?.(receipt);
+      await recordLedgerReceipt(receipt);
+    }
     await finishRun("write_completed", 1, runPlan.maxStepsForRun);
     return;
   }
@@ -13918,13 +14725,25 @@ export async function runAgentMission({
       );
       throw error;
     }
+    const deadlineWriteSettlement =
+      await settleCommittedProofGatedWriteBeforeDeadlineStop({
+        receipt,
+        kind: directCurrentNoteWritebackKind,
+        step: 1,
+        maxSteps: runPlan.maxStepsForRun,
+      });
+    if (deadlineWriteSettlement === "run_finished") {
+      return;
+    }
     if (await stopIfRequested(1)) {
       return;
     }
-    markStreamingWritebackGoalDone(operationGoals, directCurrentNoteWritebackKind);
-    writeReceipts.push(receipt);
-    events.onReceipt?.(receipt);
-    await recordLedgerReceipt(receipt);
+    if (deadlineWriteSettlement === "not_applicable") {
+      markStreamingWritebackGoalDone(operationGoals, directCurrentNoteWritebackKind);
+      writeReceipts.push(receipt);
+      events.onReceipt?.(receipt);
+      await recordLedgerReceipt(receipt);
+    }
     await finishRun("write_completed", 1, runPlan.maxStepsForRun);
     return;
   }
@@ -14088,7 +14907,7 @@ export async function runAgentMission({
     MAX_AGENT_STEPS,
     normalizeInvocationStepLimit(providedMaxSteps),
   );
-  const maxRunMs = configuredMaxRunMs;
+  const maxRunMs = effectiveMaxRunMs;
   const isRepeatedToolBudgetSpent = () => {
     const lastActionSignature = recentActions.at(-1)?.signature;
     const previousActionSignature = recentActions.at(-2)?.signature;
@@ -14145,7 +14964,11 @@ export async function runAgentMission({
           output: receipt.output,
           resource: receipt.resource,
         })),
-      ) || successfulToolNames.includes("github_create_private_repository");
+      ) ||
+      successfulToolNames.includes(CREATE_GITHUB_REPOSITORY_TOOL_NAME) ||
+      successfulToolNames.includes(
+        LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+      );
     const decision = decideSetLooseHostProgressV1({
       unpaidDeliveryKeys: unpaidBefore,
       profileKey,
@@ -14186,7 +15009,7 @@ export async function runAgentMission({
         content: [
           `Workspace ${decision.workspaceId} already has a durable binding.`,
           "Do not call code_workspace_create again.",
-          "Prefer github_create_private_repository then publish_verified_code_to_github action=publish_draft.",
+          "Prefer github_create_repository with the public/private choice stated by the user, then publish_verified_code_to_github action=publish_draft.",
         ].join(" "),
       });
       return "progressed";
@@ -14245,16 +15068,22 @@ export async function runAgentMission({
     }
 
     if (decision.kind === "host_github_create") {
+      const visibilityChoice = resolveExplicitRepositoryVisibilityChoiceV1(
+        activeIntentPrompt,
+      );
       events.onStatus?.(
-        `Host-driving github_create_private_repository for profile ${decision.profileKey} after set-loose stall.`,
+        `Host-driving github_create_repository for profile ${decision.profileKey} after set-loose stall.`,
       );
       const createResult = await runObservedModelToolCall({
         origin: "runner",
         toolCall: {
-          name: "github_create_private_repository",
+          name: CREATE_GITHUB_REPOSITORY_TOOL_NAME,
           arguments: {
             profileKey: decision.profileKey,
             description: `Set-loose host create for ${decision.profileKey}`,
+            ...(visibilityChoice.status === "chosen"
+              ? { visibility: visibilityChoice.visibility }
+              : {}),
           },
         },
         step: input.step,
@@ -14263,12 +15092,12 @@ export async function runAgentMission({
       });
       if (!createResult.ok) {
         events.onStatus?.(
-          `Host github_create_private_repository failed: ${createResult.error?.message ?? "unknown"}`,
+          `Host github_create_repository failed: ${createResult.error?.message ?? "unknown"}`,
         );
         return "none";
       }
       applyHostProofs(
-        "github_create_private_repository",
+        CREATE_GITHUB_REPOSITORY_TOOL_NAME,
         createResult.output,
         decision.profileKey,
       );
@@ -14389,10 +15218,9 @@ export async function runAgentMission({
       : "progressed";
   };
 
-  // At most one watchdog consultation per run. Two agents handing a stuck run
-  // back and forth would spend the whole budget looking busy, which is worse
-  // than stopping.
-  let secondAgentConsulted = false;
+  // At most one recovery_verifier cycle per run. Lead/Specialist ping-pong
+  // would spend the shared budget looking busy instead of making progress.
+  let specialistRecoveryConsulted = false;
 
   for (let step = 1; step <= stepLimit; step += 1) {
     if (await stopIfRequested(step)) {
@@ -14586,6 +15414,7 @@ export async function runAgentMission({
           contextBudgetChars: runContextBudget.maxPromptChars,
           contextBudgetSource: runContextBudget.budgetSource,
           performanceGates: evaluatePerformanceGates(metricEvents),
+          noteOutputPlan,
         }),
       );
     }
@@ -14754,7 +15583,7 @@ export async function runAgentMission({
             "linear_create_issue",
             "linear_get_issue",
             "linear_search_issues",
-            "github_create_private_repository",
+            CREATE_GITHUB_REPOSITORY_TOOL_NAME,
             "publish_verified_code_to_github",
             "read_template",
           ],
@@ -15053,7 +15882,8 @@ export async function runAgentMission({
       stepTools.some((tool) => {
         const name = tool.function.name;
         return (
-          name === "github_create_private_repository" ||
+          name === CREATE_GITHUB_REPOSITORY_TOOL_NAME ||
+          name === LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME ||
           name === "publish_verified_code_to_github" ||
           name === "code_commit_verified" ||
           name === "code_workspace_write_expected" ||
@@ -15115,7 +15945,11 @@ export async function runAgentMission({
       !passageGroundedWriteContractInjected &&
       stepAllowedToolNames.has("append_to_current_file") &&
       shouldRequireClaimGrounding(activeIntentPrompt) &&
-      requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+      requiresVerifiedFinalOutput(
+        missionPlan,
+        researchPlan,
+        activeIntentPrompt,
+      ) &&
       hasSatisfiedDurablePreWriteProof() &&
       acceptedWritebackPassageIds.length > 0
     ) {
@@ -15561,19 +16395,26 @@ export async function runAgentMission({
       response.toolCalls.length === 0 && responseToolCalls.length > 0;
     const githubToolsOfferedThisStep =
       setLooseCompoundEnabled &&
-      (stepAllowedToolNames.has("github_create_private_repository") ||
+      (stepAllowedToolNames.has(CREATE_GITHUB_REPOSITORY_TOOL_NAME) ||
+        stepAllowedToolNames.has(
+          LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+        ) ||
         stepAllowedToolNames.has("publish_verified_code_to_github") ||
         Boolean(
           setLooseOfferedToolNames?.includes(
-            "github_create_private_repository",
+            CREATE_GITHUB_REPOSITORY_TOOL_NAME,
           ) ||
+            setLooseOfferedToolNames?.includes(
+              LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+            ) ||
             setLooseOfferedToolNames?.includes(
               "publish_verified_code_to_github",
             ),
         ));
     const modelUsedGithubTool = responseToolCalls.some(
       (call) =>
-        call.name === "github_create_private_repository" ||
+        call.name === CREATE_GITHUB_REPOSITORY_TOOL_NAME ||
+        call.name === LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME ||
         call.name === "publish_verified_code_to_github" ||
         call.name === "github_publish_verified_branch",
     );
@@ -16229,6 +17070,89 @@ export async function runAgentMission({
           researchPlan,
           activeIntentPrompt,
         );
+        if (lastClaimLedger) {
+          const exactFindings = constrainExactFindingSentenceContract(
+            verifiedFinalAppendCandidate,
+            activeIntentPrompt,
+            lastClaimLedger,
+          );
+          if (
+            exactFindings.removedClaimIds.length > 0 &&
+            hasRenderableAssistantContent(exactFindings.content)
+          ) {
+            verifiedFinalAppendCandidate = exactFindings.content;
+            candidateAcceptance = requireAcceptedPassageCitationCoverage(
+              getProofGatedWritebackCandidateAcceptance(
+                evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
+                requiredWriteTools,
+              ),
+              verifiedFinalAppendCandidate,
+              acceptedWritebackPassageIds,
+              researchPlan,
+              activeIntentPrompt,
+            );
+            events.onTrace?.({
+              id: `verified-final-append-${step}:finding-count-constrained`,
+              kind: "verification",
+              step,
+              toolName: "append_to_current_file",
+              message:
+                `Removed ${exactFindings.removedClaimIds.length} material claim(s) outside the exact ${exactFindings.requiredCount ?? 0}-sentence Findings contract; verification=${candidateAcceptance.status}.`,
+              outputPreview: {
+                removedClaimIds: exactFindings.removedClaimIds,
+                requiredCount: exactFindings.requiredCount,
+                observedFindingCount: exactFindings.observedFindingCount,
+                payloadFingerprint: hashOperationInput(
+                  verifiedFinalAppendCandidate,
+                ),
+                acceptance: candidateAcceptance,
+              },
+            });
+          }
+        }
+        if (
+          candidateAcceptance.status !== "pass" &&
+          candidateAcceptance.missing.some((item) =>
+            item.startsWith("claim_grounding:ungrounded:"),
+          ) &&
+          lastClaimLedger
+        ) {
+          const pruned = pruneUniquelyMatchedUngroundedClaims(
+            verifiedFinalAppendCandidate,
+            lastClaimLedger,
+          );
+          if (
+            pruned.removedClaimIds.length > 0 &&
+            hasRenderableAssistantContent(pruned.content)
+          ) {
+            verifiedFinalAppendCandidate = pruned.content;
+            candidateAcceptance = requireAcceptedPassageCitationCoverage(
+              getProofGatedWritebackCandidateAcceptance(
+                evaluateCurrentAcceptance(verifiedFinalAppendCandidate),
+                requiredWriteTools,
+              ),
+              verifiedFinalAppendCandidate,
+              acceptedWritebackPassageIds,
+              researchPlan,
+              activeIntentPrompt,
+            );
+            events.onTrace?.({
+              id: `verified-final-append-${step}:ungrounded-claims-pruned`,
+              kind: "verification",
+              step,
+              toolName: "append_to_current_file",
+              message:
+                `Removed ${pruned.removedClaimIds.length} uniquely matched ungrounded claim(s); verification=${candidateAcceptance.status}.`,
+              outputPreview: {
+                removedClaimIds: pruned.removedClaimIds,
+                payloadFingerprint: hashOperationInput(
+                  verifiedFinalAppendCandidate,
+                ),
+                acceptance: candidateAcceptance,
+              },
+            });
+          }
+        }
         if (
           candidateAcceptance.status !== "pass" &&
           candidateAcceptance.missing.length > 0 &&
@@ -16315,16 +17239,52 @@ export async function runAgentMission({
             ),
           });
           if (appendResult.ok) {
+            const receiptBackedAppend = getLastReceiptBackedCurrentNoteWrite();
+            const matchingReceiptBackedAppend =
+              receiptBackedAppend?.toolName === "append_to_current_file" &&
+              receiptBackedAppend.step === step &&
+              receiptBackedAppend.toolIndex === "verified-final-append"
+                ? receiptBackedAppend
+                : null;
+            const executedAppendPayload =
+              matchingReceiptBackedAppend?.payload ??
+              verifiedFinalAppendCandidate;
+            if (
+              candidateAcceptance.status === "pass" &&
+              matchingReceiptBackedAppend
+            ) {
+              const executedPayloadAcceptance =
+                hashOperationInput(executedAppendPayload) ===
+                hashOperationInput(verifiedFinalAppendCandidate)
+                  ? candidateAcceptance
+                  : requireAcceptedPassageCitationCoverage(
+                      getProofGatedWritebackCandidateAcceptance(
+                        evaluateCurrentAcceptance(executedAppendPayload),
+                        requiredWriteTools,
+                      ),
+                      executedAppendPayload,
+                      acceptedWritebackPassageIds,
+                      researchPlan,
+                      activeIntentPrompt,
+                    );
+              if (executedPayloadAcceptance.status === "pass") {
+                recordCommittedProofGatedWrite(
+                  executedAppendPayload,
+                  executedPayloadAcceptance,
+                  matchingReceiptBackedAppend.receipt,
+                );
+              }
+            }
             commitAcceptedEvidenceConflictAcknowledgements(
-              verifiedFinalAppendCandidate,
+              executedAppendPayload,
             );
-            lastFinalOutput = verifiedFinalAppendCandidate;
+            lastFinalOutput = executedAppendPayload;
             Object.assign(
               setLooseDeliveryProofs,
               applySetLooseDeliveryProofFromSuccessfulTool({
                 toolName: "append_to_current_file",
                 output: appendResult.output,
-                argumentsText: verifiedFinalAppendCandidate,
+                argumentsText: executedAppendPayload,
                 proofs: setLooseDeliveryProofs,
               }),
             );
@@ -16513,13 +17473,25 @@ export async function runAgentMission({
           await finishErroredRunFromException(error, step, stepLimit, "model");
           throw error;
         }
+        const deadlineWriteSettlement =
+          await settleCommittedProofGatedWriteBeforeDeadlineStop({
+            receipt,
+            kind: streamingWritebackKind,
+            step,
+            maxSteps: stepLimit,
+          });
+        if (deadlineWriteSettlement === "run_finished") {
+          return;
+        }
         if (await stopIfRequested(step)) {
           return;
         }
-        markStreamingWritebackGoalDone(operationGoals, streamingWritebackKind);
-        writeReceipts.push(receipt);
-        events.onReceipt?.(receipt);
-        await recordLedgerReceipt(receipt);
+        if (deadlineWriteSettlement === "not_applicable") {
+          markStreamingWritebackGoalDone(operationGoals, streamingWritebackKind);
+          writeReceipts.push(receipt);
+          events.onReceipt?.(receipt);
+          await recordLedgerReceipt(receipt);
+        }
         // Item 16: do not finish while other operation goals remain pending.
         if (hasPendingOperationGoals(operationGoals)) {
           events.onStatus?.(
@@ -16905,6 +17877,7 @@ export async function runAgentMission({
       const requiresPreEmissionVerification = requiresVerifiedFinalOutput(
         missionPlan,
         researchPlan,
+        activeIntentPrompt,
       ) || verifiedHostExportFinalAnswer !== null;
 
       if (
@@ -16989,22 +17962,29 @@ export async function runAgentMission({
             events.onStatus?.(
               `Word count ${initialCount}/${wordTarget.target} outside target; requesting one correction pass...`,
             );
-            const corrected = await requestWordCountCorrection({
-              modelClient,
-              messages,
-              draft: directContent,
-              wordTarget,
-              currentCount: initialCount,
-              events,
-              think: activeThink,
-              options: modelOptions,
-              abortSignal,
-              onThinkingUnsupported: disableThinkingForRun,
-              metricName: "direct_answer_word_count_correction",
-            });
-            if (corrected.trim()) {
-              directContent = corrected;
-              correctionUsed = true;
+            try {
+              const corrected = await requestWordCountCorrection({
+                modelClient,
+                messages,
+                draft: directContent,
+                wordTarget,
+                currentCount: initialCount,
+                events,
+                think: activeThink,
+                options: modelOptions,
+                abortSignal,
+                onThinkingUnsupported: disableThinkingForRun,
+                metricName: "direct_answer_word_count_correction",
+              });
+              if (corrected.trim()) {
+                directContent = corrected;
+                correctionUsed = true;
+              }
+            } catch (error) {
+              if (!isProviderBudgetExhaustedError(error)) throw error;
+              events.onStatus?.(
+                "Finalization reserve reached before word-count correction; returning the best available draft.",
+              );
             }
           }
           const finalCount = countMarkdownVisibleText(directContent).wordCount;
@@ -17028,17 +18008,26 @@ export async function runAgentMission({
           runPlan.requiresEnglishGuard &&
           verifiedHostExportFinalAnswer === null
         ) {
-          directContent = await repairEnglishOnlyOutput({
-            modelClient,
-            messages,
-            draft: directContent,
-            events,
-            think: activeThink,
-            options: modelOptions,
-            abortSignal,
-            onThinkingUnsupported: disableThinkingForRun,
-            metricName: "direct_answer_english_repair",
-          });
+          try {
+            directContent = await repairEnglishOnlyOutput({
+              modelClient,
+              messages,
+              draft: directContent,
+              events,
+              think: activeThink,
+              options: modelOptions,
+              abortSignal,
+              onThinkingUnsupported: disableThinkingForRun,
+              metricName: "direct_answer_english_repair",
+            });
+          } catch (error) {
+            if (!isProviderBudgetExhaustedError(error)) throw error;
+            directContent =
+              "The draft failed the English-only safety check, and the Direct model-call budget is exhausted. Retry this request to generate a clean answer.";
+            events.onStatus?.(
+              "English-only repair skipped because the Direct finalization budget was exhausted.",
+            );
+          }
         }
         if (!requiresPreEmissionVerification) {
           emitDirectAssistantAnswer(
@@ -17188,6 +18177,7 @@ export async function runAgentMission({
     let shouldReplanAfterLiteralWrite = false;
     let lifecycleStageMutationAttemptedThisResponse = false;
     let workspaceCorrectionAttemptedThisResponse = false;
+    let proofGatedWriteCommittedThisResponse = false;
     let liveStepTools = stepTools;
 
     for (let toolIndex = 0; toolIndex < responseToolCalls.length;) {
@@ -17400,7 +18390,8 @@ export async function runAgentMission({
       }
       if (
         exactGraphPathBinding &&
-        exactGraphPathBinding.toolName === "read_file" &&
+        (exactGraphPathBinding.toolName === "read_file" ||
+          exactGraphPathBinding.toolName === "create_file") &&
         toolCall.name === exactGraphPathBinding.toolName &&
         getString(toolCall.arguments.path) !== exactGraphPathBinding.path
       ) {
@@ -17880,7 +18871,11 @@ export async function runAgentMission({
         : evaluateCurrentAcceptance().missing.filter(isBlockingPreWriteProof);
       const proposedWriteAcceptance =
         proofGatedCurrentNoteTool &&
-        requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+        requiresVerifiedFinalOutput(
+          missionPlan,
+          researchPlan,
+          activeIntentPrompt,
+        ) &&
         durablePreWriteProofSatisfied &&
         proposedWriteText.trim()
           ? requireAcceptedPassageCitationCoverage(
@@ -17911,7 +18906,11 @@ export async function runAgentMission({
           : null;
       if (
         proofGatedCurrentNoteTool &&
-        requiresVerifiedFinalOutput(missionPlan, researchPlan) &&
+        requiresVerifiedFinalOutput(
+          missionPlan,
+          researchPlan,
+          activeIntentPrompt,
+        ) &&
         (!durablePreWriteProofSatisfied ||
           proposedWriteAcceptance?.status !== "pass")
       ) {
@@ -18125,6 +19124,27 @@ export async function runAgentMission({
         });
         if (
           result.ok &&
+          proofGatedCurrentNoteTool &&
+          proposedWriteText.trim()
+        ) {
+          // This exact candidate already passed the pre-write acceptance gate
+          // and is now receipt-backed. Preserve it as the terminal artifact so
+          // post-tool acceptance does not evaluate an empty model message.
+          lastFinalOutput = proposedWriteText;
+          proofGatedWriteCommittedThisResponse = true;
+          const receipt = [...writeReceipts]
+            .reverse()
+            .find((candidate) => candidate.toolName === toolCall.name);
+          if (proposedWriteAcceptance?.status === "pass" && receipt) {
+            recordCommittedProofGatedWrite(
+              proposedWriteText,
+              proposedWriteAcceptance,
+              receipt,
+            );
+          }
+        }
+        if (
+          result.ok &&
           projectedDirectWriteConflicts !== null &&
           proposedWriteText.trim()
         ) {
@@ -18152,7 +19172,17 @@ export async function runAgentMission({
       toolIndex += 1;
     }
 
-    if (await stopIfRequested(step)) {
+    const deadlineExpiredAfterCommittedWrite =
+      proofGatedWriteCommittedThisResponse &&
+      Boolean(
+        (abortSignal?.aborted &&
+          !externalAbortSignal?.aborted) ||
+          isDeadlineAbortSignal(externalAbortSignal),
+      );
+    if (
+      !deadlineExpiredAfterCommittedWrite &&
+      (await stopIfRequested(step))
+    ) {
       return;
     }
 
@@ -18464,13 +19494,25 @@ export async function runAgentMission({
         await finishErroredRunFromException(error, step, stepLimit, "model");
         throw error;
       }
+      const deadlineWriteSettlement =
+        await settleCommittedProofGatedWriteBeforeDeadlineStop({
+          receipt,
+          kind: streamingWritebackKind,
+          step,
+          maxSteps: stepLimit,
+        });
+      if (deadlineWriteSettlement === "run_finished") {
+        return;
+      }
       if (await stopIfRequested(step)) {
         return;
       }
-      markStreamingWritebackGoalDone(operationGoals, streamingWritebackKind);
-      writeReceipts.push(receipt);
-      events.onReceipt?.(receipt);
-      await recordLedgerReceipt(receipt);
+      if (deadlineWriteSettlement === "not_applicable") {
+        markStreamingWritebackGoalDone(operationGoals, streamingWritebackKind);
+        writeReceipts.push(receipt);
+        events.onReceipt?.(receipt);
+        await recordLedgerReceipt(receipt);
+      }
       if (!hasPendingOperationGoals(operationGoals)) {
         await finishRun("write_completed", lastStep, stepLimit);
         return;
@@ -18499,7 +19541,10 @@ export async function runAgentMission({
       // receipt-backed final artifact. Re-evaluate that artifact rather than
       // treating the post-tool turn as output-less and asking the model to
       // write it again through the streaming finalizer.
-      ? evaluateCurrentAcceptance(lastFinalOutput || undefined)
+      ? reconcileCommittedProofGatedWriteAcceptance(
+          evaluateCurrentAcceptance(lastFinalOutput || undefined),
+          step,
+        )
       : null;
     const writeMissionComplete =
       operationWriteComplete &&
@@ -18623,8 +19668,8 @@ export async function runAgentMission({
       researchWriteToolsBlocked:
         researchPhaseDescriptor?.researchBearing === true &&
         researchPhaseDescriptor.writeToolsAllowed !== true,
-      secondAgentAvailable: utilitySlotClientForWatchdog !== null,
-      secondAgentConsulted: secondAgentConsulted,
+      secondAgentAvailable: specialistClientForRecovery !== null,
+      secondAgentConsulted: specialistRecoveryConsulted,
     };
     const loopDecision = applyResearchPhaseToLoopDecision(
       decideNextLoopAction(loopLedger, loopBudgetPlan),
@@ -19052,18 +20097,19 @@ export async function runAgentMission({
     }
     if (
       loopDecision.action === "escalate_to_second_agent" &&
-      utilitySlotClientForWatchdog &&
-      !secondAgentConsulted
+      specialistClientForRecovery &&
+      !specialistRecoveryConsulted
     ) {
-      // Consume the escalation before running it: a watchdog that itself fails
+      // Consume the cycle before running it: a verifier that itself fails
       // must not leave the run eligible to escalate again next iteration.
-      secondAgentConsulted = true;
-      const watchdogModel = runToolContext.settings?.utilityModel?.trim();
-      // Escalation spends money on a second endpoint. Never do that silently.
+      specialistRecoveryConsulted = true;
+      const specialistModel =
+        runToolContext.settings?.specialistModel?.trim() ||
+        runToolContext.settings?.utilityModel?.trim();
       events.onStatus?.(
-        `Primary agent is repeating itself; asking the second agent (${watchdogModel || "utility model"}) how to proceed...`,
+        `Lead is repeating itself; Adaptive Specialist (${specialistModel || "configured model"}) entered recovery_verifier mode...`,
       );
-      const verdict = await runWatchdogWorker({
+      const verdict = await runSpecialistRecoveryVerifier({
         runId,
         missionPrompt: prompt,
         recentTranscript: summarizeTranscriptForWatchdog(messages),
@@ -19071,13 +20117,17 @@ export async function runAgentMission({
           ? `research_phase_gate:${researchPhaseDescriptor.phase}`
           : null,
         repeatedToolCalls: loopLedger.repeatedToolCalls,
-        modelClient: utilitySlotClientForWatchdog,
-        ...(watchdogModel ? { model: watchdogModel } : {}),
+        modelClient: specialistClientForRecovery,
+        ...(specialistModel ? { model: specialistModel } : {}),
         abortSignal: runToolContext.abortSignal,
       });
-      events.onStatus?.(`Second agent: ${verdict.action} — ${verdict.rationale}`);
+      events.onStatus?.(
+        `Adaptive Specialist recovery: ${verdict.action} — ${verdict.rationale}`,
+      );
       if (verdict.action === "stop") {
-        recordLedgerBlocker(`Second agent stopped the run: ${verdict.rationale}`);
+        recordLedgerBlocker(
+          `Adaptive Specialist stopped the run: ${verdict.rationale}`,
+        );
         await finishRun("budget", lastStep, stepLimit);
         return;
       }
@@ -19822,17 +20872,13 @@ function buildRunConfigEvent({
     modelProvider: settings?.modelProvider ?? "ollama",
     modelExecutionBudget: {
       schemaVersion: 1,
-      maxCalls: Math.max(4, runPlan.maxStepsForRun * 3 + 8),
+      maxCalls: runPlan.effortDecision.maxModelCalls,
       maxTokens: Math.max(
         32_768,
-        Math.max(4, runPlan.maxStepsForRun * 3 + 8) *
+        runPlan.effortDecision.maxModelCalls *
           Math.max(4_096, modelOptions?.num_ctx ?? DEFAULT_ASSUMED_NUM_CTX),
       ),
-      maxWallClockMs:
-        typeof settings?.maxRunMinutes === "number" &&
-        settings.maxRunMinutes > 0
-          ? settings.maxRunMinutes * 60_000
-          : 60 * 60_000,
+      maxWallClockMs: runPlan.effortDecision.maxWallClockMs,
     },
     streaming: enableStreaming,
     thinkingMode: settings?.thinkingMode ?? "auto",
@@ -19856,6 +20902,7 @@ function buildRunConfigEvent({
     allowedToolNames: runPlan.allowedToolNames,
     routeTraceReasons: runPlan.traceReasons,
     budgetProfile: runPlan.budgetProfile,
+    effortDecision: runPlan.effortDecision,
     englishGuard: runPlan.requiresEnglishGuard,
     temperature: modelOptions?.temperature,
     topK: modelOptions?.top_k,
@@ -20101,6 +21148,7 @@ function bindWorkspaceDestinationToolSchemaV1(
 
 const EXACT_REORDERABLE_PATH_TOOL_NAMES = new Set([
   "read_file",
+  "create_file",
   "code_workspace_read",
   "code_workspace_create_file",
   "code_workspace_write_expected",
@@ -22449,7 +23497,7 @@ const WRITE_TOOL_NAMES = new Set([
   ),
   PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
   PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME,
-  CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  CREATE_GITHUB_REPOSITORY_TOOL_NAME,
   PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
   "open_web_source",
   "create_design_canvas",
@@ -22819,7 +23867,12 @@ function getRequestedPreparedBackgroundGitHubTools(
  * new note, vault, or web authority. The prompt-derived scope remains the
  * ceiling; only tools inside that ceiling can be reintroduced as companions.
  */
-function constrainSetLooseCompanionsToAutonomyScope(
+/**
+ * Exported so the offered frontier can be asserted deterministically. Three
+ * live runs could not answer "was the tool offered at reflection?" because run
+ * telemetry does not reliably capture frontier contents; a unit assertion does.
+ */
+export function constrainSetLooseCompanionsToAutonomyScope(
   toolNames: readonly string[],
   scope: AutonomyScope,
 ): string[] {
@@ -22864,6 +23917,12 @@ function getAllowedToolDefinitions(
   reflex: ReflexDecision | null = null,
   routedCodeToolNames: readonly string[] = [],
   hasActiveMarkdownNote = false,
+  /**
+   * The prompt names a heading that the active note actually has. The word
+   * patterns below require the literal word "section", so a request that names
+   * the section by title would otherwise never be offered the section tools.
+   */
+  namesActiveNoteSection = false,
 ) {
   // A broad mutation with no file, folder, artifact, or current-note target is
   // a clarification turn, not a vault-discovery mission. Exposing read tools
@@ -22878,7 +23937,8 @@ function getAllowedToolDefinitions(
 
   const noteOutputIntent = missionIntent.noteOutput;
   const allowAppend = hasAppendIntent(prompt);
-  const allowSectionAppend = hasSectionAppendIntent(prompt);
+  const allowSectionAppend =
+    hasSectionAppendIntent(prompt) || namesActiveNoteSection;
   const allowDelete = hasDeleteIntent(prompt);
   const allowDeletePath = hasDeletePathIntent(prompt);
   const allowWholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
@@ -22887,7 +23947,9 @@ function getAllowedToolDefinitions(
     allowWholeNoteReplace ||
     streamingWritebackKind === "replace";
   const allowEdit =
-    hasEditIntent(prompt) && !allowWholeNoteReplace && !preferHostOwnedReplace;
+    (hasEditIntent(prompt) || namesActiveNoteSection) &&
+    !allowWholeNoteReplace &&
+    !preferHostOwnedReplace;
   const allowHighlight = hasHighlightIntent(prompt);
   const allowRestore = hasRestoreIntent(prompt);
   const allowReplace =
@@ -23048,15 +24110,15 @@ function getAllowedToolDefinitions(
       return (
         hasExplicitGitHubPublicationIntent(prompt) &&
         (compoundPrivatePublication ||
-          !hasExplicitPrivateGitHubRepositoryCreationIntent(prompt)) &&
+          !hasGitHubRepositoryCreationIntent(prompt)) &&
         preparedBackgroundGitHubNames.size === 0
       );
     }
 
-    if (name === CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME) {
+    if (name === CREATE_GITHUB_REPOSITORY_TOOL_NAME) {
       return (
         settings?.githubEnabled === true &&
-        hasPrivateGitHubRepositoryBootstrapIntent(prompt)
+        hasGitHubRepositoryBootstrapIntent(prompt)
       );
     }
 
@@ -24013,8 +25075,8 @@ function getRequiredWriteToolNames(
       lifecycleRequiredToolNames.push(...getRequiredCodeWorkflowToolNames(prompt));
     }
     if (lifecycleStages.includes("private_github_publication")) {
-      if (allowedToolNames.has(CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME)) {
-        lifecycleRequiredToolNames.push(CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME);
+      if (allowedToolNames.has(CREATE_GITHUB_REPOSITORY_TOOL_NAME)) {
+        lifecycleRequiredToolNames.push(CREATE_GITHUB_REPOSITORY_TOOL_NAME);
       }
       if (allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME)) {
         lifecycleRequiredToolNames.push(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME);
@@ -24129,11 +25191,11 @@ function getRequiredWriteToolNames(
   }
   if (
     !compoundLifecycle &&
-    allowedToolNames.has(CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME) &&
-    hasPrivateGitHubRepositoryBootstrapIntent(prompt)
+    allowedToolNames.has(CREATE_GITHUB_REPOSITORY_TOOL_NAME) &&
+    hasGitHubRepositoryBootstrapIntent(prompt)
   ) {
     return [
-      CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+      CREATE_GITHUB_REPOSITORY_TOOL_NAME,
       ...(allowedToolNames.has(PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME) &&
       hasExplicitGitHubPublicationIntent(prompt)
         ? [PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME]
@@ -24643,7 +25705,7 @@ export function getRequiredCodeWorkflowToolNames(prompt: string): string[] {
  * may seed when deterministic wording grants a bounded execution turn but does
  * not identify code work itself. It intentionally excludes commit, dependency
  * installation, arbitrary edits, moves, copies, and deletion; host-directory
- * export remains available only when the prompt explicitly names that target.
+ * export defaults to the active vault's sibling Agent Projects directory.
  */
 export function getRoutedCodeWorkflowToolNames(prompt: string): string[] {
   // No code_repair_record_cycle: this seed never binds a trusted repository,
@@ -24656,9 +25718,7 @@ export function getRoutedCodeWorkflowToolNames(prompt: string): string[] {
     "code_validate_targeted",
     "code_validate_full",
   ];
-  if (hasKnownHostDirectoryExportIntent(prompt)) {
-    tools.push("code_workspace_export_directory");
-  }
+  tools.push("code_workspace_export_directory");
   return tools;
 }
 
@@ -24747,7 +25807,10 @@ function getRequiredCodeWorkflowToolNamesExact(prompt: string): string[] {
   ) {
     tools.push("code_validate_targeted", "code_validate_full");
   }
-  if (codeDeliverable && hasKnownHostDirectoryExportIntent(prompt)) {
+  if (
+    codeDeliverable &&
+    (!repositoryMutation || hasKnownHostDirectoryExportIntent(prompt))
+  ) {
     tools.push("code_workspace_export_directory");
   }
   if (hasRepositoryCodeEditIntent(prompt) || /\bcommit\b/i.test(prompt)) {
@@ -25030,6 +26093,109 @@ function removeToolDefinition(
   return tools.filter((tool) => tool.function.name !== name);
 }
 
+const BUFFERED_NEW_NOTE_MUTATION_TOOLS = new Set([
+  "append_to_current_file",
+  "replace_current_file",
+  "edit_current_section",
+  "append_to_current_section",
+  "append_file",
+  "replace_file",
+  "move_path",
+  "delete_path",
+  "rename_current_file",
+  "retitle_current_file",
+  "link_related_notes_in_current_file",
+]);
+
+function isBufferedNewNoteOutput(
+  noteOutputPlan: NoteOutputPlan,
+  streamingWritebackKind: StreamingWritebackKind | null,
+): boolean {
+  return (
+    noteOutputPlan.destination === "new_note" &&
+    streamingWritebackKind === null
+  );
+}
+
+function bindPlannedNewNoteOutputAuthority(input: {
+  toolContext: ToolExecutionContext;
+  prompt: string;
+  noteOutputPlan: NoteOutputPlan;
+  persistedPath?: string | null;
+}): ToolExecutionContext {
+  if (input.noteOutputPlan.destination !== "new_note") {
+    return {
+      ...input.toolContext,
+      plannedNoteOutputPath: undefined,
+    };
+  }
+  const persistedPath = input.persistedPath
+    ? normalizeVaultPath(input.persistedPath, { requireMarkdown: true })
+    : null;
+  const plannedNoteOutputPath =
+    persistedPath ??
+    input.toolContext.plannedNoteOutputPath ??
+    resolveAutonomousNoteTarget({
+      app: input.toolContext.app,
+      activeNotePath:
+        input.toolContext.getCurrentMarkdownFile?.()?.path ?? null,
+      preferredBasename: deriveAutonomousNoteBasenameFromPrompt(input.prompt),
+    }).path;
+  return {
+    ...input.toolContext,
+    plannedNoteOutputPath,
+  };
+}
+
+function constrainBufferedNewNoteOutputTools(input: {
+  tools: ModelToolDefinition[];
+  toolRegistry: ToolRegistry;
+  noteOutputPlan: NoteOutputPlan;
+  streamingWritebackKind: StreamingWritebackKind | null;
+  toolContext: ToolExecutionContext;
+}): ModelToolDefinition[] {
+  if (!isBufferedNewNoteOutput(input.noteOutputPlan, input.streamingWritebackKind)) {
+    return input.tools;
+  }
+  const exactPath = input.toolContext.plannedNoteOutputPath;
+  if (!exactPath) {
+    throw new Error(
+      "Automatic new-note output has no host-allocated destination path.",
+    );
+  }
+  return addToolDefinitions(input.tools, input.toolRegistry, ["create_file"])
+    .filter(
+      (tool) =>
+        !BUFFERED_NEW_NOTE_MUTATION_TOOLS.has(tool.function.name) ||
+        tool.function.name === "create_file",
+    )
+    .map((tool) =>
+      tool.function.name === "create_file"
+        ? {
+            ...tool,
+            function: {
+              ...tool.function,
+              description:
+                `Create the one host-planned report note at ${exactPath}; ` +
+                "the path is no-overwrite and exact readback is required.",
+              parameters: {
+                ...tool.function.parameters,
+                properties: {
+                  ...(tool.function.parameters.properties ?? {}),
+                  path: {
+                    ...(tool.function.parameters.properties?.path ?? {}),
+                    type: "string",
+                    enum: [exactPath],
+                    description: `Exact host-allocated new-note path: ${exactPath}`,
+                  },
+                },
+              },
+            },
+          }
+        : tool,
+    );
+}
+
 function addToolDefinitions(
   tools: ModelToolDefinition[],
   toolRegistry: ToolRegistry,
@@ -25068,6 +26234,22 @@ function shouldOmitCurrentNoteReadForTargetOnlyWrite(
   );
 }
 
+/** True when the prompt confidently names a heading in the active note. */
+export function promptTargetsActiveNoteSectionV1(
+  prompt: string,
+  toolContext: ToolExecutionContext,
+): boolean {
+  const activeFile =
+    toolContext.getCurrentMarkdownFile?.() ??
+    toolContext.app?.workspace?.getActiveFile?.() ??
+    null;
+  if (!activeFile) return false;
+  return detectSectionTargetFromHeadingsV1({
+    prompt,
+    headings: readActiveNoteHeadingsV1(toolContext, activeFile),
+  }).confident;
+}
+
 function getDirectCurrentNoteWritebackKind({
   prompt,
   missionIntent,
@@ -25087,6 +26269,13 @@ function getDirectCurrentNoteWritebackKind({
   // the pre-write backup. A revision reaches the host stream by calling
   // replace_current_file (the authorization handshake); this branch is only for
   // the narrow cases that may stream with no tool call at all.
+  // A request that names real headings must reach the tool loop so it can call
+  // append_to_current_section / edit_current_section. Streaming here is what
+  // appended a fresh essay to the end of a note instead of extending the two
+  // sections the request named.
+  if (promptTargetsActiveNoteSectionV1(prompt, toolContext)) {
+    return null;
+  }
   const hostAuthorizedReplace =
     hasWordCountShortfallFollowUp(prompt) ||
     prefersStreamedReplaceForEditOrganize(prompt);
@@ -26210,6 +27399,35 @@ function resolveOutputProfile(
   return "active_or_new_note";
 }
 
+/** Headings for the active note, preferring Obsidian's cache over a file read. */
+function readActiveNoteHeadingsV1(
+  toolContext: ToolExecutionContext,
+  activeFile: unknown,
+): MarkdownHeadingV1[] {
+  try {
+    const cache = (
+      toolContext.app as unknown as {
+        metadataCache?: {
+          getFileCache?(file: unknown): {
+            headings?: Array<{ heading?: unknown; level?: unknown }> | null;
+          } | null;
+        };
+      }
+    )?.metadataCache?.getFileCache?.(activeFile);
+    const headings = cache?.headings;
+    if (!Array.isArray(headings)) return [];
+    return headings.flatMap((entry) => {
+      const text = typeof entry?.heading === "string" ? entry.heading.trim() : "";
+      const level = typeof entry?.level === "number" ? entry.level : 0;
+      return text && level >= 1 && level <= 6 ? [{ text, level }] : [];
+    });
+  } catch {
+    // A missing or stale cache must not break note routing; the plan simply
+    // falls back to its previous whole-note behaviour.
+    return [];
+  }
+}
+
 function buildMissionNoteOutputPlan(input: {
   prompt: string;
   missionIntent: MissionIntent;
@@ -26221,8 +27439,11 @@ function buildMissionNoteOutputPlan(input: {
     input.toolContext.getCurrentMarkdownFile?.() ??
     input.toolContext.app?.workspace?.getActiveFile?.() ??
     null;
-  const hasActive =
-    Boolean(activeFile && (activeFile as { extension?: string }).extension === "md");
+  const hostAppAvailable = Boolean(input.toolContext.app?.vault);
+  const hasActive = Boolean(
+    (activeFile && (activeFile as { extension?: string }).extension === "md") ||
+      (!hostAppAvailable && detectExplicitActiveNoteTarget(input.prompt)),
+  );
   const specialized =
     hasPriorAssistantResponseWritebackIntent(input.prompt) ||
     hasResearchMemoryWriteIntent(input.prompt) ||
@@ -26248,16 +27469,41 @@ function buildMissionNoteOutputPlan(input: {
     input.missionIntent.explicitDelete ||
     (input.missionIntent.explicitMutation && !input.missionIntent.noteOutput);
 
+  // Headings come from Obsidian's metadata cache, which is synchronous and
+  // already maintained for the active file, so naming a section costs no read.
+  const sectionTarget = activeFile
+    ? detectSectionTargetFromHeadingsV1({
+        prompt: input.prompt,
+        headings: readActiveNoteHeadingsV1(input.toolContext, activeFile),
+      })
+    : null;
+
   return resolveNoteOutputPlan({
     prompt: input.prompt,
     forceChatOnly: input.forceChatOnly,
     hasActiveMarkdownNote: hasActive,
-    activeNoteIsPlaceholder: hasActive
+    ...(sectionTarget?.confident
+      ? {
+          sectionTarget: {
+            headings: sectionTarget.headings.map((heading) => heading.text),
+            mode: sectionTarget.mode,
+          },
+        }
+      : {}),
+    sectionTargetAmbiguous: sectionTarget?.ambiguous === true,
+    activeNoteIsPlaceholder: activeFile
       ? isPlaceholderNoteBasename(
           (activeFile as { basename?: string }).basename ?? "",
         )
       : true,
-    outputProfile: resolveOutputProfile(input.toolContext.settings),
+    // ToolExecutionContext requires an Obsidian App in production. Some
+    // isolated integrations intentionally provide only a fake tool registry;
+    // degrade those malformed hosts to Chat instead of attempting a new-note
+    // allocation through an absent vault.
+    outputProfile:
+      !hostAppAvailable && !hasActive
+        ? "chat_first"
+        : resolveOutputProfile(input.toolContext.settings),
     enableStreaming: input.enableStreaming,
     streamWritebackMode:
       input.toolContext.settings?.streamWritebackMode ??
@@ -29204,6 +30450,13 @@ function isInvalidResponseError(error: unknown): boolean {
   );
 }
 
+function isProviderBudgetExhaustedError(error: unknown): boolean {
+  return (
+    error instanceof ModelClientError &&
+    error.category === "provider_budget_exhausted"
+  );
+}
+
 
 
 
@@ -30595,12 +31848,14 @@ function getStreamingWritebackToolName(
       : "edit_current_section";
 }
 
-function requiresVerifiedFinalOutput(
+export function requiresVerifiedFinalOutput(
   missionPlan: MissionPlan | null,
   researchPlan: ResearchPlan | null,
+  missionPrompt: string,
 ): boolean {
   return Boolean(
-    researchPlan ||
+    shouldRequireClaimGrounding(missionPrompt) ||
+      researchPlan ||
       missionPlan?.tasks.some((task) =>
         task.completionContract.citationMode !== undefined,
       ),
@@ -30631,6 +31886,7 @@ function isRepairableFinalOutputProof(item: string): boolean {
     item === "verifier:final_relevance" ||
     item === "research_phase_acceptance:analyze" ||
     item.includes("claim_grounding") ||
+    item.startsWith("final_output:findings_sentence_count:") ||
     /^verifier:[^:]+:final_relevance$/u.test(item) ||
     /^plan:[^:]+:final_relevance$/u.test(item)
   );
@@ -31398,6 +32654,103 @@ export function resolveEffectiveTerminalStopReasonV1(input: {
     return "budget";
   }
   return input.stopReason;
+}
+
+/**
+ * A proof-gated current-note payload is checked before mutation, then written
+ * through a receipt-producing tool. State projections may advance after that
+ * receipt (active graph task, operation goals, research phase), but those
+ * transitions must not invalidate content proofs that already passed for the
+ * exact payload. Preserve that proof only when the same bytes are current and
+ * the matching mutation produced a verified, non-partial receipt. Unrelated
+ * debt, a changed payload, or a partial/unverified write still fail closed.
+ */
+export function resolveCommittedProofGatedWriteAcceptanceV1(input: {
+  preCommitAcceptance: MissionAcceptanceResult;
+  postCommitAcceptance: MissionAcceptanceResult;
+  payloadMatches: boolean;
+  receipt: AgentRunReceipt | null | undefined;
+}): {
+  acceptance: MissionAcceptanceResult;
+  usedPreCommitProof: boolean;
+} {
+  const verifiedCompleteReceipt = hasVerifiedCompleteWriteReceipt(
+    input.receipt,
+  );
+  const onlyCandidateContentProjectionDebt =
+    input.postCommitAcceptance.missing.length > 0 &&
+    input.postCommitAcceptance.missing.every(isRepairableFinalOutputProof);
+  if (
+    input.preCommitAcceptance.status !== "pass" ||
+    !input.payloadMatches ||
+    !verifiedCompleteReceipt ||
+    !onlyCandidateContentProjectionDebt
+  ) {
+    return {
+      acceptance: input.postCommitAcceptance,
+      usedPreCommitProof: false,
+    };
+  }
+  return {
+    acceptance: {
+      ...input.postCommitAcceptance,
+      status: "pass",
+      confidence: Math.max(
+        input.preCommitAcceptance.confidence,
+        input.postCommitAcceptance.confidence,
+      ),
+      missing: [],
+      reasons: [
+        ...new Set([
+          ...input.postCommitAcceptance.reasons,
+          "exact_preverified_write_candidate_committed",
+        ]),
+      ],
+      nextAction: undefined,
+    },
+    usedPreCommitProof: true,
+  };
+}
+
+function hasVerifiedCompleteWriteReceipt(
+  receipt: AgentRunReceipt | null | undefined,
+): boolean {
+  const receiptOutput = isRecord(receipt?.output) ? receipt?.output : null;
+  return Boolean(
+    receipt &&
+      receipt.readback?.status === "verified" &&
+      receiptOutput?.partial !== true,
+  );
+}
+
+/**
+ * Decide whether a deadline that arrived after a proof-gated note mutation may
+ * observe and persist that already-completed effect before normal stop
+ * handling. Only the exact preaccepted payload plus its matching, verified,
+ * non-partial receipt can cross this boundary. Terminal success additionally
+ * requires that the write pays the final pending operation goal.
+ */
+export function resolveCommittedProofGatedWriteDeadlineSettlementV1(input: {
+  preCommitAcceptance: MissionAcceptanceResult | null | undefined;
+  payloadMatches: boolean;
+  receiptMatches: boolean;
+  receipt: AgentRunReceipt | null | undefined;
+  hasPendingOperationGoalsAfterWrite: boolean;
+}): {
+  persistReceiptBeforeStop: boolean;
+  finishWriteBeforeStop: boolean;
+} {
+  const persistReceiptBeforeStop = Boolean(
+    input.preCommitAcceptance?.status === "pass" &&
+      input.payloadMatches &&
+      input.receiptMatches &&
+      hasVerifiedCompleteWriteReceipt(input.receipt),
+  );
+  return {
+    persistReceiptBeforeStop,
+    finishWriteBeforeStop:
+      persistReceiptBeforeStop && !input.hasPendingOperationGoalsAfterWrite,
+  };
 }
 
 export function resolveMissionGraphToolResultOk(
@@ -32401,6 +33754,204 @@ export function attachGroundedPassageCitations(
   return {
     content,
     insertedPassageIds,
+  };
+}
+
+/**
+ * Removes only unsupported material claims that can be matched exactly once in
+ * the held draft. This is a fail-closed finalization repair: deleting an
+ * unsupported sentence is safer than inventing a citation for it, while
+ * duplicate or normalized-only matches remain untouched for model correction.
+ */
+export function pruneUniquelyMatchedUngroundedClaims(
+  draft: string,
+  ledger: ClaimLedger,
+): { content: string; removedClaimIds: string[] } {
+  const removals: Array<{ start: number; end: number; claimId: string }> = [];
+
+  for (const claim of ledger.claims) {
+    if (claim.status !== "ungrounded") continue;
+    const claimText = claim.text.trim();
+    if (!claimText) continue;
+    const start = draft.indexOf(claimText);
+    if (start < 0 || draft.indexOf(claimText, start + claimText.length) >= 0) {
+      continue;
+    }
+    removals.push({
+      start,
+      end: start + claimText.length,
+      claimId: claim.id,
+    });
+  }
+
+  let content = draft;
+  for (const removal of removals.sort((left, right) => right.start - left.start)) {
+    content = content.slice(0, removal.start) + content.slice(removal.end);
+  }
+  if (removals.length > 0) {
+    content = content
+      .replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]*(?=\r?$)/gmu, "")
+      .replace(/[ \t]+(?=\r?$)/gmu, "")
+      .replace(/\n[ \t]+\n/gu, "\n\n")
+      .replace(/\n{3,}/gu, "\n\n")
+      .trim();
+  }
+
+  return {
+    content,
+    removedClaimIds: removals.map((removal) => removal.claimId),
+  };
+}
+
+const EXACT_FINDING_COUNT_WORDS: Readonly<Record<string, number>> = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+};
+
+interface ExactFindingSentenceInspectionV1 {
+  requiredCount: number;
+  observedFindingCount: number;
+  findingClaimIds: string[];
+  outsideMaterialClaimIds: string[];
+  mappingComplete: boolean;
+  removableClaims: Array<{ id: string; start: number; end: number }>;
+}
+
+function resolveExactFindingSentenceCount(prompt: string): number | null {
+  const match =
+    /\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+(?:cited\s+)?findings?(?:\s+sentences?)?\b/iu.exec(
+      prompt,
+    );
+  if (!match?.[1]) return null;
+  const token = match[1].toLowerCase();
+  const count = EXACT_FINDING_COUNT_WORDS[token] ?? Number.parseInt(token, 10);
+  return Number.isInteger(count) && count >= 1 && count <= 20 ? count : null;
+}
+
+function findFindingsSectionBounds(
+  draft: string,
+): { start: number; end: number } | null {
+  const headingPattern =
+    /^[ \t]{0,3}#{1,6}[ \t]+findings?[ \t]*#*[ \t]*(?:\r?\n|$)/gimu;
+  const heading = headingPattern.exec(draft);
+  if (!heading) return null;
+  const start = heading.index + heading[0].length;
+  const nextHeadingPattern = /^[ \t]{0,3}#{1,6}[ \t]+\S.*$/gmu;
+  nextHeadingPattern.lastIndex = start;
+  const nextHeading = nextHeadingPattern.exec(draft);
+  return {
+    start,
+    end: nextHeading?.index ?? draft.length,
+  };
+}
+
+function inspectExactFindingSentenceContract(
+  draft: string,
+  prompt: string,
+  ledger: ClaimLedger,
+): ExactFindingSentenceInspectionV1 | null {
+  const requiredCount = resolveExactFindingSentenceCount(prompt);
+  if (requiredCount === null) return null;
+  const bounds = findFindingsSectionBounds(draft);
+  if (!bounds) {
+    return {
+      requiredCount,
+      observedFindingCount: 0,
+      findingClaimIds: [],
+      outsideMaterialClaimIds: ledger.claims
+        .filter((claim) => claim.status !== "exempt")
+        .map((claim) => claim.id),
+      mappingComplete: false,
+      removableClaims: [],
+    };
+  }
+
+  const mapped: Array<{ id: string; start: number; end: number }> = [];
+  const materialClaims = ledger.claims.filter(
+    (claim) => claim.status !== "exempt" && claim.text.trim(),
+  );
+  let mappingComplete = true;
+  for (const claim of materialClaims) {
+    const text = claim.text.trim();
+    const start = draft.indexOf(text);
+    if (start < 0 || draft.indexOf(text, start + text.length) >= 0) {
+      mappingComplete = false;
+      continue;
+    }
+    mapped.push({ id: claim.id, start, end: start + text.length });
+  }
+
+  const findingClaims = mapped.filter(
+    (claim) => claim.start >= bounds.start && claim.start < bounds.end,
+  );
+  const outsideClaims = mapped.filter(
+    (claim) => claim.start < bounds.start || claim.start >= bounds.end,
+  );
+  const removableClaims =
+    findingClaims.length >= requiredCount && mappingComplete
+      ? [...findingClaims.slice(requiredCount), ...outsideClaims]
+      : [];
+  return {
+    requiredCount,
+    observedFindingCount: findingClaims.length,
+    findingClaimIds: findingClaims.map((claim) => claim.id),
+    outsideMaterialClaimIds: outsideClaims.map((claim) => claim.id),
+    mappingComplete,
+    removableClaims,
+  };
+}
+
+/**
+ * Enforces an explicit "exactly N findings" output contract by deletion only.
+ * The first N uniquely mapped material claims inside Findings are retained;
+ * extra Findings claims and material preamble claims are removed. Any
+ * ambiguous mapping fails closed and is left for the bounded model correction.
+ */
+export function constrainExactFindingSentenceContract(
+  draft: string,
+  prompt: string,
+  ledger: ClaimLedger,
+): {
+  content: string;
+  requiredCount: number | null;
+  observedFindingCount: number;
+  removedClaimIds: string[];
+} {
+  const inspection = inspectExactFindingSentenceContract(draft, prompt, ledger);
+  if (!inspection || inspection.removableClaims.length === 0) {
+    return {
+      content: draft,
+      requiredCount: inspection?.requiredCount ?? null,
+      observedFindingCount: inspection?.observedFindingCount ?? 0,
+      removedClaimIds: [],
+    };
+  }
+
+  let content = draft;
+  for (const removal of inspection.removableClaims.sort(
+    (left, right) => right.start - left.start,
+  )) {
+    content = content.slice(0, removal.start) + content.slice(removal.end);
+  }
+  content = content
+    .replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]*(?=\r?$)/gmu, "")
+    .replace(/[ \t]+(?=\r?$)/gmu, "")
+    .replace(/\n[ \t]+\n/gu, "\n\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+  return {
+    content,
+    requiredCount: inspection.requiredCount,
+    observedFindingCount: inspection.observedFindingCount,
+    removedClaimIds: inspection.removableClaims.map((claim) => claim.id),
   };
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   planTopLevelDirectMissionGraphV1,
+  resolveResearchTeamOutputTargetV1,
   resolveTopLevelMissionDispatchV1,
   topLevelDispatchExecutorId,
 } from "../src/agent/topLevelMissionDispatch";
@@ -52,7 +53,7 @@ test("host dispatch preserves force-chat and extension gates before direct execu
     codeTeamRequest: null,
     codeTeamBridgeIntent: false,
   });
-  assert.deepEqual(research, { kind: "research_team" });
+  assert.deepEqual(research, { kind: "research_team", outputTarget: "chat" });
 });
 
 test("top-level dispatch never resolves the deprecated code_team executor", () => {
@@ -150,7 +151,7 @@ test("structured routing cannot replace research dispatch with an unknown execut
   const result = await planTopLevelDirectMissionGraphV1({
     missionId: "run-direct-research",
     objective: "Compare current sources.",
-    decision: { kind: "research_team" },
+    decision: { kind: "research_team", outputTarget: "chat" },
     routerMode: "authority",
     modelClient: client,
     now: NOW,
@@ -160,6 +161,33 @@ test("structured routing cannot replace research dispatch with an unknown execut
   assert.equal(result.fallbackReason, "structured_model_authority_widening");
   assert.equal(topLevelDispatchExecutorId(result.graph), "research-team");
   assert.deepEqual(Object.keys(result.graph.nodes).sort(), ["dispatch", "final"]);
+});
+
+test("research report dispatch aligns parent mutation authority with note output", async () => {
+  const prompt = "Deep research this topic and write a cited report.";
+  assert.equal(resolveResearchTeamOutputTargetV1(prompt), "note");
+  const result = await planTopLevelDirectMissionGraphV1({
+    missionId: "run-research-note-output",
+    objective: prompt,
+    decision: { kind: "research_team", outputTarget: "note" },
+    routerMode: "off",
+    now: NOW,
+  });
+  const dispatch = result.graph.nodes.dispatch;
+  assert.equal(dispatch.effect, "mutation");
+  assert.deepEqual(dispatch.destination, {
+    bindingId: "research-note-output",
+    effect: "mutation",
+    selector: null,
+  });
+  assert.deepEqual(
+    result.graph.capabilityEnvelope.executors["research-team"].allowedEffects,
+    ["mutation"],
+  );
+  assert.deepEqual(
+    result.graph.capabilityEnvelope.bindings["research-note-output"].allowedEffects,
+    ["mutation", "read"],
+  );
 });
 
 test("missing code capability persists only a host guard and no execution authority", async () => {

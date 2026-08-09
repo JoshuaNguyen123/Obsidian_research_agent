@@ -13,6 +13,7 @@ import {
   LINEAR_RESEARCH_PROJECT_HIERARCHY_RECEIPT_TOOL_NAME,
   ResearchProjectHierarchyWorkflowV1,
   providerSummary,
+  renderHierarchyIssueDescriptionV1,
   type ResearchProjectHierarchyCheckpointV1,
   type ResearchProjectHierarchyCheckpointPortV1,
 } from "../src/integrations/linear/ResearchProjectHierarchyWorkflowV1";
@@ -429,14 +430,14 @@ test("hierarchy deduplicates an existing dependency relation after issue recover
       id: "foundation-existing",
       resourceType: "issue",
       title: foundation.title,
-      description: cleanHierarchyIssueDescription(foundation),
+      description: renderHierarchyIssueDescriptionV1(foundation, plan),
       snapshotHash: HASH("3"),
     },
     {
       id: "integration-existing",
       resourceType: "issue",
       title: integration.title,
-      description: cleanHierarchyIssueDescription(integration),
+      description: renderHierarchyIssueDescriptionV1(integration, plan),
       snapshotHash: HASH("4"),
     },
     {
@@ -706,13 +707,6 @@ function planFixture() {
   });
 }
 
-function cleanHierarchyIssueDescription(
-  issue: ReturnType<typeof planFixture>["issues"][number],
-): string {
-  return `${issue.description}\n\n## Acceptance criteria\n${issue.acceptanceCriteria
-    .map((criterion) => `- ${criterion}`)
-    .join("\n")}`;
-}
 
 async function hierarchyGrant(): Promise<AuthorityGrantV1> {
   return createBoundedGrant({

@@ -4,13 +4,20 @@ import test from "node:test";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
 import type { ActionReceipt } from "../src/agent/actions";
 import {
+  CREATE_GITHUB_REPOSITORY_TOOL_NAME,
+  LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  createGitHubRepositoryTool,
   createGitHubPrivateRepositoryTool,
+  hasGitHubRepositoryBootstrapIntent,
   hasExplicitPrivateGitHubRepositoryCreationIntent,
   hasPrivateGitHubRepositoryBootstrapIntent,
+  parseGitHubPrivateRepositoryCheckpointMapV1,
   type GitHubPrivateRepositoryCheckpointV1,
   type GitHubPrivateRepositoryDestinationV1,
 } from "../src/tools/githubPrivateRepositoryTool";
+import { createDefaultToolRegistry } from "../src/tools/createToolRegistry";
 import type { ToolExecutionContext } from "../src/tools/types";
+import { resolveExplicitRepositoryVisibilityChoiceV1 } from "../src/integrations/github/RepositoryVisibility";
 
 const NOW = new Date("2026-07-16T16:00:00.000Z");
 
@@ -46,6 +53,7 @@ test("private repository creation checkpoints before dispatch and accepts only i
   });
   const result = await tool.executeResult!({
     profileKey: "fixture",
+    visibility: "private",
     description: "Daily use fixture",
   }, context(async (request) => {
     approvedActionId = request.preparedAction!.id;
@@ -66,7 +74,7 @@ test("private repository creation checkpoints before dispatch and accepts only i
   assert.equal(result.ok, true);
   assert.equal(createCount, 1);
   assert.equal(readCount, 2, "precondition and independent post-create readback both run");
-  assert.equal(approvedActionId, "github-private-fixture");
+  assert.equal(approvedActionId, "github-repository-fixture");
   assert.deepEqual(checkpoints.map((item) => item.status), [
     "prepared",
     "reconcile_required",
@@ -98,11 +106,14 @@ test("existing public repository is blocked and never converted or approved", as
   });
 
   await assert.rejects(
-    tool.executeResult!({ profileKey: "fixture" }, context(async () => {
+    tool.executeResult!({
+      profileKey: "fixture",
+      visibility: "private",
+    }, context(async () => {
       approvalCount += 1;
       throw new Error("approval must not run");
     })),
-    /Public repositories are never converted automatically/iu,
+    /Existing repositories are never converted automatically/iu,
   );
   assert.equal(createCount, 0);
   assert.equal(approvalCount, 0);
@@ -142,7 +153,10 @@ test("ambiguous creation resumes through readback without redispatch", async () 
     approvalFingerprint: request.preparedAction!.payloadFingerprint,
   });
   await assert.rejects(
-    tool.executeResult!({ profileKey: "fixture" }, context(approval)),
+    tool.executeResult!({
+      profileKey: "fixture",
+      visibility: "private",
+    }, context(approval)),
     /transport interrupted/iu,
   );
   assert.equal(
@@ -150,10 +164,223 @@ test("ambiguous creation resumes through readback without redispatch", async () 
     "reconcile_required",
   );
   providerRecovered = true;
-  const result = await tool.executeResult!({ profileKey: "fixture" }, context(approval));
+  const result = await tool.executeResult!({
+    profileKey: "fixture",
+    visibility: "private",
+  }, context(approval));
   assert.equal(result.ok, true);
   assert.equal(createCount, 1, "resume performs readback only");
   assert.equal(result.receipt?.commitKind, "reconciled");
+});
+
+test("repository creation durably waits for an explicit public/private choice without GitHub mutation", async () => {
+  const checkpoints: GitHubPrivateRepositoryCheckpointV1[] = [];
+  let readCount = 0;
+  let createCount = 0;
+  let approvalCount = 0;
+  const tool = createGitHubRepositoryTool({
+    resolveDestination: async () => destination(),
+    readRepository: async () => {
+      readCount += 1;
+      return null;
+    },
+    createRepository: async () => {
+      createCount += 1;
+      return repository(true);
+    },
+    getCheckpoint: async () => null,
+    persistCheckpoint: async (checkpoint) => {
+      checkpoints.push(structuredClone(checkpoint));
+    },
+    persistBinding: async () => undefined,
+    persistExternalReceipt: async () => undefined,
+    now: () => NOW,
+  });
+
+  await assert.rejects(
+    tool.executeResult!(
+      { profileKey: "fixture" },
+      context(async () => {
+        approvalCount += 1;
+        throw new Error("approval must not run");
+      }, "Publish the verified project to GitHub as a draft pull request."),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "waiting_for_repository_visibility",
+  );
+
+  assert.equal(readCount, 0);
+  assert.equal(createCount, 0);
+  assert.equal(approvalCount, 0);
+  assert.equal(checkpoints.length, 1);
+  assert.equal(checkpoints[0]?.status, "waiting_for_repository_visibility");
+  assert.equal(checkpoints[0]?.visibility, null);
+  assert.equal(checkpoints[0]?.preparedAction, null);
+  assert.match(
+    checkpoints[0]?.blocker?.message ?? "",
+    /public or private/iu,
+  );
+});
+
+test("tool registry exposes the generic name and V1 alias with the same explicit visibility gate", async () => {
+  const checkpoints: GitHubPrivateRepositoryCheckpointV1[] = [];
+  let readCount = 0;
+  let createCount = 0;
+  let approvalCount = 0;
+  const repositoryTool = createGitHubRepositoryTool({
+    resolveDestination: async () => destination(),
+    readRepository: async () => {
+      readCount += 1;
+      return null;
+    },
+    createRepository: async () => {
+      createCount += 1;
+      return repository(true);
+    },
+    getCheckpoint: async () => null,
+    persistCheckpoint: async (checkpoint) => {
+      checkpoints.push(structuredClone(checkpoint));
+    },
+    persistBinding: async () => undefined,
+    persistExternalReceipt: async () => undefined,
+    now: () => NOW,
+  });
+  const registry = createDefaultToolRegistry({
+    githubPrivateRepositoryTool: repositoryTool,
+  });
+  const definitions = new Set(
+    registry
+      .getDefinitions()
+      .map((definition) => definition.function.name),
+  );
+  assert.ok(definitions.has(CREATE_GITHUB_REPOSITORY_TOOL_NAME));
+  assert.ok(definitions.has(LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME));
+
+  for (const name of [
+    CREATE_GITHUB_REPOSITORY_TOOL_NAME,
+    LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  ]) {
+    const result = await registry.execute(
+      { name, arguments: { profileKey: "fixture" } },
+      context(async () => {
+        approvalCount += 1;
+        throw new Error("approval must not run");
+      }, "Publish the verified project to GitHub as a draft pull request."),
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.toolName, name);
+    assert.equal(result.error?.code, "waiting_for_repository_visibility");
+    assert.equal(result.mutationState, "not_applied");
+  }
+
+  assert.equal(readCount, 0);
+  assert.equal(createCount, 0);
+  assert.equal(approvalCount, 0);
+  assert.deepEqual(
+    checkpoints.map((checkpoint) => checkpoint.status),
+    ["waiting_for_repository_visibility", "waiting_for_repository_visibility"],
+  );
+});
+
+test("V1 private checkpoint without a top-level visibility projects to private only", async () => {
+  const checkpoints: GitHubPrivateRepositoryCheckpointV1[] = [];
+  const tool = createGitHubRepositoryTool({
+    resolveDestination: async () => destination(),
+    readRepository: async () => null,
+    createRepository: async () => repository(true),
+    getCheckpoint: async () => null,
+    persistCheckpoint: async (checkpoint) => {
+      checkpoints.push(structuredClone(checkpoint));
+    },
+    persistBinding: async () => undefined,
+    persistExternalReceipt: async () => undefined,
+    now: () => NOW,
+  });
+  await assert.rejects(
+    tool.executeResult!(
+      { profileKey: "fixture", visibility: "private" },
+      context(async () => {
+        throw new Error("stop after prepared checkpoint");
+      }),
+    ),
+    /stop after prepared checkpoint/iu,
+  );
+  const legacy = structuredClone(checkpoints[0]) as unknown as Record<
+    string,
+    unknown
+  >;
+  const legacyCreationId = "github-private-fixture";
+  legacy.creationId = legacyCreationId;
+  delete legacy.visibility;
+  const legacyAction = legacy.preparedAction as Record<string, unknown>;
+  legacyAction.id = legacyCreationId;
+  legacyAction.toolName = LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME;
+
+  const parsed = parseGitHubPrivateRepositoryCheckpointMapV1({
+    [legacyCreationId]: legacy,
+  });
+  assert.equal(parsed[legacyCreationId]?.visibility, "private");
+  assert.equal(
+    parsed[legacyCreationId]?.preparedAction?.toolName,
+    LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  );
+});
+
+test("public repository creation warns, approves, and independently verifies public visibility", async () => {
+  const checkpoints: GitHubPrivateRepositoryCheckpointV1[] = [];
+  let readCount = 0;
+  let createCount = 0;
+  const tool = createGitHubRepositoryTool({
+    resolveDestination: async () => destination(),
+    readRepository: async () => ++readCount === 1 ? null : repository(false),
+    createRepository: async (_resolved, visibility) => {
+      createCount += 1;
+      assert.equal(visibility, "public");
+      return repository(false);
+    },
+    getCheckpoint: async (id) =>
+      checkpoints.slice().reverse().find((item) => item.creationId === id) ?? null,
+    persistCheckpoint: async (checkpoint) => {
+      checkpoints.push(structuredClone(checkpoint));
+    },
+    persistBinding: async () => undefined,
+    persistExternalReceipt: async () => undefined,
+    now: () => NOW,
+  });
+
+  const result = await tool.executeResult!(
+    { profileKey: "fixture", visibility: "public" },
+    context(async (request) => {
+      assert.equal(request.toolName, CREATE_GITHUB_REPOSITORY_TOOL_NAME);
+      assert.ok(request.policyTags.includes("internet_visible"));
+      assert.match(request.reason, /visible on the internet/iu);
+      assert.deepEqual(request.preparedAction?.preview.after, {
+        visibility: "public",
+        archived: false,
+      });
+      assert.match(
+        request.preparedAction?.preview.warnings.join(" ") ?? "",
+        /visible on the internet/iu,
+      );
+      return {
+        approved: true,
+        approvalId: "approval-public-create",
+        approvalFingerprint: request.preparedAction!.payloadFingerprint,
+      };
+    }, "Create this GitHub repository as public."),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(createCount, 1);
+  assert.equal(readCount, 2);
+  assert.equal(
+    (result.output as { binding: { visibility: string } }).binding.visibility,
+    "public",
+  );
+  assert.equal(result.receipt?.resource.resourceType, "public_repository");
+  assert.equal(checkpoints.at(-1)?.visibility, "public");
 });
 
 test("private repository intent honors explicit negation", () => {
@@ -201,6 +428,39 @@ test("private repository intent honors explicit negation", () => {
     false,
     "explicit creation negation must dominate bound-destination publication",
   );
+  assert.equal(
+    hasGitHubRepositoryBootstrapIntent(
+      "Publish this commit to GitHub as a draft pull request.",
+    ),
+    true,
+    "generic publication must enter the visibility-choice gate",
+  );
+});
+
+test("repository visibility requires an affirmative choice instead of inverting negation", () => {
+  assert.deepEqual(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "Create the repository, but do not make it public.",
+    ),
+    {
+      status: "waiting",
+      code: "waiting_for_repository_visibility",
+      message:
+        "Should this GitHub repository be public or private? No GitHub mutation was performed.",
+    },
+  );
+  assert.equal(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "Publish it, but never use a private repository.",
+    ).status,
+    "waiting",
+  );
+  assert.deepEqual(
+    resolveExplicitRepositoryVisibilityChoiceV1(
+      "Do not make it public; create a private GitHub repository.",
+    ),
+    { status: "chosen", visibility: "private" },
+  );
 });
 
 function destination(): GitHubPrivateRepositoryDestinationV1 {
@@ -229,17 +489,19 @@ function repository(privateVisibility: boolean) {
     htmlUrl: "https://github.com/acme/private-agent",
     defaultBranch: "main",
     private: privateVisibility,
+    visibility: privateVisibility ? "private" as const : "public" as const,
     archived: false,
   };
 }
 
 function context(
   requestNestedApproval: NonNullable<ToolExecutionContext["requestNestedApproval"]>,
+  originalPrompt = "Create a private GitHub repository for this project.",
 ): ToolExecutionContext {
   return {
     app: {} as never,
     settings: {} as never,
-    originalPrompt: "Create a private GitHub repository for this project.",
+    originalPrompt,
     runId: "run-private-repository",
     operationId: "tool-private-repository",
     httpTransport: async () => {

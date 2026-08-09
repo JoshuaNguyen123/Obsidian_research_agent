@@ -15,10 +15,14 @@ import type {
 } from "../AgentRunner";
 import { type AgentRuntimeCache, type CodeValidationDiagnosticObservation, type ToolExecutionContext, type ToolExecutionResult, type VerifiedWorkspaceReadObservation } from "../tools/types";
 import { type MissionAcceptanceResult } from "./missionAcceptance";
+import { hasCodeDeliverableIntent } from "./codeDeliverableIntent";
 import { isAdaptiveCodeWorkspaceMutationToolNameV1 } from "./missionGraphFrontier";
 import { getMissionGraphNodeSelector, getSafeMissionCompositeLifecycleSpecV1 } from "./missionGraphSelectors";
 import { extractRequiredLiteralAnchors } from "./missionPlan";
-import { hasKnownHostDirectoryExportIntent } from "./promptIntentClassifiers";
+import {
+  hasExplicitNoHostDirectoryExportIntent,
+  hasKnownHostDirectoryExportIntent,
+} from "./promptIntentClassifiers";
 import { getString, isRecord } from "./recordUtils";
 
 export interface MissionOperationGoals {
@@ -665,10 +669,20 @@ export function bindVerifiedWorkspaceDirectoryExport(
   durableReceipts: readonly AgentRunReceipt[],
 ): ModelToolCall | null {
   if (toolCall.name !== "code_workspace_export_directory") return null;
+  if (hasExplicitNoHostDirectoryExportIntent(prompt)) return null;
   const workspaceId = getSingleVerifiedDurableWorkspaceId(durableReceipts);
-  if (!workspaceId || !hasKnownHostDirectoryExportIntent(prompt)) return null;
+  const hasExplicitKnownHostDirectory =
+    hasKnownHostDirectoryExportIntent(prompt);
+  if (
+    !workspaceId ||
+    (!hasExplicitKnownHostDirectory && !hasCodeDeliverableIntent(prompt))
+  ) {
+    return null;
+  }
 
-  const destinationRoots = new Set<"desktop" | "documents" | "downloads">();
+  const destinationRoots = new Set<
+    "desktop" | "documents" | "downloads"
+  >();
   if (/\bdesktop\b/iu.test(prompt)) destinationRoots.add("desktop");
   if (/\bdocuments?(?:\s+folder)?\b/iu.test(prompt)) {
     destinationRoots.add("documents");
@@ -676,7 +690,11 @@ export function bindVerifiedWorkspaceDirectoryExport(
   if (/\bdownloads?(?:\s+folder)?\b/iu.test(prompt)) {
     destinationRoots.add("downloads");
   }
-  if (destinationRoots.size !== 1) return null;
+  if (destinationRoots.size > 1) return null;
+  const destinationRoot =
+    destinationRoots.size === 1
+      ? [...destinationRoots][0]!
+      : "vault_sibling_projects";
 
   const normalizedRunId = runId
     .trim()
@@ -690,7 +708,7 @@ export function bindVerifiedWorkspaceDirectoryExport(
       ...toolCall.arguments,
       workspaceId,
       sourcePath: "",
-      destinationRoot: [...destinationRoots][0]!,
+      destinationRoot,
       destinationPath: `${deliverableLabel}-${runSuffix}`,
     },
   };

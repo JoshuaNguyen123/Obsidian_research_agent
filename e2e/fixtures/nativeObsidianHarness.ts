@@ -208,7 +208,11 @@ export async function startNativeObsidianHarness(
         "--js-flags=--max-old-space-size=8192",
         vaultRoot,
       ],
-      { windowsHide: true },
+      {
+        // Normal proof lanes stay hidden. The external demo recorder opts into
+        // a visible DWM-composited window so FFmpeg can capture genuine UI.
+        windowsHide: process.env.E2E_SHOW_OBSIDIAN_WINDOW !== "1",
+      },
     );
     drainObsidianStdio(processHandle, options.label);
     await waitForCdp(cdpPort, processHandle, 45_000);

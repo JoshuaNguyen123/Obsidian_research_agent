@@ -90,7 +90,12 @@ export function buildRouteBudgetProfile({
   ) {
     return makeProfile(route, 1, 0, 1, "single_synthesis_after_prefetch", inferredTools);
   }
-  if (explicitDeepResearch || /\b(deep|long|in-depth|comprehensive|multi[-\s]?source)\b/i.test(mission)) {
+  if (
+    explicitDeepResearch ||
+    /\b(?:deep\s+research|long\s+research|in[-\s]?depth\s+research|comprehensive\s+research|multi[-\s]?source\s+(?:research|review|comparison))\b/i.test(
+      mission,
+    )
+  ) {
     return makeProfile(
       route,
       cap,

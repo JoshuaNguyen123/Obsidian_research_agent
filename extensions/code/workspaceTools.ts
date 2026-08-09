@@ -124,7 +124,11 @@ export interface CodeWorkspaceToolFactoryOptionsV2 {
   ) => Promise<string>;
 }
 
-export type KnownHostDirectoryV2 = "desktop" | "documents" | "downloads";
+export type KnownHostDirectoryV2 =
+  | "desktop"
+  | "documents"
+  | "downloads"
+  | "vault_sibling_projects";
 
 export function createCodeWorkspaceToolContributionsV2(
   options: CodeWorkspaceToolFactoryOptionsV2,
@@ -717,7 +721,7 @@ class WorkspaceToolRuntimeV2 {
         `Export to ${destinationRoot} requires that exact known directory in the foreground user mission.`,
       );
     }
-    const destinationPath = assertWorkspaceRelativePathV2(
+    const requestedDestinationPath = assertWorkspaceRelativePathV2(
       requiredString(args.destinationPath, "destinationPath"),
       "destinationPath",
     );
@@ -730,10 +734,12 @@ class WorkspaceToolRuntimeV2 {
       workspaceId,
       sourcePath,
     );
-    const root = await resolveSafeKnownHostRootV2(
+    const target = await resolveSafeHostExportTargetV2(
       await this.resolveKnownHostDirectory(destinationRoot, context),
       destinationRoot,
+      requestedDestinationPath,
     );
+    const { root, destinationPath } = target;
     const destination = await inspectHostExportDestinationV2(
       root,
       destinationPath,
@@ -766,6 +772,7 @@ class WorkspaceToolRuntimeV2 {
         payloadBytes: sourceSnapshot.bytes,
         destinationRoot,
         destinationRootCanonical: root,
+        requestedDestinationPath,
         destinationPath,
         expectedTargetState: "absent",
       },
@@ -791,7 +798,9 @@ class WorkspaceToolRuntimeV2 {
         ),
       ],
       warnings: [
-        "This creates files outside the Obsidian vault in the exact approved known-directory destination.",
+        destinationRoot === "vault_sibling_projects"
+          ? "This creates a real project beside the Obsidian vault, outside vault indexing, in the exact approved destination."
+          : "This creates files outside the Obsidian vault in the exact approved known-directory destination.",
         "The destination must remain absent; existing files or directories are never overwritten.",
       ],
     });
@@ -817,10 +826,15 @@ class WorkspaceToolRuntimeV2 {
       leaseOwnerId,
     );
     const destinationRoot = requiredKnownHostDirectory(args.destinationRoot);
-    const root = await resolveSafeKnownHostRootV2(
+    const target = await resolveSafeHostExportTargetV2(
       await this.resolveKnownHostDirectory(destinationRoot, context),
       destinationRoot,
+      requiredString(
+        args.requestedDestinationPath ?? args.destinationPath,
+        "requestedDestinationPath",
+      ),
     );
+    const { root, destinationPath } = target;
     const expectedRoot = requiredString(
       args.destinationRootCanonical,
       "destinationRootCanonical",
@@ -831,10 +845,18 @@ class WorkspaceToolRuntimeV2 {
         "The known host directory changed after approval.",
       );
     }
-    const destinationPath = assertWorkspaceRelativePathV2(
-      requiredString(args.destinationPath, "destinationPath"),
-      "destinationPath",
-    );
+    if (
+      destinationPath !==
+      assertWorkspaceRelativePathV2(
+        requiredString(args.destinationPath, "destinationPath"),
+        "destinationPath",
+      )
+    ) {
+      throw new WorkspaceManagerErrorV2(
+        "host_directory_binding_drift",
+        "The resolved host export destination changed after approval.",
+      );
+    }
     const destination = await inspectHostExportDestinationV2(
       root,
       destinationPath,
@@ -913,10 +935,15 @@ class WorkspaceToolRuntimeV2 {
   ) {
     const args = action.normalizedArgs;
     const destinationRoot = requiredKnownHostDirectory(args.destinationRoot);
-    const root = await resolveSafeKnownHostRootV2(
+    const target = await resolveSafeHostExportTargetV2(
       await this.resolveKnownHostDirectory(destinationRoot, context),
       destinationRoot,
+      requiredString(
+        args.requestedDestinationPath ?? args.destinationPath,
+        "requestedDestinationPath",
+      ),
     );
+    const { root, destinationPath } = target;
     if (
       !samePath(
         root,
@@ -931,10 +958,18 @@ class WorkspaceToolRuntimeV2 {
         message: "Known host directory binding changed after preparation.",
       };
     }
-    const destinationPath = assertWorkspaceRelativePathV2(
-      requiredString(args.destinationPath, "destinationPath"),
-      "destinationPath",
-    );
+    if (
+      destinationPath !==
+      assertWorkspaceRelativePathV2(
+        requiredString(args.destinationPath, "destinationPath"),
+        "destinationPath",
+      )
+    ) {
+      return {
+        outcome: "still_uncertain" as const,
+        message: "Resolved host export destination changed after preparation.",
+      };
+    }
     const destination = await inspectHostExportDestinationV2(
       root,
       destinationPath,
@@ -2047,7 +2082,12 @@ function schema(name: CodeWorkspaceToolNameV2): JsonSchemaObjectV1 {
         sourcePath: stringSchema(),
         destinationRoot: {
           type: "string",
-          enum: ["desktop", "documents", "downloads"],
+          enum: [
+            "desktop",
+            "documents",
+            "downloads",
+            "vault_sibling_projects",
+          ],
         },
         destinationPath: stringSchema(),
       },
@@ -2085,16 +2125,16 @@ function jupyterNotebookInputSchema(): JsonSchemaObjectV1 {
 }
 
 function description(name: string): string {
-  const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace. This workspace is a real directory on the user's local filesystem. Finished workspace trees can be exported to Desktop, Documents, or Downloads with code_workspace_export_directory.`;
+  const base = `${name.replace(/_/gu, " ")} through one durable, bounded, hash-verified code workspace. This workspace is a real directory on the user's local filesystem. Finished workspace trees can be delivered beside the active Obsidian vault by default, or explicitly exported to Desktop, Documents, or Downloads, with code_workspace_export_directory.`;
   let text = base;
   if (name === "code_workspace_create") {
     text = `${base} This is the bootstrap step, not the final deliverable. After it succeeds, code_workspace_mkdir and code_workspace_create_file become available. Prefer repositoryProfileKey for a configured repository; repositoryRoot is the raw foreground-user alternative. If both are supplied, the host accepts them only when canonical readback proves they identify the same repository.`;
   } else if (name === "code_workspace_mkdir") {
     text = `Purpose: Create a nested directory path inside the bounded code workspace. Required: path. Side effects: bound write. ${base} Every missing parent directory is created safely; an existing directory is accepted, but a file conflict is rejected.`;
   } else if (name === "code_workspace_export_directory") {
-    text = `Purpose: Copy a completed workspace directory tree to a user-requested known host folder. Use when: the foreground mission explicitly names Desktop, Documents, or Downloads. Required: destinationRoot plus a safe nested destinationPath; sourcePath is optional and defaults to the workspace root. Side effects: exact approval-gated host write. ${base} The destination must be absent and every parent and file is verified. It never overwrites an existing file or directory.`;
+    text = `Purpose: Copy a completed workspace directory tree to a real, discoverable host folder. Use destinationRoot vault_sibling_projects by default for a new standalone project; use Desktop, Documents, or Downloads only when the foreground mission explicitly names one. Required: destinationRoot plus a safe project name in destinationPath; sourcePath is optional and defaults to the workspace root. Side effects: exact approval-gated host write. ${base} The vault-sibling destination resolves to <vault parent>/<vault name> Agent Projects/<destinationPath>. The destination must be absent and every parent and file is verified. It never overwrites an existing file or directory.`;
   } else if (name === "code_workspace_create_file") {
-    text = `Purpose: Create a new file in the real local filesystem workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write. ${base} Retrying is safe only when the existing file is byte-identical: that case returns a verified no-op. Different content is never overwritten by create; the error reports its SHA-256 and requires code_workspace_read followed by code_workspace_write_expected. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+    text = `Purpose: Create a new file in the real local filesystem workspace. Use when: adding a new workspace path. Do not use when: writing Obsidian note content — use append_to_current_file. Required: path + content. Next: code_validate_fast, then code_workspace_export_directory for vault-sibling delivery unless another destination was explicit. Side effects: bound local write. ${base} Retrying is safe only when the existing file is byte-identical: that case returns a verified no-op. Different content is never overwritten by create; the error reports its SHA-256 and requires code_workspace_read followed by code_workspace_write_expected. For .ipynb, prefer the structured notebook cells field so the host emits deterministic nbformat 4 JSON with empty outputs and an explicit not-executed state. For other files provide complete content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
     text += " Missing parent directories are created automatically, so paths such as src/game/ui/checkers.py are valid in one call.";
   } else if (name === "code_workspace_patch") {
     text = `Purpose: Exact text replacements in an existing workspace file. Use when: small edits after read+SHA. Do not use when: creating a new file. Required: path, replacements. Next: validate. Side effects: bound write. ${base} Use this only for an existing file after reading its SHA-256; a missing path must use code_workspace_create_file instead.`;
@@ -2102,7 +2142,7 @@ function description(name: string): string {
     name === "code_workspace_write_expected" ||
     name === "write_workspace_file"
   ) {
-    text = `Purpose: Hash-bound full-file correction in the real local filesystem workspace. Use when: repairing after code_workspace_read with expectedSha256. Do not use when: first create (use code_workspace_create_file) or inventing a patch tool. Required: path, content, expectedSha256. Next: validate/repair, then code_workspace_export_directory for Desktop/Documents/Downloads delivery. Side effects: bound local write. ${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
+    text = `Purpose: Hash-bound full-file correction in the real local filesystem workspace. Use when: repairing after code_workspace_read with expectedSha256. Do not use when: first create (use code_workspace_create_file) or inventing a patch tool. Required: path, content, expectedSha256. Next: validate/repair, then code_workspace_export_directory for vault-sibling delivery unless another destination was explicit. Side effects: bound local write. ${base} Provide the complete replacement file content; never use a placeholder, TODO-only stub, ellipsis, or prose reference to omitted content. Source creation explicitly supports ${CODE_CREATION_LANGUAGE_SUMMARY_V1}.`;
   }
   return text;
 }
@@ -2177,6 +2217,12 @@ function resolveCreateFileContentV1(
 export async function resolveKnownHostDirectoryV2(
   directory: KnownHostDirectoryV2,
 ): Promise<string> {
+  if (directory === "vault_sibling_projects") {
+    throw new WorkspaceManagerErrorV2(
+      "vault_sibling_directory_unavailable",
+      "Vault-sibling project delivery requires the Obsidian host to provide the active vault location.",
+    );
+  }
   const userHome = homedir();
   const oneDrive = process.env.OneDrive?.trim();
   const candidates =
@@ -2207,11 +2253,12 @@ function requiredKnownHostDirectory(value: unknown): KnownHostDirectoryV2 {
   if (
     value !== "desktop" &&
     value !== "documents" &&
-    value !== "downloads"
+    value !== "downloads" &&
+    value !== "vault_sibling_projects"
   ) {
     throw new WorkspaceManagerErrorV2(
       "invalid_arguments",
-      "destinationRoot must be desktop, documents, or downloads.",
+      "destinationRoot must be vault_sibling_projects, desktop, documents, or downloads.",
     );
   }
   return value;
@@ -2227,7 +2274,9 @@ function foregroundMissionNamesKnownHostDirectory(
       ? /\bdesktop\b/iu
       : directory === "documents"
         ? /\bdocuments?(?:\s+folder)?\b/iu
-        : /\bdownloads?(?:\s+folder)?\b/iu;
+        : directory === "downloads"
+          ? /\bdownloads?(?:\s+folder)?\b/iu
+          : /\b(?:code|project|app|application|script|package|library|website|game|test\s+suite|implement|build|create)\b/iu;
   return Boolean(
     context.missionId &&
       /^run-/u.test(context.missionId) &&
@@ -2739,6 +2788,99 @@ function mutationChanges(
     beforeSha256: args.expectedTargetState === "absent" ? null : before,
     afterSha256: args.expectedKind === "directory" ? before : after,
   }];
+}
+
+/**
+ * Resolve one approved export target without requiring the vault-sibling
+ * container to exist before approval. The Obsidian host supplies the intended
+ * `<vault parent>/<vault name> Agent Projects` container; this function binds
+ * its existing canonical parent as the trusted root and prepends the fixed
+ * container name to the model-supplied project path.
+ */
+async function resolveSafeHostExportTargetV2(
+  rawRoot: string,
+  directory: KnownHostDirectoryV2,
+  requestedDestinationPath: string,
+): Promise<{ root: string; destinationPath: string }> {
+  const requested = assertWorkspaceRelativePathV2(
+    requestedDestinationPath,
+    "destinationPath",
+  );
+  if (directory !== "vault_sibling_projects") {
+    return {
+      root: await resolveSafeKnownHostRootV2(rawRoot, directory),
+      destinationPath: requested,
+    };
+  }
+  if (!path.isAbsolute(rawRoot)) {
+    throw new WorkspaceManagerErrorV2(
+      "known_host_directory_invalid",
+      "Resolved vault-sibling project container must be absolute.",
+    );
+  }
+  const container = path.resolve(rawRoot);
+  const containerName = path.basename(container);
+  if (
+    !containerName.endsWith(" Agent Projects") ||
+    containerName === " Agent Projects" ||
+    /[<>:"/\\|?*\u0000-\u001f]/u.test(containerName)
+  ) {
+    throw new WorkspaceManagerErrorV2(
+      "known_host_directory_invalid",
+      "Vault-sibling project container name is invalid.",
+    );
+  }
+  const root = await resolveSafeKnownHostRootV2(
+    path.dirname(container),
+    directory,
+  );
+  if (!samePath(path.join(root, containerName), container)) {
+    throw new WorkspaceManagerErrorV2(
+      "known_host_directory_invalid",
+      "Vault-sibling project container changed during canonical readback.",
+    );
+  }
+  return {
+    root,
+    destinationPath: assertWorkspaceRelativePathV2(
+      `${containerName}/${requested}`,
+      "destinationPath",
+    ),
+  };
+}
+
+export async function resolveVaultSiblingProjectsDirectoryV2(
+  rawVaultRoot: string,
+): Promise<string> {
+  if (!path.isAbsolute(rawVaultRoot)) {
+    throw new WorkspaceManagerErrorV2(
+      "vault_root_invalid",
+      "The active vault root must be absolute for project delivery.",
+    );
+  }
+  const vaultRoot = path.resolve(rawVaultRoot);
+  const stat = await fs.lstat(vaultRoot);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new WorkspaceManagerErrorV2(
+      "vault_root_invalid",
+      "The active vault root is not a safe local directory.",
+    );
+  }
+  const canonicalVault = await fs.realpath(vaultRoot);
+  if (!samePath(canonicalVault, vaultRoot)) {
+    throw new WorkspaceManagerErrorV2(
+      "vault_root_invalid",
+      "The active vault root changed during canonical readback.",
+    );
+  }
+  const vaultName = path.basename(canonicalVault).trim();
+  if (!vaultName || /[<>:"/\\|?*\u0000-\u001f]/u.test(vaultName)) {
+    throw new WorkspaceManagerErrorV2(
+      "vault_root_invalid",
+      "The active vault name is not safe for a sibling project container.",
+    );
+  }
+  return path.join(path.dirname(canonicalVault), `${vaultName} Agent Projects`);
 }
 
 interface RepositoryMutationScopeBindingV2 extends Record<string, JsonValueV1> {

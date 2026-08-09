@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createConfiguredModelClient } from "../src/model/createModelClient";
+import {
+  createConfiguredModelClient,
+  createModelClientForSlot,
+} from "../src/model/createModelClient";
 import type { AgentSettings } from "../src/settings";
 
 function settings(overrides: Partial<AgentSettings> = {}): AgentSettings {
@@ -58,4 +61,39 @@ test("createConfiguredModelClient selects OpenAI-compatible provider", () => {
     settings({ modelProvider: "openai_compatible" }),
   );
   assert.equal(client.constructor.name, "OpenAICompatibleClient");
+});
+
+test("model clients reject credential-bearing remote HTTP but allow loopback HTTP", () => {
+  assert.throws(
+    () =>
+      createModelClientForSlot({
+        provider: "openai_compatible",
+        model: "test-model",
+        baseUrl: "http://models.example.test/v1",
+        apiKey: "must-not-leak",
+        requestTimeoutMs: 1_000,
+      }),
+    /must use HTTPS/iu,
+  );
+  assert.equal(
+    createModelClientForSlot({
+      provider: "ollama",
+      model: "test-model",
+      baseUrl: "http://127.0.0.1:11434",
+      apiKey: "local-key",
+      requestTimeoutMs: 1_000,
+    }).constructor.name,
+    "OllamaClient",
+  );
+  assert.throws(
+    () =>
+      createModelClientForSlot({
+        provider: "ollama",
+        model: "test-model",
+        baseUrl: "http://127.0.0.1.attacker.example",
+        apiKey: "must-not-leak",
+        requestTimeoutMs: 1_000,
+      }),
+    /must use HTTPS/iu,
+  );
 });

@@ -25,6 +25,7 @@ import {
   extractMarkdownPathMentions,
   hasExplicitCurrentNoteMutationIntent,
   isBroadUnscopedVaultMutation,
+  hasExplicitNoVaultReadIntent,
 } from "../src/agent/missionScope";
 
 test("explicit vault read paths stay inside affirmative read clauses", () => {
@@ -150,6 +151,45 @@ test("a singular affirmative workspace creation binds only its direct source pat
   assert.deepEqual(
     extractExplicitNewWorkspaceFilePaths(
       "Do not create secrets.py. Create the Linear issue described in Projects/Plan.md.",
+    ),
+    [],
+  );
+});
+
+test("an affirmative new-project clause binds its named source and test files", () => {
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Build a working Python calculator project with calculator.py and test_calculator.py using unittest. Create both source and test files.",
+    ),
+    ["calculator.py", "test_calculator.py"],
+  );
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Review a Python calculator project with calculator.py and test_calculator.py. Do not create files.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Create a report about a Python project with calculator.py and test_calculator.py.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Write a report about a project with calculator.py and test_calculator.py.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Do not build a Python project with calculator.py and test_calculator.py.",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    extractExplicitNewWorkspaceFilePaths(
+      "Build the project with existing config.py as an input.",
     ),
     [],
   );
@@ -548,6 +588,27 @@ test("vault paths containing source do not manufacture public-web intent", () =>
   );
 });
 
+test("code source-file deliverables do not manufacture public-web proof debt", () => {
+  const intent = {
+    explicitMutation: true,
+    requireWriteCompletion: true,
+  } as MissionIntent;
+  assert.equal(
+    requiresWebEvidenceProof(
+      "Build a working Python calculator project. Create both source and test files, then validate the full test suite.",
+      intent,
+    ),
+    false,
+  );
+  assert.equal(
+    requiresWebEvidenceProof(
+      "Build source files and tests, then research current sources on the web.",
+      intent,
+    ),
+    true,
+  );
+});
+
 test("literary citations from the text are not public-web proof debt", () => {
   const prompt =
     "Write a 3000 college level essay on the Catcher in the rye. Use supporting details and quotes, and citations directly from the text to support your essay.";
@@ -572,6 +633,17 @@ test("literary citations from the text are not public-web proof debt", () => {
     ),
     false,
   );
+});
+
+test("explicit no-vault research keeps web authority and removes every local read scope", () => {
+  const prompt =
+    "Research this using current web sources, but do not read, search, or use my vault or notes.";
+  assert.equal(hasExplicitNoVaultReadIntent(prompt), true);
+  const scope = deriveAutonomyScope(prompt, { vaultContext: true });
+  assert.equal(scope.read.web, true);
+  assert.equal(scope.read.vault, false);
+  assert.deepEqual(scope.read.files, []);
+  assert.deepEqual(scope.read.folders, []);
 });
 
 test("autonomy scope extracts a labeled spaced markdown path without preceding prose", () => {

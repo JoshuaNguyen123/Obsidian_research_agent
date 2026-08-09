@@ -63,7 +63,7 @@ test("buildBundledApprovalPreview seeds Bound families and excludes Hard", async
       "code_workspace_create",
       "code_validate_fast",
       "code_commit_verified",
-      "github_create_private_repository",
+      "github_create_repository",
       "publish_verified_code_to_github",
       "github_merge_pull_request",
       "github_delete_private_repository",

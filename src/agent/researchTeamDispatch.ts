@@ -4,6 +4,7 @@ import type { MissionIntent } from "../tools/types";
 import { classifyIntent } from "./reflex/intentRouter";
 import { createDefaultAutonomyScope } from "./missionScope";
 import { isLiteraryPrimaryTextWriteMission } from "./evidenceIntent";
+import type { SpecialistMode } from "../orchestrator/types";
 
 /**
  * The deterministic keyword floor for Lead + Researcher orchestration, moved
@@ -34,6 +35,13 @@ export interface ResearchTeamDispatchDecisionV1 {
   reason: string;
 }
 
+export interface AdaptiveTeamDispatchDecisionV2
+  extends ResearchTeamDispatchDecisionV1 {
+  orchestrationMode: "single" | "adaptive_team";
+  specialistModes: SpecialistMode[];
+  initialSpecialistMode: SpecialistMode | null;
+}
+
 /**
  * Layered research-team routing, replacing the bare regex trigger:
  *
@@ -44,7 +52,7 @@ export interface ResearchTeamDispatchDecisionV1 {
  *    accepted before is still accepted.
  * 3. Structural signals — deterministic, model-free evidence that the mission
  *    is multi-source research even without the floor's keywords: multiple
- *    URLs, explicitly-deep phrasing, or comparative/temporal shape.
+ *    URLs, explicitly extended-research phrasing, or comparative/temporal shape.
  * 4. Embedding widener — classifyIntent's `web_research` label at high
  *    confidence may WIDEN into the team; a `chat_answer` label can never veto
  *    layers 2–3, and the layer is inert whenever reflex is off or no
@@ -53,53 +61,174 @@ export interface ResearchTeamDispatchDecisionV1 {
 export async function resolveResearchTeamDispatchV1(
   input: ResearchTeamDispatchInputV1,
 ): Promise<ResearchTeamDispatchDecisionV1> {
+  const adaptive = await resolveAdaptiveTeamDispatchV2(input);
+  return {
+    useTeam: adaptive.useTeam,
+    signals: adaptive.signals.includes("keyword_floor")
+      ? ["keyword_floor"]
+      : adaptive.signals,
+    reason: adaptive.signals.includes("keyword_floor")
+      ? "Deterministic research-team keywords matched."
+      : adaptive.reason,
+  };
+}
+
+/**
+ * Activates the one Lead + one Adaptive Specialist team for complex research,
+ * Linear planning, code, GitHub publication preparation, or compound work.
+ * Simple chat/note work remains single-agent.
+ */
+export async function resolveAdaptiveTeamDispatchV2(
+  input: ResearchTeamDispatchInputV1,
+): Promise<AdaptiveTeamDispatchDecisionV2> {
   if (!input.orchestratorEnabled) {
-    return decision(false, ["orchestrator_disabled"], "Orchestrator is disabled.");
+    return adaptiveDecision(
+      false,
+      ["orchestrator_disabled"],
+      "Orchestrator is disabled.",
+      [],
+    );
   }
   if (input.forceChatOnly) {
-    return decision(false, ["chat_only"], "Chat-only missions never open a team runtime.");
+    return adaptiveDecision(
+      false,
+      ["chat_only"],
+      "Chat-only missions never open a team runtime.",
+      [],
+    );
   }
   if (isLiteraryPrimaryTextWriteMission(input.prompt)) {
-    return decision(
+    return adaptiveDecision(
       false,
       ["literary_primary_text"],
       "Literary primary-text essays are single-agent write missions.",
+      [],
     );
   }
 
+  const signals: string[] = [];
+  const specialistModes: SpecialistMode[] = [];
   if (RESEARCH_TEAM_KEYWORD_FLOOR.test(input.prompt)) {
-    return decision(
-      true,
-      ["keyword_floor"],
-      "Deterministic research-team keywords matched.",
-    );
+    signals.push("keyword_floor");
+    specialistModes.push("researcher");
   }
-
   const structural = structuralSignals(input.prompt);
   if (structural.length > 0) {
-    return decision(
+    signals.push(...structural);
+    specialistModes.push("researcher");
+  }
+  if (hasComplexResearchShape(input.prompt)) {
+    signals.push("complex_research");
+    specialistModes.push("researcher");
+  }
+  if (hasLinearWorkflowShape(input.prompt)) {
+    signals.push("linear_workflow");
+    specialistModes.push("linear_planner");
+  }
+  if (hasCodeWorkflowShape(input.prompt)) {
+    signals.push("code_workflow");
+    specialistModes.push("code_builder", "code_reviewer");
+  }
+  if (hasGithubWorkflowShape(input.prompt)) {
+    signals.push("github_workflow");
+    specialistModes.push("code_reviewer");
+  }
+  const domainSignals = signals.filter((signal) =>
+    /^(?:keyword_floor|multiple_urls|explicitly_deep|comparative_or_temporal|complex_research|linear_workflow|code_workflow|github_workflow)$/u.test(
+      signal,
+    ),
+  );
+  const distinctDomains = new Set(
+    domainSignals.map((signal) =>
+      signal === "linear_workflow"
+        ? "linear"
+        : signal === "code_workflow"
+          ? "code"
+          : signal === "github_workflow"
+            ? "github"
+            : "research",
+    ),
+  );
+  if (distinctDomains.size >= 2) signals.unshift("compound_workflow");
+  if (signals.length > 0) {
+    return adaptiveDecision(
       true,
-      structural,
-      "Deterministic structural research signals matched.",
+      [...new Set(signals)],
+      distinctDomains.size >= 2
+        ? "Compound workflow requires staged Specialist modes."
+        : "A complex workflow signal requires the Adaptive Specialist.",
+      [...new Set(specialistModes)],
     );
   }
 
   const widened = await embeddingWidener(input);
   if (widened) {
-    return decision(
+    return adaptiveDecision(
       true,
       ["embedding_web_research", widened],
       "Semantic routing classified this as web research at high confidence.",
+      ["researcher"],
     );
   }
 
-  return decision(false, ["no_signal"], "No research-team signal; single-agent.");
+  return adaptiveDecision(
+    false,
+    ["no_signal"],
+    "No complex workflow signal; single-agent.",
+    [],
+  );
+}
+
+function hasComplexResearchShape(prompt: string): boolean {
+  const requestedWords = [...prompt.matchAll(/\b(\d{3,5})[-\s]?words?\b/giu)].some(
+    (match) => Number.parseInt(match[1] ?? "0", 10) >= 1_000,
+  );
+  return (
+    requestedWords ||
+    /\b(?:deep[-\s]?dive|in[-\s]?depth\s+(?:guide|report|analysis)|comprehensive\s+(?:guide|report|analysis)|best\s+strategies\s+for|most\s+important\s+topics?\s+(?:of|in)|research\s+report|literature\s+review)\b/iu.test(
+      prompt,
+    )
+  );
+}
+
+function hasLinearWorkflowShape(prompt: string): boolean {
+  return (
+    /\blinear\b/iu.test(prompt) &&
+    /\b(?:create|draft|recognize|find|read|list|update|post|turn|convert|track|plan|initiative|project|issues?|status)\b/iu.test(
+      prompt,
+    )
+  );
+}
+
+function hasCodeWorkflowShape(prompt: string): boolean {
+  const explicitCodeNoun =
+    /\b(?:code|application|app|library|package|module|script|test\s*suite|python|typescript|javascript|source\s+files?)\b/iu.test(
+      prompt,
+    );
+  const projectBuild =
+    /\b(?:build|implement|write|generate|repair|fix|test|validate|deliver)\b/iu.test(
+      prompt,
+    ) && /\b(?:project|repository|repo)\b/iu.test(prompt);
+  return (
+    /\b(?:create|build|implement|write|generate|repair|fix|test|validate|deliver)\b/iu.test(
+      prompt,
+    ) && (explicitCodeNoun || projectBuild)
+  );
+}
+
+function hasGithubWorkflowShape(prompt: string): boolean {
+  return (
+    /\b(?:github|pull\s+request|draft\s+pr|repository|repo)\b/iu.test(prompt) &&
+    /\b(?:create|publish|push|open|commit|upload|make|private|public|visibility|merge)\b/iu.test(
+      prompt,
+    )
+  );
 }
 
 /**
  * Deterministic, model-free structure that marks multi-source research even
  * when the keyword floor missed: several distinct URLs to reconcile,
- * explicitly-deep phrasing, or a comparative/temporal question shape.
+ * explicitly extended-research phrasing, or a comparative/temporal question shape.
  */
 function structuralSignals(prompt: string): string[] {
   const signals: string[] = [];
@@ -110,7 +239,7 @@ function structuralSignals(prompt: string): string[] {
   );
   if (urls.size >= 2) signals.push("multiple_urls");
   if (
-    /\b(?:in[- ]depth|exhaustive|systematic\s+review|all\s+available\s+sources|overnight\s+research)\b/iu.test(
+    /\b(?:deep\s+research|long\s+research|in[- ]depth\s+research|exhaustive\s+research|systematic\s+review|all\s+available\s+sources|overnight\s+research|multi[- ]source\s+(?:research|review|comparison))\b/iu.test(
       prompt,
     )
   ) {
@@ -200,10 +329,19 @@ function neutralMissionIntent(): MissionIntent {
   };
 }
 
-function decision(
+function adaptiveDecision(
   useTeam: boolean,
   signals: string[],
   reason: string,
-): ResearchTeamDispatchDecisionV1 {
-  return { useTeam, signals, reason };
+  specialistModes: SpecialistMode[],
+): AdaptiveTeamDispatchDecisionV2 {
+  const normalizedModes = [...new Set(specialistModes)];
+  return {
+    useTeam,
+    signals,
+    reason,
+    orchestrationMode: useTeam ? "adaptive_team" : "single",
+    specialistModes: normalizedModes,
+    initialSpecialistMode: normalizedModes[0] ?? null,
+  };
 }

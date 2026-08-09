@@ -25,7 +25,7 @@ export type TopLevelMissionDispatchDecisionV1 =
       kind: "code_team";
       request: ExplicitCodeTeamDispatchRequestV1;
     }
-  | { kind: "research_team" }
+  | { kind: "research_team"; outputTarget: "chat" | "note" }
   | {
       kind: "blocked";
       blockerCode: "code_extension_unavailable";
@@ -47,6 +47,7 @@ export interface ResolveTopLevelMissionDispatchInputV1 {
   forceChatOnly: boolean;
   codeExtensionAvailable: boolean;
   codeClarificationMessage: string;
+  researchOutputTarget?: "chat" | "note";
 }
 
 /**
@@ -80,7 +81,10 @@ export function resolveTopLevelMissionDispatchV1(
     return { kind: "single_agent" };
   }
   if (input.researchTeamRequested) {
-    return { kind: "research_team" };
+    return {
+      kind: "research_team",
+      outputTarget: input.researchOutputTarget ?? "chat",
+    };
   }
   return { kind: "single_agent" };
 }
@@ -209,29 +213,82 @@ async function buildRouteAuthority(
   }
 
   const isResearch = input.decision.kind === "research_team";
+  const writesResearchNote =
+    input.decision.kind === "research_team" &&
+    input.decision.outputTarget === "note";
   const capabilityId = isResearch
-    ? "orchestrator.research.read"
+    ? writesResearchNote
+      ? "orchestrator.research.note_output"
+      : "orchestrator.research.read"
     : "orchestrator.dispatch.guard";
   const executorId = isResearch ? "research-team" : "host-dispatch-guard";
   const objective =
     input.decision.kind === "research_team"
       ? `Run bounded multi-agent research for: ${input.objective}`
       : input.decision.message;
+  const binding: MissionBindingGrantV1 | null = writesResearchNote
+    ? {
+        id: "research-note-output",
+        kind: "vault-markdown-note-output",
+        destinationFingerprint: await sha256Fingerprint({
+          missionId: input.missionId,
+          objective: input.objective,
+          outputTarget: "automatic-new-note",
+        }),
+        allowedEffects: ["read", "mutation"],
+      }
+    : null;
   return {
     executorId,
-    effect: "read",
+    effect: writesResearchNote ? "mutation" : "read",
     capabilityId,
-    binding: null,
+    binding,
     node: {
       ...common,
       objective: objective.slice(0, 4_000),
       executorId,
-      effect: "read",
+      effect: writesResearchNote ? "mutation" : "read",
+      inputs: binding
+        ? {
+            output: {
+              kind: "binding",
+              bindingId: binding.id,
+              selector: null,
+            },
+          }
+        : {},
       requiredCapabilities: [capabilityId],
-      destination: null,
-      resourceLocks: [],
+      destination: binding
+        ? {
+            bindingId: binding.id,
+            effect: "mutation",
+            selector: null,
+          }
+        : null,
+      resourceLocks: binding
+        ? [{ bindingId: binding.id, mode: "exclusive" }]
+        : [],
     },
   };
+}
+
+export function resolveResearchTeamOutputTargetV1(
+  prompt: string,
+  forceChatOnly = false,
+): "chat" | "note" {
+  if (
+    forceChatOnly ||
+    /\b(?:chat\s+only|only\s+in\s+chat|answer\s+in\s+chat|do\s+not\s+(?:write|save|append))\b/iu.test(
+      prompt,
+    )
+  ) {
+    return "chat";
+  }
+  return /\b(?:write|draft|compose|create|generate|save|append)\b[\s\S]{0,100}\b(?:guide|report|article|brief|essay|note|markdown|page|document)\b|\b(?:guide|report|article|brief|essay)\b/iu.test(
+    prompt,
+  )
+    ? "note"
+    : "chat";
 }
 
 async function buildEnvelope(input: {

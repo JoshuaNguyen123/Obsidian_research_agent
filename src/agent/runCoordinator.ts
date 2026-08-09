@@ -10,7 +10,10 @@ import type {
 } from "../AgentRunner";
 import type { MissionGraphV3 } from "../../packages/headless-runtime/src/missionGraphV3";
 import type { MissionLedgerSummary } from "./missionLedger";
-import type { MissionScorecardV1 } from "./missionScorecard";
+import {
+  mergeMissionScorecardObservationsV1,
+  type MissionScorecardV1,
+} from "./missionScorecard";
 import type { MissionGraphStoreReferenceV1 } from "./runStore";
 import {
   createRunSteeringQueue,
@@ -514,7 +517,10 @@ export class RunCoordinator {
     } else if (key === "onMissionScorecard") {
       const scorecard = args[0] as MissionScorecardV1 | undefined;
       if (scorecard) {
-        this.lastMissionScorecard = structuredCloneValue(scorecard);
+        this.lastMissionScorecard = mergeMissionScorecardObservationsV1(
+          this.lastMissionScorecard,
+          scorecard,
+        );
       }
     } else if (key === "onTrace") {
       const trace = args[0] as
@@ -705,7 +711,7 @@ function emptyProviderUsage(): ModelUsageAggregateV1 {
 
 function isAttestedDiagnosticTraceId(id: string): boolean {
   return (
-    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|checkpoint-resume:|mission-ledger-resume:invalid-handoff$|resume-mutation-reconciliation-required$|operation-goals:)/u.test(
+    /^(?:agent-step-response-|loop-decision-|passage-writeback-contract-|verified-final-append-|pending-write-gate-|tool-call-budget-precheck-|mission-acceptance-|terminal-acceptance-gate-|committed-write-acceptance-invariant-|wall-clock-budget-|mission-graph-tool-frontier-|mission-graph-initialization-failed$|run-coordinator-terminal-error$|run-coordinator-pre-authority-completion$|checkpoint-resume:|mission-ledger-resume:invalid-handoff$|resume-mutation-reconciliation-required$|operation-goals:)/u.test(
       id,
     ) ||
     id.endsWith(":proof-gated-writeback-rejected") ||

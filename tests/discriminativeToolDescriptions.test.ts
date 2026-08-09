@@ -22,7 +22,7 @@ test("covers confused pairs with Purpose / Do not use when", () => {
   }
 });
 
-test("code delivery descriptions identify the real local filesystem and export route", () => {
+test("code delivery descriptions identify the real filesystem and standalone export route", () => {
   for (const name of [
     "code_workspace_create_file",
     "code_workspace_write_expected",
@@ -30,7 +30,7 @@ test("code delivery descriptions identify the real local filesystem and export r
   ] as const) {
     const text = DISCRIMINATIVE_TOOL_DESCRIPTIONS[name];
     assert.match(text, /real (?:directory|local filesystem)/iu);
-    assert.match(text, /Desktop/iu);
+    assert.match(text, /standalone-project|vault_sibling_projects/iu);
     assert.match(
       text,
       /code_workspace_export_directory|absolute verified export path/iu,

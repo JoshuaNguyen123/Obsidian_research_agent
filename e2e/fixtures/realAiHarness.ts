@@ -44,7 +44,7 @@ export interface RealAiHarness extends NativeObsidianHarness {
   readNote(path?: string): Promise<string>;
   installOwnedWebBackend(options?: {
     failFirstFetch?: boolean;
-    sourceCount?: 2 | 3;
+    sourceCount?: 1 | 2 | 3;
     topic?: "generic" | "checkers";
     conflictingEvidence?: boolean;
   }): Promise<void>;
@@ -238,6 +238,11 @@ export async function startRealAiHarness(
     utilityModel: "",
     enableStreaming: false,
     thinkingMode: "off",
+    // The console now remembers its last tab. Without pinning it, a scenario
+    // that ends on Run Details leaves the next one's Chat panel hidden, and
+    // submitMission's fill() on textarea.agentic-researcher-prompt would time
+    // out on an invisible element depending purely on scenario order.
+    runDetailsActiveTab: "chat",
     // Cap per-request HTTP timeout below the mission wall clock. Coupling them
     // lets one stalled chat() burn the full completion wait (seen as
     // Running mission... with empty progress after Continue on error).
@@ -1281,7 +1286,7 @@ async function approveUntilMissionComplete(
     if (committedRestartStage && options.restartCorePlugin) {
       restartedStages.add(committedRestartStage);
       await options.restartCorePlugin(committedRestartStage);
-      await page.getByRole("tab", { name: "Activity" }).click({ timeout: 10_000 });
+      await page.getByRole("tab", { name: "Run Details" }).click({ timeout: 10_000 });
       const continued = await continueLatestRunAfterStageRestart(page);
       if (continued) {
         continuations += 1;
@@ -1809,6 +1814,13 @@ async function assertProductionClientReady(
   await verifyWithWorkerConnectionAttestation({
     registry: VERIFIED_REAL_AI_CONNECTIONS,
     target: { provider, baseUrl: config.baseUrl, model: config.model },
+    // Provider preflight must leave enough time for the mission it protects.
+    // A stalled health/tool probe previously consumed the entire 15-minute
+    // Playwright test before Chat received the prompt.
+    timeoutMs: Math.max(
+      1_000,
+      Math.min(60_000, config.firstChunkTimeoutMs, config.missionTimeoutMs),
+    ),
     verify: async ({ reuseWorkerAttestation }) =>
       page.evaluate(async ({ pluginId, reuseWorkerAttestation }) => {
         const app = (window as typeof window & { app?: any }).app;
@@ -2024,7 +2036,7 @@ async function submitMission(
 async function waitForMissionComplete(page: Page, timeoutMs: number): Promise<void> {
   const run = page.locator("button.agentic-researcher-run");
   await expect(run).toHaveText("Run Mission", { timeout: timeoutMs });
-  await expect(run).toBeEnabled();
+  await expect(run).toBeEnabled({ timeout: timeoutMs });
   await expect(page.locator(".agentic-researcher-run-status-text")).toHaveText(
     IDLE_PRIMARY_STATUS_PATTERN,
   );
@@ -2133,7 +2145,7 @@ async function installOwnedWebBackend(
   marker: string,
   options: {
     failFirstFetch?: boolean;
-    sourceCount?: 2 | 3;
+    sourceCount?: 1 | 2 | 3;
     topic?: "generic" | "checkers";
     conflictingEvidence?: boolean;
   },
@@ -2167,7 +2179,7 @@ async function installOwnedWebBackend(
           const results = topic === "checkers"
             ? [
                 {
-                  title: "Owned American checkers rules",
+                  title: "Owned primary source: American checkers rules",
                   url: `https://primary.owned.example/checkers/${markerPath}`,
                   snippet:
                     "American checkers uses an 8x8 board, twelve men per side, diagonal movement, mandatory captures, multi-jumps, and kings.",
@@ -2180,7 +2192,7 @@ async function installOwnedWebBackend(
                 },
               ]
             : [
-                { title: "Owned primary", url: `https://primary.owned.example/evidence/${markerPath}`, snippet: "Owned passage: alpha evidence establishes the first finding." },
+                { title: "Owned primary source", url: `https://primary.owned.example/evidence/${markerPath}`, snippet: "Owned passage: alpha evidence establishes the first finding." },
                 { title: "Owned alternate", url: `https://alternate-owned.example/evidence/${markerPath}`, snippet: "Owned passage: beta evidence establishes the second finding." },
               ];
           if (sourceCount === 3) {
@@ -2190,7 +2202,11 @@ async function installOwnedWebBackend(
               snippet: "Owned passage: gamma evidence independently corroborates the bounded synthesis.",
             });
           }
-          return { status: 200, headers: {}, json: { results } };
+          return {
+            status: 200,
+            headers: {},
+            json: { results: results.slice(0, sourceCount) },
+          };
         }
         if (String(request.url).endsWith("/web_fetch")) {
           fetchCalls += 1;
@@ -2211,7 +2227,7 @@ async function installOwnedWebBackend(
               ? "Owned corroborating"
               : alternate
                 ? "Owned alternate"
-                : "Owned primary",
+                : "Owned primary source",
             content: topic === "checkers"
               ? alternate
                 ? "American checkers ends when a player has no pieces or no legal move. A legal-move engine must return captures instead of quiet moves whenever any capture exists. After a jump, the same piece must continue while another jump is available, so the turn changes only after the capture sequence ends. A man reaching the opponent's back rank is crowned as a king; kings may move and capture diagonally forward or backward. Draw conventions vary and should be documented rather than invented for a bounded implementation."

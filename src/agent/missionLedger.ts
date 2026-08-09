@@ -251,6 +251,8 @@ export interface MissionLedgerSummary {
     remainingTasks: number;
     nextAction: string;
   };
+  /** Operational projection retained for Run Details/live attestation. */
+  orchestrator?: OrchestratorSnapshotV1;
   iterationCount: number;
   progressScore: number;
   stalledCount: number;
@@ -774,6 +776,13 @@ export function summarizeMissionLedger(
       remainingTasks: ledger.missionPlan.progress.remainingTasks,
       nextAction: ledger.missionPlan.nextAction?.summary ?? "none",
     };
+  }
+  const orchestrator = normalizeOrchestratorSnapshot(ledger.orchestrator, {
+    fallbackRunId: ledger.runId,
+    now: new Date(ledger.updatedAt),
+  });
+  if (orchestrator) {
+    summary.orchestrator = orchestrator;
   }
   if (ledger.activeTaskId) {
     summary.activeTaskId = ledger.activeTaskId;

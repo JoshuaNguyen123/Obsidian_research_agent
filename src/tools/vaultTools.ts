@@ -59,6 +59,7 @@ import {
   LINEAR_ISSUE_TEMPLATE_PATH,
   LINEAR_ISSUE_TEMPLATE_V1,
 } from "./agentTemplateLibrary";
+import { promptTargetsHeadingV1 } from "../agent/sectionTarget";
 import { hasExplicitResearchPublicationIntent } from "./researchPublicationTool";
 import { hasExplicitResearchProjectHierarchyIntent } from "./researchProjectHierarchyTool";
 import {
@@ -2025,10 +2026,10 @@ export const createFileTool: AgentTool = {
     additionalProperties: false,
   },
   async execute(args, context) {
-    assertCreateIntent(context, "create_file");
     const path = normalizeVaultPath(getRequiredString(args, "path"), {
       requireMarkdown: true,
     });
+    assertCreateIntent(context, "create_file", path);
     const content = getString(args, "content");
     const createFolders = getOptionalBoolean(args, "createFolders") ?? false;
 
@@ -2037,12 +2038,28 @@ export const createFileTool: AgentTool = {
     }
 
     await ensureParentFolder(context, path, createFolders);
-    await context.app.vault.create(path, content);
+    const file = await context.app.vault.create(path, content);
+    const observed = await context.app.vault.read(file);
+    if (observed !== content) {
+      throw new ToolExecutionError(
+        "vault_readback_failed",
+        `Vault create acknowledged, but exact readback did not match: ${path}.`,
+        { mutationState: "may_have_applied" },
+      );
+    }
+    const checkedAt = (context.now?.() ?? new Date()).toISOString();
+    const observedFingerprint = await sha256Fingerprint(observed);
 
     return {
       path,
       operation: "create",
       bytesWritten: getByteLength(content),
+      readback: {
+        status: "verified",
+        checkedAt,
+        observedRevision: observedFingerprint,
+        observedFingerprint,
+      },
     };
   },
 };
@@ -2521,9 +2538,15 @@ export const editCurrentSectionTool: AgentTool = {
       throw new Error("edit_current_section level must be between 1 and 6.");
     }
 
-    if (!EDIT_INTENT_PATTERN.test(context.originalPrompt)) {
+    // Either the user said the word "section", or they named this heading.
+    // Naming it is the stronger signal: the model cannot rewrite a section the
+    // request never mentioned.
+    if (
+      !EDIT_INTENT_PATTERN.test(context.originalPrompt) &&
+      !promptTargetsHeadingV1(context.originalPrompt, heading)
+    ) {
       throw new Error(
-        "edit_current_section requires the user to explicitly ask to edit, revise, update, replace, or rewrite a section.",
+        "edit_current_section requires the user to explicitly ask to edit, revise, update, replace, or rewrite this section by name.",
       );
     }
 
@@ -2619,9 +2642,12 @@ export const prepareEditCurrentSectionTool: AgentTool = {
       throw new Error("prepare_edit_current_section level must be between 1 and 6.");
     }
 
-    if (!EDIT_INTENT_PATTERN.test(context.originalPrompt)) {
+    if (
+      !EDIT_INTENT_PATTERN.test(context.originalPrompt) &&
+      !promptTargetsHeadingV1(context.originalPrompt, heading)
+    ) {
       throw new Error(
-        "prepare_edit_current_section requires the user to explicitly ask to edit, revise, update, replace, or rewrite a section.",
+        "prepare_edit_current_section requires the user to explicitly ask to edit, revise, update, replace, or rewrite this section by name.",
       );
     }
 
@@ -2682,9 +2708,12 @@ export const appendToCurrentSectionTool: AgentTool = {
       throw new Error("append_to_current_section level must be between 1 and 6.");
     }
 
-    if (!SECTION_APPEND_INTENT_PATTERN.test(context.originalPrompt)) {
+    if (
+      !SECTION_APPEND_INTENT_PATTERN.test(context.originalPrompt) &&
+      !promptTargetsHeadingV1(context.originalPrompt, heading)
+    ) {
       throw new Error(
-        "append_to_current_section requires the user to explicitly ask to write, add, append, or insert content below a section or heading.",
+        "append_to_current_section requires the user to explicitly ask to write, add, append, or insert content below this section, naming it.",
       );
     }
 
@@ -2883,8 +2912,17 @@ function assertTemplateSeedIntent(
   }
 }
 
-function assertCreateIntent(context: ToolExecutionContext, toolName: string) {
-  if (!CREATE_INTENT_PATTERN.test(context.originalPrompt)) {
+function assertCreateIntent(
+  context: ToolExecutionContext,
+  toolName: string,
+  requestedPath?: string,
+) {
+  const hostPlannedNewNoteCreate =
+    toolName === "create_file" &&
+    context.missionIntent?.noteOutput === true &&
+    typeof requestedPath === "string" &&
+    requestedPath === context.plannedNoteOutputPath;
+  if (!CREATE_INTENT_PATTERN.test(context.originalPrompt) && !hostPlannedNewNoteCreate) {
     throw new Error(`${toolName} requires the user to explicitly ask to create a file or folder.`);
   }
 }

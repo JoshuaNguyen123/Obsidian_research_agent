@@ -234,6 +234,53 @@ test("run coordinator retains, replays, and resets the latest mission scorecard"
   await next;
 });
 
+test("run coordinator retains applicable research dimensions across compound segments", async () => {
+  const coordinator = new RunCoordinator();
+  const research = scoreMissionV1({
+    acceptanceCriteriaTotal: 1,
+    acceptanceCriteriaMissing: 0,
+    acceptancePassed: true,
+    claimsRequiringEvidence: 2,
+    claimsWithEvidence: 2,
+    mutationsPerformed: 1,
+    mutationsWithReceipts: 1,
+    recoveryAttempts: 0,
+    modelCalls: 1,
+    modelCallBudget: 3,
+    wallClockMs: 10,
+    wallClockBudgetMs: 100,
+  });
+  const later = scoreMissionV1({
+    acceptanceCriteriaTotal: 1,
+    acceptanceCriteriaMissing: 0,
+    acceptancePassed: true,
+    claimsRequiringEvidence: 2,
+    claimsWithEvidence: 0,
+    evidenceGroundingApplicable: false,
+    mutationsPerformed: 2,
+    mutationsWithReceipts: 2,
+    recoveryAttempts: 0,
+    modelCalls: 2,
+    modelCallBudget: 3,
+    wallClockMs: 20,
+    wallClockBudgetMs: 100,
+  });
+
+  await coordinator.start(async (_signal, events) => {
+    events.onMissionScorecard?.(research);
+    events.onMissionScorecard?.(later);
+    events.onRunComplete?.({ step: 1, maxSteps: 1, stopReason: "final" });
+  });
+
+  const grounding = coordinator
+    .getSnapshot()
+    .lastMissionScorecard?.dimensions.find(
+      (item) => item.id === "evidence_grounding",
+    );
+  assert.equal(grounding?.score, 1);
+  assert.equal(grounding?.applicable, true);
+});
+
 test("run coordinator retains only redacted durable source evidence", async () => {
   const coordinator = new RunCoordinator();
   await coordinator.start(async (_signal, events) => {
@@ -808,6 +855,37 @@ test("run coordinator retains a redacted failed tool-result code", async () => {
       missing: [],
     },
   ]);
+});
+
+test("run coordinator retains committed-write and wall-clock acceptance diagnostics", async () => {
+  const coordinator = new RunCoordinator();
+  await coordinator.start(async (_signal, events) => {
+    events.onTrace?.({
+      id: "committed-write-acceptance-invariant-4",
+      kind: "acceptance",
+      step: 4,
+      message: "Exact verified payload retained.",
+      outputPreview: { missing: ["claim_grounding:ungrounded:claim:1"] },
+    });
+    events.onTrace?.({
+      id: "wall-clock-budget-lead",
+      kind: "status",
+      message: "Adaptive Lead wall-clock budget exhausted.",
+    });
+    events.onRunComplete?.({ step: 4, maxSteps: 10, stopReason: "budget" });
+  });
+
+  assert.deepEqual(
+    coordinator.getSnapshot().diagnosticAttestations.map((item) => item.id),
+    [
+      "committed-write-acceptance-invariant-4",
+      "wall-clock-budget-lead",
+    ],
+  );
+  assert.deepEqual(
+    coordinator.getSnapshot().diagnosticAttestations[0]?.missing,
+    ["claim_grounding:ungrounded:claim:1"],
+  );
 });
 
 test("run event observer failures are redacted and cannot abort the mission", async () => {

@@ -15,7 +15,9 @@ import { appendToolTranscript } from "../model/toolTranscript";
 import { serializeToolResultForModel } from "../model/toolResultPayload";
 
 /**
- * Independent model-backed critic for the two-agent research mission.
+ * Independent review performed by the same Adaptive Specialist in
+ * `recovery_verifier` mode. "Independent" describes transcript isolation; it
+ * is not a third participant identity.
  *
  * Independence is structural, not prompted:
  * - Its transcript is seeded ONLY with the objective, the Lead's final output,
@@ -63,12 +65,17 @@ export async function runCriticWorker(input: {
   toolContext: ToolExecutionContext;
   abortSignal?: AbortSignal;
   maxSteps?: number;
+  maxToolCalls?: number;
   onModelCallEvidence?: (event: ModelCallEvidenceV1) => void;
   now?: () => Date;
 }): Promise<CriticWorkerResult> {
   const now = input.now ?? (() => new Date());
   const registry = createCriticRegistry(input.toolRegistry);
   const maxSteps = Math.min(CRITIC_MAX_STEPS, Math.max(1, input.maxSteps ?? CRITIC_MAX_STEPS));
+  const maxToolCalls = Math.min(
+    CRITIC_MAX_TOOL_CALLS,
+    Math.max(0, input.maxToolCalls ?? CRITIC_MAX_TOOL_CALLS),
+  );
   const modelCallCap = Math.max(4, maxSteps * 3 + 8);
   const contextTokens = Math.max(
     4_096,
@@ -141,7 +148,7 @@ export async function runCriticWorker(input: {
         continue;
       }
       for (const call of response.toolCalls) {
-        if (toolCalls >= CRITIC_MAX_TOOL_CALLS) break;
+        if (toolCalls >= maxToolCalls) break;
         toolCalls += 1;
         throwIfAborted(input.abortSignal);
         const result = await registry.execute(call, {
@@ -160,7 +167,7 @@ export async function runCriticWorker(input: {
           fallbackId: call.id ?? `critic-tool-${toolCalls}`,
         });
       }
-      if (toolCalls >= CRITIC_MAX_TOOL_CALLS) {
+      if (toolCalls >= maxToolCalls) {
         messages.push({
           role: "user",
           content:

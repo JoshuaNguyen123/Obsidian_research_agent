@@ -24,14 +24,14 @@ import {
   createWorkItemSpecV1,
   createWorkItemSpecV2,
   parseRenderedCompatibleWorkItemSpec,
-  renderWorkItemSpecV1,
-  renderWorkItemSpecV2,
+  renderQueueExecutableHumanWorkItemSpecV2,
   type LinearIssueRecord,
   type LinearOperationResult,
   type ResearchTicketWorkItemDraftV2,
   type SynthesizedResearchTicketSectionsV1,
 } from "../src/integrations/linear";
 import type { ToolExecutionContext } from "../src/tools/types";
+import { renderContractBoundIssueBodyV1 } from "./fixtures/linearWorkItemBody";
 
 const T0 = "2026-07-12T12:00:00.000Z";
 const T1 = "2026-07-12T12:01:00.000Z";
@@ -156,7 +156,7 @@ test("compatible rendering and parsing preserve the existing v1 contract", () =>
     originRunId: "legacy-run",
     generation: 0,
   });
-  const markdown = renderWorkItemSpecV1(v1);
+  const markdown = renderContractBoundIssueBodyV1(v1);
   const parsed = parseRenderedCompatibleWorkItemSpec(markdown).spec;
   assert.equal(parsed.schemaVersion, 1);
   assert.deepEqual(parsed, v1);
@@ -203,13 +203,13 @@ test("preclaim readback verifies project, state, timestamp, contract, and finger
     remoteStateId: "state-todo",
     workItem,
   });
-  const exact = issue("issue-verify", T0, renderWorkItemSpecV2(workItem));
+  const exact = issue("issue-verify", T0, renderQueueExecutableHumanWorkItemSpecV2(workItem));
   const differentContract = researchWorkItem({ objective: "Synthesize different evidence." });
   const cases: Array<[string, LinearIssueRecord]> = [
     ["project", { ...exact, project: { id: "project-other" } }],
     ["state", { ...exact, state: { id: "state-started", type: "started" } }],
     ["timestamp", { ...exact, updatedAt: T1 }],
-    ["contract fingerprint", { ...exact, description: renderWorkItemSpecV2(differentContract) }],
+    ["contract fingerprint", { ...exact, description: renderQueueExecutableHumanWorkItemSpecV2(differentContract) }],
   ];
   assert.equal(await verifierFor(exact).verifyCandidateBeforeClaim({
     candidate: queue.candidates["issue-verify"],
@@ -250,7 +250,7 @@ test("stale preclaim timestamp blocks a v2 claim before any mutation", async () 
   const changed = issue(
     "issue-stale",
     T1,
-    renderWorkItemSpecV2(researchSpec),
+    renderQueueExecutableHumanWorkItemSpecV2(researchSpec),
   );
   const supervisor = new LinearQueueSupervisor({
     queueProjectId: PROJECT_ID,

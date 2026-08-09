@@ -12,10 +12,10 @@ import {
   parseRenderedWorkItemSpecV1,
 } from "../src/integrations/linear/WorkItemParser";
 import {
-  renderWorkItemSpecV1,
   renderHumanCompatibleWorkItemSpec,
   WORK_ITEM_CONTRACT_END,
 } from "../src/integrations/linear/WorkItemRenderer";
+import { renderContractBoundIssueBodyV1 } from "./fixtures/linearWorkItemBody";
 import {
   createWorkItemSpecV1,
   parseWorkItemSpecV1,
@@ -74,7 +74,7 @@ test("work item creation fingerprints the exact strict v1 contract", () => {
 
 test("rendered Linear descriptions round-trip through the machine contract", () => {
   const spec = createWorkItemSpecV1(UNSIGNED);
-  const markdown = renderWorkItemSpecV1(spec, {
+  const markdown = renderContractBoundIssueBodyV1(spec, {
     problemImpact: "Duplicate execution could corrupt an autonomous coding run.",
     confidenceLimitations: "The queue is deterministic; remote webhook delivery is out of scope.",
     proposedWork: ["Persist a revisioned queue and expiring leases."],
@@ -86,10 +86,15 @@ test("rendered Linear descriptions round-trip through the machine contract", () 
   assert.deepEqual(parsed.spec, spec);
   assert.match(markdown, /## Problem \/ impact/);
   assert.match(markdown, /## Confidence \/ limitations/);
-  assert.match(markdown, /## Proposed work \/ non-goals/);
-  assert.match(markdown, /## Scope \/ dependencies/);
+  assert.match(markdown, /## Proposed work/);
+  assert.match(markdown, /## Non-goals/);
+  assert.match(markdown, /## Scope/);
+  assert.match(markdown, /## Dependencies/);
   assert.match(markdown, /## Acceptance criteria/);
-  assert.match(markdown, /- \[ \] \*\*AC-1\*\*/);
+  assert.match(markdown, /- \*\*AC-1\*\*/);
+  // Linear rewrites task-list checkboxes on round-trip, so no host-rendered
+  // body may contain them.
+  assert.doesNotMatch(markdown, /- \[ \]/u);
   assert.ok(markdown.endsWith(WORK_ITEM_CONTRACT_END));
 });
 test("normal Linear issue prose stays human-readable and excludes host metadata", () => {
@@ -148,7 +153,10 @@ test("tampering, unknown fields, duplicate markers, and unsafe readiness fail cl
     /AC-1 through AC-99/i,
   );
   assert.throws(
-    () => parseRenderedWorkItemSpecV1(`${renderWorkItemSpecV1(spec)}\n${WORK_ITEM_CONTRACT_END}`),
+    () =>
+      parseRenderedWorkItemSpecV1(
+        `${renderContractBoundIssueBodyV1(spec)}\n${WORK_ITEM_CONTRACT_END}`,
+      ),
     /exactly one complete/i,
   );
 });

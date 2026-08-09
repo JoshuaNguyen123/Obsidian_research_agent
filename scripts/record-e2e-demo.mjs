@@ -341,6 +341,7 @@ $signature = @"
 using System;
 using System.Runtime.InteropServices;
 public static class DemoCaptureWindow {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [StructLayout(LayoutKind.Sequential)]
   public struct RECT {
     public int Left;
@@ -349,22 +350,59 @@ public static class DemoCaptureWindow {
     public int Bottom;
   }
   [DllImport("user32.dll")]
+  public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")]
+  public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
+  [DllImport("user32.dll")]
+  public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")]
   public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")]
   public static extern int GetSystemMetrics(int index);
 }
 "@
 Add-Type -TypeDefinition $signature -ErrorAction SilentlyContinue
-$process = Get-Process Obsidian -ErrorAction SilentlyContinue |
-  Where-Object { $_.MainWindowTitle -and $_.MainWindowHandle -ne 0 } |
-  Select-Object -First 1
-if ($null -eq $process) { exit 3 }
+$obsidianProcessIds = @(Get-Process Obsidian -ErrorAction SilentlyContinue |
+  ForEach-Object { [int]$_.Id })
+if ($obsidianProcessIds.Count -eq 0) { exit 3 }
+$windows = [System.Collections.Generic.List[object]]::new()
+$callback = [DemoCaptureWindow+EnumWindowsProc]{
+  param([IntPtr]$handle, [IntPtr]$unused)
+  [uint32]$windowProcessId = 0
+  [void][DemoCaptureWindow]::GetWindowThreadProcessId($handle, [ref]$windowProcessId)
+  if ($obsidianProcessIds -contains [int]$windowProcessId -and
+      [DemoCaptureWindow]::IsWindowVisible($handle)) {
+    $titleLength = [DemoCaptureWindow]::GetWindowTextLength($handle)
+    if ($titleLength -gt 0) {
+      $titleBuffer = [System.Text.StringBuilder]::new($titleLength + 1)
+      [void][DemoCaptureWindow]::GetWindowText($handle, $titleBuffer, $titleBuffer.Capacity)
+      $windowRect = New-Object DemoCaptureWindow+RECT
+      if ([DemoCaptureWindow]::GetWindowRect($handle, [ref]$windowRect)) {
+        $windows.Add([pscustomobject]@{
+          handle = $handle
+          title = $titleBuffer.ToString()
+          rect = $windowRect
+          area = [long]($windowRect.Right - $windowRect.Left) *
+            [long]($windowRect.Bottom - $windowRect.Top)
+        })
+      }
+    }
+  }
+  return $true
+}
+[void][DemoCaptureWindow]::EnumWindows($callback, [IntPtr]::Zero)
+$window = $windows | Sort-Object area -Descending | Select-Object -First 1
+if ($null -eq $window) { exit 3 }
 $rect = New-Object DemoCaptureWindow+RECT
-if (-not [DemoCaptureWindow]::GetWindowRect($process.MainWindowHandle, [ref]$rect)) {
+if (-not [DemoCaptureWindow]::GetWindowRect($window.handle, [ref]$rect)) {
   exit 4
 }
 [pscustomobject]@{
-  title = $process.MainWindowTitle
+  title = $window.title
   window = [pscustomobject]@{
     left = $rect.Left
     top = $rect.Top
@@ -526,6 +564,7 @@ const child = spawn(
     env: {
       ...process.env,
       DEMO_CAPTURE_DIR: captureDir,
+      E2E_SHOW_OBSIDIAN_WINDOW: "1",
       ...(showcaseVault
         ? {
             OBSIDIAN_VAULT: showcaseVault,

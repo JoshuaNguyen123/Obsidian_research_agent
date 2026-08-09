@@ -4,6 +4,7 @@ import test from "node:test";
 import { detectRepositoryProfileV2 } from "../extensions/code/repositories/RepositoryProfileV2";
 import { createTrustedGitHubRepositoryBindingV1 } from "../src/integrations/github/TrustedGitHubRepositoryBindingV1";
 import {
+  assertFreshGitHubRepositoryBindingV2,
   assertFreshPrivateGitHubRepositoryBindingV2,
   assertGitHubApprovalBindingFreshV2,
   createTrustedGitHubRepositoryBindingV2,
@@ -79,6 +80,48 @@ test("legacy binding upgrades only through a fresh exact private provider readba
   }), /ID does not match/u);
 });
 
+test("TrustedGitHubRepositoryBindingV2 independently binds explicit public visibility", () => {
+  const binding = createTrustedGitHubRepositoryBindingV2({
+    key: "github-fixture",
+    profile: profileFixture(),
+    owner: "acme",
+    repository: "private-agent",
+    repositoryReadback: repositoryFixture(false),
+    expectedVisibility: "public",
+    observedAt: OBSERVED_AT,
+    verifiedAccountId: 202,
+    verifiedAccountLogin: "agent-owner",
+    trustedAt: "2026-07-16T14:00:00.000Z",
+  });
+
+  assert.equal(binding.visibility, "public");
+  assert.equal(
+    assertFreshGitHubRepositoryBindingV2(binding, {
+      now: new Date("2026-07-16T15:04:00.000Z"),
+    }).visibility,
+    "public",
+  );
+  assert.throws(
+    () => assertFreshPrivateGitHubRepositoryBindingV2(binding),
+    /not private/iu,
+  );
+  assert.throws(
+    () => createTrustedGitHubRepositoryBindingV2({
+      key: "github-fixture",
+      profile: profileFixture(),
+      owner: "acme",
+      repository: "private-agent",
+      repositoryReadback: repositoryFixture(true),
+      expectedVisibility: "public",
+      observedAt: OBSERVED_AT,
+      verifiedAccountId: 202,
+      verifiedAccountLogin: "agent-owner",
+      trustedAt: "2026-07-16T14:00:00.000Z",
+    }),
+    /exact active public repository/iu,
+  );
+});
+
 test("publication approval rejects stale visibility and legacy binding fingerprints", () => {
   const binding = createTrustedGitHubRepositoryBindingV2({
     key: "github-fixture",
@@ -126,6 +169,7 @@ function repositoryFixture(privateVisibility: boolean) {
     htmlUrl: "https://github.com/acme/private-agent",
     defaultBranch: "main",
     private: privateVisibility,
+    visibility: privateVisibility ? "private" as const : "public" as const,
     archived: false,
   };
 }

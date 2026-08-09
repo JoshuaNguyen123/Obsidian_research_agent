@@ -17,7 +17,8 @@ export const TOOL_USAGE_POLICY = `TOOL USAGE POLICY (host):
 - Compound sequence (when those stages are in plan):
   research note → Linear create/get → code_workspace_create → edit → validate_fast → repair →
   validate_targeted/full → code_commit_verified (host git add+commit) →
-  github_create_private_repository → publish_verified_code_to_github publish_draft → note reflect.
+  ask public-or-private → github_create_repository with that exact choice → publish_verified_code_to_github publish_draft →
+  note reflect → report_progress_to_linear (comment + level) when that tool is offered.
 - Do not invent git_*, verify_all, patch, send_email, or tools not listed.`;
 
 if (TOOL_USAGE_POLICY.length > TOOL_USAGE_POLICY_MAX_CHARS) {

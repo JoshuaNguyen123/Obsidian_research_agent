@@ -18,9 +18,12 @@ import {
   type AgentConversationMessage,
 } from "./src/conversationHistory";
 import {
+  createSpecialistModelClient,
   createConfiguredModelClient,
   requestUrlTransport,
+  resolveAgentModelSlotV2,
 } from "./src/model/createModelClient";
+import { normalizeSecureProviderBaseUrlV1 } from "./src/model/providerEndpointPolicy";
 import {
   isDirectOllamaCloudApiBaseUrl,
   preflightOllamaCloudAgentCapabilities,
@@ -63,6 +66,7 @@ import {
 import { normalizeModelRouterMode } from "./src/agent/missionRouter";
 import {
   planTopLevelDirectMissionGraphV1,
+  resolveResearchTeamOutputTargetV1,
   resolveTopLevelMissionDispatchV1,
   topLevelDispatchExecutorId,
   type TopLevelMissionDispatchDecisionV1,
@@ -76,6 +80,16 @@ import type {
   MissionGraphV3,
 } from "./src/agent/missionGraphV3";
 import { projectMissionGraphToOrchestratorSnapshot } from "./src/agent/missionGraphLegacyProjection";
+import {
+  resolveTopLevelMissionTerminalV1,
+  type TopLevelMissionTerminalDecisionV1,
+} from "./src/agent/topLevelMissionTerminal";
+import {
+  createTopLevelChildTerminalCheckpointV1,
+  parseTopLevelChildTerminalCheckpointV1,
+  reconcileTopLevelChildTerminalProjectionV1,
+  type TopLevelChildTerminalCheckpointV1,
+} from "./src/agent/topLevelMissionRecovery";
 import { reconcileCompanionMissionCompletionV1 } from "./src/agent/companionMissionReconciliation";
 import type { CompanionEventV1, CompanionReceiptV1 } from "./packages/headless-runtime/src/backgroundContinuation";
 import type {
@@ -257,6 +271,12 @@ import {
   BundledIntegrationsCapability,
   type BundledCapabilitiesV1,
 } from "./src/extensions/BundledCapabilityRuntime";
+import {
+  createProviderHealthResultV1,
+  ProviderHealthCacheV1,
+  type ProviderHealthResultV1,
+} from "./src/extensions/providerHealthCache";
+import { buildNoteDeliveryChatSummaryV1 } from "./src/agent/noteDeliveryChatSummary";
 import { selectExtensionOwnedPluginData } from "./src/extensions/pluginDataOwnership";
 import { withPluginDataLock } from "./extensions/shared/softDependency";
 import {
@@ -277,24 +297,31 @@ import type {
   VerifiedLinearCodeRepositoryBindingV1,
 } from "./src/tools/types";
 import { ScopedToolRegistry } from "./src/tools/ScopedToolRegistry";
-import type { OrchestratorSnapshotV1 } from "./src/orchestrator/types";
+import type {
+  OrchestratorSnapshotV1,
+  SpecialistMode,
+} from "./src/orchestrator/types";
 import {
   normalizeOrchestratorSnapshot,
   reconcileOrphanedOrchestratorSnapshot,
 } from "./src/orchestrator/orchestratorStore";
+import { OrchestratorRuntime } from "./src/orchestrator/orchestratorRuntime";
+import { createAdaptiveTeamScaffoldV2 } from "./src/orchestrator/adaptiveTeam";
 import {
-  OrchestratorRuntime,
-  createCodeTeamScaffold,
-  createResearchTeamScaffold,
-} from "./src/orchestrator/orchestratorRuntime";
-import { resolveResearchTeamDispatchV1 } from "./src/agent/researchTeamDispatch";
+  createSpecialistHandoffV2,
+  fingerprintSpecialistWorkspaceDiff,
+} from "./src/orchestrator/specialistHandoff";
+import { resolveAdaptiveTeamDispatchV2 } from "./src/agent/researchTeamDispatch";
 import { runExtensionVerifiers } from "./src/agent/extensionVerifiers";
 import { runCriticWorker } from "./src/orchestrator/criticWorker";
 import type { VerificationCheck } from "./src/agent/verifiers";
 import { runResearchWorker } from "./src/orchestrator/researchWorker";
 import { mergeResearchWorkerResult } from "./src/orchestrator/teamEvidenceMerge";
 import type { ResearchWorkerResult } from "./src/orchestrator/researchWorker";
-import { shouldContinueResearchLead } from "./src/orchestrator/leadContinuation";
+import {
+  createLeadProgressFingerprintV1,
+  shouldContinueResearchLead,
+} from "./src/orchestrator/leadContinuation";
 import { resolveResearchTeamBudget } from "./src/orchestrator/researchTeamBudget";
 import { summarizeSourceLedger } from "./src/orchestrator/sourceLedgerSummary";
 import { buildResearcherAssignment } from "./src/orchestrator/researcherSoftCatalog";
@@ -416,6 +443,7 @@ import {
   ObsidianSecretStoreV1,
 } from "./src/integrations/ObsidianSecretStoreV1";
 import {
+  createSpecialistCredentialBindingV1,
   emptyModelCredentialReferencesV1,
   ModelCredentialStoreV1,
 } from "./src/integrations/ModelCredentialStoreV1";
@@ -508,6 +536,10 @@ import {
   type TrustedGitHubRepositoryBindingV2,
 } from "./src/integrations/github/TrustedGitHubRepositoryBindingV2";
 import {
+  repositoryVisibilityFromReadback,
+  type RepositoryVisibility,
+} from "./src/integrations/github/RepositoryVisibility";
+import {
   createPendingExternalActionStateV2,
 } from "./src/integrations/PendingExternalActionStateV2";
 import type { VerifiedCodePublicationHandoffV1 } from "./packages/core-api/src";
@@ -515,7 +547,9 @@ import {
   advanceProjectLineageV1,
   createProjectLineageV1,
   createResearcherHandoffV1,
+  parseGitHubPublicationLineageProofV2,
   parseProjectLineageNamespaceV1,
+  projectGitHubPublicationLineageProofV2ToV1,
   ProjectLineageStoreV1,
   type ProjectLineageNamespaceV1,
   type ProjectLineageV1,
@@ -549,6 +583,10 @@ import {
   createResearchProjectHierarchyTool,
   selectAcceptedResearchBindingForCurrentMission,
 } from "./src/tools/researchProjectHierarchyTool";
+import {
+  collectBoundLinearIssueIdsFromProjectLineagesV1,
+  createReportProgressToLinearTool,
+} from "./src/tools/reportProgressToLinearTool";
 import {
   createGitHubPublicationTool,
   type GitHubPublicationBindingResolutionV1,
@@ -707,6 +745,14 @@ export default class AgenticResearcherPlugin extends Plugin {
     provider: DEFAULT_SETTINGS.modelProvider,
     model: DEFAULT_SETTINGS.model,
   };
+  private specialistModelConnectionStatus: ModelConnectionStatusV1 = {
+    status: "untested",
+    message: "Agent 2 connection not tested in this session.",
+    checkedAt: null,
+    latencyMs: null,
+    provider: DEFAULT_SETTINGS.specialistProvider ?? DEFAULT_SETTINGS.modelProvider,
+    model: DEFAULT_SETTINGS.specialistModel || DEFAULT_SETTINGS.model,
+  };
   private missionScheduler: MissionScheduler | null = null;
   private scheduledRunActive = false;
   private semanticIndexQueuedPaths = new Set<string>();
@@ -726,6 +772,8 @@ export default class AgenticResearcherPlugin extends Plugin {
   private companionLinearQueueProjection: CompanionLinearQueueRunDetailsProjectionV1 | null = null;
   private unloading = false;
   private latestOrchestratorSnapshot: OrchestratorSnapshotV1 | null = null;
+  private topLevelChildTerminalCheckpoint: TopLevelChildTerminalCheckpointV1 | null =
+    null;
   /** Model keys live only in memory; plugin data contains opaque SecretStorage references. */
   private modelCredentialStore: ModelCredentialStoreV1 | null = null;
   /** Session-only fallback; plaintext is never written to data.json or tool settings. */
@@ -744,7 +792,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   private githubDeviceFlowState: GitHubDeviceFlowStateV1 | null = null;
   private githubAuthStatusMessage = "GitHub is not connected.";
   private githubAuthGeneration = 0;
-  /** Private-visibility authority is persisted separately from legacy V1 push bindings. */
+  /** Explicit visibility authority is persisted separately from legacy V1 push bindings. */
   private trustedGitHubRepositoryBindingsV2: Record<
     string,
     TrustedGitHubRepositoryBindingV2
@@ -891,6 +939,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     | "checking"
     | "ready"
     | "blocked" = "idle";
+  private readonly providerHealthCache = new ProviderHealthCacheV1();
   private extensionHealthPostMigrationTimer: ReturnType<typeof setTimeout> | null = null;
   private startupPhase = "constructed";
   private startupFailure: string | null = null;
@@ -1293,6 +1342,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     return { ...this.modelConnectionStatus };
   }
 
+  getSpecialistModelConnectionStatus(): ModelConnectionStatusV1 {
+    return { ...this.specialistModelConnectionStatus };
+  }
+
   hasVerifiedModelConnection(): boolean {
     if (
       this.modelConnectionStatus.status === "ready" &&
@@ -1365,10 +1418,36 @@ export default class AgenticResearcherPlugin extends Plugin {
       provider: this.settings.modelProvider,
       model: this.settings.model,
     };
+    if (this.settings.specialistConnectionMode !== "separate") {
+      this.invalidateSpecialistModelConnectionStatus(
+        "Agent 1 changed; retest the shared Agent 2 connection.",
+      );
+    }
     this.activeAgentView?.refreshFirstRunState();
   }
 
-  async testModelConnection(): Promise<ModelConnectionStatusV1> {
+  invalidateSpecialistModelConnectionStatus(
+    message = "Agent 2 connection changed; test it before complex work.",
+  ): void {
+    this.settings.specialistConnectionVerifiedAt = undefined;
+    this.settings.specialistConnectionVerifiedProvider = undefined;
+    this.settings.specialistConnectionVerifiedModel = undefined;
+    this.settings.specialistConnectionVerifiedBaseUrl = undefined;
+    this.settings.specialistConnectionVerifiedMode = undefined;
+    const resolution = resolveAgentModelSlotV2(this.settings, "specialist");
+    this.specialistModelConnectionStatus = {
+      status: "untested",
+      message,
+      checkedAt: null,
+      latencyMs: null,
+      provider: resolution.slot.provider,
+      model: resolution.slot.model,
+    };
+  }
+
+  async testModelConnection(options?: {
+    returnToChatOnSuccess?: boolean;
+  }): Promise<ModelConnectionStatusV1> {
     const provider = this.settings.modelProvider;
     const model = this.settings.model;
     this.modelConnectionStatus = {
@@ -1446,7 +1525,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.settings.modelConnectionVerifiedContextLength =
         cloudCapabilityProof?.contextLength ?? undefined;
       await this.savePluginData();
-      await this.returnToChatAfterFirstRunSetup();
+      if (options?.returnToChatOnSuccess !== false) {
+        await this.returnToChatAfterFirstRunSetup();
+      }
     } catch (error) {
       this.settings.modelConnectionVerifiedAt = undefined;
       this.settings.modelConnectionVerifiedProvider = undefined;
@@ -1466,6 +1547,135 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.activeAgentView?.refreshFirstRunState();
     }
     return this.getModelConnectionStatus();
+  }
+
+  async testSpecialistModelConnection(): Promise<ModelConnectionStatusV1> {
+    const resolution = resolveAgentModelSlotV2(this.settings, "specialist");
+    const { provider, model, baseUrl, connectionMode } = resolution.slot;
+    this.specialistModelConnectionStatus = {
+      status: "testing",
+      message: `Testing Agent 2 (${provider} / ${model}) without exposing credentials...`,
+      checkedAt: null,
+      latencyMs: null,
+      provider,
+      model,
+    };
+    const startedAt = Date.now();
+    try {
+      if (!resolution.available) {
+        const reason =
+          resolution.unavailableReason === "disabled"
+            ? "Agent 2 is disabled."
+            : resolution.unavailableReason === "missing_model"
+              ? "Agent 2 needs a model name or a configured Lead model."
+              : resolution.unavailableReason === "missing_endpoint"
+                ? "Agent 2 separate mode needs its own base URL."
+                : "Agent 2 separate mode needs its own API key; the Lead key is never inherited.";
+        throw new Error(reason);
+      }
+      const client = createSpecialistModelClient(this.settings);
+      if (!client) {
+        throw new Error("Agent 2 client is unavailable for this configuration.");
+      }
+      const specialistKey =
+        connectionMode === "shared_primary"
+          ? provider === "openai_compatible"
+            ? this.settings.openAiCompatibleApiKey
+            : this.settings.ollamaApiKey
+          : this.settings.specialistApiKey ?? "";
+      const cloudCapabilityProof =
+        provider === "ollama" && client.descriptor
+          ? await preflightOllamaCloudAgentCapabilities({
+              descriptor: client.descriptor,
+              baseUrl,
+              apiKey: specialistKey,
+              model,
+              transport: requestUrlTransport,
+              requestTimeoutMs: this.settings.requestTimeoutMs,
+            })
+          : null;
+      const response = await client.chat({
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are Agent 2, the bounded Specialist. This is a connection health check. Reply briefly and do not call tools.",
+          },
+          { role: "user", content: "Agent 2 connection health check." },
+        ],
+        options: { temperature: 0 },
+        evidencePhase: "worker",
+      });
+      if (response.message.role !== "assistant") {
+        throw new Error("Agent 2 provider returned an invalid health-check role.");
+      }
+      const toolProbe = await probeToolCallBehavior((request) =>
+        client.chat({ ...request, model, evidencePhase: "worker" }),
+      ).catch(() => null);
+      const toolSummary =
+        toolProbe?.outcome === "native_tool_call"
+          ? "native tools"
+          : toolProbe?.outcome === "recovered_text_call"
+            ? "text-recovered tools"
+            : "tool emission unverified";
+      const latencyMs = Math.max(0, Date.now() - startedAt);
+      const checkedAt = new Date().toISOString();
+      const connectionSummary =
+        connectionMode === "shared_primary"
+          ? "shared Agent 1 connection"
+          : "dedicated Agent 2 connection";
+      const contextSummary = cloudCapabilityProof?.contextLength
+        ? `, ${cloudCapabilityProof.contextLength.toLocaleString("en-US")}-token context`
+        : "";
+      this.specialistModelConnectionStatus = {
+        status: "ready",
+        message: `Agent 2 connected through the ${connectionSummary} (${client.descriptor?.endpointCategory ?? "custom"}; ${toolSummary}${contextSummary}) in ${latencyMs}ms.`,
+        checkedAt,
+        latencyMs,
+        provider,
+        model,
+      };
+      this.settings.specialistConnectionVerifiedAt = checkedAt;
+      this.settings.specialistConnectionVerifiedProvider = provider;
+      this.settings.specialistConnectionVerifiedModel = model;
+      this.settings.specialistConnectionVerifiedBaseUrl = baseUrl
+        .trim()
+        .replace(/\/+$/u, "");
+      this.settings.specialistConnectionVerifiedMode = connectionMode;
+    } catch (error) {
+      this.settings.specialistConnectionVerifiedAt = undefined;
+      this.settings.specialistConnectionVerifiedProvider = undefined;
+      this.settings.specialistConnectionVerifiedModel = undefined;
+      this.settings.specialistConnectionVerifiedBaseUrl = undefined;
+      this.settings.specialistConnectionVerifiedMode = undefined;
+      this.specialistModelConnectionStatus = {
+        status: "error",
+        message: `Agent 2 connection failed: ${formatModelClientError(error)}`,
+        checkedAt: new Date().toISOString(),
+        latencyMs: Math.max(0, Date.now() - startedAt),
+        provider,
+        model,
+      };
+    }
+    await this.savePluginData();
+    return this.getSpecialistModelConnectionStatus();
+  }
+
+  async testBothModelConnections(): Promise<{
+    lead: ModelConnectionStatusV1;
+    specialist: ModelConnectionStatusV1;
+    ready: boolean;
+  }> {
+    const [lead, specialist] = await Promise.all([
+      this.testModelConnection({ returnToChatOnSuccess: false }),
+      this.testSpecialistModelConnection(),
+    ]);
+    return {
+      lead,
+      specialist,
+      ready: lead.status === "ready" && specialist.status === "ready",
+    };
   }
 
   async openFirstRunModelSetup(): Promise<void> {
@@ -1620,8 +1830,11 @@ export default class AgenticResearcherPlugin extends Plugin {
       conversationHistory: rawHistory,
       researchMemoryIndex: rawResearchMemoryIndex,
       latestOrchestratorSnapshot: rawOrchestratorSnapshot,
+      topLevelChildTerminalCheckpoint: rawTopLevelChildTerminalCheckpoint,
       ollamaApiKey: rawOllamaApiKey,
       openAiCompatibleApiKey: rawOpenAiCompatibleApiKey,
+      specialistApiKey: rawSpecialistApiKey,
+      utilityApiKey: rawUtilityApiKey,
       modelCredentialReferences: rawModelCredentialReferences,
       linearApiKey: rawLinearApiKey,
       linearCredentialReference: rawLinearCredentialReference,
@@ -1656,7 +1869,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     const hadLegacyModelPlaintext =
       (typeof rawOllamaApiKey === "string" && rawOllamaApiKey.trim().length > 0) ||
       (typeof rawOpenAiCompatibleApiKey === "string" &&
-        rawOpenAiCompatibleApiKey.trim().length > 0);
+        rawOpenAiCompatibleApiKey.trim().length > 0) ||
+      (typeof rawSpecialistApiKey === "string" &&
+        rawSpecialistApiKey.trim().length > 0) ||
+      (typeof rawUtilityApiKey === "string" &&
+        rawUtilityApiKey.trim().length > 0);
     void _rawExtensionStateMigration;
     void _rawPluginDataV3Migration;
     // Preserve the exact persisted compatibility inputs before any extension
@@ -1798,14 +2015,50 @@ export default class AgenticResearcherPlugin extends Plugin {
         : "off";
     settings.agenticReflexDiagnosticsEnabled =
       settings.agenticReflexDiagnosticsEnabled !== false;
-    settings.runDetailsDiagnosticsExpanded =
-      settings.runDetailsDiagnosticsExpanded === true;
-    settings.utilityModel =
-      typeof settings.utilityModel === "string" ? settings.utilityModel.trim() : "";
+    const legacyUtilityBaseUrl =
+      typeof settingsData.utilityBaseUrl === "string"
+        ? settingsData.utilityBaseUrl.trim()
+        : "";
+    settings.specialistEnabled = settingsData.specialistEnabled !== false;
+    settings.specialistModel =
+      typeof settingsData.specialistModel === "string"
+        ? settingsData.specialistModel.trim()
+        : typeof settingsData.utilityModel === "string"
+          ? settingsData.utilityModel.trim()
+          : "";
+    settings.specialistConnectionMode =
+      settingsData.specialistConnectionMode === "separate" ||
+      settingsData.specialistConnectionMode === "shared_primary"
+        ? settingsData.specialistConnectionMode
+        : legacyUtilityBaseUrl
+          ? "separate"
+          : "shared_primary";
+    settings.specialistProvider =
+      settingsData.specialistProvider === "openai_compatible" ||
+      settingsData.specialistProvider === "ollama"
+        ? settingsData.specialistProvider
+        : settingsData.utilityModelProvider === "openai_compatible" ||
+            settingsData.utilityModelProvider === "ollama"
+          ? settingsData.utilityModelProvider
+          : settings.modelProvider;
+    settings.specialistBaseUrl =
+      settings.specialistConnectionMode === "separate"
+        ? normalizeBaseUrlSetting(settingsData.specialistBaseUrl) ??
+          normalizeBaseUrlSetting(legacyUtilityBaseUrl) ??
+          ""
+        : "";
+    // Runtime aliases keep schema-4 call sites working during the migration;
+    // savePluginData strips them so they are never persisted again.
+    settings.utilityModel = settings.specialistModel;
     settings.utilityModelProvider =
-      settings.utilityModelProvider === "openai_compatible"
-        ? settings.utilityModelProvider
-        : "ollama";
+      settings.specialistConnectionMode === "separate"
+        ? settings.specialistProvider
+        : settings.modelProvider;
+    settings.utilityBaseUrl =
+      settings.specialistConnectionMode === "separate"
+        ? settings.specialistBaseUrl
+        : "";
+    settings.utilityApiKey = "";
     settings.modelRouterMode = normalizeModelRouterMode(
       settings.modelRouterMode,
       settings.modelRouterEnabled === true,
@@ -1931,11 +2184,25 @@ export default class AgenticResearcherPlugin extends Plugin {
           typeof rawOpenAiCompatibleApiKey === "string"
             ? rawOpenAiCompatibleApiKey
             : "",
+        specialist:
+          typeof rawSpecialistApiKey === "string" && rawSpecialistApiKey.trim()
+            ? rawSpecialistApiKey
+            : typeof rawUtilityApiKey === "string"
+              ? rawUtilityApiKey
+              : "",
       },
+      settings.specialistConnectionMode === "separate" &&
+      settings.specialistBaseUrl
+        ? createSpecialistCredentialBindingV1({
+            provider: settings.specialistProvider,
+            baseUrl: settings.specialistBaseUrl,
+          })
+        : null,
     );
     settings.ollamaApiKey = loadedModelCredentials.values.ollama;
     settings.openAiCompatibleApiKey =
       loadedModelCredentials.values.openAiCompatible;
+    settings.specialistApiKey = loadedModelCredentials.values.specialist;
 
     const normalizedProfiles = normalizeAgentSettings(
       persistedSettingsData,
@@ -1988,6 +2255,49 @@ export default class AgenticResearcherPlugin extends Plugin {
         latencyMs: null,
         provider: settings.modelProvider,
         model: settings.model,
+      };
+    }
+    const specialistResolution = resolveAgentModelSlotV2(
+      settings,
+      "specialist",
+    );
+    const specialistVerifiedConnectionMatches =
+      specialistResolution.available &&
+      typeof settings.specialistConnectionVerifiedAt === "string" &&
+      Number.isFinite(Date.parse(settings.specialistConnectionVerifiedAt)) &&
+      settings.specialistConnectionVerifiedProvider ===
+        specialistResolution.slot.provider &&
+      settings.specialistConnectionVerifiedModel === specialistResolution.slot.model &&
+      settings.specialistConnectionVerifiedBaseUrl ===
+        specialistResolution.slot.baseUrl.trim().replace(/\/+$/u, "") &&
+      settings.specialistConnectionVerifiedMode ===
+        specialistResolution.slot.connectionMode;
+    if (specialistVerifiedConnectionMatches) {
+      this.specialistModelConnectionStatus = {
+        status: "ready",
+        message: `Agent 2 connection previously verified for ${specialistResolution.slot.provider} model ${specialistResolution.slot.model}.`,
+        checkedAt: settings.specialistConnectionVerifiedAt!,
+        latencyMs: null,
+        provider: specialistResolution.slot.provider,
+        model: specialistResolution.slot.model,
+      };
+    } else {
+      settings.specialistConnectionVerifiedAt = undefined;
+      settings.specialistConnectionVerifiedProvider = undefined;
+      settings.specialistConnectionVerifiedModel = undefined;
+      settings.specialistConnectionVerifiedBaseUrl = undefined;
+      settings.specialistConnectionVerifiedMode = undefined;
+      this.specialistModelConnectionStatus = {
+        status: "untested",
+        message:
+          specialistResolution.unavailableReason ===
+          "missing_specialist_credential"
+            ? "Agent 2 separate mode needs its own SecretStorage-backed API key."
+            : "Agent 2 connection has not passed testing for this configuration.",
+        checkedAt: null,
+        latencyMs: null,
+        provider: specialistResolution.slot.provider,
+        model: specialistResolution.slot.model,
       };
     }
     const credentialReference = normalizeLinearCredentialReference(
@@ -2078,6 +2388,10 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.latestOrchestratorSnapshot = normalizeOrchestratorSnapshot(
       rawOrchestratorSnapshot,
     );
+    this.topLevelChildTerminalCheckpoint =
+      parseTopLevelChildTerminalCheckpointV1(
+        rawTopLevelChildTerminalCheckpoint,
+      );
     this.linearIntegrationState = normalizeLinearIntegrationStateOrDefault(
       rawLinearIntegrationState,
     );
@@ -2184,11 +2498,42 @@ export default class AgenticResearcherPlugin extends Plugin {
     ) {
       this.settings.linearQueueEnabled = false;
     }
+    this.settings.specialistEnabled = this.settings.specialistEnabled !== false;
+    this.settings.specialistModel = this.settings.specialistModel?.trim() ?? "";
+    this.settings.specialistConnectionMode =
+      this.settings.specialistConnectionMode === "separate"
+        ? "separate"
+        : "shared_primary";
+    this.settings.specialistProvider =
+      this.settings.specialistProvider === "openai_compatible"
+        ? "openai_compatible"
+        : "ollama";
+    this.settings.specialistBaseUrl =
+      this.settings.specialistConnectionMode === "separate"
+        ? normalizeBaseUrlSetting(this.settings.specialistBaseUrl) ?? ""
+        : "";
+    this.settings.utilityModel = this.settings.specialistModel;
+    this.settings.utilityModelProvider =
+      this.settings.specialistConnectionMode === "separate"
+        ? this.settings.specialistProvider
+        : this.settings.modelProvider;
+    this.settings.utilityBaseUrl =
+      this.settings.specialistConnectionMode === "separate"
+        ? this.settings.specialistBaseUrl
+        : "";
     const retiredModelCredentialReferences = this.modelCredentialStore
       ? await this.modelCredentialStore.synchronize({
           ollama: this.settings.ollamaApiKey,
           openAiCompatible: this.settings.openAiCompatibleApiKey,
-        })
+          specialist: this.settings.specialistApiKey ?? "",
+        },
+        this.settings.specialistConnectionMode === "separate" &&
+        this.settings.specialistBaseUrl
+          ? createSpecialistCredentialBindingV1({
+              provider: this.settings.specialistProvider,
+              baseUrl: this.settings.specialistBaseUrl,
+            })
+          : null)
       : [];
     await this.savePluginData();
     await this.modelCredentialStore?.removeRetired(
@@ -2631,8 +2976,12 @@ export default class AgenticResearcherPlugin extends Plugin {
       await auth.removeCredential(credential);
       this.githubAuthStatusMessage = "GitHub was disconnected and its local credential was removed.";
     } catch {
+      this.githubCredential = credential;
+      this.settings.githubEnabled = true;
+      await this.savePluginData().catch(() => undefined);
       this.githubAuthStatusMessage =
-        "GitHub was disconnected, but secure-store cleanup could not be verified.";
+        "GitHub disconnect was not completed because secure-store cleanup could not be verified; the credential reference was retained for retry.";
+      return { ok: false, message: this.githubAuthStatusMessage };
     }
     return { ok: true, message: this.githubAuthStatusMessage };
   }
@@ -2723,8 +3072,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         timeoutMs: Math.min(this.settings.requestTimeoutMs, 30_000),
       });
       const remote = await client.getRepository(owner, repository, signal);
+      const visibility = repositoryVisibilityFromReadback(remote);
       if (
-        remote.private !== true ||
+        visibility === null ||
         remote.archived ||
         remote.fullName.toLowerCase() !== `${owner}/${repository}`.toLowerCase() ||
         remote.defaultBranch !== profile.defaultBranch
@@ -2741,12 +3091,13 @@ export default class AgenticResearcherPlugin extends Plugin {
         verifiedAccountLogin: account.login,
         trustedAt,
       });
-      const privateBinding = createTrustedGitHubRepositoryBindingV2({
+      const repositoryBinding = createTrustedGitHubRepositoryBindingV2({
         key: binding.key,
         profile,
         owner,
         repository,
         repositoryReadback: remote,
+        expectedVisibility: visibility,
         observedAt: new Date().toISOString(),
         verifiedAccountId: account.id,
         verifiedAccountLogin: account.login,
@@ -2754,7 +3105,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       });
       this.trustedGitHubRepositoryBindingsV2 = {
         ...this.trustedGitHubRepositoryBindingsV2,
-        [profile.key]: privateBinding,
+        [profile.key]: repositoryBinding,
       };
       await this.savePluginData();
       return use({ client, binding, profile, repositoryReadback: remote });
@@ -6509,6 +6860,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       runMission: (prompt) => this.runMission(prompt, []),
       runReviewRepairMission: (prompt) =>
         this.runReviewRepairCodeMission(prompt, []),
+      onHealthChanged: () => this.refreshExtensionRuntimeProjection(),
     });
     const companion = new BundledCompanionCapability({
       api,
@@ -6525,6 +6877,18 @@ export default class AgenticResearcherPlugin extends Plugin {
       migrationOffer: this.getExtensionStateMigrationOffer(
         "agentic-researcher-integrations",
       ),
+      readLinearHealth: () =>
+        this.providerHealthCache.read({
+          provider: "linear",
+          enabled: this.settings.linearEnabled === true,
+          credentialPresent: this.hasLinearApiKey(),
+        }),
+      readGitHubHealth: () =>
+        this.providerHealthCache.read({
+          provider: "github",
+          enabled: this.settings.githubEnabled === true,
+          credentialPresent: this.githubCredential !== null,
+        }),
     });
     try {
       await code.initialize();
@@ -6915,6 +7279,226 @@ export default class AgenticResearcherPlugin extends Plugin {
     return this.extensionHealthProjection.health;
   }
 
+  /**
+   * User-triggered live verification. Linear and GitHub provider calls are
+   * intentionally reachable only through this explicit action (or their
+   * existing dedicated connection-test controls), never through passive UI
+   * rendering.
+   */
+  async refreshCapabilityHealth(): Promise<{ ok: boolean; message: string }> {
+    const generation = this.providerHealthCache.beginRefresh();
+    const code = this.getBundledCapability<BundledCodeCapability>(
+      "agentic-researcher-code",
+    );
+    const codeBoundary = await code
+      ?.ensureHostProvisionedSandboxReadinessV1()
+      .catch(() => undefined);
+    const generatedArtifact = codeBoundary?.executionAvailable
+      ? await code
+          ?.probeGeneratedArtifactExecutionReadbackV1()
+          .catch(() => undefined)
+      : undefined;
+
+    const results = await Promise.all([
+      this.probeLinearProviderHealth(),
+      this.probeGitHubProviderHealth(),
+    ]);
+    if (!this.providerHealthCache.commit(generation, results)) {
+      return {
+        ok: false,
+        message: "A newer health refresh finished first; the older result was discarded.",
+      };
+    }
+    this.refreshExtensionRuntimeProjection();
+    return {
+      ok:
+        codeBoundary?.executionAvailable === true &&
+        generatedArtifact?.status === "healthy" &&
+        results.every((result) =>
+          ["healthy", "disabled"].includes(result.status),
+        ),
+      message: [
+        codeBoundary
+          ? `Code sandbox: ${codeBoundary.executionAvailable ? "healthy" : "degraded"}`
+          : "Code sandbox: unavailable",
+        generatedArtifact
+          ? `Generated artifact: ${generatedArtifact.status}`
+          : "Generated artifact: blocked",
+        ...results.map((result) => `${result.provider}: ${result.status}`),
+      ].join("; "),
+    };
+  }
+
+  async runCompanionCapabilityAction(
+    action: "install" | "connect" | "provision_signer",
+  ): Promise<{ ok: boolean; message: string }> {
+    const companion = this.getBundledCapability<BundledCompanionCapability>(
+      "agentic-researcher-companion",
+    );
+    if (!companion) {
+      return { ok: false, message: "The built-in Companion capability is unavailable." };
+    }
+    try {
+      let message: string;
+      if (action === "install") {
+        const result = await companion.installCompanionService();
+        message = `Companion installed and connected (${result.platform}).`;
+      } else if (action === "provision_signer") {
+        const fingerprint = await companion.provisionHostApprovalSigner();
+        message = `Companion signing key verified (${fingerprint.slice(0, 23)}…).`;
+      } else {
+        await companion.connectCompanionService();
+        message = "Authenticated Companion service connected.";
+      }
+      this.refreshExtensionRuntimeProjection();
+      return { ok: true, message };
+    } catch (error) {
+      this.refreshExtensionRuntimeProjection();
+      return {
+        ok: false,
+        message: sanitizeExtensionRuntimeError(error),
+      };
+    }
+  }
+
+  private async probeLinearProviderHealth(): Promise<ProviderHealthResultV1> {
+    const checkedAt = new Date();
+    if (this.settings.linearEnabled !== true) {
+      return createProviderHealthResultV1({
+        provider: "linear",
+        status: "disabled",
+        summary: "Linear is switched off.",
+        checkedAt,
+      });
+    }
+    if (!this.hasLinearApiKey()) {
+      return createProviderHealthResultV1({
+        provider: "linear",
+        status: "blocked",
+        summary: "Linear is enabled but has no verified credential.",
+        checkedAt,
+      });
+    }
+    try {
+      const snapshot = await discoverLinearCapabilities(
+        this.createSecretBackedLinearClient(),
+        {
+          deadlineAt:
+            Date.now() + Math.min(this.settings.requestTimeoutMs, 30_000),
+          freshnessTtlMs: 15 * 60_000,
+        },
+      );
+      const configured = [
+        ["team", this.settings.linearDefaultTeamId, snapshot.teams],
+        ["project", this.settings.linearQueueProjectId, snapshot.projects],
+        ["ready state", this.settings.linearReadyStateId, snapshot.workflowStates],
+        ["started state", this.settings.linearStartedStateId, snapshot.workflowStates],
+        ["completed state", this.settings.linearCompletedStateId, snapshot.workflowStates],
+      ] as const;
+      const mismatches = configured.flatMap(([label, id, collection]) =>
+        typeof id !== "string" || !id.trim()
+          ? [`${label}:not_configured`]
+          : collection.some((item) => item.id === id)
+            ? []
+            : [`${label}:identity_mismatch`],
+      );
+      const healthy = mismatches.length === 0;
+      return createProviderHealthResultV1({
+        provider: "linear",
+        status: healthy ? "healthy" : "degraded",
+        summary: healthy
+          ? `Linear verified ${snapshot.workspace.name ?? snapshot.workspace.id} as ${snapshot.viewer.name ?? snapshot.viewer.id}.`
+          : `Linear provider readback succeeded, but configured selections need attention: ${mismatches.join(", ")}.`,
+        checkedAt,
+        details: {
+          viewerId: snapshot.viewer.id,
+          workspaceId: snapshot.workspace.id,
+          teamCount: snapshot.teams.length,
+          projectCount: snapshot.projects.length,
+          workflowStateCount: snapshot.workflowStates.length,
+          identityMatch: healthy,
+        },
+      });
+    } catch (error) {
+      return createProviderHealthResultV1({
+        provider: "linear",
+        status: "degraded",
+        summary: `Linear provider verification failed: ${sanitizeExtensionRuntimeError(error)}`,
+        checkedAt,
+      });
+    }
+  }
+
+  private async probeGitHubProviderHealth(): Promise<ProviderHealthResultV1> {
+    const checkedAt = new Date();
+    if (this.settings.githubEnabled !== true) {
+      return createProviderHealthResultV1({
+        provider: "github",
+        status: "disabled",
+        summary: "GitHub is switched off.",
+        checkedAt,
+      });
+    }
+    const credential = this.githubCredential;
+    if (!credential) {
+      return createProviderHealthResultV1({
+        provider: "github",
+        status: "blocked",
+        summary: "GitHub is enabled but has no verified credential.",
+        checkedAt,
+      });
+    }
+    try {
+      return await this.withGitHubCredentialToken(async (token, account) => {
+        const identity = await new GitHubRestClient({
+          transport: requestUrlTransport,
+          token,
+          timeoutMs: Math.min(this.settings.requestTimeoutMs, 30_000),
+        }).getAuthenticatedUserWithOAuthScopes();
+        const identityMatch =
+          identity.id === account.id &&
+          identity.login.toLowerCase() === account.login.toLowerCase();
+        const expectedScopes = credential.scopes ?? [];
+        const observedScopes = identity.oauthScopes;
+        const scopesMatch =
+          expectedScopes.length > 0 &&
+          observedScopes !== null &&
+          expectedScopes.every((scope) => observedScopes.includes(scope));
+        const healthy = identityMatch && scopesMatch;
+        return createProviderHealthResultV1({
+          provider: "github",
+          status: healthy ? "healthy" : "degraded",
+          summary: healthy
+            ? `GitHub verified ${identity.login} and the required OAuth scopes.`
+            : identityMatch
+              ? "GitHub identity matched, but required scope readback is unavailable or incomplete."
+              : "GitHub provider identity does not match the pinned account.",
+          checkedAt,
+          details: {
+            accountId: identity.id,
+            accountLogin: identity.login,
+            identityMatch,
+            scopesMatch,
+            expectedScopes,
+            observedScopes: observedScopes ?? [],
+          },
+        });
+      });
+    } catch (error) {
+      return createProviderHealthResultV1({
+        provider: "github",
+        status: "degraded",
+        summary: `GitHub provider verification failed: ${sanitizeExtensionRuntimeError(error)}`,
+        checkedAt,
+      });
+    }
+  }
+
+  async openCapabilityDiagnostics(): Promise<void> {
+    await this.activateView();
+    this.activeAgentView?.openRunDetails(true);
+  }
+
   private refreshExtensionRuntimeProjection(): void {
     const revision = ++this.extensionHealthRefreshRevision;
     this.extensionHealthAbortController?.abort("extension_health_superseded");
@@ -7034,11 +7618,15 @@ export default class AgenticResearcherPlugin extends Plugin {
    * prompts that preserve MissionGraph authority must skip this.
    */
   async clearLatestOrchestratorSnapshot(): Promise<void> {
-    if (this.latestOrchestratorSnapshot === null) {
+    if (
+      this.latestOrchestratorSnapshot === null &&
+      this.topLevelChildTerminalCheckpoint === null
+    ) {
       this.activeAgentView?.refreshOrchestratorAvailability();
       return;
     }
     this.latestOrchestratorSnapshot = null;
+    this.topLevelChildTerminalCheckpoint = null;
     await this.savePluginData();
     this.activeAgentView?.refreshOrchestratorAvailability();
   }
@@ -7053,12 +7641,52 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   private async reconcilePersistedOrchestratorProjection(): Promise<void> {
     const snapshot = this.latestOrchestratorSnapshot;
-    if (!snapshot || snapshot.status !== "running") return;
+    if (!snapshot || snapshot.status !== "running") {
+      if (this.topLevelChildTerminalCheckpoint) {
+        this.topLevelChildTerminalCheckpoint = null;
+        await this.savePluginData();
+      }
+      return;
+    }
     const coordinator = this.runCoordinator.getSnapshot();
     if (coordinator.isRunning && coordinator.runId === snapshot.runId) return;
-    const reconciled = reconcileOrphanedOrchestratorSnapshot(snapshot);
+    const reconciled =
+      reconcileTopLevelChildTerminalProjectionV1(
+        snapshot,
+        this.topLevelChildTerminalCheckpoint,
+      ) ?? reconcileOrphanedOrchestratorSnapshot(snapshot);
     if (!reconciled) return;
-    await this.setLatestOrchestratorSnapshot(reconciled);
+    this.latestOrchestratorSnapshot = reconciled;
+    this.topLevelChildTerminalCheckpoint = null;
+    await this.savePluginData();
+    this.activeAgentView?.refreshOrchestratorAvailability();
+  }
+
+  private async checkpointTopLevelChildTerminal(
+    parentRunId: string,
+    childRunId: string,
+    terminal: TopLevelMissionTerminalDecisionV1,
+  ): Promise<void> {
+    this.topLevelChildTerminalCheckpoint =
+      createTopLevelChildTerminalCheckpointV1({
+        parentRunId,
+        childRunId,
+        terminal,
+      });
+    await this.savePluginData();
+  }
+
+  private async clearTopLevelChildTerminalCheckpoint(
+    parentRunId: string,
+  ): Promise<void> {
+    if (
+      !this.topLevelChildTerminalCheckpoint ||
+      this.topLevelChildTerminalCheckpoint.parentRunId !== parentRunId
+    ) {
+      return;
+    }
+    this.topLevelChildTerminalCheckpoint = null;
+    await this.savePluginData();
   }
 
   async appendConversationMessage(message: AgentConversationMessage) {
@@ -7106,10 +7734,20 @@ export default class AgenticResearcherPlugin extends Plugin {
         const {
           ollamaApiKey: _ollamaApiKey,
           openAiCompatibleApiKey: _openAiCompatibleApiKey,
+          specialistApiKey: _specialistApiKey,
+          utilityApiKey: _utilityApiKey,
+          utilityModel: _utilityModel,
+          utilityModelProvider: _utilityModelProvider,
+          utilityBaseUrl: _utilityBaseUrl,
           ...persistableSettings
         } = this.settings;
         void _ollamaApiKey;
         void _openAiCompatibleApiKey;
+        void _specialistApiKey;
+        void _utilityApiKey;
+        void _utilityModel;
+        void _utilityModelProvider;
+        void _utilityBaseUrl;
         await withPluginDataLock(this, async () => {
           const extensionOwnedData = selectExtensionOwnedPluginData(
             await this.loadData(),
@@ -7138,6 +7776,8 @@ export default class AgenticResearcherPlugin extends Plugin {
             conversationHistory: this.conversationHistory,
             researchMemoryIndex: this.researchMemoryIndex,
             latestOrchestratorSnapshot: this.latestOrchestratorSnapshot,
+            topLevelChildTerminalCheckpoint:
+              this.topLevelChildTerminalCheckpoint,
             linearIntegrationState: this.linearIntegrationState,
             pendingLinearReconciliationState: this.pendingLinearReconciliationState,
             externalActionReceiptLedger: this.externalActionReceiptLedger,
@@ -7716,12 +8356,15 @@ export default class AgenticResearcherPlugin extends Plugin {
         (this.settings.autoContinueLongRuns !== false &&
           isExplicitLongRunningResearchPrompt(prompt)));
     const maxSegments = autoContinueLongRun
-      ? completionDrivenLoops
-        ? Math.min(
-            48,
-            Math.max(4, this.settings.maxCompletionSegments ?? 24),
-          )
-        : Math.min(8, Math.max(1, this.settings.maxLongRunSegments ?? 4))
+      ? Math.min(
+          isExplicitLongRunningResearchPrompt(prompt) ? 3 : 2,
+          Math.max(
+            1,
+            completionDrivenLoops
+              ? this.settings.maxCompletionSegments ?? 2
+              : this.settings.maxLongRunSegments ?? 2,
+          ),
+        )
       : 1;
     const assistantCapture: AgentRunEvents = {
       onAssistantMessageStart: () => {
@@ -7768,7 +8411,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           }
 
           const codeTeamRequest = parseExplicitCodeTeamRequest(prompt);
-          const researchTeamDispatch = await resolveResearchTeamDispatchV1({
+          const adaptiveTeamDispatch = await resolveAdaptiveTeamDispatchV2({
             prompt,
             orchestratorEnabled: this.settings.orchestratorEnabled !== false,
             forceChatOnly: options.forceChatOnly === true,
@@ -7776,16 +8419,20 @@ export default class AgenticResearcherPlugin extends Plugin {
             embeddingProvider: this.getSemanticEmbeddingProvider(),
           });
           events.onStatus?.(
-            `Research-team routing: ${researchTeamDispatch.useTeam ? "team" : "single"} [${researchTeamDispatch.signals.join(", ")}]`,
+            `Adaptive-team routing: ${adaptiveTeamDispatch.useTeam ? "Lead + Specialist" : "single"} [${adaptiveTeamDispatch.signals.join(", ")}]`,
           );
           const directDispatch = resolveTopLevelMissionDispatchV1({
             codeTeamRequest,
             codeTeamBridgeIntent: hasCodeTeamBridgeIntent(prompt),
-            researchTeamRequested: researchTeamDispatch.useTeam,
+            researchTeamRequested: adaptiveTeamDispatch.useTeam,
             orchestratorEnabled: this.settings.orchestratorEnabled !== false,
             forceChatOnly: options.forceChatOnly === true,
             codeExtensionAvailable: this.getOptionalExtensionCapabilities().code,
             codeClarificationMessage: CODE_TEAM_CLARIFY_TEMPLATE,
+            researchOutputTarget: resolveResearchTeamOutputTargetV1(
+              prompt,
+              options.forceChatOnly === true,
+            ),
           });
 
           if (directDispatch.kind !== "single_agent") {
@@ -7882,17 +8529,27 @@ export default class AgenticResearcherPlugin extends Plugin {
                       conversationHistory,
                       abortSignal,
                       events,
+                      forceChatOnly: options.forceChatOnly === true,
+                      specialistModes: adaptiveTeamDispatch.specialistModes,
                     });
+              await this.checkpointTopLevelChildTerminal(
+                canonicalDispatch.session.graph.missionId,
+                snapshot?.runId ?? canonicalDispatch.session.graph.missionId,
+                resolveTopLevelMissionTerminalV1({
+                  childStatus: snapshot?.status ?? null,
+                }),
+              );
               await this.finalizeTopLevelDirectMission(
                 canonicalDispatch.session,
                 snapshot,
               );
             } catch (error) {
-              await this.blockTopLevelDirectMission(
+              await this.terminalizeTopLevelDirectMission(
                 canonicalDispatch.session,
-                "direct_executor_failed",
-                getUnknownErrorMessage(error),
-                "Inspect executor evidence and retry only after correcting the failure.",
+                resolveTopLevelMissionTerminalV1({
+                  userStopped: abortSignal.aborted,
+                  failureMessage: getUnknownErrorMessage(error),
+                }),
               ).catch(() => undefined);
               throw error;
             } finally {
@@ -7903,6 +8560,9 @@ export default class AgenticResearcherPlugin extends Plugin {
               }
               await this.persistCanonicalOrchestratorProjection(
                 canonicalDispatch.session.graph,
+              );
+              await this.clearTopLevelChildTerminalCheckpoint(
+                canonicalDispatch.session.graph.missionId,
               );
             }
             return;
@@ -7987,6 +8647,12 @@ export default class AgenticResearcherPlugin extends Plugin {
     } finally {
       if (assistantContent.trim()) {
         try {
+          const snapshot = this.runCoordinator.getSnapshot();
+          assistantContent = buildNoteDeliveryChatSummaryV1({
+            fullContent: assistantContent,
+            noteOutputPlan: snapshot.lastConfig?.noteOutputPlan,
+            receipts: snapshot.lastReceipts,
+          });
           await this.appendConversationMessage({
             role: "assistant",
             content: assistantContent,
@@ -8185,66 +8851,77 @@ export default class AgenticResearcherPlugin extends Plugin {
     message: string,
     requiredAction: string,
   ): Promise<void> {
-    let node = session.graph.nodes.dispatch;
-    if (!node || ["blocked", "complete", "cancelled"].includes(node.status)) {
-      return;
-    }
-    if (node.status === "ready") {
-      await session.startNode(node.id);
-      node = session.graph.nodes.dispatch;
-    }
-    const failureFingerprint = await sha256Fingerprint({
-      missionId: session.graph.missionId,
-      code,
-      message,
-    });
-    await session.recordFailure(node.id, failureFingerprint, {
+    await this.terminalizeTopLevelDirectMission(session, {
+      version: 1,
+      kind: "blocked",
       code,
       message,
       requiredAction,
     });
   }
 
+  private async terminalizeTopLevelDirectMission(
+    session: MissionGraphSession,
+    terminal: TopLevelMissionTerminalDecisionV1,
+  ): Promise<void> {
+    if (terminal.kind === "complete") return;
+    const nodeIds = ["dispatch", "final"] as const;
+    for (const nodeId of nodeIds) {
+      const node = session.graph.nodes[nodeId];
+      if (!node || ["complete", "cancelled"].includes(node.status)) continue;
+      if (terminal.kind === "cancelled") {
+        await session.transitionNode(nodeId, "cancelled");
+        continue;
+      }
+      if (node.status === "blocked") continue;
+      await session.transitionNode(nodeId, "blocked", {
+        code: terminal.code,
+        message: terminal.message,
+        requiredAction: terminal.requiredAction,
+      });
+    }
+  }
+
   private async finalizeTopLevelDirectMission(
     session: MissionGraphSession,
     snapshot: OrchestratorSnapshotV1 | null,
   ): Promise<void> {
-    const node = session.graph.nodes.dispatch;
-    if (!node || ["blocked", "cancelled", "complete"].includes(node.status)) {
-      return;
-    }
-    if (!snapshot || snapshot.status !== "complete") {
-      const message = snapshot
-        ? `Direct executor stopped with ${snapshot.status}.`
-        : "Direct executor did not return a readback snapshot.";
-      await this.blockTopLevelDirectMission(
-        session,
-        "direct_executor_incomplete",
-        message,
-        "Inspect executor evidence and resume from the persisted mission graph.",
-      );
+    let node = session.graph.nodes.dispatch;
+    if (!node) return;
+    const terminal = resolveTopLevelMissionTerminalV1({
+      childStatus: snapshot?.status ?? null,
+    });
+    if (terminal.kind !== "complete") {
+      await this.terminalizeTopLevelDirectMission(session, terminal);
       return;
     }
 
+    if (["blocked", "cancelled"].includes(node.status)) return;
+
     if (node.status === "waiting_approval") {
       await session.transitionNode(node.id, "running");
+      node = session.graph.nodes.dispatch;
     }
     const observedAt = new Date().toISOString();
     const snapshotFingerprint = await sha256Fingerprint(snapshot);
-    await session.recordSuccessfulAttempt(node.id);
-    await session.appendEvidence(node.id, {
-      id: `orchestrator-result-${session.graph.revision + 1}`,
-      kind: "orchestrator-result",
-      fingerprint: snapshotFingerprint,
-      observedAt,
-    });
-    await session.transitionNode(node.id, "verifying");
-    await session.transitionNode(node.id, "complete");
+    if (node.status !== "complete") {
+      await session.recordSuccessfulAttempt(node.id);
+      await session.appendEvidence(node.id, {
+        id: `orchestrator-result-${session.graph.revision + 1}`,
+        kind: "orchestrator-result",
+        fingerprint: snapshotFingerprint,
+        observedAt,
+      });
+      await session.transitionNode(node.id, "verifying");
+      await session.transitionNode(node.id, "complete");
+    }
     await session.promoteReadyNodes();
-    await session.completeFinalOutput({
-      outputFingerprint: snapshotFingerprint,
-      observedAt,
-    });
+    if (session.graph.nodes.final?.status !== "complete") {
+      await session.completeFinalOutput({
+        outputFingerprint: snapshotFingerprint,
+        observedAt,
+      });
+    }
   }
 
   /**
@@ -8290,6 +8967,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     events: AgentRunEvents;
     toolRegistry?: ToolRegistry;
     forceChatOnly?: boolean;
+    specialistModes?: SpecialistMode[];
   }): Promise<OrchestratorSnapshotV1 | null> {
     const workerMaxMinutes = this.settings.orchestratorWorkerMaxMinutes ?? 15;
     const configuredMaxRunMinutes =
@@ -8298,7 +8976,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       this.settings.maxRunMinutes > 0
         ? Math.trunc(this.settings.maxRunMinutes)
         : null;
-    // Lead needs a real synthesis window after the Researcher. Derive from
+    // Lead needs a real synthesis window after the Adaptive Specialist. Derive from
     // worker minutes + maxRunMinutes (when set); never hard-cap root at 30m
     // while settings allow a longer worker budget.
     const leadMaxMinutes = Math.max(
@@ -8314,6 +8992,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
     try {
     const runId = input.runId ?? createAgentRunId();
+    const teamBaseRegistry = input.toolRegistry ?? this.createToolRegistry();
+    const teamReadOnlyRegistry = new ScopedToolRegistry(
+      teamBaseRegistry,
+      (_toolName, descriptor) => descriptor?.effect === "read",
+    );
     const teamBudget = resolveResearchTeamBudget({
       configuredMaxAgentSteps: this.settings.maxAgentSteps,
       requestedWorkerMaxSteps: this.settings.orchestratorWorkerMaxSteps,
@@ -8342,13 +9025,13 @@ export default class AgenticResearcherPlugin extends Plugin {
       ? leadMaxToolCalls - leadContinuationToolCalls
       : leadMaxToolCalls;
     const leadMaxSegments = Math.min(
-      24,
-      Math.max(4, this.settings.maxCompletionSegments ?? 24),
+      3,
+      Math.max(1, this.settings.maxCompletionSegments ?? 3),
     );
     let operationalSnapshot: OrchestratorSnapshotV1 | null = null;
     const runtime = new OrchestratorRuntime({
       runId,
-      mode: "research_team",
+      mode: "adaptive_team",
       repository: {
         read: async (requestedRunId) =>
           operationalSnapshot?.runId === requestedRunId
@@ -8358,6 +9041,15 @@ export default class AgenticResearcherPlugin extends Plugin {
           operationalSnapshot = normalizeOrchestratorSnapshot(snapshot);
         },
       },
+      onEvent: async (event, snapshot) => {
+        // Keep the live two-participant projection visible and forward it into
+        // the coordinator event stream. The Lead's Mission Ledger persists the
+        // complete adaptive task tree/handoff; the separate latest projection
+        // returns to canonical MissionGraph state when the parent finalizes.
+        this.latestOrchestratorSnapshot = normalizeOrchestratorSnapshot(snapshot);
+        input.events.onOrchestratorEvent?.(event, snapshot);
+        this.activeAgentView?.refreshOrchestratorAvailability();
+      },
       // Legacy runtime events are executor-local telemetry. MissionGraphV3 is
       // the only state projected to the primary UI and durable plugin state.
       rootModelSteps: teamBudget.rootModelSteps,
@@ -8365,12 +9057,20 @@ export default class AgenticResearcherPlugin extends Plugin {
       rootWallClockMs,
       finalizationReserveSteps: 4,
     });
-    const scaffold = createResearchTeamScaffold({
+    const specialistModes =
+      input.specialistModes && input.specialistModes.length > 0
+        ? input.specialistModes
+        : ["researcher" as const];
+    const scaffold = createAdaptiveTeamScaffoldV2({
       runId,
       mission: input.prompt,
-      workerMaxSteps,
-      workerMaxToolCalls,
-      workerMaxMinutes,
+      specialistModes,
+      specialistMaxSteps: workerMaxSteps,
+      specialistMaxToolCalls: workerMaxToolCalls,
+      specialistMaxMinutes: workerMaxMinutes,
+      leadMaxSteps,
+      leadMaxToolCalls,
+      leadMaxMinutes,
     });
     runtime.registerParticipantBudget({
       participantId: "lead",
@@ -8380,42 +9080,51 @@ export default class AgenticResearcherPlugin extends Plugin {
       lead: true,
     });
     runtime.registerParticipantBudget({
-      participantId: "researcher",
+      participantId: "specialist",
       modelSteps: workerMaxSteps,
       toolCalls: workerMaxToolCalls,
       wallClockMs: workerMaxMinutes * 60_000,
     });
 
-    const researchNodeId = `${runId}:research`;
-    const handoffNodeId = `${runId}:handoff`;
-    const leadNodeId = `${runId}:lead`;
-    const verifyNodeId = `${runId}:verify`;
-    const rootNodeId = `${runId}:mission`;
+    const researchNodeId = scaffold.nodeIds.specialist;
+    const handoffNodeId = scaffold.nodeIds.handoff;
+    const leadNodeId = scaffold.nodeIds.lead;
+    const verifyNodeId = scaffold.nodeIds.verify;
+    const rootNodeId = scaffold.nodeIds.root;
     await runtime.start(scaffold);
     const teamAutonomyStats = createAutonomyRunStats();
     const teamStartedAt = Date.now();
-    input.events.onStatus?.("Researcher gathering Soft evidence...");
+    input.events.onStatus?.(
+      `Adaptive Specialist (${specialistModes[0]}) gathering bounded evidence...`,
+    );
     await runtime.progress(researchNodeId, {
       status: "running",
-      lastAction: "Researcher accepted a read-only assignment.",
+      lastAction: `Adaptive Specialist entered ${specialistModes[0]} mode with read-only mission authority.`,
     });
-    await runtime.updateParticipant("researcher", {
+    await runtime.updateParticipant("specialist", {
       status: "researching",
+      specialistMode: specialistModes[0],
       startedAt: new Date().toISOString(),
       lastAction: "Inspecting independent web and vault evidence.",
     });
 
     let workerResult: ResearchWorkerResult | null = null;
+    const specialistModelClient = createSpecialistModelClient(this.settings);
     const workerStartedAt = Date.now();
     const workerDeadline = createLinkedDeadlineSignal(
       rootDeadline.signal,
       workerMaxMinutes * 60_000,
-      "Researcher wall-clock budget exhausted.",
+      "Adaptive Specialist wall-clock budget exhausted.",
     );
     try {
+      if (!specialistModelClient) {
+        throw new Error(
+          "Adaptive Specialist model slot is unavailable; Lead will continue in safe single-agent mode.",
+        );
+      }
       workerResult = await runResearchWorker({
         runId,
-        participantId: "researcher",
+        participantId: "specialist",
         leadParticipantId: "lead",
         taskId: researchNodeId,
         assignment: buildResearcherAssignment({
@@ -8426,8 +9135,8 @@ export default class AgenticResearcherPlugin extends Plugin {
           ),
         }),
         originalMission: input.prompt,
-        modelClient: this.createModelClient(),
-        toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
+        modelClient: specialistModelClient,
+        toolRegistry: teamReadOnlyRegistry,
         toolContext: this.createToolExecutionContext(input.prompt),
         abortSignal: workerDeadline.signal,
         maxSteps: workerMaxSteps,
@@ -8438,12 +9147,12 @@ export default class AgenticResearcherPlugin extends Plugin {
           },
           onStatus: async (status) => {
             recordResearcherStep(teamAutonomyStats);
-            input.events.onStatus?.(`Researcher step: ${status}`);
+            input.events.onStatus?.(`Adaptive Specialist step: ${status}`);
             await runtime.progress(researchNodeId, {
               status: "running",
               lastAction: status,
             });
-            await runtime.updateParticipant("researcher", {
+            await runtime.updateParticipant("specialist", {
               status: "researching",
               lastAction: status,
             });
@@ -8451,7 +9160,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           onToolStart: async (event) => {
             recordResearcherStep(teamAutonomyStats);
             input.events.onStatus?.(
-              `Researcher step: using ${event.name}...`,
+              `Adaptive Specialist step: using ${event.name}...`,
             );
             await runtime.progress(researchNodeId, {
               lastAction: `Using ${event.name}`,
@@ -8465,19 +9174,19 @@ export default class AgenticResearcherPlugin extends Plugin {
         },
       });
       await runtime.consumeOrThrow(
-        "researcher",
+        "specialist",
         "modelSteps",
         Math.max(1, workerResult.modelSteps),
       );
       if (workerResult.toolCalls > 0) {
         await runtime.consumeOrThrow(
-          "researcher",
+          "specialist",
           "toolCalls",
           workerResult.toolCalls,
         );
       }
       await runtime.consumeOrThrow(
-        "researcher",
+        "specialist",
         "wallClockMs",
         Math.max(1, Date.now() - workerStartedAt),
       );
@@ -8488,12 +9197,33 @@ export default class AgenticResearcherPlugin extends Plugin {
         researchNodeId,
         workerResult.finalSummary,
       );
-      await runtime.updateParticipant("researcher", {
+      await runtime.updateParticipant("specialist", {
         status: "handoff",
         handoffStatus: "ready",
         lastAction: "Structured evidence handoff ready.",
       });
-      await runtime.handoffReady(workerResult.handoff);
+      const specialistHandoff = createSpecialistHandoffV2({
+        handoff: workerResult.handoff,
+        missionGraphId: runId,
+        specialistMode: specialistModes[0],
+        missionInput: { prompt: input.prompt, specialistModes },
+        acceptanceCriteria: [
+          "Every referenced evidence id resolves to host-observed mission evidence.",
+          "Lead independently verifies acceptance before any mutation.",
+        ],
+        recommendedNextAction:
+          specialistModes.length > 1
+            ? `Lead verifies this handoff, then advances the same Specialist to ${specialistModes[1]} mode.`
+            : "Lead verifies the evidence and continues the authorized mission.",
+      });
+      workerResult = { ...workerResult, handoff: specialistHandoff };
+      await runtime.specialistHandoffReady(specialistHandoff, {
+        missionGraphId: runId,
+        evidenceIds: new Set(workerResult.evidence.map((item) => item.id)),
+        receiptIds: new Set(),
+        artifactIds: new Set(),
+        validationIds: new Set(),
+      });
     } catch (error) {
       workerResult = null;
       if (rootDeadline.signal.aborted) {
@@ -8511,13 +9241,13 @@ export default class AgenticResearcherPlugin extends Plugin {
       }
       const message = getUnknownErrorMessage(error);
       await runtime.blockNode(researchNodeId, message);
-      await runtime.updateParticipant("researcher", {
+      await runtime.updateParticipant("specialist", {
         status: "failed",
         blocker: message,
         lastAction: "Worker failed; Lead will continue independently.",
       });
       input.events.onStatus?.(
-        `ORCH> Researcher failed (${message}); Lead is continuing independently.`,
+        `ORCH> Adaptive Specialist unavailable (${message}); Lead is continuing independently.`,
       );
     } finally {
       workerDeadline.dispose();
@@ -8526,7 +9256,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     let seedEvidence = workerResult?.evidence ?? [];
     let seedClaimPassages = workerResult?.claimPassages ?? [];
     let handoffContext =
-      "The read-only Researcher produced no usable handoff. Continue independently and do not treat search snippets as proof.";
+      "The read-only Adaptive Specialist produced no usable handoff. Continue independently and do not treat search snippets as proof.";
     await runtime.mergeStarted();
     if (workerResult) {
       const merged = mergeResearchWorkerResult({ worker: workerResult });
@@ -8600,7 +9330,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             ? "Handoff ready."
             : "Handoff rejected.",
       );
-      input.events.onStatus?.("Lead synthesizing from Researcher evidence.");
+      input.events.onStatus?.("Lead synthesizing from Adaptive Specialist evidence.");
       await runtime.setSourceLedgerSummary(
         summarizeSourceLedger(workerResult.sourceLedger),
       );
@@ -8618,7 +9348,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             ? "Lead accepted the structured evidence handoff."
             : "Handoff contained no usable proof; Lead is continuing independently.",
       });
-      await runtime.updateParticipant("researcher", {
+      await runtime.updateParticipant("specialist", {
         status: "complete",
         handoffStatus: merged.handoff.status,
         lastAction: "Handoff reviewed by Lead.",
@@ -8634,7 +9364,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         commitShas: [],
         verificationStatus: "pending",
         integrationStatus: "not_applicable",
-        blocker: "Researcher unavailable; Lead continued independently.",
+        blocker: "Adaptive Specialist unavailable; Lead continued independently.",
         updatedAt: new Date().toISOString(),
       });
       await runtime.progress(handoffNodeId, {
@@ -8662,9 +9392,36 @@ export default class AgenticResearcherPlugin extends Plugin {
     // evidence, and receipt ids ever reach it — never the Lead's transcript.
     let leadFinalOutput = "";
     const leadReceiptIds: string[] = [];
+    let previousLeadProgressFingerprint: string | undefined;
+    let previousLeadAcceptanceMissing: string[] | undefined;
     let leadEventQueue = Promise.resolve();
+    const latestLeadRunConfig: { current: AgentRunConfigEvent | null } = {
+      current: null,
+    };
     const enqueueLeadEvent = (operation: () => Promise<unknown>) => {
       leadEventQueue = leadEventQueue.then(operation, operation).then(() => undefined);
+    };
+    const forwardAdaptiveRunConfig = (
+      event: AgentRunConfigEvent,
+      snapshot = runtime.getSnapshot(),
+    ) => {
+      const normalizedSnapshot = snapshot
+        ? normalizeOrchestratorSnapshot(snapshot)
+        : null;
+      const projected: AgentRunConfigEvent = {
+        ...event,
+        runId,
+        ...(event.missionLedger && normalizedSnapshot
+          ? {
+              missionLedger: {
+                ...event.missionLedger,
+                orchestrator: normalizedSnapshot,
+              },
+            }
+          : {}),
+      };
+      latestLeadRunConfig.current = projected;
+      input.events.onRunConfig?.(projected);
     };
     const leadEvents = new Proxy(input.events, {
       get: (target, property, receiver) => {
@@ -8678,7 +9435,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         }
         if (property === "onRunConfig") {
           return (event: AgentRunConfigEvent) => {
-            target.onRunConfig?.({ ...event, runId });
+            forwardAdaptiveRunConfig(event);
           };
         }
         if (property === "onRunComplete") {
@@ -8741,6 +9498,61 @@ export default class AgenticResearcherPlugin extends Plugin {
       },
     });
     const leadStartedAt = Date.now();
+    const leadDeadline = createLinkedDeadlineSignal(
+      rootDeadline.signal,
+      leadWallClockMs,
+      "Adaptive Lead wall-clock budget exhausted.",
+    );
+    let settledLeadModelSteps = 0;
+    let settledLeadToolCalls = 0;
+    let settledLeadWallClockMs = 0;
+    const settleLeadBudget = async () => {
+      const modelSteps = Math.max(1, leadModelSteps);
+      const modelStepDelta = modelSteps - settledLeadModelSteps;
+      if (modelStepDelta > 0) {
+        await runtime.consumeOrThrow(
+          "lead",
+          "modelSteps",
+          modelStepDelta,
+          true,
+        );
+        settledLeadModelSteps = modelSteps;
+      }
+      const toolCallDelta = leadToolCalls - settledLeadToolCalls;
+      if (toolCallDelta > 0) {
+        await runtime.consumeOrThrow("lead", "toolCalls", toolCallDelta);
+        settledLeadToolCalls = leadToolCalls;
+      }
+      const wallClockMs = Math.min(
+        leadWallClockMs,
+        Math.max(1, Date.now() - leadStartedAt),
+      );
+      const wallClockDelta = wallClockMs - settledLeadWallClockMs;
+      if (wallClockDelta > 0) {
+        await runtime.consumeOrThrow("lead", "wallClockMs", wallClockDelta);
+        settledLeadWallClockMs = wallClockMs;
+      }
+    };
+    const resolveLeadTerminalBlocker = (
+      completion: AgentRunCompleteEvent | null,
+    ): string => {
+      if (input.abortSignal.aborted) {
+        return "User stopped the mission.";
+      }
+      if (rootDeadline.signal.aborted) {
+        return getAbortSignalMessage(
+          rootDeadline.signal,
+          "Orchestrator root wall-clock budget exhausted.",
+        );
+      }
+      if (leadDeadline.signal.aborted) {
+        return getAbortSignalMessage(
+          leadDeadline.signal,
+          "Adaptive Lead wall-clock budget exhausted.",
+        );
+      }
+      return `Lead stopped with ${completion?.stopReason ?? "unknown"}.`;
+    };
     try {
       let leadPrompt = input.prompt;
       let leadHistory = input.conversationHistory;
@@ -8749,15 +9561,19 @@ export default class AgenticResearcherPlugin extends Plugin {
         let segmentIndex = 0;
         segmentIndex < leadMaxSegments &&
         leadModelSteps < leadMaxSteps &&
-        leadToolCalls < leadMaxToolCalls;
+        leadToolCalls < leadMaxToolCalls &&
+        !leadDeadline.signal.aborted;
         segmentIndex += 1
       ) {
         let continueLead = false;
         let segmentToolCalls = 0;
         leadCompletion.current = null;
-        const segmentStepBudget = segmentIndex === 0
-          ? leadInitialSegmentSteps
-          : Math.min(24, leadMaxSteps - leadModelSteps);
+        const segmentStepBudget = Math.min(
+          10,
+          segmentIndex === 0
+            ? leadInitialSegmentSteps
+            : leadMaxSteps - leadModelSteps,
+        );
         const segmentToolCallBudget = segmentIndex === 0
           ? leadInitialSegmentToolCalls
           : Math.min(32, leadMaxToolCalls - leadToolCalls);
@@ -8774,6 +9590,15 @@ export default class AgenticResearcherPlugin extends Plugin {
           onRunComplete: (event) => {
             leadCompletion.current = event;
             leadModelSteps += Math.max(1, event.step);
+            const currentProgressFingerprint = createLeadProgressFingerprintV1({
+              finalOutput: leadFinalOutput,
+              receiptIds: leadReceiptIds,
+              stopDetail: event.stopDetail,
+            });
+            const currentAcceptanceMissing =
+              event.autoContinueReason === "acceptance_failed"
+                ? [event.stopDetail ?? "acceptance_failed"]
+                : [];
             continueLead = shouldContinueResearchLead({
               stopReason: event.stopReason,
               autoContinueRecommended: event.autoContinueRecommended,
@@ -8784,8 +9609,16 @@ export default class AgenticResearcherPlugin extends Plugin {
               maxToolCalls: leadMaxToolCalls,
               segmentIndex,
               maxSegments: leadMaxSegments,
-              aborted: rootDeadline.signal.aborted,
+              aborted: leadDeadline.signal.aborted,
+              currentProgressFingerprint,
+              previousProgressFingerprint: previousLeadProgressFingerprint,
+              currentAcceptanceMissing,
+              previousAcceptanceMissing: previousLeadAcceptanceMissing,
+              availableRepairAction:
+                event.autoContinueReason !== "required_tool_failure",
             });
+            previousLeadProgressFingerprint = currentProgressFingerprint;
+            previousLeadAcceptanceMissing = currentAcceptanceMissing;
             return continueLead;
           },
         });
@@ -8794,10 +9627,12 @@ export default class AgenticResearcherPlugin extends Plugin {
           ...(segmentIndex === 0 ? { runId: leadSegmentRunId } : {}),
           conversationHistory: leadHistory,
           modelClient: this.createModelClient(),
-          toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
+          // The Specialist is read-only; the Lead retains the mission's
+          // ordinary host/policy-gated write and external-action authority.
+          toolRegistry: teamBaseRegistry,
           toolContext: this.createToolExecutionContext(leadPrompt),
           enableStreaming: this.settings.enableStreaming,
-          abortSignal: rootDeadline.signal,
+          abortSignal: leadDeadline.signal,
           approvalBroker: this.approvalBroker,
           forceChatOnly: input.forceChatOnly === true,
           events: segmentEvents,
@@ -8834,82 +9669,55 @@ export default class AgenticResearcherPlugin extends Plugin {
         leadHistory = [];
       }
       await leadEventQueue;
-      const leadComplete = leadCompletion.current;
-      await runtime.consumeOrThrow(
-        "lead",
-        "modelSteps",
-        Math.max(1, leadModelSteps),
-        true,
-      );
-      if (leadToolCalls > 0) {
-        await runtime.consumeOrThrow("lead", "toolCalls", leadToolCalls);
-      }
-      await runtime.consumeOrThrow(
-        "lead",
-        "wallClockMs",
-        Math.max(1, Date.now() - leadStartedAt),
-      );
-      if (leadComplete?.stopReason === "clarifying_question") {
-        const blocker = "Waiting for the user to answer the Lead clarification.";
-        await runtime.progress(leadNodeId, {
-          status: "waiting",
-          lastAction: blocker,
-          blocker,
-        });
-        await runtime.progress(verifyNodeId, {
-          status: "waiting",
-          lastAction: "Verification will resume after clarification.",
-          blocker,
-        });
-        await runtime.updateParticipant("lead", {
-          status: "waiting",
-          blocker,
-          lastAction: blocker,
-        });
-        await runtime.finish("blocked", blocker);
-        return runtime.getSnapshot();
-      }
-      const terminalSuccess =
-        leadComplete?.stopReason === "final" ||
-        leadComplete?.stopReason === "write_completed";
-      if (!terminalSuccess) {
-        const blocker = `Lead stopped with ${leadComplete?.stopReason ?? "unknown"}.`;
-        await runtime.blockNode(verifyNodeId, blocker);
-        await runtime.updateParticipant("lead", {
-          status: "blocked",
-          blocker,
-          lastAction: blocker,
-        });
-        await runtime.finish("blocked", blocker);
-        return runtime.getSnapshot();
-      }
-      await runtime.completeNode(leadNodeId, "Lead mission execution completed.");
-      await runtime.progress(verifyNodeId, {
-        status: "running",
-        lastAction: "Checking the Lead terminal proof contract.",
-      });
-      // Independent critic review. Advisory-first: missionAcceptance remains
-      // the sole terminal gate, and the critic may trigger AT MOST ONE bounded
-      // Lead continuation (no retry loop of its own), so it cannot livelock
-      // against acceptance or proof-debt.
-      if (this.settings.agenticReflexEnabled !== false && leadFinalOutput.trim()) {
+      const initialLeadComplete = leadCompletion.current;
+      const initialLeadTerminalSuccess =
+        initialLeadComplete?.stopReason === "final" ||
+        initialLeadComplete?.stopReason === "write_completed";
+      // The same second participant switches to recovery_verifier mode for an
+      // isolated peer review. It is not a third critic identity and may spend
+      // only an unconsumed Specialist model turn from the shared mission cap.
+      const specialistBudget = runtime.getSnapshot()?.participants.specialist?.budget;
+      const specialistReviewStepsRemaining = specialistBudget
+        ? specialistBudget.modelSteps.limit - specialistBudget.modelSteps.used
+        : 0;
+      if (
+        initialLeadTerminalSuccess &&
+        this.settings.agenticReflexEnabled !== false &&
+        leadFinalOutput.trim() &&
+        specialistModelClient !== null &&
+        specialistReviewStepsRemaining > 0
+      ) {
         try {
-          input.events.onStatus?.("ORCH> Independent critic reviewing the Lead result.");
+          await runtime.setSpecialistMode(
+            "recovery_verifier",
+            "Reviewing the Lead result from an isolated evidence-only transcript.",
+          );
+          await runtime.updateParticipant("specialist", { status: "verifying" });
+          input.events.onStatus?.(
+            "ORCH> Adaptive Specialist recovery verifier reviewing the Lead result.",
+          );
           const criticResult = await runCriticWorker({
             runId,
             objective: input.prompt,
             finalOutput: leadFinalOutput,
             evidence: seedEvidence,
             receiptIds: leadReceiptIds,
-            modelClient: this.createModelClient(),
-            toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
+            modelClient: specialistModelClient,
+            toolRegistry: teamReadOnlyRegistry,
             toolContext: this.createToolExecutionContext(input.prompt),
             abortSignal: rootDeadline.signal,
+            maxSteps: 1,
+            maxToolCalls: 0,
             onModelCallEvidence: (event) => {
               input.events.onModelCallEvidence?.(event);
             },
             now: () => new Date(),
           });
+          await runtime.consumeOrThrow(
+            "specialist",
+            "modelSteps",
+            Math.max(1, criticResult.modelSteps),
+          );
           input.events.onTrace?.({
             id: `critic-review-${runId}`,
             kind: "status",
@@ -8921,12 +9729,28 @@ export default class AgenticResearcherPlugin extends Plugin {
               toolCalls: criticResult.toolCalls,
             },
           });
+          const repairDecision =
+            criticResult.status === "needs_more_work" &&
+            criticResult.check.missing.length > 0
+              ? await runtime.authorizeSpecialistRepair({
+                  failedProgressFingerprint: await sha256Fingerprint({
+                    runId,
+                    finalOutput: leadFinalOutput,
+                    receiptIds: leadReceiptIds,
+                    missing: criticResult.check.missing,
+                  }),
+                  previousApproach:
+                    "Lead synthesized the current final output from the accepted evidence and receipts.",
+                  revisedApproach: `Apply a targeted correction pass only for these verified gaps: ${criticResult.check.missing.join("; ")}`,
+                })
+              : null;
           if (
             criticResult.status === "needs_more_work" &&
             criticResult.check.missing.length > 0 &&
+            repairDecision?.authorized === true &&
             leadModelSteps < leadMaxSteps &&
             leadToolCalls < leadMaxToolCalls &&
-            !rootDeadline.signal.aborted
+            !leadDeadline.signal.aborted
           ) {
             // The single permitted escalation: one more bounded Lead segment
             // addressing the critic's missing items, then verification
@@ -8954,10 +9778,10 @@ export default class AgenticResearcherPlugin extends Plugin {
               ].join("\n"),
               conversationHistory: [],
               modelClient: this.createModelClient(),
-              toolRegistry: input.toolRegistry ?? this.createToolRegistry(),
+              toolRegistry: teamBaseRegistry,
               toolContext: this.createToolExecutionContext(input.prompt),
               enableStreaming: this.settings.enableStreaming,
-              abortSignal: rootDeadline.signal,
+              abortSignal: leadDeadline.signal,
               approvalBroker: this.approvalBroker,
               forceChatOnly: input.forceChatOnly === true,
               events: escalationEvents,
@@ -8969,8 +9793,15 @@ export default class AgenticResearcherPlugin extends Plugin {
             });
             await leadEventQueue;
           }
+          await runtime.updateParticipant("specialist", {
+            status: "complete",
+            lastAction:
+              repairDecision?.authorized === true
+                ? "Completed the single authorized peer repair review."
+                : "Completed the bounded recovery verification.",
+          });
         } catch (criticError) {
-          // The critic is advisory; its own failure never blocks the mission.
+          // Specialist review is advisory; its own failure never blocks the mission.
           input.events.onTrace?.({
             id: `critic-review-error-${runId}`,
             kind: "status",
@@ -8980,6 +9811,58 @@ export default class AgenticResearcherPlugin extends Plugin {
           });
         }
       }
+      await settleLeadBudget();
+      const leadComplete = leadCompletion.current;
+      const terminalInterrupted =
+        input.abortSignal.aborted ||
+        rootDeadline.signal.aborted ||
+        leadDeadline.signal.aborted;
+      if (
+        leadComplete?.stopReason === "clarifying_question" &&
+        !terminalInterrupted
+      ) {
+        const blocker = "Waiting for the user to answer the Lead clarification.";
+        await runtime.progress(leadNodeId, {
+          status: "waiting",
+          lastAction: blocker,
+          blocker,
+        });
+        await runtime.progress(verifyNodeId, {
+          status: "waiting",
+          lastAction: "Verification will resume after clarification.",
+          blocker,
+        });
+        await runtime.updateParticipant("lead", {
+          status: "waiting",
+          blocker,
+          lastAction: blocker,
+        });
+        await runtime.finish("blocked", blocker);
+        return runtime.getSnapshot();
+      }
+      const terminalSuccess =
+        leadComplete?.stopReason === "final" ||
+        leadComplete?.stopReason === "write_completed";
+      if (!terminalSuccess) {
+        const blocker = resolveLeadTerminalBlocker(leadComplete);
+        await runtime.blockNode(leadNodeId, blocker);
+        await runtime.blockNode(verifyNodeId, blocker);
+        await runtime.updateParticipant("lead", {
+          status: input.abortSignal.aborted ? "cancelled" : "blocked",
+          blocker,
+          lastAction: blocker,
+        });
+        await runtime.finish(
+          input.abortSignal.aborted ? "cancelled" : "blocked",
+          blocker,
+        );
+        return runtime.getSnapshot();
+      }
+      await runtime.completeNode(leadNodeId, "Lead mission execution completed.");
+      await runtime.progress(verifyNodeId, {
+        status: "running",
+        lastAction: "Checking the Lead terminal proof contract.",
+      });
       // Registered mission_verifier extension contributions run at the verify
       // node and fail closed: any fail/needs_more_work/blocked check blocks the
       // node instead of the previous unconditional success.
@@ -9028,34 +9911,48 @@ export default class AgenticResearcherPlugin extends Plugin {
       await leadEventQueue;
       const userStopped = input.abortSignal.aborted;
       const rootBudgetExpired = rootDeadline.signal.aborted && !userStopped;
+      const leadBudgetExpired =
+        leadDeadline.signal.aborted && !rootBudgetExpired && !userStopped;
       const status = userStopped
         ? "cancelled"
-        : rootBudgetExpired
+        : rootBudgetExpired || leadBudgetExpired
           ? "blocked"
           : "failed";
-      await runtime.blockNode(
-        leadNodeId,
-        userStopped
-          ? "User stopped the mission."
-          : rootBudgetExpired
+      const blocker = userStopped
+        ? "User stopped the mission."
+        : rootBudgetExpired
+          ? getAbortSignalMessage(
+              rootDeadline.signal,
+              "Orchestrator root wall-clock budget exhausted.",
+            )
+          : leadBudgetExpired
             ? getAbortSignalMessage(
-                rootDeadline.signal,
-                "Orchestrator root wall-clock budget exhausted.",
+                leadDeadline.signal,
+                "Adaptive Lead wall-clock budget exhausted.",
               )
-            : getUnknownErrorMessage(error),
-      );
+            : getUnknownErrorMessage(error);
+      await runtime.blockNode(leadNodeId, blocker);
       await runtime.finish(
         status,
         userStopped
           ? "User stopped the orchestrated mission."
-          : rootBudgetExpired
-            ? getAbortSignalMessage(
-                rootDeadline.signal,
-                "Orchestrator root wall-clock budget exhausted.",
-              )
-            : getUnknownErrorMessage(error),
+          : blocker,
       );
       throw error;
+    } finally {
+      try {
+        const finalConfig = latestLeadRunConfig.current;
+        const finalSnapshot = runtime.getSnapshot();
+        if (finalConfig?.missionLedger && finalSnapshot) {
+          // The child runner publishes its terminal ledger before the parent
+          // settles aggregate Lead usage and status. Re-forward that same
+          // ledger authority with the final adaptive snapshot so Run Details
+          // never retains the pre-settlement zero-usage projection.
+          forwardAdaptiveRunConfig(finalConfig, finalSnapshot);
+        }
+      } finally {
+        leadDeadline.dispose();
+      }
     }
     } finally {
       rootDeadline.dispose();
@@ -9111,7 +10008,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     let operationalSnapshot: OrchestratorSnapshotV1 | null = null;
     const runtime = new OrchestratorRuntime({
       runId,
-      mode: "code_team",
+      mode: "adaptive_team",
       repository: {
         read: async (requestedRunId) =>
           operationalSnapshot?.runId === requestedRunId
@@ -9136,23 +10033,30 @@ export default class AgenticResearcherPlugin extends Plugin {
       lead: true,
     });
     runtime.registerParticipantBudget({
-      participantId: "code_worker",
+      participantId: "specialist",
       modelSteps: workerMaxSteps,
       toolCalls: workerMaxToolCalls,
       wallClockMs: workerMaxMinutes * 60_000,
     });
-    const scaffold = createCodeTeamScaffold({
+    const scaffold = createAdaptiveTeamScaffoldV2({
       runId,
       mission: input.prompt,
-      workerMaxSteps,
-      workerMaxToolCalls,
-      workerMaxMinutes,
+      specialistModes: ["code_builder", "code_reviewer"],
+      specialistMaxSteps: workerMaxSteps,
+      specialistMaxToolCalls: workerMaxToolCalls,
+      specialistMaxMinutes: workerMaxMinutes,
+      leadMaxSteps: Math.max(4, MAX_AGENT_STEPS - workerMaxSteps),
+      leadMaxToolCalls: Math.max(
+        16,
+        MAX_AGENT_STEPS * 2 - workerMaxToolCalls,
+      ),
+      leadMaxMinutes: 30,
     });
-    const codeNodeId = `${runId}:code`;
-    const testNodeId = `${runId}:test`;
-    const mergeNodeId = `${runId}:merge`;
-    const verifyNodeId = `${runId}:verify`;
-    const rootNodeId = `${runId}:mission`;
+    const codeNodeId = scaffold.nodeIds.specialist;
+    const testNodeId = scaffold.nodeIds.handoff;
+    const mergeNodeId = scaffold.nodeIds.lead;
+    const verifyNodeId = scaffold.nodeIds.verify;
+    const rootNodeId = scaffold.nodeIds.root;
     await runtime.start(scaffold);
     const manager = new GitWorktreeManager();
     worktreeManager = manager;
@@ -9277,8 +10181,9 @@ export default class AgenticResearcherPlugin extends Plugin {
       await runtime.updateWorktree(
         toGitWorktreeState(worker, codeNodeId, "ready", validationCommands),
       );
-      await runtime.updateParticipant("code_worker", {
+      await runtime.updateParticipant("specialist", {
         status: "coding",
+        specialistMode: "code_builder",
         currentNodeId: codeNodeId,
         startedAt: new Date().toISOString(),
         lastAction: "Editing only inside the approved worktree.",
@@ -9287,16 +10192,23 @@ export default class AgenticResearcherPlugin extends Plugin {
       const workerDeadline = createLinkedDeadlineSignal(
         rootDeadline.signal,
         workerMaxMinutes * 60_000,
-        "Code worker wall-clock budget exhausted.",
+        "Adaptive Specialist code-builder wall-clock budget exhausted.",
       );
-      const codeResult = await runCodeWorker({
+      const specialistModelClient = createSpecialistModelClient(this.settings);
+      if (!specialistModelClient) {
+        workerDeadline.dispose();
+        throw new Error(
+          "Adaptive Specialist model slot is unavailable; bounded code work was not started.",
+        );
+      }
+      let codeResult = await runCodeWorker({
         runId,
-        participantId: "code_worker",
+        participantId: "specialist",
         leadParticipantId: "lead",
         taskId: codeNodeId,
         assignment: input.assignment,
         worktreePath: worker.path,
-        modelClient: this.createModelClient(),
+        modelClient: specialistModelClient,
         abortSignal: workerDeadline.signal,
         maxSteps: workerMaxSteps,
         maxToolCalls: workerMaxToolCalls,
@@ -9332,24 +10244,24 @@ export default class AgenticResearcherPlugin extends Plugin {
         },
       }).finally(() => workerDeadline.dispose());
       await runtime.consumeOrThrow(
-        "code_worker",
+        "specialist",
         "modelSteps",
         Math.max(1, codeResult.modelSteps),
       );
       if (codeResult.toolCalls > 0) {
         await runtime.consumeOrThrow(
-          "code_worker",
+          "specialist",
           "toolCalls",
           codeResult.toolCalls,
         );
       }
       await runtime.consumeOrThrow(
-        "code_worker",
+        "specialist",
         "wallClockMs",
         Math.max(1, Date.now() - workerStartedAt),
       );
       if (codeResult.changedFilePaths.length === 0) {
-        throw new Error("Code worker produced no file changes.");
+        throw new Error("Adaptive Specialist produced no file changes.");
       }
       const changedFiles = await manager.getChangedFileCount(
         worker,
@@ -9359,6 +10271,26 @@ export default class AgenticResearcherPlugin extends Plugin {
         worker,
         rootDeadline.signal,
       );
+      const specialistCodeHandoff = createSpecialistHandoffV2({
+        handoff: codeResult.handoff,
+        missionGraphId: runId,
+        specialistMode: "code_builder",
+        missionInput: {
+          assignment: input.assignment,
+          repositoryHead: repository.headSha,
+        },
+        acceptanceCriteria: [
+          "Every changed path is inside the approved worktree lease.",
+          "Lead independently reruns validation before accepting the handoff.",
+        ],
+        changedFiles: changedFilePaths,
+        workspaceLeaseId: worker.id,
+        workspaceDiffFingerprint:
+          fingerprintSpecialistWorkspaceDiff(changedFilePaths),
+        recommendedNextAction:
+          "Lead verifies the exact workspace diff and validation receipts.",
+      });
+      codeResult = { ...codeResult, handoff: specialistCodeHandoff };
       const reportedPaths = new Set(
         codeResult.changedFilePaths.map(normalizeWorktreeRelativePath),
       );
@@ -9431,10 +10363,18 @@ export default class AgenticResearcherPlugin extends Plugin {
           validationPassed: false,
           blocker: `verification_failed:${failure}`,
         });
-        throw new Error(`Code worker verification failed before handoff: ${failure}`);
+        throw new Error(`Adaptive Specialist verification failed before handoff: ${failure}`);
       }
 
-      await runtime.handoffReady(codeResult.handoff);
+      await runtime.specialistHandoffReady(specialistCodeHandoff, {
+        missionGraphId: runId,
+        evidenceIds: new Set(),
+        receiptIds: new Set(),
+        artifactIds: new Set(),
+        validationIds: new Set(),
+        workspaceDiffFingerprint:
+          specialistCodeHandoff.workspaceDiffFingerprint,
+      });
       await runtime.updateHandoff(
         codeResult.handoff.id,
         "accepted",
@@ -9503,8 +10443,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         commitSha: committed.commitSha,
       });
       workerGreen = true;
-      await runtime.updateParticipant("code_worker", {
+      await runtime.updateParticipant("specialist", {
         status: "complete",
+        specialistMode: "code_reviewer",
         handoffStatus: "accepted",
         lastAction: `Green commit ${committed.commitSha} handed to Lead.`,
       });
@@ -9767,7 +10708,9 @@ export default class AgenticResearcherPlugin extends Plugin {
             toolStepBudget: MAX_AGENT_STEPS - 4,
             finalizationReserve: 4,
             expectedTools:
-              orchestrator.mode === "code_team"
+              orchestrator.mode === "code_team" ||
+              orchestrator.participants.specialist?.specialistMode ===
+                "code_builder"
                 ? ["git_worktree", "code_worker", "npm_test", "npm_build"]
                 : ["research_worker", "web_search", "web_fetch"],
             stopWhenSatisfied: true,
@@ -10760,7 +11703,12 @@ export default class AgenticResearcherPlugin extends Plugin {
             throw error;
           }
         }),
-      createPrivateRepository: async (destination, description, signal) =>
+      createRepository: async (
+        destination,
+        visibility,
+        description,
+        signal,
+      ) =>
         this.withGitHubCredentialToken(async (token, account) => {
           if (
             account.id !== destination.accountId ||
@@ -10768,17 +11716,18 @@ export default class AgenticResearcherPlugin extends Plugin {
               destination.accountLogin.toLowerCase()
           ) {
             throw new Error(
-              "GitHub credential identity drifted before private-repository creation.",
+              "GitHub credential identity drifted before repository creation.",
             );
           }
           return new GitHubRestClient({
             transport: requestUrlTransport,
             token,
             timeoutMs: Math.min(this.settings.requestTimeoutMs, 30_000),
-          }).createPrivateRepository({
+          }).createRepository({
             ownerKind: destination.ownerKind,
             owner: destination.owner,
             repository: destination.repository,
+            visibility,
             ...(description ? { description } : {}),
           }, signal);
         }),
@@ -10969,6 +11918,89 @@ export default class AgenticResearcherPlugin extends Plugin {
         },
       }),
     );
+  }
+
+  /**
+   * End-of-mission progress report. The model chooses whether to report, what
+   * to say, and which level; the host resolves the level onto the workspace's
+   * configured state id and binds the issue to this run's own lineage.
+   */
+  private createReportProgressToLinearAgentTool(): AgentTool {
+    return createReportProgressToLinearTool({
+      isAvailable: () =>
+        this.settings.linearEnabled === true && this.hasLinearApiKey(),
+      resolveBoundIssueIds: async (context: ToolExecutionContext) => {
+        const runIds = new Set(
+          [context.rootMissionId, context.runId]
+            .map((value) => value?.trim())
+            .filter((value): value is string => Boolean(value)),
+        );
+        const fromLineage = collectBoundLinearIssueIdsFromProjectLineagesV1(
+          context.getProjectLineages?.() ?? [],
+          runIds,
+        );
+        // A single publish_research_to_linear binds one issue without writing a
+        // linear_hierarchy commit, so the durable checkpoint is the only place
+        // that issue can be recovered from.
+        const fromPublications = (
+          await this.researchPublicationCheckpointStore.list()
+        ).flatMap((checkpoint) => {
+          const issueId = checkpoint.binding?.issueId;
+          if (typeof issueId !== "string" || !issueId.trim()) return [];
+          return runIds.has(checkpoint.artifact.originRunId) ? [issueId] : [];
+        });
+        return [...new Set([...fromLineage, ...fromPublications])];
+      },
+      resolveStateIds: () => ({
+        started: this.settings.linearStartedStateId ?? "",
+        blocked: this.settings.linearBlockedStateId ?? "",
+        completed: this.settings.linearCompletedStateId ?? "",
+      }),
+      postComment: async ({ issueId, body, context }) => {
+        const receipt = await this.executeApprovedLinearFinalizationAction({
+          context,
+          durableRunId:
+            context.rootMissionId?.trim() || context.runId?.trim() || "",
+          toolCallId: `progress-comment-${issueId}`,
+          toolName: "linear_create_comment",
+          arguments: { issueId, body },
+          approvalReason:
+            "Post the mission's progress reflection to its Linear issue.",
+        });
+        return {
+          receiptId: receipt.id,
+          commentId: String(receipt.resource?.id ?? ""),
+        };
+      },
+      moveIssueState: async ({ issueId, stateId, context }) => {
+        try {
+          const receipt = await this.executeApprovedLinearFinalizationAction({
+            context,
+            durableRunId:
+            context.rootMissionId?.trim() || context.runId?.trim() || "",
+            toolCallId: `progress-state-${issueId}`,
+            toolName: "linear_update_issue",
+            arguments: { id: issueId, stateId },
+            approvalReason:
+              "Move the mission's Linear issue to the reported progress level.",
+          });
+          return { receiptId: receipt.id, changed: true };
+        } catch (error) {
+          // The issue is already in the requested state. A reflection that
+          // confirms the current level has reported successfully; only the
+          // release-gating finalizer treats this as a blocker.
+          const code =
+            error && typeof error === "object" && "code" in error
+              ? String((error as { code?: unknown }).code ?? "")
+              : "";
+          const message = error instanceof Error ? error.message : String(error);
+          if (code === "linear_no_changes" || /linear_no_changes/u.test(message)) {
+            return { receiptId: "", changed: false };
+          }
+          throw error;
+        }
+      },
+    });
   }
 
   private createResearchProjectHierarchyAgentTool(
@@ -11326,8 +12358,9 @@ export default class AgenticResearcherPlugin extends Plugin {
         timeoutMs: Math.min(this.settings.requestTimeoutMs, 30_000),
       });
       const remote = await client.getRepository(owner, repository);
+      const visibility = repositoryVisibilityFromReadback(remote);
       if (
-        remote.private !== true ||
+        visibility === null ||
         remote.archived ||
         remote.fullName.toLowerCase() !== `${owner}/${repository}`.toLowerCase() ||
         remote.defaultBranch !== profile.defaultBranch
@@ -11367,6 +12400,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         owner,
         repository,
         repositoryReadback: remote,
+        expectedVisibility: visibility,
         observedAt: new Date().toISOString(),
         verifiedAccountId: account.id,
         verifiedAccountLogin: account.login,
@@ -11380,6 +12414,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       return {
         publicationBinding,
         privateRepositoryBinding,
+        repositoryBinding: privateRepositoryBinding,
         profile,
         completionProof:
           legacy.promotionPolicy.completionProof === "draft_pr"
@@ -11387,7 +12422,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             : "merged_pr",
         workflowBinding: {
           // V2 includes the exact independently-read repository identity and
-          // private visibility. Older approvals therefore cannot survive the
+          // explicit visibility. Older approvals therefore cannot survive the
           // visibility-contract upgrade or a repository recreation.
           bindingFingerprint: privateRepositoryBinding.fingerprint,
           profileKey: profile.key,
@@ -11416,7 +12451,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           resolution.privateRepositoryBinding.verifiedAccountLogin.toLowerCase()
       ) {
         throw new Error(
-          "GitHub credential identity drifted from the private repository binding.",
+          "GitHub credential identity drifted from the repository binding.",
         );
       }
       const remote = await new GitHubRestClient({
@@ -11431,7 +12466,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       if (remote.permissions && remote.permissions.push !== true) {
         throw new Error(
           [
-            "GitHub credential can see the private repository but lacks Contents push permission.",
+            "GitHub credential can see the repository but lacks Contents push permission.",
             "REST Administration (create) can succeed while git push fails for fine-grained PATs",
             "without Contents:write on the new repository.",
             "Heal: install a github_pat_ with Contents:write (All repositories) or a classic/gh",
@@ -11446,6 +12481,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         owner: resolution.privateRepositoryBinding.owner,
         repository: resolution.privateRepositoryBinding.repository,
         repositoryReadback: remote,
+        expectedVisibility: resolution.privateRepositoryBinding.visibility,
         observedAt: new Date().toISOString(),
         verifiedAccountId: account.id,
         verifiedAccountLogin: account.login,
@@ -11455,7 +12491,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         refreshed.fingerprint !== resolution.privateRepositoryBinding.fingerprint
       ) {
         throw new Error(
-          "GitHub repository identity changed after approval; prepare and approve the exact private target again.",
+          "GitHub repository identity or visibility changed after approval; prepare and approve the exact target again.",
         );
       }
       this.trustedGitHubRepositoryBindingsV2 = {
@@ -11515,7 +12551,10 @@ export default class AgenticResearcherPlugin extends Plugin {
                   this.requestGitHubReviewRepairExactApproval(request),
               },
               checkpoints: this.githubPublicationCheckpointStore,
-              provider: this.createGitHubPublicationProviderPort(handoff.runId),
+              provider: this.createGitHubPublicationProviderPort(
+                handoff.runId,
+                resolved.privateRepositoryBinding.visibility,
+              ),
               push: this.createGitHubPublicationPushPort({
                 runId: handoff.runId,
                 handoff,
@@ -11725,6 +12764,7 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   private createGitHubPublicationProviderPort(
     runId: string,
+    expectedVisibility: RepositoryVisibility,
   ): GitHubPublicationProviderPortV1 {
     const withClient = <T>(
       use: (client: GitHubRestClient) => Promise<T>,
@@ -11735,7 +12775,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         timeoutMs: Math.min(this.settings.requestTimeoutMs, 30_000),
       }))
     );
-    const requirePrivateRepository = async (
+    const requireExactRepository = async (
       client: GitHubRestClient,
       owner: string,
       repository: string,
@@ -11743,13 +12783,13 @@ export default class AgenticResearcherPlugin extends Plugin {
     ) => {
       const readback = await client.getRepository(owner, repository, signal);
       if (
-        readback.private !== true ||
+        repositoryVisibilityFromReadback(readback) !== expectedVisibility ||
         readback.archived === true ||
         readback.fullName.toLowerCase() !==
           `${owner}/${repository}`.toLowerCase()
       ) {
         throw new Error(
-          "GitHub publication requires a fresh readback of the exact active private repository.",
+          `GitHub publication requires a fresh readback of the exact active ${expectedVisibility} repository.`,
         );
       }
       return readback;
@@ -11773,6 +12813,7 @@ export default class AgenticResearcherPlugin extends Plugin {
                   baseSha: expectedBaseSha,
                   headBranch: input.head,
                   headSha: expectedHeadSha,
+                  expectedVisibility,
                 },
                 signal,
               );
@@ -11835,7 +12876,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       markPullRequestReady: async (owner, repository, number, signal) => {
         const pullRequest = projectGitHubPublicationPullRequestV1(
           await withClient(async (client) => {
-            await requirePrivateRepository(client, owner, repository, signal);
+            await requireExactRepository(client, owner, repository, signal);
             return client.markPullRequestReadyForReview(
               { owner, repository, number },
               signal,
@@ -11853,7 +12894,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       },
       mergePullRequest: async (input, signal) => {
         const merged = await withClient(async (client) => {
-          await requirePrivateRepository(
+          await requireExactRepository(
             client,
             input.owner,
             input.repository,
@@ -11947,7 +12988,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         },
       ],
       message:
-        `Changed the new private repository default branch from ` +
+        `Changed the new ${repositoryVisibilityFromReadback(input.proof.repository) ?? "explicit-visibility"} repository default branch from ` +
         `${input.proof.previousDefaultBranch} to the verified base ` +
         `${input.baseBranch}, then independently read back both exact refs.`,
       payloadFingerprint: fingerprint,
@@ -12168,6 +13209,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         checkpoints: this.githubPublicationCheckpointStore,
         provider: this.createGitHubPublicationProviderPort(
           context.runId ?? approvalIdentity.runId,
+          binding.privateRepositoryBinding.visibility,
         ),
         finalizers: this.createGitHubPublicationFinalizers({
           context,
@@ -12813,11 +13855,21 @@ export default class AgenticResearcherPlugin extends Plugin {
           input.origin.artifact.artifactFingerprint,
     );
     if (!lineage || lineage.commits.length < 3) return;
+    const binding =
+      this.trustedGitHubRepositoryBindingsV2[
+        input.handoff.repositoryProfileKey
+      ];
+    if (!binding) {
+      throw new Error(
+        "Project lineage requires a fresh visibility-bound GitHub repository binding.",
+      );
+    }
     const existing = lineage.commits.find(
       (commit) => commit.stage === "private_github_publication",
     );
     if (existing) {
       if (
+        binding.visibility !== "private" ||
         existing.proof.stage !== "private_github_publication" ||
         existing.proof.remoteSha !== input.handoff.commitSha
       ) {
@@ -12827,12 +13879,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       }
       return;
     }
-    const binding =
-      this.trustedGitHubRepositoryBindingsV2[
-        input.handoff.repositoryProfileKey
-      ];
     if (
-      !binding ||
       input.pullRequest.draft !== true ||
       input.pullRequest.head.sha !== input.handoff.commitSha ||
       input.checkpoint.remoteSha !== input.handoff.commitSha
@@ -12850,6 +13897,25 @@ export default class AgenticResearcherPlugin extends Plugin {
       head: input.pullRequest.head,
       base: input.pullRequest.base,
     });
+    const canonicalProof = parseGitHubPublicationLineageProofV2({
+      stage: "github_publication",
+      trustedBindingFingerprint: binding.fingerprint,
+      owner: binding.owner,
+      repository: binding.repository,
+      visibility: binding.visibility,
+      verifiedVisibility: true,
+      branch: input.checkpoint.branch,
+      pullRequestNumber: input.pullRequest.number,
+      draft: true,
+      remoteSha: input.handoff.commitSha,
+      repositoryReadbackFingerprint:
+        binding.repositoryReadbackFingerprint,
+      pullRequestReadbackFingerprint,
+    });
+    // ProjectLineageV1 is a private-only compatibility record. The canonical
+    // V2 binding + publication checkpoint already persist public truth; never
+    // forge verifiedPrivate merely to fit the legacy projection.
+    if (canonicalProof.visibility === "public") return;
     await this.projectLineageStore.upsert(
       advanceProjectLineageV1({
         lineage,
@@ -12857,20 +13923,7 @@ export default class AgenticResearcherPlugin extends Plugin {
           lineage.updatedAt,
           input.checkpoint.updatedAt,
         ),
-        proof: {
-          stage: "private_github_publication",
-          trustedBindingFingerprint: binding.fingerprint,
-          owner: binding.owner,
-          repository: binding.repository,
-          verifiedPrivate: true,
-          branch: input.checkpoint.branch,
-          pullRequestNumber: input.pullRequest.number,
-          draft: true,
-          remoteSha: input.handoff.commitSha,
-          repositoryReadbackFingerprint:
-            binding.repositoryReadbackFingerprint,
-          pullRequestReadbackFingerprint,
-        },
+        proof: projectGitHubPublicationLineageProofV2ToV1(canonicalProof),
       }),
     );
   }
@@ -13145,6 +14198,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             this.createResearchPublicationAgentTool(linearClient) ?? undefined,
           researchProjectHierarchyTool:
             this.createResearchProjectHierarchyAgentTool(linearClient) ?? undefined,
+          reportProgressTool: this.createReportProgressToLinearAgentTool(),
         },
         githubPublicationTool: githubPublicationTool ?? undefined,
         githubPrivateRepositoryTool:
@@ -14050,27 +15104,7 @@ function normalizeOpaqueIdSetting(value: unknown): string {
 }
 
 function normalizeBaseUrlSetting(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  const trimmed = value.trim().replace(/\/+$/, "");
-  if (!trimmed) {
-    return null;
-  }
-
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return null;
-    }
-    if (parsed.username || parsed.password) {
-      return null;
-    }
-    return parsed.toString().replace(/\/+$/, "");
-  } catch {
-    return null;
-  }
+  return normalizeSecureProviderBaseUrlV1(value);
 }
 
 function getConfiguredModelBaseUrl(settings: AgentSettings): string {

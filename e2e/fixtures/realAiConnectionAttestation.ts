@@ -67,14 +67,33 @@ export async function verifyWithWorkerConnectionAttestation<T>({
   target,
   verify,
   validate,
+  timeoutMs = 60_000,
 }: {
   registry: RealAiConnectionAttestationRegistry;
   target: RealAiConnectionTarget;
   verify(input: { reuseWorkerAttestation: boolean }): Promise<T>;
   validate(state: T): Promise<void> | void;
+  timeoutMs?: number;
 }): Promise<T> {
   const reuseWorkerAttestation = registry.has(target);
-  const state = await verify({ reuseWorkerAttestation });
+  const normalizedTimeoutMs = Math.max(1, Math.trunc(timeoutMs));
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const state = await Promise.race([
+    verify({ reuseWorkerAttestation }),
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `Real AI connection attestation timed out after ${normalizedTimeoutMs} ms.`,
+            ),
+          ),
+        normalizedTimeoutMs,
+      );
+    }),
+  ]).finally(() => {
+    if (timeout !== null) clearTimeout(timeout);
+  });
   await validate(state);
   // Publish only after every production, no-mock, and UI readiness assertion
   // succeeds. Failed transport or validation cannot poison later scenarios.

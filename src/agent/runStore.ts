@@ -31,6 +31,7 @@ import { normalizeVaultPath } from "../tools/validation";
 import type { OrchestratorSnapshotV1 } from "../orchestrator/types";
 import { normalizeOrchestratorSnapshot } from "../orchestrator/orchestratorStore";
 import {
+  canonicalJson,
   sha256Fingerprint,
   verifyPreparedActionFingerprint,
   type ActionReceipt,
@@ -316,6 +317,8 @@ export interface MissionRuntimeSnapshotV2 {
   runId: string;
   originalMission: string;
   currentNotePath?: string;
+  /** Host-allocated destination for automatic new-note output. */
+  outputTargetPath?: string;
   lineage: MissionRunLineage;
   status: MissionRuntimeStatus;
   createdAt: string;
@@ -510,6 +513,7 @@ export interface CreateMissionRuntimeSnapshotInput {
   runId: string;
   originalMission: string;
   currentNotePath?: string | null;
+  outputTargetPath?: string | null;
   rootRunId?: string;
   segmentId?: string;
   segmentIndex?: number;
@@ -541,6 +545,7 @@ export function createMissionRuntimeSnapshot({
   runId,
   originalMission,
   currentNotePath,
+  outputTargetPath,
   rootRunId = runId,
   segmentId = runId,
   segmentIndex = 0,
@@ -584,6 +589,7 @@ export function createMissionRuntimeSnapshot({
     runId,
     originalMission,
     currentNotePath: normalizeCurrentNotePath(currentNotePath),
+    outputTargetPath: normalizeCurrentNotePath(outputTargetPath),
     lineage: {
       rootRunId,
       segmentId,
@@ -690,6 +696,7 @@ export function normalizeMissionRuntimeSnapshot(
     runId,
     originalMission,
     currentNotePath: normalizeCurrentNotePath(value.currentNotePath),
+    outputTargetPath: normalizeCurrentNotePath(value.outputTargetPath),
     lineage,
     status,
     createdAt,
@@ -1265,6 +1272,8 @@ const EXACT_LIFECYCLE_RECONCILIATION_TOOLS = new Set([
   "publish_research_to_linear",
   "publish_research_project_to_linear",
   "code_commit_verified",
+  "github_create_repository",
+  // Persisted V1 journals retain the private-only alias.
   "github_create_private_repository",
   "publish_verified_code_to_github",
   "github_delete_private_repository",
@@ -1286,6 +1295,7 @@ export function reconcilePriorExactLifecycleJournalRecords(
 ): OperationJournalRecord[] {
   const eligible =
     current.state === "committed" &&
+    current.preparedAction !== undefined &&
     typeof current.nodeId === "string" &&
     current.nodeId.length > 0 &&
     EXACT_LIFECYCLE_RECONCILIATION_TOOLS.has(current.toolName) &&
@@ -1302,7 +1312,8 @@ export function reconcilePriorExactLifecycleJournalRecords(
       record.state !== "reconcile_required" ||
       record.rootRunId !== current.rootRunId ||
       record.nodeId !== current.nodeId ||
-      record.toolName !== current.toolName
+      record.toolName !== current.toolName ||
+      !exactLifecyclePreparedActionMatchesV1(record, current)
     ) {
       return { ...record };
     }
@@ -1439,34 +1450,133 @@ function exactLifecycleReceiptMatches(
   compositeToolName: string,
   receipt: ActionReceipt | MissionRuntimeReceipt,
 ): boolean {
-  const expected: Record<string, { system: ResourceRef["system"]; prefix: string }> = {
+  const expected: Record<
+    string,
+    { system: ResourceRef["system"]; prefixes: readonly string[] }
+  > = {
     publish_research_to_linear: {
       system: "linear",
-      prefix: "research-publication:",
+      prefixes: ["research-publication:"],
     },
     publish_research_project_to_linear: {
       system: "linear",
-      prefix: "linear-research-project:",
+      prefixes: ["linear-research-project:"],
+    },
+    github_create_repository: {
+      system: "github",
+      prefixes: [
+        "github-private-repository:",
+        "github-public-repository:",
+      ],
     },
     github_create_private_repository: {
       system: "github",
-      prefix: "github-private-repository:",
+      prefixes: ["github-private-repository:"],
     },
     publish_verified_code_to_github: {
       system: "github",
-      prefix: "github-publication:",
+      prefixes: ["github-publication:"],
     },
     github_delete_private_repository: {
       system: "github",
-      prefix: "github-private-repository-cleanup:",
+      prefixes: ["github-private-repository-cleanup:"],
     },
   };
   const binding = expected[compositeToolName];
   return Boolean(
     binding &&
     receipt.resource?.system === binding.system &&
-    receipt.idempotencyKey?.startsWith(binding.prefix),
+    binding.prefixes.some((prefix) =>
+      receipt.idempotencyKey?.startsWith(prefix),
+    ),
   );
+}
+
+export interface ReceiptBackedOutputTargetPathV1 {
+  path: string;
+  observedFingerprint: string;
+  receiptId: string;
+  operationId: string;
+}
+
+/**
+ * A persisted outputTargetPath is only a hint until a committed WAL row proves
+ * that this exact run created the note and verified its contents. Without this
+ * binding, editing an Agent Run markdown snapshot could redirect a resumed
+ * write into any existing vault note.
+ */
+export function resolveReceiptBackedOutputTargetPathV1(
+  snapshot: MissionRuntimeSnapshotV2,
+): ReceiptBackedOutputTargetPathV1 | null {
+  const targetPath = snapshot.outputTargetPath
+    ? normalizeCurrentNotePath(snapshot.outputTargetPath)
+    : undefined;
+  if (!targetPath) return null;
+
+  for (let index = snapshot.operationJournal.length - 1; index >= 0; index -= 1) {
+    const record = snapshot.operationJournal[index];
+    const receipt = record.receipt;
+    if (
+      record.rootRunId !== snapshot.lineage.rootRunId ||
+      record.state !== "committed" ||
+      record.mutationMayHaveApplied !== true ||
+      !receipt ||
+      receipt.readback?.status !== "verified" ||
+      !receipt.readback.observedFingerprint ||
+      receipt.path !== targetPath
+    ) {
+      continue;
+    }
+
+    const output = isRecord(receipt.output) ? receipt.output : null;
+    if (output?.partial === true) continue;
+    const streamedCreate =
+      getNonEmptyString(output?.createdPath) === targetPath &&
+      output?.partial === false;
+    const exactCreate =
+      record.toolName === "create_file" &&
+      receipt.toolName === "create_file" &&
+      (record.operation === "create" || receipt.operation === "create");
+    if (!streamedCreate && !exactCreate) continue;
+
+    return {
+      path: targetPath,
+      observedFingerprint: receipt.readback.observedFingerprint,
+      receiptId: receipt.id,
+      operationId: record.operationId,
+    };
+  }
+  return null;
+}
+
+function exactLifecyclePreparedActionMatchesV1(
+  prior: OperationJournalRecord,
+  current: OperationJournalRecord,
+): boolean {
+  const left = prior.preparedAction;
+  const right = current.preparedAction;
+  if (!left || !right) return false;
+  try {
+    return canonicalJson({
+      toolName: left.toolName,
+      target: left.target,
+      relatedResources: left.relatedResources,
+      normalizedArgs: left.normalizedArgs,
+      expectedTargetRevision: left.expectedTargetRevision ?? null,
+      idempotencyKey: left.idempotencyKey ?? null,
+      reconciliationKey: left.reconciliationKey ?? null,
+    }) === canonicalJson({
+      toolName: right.toolName,
+      target: right.target,
+      relatedResources: right.relatedResources,
+      normalizedArgs: right.normalizedArgs,
+      expectedTargetRevision: right.expectedTargetRevision ?? null,
+      idempotencyKey: right.idempotencyKey ?? null,
+      reconciliationKey: right.reconciliationKey ?? null,
+    });
+  } catch {
+    return false;
+  }
 }
 
 /**

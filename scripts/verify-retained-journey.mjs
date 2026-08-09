@@ -233,7 +233,7 @@ const requiredGraphTools = [
   "code_validate_full",
   "code_commit_verified",
   "linear_create_issue",
-  "github_create_private_repository",
+  "github_create_repository",
   "publish_verified_code_to_github",
 ];
 const completedGraphTools = new Set(

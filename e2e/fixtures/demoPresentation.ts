@@ -69,7 +69,6 @@ export async function prepareDemoPresentationV1(
         ".mod-root .workspace-leaf-content[data-type='markdown'] > .view-header,",
         ".mod-root .workspace-tab-header-container,",
         ".mod-root .workspace-tab-header-status-container,",
-        ".agentic-researcher-prompt-shortcut,",
         ".agentic-researcher-chat-only-toggle,",
         ".agentic-researcher-clear,",
         ".agentic-researcher-log-system,",
@@ -91,9 +90,6 @@ export async function prepareDemoPresentationV1(
         ".workspace-split.mod-right-split {",
         "  flex: 0 0 520px !important;",
         "  width: 520px !important;",
-        "}",
-        ".agentic-researcher-tabs.has-orchestrator {",
-        "  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;",
         "}",
         ".agentic-researcher-dashboard-section-final-answer .agentic-researcher-dashboard-body,",
         ".agentic-researcher-dashboard-section-receipts .agentic-researcher-dashboard-body,",
@@ -220,15 +216,6 @@ export async function prepareDemoPresentationV1(
           ].find(([pattern]) => (pattern as RegExp).test(text));
           if (readableToolEvent) {
             line.textContent = readableToolEvent[1] as string;
-          }
-        }
-        for (const tab of Array.from(
-          document.querySelectorAll<HTMLElement>(
-            ".agentic-researcher-tab",
-          ),
-        )) {
-          if (tab.textContent?.trim() === "Orchestrator") {
-            tab.style.setProperty("display", "none", "important");
           }
         }
       };
@@ -503,7 +490,7 @@ export function waitForDemoMissionBrokerV1(
  * acceptance stay visible while presentation-only diagnostics remain hidden.
  */
 export async function prepareDemoFinaleV1(page: Page): Promise<void> {
-  await page.getByRole("tab", { name: "Activity" }).click();
+  await page.getByRole("tab", { name: "Run Details" }).click();
   await page.evaluate(() => {
     document
       .querySelectorAll<HTMLDetailsElement>(

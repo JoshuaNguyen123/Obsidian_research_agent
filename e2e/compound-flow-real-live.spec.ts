@@ -10,6 +10,7 @@ import {
   GitHubRestClient,
 } from "../src/integrations/github/GitHubRestClient";
 import type { HttpTransport } from "../src/model/types";
+import { recordDailyUseAcceptance } from "./fixtures/dailyUseAcceptance";
 import {
   deleteDisposableGitHubRepositoryAndVerify,
   DisposableExternalCleanupManifest,
@@ -48,7 +49,7 @@ const VALIDATION_PROFILE_KEY = "compound-flow-real-ts-validation";
  * to prove the issue reached its configured completed state with the
  * lineage summary comment before cleanup trashes it.
  */
-test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async () => {
+test("FLOW-REAL-01 COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async () => {
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
   test.skip(
     !laneSelectedV1(LANE),
@@ -189,7 +190,7 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
         "GitHub must be ready via E2E_GITHUB_TOKEN (github_pat_…) or a vault fine-grained PAT with Administration:write.",
       );
     }
-    // Agent-driven github_create_private_repository uses the vault lease, not
+    // Agent-driven github_create_repository uses the vault lease, not
     // gh CLI. Fail closed unless that lease can create+delete; when the vault
     // fine-grained PAT lacks Administration:write, install the local gh OAuth
     // token through the harness-only credential API (test vault only).
@@ -201,7 +202,7 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
     });
     // Profile may have been seeded as pending/<repo> when only the vault lease
     // supplies login. Bind the exact owner/repo before the mission so
-    // github_create_private_repository does not mutate under owner "pending".
+    // github_create_repository does not mutate under owner "pending".
     profile.promotionPolicy.githubRepository = `${githubLogin}/${repository}`;
     await bindGitHubRepositoryDestination(
       harness.page,
@@ -322,7 +323,7 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
       `Then call code_validate_fast, code_repair_record_cycle, code_validate_targeted, code_validate_full, and code_commit_verified with that same requestId ${requestId}.`,
       `Do not rewrite package.json or scripts.`,
       // Prose + tool token: snake_case alone does not match \bcreate\b intent regexes.
-      `Create the exact private GitHub repository ${githubLogin}/${repository} (github_create_private_repository).`,
+      `Create the exact private GitHub repository ${githubLogin}/${repository} with github_create_repository visibility private.`,
       `After the verified commit exists, call publish_verified_code_to_github with action publish_draft for trusted profile ${PROFILE_KEY} so a draft pull request URL exists (create-only is not enough).`,
       // Prose keeps hasAppendIntent; tool token is also recognized.
       `Append a Flow real reflection to the current note via append_to_current_file containing marker ${marker}, the Linear issue URL, the private GitHub repo URL, the draft PR URL, and workspace ${workspaceId}.`,
@@ -398,9 +399,22 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
       researchPublication!.backlinkVerified,
       "research publication backlink must be verified",
     ).toBe(true);
+    expect(
+      researchPublication!.acceptedProofExact,
+      "research publication must retain the exact host-accepted artifact/package/work-item/binding proof chain",
+    ).toBe(true);
+    expect(
+      researchPublication!.webEvidenceReferences.length,
+      "accepted research publication must retain at least two distinct web evidence references",
+    ).toBeGreaterThanOrEqual(2);
+    for (const reference of researchPublication!.webEvidenceReferences) {
+      expect(
+        finalNote,
+        `accepted evidence reference must remain in the initiating note: ${reference}`,
+      ).toContain(reference);
+    }
     issueId = researchPublication!.issueId;
-
-    issueUrl = extractLinearUrl(finalNote);
+    issueUrl = researchPublication!.issueUrl;
     if (!issueUrl) {
       const title = `Flow real ${marker}`;
       const recovered =
@@ -453,10 +467,22 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
       finalNote,
       "reflection note must include the private GitHub repository URL",
     ).toContain(githubHtmlUrl!);
+    // Accept any canonical reflection heading, matching the byok-autonomous
+    // journey and e2eProjectRouting. The host's own finalizer writes
+    // "## Agent project reflection" (AcceptedResearchNoteWriter) or
+    // "## Mission completion reflection" (initiatingNoteReflection), and that
+    // reflection satisfies the noteReflectionWithMarkers delivery proof — which
+    // completes delivery and withdraws the write tools before the model can add
+    // its own "Flow real reflection". Requiring the model-authored heading made
+    // this lane depend on the model appending before GitHub publish. The proofs
+    // that matter (marker, Linear URL, repo URL, draft PR URL) are asserted
+    // individually above and below.
     expect(
       finalNote,
       "reflection section heading must be present",
-    ).toMatch(/##\s*Flow real(?:\s+reflection)?/i);
+    ).toMatch(
+      /##\s*(?:Flow real(?:\s+reflection)?|Agent project reflection|Mission completion reflection)/i,
+    );
 
     const codeProbe = await softProbeCodeDepth(
       harness.page,
@@ -473,10 +499,9 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
     const draftPrMatch = finalNote.match(
       /https:\/\/github\.com\/[^\s)\]"']+\/pull\/\d+/iu,
     );
-    expect(
-      draftPrMatch?.[0],
-      "reflection note must include a draft PR URL (not create-only)",
-    ).toMatch(/\/pull\/\d+/iu);
+    expect(draftPrMatch?.[0], "reflection note must include a draft PR URL").toMatch(
+      /\/pull\/\d+/iu,
+    );
 
     if (process.env.COMPOUND_REAL_MERGE === "1") {
       expect(
@@ -497,6 +522,20 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
     );
     expect(publication.pullRequestHtmlUrl).toContain(`/${repository}/pull/`);
     expect(publication.pullRequestNumber).toBeGreaterThanOrEqual(1);
+    expect(publication.completionProof).toBe("draft_pr");
+    expect(publication.pullRequestState).toBe("open");
+    expect(publication.pullRequestDraft).toBe(true);
+    expect(publication.pullRequestMerged).toBe(false);
+    expect(publication.handoffFingerprint).toBe(codeProbe.handoffFingerprint);
+    expect(publication.headSha).toBe(codeProbe.commitSha);
+    expect(publication.remoteSha).toBe(codeProbe.commitSha);
+    expect(publication.pullRequestHeadSha).toBe(codeProbe.commitSha);
+    expect(publication.pullRequestHeadRef).toBe(codeProbe.branch);
+    expect(
+      draftPrMatch?.[0],
+      "reflection note must contain the exact provider-read-back pull request URL",
+    ).toBe(publication.pullRequestHtmlUrl);
+    expect(finalNote).toContain(publication.pullRequestHtmlUrl);
     const completionReceipt = await readExternalActionReceipt(
       harness.page,
       publication.linearCompletionReceiptId,
@@ -551,6 +590,124 @@ test("COMPOUND-REAL Obsidian agent Linear Code GitHub note reflection", async ()
     expect(summaryComment.body).toContain(publication.pullRequestHtmlUrl);
     expect(summaryComment.body).toContain(
       `Publication lineage: \`${publication.publicationId}\``,
+    );
+
+    // FLOW-REAL-01 acceptance. Every token is gated on the exact value this
+    // lane just asserted, so a token can only enter the record from observed
+    // evidence — never from the schema. DU-06 is deliberately not used: it
+    // mandates a Linear initiative and project that this single-issue chain
+    // never creates.
+    const acceptanceSnapshot = await harness.attestProductionRun();
+    const observedArtifacts: string[] = [];
+    const observedProofs: string[] = [];
+    const observedBindings: string[] = [];
+    const attest = (bucket: string[], token: string, observed: boolean) => {
+      if (observed) bucket.push(token);
+    };
+
+    attest(observedArtifacts, "vault:research_note", researchPublication !== null);
+    attest(
+      observedArtifacts,
+      "linear:issue",
+      /^https:\/\/linear\.app\//iu.test(issueUrl ?? ""),
+    );
+    attest(observedArtifacts, "git:local_commit", codeProbe.commitProofExact);
+    attest(observedArtifacts, "github:private_repository", remote.private === true);
+    attest(
+      observedArtifacts,
+      "github:draft_pr",
+      publication.pullRequestNumber >= 1,
+    );
+    attest(
+      observedArtifacts,
+      "vault:completion_reflection",
+      /##\s*(?:Flow real(?:\s+reflection)?|Agent project reflection|Mission completion reflection)/i
+        .test(finalNote),
+    );
+
+    attest(observedProofs, "research:accepted", researchPublication!.acceptedProofExact);
+    attest(
+      observedProofs,
+      "research:two_distinct_sources",
+      researchPublication!.webEvidenceReferences.length >= 2 &&
+        researchPublication!.webEvidenceReferences.every((reference) =>
+          finalNote.includes(reference),
+        ),
+    );
+    attest(
+      observedProofs,
+      "linear:provider_readback",
+      researchPublication?.backlinkVerified === true,
+    );
+    attest(
+      observedProofs,
+      "linear:completion_readback",
+      completionProof.stateType === "completed" &&
+        completionProof.stateId === completionProof.configuredCompletedStateId &&
+        Boolean(completionProof.completedAt),
+    );
+    attest(observedProofs, "code:workspace_validated", codeProbe.validationProofExact);
+    attest(observedProofs, "git:verified_commit", codeProbe.commitProofExact);
+    attest(
+      observedProofs,
+      "github:private_visibility_readback",
+      remote.private === true,
+    );
+    attest(
+      observedProofs,
+      "github:draft_pr_readback",
+      publication.completionProof === "draft_pr" &&
+        publication.pullRequestState === "open" &&
+        publication.pullRequestDraft === true &&
+        publication.pullRequestMerged === false &&
+        publication.handoffFingerprint === codeProbe.handoffFingerprint &&
+        publication.headSha === codeProbe.commitSha &&
+        publication.remoteSha === codeProbe.commitSha &&
+        publication.pullRequestHeadSha === codeProbe.commitSha,
+    );
+    attest(
+      observedProofs,
+      "reconciliation:backlinks_and_status",
+      summaryComment.issueId === completedIssueId &&
+        summaryComment.body.includes(publication.pullRequestHtmlUrl),
+    );
+
+    attest(
+      observedBindings,
+      "binding:note_linear_issue",
+      Boolean(issueUrl) && finalNote.includes(issueUrl!),
+    );
+    attest(
+      observedBindings,
+      "binding:note_commit_pr",
+      finalNote.includes(githubHtmlUrl!) &&
+        draftPrMatch?.[0] === publication.pullRequestHtmlUrl &&
+        publication.pullRequestHeadSha === codeProbe.commitSha,
+    );
+    attest(
+      observedBindings,
+      "binding:linear_commit_pr",
+      summaryComment.body.includes(publication.pullRequestHtmlUrl),
+    );
+
+    await recordDailyUseAcceptance(
+      test.info(),
+      "FLOW-REAL-01",
+      {
+        artifacts: observedArtifacts,
+        proofs: observedProofs,
+        // Unattended set-loose: no approval boundaries, and cleanup runs after
+        // this record, so both stay empty by contract.
+        approvals: [],
+        bindings: observedBindings,
+        cleanup: [],
+      },
+      {
+        modelCalls: acceptanceSnapshot?.modelCallEvidence?.length,
+        toolCalls: acceptanceSnapshot?.missionEvidence?.length,
+        missionScorecard: acceptanceSnapshot?.lastMissionScorecard ?? null,
+      },
+      { requireComplete: true },
     );
 
     console.log(
@@ -707,7 +864,10 @@ async function readCompleteResearchPublication(
 ): Promise<{
   publicationId: string;
   issueId: string;
+  issueUrl: string;
   backlinkVerified: boolean;
+  acceptedProofExact: boolean;
+  webEvidenceReferences: string[];
 } | null> {
   return page.evaluate(({ pluginId, notePath }) => {
     const plugin = (window as typeof window & { app?: any }).app?.plugins
@@ -722,12 +882,80 @@ async function readCompleteResearchPublication(
         checkpoint?.status === "complete",
     );
     if (!matched) return null;
+    const artifact = matched.artifact ?? {};
+    const acceptedPackage = matched.acceptedPackage ?? null;
+    const binding = matched.binding ?? null;
+    const issue = matched.issue ?? null;
+    const backlink = matched.backlink ?? null;
+    const artifactEvidence = Array.isArray(artifact.evidence)
+      ? artifact.evidence
+      : [];
+    const packageEvidence = Array.isArray(acceptedPackage?.evidence)
+      ? acceptedPackage.evidence
+      : [];
+    const evidenceMatches =
+      artifactEvidence.length > 0 &&
+      artifactEvidence.length === packageEvidence.length &&
+      artifactEvidence.every((entry: any) =>
+        packageEvidence.some(
+          (candidate: any) =>
+            candidate?.id === entry?.id &&
+            candidate?.kind === entry?.kind &&
+            candidate?.reference === entry?.reference &&
+            candidate?.contentSha256 === entry?.contentSha256,
+        ),
+      );
+    const webEvidenceReferences: string[] = Array.from(
+      new Set<string>(
+        artifactEvidence
+          .filter(
+            (entry: any) =>
+              entry?.kind === "web" &&
+              /^https?:\/\//iu.test(String(entry?.reference ?? "")),
+          )
+          .map((entry: any): string => String(entry.reference)),
+      ),
+    );
+    const sha256 = (value: unknown) =>
+      /^sha256:[a-f0-9]{64}$/u.test(String(value ?? ""));
+    const issueId = String(issue?.id ?? "");
+    const issueUrl = String(issue?.url ?? "");
+    const workItemFingerprint = String(matched.workItemFingerprint ?? "");
+    const artifactFingerprint = String(artifact.artifactFingerprint ?? "");
+    const acceptedProofExact =
+      matched.status === "complete" &&
+      matched.pendingAction === null &&
+      matched.error === null &&
+      acceptedPackage !== null &&
+      artifact?.acceptedBy === "host" &&
+      artifact?.notePath === notePath &&
+      sha256(artifact?.noteSha256) &&
+      sha256(artifactFingerprint) &&
+      String(artifact?.noteReceiptId ?? "").length > 0 &&
+      acceptedPackage?.originRunId === artifact?.originRunId &&
+      acceptedPackage?.vaultBindingKey === artifact?.vaultBindingKey &&
+      evidenceMatches &&
+      sha256(workItemFingerprint) &&
+      binding?.provider === "linear" &&
+      binding?.issueId === issueId &&
+      binding?.issueUrl === issueUrl &&
+      binding?.workItemFingerprint === workItemFingerprint &&
+      binding?.acceptedResearchArtifactFingerprint === artifactFingerprint &&
+      sha256(binding?.bindingFingerprint) &&
+      /^https:\/\/linear\.app\//iu.test(issueUrl) &&
+      backlink?.path === notePath &&
+      backlink?.issueUrl === issueUrl &&
+      sha256(backlink?.beforeSha256) &&
+      sha256(backlink?.afterSha256);
     return {
       publicationId: String(matched.publicationId ?? ""),
-      issueId: String(matched.issue?.id ?? ""),
+      issueId,
+      issueUrl,
       backlinkVerified:
-        typeof matched.backlink?.afterSha256 === "string" &&
-        /^sha256:[a-f0-9]{64}$/u.test(matched.backlink.afterSha256),
+        typeof backlink?.afterSha256 === "string" &&
+        /^sha256:[a-f0-9]{64}$/u.test(backlink.afterSha256),
+      acceptedProofExact,
+      webEvidenceReferences,
     };
   }, { pluginId: NATIVE_CORE_PLUGIN_ID, notePath });
 }
@@ -747,6 +975,16 @@ async function pollForFinalizedGithubPublication(
   status: string;
   pullRequestHtmlUrl: string;
   pullRequestNumber: number;
+  pullRequestState: string;
+  pullRequestDraft: boolean;
+  pullRequestMerged: boolean;
+  pullRequestHeadRef: string;
+  pullRequestHeadSha: string;
+  completionProof: string;
+  handoffFingerprint: string;
+  bindingFingerprint: string;
+  headSha: string;
+  remoteSha: string;
   linearLinkReceiptId: string;
   linearCompletionReceiptId: string;
   obsidianReceiptId: string;
@@ -772,6 +1010,16 @@ async function pollForFinalizedGithubPublication(
           status: String(checkpoint.status ?? ""),
           pullRequestHtmlUrl: String(checkpoint.pullRequest?.htmlUrl ?? ""),
           pullRequestNumber: Number(checkpoint.pullRequest?.number ?? 0),
+          pullRequestState: String(checkpoint.pullRequest?.state ?? ""),
+          pullRequestDraft: checkpoint.pullRequest?.draft === true,
+          pullRequestMerged: checkpoint.pullRequest?.merged === true,
+          pullRequestHeadRef: String(checkpoint.pullRequest?.head?.ref ?? ""),
+          pullRequestHeadSha: String(checkpoint.pullRequest?.head?.sha ?? ""),
+          completionProof: String(checkpoint.completionProof ?? ""),
+          handoffFingerprint: String(checkpoint.handoffFingerprint ?? ""),
+          bindingFingerprint: String(checkpoint.bindingFingerprint ?? ""),
+          headSha: String(checkpoint.headSha ?? ""),
+          remoteSha: String(checkpoint.remoteSha ?? ""),
           linearLinkReceiptId: String(checkpoint.linearLinkReceiptId ?? ""),
           linearCompletionReceiptId: String(
             checkpoint.linearCompletionReceiptId ?? "",
@@ -783,6 +1031,15 @@ async function pollForFinalizedGithubPublication(
     const finalized = publications.find(
       (item) =>
         item.status === "finalized" &&
+        item.completionProof === "draft_pr" &&
+        item.pullRequestState === "open" &&
+        item.pullRequestDraft === true &&
+        item.pullRequestMerged === false &&
+        /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(item.headSha) &&
+        item.remoteSha === item.headSha &&
+        item.pullRequestHeadSha === item.headSha &&
+        /^sha256:[0-9a-f]{64}$/u.test(item.handoffFingerprint) &&
+        /^sha256:[0-9a-f]{64}$/u.test(item.bindingFingerprint) &&
         item.linearLinkReceiptId &&
         item.linearCompletionReceiptId &&
         item.obsidianReceiptId,
@@ -974,9 +1231,17 @@ async function softProbeCodeDepth(
   relativePath: string,
   marker: string,
   profileKey: string,
-): Promise<{ depth: string; detail?: string }> {
+): Promise<{
+  depth: string;
+  detail?: string;
+  handoffFingerprint?: string;
+  commitSha?: string;
+  branch?: string;
+  validationProofExact: boolean;
+  commitProofExact: boolean;
+}> {
   try {
-    return await page.evaluate(
+    const raw = await page.evaluate(
       async ({
         corePluginId,
         codePluginId,
@@ -1039,7 +1304,7 @@ async function softProbeCodeDepth(
           };
         }
 
-        // Authoritative Soft-union signal: publication-eligible verified commit.
+        // Authoritative signal: an exact publication-eligible verified handoff.
         try {
           const resolveHandoff =
             typeof code?.resolveVerifiedCodePublicationHandoff === "function"
@@ -1051,12 +1316,76 @@ async function softProbeCodeDepth(
             const handoff = await resolveHandoff(profileKey);
             const commitSha = String(handoff?.commitSha ?? "").trim();
             const handoffWorkspace = String(handoff?.workspaceId ?? "").trim();
-            if (
-              /^[0-9a-f]{7,64}$/iu.test(commitSha) &&
-              (!handoffWorkspace || handoffWorkspace === workspaceId)
-            ) {
-              return { depth: "committed", detail: "handoff_commit_sha" };
+            const handoffFingerprint = String(handoff?.fingerprint ?? "").trim();
+            const branch = String(handoff?.branch ?? "").trim();
+            const targetedReceiptId = String(
+              handoff?.targetedValidationReceiptId ?? "",
+            ).trim();
+            const fullReceiptId = String(
+              handoff?.fullValidationReceiptId ?? "",
+            ).trim();
+            const targetedFingerprint = String(
+              handoff?.targetedValidationFingerprint ?? "",
+            ).trim();
+            const fullFingerprint = String(
+              handoff?.fullValidationFingerprint ?? "",
+            ).trim();
+            const localCommitReceiptId = String(
+              handoff?.localCommitReceiptId ?? "",
+            ).trim();
+            const localCommitReceiptFingerprint = String(
+              handoff?.localCommitReceiptFingerprint ?? "",
+            ).trim();
+            const normalizedRelativePath = relativePath.replace(/\\/gu, "/");
+            const artifactHashes = Array.isArray(handoff?.artifactHashes)
+              ? handoff.artifactHashes
+              : [];
+            const artifactBound = artifactHashes.some(
+              (entry: any) =>
+                String(entry?.path ?? "").replace(/\\/gu, "/") ===
+                  normalizedRelativePath &&
+                /^sha256:[0-9a-f]{64}$/u.test(String(entry?.sha256 ?? "")) &&
+                Number(entry?.bytes ?? 0) > 0,
+            );
+            const validationProofExact =
+              targetedReceiptId.length > 0 &&
+              fullReceiptId.length > 0 &&
+              targetedReceiptId !== fullReceiptId &&
+              /^sha256:[0-9a-f]{64}$/u.test(targetedFingerprint) &&
+              /^sha256:[0-9a-f]{64}$/u.test(fullFingerprint);
+            const commitProofExact =
+              handoff?.version === 1 &&
+              handoff?.kind === "verified_code_publication_handoff" &&
+              handoff?.status === "verified" &&
+              handoff?.repositoryProfileKey === profileKey &&
+              handoffWorkspace === workspaceId &&
+              /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(commitSha) &&
+              /^codex\//u.test(branch) &&
+              /^sha256:[0-9a-f]{64}$/u.test(handoffFingerprint) &&
+              localCommitReceiptId.length > 0 &&
+              /^sha256:[0-9a-f]{64}$/u.test(localCommitReceiptFingerprint) &&
+              artifactBound &&
+              validationProofExact;
+            if (commitProofExact) {
+              return {
+                depth: "committed",
+                detail: "verified_handoff_receipt_chain",
+                handoffFingerprint,
+                commitSha,
+                branch,
+                validationProofExact,
+                commitProofExact,
+              };
             }
+            return {
+              depth: "marker_ok",
+              detail: "handoff_proof_incomplete",
+              handoffFingerprint: handoffFingerprint || undefined,
+              commitSha: commitSha || undefined,
+              branch: branch || undefined,
+              validationProofExact,
+              commitProofExact: false,
+            };
           }
         } catch (error) {
           return {
@@ -1065,37 +1394,7 @@ async function softProbeCodeDepth(
           };
         }
 
-        // Fallback: worktree HEAD advanced past workspace baseSha.
-        try {
-          const manifest = await manager.loadManifest?.(workspaceId);
-          const baseSha = String(manifest?.baseSha ?? "").trim().toLowerCase();
-          const worktreeRoot = String(
-            manifest?.repositoryBinding?.worktreeRoot ??
-              manifest?.canonicalRoot ??
-              "",
-          ).trim();
-          const inspect =
-            typeof code?.inspectWorktree === "function"
-              ? await code.inspectWorktree(worktreeRoot)
-              : typeof manager?.inspectWorktree === "function"
-                ? await manager.inspectWorktree(worktreeRoot)
-                : null;
-          const head = String(
-            inspect?.head ?? inspect?.headSha ?? inspect?.commitSha ?? "",
-          )
-            .trim()
-            .toLowerCase();
-          if (
-            /^[0-9a-f]{7,64}$/iu.test(head) &&
-            (!baseSha || head !== baseSha)
-          ) {
-            return { depth: "committed", detail: "worktree_head_advanced" };
-          }
-        } catch {
-          // fall through to marker_ok
-        }
-
-        return { depth: "marker_ok", detail: "no_commit_sha" };
+        return { depth: "marker_ok", detail: "no_verified_handoff" };
       },
       {
         corePluginId: NATIVE_CORE_PLUGIN_ID,
@@ -1106,10 +1405,17 @@ async function softProbeCodeDepth(
         profileKey,
       },
     );
+    return {
+      validationProofExact: false,
+      commitProofExact: false,
+      ...raw,
+    };
   } catch (error) {
     return {
       depth: "unreadable",
       detail: String((error as Error)?.message ?? error).slice(0, 160),
+      validationProofExact: false,
+      commitProofExact: false,
     };
   }
 }

@@ -1566,6 +1566,23 @@ test("path CRUD tools create, append, replace with backup, move, and trash markd
   );
   assert.equal(created.ok, true);
   assert.equal(mock.content.get("Projects/New/Brief.md"), "# Brief");
+  const createReadback = (
+    created.output as {
+      readback?: {
+        status: string;
+        checkedAt: string;
+        observedRevision: string;
+        observedFingerprint: string;
+      };
+    }
+  ).readback;
+  assert.equal(createReadback?.status, "verified");
+  assert.equal(createReadback?.checkedAt, new Date(123).toISOString());
+  assert.match(createReadback?.observedRevision ?? "", /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(
+    createReadback?.observedFingerprint,
+    createReadback?.observedRevision,
+  );
 
   const appended = await registry.execute(
     {
@@ -2480,6 +2497,45 @@ test("append_to_current_file is blocked on revise missions with existing body", 
   assert.equal(result.ok, false);
   assert.match(result.error?.message ?? "", /blocked for this revise\/replace/i);
   assert.match(mock.content.get("Current.md") ?? "", /Draft paragraph/);
+});
+
+test("host-planned report creation permits only its exact new-note path", async () => {
+  const registry = createDefaultToolRegistry();
+  const prompt =
+    "Write me an in depth guide/report to agent orchestration and explain why it matters.";
+  const mock = createMockContext({ prompt, now: new Date(456) });
+  mock.context.missionIntent = { noteOutput: true } as never;
+  mock.context.plannedNoteOutputPath = "Agent Orchestration Guide.md";
+
+  const created = await registry.execute(
+    {
+      name: "create_file",
+      arguments: {
+        path: "Agent Orchestration Guide.md",
+        content: "# Agent Orchestration Guide",
+      },
+    },
+    mock.context,
+  );
+  assert.equal(created.ok, true);
+  assert.equal(
+    (created.output as { readback?: { status?: string } }).readback?.status,
+    "verified",
+  );
+
+  const mismatched = await registry.execute(
+    {
+      name: "create_file",
+      arguments: {
+        path: "Different Report.md",
+        content: "# Different Report",
+      },
+    },
+    mock.context,
+  );
+  assert.equal(mismatched.ok, false);
+  assert.match(mismatched.error?.message ?? "", /explicitly ask to create/u);
+  assert.equal(mock.content.has("Different Report.md"), false);
 });
 
 test("append_to_current_file permits a reflection when a code rewrite is explicitly forbidden", async () => {

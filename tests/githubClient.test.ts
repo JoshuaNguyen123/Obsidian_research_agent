@@ -193,6 +193,97 @@ test("GitHubRestClient creates only an exact private repository payload", async 
   });
 });
 
+test("GitHubRestClient creates an exact explicitly public repository payload", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    return response(201, {
+      ...repositoryPayload(),
+      private: false,
+      visibility: "public",
+    });
+  });
+
+  const created = await client.createRepository({
+    ownerKind: "organization",
+    owner: "acme",
+    repository: "research-agent",
+    visibility: "public",
+    description: "Public fixture",
+  });
+
+  assert.equal(created.private, false);
+  assert.equal(created.visibility, "public");
+  assert.deepEqual(JSON.parse(String(requests[0]?.body)), {
+    name: "research-agent",
+    private: false,
+    visibility: "public",
+    auto_init: false,
+    has_issues: true,
+    has_projects: false,
+    has_wiki: false,
+    description: "Public fixture",
+  });
+});
+
+test("GitHubRestClient binds user repository creation to the authenticated actor before POST", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    if (request.method === "GET") {
+      return response(200, {
+        id: 77,
+        login: "agent-bot",
+        html_url: "https://github.com/agent-bot",
+      });
+    }
+    return response(201, {
+      ...repositoryPayload(),
+      full_name: "agent-bot/research-agent",
+      html_url: "https://github.com/agent-bot/research-agent",
+    });
+  });
+
+  const created = await client.createRepository({
+    ownerKind: "user",
+    owner: "agent-bot",
+    repository: "research-agent",
+    visibility: "private",
+  });
+  assert.equal(created.fullName, "agent-bot/research-agent");
+  assert.deepEqual(
+    requests.map((request) => request.method),
+    ["GET", "POST"],
+  );
+  assert.equal(requests[0]?.url, "https://api.github.com/user");
+  assert.equal(requests[1]?.url, "https://api.github.com/user/repos");
+});
+
+test("GitHubRestClient rejects a user-owner mismatch before repository creation", async () => {
+  const requests: HttpRequest[] = [];
+  const client = clientWith(async (request) => {
+    requests.push(request);
+    return response(200, {
+      id: 77,
+      login: "authenticated-owner",
+      html_url: "https://github.com/authenticated-owner",
+    });
+  });
+
+  await assert.rejects(
+    client.createRepository({
+      ownerKind: "user",
+      owner: "different-owner",
+      repository: "public-leak",
+      visibility: "public",
+    }),
+    /does not match the requested repository owner/iu,
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.method, "GET");
+  assert.equal(requests.some((request) => request.method === "POST"), false);
+});
+
 test("GitHubRestClient deletes only the exact fixed repository endpoint", async () => {
   const requests: HttpRequest[] = [];
   const client = clientWith(async (request) => {
@@ -246,7 +337,7 @@ test("GitHubRestClient rejects a create response that is public or identity-drif
   }));
   await assert.rejects(
     client.createPrivateRepository({
-      ownerKind: "user",
+      ownerKind: "organization",
       owner: "acme",
       repository: "research-agent",
     }),

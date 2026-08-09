@@ -141,7 +141,8 @@ const FAMILY_SUMMARIES: Record<BundledActionFamilyId, string> = {
   code_workspace: "Create and edit the trusted code workspace",
   code_validate: "Run sandbox validation and repair cycles",
   code_commit: "Create a verified local commit after validation",
-  github_publish: "Create a private GitHub repository and draft PR",
+  github_publish:
+    "Create the explicitly chosen public/private GitHub repository and draft PR",
   vault_replace: "Replace the initiating note when explicitly required",
 };
 
@@ -221,6 +222,7 @@ export function bundledActionFamilyForTool(
     };
   }
   if (
+    name === "github_create_repository" ||
     name === "github_create_private_repository" ||
     name === "github_publish_verified_branch" ||
     name === "publish_verified_code_to_github" ||

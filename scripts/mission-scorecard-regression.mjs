@@ -20,9 +20,12 @@ export const DEFAULT_DAILY_USE_SUMMARY_PATH = path.join(
  * not listed here and not in the baseline is treated as proof debt and fails.
  */
 export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
+  // Native renderer boundary probe: no model call or mission is involved.
+  "safe-assistant-renderer",
   // No model calls: these drive production tools against real external
   // services, so there is no mission to score.
   "configured-linear-live",
+  "configured-github-visibility-live",
   "linear-flow-real-cleanup",
   "github-askpass-runtime-live",
   "disposable-live-external",
@@ -32,6 +35,8 @@ export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
   // reporter records scenarioId=null for it, so no scorecard is ever emitted.
   // Its proof lives in the execution report and mission acceptance asserts.
   "desktop-code-delivery-real-live",
+  // Same bounded code-delivery proof, with the default vault-sibling target.
+  "vault-sibling-code-delivery-real-live",
   // Demo footage drivers, not proof lanes; assert only verified completion.
   "demo-recording",
   "demo-journey-recording",
@@ -77,6 +82,19 @@ export function missionScorecardRecordKey(record) {
     boundedString(record?.project, "project"),
     boundedString(record?.scenarioId, "scenarioId"),
     normalizeProofPath(record?.file),
+    boundedString(record?.title, "title"),
+  ].join("|");
+}
+
+/**
+ * Stable identity shared by Playwright execution proof and scorecard records.
+ * Playwright reports files relative to its `e2e/` root while the scorecard
+ * stores repository-relative paths, so remove only that known prefix.
+ */
+export function missionScorecardExecutionKey(record) {
+  return [
+    boundedString(record?.project, "project"),
+    normalizeProofPath(record?.file).replace(/^e2e\//u, ""),
     boundedString(record?.title, "title"),
   ].join("|");
 }
@@ -143,6 +161,7 @@ export async function assertMissionScorecardSummaryFile(options = {}) {
     summary,
     baseline,
     selectedProjects: [...selectedProjects],
+    executedTests: options.executedTests,
   });
 }
 
@@ -150,6 +169,7 @@ export function assertMissionScorecardRegressions({
   summary,
   baseline,
   selectedProjects = [],
+  executedTests,
 }) {
   validateBaseline(baseline);
   if (
@@ -166,9 +186,40 @@ export function assertMissionScorecardRegressions({
       ? selectedProjects
       : summary.records.map((record) => String(record?.project ?? "")),
   );
-  const applicableBaselines = baseline.records.filter((record) =>
-    activeProjects.has(record.project),
+  const executedTestKeys = Array.isArray(executedTests)
+    ? new Set(executedTests.map(missionScorecardExecutionKey))
+    : null;
+  const applicableBaselines = baseline.records.filter(
+    (record) =>
+      activeProjects.has(record.project) &&
+      (!executedTestKeys ||
+        executedTestKeys.has(missionScorecardExecutionKey(record))),
   );
+  if (executedTestKeys) {
+    const baselineExecutionKeys = new Set(
+      applicableBaselines.map(missionScorecardExecutionKey),
+    );
+    const exactScoredExecutions = new Set(
+      summary.records
+        .filter(
+          (record) =>
+            activeProjects.has(String(record?.project ?? "")) &&
+            typeof record?.scenarioId === "string" &&
+            record.scenarioId.trim().length > 0,
+        )
+        .map(missionScorecardExecutionKey)
+        .filter((key) => executedTestKeys.has(key)),
+    );
+    const missingExactBaselines = [...exactScoredExecutions].filter(
+      (key) => !baselineExecutionKeys.has(key),
+    );
+    if (missingExactBaselines.length > 0) {
+      throw new Error(
+        "No exact mission-scorecard baseline exists for the scored test(s) that ran:\n- " +
+          missingExactBaselines.join("\n- "),
+      );
+    }
+  }
   if (applicableBaselines.length === 0) {
     return { checkedRecords: 0, skipped: true };
   }
@@ -215,9 +266,22 @@ export function assertMissionScorecardRegressions({
     const previousById = new Map(
       previous.dimensions.map((dimension) => [dimension.id, dimension.score]),
     );
+    // A dimension marked inapplicable had nothing to measure, so its score is a
+    // placeholder 1 rather than an earned one. Comparing it would flag any
+    // later run that actually measured the dimension and scored honestly below
+    // 1. Absent `applicable` means applicable, so pre-existing baselines are
+    // unaffected.
+    const previousApplicable = new Set(
+      previous.dimensions
+        .filter((dimension) => dimension.applicable !== false)
+        .map((dimension) => dimension.id),
+    );
     for (const dimension of current.dimensions) {
       const baselineScore = previousById.get(dimension.id);
       if (baselineScore === undefined) continue;
+      if (dimension.applicable === false || !previousApplicable.has(dimension.id)) {
+        continue;
+      }
       const delta = round4(dimension.score - baselineScore);
       if (delta < -Math.abs(baseline.tolerance)) {
         failures.push(
@@ -293,7 +357,9 @@ function validateScorecard(value, label) {
       !DIMENSION_IDS.includes(dimension?.id) ||
       seen.has(dimension.id) ||
       !unitInterval(dimension.score) ||
-      !unitInterval(dimension.weight)
+      !unitInterval(dimension.weight) ||
+      (dimension.applicable !== undefined &&
+        typeof dimension.applicable !== "boolean")
     ) {
       throw new Error(`${label} contains an invalid dimension.`);
     }

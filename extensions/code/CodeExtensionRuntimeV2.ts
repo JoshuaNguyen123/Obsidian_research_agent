@@ -61,6 +61,9 @@ import {
   CODE_WORKSPACE_TOOL_NAMES_V2,
   LocalGitWorkspaceProvisionerV2,
   createCodeWorkspaceToolContributionsV2,
+  resolveKnownHostDirectoryV2,
+  resolveVaultSiblingProjectsDirectoryV2,
+  type KnownHostDirectoryV2,
   type RepositoryInspectionV2,
   type RepositoryWorktreeProvisionV2,
   type WorkspaceRepositoryProvisionerV2,
@@ -204,6 +207,16 @@ export interface CodeExtensionRuntimeOptionsV2 {
   now?: () => Date;
 }
 
+export interface GeneratedArtifactHealthProofV1 {
+  version: 1;
+  status: "healthy" | "degraded";
+  summary: string;
+  checkedAt: string;
+  provider: string | null;
+  receiptFingerprint: string | null;
+  artifactFingerprint: string | null;
+}
+
 export interface CodeReviewRepairBaseResolutionInputV1 {
   profileKey: string;
   workspaceId: string;
@@ -326,6 +339,7 @@ export class CodeExtensionRuntimeV2 {
     manager: SandboxManagerV2;
     promise: Promise<SandboxCapabilityStatusV2>;
   } | null = null;
+  private generatedArtifactHealth: GeneratedArtifactHealthProofV1 | null = null;
 
   constructor(options: CodeExtensionRuntimeOptionsV2) {
     if (options.sandboxManager && options.sandboxRunner) {
@@ -387,6 +401,8 @@ export class CodeExtensionRuntimeV2 {
           context.missionId &&
           /^run-/u.test(context.missionId),
         ),
+      resolveKnownHostDirectory: (directory) =>
+        this.resolveKnownHostDirectory(directory),
     });
     const execution = createCodeExecutionContributionsV2({
       // Settings may replace the configured manager after extension
@@ -423,7 +439,8 @@ export class CodeExtensionRuntimeV2 {
         prepareBackgroundValidationCommitApproval: (input) =>
           this.prepareBackgroundValidationCommitApproval(input),
       }),
-      this.createRuntimeStatusContribution(),
+      this.createSandboxIsolationStatusContribution(),
+      this.createGeneratedArtifactStatusContribution(),
       this.createSettingsContribution(),
       ...(this.repairContributions.length > 0
         ? this.repairContributions
@@ -1186,6 +1203,179 @@ export class CodeExtensionRuntimeV2 {
     return this.probeConfiguredSandboxProviders(signal);
   }
 
+  private async resolveKnownHostDirectory(
+    directory: KnownHostDirectoryV2,
+  ): Promise<string> {
+    if (directory !== "vault_sibling_projects") {
+      return resolveKnownHostDirectoryV2(directory);
+    }
+    const adapter = this.plugin.app.vault.adapter as {
+      getBasePath?: () => string;
+    };
+    const rawVaultRoot = adapter.getBasePath?.();
+    if (!rawVaultRoot?.trim()) {
+      throw new WorkspaceManagerErrorV2(
+        "vault_sibling_directory_unavailable",
+        "The active vault does not expose a safe local filesystem root for sibling project delivery.",
+      );
+    }
+    return resolveVaultSiblingProjectsDirectoryV2(rawVaultRoot);
+  }
+
+  /**
+   * Explicit health-only execution proof. It runs a fixed, credential-free
+   * Node command in the verified sandbox and accepts success only when the
+   * generated artifact returns through the hash-checked importer contract.
+   */
+  async probeGeneratedArtifactExecutionReadbackV1(
+    signal?: AbortSignal,
+  ): Promise<GeneratedArtifactHealthProofV1> {
+    this.assertInitialized();
+    const checkedAt = this.isoNow();
+    try {
+      const status = await this.ensureHostProvisionedSandboxReadinessV1(signal);
+      if (!status.executionAvailable || !status.selectedProvider) {
+        return this.recordGeneratedArtifactHealth({
+          version: 1,
+          status: "degraded",
+          summary:
+            status.blocker?.message ??
+            "Generated-artifact health requires a verified sandbox provider.",
+          checkedAt,
+          provider: status.selectedProvider,
+          receiptFingerprint: null,
+          artifactFingerprint: null,
+        });
+      }
+      const provider = this.requireState().sandbox.providerConfigs.find(
+        (candidate) => candidate.kind === status.selectedProvider,
+      );
+      if (!provider) {
+        throw new Error("The verified sandbox provider is not bound to durable Code state.");
+      }
+      const artifactPath = "dist/capability-health.txt";
+      const artifactBytes = new TextEncoder().encode(
+        "agentic-researcher-generated-code-health-v1\n",
+      );
+      const packageBytes = new TextEncoder().encode(
+        JSON.stringify({
+          name: "agentic-researcher-code-health",
+          version: "1.0.0",
+          private: true,
+          scripts: {
+            test:
+              "node -e \"const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/capability-health.txt','agentic-researcher-generated-code-health-v1\\n')\"",
+          },
+        }),
+      );
+      const profile = detectRepositoryProfileV2({
+        key: "agentic-researcher-code-health",
+        displayName: "Agentic Researcher Code health",
+        repositoryRoot: "/agentic-researcher-code-health",
+        defaultBranch: "main",
+        files: ["package.json", ".nvmrc"],
+        fileContents: { ".nvmrc": "24.16.0" },
+        runtimeDigests: { node: provider.runtimeDigest },
+        allowedPaths: ["package.json", ".nvmrc", "dist"],
+        generatedOutputs: ["dist"],
+      });
+      const command = profile.validationCatalog.find(
+        (candidate) => candidate.projectId === "root" && candidate.phase === "fast",
+      );
+      if (!command) throw new Error("The health profile has no fixed fast command.");
+      const stagingManifest = [
+        {
+          path: "package.json",
+          bytes: packageBytes.byteLength,
+          sha256: sha256Bytes(packageBytes),
+        },
+      ];
+      const preparation = await this.requireSandboxManager().prepareExecution({
+        profile,
+        purpose: "validation_fast",
+        projectId: "root",
+        commandId: command.id,
+        workspaceId: "agentic-researcher-code-health",
+        repairRequestId: "agentic-researcher-code-health",
+        workspaceManifestFingerprint: sha256Canonical(stagingManifest),
+        stagingManifest,
+        expectedArtifacts: [
+          {
+            path: artifactPath,
+            expectedSha256: sha256Bytes(artifactBytes),
+            maxBytes: 4_096,
+            required: true,
+          },
+        ],
+        environment: { CI: "true" },
+        resources: { timeoutMs: 60_000 },
+      });
+      if (preparation.status !== "prepared") {
+        throw new Error(preparation.blocker.message);
+      }
+      const result = await this.requireSandboxManager().executePrepared(
+        preparation.action,
+        {
+          authorization: {
+            preparedActionId: preparation.action.id,
+            payloadFingerprint: preparation.action.payloadFingerprint,
+            grantId: "host-explicit-health-refresh",
+          },
+          stagedFiles: [{ path: "package.json", bytes: packageBytes }],
+          artifactImporter: {
+            async importArtifacts(artifacts) {
+              return artifacts.map((artifact) => ({
+                path: artifact.path,
+                readbackSha256: sha256Bytes(artifact.bytes),
+              }));
+            },
+          },
+          signal,
+        },
+      );
+      if (
+        result.status !== "verified" ||
+        result.receipt.importedArtifacts.length !== 1 ||
+        result.receipt.importedArtifacts[0]?.path !== artifactPath ||
+        result.receipt.importedArtifacts[0]?.sha256 !== sha256Bytes(artifactBytes) ||
+        result.receipt.importedArtifacts[0]?.readbackSha256 !==
+          sha256Bytes(artifactBytes)
+      ) {
+        throw new Error(
+          result.status === "blocked"
+            ? result.blocker.message
+            : "Generated artifact execution did not return one exact readback.",
+        );
+      }
+      return this.recordGeneratedArtifactHealth({
+        version: 1,
+        status: "healthy",
+        summary: `Generated code executed through ${status.selectedProvider}; one artifact passed exact hash readback.`,
+        checkedAt,
+        provider: status.selectedProvider,
+        receiptFingerprint: result.receipt.fingerprint,
+        artifactFingerprint: result.receipt.importedArtifacts[0].readbackSha256,
+      });
+    } catch (error) {
+      return this.recordGeneratedArtifactHealth({
+        version: 1,
+        status: "degraded",
+        summary: `Generated-artifact execution/readback failed: ${safeCodeHealthError(error)}`,
+        checkedAt,
+        provider: this.requireSandboxManager().readStatus().selectedProvider,
+        receiptFingerprint: null,
+        artifactFingerprint: null,
+      });
+    }
+  }
+
+  private recordGeneratedArtifactHealth(
+    proof: GeneratedArtifactHealthProofV1,
+  ): GeneratedArtifactHealthProofV1 {
+    this.generatedArtifactHealth = { ...proof };
+    return { ...proof };
+  }
+
   /**
    * Persist one exact immutable provider binding from the local settings UI.
    * The model/tool surface receives no handle to this method. Any change drops
@@ -1932,13 +2122,13 @@ export class CodeExtensionRuntimeV2 {
     });
   }
 
-  private createRuntimeStatusContribution(): StatusContributionV1 {
+  private createSandboxIsolationStatusContribution(): StatusContributionV1 {
     return {
       descriptor: {
         version: 1,
         kind: "status",
-        id: `${EXTENSION_ID}:runtime-health`,
-        displayName: "Code runtime health",
+        id: `${EXTENSION_ID}:sandbox-isolation-health`,
+        displayName: "Code sandbox isolation",
       },
       readStatus: async (context) => {
         await this.refreshMigratedProfiles();
@@ -1947,27 +2137,52 @@ export class CodeExtensionRuntimeV2 {
         return {
           status: sandbox.executionAvailable ? "healthy" : "degraded",
           summary: sandbox.executionAvailable
-            ? `Durable workspace editing, sandbox execution, and selective hash-verified generated-artifact import are available through ${sandbox.selectedProvider}.`
-            : "Durable workspace editing is available; generated-code execution and generated-artifact import are blocked until an immutable provider passes an explicit boundary probe.",
+            ? `The immutable sandbox boundary is verified through ${sandbox.selectedProvider}.`
+            : "Sandbox isolation has not passed a live boundary probe. Durable workspace editing remains available.",
           details: {
             stateVersion: state.version,
             repositoryProfileCount: Object.keys(state.repositoryProfiles).length,
             migratedProfileCount: state.migration?.migratedProfileKeys.length ?? 0,
             workspaceMetadataRoot: this.workspaceManager.metadataRoot,
             executionMode: sandbox.mode,
-            artifactImport: "selective_sandbox_generated_hash_verified",
-            repairMode: this.repairContributions.length > 0
-              ? "handlers_contributed"
-              : state.repair.mode,
-            backgroundValidationCommitCapability:
-              PREPARED_BACKGROUND_CODE_TOOL_NAME_V1,
-            backgroundValidationCommitExecutionHost: "headless_runtime",
-            backgroundValidationCommitForegroundFallback: false,
-            backgroundValidationCommitAvailability: sandbox.executionAvailable
-              ? "registered_sandbox_verified"
-              : "registered_blocked_until_sandbox_verified",
+            selectedProvider: sandbox.selectedProvider,
+            providers: sandbox.providers.map((provider) =>
+              `${provider.provider}:${provider.state}`
+            ),
           },
           checkedAt: context.now().toISOString(),
+        };
+      },
+    };
+  }
+
+  private createGeneratedArtifactStatusContribution(): StatusContributionV1 {
+    return {
+      descriptor: {
+        version: 1,
+        kind: "status",
+        id: `${EXTENSION_ID}:generated-artifact-health`,
+        displayName: "Generated-code execution and readback",
+      },
+      readStatus: async (context) => {
+        const proof = this.generatedArtifactHealth;
+        return {
+          status: proof?.status ?? "degraded",
+          summary:
+            proof?.summary ??
+            "No generated artifact has completed sandbox execution and hash readback in this session. Select Refresh health.",
+          details: {
+            provider: proof?.provider ?? null,
+            receiptFingerprint: proof?.receiptFingerprint ?? null,
+            artifactFingerprint: proof?.artifactFingerprint ?? null,
+            repairMode:
+              this.repairContributions.length > 0
+                ? "handlers_contributed"
+                : this.requireState().repair.mode,
+            backgroundValidationCommitCapability:
+              PREPARED_BACKGROUND_CODE_TOOL_NAME_V1,
+          },
+          checkedAt: proof?.checkedAt ?? context.now().toISOString(),
         };
       },
     };
@@ -2912,6 +3127,19 @@ function createScratchPythonSandboxProfileV2(input: {
     version: 1,
     workspaceId: input.workspaceId,
   }).slice("sha256:".length, "sha256:".length + 32)}`;
+  const pythonTestPaths = pythonPaths.filter((entryPath) =>
+    /^test[^/]*\.py$/iu.test(entryPath.split("/").at(-1) ?? ""),
+  );
+  const pythonTestDirectories = [
+    ...new Set(
+      pythonTestPaths.map((entryPath) => {
+        const separator = entryPath.lastIndexOf("/");
+        return separator < 0 ? "." : entryPath.slice(0, separator) || ".";
+      }),
+    ),
+  ];
+  const unittestStartDirectory =
+    pythonTestDirectories.length === 1 ? pythonTestDirectories[0]! : ".";
   const validationCatalog: RepositoryValidationCommandV2[] = (
     ["fast", "targeted", "full"] as const
   ).map((phase) => ({
@@ -2919,7 +3147,18 @@ function createScratchPythonSandboxProfileV2(input: {
     phase,
     projectId: SCRATCH_SANDBOX_PROJECT_ID,
     executable: "python",
-    args: ["-m", "compileall", "-q", "."],
+    args:
+      phase === "fast" || pythonTestPaths.length === 0
+        ? ["-m", "compileall", "-q", "."]
+        : [
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            unittestStartDirectory,
+            "-p",
+            "test*.py",
+          ],
     cwd: ".",
     timeoutMs: 60_000,
     network: "disabled",
@@ -2972,6 +3211,16 @@ function sha256Canonical(value: unknown): string {
 
 function sha256Bytes(value: Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function safeCodeHealthError(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error))
+    .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
+    .replace(
+      /(token|secret|password)\s*[=:]\s*[^\s,;}]+/giu,
+      "$1=[REDACTED]",
+    )
+    .slice(0, 1_000);
 }
 
 function cloneJson<T>(value: T): T {

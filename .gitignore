@@ -57,6 +57,11 @@ Thumbs.db
 skills/
 .agents/
 .codex/
+.claude/
+[Cc][Ll][Aa][Uu][Dd][Ee].md
+[Cc][Oo][Dd][Ee][Xx].md
+[Mm][Ee][Mm][Oo][Rr][Yy].md
+*.local.md
 
 # Playwright
 /test-results/

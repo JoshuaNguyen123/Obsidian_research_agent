@@ -180,6 +180,22 @@ export function projectEvidenceConflictAcknowledgements(
   finalOutput: string,
 ): EvidenceConflict[] {
   const output = finalOutput.trim();
+  const candidateBoundConflicts = (conflicts ?? []).map((conflict) => {
+    if (
+      conflict.claimIds.length > 0 ||
+      !conflict.passageIds.every((passageId) => output.includes(passageId))
+    ) {
+      return { ...conflict };
+    }
+    // Exact candidate citation of both sides is a deterministic material-claim
+    // binding. This keeps unrelated detector noise diagnostic-only while a
+    // draft that actually relies on contradictory passages must acknowledge
+    // the disagreement before acceptance.
+    return {
+      ...conflict,
+      claimIds: [`candidate:${hashKey(conflict.passageIds.join("|"))}`],
+    };
+  });
   const hasExplicitLimitationsSection =
     /(?:^|\n)\s{0,3}(?:(?:#{1,6}\s+)|\*\*)?(?:limitations?|uncertaint(?:y|ies)|conflicting\s+evidence|source\s+disagreements?|open\s+questions?)(?:\*\*)?(?:\s*:|\s*(?:\n|$))/imu.test(
       output,
@@ -189,9 +205,9 @@ export function projectEvidenceConflictAcknowledgements(
       output,
     );
   if (!hasExplicitLimitationsSection || !explicitlyDescribesConflict) {
-    return (conflicts ?? []).map((conflict) => ({ ...conflict }));
+    return candidateBoundConflicts;
   }
-  return (conflicts ?? []).map((conflict) =>
+  return candidateBoundConflicts.map((conflict) =>
     conflict.status === "open"
       ? acknowledgeEvidenceConflict(
           conflict,
@@ -214,7 +230,8 @@ export function resolveEvidenceConflict(
 }
 
 /**
- * Open conflicts block acceptance. acknowledged_limitation passes only when
+ * Open conflicts bound to material claims block acceptance. Unbound conflicts
+ * remain diagnostics only. acknowledged_limitation passes only when
  * final output includes explicit limitation language (and the resolution note
  * when one was recorded).
  */
@@ -232,7 +249,7 @@ export function evaluateEvidenceConflictAcceptance({
   const missing: string[] = [];
   const reasons: string[] = [];
   const openConflictIds = conflicts
-    .filter((item) => item.status === "open")
+    .filter((item) => item.status === "open" && item.claimIds.length > 0)
     .map((item) => item.id);
 
   if (openConflictIds.length > 0) {

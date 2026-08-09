@@ -159,6 +159,12 @@ export interface ToolExecutionContext {
   /** When true, rename_current_file may run without explicit title-intent language. */
   autoTitleAuthorized?: boolean;
   missionIntent?: MissionIntent;
+  /**
+   * Exact host-allocated destination for automatic new-note output. This is
+   * run authority, never a model-selected path, and may only be consumed by a
+   * matching no-overwrite create_file call.
+   */
+  plannedNoteOutputPath?: string;
   now?: () => Date;
   getCurrentMarkdownFile?: () => TFile | null;
   getCurrentMarkdownContent?: (file: TFile) => string | null;

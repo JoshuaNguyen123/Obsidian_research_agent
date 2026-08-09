@@ -70,6 +70,7 @@ export function deriveAutonomyScope(
   input: DeriveAutonomyScopeInput = {},
 ): AutonomyScope {
   const scope = createDefaultAutonomyScope();
+  const explicitNoVaultRead = hasExplicitNoVaultReadIntent(prompt);
   const mentionedFiles = extractMarkdownPathMentions(prompt);
   const mentionedFolders = extractFolderMentions(prompt, mentionedFiles);
   const initiatingNoteReference =
@@ -106,14 +107,15 @@ export function deriveAutonomyScope(
     scope.read.web = false;
   }
   scope.read.vault =
-    input.vaultContext === true ||
-    /\b(vault|folders|graph|backlinks?|related notes?|markdown files?|md files?|my notes|across notes|notes in|note graph)\b/i.test(
-      prompt,
-    ) ||
-    mentionedFolders.length > 0 ||
-    mentionedFiles.length > 0;
-  scope.read.files = mentionedFiles;
-  scope.read.folders = mentionedFolders;
+    !explicitNoVaultRead &&
+    (input.vaultContext === true ||
+      /\b(vault|folders|graph|backlinks?|related notes?|markdown files?|md files?|my notes|across notes|notes in|note graph)\b/i.test(
+        prompt,
+      ) ||
+      mentionedFolders.length > 0 ||
+      mentionedFiles.length > 0);
+  scope.read.files = explicitNoVaultRead ? [] : mentionedFiles;
+  scope.read.folders = explicitNoVaultRead ? [] : mentionedFolders;
 
   scope.write.currentNote =
     (input.noteOutput === true &&
@@ -183,6 +185,28 @@ export function deriveAutonomyScope(
     !scope.destructive.deleteCurrentNote;
 
   return dedupeScope(scope);
+}
+
+/**
+ * A clause-local negative authority signal for vault/note reads. The helper is
+ * intentionally independent from web negation so a mission may still use
+ * public sources while refusing all local-note access.
+ */
+export function hasExplicitNoVaultReadIntent(prompt: string): boolean {
+  return prompt
+    .replace(/\r\n?/gu, "\n")
+    .split(/(?:[.!?;\n]+|\bbut\b)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some(
+      (clause) =>
+        /\b(?:do\s+not|don't|never|without)\b[^.!?;\n]{0,100}\b(?:read|reading|search|searching|inspect|inspecting|use|using|access|accessing|look(?:ing)?\s+through|scan(?:ning)?|query(?:ing)?)\b[^.!?;\n]{0,140}\b(?:my\s+|the\s+)?(?:vault|notes?|notebook|markdown\s+files?|md\s+files?|note\s+graph|folders?)\b/iu.test(
+          clause,
+        ) ||
+        /\b(?:do\s+not|don't|never|without)\b[^.!?;\n]{0,100}\b(?:my\s+|the\s+)?(?:vault|notes?|notebook|markdown\s+files?|md\s+files?|note\s+graph|folders?)\b/iu.test(
+          clause,
+        ),
+    );
 }
 
 export function isBroadUnscopedVaultMutation(scope: AutonomyScope): boolean {
@@ -496,9 +520,11 @@ function safeExplicitVaultReadPath(rawPath: string): string | null {
 /**
  * Extracts a bounded, explicit new-file set from phrases such as
  * "Add only README.md, src/app.ts, and tests/app.test.ts", plus singular
- * affirmative requests such as "create app.py". Multi-file authority still
- * requires only/exactly wording; a singular action may bind its one directly
- * named path without treating unrelated note or provider paths as mutations.
+ * affirmative requests such as "create app.py". A natural new-project clause
+ * may also bind a bounded list such as "build a project with app.py and
+ * test_app.py". Other multi-file authority still requires only/exactly
+ * wording; a singular action may bind its one directly named path without
+ * treating unrelated note or provider paths as mutations.
  */
 export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
   if (prompt.length > 100_000 || prompt.includes("\0")) return [];
@@ -533,6 +559,43 @@ export function extractExplicitNewWorkspaceFilePaths(prompt: string): string[] {
       if (!isSafeExplicitWorkspaceFilePath(candidate)) continue;
       paths.push(candidate);
     }
+  }
+  // Natural standalone-project phrasing commonly names the required source
+  // and test files after `with` instead of repeating `create` for each path.
+  // Require an affirmative build verb, a project noun, and at least two safe
+  // paths in the same sentence. The >=2 floor keeps an ambiguous singular
+  // reference such as "build the project with existing config.py" out of
+  // new-file authority; create_file itself remains no-overwrite.
+  for (const clause of prompt.split(/[!?;\r\n]+|\.\s+(?=[A-Z])/gu)) {
+    const introduction = /\b(?:build|create|implement|make)\b[^.!?\r\n]{0,240}\b(?:project|application|app|program|package|library|module|tool|game)\b[^.!?\r\n]{0,80}\b(?:with|including|containing)\b/iu.exec(
+      clause,
+    );
+    if (!introduction) continue;
+    if (
+      /\b(?:report|essay|analysis|guide|note|summary|documentation)\b/iu.test(
+        introduction[0],
+      )
+    ) {
+      continue;
+    }
+    const actionIndex = introduction.index ?? 0;
+    const prefix = clause.slice(Math.max(0, actionIndex - 100), actionIndex);
+    if (
+      /(?:\bdo\s+not\b|\bdon't\b|\bnever\b|\bwithout\b)[^.!?\r\n]{0,80}$/iu.test(
+        prefix,
+      )
+    ) {
+      continue;
+    }
+    const namedPaths: string[] = [];
+    const remainder = clause.slice(actionIndex + introduction[0].length);
+    for (const match of remainder.matchAll(
+      /(?:^|[\s,("'\x60])((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?=$|[\s,):."'\x60])/gu,
+    )) {
+      const candidate = match[1] ?? "";
+      if (isSafeExplicitWorkspaceFilePath(candidate)) namedPaths.push(candidate);
+    }
+    if (namedPaths.length >= 2) paths.push(...namedPaths);
   }
   for (const match of prompt.matchAll(
     /\b(?:add|create|make)\b[ \t]+(?:(?:a|an|the|one|new|exact|source|workspace|repository)[ \t]+){0,4}(?:file[ \t]+)?["'\x60]?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?=$|[\s,):.;"'\x60])/giu,

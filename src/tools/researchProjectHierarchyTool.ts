@@ -514,8 +514,60 @@ function parseIssues(value: unknown) {
           ),
         ),
       ),
+      ...optionalIssueNarrative(item.problemImpact, `issue ${index + 1} problemImpact`, "problemImpact"),
+      ...optionalIssueNarrative(
+        item.confidenceLimitations,
+        `issue ${index + 1} confidenceLimitations`,
+        "confidenceLimitations",
+      ),
+      ...optionalIssueNarrativeList(item.proposedWork, `issue ${index + 1} proposedWork`, "proposedWork"),
+      ...optionalIssueNarrativeList(item.nonGoals, `issue ${index + 1} nonGoals`, "nonGoals"),
+      ...optionalIssueNarrativeList(item.scope, `issue ${index + 1} scope`, "scope"),
+      ...optionalIssueNarrativeList(item.validation, `issue ${index + 1} validation`, "validation"),
     };
   });
+}
+
+/** Absent optional sections stay absent; the host renders their empty state. */
+function isAbsentOptionalSection(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (typeof value === "string" && value.trim() === "") ||
+    (Array.isArray(value) && value.length === 0)
+  );
+}
+
+function optionalIssueNarrative(
+  value: unknown,
+  label: string,
+  key: string,
+): Record<string, string> {
+  if (isAbsentOptionalSection(value)) return {};
+  return { [key]: sanitizeHierarchyNarrative(requireText(value, label, 8_000)) };
+}
+
+/** Tolerate a scalar where the schema asks for a list, as the sibling canonicalizers do. */
+function optionalIssueNarrativeList(
+  value: unknown,
+  label: string,
+  key: string,
+): Record<string, string[]> {
+  if (isAbsentOptionalSection(value)) return {};
+  const entries = Array.isArray(value) ? value : [value];
+  if (entries.length > 20) {
+    throw notApplied(
+      "linear_hierarchy_invalid_arguments",
+      `${label} accepts at most 20 entries.`,
+    );
+  }
+  return {
+    [key]: entries.map((entry, entryIndex) =>
+      sanitizeHierarchyNarrative(
+        requireText(entry, `${label} ${entryIndex + 1}`, 1_000),
+      ),
+    ),
+  };
 }
 
 /**
@@ -746,6 +798,29 @@ const RESEARCH_PROJECT_HIERARCHY_PARAMETERS: JsonSchemaObject = {
               description: STRING,
               dependencyKeys: { type: "array", items: STRING, maxItems: 19 },
               acceptanceCriteria: { type: "array", items: STRING, minItems: 1, maxItems: 20 },
+              problemImpact: {
+                type: "string",
+                description:
+                  "Optional. Problem and impact prose; defaults to description.",
+              },
+              confidenceLimitations: {
+                type: "string",
+                description: "Optional. Confidence and known limitations.",
+              },
+              proposedWork: {
+                type: "array",
+                items: STRING,
+                maxItems: 20,
+                description: "Optional. Proposed work items; defaults to description.",
+              },
+              nonGoals: { type: "array", items: STRING, maxItems: 20 },
+              scope: { type: "array", items: STRING, maxItems: 20 },
+              validation: {
+                type: "array",
+                items: STRING,
+                maxItems: 20,
+                description: "Optional. How completion is validated.",
+              },
               workItemFingerprint: {
                 type: "string",
                 description:

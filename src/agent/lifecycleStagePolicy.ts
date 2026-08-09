@@ -3,6 +3,7 @@ import {
   type ProjectLifecycleStageV1,
 } from "./projectLifecycle";
 import { PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME } from "../tools/researchPublicationTool";
+import { REPORT_PROGRESS_TO_LINEAR_TOOL_NAME } from "../tools/reportProgressToLinearTool";
 import { PUBLISH_RESEARCH_PROJECT_TO_LINEAR_TOOL_NAME } from "../tools/researchProjectHierarchyTool";
 import {
   CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
@@ -121,6 +122,7 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     "replace_current_file",
     "count_words",
     PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
+    REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
   ],
   linear_hierarchy: [
     PUBLISH_RESEARCH_TO_LINEAR_TOOL_NAME,
@@ -129,6 +131,10 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     "linear_create_issue",
     "linear_get_issue",
     "linear_search_issues",
+    // Deliberately NOT report_progress_to_linear. Once linear_hierarchy is no
+    // longer the earliest unpaid stage, toolsOfferedForSetLooseTurn deletes
+    // every tool in this list — so listing the progress report here strips it
+    // from the reflection turn, which is the one turn it exists for.
   ],
   code_execution: [...CODE_EXECUTION_TOOL_ALLOW],
   private_github_publication: [
@@ -136,6 +142,7 @@ const LIFECYCLE_STAGE_TOOL_ALLOW: Record<
     PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
     ...GITHUB_STAGE_READ_TOOL_ALLOW,
     ...GITHUB_STAGE_SAFE_MUTATION_TOOL_ALLOW,
+    REPORT_PROGRESS_TO_LINEAR_TOOL_NAME,
   ],
   reconciliation_cleanup: [
     "linear_trash_issue",

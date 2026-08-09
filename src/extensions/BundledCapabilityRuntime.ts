@@ -54,11 +54,11 @@ import {
   createCompatibilityBridgeContribution,
   createMigrationStatusContribution,
   createScaffoldSettingsContribution,
-  createScaffoldStatusContribution,
   persistMigrationSnapshot,
   withPluginDataLock,
 } from "../../extensions/shared/softDependency";
 import { requireNodeModule } from "../platform/nodeRequire";
+import type { ProviderHealthResultV1 } from "./providerHealthCache";
 
 const CODE_ID = "agentic-researcher-code" as const;
 const INTEGRATIONS_ID = "agentic-researcher-integrations" as const;
@@ -91,6 +91,7 @@ export interface BundledCodeCapabilityOptions
   host: Plugin;
   runMission(prompt: string): Promise<unknown>;
   runReviewRepairMission(prompt: string): Promise<unknown>;
+  onHealthChanged?: () => void;
 }
 
 /** Built-in Code capability. It keeps its scoped state and contribution API. */
@@ -187,6 +188,7 @@ export class BundledCodeCapability {
       .finally(() => {
         if (this.probeController === controller) this.probeController = null;
         this.probeInFlight = null;
+        this.options.onHealthChanged?.();
       });
   }
 
@@ -344,6 +346,10 @@ export class BundledCodeCapability {
     return this.runtime.ensureHostProvisionedSandboxReadinessV1(signal);
   }
 
+  async probeGeneratedArtifactExecutionReadbackV1(signal?: AbortSignal) {
+    return this.runtime.probeGeneratedArtifactExecutionReadbackV1(signal);
+  }
+
   private registerCommands(): void {
     this.options.host.addCommand({
       id: "probe-sandbox-boundaries",
@@ -389,6 +395,7 @@ export class BundledCodeCapability {
       .finally(() => {
         if (this.probeController === controller) this.probeController = null;
         this.probeInFlight = null;
+        this.options.onHealthChanged?.();
       });
   }
 }
@@ -793,6 +800,8 @@ export class BundledCompanionCapability {
 export interface BundledIntegrationsCapabilityOptions
   extends BundledCapabilityRegistrationOptions {
   code: BundledCodeCapability;
+  readLinearHealth: () => ProviderHealthResultV1;
+  readGitHubHealth: () => ProviderHealthResultV1;
 }
 
 /** Built-in integrations host with the same prepared-action contracts. */
@@ -850,12 +859,16 @@ export class BundledIntegrationsCapability {
             },
           ],
         }),
-        createScaffoldStatusContribution({
-          id: INTEGRATIONS_ID,
-          displayName: "Integrations",
-          summary:
-            "Linear and GitHub capability code is built into Agentic Researcher; provider access remains disabled until configured and verified.",
-        }),
+        createProviderHealthContribution(
+          `${INTEGRATIONS_ID}:linear_status`,
+          "Linear",
+          this.options.readLinearHealth,
+        ),
+        createProviderHealthContribution(
+          `${INTEGRATIONS_ID}:github_status`,
+          "GitHub",
+          this.options.readGitHubHealth,
+        ),
         createMigrationStatusContribution(INTEGRATIONS_ID, () => ({
           status: migrationStatus,
           message: migrationMessage,
@@ -938,6 +951,37 @@ export class BundledIntegrationsCapability {
     }
     return this.host;
   }
+}
+
+function createProviderHealthContribution(
+  id: string,
+  displayName: string,
+  read: () => ProviderHealthResultV1,
+): ExtensionContributionV1 {
+  return {
+    descriptor: {
+      version: 1,
+      kind: "status",
+      id,
+      displayName,
+    },
+    async readStatus(context) {
+      const current = read();
+      return {
+        status: current.status,
+        summary: current.summary,
+        details: {
+          provider: current.provider,
+          expiresAt: current.expiresAt,
+          ...(current.details ?? {}),
+        },
+        checkedAt:
+          current.checkedAt === new Date(0).toISOString()
+            ? context.now().toISOString()
+            : current.checkedAt,
+      };
+    },
+  };
 }
 
 export interface BundledCapabilitiesV1 {

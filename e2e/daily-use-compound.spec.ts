@@ -1053,7 +1053,11 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
           "github:draft_pr_readback",
           "reconciliation:backlinks_and_status",
           "authority:no_unapproved_mutations",
-          "resume:no_duplicates",
+          // DU-06 declares idempotency:no_duplicates. The lane proves exactly
+          // that above ("DU-06 resume did not replay <stage>"), but recorded it
+          // under a token no contract declares, so acceptance could never reach
+          // pass and no scorecard was ever harvestable for this lane.
+          "idempotency:no_duplicates",
         ],
         approvals: [
           "approval:linear_issue_create",

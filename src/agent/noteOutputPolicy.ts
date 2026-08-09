@@ -4,7 +4,14 @@
  */
 
 export type NoteOutputDestination = "active_note" | "new_note" | "chat";
-export type NoteOutputMutation = "append" | "replace" | "create";
+export type NoteOutputMutation =
+  | "append"
+  | "replace"
+  | "create"
+  /** Add beneath a named heading, above the next one. */
+  | "section_append"
+  /** Rewrite one heading's body, preserving the heading line. */
+  | "section_replace";
 export type NoteOutputDelivery = "stream" | "atomic";
 export type NoteOutputTitlePolicy = "automatic" | "preserve" | "explicit";
 
@@ -14,13 +21,16 @@ export type NoteOutputReasonCode =
   | "trivial_chat"
   | "specialized_route"
   | "explicit_new_note"
+  | "untargeted_content_create"
   | "active_note_available"
   | "no_active_note_create"
   | "no_active_note_chat_first"
   | "active_note_only_no_file"
   | "output_streaming_disabled"
   | "replace_explicit"
-  | "preserve_named_title";
+  | "preserve_named_title"
+  | "section_target_matched"
+  | "section_target_ambiguous";
 
 export type AutonomyProfile = "automatic" | "conservative" | "custom";
 export type OutputProfile =
@@ -49,12 +59,24 @@ export interface NoteOutputPolicyInput {
   specializedRoute?: boolean;
   /** Explicit create-new-note wording. */
   explicitNewNote?: boolean;
+  /** Explicit reference to this/current/active note or page. */
+  explicitActiveNoteTarget?: boolean;
   /** Explicit whole-note replace / rewrite. */
   explicitReplace?: boolean;
   /** Explicit preserve/keep title wording. */
   preserveTitle?: boolean;
   /** Content-producing (draft/explain/report) vs trivial chat. */
   contentProducing?: boolean;
+  /**
+   * Headings in the active note that this request names, from
+   * `detectSectionTargetV1`. Present only on a confident match.
+   */
+  sectionTarget?: {
+    headings: readonly string[];
+    mode: "append" | "replace";
+  };
+  /** Section language was used but matched no heading; ask instead of guessing. */
+  sectionTargetAmbiguous?: boolean;
 }
 
 const CHAT_ONLY_PATTERN =
@@ -62,6 +84,12 @@ const CHAT_ONLY_PATTERN =
 
 const EXPLICIT_NEW_NOTE_PATTERN =
   /\b(create|make|new)\b[\s\S]{0,80}\b(note|markdown\s+file|file)\b|\b(note|markdown\s+file)\b[\s\S]{0,40}\b(named|called|titled)\b/i;
+
+const EXPLICIT_ACTIVE_NOTE_TARGET_PATTERN =
+  /\b(?:this|the|current|active)\s+(?:note|page|document|file)\b|\b(?:on|onto|to|into|in)\s+(?:this|the\s+current|the\s+active)\s+(?:note|page|document|file)\b|\bstream\s+writeback\s+(?:onto|to|into)\s+the\s+page\b/iu;
+
+const UNTARGETED_REPORT_ARTIFACT_PATTERN =
+  /\b(?:guide|report)\b/iu;
 
 const EXPLICIT_REPLACE_PATTERN =
   /\b(replace|rewrite|overwrite|start\s+fresh|reset|clear\s+(?:and\s+)?write|delete\s+(?:the\s+)?(?:content|body)\s+and\s+write|correct(?:ing)?|fix(?:ing)?|proofread(?:ing)?|polish(?:ing)?)\b[\s\S]{0,120}\b(?:entire|whole)\s+(?:page|note|file|document|essay|draft|article|content|body)\b|\b(replace|rewrite|overwrite|start\s+fresh|reset|clear\s+(?:and\s+)?write|delete\s+(?:the\s+)?(?:content|body)\s+and\s+write)\b/i;
@@ -81,6 +109,10 @@ export function detectChatOnlyIntent(prompt: string): boolean {
 
 export function detectExplicitNewNoteIntent(prompt: string): boolean {
   return EXPLICIT_NEW_NOTE_PATTERN.test(prompt);
+}
+
+export function detectExplicitActiveNoteTarget(prompt: string): boolean {
+  return EXPLICIT_ACTIVE_NOTE_TARGET_PATTERN.test(prompt);
 }
 
 export function detectExplicitReplaceIntent(prompt: string): boolean {
@@ -115,6 +147,8 @@ export function resolveNoteOutputPlan(
     input.explicitReplace ?? detectExplicitReplaceIntent(prompt);
   const preserveTitle =
     input.preserveTitle ?? detectPreserveTitleIntent(prompt);
+  const explicitActiveNoteTarget =
+    input.explicitActiveNoteTarget ?? detectExplicitActiveNoteTarget(prompt);
 
   if (input.forceChatOnly) {
     return chatPlan("force_chat_only");
@@ -147,6 +181,62 @@ export function resolveNoteOutputPlan(
   }
 
   if (input.hasActiveMarkdownNote) {
+    // A request that names real headings is a scoped revision, not a bulk
+    // append. Without this, "add more detail under Passive Thread Locking"
+    // fell through to append+stream and dumped a fresh essay onto the end of
+    // the note, duplicating the sections it was asked to extend.
+    if (input.sectionTarget && input.sectionTarget.headings.length > 0) {
+      return {
+        destination: "active_note",
+        mutation:
+          input.sectionTarget.mode === "replace"
+            ? "section_replace"
+            : "section_append",
+        delivery,
+        title: "preserve",
+        reason: "section_target_matched",
+      };
+    }
+    // Section language with no heading match: the caller asks which section
+    // rather than guessing, because guessing here is what produced the bulk
+    // append in the first place.
+    if (input.sectionTargetAmbiguous) {
+      return {
+        destination: "chat",
+        mutation: "append",
+        delivery: "atomic",
+        title: "preserve",
+        reason: "section_target_ambiguous",
+      };
+    }
+    if (
+      explicitActiveNoteTarget ||
+      explicitReplace ||
+      input.outputProfile === "active_note_only"
+    ) {
+      return {
+        destination: "active_note",
+        mutation: explicitReplace ? "replace" : "append",
+        delivery,
+        title,
+        reason: explicitReplace ? "replace_explicit" : "active_note_available",
+      };
+    }
+
+    if (input.outputProfile === "chat_first") {
+      return chatPlan("no_active_note_chat_first");
+    }
+
+    if (UNTARGETED_REPORT_ARTIFACT_PATTERN.test(prompt)) {
+      return {
+        destination: "new_note",
+        mutation: "create",
+        delivery,
+        title: input.autoTitleOnWrite && !preserveTitle ? "automatic" : "preserve",
+        reason: "untargeted_content_create",
+      };
+    }
+
     return {
       destination: "active_note",
       mutation: explicitReplace ? "replace" : "append",

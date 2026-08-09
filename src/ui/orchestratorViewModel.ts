@@ -746,6 +746,8 @@ function normalizeLimits(
 
 function modeLabel(mode: string): string {
   switch (mode) {
+    case "adaptive_team":
+      return "Lead + Adaptive Specialist";
     case "research_team":
       return "Research team";
     case "code_team":

@@ -826,26 +826,58 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
       randomId: incrementingId(),
     });
     let sandboxProbeCount = 0;
+    const executionRoot = path.join(root, "sandbox-execution");
     const sandboxRunner: SandboxCommandRunnerV2 = {
-      async run(spec) {
-        assert.equal(spec.purpose, "boundary_probe");
-        sandboxProbeCount += 1;
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify({
-            version: 1,
-            uid: 65532,
-            networkBlocked: true,
-            rootReadOnly: true,
-            hostRootAbsent: true,
-            containerSocketAbsent: true,
-            runtimeReadOnly: true,
-            runtimeDigest: SHA("f"),
-            stagingIsolated: true,
-            resourceLimitsEnforced: true,
-          }),
-          stderr: "",
-        };
+      async run(spec, input) {
+        if (spec.purpose === "boundary_probe") {
+          sandboxProbeCount += 1;
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              version: 1,
+              uid: 65532,
+              networkBlocked: true,
+              rootReadOnly: true,
+              hostRootAbsent: true,
+              containerSocketAbsent: true,
+              runtimeReadOnly: true,
+              runtimeDigest: SHA("f"),
+              stagingIsolated: true,
+              resourceLimitsEnforced: true,
+            }),
+            stderr: "",
+          };
+        }
+        await mkdir(executionRoot, { recursive: true });
+        for (const stagedFile of input?.stagedFiles ?? []) {
+          const target = path.join(executionRoot, ...stagedFile.path.split("/"));
+          await mkdir(path.dirname(target), { recursive: true });
+          await writeFile(target, stagedFile.bytes);
+        }
+        const delimiter = spec.args.lastIndexOf("--");
+        assert.ok(delimiter >= 0, "sandbox command must delimit the exact guest argv");
+        const executable = spec.args[delimiter + 1]!;
+        const args = spec.args.slice(delimiter + 2);
+        try {
+          const completed = await execFileAsync(executable, args, {
+            cwd: executionRoot,
+            windowsHide: true,
+            timeout: 30_000,
+            encoding: "utf8",
+          });
+          return { exitCode: 0, stdout: completed.stdout, stderr: completed.stderr };
+        } catch (error) {
+          const failed = error as Error & {
+            code?: number | string;
+            stdout?: string;
+            stderr?: string;
+          };
+          return {
+            exitCode: typeof failed.code === "number" ? failed.code : 1,
+            stdout: failed.stdout ?? "",
+            stderr: failed.stderr ?? failed.message,
+          };
+        }
       },
     };
     const runtime = new CodeExtensionRuntimeV2({
@@ -874,11 +906,26 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
       "extension:scratch-python-run",
     );
     const source = "number = 7\nprint(f'Guess: {number}')\n";
+    const testSource = [
+      "import unittest",
+      "import number_game",
+      "",
+      "class NumberGameTest(unittest.TestCase):",
+      "    def test_number(self):",
+      "        self.assertEqual(number_game.number, 8)",
+      "",
+    ].join("\n");
     await manager.createFile(
       manifest.workspaceId,
       leased.lease!.id,
       "number_game.py",
       source,
+    );
+    await manager.createFile(
+      manifest.workspaceId,
+      leased.lease!.id,
+      "test_number_game.py",
+      testSource,
     );
 
     const fast = await runtime.resolveSandboxPreparationInput(
@@ -896,6 +943,7 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
     );
     assert.deepEqual(fast.stagingManifest.map((entry) => entry.path), [
       "number_game.py",
+      "test_number_game.py",
     ]);
     assert.equal(
       await runtime.getRepositoryProfile(fast.profile.key),
@@ -935,7 +983,50 @@ test("CodeExtensionRuntimeV2 validates hash-bound Python scratch workspaces with
     );
     assert.equal(targeted.commandId, "scratch-python-targeted");
     assert.equal(full.commandId, "scratch-python-full");
-    assert.equal(sandboxProbeCount, 3);
+    for (const prepared of [targeted, full]) {
+      assert.equal(
+        prepared.profile.validationCatalog
+          .find((command) => command.id === prepared.commandId)
+          ?.args.join(" "),
+        "-m unittest discover -s . -p test*.py",
+      );
+    }
+    const fullContribution = runtime.getContributions().find(
+      (candidate: any) =>
+        candidate?.descriptor?.kind === "tool" &&
+        candidate?.tool?.name === "code_validate_full",
+    ) as any;
+    assert.ok(fullContribution?.tool?.prepare);
+    assert.ok(fullContribution?.tool?.executePrepared);
+    const preparedResult = await fullContribution.tool.prepare(
+      {
+        workspaceId: manifest.workspaceId,
+        repairRequestId: "scratch-failing-unittest",
+      },
+      extensionContext(),
+    );
+    assert.equal(preparedResult.ok, true);
+    const preparedAction = preparedResult.action;
+    const executed = await fullContribution.tool.executePrepared(
+      preparedAction,
+      {
+        ...extensionContext(),
+        authorizedAction: {
+          preparedActionId: preparedAction.id,
+          payloadFingerprint: preparedAction.payloadFingerprint,
+          grantId: "scratch-failing-unittest-grant",
+        },
+      },
+    );
+    assert.equal(executed.output.status, "failed");
+    assert.equal(executed.output.sandboxReceipt.status, "failed");
+    assert.notEqual(executed.output.sandboxReceipt.exitCode, 0);
+    assert.equal(
+      executed.receipt.readback.status,
+      "verified",
+      "the canonical receipt must verify that the full-validation result was red",
+    );
+    assert.equal(sandboxProbeCount, 5);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

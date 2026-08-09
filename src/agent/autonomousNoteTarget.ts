@@ -41,6 +41,48 @@ export interface ResolveAutonomousNoteTargetInput {
   exists?: (path: string) => boolean;
 }
 
+/**
+ * Derive a quiet, deterministic filename from an untargeted writing prompt.
+ * The model may later improve the visible title, but the host must allocate a
+ * useful collision-safe path before the first streamed bytes arrive.
+ */
+export function deriveAutonomousNoteBasenameFromPrompt(prompt: string): string {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  if (/\bagent\s+orchestr(?:ation|ater|ator)\b/iu.test(normalized)) {
+    return "Agent Orchestration Guide";
+  }
+
+  const topicMatch =
+    /\b(?:guide|report|article|brief|essay)\b[\s/]*(?:about|on|to)\s+(.+?)(?=[.!?]|\b(?:what\s+is|why\s+is|why\s+does|how\s+to|and\s+then)\b|$)/iu.exec(
+      normalized,
+    ) ??
+    /\b(?:write|draft|compose|create|generate)\b[\s\S]{0,80}?\b(?:about|on)\s+(.+?)(?=[.!?]|$)/iu.exec(
+      normalized,
+    );
+  const rawTopic = topicMatch?.[1]?.trim() ?? "";
+  if (!rawTopic) {
+    return "Untitled";
+  }
+  const topic = rawTopic
+    .split(/\s+/u)
+    .slice(0, 8)
+    .map((word) =>
+      /^(?:a|an|and|as|at|by|for|in|of|on|or|the|to)$/iu.test(word)
+        ? word.toLowerCase()
+        : `${word.charAt(0).toUpperCase()}${word.slice(1).toLowerCase()}`,
+    )
+    .join(" ");
+  const suffix = /\bguide\b/iu.test(normalized)
+    ? " Guide"
+    : /\breport\b/iu.test(normalized)
+      ? " Report"
+      : "";
+  const titled = topic.toLowerCase().endsWith(suffix.trim().toLowerCase())
+    ? topic
+    : `${topic}${suffix}`;
+  return sanitizeFileBasename(titled) || "Untitled";
+}
+
 export function resolveAutonomousNoteTarget(
   input: ResolveAutonomousNoteTargetInput,
 ): AutonomousNoteTargetPlan {

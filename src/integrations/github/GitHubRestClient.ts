@@ -1,4 +1,5 @@
 import type { HttpResponse, HttpTransport } from "../../model/types";
+import type { RepositoryVisibility } from "./RepositoryVisibility";
 
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_API_VERSION = "2026-03-10";
@@ -64,12 +65,18 @@ export interface GitHubRepositoryRecord {
   };
 }
 
-export interface CreatePrivateGitHubRepositoryInput {
+export interface CreateGitHubRepositoryInput {
   ownerKind: "user" | "organization";
   owner: string;
   repository: string;
+  visibility: RepositoryVisibility;
   description?: string;
 }
+
+export type CreatePrivateGitHubRepositoryInput = Omit<
+  CreateGitHubRepositoryInput,
+  "visibility"
+>;
 
 export interface GitHubReferenceRecord {
   ref: string;
@@ -350,25 +357,33 @@ export class GitHubRestClient {
     );
   }
 
-  /**
-   * The creation payload is intentionally fixed. In particular, callers
-   * cannot request public visibility, initialize content, or widen unrelated
-   * repository features through model-supplied fields.
-   */
-  async createPrivateRepository(
-    input: CreatePrivateGitHubRepositoryInput,
+  /** Create one exact repository at the explicitly selected visibility. */
+  async createRepository(
+    input: CreateGitHubRepositoryInput,
     signal?: AbortSignal,
   ): Promise<GitHubRepositoryRecord> {
     const owner = validateLogin(input.owner);
     const repository = validateOwnerRepoSegment(input.repository, "repository");
+    const visibility = input.visibility;
+    if (visibility !== "private" && visibility !== "public") {
+      throw new TypeError("GitHub repository visibility must be public or private.");
+    }
+    if (input.ownerKind === "user") {
+      const actor = await this.getAuthenticatedUser(signal);
+      if (actor.login.toLowerCase() !== owner.toLowerCase()) {
+        throw invalidResponse(
+          "Authenticated GitHub user does not match the requested repository owner; no repository was created.",
+        );
+      }
+    }
     const description = optionalBoundedText(input.description, "description", 1_024);
     const path = input.ownerKind === "user"
       ? "/user/repos"
       : `/orgs/${encodeURIComponent(owner)}/repos`;
     const created = normalizeRepository(await this.request("POST", path, {
       name: repository,
-      private: true,
-      visibility: "private",
+      private: visibility === "private",
+      visibility,
       auto_init: false,
       has_issues: true,
       has_projects: false,
@@ -376,15 +391,24 @@ export class GitHubRestClient {
       ...(description ? { description } : {}),
     }, signal));
     if (
-      created.private !== true ||
+      created.private !== (visibility === "private") ||
+      created.visibility !== visibility ||
       created.archived === true ||
       created.fullName.toLowerCase() !== `${owner}/${repository}`.toLowerCase()
     ) {
       throw invalidResponse(
-        "GitHub did not create the exact active private repository requested.",
+        `GitHub did not create the exact active ${visibility} repository requested.`,
       );
     }
     return created;
+  }
+
+  /** Legacy private-only compatibility wrapper. */
+  async createPrivateRepository(
+    input: CreatePrivateGitHubRepositoryInput,
+    signal?: AbortSignal,
+  ): Promise<GitHubRepositoryRecord> {
+    return this.createRepository({ ...input, visibility: "private" }, signal);
   }
 
   /**

@@ -29,6 +29,9 @@ import {
   extractMarkdownPathMentions,
 } from "./missionScope";
 import {
+  hasExplicitNoHostDirectoryExportIntent,
+} from "./promptIntentClassifiers";
+import {
   buildProjectLifecycleStageNodesV1,
   createProjectLifecycleIntentV1,
   detectProjectLifecycleStagesV1,
@@ -64,6 +67,8 @@ export interface BuildHostMissionGraphPlanInput {
   /** Host-owned actions that may run only after result acceptance. */
   postAcceptanceToolNames?: Iterable<string>;
   currentNotePath?: string | null;
+  /** Exact host-allocated no-overwrite destination for automatic note output. */
+  plannedVaultCreatePath?: string | null;
   maxToolCalls: number;
   maxWallClockMs: number;
   /** Bounded depth already required by a trusted persisted legacy plan. */
@@ -134,7 +139,13 @@ export async function buildHostMissionGraphPlanV1(
     if (explicitNewWorkspaceFilePaths.length > 0) return [];
     return explicitWorkspaceReadFilePaths;
   })();
-  const plannedToolNames = [...input.plannedToolNames];
+  const suppressHostDirectoryExport =
+    hasExplicitNoHostDirectoryExportIntent(input.objective);
+  const plannedToolNames = [...input.plannedToolNames].filter(
+    (name) =>
+      !(suppressHostDirectoryExport &&
+        name === "code_workspace_export_directory"),
+  );
   const explicitVaultReadFilePathAnalysis =
     analyzeExplicitVaultReadFilePaths(input.objective);
   const explicitVaultReadFilePaths = explicitVaultReadFilePathAnalysis.paths;
@@ -209,6 +220,19 @@ export async function buildHostMissionGraphPlanV1(
     const isVerifiedMermaidRevision =
       name === "upsert_mermaid_block" &&
       basePlannedSteps.at(-1)?.name === "read_mermaid_block";
+    if (
+      name === "create_file" &&
+      input.plannedVaultCreatePath &&
+      !seenEffectfulPlannedNames.has(name)
+    ) {
+      seenEffectfulPlannedNames.add(name);
+      basePlannedSteps.push({
+        name,
+        selector: input.plannedVaultCreatePath,
+        objective: `Create the exact new vault note ${input.plannedVaultCreatePath} without overwrite.`,
+      });
+      continue;
+    }
     if (
       name === "code_workspace_create_file" &&
       boundNewWorkspaceFilePaths.length > 0 &&
@@ -721,10 +745,7 @@ function buildCompositeLifecyclePlanV1(input: {
   const conditionalStandaloneCodeDelivery =
     stages.length === 1 &&
     stages[0] === "code_execution" &&
-    input.steps.some((step) => step.name === "code_validate_fast") &&
-    input.steps.some(
-      (step) => step.name === "code_workspace_export_directory",
-    );
+    input.steps.some((step) => step.name === "code_validate_fast");
   if (
     (stages.length < 2 && !conditionalStandaloneCodeDelivery) ||
     input.steps.length === 0

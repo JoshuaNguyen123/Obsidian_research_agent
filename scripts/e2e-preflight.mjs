@@ -61,6 +61,7 @@ if (playwrightLanes.some((lane) => [
   "byok-autonomous-journey",
   "daily-use-code-live",
   "desktop-code-delivery-real-live",
+  "vault-sibling-code-delivery-real-live",
   "desktop-checkers-delivery-real-live",
   "demo-recording",
   "demo-journey-recording",
@@ -91,11 +92,13 @@ async function resolveExpectedPluginIds() {
   // Every remaining lane runs the single installed plugin; none needs an extra
   // community plugin. Credential presence is enforced by run-e2e-exclusive.mjs.
   const requiredByLane = {
+    "safe-assistant-renderer": [],
     "retained-journey": [],
     "byok-autonomous-journey": [],
     "daily-use-research": [],
     "daily-use-code-live": [],
     "desktop-code-delivery-real-live": [],
+    "vault-sibling-code-delivery-real-live": [],
     "desktop-checkers-delivery-real-live": [],
     "demo-recording": [],
     "demo-journey-recording": [],
@@ -107,6 +110,7 @@ async function resolveExpectedPluginIds() {
     "release-vertical": [],
     "disposable-live-external": [],
     "configured-linear-live": [],
+    "configured-github-visibility-live": [],
     "linear-flow-real-cleanup": [],
     "compound-flow-real-live": [],
     "github-askpass-runtime-live": [],

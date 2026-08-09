@@ -41,6 +41,11 @@ import {
   type ExecutionTier,
   type MissionSpeechAct,
 } from "./missionSpeechAct";
+import {
+  resolveMissionEffortDecisionV1,
+  type MissionEffortDecisionV1,
+} from "./missionEffortDecision";
+import type { NoteOutputDestination } from "./noteOutputPolicy";
 
 export type RunRoute =
   | "instant_local"
@@ -79,6 +84,7 @@ export interface RunPlan {
    * Non-compound note/research routes default to soft.
    */
   maxEffectClassWithoutGrant: AutonomyEffectClass;
+  effortDecision: MissionEffortDecisionV1;
 }
 
 export interface CreateRunPlanInput {
@@ -102,6 +108,8 @@ export interface CreateRunPlanInput {
    * widens side-effect authority — frontier/approval synthesis is unchanged.
    */
   routedIntent?: RoutedMissionIntent | null;
+  /** Host-resolved output destination. Automatic defaults to a new note. */
+  outputTarget?: NoteOutputDestination;
 }
 
 export interface RunPlanDecision extends RunPlan {
@@ -120,6 +128,7 @@ export function createRunPlan({
   reflex,
   speechActOverride,
   routedIntent,
+  outputTarget,
 }: CreateRunPlanInput): RunPlanDecision {
   const speechAct = speechActOverride ?? classifyMissionSpeechAct(prompt);
   const routedCodeExecutionProposal =
@@ -160,6 +169,7 @@ export function createRunPlan({
     | "maxEffectClassWithoutGrant"
     | "speechAct"
     | "executionTier"
+    | "effortDecision"
   >): RunPlanDecision => {
     const allowedToolNames = allowedTools.map((tool) => tool.function.name);
     const generated = analyzeGeneratedOutputPrompt(prompt);
@@ -184,6 +194,16 @@ export function createRunPlan({
         /web_|semantic_|read_|count_words|run_code_block|create_|append_|replace_|rename_|highlight_/.test(name),
       ),
     });
+    const effortDecision = resolveMissionEffortDecisionV1({
+      prompt,
+      route,
+      outputTarget:
+        outputTarget ?? (missionIntent.noteOutput ? "new_note" : "chat"),
+      configuredMaxModelCalls: configuredMaxSteps,
+      configuredMaxToolCalls: configuredMaxSteps,
+      configuredMaxRunMinutes: settings?.maxRunMinutes,
+      forceExtendedTeam: detectProjectLifecycleStagesV1(prompt).length > 1,
+    });
     return {
       route,
       speechAct: speechAct.speechAct,
@@ -196,6 +216,7 @@ export function createRunPlan({
       expectedTimeClass,
       requiresEnglishGuard,
       maxEffectClassWithoutGrant: maxEffectClassWithoutGrantForRoute(route),
+      effortDecision,
       traceReasons,
       budgetProfile: {
         ...budgetProfile,
@@ -1054,7 +1075,7 @@ function hasCurrentWebFactIntent(prompt: string): boolean {
 }
 
 function hasDeepResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|in[-\s]?depth(?:\s+(?:research|analysis|investigation|report))?|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
+  return /\b(deep\s+research|in[-\s]?depth\s+(?:research|analysis|investigation)|deep\s+dive|thorough\s+research|comprehensive\s+research|serious\s+research)\b/i.test(
     prompt,
   );
 }

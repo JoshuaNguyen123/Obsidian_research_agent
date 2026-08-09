@@ -1,7 +1,7 @@
 import type { ApprovalRequest } from "../agent/approvalBroker";
 
 /**
- * Pure view-model for the Activity approval card.
+ * Pure view-model for the Run Details approval card.
  *
  * The card is the moment a user authorizes an outward-facing mutation, and its
  * strings were composed inline across ~140 lines of DOM construction — which

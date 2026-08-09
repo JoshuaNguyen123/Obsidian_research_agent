@@ -17,6 +17,7 @@ import {
 } from "./CompanionServiceController";
 import { requireNodeModule } from "../../src/platform/nodeRequire";
 import { createSessionBootstrapTokenLeaseV1 } from "@agentic-researcher/headless-runtime";
+import { createHostApprovalReceiptEvidenceV1 } from "../../packages/core-api/src/hostApprovalReceiptV1";
 
 export default class AgenticResearcherCompanionExtension extends Plugin {
   public readonly companionCoordinator = new CompanionExtensionCoordinatorV1();
@@ -350,12 +351,23 @@ export function createCompanionStatusContribution(
       const hostApprovalSigner = snapshot.configured
         ? await coordinator.describeHostApprovalSigner().catch(() => null)
         : null;
+      const signatureVerified =
+        snapshot.configured &&
+        hostApprovalSigner?.persistent === true &&
+        hostApprovalSigner.provisioned === true
+          ? await verifyCompanionApprovalSignerRoundTrip(coordinator).catch(
+              () => false,
+            )
+          : false;
       const healthy = Boolean(
           health?.ok &&
           health.coordinatorReady &&
           health.workerReady &&
           health.backgroundEnabled &&
-          health.secureStorePersistent,
+          health.secureStorePersistent &&
+          hostApprovalSigner?.persistent &&
+          hostApprovalSigner.provisioned &&
+          signatureVerified,
       );
       return {
         status: healthy ? "healthy" : snapshot.configured ? "degraded" : "blocked",
@@ -378,19 +390,43 @@ export function createCompanionStatusContribution(
             hostApprovalSigner?.provisioned ?? false,
           hostApprovalSigningKeyFingerprint:
             hostApprovalSigner?.signingKeyFingerprint ?? null,
+          hostApprovalSignatureVerified: signatureVerified,
           backgroundEnabled: health?.backgroundEnabled ?? false,
           backgroundBlocker: health?.backgroundBlocker ?? null,
           lastWaitingObsidianNodeId: snapshot.lastWaitingObsidianNodeId,
           requiredAction: healthy
-            ? hostApprovalSigner?.provisioned
-              ? null
-              : "Run Companion: Provision approval signing key before background GitHub mutations."
-            : "Install/connect the service and verify an OS credential-store backend.",
+            ? null
+            : !hostApprovalSigner?.provisioned
+              ? "Run Companion: Provision approval signing key."
+              : "Install/connect the service and verify coordinator, worker, persistence, secure storage, and signing diagnostics.",
         },
         checkedAt: context.now().toISOString(),
       };
     },
   };
+}
+
+async function verifyCompanionApprovalSignerRoundTrip(
+  coordinator: CompanionExtensionCoordinatorV1,
+): Promise<boolean> {
+  const hashA = `sha256:${"1".repeat(64)}`;
+  const hashB = `sha256:${"2".repeat(64)}`;
+  const hashC = `sha256:${"3".repeat(64)}`;
+  const evidence = createHostApprovalReceiptEvidenceV1({
+    id: "companion-health-signature-probe",
+    preparedActionId: "companion-health-read-only-probe",
+    preparedActionFingerprint: hashA,
+    confirmationOrdinal: 1,
+    requiredConfirmations: 1,
+    decision: "approved",
+    hostInstanceFingerprint: hashB,
+    actorFingerprint: hashC,
+    sessionFingerprint: hashA,
+    decidedAt: new Date().toISOString(),
+  });
+  const receipt = await coordinator.sealHostApprovalReceipt(evidence);
+  const verified = await coordinator.verifyHostApprovalReceipt(receipt);
+  return verified.verified && verified.reason === "verified";
 }
 
 export function createCompanionReplayContribution(

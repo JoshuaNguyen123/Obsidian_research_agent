@@ -174,7 +174,7 @@ test("OBS-HELLO Obsidian prompt creates TypeScript app and private GitHub draft 
     // Phase 2: publish only — private repo + draft PR from the verified handoff.
     const publishMission = [
       `Using trusted repository key ${PROFILE_KEY}, create the exact host-bound private GitHub repository ${githubAccount.login}/${repository}.`,
-      "Call github_create_private_repository, then publish_verified_code_to_github for the existing verified_code_publication_handoff.",
+      "Call github_create_repository with visibility private, then publish_verified_code_to_github for the existing verified_code_publication_handoff.",
       "Publish the verified commit to its agent-owned branch and open one draft pull request.",
       "Do not merge. Do not clean up or delete any provider resource.",
       "Use the visible exact approval surface whenever required.",

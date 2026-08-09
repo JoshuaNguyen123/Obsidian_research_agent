@@ -1,5 +1,9 @@
+import { randomUUID } from "node:crypto";
+
 import { expect, test } from "@playwright/test";
 
+import { renderLinearIssueBodyV1 } from "../src/integrations/linear/LinearIssueFormatV1";
+import { normalizeComparableTicketText } from "../src/integrations/linear/ResearchTicketPublisher";
 import {
   NATIVE_CORE_PLUGIN_ID,
   startNativeObsidianHarness,
@@ -8,6 +12,28 @@ import {
 import { laneSelectedV1 } from "./fixtures/laneSelection";
 
 const CONFIGURED_LINEAR_LIVE_LANE = "configured-linear-live";
+
+/**
+ * Report every raw line Linear's serializer rewrote. The bodies are our own
+ * generated proof content, so quoting them leaks nothing, and knowing exactly
+ * which constructs get reformatted is what tells us whether the renderer can
+ * be made byte-stable across a round-trip.
+ */
+function describeFirstLineDifference(sent: string, readback: string): string {
+  const sentLines = sent.replace(/\r\n?/gu, "\n").split("\n");
+  const readLines = readback.replace(/\r\n?/gu, "\n").split("\n");
+  const differences: string[] = [];
+  for (let index = 0; index < Math.max(sentLines.length, readLines.length); index += 1) {
+    if (sentLines[index] === readLines[index]) continue;
+    differences.push(
+      `line ${index + 1}: sent=${JSON.stringify(sentLines[index] ?? "<missing>")} readback=${JSON.stringify(readLines[index] ?? "<missing>")}`,
+    );
+    if (differences.length >= 6) break;
+  }
+  return `Line counts sent=${sentLines.length} readback=${readLines.length}. ${
+    differences.length > 0 ? differences.join(" | ") : "No raw line differences."
+  }`;
+}
 
 test.describe.serial("configured native Linear live proof", () => {
   test.skip(process.platform !== "win32", "Obsidian desktop e2e requires Windows.");
@@ -48,7 +74,34 @@ test.describe.serial("configured native Linear live proof", () => {
         },
       });
 
-      const proof = await harness.page.evaluate(async (pluginId) => {
+      // Give the disposable issue a canonically rendered body so this lane
+      // proves the shared section contract survives a real Linear round-trip,
+      // not just that the mutation machinery works. Built in Node because the
+      // renderer is host code, not something the plugin exposes to the page.
+      const suffix = randomUUID();
+      const canonicalIssueDescription = renderLinearIssueBodyV1({
+        problemImpact: `Disposable production-path proof created by Agentic Researcher. Run marker: ${suffix}`,
+        evidence: ["https://example.test/configured-linear-live"],
+        confidenceLimitations:
+          "Disposable proof only; the same test trashes this issue before it exits.",
+        proposedWork: [
+          "Verify the canonical issue body survives a Linear markdown round-trip.",
+        ],
+        nonGoals: ["Any durable change to this workspace."],
+        scope: ["One disposable issue inside the disposable proof project."],
+        dependencies: ["The disposable configured-credential project."],
+        acceptanceCriteria: [
+          { id: "AC-1", text: "Independent readback returns the same normalized body." },
+          { id: "AC-2", text: "Every disposable resource is trashed before exit." },
+        ],
+        validation: ["profile:configured-linear-live"],
+      });
+
+      const proof = await harness.page.evaluate(async ({
+        pluginId,
+        suffix,
+        canonicalIssueDescription,
+      }) => {
         const plugin = (window as typeof window & { app?: any }).app?.plugins
           ?.plugins?.[pluginId];
         if (!plugin) throw new Error("Agentic Researcher is unavailable.");
@@ -167,10 +220,10 @@ test.describe.serial("configured native Linear live proof", () => {
           }
         }
 
-        const suffix = crypto.randomUUID();
         const title = `Agentic configured live ${suffix}`;
         const runId = `configured-linear-live-${suffix}`;
         let operationSequence = 0;
+        let issueDescriptionReadback: string | null = null;
         let issueId: string | null = null;
         let commentId: string | null = null;
         let initiativeId: string | null = null;
@@ -390,11 +443,7 @@ test.describe.serial("configured native Linear live proof", () => {
               teamId,
               projectId,
               title,
-              description: [
-                "Disposable production-path proof created by Agentic Researcher.",
-                `Run marker: ${suffix}`,
-                "The same test must trash this issue before it exits.",
-              ].join("\n\n"),
+              description: canonicalIssueDescription,
             },
             `configured-linear-create-${suffix}`,
           );
@@ -410,6 +459,8 @@ test.describe.serial("configured native Linear live proof", () => {
           if (issue?.id !== issueId || issue?.title !== title) {
             throw new Error("Independent Linear issue readback did not match creation.");
           }
+          issueDescriptionReadback =
+            typeof issue?.description === "string" ? issue.description : null;
           const search = (await executeRead("linear_search_issues", {
             query: suffix,
             first: 10,
@@ -553,6 +604,7 @@ test.describe.serial("configured native Linear live proof", () => {
           teamCount: snapshot.teams.length,
           projectCount: snapshot.projects.length,
           workflowStateCount: snapshot.workflowStates.length,
+          issueDescriptionReadback,
           cleaned:
             issueId === null &&
             commentId === null &&
@@ -560,7 +612,11 @@ test.describe.serial("configured native Linear live proof", () => {
             projectId === null &&
             initiativeProjectLinkId === null,
         };
-      }, NATIVE_CORE_PLUGIN_ID);
+      }, {
+        pluginId: NATIVE_CORE_PLUGIN_ID,
+        suffix,
+        canonicalIssueDescription,
+      });
 
       expect(proof).toMatchObject({
         credentialConfigured: true,
@@ -569,6 +625,26 @@ test.describe.serial("configured native Linear live proof", () => {
       });
       expect(proof.teamCount).toBeGreaterThan(0);
       expect(proof.workflowStateCount).toBeGreaterThan(0);
+
+      // The canonical body must survive Linear's markdown serializer well enough
+      // for readback comparison to accept it. Exactness is reported separately:
+      // it is the precondition for tightening host-rendered readback from
+      // token-overlap to exact match.
+      const readback = proof.issueDescriptionReadback;
+      expect(readback).not.toBeNull();
+      expect(normalizeComparableTicketText(readback ?? "")).toBe(
+        normalizeComparableTicketText(canonicalIssueDescription),
+      );
+      const byteExact = readback === canonicalIssueDescription;
+      test.info().annotations.push({
+        type: "canonical-issue-body-roundtrip",
+        description: byteExact
+          ? "Linear returned the canonical issue body byte-for-byte."
+          : `Linear reformatted the canonical issue body; it still matched after comparable-text normalization. ${describeFirstLineDifference(
+              canonicalIssueDescription,
+              readback ?? "",
+            )}`,
+      });
       test.info().annotations.push({
         type: "live-provider-proof",
         description:

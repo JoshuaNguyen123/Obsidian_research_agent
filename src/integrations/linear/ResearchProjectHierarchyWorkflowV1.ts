@@ -10,7 +10,10 @@ import type {
   HostLinearActionExecutor,
   LinearAuthoritySubject,
 } from "./HostLinearActionExecutor";
-import { assertCleanLinearHumanOutputV1 } from "./WorkItemRenderer";
+import {
+  assertCleanLinearHumanOutputV1,
+  renderLinearIssueBodyV1,
+} from "./LinearIssueFormatV1";
 import type { LinearToolClient } from "./LinearTools";
 import { listAllLinearPages } from "./linearPagination";
 import {
@@ -674,7 +677,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
           teamId: plan.destination.teamId,
           projectId,
           title: issue.title,
-          description: renderHierarchyIssueDescriptionV1(issue),
+          description: renderHierarchyIssueDescriptionV1(issue, plan),
         },
         duplicate: duplicates.get(issue.idempotencyKey),
       });
@@ -796,7 +799,7 @@ export class ResearchProjectHierarchyWorkflowV1 {
         matches: (record: LinearBaseRecord) =>
           record.resourceType === "issue" &&
           record.title === issue.title &&
-          record.description === renderHierarchyIssueDescriptionV1(issue),
+          record.description === renderHierarchyIssueDescriptionV1(issue, plan),
       })),
     ];
     for (const record of catalogs.flat()) {
@@ -942,14 +945,30 @@ function stableToolCallId(planFingerprint: string, key: string): string {
     .slice(0, 150);
 }
 
-function renderHierarchyIssueDescriptionV1(
+/**
+ * Render one hierarchy issue through the shared section contract, so a project
+ * issue and a published research ticket land in Linear with the same shape.
+ * Dependencies come from the plan's dependency graph and evidence from its
+ * accepted-research source note; neither is model prose.
+ */
+export function renderHierarchyIssueDescriptionV1(
   issue: ResearchProjectPlanV1["issues"][number],
+  plan: ResearchProjectPlanV1,
 ): string {
-  // Use plain bullets. Linear markdown round-trips often rewrite task-list
-  // checkboxes (`- [ ]`), which breaks exact create readback.
-  const description = `${issue.description}\n\n## Acceptance criteria\n${issue.acceptanceCriteria
-    .map((criterion) => `- ${criterion}`)
-    .join("\n")}`;
+  const titlesByKey = new Map(plan.issues.map((entry) => [entry.key, entry.title]));
+  const description = renderLinearIssueBodyV1({
+    problemImpact: issue.problemImpact ?? issue.description,
+    evidence: [plan.sourceNotePath],
+    confidenceLimitations: issue.confidenceLimitations,
+    proposedWork: issue.proposedWork ?? [issue.description],
+    nonGoals: issue.nonGoals,
+    scope: issue.scope,
+    dependencies: issue.dependencyKeys.map(
+      (key) => `Depends on: ${titlesByKey.get(key) ?? key}`,
+    ),
+    acceptanceCriteria: issue.acceptanceCriteria.map((text) => ({ text })),
+    validation: issue.validation,
+  });
   assertCleanLinearHumanOutputV1(description, `Linear issue ${issue.title}`);
   return description;
 }

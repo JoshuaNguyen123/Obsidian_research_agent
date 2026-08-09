@@ -21,17 +21,17 @@ export type HostRoutingToolCardV1 = {
 export const COMPOUND_TOOL_PURPOSE: Readonly<Record<string, string>> = {
   code_sandbox_status: "verify sandbox Ready before validate/commit",
   code_workspace_create:
-    "create a real local-filesystem workspace; export its finished tree to Desktop/Documents/Downloads with code_workspace_export_directory",
+    "create a real workspace; deliver standalone projects beside the vault by default",
   code_workspace_status: "workspace binding and status",
   code_workspace_read: "read workspace/repo file (not vault)",
   code_workspace_create_file:
-    "create a file in the real local-filesystem workspace; export via code_workspace_export_directory to Desktop/Documents/Downloads",
+    "create a file in the real workspace; export the finished standalone project",
   code_workspace_export_directory:
-    "deliver a verified workspace tree to an explicitly requested known folder",
+    "deliver beside the vault by default, or to an explicitly named host folder",
   code_workspace_append: "append to workspace file",
   code_workspace_patch: "patch workspace file",
   code_workspace_write_expected:
-    "hash-bound correction in the real local-filesystem workspace; export via code_workspace_export_directory to Desktop/Documents/Downloads",
+    "hash-bound correction in the real workspace before validation and delivery",
   code_workspace_mkdir: "create workspace directory",
   code_validate_fast: "sandbox smoke tests",
   code_validate_targeted: "targeted sandbox validation",
@@ -44,7 +44,12 @@ export const COMPOUND_TOOL_PURPOSE: Readonly<Record<string, string>> = {
   linear_get_issue: "read verified Linear issue",
   publish_research_to_linear: "publish accepted research to Linear",
   publish_research_project_to_linear: "publish Linear hierarchy from research",
-  github_create_private_repository: "create private GitHub repository",
+  report_progress_to_linear:
+    "comment progress on this run's Linear issue and set started/blocked/completed",
+  github_create_repository:
+    "create the repository after the user explicitly chooses public or private",
+  github_create_private_repository:
+    "legacy repository-create alias; still requires explicit visibility",
   publish_verified_code_to_github: "push verified branch + draft PR (or merge)",
   github_publish_verified_branch: "alias publish verified branch/draft PR",
   github_get_pull_request: "readback pull request",

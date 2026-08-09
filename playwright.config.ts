@@ -6,8 +6,9 @@ import { defineConfig } from "@playwright/test";
  * because they passed on a host whose plugin could not actually run a mission
  * — they injected the sandbox provider configuration the product never adopted,
  * which is exactly the failure they were supposed to catch. Each lane below
- * calls a real model, a real external service, or both, and asserts on items
- * that really exist afterwards.
+ * calls a real model, a real external service, or both, except for explicit
+ * native UI security probes that exercise the installed production renderer.
+ * Every lane asserts on items that really exist afterwards.
  */
 
 const activeLanes = new Set(
@@ -25,6 +26,7 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
     ? 135 * 60_000
   : activeLanes.has("daily-use-code-live") ||
       activeLanes.has("desktop-code-delivery-real-live") ||
+      activeLanes.has("vault-sibling-code-delivery-real-live") ||
       activeLanes.has("desktop-checkers-delivery-real-live") ||
       activeLanes.has("real-ai-soak") ||
       activeLanes.has("daily-use-research") ||
@@ -55,6 +57,15 @@ export default defineConfig({
     video: protectedLogMode ? "off" : "retain-on-failure",
   },
   projects: [
+    {
+      // Native UI security proof; no model or external service is required.
+      name: "safe-assistant-renderer",
+      testMatch: /safe-assistant-renderer\.spec\.ts/u,
+      retries: 0,
+      timeout: 240_000,
+      expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
     {
       name: "real-ai-contract",
       testMatch: /daily-use-research\.spec\.ts/u,
@@ -101,6 +112,14 @@ export default defineConfig({
     {
       name: "desktop-code-delivery-real-live",
       testMatch: /desktop-code-delivery-real-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 2_700_000,
+      expect: { timeout: 180_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "vault-sibling-code-delivery-real-live",
+      testMatch: /vault-sibling-code-delivery-real-live\.spec\.ts/u,
       retries: 0,
       timeout: 2_700_000,
       expect: { timeout: 180_000 },
@@ -199,6 +218,14 @@ export default defineConfig({
     {
       name: "configured-linear-live",
       testMatch: /configured-linear-live\.spec\.ts/u,
+      retries: 0,
+      timeout: 600_000,
+      expect: { timeout: 30_000 },
+      use: { trace: "off", screenshot: "off", video: "off" },
+    },
+    {
+      name: "configured-github-visibility-live",
+      testMatch: /configured-github-visibility-live\.spec\.ts/u,
       retries: 0,
       timeout: 600_000,
       expect: { timeout: 30_000 },

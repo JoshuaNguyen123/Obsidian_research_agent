@@ -79,6 +79,94 @@ test("GitHub publication tool accepts only a logical profile and host-resolves p
   assert.equal(persisted.length, 1);
 });
 
+test("GitHub publication pauses without an explicit visibility confirmation", async () => {
+  let workflowCreates = 0;
+  const tool = createGitHubPublicationTool({
+    async resolveHandoff() {
+      return verifiedHandoff();
+    },
+    async resolveBinding() {
+      return bindingResolution();
+    },
+    async getCheckpoint() {
+      return null;
+    },
+    createWorkflow() {
+      workflowCreates += 1;
+      return {} as never;
+    },
+    async persistExternalReceipt() {},
+  });
+
+  await assert.rejects(
+    tool.executeResult!(
+      { action: "publish_draft", profileKey: "fixture" },
+      {
+        ...context(),
+        originalPrompt: "Push the verified code to GitHub and open a draft PR.",
+      },
+    ),
+    (error: unknown) =>
+      error instanceof ToolExecutionError &&
+      error.code === "waiting_for_repository_visibility" &&
+      error.mutationState === "not_applied",
+  );
+  assert.equal(workflowCreates, 0);
+});
+
+test("public GitHub publication carries internet-visible approval metadata", async () => {
+  const tool = createGitHubPublicationTool({
+    async resolveHandoff() {
+      return verifiedHandoff();
+    },
+    async resolveBinding() {
+      return bindingResolution("public");
+    },
+    async getCheckpoint() {
+      return null;
+    },
+    createWorkflow(input) {
+      return {
+        async publishDraft() {
+          const action = await preparedAction(input.approvalIdentity);
+          const approval = await input.approvals.request({
+            kind: "publish",
+            approvalFingerprint: action.payloadFingerprint,
+            preparedAction: action,
+            requiredConfirmations: 1,
+            summary: "Publish verified branch",
+            destination: "acme/research-agent",
+          });
+          assert.equal(approval.approved, true);
+          return checkpoint("review_or_merge_ready");
+        },
+      } as never;
+    },
+    async persistExternalReceipt() {},
+  });
+  const publicContext = {
+    ...context(),
+    originalPrompt:
+      "Push the verified code to the public GitHub repository and open a draft PR.",
+    async requestNestedApproval(request: Parameters<NonNullable<ToolExecutionContext["requestNestedApproval"]>>[0]) {
+      assert.ok(request.policyTags.includes("internet_visible"));
+      assert.ok(request.policyTags.includes("visibility_public"));
+      assert.match(request.reason, /visible on the internet/iu);
+      return {
+        approved: true as const,
+        approvalId: "approval-public-publish",
+        approvalFingerprint: request.preparedAction!.payloadFingerprint,
+      };
+    },
+  };
+
+  const result = await tool.executeResult!(
+    { action: "publish_draft", profileKey: "fixture" },
+    publicContext,
+  );
+  assert.equal(result.ok, true);
+});
+
 test("GitHub draft publication derives bounded prose when the model omits it", async () => {
   const handoff = verifiedHandoff();
   let published = 0;
@@ -208,7 +296,7 @@ test("GitHub merge requests two distinct exact approval gestures", async () => {
   });
   const mergeContext: ToolExecutionContext = {
     ...context(),
-    originalPrompt: "Merge the GitHub pull request after fresh checks pass.",
+    originalPrompt: "Merge the private GitHub repository pull request after fresh checks pass.",
     async requestNestedApproval(request) {
       assert.ok(request.preparedAction);
       assert.equal(await verifyPreparedActionFingerprint(request.preparedAction), true);
@@ -674,7 +762,7 @@ test("merge refuses a finalized draft-only checkpoint without merge proof", asyn
         { action: "merge", profileKey: "fixture" },
         {
           ...context(),
-          originalPrompt: "Merge the verified GitHub pull request.",
+          originalPrompt: "Merge the verified private GitHub repository pull request.",
         },
       ),
     (error: unknown) =>
@@ -718,7 +806,7 @@ function context(): ToolExecutionContext {
   return {
     app: {} as never,
     settings: {} as never,
-    originalPrompt: "Push the verified code to GitHub and open a draft PR.",
+    originalPrompt: "Push the verified code to the private GitHub repository and open a draft PR.",
     runId: "run-1",
     operationId: "tool-call-1",
     httpTransport: async () => ({ status: 500, headers: {} }),
@@ -781,11 +869,13 @@ function binding() {
   };
 }
 
-function bindingResolution() {
+function bindingResolution(visibility: "public" | "private" = "private") {
+  const repositoryBinding = { visibility } as never;
   return {
     workflowBinding: binding(),
     publicationBinding: {} as never,
-    privateRepositoryBinding: {} as never,
+    privateRepositoryBinding: repositoryBinding,
+    repositoryBinding,
     profile: {} as never,
   };
 }

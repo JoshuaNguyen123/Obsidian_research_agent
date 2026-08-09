@@ -82,7 +82,7 @@ export function stopReasonChatLine(
     case "clarifying_question":
       return `Needs clarification.${suffix}`;
     case "user_aborted":
-      return `Stopped.${suffix}`;
+      return `Stopped by you. Any completed draft and receipts were preserved in Run Details.${suffix}`;
     case "wall_clock":
       return `Paused: wall-clock budget expired. Ask me to continue.${suffix}`;
     case "step_budget":

@@ -10,6 +10,9 @@ import {
 } from "../integrations/github/GitHubPublicationWorkflow";
 import type { TrustedGitHubRepositoryBindingV1 } from "../integrations/github/TrustedGitHubRepositoryBindingV1";
 import type { TrustedGitHubRepositoryBindingV2 } from "../integrations/github/TrustedGitHubRepositoryBindingV2";
+import {
+  resolveExplicitRepositoryVisibilityChoiceV1,
+} from "../integrations/github/RepositoryVisibility";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 
@@ -40,6 +43,8 @@ export interface GitHubPublicationBindingResolutionV1 {
   workflowBinding: TrustedGitHubPublicationBindingV1;
   publicationBinding: TrustedGitHubRepositoryBindingV1;
   privateRepositoryBinding: TrustedGitHubRepositoryBindingV2;
+  /** Canonical name; privateRepositoryBinding remains for V1 callers. */
+  repositoryBinding?: TrustedGitHubRepositoryBindingV2;
   profile: RepositoryProfileV2;
   completionProof?: "draft_pr" | "merged_pr";
 }
@@ -50,7 +55,7 @@ export function createGitHubPublicationTool(
   const tool: AgentTool = {
     name: PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME,
     description:
-      "Purpose: Push verified branch and create draft PR (or Bound merge when mission asks). Use when: after code_commit_verified + private repo. Do not use when: before commit; do not invent git_push. Required: action publish_draft|merge + bindings. Next: note reflection. Side effects: bound/hard for merge. Publish the latest host-verified local commit for a trusted repository profile to its agent-owned GitHub branch and draft pull request, or refresh proof and request a separate double-exact merge. The model supplies only a logical profile key and optional PR prose; when title or body is omitted for publish_draft, the host emits a bounded verified-publication summary. Local paths, SHAs, credentials, repository destinations, checks, and merge policy are host-resolved.",
+      "Purpose: Push a verified branch and create a draft PR (or Bound merge when the mission asks). Use only after code_commit_verified and after the user explicitly confirms the exact repository's public/private visibility. Never infer visibility. Public publication warns that repository content and commit history are internet-visible. The model supplies only a logical profile key and optional PR prose; local paths, SHAs, credentials, repository destinations, checks, and merge policy are host-resolved.",
     parameters: {
       type: "object",
       properties: {
@@ -217,6 +222,20 @@ async function executeGitHubPublication(
       "The repository profile has no verified GitHub destination bound to the pinned account.",
     );
   }
+  const repositoryBinding =
+    binding.repositoryBinding ?? binding.privateRepositoryBinding;
+  const visibilityChoice = resolveExplicitRepositoryVisibilityChoiceV1(
+    context.originalPrompt,
+  );
+  if (visibilityChoice.status !== "chosen") {
+    throw notApplied(visibilityChoice.code, visibilityChoice.message);
+  }
+  if (visibilityChoice.visibility !== repositoryBinding.visibility) {
+    throw notApplied(
+      "github_repository_visibility_confirmation_mismatch",
+      `GitHub readback reports ${repositoryBinding.visibility} visibility, but the user confirmed ${visibilityChoice.visibility}. No publication was performed.`,
+    );
+  }
   const runId = identity(context.runId, "run id");
   const toolCallId = identity(context.operationId, "tool call id");
   if (!context.requestNestedApproval) {
@@ -239,9 +258,15 @@ async function executeGitHubPublication(
           reason:
             request.kind === "merge"
               ? "Approve the exact PR head, base, fresh check/review snapshot, and squash merge. Any drift invalidates this approval."
-              : "Approve the exact trusted repository, agent branch, verified commit, and outbound GitHub payload.",
+              : repositoryBinding.visibility === "public"
+                ? "Approve the exact public repository, agent branch, verified commit, and outbound GitHub payload. Repository content and committed history are visible on the internet."
+                : "Approve the exact private repository, agent branch, verified commit, and outbound GitHub payload.",
           policyTags: [
             "github_publication",
+            `visibility_${repositoryBinding.visibility}`,
+            ...(repositoryBinding.visibility === "public"
+              ? ["internet_visible"]
+              : []),
             request.kind,
             request.requiredConfirmations === 2 ? "double_exact" : "exact",
           ],

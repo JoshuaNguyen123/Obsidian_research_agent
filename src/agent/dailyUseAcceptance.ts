@@ -6,7 +6,8 @@ export type DailyUseScenarioId =
   | "DU-05"
   | "DU-06"
   | "BYOK-01"
-  | "DESKTOP-01";
+  | "DESKTOP-01"
+  | "FLOW-REAL-01";
 
 export interface DailyUseAcceptanceV1 {
   version: 1;
@@ -128,6 +129,52 @@ export const DESKTOP_01_ACCEPTANCE_TOKENS = Object.freeze({
     "cleanup:desktop_export",
     "cleanup:scratch_workspace",
   ] as const),
+});
+
+/**
+ * Runtime observations for the unattended single-issue compound chain.
+ *
+ * Deliberately separate from DU-06. DU-06 proves the *hierarchy* shape — an
+ * initiative, a project, and their link — and pays five approval boundaries.
+ * FLOW-REAL-01 proves the other production shape: one accepted research note
+ * published as exactly one Linear issue via publish_research_to_linear, then
+ * carried through a verified commit, a private repository, and a draft pull
+ * request with no approval stops at all. Mapping this lane onto DU-06 would
+ * require recording initiative and project artifacts it never creates.
+ *
+ * There are no approval boundaries by design: this is the set-loose path, and
+ * the lane separately asserts no Approve control survives to Idle. Cleanup is
+ * likewise absent — the Linear issue is deliberately retained for the
+ * pattern-anchored janitor lane, and GitHub teardown runs after acceptance is
+ * recorded, so claiming a cleanup token here would assert an unobserved fact.
+ */
+export const FLOW_REAL_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze([
+    "vault:research_note",
+    "linear:issue",
+    "git:local_commit",
+    "github:private_repository",
+    "github:draft_pr",
+    "vault:completion_reflection",
+  ] as const),
+  proofs: Object.freeze([
+    "research:accepted",
+    "research:two_distinct_sources",
+    "linear:provider_readback",
+    "linear:completion_readback",
+    "code:workspace_validated",
+    "git:verified_commit",
+    "github:private_visibility_readback",
+    "github:draft_pr_readback",
+    "reconciliation:backlinks_and_status",
+  ] as const),
+  approvals: Object.freeze([] as const),
+  bindings: Object.freeze([
+    "binding:note_linear_issue",
+    "binding:note_commit_pr",
+    "binding:linear_commit_pr",
+  ] as const),
+  cleanup: Object.freeze([] as const),
 });
 
 /**
@@ -283,6 +330,13 @@ export const DAILY_USE_ACCEPTANCE_V1: Readonly<
     approvalBoundaries: DESKTOP_01_ACCEPTANCE_TOKENS.approvals,
     finalBindings: DESKTOP_01_ACCEPTANCE_TOKENS.bindings,
     cleanupObligations: DESKTOP_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "FLOW-REAL-01": contract("FLOW-REAL-01", {
+    requestedArtifacts: FLOW_REAL_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: FLOW_REAL_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: FLOW_REAL_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: FLOW_REAL_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: FLOW_REAL_01_ACCEPTANCE_TOKENS.cleanup,
   }),
 });
 

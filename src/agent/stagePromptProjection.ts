@@ -32,7 +32,7 @@ const STAGE_OBJECTIVES: Readonly<Record<ProjectLifecycleStageV1, string>> = {
   code_execution:
     "Advance unpaid code proof: sandbox ready → workspace edit → validate/repair → verified commit.",
   private_github_publication:
-    "Publish the verified workspace to the exact private GitHub repository / draft PR.",
+    "Ask whether the exact GitHub repository is public or private, then publish the verified workspace as a draft PR.",
   reconciliation_cleanup:
     "Trash only exact disposable Linear/GitHub targets and prove provider absence.",
 };

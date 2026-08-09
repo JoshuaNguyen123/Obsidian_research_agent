@@ -34,6 +34,7 @@ export * from "./linearProjectAssociation";
 export * from "./resolveLinearProjectAssociation";
 export * from "./PendingLinearReconciliationState";
 export * from "./ExternalActionReceiptLedger";
+export * from "./LinearIssueFormatV1";
 export * from "./WorkItemParser";
 export * from "./WorkItemRenderer";
 export * from "./WorkItemSpecV1";

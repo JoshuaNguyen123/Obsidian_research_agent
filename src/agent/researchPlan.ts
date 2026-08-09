@@ -12,6 +12,7 @@ import {
 } from "./missionPlan";
 import { hasExplicitNoWebIntent } from "./evidenceIntent";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "./replaceIntent";
+import { hasExplicitNoVaultReadIntent } from "./missionScope";
 import {
   evaluateReportStructure,
   reportStrictnessForTier,
@@ -1092,11 +1093,15 @@ function classifyResearchMode(
     return "none";
   }
 
-  const web = !hasExplicitNoWebIntent(prompt) && hasDeepWebResearchIntent(prompt);
-  const vault = hasDeepVaultResearchIntent(prompt);
-  const deep = hasDeepResearchIntent(prompt) || hasInvestigativeIntent(prompt);
   const explicitWeb =
     !hasExplicitNoWebIntent(prompt) && hasExplicitWebSignal(prompt);
+  const web = !hasExplicitNoWebIntent(prompt) && hasDeepWebResearchIntent(prompt);
+  const vault =
+    !hasExplicitNoVaultReadIntent(prompt) && hasDeepVaultResearchIntent(prompt);
+  const deep =
+    hasDeepResearchIntent(prompt) ||
+    hasInvestigativeIntent(prompt) ||
+    (/\bin[-\s]?depth\b/iu.test(prompt) && (explicitWeb || vault));
 
   if ((web || (deep && explicitWeb)) && vault) {
     return "deep_hybrid";
@@ -1699,7 +1704,7 @@ function getResearchAcceptanceNextAction(missing: string[]): string | undefined 
 }
 
 function hasDeepResearchIntent(prompt: string): boolean {
-  return /\b(deep\s+research|long\s+research|in[-\s]?depth|deep\s+dive|thorough|comprehensive|multi[-\s]?source|compare\s+sources?|evidence\s+ledger|long[-\s]?running)\b/i.test(prompt);
+  return /\b(deep\s+research|long\s+research|in[-\s]?depth\s+(?:research|analysis|investigation)|deep\s+dive|thorough\s+research|comprehensive\s+research|multi[-\s]?source\s+(?:research|review|comparison)|compare\s+sources?|evidence\s+ledger|long[-\s]?running\s+research)\b/i.test(prompt);
 }
 
 function hasInvestigativeIntent(prompt: string): boolean {

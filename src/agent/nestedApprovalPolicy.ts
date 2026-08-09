@@ -4,6 +4,7 @@ import type {
   ToolRegistry,
 } from "../tools/types";
 import { PUBLISH_VERIFIED_CODE_TO_GITHUB_TOOL_NAME } from "../tools/githubPublicationTool";
+import { REPORT_PROGRESS_TO_LINEAR_TOOL_NAME } from "../tools/reportProgressToLinearTool";
 
 export const FINALIZE_GITHUB_LINKS_IN_OBSIDIAN_TOOL_NAME =
   "finalize_github_links_in_obsidian";
@@ -77,6 +78,21 @@ const NESTED_SUBACTION_RULES: Readonly<
       system: "vault",
       resourceType: "markdown_file",
       action: "append",
+    },
+  },
+  // The end-of-mission progress report presents the same two Linear effects.
+  // It may present nothing else: the closed contract is what stops an outer
+  // tool turning its approval callback into a general Linear capability.
+  [REPORT_PROGRESS_TO_LINEAR_TOOL_NAME]: {
+    linear_create_comment: {
+      system: "linear",
+      resourceType: "comment",
+      action: "create",
+    },
+    linear_update_issue: {
+      system: "linear",
+      resourceType: "issue",
+      action: "update",
     },
   },
 };

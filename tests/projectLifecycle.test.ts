@@ -5,16 +5,23 @@ import {
   advanceProjectLineageV1,
   buildProjectLifecycleStageNodesV1,
   createProjectLifecycleIntentV1,
+  createProjectLifecycleIntentV2,
   createProjectLineageV1,
   createResearchProjectPlanV1,
   createResearcherHandoffV1,
   detectProjectLifecycleStagesV1,
+  detectProjectLifecycleStagesV2,
   estimateProjectLifecycleV1,
   getProjectLineageFingerprintHistoryV1,
   parseProjectLineageV1,
+  parseProjectLifecycleIntentV2,
   parseProjectLineageNamespaceV1,
   parseResearchProjectPlanV1,
   ProjectLineageStoreV1,
+  migratePrivateGitHubPublicationLineageProofV1ToV2,
+  migrateProjectLifecycleIntentV1ToV2,
+  projectGitHubPublicationLineageProofV2ToV1,
+  projectProjectLifecycleIntentV2ToV1,
   resolveResearcherHandoffForLeadV1,
 } from "../src/agent/projectLifecycle";
 import { createAcceptedResearchArtifactV1 } from "../src/integrations/linear/AcceptedResearchArtifactV1";
@@ -346,6 +353,62 @@ test("explicit lifecycle classification is ordered, negation-authoritative, and 
   assert.equal(nodes.length, 5);
   assert.equal(nodes.every((node) => node.composite), true);
   assert.deepEqual(nodes[2].dependencyIds, ["lifecycle-linear_hierarchy"]);
+});
+
+test("V2 lifecycle generalizes GitHub publication while projecting valid V1 private state", () => {
+  const legacy = createProjectLifecycleIntentV1({
+    runId: "run-project-1",
+    exactUserCommand: "Publish the verified code to a private GitHub repository.",
+    stages: ["code_execution", "private_github_publication"],
+    requestedAt: AT,
+  });
+  const migrated = migrateProjectLifecycleIntentV1ToV2(legacy);
+  assert.deepEqual(migrated.stages, ["code_execution", "github_publication"]);
+  assert.deepEqual(parseProjectLifecycleIntentV2(legacy), migrated);
+  assert.deepEqual(projectProjectLifecycleIntentV2ToV1(migrated), legacy);
+  assert.deepEqual(
+    detectProjectLifecycleStagesV2(
+      "Implement the code and publish it to GitHub as a public repository.",
+    ),
+    ["code_execution", "github_publication"],
+  );
+
+  const publicIntent = createProjectLifecycleIntentV2({
+    runId: "run-project-public",
+    exactUserCommand: "Publish the verified code to a public GitHub repository.",
+    stages: ["code_execution", "github_publication"],
+    requestedAt: AT,
+  });
+  assert.deepEqual(parseProjectLifecycleIntentV2(publicIntent), publicIntent);
+
+  const legacyProof = {
+    stage: "private_github_publication" as const,
+    trustedBindingFingerprint: SHA("1"),
+    owner: "acme",
+    repository: "agent-project",
+    verifiedPrivate: true as const,
+    branch: "codex/project",
+    pullRequestNumber: 12,
+    draft: true as const,
+    remoteSha: "a".repeat(40),
+    repositoryReadbackFingerprint: SHA("2"),
+    pullRequestReadbackFingerprint: SHA("3"),
+  };
+  const migratedProof =
+    migratePrivateGitHubPublicationLineageProofV1ToV2(legacyProof);
+  assert.equal(migratedProof.stage, "github_publication");
+  assert.equal(migratedProof.visibility, "private");
+  assert.deepEqual(
+    projectGitHubPublicationLineageProofV2ToV1(migratedProof),
+    legacyProof,
+  );
+  assert.throws(
+    () => projectGitHubPublicationLineageProofV2ToV1({
+      ...migratedProof,
+      visibility: "public",
+    }),
+    /cannot be projected as verified private/iu,
+  );
 });
 
 test("project lineage advances once per verified stage and binds exact local and remote SHAs", () => {

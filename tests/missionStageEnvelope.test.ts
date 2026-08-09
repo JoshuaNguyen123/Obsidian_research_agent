@@ -205,6 +205,10 @@ test("lifecycleStageForEnvelopeTool and isEnvelopeCreateMutation classify Bound 
   assert.equal(isEnvelopeCreateMutation("code_workspace_create_file"), true);
   assert.equal(isEnvelopeCreateMutation("code_commit_verified"), false);
   assert.equal(isEnvelopeCreateMutation("github_create_private_repository"), true);
+  assert.equal(
+    lifecycleStageForEnvelopeTool("github_create_repository"),
+    "private_github_publication",
+  );
 });
 
 test("GitHub catalog envelope maps reads and safe mutations to publication while delete stays cleanup hard", () => {

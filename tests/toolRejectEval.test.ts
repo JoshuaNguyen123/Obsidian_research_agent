@@ -22,10 +22,10 @@ test("maps create_repo and publish aliases when listed", () => {
   assert.match(
     String(
       describeOffFrontierToolNearMiss("create_repo", [
-        "github_create_private_repository",
+        "github_create_repository",
       ]),
     ),
-    /github_create_private_repository/,
+    /github_create_repository/,
   );
   assert.match(
     String(

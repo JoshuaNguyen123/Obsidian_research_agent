@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 // @ts-ignore The production runner is an intentionally unbundled Node ESM script.
-import { assertProjectsExecuted } from "../scripts/run-e2e-exclusive.mjs";
+import {
+  assertProjectsExecuted,
+  collectExecutedPlaywrightTests,
+  hasTargetedPlaywrightSelection,
+} from "../scripts/run-e2e-exclusive.mjs";
 // @ts-ignore The production gate is an intentionally unbundled Node ESM script.
 import { MISSION_SCORECARD_EXEMPT_PROJECTS, assertMissionScorecardSummaryFile } from "../scripts/mission-scorecard-regression.mjs";
 import { BYOK_01_ACCEPTANCE_TOKENS } from "../src/agent/dailyUseAcceptance";
@@ -107,6 +111,47 @@ test("selecting no project is a no-op rather than a false failure", () => {
   });
 });
 
+test("targeted Playwright selection is explicit and execution identities are retained", () => {
+  assert.equal(
+    hasTargetedPlaywrightSelection(["--project=daily-use-research"]),
+    false,
+  );
+  assert.equal(
+    hasTargetedPlaywrightSelection(["--grep=Agent settings"]),
+    true,
+  );
+  const report = {
+    suites: [
+      {
+        file: "daily-use-research.spec.ts",
+        specs: [
+          {
+            title: "Agent settings expose an API slot",
+            file: "daily-use-research.spec.ts",
+            tests: [
+              {
+                projectName: "daily-use-research",
+                results: [{ status: "passed" }],
+              },
+            ],
+          },
+        ],
+        suites: [],
+      },
+    ],
+  };
+  assert.deepEqual(
+    collectExecutedPlaywrightTests(report, ["daily-use-research"]),
+    [
+      {
+        project: "daily-use-research",
+        file: "daily-use-research.spec.ts",
+        title: "Agent settings expose an API slot",
+      },
+    ],
+  );
+});
+
 test("a lane with no scorecard baseline is proof debt, not a silent pass", async () => {
   // Previously this returned {skipped:true} before even reading the summary,
   // which disabled the gate for every lane once the only baseline record
@@ -123,7 +168,9 @@ test("a lane with no scorecard baseline is proof debt, not a silent pass", async
 
 test("model-free lanes are explicitly exempt, with the set stated in code", () => {
   for (const lane of [
+    "safe-assistant-renderer",
     "configured-linear-live",
+    "configured-github-visibility-live",
     "github-askpass-runtime-live",
     "disposable-live-external",
     "provider-canary",
@@ -144,6 +191,21 @@ test("model-free lanes are explicitly exempt, with the set stated in code", () =
     "retained-journey",
   ]) {
     assert.equal(MISSION_SCORECARD_EXEMPT_PROJECTS.has(lane), false, lane);
+  }
+});
+
+test("no lane records a duplicate-proof token that no contract declares", () => {
+  // resume:no_duplicates is declared by no contract, so recording it strands
+  // that lane's acceptance at needs_more_work forever: the scorecard is never
+  // harvestable and the lane fails the proof-debt gate for a reason that looks
+  // like missing work rather than a mislabelled token. daily-use-compound sat
+  // in exactly that state while proving the property under the wrong name.
+  for (const spec of [
+    "../e2e/daily-use-compound.spec.ts",
+    "../e2e/byok-autonomous-journey.spec.ts",
+    "../e2e/compound-flow-real-live.spec.ts",
+  ]) {
+    assert.doesNotMatch(readFileText(spec), /"resume:no_duplicates"/u, spec);
   }
 });
 
@@ -245,6 +307,43 @@ test("the BYOK autonomous journey proves every handoff through production bounda
   );
   for (const token of Object.values(BYOK_01_ACCEPTANCE_TOKENS).flat()) {
     assert.match(spec, new RegExp(escapeRegExp(token), "u"), token);
+  }
+});
+
+test("the compound live lane awards acceptance only from exact durable proof bindings", () => {
+  const spec = readFileText("../e2e/compound-flow-real-live.spec.ts");
+  for (const required of [
+    "acceptedProofExact",
+    "acceptedResearchArtifactFingerprint",
+    "targetedValidationReceiptId",
+    "fullValidationReceiptId",
+    "localCommitReceiptId",
+    "verified_handoff_receipt_chain",
+    "publication.handoffFingerprint === codeProbe.handoffFingerprint",
+    "publication.remoteSha === codeProbe.commitSha",
+    "publication.pullRequestHeadSha === codeProbe.commitSha",
+    "draftPrMatch?.[0] === publication.pullRequestHtmlUrl",
+  ]) {
+    assert.match(spec, new RegExp(escapeRegExp(required), "u"), required);
+  }
+  assert.doesNotMatch(spec, /worktree_head_advanced/u);
+  assert.doesNotMatch(
+    spec,
+    /attest\(observedProofs,\s*"git:verified_commit",\s*codeProbe\.depth === "committed"/u,
+  );
+});
+
+test("the native assistant renderer lane proves inert provider history", () => {
+  const spec = readFileText("../e2e/safe-assistant-renderer.spec.ts");
+  for (const required of [
+    "plugin.conversationHistory",
+    "Image blocked: remote",
+    "Vault embed blocked",
+    "img, iframe, embed, object, a",
+    "activeProbeRequests",
+    "toEqual([])",
+  ]) {
+    assert.match(spec, new RegExp(escapeRegExp(required), "u"), required);
   }
 });
 

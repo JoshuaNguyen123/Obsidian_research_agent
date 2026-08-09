@@ -42,6 +42,20 @@ test("GitHub publication repairs only the verified empty-repository agent-defaul
   assert.equal(client.referenceReads, 4);
 });
 
+test("GitHub publication verifies the explicitly public default-branch transition", async () => {
+  const client = new FakeDefaultBranchClient(HEAD_BRANCH, {
+    visibility: "public",
+  });
+  const proof = await ensureGitHubPublicationDefaultBranchV1(
+    client,
+    { ...input(), expectedVisibility: "public" },
+  );
+
+  assert.equal(proof.status, "updated_verified");
+  assert.equal(proof.repository.visibility, "public");
+  assert.equal(client.updateCalls, 1);
+});
+
 test("GitHub publication rejects an unrelated default branch without mutating", async () => {
   const client = new FakeDefaultBranchClient("release");
   await assert.rejects(
@@ -81,14 +95,20 @@ class FakeDefaultBranchClient
   private defaultBranch: string;
   private readonly baseSha: string;
   private readonly headSha: string;
+  private readonly visibility: "public" | "private";
 
   constructor(
     defaultBranch: string,
-    options: { baseSha?: string; headSha?: string } = {},
+    options: {
+      baseSha?: string;
+      headSha?: string;
+      visibility?: "public" | "private";
+    } = {},
   ) {
     this.defaultBranch = defaultBranch;
     this.baseSha = options.baseSha ?? BASE;
     this.headSha = options.headSha ?? HEAD;
+    this.visibility = options.visibility ?? "private";
   }
 
   async getRepository(): Promise<GitHubRepositoryRecord> {
@@ -102,9 +122,9 @@ class FakeDefaultBranchClient
       fullName: "acme/research-agent",
       htmlUrl: "https://github.com/acme/research-agent",
       defaultBranch: this.defaultBranch,
-      private: true,
+      private: this.visibility === "private",
       archived: false,
-      visibility: "private",
+      visibility: this.visibility,
     };
   }
 

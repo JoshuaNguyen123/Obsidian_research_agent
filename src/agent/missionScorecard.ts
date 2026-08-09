@@ -92,6 +92,14 @@ export interface MissionScorecardInput {
   claimsRequiringEvidence: number;
   /** Claims actually backed by a ledger evidence entry or passage citation. */
   claimsWithEvidence: number;
+  /**
+   * Whether this run segment produced an evidence-bearing answer that should
+   * be graded. Defaults to `claimsRequiringEvidence > 0` for compatibility.
+   * A compound mission may carry a prior segment's claim ledger into a later
+   * code/Linear segment; that inherited ledger must not turn the later segment
+   * into a new (and falsely ungrounded) research measurement.
+   */
+  evidenceGroundingApplicable?: boolean;
   /** Mutations performed during the run. */
   mutationsPerformed: number;
   /** Mutations that returned a validated receipt. */
@@ -115,10 +123,19 @@ export interface MissionScorecardInput {
 
 export interface MissionScoreDimension {
   id: MissionScoreDimensionId;
-  /** 0..1, higher is better. */
+  /** 0..1, higher is better. Held at 1 when {@link applicable} is false. */
   score: number;
   weight: number;
   detail: string;
+  /**
+   * False when the run had nothing to measure for this dimension — no claims
+   * needing citation, no mutations, no web research. Such a dimension is
+   * excluded from the weighted total rather than contributing a free 1.
+   *
+   * Optional so a baseline harvested before this field stays parseable; absent
+   * means applicable, which is what every pre-existing record meant.
+   */
+  applicable?: boolean;
 }
 
 export interface MissionScorecardV1 {
@@ -144,16 +161,19 @@ export function scoreMissionV1(
       "acceptance_coverage",
       ratioMet(input.acceptanceCriteriaTotal, input.acceptanceCriteriaMissing),
       `${input.acceptanceCriteriaTotal - clampCount(input.acceptanceCriteriaMissing, input.acceptanceCriteriaTotal)}/${input.acceptanceCriteriaTotal} criteria met`,
+      input.acceptanceCriteriaTotal > 0,
     ),
     dimension(
       "evidence_grounding",
       coverage(input.claimsWithEvidence, input.claimsRequiringEvidence),
       `${input.claimsWithEvidence}/${input.claimsRequiringEvidence} claims cited`,
+      input.evidenceGroundingApplicable ?? input.claimsRequiringEvidence > 0,
     ),
     dimension(
       "receipt_coverage",
       coverage(input.mutationsWithReceipts, input.mutationsPerformed),
       `${input.mutationsWithReceipts}/${input.mutationsPerformed} mutations receipted`,
+      input.mutationsPerformed > 0,
     ),
     dimension(
       "source_independence",
@@ -161,6 +181,7 @@ export function scoreMissionV1(
       input.research
         ? `${distinctDomainCount(input.research.usableSourceUrls)}/${input.research.requiredDistinctDomains} distinct domains`
         : "no web sources required",
+      Boolean(input.research),
     ),
     dimension(
       "research_depth",
@@ -168,6 +189,7 @@ export function scoreMissionV1(
       input.research
         ? `${input.research.citedPassageCount} cited passages, ${distinctDomainCount(input.research.usableSourceUrls)} domains, ${input.research.quotedSpanCount} quotes, ${input.research.sectionCount} sections`
         : "no web sources required",
+      Boolean(input.research),
     ),
     dimension(
       "recovery_cleanliness",
@@ -189,16 +211,61 @@ export function scoreMissionV1(
     ),
   ];
 
-  const total = dimensions.reduce(
-    (sum, item) => sum + item.score * item.weight,
-    0,
-  );
+  // Weighted average over what was actually measured. A dimension with nothing
+  // to measure is excluded and its weight renormalized away, rather than
+  // contributing a free 1 that inflates the total. Before this, a compound run
+  // with no cited claims and no web research banked 35% of its score for work
+  // it never did.
+  const applicable = dimensions.filter((item) => item.applicable !== false);
+  const applicableWeight = applicable.reduce((sum, item) => sum + item.weight, 0);
+  const total = applicableWeight > 0
+    ? applicable.reduce((sum, item) => sum + item.score * item.weight, 0) /
+      applicableWeight
+    : 1;
 
   return {
     version: 1,
     acceptancePassed: input.acceptancePassed,
     dimensions,
     total: round4(total),
+  };
+}
+
+/**
+ * Merge scorecards emitted by consecutive segments of one root mission.
+ *
+ * Each dimension keeps the newest applicable observation. An inapplicable
+ * projection means "this segment did not measure that dimension", not "erase
+ * the value measured by an earlier segment". This matters for compound runs:
+ * research can be followed by code, Linear, and GitHub segments, each of which
+ * emits a scorecard through the same RunCoordinator.
+ */
+export function mergeMissionScorecardObservationsV1(
+  previous: MissionScorecardV1 | null | undefined,
+  current: MissionScorecardV1,
+): MissionScorecardV1 {
+  if (!previous) {
+    return structuredCloneScorecard(current);
+  }
+
+  const previousById = new Map(
+    previous.dimensions.map((item) => [item.id, item] as const),
+  );
+  const dimensions = current.dimensions.map((item) => {
+    const prior = previousById.get(item.id);
+    const selected = item.applicable === false && prior && prior.applicable !== false
+      ? prior
+      : item;
+    return { ...selected };
+  });
+
+  return {
+    version: 1,
+    // Acceptance describes the latest terminal projection. A correction that
+    // passes must be able to replace an earlier needs-more-work result.
+    acceptancePassed: current.acceptancePassed,
+    dimensions,
+    total: weightedApplicableTotal(dimensions),
   };
 }
 
@@ -214,11 +281,22 @@ export function regressedAgainst(
   const baselineById = new Map(
     baseline.dimensions.map((item) => [item.id, item.score]),
   );
+  const baselineApplicable = new Set(
+    baseline.dimensions
+      .filter((item) => item.applicable !== false)
+      .map((item) => item.id),
+  );
 
   return current.dimensions
     .flatMap((item) => {
       const previous = baselineById.get(item.id);
       if (previous === undefined) return [];
+      // A dimension the run could not measure has no score to compare. Without
+      // this, a baseline whose unmeasured dimension banked a 1 would flag every
+      // later run that actually measured it and scored honestly below 1.
+      if (item.applicable === false || !baselineApplicable.has(item.id)) {
+        return [];
+      }
       const delta = round4(item.score - previous);
       return delta < -Math.abs(tolerance)
         ? [{ id: item.id, baseline: previous, current: item.score, delta }]
@@ -265,12 +343,18 @@ export function normalizeMissionScorecard(
     ) {
       return null;
     }
+    if (dim.applicable !== undefined && typeof dim.applicable !== "boolean") {
+      return null;
+    }
     seen.add(dim.id);
     dimensions.push({
       id: dim.id as MissionScoreDimensionId,
       score: round4(dim.score as number),
       weight: dim.weight as number,
       detail: dim.detail.slice(0, 400),
+      // Absent means applicable: that is what every record written before the
+      // field existed meant, so old baselines keep parsing unchanged.
+      applicable: dim.applicable !== false,
     });
   }
   if (!isUnitInterval(record.total)) return null;
@@ -300,12 +384,36 @@ function dimension(
   id: MissionScoreDimensionId,
   score: number,
   detail: string,
+  applicable = true,
 ): MissionScoreDimension {
   return {
     id,
     score: round4(clamp01(score)),
     weight: MISSION_SCORE_WEIGHTS[id],
     detail,
+    applicable,
+  };
+}
+
+function weightedApplicableTotal(
+  dimensions: readonly MissionScoreDimension[],
+): number {
+  const applicable = dimensions.filter((item) => item.applicable !== false);
+  const applicableWeight = applicable.reduce((sum, item) => sum + item.weight, 0);
+  return applicableWeight > 0
+    ? round4(
+        applicable.reduce((sum, item) => sum + item.score * item.weight, 0) /
+          applicableWeight,
+      )
+    : 1;
+}
+
+function structuredCloneScorecard(card: MissionScorecardV1): MissionScorecardV1 {
+  return {
+    version: 1,
+    acceptancePassed: card.acceptancePassed,
+    dimensions: card.dimensions.map((item) => ({ ...item })),
+    total: card.total,
   };
 }
 
@@ -317,14 +425,15 @@ function dimension(
 /**
  * Fraction of a required set that was covered.
  *
- * KNOWN LIMITATION: an empty requirement scores 1, so "0 of 0 claims needed a
- * citation" is indistinguishable from "every claim that needed one got it". A
- * mission that quietly does less work therefore scores *higher*. This measures
- * degradation within a fixed scenario; it does not detect a scenario becoming
- * less demanding, so a perfect total is not evidence the mission was hard.
+ * An empty requirement still returns 1, but the caller marks that dimension
+ * `applicable: false` so it is excluded from the weighted total instead of
+ * banking a free 1. "0 of 0 claims needed a citation" therefore no longer
+ * inflates the score the way "every claim that needed one got it" does.
  *
- * Changing this changes every score, which invalidates every harvested
- * baseline — treat it as a dimension change and re-harvest (see AGENTS.md).
+ * The residual caveat is narrower: a total is now a weighted average over the
+ * dimensions a run could measure, so comparing totals across runs that measured
+ * different dimensions still compares unlike things. Per-dimension regression
+ * comparison skips any dimension either side could not measure.
  */
 function coverage(covered: number, total: number): number {
   if (total <= 0) return 1;

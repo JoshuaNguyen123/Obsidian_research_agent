@@ -65,7 +65,15 @@ export function mergeResearchWorkerResult(input: {
   ).length;
   const handoff: WorkerHandoff = {
     ...input.worker.handoff,
-    status: accepted + deduplicated > 0 ? "accepted" : "rejected",
+    // Accept only a worker handoff that satisfied its own proof contract.
+    // Usable partial evidence remains available to the Lead for recovery, but
+    // it must not silently convert a rejected handoff into accepted proof.
+    status:
+      accepted + deduplicated > 0 &&
+      (input.worker.handoff.status === "ready" ||
+        input.worker.handoff.status === "accepted")
+        ? "accepted"
+        : "rejected",
     updatedAt: now,
   };
   const merge: MergeSummary = {
@@ -101,7 +109,11 @@ export function formatHandoffForLead(
   const usable = evidence.filter(isUsableEvidence);
   const evidenceLines = usable.slice(0, 12).map((item) => {
     const locator = item.url ?? item.path ?? item.sourceId ?? item.id;
-    const passages = item.passageIds?.slice(0, 4).join(", ") ?? "none";
+    const passages =
+      item.passageIds
+        ?.slice(0, 4)
+        .map((passageId) => `[${passageId}]`)
+        .join(", ") ?? "none";
     return `- ${item.title}: ${locator}; passages=${passages}; ${item.summary}`;
   });
 
@@ -135,7 +147,8 @@ export function formatHandoffForLead(
     ...evidenceLines,
     "Lead-only completion contract:",
     "- The Researcher is read-only. Only the Lead may request the authorized write.",
-    "- Cite each factual claim with the accepted passage identifier in the exact form [passage:<id>].",
+    "- Cite each factual claim by copying an accepted passage identifier exactly as shown in Evidence (for example [source:abc123:passage:0-120]).",
+    "- Never prepend another passage: label or invent a passage identifier.",
     "- Include explicit ## Limitations and ## Confidence sections before final acceptance.",
     "- When the mission requests current-note append, append exactly once with append_to_current_file after the synthesis passes verification.",
   ].join("\n");

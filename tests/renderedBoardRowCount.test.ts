@@ -60,6 +60,23 @@ const FIXED_WIDTH_BLANK_CELL_BOARD = [
 ].join("\r\n");
 
 /**
+ * Captured from a live desktop-checkers run. Only playable squares receive a
+ * glyph and each logical square is two columns wide, so the row body is 16
+ * characters rather than the wider four-column layouts above.
+ */
+const COMPACT_PLAYABLE_SQUARE_BOARD = [
+  "   a b c d e f g h",
+  "1    b   b   b   b ",
+  "2  b   b   b   b   ",
+  "3    b   b   b   b ",
+  "4  .   .   .   .   ",
+  "5    .   .   .   . ",
+  "6  r   r   r   r   ",
+  "7    r   r   r   r ",
+  "8  r   r   r   r   ",
+].join("\n");
+
+/**
  * Captured from a second real-model run. This renderer labels both sides and
  * uses only spaces for empty rows; the right label must be removed without
  * greedily consuming the row's board-width whitespace.
@@ -191,6 +208,10 @@ test("a plain token board counts eight rows", () => {
 
 test("a real fixed-width board with whitespace-only empty rows counts eight rows", () => {
   assert.equal(renderedBoardRowCount(FIXED_WIDTH_BLANK_CELL_BOARD), 8);
+});
+
+test("a compact four-playable-square board counts eight rows", () => {
+  assert.equal(renderedBoardRowCount(COMPACT_PLAYABLE_SQUARE_BOARD), 8);
 });
 
 test("a mirrored-label fixed-width board counts all eight rows", () => {

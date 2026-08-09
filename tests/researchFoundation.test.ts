@@ -802,6 +802,29 @@ test("deep research explicitly scoped across the vault stays vault-only", () => 
   assert.equal(plan.sourceRequirements.minDistinctDomains, 0);
 });
 
+test("explicit no-vault research produces a web-only observable research plan", () => {
+  const plan = createResearchPlan({
+    prompt:
+      "Do deep research using current web sources, but do not read, search, or use my vault or notes.",
+    missionIntent: researchIntent(),
+    runPlan: {
+      route: "grounded_workflow",
+      slowPathReason: "needs_web_sources",
+    },
+  });
+
+  assert.ok(plan);
+  assert.equal(plan.mode, "deep_web");
+  assert.ok(plan.sourceRequirements.minFetchedSources > 0);
+  assert.equal(
+    plan.subquestions.every(
+      (item) => item.requiredEvidenceType !== "vault_note",
+    ),
+    true,
+  );
+  assert.equal(plan.nextAction?.toolName, "web_search");
+});
+
 test("explicit source cardinality overrides the deep-research default without reading claim counts", () => {
   assert.equal(
     parseExplicitResearchSourceCount(

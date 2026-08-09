@@ -55,6 +55,7 @@ test("real-model lanes assert the sandbox the product adopted for itself", () =>
     "byok-autonomous-journey",
     "desktop-checkers-delivery-real-live",
     "desktop-code-delivery-real-live",
+    "vault-sibling-code-delivery-real-live",
     "daily-use-code-live",
     "daily-use-compound",
     "obsidian-hello-github-live",
@@ -274,6 +275,13 @@ test("real AI and live external flags cannot widen into other projects", () => {
       "--project=desktop-code-delivery-real-live",
     ]).projects,
     ["desktop-code-delivery-real-live"],
+  );
+  assert.deepEqual(
+    normalizeExclusiveArgs([
+      "--real-ai",
+      "--project=vault-sibling-code-delivery-real-live",
+    ]).projects,
+    ["vault-sibling-code-delivery-real-live"],
   );
   assert.throws(
     () => normalizeExclusiveArgs(["--real-ai", "--project=configured-linear-live"]),
@@ -516,6 +524,10 @@ test("package commands route only to real lanes and live projects disable reruns
     /--real-ai --project=desktop-code-delivery-real-live/u,
   );
   assert.match(
+    packageJson.scripts["test:e2e:vault-sibling-code-delivery"],
+    /--real-ai --project=vault-sibling-code-delivery-real-live/u,
+  );
+  assert.match(
     packageJson.scripts["test:e2e:byok-autonomous-journey"],
     /--real-ai --project=byok-autonomous-journey/u,
   );
@@ -571,6 +583,7 @@ test("package commands route only to real lanes and live projects disable reruns
     "daily-use-research",
     "daily-use-code-live",
     "desktop-code-delivery-real-live",
+    "vault-sibling-code-delivery-real-live",
     "daily-use-compound",
     "real-ai-soak",
     "provider-canary",
@@ -585,6 +598,7 @@ test("package commands route only to real lanes and live projects disable reruns
     "utf8",
   );
   assert.match(preflight, /"byok-autonomous-journey": \[\]/u);
+  assert.match(preflight, /"safe-assistant-renderer": \[\]/u);
 });
 
 test("protected release workflow is exact-SHA, self-hosted, and cannot dispatch broad or merge lanes", () => {

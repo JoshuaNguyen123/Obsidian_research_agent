@@ -3,47 +3,113 @@ import type {
   SecretStoreV1,
 } from "../../packages/core-api/src/secretStoreV1";
 import { isObsidianSecretReferenceV1 } from "./ObsidianSecretStoreV1";
+import type { ModelProvider } from "../model/types";
+import { normalizeSecureProviderBaseUrlV1 } from "../model/providerEndpointPolicy";
+
+export interface SpecialistCredentialBindingV1 {
+  provider: ModelProvider;
+  endpointBaseUrl: string;
+}
 
 export interface ModelCredentialReferencesV1 {
   version: 1;
   ollama: SecretDescriptionV1 | null;
   openAiCompatible: SecretDescriptionV1 | null;
+  specialist: SecretDescriptionV1 | null;
 }
 
 export interface ModelCredentialValuesV1 {
   ollama: string;
   openAiCompatible: string;
+  specialist: string;
 }
 
-type ProviderKey = keyof ModelCredentialValuesV1;
+type CredentialKey = keyof ModelCredentialValuesV1;
 
-const PROVIDER_METADATA: Record<ProviderKey, "ollama" | "openai_compatible"> = {
-  ollama: "ollama",
-  openAiCompatible: "openai_compatible",
+const CREDENTIAL_METADATA: Record<
+  CredentialKey,
+  {
+    label: string;
+    provider?: "ollama" | "openai_compatible";
+    agentSlot: "lead" | "specialist";
+    scope: string;
+  }
+> = {
+  ollama: {
+    label: "ollama",
+    provider: "ollama",
+    agentSlot: "lead",
+    scope: "lead_model_requests",
+  },
+  openAiCompatible: {
+    label: "openai_compatible",
+    provider: "openai_compatible",
+    agentSlot: "lead",
+    scope: "lead_model_requests",
+  },
+  specialist: {
+    label: "specialist",
+    agentSlot: "specialist",
+    scope: "specialist_model_requests",
+  },
 };
 
 export class ModelCredentialStoreV1 {
   private references: ModelCredentialReferencesV1 = emptyModelCredentialReferencesV1();
   /** Null means an opaque reference exists but could not be leased this session. */
-  private readonly knownDigests: Record<ProviderKey, string | null> = {
+  private readonly knownDigests: Record<CredentialKey, string | null> = {
     ollama: "",
     openAiCompatible: "",
+    specialist: "",
   };
+  /** Undefined preserves compatibility for non-production unit callers. */
+  private specialistBinding: SpecialistCredentialBindingV1 | null | undefined;
 
   constructor(private readonly store: SecretStoreV1) {}
 
   async load(
     rawReferences: unknown,
     legacy: Partial<ModelCredentialValuesV1>,
+    specialistBinding?: SpecialistCredentialBindingV1 | null,
   ): Promise<{ values: ModelCredentialValuesV1; migrated: boolean }> {
+    this.specialistBinding = normalizeSpecialistCredentialBindingV1(
+      specialistBinding,
+    );
     this.references = parseModelCredentialReferencesV1(rawReferences);
-    const values: ModelCredentialValuesV1 = { ollama: "", openAiCompatible: "" };
+    const values: ModelCredentialValuesV1 = {
+      ollama: "",
+      openAiCompatible: "",
+      specialist: "",
+    };
     let migrated = false;
     for (const provider of providerKeys()) {
       const reference = this.references[provider];
       if (reference) {
         try {
-          const value = await this.leaseVerified(reference);
+          const readback = await this.store.describe(reference.referenceId);
+          const verifiedReference = parseDescription(readback, provider);
+          if (
+            !verifiedReference ||
+            verifiedReference.referenceId !== reference.referenceId
+          ) {
+            throw new Error("Secure model credential slot binding failed.");
+          }
+          if (
+            provider === "specialist" &&
+            this.specialistBinding !== undefined &&
+            !specialistReferenceMatchesBindingV1(
+              verifiedReference,
+              this.specialistBinding,
+            )
+          ) {
+            this.references.specialist = null;
+            this.knownDigests.specialist = "";
+            await this.store.remove(reference.referenceId).catch(() => false);
+            migrated = true;
+            continue;
+          }
+          this.references[provider] = verifiedReference;
+          const value = await this.leaseVerified(verifiedReference);
           values[provider] = value;
           this.knownDigests[provider] = await secretDigest(value);
           continue;
@@ -54,6 +120,10 @@ export class ModelCredentialStoreV1 {
       }
       const legacyValue = normalizeSecret(legacy[provider]);
       if (!legacyValue) continue;
+      if (provider === "specialist" && this.specialistBinding === null) {
+        migrated = true;
+        continue;
+      }
       values[provider] = legacyValue;
       try {
         this.references[provider] = await this.putVerified(provider, legacyValue);
@@ -68,11 +138,36 @@ export class ModelCredentialStoreV1 {
     return { values, migrated };
   }
 
-  async synchronize(values: ModelCredentialValuesV1): Promise<string[]> {
+  async synchronize(
+    values: ModelCredentialValuesV1,
+    specialistBinding?: SpecialistCredentialBindingV1 | null,
+  ): Promise<string[]> {
+    if (specialistBinding !== undefined) {
+      this.specialistBinding = normalizeSpecialistCredentialBindingV1(
+        specialistBinding,
+      );
+    }
     const retired: string[] = [];
     for (const provider of providerKeys()) {
       const value = normalizeSecret(values[provider]);
-      const reference = this.references[provider];
+      let reference = this.references[provider];
+      if (
+        provider === "specialist" &&
+        reference &&
+        this.specialistBinding !== undefined &&
+        !specialistReferenceMatchesBindingV1(reference, this.specialistBinding)
+      ) {
+        retired.push(reference.referenceId);
+        this.references.specialist = null;
+        this.knownDigests.specialist = "";
+        reference = null;
+        if (value) {
+          await this.store.remove(retired.at(-1)!).catch(() => false);
+          throw new Error(
+            "Specialist provider destination changed. Re-enter the dedicated Agent 2 credential for the new endpoint.",
+          );
+        }
+      }
       const knownDigest = this.knownDigests[provider];
       if (reference && knownDigest === null && !value) continue;
       const digest = value ? await secretDigest(value) : "";
@@ -98,6 +193,7 @@ export class ModelCredentialStoreV1 {
       version: 1,
       ollama: cloneDescription(this.references.ollama),
       openAiCompatible: cloneDescription(this.references.openAiCompatible),
+      specialist: cloneDescription(this.references.specialist),
     };
   }
 
@@ -112,37 +208,56 @@ export class ModelCredentialStoreV1 {
   }
 
   private async putVerified(
-    provider: ProviderKey,
+    credential: CredentialKey,
     value: string,
   ): Promise<SecretDescriptionV1> {
+    const descriptor = CREDENTIAL_METADATA[credential];
+    if (credential === "specialist" && this.specialistBinding === null) {
+      throw new Error(
+        "A Specialist credential cannot be stored without a separate provider destination.",
+      );
+    }
     const health = await this.store.health();
     if (!health.available || !health.persistent) {
       throw new Error("Persistent secure model credential storage is unavailable.");
     }
     const description = await this.store.put({
       value,
-      label: `${PROVIDER_METADATA[provider]} model API credential`,
+      label: `${descriptor.label} model API credential`,
       metadata: {
-        provider: PROVIDER_METADATA[provider],
+        ...(descriptor.provider ? { provider: descriptor.provider } : {}),
+        ...(credential === "specialist" && this.specialistBinding
+          ? {
+              provider: this.specialistBinding.provider,
+              endpoint: this.specialistBinding.endpointBaseUrl,
+            }
+          : {}),
+        actor: descriptor.agentSlot,
         credentialKind: "model_api_key",
-        scope: "foreground_model_requests",
+        scope: descriptor.scope,
       },
     });
     const readback = await this.store.describe(description.referenceId);
+    const verifiedReadback = parseDescription(readback, credential);
     if (
-      readback.referenceId !== description.referenceId ||
-      readback.backend !== description.backend ||
-      readback.persistent !== true
+      !verifiedReadback ||
+      verifiedReadback.referenceId !== description.referenceId ||
+      (credential === "specialist" &&
+        this.specialistBinding !== undefined &&
+        !specialistReferenceMatchesBindingV1(
+          verifiedReadback,
+          this.specialistBinding,
+        ))
     ) {
       await this.store.remove(description.referenceId).catch(() => false);
       throw new Error("Secure model credential metadata readback failed.");
     }
-    const leased = await this.leaseVerified(readback);
+    const leased = await this.leaseVerified(verifiedReadback);
     if (leased !== value) {
       await this.store.remove(description.referenceId).catch(() => false);
       throw new Error("Secure model credential value readback failed.");
     }
-    return readback;
+    return verifiedReadback;
   }
 
   private async leaseVerified(reference: SecretDescriptionV1): Promise<string> {
@@ -160,7 +275,12 @@ export class ModelCredentialStoreV1 {
 }
 
 export function emptyModelCredentialReferencesV1(): ModelCredentialReferencesV1 {
-  return { version: 1, ollama: null, openAiCompatible: null };
+  return {
+    version: 1,
+    ollama: null,
+    openAiCompatible: null,
+    specialist: null,
+  };
 }
 
 export function parseModelCredentialReferencesV1(
@@ -174,16 +294,18 @@ export function parseModelCredentialReferencesV1(
     ollama: parseDescription(value.ollama, "ollama"),
     openAiCompatible: parseDescription(
       value.openAiCompatible,
-      "openai_compatible",
+      "openAiCompatible",
     ),
+    specialist: parseDescription(value.specialist, "specialist"),
   };
 }
 
 function parseDescription(
   value: unknown,
-  provider: "ollama" | "openai_compatible",
+  credential: CredentialKey,
 ): SecretDescriptionV1 | null {
   if (!isRecord(value) || !isRecord(value.metadata)) return null;
+  const descriptor = CREDENTIAL_METADATA[credential];
   const referenceId = value.referenceId;
   if (
     value.version !== 1 ||
@@ -191,7 +313,9 @@ function parseDescription(
     !isObsidianSecretReferenceV1(referenceId) ||
     value.backend !== "obsidian-secret-storage" ||
     value.persistent !== true ||
-    value.metadata.provider !== provider ||
+    (descriptor.provider
+      ? value.metadata.provider !== descriptor.provider
+      : value.metadata.actor !== "specialist") ||
     value.metadata.credentialKind !== "model_api_key" ||
     typeof value.label !== "string" ||
     typeof value.createdAt !== "string" ||
@@ -206,7 +330,17 @@ function parseDescription(
     referenceId,
     label: value.label,
     metadata: {
-      provider,
+      ...(descriptor.provider ? { provider: descriptor.provider } : {}),
+      ...(credential === "specialist" &&
+      (value.metadata.provider === "ollama" ||
+        value.metadata.provider === "openai_compatible")
+        ? { provider: value.metadata.provider }
+        : {}),
+      ...(credential === "specialist" &&
+      typeof value.metadata.endpoint === "string"
+        ? { endpoint: value.metadata.endpoint }
+        : {}),
+      actor: descriptor.agentSlot,
       credentialKind: "model_api_key",
       ...(typeof value.metadata.scope === "string"
         ? { scope: value.metadata.scope }
@@ -219,14 +353,46 @@ function parseDescription(
   };
 }
 
+export function createSpecialistCredentialBindingV1(input: {
+  provider: ModelProvider;
+  baseUrl: string;
+}): SpecialistCredentialBindingV1 {
+  const endpointBaseUrl = normalizeSecureProviderBaseUrlV1(input.baseUrl);
+  if (!endpointBaseUrl) {
+    throw new Error("Specialist credential destination is not a secure endpoint.");
+  }
+  return { provider: input.provider, endpointBaseUrl };
+}
+
+function normalizeSpecialistCredentialBindingV1(
+  value: SpecialistCredentialBindingV1 | null | undefined,
+): SpecialistCredentialBindingV1 | null | undefined {
+  if (value === undefined || value === null) return value;
+  return createSpecialistCredentialBindingV1({
+    provider: value.provider,
+    baseUrl: value.endpointBaseUrl,
+  });
+}
+
+function specialistReferenceMatchesBindingV1(
+  reference: SecretDescriptionV1,
+  binding: SpecialistCredentialBindingV1 | null,
+): boolean {
+  return (
+    binding !== null &&
+    reference.metadata.provider === binding.provider &&
+    reference.metadata.endpoint === binding.endpointBaseUrl
+  );
+}
+
 function cloneDescription(
   value: SecretDescriptionV1 | null,
 ): SecretDescriptionV1 | null {
   return value ? { ...value, metadata: { ...value.metadata } } : null;
 }
 
-function providerKeys(): ProviderKey[] {
-  return ["ollama", "openAiCompatible"];
+function providerKeys(): CredentialKey[] {
+  return ["ollama", "openAiCompatible", "specialist"];
 }
 
 function normalizeSecret(value: unknown): string {

@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Agentic Researcher is a native Obsidian assistant that reads context, runs approved tools, writes back, and shows receipts — autonomously, for as long as the question deserves."
+      content="Agentic Researcher is a native Obsidian assistant that reads context, runs approved tools, writes back, and shows receipts."
     />
-    <meta name="theme-color" content="#000000" />
+    <meta name="theme-color" content="#0b0d0c" />
     <title>Agentic Researcher for Obsidian</title>
     <link rel="stylesheet" href="./styles.css" />
     <script src="./site.js" defer></script>
@@ -22,7 +22,7 @@
           <span>Agentic Researcher</span>
         </a>
         <nav aria-label="Primary navigation">
-          <a href="#demos">Demo</a>
+          <a href="#demos">Demos</a>
           <a href="#trust">Trust</a>
           <a
             class="nav-cta"
@@ -34,71 +34,72 @@
 
     <main id="main">
       <section class="hero" id="top" aria-labelledby="hero-title">
-        <p class="kicker">Native Obsidian assistant</p>
-        <h1 id="hero-title">The research assistant that works inside your vault.</h1>
+        <p class="eyebrow">Native Obsidian assistant <span aria-hidden="true">&middot;</span> Open source</p>
+        <h1 id="hero-title">Research and build from the notes you already have.</h1>
         <p class="lede">
-          It reads your notes, runs approved tools, and writes back cited, verifiable
-          results — autonomously, for as long as the question truly deserves.
+          One native Obsidian assistant that reads context, runs approved tools,
+          writes back, and shows the receipts.
         </p>
         <div class="hero-actions">
-          <a class="button primary" href="#demos">See it work</a>
+          <a class="button primary" href="#demos">Watch real runs</a>
           <a
             class="button secondary"
             href="https://github.com/JoshuaNguyen123/Obsidian_research_agent#install-for-development"
           >Install the development build</a>
         </div>
-        <dl class="hero-stats" aria-label="What a run produces">
+        <dl class="proof-strip" aria-label="How a mission works">
           <div>
-            <dt>Reads</dt>
-            <dd>Your notes and approved sources</dd>
+            <dt>01</dt>
+            <dd>Reads the context that matters</dd>
           </div>
           <div>
-            <dt>Runs</dt>
-            <dd>Only the tools you allow</dd>
+            <dt>02</dt>
+            <dd>Runs only approved tools</dd>
           </div>
           <div>
-            <dt>Returns</dt>
-            <dd>Cited results with receipts</dd>
+            <dt>03</dt>
+            <dd>Returns results with receipts</dd>
           </div>
         </dl>
       </section>
 
-      <section class="demo-scroll" id="demos" aria-labelledby="demos-title">
-        <div class="demo-stage">
-          <div class="demo-intro">
-            <p class="kicker">One autonomous run</p>
-            <h2 id="demos-title">Scroll to watch a real run unfold.</h2>
-            <div class="role-tabs" role="tablist" aria-label="Choose a demo role">
-              <button
-                id="researcher-tab"
-                class="role-tab"
-                type="button"
-                role="tab"
-                aria-selected="true"
-                aria-controls="demo-panel"
-                data-demo-role="researcher"
-                tabindex="0"
-              >Researcher</button>
-              <button
-                id="builder-tab"
-                class="role-tab"
-                type="button"
-                role="tab"
-                aria-selected="false"
-                aria-controls="demo-panel"
-                data-demo-role="builder"
-                tabindex="-1"
-              >Builder</button>
-            </div>
+      <section class="demos" id="demos" aria-labelledby="demos-title">
+        <div class="section-heading demo-heading">
+          <div>
+            <p class="eyebrow">Two ways to work</p>
+            <h2 id="demos-title">Choose the role. Give it the outcome.</h2>
           </div>
+          <div class="role-tabs" role="tablist" aria-label="Choose a demo role">
+            <button
+              id="researcher-tab"
+              class="role-tab"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="demo-panel"
+              data-demo-role="researcher"
+              tabindex="0"
+            >Researcher</button>
+            <button
+              id="builder-tab"
+              class="role-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="demo-panel"
+              data-demo-role="builder"
+              tabindex="-1"
+            >Builder</button>
+          </div>
+        </div>
 
-          <div
-            class="demo-frame"
-            id="demo-panel"
-            role="tabpanel"
-            aria-labelledby="researcher-tab"
-            tabindex="0"
-          >
+        <div
+          class="demo-panel"
+          id="demo-panel"
+          role="tabpanel"
+          aria-labelledby="researcher-tab"
+        >
+          <div class="demo-frame">
             <video
               id="role-demo"
               muted
@@ -106,7 +107,7 @@
               preload="none"
               poster="./media/researcher-demo-poster.jpg?v=2026-07-30-clean-demos-v2"
               aria-label="Researcher demo: a real run turns a note-search brief into a cited decision"
-              aria-describedby="demo-description"
+              aria-describedby="demo-description demo-run-note"
             >
               <source
                 id="role-demo-webm"
@@ -120,62 +121,72 @@
               />
               Your browser does not support embedded video.
             </video>
-            <div class="demo-scrubline" aria-hidden="true">
-              <span class="demo-scrubline-fill" id="demo-scrubline-fill"></span>
-            </div>
+            <button class="demo-play" id="demo-play" type="button">
+              Play Researcher run
+            </button>
+            <p class="demo-status" id="demo-status" aria-live="polite"></p>
           </div>
 
-          <aside class="demo-readout">
+          <div class="demo-readout">
             <p class="role-label" id="demo-role-label">Researcher</p>
             <h3 id="demo-outcome">Turn a research brief into a cited decision.</h3>
             <p id="demo-description">
-              The agent reads one useful note, checks its two linked sources, and appends a
-              compact decision with citations and a verified write receipt.
+              The agent reads one useful note, checks its linked sources, and
+              appends a compact decision with citations.
             </p>
-            <ol class="demo-steps" id="demo-steps" aria-label="Run progress">
+            <ol class="demo-steps" id="demo-steps" aria-label="Run proof">
               <li>Reads the active-note brief</li>
               <li>Reads both linked sources</li>
               <li>Appends the cited decision</li>
               <li>Confirms the verified receipt</li>
             </ol>
+            <div class="demo-receipt" aria-label="Result receipt">
+              <span>Receipt</span>
+              <strong id="demo-receipt">Decision appended and verified</strong>
+            </div>
             <p class="real-run-note" id="demo-run-note">
-              A genuine release-build run, edited only for time. No simulated agent states.
+              Genuine release-build run. Edited only for time.
             </p>
-          </aside>
+          </div>
         </div>
       </section>
 
       <section class="trust" id="trust" aria-labelledby="trust-title">
-        <div class="trust-heading">
-          <p class="kicker">Designed for trust</p>
+        <div class="section-heading trust-heading">
+          <p class="eyebrow">Designed for trust</p>
           <h2 id="trust-title">Local by default. Explicit when it matters.</h2>
         </div>
-        <div class="trust-lines">
-          <article>
-            <h3>Local-first context</h3>
-            <p>Notes stay in Obsidian and are accessed through vault-relative paths.</p>
-          </article>
-          <article>
-            <h3>Append-first writing</h3>
-            <p>Ordinary writeback adds safely; replacement requires explicit intent and backup.</p>
-          </article>
-          <article>
-            <h3>Approval-gated actions</h3>
-            <p>External publication and destructive actions stay behind clear authority gates.</p>
-          </article>
-        </div>
-        <p class="integration-note">
-          When a task calls for it, the same prompt-first workflow connects to Linear and GitHub
-          without turning the sidebar into a control panel.
-        </p>
+        <ol class="trust-flow">
+          <li>
+            <span>01</span>
+            <div>
+              <h3>Reads your context</h3>
+              <p>Relevant notes stay in Obsidian and are accessed through vault-relative paths.</p>
+            </div>
+          </li>
+          <li>
+            <span>02</span>
+            <div>
+              <h3>Runs approved tools</h3>
+              <p>External, destructive, and publication actions remain behind explicit authority.</p>
+            </div>
+          </li>
+          <li>
+            <span>03</span>
+            <div>
+              <h3>Returns receipts</h3>
+              <p>Writes and external actions report what changed, where it landed, and how it was verified.</p>
+            </div>
+          </li>
+        </ol>
       </section>
 
       <section class="final-cta" aria-labelledby="cta-title">
-        <p class="kicker">Bring the work back to your vault</p>
-        <h2 id="cta-title">Bring the next task into your vault.</h2>
+        <p class="eyebrow">Bring the work back to your vault</p>
+        <h2 id="cta-title">Give the next task an outcome.</h2>
         <p>
-          Agentic Researcher is under active development. Inspect the source or install the
-          development build to try the native workflow.
+          Agentic Researcher is under active development. Inspect the source or
+          install the development build to try the native workflow.
         </p>
         <div class="cta-actions">
           <a

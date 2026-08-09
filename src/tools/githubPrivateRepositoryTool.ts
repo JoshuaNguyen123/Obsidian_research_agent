@@ -7,9 +7,14 @@ import {
   type ToolDescriptor,
 } from "../agent/actions";
 import type {
-  CreatePrivateGitHubRepositoryInput,
+  CreateGitHubRepositoryInput,
   GitHubRepositoryRecord,
 } from "../integrations/github/GitHubRestClient";
+import {
+  isRepositoryVisibility,
+  resolveExplicitRepositoryVisibilityChoiceV1,
+  type RepositoryVisibility,
+} from "../integrations/github/RepositoryVisibility";
 import {
   createTrustedGitHubRepositoryBindingV2,
   parseTrustedGitHubRepositoryBindingV2,
@@ -20,18 +25,26 @@ import { hasExplicitGitHubPublicationIntent } from "./githubPublicationTool";
 import type { AgentTool, ToolExecutionContext } from "./types";
 import { ToolExecutionError } from "./types";
 
-export const CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME =
+export const CREATE_GITHUB_REPOSITORY_TOOL_NAME = "github_create_repository";
+export const LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME =
   "github_create_private_repository";
+/** @deprecated Use CREATE_GITHUB_REPOSITORY_TOOL_NAME. */
+export const CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME =
+  CREATE_GITHUB_REPOSITORY_TOOL_NAME;
 
-export interface GitHubPrivateRepositoryDestinationV1
-  extends CreatePrivateGitHubRepositoryInput {
+export interface GitHubRepositoryDestinationV2
+  extends Omit<CreateGitHubRepositoryInput, "visibility"> {
   profile: RepositoryProfileV2;
   accountId: number;
   accountLogin: string;
   trustedAt: string;
 }
 
+/** Legacy type alias; visibility is now selected explicitly per operation. */
+export type GitHubPrivateRepositoryDestinationV1 = GitHubRepositoryDestinationV2;
+
 export type GitHubPrivateRepositoryCheckpointStatusV1 =
+  | "waiting_for_repository_visibility"
   | "prepared"
   | "reconcile_required"
   | "verified"
@@ -46,7 +59,8 @@ export interface GitHubPrivateRepositoryCheckpointV1 {
   ownerKind: "user" | "organization";
   owner: string;
   repository: string;
-  preparedAction: PreparedAction;
+  visibility: RepositoryVisibility | null;
+  preparedAction: PreparedAction | null;
   approvalId: string | null;
   approvalFingerprint: string | null;
   binding: TrustedGitHubRepositoryBindingV2 | null;
@@ -59,16 +73,23 @@ export interface CreateGitHubPrivateRepositoryToolOptionsV1 {
   resolveDestination(
     profileKey: string,
     signal?: AbortSignal,
-  ): Promise<GitHubPrivateRepositoryDestinationV1 | null>;
+  ): Promise<GitHubRepositoryDestinationV2 | null>;
   readRepository(
-    destination: GitHubPrivateRepositoryDestinationV1,
+    destination: GitHubRepositoryDestinationV2,
     signal?: AbortSignal,
   ): Promise<GitHubRepositoryRecord | null>;
-  createPrivateRepository(
-    destination: GitHubPrivateRepositoryDestinationV1,
+  createRepository?: (
+    destination: GitHubRepositoryDestinationV2,
+    visibility: RepositoryVisibility,
     description: string | undefined,
     signal?: AbortSignal,
-  ): Promise<GitHubRepositoryRecord>;
+  ) => Promise<GitHubRepositoryRecord>;
+  /** Legacy private-only provider adapter. */
+  createPrivateRepository?: (
+    destination: GitHubRepositoryDestinationV2,
+    description: string | undefined,
+    signal?: AbortSignal,
+  ) => Promise<GitHubRepositoryRecord>;
   getCheckpoint(
     creationId: string,
   ): Promise<GitHubPrivateRepositoryCheckpointV1 | null>;
@@ -79,31 +100,105 @@ export interface CreateGitHubPrivateRepositoryToolOptionsV1 {
   now?: () => Date;
 }
 
-export function createGitHubPrivateRepositoryTool(
-  options: CreateGitHubPrivateRepositoryToolOptionsV1,
+export type CreateGitHubRepositoryToolOptionsV2 =
+  CreateGitHubPrivateRepositoryToolOptionsV1;
+
+export function createGitHubRepositoryTool(
+  options: CreateGitHubRepositoryToolOptionsV2,
 ): AgentTool {
   const tool: AgentTool = {
-    name: CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    name: CREATE_GITHUB_REPOSITORY_TOOL_NAME,
     description:
-      "Create exactly the host-bound GitHub repository as private after one fingerprint-bound approval. The host checkpoints before dispatch, performs an independent private-visibility readback, persists a V2 trusted binding, and reconciles ambiguous outcomes without blindly creating again.",
-    parameters: PRIVATE_REPOSITORY_PARAMETERS,
-    descriptor: PRIVATE_REPOSITORY_DESCRIPTOR,
+      "Create exactly the host-bound GitHub repository only after the user explicitly chooses public or private visibility and approves the fingerprint-bound action. If visibility is unanswered, pause without a GitHub mutation. Public creation warns that the repository and committed history will be internet-visible. The host checkpoints before dispatch, independently reads visibility back, and reconciles ambiguity without blindly creating again.",
+    parameters: REPOSITORY_PARAMETERS,
+    descriptor: REPOSITORY_DESCRIPTOR,
     async execute(args, context) {
-      return executePrivateRepositoryCreation(options, args, context);
+      return executeRepositoryCreation(options, args, context);
     },
   };
   tool.executeResult = async (args, context) => {
-    const output = await executePrivateRepositoryCreation(options, args, context);
+    const output = await executeRepositoryCreation(options, args, context);
     await options.persistExternalReceipt(output.receipt);
     return {
       ok: true,
-      toolName: CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+      toolName: CREATE_GITHUB_REPOSITORY_TOOL_NAME,
       output,
       receipt: output.receipt,
       mutationState: "applied" as const,
     };
   };
   return tool;
+}
+
+/** Legacy factory name retained for callers and persisted V1 state. */
+export function createGitHubPrivateRepositoryTool(
+  options: CreateGitHubPrivateRepositoryToolOptionsV1,
+): AgentTool {
+  return createGitHubRepositoryTool(options);
+}
+
+/**
+ * V1 routing/checkpoint compatibility. The alias executes the same explicit
+ * visibility gate and therefore never restores a private default.
+ */
+export function createLegacyPrivateGitHubRepositoryToolAlias(
+  tool: AgentTool,
+): AgentTool {
+  if (tool.name !== CREATE_GITHUB_REPOSITORY_TOOL_NAME) {
+    throw new TypeError("Legacy GitHub repository alias requires the V2 tool.");
+  }
+  return {
+    ...tool,
+    name: LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    description:
+      "Legacy routing alias for github_create_repository. It still requires the user's explicit public/private choice and never defaults to private.",
+    ...(tool.descriptor
+      ? {
+          descriptor: {
+            ...tool.descriptor,
+            name: LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+          },
+        }
+      : {}),
+    ...(tool.executeResult
+      ? {
+          executeResult: async (
+            args: Record<string, unknown>,
+            context: ToolExecutionContext,
+          ) => ({
+            ...(await tool.executeResult!(args, context)),
+            toolName: LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+          }),
+        }
+      : {}),
+  };
+}
+
+export function hasGitHubRepositoryCreationIntent(prompt: string): boolean {
+  const value = typeof prompt === "string" ? prompt : "";
+  if (hasPrivateGitHubRepositoryCreationNegation(value)) return false;
+  if (
+    /\b(?:github_create_repository|github_create_private_repository)\b/iu.test(
+      value,
+    )
+  ) {
+    return true;
+  }
+  return (
+    /\b(?:create|make|provision)\b[\s\S]{0,120}\b(?:github\s+)?(?:repository|repo)\b/iu.test(
+      value,
+    ) ||
+    /\b(?:create|make|provision)\b[\s\S]{0,120}\bgithub\b/iu.test(value)
+  );
+}
+
+export function hasGitHubRepositoryBootstrapIntent(prompt: string): boolean {
+  const value = typeof prompt === "string" ? prompt : "";
+  return (
+    hasGitHubRepositoryCreationIntent(value) ||
+    (!hasPrivateGitHubRepositoryCreationNegation(value) &&
+      hasExplicitGitHubPublicationIntent(value))
+  );
 }
 
 export function hasExplicitPrivateGitHubRepositoryCreationIntent(
@@ -219,8 +314,11 @@ export function parseGitHubPrivateRepositoryCheckpointMapV1(
   return parsed;
 }
 
-async function executePrivateRepositoryCreation(
-  options: CreateGitHubPrivateRepositoryToolOptionsV1,
+export const parseGitHubRepositoryCheckpointMapV2 =
+  parseGitHubPrivateRepositoryCheckpointMapV1;
+
+async function executeRepositoryCreation(
+  options: CreateGitHubRepositoryToolOptionsV2,
   args: Record<string, unknown>,
   context: ToolExecutionContext,
 ): Promise<{
@@ -231,20 +329,14 @@ async function executePrivateRepositoryCreation(
 }> {
   if (options.isAvailable?.() === false) {
     throw notApplied(
-      "github_private_repository_unavailable",
-      "Private repository creation requires a verified GitHub credential and the Integrations and Code capabilities.",
+      "github_repository_unavailable",
+      "Repository creation requires a verified GitHub credential and the Integrations and Code capabilities.",
     );
   }
-  if (!hasPrivateGitHubRepositoryBootstrapIntent(context.originalPrompt)) {
+  if (!hasGitHubRepositoryBootstrapIntent(context.originalPrompt)) {
     throw notApplied(
-      "github_private_repository_explicit_intent_required",
-      "Creating a GitHub repository requires either an explicit creation request or explicit publication to the exact host-bound private GitHub destination.",
-    );
-  }
-  if (!context.requestNestedApproval) {
-    throw notApplied(
-      "github_private_repository_approval_unavailable",
-      "The exact GitHub repository-creation approval surface is unavailable.",
+      "github_repository_explicit_intent_required",
+      "Creating a GitHub repository requires an explicit current creation or publication request.",
     );
   }
   const profileKey = logicalKey(args.profileKey, "repository profile key");
@@ -257,24 +349,66 @@ async function executePrivateRepositoryCreation(
   );
   if (!destination || destination.profile.key !== profileKey) {
     throw notApplied(
-      "github_private_repository_destination_missing",
+      "github_repository_destination_missing",
       "The repository profile has no exact host-trusted GitHub destination.",
     );
   }
-  const creationId = `github-private-${profileKey}`;
-  const existingCheckpoint = await options.getCheckpoint(creationId);
+  const creationId = `github-repository-${profileKey}`;
+  const legacyCreationId = `github-private-${profileKey}`;
+  const visibilityChoice = resolveExplicitRepositoryVisibilityChoiceV1(
+    context.originalPrompt,
+  );
+  const requestedVisibility = isRepositoryVisibility(args.visibility)
+    ? args.visibility
+    : null;
+  if (
+    visibilityChoice.status !== "chosen" ||
+    requestedVisibility === null ||
+    requestedVisibility !== visibilityChoice.visibility
+  ) {
+    const checkpoint = waitingCheckpoint({
+      creationId,
+      destination,
+      now: now(options, context),
+      message:
+        visibilityChoice.status === "chosen" && requestedVisibility !== null
+          ? `The requested ${requestedVisibility} visibility does not match the user's explicit ${visibilityChoice.visibility} choice. Ask again before any GitHub mutation.`
+          : visibilityChoice.status === "chosen"
+            ? `The user chose ${visibilityChoice.visibility}, but the repository action omitted that exact visibility. Retry with the explicit choice.`
+            : visibilityChoice.message,
+    });
+    await options.persistCheckpoint(checkpoint);
+    throw notApplied(
+      "waiting_for_repository_visibility",
+      checkpoint.blocker!.message,
+    );
+  }
+  const visibility = visibilityChoice.visibility;
+  if (!context.requestNestedApproval) {
+    throw notApplied(
+      "github_repository_approval_unavailable",
+      "The exact GitHub repository-creation approval surface is unavailable.",
+    );
+  }
+  const existingCheckpoint =
+    (await options.getCheckpoint(creationId)) ??
+    (visibility === "private"
+      ? await options.getCheckpoint(legacyCreationId)
+      : null);
   if (
     existingCheckpoint &&
     existingCheckpoint.profileKey === profileKey &&
     existingCheckpoint.owner.toLowerCase() === destination.owner.toLowerCase() &&
     existingCheckpoint.repository.toLowerCase() ===
       destination.repository.toLowerCase() &&
+    existingCheckpoint.visibility === visibility &&
     ["prepared", "reconcile_required"].includes(existingCheckpoint.status)
   ) {
     const reconciled = await reconcileReadback(
       options,
       existingCheckpoint,
       destination,
+      visibility,
       context,
     );
     if (reconciled) return reconciled;
@@ -285,6 +419,7 @@ async function executePrivateRepositoryCreation(
     runId,
     toolCallId,
     destination,
+    visibility,
     description,
     now: now(options, context),
   });
@@ -293,24 +428,29 @@ async function executePrivateRepositoryCreation(
   if (before) {
     return acceptVerifiedReadback({
       options,
-      checkpoint: baseCheckpoint(action, destination, "prepared"),
+      checkpoint: baseCheckpoint(action, destination, visibility, "prepared"),
       destination,
+      visibility,
       readback: before,
       context,
       commitKind: "reconciled",
-      grantId: "github-private-repository-deduplicated-readback",
+      grantId: `github-${visibility}-repository-deduplicated-readback`,
     });
   }
 
-  let checkpoint = baseCheckpoint(action, destination, "prepared");
+  let checkpoint = baseCheckpoint(action, destination, visibility, "prepared");
   await options.persistCheckpoint(checkpoint);
   const approval = await context.requestNestedApproval({
-    toolName: CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    toolName: CREATE_GITHUB_REPOSITORY_TOOL_NAME,
     action: action.preview.summary,
     reason:
-      "Approve only creation of this exact host-bound repository with private visibility. Push, pull request, merge, and cleanup require separate approval boundaries.",
+      visibility === "public"
+        ? "Approve creation of this exact public repository. Its contents and committed history will be visible on the internet. Push, pull request, merge, and cleanup require separate approval boundaries."
+        : "Approve only creation of this exact host-bound repository with private visibility. Push, pull request, merge, and cleanup require separate approval boundaries.",
     policyTags: [
-      "github_private_repository_create",
+      "github_repository_create",
+      `visibility_${visibility}`,
+      ...(visibility === "public" ? ["internet_visible"] : []),
       "exact",
       "separate_publication_authority",
     ],
@@ -324,20 +464,20 @@ async function executePrivateRepositoryCreation(
       ...checkpoint,
       status: "not_applied",
       blocker: {
-        code: "github_private_repository_approval_denied",
-        message: "Private repository creation was not approved.",
+        code: "github_repository_approval_denied",
+        message: `${capitalize(visibility)} repository creation was not approved.`,
       },
       updatedAt: now(options, context).toISOString(),
     };
     await options.persistCheckpoint(checkpoint);
     throw notApplied(
-      "github_private_repository_approval_denied",
-      "Private repository creation was not approved.",
+      "github_repository_approval_denied",
+      `${capitalize(visibility)} repository creation was not approved.`,
     );
   }
   if (approval.approvalFingerprint !== action.payloadFingerprint) {
     throw notApplied(
-      "github_private_repository_approval_stale",
+      "github_repository_approval_stale",
       "The GitHub repository-creation approval does not match the exact prepared payload.",
     );
   }
@@ -350,7 +490,7 @@ async function executePrivateRepositoryCreation(
     approvalId: approval.approvalId,
     approvalFingerprint: approval.approvalFingerprint,
     blocker: {
-      code: "github_private_repository_readback_required",
+      code: "github_repository_readback_required",
       message:
         "Repository creation may have been dispatched; exact provider readback is required before any retry.",
     },
@@ -360,11 +500,25 @@ async function executePrivateRepositoryCreation(
 
   let createFailureCode: string | null = null;
   try {
-    await options.createPrivateRepository(
-      destination,
-      description,
-      context.abortSignal,
-    );
+    if (options.createRepository) {
+      await options.createRepository(
+        destination,
+        visibility,
+        description,
+        context.abortSignal,
+      );
+    } else if (visibility === "private" && options.createPrivateRepository) {
+      await options.createPrivateRepository(
+        destination,
+        description,
+        context.abortSignal,
+      );
+    } else {
+      throw notApplied(
+        "github_public_repository_provider_unavailable",
+        "The host does not provide a public-repository creation adapter.",
+      );
+    }
   } catch (error) {
     // Creation conflicts and transport ambiguity are intentionally handled by
     // the same independent readback below. Provider error bodies are not
@@ -380,20 +534,20 @@ async function executePrivateRepositoryCreation(
   const readback = await options.readRepository(destination, context.abortSignal);
   if (!readback) {
     const blockerMessage = createFailureCode
-      ? `Independent GitHub readback proves the private repository does not exist after create (${createFailureCode}) for ${destination.owner}/${destination.repository}; a new explicit approval is required to try again.`
-      : `Independent GitHub readback proves the private repository does not exist for ${destination.owner}/${destination.repository}; a new explicit approval is required to try again.`;
+      ? `Independent GitHub readback proves the ${visibility} repository does not exist after create (${createFailureCode}) for ${destination.owner}/${destination.repository}; a new explicit approval is required to try again.`
+      : `Independent GitHub readback proves the ${visibility} repository does not exist for ${destination.owner}/${destination.repository}; a new explicit approval is required to try again.`;
     checkpoint = {
       ...checkpoint,
       status: "not_applied",
       blocker: {
-        code: "github_private_repository_not_applied",
+        code: "github_repository_not_applied",
         message: blockerMessage,
       },
       updatedAt: now(options, context).toISOString(),
     };
     await options.persistCheckpoint(checkpoint);
     throw notApplied(
-      "github_private_repository_not_applied",
+      "github_repository_not_applied",
       blockerMessage,
     );
   }
@@ -401,6 +555,7 @@ async function executePrivateRepositoryCreation(
     options,
     checkpoint,
     destination,
+    visibility,
     readback,
     context,
     commitKind: "committed",
@@ -409,9 +564,10 @@ async function executePrivateRepositoryCreation(
 }
 
 async function reconcileReadback(
-  options: CreateGitHubPrivateRepositoryToolOptionsV1,
+  options: CreateGitHubRepositoryToolOptionsV2,
   checkpoint: GitHubPrivateRepositoryCheckpointV1,
-  destination: GitHubPrivateRepositoryDestinationV1,
+  destination: GitHubRepositoryDestinationV2,
+  visibility: RepositoryVisibility,
   context: ToolExecutionContext,
 ) {
   const readback = await options.readRepository(destination, context.abortSignal);
@@ -420,7 +576,7 @@ async function reconcileReadback(
       ...checkpoint,
       status: "not_applied",
       blocker: {
-        code: "github_private_repository_not_applied",
+        code: "github_repository_not_applied",
         message:
           "Read-only reconciliation proved the repository was not created; no mutation was replayed.",
       },
@@ -433,18 +589,21 @@ async function reconcileReadback(
     options,
     checkpoint,
     destination,
+    visibility,
     readback,
     context,
     commitKind: "reconciled",
     grantId:
-      checkpoint.approvalId ?? "github-private-repository-reconciled-readback",
+      checkpoint.approvalId ??
+      `github-${visibility}-repository-reconciled-readback`,
   });
 }
 
 async function acceptVerifiedReadback(input: {
-  options: CreateGitHubPrivateRepositoryToolOptionsV1;
+  options: CreateGitHubRepositoryToolOptionsV2;
   checkpoint: GitHubPrivateRepositoryCheckpointV1;
-  destination: GitHubPrivateRepositoryDestinationV1;
+  destination: GitHubRepositoryDestinationV2;
+  visibility: RepositoryVisibility;
   readback: GitHubRepositoryRecord;
   context: ToolExecutionContext;
   commitKind: "committed" | "reconciled";
@@ -459,6 +618,7 @@ async function acceptVerifiedReadback(input: {
       owner: input.destination.owner,
       repository: input.destination.repository,
       repositoryReadback: input.readback,
+      expectedVisibility: input.visibility,
       observedAt,
       verifiedAccountId: input.destination.accountId,
       verifiedAccountLogin: input.destination.accountLogin,
@@ -466,32 +626,42 @@ async function acceptVerifiedReadback(input: {
     });
   } catch {
     const blockerMessage =
-      "GitHub readback is not the exact active private repository. Public repositories are never converted automatically.";
+      `GitHub readback is not the exact active ${input.visibility} repository. Existing repositories are never converted automatically.`;
     const blocked: GitHubPrivateRepositoryCheckpointV1 = {
       ...input.checkpoint,
       status: "blocked",
       blocker: {
-        code: "github_private_repository_visibility_or_identity_mismatch",
+        code: "github_repository_visibility_or_identity_mismatch",
         message: blockerMessage,
       },
       updatedAt: observedAt,
     };
     await input.options.persistCheckpoint(blocked);
     throw notApplied(
-      "github_private_repository_visibility_or_identity_mismatch",
+      "github_repository_visibility_or_identity_mismatch",
       blockerMessage,
+    );
+  }
+  const action = input.checkpoint.preparedAction;
+  if (!action) {
+    throw notApplied(
+      "github_repository_prepared_action_missing",
+      "Verified repository readback has no exact prepared creation action.",
     );
   }
   const receipt: ActionReceipt = {
     version: 1,
-    id: `github-private-repository-${binding.repositoryReadbackFingerprint.slice(7, 39)}`,
-    runId: input.checkpoint.preparedAction.runId,
-    actionId: input.checkpoint.preparedAction.id,
-    toolName: CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    id: `github-${binding.visibility}-repository-${binding.repositoryReadbackFingerprint.slice(7, 39)}`,
+    runId: action.runId,
+    actionId: action.id,
+    toolName: CREATE_GITHUB_REPOSITORY_TOOL_NAME,
     operation: "create",
     resource: {
       system: "github",
-      resourceType: "private_repository",
+      resourceType:
+        binding.visibility === "private"
+          ? "private_repository"
+          : "public_repository",
       id: String(binding.repositoryId),
       identifier: `${binding.owner}/${binding.repository}`,
       url: input.readback.htmlUrl,
@@ -509,12 +679,12 @@ async function acceptVerifiedReadback(input: {
     }],
     message:
       input.commitKind === "committed"
-        ? `Created and independently verified private GitHub repository ${binding.owner}/${binding.repository}.`
-        : `Reconciled and independently verified private GitHub repository ${binding.owner}/${binding.repository} without replay.`,
-    payloadFingerprint: input.checkpoint.preparedAction.payloadFingerprint,
+        ? `Created and independently verified ${binding.visibility} GitHub repository ${binding.owner}/${binding.repository}.`
+        : `Reconciled and independently verified ${binding.visibility} GitHub repository ${binding.owner}/${binding.repository} without replay.`,
+    payloadFingerprint: action.payloadFingerprint,
     grantId: input.grantId,
-    idempotencyKey: input.checkpoint.preparedAction.idempotencyKey,
-    startedAt: input.checkpoint.preparedAction.preparedAt,
+    idempotencyKey: action.idempotencyKey,
+    startedAt: action.preparedAt,
     committedAt: observedAt,
     commitKind: input.commitKind,
     readback: {
@@ -542,7 +712,8 @@ async function buildPreparedAction(input: {
   creationId: string;
   runId: string;
   toolCallId: string;
-  destination: GitHubPrivateRepositoryDestinationV1;
+  destination: GitHubRepositoryDestinationV2;
+  visibility: RepositoryVisibility;
   description: string | undefined;
   now: Date;
 }): Promise<PreparedAction> {
@@ -553,8 +724,8 @@ async function buildPreparedAction(input: {
     ownerKind: input.destination.ownerKind,
     owner: input.destination.owner,
     repository: input.destination.repository,
-    visibility: "private",
-    private: true,
+    visibility: input.visibility,
+    private: input.visibility === "private",
     ...(input.description ? { description: input.description } : {}),
   };
   return withPreparedActionFingerprint({
@@ -562,10 +733,13 @@ async function buildPreparedAction(input: {
     id: input.creationId,
     runId: input.runId,
     toolCallId: input.toolCallId,
-    toolName: CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    toolName: CREATE_GITHUB_REPOSITORY_TOOL_NAME,
     target: {
       system: "github",
-      resourceType: "private_repository",
+      resourceType:
+        input.visibility === "private"
+          ? "private_repository"
+          : "public_repository",
       id: repositoryIdentity,
       identifier: repositoryIdentity,
       accountId: String(input.destination.accountId),
@@ -581,28 +755,62 @@ async function buildPreparedAction(input: {
     }],
     normalizedArgs,
     preview: {
-      summary: `Create private GitHub repository ${repositoryIdentity}.`,
-      destination: `GitHub ${repositoryIdentity} (private)`,
+      summary: `Create ${input.visibility} GitHub repository ${repositoryIdentity}.`,
+      destination: `GitHub ${repositoryIdentity} (${input.visibility})`,
       before: { state: "absent" },
-      after: { visibility: "private", archived: false },
+      after: { visibility: input.visibility, archived: false },
       outboundPayload: normalizedArgs,
       warnings: [
+        ...(input.visibility === "public"
+          ? [
+              "Public repository contents and committed history will be visible on the internet.",
+            ]
+          : []),
         "This approval does not authorize a push, pull request, merge, visibility change, or cleanup.",
       ],
       outboundBytes: new TextEncoder().encode(JSON.stringify(normalizedArgs)).length,
     },
     expectedTargetRevision: "absent",
-    idempotencyKey: `github-private-repository:${repositoryIdentity.toLowerCase()}`,
-    reconciliationKey: `github-private-repository:${repositoryIdentity.toLowerCase()}`,
+    idempotencyKey: `github-${input.visibility}-repository:${repositoryIdentity.toLowerCase()}`,
+    reconciliationKey: `github-${input.visibility}-repository:${repositoryIdentity.toLowerCase()}`,
     requiredConfirmations: 1,
     preparedAt,
     expiresAt: new Date(input.now.getTime() + 120_000).toISOString(),
   });
 }
 
+function waitingCheckpoint(input: {
+  creationId: string;
+  destination: GitHubRepositoryDestinationV2;
+  now: Date;
+  message: string;
+}): GitHubPrivateRepositoryCheckpointV1 {
+  return {
+    version: 1,
+    creationId: input.creationId,
+    status: "waiting_for_repository_visibility",
+    profileKey: input.destination.profile.key,
+    ownerKind: input.destination.ownerKind,
+    owner: input.destination.owner,
+    repository: input.destination.repository,
+    visibility: null,
+    preparedAction: null,
+    approvalId: null,
+    approvalFingerprint: null,
+    binding: null,
+    receipt: null,
+    blocker: {
+      code: "waiting_for_repository_visibility",
+      message: input.message,
+    },
+    updatedAt: input.now.toISOString(),
+  };
+}
+
 function baseCheckpoint(
   action: PreparedAction,
-  destination: GitHubPrivateRepositoryDestinationV1,
+  destination: GitHubRepositoryDestinationV2,
+  visibility: RepositoryVisibility,
   status: GitHubPrivateRepositoryCheckpointStatusV1,
 ): GitHubPrivateRepositoryCheckpointV1 {
   return {
@@ -613,6 +821,7 @@ function baseCheckpoint(
     ownerKind: destination.ownerKind,
     owner: destination.owner,
     repository: destination.repository,
+    visibility,
     preparedAction: action,
     approvalId: null,
     approvalFingerprint: null,
@@ -625,26 +834,52 @@ function baseCheckpoint(
 
 function parseCheckpoint(value: unknown): GitHubPrivateRepositoryCheckpointV1 {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError("GitHub private repository checkpoint must be an object.");
+    throw new TypeError("GitHub repository checkpoint must be an object.");
   }
   const record = value as Record<string, unknown>;
   const status = String(record.status);
   if (
     record.version !== 1 ||
-    !["prepared", "reconcile_required", "verified", "not_applied", "blocked"].includes(status)
+    ![
+      "waiting_for_repository_visibility",
+      "prepared",
+      "reconcile_required",
+      "verified",
+      "not_applied",
+      "blocked",
+    ].includes(status)
   ) {
-    throw new TypeError("Unsupported GitHub private repository checkpoint.");
+    throw new TypeError("Unsupported GitHub repository checkpoint.");
   }
-  const action = record.preparedAction as PreparedAction;
+  const action = record.preparedAction === null
+    ? null
+    : record.preparedAction as PreparedAction;
+  const visibility = isRepositoryVisibility(record.visibility)
+    ? record.visibility
+    : action?.toolName === LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME
+      ? "private"
+      : null;
   const binding = record.binding === null
     ? null
     : parseTrustedGitHubRepositoryBindingV2(record.binding);
-  if (
+  if (status === "waiting_for_repository_visibility") {
+    if (action !== null || visibility !== null) {
+      throw new TypeError("Waiting GitHub repository checkpoint is invalid.");
+    }
+  } else if (
     !action ||
-    action.toolName !== CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME ||
-    action.id !== record.creationId
+    ![
+      CREATE_GITHUB_REPOSITORY_TOOL_NAME,
+      LEGACY_CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+    ].includes(action.toolName) ||
+    action.id !== record.creationId ||
+    visibility === null ||
+    action.normalizedArgs.visibility !== visibility
   ) {
-    throw new TypeError("GitHub private repository checkpoint action is invalid.");
+    throw new TypeError("GitHub repository checkpoint action is invalid.");
+  }
+  if (binding && binding.visibility !== visibility) {
+    throw new TypeError("GitHub repository checkpoint binding visibility drifted.");
   }
   const blocker = record.blocker === null
     ? null
@@ -657,6 +892,7 @@ function parseCheckpoint(value: unknown): GitHubPrivateRepositoryCheckpointV1 {
     ownerKind: record.ownerKind === "user" ? "user" : "organization",
     owner: identity(record.owner, "owner"),
     repository: identity(record.repository, "repository"),
+    visibility,
     preparedAction: action,
     approvalId: record.approvalId === null
       ? null
@@ -672,7 +908,7 @@ function parseCheckpoint(value: unknown): GitHubPrivateRepositoryCheckpointV1 {
 }
 
 function now(
-  options: CreateGitHubPrivateRepositoryToolOptionsV1,
+  options: CreateGitHubRepositoryToolOptionsV2,
   context: ToolExecutionContext,
 ): Date {
   return (options.now ?? context.now ?? (() => new Date()))();
@@ -681,7 +917,7 @@ function now(
 function identity(value: unknown, label: string): string {
   const text = typeof value === "string" ? value.trim() : "";
   if (!text || text.length > 500 || /[\0\r\n]/u.test(text)) {
-    throw notApplied("github_private_repository_invalid_argument", `${label} is invalid.`);
+    throw notApplied("github_repository_invalid_argument", `${label} is invalid.`);
   }
   return text;
 }
@@ -689,7 +925,7 @@ function identity(value: unknown, label: string): string {
 function logicalKey(value: unknown, label: string): string {
   const key = identity(value, label);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(key)) {
-    throw notApplied("github_private_repository_invalid_argument", `${label} is invalid.`);
+    throw notApplied("github_repository_invalid_argument", `${label} is invalid.`);
   }
   return key;
 }
@@ -703,7 +939,7 @@ function optionalText(
   const text = identity(value, label);
   if (text.length > maximum) {
     throw notApplied(
-      "github_private_repository_invalid_argument",
+      "github_repository_invalid_argument",
       `${label} is too long.`,
     );
   }
@@ -733,12 +969,16 @@ function notApplied(code: string, message: string): ToolExecutionError {
   return new ToolExecutionError(code, message, { mutationState: "not_applied" });
 }
 
-const PRIVATE_REPOSITORY_DESCRIPTOR: ToolDescriptor = {
+function capitalize(value: RepositoryVisibility): string {
+  return value === "public" ? "Public" : "Private";
+}
+
+const REPOSITORY_DESCRIPTOR: ToolDescriptor = {
   version: 1,
-  name: CREATE_PRIVATE_GITHUB_REPOSITORY_TOOL_NAME,
+  name: CREATE_GITHUB_REPOSITORY_TOOL_NAME,
   capability: {
     system: "github",
-    resourceType: "private_repository",
+    resourceType: "repository",
     action: "create",
   },
   effect: "publish",
@@ -762,14 +1002,23 @@ const PRIVATE_REPOSITORY_DESCRIPTOR: ToolDescriptor = {
   },
   allowedPrincipals: ["single_agent", "lead"],
   receiptKind: "external_action",
-  operationGoals: ["github_private_repository_create"],
+  operationGoals: [
+    "github_repository_create",
+    "github_private_repository_create",
+  ],
 };
 
-const PRIVATE_REPOSITORY_PARAMETERS: JsonSchemaObject = {
+const REPOSITORY_PARAMETERS: JsonSchemaObject = {
   type: "object",
   additionalProperties: false,
   properties: {
     profileKey: { type: "string" },
+    visibility: {
+      type: "string",
+      enum: ["public", "private"],
+      description:
+        "The user's explicit public/private choice. Omit when unanswered so the host can pause without mutation.",
+    },
     description: { type: "string" },
   },
   required: ["profileKey"],

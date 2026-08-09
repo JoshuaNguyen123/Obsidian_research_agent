@@ -76,7 +76,7 @@ test("research worker leases and deduplicates source candidates before fetch", a
   assert.ok(modelEvidence.every((event) => event.clientInvoked));
   assert.ok(modelEvidence.every((event) => event.phase === "worker"));
   assert.deepEqual(executed, ["web_search", "web_fetch"]);
-  assert.equal(result.toolCalls, 3);
+  assert.equal(result.toolCalls, 4);
   assert.equal(
     result.evidence.filter(
       (item) => item.kind === "web_source" && (item.passageIds?.length ?? 0) > 0,
@@ -176,6 +176,251 @@ test("deep-research worker rejects an early handoff until three sources are usab
       (candidate) => candidate.status === "usable",
     ).length,
     3,
+  );
+});
+
+test("a missing preferred source type is a limitation, not zero-count blocking debt", async () => {
+  const url = "https://owned.example/evidence";
+  const responses = [
+    toolResponse("web_search", { query: "owned evidence" }),
+    toolResponse("web_fetch", { url }),
+    finalResponse("One passage-backed source is ready for the Lead."),
+  ];
+  const requests: ModelChatRequest[] = [];
+  let responseIndex = 0;
+  const model: ModelClient = {
+    async chat(request) {
+      requests.push(request);
+      return responses[Math.min(responseIndex++, responses.length - 1)];
+    },
+    async streamChat(request) {
+      requests.push(request);
+      return responses[Math.min(responseIndex++, responses.length - 1)];
+    },
+  };
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      ["web_search", "web_fetch"].map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    async execute(call) {
+      if (call.name === "web_search") {
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: [
+              { title: "Owned evidence", url, snippet: "Owned navigation result." },
+            ],
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: "Owned evidence",
+          url,
+          content:
+            "This independently fetched passage contains detailed, verifiable evidence for the bounded claim and enough context for the Lead to cite it accurately.",
+          parserStatus: "parsed",
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-preferred-source-advisory",
+    participantId: "specialist",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Find exactly one usable source for the claim.",
+    originalMission: "Research the claim using exactly one source.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {} as ToolExecutionContext,
+    maxSteps: 6,
+  });
+
+  assert.equal(result.modelSteps, 3);
+  assert.equal(result.handoff.status, "ready");
+  assert.equal(result.handoff.stopReason, "handoff_ready");
+  assert.deepEqual(result.handoff.unresolvedQuestions, []);
+  assert.match(result.finalSummary, /Source-quality limitation/iu);
+  assert.match(result.finalSummary, /no primary source was identified/iu);
+  assert.doesNotMatch(JSON.stringify(requests), /lacks 0 required usable source/iu);
+});
+
+test("worker host-fetches one claim-bound result when the model repeats searches", async () => {
+  const firstUrl = "https://owned.example/first";
+  const secondUrl = "https://owned.example/second";
+  const responses = [
+    toolResponse("web_search", { query: "first owned evidence" }),
+    toolResponse("web_search", { query: "second owned evidence" }),
+    finalResponse("The fetched source is ready for the Lead."),
+  ];
+  const requestMessages: string[] = [];
+  let responseIndex = 0;
+  const model: ModelClient = {
+    async chat(request) {
+      requestMessages.push(JSON.stringify(request.messages));
+      return responses[Math.min(responseIndex++, responses.length - 1)];
+    },
+    async streamChat(request) {
+      requestMessages.push(JSON.stringify(request.messages));
+      return responses[Math.min(responseIndex++, responses.length - 1)];
+    },
+  };
+  const executed: ModelToolCall[] = [];
+  const started: string[] = [];
+  const completed: string[] = [];
+  const statuses: string[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      ["web_search", "web_fetch"].map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    async execute(call) {
+      executed.push(call);
+      if (call.name === "web_search") {
+        const second = String(call.arguments.query).includes("second");
+        const url = second ? secondUrl : firstUrl;
+        return {
+          ok: true,
+          toolName: call.name,
+          output: {
+            results: [
+              {
+                title: second ? "Second owned source" : "First owned source",
+                url,
+                snippet: "A claim-bound owned source candidate.",
+              },
+            ],
+          },
+        };
+      }
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          title: "First owned source",
+          url: String(call.arguments.url),
+          content:
+            "This fetched owned passage provides detailed, independently verifiable evidence with enough concrete context for the Lead to cite accurately.",
+          parserStatus: "parsed",
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-search-host-fetch",
+    participantId: "specialist",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Find one owned source for the claim.",
+    originalMission: "Research the claim using exactly one source.",
+    modelClient: model,
+    toolRegistry: registry,
+    toolContext: {
+      settings: { adaptiveResearchProgress: false },
+    } as ToolExecutionContext,
+    maxSteps: 3,
+    maxToolCalls: 4,
+    events: {
+      onStatus: (status) => {
+        statuses.push(status);
+      },
+      onToolStart: (event) => {
+        started.push(event.name);
+      },
+      onToolDone: (event) => {
+        completed.push(event.name);
+      },
+    },
+  });
+
+  assert.deepEqual(
+    executed.map((call) => call.name),
+    ["web_search", "web_fetch", "web_search"],
+  );
+  assert.deepEqual(
+    executed.filter((call) => call.name === "web_fetch").map((call) => call.arguments.url),
+    [firstUrl],
+  );
+  assert.deepEqual(started, ["web_search", "web_fetch", "web_search"]);
+  assert.deepEqual(completed, started);
+  assert.ok(statuses.some((status) => /claim-bound source/iu.test(status)));
+  assert.equal(result.toolCalls, 3);
+  assert.equal(result.handoff.status, "ready");
+  assert.ok(result.evidence.some((item) => item.url === firstUrl));
+  assert.ok(!result.evidence.some((item) => item.url === secondUrl));
+  assert.ok(result.claimPassages.length > 0);
+  assert.equal(
+    Object.values(result.sourceLedger.candidates).find(
+      (candidate) => candidate.url === firstUrl,
+    )?.status,
+    "usable",
+  );
+  assert.equal(
+    Object.values(result.sourceLedger.candidates).find(
+      (candidate) => candidate.url === secondUrl,
+    )?.status,
+    "candidate",
+  );
+  assert.match(requestMessages[1] ?? "", /worker-search-fetch-1/u);
+  assert.match(requestMessages[1] ?? "", /owned\.example\/first/u);
+});
+
+test("worker does not spend a host fetch beyond the shared tool budget", async () => {
+  const url = "https://owned.example/budgeted";
+  const executed: string[] = [];
+  const registry: ToolRegistry = {
+    getDefinitions: () =>
+      ["web_search", "web_fetch"].map((name) => ({
+        type: "function" as const,
+        function: { name, parameters: { type: "object" } },
+      })),
+    async execute(call) {
+      executed.push(call.name);
+      return {
+        ok: true,
+        toolName: call.name,
+        output: {
+          results: [{ title: "Budgeted source", url, snippet: "Candidate" }],
+        },
+      };
+    },
+  };
+
+  const result = await runResearchWorker({
+    runId: "run-search-host-fetch-budget",
+    participantId: "specialist",
+    leadParticipantId: "lead",
+    taskId: "research",
+    assignment: "Find one source within the shared budget.",
+    originalMission: "Research the claim using exactly one source.",
+    modelClient: sequenceModel([
+      toolResponse("web_search", { query: "budgeted evidence" }),
+    ]),
+    toolRegistry: registry,
+    toolContext: {
+      settings: { adaptiveResearchProgress: false },
+    } as ToolExecutionContext,
+    maxSteps: 1,
+    maxToolCalls: 1,
+  });
+
+  assert.deepEqual(executed, ["web_search"]);
+  assert.equal(result.toolCalls, 1);
+  assert.equal(result.handoff.status, "rejected");
+  assert.equal(
+    Object.values(result.sourceLedger.candidates).find(
+      (candidate) => candidate.url === url,
+    )?.status,
+    "candidate",
   );
 });
 

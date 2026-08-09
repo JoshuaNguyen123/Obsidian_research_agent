@@ -10,7 +10,7 @@ import {
 import { isMutatingToolName } from "../agent/policyEngine";
 
 /**
- * Second-agent watchdog for a stuck primary run.
+ * Adaptive Specialist recovery_verifier mode for a stuck Lead run.
  *
  * Fires when the primary agent repeats a tool without progress, or re-hits one
  * blocker across resumes. It reads the recent transcript and returns a single
@@ -24,11 +24,14 @@ import { isMutatingToolName } from "../agent/policyEngine";
  * is exported as the empty set so that invariant is assertable rather than
  * merely documented.
  */
-export const WATCHDOG_ALLOWED_TOOLS: ReadonlySet<string> = new Set<string>();
+export const SPECIALIST_RECOVERY_ALLOWED_TOOLS: ReadonlySet<string> =
+  new Set<string>();
+/** @deprecated Compatibility alias; this is not a third watchdog identity. */
+export const WATCHDOG_ALLOWED_TOOLS = SPECIALIST_RECOVERY_ALLOWED_TOOLS;
 
 const MAX_TRANSCRIPT_CHARS = 8_000;
 const MAX_MISSION_PROMPT_CHARS = 2_000;
-const WATCHDOG_MODEL_CALL_CAP = 2;
+const SPECIALIST_RECOVERY_MODEL_CALL_CAP = 2;
 
 /**
  * Every action maps onto a LoopDecision the runner already implements, so the
@@ -68,14 +71,14 @@ export interface RunWatchdogWorkerInput {
  * path here resolves to a verdict rather than throwing. Escalation is a
  * last-resort recovery; it must not become a new source of run failure.
  */
-export async function runWatchdogWorker(
+export async function runSpecialistRecoveryVerifier(
   input: RunWatchdogWorkerInput,
 ): Promise<WatchdogVerdict> {
   const observed = createObservableModelClient({
     client: input.modelClient,
     budget: {
       schemaVersion: 1,
-      maxCalls: WATCHDOG_MODEL_CALL_CAP,
+      maxCalls: SPECIALIST_RECOVERY_MODEL_CALL_CAP,
       maxTokens: 64_000,
       maxWallClockMs: 5 * 60_000,
     },
@@ -86,7 +89,7 @@ export async function runWatchdogWorker(
     {
       role: "system",
       content: [
-        "You are a watchdog for another agent that is stuck in a loop.",
+        "You are the Adaptive Specialist in recovery_verifier mode. The Lead is stuck in a loop.",
         "You did not produce the transcript below and must judge only what it shows.",
         "Decide the single best way to break the loop:",
         '- "force_final_no_tools": it has enough to answer; make it answer now without another tool call.',
@@ -132,6 +135,13 @@ export async function runWatchdogWorker(
       rationale: `Watchdog could not be reached (${describeError(error)}); stopping rather than continuing to loop.`,
     };
   }
+}
+
+/** @deprecated Use runSpecialistRecoveryVerifier. */
+export async function runWatchdogWorker(
+  input: RunWatchdogWorkerInput,
+): Promise<WatchdogVerdict> {
+  return runSpecialistRecoveryVerifier(input);
 }
 
 /** Exported for tests: the verdict contract is the whole interface. */
@@ -242,10 +252,13 @@ function getWatchdogAction(value: unknown): WatchdogAction | null {
  * granting the watchdog write authority.
  */
 export function watchdogAllowListIsReadOnly(): boolean {
-  return [...WATCHDOG_ALLOWED_TOOLS].every(
+  return [...SPECIALIST_RECOVERY_ALLOWED_TOOLS].every(
     (toolName) => !isMutatingToolName(toolName),
   );
 }
+
+export const specialistRecoveryAllowListIsReadOnly =
+  watchdogAllowListIsReadOnly;
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

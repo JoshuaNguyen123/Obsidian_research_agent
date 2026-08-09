@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   RESEARCH_TEAM_KEYWORD_FLOOR,
+  resolveAdaptiveTeamDispatchV2,
   resolveResearchTeamDispatchV1,
   type ResearchTeamDispatchInputV1,
 } from "../src/agent/researchTeamDispatch";
@@ -91,6 +92,54 @@ test("deliberate negatives stay single-agent", async () => {
   }
 });
 
+test("representative complex research prompts route to one Adaptive Specialist", async () => {
+  const prompts = [
+    "Write a 2000-word report about the book The Federalist Papers",
+    "Write a deep dive about transformers",
+    "What are the best strategies for multi-agent orchestration?",
+    "Write a 1000-word essay on American exceptionalism",
+    "What are the most important topics in distributed systems?",
+  ];
+  for (const prompt of prompts) {
+    const decision = await resolveAdaptiveTeamDispatchV2(dispatchInput(prompt));
+    assert.equal(decision.useTeam, true, prompt);
+    assert.equal(decision.orchestrationMode, "adaptive_team", prompt);
+    assert.equal(decision.initialSpecialistMode, "researcher", prompt);
+    assert.deepEqual(decision.specialistModes, ["researcher"], prompt);
+  }
+
+  const simple = await resolveAdaptiveTeamDispatchV2(
+    dispatchInput("Summarize the meeting transcript below"),
+  );
+  assert.equal(simple.orchestrationMode, "single");
+  assert.equal(simple.initialSpecialistMode, null);
+});
+
+test("Linear, code, GitHub, and compound missions select staged Specialist modes", async () => {
+  const linear = await resolveAdaptiveTeamDispatchV2(
+    dispatchInput("Create a Linear initiative with a project and tracked issues"),
+  );
+  assert.deepEqual(linear.specialistModes, ["linear_planner"]);
+
+  const code = await resolveAdaptiveTeamDispatchV2(
+    dispatchInput("Build a TypeScript project with a meaningful test suite"),
+  );
+  assert.deepEqual(code.specialistModes, ["code_builder", "code_reviewer"]);
+
+  const compound = await resolveAdaptiveTeamDispatchV2(
+    dispatchInput(
+      "Deep research transformer orchestration, create Linear issues, build a Python project, and publish it to a private GitHub repo",
+    ),
+  );
+  assert.equal(compound.signals[0], "compound_workflow");
+  assert.deepEqual(compound.specialistModes, [
+    "researcher",
+    "linear_planner",
+    "code_builder",
+    "code_reviewer",
+  ]);
+});
+
 test("structural signals widen deterministically without floor keywords", async () => {
   const multiUrl = await resolveResearchTeamDispatchV1(
     dispatchInput(
@@ -113,7 +162,7 @@ test("structural signals widen deterministically without floor keywords", async 
   assert.equal(duplicateUrl.useTeam, false, "duplicate URLs count once");
 
   const deep = await resolveResearchTeamDispatchV1(
-    dispatchInput("I need an exhaustive systematic review of sleep studies"),
+    dispatchInput("I need a systematic review of sleep studies"),
   );
   assert.equal(deep.useTeam, true);
   assert.ok(deep.signals.includes("explicitly_deep"));

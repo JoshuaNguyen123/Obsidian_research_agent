@@ -143,11 +143,14 @@ export function describeOffFrontierToolNearMiss(
     name === "create_repository" ||
     name === "github_create_repo"
   ) {
-    const listed = listedAmong("github_create_private_repository");
+    const listed = listedAmong(
+      "github_create_repository",
+      "github_create_private_repository",
+    );
     if (listed.length > 0) {
-      return "Near-miss: call github_create_private_repository now.";
+      return `Near-miss: call ${listed[0]} now; repository visibility must come from the user's explicit public/private choice.`;
     }
-    return "Near-miss: use github_create_private_repository when listed on the frontier.";
+    return "Near-miss: use github_create_repository when listed on the frontier; never infer public or private visibility.";
   }
 
   if (

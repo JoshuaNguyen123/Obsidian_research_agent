@@ -20,10 +20,12 @@ import {
   parseAcceptedResearchArtifactV1,
   type AcceptedResearchArtifactV1,
 } from "../integrations/linear/AcceptedResearchArtifactV1";
+import type { RepositoryVisibility } from "../integrations/github/RepositoryVisibility";
 
 export const RESEARCHER_HANDOFF_SCHEMA_VERSION = 1 as const;
 export const RESEARCH_PROJECT_PLAN_SCHEMA_VERSION = 1 as const;
 export const PROJECT_LIFECYCLE_INTENT_SCHEMA_VERSION = 1 as const;
+export const PROJECT_LIFECYCLE_INTENT_V2_SCHEMA_VERSION = 2 as const;
 export const PROJECT_LINEAGE_SCHEMA_VERSION = 1 as const;
 
 export const PROJECT_LIFECYCLE_STAGES = Object.freeze([
@@ -35,6 +37,33 @@ export const PROJECT_LIFECYCLE_STAGES = Object.freeze([
 ] as const);
 
 export type ProjectLifecycleStageV1 = (typeof PROJECT_LIFECYCLE_STAGES)[number];
+
+/** Canonical lifecycle vocabulary for new durable state. */
+export const PROJECT_LIFECYCLE_STAGES_V2 = Object.freeze([
+  "accepted_research",
+  "linear_hierarchy",
+  "code_execution",
+  "github_publication",
+  "reconciliation_cleanup",
+] as const);
+
+export type ProjectLifecycleStageV2 =
+  (typeof PROJECT_LIFECYCLE_STAGES_V2)[number];
+
+export interface ProjectLifecycleIntentV2 {
+  schemaVersion: typeof PROJECT_LIFECYCLE_INTENT_V2_SCHEMA_VERSION;
+  kind: "project_lifecycle_intent";
+  runId: string;
+  exactUserCommand: string;
+  stages: ProjectLifecycleStageV2[];
+  requestedAt: string;
+  fingerprint: string;
+}
+
+export type ProjectLifecycleIntentUnsignedV2 = Omit<
+  ProjectLifecycleIntentV2,
+  "schemaVersion" | "kind" | "fingerprint"
+>;
 
 export interface ProjectLifecycleStageEstimateV1 {
   stage: ProjectLifecycleStageV1;
@@ -91,6 +120,19 @@ export interface ResearchProjectIssueV1
   dependencyKeys: string[];
   acceptanceCriteria: string[];
   workItemFingerprint: string;
+  /**
+   * Optional sections of the shared Linear issue body contract. `description`
+   * remains the required `Problem / impact` fallback so an older plan still
+   * renders a complete ticket. The `Dependencies` section is derived from
+   * `dependencyKeys` and the `Evidence` section from the plan's source note,
+   * so neither has a field here.
+   */
+  problemImpact?: string;
+  confidenceLimitations?: string;
+  proposedWork?: string[];
+  nonGoals?: string[];
+  scope?: string[];
+  validation?: string[];
 }
 
 export interface ResearchProjectPlanV1 {
@@ -180,6 +222,21 @@ export interface PrivateGitHubPublicationLineageProofV1 {
   owner: string;
   repository: string;
   verifiedPrivate: true;
+  branch: string;
+  pullRequestNumber: number;
+  draft: true;
+  remoteSha: string;
+  repositoryReadbackFingerprint: string;
+  pullRequestReadbackFingerprint: string;
+}
+
+export interface GitHubPublicationLineageProofV2 {
+  stage: "github_publication";
+  trustedBindingFingerprint: string;
+  owner: string;
+  repository: string;
+  visibility: RepositoryVisibility;
+  verifiedVisibility: true;
   branch: string;
   pullRequestNumber: number;
   draft: true;
@@ -395,6 +452,248 @@ export function fingerprintProjectLifecycleIntentV1(
   return fingerprintContract(stable);
 }
 
+export function migrateProjectLifecycleStageV1ToV2(
+  stage: ProjectLifecycleStageV1,
+): ProjectLifecycleStageV2 {
+  return stage === "private_github_publication" ? "github_publication" : stage;
+}
+
+export function projectProjectLifecycleStageV2ToV1(
+  stage: ProjectLifecycleStageV2,
+): ProjectLifecycleStageV1 {
+  return stage === "github_publication" ? "private_github_publication" : stage;
+}
+
+export function createProjectLifecycleIntentV2(
+  input: ProjectLifecycleIntentUnsignedV2,
+): ProjectLifecycleIntentV2 {
+  const normalized = normalizeProjectLifecycleIntentV2(input);
+  const fixed = {
+    schemaVersion: PROJECT_LIFECYCLE_INTENT_V2_SCHEMA_VERSION,
+    kind: "project_lifecycle_intent" as const,
+    ...normalized,
+  };
+  return {
+    ...fixed,
+    fingerprint: fingerprintProjectLifecycleIntentV2(fixed),
+  };
+}
+
+/** Parse canonical V2 state or upgrade a valid private-only V1 intent. */
+export function parseProjectLifecycleIntentV2(
+  value: unknown,
+): ProjectLifecycleIntentV2 {
+  const record = expectPlainRecord(value, "project lifecycle intent v2");
+  if (record.schemaVersion === PROJECT_LIFECYCLE_INTENT_SCHEMA_VERSION) {
+    return migrateProjectLifecycleIntentV1ToV2(
+      parseProjectLifecycleIntentV1(value),
+    );
+  }
+  assertExactKeys(
+    record,
+    [
+      "schemaVersion",
+      "kind",
+      "runId",
+      "exactUserCommand",
+      "stages",
+      "requestedAt",
+      "fingerprint",
+    ],
+    [],
+    "project lifecycle intent v2",
+  );
+  if (
+    record.schemaVersion !== PROJECT_LIFECYCLE_INTENT_V2_SCHEMA_VERSION ||
+    record.kind !== "project_lifecycle_intent"
+  ) {
+    throw new DurableLinearContractError(
+      "Unsupported project lifecycle intent v2 contract.",
+    );
+  }
+  const normalized = normalizeProjectLifecycleIntentV2(
+    record as unknown as ProjectLifecycleIntentUnsignedV2,
+  );
+  const fixed = {
+    schemaVersion: PROJECT_LIFECYCLE_INTENT_V2_SCHEMA_VERSION,
+    kind: "project_lifecycle_intent" as const,
+    ...normalized,
+  };
+  const fingerprint = expectSha256(
+    record.fingerprint,
+    "project lifecycle intent v2 fingerprint",
+  );
+  if (
+    !constantTimeFingerprintEqual(
+      fingerprint,
+      fingerprintProjectLifecycleIntentV2(fixed),
+    )
+  ) {
+    throw new DurableLinearContractError(
+      "Project lifecycle intent v2 fingerprint does not match its canonical payload.",
+    );
+  }
+  return { ...fixed, fingerprint };
+}
+
+export function migrateProjectLifecycleIntentV1ToV2(
+  value: unknown,
+): ProjectLifecycleIntentV2 {
+  const legacy = parseProjectLifecycleIntentV1(value);
+  return createProjectLifecycleIntentV2({
+    runId: legacy.runId,
+    exactUserCommand: legacy.exactUserCommand,
+    stages: legacy.stages.map(migrateProjectLifecycleStageV1ToV2),
+    requestedAt: legacy.requestedAt,
+  });
+}
+
+/**
+ * Compatibility projection for the current V1 mission host. The legacy
+ * private-named stage is a routing label only; public/private authority remains
+ * exclusively in the explicit repository binding and approval.
+ */
+export function projectProjectLifecycleIntentV2ToV1(
+  value: unknown,
+): ProjectLifecycleIntentV1 {
+  const intent = parseProjectLifecycleIntentV2(value);
+  return createProjectLifecycleIntentV1({
+    runId: intent.runId,
+    exactUserCommand: intent.exactUserCommand,
+    stages: intent.stages.map(projectProjectLifecycleStageV2ToV1),
+    requestedAt: intent.requestedAt,
+  });
+}
+
+export function fingerprintProjectLifecycleIntentV2(
+  intent:
+    | Omit<ProjectLifecycleIntentV2, "fingerprint">
+    | ProjectLifecycleIntentV2,
+): string {
+  const {
+    fingerprint: _fingerprint,
+    requestedAt: _requestedAt,
+    ...stable
+  } = intent as ProjectLifecycleIntentV2;
+  return fingerprintContract(stable);
+}
+
+export function migratePrivateGitHubPublicationLineageProofV1ToV2(
+  value: unknown,
+): GitHubPublicationLineageProofV2 {
+  const proof = parseStageProof(value);
+  if (proof.stage !== "private_github_publication") {
+    throw new DurableLinearContractError(
+      "Legacy GitHub publication proof must use private_github_publication.",
+    );
+  }
+  return {
+    stage: "github_publication",
+    trustedBindingFingerprint: proof.trustedBindingFingerprint,
+    owner: proof.owner,
+    repository: proof.repository,
+    visibility: "private",
+    verifiedVisibility: true,
+    branch: proof.branch,
+    pullRequestNumber: proof.pullRequestNumber,
+    draft: true,
+    remoteSha: proof.remoteSha,
+    repositoryReadbackFingerprint: proof.repositoryReadbackFingerprint,
+    pullRequestReadbackFingerprint: proof.pullRequestReadbackFingerprint,
+  };
+}
+
+export function parseGitHubPublicationLineageProofV2(
+  value: unknown,
+): GitHubPublicationLineageProofV2 {
+  const record = expectPlainRecord(value, "GitHub publication lineage proof v2");
+  if (record.stage === "private_github_publication") {
+    return migratePrivateGitHubPublicationLineageProofV1ToV2(record);
+  }
+  assertExactKeys(
+    record,
+    [
+      "stage",
+      "trustedBindingFingerprint",
+      "owner",
+      "repository",
+      "visibility",
+      "verifiedVisibility",
+      "branch",
+      "pullRequestNumber",
+      "draft",
+      "remoteSha",
+      "repositoryReadbackFingerprint",
+      "pullRequestReadbackFingerprint",
+    ],
+    [],
+    "GitHub publication lineage proof v2",
+  );
+  if (
+    record.stage !== "github_publication" ||
+    (record.visibility !== "public" && record.visibility !== "private") ||
+    record.verifiedVisibility !== true ||
+    record.draft !== true
+  ) {
+    throw new DurableLinearContractError(
+      "GitHub publication lineage requires explicit verified visibility and a draft pull request.",
+    );
+  }
+  return {
+    stage: "github_publication",
+    trustedBindingFingerprint: expectSha256(
+      record.trustedBindingFingerprint,
+      "trusted GitHub binding fingerprint",
+    ),
+    owner: githubName(record.owner, "GitHub owner"),
+    repository: githubName(record.repository, "GitHub repository"),
+    visibility: record.visibility,
+    verifiedVisibility: true,
+    branch: gitBranch(record.branch),
+    pullRequestNumber: expectInteger(
+      record.pullRequestNumber,
+      "GitHub pull request number",
+      1,
+      2_147_483_647,
+    ),
+    draft: true,
+    remoteSha: gitSha(record.remoteSha, "remote GitHub SHA"),
+    repositoryReadbackFingerprint: expectSha256(
+      record.repositoryReadbackFingerprint,
+      "GitHub repository readback fingerprint",
+    ),
+    pullRequestReadbackFingerprint: expectSha256(
+      record.pullRequestReadbackFingerprint,
+      "GitHub pull request readback fingerprint",
+    ),
+  };
+}
+
+/** V1 can represent only private proof; public proof must stay V2. */
+export function projectGitHubPublicationLineageProofV2ToV1(
+  value: unknown,
+): PrivateGitHubPublicationLineageProofV1 {
+  const proof = parseGitHubPublicationLineageProofV2(value);
+  if (proof.visibility !== "private") {
+    throw new DurableLinearContractError(
+      "Public GitHub publication proof cannot be projected as verified private V1 proof.",
+    );
+  }
+  return {
+    stage: "private_github_publication",
+    trustedBindingFingerprint: proof.trustedBindingFingerprint,
+    owner: proof.owner,
+    repository: proof.repository,
+    verifiedPrivate: true,
+    branch: proof.branch,
+    pullRequestNumber: proof.pullRequestNumber,
+    draft: true,
+    remoteSha: proof.remoteSha,
+    repositoryReadbackFingerprint: proof.repositoryReadbackFingerprint,
+    pullRequestReadbackFingerprint: proof.pullRequestReadbackFingerprint,
+  };
+}
+
 /**
  * Deterministic stage classification. Action verbs are required so provider
  * names in source text cannot widen the mission. Explicit negation wins.
@@ -533,6 +832,14 @@ export function detectProjectLifecycleStagesV1(command: string): ProjectLifecycl
     stages.push("reconciliation_cleanup");
   }
   return PROJECT_LIFECYCLE_STAGES.filter((stage) => stages.includes(stage));
+}
+
+export function detectProjectLifecycleStagesV2(
+  command: string,
+): ProjectLifecycleStageV2[] {
+  return detectProjectLifecycleStagesV1(command).map(
+    migrateProjectLifecycleStageV1ToV2,
+  );
 }
 
 /**
@@ -1058,9 +1365,29 @@ function parseIssue(value: unknown, index: number): ResearchProjectPlanUnsignedV
   assertExactKeys(
     record,
     ["key", "title", "description", "dependencyKeys", "acceptanceCriteria", "workItemFingerprint"],
-    ["idempotencyKey"],
+    [
+      "idempotencyKey",
+      "problemImpact",
+      "confidenceLimitations",
+      "proposedWork",
+      "nonGoals",
+      "scope",
+      "validation",
+    ],
     label,
   );
+  const optionalNarrative = (key: "problemImpact" | "confidenceLimitations") =>
+    record[key] === undefined
+      ? {}
+      : { [key]: cleanProjectNarrative(record[key], `${label} ${key}`, 8_000) };
+  const optionalNarrativeList = (
+    key: "proposedWork" | "nonGoals" | "scope" | "validation",
+  ) =>
+    record[key] === undefined
+      ? {}
+      : {
+          [key]: parseProjectNarrativeList(record[key], `${label} ${key}`, 1, 20, 1_000),
+        };
   return {
     key: expectLogicalKey(record.key, `${label} key`, 100),
     title: expectString(record.title, `${label} title`, 1, 240, { secretFree: true }),
@@ -1078,6 +1405,12 @@ function parseIssue(value: unknown, index: number): ResearchProjectPlanUnsignedV
       500,
     ),
     workItemFingerprint: expectSha256(record.workItemFingerprint, `${label} work item fingerprint`),
+    ...optionalNarrative("problemImpact"),
+    ...optionalNarrative("confidenceLimitations"),
+    ...optionalNarrativeList("proposedWork"),
+    ...optionalNarrativeList("nonGoals"),
+    ...optionalNarrativeList("scope"),
+    ...optionalNarrativeList("validation"),
     ...(record.idempotencyKey === undefined
       ? {}
       : { idempotencyKey: expectString(record.idempotencyKey, `${label} idempotency key`, 1, 500, { secretFree: true }) }),
@@ -1108,6 +1441,44 @@ function assertAcyclicIssueDependencies(issues: ResearchProjectPlanUnsignedV1["i
     visited.add(key);
   };
   for (const issue of issues) visit(issue.key);
+}
+
+function normalizeProjectLifecycleIntentV2(
+  input: ProjectLifecycleIntentUnsignedV2,
+): ProjectLifecycleIntentUnsignedV2 {
+  const record = expectPlainRecord(input, "project lifecycle intent v2");
+  const rawStages = parseUniqueStrings(
+    record.stages,
+    "project lifecycle stage v2",
+    1,
+    PROJECT_LIFECYCLE_STAGES_V2.length,
+    64,
+    (value, label) =>
+      expectEnum(value, label, PROJECT_LIFECYCLE_STAGES_V2),
+  ) as ProjectLifecycleStageV2[];
+  const stages = PROJECT_LIFECYCLE_STAGES_V2.filter((stage) =>
+    rawStages.includes(stage)
+  );
+  if (stages.join("\0") !== rawStages.join("\0")) {
+    throw new DurableLinearContractError(
+      "Project lifecycle v2 stages must use canonical lifecycle order.",
+    );
+  }
+  return {
+    runId: expectOpaqueId(record.runId, "project lifecycle v2 run id"),
+    exactUserCommand: expectString(
+      record.exactUserCommand,
+      "project lifecycle v2 exact user command",
+      1,
+      8_000,
+      { allowNewlines: true, secretFree: true },
+    ),
+    stages,
+    requestedAt: expectIsoTimestamp(
+      record.requestedAt,
+      "project lifecycle v2 requested at",
+    ),
+  };
 }
 
 function normalizeProjectLifecycleIntent(

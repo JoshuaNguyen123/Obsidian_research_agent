@@ -11,9 +11,9 @@ import { repairOllamaCloudBaseUrl } from "../model/cloudProviderPresets";
 import type { ModelProvider } from "../model/types";
 import { MAX_AGENT_STEPS } from "../tools/constants";
 
-export const SETTINGS_SCHEMA_VERSION = 4;
+export const SETTINGS_SCHEMA_VERSION = 5;
 
-export type SupportedSettingsSchemaVersion = 1 | 2 | 3 | 4;
+export type SupportedSettingsSchemaVersion = 1 | 2 | 3 | 4 | 5;
 
 /** Missing version is the original schema-1 representation. */
 export function parseSupportedSettingsSchemaVersion(
@@ -24,7 +24,8 @@ export function parseSupportedSettingsSchemaVersion(
     value === 1 ||
     value === 2 ||
     value === 3 ||
-    value === 4
+    value === 4 ||
+    value === 5
   ) {
     return (value ?? 1) as SupportedSettingsSchemaVersion;
   }
@@ -34,7 +35,7 @@ export function parseSupportedSettingsSchemaVersion(
     value < 1
   ) {
     throw new Error(
-      "settingsSchemaVersion must be one of the supported integer schemas: 1, 2, 3, or 4.",
+      "settingsSchemaVersion must be one of the supported integer schemas: 1, 2, 3, 4, or 5.",
     );
   }
   throw new Error(
@@ -66,8 +67,21 @@ export interface NormalizableAgentSettings {
   openAiCompatibleApiKey: string;
   openAiCompatibleBaseUrl: string;
   model: string;
+  specialistEnabled?: boolean;
+  specialistModel?: string;
+  specialistConnectionMode?: "shared_primary" | "separate";
+  specialistProvider?: ModelProvider;
+  specialistBaseUrl?: string;
+  /** Runtime-only. Persisted settings must replace this with an opaque reference. */
+  specialistApiKey?: string;
+  /** @deprecated Schema-4 migration input only. */
   utilityModel?: string;
+  /** @deprecated Schema-4 migration input only. */
   utilityModelProvider?: ModelProvider;
+  /** @deprecated Schema-4 migration input only. */
+  utilityBaseUrl?: string;
+  /** @deprecated Schema-4 migration input only. */
+  utilityApiKey?: string;
   modelRouterEnabled?: boolean;
   modelRouterMode?: "off" | "shadow" | "authority";
   enableStreaming: boolean;
@@ -151,8 +165,11 @@ const BASE_DEFAULTS: NormalizableAgentSettings = {
   openAiCompatibleApiKey: "",
   openAiCompatibleBaseUrl: "https://api.openai.com/v1",
   model: "glm-5.2",
-  utilityModel: "",
-  utilityModelProvider: "ollama",
+  specialistEnabled: true,
+  specialistModel: "",
+  specialistConnectionMode: "shared_primary",
+  specialistProvider: "ollama",
+  specialistBaseUrl: "",
   modelRouterEnabled: true,
   modelRouterMode: "authority",
   enableStreaming: true,
@@ -286,6 +303,34 @@ export function normalizeAgentSettings(
   merged.githubOAuthClientId = normalizeGitHubOAuthClientIdSetting(
     merged.githubOAuthClientId,
   );
+
+  // Schema 5 gives the second agent an explicit model slot and connection
+  // boundary. The schema-4 utility fields are read only when their canonical
+  // replacement is absent; they are never copied back into normalized output.
+  const canonicalSpecialistModel = normalizeOptionalString(data.specialistModel);
+  const legacyUtilityModel = normalizeOptionalString(data.utilityModel);
+  merged.specialistEnabled = data.specialistEnabled !== false;
+  merged.specialistModel = canonicalSpecialistModel || legacyUtilityModel;
+  const legacyUtilityBaseUrl = normalizeOptionalString(data.utilityBaseUrl);
+  merged.specialistConnectionMode =
+    data.specialistConnectionMode === "separate" ||
+    data.specialistConnectionMode === "shared_primary"
+      ? data.specialistConnectionMode
+      : legacyUtilityBaseUrl
+        ? "separate"
+        : "shared_primary";
+  merged.specialistProvider =
+    data.specialistProvider === "openai_compatible" ||
+    data.specialistProvider === "ollama"
+      ? data.specialistProvider
+      : data.utilityModelProvider === "openai_compatible" ||
+          data.utilityModelProvider === "ollama"
+        ? data.utilityModelProvider
+        : merged.modelProvider;
+  merged.specialistBaseUrl =
+    merged.specialistConnectionMode === "separate"
+      ? normalizeOptionalString(data.specialistBaseUrl) || legacyUtilityBaseUrl
+      : "";
 
   const schemaVersion = parseSupportedSettingsSchemaVersion(
     data.settingsSchemaVersion,
@@ -539,6 +584,10 @@ function coerceBoolean(value: unknown, fallback: boolean): boolean {
     return value;
   }
   return fallback;
+}
+
+function normalizeOptionalString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function coerceStreamWritebackMode(value: unknown): StreamWritebackMode {

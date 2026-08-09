@@ -2,6 +2,11 @@ import { isLiteraryPrimaryTextWriteMission } from "../agent/evidenceIntent";
 import { RESEARCH_TEAM_KEYWORD_FLOOR } from "../agent/researchTeamDispatch";
 import { OrchestratorStore, type OrchestratorSnapshotRepository } from "./orchestratorStore";
 import { SharedBudget, type BudgetResource } from "./sharedBudget";
+import {
+  validateSpecialistHandoffV2,
+  type SpecialistHandoffAuthorityV2,
+} from "./specialistHandoff";
+import { authorizeSpecialistRepairV2 } from "./specialistRecovery";
 import type {
   AgentParticipant,
   MergeSummary,
@@ -10,6 +15,9 @@ import type {
   OrchestratorSnapshotV1,
   OrchestratorWorkNode,
   WorkerHandoff,
+  SpecialistHandoffV2,
+  SpecialistMode,
+  SpecialistRepairStateV2,
   GitWorktreeState,
   VerificationStatus,
   WorkNodeStatus,
@@ -136,6 +144,31 @@ export class OrchestratorRuntime {
     return this.emit({ kind: "handoff_ready", handoff });
   }
 
+  /**
+   * V2 handoffs fail closed until every proof reference resolves against the
+   * host's MissionGraph/receipt authority snapshot.
+   */
+  async specialistHandoffReady(
+    handoff: SpecialistHandoffV2,
+    authority: SpecialistHandoffAuthorityV2,
+  ): Promise<OrchestratorSnapshotV1> {
+    if (handoff.status !== "ready" && handoff.status !== "accepted") {
+      throw new Error(
+        `Specialist handoff proof rejected (status:${handoff.status}).`,
+      );
+    }
+    const validation = validateSpecialistHandoffV2(handoff, authority);
+    if (!validation.ok) {
+      throw new Error(
+        `Specialist handoff proof rejected (${[
+          ...validation.missing.map((item) => `missing:${item}`),
+          ...validation.stale.map((item) => `stale:${item}`),
+        ].join(", ")}).`,
+      );
+    }
+    return this.emit({ kind: "handoff_ready", handoff });
+  }
+
   async updateHandoff(
     handoffId: string,
     status: WorkerHandoff["status"],
@@ -170,6 +203,49 @@ export class OrchestratorRuntime {
     patch: Partial<Omit<AgentParticipant, "id" | "role">>,
   ): Promise<OrchestratorSnapshotV1> {
     return this.emit({ kind: "participant_updated", participantId, patch });
+  }
+
+  async setSpecialistMode(
+    specialistMode: SpecialistMode,
+    lastAction?: string,
+  ): Promise<OrchestratorSnapshotV1> {
+    const specialist = this.getSnapshot()?.participants.specialist;
+    if (!specialist || specialist.role !== "specialist") {
+      throw new Error("Adaptive Specialist participant is not registered.");
+    }
+    return this.updateParticipant("specialist", {
+      specialistMode,
+      ...(lastAction ? { lastAction } : {}),
+    });
+  }
+
+  /** Persist the sole materially-different repair authorization in the snapshot. */
+  async authorizeSpecialistRepair(input: {
+    failedProgressFingerprint: string;
+    previousApproach: string;
+    revisedApproach: string;
+  }): Promise<{
+    authorized: boolean;
+    reason: string;
+    state: SpecialistRepairStateV2;
+    snapshot: OrchestratorSnapshotV1;
+  }> {
+    const specialist = this.getSnapshot()?.participants.specialist;
+    if (!specialist || specialist.role !== "specialist") {
+      throw new Error("Adaptive Specialist participant is not registered.");
+    }
+    const decision = authorizeSpecialistRepairV2({
+      state: specialist.repairState,
+      ...input,
+    });
+    const snapshot = await this.updateParticipant("specialist", {
+      repairState: decision.state,
+      specialistMode: "recovery_verifier",
+      lastAction: decision.authorized
+        ? "One materially different peer repair cycle authorized."
+        : `Peer repair blocked: ${decision.reason}.`,
+    });
+    return { ...decision, snapshot };
   }
 
   async consume(
