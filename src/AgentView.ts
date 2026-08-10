@@ -449,6 +449,16 @@ export class AgentView extends ItemView {
     );
   }
 
+  /**
+   * Clears a finished (non-running) run from Run Details on explicit user
+   * request — the same projection reset a fresh mission start performs, but
+   * user-triggered so a terminal run does not have to sit there until the
+   * next prompt or app restart clears it.
+   */
+  private handleDismissOrchestratorRun(): void {
+    void this.plugin.clearLatestOrchestratorSnapshot();
+  }
+
   /** Keeps the Orchestrator tab mounted; Chat remains the landing tab. */
   refreshOrchestratorAvailability(): void {
     const loaded = this.plugin.getLatestOrchestratorSnapshot();
@@ -517,6 +527,7 @@ export class AgentView extends ItemView {
       this.orchestratorTab = new OrchestratorTab(this.orchestratorPanelEl, {
         onNavigateToRunDetails: (target) =>
           this.navigateFromOrchestrator(target),
+        onDismiss: () => this.handleDismissOrchestratorRun(),
       });
     }
     this.detailsPanelEl = container.createDiv({
@@ -4127,6 +4138,7 @@ export class AgentView extends ItemView {
     this.orchestratorTab = new OrchestratorTab(panel, {
       onNavigateToRunDetails: (target) =>
         this.navigateFromOrchestrator(target),
+      onDismiss: () => this.handleDismissOrchestratorRun(),
     });
     if (snapshot) {
       this.orchestratorTab.render(snapshot);

@@ -41,6 +41,35 @@ test("pure final_relevance budget still maps to relevance_rejected", () => {
   );
 });
 
+test("provider budget exhaustion is a resumable safety-limit pause, not an external blocker", () => {
+  // The full stop detail of the 2026-08 failure: acceptance keys, the graph
+  // marker, and the provider-budget message all in one string. It must read
+  // as a budget pause even though "mission_graph_incomplete" is present.
+  const reason = fromAgentRunStopReason(
+    "budget",
+    "tool:create_design_canvas,write_receipt,fetched_sources:1/3,research_plan_items," +
+      "subquestion_evidence:rq-1:1/3,citation_url_coverage,limitations_section," +
+      "confidence_section,plan:tool-01-create_design_canvas:artifact_receipt," +
+      "plan:final:final_relevance,verifier:tool-01-create_design_canvas:artifact_receipt," +
+      "verifier:final:final_relevance,research_phase_acceptance;gather;mission_graph_incomplete;" +
+      'Provider execution budget exhausted before mission acceptance. Resolve the blocker, then run "continue run run-x".',
+  );
+  assert.equal(reason, "model_budget");
+  assert.match(stopReasonChatLine(reason), /Paused at a safety limit/i);
+
+  // The bare error category token classifies the same way.
+  assert.equal(
+    fromAgentRunStopReason("budget", "provider_budget_exhausted"),
+    "model_budget",
+  );
+
+  // A graph blocker without the provider-budget message keeps its meaning.
+  assert.equal(
+    fromAgentRunStopReason("budget", "tool:web_fetch;mission_graph_incomplete"),
+    "graph_blocked",
+  );
+});
+
 test("mission-graph authority errors map to graph_blocked not provider_error", () => {
   assert.equal(
     fromAgentRunStopReason(

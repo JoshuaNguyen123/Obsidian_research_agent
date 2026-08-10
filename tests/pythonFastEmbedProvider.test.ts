@@ -164,6 +164,78 @@ test("persistent FastEmbed provider shuts helper down after idle window and resp
   }
 });
 
+test("an oversized helper response fails fast with output_too_large instead of hanging", async () => {
+  const { runtime, spawned } = createFakeRuntime((child) => {
+    child.onWrite = () => {
+      // A response line larger than the transport cap, with the terminating
+      // newline arriving only past the cap — the shape that used to be
+      // silently truncated and then waited out the full request timeout.
+      const oversizedChunk = "x".repeat(6_000_000);
+      child.emitStdout(oversizedChunk);
+      child.emitStdout(oversizedChunk);
+      child.emitStdout("\n");
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+    // If the overflow path regressed to the old hang, this test would only
+    // fail after the timeout below rather than blocking the suite for 3 min.
+    requestTimeoutMs: 5_000,
+  });
+  try {
+    const startedAt = Date.now();
+    const result = await provider.embed(REQUEST);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "output_too_large");
+    assert.ok(
+      Date.now() - startedAt < 4_000,
+      "overflow must settle immediately, not via the request timeout",
+    );
+    assert.equal(spawned[0].killed, true);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
+test("persistent FastEmbed provider recovers with a fresh helper after an overflow", async () => {
+  let overflowFirst = true;
+  const { runtime, spawned } = createFakeRuntime((child) => {
+    child.onWrite = (line: string) => {
+      if (overflowFirst && child === spawned[0]) {
+        child.emitStdout("y".repeat(11_000_000));
+        return;
+      }
+      const request = JSON.parse(line) as { id: string; model: string; dim: number };
+      child.emitStdout(
+        JSON.stringify({
+          id: request.id,
+          ok: true,
+          model: request.model,
+          dim: request.dim,
+          documents: [[1, 0]],
+          queries: [[0, 1]],
+        }) + "\n",
+      );
+    };
+  });
+  const provider = createPythonFastEmbedProvider(SETTINGS, {
+    loadRuntime: () => runtime,
+    requestTimeoutMs: 5_000,
+  });
+  try {
+    const first = await provider.embed(REQUEST);
+    assert.equal(first.ok, false);
+    assert.equal(first.code, "output_too_large");
+
+    overflowFirst = false;
+    const second = await provider.embed(REQUEST);
+    assert.equal(second.ok, true);
+    assert.equal(spawned.length, 2);
+  } finally {
+    provider.dispose?.();
+  }
+});
+
 test("persistent FastEmbed provider respawns once when a reused helper dies mid-request", async () => {
   let crashNextWrite = false;
   const { runtime, spawned } = createFakeRuntime((child) => {

@@ -146,6 +146,11 @@ class DefaultSemanticIndexService implements SemanticIndexService {
   private readonly getSettings: () => AgentSettings;
   private readonly getEmbeddingProvider: () => SemanticEmbeddingProvider;
   private readonly now: () => Date;
+  // Content hash (indexedAt excluded) of the last version written per shard
+  // path. Incremental updates re-shard the whole row set, so without this
+  // every debounced single-note save rewrote every multi-MB shard file and
+  // kept Obsidian's own indexer permanently busy.
+  private readonly lastWrittenShardHashes = new Map<string, string>();
 
   constructor(options: SemanticIndexServiceOptions) {
     this.app = options.app;
@@ -645,11 +650,18 @@ class DefaultSemanticIndexService implements SemanticIndexService {
     const paths = getSemanticIndexPaths(settings);
     await ensureFolderPath(this.app, paths.folder);
     for (const shard of shards) {
-      await writeVaultText(
-        this.app,
-        getShardPath(paths.folder, shard.id),
-        `${JSON.stringify(shard)}\n`,
+      const shardPath = getShardPath(paths.folder, shard.id);
+      const contentHash = hashText(
+        JSON.stringify({ ...shard, indexedAt: "" }),
       );
+      if (
+        this.lastWrittenShardHashes.get(shardPath) === contentHash &&
+        this.app.vault.getFileByPath(shardPath)
+      ) {
+        continue;
+      }
+      await writeVaultText(this.app, shardPath, `${JSON.stringify(shard)}\n`);
+      this.lastWrittenShardHashes.set(shardPath, contentHash);
     }
     await writeVaultText(
       this.app,
@@ -790,35 +802,53 @@ function decodeFloat32Base64(value: string): number[] {
   return [...new Float32Array(bytes.buffer)];
 }
 
-async function embedIndexDocuments({
+/**
+ * Documents per embed request. A vault rebuild used to send every chunk in one
+ * request — up to maxFiles(10000) x 40 chunks — which made the Python helper
+ * hold the inputs, the vector lists, and the serialized JSON response
+ * simultaneously (observed >13 GB RSS) while the response line blew past the
+ * helper transport's output cap and could never be parsed. Batches keep each
+ * response around 1-2 MB and helper memory flat.
+ */
+export const SEMANTIC_EMBED_BATCH_SIZE = 128;
+
+export async function embedIndexDocuments({
   provider,
   settings,
   documents,
+  batchSize = SEMANTIC_EMBED_BATCH_SIZE,
 }: {
   provider: SemanticEmbeddingProvider;
   settings: AgentSettings;
   documents: string[];
+  batchSize?: number;
 }): Promise<{ ok: true; vectors: number[][] } | { ok: false; code: string; message: string }> {
   if (documents.length === 0) {
     return { ok: true, vectors: [] };
   }
 
-  const response = await provider.embed({
-    model: getSemanticModel(settings),
-    dim: getSemanticDim(settings),
-    cacheDir: settings.semanticModelCacheDir || undefined,
-    documents,
-    queries: [],
-  });
-  if (!response.ok || response.documents?.length !== documents.length) {
-    return {
-      ok: false,
-      code: response.code ?? "document_embedding_failed",
-      message: response.message ?? "Unable to embed semantic index documents.",
-    };
+  const boundedBatchSize = Math.max(1, Math.trunc(batchSize));
+  const vectors: number[][] = [];
+  for (let start = 0; start < documents.length; start += boundedBatchSize) {
+    const batch = documents.slice(start, start + boundedBatchSize);
+    const response = await provider.embed({
+      model: getSemanticModel(settings),
+      dim: getSemanticDim(settings),
+      cacheDir: settings.semanticModelCacheDir || undefined,
+      documents: batch,
+      queries: [],
+    });
+    if (!response.ok || response.documents?.length !== batch.length) {
+      return {
+        ok: false,
+        code: response.code ?? "document_embedding_failed",
+        message: response.message ?? "Unable to embed semantic index documents.",
+      };
+    }
+    vectors.push(...response.documents);
   }
 
-  return { ok: true, vectors: response.documents };
+  return { ok: true, vectors };
 }
 
 /**

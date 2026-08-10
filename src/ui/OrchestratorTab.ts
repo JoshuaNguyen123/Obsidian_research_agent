@@ -28,6 +28,7 @@ export interface OrchestratorTabOptions {
   now?: () => number;
   onNavigateToRunDetails?: (target: OrchestratorDetailsTarget) => void;
   onNodeSelected?: (nodeId: string) => void;
+  onDismiss?: () => void;
 }
 
 interface OrchestratorRenderState {
@@ -249,7 +250,23 @@ export class OrchestratorTab {
     const header = section.querySelector<HTMLElement>(
       ".agentic-researcher-orchestrator-section-header",
     );
-    header?.appendChild(statusBadge(viewModel.summary.status));
+    if (header) {
+      const statusGroup = createElement(
+        "div",
+        "agentic-researcher-orchestrator-summary-status-group",
+      );
+      statusGroup.appendChild(statusBadge(viewModel.summary.status));
+      if (viewModel.summary.status !== "running" && this.options.onDismiss) {
+        const dismissButton = actionButton("Dismiss", () =>
+          this.options.onDismiss?.(),
+        );
+        dismissButton.classList.add(
+          "agentic-researcher-orchestrator-dismiss-button",
+        );
+        statusGroup.appendChild(dismissButton);
+      }
+      header.appendChild(statusGroup);
+    }
 
     const metrics = createElement(
       "div",

@@ -2635,6 +2635,17 @@
   color: var(--agent-error);
 }
 
+.agentic-researcher-orchestrator-summary-status-group {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--agent-space-2);
+}
+
+button.agentic-researcher-orchestrator-dismiss-button {
+  margin-top: 0;
+}
+
 .agentic-researcher-orchestrator-inspector {
   align-self: start;
   max-height: clamp(13.75em, 48vh, 32.5em);

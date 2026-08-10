@@ -149,8 +149,26 @@ export function createPythonFastEmbedProvider(
     child.stdin.on?.("error", () => {});
 
     child.stdout.on("data", (chunk: Buffer) => {
-      if (created.stdoutBuffer.length < MAX_OUTPUT_CHARS) {
-        created.stdoutBuffer += chunk.toString("utf8");
+      if (!created.alive) {
+        return;
+      }
+      created.stdoutBuffer += chunk.toString("utf8");
+      if (created.stdoutBuffer.length > MAX_OUTPUT_CHARS) {
+        // Silently dropping bytes here used to also drop the response's
+        // trailing newline, so the request could never parse and sat until
+        // the 3-minute timeout — then the caller retried the identical
+        // oversized request forever. Fail fast with a diagnosable code.
+        settlePending(created, {
+          ok: false,
+          model: "",
+          dim: 0,
+          code: "output_too_large",
+          message:
+            `FastEmbed helper response exceeded ${MAX_OUTPUT_CHARS} characters; ` +
+            "send fewer documents per embed request.",
+        });
+        destroySession(created);
+        return;
       }
       drainStdoutLines(created);
     });

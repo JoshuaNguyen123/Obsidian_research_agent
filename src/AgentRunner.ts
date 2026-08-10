@@ -251,6 +251,10 @@ import {
   type SlowPathReason,
   type StreamingWritebackKind,
 } from "./agent/runPlan";
+import {
+  escalateMissionEffortDecisionForResearchV1,
+  type MissionEffortDecisionV1,
+} from "./agent/missionEffortDecision";
 import { classifyMissionSpeechAct } from "./agent/missionSpeechAct";
 import { canonicalizeKeywordTypos } from "./agent/promptNormalization";
 import {
@@ -2222,6 +2226,30 @@ export async function runAgentMission({
     runToolContext.deadlineAt = runDeadlineAt;
     return maxRunMs;
   };
+  // Router calls happen before the effort narrowing and planning (research
+  // assists, graph planner) happens after it, yet all of them draw provider
+  // calls from the same counter as the tool loop. Granting the effort
+  // allowance on top of calls already spent — plus a bounded reserve for the
+  // planning still to come — is what keeps a compose mission (6 execution
+  // calls) from exhausting its budget before step 1.
+  const PLANNING_MODEL_CALL_RESERVE = 12;
+  const applyExecutionBudgetForEffortDecision = (
+    effort: MissionEffortDecisionV1,
+    planningReserveCalls: number,
+  ): void => {
+    const usageNow = observableModel.getUsage();
+    const maxCalls =
+      usageNow.modelCallCount + planningReserveCalls + effort.maxModelCalls;
+    const maxRunMs = applyEffortRunDeadline(
+      usageNow.wallClockMs + effort.maxWallClockMs,
+    );
+    updateModelExecutionBudget({
+      schemaVersion: 1,
+      maxCalls,
+      maxTokens: Math.max(32_768, maxCalls * configuredContextTokens),
+      maxWallClockMs: maxRunMs,
+    });
+  };
   const evaluateVerifiedLinearCodeRepositoryBindingFromIssueReadV1 = async (
     input: {
       result: ToolExecutionResult;
@@ -2982,6 +3010,10 @@ export async function runAgentMission({
   let runtimeSnapshotPersistenceBlockedError: unknown = null;
   let currentNoteContext: unknown = null;
   let researchPlan: ResearchPlan | null = null;
+  // Research plan built during mission-graph bootstrap, reused by the main
+  // research-plan step so its model assists (mode/effort/subquestion) are not
+  // paid for twice per run.
+  let bootstrapResearchPlanCache: ResearchPlan | null = null;
   let researchPhaseDescriptor: ResearchPhaseDescriptor | null = null;
   let lastResearchPhase: ResearchRunPhase | null = null;
   let runtimeSnapshot: MissionRuntimeSnapshotV2 | null = null;
@@ -3010,19 +3042,10 @@ export async function runAgentMission({
       formatProjectLifecycleEstimate(initialProjectLifecycleEstimate),
     );
   }
-  const routedModelCallCap = runPlan.effortDecision.maxModelCalls;
-  const routedMaxRunMs = applyEffortRunDeadline(
-    runPlan.effortDecision.maxWallClockMs,
+  applyExecutionBudgetForEffortDecision(
+    runPlan.effortDecision,
+    PLANNING_MODEL_CALL_RESERVE,
   );
-  updateModelExecutionBudget({
-    schemaVersion: 1,
-    maxCalls: routedModelCallCap,
-    maxTokens: Math.max(
-      32_768,
-      routedModelCallCap * configuredContextTokens,
-    ),
-    maxWallClockMs: routedMaxRunMs,
-  });
   activeThink = runPlan.thinking;
   tools = runPlan.allowedTools;
   allowedToolNames = new Set(tools.map((tool) => tool.function.name));
@@ -3758,18 +3781,10 @@ export async function runAgentMission({
       normalizeInvocationToolCallLimit(providedMaxToolCalls),
       runPlan.effortDecision.maxToolCalls,
     );
-    const resumedMaxRunMs = applyEffortRunDeadline(
-      runPlan.effortDecision.maxWallClockMs,
+    applyExecutionBudgetForEffortDecision(
+      runPlan.effortDecision,
+      PLANNING_MODEL_CALL_RESERVE,
     );
-    updateModelExecutionBudget({
-      schemaVersion: 1,
-      maxCalls: runPlan.effortDecision.maxModelCalls,
-      maxTokens: Math.max(
-        32_768,
-        runPlan.effortDecision.maxModelCalls * configuredContextTokens,
-      ),
-      maxWallClockMs: resumedMaxRunMs,
-    });
     activeThink = runPlan.thinking;
     followupIntentContext = null;
     events.onTrace?.({
@@ -3977,6 +3992,7 @@ export async function runAgentMission({
               ),
               ...researchPlanSettingOverrides(runToolContext.settings),
             });
+        bootstrapResearchPlanCache = bootstrapResearchPlan;
         const requiredGraphFetchCount = requiresWebEvidenceProof(
           activeIntentPrompt,
           missionIntent,
@@ -5233,7 +5249,8 @@ export async function runAgentMission({
     ? null
     : proofBoundProviderLifecycle
     ? null
-    : await createResearchPlanWithAssist({
+    : bootstrapResearchPlanCache ??
+      (await createResearchPlanWithAssist({
         prompt: activeIntentPrompt,
         missionIntent,
         runPlan,
@@ -5253,7 +5270,7 @@ export async function runAgentMission({
           runToolContext.settings?.utilityModel?.trim() || undefined,
         ),
         ...researchPlanSettingOverrides(runToolContext.settings),
-      });
+      }));
   const restoredResearchPlan =
     resumeSnapshot?.researchPlan ?? resumeLedger?.researchPlan;
   if (
@@ -5261,6 +5278,54 @@ export async function runAgentMission({
     restoredResearchPlan
   ) {
     researchPlan = JSON.parse(JSON.stringify(restoredResearchPlan)) as ResearchPlan;
+  }
+  if (researchPlan) {
+    // The effort profile was chosen from prompt regexes before planning ran.
+    // If planning (including its model-based assists) attached a research
+    // contract — a fetched-source floor and/or an adaptive effort tier — the
+    // provider budget must be floored to the grounded-research profile now,
+    // or the contract is unsatisfiable: gather blocks write tools until the
+    // sources are fetched, and a compose budget starves before that happens.
+    const escalatedEffort = escalateMissionEffortDecisionForResearchV1(
+      runPlan.effortDecision,
+      {
+        researchContractAttached:
+          researchPlan.sourceRequirements.minFetchedSources > 0 ||
+          Boolean(researchPlan.effort),
+        configuredMaxModelCalls: configuredStepBudget,
+        configuredMaxToolCalls: configuredStepBudget,
+        configuredMaxRunMinutes:
+          configuredMaxRunMs == null ? null : configuredMaxRunMs / 60_000,
+      },
+    );
+    if (escalatedEffort !== runPlan.effortDecision) {
+      runPlan = { ...runPlan, effortDecision: escalatedEffort };
+      maxToolCalls = Math.max(
+        maxToolCalls,
+        Math.min(
+          normalizeInvocationToolCallLimit(providedMaxToolCalls),
+          escalatedEffort.maxToolCalls,
+        ),
+      );
+      // Planning is already paid for by this point; no extra reserve.
+      applyExecutionBudgetForEffortDecision(escalatedEffort, 0);
+      events.onStatus?.(
+        "Research contract attached: raised the execution budget to the grounded-research profile.",
+      );
+      events.onTrace?.({
+        id: "research-effort-escalation",
+        kind: "status",
+        message:
+          "Effort decision floored to grounded_research: planning attached a research contract the routed profile could not satisfy.",
+        outputPreview: {
+          profile: escalatedEffort.profile,
+          maxModelCalls: escalatedEffort.maxModelCalls,
+          maxToolCalls: escalatedEffort.maxToolCalls,
+          maxWallClockMs: escalatedEffort.maxWallClockMs,
+          minFetchedSources: researchPlan.sourceRequirements.minFetchedSources,
+        },
+      });
+    }
   }
   if (researchPlan?.effort) {
     const effortBudget = researchPlan.effort.budget;
@@ -5632,19 +5697,11 @@ export async function runAgentMission({
     normalizeInvocationToolCallLimit(providedMaxToolCalls),
     runPlan.effortDecision.maxToolCalls,
   );
-  const finalizedModelCallCap = runPlan.effortDecision.maxModelCalls;
-  const finalizedMaxRunMs = applyEffortRunDeadline(
-    runPlan.effortDecision.maxWallClockMs,
-  );
-  updateModelExecutionBudget({
-    schemaVersion: 1,
-    maxCalls: finalizedModelCallCap,
-    maxTokens: Math.max(
-      32_768,
-      finalizedModelCallCap * configuredContextTokens,
-    ),
-    maxWallClockMs: finalizedMaxRunMs,
-  });
+  // Planning (router, assists, graph) is fully paid for by this point, so the
+  // effort allowance is granted on top of the calls already spent with no
+  // extra reserve. An absolute cap here would re-starve the tool loop of
+  // whatever planning consumed.
+  applyExecutionBudgetForEffortDecision(runPlan.effortDecision, 0);
   if (resumedOriginalMission) {
     events.onRunConfig?.(
       buildRunConfigEvent({
@@ -8618,7 +8675,9 @@ export async function runAgentMission({
     );
     const nextAction = partialWriteKept
       ? `${message} Partial draft was kept in the note. Run "${continuationCommand}" to expand it in place to the word target (do not start a fresh append).`
-      : `${message} Resolve the blocker, then run "${continuationCommand}".`;
+      : providerBudgetExhausted
+        ? `${message} Run "${continuationCommand}" to resume with a fresh budget — progress so far is preserved.`
+        : `${message} Resolve the blocker, then run "${continuationCommand}".`;
     events.onStatus?.(message);
     events.onPhaseChange?.("error", message);
     events.onTrace?.({

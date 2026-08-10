@@ -36,6 +36,10 @@ import {
   shouldSemanticIndexTrackPath,
 } from "./src/embeddings/semanticIndex";
 import type { SemanticIndexService } from "./src/embeddings/semanticIndexTypes";
+import {
+  computeSemanticIndexRetryDelayMs,
+  SEMANTIC_INDEX_MAX_AUTO_RETRIES,
+} from "./src/embeddings/semanticIndexRetry";
 import type { SemanticEmbeddingProvider } from "./src/embeddings/types";
 import { formatModelClientError, type ModelClient } from "./src/model/types";
 import { AgentSettings, AgentSettingTab, DEFAULT_SETTINGS } from "./src/settings";
@@ -635,7 +639,6 @@ import {
 } from "./src/agent/repositories";
 
 const LEGACY_DEFAULT_REQUEST_TIMEOUT_MS = 60000;
-const SEMANTIC_INDEX_RETRY_MS = 30_000;
 const DURABLE_SEGMENT_MAX_MINUTES = 30;
 const LINEAR_QUEUE_LEASE_MS = 15 * 60_000;
 const LINEAR_QUEUE_VAULT_BINDING_KEY = "current-vault";
@@ -759,6 +762,8 @@ export default class AgenticResearcherPlugin extends Plugin {
   private semanticIndexTimer: ReturnType<typeof setTimeout> | null = null;
   private semanticIndexFlushPromise: Promise<void> | null = null;
   private semanticIndexNeedsBootstrap = false;
+  private semanticIndexConsecutiveFailures = 0;
+  private semanticIndexAutoUpdatesSuspended = false;
   private readonly runCoordinator = new RunCoordinator();
   private readonly approvalBroker = new ApprovalBroker();
   private readonly durableMissionOwnerId = `plugin-${createAgentRunId()}`;
@@ -1290,9 +1295,15 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
     const semanticEmbeddingProvider = this.semanticEmbeddingProvider;
     this.semanticEmbeddingProvider = null;
-    void this.runCoordinator
-      .shutdown()
-      .finally(() => semanticEmbeddingProvider?.dispose?.());
+    // Dispose the Python embed helper immediately instead of chaining it
+    // behind shutdown(): if that promise never settled (or the app quit
+    // first), the child survived as an orphan holding its working set.
+    try {
+      semanticEmbeddingProvider?.dispose?.();
+    } catch {
+      // The helper may already be gone.
+    }
+    void this.runCoordinator.shutdown();
   }
 
   registerAgentView(view: AgentView) {
@@ -7642,6 +7653,13 @@ export default class AgenticResearcherPlugin extends Plugin {
   private async reconcilePersistedOrchestratorProjection(): Promise<void> {
     const snapshot = this.latestOrchestratorSnapshot;
     if (!snapshot || snapshot.status !== "running") {
+      // A "blocked" projection surviving from a prior session has no live
+      // executor behind it — there is nothing left to resume, so it must not
+      // keep greeting every future open as if it were still actionable.
+      if (snapshot?.status === "blocked") {
+        await this.clearLatestOrchestratorSnapshot();
+        return;
+      }
       if (this.topLevelChildTerminalCheckpoint) {
         this.topLevelChildTerminalCheckpoint = null;
         await this.savePluginData();
@@ -7656,8 +7674,15 @@ export default class AgenticResearcherPlugin extends Plugin {
         this.topLevelChildTerminalCheckpoint,
       ) ?? reconcileOrphanedOrchestratorSnapshot(snapshot);
     if (!reconciled) return;
-    this.latestOrchestratorSnapshot = reconciled;
     this.topLevelChildTerminalCheckpoint = null;
+    if (reconciled.status === "blocked") {
+      // Same rule as above: a restart-interrupted run that lands on
+      // "blocked" this session is just as unresumable, so clear it now
+      // instead of persisting a stale blocker for future opens to inherit.
+      await this.clearLatestOrchestratorSnapshot();
+      return;
+    }
+    this.latestOrchestratorSnapshot = reconciled;
     await this.savePluginData();
     this.activeAgentView?.refreshOrchestratorAvailability();
   }
@@ -14361,6 +14386,8 @@ export default class AgenticResearcherPlugin extends Plugin {
     this.semanticEmbeddingProvider = provider;
     this.semanticIndexService = this.createSemanticIndexService();
     this.semanticIndexNeedsBootstrap = true;
+    this.semanticIndexConsecutiveFailures = 0;
+    this.semanticIndexAutoUpdatesSuspended = false;
   }
 
   private createSemanticIndexService(): SemanticIndexService {
@@ -14426,6 +14453,9 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   private async drainSemanticIndexQueue() {
+    if (this.semanticIndexAutoUpdatesSuspended) {
+      return;
+    }
     const service = this.getSemanticIndexService();
     try {
       if (this.semanticIndexNeedsBootstrap) {
@@ -14450,9 +14480,34 @@ export default class AgenticResearcherPlugin extends Plugin {
           throw new Error(result.message ?? result.code ?? "semantic_index_update_failed");
         }
       }
+      this.semanticIndexConsecutiveFailures = 0;
     } catch (error) {
-      console.warn("Unable to update semantic index; queued paths will retry.", error);
-      this.scheduleSemanticIndexFlush(SEMANTIC_INDEX_RETRY_MS);
+      this.semanticIndexConsecutiveFailures += 1;
+      if (
+        this.semanticIndexConsecutiveFailures >= SEMANTIC_INDEX_MAX_AUTO_RETRIES
+      ) {
+        // A rebuild that keeps failing must not re-run a whole-vault embed
+        // every few minutes for the lifetime of the session. Stop retrying,
+        // tell the user once, and let a manual rebuild or reload start fresh.
+        this.semanticIndexAutoUpdatesSuspended = true;
+        console.warn(
+          "Semantic index updates suspended after repeated failures.",
+          error,
+        );
+        new Notice(
+          "Semantic search index updates are paused after repeated failures. " +
+            "See the developer console for the error, then run a manual index rebuild or reload Obsidian to retry.",
+        );
+        return;
+      }
+      const retryDelayMs = computeSemanticIndexRetryDelayMs(
+        this.semanticIndexConsecutiveFailures,
+      );
+      console.warn(
+        `Unable to update semantic index; retrying in ${Math.round(retryDelayMs / 1000)}s.`,
+        error,
+      );
+      this.scheduleSemanticIndexFlush(retryDelayMs);
     }
   }
 

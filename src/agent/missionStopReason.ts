@@ -164,6 +164,13 @@ function classifyBudgetDetail(detail?: string | null): MissionStopReason {
   if (/wall.?clock/.test(text)) return "wall_clock";
   if (/repeated_tool|no_progress/.test(text)) return "repeated_tool_no_progress";
   if (/required_tools_failed/.test(text)) return "required_tools_failed";
+  // A provider-budget stop often rides along with acceptance keys and
+  // "mission_graph_incomplete" in the same detail string; classify it before
+  // the graph branch so Chat says "paused at a safety limit" instead of
+  // presenting a resumable budget pause as an external blocker.
+  if (/provider[\s_]?(?:execution[\s_]?)?budget[\s_]?exhausted/.test(text)) {
+    return "model_budget";
+  }
   if (/model|token/.test(text)) return "model_budget";
   if (/approval/.test(text)) return "approval_denied";
   // Unpaid compound delivery / graph blockers outrank verifier:final_relevance so

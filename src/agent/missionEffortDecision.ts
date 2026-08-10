@@ -147,6 +147,98 @@ export function resolveMissionEffortDecisionV1(
   };
 }
 
+export interface MissionEffortResearchEscalationInputV1 {
+  /**
+   * True when planning attached a research contract the mission must satisfy
+   * before acceptance (a fetched-source floor and/or an adaptive research
+   * effort tier).
+   */
+  researchContractAttached: boolean;
+  configuredMaxModelCalls?: number | null;
+  configuredMaxToolCalls?: number | null;
+  configuredMaxRunMinutes?: number | null;
+}
+
+/**
+ * Reconcile a pre-execution effort decision with what planning actually
+ * attached to the mission. The profile above is decided by prompt regexes, but
+ * the research contract can be attached later by a model-based classifier the
+ * regexes cannot see — leaving a compose-sized budget (6 calls / 4 tools /
+ * 3 min) responsible for a grounded-research contract (fetch N sources before
+ * any write tool unlocks). That mismatch exhausted the provider budget before
+ * acceptance on plain prompts like "write me a brief with diagrams".
+ *
+ * Floors the budget up to the grounded_research profile; never lowers an
+ * already-larger decision, and still respects configured settings ceilings.
+ */
+export function escalateMissionEffortDecisionForResearchV1(
+  decision: MissionEffortDecisionV1,
+  input: MissionEffortResearchEscalationInputV1,
+): MissionEffortDecisionV1 {
+  if (!input.researchContractAttached) {
+    return decision;
+  }
+  if (
+    decision.profile === "grounded_research" ||
+    decision.profile === "extended_team"
+  ) {
+    return decision;
+  }
+  const grounded = profileDefaults("grounded_research");
+  const flooredModelCalls = Math.max(
+    decision.maxModelCalls,
+    applyPositiveCeiling(grounded.maxModelCalls, input.configuredMaxModelCalls),
+  );
+  const flooredToolCalls = Math.max(
+    decision.maxToolCalls,
+    applyNonNegativeCeiling(grounded.maxToolCalls, input.configuredMaxToolCalls),
+  );
+  const configuredWallClockMs =
+    typeof input.configuredMaxRunMinutes === "number" &&
+    Number.isFinite(input.configuredMaxRunMinutes) &&
+    input.configuredMaxRunMinutes > 0
+      ? Math.floor(input.configuredMaxRunMinutes * 60_000)
+      : null;
+  const flooredWallClockMs = Math.max(
+    decision.maxWallClockMs,
+    configuredWallClockMs === null
+      ? grounded.maxWallClockMs
+      : Math.min(grounded.maxWallClockMs, configuredWallClockMs),
+  );
+
+  return {
+    ...decision,
+    profile: "grounded_research",
+    researchDepth:
+      decision.researchDepth === "none" ? "grounded" : decision.researchDepth,
+    maxModelCalls: flooredModelCalls,
+    maxToolCalls: flooredToolCalls,
+    maxWallClockMs: flooredWallClockMs,
+    maxSegments: Math.max(decision.maxSegments, grounded.maxSegments),
+    finalizationReserve: {
+      ...decision.finalizationReserve,
+      modelCalls: Math.min(
+        Math.max(
+          decision.finalizationReserve.modelCalls,
+          grounded.finalizationModelCalls,
+        ),
+        flooredModelCalls,
+      ),
+      toolCalls: Math.min(
+        Math.max(
+          decision.finalizationReserve.toolCalls,
+          grounded.finalizationToolCalls,
+        ),
+        flooredToolCalls,
+      ),
+    },
+    escalationReasons: [
+      ...decision.escalationReasons,
+      "research_contract_attached_after_planning",
+    ],
+  };
+}
+
 function profileDefaults(profile: MissionEffortProfileV1): {
   maxModelCalls: number;
   maxToolCalls: number;
