@@ -1,7 +1,10 @@
 import { createSessionBootstrapTokenLeaseV1 } from "@agentic-researcher/headless-runtime";
 import type { BootstrapTokenLeaseV1 } from "@agentic-researcher/headless-runtime";
 import { requireNodeModule } from "../../src/platform/nodeRequire";
-import { COMPANION_RUNTIME_ASSETS_V1 } from "./runtimeAssets";
+import {
+  getCompanionRuntimeAssetManifestV1,
+  loadCompanionRuntimeAssetsFromDiskV1,
+} from "./runtimeAssets";
 
 export interface CompanionServiceCommandResultV1 {
   ok: boolean;
@@ -42,13 +45,21 @@ export class CompanionServiceControllerV1 {
   readonly port: number;
   private readonly pythonCommands: Array<{ executable: string; args: string[] }>;
   private readonly timeoutMs: number;
-  private readonly runtimeAssets: Readonly<Record<string, string>>;
+  /**
+   * Test seam: an injected asset record bypasses the sibling artifact and is
+   * hashed lazily exactly as the legacy embedded assets were. Production
+   * leaves this null and resolves identity from the bundled manifest while
+   * loading content from companion-assets.json on first materialization.
+   */
+  private readonly injectedRuntimeAssets: Readonly<Record<string, string>> | null;
+  private diskRuntimeAssets: Readonly<Record<string, string>> | null = null;
   private readonly applicationDataRoot: string;
   private nodeExecutable: string | null = null;
   /**
-   * Hashing every bundled runtime asset (~950 KB) is deferred to first use.
-   * Both hosts construct this controller during plugin load, and a session
-   * that never touches the companion should not pay the hash walk at startup.
+   * Runtime identity is deferred to first use. Both hosts construct this
+   * controller during plugin load, and a session that never touches the
+   * companion should pay neither a hash walk nor a disk read at startup —
+   * and a missing sibling artifact must not break plugin load.
    */
   private runtimeIdentity: {
     fileHashes: Record<string, string>;
@@ -73,7 +84,7 @@ export class CompanionServiceControllerV1 {
     this.dataDir = path.resolve(options.dataDir ?? defaultRoot);
     this.codeApplicationDataRoot = path.join(this.applicationDataRoot, "code");
     assertSafeApplicationDataPath(this.applicationDataRoot, this.dataDir, path);
-    this.runtimeAssets = options.runtimeAssets ?? COMPANION_RUNTIME_ASSETS_V1;
+    this.injectedRuntimeAssets = options.runtimeAssets ?? null;
     this.port = clampInteger(options.port ?? 8765, 1, 65_535);
     this.baseUrl = `http://127.0.0.1:${this.port}`;
     this.pythonCommands = options.pythonCommands ?? defaultPythonCommands(os.platform());
@@ -109,16 +120,29 @@ export class CompanionServiceControllerV1 {
       "path",
       "companion_service_control",
     );
-    const crypto = requireNodeModule<typeof import("crypto")>(
-      "crypto",
-      "companion_service_control",
-    );
-    const fileHashes = Object.fromEntries(
-      Object.entries(this.runtimeAssets)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([name, content]) => [name, sha256(content, crypto)]),
-    );
-    const bundleHash = sha256(JSON.stringify(fileHashes), crypto);
+    let fileHashes: Record<string, string>;
+    let bundleHash: string;
+    if (this.injectedRuntimeAssets) {
+      const crypto = requireNodeModule<typeof import("crypto")>(
+        "crypto",
+        "companion_service_control",
+      );
+      fileHashes = Object.fromEntries(
+        Object.entries(this.injectedRuntimeAssets)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([name, content]) => [name, sha256(content, crypto)]),
+      );
+      bundleHash = sha256(JSON.stringify(fileHashes), crypto);
+    } else {
+      // Identity comes from the bundled manifest, not the sibling artifact:
+      // status/attest paths keep a stable runtime root and hash contract even
+      // when companion-assets.json is missing, and the hash computation is
+      // byte-identical to the legacy embedded walk so already-materialized
+      // runtime/v1-<hash16> directories keep their identity.
+      const manifest = getCompanionRuntimeAssetManifestV1();
+      fileHashes = { ...manifest.fileHashes };
+      bundleHash = manifest.bundleHash;
+    }
     const runtimeRoot = path.join(
       this.dataDir,
       "runtime",
@@ -131,6 +155,22 @@ export class CompanionServiceControllerV1 {
       controlScriptPath: path.join(runtimeRoot, "companion_control.py"),
     };
     return this.runtimeIdentity;
+  }
+
+  /**
+   * Asset contents for materialization. Injected assets (tests) win; the
+   * production path lazily reads and hash-verifies companion-assets.json on
+   * first use and throws CompanionRuntimeAssetsUnavailableError with a
+   * reinstall instruction when the sibling artifact is missing or stale.
+   */
+  private resolveRuntimeAssets(): Readonly<Record<string, string>> {
+    if (this.injectedRuntimeAssets) {
+      return this.injectedRuntimeAssets;
+    }
+    if (!this.diskRuntimeAssets) {
+      this.diskRuntimeAssets = loadCompanionRuntimeAssetsFromDiskV1();
+    }
+    return this.diskRuntimeAssets;
   }
 
   async install(): Promise<CompanionServiceCommandResultV1> {
@@ -176,7 +216,11 @@ export class CompanionServiceControllerV1 {
     }
   }
 
-  /** Atomically materialize and hash-readback the runtime embedded in main.js. */
+  /**
+   * Atomically materialize and hash-readback the runtime from the sibling
+   * companion-assets.json artifact (or injected test assets), verifying every
+   * file against the bundled manifest hashes.
+   */
   materializeRuntime(): CompanionRuntimeMaterializationV1 {
     const fs = requireNodeModule<typeof import("fs")>(
       "fs",
@@ -208,7 +252,9 @@ export class CompanionServiceControllerV1 {
       path,
     );
     const resolvedRoot = fs.realpathSync(this.runtimeRoot);
-    for (const [relativePath, content] of Object.entries(this.runtimeAssets)) {
+    for (const [relativePath, content] of Object.entries(
+      this.resolveRuntimeAssets(),
+    )) {
       if (
         !relativePath ||
         path.isAbsolute(relativePath) ||
@@ -306,7 +352,9 @@ export class CompanionServiceControllerV1 {
       path,
     );
     const resolvedRoot = fs.realpathSync(this.runtimeRoot);
-    for (const relativePath of Object.keys(this.runtimeAssets)) {
+    // Attestation needs only names and hashes, both bundled in the manifest,
+    // so it works without reading the sibling artifact.
+    for (const relativePath of Object.keys(this.fileHashes)) {
       if (
         !relativePath ||
         path.isAbsolute(relativePath) ||

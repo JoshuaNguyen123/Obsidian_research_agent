@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -51,13 +59,26 @@ test("companion and Code runtime defaults resolve the identical Code application
   }
 });
 
-test("companion controller hash-materializes embedded runtime assets under application data", async () => {
+test("companion controller hash-materializes sibling-artifact runtime assets under application data", async () => {
   const fixtureRoot = await mkdtemp(path.join(tmpdir(), "agentic-companion-runtime-"));
   try {
     const Controller = await loadBundledController(fixtureRoot);
+    // Production path: the assets live in companion-assets.json next to the
+    // installed bundle, never inside it.
+    await copyFile(
+      path.resolve("companion-assets.json"),
+      path.join(fixtureRoot, "companion-assets.json"),
+    );
     const dataDir = path.join(fixtureRoot, "data");
     const controller = new Controller({ dataDir, applicationDataRoot: fixtureRoot });
     const materialized = controller.materializeRuntime();
+    const manifest = JSON.parse(
+      await readFile(
+        path.resolve("extensions", "companion", "generated", "runtime-assets-manifest.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(materialized.bundleHash, manifest.bundleHash);
 
     assert.ok(isWithin(dataDir, materialized.runtimeRoot));
     assert.equal(materialized.runtimeRoot, controller.runtimeRoot);
@@ -107,6 +128,73 @@ test("companion controller hash-materializes embedded runtime assets under appli
   }
 });
 
+test("a missing sibling artifact disables the companion with a reinstall instruction", async () => {
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), "agentic-companion-missing-"));
+  try {
+    const Controller = await loadBundledController(fixtureRoot);
+    // BRAT/manual installs historically copy only main.js, styles.css, and
+    // manifest.json. Construction and runtime identity must still work — the
+    // hashes are bundled — and only materialization fails, with a clear
+    // actionable message instead of a crash.
+    const controller = new Controller({
+      dataDir: path.join(fixtureRoot, "data"),
+      applicationDataRoot: fixtureRoot,
+    });
+    assert.match(controller.runtimeRoot, /runtime[\\/]v1-[a-f0-9]{16}$/u);
+    assert.throws(
+      () => controller.materializeRuntime(),
+      /companion-assets\.json" was not found[\s\S]*Reinstall the plugin with its complete artifact set/u,
+    );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("a stale or tampered sibling artifact fails closed before any write", async () => {
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), "agentic-companion-stale-"));
+  try {
+    const Controller = await loadBundledController(fixtureRoot);
+    const artifact = JSON.parse(
+      await readFile(path.resolve("companion-assets.json"), "utf8"),
+    );
+    artifact.files["auth.py"] = `${artifact.files["auth.py"]}\n# tampered`;
+    await writeFile(
+      path.join(fixtureRoot, "companion-assets.json"),
+      JSON.stringify(artifact),
+      "utf8",
+    );
+    const controller = new Controller({
+      dataDir: path.join(fixtureRoot, "data"),
+      applicationDataRoot: fixtureRoot,
+    });
+    assert.throws(
+      () => controller.materializeRuntime(),
+      /"auth\.py" asset does not match this plugin build[\s\S]*Reinstall the plugin/u,
+    );
+    // No runtime content may be written from unverified assets.
+    await assert.rejects(readFile(path.join(fixtureRoot, "data", "runtime")));
+
+    // A whole-artifact swap from a different build is rejected on the bundle
+    // hash before any per-file work.
+    artifact.bundleHash = "sha256:" + "0".repeat(64);
+    await writeFile(
+      path.join(fixtureRoot, "companion-assets.json"),
+      JSON.stringify(artifact),
+      "utf8",
+    );
+    const second = new Controller({
+      dataDir: path.join(fixtureRoot, "data-second"),
+      applicationDataRoot: fixtureRoot,
+    });
+    assert.throws(
+      () => second.materializeRuntime(),
+      /belongs to a different plugin build/u,
+    );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("constructing the controller never reads or hashes the bundled runtime assets", async () => {
   const fixtureRoot = await mkdtemp(path.join(tmpdir(), "agentic-companion-lazy-"));
   try {
@@ -151,6 +239,10 @@ test("companion controller passes exact approved-root argv to service and token 
   const fixtureRoot = await mkdtemp(path.join(tmpdir(), "agentic-companion-argv-"));
   try {
     const Controller = await loadBundledController(fixtureRoot);
+    await copyFile(
+      path.resolve("companion-assets.json"),
+      path.join(fixtureRoot, "companion-assets.json"),
+    );
     const capturePath = path.join(fixtureRoot, "argv.jsonl");
     const helperPath = path.join(fixtureRoot, "fake-python.cjs");
     await writeFile(

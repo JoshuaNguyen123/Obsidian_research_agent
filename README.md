@@ -68,9 +68,13 @@ Required files:
 main.js
 manifest.json
 styles.css
+companion-assets.json
 ```
 
 Then enable `Agentic Researcher` in Obsidian's community plugin settings.
+
+Without `companion-assets.json` the plugin still loads and runs; only the
+optional local companion service is disabled until the file is installed.
 
 ## Development
 

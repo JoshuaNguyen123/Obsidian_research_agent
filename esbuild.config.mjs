@@ -8,12 +8,17 @@ import {
   validatePluginCatalog,
 } from "./scripts/plugin-catalog.mjs";
 import { buildCompanionWorker } from "./scripts/build-companion-worker.mjs";
+import { buildCompanionAssets } from "./scripts/build-companion-assets.mjs";
 
 const production = process.argv[2] === "production";
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
 await validatePluginCatalog(repoRoot);
 await buildCompanionWorker(repoRoot);
+// After the worker: the sibling companion-assets.json artifact embeds the
+// freshly built standalone worker, and the generated manifest that main.js
+// bundles must carry the hashes of exactly this build.
+await buildCompanionAssets(repoRoot);
 
 const contexts = await Promise.all(
   PLUGIN_CATALOG.map((plugin) =>
