@@ -110,6 +110,28 @@ export function extractProviderTokenUsage(raw: unknown): {
   };
 }
 
+/**
+ * Redacted size of everything the model produced in one response: prose,
+ * thinking, and tool calls. A pure tool-call reply (empty `content`, payload
+ * in the arguments) is real model output — measuring only `content.length`
+ * recorded such successes as 0 chars, which both understated estimated tokens
+ * and made harness attestation treat a healthy tool-calling model as silent.
+ */
+export function measureAssistantPayloadChars(response: {
+  message: { content: string; thinking?: string; role?: string };
+  toolCalls?: readonly unknown[];
+}): number {
+  const toolCallChars =
+    response.toolCalls && response.toolCalls.length > 0
+      ? JSON.stringify(response.toolCalls).length
+      : 0;
+  return (
+    response.message.content.length +
+    (response.message.thinking?.length ?? 0) +
+    toolCallChars
+  );
+}
+
 export function createObservableModelClient({
   client,
   budget,
@@ -181,7 +203,7 @@ export function createObservableModelClient({
         ? await client.streamChat(request, events)
         : await client.chat(request);
       const tokenUsage = extractProviderTokenUsage(response.raw);
-      const responseChars = response.message.content.length;
+      const responseChars = measureAssistantPayloadChars(response);
       const estimatedTokens = tokenUsage.reported
         ? 0
         : Math.max(1, Math.ceil((serializedChars(request) + responseChars) / 4));

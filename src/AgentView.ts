@@ -214,6 +214,7 @@ export class AgentView extends ItemView {
   private activityValueEl: HTMLElement | null = null;
   private effortValueEl: HTMLElement | null = null;
   private elapsedValueEl: HTMLElement | null = null;
+  private budgetValueEl: HTMLElement | null = null;
   private destinationValueEl: HTMLElement | null = null;
   private runStatusEl: HTMLElement | null = null;
   private runStatusTextEl: HTMLElement | null = null;
@@ -575,6 +576,7 @@ export class AgentView extends ItemView {
     this.liveRunDestinationEl = null;
     this.effortValueEl = null;
     this.elapsedValueEl = null;
+    this.budgetValueEl = null;
     this.destinationValueEl = null;
     this.liveAssistantMessageEl = null;
     this.livePlanningMessageEl = null;
@@ -1286,6 +1288,7 @@ export class AgentView extends ItemView {
     this.activityValueEl = this.createMetric(metricsEl, "State", "Idle");
     this.effortValueEl = this.createMetric(metricsEl, "Effort", "Not selected");
     this.elapsedValueEl = this.createMetric(metricsEl, "Elapsed", "0:00");
+    this.budgetValueEl = this.createMetric(metricsEl, "Budget", "Pending");
     this.destinationValueEl = this.createMetric(metricsEl, "Destination", "None");
     if (this.steeringEl) {
       dashboardEl.appendChild(this.steeringEl);
@@ -1513,15 +1516,14 @@ export class AgentView extends ItemView {
   }
 
   private refreshLiveRunBudget(): void {
-    if (!this.liveRunBudgetEl) return;
     const effort = this.runConfig?.effortDecision;
-    if (!effort) {
-      this.liveRunBudgetEl.setText("Pending");
-      return;
-    }
-    this.liveRunBudgetEl.setText(
-      `${this.liveRunModelCalls}/${effort.maxModelCalls} model · ${this.liveRunToolCalls}/${effort.maxToolCalls} tools`,
-    );
+    const label = effort
+      ? `${this.liveRunModelCalls}/${effort.maxModelCalls} model · ${this.liveRunToolCalls}/${effort.maxToolCalls} tools`
+      : "Pending";
+    this.liveRunBudgetEl?.setText(label);
+    // The same live counters back the Run Details metric tile, so the granted
+    // model-call budget is visible outside the Chat live-run card too.
+    this.setMetric(this.budgetValueEl, label);
   }
 
   private createMetric(
@@ -2050,6 +2052,7 @@ export class AgentView extends ItemView {
     this.liveRunBudgetEl?.setText("Pending");
     this.liveRunDestinationEl?.setText("Resolving");
     this.setMetric(this.effortValueEl, "Not selected");
+    this.setMetric(this.budgetValueEl, "Pending");
     this.setMetric(this.destinationValueEl, "None");
     this.resetSteeringComposer();
     this.missionGraphProjection = null;

@@ -16660,6 +16660,82 @@ test("adaptive compound research escalates a spent tier while work is unresolved
   );
 });
 
+test("evidence saturation closes the compound gate early through the reserved turn", () => {
+  const deepMidBudget = {
+    effort: {
+      tier: "deep",
+      budget: {
+        maxModelStepsPerSegment: 60,
+        maxToolCallsPerSegment: 30,
+        maxSegments: 1,
+        maxTotalModelSteps: 60,
+        maxTotalToolCalls: 30,
+        maxDurationMs: null,
+      },
+      reasons: [],
+      constrained: false,
+    },
+    effortUsage: {
+      modelSteps: 12,
+      toolCalls: 6,
+      segmentsStarted: 1,
+      modelStepsInCurrentSegment: 12,
+      toolCallsInCurrentSegment: 6,
+      elapsedMs: 1_000,
+    },
+  } as any;
+
+  // Saturated with nothing unresolved → close well before any hard cap.
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepMidBudget, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: false,
+      saturated: true,
+    }),
+    { action: "close", reason: "evidence_saturated", closureAttempts: 0 },
+  );
+
+  // Unresolved work outranks the saturation verdict — keep researching.
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepMidBudget, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: true,
+      saturated: true,
+    }),
+    { action: "continue" },
+  );
+
+  // Adaptive disabled → the saturation flag is inert.
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepMidBudget, "accepted_research", {
+      enabled: false,
+      hasUnresolvedWork: false,
+      saturated: true,
+    }),
+    { action: "continue" },
+  );
+
+  // Not saturated → unchanged mid-budget continue.
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(deepMidBudget, "accepted_research", {
+      enabled: true,
+      hasUnresolvedWork: false,
+      saturated: false,
+    }),
+    { action: "continue" },
+  );
+
+  // An already-requested closure keeps its original reason.
+  const closureRequested = {
+    ...deepMidBudget,
+    effortClosure: { requested: true, attempts: 0, reason: "evidence_saturated" },
+  } as any;
+  assert.deepEqual(
+    evaluateCompoundResearchBudgetGateV1(closureRequested, "accepted_research"),
+    { action: "close", reason: "evidence_saturated", closureAttempts: 0 },
+  );
+});
+
 test("adaptive compound research never escalates past the hard duration cap", () => {
   const deepAtDuration = {
     effort: {

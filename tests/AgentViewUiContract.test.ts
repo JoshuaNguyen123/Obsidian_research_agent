@@ -51,6 +51,19 @@ test("Run Details is summary-first, conditional, and diagnostic-heavy data stays
   );
 });
 
+test("the model-call budget is visible in Run Details, not only the Chat live card", () => {
+  assert.match(
+    viewSource,
+    /this\.budgetValueEl = this\.createMetric\(metricsEl, "Budget", "Pending"\)/u,
+  );
+  // One formatter feeds both surfaces so the tile can never drift from the
+  // live-run card.
+  assert.match(
+    viewSource,
+    /refreshLiveRunBudget[\s\S]{0,600}this\.setMetric\(this\.budgetValueEl, label\)/u,
+  );
+});
+
 test("completed assistant messages use isolated host-only Markdown rendering", () => {
   assert.match(viewSource, /renderSafeAssistantMarkdownV1/u);
   assert.doesNotMatch(viewSource, /MarkdownRenderer\.render/u);

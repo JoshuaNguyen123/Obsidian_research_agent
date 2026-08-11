@@ -107,6 +107,46 @@ test("companion controller hash-materializes embedded runtime assets under appli
   }
 });
 
+test("constructing the controller never reads or hashes the bundled runtime assets", async () => {
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), "agentic-companion-lazy-"));
+  try {
+    const Controller = await loadBundledController(fixtureRoot);
+    let assetReads = 0;
+    const recordingAssets = new Proxy(
+      { "companion_control.py": "print('safe')\n" },
+      {
+        get(target, property, receiver) {
+          if (typeof property === "string" && property in target) {
+            assetReads += 1;
+          }
+          return Reflect.get(target, property, receiver);
+        },
+        ownKeys(target) {
+          assetReads += 1;
+          return Reflect.ownKeys(target);
+        },
+      },
+    );
+    const controller = new Controller({
+      dataDir: path.join(fixtureRoot, "data"),
+      applicationDataRoot: fixtureRoot,
+      runtimeAssets: recordingAssets,
+    });
+    assert.equal(
+      assetReads,
+      0,
+      "plugin load must not pay the ~950 KB asset hash walk",
+    );
+    assert.match(controller.runtimeRoot, /runtime/u);
+    assert.ok(
+      assetReads > 0,
+      "first runtime-identity access performs the deferred hash walk",
+    );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("companion controller passes exact approved-root argv to service and token commands", async () => {
   const fixtureRoot = await mkdtemp(path.join(tmpdir(), "agentic-companion-argv-"));
   try {

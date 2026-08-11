@@ -122,7 +122,18 @@ type BufferedRunEvent = {
   args: unknown[];
 };
 
+export interface RunCoordinatorOptions {
+  /**
+   * Host-owned tap fired for every model-call evidence record the coordinator
+   * accepts. Session-scoped observers (e.g. the latency tracker) live on the
+   * plugin, not in per-run state, so they survive across runs.
+   */
+  observeModelCallEvidence?: (evidence: ModelCallEvidenceV1) => void;
+}
+
 export class RunCoordinator {
+  constructor(private readonly options: RunCoordinatorOptions = {}) {}
+
   private readonly listeners = new Set<AgentRunEvents>();
   private readonly bufferedEvents: BufferedRunEvent[] = [];
   private activePromise: Promise<RunOutcome> | null = null;
@@ -484,6 +495,7 @@ export class RunCoordinator {
     } else if (key === "onModelCallEvidence") {
       const evidence = args[0] as ModelCallEvidenceV1 | undefined;
       if (evidence) {
+        this.options.observeModelCallEvidence?.(evidence);
         this.modelCallEvidence.push({ ...evidence });
         if (this.modelCallEvidence.length > 256) this.modelCallEvidence.shift();
         // A local observer-budget rejection and a client-returned quota error

@@ -9,6 +9,12 @@ export interface LeadContinuationDecisionInput {
   segmentIndex: number;
   maxSegments: number;
   aborted: boolean;
+  /**
+   * The completed segment reported research evidence saturation: retrieval
+   * ran dry with nothing unresolved. Another segment cannot add material
+   * evidence, so continuation is refused regardless of remaining caps.
+   */
+  evidenceSaturated?: boolean;
   currentProgressFingerprint?: string;
   previousProgressFingerprint?: string;
   currentAcceptanceMissing?: readonly string[];
@@ -34,6 +40,32 @@ export function createLeadProgressFingerprintV1(input: {
   return `progress:${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+export interface LeadCompletionShape {
+  step: number;
+  stopReason: string;
+}
+
+/**
+ * A Lead segment started on an already-aborted deadline performs zero steps
+ * and reports stopReason "budget" (or "user_stopped" if the abort reason text
+ * escaped deadline classification). Adopting that completion would demote a
+ * mission whose result was already applied and forwarded. Such an event is a
+ * scheduling artifact, not an outcome, and must not replace the prior
+ * terminal-success completion.
+ */
+export function isDemotingZeroStepLeadCompletion(
+  previousSuccess: LeadCompletionShape | null,
+  next: LeadCompletionShape,
+): boolean {
+  return (
+    previousSuccess !== null &&
+    (previousSuccess.stopReason === "write_completed" ||
+      previousSuccess.stopReason === "final") &&
+    next.step === 0 &&
+    (next.stopReason === "budget" || next.stopReason === "user_stopped")
+  );
+}
+
 /**
  * An orchestrated Lead owns a bounded proof-repair reserve after handoff.
  * Generic missions intentionally do not auto-continue acceptance failures, but
@@ -49,6 +81,7 @@ export function shouldContinueResearchLead(
     input.usedToolCalls >= input.maxToolCalls ||
     input.segmentIndex + 1 >= input.maxSegments ||
     input.aborted ||
+    input.evidenceSaturated === true ||
     input.availableRepairAction === false
   ) {
     return false;

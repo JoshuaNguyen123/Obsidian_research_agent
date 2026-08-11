@@ -4,6 +4,7 @@ import {
   categorizeModelEndpoint,
   createObservableModelClient,
   extractProviderTokenUsage,
+  measureAssistantPayloadChars,
   type ModelCallEvidenceV1,
 } from "../src/model/modelCallEvidence";
 import { ModelClientError, type ModelClient } from "../src/model/types";
@@ -75,6 +76,55 @@ test("emits redacted production evidence and enforces the call budget", async ()
   assert.equal(evidence[1].model, "gpt-oss:120b-cloud");
   assert.doesNotMatch(JSON.stringify(evidence), /secret prompt|provider text|ollama\.com/);
   assert.equal(observed.getUsage().modelCallCount, 1);
+});
+
+test("a pure tool-call success records its payload size, never zero chars", async () => {
+  const toolCallResponse = {
+    message: { role: "assistant" as const, content: "" },
+    toolCalls: [
+      {
+        id: "call-1",
+        name: "append_to_current_file",
+        arguments: { content: "## Section\nStreamed body text." },
+      },
+    ],
+  };
+  assert.ok(measureAssistantPayloadChars(toolCallResponse) > 0);
+  assert.equal(
+    measureAssistantPayloadChars({
+      message: { role: "assistant", content: "prose", thinking: "thought" },
+      toolCalls: [],
+    }),
+    "prose".length + "thought".length,
+  );
+
+  const evidence: ModelCallEvidenceV1[] = [];
+  const underlying: ModelClient = {
+    descriptor: {
+      provider: "ollama",
+      model: "minimax-m3:cloud",
+      endpointCategory: "ollama_cloud",
+      transportKind: "production",
+    },
+    chat: async () => toolCallResponse,
+    streamChat: async () => {
+      throw new Error("not used");
+    },
+  };
+  const observed = createObservableModelClient({
+    client: underlying,
+    budget: { schemaVersion: 1, maxCalls: 4, maxTokens: 100_000, maxWallClockMs: 10_000 },
+    onEvidence: (item) => evidence.push(item),
+  });
+  await observed.client.chat({ messages: [{ role: "user", content: "go" }] });
+  assert.equal(evidence[0].outcome, "success");
+  // A tool-calling model is producing real output; harness attestation and
+  // token estimation must both see a non-empty response.
+  assert.ok(evidence[0].responseChars > 0);
+  assert.doesNotMatch(
+    JSON.stringify(evidence),
+    /Streamed body text|append_to_current_file/,
+  );
 });
 
 test("distinguishes an invoked-client quota failure from a local observer-budget rejection", async () => {

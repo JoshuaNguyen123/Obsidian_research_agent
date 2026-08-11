@@ -65,6 +65,7 @@ import {
 } from "./fixtures/dailyUseAcceptance";
 import type { MissionScorecardV1 } from "../src/agent/missionScorecard";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
+import { extractVisibleCompletionReflection } from "./fixtures/reflectionAssertions";
 import { PHASE4_CODE_PLUGIN_ID } from "./fixtures/phase4Harness";
 import { NATIVE_CORE_PLUGIN_ID } from "./fixtures/nativeObsidianHarness";
 import {
@@ -4303,41 +4304,6 @@ function requireNestedApproval(
   expect(approval.approvalId).toBeTruthy();
   expect(approval.approvalFingerprint).toBe(approval.payloadFingerprint);
   return approval;
-}
-
-function extractVisibleCompletionReflection(note: string): {
-  count: number;
-  visible: string;
-  wordCount: number;
-} {
-  const heading =
-    /^## (?:Mission completion reflection|Agent project reflection)\s*$/gimu;
-  const starts = [...note.matchAll(heading)];
-  const first = starts[0];
-  const bodyStart =
-    first?.index === undefined ? -1 : first.index + first[0].length;
-  const nextHeading =
-    bodyStart < 0
-      ? null
-      : /^##\s+/gmu.exec(note.slice(bodyStart));
-  const bodyEnd =
-    bodyStart < 0
-      ? -1
-      : nextHeading?.index === undefined
-        ? note.length
-        : bodyStart + nextHeading.index;
-  const raw =
-    bodyStart < 0 || bodyEnd < bodyStart
-      ? ""
-      : note.slice(bodyStart, bodyEnd);
-  const visible = raw
-    .replace(/<!--[\s\S]*?-->/gu, "")
-    .replace(/\s+/gu, " ")
-    .trim();
-  const countable = visible.replace(/https?:\/\/[^\s)]+/giu, " ");
-  const words =
-    countable.match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]*\b/gu) ?? [];
-  return { count: starts.length, visible, wordCount: words.length };
 }
 
 async function readRawRunSnapshot(page: Page): Promise<any> {

@@ -30,6 +30,7 @@ import {
   type ModelExecutionBudgetV1,
   type ModelUsageAggregateV1,
 } from "./model/modelCallEvidence";
+import { clampLatencyScale } from "./model/modelLatencyTracker";
 import {
   extractToolCallsFromAssistantText,
   recoverToolCallsFromAssistantMessage,
@@ -748,6 +749,7 @@ import {
   resolveResearchEffortBudget,
   type ResearchEffortTier,
 } from "./agent/researchEffortPolicy";
+import { createResearchProgressController } from "./agent/researchProgressController";
 import { ASK_USER_TOOL_NAME } from "./tools/clarificationTools";
 import {
   ClarificationBroker,
@@ -1251,6 +1253,12 @@ export interface AgentRunCompleteEvent {
   autoContinueRecommended?: boolean;
   autoContinueReason?: AutoContinuationReason;
   autonomyStats?: import("./agent/autonomyRunStats").AutonomyRunStatsV1 | null;
+  /**
+   * Research evidence saturated before any hard cap: further retrieval was not
+   * producing material new evidence. Continuation loops (e.g. the orchestrated
+   * Lead) must not spend more segments on retrieval after this.
+   */
+  researchSaturated?: boolean;
 }
 
 /**
@@ -1383,6 +1391,12 @@ interface RunAgentMissionOptions {
   completionSegmentIndex?: number;
   /** Soft segment budget for the current multi-segment host loop. */
   maxCompletionSegments?: number;
+  /**
+   * Session-observed model latency multiplier for effort wall-clock budgets,
+   * clamped to [1, 2] on read. The user's configured maxRunMinutes remains a
+   * hard ceiling; only the effort-tier allowance scales.
+   */
+  getLatencyScale?: () => number;
   /**
    * Host-owned mid-run steering. The runner only *drains* at step boundaries;
    * the host owns the queue and enforces the narrowing invariant at enqueue
@@ -1735,6 +1749,7 @@ export async function runAgentMission({
   completionSegmentIndex,
   maxCompletionSegments,
   runSteering,
+  getLatencyScale,
 }: RunAgentMissionOptions): Promise<void> {
   const runStartedAt = nowMs();
   const configuredMaxRunMs =
@@ -2240,8 +2255,12 @@ export async function runAgentMission({
     const usageNow = observableModel.getUsage();
     const maxCalls =
       usageNow.modelCallCount + planningReserveCalls + effort.maxModelCalls;
+    // Effort tiers were sized for a fast model; stretch only the tier's own
+    // allowance by the session's observed latency. Spent wall-clock and the
+    // user's configured cap (inside applyEffortRunDeadline) stay unscaled.
+    const latencyScale = clampLatencyScale(getLatencyScale?.());
     const maxRunMs = applyEffortRunDeadline(
-      usageNow.wallClockMs + effort.maxWallClockMs,
+      usageNow.wallClockMs + Math.round(effort.maxWallClockMs * latencyScale),
     );
     updateModelExecutionBudget({
       schemaVersion: 1,
@@ -5492,6 +5511,28 @@ export async function runAgentMission({
       );
     }
   };
+  // One evidence-saturation observer per run, created in the run closure so
+  // its state can never leak across parallel calls or the continuation pool.
+  // `recordCompoundResearchUsage` above stays the sole effortUsage accountant;
+  // the controller's internal usage is a parallel view consulted only for its
+  // acceptance_saturated verdict — every cap and escalation belongs to
+  // evaluateCompoundResearchBudgetGateV1.
+  const compoundResearchProgress =
+    compoundLifecycleDetected &&
+    researchPlan?.effort &&
+    runToolContext.settings?.adaptiveResearchProgress !== false
+      ? createResearchProgressController({
+          tier: researchPlan.effort.tier,
+          usage: researchPlan.effortUsage,
+          consecutiveLowYieldBatches:
+            researchPlan.effortSignals?.consecutiveLowYieldBatches,
+          lastEvidenceYield: researchPlan.effortSignals?.lastEvidenceYield,
+        })
+      : null;
+  let compoundResearchSaturated = false;
+  let compoundResearchObservedToolCalls =
+    researchPlan?.effortUsage?.toolCalls ?? 0;
+  let compoundResearchObservedEvidence = missionEvidenceRecords.length;
   if (
     researchPlan &&
     researchPlan.sourceRequirements.minFetchedSources > 0
@@ -8426,6 +8467,7 @@ export async function runAgentMission({
       maxSteps,
       autoContinuation,
       stopDetail,
+      compoundResearchSaturated,
     );
   };
   const backgroundDispatchTerminalCount = backgroundDispatchSummary
@@ -15526,6 +15568,52 @@ export async function runAgentMission({
         currentStage: currentLifecycleStage,
       };
     }
+    const adaptiveHasUnresolvedWork = missionPlan
+      ? !isMissionPlanComplete(missionPlan)
+      : false;
+    if (
+      compoundResearchProgress &&
+      currentLifecycleStage === "accepted_research" &&
+      researchPlan?.effort
+    ) {
+      const toolCallsNow = researchPlan.effortUsage?.toolCalls ?? 0;
+      const evidenceNow = missionEvidenceRecords.length;
+      const stepToolCalls = Math.max(
+        0,
+        toolCallsNow - compoundResearchObservedToolCalls,
+      );
+      const stepNewEvidence = Math.max(
+        0,
+        evidenceNow - compoundResearchObservedEvidence,
+      );
+      compoundResearchObservedToolCalls = toolCallsNow;
+      compoundResearchObservedEvidence = evidenceNow;
+      const progressDecision = compoundResearchProgress.evaluateBatch(
+        // A synthesis-only step passes toolCalls 0 and the controller returns
+        // a null batch yield, so pausing to write never advances saturation.
+        { toolCalls: stepToolCalls, newEvidenceCount: stepNewEvidence },
+        {
+          acceptanceGaps: [],
+          remainingQuestions: adaptiveHasUnresolvedWork ? 1 : 0,
+          conflicts: 0,
+        },
+      );
+      // Only the evidence-saturation verdict is consumed. The controller's
+      // cap/segment/escalation outputs are computed against its own parallel
+      // usage view and are deliberately ignored: the budget gate below owns
+      // every cap decision against the durable effortUsage.
+      compoundResearchSaturated =
+        progressDecision.action === "stop" &&
+        progressDecision.reason === "acceptance_saturated";
+      const signalsSnapshot = compoundResearchProgress.snapshot();
+      researchPlan = {
+        ...researchPlan,
+        effortSignals: {
+          consecutiveLowYieldBatches: signalsSnapshot.consecutiveLowYieldBatches,
+          lastEvidenceYield: signalsSnapshot.lastEvidenceYield,
+        },
+      };
+    }
     const adaptiveResearchSignal =
       runToolContext.settings?.adaptiveResearchProgress === false
         ? undefined
@@ -15534,9 +15622,8 @@ export async function runAgentMission({
             // Material work remains while the mission plan is not yet complete.
             // Once it completes the loop verdict stops the run before this gate
             // can escalate, so escalation stays bounded by real progress.
-            hasUnresolvedWork: missionPlan
-              ? !isMissionPlanComplete(missionPlan)
-              : false,
+            hasUnresolvedWork: adaptiveHasUnresolvedWork,
+            saturated: compoundResearchSaturated,
           };
     let compoundResearchGate = evaluateCompoundResearchBudgetGateV1(
       researchPlan,
@@ -15617,7 +15704,10 @@ export async function runAgentMission({
         currentLifecycleStage,
       );
       events.onStatus?.(
-        "Adaptive research budget reached; using one reserved turn to publish the accepted evidence package.",
+        compoundResearchGate.action === "close" &&
+          compoundResearchGate.reason === "evidence_saturated"
+          ? "Research evidence saturated; using one reserved turn to publish the accepted evidence package."
+          : "Adaptive research budget reached; using one reserved turn to publish the accepted evidence package.",
       );
     }
     if (setLooseCompoundEnabled) {
@@ -21440,6 +21530,12 @@ export interface CompoundResearchAdaptiveSignalV1 {
   enabled: boolean;
   hasUnresolvedWork: boolean;
   maxTier?: ResearchEffortTier;
+  /**
+   * Evidence-yield saturation verdict from the adaptive progress controller:
+   * two consecutive low-yield batches with nothing unresolved. Lets the gate
+   * close (with its reserved publication turn) well before the hard caps.
+   */
+  saturated?: boolean;
 }
 
 function nextCompoundResearchTierV1(
@@ -21630,6 +21726,17 @@ export function evaluateCompoundResearchBudgetGateV1(
     return {
       action: "close",
       reason: plan.effortClosure.reason ?? "research_budget_reached",
+      closureAttempts,
+    };
+  }
+  // Evidence saturation closes early through the same reserved-publication
+  // path as a spent budget: retrieval has run dry and nothing is unresolved,
+  // so grinding to the hard caps would only spend model calls. This branch is
+  // deliberately tier-independent.
+  if (adaptive?.enabled && adaptive.saturated && !adaptive.hasUnresolvedWork) {
+    return {
+      action: "close",
+      reason: "evidence_saturated",
       closureAttempts,
     };
   }
@@ -31721,6 +31828,7 @@ function completeRun(
   maxSteps = MAX_AGENT_STEPS,
   autoContinuation?: AutoContinuationDecision,
   stopDetail?: string | null,
+  researchSaturated?: boolean,
 ) {
   const message = getStopReasonMessage(stopReason);
   emitStatus(
@@ -31741,6 +31849,7 @@ function completeRun(
           autoContinueReason: autoContinuation.reason,
         }
       : {}),
+    ...(researchSaturated ? { researchSaturated: true } : {}),
   });
   events.onTrace?.({
     id: `final-${stopReason}`,

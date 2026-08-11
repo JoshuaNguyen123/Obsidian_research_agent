@@ -138,6 +138,25 @@ test("BYOK autonomous journey requires its Linear cleanup scope before boot", ()
   );
 });
 
+test("daily-use-compound requires its GitHub token before boot", () => {
+  assert.throws(
+    () =>
+      assertExternalCredentialProjectPreconditions(
+        { projects: ["daily-use-compound"] },
+        {},
+        "win32",
+      ),
+    /requires E2E_GITHUB_TOKEN/u,
+  );
+  assert.doesNotThrow(() =>
+    assertExternalCredentialProjectPreconditions(
+      { projects: ["daily-use-compound"] },
+      { E2E_GITHUB_TOKEN: "github_pat_disposable_scope" },
+      "win32",
+    ),
+  );
+});
+
 test("BYOK autonomous journey proves one root publication and cleans every owned issue", () => {
   const spec = readFileSync(
     new URL("../e2e/byok-autonomous-journey.spec.ts", import.meta.url),

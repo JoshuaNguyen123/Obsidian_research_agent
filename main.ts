@@ -28,6 +28,7 @@ import {
   isDirectOllamaCloudApiBaseUrl,
   preflightOllamaCloudAgentCapabilities,
 } from "./src/model/ollamaCloudCapabilityPreflight";
+import { createModelLatencyTracker } from "./src/model/modelLatencyTracker";
 import { probeToolCallBehavior } from "./src/model/toolCallBehavioralProbe";
 import { createPythonFastEmbedProvider } from "./src/embeddings/pythonFastEmbedProvider";
 import {
@@ -324,6 +325,7 @@ import { mergeResearchWorkerResult } from "./src/orchestrator/teamEvidenceMerge"
 import type { ResearchWorkerResult } from "./src/orchestrator/researchWorker";
 import {
   createLeadProgressFingerprintV1,
+  isDemotingZeroStepLeadCompletion,
   shouldContinueResearchLead,
 } from "./src/orchestrator/leadContinuation";
 import { resolveResearchTeamBudget } from "./src/orchestrator/researchTeamBudget";
@@ -764,7 +766,13 @@ export default class AgenticResearcherPlugin extends Plugin {
   private semanticIndexNeedsBootstrap = false;
   private semanticIndexConsecutiveFailures = 0;
   private semanticIndexAutoUpdatesSuspended = false;
-  private readonly runCoordinator = new RunCoordinator();
+  // Session-scoped: observed provider latency survives across runs so a slow
+  // model's second mission starts with realistically scaled wall-clock budgets.
+  private readonly modelLatencyTracker = createModelLatencyTracker();
+  private readonly runCoordinator = new RunCoordinator({
+    observeModelCallEvidence: (evidence) =>
+      this.modelLatencyTracker.observeEvidence(evidence),
+  });
   private readonly approvalBroker = new ApprovalBroker();
   private readonly durableMissionOwnerId = `plugin-${createAgentRunId()}`;
   private durableMissionRuntime: LiveDurableMissionRuntime | null = null;
@@ -4337,6 +4345,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       await runAgentMission({
         prompt,
         runId,
+        getLatencyScale: () => this.modelLatencyTracker.getScale(),
         conversationHistory: [],
         modelClient: this.createModelClient(),
         toolRegistry: registry,
@@ -4606,6 +4615,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       await runAgentMission({
         prompt,
         runId: identity.runId,
+        getLatencyScale: () => this.modelLatencyTracker.getScale(),
         conversationHistory: [],
         modelClient: this.createModelClient(),
         toolRegistry: registry,
@@ -8620,6 +8630,7 @@ export default class AgenticResearcherPlugin extends Plugin {
 
             await runAgentMission({
               prompt: segmentPrompt,
+              getLatencyScale: () => this.modelLatencyTracker.getScale(),
               conversationHistory: segmentHistory,
               modelClient: this.createModelClient(),
               toolRegistry: this.createToolRegistry(),
@@ -9008,8 +9019,17 @@ export default class AgenticResearcherPlugin extends Plugin {
       workerMaxMinutes,
       configuredMaxRunMinutes ?? workerMaxMinutes,
     );
-    const rootWallClockMs = (workerMaxMinutes + leadMaxMinutes) * 60_000;
-    const leadWallClockMs = leadMaxMinutes * 60_000;
+    // The configured minutes were sized for a fast model. Scale every
+    // wall-clock budget in this team by the session's observed latency
+    // (bounded to at most 2x) so a slow provider is not demoted to a budget
+    // terminal mid-write. Deadlines and participant ledgers must use the same
+    // scaled numbers or settleLeadBudget could overdraw the ledger.
+    const latencyScale = this.modelLatencyTracker.getScale();
+    const workerWallClockMs = Math.round(
+      workerMaxMinutes * 60_000 * latencyScale,
+    );
+    const leadWallClockMs = Math.round(leadMaxMinutes * 60_000 * latencyScale);
+    const rootWallClockMs = workerWallClockMs + leadWallClockMs;
     const rootDeadline = createLinkedDeadlineSignal(
       input.abortSignal,
       rootWallClockMs,
@@ -9108,7 +9128,7 @@ export default class AgenticResearcherPlugin extends Plugin {
       participantId: "specialist",
       modelSteps: workerMaxSteps,
       toolCalls: workerMaxToolCalls,
-      wallClockMs: workerMaxMinutes * 60_000,
+      wallClockMs: workerWallClockMs,
     });
 
     const researchNodeId = scaffold.nodeIds.specialist;
@@ -9138,7 +9158,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     const workerStartedAt = Date.now();
     const workerDeadline = createLinkedDeadlineSignal(
       rootDeadline.signal,
-      workerMaxMinutes * 60_000,
+      workerWallClockMs,
       "Adaptive Specialist wall-clock budget exhausted.",
     );
     try {
@@ -9411,6 +9431,11 @@ export default class AgenticResearcherPlugin extends Plugin {
     const leadCompletion: { current: AgentRunCompleteEvent | null } = {
       current: null,
     };
+    // The last completion whose result was actually applied and forwarded.
+    // A later zero-step segment aborted at boot must never replace it.
+    const lastSuccessfulLeadCompletion: {
+      current: AgentRunCompleteEvent | null;
+    } = { current: null };
     let leadModelSteps = 0;
     let leadToolCalls = 0;
     // Captured for the independent critic: only the objective, final output,
@@ -9466,6 +9491,12 @@ export default class AgenticResearcherPlugin extends Plugin {
         if (property === "onRunComplete") {
           return (event: AgentRunCompleteEvent) => {
             leadCompletion.current = event;
+            if (
+              event.stopReason === "write_completed" ||
+              event.stopReason === "final"
+            ) {
+              lastSuccessfulLeadCompletion.current = event;
+            }
             const finalizedTeam = finalizeAutonomyRunStats(teamAutonomyStats, {
               elapsedMs: Date.now() - teamStartedAt,
             });
@@ -9613,6 +9644,21 @@ export default class AgenticResearcherPlugin extends Plugin {
             segmentToolCalls += 1;
           },
           onRunComplete: (event) => {
+            if (
+              !input.abortSignal.aborted &&
+              isDemotingZeroStepLeadCompletion(
+                lastSuccessfulLeadCompletion.current,
+                event,
+              )
+            ) {
+              // The deadline expired between the loop's abort check and the
+              // segment's first step. Restore the applied completion and
+              // report "continuing" so the proxy never forwards the demoting
+              // terminal event; the loop still ends via continueLead.
+              leadCompletion.current = lastSuccessfulLeadCompletion.current;
+              continueLead = false;
+              return true;
+            }
             leadCompletion.current = event;
             leadModelSteps += Math.max(1, event.step);
             const currentProgressFingerprint = createLeadProgressFingerprintV1({
@@ -9635,6 +9681,7 @@ export default class AgenticResearcherPlugin extends Plugin {
               segmentIndex,
               maxSegments: leadMaxSegments,
               aborted: leadDeadline.signal.aborted,
+              evidenceSaturated: event.researchSaturated === true,
               currentProgressFingerprint,
               previousProgressFingerprint: previousLeadProgressFingerprint,
               currentAcceptanceMissing,
@@ -9649,6 +9696,7 @@ export default class AgenticResearcherPlugin extends Plugin {
         });
         await runAgentMission({
           prompt: leadPrompt,
+          getLatencyScale: () => this.modelLatencyTracker.getScale(),
           ...(segmentIndex === 0 ? { runId: leadSegmentRunId } : {}),
           conversationHistory: leadHistory,
           modelClient: this.createModelClient(),
@@ -9790,6 +9838,18 @@ export default class AgenticResearcherPlugin extends Plugin {
                 leadEvents.onRunConfig?.(event);
               },
               onRunComplete: (event) => {
+                if (
+                  !input.abortSignal.aborted &&
+                  isDemotingZeroStepLeadCompletion(
+                    lastSuccessfulLeadCompletion.current,
+                    event,
+                  )
+                ) {
+                  // The escalation segment aborted at boot after the applied
+                  // completion was already forwarded; keep that completion.
+                  leadCompletion.current = lastSuccessfulLeadCompletion.current;
+                  return true;
+                }
                 leadCompletion.current = event;
                 leadModelSteps += Math.max(1, event.step);
                 return false;
@@ -9801,6 +9861,7 @@ export default class AgenticResearcherPlugin extends Plugin {
                 "An independent critic reviewed the result and found gaps to address before finishing:",
                 ...criticResult.check.missing.map((item) => `- ${item}`),
               ].join("\n"),
+              getLatencyScale: () => this.modelLatencyTracker.getScale(),
               conversationHistory: [],
               modelClient: this.createModelClient(),
               toolRegistry: teamBaseRegistry,
@@ -10968,6 +11029,7 @@ export default class AgenticResearcherPlugin extends Plugin {
             await runAgentMission({
               prompt: segmentPrompt,
               runId: segmentRunId,
+              getLatencyScale: () => this.modelLatencyTracker.getScale(),
               conversationHistory: segmentHistory,
               modelClient: this.createModelClient(),
               toolRegistry: this.createToolRegistry(),

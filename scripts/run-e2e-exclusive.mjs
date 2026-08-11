@@ -55,6 +55,12 @@ const EXTERNAL_CREDENTIAL_PROJECTS = Object.freeze({
     requiredEnv: ["LINEAR_LIVE_TEST_TEAM_ID"],
     platforms: ["win32"],
   },
+  "daily-use-compound": {
+    // The spec hard-requires this token (DU-06 repository administration);
+    // gating here fails in seconds instead of after the ~5 minute boot.
+    requiredEnv: ["E2E_GITHUB_TOKEN"],
+    platforms: ["win32"],
+  },
   "github-askpass-runtime-live": {
     requiredEnv: ["E2E_GITHUB_TOKEN"],
     platforms: ["win32"],

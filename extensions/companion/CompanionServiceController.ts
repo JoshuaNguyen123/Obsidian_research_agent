@@ -36,19 +36,26 @@ export interface CompanionRuntimeAccessOptionsV1 {
 /** Desktop-only command boundary for the bundled Python service manager. */
 export class CompanionServiceControllerV1 {
   readonly baseUrl: string;
-  readonly controlScriptPath: string;
   readonly dataDir: string;
   /** Pinned sibling used by the Code capability and the standalone worker. */
   readonly codeApplicationDataRoot: string;
-  readonly runtimeRoot: string;
-  readonly bundleHash: string;
   readonly port: number;
   private readonly pythonCommands: Array<{ executable: string; args: string[] }>;
   private readonly timeoutMs: number;
   private readonly runtimeAssets: Readonly<Record<string, string>>;
-  private readonly fileHashes: Record<string, string>;
   private readonly applicationDataRoot: string;
   private nodeExecutable: string | null = null;
+  /**
+   * Hashing every bundled runtime asset (~950 KB) is deferred to first use.
+   * Both hosts construct this controller during plugin load, and a session
+   * that never touches the companion should not pay the hash walk at startup.
+   */
+  private runtimeIdentity: {
+    fileHashes: Record<string, string>;
+    bundleHash: string;
+    runtimeRoot: string;
+    controlScriptPath: string;
+  } | null = null;
 
   constructor(options: CompanionServiceControllerOptionsV1) {
     const path = requireNodeModule<typeof import("path")>(
@@ -67,26 +74,63 @@ export class CompanionServiceControllerV1 {
     this.codeApplicationDataRoot = path.join(this.applicationDataRoot, "code");
     assertSafeApplicationDataPath(this.applicationDataRoot, this.dataDir, path);
     this.runtimeAssets = options.runtimeAssets ?? COMPANION_RUNTIME_ASSETS_V1;
-    const crypto = requireNodeModule<typeof import("crypto")>(
-      "crypto",
-      "companion_service_control",
-    );
-    this.fileHashes = Object.fromEntries(
-      Object.entries(this.runtimeAssets)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([name, content]) => [name, sha256(content, crypto)]),
-    );
-    this.bundleHash = sha256(JSON.stringify(this.fileHashes), crypto);
-    this.runtimeRoot = path.join(
-      this.dataDir,
-      "runtime",
-      `v1-${this.bundleHash.slice("sha256:".length, "sha256:".length + 16)}`,
-    );
-    this.controlScriptPath = path.join(this.runtimeRoot, "companion_control.py");
     this.port = clampInteger(options.port ?? 8765, 1, 65_535);
     this.baseUrl = `http://127.0.0.1:${this.port}`;
     this.pythonCommands = options.pythonCommands ?? defaultPythonCommands(os.platform());
     this.timeoutMs = clampInteger(options.timeoutMs ?? 120_000, 1_000, 300_000);
+  }
+
+  get bundleHash(): string {
+    return this.resolveRuntimeIdentity().bundleHash;
+  }
+
+  get runtimeRoot(): string {
+    return this.resolveRuntimeIdentity().runtimeRoot;
+  }
+
+  get controlScriptPath(): string {
+    return this.resolveRuntimeIdentity().controlScriptPath;
+  }
+
+  private get fileHashes(): Record<string, string> {
+    return this.resolveRuntimeIdentity().fileHashes;
+  }
+
+  private resolveRuntimeIdentity(): {
+    fileHashes: Record<string, string>;
+    bundleHash: string;
+    runtimeRoot: string;
+    controlScriptPath: string;
+  } {
+    if (this.runtimeIdentity) {
+      return this.runtimeIdentity;
+    }
+    const path = requireNodeModule<typeof import("path")>(
+      "path",
+      "companion_service_control",
+    );
+    const crypto = requireNodeModule<typeof import("crypto")>(
+      "crypto",
+      "companion_service_control",
+    );
+    const fileHashes = Object.fromEntries(
+      Object.entries(this.runtimeAssets)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([name, content]) => [name, sha256(content, crypto)]),
+    );
+    const bundleHash = sha256(JSON.stringify(fileHashes), crypto);
+    const runtimeRoot = path.join(
+      this.dataDir,
+      "runtime",
+      `v1-${bundleHash.slice("sha256:".length, "sha256:".length + 16)}`,
+    );
+    this.runtimeIdentity = {
+      fileHashes,
+      bundleHash,
+      runtimeRoot,
+      controlScriptPath: path.join(runtimeRoot, "companion_control.py"),
+    };
+    return this.runtimeIdentity;
   }
 
   async install(): Promise<CompanionServiceCommandResultV1> {

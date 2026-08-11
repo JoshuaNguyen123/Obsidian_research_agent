@@ -86,6 +86,15 @@ export interface ResearchPlan {
     attempts: number;
     reason?: string;
   };
+  /**
+   * Durable evidence-saturation signals from the adaptive progress controller,
+   * persisted so a resumed run keeps its consecutive-low-yield history instead
+   * of restarting saturation detection from zero.
+   */
+  effortSignals?: {
+    consecutiveLowYieldBatches: number;
+    lastEvidenceYield: number;
+  };
   nextAction?: ResearchNextAction;
 }
 

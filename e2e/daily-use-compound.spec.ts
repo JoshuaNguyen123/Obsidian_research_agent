@@ -39,6 +39,7 @@ import { LinearGraphqlClient } from "../src/integrations/linear/client";
 import { parseRenderedCompatibleWorkItemSpec } from "../src/integrations/linear/WorkItemParser";
 import type { HttpTransport } from "../src/model/types";
 import { laneSelectedV1 } from "./fixtures/laneSelection";
+import { extractVisibleCompletionReflection } from "./fixtures/reflectionAssertions";
 
 const execFileAsync = promisify(execFile);
 const FULL_SHA = /^[a-f0-9]{40}$/u;
@@ -738,7 +739,26 @@ test("DU-06 checkers exact-SHA lifecycle restarts, cleans disposable providers, 
     expect(note).toMatch(/king/iu);
     expect(note).toMatch(/linear\.app/iu);
     expect(note).toMatch(/github\.com/iu);
-    expect(note).toMatch(/## Agent project reflection/iu);
+    // Reflection quality, not just presence: exactly one host-authored
+    // reflection whose visible prose reads as a bounded human summary with the
+    // real provider links, while proof lineage stays in the hidden marker.
+    const reflection = extractVisibleCompletionReflection(note);
+    expect(reflection.count, "exactly one project reflection").toBe(1);
+    expect(reflection.wordCount).toBeGreaterThanOrEqual(35);
+    expect(reflection.wordCount).toBeLessThanOrEqual(100);
+    expect(reflection.visible).toMatch(/linear\.app/iu);
+    expect(reflection.visible).toMatch(/github\.com/iu);
+    expect(reflection.visible).toMatch(/targeted and full validation passed/iu);
+    expect(reflection.visible).toMatch(/pull request #\d+/iu);
+    expect(reflection.visible).toMatch(
+      /published evidence stops at this draft|merge is complete/iu,
+    );
+    // Host bookkeeping vocabulary must never leak into the visible summary.
+    // (The acceptance-criterion excerpt is model-authored, so generic words
+    // like "run" or "tool" are not banned here — only host-proof jargon.)
+    expect(reflection.visible).not.toMatch(
+      /\breceipts?\b|\bfingerprint\b|\bworkspace(?: id)?\b|\bhost[- ]verified\b/iu,
+    );
     expect(note).toContain(codeHandoff.targetedValidationReceiptId);
     expect(note).toContain(codeHandoff.fullValidationReceiptId);
     expect(note).toContain(codeHandoff.localCommitReceiptId);
