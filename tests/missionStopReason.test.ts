@@ -83,3 +83,15 @@ test("mission-graph authority errors map to graph_blocked not provider_error", (
     "provider_error",
   );
 });
+
+test("repeated policy deferral is labeled as internal orchestration, not external state", () => {
+  for (const stopReason of ["error", "budget"] as const) {
+    const reason = fromAgentRunStopReason(
+      stopReason,
+      "policy_deferral_repeated: create_design_canvas",
+    );
+    assert.equal(reason, "orchestration_deadlock");
+    assert.match(stopReasonChatLine(reason), /internal mission plan/i);
+    assert.doesNotMatch(stopReasonChatLine(reason), /external state/i);
+  }
+});

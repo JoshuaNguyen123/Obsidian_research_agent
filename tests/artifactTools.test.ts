@@ -158,6 +158,41 @@ test("create_design_canvas creates lane-based architecture diagrams", async () =
   );
 });
 
+test("create_design_canvas cannot persist a disconnected architecture map", async () => {
+  const mock = createMockContext({
+    prompt: "Create a transformer architecture diagram as an Obsidian canvas.",
+  });
+
+  const output = await createDesignCanvasTool.execute(
+    {
+      path: "Designs/transformer.canvas",
+      title: "Transformer Architecture",
+      diagramType: "architecture",
+      connect: "none",
+      items: [
+        { id: "tokens", title: "Input tokens", kind: "process" },
+        { id: "attention", title: "Self-attention", kind: "process" },
+        { id: "ffn", title: "Feed-forward", kind: "process" },
+        { id: "output", title: "Output tokens", kind: "output" },
+      ],
+    },
+    mock.context,
+  );
+
+  assert.equal((output as { edgeCount: number }).edgeCount, 3);
+  const canvas = JSON.parse(
+    mock.content.get("Designs/transformer.canvas") ?? "null",
+  ) as JsonCanvas;
+  assert.deepEqual(
+    canvas.edges.map((edge) => [edge.fromNode, edge.toNode]),
+    [
+      ["tokens", "attention"],
+      ["attention", "ffn"],
+      ["ffn", "output"],
+    ],
+  );
+});
+
 test("high-level Canvas inputs emit validated integer geometry, bounded colors, and resolved edges", async () => {
   const mock = createMockContext({
     prompt: "Create a distributed system diagram on a canvas.",

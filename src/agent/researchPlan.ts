@@ -10,7 +10,11 @@ import {
   isFetchedWebEvidence,
   isVaultReadEvidence,
 } from "./missionPlan";
-import { hasExplicitNoWebIntent } from "./evidenceIntent";
+import {
+  hasExplicitNoWebIntent,
+  requiresVaultEvidenceProof,
+  requiresWebEvidenceProof,
+} from "./evidenceIntent";
 import { hasAuthorizedCurrentNoteReplaceIntent } from "./replaceIntent";
 import { hasExplicitNoVaultReadIntent } from "./missionScope";
 import {
@@ -330,16 +334,17 @@ export async function createResearchPlanWithAssist(
   },
 ): Promise<ResearchPlan | null> {
   let plan = createResearchPlan(input);
-  // Semantic activation: when the deterministic keyword floor found no research
-  // but a utility model is configured, let the model decide whether the prompt
-  // actually warrants grounding (and roughly how many sources). Regex still wins
-  // when it fired — this only fills the silence, so research becomes agentic
-  // rather than purely keyword-triggered.
+  // Semantic activation may refine explicit evidence intent, but it may not
+  // manufacture research debt merely because a stable composition request is
+  // factual. That distinction keeps ordinary briefs/essays on the writing path
+  // while preserving model-assisted depth selection for requests that actually
+  // ask for sources, verification, web research, or vault evidence.
   if (
     !plan &&
     input.utilityModelConfigured === true &&
     typeof input.modeAssist === "function" &&
     input.modeOverride === undefined &&
+    allowsResearchModeAssistActivation(input.prompt, input.missionIntent) &&
     // Only fill genuine silence. A delete or simple write-only command is
     // structurally not research, so never let the model upgrade it into a
     // grounded run.
@@ -440,6 +445,16 @@ export async function createResearchPlanWithAssist(
   );
   plan.nextAction = getNextResearchAction(plan);
   return plan;
+}
+
+export function allowsResearchModeAssistActivation(
+  prompt: string,
+  missionIntent: MissionIntent,
+): boolean {
+  return (
+    requiresWebEvidenceProof(prompt, missionIntent) ||
+    requiresVaultEvidenceProof(prompt, missionIntent)
+  );
 }
 
 /** Run the optional effort assist, validating and never throwing. */

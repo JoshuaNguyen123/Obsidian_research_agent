@@ -74,6 +74,32 @@ function summary(scorecard: MissionScorecardV1 | null = cleanScorecard()) {
   };
 }
 
+const coreIdentity = {
+  project: "core-native",
+  scenarioId: "CORE-01",
+  file: "e2e/core-native.spec.ts",
+  title: "CORE-01 creates relevant artifacts",
+};
+
+function coreRecord(overrides: Record<string, unknown> = {}) {
+  return {
+    ...coreIdentity,
+    status: "passed",
+    proofClass: "mission",
+    observed: {
+      artifacts: ["vault:transformer_brief"],
+      proofs: ["model:production_call"],
+      approvals: [],
+      bindings: [],
+      cleanup: [],
+    },
+    acceptanceStatus: "pass",
+    fingerprint: `sha256:${"1".repeat(64)}`,
+    missionScorecard: cleanScorecard(),
+    ...overrides,
+  };
+}
+
 test("mission scorecard gate passes an unchanged baselined record", () => {
   assert.deepEqual(
     assertMissionScorecardRegressions({
@@ -252,5 +278,72 @@ test("targeted scored test cannot borrow a sibling baseline from the same projec
         ],
       }),
     /No exact mission-scorecard baseline exists/u,
+  );
+});
+
+test("core-native proof gate rejects an unlabeled passing result", () => {
+  const expected = {
+    ...coreIdentity,
+    key: missionScorecardRecordKey(coreIdentity),
+    scorecard: cleanScorecard(),
+  };
+  assert.throws(
+    () =>
+      assertMissionScorecardRegressions({
+        summary: {
+          version: 1,
+          status: "passed",
+          records: [coreRecord({ proofClass: null })],
+        },
+        baseline: { version: 1, tolerance: 0.05, records: [expected] },
+        selectedProjects: [coreIdentity.project],
+      }),
+    /missing e2e proof class/u,
+  );
+});
+
+test("core-native mission proof requires atomic acceptance and a passing scorecard", () => {
+  const expected = {
+    ...coreIdentity,
+    key: missionScorecardRecordKey(coreIdentity),
+    scorecard: cleanScorecard(),
+  };
+  assert.throws(
+    () =>
+      assertMissionScorecardRegressions({
+        summary: {
+          version: 1,
+          status: "passed",
+          records: [
+            coreRecord({
+              acceptanceStatus: "needs_more_work",
+              missionScorecard: null,
+            }),
+          ],
+        },
+        baseline: { version: 1, tolerance: 0.05, records: [expected] },
+        selectedProjects: [coreIdentity.project],
+      }),
+    /no complete atomic acceptance|no passing runtime scorecard/u,
+  );
+});
+
+test("core-native mission proof passes when classification and scorecard are complete", () => {
+  const expected = {
+    ...coreIdentity,
+    key: missionScorecardRecordKey(coreIdentity),
+    scorecard: cleanScorecard(),
+  };
+  assert.deepEqual(
+    assertMissionScorecardRegressions({
+      summary: {
+        version: 1,
+        status: "passed",
+        records: [coreRecord()],
+      },
+      baseline: { version: 1, tolerance: 0.05, records: [expected] },
+      selectedProjects: [coreIdentity.project],
+    }),
+    { checkedRecords: 1, skipped: false },
   );
 });

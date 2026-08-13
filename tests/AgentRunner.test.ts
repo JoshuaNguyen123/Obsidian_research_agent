@@ -436,6 +436,28 @@ test("GitHub repository publication without visibility still routes creation bef
   );
 });
 
+test("a narrative brief with diagrams requires both note content and a canvas", () => {
+  const prompt =
+    "Can you write me a brief including diagrams, explaining in depth the transformer architecture and its importance?";
+
+  assert.deepEqual(
+    getRequiredWriteToolNamesForTests(prompt, [
+      "append_to_current_file",
+      "create_design_canvas",
+    ]),
+    ["append_to_current_file", "create_design_canvas"],
+  );
+  assert.deepEqual(
+    getRequiredWriteToolNamesForTests(
+      prompt,
+      ["append_to_current_file", "create_design_canvas"],
+      "append",
+    ),
+    ["create_design_canvas"],
+    "streaming owns the note append while the graph still owns the canvas",
+  );
+});
+
 test("standalone nested code delivery routes through workspace creation and approved Desktop export without a repository commit", () => {
   assert.deepEqual(
     getRequiredCodeWorkflowToolNames(
@@ -1660,6 +1682,126 @@ test("static essay prompts stream to chat and append to the current note", async
   );
   assert.ok(statuses.includes("Using direct note writeback; no tool loop needed..."));
   assert.ok(statuses.includes("Streaming writeback to note..."));
+});
+
+test("the exact transformer brief completes both the note and canvas without web research", async () => {
+  const prompt =
+    "Can you write me a brief including diagrams, explaining in depth the transformer architecture and its importance?";
+  const chatRequests: ModelChatRequest[] = [];
+  const streamRequests: ModelChatRequest[] = [];
+  const executedCalls: ModelToolCall[] = [];
+  const configs: AgentRunConfigEvent[] = [];
+  const receipts: AgentRunReceipt[] = [];
+  const resolvedWriteTargets: Array<string | null> = [];
+  let clarificationRequests = 0;
+  const vault = createRunnerVaultContext({
+    prompt,
+    content: "# Transformer Notes\n\n",
+  });
+  const initialCurrentFile = vault.context.getCurrentMarkdownFile?.() ?? null;
+  let markdownLeafIsActive = true;
+  vault.context.getCurrentMarkdownFile = () =>
+    markdownLeafIsActive
+      ? initialCurrentFile
+      : ({ path: "Other.md", extension: "md" } as never);
+  const client = createClient({
+    chatRequests,
+    streamRequests,
+    chatResponders: [
+      () => responseWithToolCall("create_design_canvas", {}),
+      () =>
+        responseWithToolCall("append_to_current_file", {
+          content: [
+            "# Transformer Architecture",
+            "",
+            "Transformers use token embeddings and positional encoding before multi-head self-attention.",
+            "Queries, keys, and values produce attention weights, while residual connections, layer normalization, and feed-forward networks stabilize each encoder or decoder block.",
+            "Masked attention makes autoregressive decoding possible. This parallel architecture matters because it scales sequence modeling and powers modern language models.",
+            "",
+            "See [[Designs/Product Flow.canvas|Transformer architecture diagram]].",
+          ].join("\n"),
+        }),
+    ],
+  });
+
+  await runAgentMission({
+    prompt,
+    modelClient: client,
+    toolRegistry: createRegistry(executedCalls, {
+      onExecute: (call, context) => {
+        if (call.name === "create_design_canvas") {
+          // Native Obsidian opens the Canvas in the current leaf. The later
+          // note write must retain the mission's original Markdown target.
+          markdownLeafIsActive = false;
+        }
+        if (call.name === "append_to_current_file") {
+          resolvedWriteTargets.push(
+            context.getCurrentMarkdownFile?.()?.path ?? null,
+          );
+        }
+      },
+    }),
+    toolContext: vault.context,
+    enableStreaming: true,
+    events: {
+      onRunConfig: (event) => configs.push(event),
+      onReceipt: (receipt) => receipts.push(receipt),
+      onClarificationRequest: () => {
+        clarificationRequests += 1;
+      },
+    },
+  });
+
+  assert.deepEqual(executedCalls.map((call) => call.name), [
+    "create_design_canvas",
+    "append_to_current_file",
+  ]);
+  const agentRequests = chatRequests.filter(
+    (request) => request.evidencePhase === "agent_step",
+  );
+  assert.ok(agentRequests.length >= 1);
+  assert.equal(streamRequests.length, 0);
+  assert.ok(
+    agentRequests.some((request) =>
+      (request.tools ?? []).some(
+        (tool) => tool.function.name === "create_design_canvas",
+      ),
+    ),
+  );
+  assert.equal(
+    agentRequests.some((request) =>
+      (request.tools ?? []).some((tool) => tool.function.name === "web_search"),
+    ),
+    false,
+  );
+  assert.equal(
+    agentRequests.some((request) =>
+      (request.tools ?? []).some((tool) => tool.function.name === "web_fetch"),
+    ),
+    false,
+  );
+  assert.equal(
+    agentRequests.some((request) =>
+      (request.tools ?? []).some((tool) => tool.function.name === "ask_user"),
+    ),
+    false,
+  );
+  assert.equal(clarificationRequests, 0);
+  assert.deepEqual(resolvedWriteTargets, ["Current.md"]);
+  assert.equal(configs[0]?.noteOutputPlan?.destination, "active_note");
+  assert.equal(configs[0]?.effortDecision?.researchDepth, "none");
+  assert.match(
+    String(executedCalls[1]?.arguments.content ?? ""),
+    /multi-head self-attention/iu,
+  );
+  assert.match(
+    String(executedCalls[1]?.arguments.content ?? ""),
+    /Product Flow\.canvas/iu,
+  );
+  assert.deepEqual(
+    receipts.map((receipt) => receipt.toolName).sort(),
+    ["append_to_current_file", "create_design_canvas"],
+  );
 });
 
 test("plain Q&A defaults to streamed current-note writeback when an active note exists", async () => {
@@ -20575,6 +20717,7 @@ function createRegistry(
   options: {
     readCurrentError?: string;
     inspectVaultError?: string;
+    onExecute?: (call: ModelToolCall, context: ToolExecutionContext) => void;
   } = {},
 ): ToolRegistry {
   return {
@@ -20951,8 +21094,9 @@ function createRegistry(
         },
       },
     ],
-    execute: async (call): Promise<ToolExecutionResult> => {
+    execute: async (call, context): Promise<ToolExecutionResult> => {
       executedCalls.push(call);
+      options.onExecute?.(call, context);
 
       if (call.name === "read_current_file" && options.readCurrentError) {
         return {

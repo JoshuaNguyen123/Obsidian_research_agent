@@ -30,6 +30,8 @@ import {
   DAILY_USE_METRICS_ANNOTATION,
   DAILY_USE_OBSERVED_ANNOTATION,
   DAILY_USE_SCORECARD_ANNOTATION,
+  E2E_PROOF_CLASS_ANNOTATION,
+  type E2EProofClassV1,
 } from "../fixtures/dailyUseAcceptance";
 
 interface DailyUseRunRecord extends Pick<
@@ -57,6 +59,7 @@ interface DailyUseRunRecord extends Pick<
   failureCategory: DailyUseFailureCategory | null;
   observed: DailyUseObservedAcceptanceV1 | null;
   missionScorecard: MissionScorecardV1 | null;
+  proofClass: E2EProofClassV1 | null;
   /** Explicit alias for the legacy `approvals` interaction counter. */
   interactiveApprovals: number;
 }
@@ -103,6 +106,7 @@ export default class DailyUseReporter implements Reporter {
     const missionScorecard = typedScenarioId
       ? parseScorecardAnnotation(test)
       : null;
+    const proofClass = parseProofClassAnnotation(test);
     // The evaluator is invoked for every DU-labelled test. Missing annotations
     // remain explicit proof debt rather than being converted into a pass.
     const metrics = typedScenarioId
@@ -130,6 +134,7 @@ export default class DailyUseReporter implements Reporter {
       failureCategory: result.status === "passed" ? null : classification.category,
       observed,
       missionScorecard,
+      proofClass,
       modelCalls: metrics?.modelCalls ?? 0,
       toolCalls: metrics?.toolCalls ?? 0,
       continuations: metrics?.continuations ?? 0,
@@ -321,6 +326,14 @@ function parseScorecardAnnotation(test: TestCase): MissionScorecardV1 | null {
   } catch {
     return null;
   }
+}
+
+function parseProofClassAnnotation(test: TestCase): E2EProofClassV1 | null {
+  const raw = [...test.annotations]
+    .reverse()
+    .find((annotation) => annotation.type === E2E_PROOF_CLASS_ANNOTATION)
+    ?.description;
+  return raw === "mission" || raw === "contract" ? raw : null;
 }
 
 /**

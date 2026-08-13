@@ -1473,6 +1473,51 @@ test("two identical failures stop retrying and persist a resumable blocker", asy
   assert.equal((await session.beginToolExecution("read_current_file")).ok, false);
 });
 
+test("a repeated host-policy deferral becomes a durable orchestration blocker", async () => {
+  const harness = createVaultHarness();
+  const graph = await graphFor({
+    missionId: "session-repeated-policy-deferral",
+    allowedTools: ["create_design_canvas"],
+    plannedTools: ["create_design_canvas"],
+  });
+  const session = await MissionGraphSession.open({
+    context: harness.context,
+    initialGraph: graph,
+  });
+
+  const first = requireExecution(
+    await session.beginToolExecution("create_design_canvas"),
+  );
+  const afterFirst = await session.deferToolExecution(
+    first,
+    "Research prerequisites are incomplete.",
+  );
+  assert.equal(afterFirst.nodes[first.nodeId]?.status, "ready");
+  assert.equal(afterFirst.nodes[first.nodeId]?.retries.attempts, 1);
+
+  const second = requireExecution(
+    await session.beginToolExecution("create_design_canvas"),
+  );
+  const afterSecond = await session.deferToolExecution(
+    second,
+    "Research prerequisites are incomplete.",
+  );
+  assert.equal(afterSecond.nodes[second.nodeId]?.status, "blocked");
+  assert.equal(afterSecond.nodes[second.nodeId]?.retries.attempts, 2);
+  assert.equal(
+    afterSecond.nodes[second.nodeId]?.blocker?.code,
+    "policy_deferral_repeated",
+  );
+  assert.match(
+    afterSecond.nodes[second.nodeId]?.blocker?.message ?? "",
+    /internal orchestration repeatedly deferred/iu,
+  );
+  assert.equal(
+    (await session.beginToolExecution("create_design_canvas")).ok,
+    false,
+  );
+});
+
 test("a create collision replans the same node into read then hash-bound write", async () => {
   const harness = createVaultHarness();
   const graph = await workspaceCollisionGraphFor(

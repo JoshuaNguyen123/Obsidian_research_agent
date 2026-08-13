@@ -61,6 +61,14 @@ export const MISSION_SCORECARD_EXEMPT_PROJECTS = new Set([
   // would silently weaken the gate; these fail loudly by design.
 ]);
 
+/**
+ * Projects where every passing Playwright result must declare whether it is a
+ * mission proof or a narrower contract probe. A mission result additionally
+ * needs one atomic acceptance observation and a runtime scorecard. This keeps
+ * a green but semantically uninspected test from representing product health.
+ */
+export const PROOF_CLASS_ENFORCED_PROJECTS = new Set(["core-native"]);
+
 // Must stay in lockstep with MissionScoreDimensionId in
 // src/agent/missionScorecard.ts. The shape is asserted at parse time, so
 // adding a dimension invalidates every baseline record until it is
@@ -195,6 +203,11 @@ export function assertMissionScorecardRegressions({
       (!executedTestKeys ||
         executedTestKeys.has(missionScorecardExecutionKey(record))),
   );
+  assertProofClassCoverage({
+    records: summary.records,
+    activeProjects,
+    executedTestKeys,
+  });
   if (executedTestKeys) {
     const baselineExecutionKeys = new Set(
       applicableBaselines.map(missionScorecardExecutionKey),
@@ -298,6 +311,66 @@ export function assertMissionScorecardRegressions({
     );
   }
   return { checkedRecords: applicableBaselines.length, skipped: false };
+}
+
+function assertProofClassCoverage({ records, activeProjects, executedTestKeys }) {
+  const enforcedProjects = new Set(
+    [...activeProjects].filter((project) =>
+      PROOF_CLASS_ENFORCED_PROJECTS.has(project)
+    ),
+  );
+  if (enforcedProjects.size === 0) return;
+  const applicable = records.filter((record) => {
+    if (!enforcedProjects.has(String(record?.project ?? ""))) return false;
+    return (
+      !executedTestKeys ||
+      executedTestKeys.has(missionScorecardExecutionKey(record))
+    );
+  });
+  const failures = [];
+  for (const record of applicable) {
+    const key = missionScorecardExecutionKey(record);
+    if (record?.proofClass !== "mission" && record?.proofClass !== "contract") {
+      failures.push(`${key}: missing e2e proof class`);
+      continue;
+    }
+    if (record.status !== "passed") {
+      failures.push(`${key}: Playwright status is ${String(record.status)}`);
+    }
+    if (record.proofClass === "contract") continue;
+    if (typeof record.scenarioId !== "string" || !record.scenarioId.trim()) {
+      failures.push(`${key}: mission proof has no scenario contract`);
+    }
+    if (!record.observed || record.acceptanceStatus !== "pass") {
+      failures.push(`${key}: mission proof has no complete atomic acceptance`);
+    }
+    if (
+      typeof record.fingerprint !== "string" ||
+      !/^sha256:(?!0{64}$)[a-f0-9]{64}$/u.test(record.fingerprint)
+    ) {
+      failures.push(`${key}: mission proof has no nonzero evidence fingerprint`);
+    }
+    if (
+      !record.missionScorecard ||
+      record.missionScorecard.acceptancePassed !== true
+    ) {
+      failures.push(`${key}: mission proof has no passing runtime scorecard`);
+    }
+  }
+  if (executedTestKeys) {
+    const covered = new Set(applicable.map(missionScorecardExecutionKey));
+    for (const key of executedTestKeys) {
+      const project = key.split("|", 1)[0];
+      if (enforcedProjects.has(project) && !covered.has(key)) {
+        failures.push(`${key}: executed test is missing from the proof summary`);
+      }
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      `E2E proof-class gate failed:\n- ${failures.join("\n- ")}`,
+    );
+  }
 }
 
 /**

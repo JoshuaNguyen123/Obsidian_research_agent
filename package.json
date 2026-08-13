@@ -25,7 +25,7 @@
     "cleanup:e2e-github-residue": "node scripts/cleanup-e2e-github-residue.mjs",
     "cleanup:e2e-runtime-residue": "node scripts/cleanup-owned-e2e-runtime-residue.mjs",
     "cleanup:e2e-runtime-residue:apply": "node scripts/cleanup-owned-e2e-runtime-residue.mjs --apply",
-    "test:e2e": "node scripts/run-e2e-exclusive.mjs --real-ai --project=desktop-checkers-delivery-real-live",
+    "test:e2e": "node scripts/run-e2e-exclusive.mjs --real-ai --project=core-native",
     "test:e2e:retained-journey": "node scripts/run-e2e-exclusive.mjs --real-ai --project=retained-journey",
     "test:e2e:byok-autonomous-journey": "node scripts/run-e2e-exclusive.mjs --real-ai --project=byok-autonomous-journey && node scripts/verify-byok-autonomous-journey.mjs",
     "verify:byok-autonomous-journey": "node scripts/verify-byok-autonomous-journey.mjs",

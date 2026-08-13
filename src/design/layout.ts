@@ -91,6 +91,9 @@ const DEFAULT_NODE_WIDTH = 360;
 const DEFAULT_NODE_HEIGHT = 180;
 const DEFAULT_GAP_X = 80;
 const DEFAULT_GAP_Y = 80;
+const MAX_LANE_COLUMNS = 6;
+const LANE_PADDING = 40;
+const LANE_GAP_Y = 120;
 
 export function buildLayoutCanvas(input: CanvasLayoutInput): JsonCanvas {
   const items = input.items.length > 0
@@ -138,16 +141,52 @@ function buildLaneCanvas(
     laneCounts.set(lane, items.filter((item) => getItemLane(item, diagramType) === lane).length);
   }
 
+  const laneLayouts = new Map<
+    string,
+    { columns: number; rows: number; y: number }
+  >();
+  let nextLaneY = yOffset;
+  for (const lane of lanes) {
+    const count = Math.max(1, laneCounts.get(lane) ?? 1);
+    // Row/column are useful for small sequences. On large architecture maps,
+    // honoring either literally creates a 10k-pixel strip. Cap both axes by
+    // switching to a compact grid once a single lane exceeds the visual limit.
+    const requestedColumns =
+      count > MAX_LANE_COLUMNS
+        ? getColumnCount(count, "grid")
+        : getColumnCount(count, input.direction ?? "grid");
+    const columns = Math.min(MAX_LANE_COLUMNS, requestedColumns);
+    const rows = Math.max(1, Math.ceil(count / columns));
+    laneLayouts.set(lane, { columns, rows, y: nextLaneY });
+    nextLaneY += laneHeight(rows) + LANE_GAP_Y;
+  }
   const groupNodes = lanes.map((lane, index) => {
-    const laneCount = Math.max(1, laneCounts.get(lane) ?? 1);
-    return buildLaneGroupNode(lane, index, laneCount, yOffset);
+    const layout = laneLayouts.get(lane) ?? { columns: 1, rows: 1, y: yOffset };
+    return buildLaneGroupNode(
+      lane,
+      index,
+      layout.columns,
+      layout.rows,
+      layout.y,
+    );
   });
   const itemNodes = items.map((item, index) => {
     const lane = getItemLane(item, diagramType);
-    const laneIndex = Math.max(0, lanes.indexOf(lane));
-    const column = laneItemCounters.get(lane) ?? 0;
-    laneItemCounters.set(lane, column + 1);
-    return buildLaneItemNode(item, index, laneIndex, column, diagramType, yOffset);
+    const laneLayout = laneLayouts.get(lane) ?? {
+      columns: 1,
+      rows: 1,
+      y: yOffset,
+    };
+    const itemIndex = laneItemCounters.get(lane) ?? 0;
+    laneItemCounters.set(lane, itemIndex + 1);
+    return buildLaneItemNode(
+      item,
+      index,
+      itemIndex,
+      laneLayout.columns,
+      laneLayout.y,
+      diagramType,
+    );
   });
   const nodes = titleNode
     ? [titleNode, ...groupNodes, ...itemNodes]
@@ -266,7 +305,12 @@ function buildLayoutEdges(
     }));
   }
 
-  if ((input.connect ?? "sequence") !== "sequence") {
+  const requiresArchitectureConnectivity =
+    input.diagramType === "architecture" && nodes.length > 1;
+  if (
+    (input.connect ?? "sequence") !== "sequence" &&
+    !requiresArchitectureConnectivity
+  ) {
     return [];
   }
 
@@ -276,16 +320,20 @@ function buildLayoutEdges(
 function buildLaneGroupNode(
   lane: string,
   index: number,
-  laneItemCount: number,
-  yOffset: number,
+  columns: number,
+  rows: number,
+  y: number,
 ): JsonCanvasNode {
   return {
     id: normalizeId(`lane-${slugifyId(lane)}`, index, "lane"),
     type: "group",
     x: 0,
-    y: yOffset + index * (DEFAULT_NODE_HEIGHT + DEFAULT_GAP_Y + 120),
-    width: laneItemCount * DEFAULT_NODE_WIDTH + Math.max(0, laneItemCount - 1) * DEFAULT_GAP_X + 80,
-    height: DEFAULT_NODE_HEIGHT + 80,
+    y,
+    width:
+      columns * DEFAULT_NODE_WIDTH +
+      Math.max(0, columns - 1) * DEFAULT_GAP_X +
+      LANE_PADDING * 2,
+    height: laneHeight(rows),
     color: "2",
     label: lane,
   };
@@ -294,17 +342,27 @@ function buildLaneGroupNode(
 function buildLaneItemNode(
   item: CanvasLayoutItem,
   index: number,
-  laneIndex: number,
-  column: number,
+  laneItemIndex: number,
+  columns: number,
+  laneY: number,
   diagramType: CanvasLayoutDiagramType,
-  yOffset: number,
 ): JsonCanvasNode {
   const base = buildLayoutNode(item, index, 1, diagramType);
+  const column = laneItemIndex % columns;
+  const row = Math.floor(laneItemIndex / columns);
   return {
     ...base,
-    x: 40 + column * (DEFAULT_NODE_WIDTH + DEFAULT_GAP_X),
-    y: yOffset + laneIndex * (DEFAULT_NODE_HEIGHT + DEFAULT_GAP_Y + 120) + 40,
+    x: LANE_PADDING + column * (DEFAULT_NODE_WIDTH + DEFAULT_GAP_X),
+    y: laneY + LANE_PADDING + row * (DEFAULT_NODE_HEIGHT + DEFAULT_GAP_Y),
   };
+}
+
+function laneHeight(rows: number): number {
+  return (
+    rows * DEFAULT_NODE_HEIGHT +
+    Math.max(0, rows - 1) * DEFAULT_GAP_Y +
+    LANE_PADDING * 2
+  );
 }
 
 function uniqueLaneNames(

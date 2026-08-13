@@ -22,7 +22,7 @@ const vaultRoot =
     : "");
 const cdpPort = Number.parseInt(process.env.OBSIDIAN_CDP_PORT ?? "11223", 10);
 const pluginsRoot = path.join(vaultRoot, ".obsidian", "plugins");
-const playwrightLanes = (process.env.E2E_PLAYWRIGHT_LANE ?? "desktop-checkers-delivery-real-live")
+const playwrightLanes = (process.env.E2E_PLAYWRIGHT_LANE ?? "core-native")
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
@@ -57,6 +57,7 @@ if (playwrightLanes.some((lane) => [
   "provider-canary",
   "release-vertical",
   "daily-use-research",
+  "core-native",
   "retained-journey",
   "byok-autonomous-journey",
   "daily-use-code-live",
@@ -92,6 +93,7 @@ async function resolveExpectedPluginIds() {
   // Every remaining lane runs the single installed plugin; none needs an extra
   // community plugin. Credential presence is enforced by run-e2e-exclusive.mjs.
   const requiredByLane = {
+    "core-native": [],
     "safe-assistant-renderer": [],
     "retained-journey": [],
     "byok-autonomous-journey": [],

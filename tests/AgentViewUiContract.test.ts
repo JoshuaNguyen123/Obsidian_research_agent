@@ -37,6 +37,13 @@ test("Chat exposes one live-run surface and keeps process controls out of conver
   );
 });
 
+test("clear chat removes stale blocker attention with the transcript", () => {
+  assert.match(
+    viewSource,
+    /await this\.plugin\.clearConversationHistory\(\);[\s\S]{0,400}this\.clearChatAttention\(\);[\s\S]{0,160}this\.setRunDetailsNeedsAttention\(false\);/u,
+  );
+});
+
 test("Run Details is summary-first, conditional, and diagnostic-heavy data stays collapsed", () => {
   assert.match(viewSource, /"Acceptance and next action"/u);
   assert.match(viewSource, /"Result and receipts"[\s\S]{0,120}collapseUntilPopulated: true/u);

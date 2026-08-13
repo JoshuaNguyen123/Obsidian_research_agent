@@ -101,6 +101,8 @@ export interface RealAiHarnessNativeOptions {
   preserveConfiguredGitHubCredential?: boolean;
   /** Vault-relative paths the lane deliberately keeps after harness close. */
   retainVaultPaths?: readonly string[];
+  /** Use an empty Untitled note to reproduce first-write product behavior. */
+  placeholderCurrentNote?: boolean;
 }
 
 export interface OwnedWebMetricsV1 {
@@ -277,6 +279,9 @@ export async function startRealAiHarness(
 
   const native = await startNativeObsidianHarness({
     label,
+    ...(nativeOptions.placeholderCurrentNote
+      ? { noteBasenamePrefix: "Untitled" }
+      : {}),
     corePluginDataOverrides,
     preserveConfiguredLinearCredential:
       nativeOptions.preserveConfiguredLinearCredential === true,
@@ -285,7 +290,11 @@ export async function startRealAiHarness(
     ...(nativeOptions.retainVaultPaths
       ? { retainVaultPaths: nativeOptions.retainVaultPaths }
       : {}),
-    setup: installRealAiPageHarness,
+    setup: (context) =>
+      installRealAiPageHarness(context, {
+        placeholderCurrentNote:
+          nativeOptions.placeholderCurrentNote === true,
+      }),
     beforeClose: async ({ page }) => restoreOwnedWebBackend(page),
   });
   let recordedApprovals = 0;
@@ -1753,8 +1762,8 @@ async function installRealAiPageHarness(context: {
   page: Page;
   marker: string;
   notePath: string;
-}): Promise<void> {
-  await context.page.evaluate(async ({ pluginId, notePath, marker }) => {
+}, options: { placeholderCurrentNote?: boolean } = {}): Promise<void> {
+  await context.page.evaluate(async ({ pluginId, notePath, marker, placeholderCurrentNote }) => {
     const app = (window as typeof window & { app?: any }).app;
     if (!app?.plugins || !app?.vault || !app?.workspace) {
       throw new Error("Obsidian app APIs are unavailable.");
@@ -1790,7 +1799,9 @@ async function installRealAiPageHarness(context: {
     if (existing) await app.vault.delete(existing, true);
     const note = await app.vault.create(
       notePath,
-      `# Live Provider Contract\n\nOwned live-provider fixture ${marker}.\n`,
+      placeholderCurrentNote
+        ? ""
+        : `# Live Provider Contract\n\nOwned live-provider fixture ${marker}.\n`,
     );
     const leaf =
       app.workspace.getLeavesOfType?.("markdown")?.[0] ??
@@ -1803,6 +1814,7 @@ async function installRealAiPageHarness(context: {
     pluginId: NATIVE_CORE_PLUGIN_ID,
     notePath: context.notePath,
     marker: context.marker,
+    placeholderCurrentNote: options.placeholderCurrentNote === true,
   });
 }
 

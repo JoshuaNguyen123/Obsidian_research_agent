@@ -19,12 +19,13 @@ const PLAYWRIGHT_EXECUTION_REPORT_PATH = path.join(
 );
 const DEFAULT_WAIT_MS = 30_000;
 const DEFAULT_POLL_MS = 250;
-const DEFAULT_PLAYWRIGHT_PROJECT = "desktop-checkers-delivery-real-live";
+const DEFAULT_PLAYWRIGHT_PROJECT = "core-native";
 // Only lanes that drive the production plugin against a real model, a real
 // external service, or both. Mock-model projects were removed: they proved
 // nothing about a host the product could not actually run on.
 const PLAYWRIGHT_PROJECTS = new Set([
   DEFAULT_PLAYWRIGHT_PROJECT,
+  "desktop-checkers-delivery-real-live",
   "safe-assistant-renderer",
   "retained-journey",
   "byok-autonomous-journey",
@@ -674,6 +675,7 @@ export function normalizeExclusiveArgs(rawArgs) {
   // remaining lanes make no model calls at all and instead drive production
   // tools against real external services with real credentials.
   const realAiProjects = new Set([
+    "core-native",
     "real-ai-contract",
     "real-ai-soak",
     "provider-canary",

@@ -118,6 +118,7 @@ import {
 import {
   canApplyProjectMemoryLoad,
   getProjectMemoryLocation,
+  resolveProjectMemoryAnchorPath,
 } from "./src/agent/projectMemory";
 import {
   createToolOutcomeMemory,
@@ -8021,9 +8022,7 @@ export default class AgenticResearcherPlugin extends Plugin {
 
   private async loadProjectMemoryData() {
     const generation = ++this.projectMemoryLoadGeneration;
-    const location = getProjectMemoryLocation(
-      this.getCurrentMarkdownFile()?.path ?? null,
-    );
+    const location = getProjectMemoryLocation(this.getProjectMemoryAnchorPath());
     const conversationHistory = await this.readProjectMemoryJson(
       location.conversationPath,
     );
@@ -8035,7 +8034,7 @@ export default class AgenticResearcherPlugin extends Plugin {
     );
 
     const currentLocation = getProjectMemoryLocation(
-      this.getCurrentMarkdownFile()?.path ?? null,
+      this.getProjectMemoryAnchorPath(),
     );
     if (
       !canApplyProjectMemoryLoad(
@@ -8072,7 +8071,7 @@ export default class AgenticResearcherPlugin extends Plugin {
   }
 
   private async saveProjectMemoryData() {
-    const location = getProjectMemoryLocation(this.getCurrentMarkdownFile()?.path ?? null);
+    const location = getProjectMemoryLocation(this.getProjectMemoryAnchorPath());
     await this.writeProjectMemoryJson(
       location.conversationPath,
       this.conversationHistory,
@@ -14594,6 +14593,36 @@ export default class AgenticResearcherPlugin extends Plugin {
     }
 
     return null;
+  }
+
+  private getProjectMemoryAnchorPath(): string | null {
+    const activeFile = this.app.workspace.getActiveFile();
+    const activeMarkdownFile = isMarkdownFile(activeFile) ? activeFile : null;
+    const recentMarkdownFile = getMarkdownFileFromLeaf(
+      this.app.workspace.getMostRecentLeaf(),
+    );
+    const rememberedMarkdownFile = this.lastActiveMarkdownFile
+      ? this.app.vault.getFileByPath(this.lastActiveMarkdownFile.path)
+      : null;
+    const openMarkdownFiles = this.app.workspace
+      .getLeavesOfType("markdown")
+      .map((leaf) => getMarkdownFileFromLeaf(leaf))
+      .filter((file): file is TFile => file !== null);
+    const anchorPath = resolveProjectMemoryAnchorPath({
+      activeMarkdownPath: activeMarkdownFile?.path,
+      recentMarkdownPath: recentMarkdownFile?.path,
+      rememberedMarkdownPath: isMarkdownFile(rememberedMarkdownFile)
+        ? rememberedMarkdownFile.path
+        : null,
+      openMarkdownPaths: openMarkdownFiles.map((file) => file.path),
+    });
+    if (anchorPath) {
+      const anchorFile = this.app.vault.getFileByPath(anchorPath);
+      if (isMarkdownFile(anchorFile)) {
+        this.updateLastActiveMarkdownFile(anchorFile);
+      }
+    }
+    return anchorPath;
   }
 
   private updateLastActiveMarkdownFile(file: TFile | null) {

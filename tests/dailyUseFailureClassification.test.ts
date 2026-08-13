@@ -44,6 +44,19 @@ describe("daily-use Playwright failure classification", () => {
         category: "product_assertion",
       },
     );
+    assert.deepEqual(
+      classifyDailyUseFailure({
+        title: "CORE-01 exact transformer brief",
+        file: "e2e/core-native.spec.ts",
+        project: "core-native",
+        errorMessages: [],
+      }),
+      {
+        scenarioId: "CORE-01",
+        taskFamily: "notes",
+        category: "product_assertion",
+      },
+    );
   });
 
   it("separates setup, provider competence, lifecycle, mapping, and cleanup failures", () => {

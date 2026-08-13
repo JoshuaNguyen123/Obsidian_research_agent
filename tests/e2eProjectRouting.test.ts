@@ -32,7 +32,7 @@ test("no Playwright lane runs against a mocked model", () => {
       `mock-model lane still routed: ${removed}`,
     );
   }
-  assert.match(config, /desktop-checkers-delivery-real-live/u);
+  assert.match(config, /core-native/u);
 });
 
 test("the reported desktop failure has a dedicated real-model lane", () => {
@@ -78,13 +78,13 @@ test("real-model lanes assert the sandbox the product adopted for itself", () =>
   }
 });
 
-test("exclusive E2E runner defaults to the reported desktop delivery lane", () => {
+test("exclusive E2E runner defaults to the exact reported transformer lane", () => {
   const normalized = normalizeExclusiveArgs(["--real-ai"]);
   assert.deepEqual(normalized, {
-    playwrightArgs: ["--project=desktop-checkers-delivery-real-live"],
+    playwrightArgs: ["--project=core-native"],
     aiMode: "real",
     liveExternal: false,
-    projects: ["desktop-checkers-delivery-real-live"],
+    projects: ["core-native"],
   });
 });
 
@@ -533,10 +533,10 @@ test("package commands route only to real lanes and live projects disable reruns
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   );
-  // Default `npm run test:e2e` is the exact reported daily-use failure.
+  // Default `npm run test:e2e` is the exact currently reported daily-use failure.
   assert.match(
     packageJson.scripts["test:e2e"],
-    /--real-ai --project=desktop-checkers-delivery-real-live/u,
+    /--real-ai --project=core-native/u,
   );
   assert.match(
     packageJson.scripts["test:e2e:desktop-code-delivery"],
@@ -597,6 +597,7 @@ test("package commands route only to real lanes and live projects disable reruns
   }
   const config = readFileSync(new URL("../playwright.config.ts", import.meta.url), "utf8");
   for (const project of [
+    "core-native",
     "byok-autonomous-journey",
     "desktop-checkers-delivery-real-live",
     "daily-use-research",
@@ -617,6 +618,7 @@ test("package commands route only to real lanes and live projects disable reruns
     "utf8",
   );
   assert.match(preflight, /"byok-autonomous-journey": \[\]/u);
+  assert.match(preflight, /"core-native": \[\]/u);
   assert.match(preflight, /"safe-assistant-renderer": \[\]/u);
 });
 

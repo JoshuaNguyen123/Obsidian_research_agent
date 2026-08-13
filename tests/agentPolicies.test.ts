@@ -15,6 +15,7 @@ import { decideNextLoopAction } from "../src/agent/loopDecision";
 import {
   canApplyProjectMemoryLoad,
   getProjectMemoryLocation,
+  resolveProjectMemoryAnchorPath,
 } from "../src/agent/projectMemory";
 import {
   deriveAutonomyScope,
@@ -875,5 +876,25 @@ test("project memory hydration is latest-request-wins and project-bound", () => 
     canApplyProjectMemoryLoad(secondLoad, 3, secondProject),
     false,
     "a newer in-memory mutation invalidates an in-flight hydration",
+  );
+});
+
+test("project memory stays with the remembered note while Canvas owns focus", () => {
+  assert.equal(
+    resolveProjectMemoryAnchorPath({
+      activeMarkdownPath: null,
+      recentMarkdownPath: null,
+      rememberedMarkdownPath: "E2E Agent Tests/Untitled 2.md",
+      openMarkdownPaths: ["Unrelated.md"],
+    }),
+    "E2E Agent Tests/Untitled 2.md",
+  );
+  assert.equal(
+    resolveProjectMemoryAnchorPath({
+      activeMarkdownPath: "Projects/New.md",
+      rememberedMarkdownPath: "Projects/Old.md",
+    }),
+    "Projects/New.md",
+    "an intentional Markdown focus change must still switch project memory",
   );
 });

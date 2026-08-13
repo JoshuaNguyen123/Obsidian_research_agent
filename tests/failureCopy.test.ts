@@ -181,6 +181,14 @@ test("validation repair and conversational blockers stay plain-language", () => 
     ),
     /Click Continue/i,
   );
+
+  const orchestration = conversationalBlockerCopy({
+    kind: "orchestration",
+    why: "policy_deferral_repeated: create_design_canvas",
+  });
+  assert.match(orchestration.what, /internal plan/i);
+  assert.match(orchestration.next, /No external action is required/i);
+  assert.doesNotMatch(orchestration.what, /external state/i);
 });
 
 test("provider auth copy points at settings then Continue", () => {

@@ -12,6 +12,19 @@ import type { MissionScorecardV1 } from "../../src/agent/missionScorecard";
 export const DAILY_USE_OBSERVED_ANNOTATION = "daily-use-observed-v1";
 export const DAILY_USE_METRICS_ANNOTATION = "daily-use-metrics-v1";
 export const DAILY_USE_SCORECARD_ANNOTATION = "daily-use-scorecard-v1";
+export const E2E_PROOF_CLASS_ANNOTATION = "e2e-proof-class-v1";
+
+export type E2EProofClassV1 = "mission" | "contract";
+
+export function recordE2EProofClass(
+  testInfo: TestInfo,
+  proofClass: E2EProofClassV1,
+): void {
+  testInfo.annotations.push({
+    type: E2E_PROOF_CLASS_ANNOTATION,
+    description: proofClass,
+  });
+}
 
 export async function recordDailyUseAcceptance(
   testInfo: TestInfo,
@@ -26,6 +39,7 @@ export async function recordDailyUseAcceptance(
   } = {},
   options: { requireComplete?: boolean } = {},
 ) {
+  recordE2EProofClass(testInfo, "mission");
   const normalized = normalizeObserved(observed);
   const evaluation = evaluateDailyUseAcceptanceV1(
     DAILY_USE_ACCEPTANCE_V1[scenarioId],

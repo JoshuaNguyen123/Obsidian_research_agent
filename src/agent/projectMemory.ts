@@ -12,6 +12,13 @@ export interface ProjectMemoryLoadSnapshot {
   location: ProjectMemoryLocation;
 }
 
+export interface ProjectMemoryAnchorCandidates {
+  activeMarkdownPath?: string | null;
+  recentMarkdownPath?: string | null;
+  rememberedMarkdownPath?: string | null;
+  openMarkdownPaths?: readonly string[];
+}
+
 const PROJECT_MEMORY_FOLDER = "Agent Memory";
 
 export function getProjectMemoryLocation(
@@ -27,6 +34,29 @@ export function getProjectMemoryLocation(
     toolOutcomePath: joinVaultPath(memoryFolder, "tool-outcome-memory.json"),
     researchNotesFolder: joinVaultPath(memoryFolder, "Research"),
   };
+}
+
+/**
+ * Keep project memory attached to the last intentional Markdown context while
+ * a mission opens a Canvas or another non-Markdown leaf. Obsidian's generic
+ * Markdown-leaf enumeration is not ordered by user intent, so an unrelated
+ * open note is only a final fallback after the remembered note.
+ */
+export function resolveProjectMemoryAnchorPath(
+  candidates: ProjectMemoryAnchorCandidates,
+): string | null {
+  for (const candidate of [
+    candidates.activeMarkdownPath,
+    candidates.recentMarkdownPath,
+    candidates.rememberedMarkdownPath,
+    ...(candidates.openMarkdownPaths ?? []),
+  ]) {
+    const normalized = candidate?.trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
 }
 
 /**

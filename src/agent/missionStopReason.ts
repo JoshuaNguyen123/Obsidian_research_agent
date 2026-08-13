@@ -12,6 +12,7 @@ export type MissionStopReason =
   | "wall_clock"
   | "step_budget"
   | "model_budget"
+  | "orchestration_deadlock"
   | "graph_blocked"
   | "approval_denied"
   | "relevance_rejected"
@@ -88,6 +89,10 @@ export function stopReasonChatLine(
     case "step_budget":
     case "model_budget":
       return `Paused at a safety limit. Ask me to continue.${suffix}`;
+    case "orchestration_deadlock":
+      return suffix
+        ? `Stopped: the internal mission plan could not advance.${suffix}`
+        : "Stopped: the internal mission plan could not advance. Retry the mission; no user-side change is required.";
     case "graph_blocked":
       // Lead with the blocker when the caller has one. "Blocked — open Run
       // Details" made the user open a panel to learn anything, and that
@@ -129,6 +134,8 @@ export function formatStopReasonLabel(reason: MissionStopReason): string {
       return "Step budget";
     case "model_budget":
       return "Model budget";
+    case "orchestration_deadlock":
+      return "Orchestration blocked";
     case "graph_blocked":
       return "Blocked";
     case "approval_denied":
@@ -149,6 +156,9 @@ export function formatStopReasonLabel(reason: MissionStopReason): string {
 
 function classifyErrorDetail(detail?: string | null): MissionStopReason {
   const text = (detail ?? "").toLowerCase();
+  if (/policy_deferral_repeated|orchestration_deadlock/.test(text)) {
+    return "orchestration_deadlock";
+  }
   if (
     /authoritative mission graph|not ready in the (?:exact )?authoritative|off-frontier|mission_graph_authority|mission graph/i.test(
       text,
@@ -161,6 +171,9 @@ function classifyErrorDetail(detail?: string | null): MissionStopReason {
 
 function classifyBudgetDetail(detail?: string | null): MissionStopReason {
   const text = (detail ?? "").toLowerCase();
+  if (/policy_deferral_repeated|orchestration_deadlock/.test(text)) {
+    return "orchestration_deadlock";
+  }
   if (/wall.?clock/.test(text)) return "wall_clock";
   if (/repeated_tool|no_progress/.test(text)) return "repeated_tool_no_progress";
   if (/required_tools_failed/.test(text)) return "required_tools_failed";

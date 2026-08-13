@@ -30,6 +30,7 @@ const liveGlobalTimeout = activeLanes.has("release-vertical") ||
       activeLanes.has("desktop-checkers-delivery-real-live") ||
       activeLanes.has("real-ai-soak") ||
       activeLanes.has("daily-use-research") ||
+      activeLanes.has("core-native") ||
       activeLanes.has("obsidian-hello-github-live")
     ? 60 * 60_000
     : activeLanes.has("real-ai-contract")
@@ -57,6 +58,20 @@ export default defineConfig({
     video: protectedLogMode ? "off" : "retain-on-failure",
   },
   projects: [
+    {
+      // Default product-health proof: exact reported prompt, production model,
+      // native Obsidian writes, semantic artifact QA, and atomic acceptance.
+      name: "core-native",
+      testMatch: /core-native\.spec\.ts/u,
+      retries: 0,
+      timeout: 900_000,
+      expect: { timeout: 180_000 },
+      use: {
+        trace: protectedLogMode ? "off" : "retain-on-failure",
+        screenshot: protectedLogMode ? "off" : "only-on-failure",
+        video: protectedLogMode ? "off" : "retain-on-failure",
+      },
+    },
     {
       // Native UI security proof; no model or external service is required.
       name: "safe-assistant-renderer",

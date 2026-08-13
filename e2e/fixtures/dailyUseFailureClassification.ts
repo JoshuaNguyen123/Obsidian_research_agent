@@ -31,6 +31,7 @@ export interface DailyUseFailureClassification {
     | "BYOK-01"
     | "DESKTOP-01"
     | "FLOW-REAL-01"
+    | "CORE-01"
     | null;
   taskFamily: DailyUseTaskFamily;
   category: DailyUseFailureCategory;
@@ -61,7 +62,7 @@ export function classifyDailyUseFailure(
 export function extractScenarioId(
   value: string,
 ): DailyUseFailureClassification["scenarioId"] {
-  return (value.match(/\b(?:DU-0[1-6]|BYOK-01|DESKTOP-01|FLOW-REAL-01)\b/iu)?.[0]?.toUpperCase() as
+  return (value.match(/\b(?:DU-0[1-6]|BYOK-01|DESKTOP-01|FLOW-REAL-01|CORE-01)\b/iu)?.[0]?.toUpperCase() as
     | DailyUseFailureClassification["scenarioId"]
     | undefined) ?? null;
 }
@@ -80,6 +81,7 @@ function inferTaskFamily(
     "BYOK-01": "compound",
     "DESKTOP-01": "code",
     "FLOW-REAL-01": "compound",
+    "CORE-01": "notes",
   };
   if (scenarioId) return scenarioFamily[scenarioId];
   if (/settings|migration|capability setup|connection preflight/iu.test(searchable)) {

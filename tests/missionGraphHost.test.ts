@@ -72,6 +72,43 @@ test("host graph plan turns filtered descriptors into exact read-before-mutation
   );
 });
 
+test("a narrative canvas write waits for every planned research fetch", async () => {
+  const names = ["web_search", "web_fetch", "create_design_canvas"];
+  const host = await buildHostMissionGraphPlanV1({
+    missionId: "run-research-before-canvas",
+    objective:
+      "Research three sources, then write a transformer brief with diagrams.",
+    toolRegistry: registryFor(names),
+    allowedToolNames: names,
+    modelVisibleToolNames: names,
+    plannedToolNames: [
+      "web_search",
+      "web_fetch",
+      "web_fetch",
+      "web_fetch",
+      "create_design_canvas",
+    ],
+    currentNotePath: "Research/Transformer brief.md",
+    maxToolCalls: 8,
+    maxWallClockMs: 60_000,
+    now: NOW,
+  });
+  const nodes = Object.values(host.deterministicProposal.nodes);
+  const search = nodes.find((node) => node.allowedTools.includes("web_search"));
+  const fetches = nodes.filter((node) => node.allowedTools.includes("web_fetch"));
+  const canvas = nodes.find((node) =>
+    node.allowedTools.includes("create_design_canvas"),
+  );
+
+  assert.ok(search);
+  assert.equal(fetches.length, 3);
+  assert.ok(canvas);
+  assert.deepEqual(
+    new Set(canvas.dependencyIds),
+    new Set([search.id, ...fetches.map((node) => node.id)]),
+  );
+});
+
 test("the current-note selector fallback never binds workspace or GitHub nodes to the vault note", async () => {
   const notePath = "E2E Agent Tests/BYOK-AUTONOMOUS-354b0aa81852.md";
   const workspaceNames = [

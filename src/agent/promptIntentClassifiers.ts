@@ -310,6 +310,19 @@ export function hasDesignPackageIntent(prompt: string): boolean {
   );
 }
 
+/**
+ * A single request can require both a narrative note and a visual artifact.
+ * Keep that contract distinct from a design-only request and from the existing
+ * design-package composite, which already owns its Markdown brief.
+ */
+export function hasNarrativeDesignOutputIntent(prompt: string): boolean {
+  return (
+    hasDesignIntent(prompt) &&
+    hasStaticGenerationIntent(prompt) &&
+    !hasDesignPackageIntent(prompt)
+  );
+}
+
 export function hasCanvasDesignIntent(prompt: string): boolean {
   if (hasExplicitCanvasDestinationIntent(prompt)) {
     return true;

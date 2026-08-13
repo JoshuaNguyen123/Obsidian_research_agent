@@ -185,6 +185,7 @@ export function conversationalBlockerCopy(input: {
     | "credential"
     | "approval"
     | "external"
+    | "orchestration"
     | "validation"
     | "provider"
     | "generic";
@@ -206,6 +207,16 @@ export function conversationalBlockerCopy(input: {
   }
   if (kind === "external") {
     return externalStateBlockFailureCopy(input.why);
+  }
+  if (kind === "orchestration") {
+    return {
+      what: input.what?.trim() || "The mission's internal plan could not advance.",
+      why:
+        input.why?.trim() ||
+        "A required internal prerequisite was missing or repeatedly deferred.",
+      next:
+        "No external action is required. Retry the mission; if it repeats, report the run ID from Run Details.",
+    };
   }
   if (kind === "validation") {
     const progress = validationRepairProgressCopy({

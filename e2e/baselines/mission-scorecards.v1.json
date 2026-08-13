@@ -65,6 +65,76 @@
       }
     },
     {
+      "key": "core-native|CORE-01|e2e/core-native.spec.ts|CORE-01 exact transformer brief creates a relevant note and Canvas without invented research",
+      "project": "core-native",
+      "scenarioId": "CORE-01",
+      "file": "e2e/core-native.spec.ts",
+      "title": "CORE-01 exact transformer brief creates a relevant note and Canvas without invented research",
+      "scorecard": {
+        "version": 1,
+        "acceptancePassed": true,
+        "dimensions": [
+          {
+            "id": "acceptance_coverage",
+            "score": 1,
+            "weight": 0.3,
+            "detail": "6/6 criteria met",
+            "applicable": true
+          },
+          {
+            "id": "evidence_grounding",
+            "score": 1,
+            "weight": 0.25,
+            "detail": "0/0 claims cited",
+            "applicable": false
+          },
+          {
+            "id": "receipt_coverage",
+            "score": 1,
+            "weight": 0.15,
+            "detail": "3/3 mutations receipted",
+            "applicable": true
+          },
+          {
+            "id": "source_independence",
+            "score": 1,
+            "weight": 0.05,
+            "detail": "no web sources required",
+            "applicable": false
+          },
+          {
+            "id": "research_depth",
+            "score": 1,
+            "weight": 0.05,
+            "detail": "no web sources required",
+            "applicable": false
+          },
+          {
+            "id": "recovery_cleanliness",
+            "score": 1,
+            "weight": 0.1,
+            "detail": "0 recovery attempts",
+            "applicable": true
+          },
+          {
+            "id": "model_call_efficiency",
+            "score": 1,
+            "weight": 0.05,
+            "detail": "2/6 model calls",
+            "applicable": true
+          },
+          {
+            "id": "wall_clock_efficiency",
+            "score": 1,
+            "weight": 0.05,
+            "detail": "63s/193s",
+            "applicable": true
+          }
+        ],
+        "total": 1
+      }
+    },
+    {
       "key": "daily-use-research|DU-02|e2e/daily-use-research.spec.ts|DU-02 proof-gated sourced writeback binds owned fetched passages",
       "project": "daily-use-research",
       "scenarioId": "DU-02",

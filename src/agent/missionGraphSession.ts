@@ -30,6 +30,7 @@ import {
 import type { MissionGraphStoreReferenceV1 } from "./runStore";
 import { missionGraphToolNodeWallClockMs } from "./missionGraphHost";
 import { collectRequiredDependencyIds } from "./missionGraphAuthority";
+import { sha256Fingerprint } from "../../packages/headless-runtime/src/canonicalize";
 
 export interface MissionGraphSessionEvents {
   onGraphUpdate?: (
@@ -2068,26 +2069,52 @@ export class MissionGraphSession {
   }
 
   /**
-   * Return a started tool to the ready frontier without recording an attempt.
-   * This is reserved for host policy deferrals where the tool itself never ran
-   * (for example, an early write requested during research analysis).
+   * Requeue one host-policy deferral, but journal it as an attempt. Repeating
+   * the same deferral blocks the node instead of creating an invisible
+   * ready -> running -> ready loop that can consume the whole model budget.
    */
   async deferToolExecution(
     execution: MissionGraphToolExecution,
     reason: string,
   ): Promise<MissionGraphV3> {
+    const failureFingerprint = await sha256Fingerprint({
+      kind: "host_policy_deferral",
+      toolName: execution.toolName,
+      reason: reason.replace(/\s+/gu, " ").trim(),
+    });
     return this.enqueueMutation(async () => {
       const node = this.requireExecutionNode(execution, "running");
+      const nextAttempts = node.retries.attempts + 1;
+      const sameDeferralCount =
+        node.retries.consecutiveFailureFingerprint === failureFingerprint
+          ? node.retries.consecutiveFailureCount + 1
+          : 1;
+      const terminal =
+        sameDeferralCount >= 2 ||
+        nextAttempts >= Math.max(2, node.retries.maxAttempts);
       try {
         return await this.applyUnlocked(
           `Defer ${execution.toolName} for ${node.id}: ${reason.slice(0, 240)}`,
           [
             {
+              op: "record_attempt",
+              nodeId: node.id,
+              failureFingerprint,
+              observedAt: this.now(),
+            },
+            {
               op: "set_status",
               nodeId: node.id,
               expectedStatus: "running",
-              status: "ready",
-              blocker: null,
+              status: terminal ? "blocked" : "ready",
+              blocker: terminal
+                ? {
+                    code: "policy_deferral_repeated",
+                    message: `Internal orchestration repeatedly deferred ${execution.toolName}: ${reason}`,
+                    requiredAction:
+                      "Rebuild the mission frontier so effectful work follows its read prerequisites, then retry the mission.",
+                  }
+                : null,
             },
           ],
         );

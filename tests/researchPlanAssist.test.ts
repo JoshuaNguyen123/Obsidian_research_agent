@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   applyResearchEvidence,
+  allowsResearchModeAssistActivation,
   createResearchPlan,
   createResearchPlanWithAssist,
   estimateDeterministicResearchConfidence,
@@ -100,8 +101,8 @@ test("createResearchPlanWithAssist merges utility questions when confidence is l
   );
 });
 
-test("semantic mode assist activates research on a keywordless prompt", async () => {
-  const prompt = "Write an essay on the causes of World War I.";
+test("semantic mode assist refines an explicit source request", async () => {
+  const prompt = "Write an essay on the causes of World War I using four sources.";
   const runPlan = {
     route: "grounded_workflow",
     slowPathReason: "needs_web_sources",
@@ -128,6 +129,36 @@ test("semantic mode assist activates research on a keywordless prompt", async ()
   assert.ok(upgraded);
   assert.equal(upgraded!.mode, "deep_web");
   assert.equal(upgraded!.sourceRequirements.minFetchedSources, 4);
+});
+
+test("semantic mode assist cannot turn a stable composition request into web research", async () => {
+  const prompt =
+    "Can you write me a brief including diagrams, explaining in depth the transformer architecture and its importance?";
+  const runPlan = {
+    route: "grounded_workflow",
+    slowPathReason: "needs_web_sources",
+  } as const;
+  const missionIntent = researchIntent();
+  let modeAssistCalled = false;
+
+  assert.equal(allowsResearchModeAssistActivation(prompt, missionIntent), false);
+  const plan = await createResearchPlanWithAssist({
+    prompt,
+    missionIntent,
+    runPlan,
+    utilityModelConfigured: true,
+    modeAssist: async () => {
+      modeAssistCalled = true;
+      return {
+        mode: "deep_web",
+        sourceFloor: 4,
+        rationale: "Factual prose could be cited.",
+      };
+    },
+  });
+
+  assert.equal(plan, null);
+  assert.equal(modeAssistCalled, false);
 });
 
 test("keyword floor still wins and the mode assist only fills silence", async () => {

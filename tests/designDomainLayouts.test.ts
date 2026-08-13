@@ -46,6 +46,64 @@ test("distributed system layout infers ordered tiers and preserves explicit trus
   ]);
 });
 
+test("large architecture lanes override extreme row and column strips", () => {
+  for (const direction of ["row", "column"] as const) {
+    const canvas = buildLayoutCanvas({
+      title: "Transformer architecture",
+      diagramType: "architecture",
+      direction,
+      connect: "sequence",
+      items: Array.from({ length: 51 }, (_, index) => ({
+        id: `component-${index + 1}`,
+        kind: "service" as const,
+        title: `Component ${index + 1}`,
+      })),
+    });
+
+    const group = canvas.nodes.find((node) => node.type === "group");
+    const itemNodes = canvas.nodes.filter(
+      (node) => node.type !== "group" && node.id !== "canvas-title",
+    );
+    assert.ok(group && group.type === "group");
+    assert.ok(group.width <= 2_720, `${direction} width was ${group.width}`);
+    assert.ok(group.height <= 2_420, `${direction} height was ${group.height}`);
+    assert.ok(new Set(itemNodes.map((node) => node.x)).size > 1);
+    assert.ok(new Set(itemNodes.map((node) => node.y)).size > 1);
+  }
+});
+
+test("architecture maps stay connected even when model requests no auto-edges", () => {
+  const canvas = buildLayoutCanvas({
+    title: "Transformer architecture",
+    diagramType: "architecture",
+    connect: "none",
+    items: Array.from({ length: 8 }, (_, index) => ({
+      id: `component-${index + 1}`,
+      kind: "process" as const,
+      title: `Component ${index + 1}`,
+    })),
+  });
+
+  assert.equal(canvas.edges.length, 7);
+  assert.deepEqual(
+    canvas.edges.map((edge) => [edge.fromNode, edge.toNode]),
+    Array.from({ length: 7 }, (_, index) => [
+      `component-${index + 1}`,
+      `component-${index + 2}`,
+    ]),
+  );
+
+  const nonArchitecture = buildLayoutCanvas({
+    diagramType: "sequence",
+    connect: "none",
+    items: [
+      { id: "one", title: "One" },
+      { id: "two", title: "Two" },
+    ],
+  });
+  assert.equal(nonArchitecture.edges.length, 0);
+});
+
 test("business and manufacturing layouts infer process-specific swimlanes", () => {
   assert.equal(inferCanvasLane("business_process", "actor"), "Participants");
   assert.equal(inferCanvasLane("business_process", "process"), "Process Flow");

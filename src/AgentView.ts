@@ -1972,6 +1972,11 @@ export class AgentView extends ItemView {
       await this.plugin.clearConversationHistory();
       this.pendingAssistantContent = "";
       this.liveAssistantMessageEl = null;
+      // Blocker attention is ephemeral run UI, not conversation memory. Clear
+      // it with the transcript so a recovered/new mission never shows a stale
+      // "Blocked" banner beside current successful output.
+      this.clearChatAttention();
+      this.setRunDetailsNeedsAttention(false);
       this.renderConversationLog();
       this.appendLog("system", clearChatDoneCopy());
       new Notice("Chat cleared. Notes, backups, and settings unchanged.");
@@ -2491,7 +2496,6 @@ export class AgentView extends ItemView {
     if (event.autonomyStats) {
       this.setAutonomyRunStats(event.autonomyStats);
     }
-    this.appendSilentTurnFallbackIfNeeded(event);
     this.clearChatAttention();
     this.setRunDetailsNeedsAttention(false);
     const missionStop = fromAgentRunStopReason(
@@ -2508,6 +2512,7 @@ export class AgentView extends ItemView {
     this.appendWorkstreamLine(stopLine);
     if (
       missionStop === "provider_error" ||
+      missionStop === "orchestration_deadlock" ||
       missionStop === "graph_blocked" ||
       missionStop === "approval_denied" ||
       missionStop === "required_tools_failed"
@@ -2528,9 +2533,10 @@ export class AgentView extends ItemView {
                   ? /api key|credential|auth|missing_api_key/i.test(detail)
                     ? "credential"
                     : "provider"
-                  : missionStop === "graph_blocked" ||
+                  : missionStop === "orchestration_deadlock" ||
+                      missionStop === "graph_blocked" ||
                       missionStop === "required_tools_failed"
-                    ? "external"
+                    ? "orchestration"
                     : "generic",
             why: detail,
             approvalDecision:
@@ -2541,7 +2547,8 @@ export class AgentView extends ItemView {
       this.currentRunChatId = null;
       this.renderChatBlockedContinueAttention(
         blockerCopy,
-        missionStop === "graph_blocked"
+        missionStop === "graph_blocked" ||
+          missionStop === "orchestration_deadlock"
           ? chatMissionGraphBlockerTitle()
           : writeInterrupted
             ? chatWriteInterruptedTitle()
@@ -2614,30 +2621,6 @@ export class AgentView extends ItemView {
       this.appendLog("system", line);
       this.appendWorkstreamLine(line);
     }
-  }
-
-  private appendSilentTurnFallbackIfNeeded(event: AgentRunCompleteEvent) {
-    if (!this.currentRunChatId || this.pendingAssistantContent.trim()) {
-      return;
-    }
-
-    const message = this.getSilentTurnFallbackMessage(
-      event.stopReason,
-      event.stopDetail ?? event.autoContinueReason,
-    );
-    this.appendLog("assistant", message);
-    this.pendingAssistantContent = message;
-    void this.plugin.appendConversationMessage({
-      role: "assistant",
-      content: message,
-    });
-  }
-
-  private getSilentTurnFallbackMessage(
-    stopReason: AgentRunStopReason,
-    detail?: string | null,
-  ): string {
-    return stopReasonChatLine(fromAgentRunStopReason(stopReason, detail));
   }
 
   private renderApprovalRequest(request: ApprovalRequest) {

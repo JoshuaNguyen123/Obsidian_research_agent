@@ -184,6 +184,7 @@ test("model-free lanes are explicitly exempt, with the set stated in code", () =
   // A journey lane must never be quietly exempted.
   for (const lane of [
     "byok-autonomous-journey",
+    "core-native",
     "desktop-checkers-delivery-real-live",
     "daily-use-research",
     "daily-use-compound",

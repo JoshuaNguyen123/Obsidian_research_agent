@@ -63,6 +63,8 @@ export interface NativeObsidianHarness {
 
 export interface StartNativeObsidianHarnessOptions {
   label: string;
+  /** Optional safe basename prefix for reproducing placeholder-note behavior. */
+  noteBasenamePrefix?: string;
   pluginIds?: readonly string[];
   /** Node-side settings seed; useful for credentials that must never enter traces. */
   corePluginDataOverrides?: Readonly<Record<string, unknown>>;
@@ -172,7 +174,18 @@ export async function startNativeObsidianHarness(
   );
   const id = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
   const marker = `E2E_MARKER_${id}`;
-  const notePath = `E2E Agent Tests/${options.label}-${id}.md`;
+  const noteBasenamePrefix = options.noteBasenamePrefix?.trim();
+  if (
+    noteBasenamePrefix &&
+    (!/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,60}$/u.test(noteBasenamePrefix) ||
+      /\.{2}|[\\/]/u.test(noteBasenamePrefix))
+  ) {
+    throw new Error("Native Obsidian note basename prefix is unsafe.");
+  }
+  const noteBasename = noteBasenamePrefix
+    ? `${noteBasenamePrefix} ${id.replace(/\D/gu, "")}`
+    : `${options.label}-${id}`;
+  const notePath = `E2E Agent Tests/${noteBasename}.md`;
   const noteFilePath = path.join(vaultRoot, ...notePath.split("/"));
   const setupContext: NativeObsidianSetupContext = {
     page: null as unknown as Page,

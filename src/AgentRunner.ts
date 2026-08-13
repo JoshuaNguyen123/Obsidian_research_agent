@@ -423,6 +423,7 @@ import {
   hasMarkdownTitleContentIntent,
   hasMermaidDesignIntent,
   hasMovePathIntent,
+  hasNarrativeDesignOutputIntent,
   hasNamedFolderTraversalIntent,
   hasNoteOutputIntent,
   hasOpenWebSourceIntent,
@@ -2213,6 +2214,38 @@ export async function runAgentMission({
   const getLinearCodeRepositoryBindingResolution = ():
     | VerifiedLinearCodeRepositoryBindingResolutionV1
     | null => linearCodeRepositoryBindingResolution;
+  // Pin the note that was current when the mission started. Visual tools may
+  // replace the active leaf with a Canvas or SVG before a later graph node
+  // writes the requested narrative. Letting each tool re-resolve workspace
+  // focus at that point turns a valid multi-artifact mission into "no active
+  // markdown file" (or targets a different note the user focuses mid-run).
+  // Resolve the pinned path through the vault on every access so renames can
+  // update it without retaining a stale TFile object.
+  let pinnedCurrentMarkdownPathForRun =
+    toolContext.getCurrentMarkdownFile?.()?.path ?? null;
+  const resolvePinnedCurrentMarkdownFile = (): ReturnType<
+    NonNullable<ToolExecutionContext["getCurrentMarkdownFile"]>
+  > => {
+    if (pinnedCurrentMarkdownPathForRun) {
+      const pinned = toolContext.app.vault.getFileByPath(
+        pinnedCurrentMarkdownPathForRun,
+      );
+      if (pinned?.extension === "md") {
+        return pinned;
+      }
+      // A mission that began with an exact note binding must fail closed if
+      // that file disappears. Falling through to current workspace focus could
+      // mutate an unrelated note the user opened while the run was active.
+      return null;
+    }
+
+    const current = toolContext.getCurrentMarkdownFile?.() ?? null;
+    if (current?.extension === "md") {
+      pinnedCurrentMarkdownPathForRun = current.path;
+      return current;
+    }
+    return null;
+  };
   let runToolContext: ToolExecutionContext = {
     ...toolContext,
     originalPrompt: activeIntentPrompt,
@@ -2226,6 +2259,7 @@ export async function runAgentMission({
     userApprovalGranted: false,
     writeAutonomy,
     missionIntent,
+    getCurrentMarkdownFile: resolvePinnedCurrentMarkdownFile,
     getVerifiedLinearCodeRepositoryBinding,
     runFlags: {
       compoundLifecycleDetected,
@@ -4012,17 +4046,29 @@ export async function runAgentMission({
               ...researchPlanSettingOverrides(runToolContext.settings),
             });
         bootstrapResearchPlanCache = bootstrapResearchPlan;
-        const requiredGraphFetchCount = requiresWebEvidenceProof(
-          activeIntentPrompt,
-          missionIntent,
-        )
-          ? Math.max(
-              1,
-              bootstrapResearchPlan?.sourceRequirements.minFetchedSources ??
-                parseExplicitResearchSourceCount(activeIntentPrompt) ??
-                1,
-            )
-          : 0;
+        // The attached research contract is the authority for graph proof debt.
+        // Previously this was gated a second time by lexical evidence intent,
+        // so a semantically attached N-source plan created no prerequisite
+        // nodes and an effectful design write could start before research.
+        const requiredGraphFetchCount = Math.max(
+          bootstrapResearchPlan?.sourceRequirements.minFetchedSources ?? 0,
+          requiresWebEvidenceProof(activeIntentPrompt, missionIntent)
+            ? (parseExplicitResearchSourceCount(activeIntentPrompt) ?? 1)
+            : 0,
+        );
+        const plannedResearchGraphToolNames =
+          requiredGraphFetchCount > 0
+            ? [
+                "web_search",
+                ...Array.from(
+                  { length: requiredGraphFetchCount },
+                  () => "web_fetch",
+                ),
+              ].filter((name) => graphAllowedToolNames.includes(name))
+            : [];
+        for (const name of plannedResearchGraphToolNames) {
+          currentlyRunnableGraphToolNames.add(name);
+        }
         const explicitCompoundResearchToolNames =
           getCompoundLifecycleResearchGraphToolNames(
             activeIntentPrompt,
@@ -4207,10 +4253,14 @@ export async function runAgentMission({
           ...(promptOnPageBootstrap
             ? runnerOwnedGraphToolNames
             : [
+                ...(!seededResearchHandoffSatisfiesReads
+                  ? plannedResearchGraphToolNames
+                  : []),
                 ...(explicitGraphWorkflowToolNames.length > 0
                   ? []
                   : bootstrapLoopBudget.expectedTools.filter(
                       (name) =>
+                        !plannedResearchGraphToolNames.includes(name) &&
                         !explicitCurrentNoteRenamePrerequisite.includes(name) &&
                         (!seededResearchHandoffSatisfiesReads ||
                           !["web_search", "web_fetch", "read_source_section"].includes(
@@ -4224,14 +4274,6 @@ export async function runAgentMission({
                   bootstrapLoopBudget.expectedTools,
                   reflexOutput.intent,
                 ),
-                ...(explicitGraphWorkflowToolNames.length === 0 &&
-                !seededResearchHandoffSatisfiesReads &&
-                bootstrapLoopBudget.expectedTools.includes("web_fetch")
-                  ? Array.from(
-                      { length: Math.max(0, requiredGraphFetchCount - 1) },
-                      () => "web_fetch",
-                    )
-                  : []),
                 ...explicitGraphWorkflowToolNames,
                 // Explicit workflows already contain their complete ordered
                 // tool lifecycle. Re-adding the same names as runner-owned
@@ -5581,10 +5623,14 @@ export async function runAgentMission({
       parseExplicitResearchSourceCount(activeIntentPrompt) ?? 1,
     );
   }
-  // Interactive clarification: offer ask_user only when the host listens for
-  // questions, so the agent can ask instead of guessing in the panel while a
-  // headless or e2e run keeps its compact schema and never stalls on a prompt.
-  if (events.onClarificationRequest) {
+  // Interactive clarification is an escape hatch for genuinely incomplete
+  // missions, not a generally available planning step. Offering it for a
+  // complete request lets a model burn the bounded run on an unnecessary
+  // question instead of executing the ready graph frontier.
+  if (
+    events.onClarificationRequest &&
+    shouldOfferInteractiveClarificationTool(activeIntentPrompt, noteOutputPlan)
+  ) {
     tools = addToolDefinitions(tools, toolRegistry, [ASK_USER_TOOL_NAME]);
     allowedToolNames = new Set(tools.map((tool) => tool.function.name));
     runPlan = {
@@ -6797,14 +6843,14 @@ export async function runAgentMission({
     receipt: AgentRunReceipt,
     traceId: string,
   ) => {
-    if (!runtimeSnapshot || !receipt.toPath) {
+    if (!receipt.toPath) {
       return;
     }
     const renamedCurrentNote = receipt.toolName === "rename_current_file";
     const movedPinnedCurrentNote =
       receipt.toolName === "move_path" &&
-      runtimeSnapshot.currentNotePath !== undefined &&
-      receipt.path === runtimeSnapshot.currentNotePath;
+      pinnedCurrentMarkdownPathForRun !== null &&
+      receipt.path === pinnedCurrentMarkdownPathForRun;
     if (!renamedCurrentNote && !movedPinnedCurrentNote) {
       return;
     }
@@ -6824,15 +6870,18 @@ export async function runAgentMission({
       });
       return;
     }
-    const previousPath = runtimeSnapshot.currentNotePath;
-    runtimeSnapshot.currentNotePath = nextPath;
+    const previousPath = pinnedCurrentMarkdownPathForRun;
+    pinnedCurrentMarkdownPathForRun = nextPath;
+    if (runtimeSnapshot) {
+      runtimeSnapshot.currentNotePath = nextPath;
+    }
     if (previousPath !== nextPath) {
       events.onTrace?.({
         id: `${traceId}:current-note-path`,
         kind: "status",
         toolName: receipt.toolName,
         operation: receipt.operation,
-        path: previousPath,
+        path: previousPath ?? undefined,
         toPath: nextPath,
         message: `Updated the durable current-note target to ${nextPath}.`,
       });
@@ -14254,6 +14303,19 @@ export async function runAgentMission({
             ].join("\n\n"),
           },
         ]),
+    ...(hasNarrativeDesignOutputIntent(activeIntentPrompt)
+      ? [
+          {
+            role: "system" as const,
+            content: [
+              "This mission requires two durable, related outputs: the requested narrative Markdown note and a native visual artifact.",
+              "Create the visual with the offered design tool, write the complete narrative with the offered note-write tool, and do not finish until both writes have verified receipts.",
+              "In the Markdown, include an Obsidian link to the exact visual-artifact path returned by the design tool so the two deliverables remain connected.",
+              "Do not add web or vault research unless the user explicitly requested evidence from those sources.",
+            ].join(" "),
+          },
+        ]
+      : []),
     ...(researchPlan === null
       ? []
       : [
@@ -20501,6 +20563,35 @@ function formatCurrentNoteReadSatisfiedContext(): string {
   ].join(" ");
 }
 
+function shouldOfferInteractiveClarificationTool(
+  prompt: string,
+  noteOutputPlan: NoteOutputPlan,
+): boolean {
+  if (
+    noteOutputPlan.reason === "section_target_ambiguous" ||
+    hasAmbiguousDatePrompt(prompt)
+  ) {
+    return true;
+  }
+
+  const normalized = prompt.trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return true;
+  }
+
+  if (
+    /\b(?:ask me|check with me|confirm with me|clarify with me|ask for clarification)\b/iu.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+
+  return /^(?:please\s+)?(?:help(?:\s+me)?|clarify|continue|go\s+on|do\s+(?:it|this)|fix\s+(?:it|this)|work\s+on\s+(?:it|this)|what\s+about\s+this)[.!?]*$/iu.test(
+    normalized,
+  );
+}
+
 function formatRuntimeContext(
   toolContext: ToolExecutionContext,
   prompt: string,
@@ -24994,8 +25085,6 @@ function shouldTrackStreamingAppendContent(
       "fill_template",
       "create_research_pack",
       "append_research_memory",
-      "create_design_canvas",
-      "create_svg_design",
     ].includes(toolName),
   );
   if (writeToolOwnsContent) {
@@ -25415,7 +25504,8 @@ function getRequiredWriteToolNames(
   const wholeNoteReplace = hasWholeNoteReplaceIntent(prompt);
   const noteOutputIntent = missionIntent.noteOutput;
   const specializedDesignWorkflow =
-    hasDesignIntent(prompt) || hasReviseDesignIntent(prompt);
+    (hasDesignIntent(prompt) || hasReviseDesignIntent(prompt)) &&
+    !hasNarrativeDesignOutputIntent(prompt);
 
   const preferPathTarget = hasExplicitNonCurrentNoteWriteTarget(prompt);
   const hasCurrentMutationTarget =
@@ -27129,6 +27219,7 @@ function classifyMissionIntent(
       hasResearchPackIntent(prompt));
   const explicitResearchMemoryWrite = hasResearchMemoryWriteIntent(prompt);
   const explicitDesignWrite = hasDesignIntent(prompt);
+  const narrativeDesignOutput = hasNarrativeDesignOutputIntent(prompt);
   const explicitHighlightWrite = hasHighlightIntent(prompt);
   const explicitRestoreWrite = hasRestoreIntent(prompt);
   const chatOnlyResponse = hasChatOnlyResponseIntent(prompt);
@@ -27186,6 +27277,7 @@ function classifyMissionIntent(
     !isVaultWideOrganizeIntent(prompt) &&
     (!codeWorkflowIntent || codeWorkflowNoteTarget) &&
     (hasNoteOutputIntent(prompt) ||
+      narrativeDesignOutput ||
       isCurrentNoteEditOrganizeIntent(prompt) ||
       isWholeNoteEditIntent(prompt) ||
       generated.target === "current_note_append" ||
@@ -27614,7 +27706,8 @@ function buildMissionNoteOutputPlan(input: {
     hasPriorAssistantResponseWritebackIntent(input.prompt) ||
     hasResearchMemoryWriteIntent(input.prompt) ||
     hasTemplateIntent(input.prompt) ||
-    hasDesignIntent(input.prompt) ||
+    (hasDesignIntent(input.prompt) &&
+      !hasNarrativeDesignOutputIntent(input.prompt)) ||
     hasCodeExecutionIntent(input.prompt) ||
     hasBrowserAutomationIntent(input.prompt) ||
     hasCreateFileIntent(input.prompt) ||
@@ -34222,7 +34315,7 @@ function buildResearchModeAssist(
         {
           role: "system",
           content:
-            'Decide whether answering this request well requires grounding in real sources (facts, history, current events, data, comparisons, anything a careful writer would cite) versus pure composition or opinion. Return only a JSON object like {"mode":"deep_web","sourceFloor":3,"rationale":"one short sentence"}. mode: deep_web = needs public web sources; deep_vault = should draw on the user\'s own notes/vault; deep_hybrid = both; none = no grounding needed. sourceFloor: how many distinct sources the topic warrants, 1-8. No markdown, no extra text.',
+            'This request already contains explicit evidence intent. Decide whether that named evidence should come from public web sources, the user\'s vault, or both. Do not infer public-web research merely because the requested prose is factual, historical, technical, or something a careful writer could cite. Return only a JSON object like {"mode":"deep_web","sourceFloor":3,"rationale":"one short sentence"}. mode: deep_web = the request explicitly needs public web sources; deep_vault = it explicitly needs the user\'s notes/vault; deep_hybrid = both; none = the explicit evidence wording does not require either. sourceFloor: how many distinct sources the request warrants, 1-8. No markdown, no extra text.',
         },
         {
           role: "user",

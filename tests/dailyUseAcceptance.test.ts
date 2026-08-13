@@ -21,6 +21,7 @@ describe("DailyUseAcceptanceV1", () => {
       "BYOK-01",
       "DESKTOP-01",
       "FLOW-REAL-01",
+      "CORE-01",
     ]);
     for (const [scenarioId, contract] of Object.entries(DAILY_USE_ACCEPTANCE_V1)) {
       assert.equal(contract.version, 1);

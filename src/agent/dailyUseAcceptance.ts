@@ -7,7 +7,8 @@ export type DailyUseScenarioId =
   | "DU-06"
   | "BYOK-01"
   | "DESKTOP-01"
-  | "FLOW-REAL-01";
+  | "FLOW-REAL-01"
+  | "CORE-01";
 
 export interface DailyUseAcceptanceV1 {
   version: 1;
@@ -129,6 +130,30 @@ export const DESKTOP_01_ACCEPTANCE_TOKENS = Object.freeze({
     "cleanup:desktop_export",
     "cleanup:scratch_workspace",
   ] as const),
+});
+
+/**
+ * Runtime observations for the default product-health lane. This is the exact
+ * user-reported transformer brief: one grounded-in-the-prompt Markdown brief
+ * plus one native Obsidian Canvas, with no invented web-research obligation.
+ */
+export const CORE_01_ACCEPTANCE_TOKENS = Object.freeze({
+  artifacts: Object.freeze([
+    "vault:transformer_brief",
+    "vault:transformer_canvas",
+  ] as const),
+  proofs: Object.freeze([
+    "model:production_call",
+    "route:no_unrequested_research",
+    "graph:terminal",
+    "receipt:markdown_note",
+    "receipt:canvas",
+    "relevance:transformer_brief",
+    "relevance:transformer_canvas",
+  ] as const),
+  approvals: Object.freeze([] as const),
+  bindings: Object.freeze(["binding:brief_canvas"] as const),
+  cleanup: Object.freeze([] as const),
 });
 
 /**
@@ -337,6 +362,13 @@ export const DAILY_USE_ACCEPTANCE_V1: Readonly<
     approvalBoundaries: FLOW_REAL_01_ACCEPTANCE_TOKENS.approvals,
     finalBindings: FLOW_REAL_01_ACCEPTANCE_TOKENS.bindings,
     cleanupObligations: FLOW_REAL_01_ACCEPTANCE_TOKENS.cleanup,
+  }),
+  "CORE-01": contract("CORE-01", {
+    requestedArtifacts: CORE_01_ACCEPTANCE_TOKENS.artifacts,
+    requiredProofs: CORE_01_ACCEPTANCE_TOKENS.proofs,
+    approvalBoundaries: CORE_01_ACCEPTANCE_TOKENS.approvals,
+    finalBindings: CORE_01_ACCEPTANCE_TOKENS.bindings,
+    cleanupObligations: CORE_01_ACCEPTANCE_TOKENS.cleanup,
   }),
 });
 
